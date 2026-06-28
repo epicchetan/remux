@@ -452,6 +452,10 @@ function defaultResourceId({
     return `${extensionId}:draft:${createdAt}:${sequence}`;
   }
 
+  if (resourceKind === 'terminalSession') {
+    return `${extensionId}:session:${createdAt}:${sequence}`;
+  }
+
   return null;
 }
 

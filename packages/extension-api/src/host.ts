@@ -1,4 +1,4 @@
-import { requestIpc } from './ipc';
+import { requestIpc, subscribeIpcEvents, type JsonRpcMessage } from './ipc';
 
 export type HostOverviewOpenParams = {
   section?: 'files' | 'tabs';
@@ -17,8 +17,21 @@ export type HostTabUpdate = {
   title?: string | null;
 };
 
+export type RemuxHostViewportMetrics = {
+  keyboardHeight: number;
+  keyboardVisible: boolean;
+  visibleBottom: number;
+  visibleTop: number;
+  viewportHeight: number;
+  viewportWidth: number;
+};
+
 export function dismissHostKeyboard() {
   return requestIpc('host/keyboard/dismiss', undefined, 1_000);
+}
+
+export function getHostViewportMetrics() {
+  return requestIpc<RemuxHostViewportMetrics>('host/viewport/get', undefined, 1_000);
 }
 
 export function openHostOverview(params: HostOverviewOpenParams = {}) {
@@ -35,4 +48,18 @@ export function reloadHostView() {
 
 export function updateHostTab(params: HostTabUpdate) {
   return requestIpc<{ ok: boolean }>('host/tab/update', params, 1_000);
+}
+
+export function subscribeHostViewportMetrics(subscriber: (metrics: RemuxHostViewportMetrics) => void) {
+  return subscribeIpcEvents((events) => {
+    for (const event of events) {
+      if (event.method === 'host/viewport/changed') {
+        subscriber(paramsOf<RemuxHostViewportMetrics>(event));
+      }
+    }
+  });
+}
+
+function paramsOf<T>(message: JsonRpcMessage): T {
+  return ('params' in message ? message.params : {}) as T;
 }

@@ -1,0 +1,871 @@
+import {
+  dismissHostKeyboard,
+  getHostViewportMetrics,
+  openHostOverview,
+  type RemuxHostViewportMetrics,
+  subscribeHostViewportMetrics,
+  updateHostTab,
+} from '@remux/extension-api/host';
+import type { RemuxViewerRoute } from '@remux/extension-api/route';
+import {
+  ExtensionActionBar,
+  ExtensionActionButton,
+} from '@remux/extension-ui';
+import { FitAddon } from '@xterm/addon-fit';
+import { Unicode11Addon } from '@xterm/addon-unicode11';
+import { WebLinksAddon } from '@xterm/addon-web-links';
+import { WebglAddon } from '@xterm/addon-webgl';
+import { Terminal } from '@xterm/xterm';
+import {
+  ArrowDown,
+  ArrowLeft,
+  ArrowRight,
+  ArrowUp,
+  ClipboardPaste,
+  CornerDownLeft,
+  Keyboard,
+  KeyboardOff,
+  PanelTopOpen,
+  RefreshCw,
+} from 'lucide-react';
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
+
+import {
+  attachTerminalSession,
+  bytesFromBase64,
+  killTerminalSession,
+  readRemuxSystemInfo,
+  resizeTerminalSession,
+  startTerminalSession,
+  subscribeTerminalEvents,
+  writeTerminalSession,
+  type TerminalSessionOutputFrame,
+} from './terminalRpc';
+import { setupTouchScroll } from './touchScroll';
+
+const fontFamily = 'Menlo, Consolas, "Liberation Mono", monospace';
+const textEncoder = new TextEncoder();
+const modifierAutoClearMs = 3000;
+const fitDebounceMs = 180;
+
+type TerminalSurfaceProps = {
+  route: RemuxViewerRoute;
+};
+
+type TerminalStatus =
+  | { type: 'connecting' }
+  | { cwd: string; shell: string; type: 'running' }
+  | { code: number | null; signal: string | null; type: 'exited' }
+  | { message: string; type: 'error' };
+
+export function TerminalSurface({ route }: TerminalSurfaceProps) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const fitAddonRef = useRef<FitAddon | null>(null);
+  const lastResizeRef = useRef<{ cols: number; rows: number } | null>(null);
+  const lastSeqRef = useRef(0);
+  const sessionIdRef = useRef<string | null>(null);
+  const terminalRef = useRef<Terminal | null>(null);
+  const fitTimerRef = useRef<number | null>(null);
+  const hostViewportMetricsRef = useRef<RemuxHostViewportMetrics | null>(null);
+  const modifierTimerRef = useRef<number | null>(null);
+  const [altActive, setAltActive] = useState(false);
+  const [ctrlActive, setCtrlActive] = useState(false);
+  const [keyboardOffset, setKeyboardOffset] = useState(0);
+  const [keyboardOpen, setKeyboardOpen] = useState(false);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [status, setStatus] = useState<TerminalStatus>({ type: 'connecting' });
+
+  const resetModifiers = useCallback(() => {
+    setCtrlActive(false);
+    setAltActive(false);
+  }, []);
+
+  const clearModifierTimer = useCallback(() => {
+    if (modifierTimerRef.current !== null) {
+      window.clearTimeout(modifierTimerRef.current);
+      modifierTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    clearModifierTimer();
+    if (!ctrlActive && !altActive) {
+      return undefined;
+    }
+
+    modifierTimerRef.current = window.setTimeout(() => {
+      modifierTimerRef.current = null;
+      resetModifiers();
+    }, modifierAutoClearMs);
+
+    return clearModifierTimer;
+  }, [altActive, clearModifierTimer, ctrlActive, resetModifiers]);
+
+  const currentSize = useCallback(() => {
+    const terminal = terminalRef.current;
+    if (!terminal) {
+      return { cols: 80, rows: 24 };
+    }
+
+    return {
+      cols: clampSize(terminal.cols, 2, 500),
+      rows: clampSize(terminal.rows, 2, 200),
+    };
+  }, []);
+
+  const sendResize = useCallback((cols: number, rows: number) => {
+    const normalized = {
+      cols: clampSize(cols, 2, 500),
+      rows: clampSize(rows, 2, 200),
+    };
+    const lastResize = lastResizeRef.current;
+    if (lastResize && lastResize.cols === normalized.cols && lastResize.rows === normalized.rows) {
+      return;
+    }
+
+    lastResizeRef.current = normalized;
+    const currentSessionId = sessionIdRef.current;
+    if (!currentSessionId) {
+      return;
+    }
+
+    void resizeTerminalSession({
+      cols: normalized.cols,
+      rows: normalized.rows,
+      sessionId: currentSessionId,
+    }).catch(() => undefined);
+  }, []);
+
+  const fitTerminal = useCallback(() => {
+    const container = containerRef.current;
+    const fitAddon = fitAddonRef.current;
+    const terminal = terminalRef.current;
+    if (!container || !fitAddon || !terminal || container.clientWidth <= 0 || container.clientHeight <= 0) {
+      return currentSize();
+    }
+
+    try {
+      terminal.scrollToBottom();
+      fitAddon.fit();
+    } catch {
+      return currentSize();
+    }
+
+    const size = currentSize();
+    sendResize(size.cols, size.rows);
+    return size;
+  }, [currentSize, sendResize]);
+
+  const scheduleFit = useCallback((delayMs = fitDebounceMs) => {
+    if (fitTimerRef.current !== null) {
+      window.clearTimeout(fitTimerRef.current);
+    }
+
+    fitTimerRef.current = window.setTimeout(() => {
+      fitTimerRef.current = null;
+      fitTerminal();
+    }, delayMs);
+  }, [fitTerminal]);
+
+  const updateKeyboardOffset = useCallback((metrics?: RemuxHostViewportMetrics) => {
+    if (metrics) {
+      hostViewportMetricsRef.current = metrics;
+    }
+
+    const nextOffset = normalizedKeyboardOffset(hostViewportMetricsRef.current);
+    setKeyboardOffset((currentOffset) => (
+      Math.abs(currentOffset - nextOffset) < 2 ? currentOffset : nextOffset
+    ));
+    scheduleFit(220);
+  }, [scheduleFit]);
+
+  const writeFrame = useCallback((frame: TerminalSessionOutputFrame) => {
+    if (frame.seq <= lastSeqRef.current) {
+      return;
+    }
+
+    lastSeqRef.current = frame.seq;
+    terminalRef.current?.write(bytesFromBase64(frame.dataBase64));
+  }, []);
+
+  const writeReplay = useCallback((frames: TerminalSessionOutputFrame[]) => {
+    for (const frame of frames) {
+      writeFrame(frame);
+    }
+  }, [writeFrame]);
+
+  const bindSession = useCallback((nextSessionId: string) => {
+    sessionIdRef.current = nextSessionId;
+    setSessionId(nextSessionId);
+  }, []);
+
+  const sendBytes = useCallback((data: Uint8Array, options: { clearModifiers?: boolean } = {}) => {
+    const currentSessionId = sessionIdRef.current;
+    if (!currentSessionId || data.length === 0) {
+      return;
+    }
+
+    void writeTerminalSession(currentSessionId, data).catch((error) => {
+      setStatus({ message: errorMessage(error), type: 'error' });
+    });
+
+    if (options.clearModifiers) {
+      resetModifiers();
+    }
+  }, [resetModifiers]);
+
+  const sendText = useCallback((value: string, options: { clearModifiers?: boolean } = {}) => {
+    sendBytes(textEncoder.encode(value), options);
+  }, [sendBytes]);
+
+  const startOrAttachSession = useCallback(async (options: { forceStart?: boolean } = {}) => {
+    const terminal = terminalRef.current;
+    if (!terminal) {
+      return;
+    }
+
+    setStatus({ type: 'connecting' });
+    const size = fitTerminal();
+    const preferredSessionId = preferredTerminalSessionId(route);
+    const attachSessionId = preferredSessionId && !options.forceStart ? preferredSessionId : null;
+
+    if (attachSessionId) {
+      try {
+        const attached = await attachTerminalSession({
+          cols: size.cols,
+          replaySeq: lastSeqRef.current > 0 ? lastSeqRef.current + 1 : null,
+          rows: size.rows,
+          sessionId: attachSessionId,
+        });
+
+        bindSession(attached.sessionId);
+        writeReplay(attached.replay);
+        await updateHostTab({
+          resourceId: attached.sessionId,
+          resourceKind: 'terminalSession',
+          title: 'Terminal',
+        });
+
+        if (attached.status === 'exited') {
+          setStatus({
+            code: attached.exitCode ?? null,
+            signal: attached.exitSignal ?? null,
+            type: 'exited',
+          });
+        } else {
+          setStatus({ cwd: '', shell: '', type: 'running' });
+          sendResize(size.cols, size.rows);
+        }
+        return;
+      } catch {
+        lastSeqRef.current = 0;
+        terminal.clear();
+      }
+    }
+
+    const systemInfo = await readRemuxSystemInfo();
+    const started = await startTerminalSession({
+      cols: size.cols,
+      cwd: systemInfo.cwd,
+      rows: size.rows,
+      sessionId: preferredSessionId,
+    });
+
+    bindSession(started.sessionId);
+    await updateHostTab({
+      resourceId: started.sessionId,
+      resourceKind: 'terminalSession',
+      title: 'Terminal',
+    });
+    setStatus({
+      cwd: started.cwd,
+      shell: started.shell,
+      type: 'running',
+    });
+    sendResize(started.cols, started.rows);
+  }, [bindSession, fitTerminal, route, sendResize, writeReplay]);
+
+  const restartSession = useCallback(() => {
+    const currentSessionId = sessionIdRef.current;
+    terminalRef.current?.clear();
+    lastSeqRef.current = 0;
+    if (currentSessionId) {
+      void killTerminalSession(currentSessionId)
+        .catch(() => undefined)
+        .finally(() => {
+          void startOrAttachSession({ forceStart: true }).catch((error) => {
+            setStatus({ message: errorMessage(error), type: 'error' });
+          });
+        });
+      return;
+    }
+
+    void startOrAttachSession({ forceStart: true }).catch((error) => {
+      setStatus({ message: errorMessage(error), type: 'error' });
+    });
+  }, [startOrAttachSession]);
+
+  const sendArrow = useCallback((code: 'A' | 'B' | 'C' | 'D') => {
+    const modifier = (altActive ? 2 : 0) + (ctrlActive ? 4 : 0);
+    if (modifier > 0) {
+      sendText(`\x1b[1;${modifier + 1}${code}`, { clearModifiers: true });
+      return;
+    }
+
+    sendText(`\x1b[${code}`);
+  }, [altActive, ctrlActive, sendText]);
+
+  const pasteClipboard = useCallback(async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        sendText(text, { clearModifiers: true });
+      }
+    } catch {
+      resetModifiers();
+    }
+  }, [resetModifiers, sendText]);
+
+  const helperTextarea = useCallback(() => {
+    return containerRef.current?.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement | null;
+  }, []);
+
+  const closeKeyboard = useCallback(() => {
+    const textarea = helperTextarea();
+    textarea?.setAttribute('inputmode', 'none');
+    textarea?.blur();
+    setKeyboardOpen(false);
+    void dismissHostKeyboard().catch(() => undefined);
+  }, [helperTextarea]);
+
+  const toggleKeyboard = useCallback(() => {
+    const textarea = helperTextarea();
+    if (!textarea) {
+      return;
+    }
+
+    if (keyboardOpen) {
+      closeKeyboard();
+      return;
+    }
+
+    textarea.removeAttribute('inputmode');
+    textarea.setAttribute('autocomplete', 'off');
+    textarea.setAttribute('autocorrect', 'off');
+    textarea.setAttribute('autocapitalize', 'off');
+    textarea.setAttribute('spellcheck', 'false');
+    textarea.style.transform = 'translateY(-9999px)';
+    textarea.focus({ preventScroll: true });
+    window.setTimeout(() => {
+      textarea.style.transform = '';
+    }, 0);
+    setKeyboardOpen(true);
+  }, [closeKeyboard, helperTextarea, keyboardOpen]);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) {
+      return undefined;
+    }
+    const terminalContainer = container;
+
+    let disposed = false;
+    let cleanupTouch: (() => void) | null = null;
+    let resizeObserver: ResizeObserver | null = null;
+
+    async function initializeTerminal() {
+      const fontSize = terminalFontSize();
+      await document.fonts?.load?.(`${fontSize}px ${fontFamily}`);
+      await document.fonts?.load?.(`bold ${fontSize}px ${fontFamily}`);
+      if (disposed) {
+        return;
+      }
+
+      const terminal = new Terminal({
+        allowProposedApi: true,
+        convertEol: false,
+        cursorBlink: true,
+        cursorStyle: 'block',
+        customGlyphs: true,
+        fontFamily,
+        fontSize,
+        lineHeight: 1.16,
+        rescaleOverlappingGlyphs: true,
+        scrollback: 5000,
+        theme: {
+          background: '#09090b',
+          black: '#18181b',
+          blue: '#60a5fa',
+          brightBlack: '#71717a',
+          brightBlue: '#93c5fd',
+          brightCyan: '#67e8f9',
+          brightGreen: '#86efac',
+          brightMagenta: '#f0abfc',
+          brightRed: '#fca5a5',
+          brightWhite: '#fafafa',
+          brightYellow: '#fde68a',
+          cursor: '#f97316',
+          cyan: '#22d3ee',
+          foreground: '#e4e4e7',
+          green: '#4ade80',
+          magenta: '#e879f9',
+          red: '#f87171',
+          selectionBackground: '#3f3f46',
+          white: '#e4e4e7',
+          yellow: '#facc15',
+        },
+      });
+
+      const unicode11 = new Unicode11Addon();
+      terminal.loadAddon(unicode11);
+      terminal.unicode.activeVersion = '11';
+      terminal.loadAddon(new WebLinksAddon());
+
+      const fitAddon = new FitAddon();
+      terminal.loadAddon(fitAddon);
+      terminal.open(terminalContainer);
+
+      const textarea = helperTextarea();
+      textarea?.setAttribute('inputmode', 'none');
+
+      try {
+        const webgl = new WebglAddon();
+        webgl.onContextLoss(() => webgl.dispose());
+        terminal.loadAddon(webgl);
+      } catch {
+        // The canvas renderer is the fallback when WebGL is unavailable.
+      }
+
+      terminalRef.current = terminal;
+      fitAddonRef.current = fitAddon;
+      fitTerminal();
+
+      terminal.attachCustomKeyEventHandler((event) => {
+        if (event.type === 'keydown' && event.key === 'Enter' && event.shiftKey) {
+          sendText('\x1b[13;2u', { clearModifiers: true });
+          return false;
+        }
+
+        return true;
+      });
+
+      const dataDisposable = terminal.onData((data) => {
+        sendBytes(textEncoder.encode(data));
+      });
+      const resizeDisposable = terminal.onResize(({ cols, rows }) => {
+        sendResize(cols, rows);
+      });
+
+      cleanupTouch = setupTouchScroll(terminalContainer, terminal, sendBytes);
+      resizeObserver = new ResizeObserver(() => scheduleFit());
+      resizeObserver.observe(terminalContainer);
+
+      void startOrAttachSession().catch((error) => {
+        setStatus({ message: errorMessage(error), type: 'error' });
+      });
+
+      if (disposed) {
+        dataDisposable.dispose();
+        resizeDisposable.dispose();
+        cleanupTouch?.();
+        resizeObserver?.disconnect();
+        terminal.dispose();
+        return;
+      }
+
+      return () => {
+        dataDisposable.dispose();
+        resizeDisposable.dispose();
+        cleanupTouch?.();
+        resizeObserver?.disconnect();
+        terminal.dispose();
+      };
+    }
+
+    let cleanup: (() => void) | undefined;
+    void initializeTerminal().then((nextCleanup) => {
+      if (disposed) {
+        nextCleanup?.();
+        return;
+      }
+
+      cleanup = nextCleanup;
+    });
+
+    return () => {
+      disposed = true;
+      if (fitTimerRef.current !== null) {
+        window.clearTimeout(fitTimerRef.current);
+        fitTimerRef.current = null;
+      }
+      cleanup?.();
+      terminalRef.current = null;
+      fitAddonRef.current = null;
+    };
+  }, [
+    fitTerminal,
+    helperTextarea,
+    scheduleFit,
+    sendBytes,
+    sendResize,
+    sendText,
+    startOrAttachSession,
+  ]);
+
+  useEffect(() => subscribeTerminalEvents((event) => {
+    const currentSessionId = sessionIdRef.current;
+    if (!currentSessionId) {
+      return;
+    }
+
+    if (event.type === 'output' && event.event.sessionId === currentSessionId) {
+      writeFrame(event.event.frame);
+      return;
+    }
+
+    if (event.type === 'exited' && event.event.sessionId === currentSessionId) {
+      setStatus({
+        code: event.event.exitCode,
+        signal: event.event.exitSignal,
+        type: 'exited',
+      });
+    }
+  }), [writeFrame]);
+
+  useEffect(() => {
+    const unsubscribe = subscribeHostViewportMetrics((metrics) => updateKeyboardOffset(metrics));
+    void getHostViewportMetrics()
+      .then((metrics) => updateKeyboardOffset(metrics))
+      .catch(() => updateKeyboardOffset());
+    return unsubscribe;
+  }, [updateKeyboardOffset]);
+
+  useEffect(() => {
+    const handleViewportChange = () => updateKeyboardOffset();
+    window.addEventListener('resize', handleViewportChange);
+    window.visualViewport?.addEventListener('resize', handleViewportChange);
+    window.visualViewport?.addEventListener('scroll', handleViewportChange);
+    handleViewportChange();
+
+    return () => {
+      window.removeEventListener('resize', handleViewportChange);
+      window.visualViewport?.removeEventListener('resize', handleViewportChange);
+      window.visualViewport?.removeEventListener('scroll', handleViewportChange);
+    };
+  }, [updateKeyboardOffset]);
+
+  useEffect(() => {
+    const onFocusOut = (event: FocusEvent) => {
+      const target = event.target as Element | null;
+      if (target?.classList?.contains('xterm-helper-textarea')) {
+        target.setAttribute('inputmode', 'none');
+        setKeyboardOpen(false);
+      }
+    };
+
+    document.addEventListener('focusout', onFocusOut);
+    return () => document.removeEventListener('focusout', onFocusOut);
+  }, []);
+
+  useEffect(() => {
+    if (!ctrlActive && !altActive) {
+      return undefined;
+    }
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.repeat || isModifierKey(event.key)) {
+        return;
+      }
+
+      const encoded = encodeModifiedKey(event, {
+        alt: altActive,
+        ctrl: ctrlActive,
+      });
+      if (!encoded) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      sendBytes(encoded, { clearModifiers: true });
+    };
+
+    document.addEventListener('keydown', onKeyDown, true);
+    return () => document.removeEventListener('keydown', onKeyDown, true);
+  }, [altActive, ctrlActive, sendBytes]);
+
+  return (
+    <main className="remux-terminal-shell" style={terminalShellStyle(keyboardOffset)}>
+      <section className="remux-terminal-stage">
+        <div className="remux-terminal-container" ref={containerRef} />
+        <TerminalOverlay status={status} />
+      </section>
+      <ExtensionActionBar
+        className="remux-terminal-action-bar"
+        left={(
+          <div className="remux-terminal-key-scroll">
+            <TerminalKey label="Open tabs" onPress={() => void openHostOverview({ section: 'tabs' })}>
+              <PanelTopOpen />
+            </TerminalKey>
+            <TerminalKey accent label="Escape" onPress={() => sendText('\x1b', { clearModifiers: true })}>
+              <span className="remux-terminal-key-text">Esc</span>
+            </TerminalKey>
+            <TerminalKey label="Tab" onPress={() => sendText('\t', { clearModifiers: true })}>
+              <span className="remux-terminal-key-text">Tab</span>
+            </TerminalKey>
+            <TerminalKey
+              active={ctrlActive}
+              label="Sticky control"
+              onPress={() => setCtrlActive((value) => !value)}
+            >
+              <span className="remux-terminal-key-text">Ctrl</span>
+            </TerminalKey>
+            <TerminalKey
+              active={altActive}
+              label="Sticky alt"
+              onPress={() => setAltActive((value) => !value)}
+            >
+              <span className="remux-terminal-key-text">Alt</span>
+            </TerminalKey>
+            <TerminalKey label="Arrow up" onPress={() => sendArrow('A')}>
+              <ArrowUp />
+            </TerminalKey>
+            <TerminalKey label="Arrow down" onPress={() => sendArrow('B')}>
+              <ArrowDown />
+            </TerminalKey>
+            <TerminalKey label="Arrow left" onPress={() => sendArrow('D')}>
+              <ArrowLeft />
+            </TerminalKey>
+            <TerminalKey label="Arrow right" onPress={() => sendArrow('C')}>
+              <ArrowRight />
+            </TerminalKey>
+            <TerminalKey label="Enter" onPress={() => sendText('\r', { clearModifiers: true })}>
+              <CornerDownLeft />
+            </TerminalKey>
+            <TerminalKey label="Control C" onPress={() => sendBytes(new Uint8Array([3]), { clearModifiers: true })}>
+              <span className="remux-terminal-key-text">^C</span>
+            </TerminalKey>
+            <TerminalKey label="Paste" onPress={() => void pasteClipboard()}>
+              <ClipboardPaste />
+            </TerminalKey>
+            <TerminalKey label={keyboardOpen ? 'Hide keyboard' : 'Show keyboard'} onPress={toggleKeyboard}>
+              {keyboardOpen ? <KeyboardOff /> : <Keyboard />}
+            </TerminalKey>
+            {status.type === 'error' || status.type === 'exited' ? (
+              <TerminalKey label="Start new shell" onPress={restartSession}>
+                <RefreshCw />
+              </TerminalKey>
+            ) : null}
+          </div>
+        )}
+        status={statusText(status, sessionId)}
+      />
+    </main>
+  );
+}
+
+function TerminalOverlay({ status }: { status: TerminalStatus }) {
+  if (status.type === 'running') {
+    return null;
+  }
+
+  if (status.type === 'connecting') {
+    return (
+      <div className="remux-terminal-overlay">
+        <div className="remux-terminal-spinner" aria-hidden="true" />
+      </div>
+    );
+  }
+
+  const message = status.type === 'error'
+    ? status.message
+    : status.signal
+      ? `Exited: ${status.signal}`
+      : `Exited ${status.code ?? 0}`;
+
+  return (
+    <div className="remux-terminal-overlay remux-terminal-overlay-bottom">
+      <span>{message}</span>
+    </div>
+  );
+}
+
+function TerminalKey({
+  accent,
+  active,
+  children,
+  label,
+  onPress,
+}: {
+  accent?: boolean;
+  active?: boolean;
+  children: React.ReactNode;
+  label: string;
+  onPress: () => void;
+}) {
+  return (
+    <ExtensionActionButton
+      className={[
+        'remux-terminal-key',
+        active ? 'is-active' : '',
+        accent ? 'is-accent' : '',
+      ].filter(Boolean).join(' ')}
+      icon={children}
+      label={label}
+      onClick={onPress}
+      preserveFocus
+      tone={accent ? 'primary' : 'default'}
+    />
+  );
+}
+
+function preferredTerminalSessionId(route: RemuxViewerRoute) {
+  if (route.resourceKind === 'terminalSession' && route.resourceId) {
+    return route.resourceId;
+  }
+
+  return route.tabId;
+}
+
+function terminalFontSize() {
+  if (window.matchMedia('(max-width: 420px)').matches) {
+    return 11;
+  }
+
+  if (window.matchMedia('(max-width: 820px)').matches) {
+    return 12;
+  }
+
+  return 13;
+}
+
+function terminalShellStyle(keyboardOffset: number) {
+  return {
+    '--remux-terminal-keyboard-offset': `${keyboardOffset}px`,
+  } as CSSProperties;
+}
+
+function normalizedKeyboardOffset(hostMetrics: RemuxHostViewportMetrics | null) {
+  const hostOffset = hostMetrics
+    ? Math.max(
+        0,
+        hostMetrics.keyboardHeight,
+        hostMetrics.viewportHeight - hostMetrics.visibleBottom,
+      )
+    : 0;
+  const visualOffset = visualViewportKeyboardOffset();
+  const maxOffset = Math.max(0, window.innerHeight - 96);
+
+  return Math.round(Math.min(Math.max(hostOffset, visualOffset), maxOffset));
+}
+
+function visualViewportKeyboardOffset() {
+  const viewport = window.visualViewport;
+  if (!viewport) {
+    return 0;
+  }
+
+  return Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop);
+}
+
+function encodeModifiedKey(
+  event: KeyboardEvent,
+  modifiers: { alt: boolean; ctrl: boolean },
+) {
+  const bytes: number[] = [];
+
+  if (isArrowKey(event.key)) {
+    const code = arrowCode(event.key);
+    const modifier = (modifiers.alt ? 2 : 0) + (modifiers.ctrl ? 4 : 0);
+    return textEncoder.encode(`\x1b[1;${modifier + 1}${code}`);
+  }
+
+  if (modifiers.ctrl) {
+    const byte = ctrlByte(event.key);
+    if (byte !== null) {
+      if (modifiers.alt) {
+        bytes.push(0x1b);
+      }
+      bytes.push(byte);
+      return new Uint8Array(bytes);
+    }
+  }
+
+  if (modifiers.alt && event.key.length === 1) {
+    bytes.push(0x1b, ...textEncoder.encode(event.key));
+    return new Uint8Array(bytes);
+  }
+
+  return null;
+}
+
+function ctrlByte(key: string) {
+  const code = key.toLowerCase().charCodeAt(0);
+  if (code >= 97 && code <= 122) {
+    return code - 96;
+  }
+
+  if (key === '[') {
+    return 27;
+  }
+
+  if (key === '\\') {
+    return 28;
+  }
+
+  if (key === ']') {
+    return 29;
+  }
+
+  return null;
+}
+
+function isArrowKey(key: string) {
+  return key === 'ArrowUp' || key === 'ArrowDown' || key === 'ArrowRight' || key === 'ArrowLeft';
+}
+
+function arrowCode(key: string) {
+  switch (key) {
+    case 'ArrowUp':
+      return 'A';
+    case 'ArrowDown':
+      return 'B';
+    case 'ArrowRight':
+      return 'C';
+    case 'ArrowLeft':
+    default:
+      return 'D';
+  }
+}
+
+function isModifierKey(key: string) {
+  return key === 'Alt' || key === 'Control' || key === 'Meta' || key === 'Shift';
+}
+
+function statusText(status: TerminalStatus, sessionId: string | null) {
+  if (status.type === 'running') {
+    return status.cwd || status.shell || sessionId || 'Terminal';
+  }
+
+  if (status.type === 'connecting') {
+    return 'Starting shell';
+  }
+
+  if (status.type === 'exited') {
+    return status.signal ? `Exited: ${status.signal}` : `Exited ${status.code ?? 0}`;
+  }
+
+  return status.message;
+}
+
+function clampSize(value: number, min: number, max: number) {
+  if (!Number.isFinite(value)) {
+    return min;
+  }
+
+  return Math.max(min, Math.min(max, Math.floor(value)));
+}
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}

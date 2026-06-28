@@ -3,6 +3,7 @@ import { Image, Pressable, ScrollView, StyleSheet, Text, View, useWindowDimensio
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { FilesOverview } from '../files/FilesOverview';
+import { useRemuxConnection } from '../remote/RemuxConnectionProvider';
 import { SettingsOverview } from '../settings/SettingsOverview';
 import { BrowserBottomBar } from './BrowserBottomBar';
 import {
@@ -30,6 +31,7 @@ export function BrowserOverview({
   const insets = useSafeAreaInsets();
   const scrollViewRef = useRef<ScrollView | null>(null);
   const closeTab = useBrowserStore((state) => state.closeTab);
+  const remux = useRemuxConnection();
   const section = useBrowserStore((state) => state.section);
   const selectTab = useBrowserStore((state) => state.selectTab);
   const tabs = useBrowserStore((state) => state.tabs);
@@ -107,7 +109,10 @@ export function BrowserOverview({
                         hitSlop={10}
                         onPress={(event) => {
                           event.stopPropagation();
-                          closeTab(tab.id);
+                          closeViewerTab(tab, {
+                            closeTab,
+                            request: remux.request,
+                          });
                         }}
                         style={styles.tabClose}
                       >
@@ -126,6 +131,24 @@ export function BrowserOverview({
       <BrowserBottomBar />
     </View>
   );
+}
+
+function closeViewerTab(
+  tab: BrowserTab,
+  options: {
+    closeTab: (tabId: string) => void;
+    request: (method: string, params?: unknown, timeoutMs?: number) => Promise<unknown>;
+  },
+) {
+  if (tab.extensionId === 'terminal' && tab.resourceKind === 'terminalSession' && tab.resourceId) {
+    void options.request(
+      'remux/terminal/session/kill',
+      { sessionId: tab.resourceId },
+      1_000,
+    ).catch(() => undefined);
+  }
+
+  options.closeTab(tab.id);
 }
 
 function bottomAnchoredRows<T>(items: T[], columns: number) {
