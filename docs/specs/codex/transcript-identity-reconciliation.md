@@ -1,5 +1,9 @@
 # Codex Transcript Identity Reconciliation Design
 
+Status: Active Spec
+Last verified: 2026-06-28
+Canonical code: `extensions/codex/server/src/item_identity.rs`, `extensions/codex/server/src/live_transcript.rs`, `extensions/codex/server/src/projection/`
+
 ## Purpose
 
 Remux has a faster transcript read strategy than Codex app-server for viewer use:

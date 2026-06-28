@@ -1,5 +1,9 @@
 # Rust Codex Transcript Server Spec
 
+Status: Archived
+Last verified: 2026-06-28
+Canonical code: `extensions/codex/server/src/main.rs`, `extensions/codex/server/src/resources/`, `extensions/codex/remux-extension.json`
+
 ## Purpose
 
 Replace the Codex extension's Node backend with a Rust stdio server focused on fast transcript resource reads.

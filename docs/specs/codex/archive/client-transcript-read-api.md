@@ -1,5 +1,9 @@
 # Codex Client Transcript Read API Spec
 
+Status: Archived
+Last verified: 2026-06-28
+Canonical code: `extensions/codex/viewer/transcript/resourceStore.ts`, `extensions/codex/viewer/transcript/layoutStore.ts`, `extensions/codex/server/src/resources/`
+
 ## Purpose
 
 Rework the Codex extension client transcript path around the Rust server's batch read API.

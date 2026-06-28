@@ -1,5 +1,9 @@
 # Codex Transcript Store and Scroll Implementation Spec
 
+Status: Implemented
+Last verified: 2026-06-28
+Canonical code: `extensions/codex/viewer/transcript/resourceStore.ts`, `extensions/codex/viewer/transcript/layoutStore.ts`, `extensions/codex/viewer/transcript/viewportStore.ts`, `extensions/codex/viewer/transcript/virtualizer.tsx`
+
 ## Goal
 
 Keep the Codex transcript viewer server-authoritative while making the client state easier to reason about.

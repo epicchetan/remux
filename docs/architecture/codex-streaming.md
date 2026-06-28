@@ -1,5 +1,9 @@
 # Codex App Server, Remux Backend, and Viewer Streaming Current State
 
+Status: Current
+Last verified: 2026-06-28
+Canonical code: `extensions/codex/server/src/main.rs`, `extensions/codex/server/src/app_server.rs`, `extensions/codex/server/src/live_transcript.rs`, `extensions/codex/viewer/transcript/resourceStore.ts`
+
 ## Purpose
 
 This document describes how the Codex app-server, the Remux Rust extension backend, and the Codex viewer store currently fit together.
