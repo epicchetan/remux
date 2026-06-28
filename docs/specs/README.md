@@ -26,3 +26,9 @@ Canonical code: ...
 | [codex/archive/client-transcript-read-api.md](codex/archive/client-transcript-read-api.md) | Archived | Historical client read API phase. |
 | [codex/archive/current-thread-send-invalidation.md](codex/archive/current-thread-send-invalidation.md) | Archived | Historical send/invalidation phase. |
 | [codex/archive/rust-transcript-server.md](codex/archive/rust-transcript-server.md) | Archived | Historical Rust transcript server phase. |
+
+## Terminal Specs
+
+| Spec | Status | Notes |
+| --- | --- | --- |
+| [terminal/phase-1.md](terminal/phase-1.md) | Active Spec | Phase 1 mobile-first terminal extension design. |

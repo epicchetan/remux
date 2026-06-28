@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "id": "terminal",
+  "name": "Terminal",
+  "display": {
+    "title": "Terminal",
+    "icon": "assets/terminal.svg"
+  },
+  "server": {
+    "transport": "stdio",
+    "command": "cargo",
+    "args": [
+      "run",
+      "--manifest-path",
+      "server/Cargo.toml",
+      "--target-dir",
+      "/tmp/remux-terminal-server-target",
+      "--quiet",
+      "--"
+    ],
+    "cwd": "."
+  },
+  "views": {
+    "main": {
+      "route": "/viewers/terminal",
+      "entry": "viewer/dist/index.html"
+    }
+  },
+  "launchers": [
+    {
+      "id": "new-terminal",
+      "view": "main",
+      "label": "Terminal",
+      "icon": "assets/terminal.svg",
+      "route": {
+        "kind": "launch",
+        "launch": "new-terminal",
+        "resourceKind": "terminalSession"
+      }
+    }
+  ],
+  "fileHandlers": []
+}

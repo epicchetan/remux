@@ -1,0 +1,192 @@
+:root {
+  color-scheme: dark;
+  font-family: Arial, "Helvetica Neue", sans-serif;
+  background: #09090b;
+  color: #f4f4f5;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  min-height: 100%;
+  margin: 0;
+  overflow: hidden;
+  text-size-adjust: 100%;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  background: #09090b;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+.remux-terminal-shell {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  --remux-terminal-keyboard-offset: 0px;
+  --remux-extension-background: #09090b;
+  --remux-extension-border: #3f3f46;
+  --remux-extension-chrome: #18181b;
+  --remux-extension-chrome-hover: #27272a;
+  --remux-extension-muted-foreground: #a1a1aa;
+  background: #09090b;
+}
+
+.remux-terminal-stage {
+  position: relative;
+  min-height: 0;
+  flex: 1;
+  background: #09090b;
+}
+
+.remux-terminal-container {
+  position: absolute;
+  inset: calc(env(safe-area-inset-top) + 8px) 0 0;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  padding: 0 8px 8px;
+  background: #09090b;
+  touch-action: none;
+  user-select: none;
+}
+
+.remux-terminal-container .xterm {
+  height: 100%;
+  padding: 0;
+}
+
+.remux-terminal-container .xterm-viewport {
+  background: #09090b !important;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+.remux-terminal-container .xterm-screen {
+  height: 100%;
+}
+
+.remux-terminal-container .xterm-helper-textarea {
+  opacity: 0;
+}
+
+.remux-terminal-overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+}
+
+.remux-terminal-overlay-bottom {
+  inset: auto 12px 12px;
+  display: block;
+  overflow: hidden;
+  color: #a1a1aa;
+  font-size: 12px;
+  line-height: 16px;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remux-terminal-spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgb(244 244 245 / 18%);
+  border-top-color: #f97316;
+  border-radius: 999px;
+  animation: remux-terminal-spin 800ms linear infinite;
+}
+
+.remux-terminal-action-bar {
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: flex-start;
+  margin-bottom: var(--remux-terminal-keyboard-offset);
+  transition: margin-bottom 140ms ease;
+}
+
+.remux-terminal-action-bar .remux-extension-action-group {
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.remux-terminal-action-bar .remux-extension-action-group-right:empty {
+  display: none;
+}
+
+.remux-terminal-action-bar .remux-extension-action-status {
+  bottom: max(1px, calc((var(--remux-extension-bottom-pad) - 10px) / 2));
+}
+
+.remux-terminal-key-scroll {
+  display: flex;
+  min-width: 0;
+  width: 100%;
+  max-width: none;
+  align-items: center;
+  gap: 7px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0 1px 3px;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+
+.remux-terminal-key-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.remux-terminal-key {
+  flex: 0 0 auto;
+}
+
+.remux-terminal-key.is-active {
+  border-color: color-mix(in srgb, #f97316 82%, #3f3f46);
+  color: #fff7ed;
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 12%),
+    inset 0 -2px 0 rgb(0 0 0 / 36%),
+    0 0 0 1px rgb(249 115 22 / 24%),
+    0 2px 0 rgb(0 0 0 / 36%);
+}
+
+.remux-terminal-key-text {
+  display: inline-block;
+  min-width: 22px;
+  font-family: Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+  text-align: center;
+}
+
+@media (max-width: 420px) {
+  .remux-terminal-container {
+    padding-right: 6px;
+    padding-left: 6px;
+  }
+
+  .remux-terminal-key-scroll {
+    gap: 6px;
+  }
+
+  .remux-terminal-key.remux-extension-action-button {
+    width: 37px;
+  }
+}
+
+@keyframes remux-terminal-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
