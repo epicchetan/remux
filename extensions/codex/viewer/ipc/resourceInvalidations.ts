@@ -95,6 +95,10 @@ function isCodexResourceInvalidation(value: unknown): value is CodexResourceInva
     ) &&
     typeof invalidation.threadId === 'string'
   ) || (
+    invalidation.type === 'turn' &&
+    typeof invalidation.threadId === 'string' &&
+    typeof invalidation.turnId === 'string'
+  ) || (
     invalidation.type === 'workItem' &&
     typeof invalidation.threadId === 'string' &&
     typeof invalidation.turnId === 'string' &&

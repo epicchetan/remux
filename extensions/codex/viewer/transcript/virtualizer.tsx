@@ -6,6 +6,7 @@ import { AssistantMessage } from './components/assistantMessage';
 import { Compaction } from './components/compaction';
 import { UserMessage } from './components/userMessage';
 import { WorkSection } from './components/work/WorkSection';
+import { transcriptWorkDisclosureKey } from './disclosureKeys';
 import { transcriptLayout } from './layout/constants';
 import type { TranscriptMeasuredRow, TranscriptMeasuredTurn } from './layout/types';
 import { useThreadRuntimeStore } from '../threads/runtimeStore';
@@ -47,6 +48,16 @@ type TranscriptRowPosition = {
   turnId: string;
 };
 
+type TranscriptViewportModeChangeReason =
+  | 'initial-scroll'
+  | 'mount-stickiness'
+  | 'manual-scroll'
+  | 'scroll-navigation'
+  | 'scroll-navigation-bottom'
+  | 'streaming-turn'
+  | 'touch-end-bottom'
+  | 'touch-start';
+
 export function VirtualizedTranscript({ threadId = null }: { threadId?: string | null }) {
   const activeThreadId = useTranscriptResourceStore((state) => state.activeThreadId);
   const setTranscriptThreadId = useTranscriptResourceStore((state) => state.setActiveThreadId);
@@ -65,6 +76,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
   const setAutoScrollMode = useTranscriptViewportStore((state) => state.setAutoScrollMode);
   const setScrollAvailability = useTranscriptViewportStore((state) => state.setScrollAvailability);
   const setScrollNavigationController = useTranscriptViewportStore((state) => state.setScrollNavigationController);
+  const setVisibleWorkKeys = useTranscriptViewportStore((state) => state.setVisibleWorkKeys);
   const turns = useMemo(
     () => turnOrder.map((turnId) => turnsById[turnId]).filter((turn): turn is TranscriptMeasuredTurn => Boolean(turn)),
     [turnOrder, turnsById],
@@ -160,9 +172,15 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     streamingTurnIdRef.current = streamingTurnId;
   }, [streamingTurnId]);
 
-  const setViewportAutoScrollMode = useCallback((mode: TranscriptAutoScrollMode) => {
+  const setViewportAutoScrollMode = useCallback((
+    mode: TranscriptAutoScrollMode,
+    _reason: TranscriptViewportModeChangeReason,
+  ) => {
+    const previousMode = autoScrollModeRef.current;
     autoScrollModeRef.current = mode;
-    setAutoScrollMode(mode);
+    if (!sameTranscriptAutoScrollMode(previousMode, mode)) {
+      setAutoScrollMode(mode);
+    }
   }, [setAutoScrollMode]);
 
   const captureViewportAnchor = useCallback(() => {
@@ -182,6 +200,22 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     return anchor;
   }, [viewportTopPadding]);
 
+  const updateVisibleWorkKeys = useCallback(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) {
+      setVisibleWorkKeys([]);
+      return;
+    }
+
+    setVisibleWorkKeys(visibleWorkKeysForViewport({
+      expandedRows: expandedRowsRef.current,
+      scrollTop: viewport.scrollTop,
+      topPadding: viewportTopPadding,
+      turns: turnsRef.current,
+      viewportHeight: viewport.clientHeight,
+    }));
+  }, [setVisibleWorkKeys, viewportTopPadding]);
+
   const scheduleRangeUpdate = useCallback(() => {
     if (rafRef.current !== null) {
       return;
@@ -194,19 +228,22 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       const measuredTurns = turnsRef.current;
       if (!viewport || measuredTurns.length === 0) {
         setScrollAvailability({ canScrollDown: false, canScrollUp: false });
+        setVisibleWorkKeys([]);
         return;
       }
 
-      const nextActiveTurnIds = computeTranscriptVirtualRange({
+      const range = computeTranscriptVirtualRange({
         expandedRows: expandedRowsRef.current,
         scrollTop: viewport.scrollTop,
         topPadding: viewportTopPadding,
         turns: measuredTurns,
         viewportHeight: viewport.clientHeight,
-      }).activeTurnIds;
+      });
+      const nextActiveTurnIds = range.activeTurnIds;
 
       captureViewportAnchor();
       setScrollAvailability(scrollNavigationAvailability(viewport, navigationAnchorsRef.current));
+      updateVisibleWorkKeys();
 
       if (sameTurnIds(activeTurnIdsRef.current, nextActiveTurnIds)) {
         return;
@@ -215,7 +252,14 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       activeTurnIdsRef.current = nextActiveTurnIds;
       setActiveTurnIds(nextActiveTurnIds);
     });
-  }, [captureViewportAnchor, setActiveTurnIds, setScrollAvailability, viewportTopPadding]);
+  }, [
+    captureViewportAnchor,
+    setActiveTurnIds,
+    setScrollAvailability,
+    setVisibleWorkKeys,
+    updateVisibleWorkKeys,
+    viewportTopPadding,
+  ]);
 
   const scheduleAutoScroll = useCallback(() => {
     if (bottomScrollRafRef.current !== null || touchActiveRef.current) {
@@ -249,15 +293,11 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
         scheduleRangeUpdate();
       }
 
-      if (autoScrollModeRef.current.type === 'sent-message-anchor' && target.reached) {
-        setViewportAutoScrollMode({ type: 'off' });
-      }
-
       window.requestAnimationFrame(() => {
         programmaticScrollRef.current = false;
       });
     });
-  }, [scheduleRangeUpdate, setViewportAutoScrollMode, viewportTopPadding]);
+  }, [scheduleRangeUpdate, viewportTopPadding]);
 
   useEffect(() => {
     autoScrollModeRef.current = autoScrollMode;
@@ -276,7 +316,11 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     programmaticScrollRef.current = false;
   }, []);
 
-  const scrollToPosition = useCallback((scrollTop: number, nextAutoScrollMode: TranscriptAutoScrollMode) => {
+  const scrollToPosition = useCallback((
+    scrollTop: number,
+    nextAutoScrollMode: TranscriptAutoScrollMode,
+    reason: TranscriptViewportModeChangeReason,
+  ) => {
     const viewport = viewportRef.current;
     if (!viewport) {
       return;
@@ -293,7 +337,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     const maxScrollTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
     const targetScrollTop = Math.max(0, Math.min(scrollTop, maxScrollTop));
 
-    setViewportAutoScrollMode(nextAutoScrollMode);
+    setViewportAutoScrollMode(nextAutoScrollMode, reason);
     programmaticScrollRef.current = true;
 
     if (Math.abs(targetScrollTop - startScrollTop) <= 1) {
@@ -337,7 +381,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       return;
     }
 
-    scrollToPosition(anchor.scrollTop, { type: 'off' });
+    scrollToPosition(anchor.scrollTop, { type: 'off' }, 'scroll-navigation');
   }, [scrollToPosition]);
 
   const scrollDown = useCallback(() => {
@@ -351,7 +395,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       const nextMode = anchor === lastScrollAnchor(navigationAnchorsRef.current) && anchor.turnId === streamingTurnIdRef.current
         ? { type: 'sent-message-anchor' as const, turnId: anchor.turnId }
         : { type: 'off' as const };
-      scrollToPosition(anchor.scrollTop, nextMode);
+      scrollToPosition(anchor.scrollTop, nextMode, 'scroll-navigation');
       return;
     }
 
@@ -359,7 +403,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       return;
     }
 
-    scrollToPosition(viewport.scrollHeight, { type: 'bottom' });
+    scrollToPosition(viewport.scrollHeight, { type: 'bottom' }, 'scroll-navigation-bottom');
   }, [scrollToPosition]);
 
   useEffect(() => {
@@ -385,9 +429,9 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       const movedManually = Math.abs(currentScrollTop - lastScrollTopRef.current) > scrollDirectionThresholdPx;
 
       if (nearBottom) {
-        setViewportAutoScrollMode({ type: 'bottom' });
+        setViewportAutoScrollMode({ type: 'bottom' }, 'manual-scroll');
       } else if (movedManually) {
-        setViewportAutoScrollMode({ type: 'off' });
+        setViewportAutoScrollMode({ type: 'off' }, 'manual-scroll');
       }
 
       lastScrollTopRef.current = currentScrollTop;
@@ -395,17 +439,18 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
 
     const onScroll = () => {
       updateStickiness();
+      updateVisibleWorkKeys();
       scheduleRangeUpdate();
     };
     const onTouchStart = () => {
       cancelScrollAnimation();
-      setViewportAutoScrollMode({ type: 'off' });
+      setViewportAutoScrollMode({ type: 'off' }, 'touch-start');
       touchActiveRef.current = true;
     };
     const onTouchEnd = () => {
       touchActiveRef.current = false;
       if (isNearBottom(viewport)) {
-        setViewportAutoScrollMode({ type: 'bottom' });
+        setViewportAutoScrollMode({ type: 'bottom' }, 'touch-end-bottom');
         scheduleAutoScroll();
       }
     };
@@ -417,7 +462,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     viewport.addEventListener('touchend', onTouchEnd, { passive: true });
     observer.observe(viewport);
     lastScrollTopRef.current = viewport.scrollTop;
-    setViewportAutoScrollMode(isNearBottom(viewport) ? { type: 'bottom' } : { type: 'off' });
+    setViewportAutoScrollMode(isNearBottom(viewport) ? { type: 'bottom' } : { type: 'off' }, 'mount-stickiness');
     scheduleRangeUpdate();
 
     return () => {
@@ -436,7 +481,13 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       }
       cancelScrollAnimation();
     };
-  }, [cancelScrollAnimation, scheduleAutoScroll, scheduleRangeUpdate, setViewportAutoScrollMode]);
+  }, [
+    cancelScrollAnimation,
+    scheduleAutoScroll,
+    scheduleRangeUpdate,
+    setViewportAutoScrollMode,
+    updateVisibleWorkKeys,
+  ]);
 
   useEffect(() => {
     scheduleRangeUpdate();
@@ -503,7 +554,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     }
 
     if (autoScrollModeRef.current.type === 'bottom' || isNearBottom(viewport)) {
-      setViewportAutoScrollMode({ type: 'sent-message-anchor', turnId: streamingTurnId });
+      setViewportAutoScrollMode({ type: 'sent-message-anchor', turnId: streamingTurnId }, 'streaming-turn');
       scheduleAutoScroll();
     }
   }, [scheduleAutoScroll, setViewportAutoScrollMode, streamingTurnId]);
@@ -557,7 +608,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     const initialScrollTop = initialTarget
       ? Math.max(0, Math.min(initialTarget.scrollTop, maxScrollableTop(viewport)))
       : maxScrollableTop(viewport);
-    setViewportAutoScrollMode(initialMode);
+    setViewportAutoScrollMode(initialMode, 'initial-scroll');
     programmaticScrollRef.current = true;
     viewport.scrollTop = initialScrollTop;
     lastScrollTopRef.current = viewport.scrollTop;
@@ -613,6 +664,13 @@ function isNearBottom(node: HTMLElement) {
   return distanceFromBottom(node) <= bottomStickThresholdPx;
 }
 
+function sameTranscriptAutoScrollMode(left: TranscriptAutoScrollMode, right: TranscriptAutoScrollMode) {
+  return left.type === right.type && (
+    left.type !== 'sent-message-anchor' ||
+    (right.type === 'sent-message-anchor' && left.turnId === right.turnId)
+  );
+}
+
 function autoScrollTarget({
   expandedRows,
   mode,
@@ -625,9 +683,9 @@ function autoScrollTarget({
   topPadding: number;
   turns: TranscriptMeasuredTurn[];
   viewport: HTMLElement;
-}): { reached: boolean; scrollTop: number } | null {
+}): { scrollTop: number } | null {
   if (mode.type === 'bottom') {
-    return { reached: false, scrollTop: maxScrollableTop(viewport) };
+    return { scrollTop: maxScrollableTop(viewport) };
   }
 
   if (mode.type !== 'sent-message-anchor') {
@@ -647,10 +705,7 @@ function autoScrollTarget({
 
   const maxScrollTop = maxScrollableTop(viewport);
   const scrollTop = Math.max(0, Math.min(desiredScrollTop, maxScrollTop));
-  return {
-    reached: scrollTop >= desiredScrollTop - 1 || viewport.scrollTop >= desiredScrollTop - 1,
-    scrollTop,
-  };
+  return { scrollTop };
 }
 
 function scrollNavigationAvailability(node: HTMLElement, anchors: TranscriptScrollAnchor[]) {
@@ -843,6 +898,39 @@ function transcriptRowPositions({
   });
 
   return positions;
+}
+
+function visibleWorkKeysForViewport({
+  expandedRows,
+  scrollTop,
+  topPadding,
+  turns,
+  viewportHeight,
+}: {
+  expandedRows: TranscriptExpandedRow[];
+  scrollTop: number;
+  topPadding: number;
+  turns: TranscriptMeasuredTurn[];
+  viewportHeight: number;
+}) {
+  const keys: string[] = [];
+  const viewportTop = scrollTop;
+  const viewportBottom = scrollTop + viewportHeight;
+  const expanded = expandedRowGeometry(turns, expandedRows);
+
+  turns.forEach((turn, turnIndex) => {
+    let rowTop = topPadding + turn.collapsedTop + expanded.heightBeforeTurnIndex(turnIndex);
+
+    for (const row of turn.rows) {
+      const rowBottom = rowTop + row.height + expanded.heightAfterRow(turn.turnId, row.id);
+      if (row.segment.type === 'work' && rowBottom > viewportTop && rowTop < viewportBottom) {
+        keys.push(transcriptWorkDisclosureKey(row.turnId, row.segmentId));
+      }
+      rowTop = rowBottom;
+    }
+  });
+
+  return keys;
 }
 
 function userMessageScrollAnchors({

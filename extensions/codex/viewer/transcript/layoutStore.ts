@@ -8,7 +8,11 @@ import { createExternalStore } from './externalStore';
 import { TranscriptMeasureCache } from './layout/measureCache';
 import { reconcileMeasuredTranscript } from './layout/reconcileMeasured';
 import type { TranscriptMeasuredTurn } from './layout/types';
-import { reconcileTranscriptViewportForLayout, resetTranscriptViewportForThread } from './viewportStore';
+import {
+  getTranscriptViewportState,
+  reconcileTranscriptViewportForLayout,
+  resetTranscriptViewportForThread,
+} from './viewportStore';
 
 export type TranscriptOpenWorkDisclosure = {
   additionalHeight: number;
@@ -32,6 +36,11 @@ export type TranscriptLayoutResourceSnapshot = {
   status: 'idle' | 'loading' | 'ready' | 'failed';
   turnOrder: string[];
   turnsById: Record<string, { turn: CodexTranscriptTurn } | undefined>;
+};
+
+type TranscriptDisclosureReconcileOptions = {
+  autoWorkManaged?: boolean;
+  visibleWorkKeys?: ReadonlySet<string>;
 };
 
 type TranscriptLayoutResourceAdapter = {
@@ -78,7 +87,7 @@ const actions: Pick<
     }
 
     layoutStore.setState({
-      disclosure: {
+      disclosure: promoteOpenWorkDisclosure({
         ...disclosure,
         openWorkByKey: {
           ...disclosure.openWorkByKey,
@@ -87,7 +96,7 @@ const actions: Pick<
             openChildByKey,
           },
         },
-      },
+      }, workKey),
     });
   },
   setOpenWorkAdditionalHeight(workKey, rowId, additionalHeight) {
@@ -162,7 +171,7 @@ const actions: Pick<
     }
 
     layoutStore.setState({
-      disclosure: {
+      disclosure: promoteOpenWorkDisclosure({
         ...disclosure,
         openWorkByKey: {
           ...disclosure.openWorkByKey,
@@ -174,7 +183,7 @@ const actions: Pick<
             },
           },
         },
-      },
+      }, workKey),
     });
   },
   toggleWorkDisclosure(input) {
@@ -301,7 +310,10 @@ export function reconcileTranscriptLayoutFromResources(
   const runtime = getThreadRuntimeState();
   const autoOpenTurnId = runtime.status === 'running' || runtime.status === 'stopping' ? runtime.activeTurnId : null;
   layoutStore.setState({
-    disclosure: reconcileTranscriptDisclosure(previousState.disclosure, layout.turns, autoOpenTurnId),
+    disclosure: reconcileTranscriptDisclosure(previousState.disclosure, layout.turns, autoOpenTurnId, {
+      autoWorkManaged: transcriptViewportAllowsAutoWork(previousState.disclosure),
+      visibleWorkKeys: new Set(getTranscriptViewportState().visibleWorkKeys),
+    }),
     turnOrder: layout.turns.map((turn) => turn.turnId),
     turnsById: layout.turnsById,
     width: layout.width,
@@ -313,7 +325,10 @@ export function reconcileTranscriptDisclosure(
   disclosure: TranscriptDisclosureState,
   turns: TranscriptMeasuredTurn[],
   autoOpenTurnId?: string | null,
+  options: TranscriptDisclosureReconcileOptions = {},
 ): TranscriptDisclosureState {
+  const autoWorkManaged = options.autoWorkManaged ?? true;
+  const visibleWorkKeys = options.visibleWorkKeys ?? new Set<string>();
   const turnsById = Object.fromEntries(turns.map((turn) => [turn.turnId, turn]));
   const manuallyClosedAutoWorkByTurnId = filterManualClosedWorkTurns(
     disclosure.manuallyClosedAutoWorkByTurnId,
@@ -335,21 +350,104 @@ export function reconcileTranscriptDisclosure(
     }
   }
 
+  const preservePreviousAutoWork = () => {
+    if (!previousAutoOpenWork || manuallyClosedAutoWorkByTurnId[previousAutoOpenWork.turnId]) {
+      return null;
+    }
+
+    return {
+      autoOpenWorkKey: previousAutoOpenWork.key,
+      expandedUserMessageByKey,
+      manuallyClosedAutoWorkByTurnId,
+      openWorkByKey: {
+        ...openWorkByKey,
+        [previousAutoOpenWork.key]: previousAutoOpenWork,
+      },
+    };
+  };
+
   const workingTurn = autoOpenTurnId === undefined
     ? turns.find((turn) => turn.turn.status === 'inProgress') ?? null
     : turns.find((turn) => turn.turnId === autoOpenTurnId && turn.turn.status === 'inProgress') ?? null;
-  if (!workingTurn || manuallyClosedAutoWorkByTurnId[workingTurn.turnId]) {
-    return { autoOpenWorkKey: null, expandedUserMessageByKey, manuallyClosedAutoWorkByTurnId, openWorkByKey };
+
+  const preserveUnmanagedPreviousAutoWork = () => {
+    if (!previousAutoOpenWork || manuallyClosedAutoWorkByTurnId[previousAutoOpenWork.turnId]) {
+      return null;
+    }
+    if (!visibleWorkKeys.has(previousAutoOpenWork.key) && !hasOpenWorkChild(previousAutoOpenWork)) {
+      return null;
+    }
+
+    return {
+      autoOpenWorkKey: null,
+      expandedUserMessageByKey,
+      manuallyClosedAutoWorkByTurnId,
+      openWorkByKey: {
+        ...openWorkByKey,
+        [previousAutoOpenWork.key]: {
+          ...previousAutoOpenWork,
+          source: 'user' as const,
+        },
+      },
+    };
+  };
+
+  if (!autoWorkManaged) {
+    const preserved = preserveUnmanagedPreviousAutoWork();
+    return preserved ?? {
+      autoOpenWorkKey: null,
+      expandedUserMessageByKey,
+      manuallyClosedAutoWorkByTurnId,
+      openWorkByKey,
+    };
+  }
+
+  if (!workingTurn) {
+    return {
+      autoOpenWorkKey: null,
+      expandedUserMessageByKey,
+      manuallyClosedAutoWorkByTurnId,
+      openWorkByKey,
+    };
+  }
+
+  if (manuallyClosedAutoWorkByTurnId[workingTurn.turnId]) {
+    return {
+      autoOpenWorkKey: null,
+      expandedUserMessageByKey,
+      manuallyClosedAutoWorkByTurnId,
+      openWorkByKey,
+    };
+  }
+
+  if (turnHasAssistantMessage(workingTurn)) {
+    return {
+      autoOpenWorkKey: null,
+      expandedUserMessageByKey,
+      manuallyClosedAutoWorkByTurnId,
+      openWorkByKey,
+    };
   }
 
   const autoRow = preferredAutoOpenWorkRow(workingTurn);
   if (!autoRow) {
-    return { autoOpenWorkKey: null, expandedUserMessageByKey, manuallyClosedAutoWorkByTurnId, openWorkByKey };
+    const preserved = previousAutoOpenWork?.turnId === workingTurn.turnId ? preservePreviousAutoWork() : null;
+    return preserved ?? {
+      autoOpenWorkKey: null,
+      expandedUserMessageByKey,
+      manuallyClosedAutoWorkByTurnId,
+      openWorkByKey,
+    };
   }
 
   const autoWorkKey = transcriptWorkDisclosureKey(autoRow.turnId, autoRow.segmentId);
   if (openWorkByKey[autoWorkKey]) {
-    return { autoOpenWorkKey: null, expandedUserMessageByKey, manuallyClosedAutoWorkByTurnId, openWorkByKey };
+    return {
+      autoOpenWorkKey: null,
+      expandedUserMessageByKey,
+      manuallyClosedAutoWorkByTurnId,
+      openWorkByKey,
+    };
   }
 
   openWorkByKey[autoWorkKey] = workDisclosureForRow({
@@ -363,6 +461,28 @@ export function reconcileTranscriptDisclosure(
     expandedUserMessageByKey,
     manuallyClosedAutoWorkByTurnId,
     openWorkByKey,
+  };
+}
+
+export function promoteOpenWorkDisclosure(
+  disclosure: TranscriptDisclosureState,
+  workKey: string,
+): TranscriptDisclosureState {
+  const openWork = disclosure.openWorkByKey[workKey];
+  if (!openWork || openWork.source !== 'auto') {
+    return disclosure;
+  }
+
+  return {
+    ...disclosure,
+    autoOpenWorkKey: disclosure.autoOpenWorkKey === workKey ? null : disclosure.autoOpenWorkKey,
+    openWorkByKey: {
+      ...disclosure.openWorkByKey,
+      [workKey]: {
+        ...openWork,
+        source: 'user',
+      },
+    },
   };
 }
 
@@ -433,6 +553,27 @@ function preferredAutoOpenWorkRow(turn: TranscriptMeasuredTurn) {
     [...turn.rows].reverse().find((row) => row.segment.type === 'work' && row.segment.state === 'running') ??
     null
   );
+}
+
+function turnHasAssistantMessage(turn: TranscriptMeasuredTurn) {
+  return turn.rows.some((row) => row.segment.type === 'assistantMessage');
+}
+
+function transcriptViewportAllowsAutoWork(disclosure: TranscriptDisclosureState) {
+  const viewport = getTranscriptViewportState();
+  if (viewport.autoScrollMode.type !== 'off') {
+    return true;
+  }
+
+  return viewport.activeTurnIds.length === 0 && !hasAutoOpenWork(disclosure);
+}
+
+function hasAutoOpenWork(disclosure: TranscriptDisclosureState) {
+  return Object.values(disclosure.openWorkByKey).some((openWork) => openWork.source === 'auto');
+}
+
+function hasOpenWorkChild(openWork: TranscriptOpenWorkDisclosure) {
+  return Object.values(openWork.openChildByKey).some(Boolean);
 }
 
 function workRowForDisclosure(

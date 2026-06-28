@@ -12,7 +12,7 @@ use crate::history::{
     build_session_index, discover_session_files, file_revision, read_rows_range, session_meta_id,
 };
 use crate::live_transcript::LiveTranscriptStore;
-use crate::projection::{ProjectedTurn, project_raw_turn, project_rows_to_raw_turn};
+use crate::projection::{ProjectedTurn, RawTurn, project_raw_turn, project_rows_to_raw_turn};
 use crate::transcript::{
     MAX_TAIL_TURNS, ResourceRequest, ResourcesReadParams, SessionIndex, TurnRange,
 };
@@ -402,17 +402,13 @@ impl CodexTranscriptServer {
         );
         if let Some(cached) = self.turn_cache.get(&cache_key) {
             if cached.file_revision == file_revision && cached.range == *range {
-                self.live_transcript
-                    .record_disk_turn_aliases(thread_id, &cached.turn.raw_turn);
-                return Ok(cached.turn.clone());
+                return Ok(self.project_disk_turn(thread_id, cached.turn.raw_turn.clone()));
             }
         }
 
         let rows = read_rows_range(path, range)?;
         let raw_turn = project_rows_to_raw_turn(turn_id, &rows, range);
-        self.live_transcript
-            .record_disk_turn_aliases(thread_id, &raw_turn);
-        let projected = project_raw_turn(raw_turn);
+        let projected = self.project_disk_turn(thread_id, raw_turn);
         self.turn_cache.insert(
             cache_key,
             CachedTurn {
@@ -422,6 +418,12 @@ impl CodexTranscriptServer {
             },
         );
         Ok(projected)
+    }
+
+    fn project_disk_turn(&mut self, thread_id: &str, mut raw_turn: RawTurn) -> ProjectedTurn {
+        self.live_transcript
+            .apply_disk_identity(thread_id, &mut raw_turn);
+        project_raw_turn(raw_turn)
     }
 
     fn project_turn_or_live(

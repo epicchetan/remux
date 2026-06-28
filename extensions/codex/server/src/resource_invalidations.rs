@@ -82,6 +82,16 @@ pub(crate) fn invalidations_for_app_server_notification(
         );
     }
 
+    if invalidates_turn(method)
+        && let Some(turn_id) = notification.get("params").and_then(turn_id_from_params)
+    {
+        push_unique(
+            &mut invalidations,
+            &mut seen,
+            turn_invalidation(thread_id, turn_id, "appServerEvent"),
+        );
+    }
+
     if invalidates_thread_transcript(method) || !rekeyed_item_ids.is_empty() {
         push_unique(
             &mut invalidations,
@@ -186,6 +196,16 @@ fn thread_transcript_invalidation(thread_id: &str, reason: &str) -> Value {
     })
 }
 
+fn turn_invalidation(thread_id: &str, turn_id: &str, reason: &str) -> Value {
+    json!({
+        "key": format!("turn:{thread_id}:{turn_id}"),
+        "reason": reason,
+        "threadId": thread_id,
+        "turnId": turn_id,
+        "type": "turn",
+    })
+}
+
 fn work_item_invalidation(thread_id: &str, turn_id: &str, item_id: &str, reason: &str) -> Value {
     json!({
         "itemId": item_id,
@@ -287,7 +307,6 @@ fn invalidates_thread_transcript(method: &str) -> bool {
             | "item/started"
             | "item/completed"
             | "rawResponseItem/completed"
-            | "item/agentMessage/delta"
             | "item/commandExecution/terminalInteraction"
             | "item/reasoning/summaryPartAdded"
             | "thread/compacted"
@@ -297,6 +316,10 @@ fn invalidates_thread_transcript(method: &str) -> bool {
             | "guardianWarning"
             | "error"
     )
+}
+
+fn invalidates_turn(method: &str) -> bool {
+    matches!(method, "item/agentMessage/delta")
 }
 
 fn invalidates_work_item(method: &str) -> bool {
@@ -405,11 +428,15 @@ mod tests {
     }
 
     #[test]
-    fn item_delta_only_invalidates_transcript() {
+    fn agent_message_delta_invalidates_turn_and_work_item() {
         let invalidations = invalidations_for_app_server_notification(
             &json!({
                 "method": "item/agentMessage/delta",
-                "params": { "threadId": "thread-3" },
+                "params": {
+                    "itemId": "agent-1",
+                    "threadId": "thread-3",
+                    "turnId": "turn-1"
+                },
             }),
             None,
             &[],
@@ -417,7 +444,10 @@ mod tests {
 
         assert_eq!(
             invalidations,
-            vec![thread_transcript_invalidation("thread-3", "appServerEvent")]
+            vec![
+                turn_invalidation("thread-3", "turn-1", "appServerEvent"),
+                work_item_invalidation("thread-3", "turn-1", "agent-1", "appServerEvent"),
+            ]
         );
     }
 

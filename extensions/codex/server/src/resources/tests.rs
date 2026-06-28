@@ -1989,6 +1989,101 @@ fn live_durable_agent_item_dedupes_with_legacy_disk_message() {
 }
 
 #[test]
+fn completed_disk_turn_preserves_live_work_segment_id() {
+    let in_progress_session = r#"{"type":"session_meta","payload":{"id":"019test"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","started_at":1}}
+{"type":"event_msg","payload":{"type":"user_message","message":"prompt"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"Inspecting logs","phase":"commentary"}}
+"#;
+    let completed_session = r#"{"type":"session_meta","payload":{"id":"019test"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","started_at":1}}
+{"type":"event_msg","payload":{"type":"user_message","message":"prompt"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"Inspecting logs","phase":"commentary"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":2,"duration_ms":1}}
+"#;
+    let completed_session_reread = r#"{"type":"session_meta","payload":{"id":"019test"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","started_at":1}}
+{"type":"event_msg","payload":{"type":"user_message","message":"prompt"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"Inspecting logs","phase":"commentary"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":2,"duration_ms":1}}
+{"type":"event_msg","payload":{"type":"token_count","turn_id":"turn-1"}}
+"#;
+    let (home, path) = write_temp_session(in_progress_session);
+    let live = LiveTranscriptStore::default();
+    live.record_notification(&json!({
+        "method": "item/completed",
+        "params": {
+            "item": {
+                "id": "msg-1",
+                "memoryCitation": null,
+                "phase": "commentary",
+                "text": "Inspecting logs",
+                "type": "agentMessage"
+            },
+            "threadId": "019test",
+            "turnId": "turn-1"
+        }
+    }));
+    let mut server = CodexTranscriptServer::new_with_live_transcript(home.clone(), live);
+    let durable_work_id = format!("turn-1:work:{}", canonical_id("turn-1", "msg-1"));
+    let legacy_id = "cxitem:v1:turn-1:legacy:agentMessage:0";
+
+    let live_turn = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [
+                { "type": "turn", "turnId": "turn-1" }
+            ]
+        }))
+        .expect("live turn read should succeed");
+    let live_work_id = live_turn["resources"][0]["value"]["turn"]["segments"][1]["id"]
+        .as_str()
+        .expect("live work segment id")
+        .to_string();
+    assert_eq!(live_work_id, durable_work_id);
+
+    fs::write(&path, completed_session).expect("write completed session");
+    let completed_turn = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [
+                { "type": "turn", "turnId": "turn-1" },
+                { "type": "workDetails", "turnId": "turn-1", "segmentId": durable_work_id },
+                { "type": "workItem", "turnId": "turn-1", "itemId": legacy_id }
+            ]
+        }))
+        .expect("completed turn read should succeed");
+    assert_eq!(
+        completed_turn["resources"][0]["value"]["turn"]["segments"][1]["id"],
+        json!(durable_work_id)
+    );
+    assert_eq!(
+        completed_turn["resources"][1]["value"]["details"]["itemIds"],
+        json!([canonical_id("turn-1", "msg-1")])
+    );
+    assert_eq!(
+        completed_turn["resources"][2]["value"]["itemId"],
+        json!(canonical_id("turn-1", "msg-1"))
+    );
+
+    fs::write(&path, completed_session_reread).expect("write completed session for reread");
+    let reread_turn = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [
+                { "type": "turn", "turnId": "turn-1" }
+            ]
+        }))
+        .expect("completed reread should succeed");
+    assert_eq!(
+        reread_turn["resources"][0]["value"]["turn"]["segments"][1]["id"],
+        json!(durable_work_id)
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
 fn interleaved_turns_do_not_leak_rows_or_stay_in_progress() {
     let (home, _path) = write_temp_session(
         r#"{"type":"session_meta","payload":{"id":"019test"}}

@@ -290,14 +290,6 @@ impl LiveTranscriptStore {
         })
     }
 
-    pub(crate) fn record_disk_turn_aliases(&self, thread_id: &str, raw_turn: &RawTurn) {
-        let mut inner = match self.inner.lock() {
-            Ok(inner) => inner,
-            Err(_) => return,
-        };
-        record_raw_turn_aliases(&mut inner, thread_id, raw_turn);
-    }
-
     pub(crate) fn resolve_item_id(&self, thread_id: &str, turn_id: &str, item_id: &str) -> String {
         self.inner
             .lock()
@@ -308,6 +300,17 @@ impl LiveTranscriptStore {
                     .resolve_existing_item_id(thread_id, turn_id, item_id)
             })
             .unwrap_or_else(|| item_id.to_string())
+    }
+
+    pub(crate) fn apply_disk_identity(&self, thread_id: &str, raw_turn: &mut RawTurn) {
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => return,
+        };
+        record_raw_turn_aliases(&mut inner, thread_id, raw_turn);
+        canonicalize_raw_turn_item_ids(&mut inner.identity, thread_id, raw_turn);
+        reconcile_raw_turn_items(raw_turn);
+        record_raw_turn_aliases(&mut inner, thread_id, raw_turn);
     }
 
     pub(crate) fn apply_overlay(&self, thread_id: &str, projected: ProjectedTurn) -> ProjectedTurn {
@@ -323,7 +326,6 @@ impl LiveTranscriptStore {
             if projected.raw_turn.status != "inProgress" {
                 thread.turn_order.retain(|id| id != &turn_id);
                 thread.turns.remove(&turn_id);
-                inner.identity.remove_turn(thread_id, &turn_id);
                 return projected;
             }
             thread.turns.get(&turn_id).cloned()
@@ -386,6 +388,25 @@ fn record_raw_turn_aliases(inner: &mut LiveTranscriptInner, thread_id: &str, raw
     }
     if let Some(thread) = inner.threads.get_mut(thread_id) {
         apply_rekeys_to_live_thread(thread, &raw_turn.id, &rekeys);
+    }
+}
+
+fn canonicalize_raw_turn_item_ids(
+    identity: &mut ItemIdentityState,
+    thread_id: &str,
+    raw_turn: &mut RawTurn,
+) {
+    let turn_id = raw_turn.id.clone();
+    for item in &mut raw_turn.items {
+        let Some(item_id) = item_id(item).map(str::to_string) else {
+            continue;
+        };
+        let resolved_item_id = identity.resolve_existing_item_id(thread_id, &turn_id, &item_id);
+        if resolved_item_id == item_id {
+            continue;
+        }
+        add_identity_alias(item, canonical_identity_alias(&item_id));
+        item["id"] = Value::String(resolved_item_id);
     }
 }
 

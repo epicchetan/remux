@@ -2,6 +2,7 @@ import type {
   CodexThreadTranscriptResource,
   CodexTranscriptResourceRequest,
   CodexTranscriptResourceResult,
+  CodexTranscriptResourcesReadResponse,
   CodexTranscriptTurn,
   CodexTurnResource,
   CodexWorkDetails,
@@ -204,23 +205,32 @@ export async function invalidateTranscriptResources(invalidations: CodexResource
       },
       {
         warn:
+          invalidationSummary.duplicateTurnKeys.length > 0 ||
+          invalidationSummary.duplicateTurnResourceIds.length > 0 ||
           invalidationSummary.duplicateWorkItemKeys.length > 0 ||
           invalidationSummary.duplicateWorkItemResourceIds.length > 0,
       },
     );
   }
 
+  const turnInvalidations = invalidations.filter(
+    (invalidation): invalidation is Extract<CodexResourceInvalidation, { type: 'turn' }> =>
+      invalidation.type === 'turn' && invalidation.threadId === activeThreadId,
+  );
   const workItemInvalidations = invalidations.filter(
     (invalidation): invalidation is Extract<CodexResourceInvalidation, { type: 'workItem' }> =>
       invalidation.type === 'workItem' && invalidation.threadId === activeThreadId,
   );
+  const turnRefresh = shouldRefreshTranscript
+    ? Promise.resolve()
+    : refreshInvalidatedTurns(activeThreadId, turnInvalidations);
   const workItemRefresh = Promise.all(workItemInvalidations.map((invalidation) =>
     requestWorkItem(activeThreadId, invalidation.turnId, invalidation.itemId, {
       keepExistingVisible: true,
     }))).then(() => undefined);
 
   if (!shouldRefreshTranscript) {
-    await workItemRefresh;
+    await Promise.all([turnRefresh, workItemRefresh]);
     return;
   }
 
@@ -562,6 +572,253 @@ function reconcileThreadResource(result: CodexTranscriptResourceResult | undefin
   }
 
   return result.value;
+}
+
+async function refreshInvalidatedTurns(
+  activeThreadId: string,
+  invalidations: Extract<CodexResourceInvalidation, { type: 'turn' }>[],
+) {
+  if (invalidations.length === 0 || getTranscriptLayoutState().width === null) {
+    return;
+  }
+
+  const turnIds = Array.from(new Set(invalidations.map((invalidation) => invalidation.turnId)));
+  const state = resourceStore.getState();
+  if (state.activeThreadId !== activeThreadId) {
+    return;
+  }
+
+  if (state.status !== 'ready') {
+    logTranscriptDebug('turn.refresh.fallback', {
+      activeThreadId,
+      reason: 'transcriptNotReady',
+      status: state.status,
+      turnIds,
+    }, { warn: true });
+    await scheduleInvalidatedTranscriptRefresh(activeThreadId, {
+      forceFullMeasure: false,
+      preserveReady: true,
+    });
+    return;
+  }
+
+  const loadedTurnIds = new Set(state.turnOrder);
+  const unloadedTurnIds = turnIds.filter((turnId) => !loadedTurnIds.has(turnId));
+  if (unloadedTurnIds.length > 0) {
+    logTranscriptDebug('turn.refresh.fallback', {
+      activeThreadId,
+      reason: 'turnNotLoaded',
+      turnIds,
+      unloadedTurnIds,
+    }, { warn: true });
+    await scheduleInvalidatedTranscriptRefresh(activeThreadId, {
+      forceFullMeasure: false,
+      preserveReady: true,
+    });
+    return;
+  }
+
+  const requests: CodexTranscriptResourceRequest[] = turnIds.map((turnId) => ({
+    knownRevision: state.turnResourcesById[turnId]?.revision,
+    turnId,
+    type: 'turn',
+  }));
+
+  let response: CodexTranscriptResourcesReadResponse;
+  try {
+    response = await readTranscriptResources(activeThreadId, requests);
+  } catch {
+    logTranscriptDebug('turn.refresh.fallback', {
+      activeThreadId,
+      reason: 'readFailed',
+      turnIds,
+    }, { warn: true });
+    await scheduleInvalidatedTranscriptRefresh(activeThreadId, {
+      forceFullMeasure: false,
+      preserveReady: true,
+    });
+    return;
+  }
+
+  const latestState = resourceStore.getState();
+  if (latestState.activeThreadId !== activeThreadId) {
+    return;
+  }
+
+  if (latestState.status !== 'ready') {
+    logTranscriptDebug('turn.refresh.fallback', {
+      activeThreadId,
+      reason: 'transcriptNoLongerReady',
+      status: latestState.status,
+      turnIds,
+    }, { warn: true });
+    await scheduleInvalidatedTranscriptRefresh(activeThreadId, {
+      forceFullMeasure: false,
+      preserveReady: true,
+    });
+    return;
+  }
+
+  const latestLoadedTurnIds = new Set(latestState.turnOrder);
+  const latestUnloadedTurnIds = turnIds.filter((turnId) => !latestLoadedTurnIds.has(turnId));
+  if (latestUnloadedTurnIds.length > 0) {
+    logTranscriptDebug('turn.refresh.fallback', {
+      activeThreadId,
+      reason: 'turnNoLongerLoaded',
+      turnIds,
+      unloadedTurnIds: latestUnloadedTurnIds,
+    }, { warn: true });
+    await scheduleInvalidatedTranscriptRefresh(activeThreadId, {
+      forceFullMeasure: false,
+      preserveReady: true,
+    });
+    return;
+  }
+
+  let nextTurnResourcesById = latestState.turnResourcesById;
+  const dirtyTurnIds = new Set<string>();
+  const staleTurnIds = new Set<string>();
+  for (const result of response.resources) {
+    const request = requests[result.requestIndex];
+    if (!request || request.type !== 'turn') {
+      continue;
+    }
+
+    const latestRevision = latestState.turnResourcesById[request.turnId]?.revision ?? null;
+    const requestRevision = request.knownRevision ?? null;
+    if (latestRevision !== requestRevision) {
+      staleTurnIds.add(request.turnId);
+      logTranscriptDebug('turn.refresh.stale', {
+        activeThreadId,
+        latestRevision,
+        requestRevision,
+        responseRevision: result.revision ?? null,
+        turnId: request.turnId,
+        turnIds,
+      });
+      continue;
+    }
+
+    const previous = nextTurnResourcesById[request.turnId];
+    if (result.status === 'notModified' && previous) {
+      logTranscriptDebug('turn.notModified', {
+        activeThreadId,
+        knownRevision: request.knownRevision ?? null,
+        turnId: request.turnId,
+      });
+      continue;
+    }
+
+    if (result.status !== 'ok') {
+      logTranscriptDebug('turn.refresh.fallback', {
+        activeThreadId,
+        reason: 'turnReadNotOk',
+        responseRevision: result.revision ?? null,
+        status: result.status,
+        turnId: request.turnId,
+        turnIds,
+      }, { warn: true });
+      await scheduleInvalidatedTranscriptRefresh(activeThreadId, {
+        forceFullMeasure: false,
+        preserveReady: true,
+      });
+      return;
+    }
+
+    const turnResource = parseTurnResource(result);
+    if (
+      !turnResource ||
+      turnResource.threadId !== activeThreadId ||
+      turnResource.turnId !== request.turnId
+    ) {
+      logTranscriptDebug('turn.refresh.fallback', {
+        activeThreadId,
+        reason: 'turnParseMismatch',
+        responseRevision: result.revision ?? null,
+        responseThreadId: turnResource?.threadId ?? null,
+        responseTurnId: turnResource?.turnId ?? null,
+        turnId: request.turnId,
+        turnIds,
+      }, { warn: true });
+      await scheduleInvalidatedTranscriptRefresh(activeThreadId, {
+        forceFullMeasure: false,
+        preserveReady: true,
+      });
+      return;
+    }
+
+    if (nextTurnResourcesById === latestState.turnResourcesById) {
+      nextTurnResourcesById = { ...latestState.turnResourcesById };
+    }
+    if (
+      previous?.revision !== turnResource.revision ||
+      previous?.layoutRevision !== turnResource.layoutRevision
+    ) {
+      dirtyTurnIds.add(turnResource.turnId);
+    }
+    nextTurnResourcesById[turnResource.turnId] = {
+      layoutRevision: turnResource.layoutRevision,
+      revision: turnResource.revision,
+      status: 'ready',
+      turn: turnResource.turn,
+    };
+  }
+
+  if (dirtyTurnIds.size === 0) {
+    if (staleTurnIds.size > 0) {
+      await refreshInvalidatedTurns(activeThreadId, turnInvalidationsForStaleRefresh(activeThreadId, staleTurnIds));
+    }
+    return;
+  }
+
+  const turns = latestState.turnOrder
+    .map((turnId) => nextTurnResourcesById[turnId]?.turn)
+    .filter((turn): turn is CodexTranscriptTurn => Boolean(turn));
+  const workingTurnId = workingTurnIdFromTurns(turns);
+  if (transcriptDebugEnabled()) {
+    const turnSummary = summarizeTranscriptTurns(turns);
+    logTranscriptDebug(
+      'turns.refreshed',
+      {
+        activeThreadId,
+        dirtyTurnIds: Array.from(dirtyTurnIds),
+        turnIds,
+        turns: turnSummary,
+        workingTurnId,
+      },
+      {
+        warn: turnSummary.some((turn) =>
+          turn.duplicateSegmentIds.length > 0 || turn.duplicateWorkSegmentIds.length > 0),
+      },
+    );
+  }
+  resourceStore.setState({
+    isWorking: workingTurnId !== null,
+    status: 'ready',
+    turnResourcesById: nextTurnResourcesById,
+    workingTurnId,
+  });
+  reconcileTranscriptLayoutFromResources(transcriptLayoutResourceSnapshot(), {
+    dirtyTurnIds,
+    forceFullMeasure: false,
+  });
+  if (staleTurnIds.size > 0) {
+    await refreshInvalidatedTurns(activeThreadId, turnInvalidationsForStaleRefresh(activeThreadId, staleTurnIds));
+  }
+  void refreshOpenWorkDetails(activeThreadId);
+}
+
+function turnInvalidationsForStaleRefresh(
+  activeThreadId: string,
+  turnIds: ReadonlySet<string>,
+): Extract<CodexResourceInvalidation, { type: 'turn' }>[] {
+  return Array.from(turnIds, (turnId) => ({
+    key: `turn:${activeThreadId}:${turnId}`,
+    reason: 'appServerEvent' as const,
+    threadId: activeThreadId,
+    turnId,
+    type: 'turn' as const,
+  }));
 }
 
 async function ensureWorkDetails({ segmentId, turnId }: { segmentId: string; turnId: string }) {

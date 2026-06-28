@@ -91,6 +91,13 @@ export type CodexResourceInvalidation =
       type: 'threadComposerState' | 'threadRuntime' | 'threadSummary' | 'threadTokenUsage' | 'threadTranscript';
     }
   | {
+      key: string;
+      reason: CodexResourceInvalidationReason;
+      threadId: string;
+      turnId: string;
+      type: 'turn';
+    }
+  | {
       itemId: string;
       key: string;
       reason: CodexResourceInvalidationReason;

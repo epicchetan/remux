@@ -38,7 +38,6 @@ import { cn } from '../../../ui/cn';
 import { Separator } from '../../../ui/Separator';
 import { transcriptWorkDisclosureKey, useTranscriptLayoutStore } from '../../layoutStore';
 import { useTranscriptResourceStore, workItemResourceKey } from '../../resourceStore';
-import { logTranscriptDebug, summarizeWorkDetails, transcriptDebugEnabled } from '../../debug';
 import { Compaction } from '../compaction';
 import { UserMessage } from '../userMessage';
 
@@ -100,53 +99,6 @@ export function WorkSection({
 
     void ensureWorkDetails({ segmentId: segment.id, turnId });
   }, [details, ensureWorkDetails, segment.hasDetails, segment.id, turnId, workOpen]);
-
-  useEffect(() => {
-    if (!workOpen || !transcriptDebugEnabled()) {
-      return;
-    }
-
-    const detailsSummary = summarizeWorkDetails(details);
-    logTranscriptDebug(
-      'workSection.renderInputs',
-      {
-        details: detailsSummary,
-        rowId,
-        segment: {
-          durationMs: segment.durationMs,
-          hasDetails: segment.hasDetails,
-          id: segment.id,
-          revision: segment.revision,
-          state: segment.state,
-        },
-        threadId,
-        turnId,
-        waitingForDetails,
-      },
-      {
-        warn: Boolean(
-          detailsSummary &&
-            (
-              detailsSummary.duplicateEntryIds.length > 0 ||
-              detailsSummary.duplicateItemIds.length > 0 ||
-              detailsSummary.duplicateRenderItemIds.length > 0
-            ),
-        ),
-      },
-    );
-  }, [
-    details,
-    rowId,
-    segment.durationMs,
-    segment.hasDetails,
-    segment.id,
-    segment.revision,
-    segment.state,
-    threadId,
-    turnId,
-    waitingForDetails,
-    workOpen,
-  ]);
 
   useLayoutEffect(() => {
     if (!workOpen) {

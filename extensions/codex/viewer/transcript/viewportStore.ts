@@ -23,13 +23,19 @@ type TranscriptViewportStoreState = {
   setAutoScrollMode: (mode: TranscriptAutoScrollMode) => void;
   setScrollAvailability: (availability: { canScrollDown: boolean; canScrollUp: boolean }) => void;
   setScrollNavigationController: (controller: TranscriptScrollNavigationController | null) => void;
+  setVisibleWorkKeys: (visibleWorkKeys: string[]) => void;
+  visibleWorkKeys: string[];
 };
 
 const noopScrollNavigation = () => undefined;
 
 const actions: Pick<
   TranscriptViewportStoreState,
-  'setActiveTurnIds' | 'setAutoScrollMode' | 'setScrollAvailability' | 'setScrollNavigationController'
+  | 'setActiveTurnIds'
+  | 'setAutoScrollMode'
+  | 'setScrollAvailability'
+  | 'setScrollNavigationController'
+  | 'setVisibleWorkKeys'
 > = {
   setActiveTurnIds(activeTurnIds) {
     if (sameTurnIds(viewportStore.getState().activeTurnIds, activeTurnIds)) {
@@ -65,6 +71,13 @@ const actions: Pick<
       scrollUp: controller?.scrollUp ?? noopScrollNavigation,
     });
   },
+  setVisibleWorkKeys(visibleWorkKeys) {
+    if (sameTurnIds(viewportStore.getState().visibleWorkKeys, visibleWorkKeys)) {
+      return;
+    }
+
+    viewportStore.setState({ visibleWorkKeys });
+  },
 };
 
 const viewportStore = createExternalStore<TranscriptViewportStoreState>({
@@ -74,10 +87,15 @@ const viewportStore = createExternalStore<TranscriptViewportStoreState>({
   canScrollUp: false,
   scrollDown: noopScrollNavigation,
   scrollUp: noopScrollNavigation,
+  visibleWorkKeys: [],
   ...actions,
 });
 
 export const useTranscriptViewportStore = viewportStore.useStore;
+
+export function getTranscriptViewportState() {
+  return viewportStore.getState();
+}
 
 export function resetTranscriptViewportForThread() {
   viewportStore.setState({
@@ -85,6 +103,7 @@ export function resetTranscriptViewportForThread() {
     autoScrollMode: { type: 'off' },
     canScrollDown: false,
     canScrollUp: false,
+    visibleWorkKeys: [],
   });
 }
 

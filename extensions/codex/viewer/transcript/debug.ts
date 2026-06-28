@@ -30,10 +30,23 @@ export function transcriptDebugEnabled() {
 
   try {
     const params = new URLSearchParams(window.location.search);
-    return (
-      params.has('codexTranscriptDebug') ||
-      window.localStorage.getItem('remux.codex.transcriptDebug') === '1'
-    );
+    const queryOverride = params.get('codexTranscriptDebug');
+    if (queryOverride === '0' || queryOverride === 'false') {
+      return false;
+    }
+    if (queryOverride !== null) {
+      return true;
+    }
+
+    const storedOverride = window.localStorage.getItem('remux.codex.transcriptDebug');
+    if (storedOverride === '0' || storedOverride === 'false') {
+      return false;
+    }
+    if (storedOverride === '1' || storedOverride === 'true') {
+      return true;
+    }
+
+    return false;
   } catch {
     return false;
   }
@@ -170,10 +183,19 @@ export function duplicateStrings(ids: readonly string[]) {
 
 export function summarizeInvalidations(invalidations: readonly CodexResourceInvalidation[]) {
   const types = new Map<string, number>();
+  const turns: Array<{ key: string; reason: string; threadId: string; turnId: string }> = [];
   const workItems: Array<{ itemId: string; key: string; reason: string; threadId: string; turnId: string }> = [];
 
   for (const invalidation of invalidations) {
     types.set(invalidation.type, (types.get(invalidation.type) ?? 0) + 1);
+    if (invalidation.type === 'turn') {
+      turns.push({
+        key: invalidation.key,
+        reason: invalidation.reason,
+        threadId: invalidation.threadId,
+        turnId: invalidation.turnId,
+      });
+    }
     if (invalidation.type === 'workItem') {
       workItems.push({
         itemId: invalidation.itemId,
@@ -187,9 +209,12 @@ export function summarizeInvalidations(invalidations: readonly CodexResourceInva
 
   return {
     count: invalidations.length,
+    duplicateTurnKeys: duplicateStrings(turns.map((turn) => turn.key)),
+    duplicateTurnResourceIds: duplicateStrings(turns.map((turn) => `${turn.threadId}:${turn.turnId}`)),
     duplicateWorkItemKeys: duplicateStrings(workItems.map((item) => item.key)),
     duplicateWorkItemResourceIds: duplicateStrings(workItems.map((item) =>
       `${item.threadId}:${item.turnId}:${item.itemId}`)),
+    turns,
     types: Object.fromEntries(types),
     workItems,
   };
