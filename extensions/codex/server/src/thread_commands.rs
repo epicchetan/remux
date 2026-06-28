@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
@@ -8,12 +9,14 @@ use crate::app_server::AppServerRuntime;
 use crate::composer_config::{ComposerConfig, ComposerConfigStore};
 use crate::live_transcript::LiveTranscriptStore;
 use crate::resource_invalidations::{command_accepted_invalidations, send_accepted_invalidations};
+use crate::resources::CodexTranscriptServer;
 use crate::thread_runtime::ThreadRuntimeStore;
 
 #[derive(Debug)]
 pub(crate) struct CodexThreadCommandServer {
     app_server: Arc<dyn AppServerRequester>,
     composer_config: ComposerConfigStore,
+    fork_target_validator: Arc<dyn ForkTargetValidator>,
     live_transcript: LiveTranscriptStore,
     resumed_thread_ids: Mutex<HashSet<String>>,
     thread_runtime: ThreadRuntimeStore,
@@ -23,9 +26,130 @@ trait AppServerRequester: Send + Sync + std::fmt::Debug {
     fn request(&self, method: &str, params: Value) -> Result<Value, String>;
 }
 
+trait ForkTargetValidator: Send + Sync + std::fmt::Debug {
+    fn validate(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        assistant_message_id: &str,
+    ) -> Result<(), String>;
+}
+
+const THREAD_TURNS_LIST_PAGE_LIMIT: usize = 200;
+
 impl AppServerRequester for AppServerRuntime {
     fn request(&self, method: &str, params: Value) -> Result<Value, String> {
         AppServerRuntime::request(self, method, params)
+    }
+}
+
+#[derive(Debug)]
+struct ProjectedTranscriptForkTargetValidator {
+    live_transcript: LiveTranscriptStore,
+    transcript: Mutex<CodexTranscriptServer>,
+}
+
+impl ProjectedTranscriptForkTargetValidator {
+    fn new(codex_home: PathBuf, live_transcript: LiveTranscriptStore) -> Self {
+        Self {
+            live_transcript: live_transcript.clone(),
+            transcript: Mutex::new(CodexTranscriptServer::new_with_live_transcript(
+                codex_home,
+                live_transcript,
+            )),
+        }
+    }
+
+    fn validate_transcript_response(
+        response: &Value,
+        turn_id: &str,
+        assistant_message_id: &str,
+    ) -> Result<(), String> {
+        let resource = response
+            .get("resources")
+            .and_then(Value::as_array)
+            .and_then(|resources| resources.first())
+            .ok_or_else(|| "transcript turn response missing resource".to_string())?;
+        if resource.get("status").and_then(Value::as_str) != Some("ok") {
+            let reason = resource
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("turn_not_found");
+            return Err(format!(
+                "turnId {turn_id} was not found in source transcript: {reason}"
+            ));
+        }
+        let turn = resource
+            .get("value")
+            .and_then(|value| value.get("turn"))
+            .ok_or_else(|| "transcript turn response missing turn".to_string())?;
+        validate_projected_turn(turn, turn_id, assistant_message_id)
+    }
+
+    fn validate_live_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        assistant_message_id: &str,
+    ) -> Option<Result<(), String>> {
+        self.live_transcript
+            .projected_turn(thread_id, turn_id)
+            .map(|projected| {
+                validate_projected_turn(&projected.turn, turn_id, assistant_message_id)
+            })
+    }
+}
+
+impl ForkTargetValidator for ProjectedTranscriptForkTargetValidator {
+    fn validate(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        assistant_message_id: &str,
+    ) -> Result<(), String> {
+        let transcript_result = self
+            .transcript
+            .lock()
+            .map_err(|_| "fork target transcript validator poisoned".to_string())
+            .and_then(|mut transcript| {
+                transcript.read_resources(json!({
+                    "threadId": thread_id,
+                    "requests": [
+                        {
+                            "type": "turn",
+                            "turnId": turn_id,
+                        }
+                    ],
+                }))
+            })
+            .and_then(|response| {
+                Self::validate_transcript_response(&response, turn_id, assistant_message_id)
+            });
+        let transcript_error = match transcript_result {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+
+        match self.validate_live_turn(thread_id, turn_id, assistant_message_id) {
+            Some(result) => result,
+            None => Err(transcript_error),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct AllowAllForkTargetValidator;
+
+#[cfg(test)]
+impl ForkTargetValidator for AllowAllForkTargetValidator {
+    fn validate(
+        &self,
+        _thread_id: &str,
+        _turn_id: &str,
+        _assistant_message_id: &str,
+    ) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -106,34 +230,73 @@ impl CodexThreadCommandServer {
         composer_config: ComposerConfigStore,
         live_transcript: LiveTranscriptStore,
         thread_runtime: ThreadRuntimeStore,
+        codex_home: PathBuf,
     ) -> Self {
-        Self::with_requester_and_live_transcript(
+        let fork_target_validator = Arc::new(ProjectedTranscriptForkTargetValidator::new(
+            codex_home,
+            live_transcript.clone(),
+        ));
+        Self::with_requester_live_transcript_and_fork_target_validator(
             Arc::new(app_server),
             composer_config,
             live_transcript,
             thread_runtime,
+            fork_target_validator,
         )
     }
 
     #[cfg(test)]
     fn with_requester(app_server: Arc<dyn AppServerRequester>) -> Self {
-        Self::with_requester_and_live_transcript(
+        Self::with_requester_live_transcript_and_fork_target_validator(
             app_server,
             ComposerConfigStore::default(),
             LiveTranscriptStore::default(),
             ThreadRuntimeStore::default(),
+            Arc::new(AllowAllForkTargetValidator),
         )
     }
 
+    #[cfg(test)]
     fn with_requester_and_live_transcript(
         app_server: Arc<dyn AppServerRequester>,
         composer_config: ComposerConfigStore,
         live_transcript: LiveTranscriptStore,
         thread_runtime: ThreadRuntimeStore,
     ) -> Self {
+        Self::with_requester_live_transcript_and_fork_target_validator(
+            app_server,
+            composer_config,
+            live_transcript,
+            thread_runtime,
+            Arc::new(AllowAllForkTargetValidator),
+        )
+    }
+
+    #[cfg(test)]
+    fn with_requester_and_fork_target_validator(
+        app_server: Arc<dyn AppServerRequester>,
+        fork_target_validator: Arc<dyn ForkTargetValidator>,
+    ) -> Self {
+        Self::with_requester_live_transcript_and_fork_target_validator(
+            app_server,
+            ComposerConfigStore::default(),
+            LiveTranscriptStore::default(),
+            ThreadRuntimeStore::default(),
+            fork_target_validator,
+        )
+    }
+
+    fn with_requester_live_transcript_and_fork_target_validator(
+        app_server: Arc<dyn AppServerRequester>,
+        composer_config: ComposerConfigStore,
+        live_transcript: LiveTranscriptStore,
+        thread_runtime: ThreadRuntimeStore,
+        fork_target_validator: Arc<dyn ForkTargetValidator>,
+    ) -> Self {
         Self {
             app_server,
             composer_config,
+            fork_target_validator,
             live_transcript,
             resumed_thread_ids: Mutex::new(HashSet::new()),
             thread_runtime,
@@ -412,14 +575,49 @@ impl CodexThreadCommandServer {
         turn_id: &str,
         assistant_message_id: &str,
     ) -> Result<ForkTarget, String> {
-        let response = self.app_server.request(
-            "thread/read",
-            json!({
-                "threadId": thread_id,
-                "includeTurns": true,
-            }),
-        )?;
-        fork_target_from_thread_read(&response, turn_id, assistant_message_id)
+        let mut cursor: Option<String> = None;
+        let mut rollback_turns_after = 0usize;
+
+        loop {
+            let response = self.app_server.request(
+                "thread/turns/list",
+                json!({
+                    "threadId": thread_id,
+                    "cursor": cursor.as_deref(),
+                    "limit": THREAD_TURNS_LIST_PAGE_LIMIT,
+                    "sortDirection": "desc",
+                }),
+            )?;
+
+            let turns = response
+                .get("data")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "thread/turns/list response missing data".to_string())?;
+            for turn in turns {
+                if turn.get("id").and_then(Value::as_str) == Some(turn_id) {
+                    self.fork_target_validator.validate(
+                        thread_id,
+                        turn_id,
+                        assistant_message_id,
+                    )?;
+                    return Ok(ForkTarget {
+                        rollback_turns_after,
+                    });
+                }
+                rollback_turns_after += 1;
+            }
+
+            cursor = response
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|value| !value.trim().is_empty());
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        Err(format!("turnId {turn_id} was not found in source thread"))
     }
 
     fn start_turn(
@@ -466,44 +664,35 @@ struct ForkTarget {
     rollback_turns_after: usize,
 }
 
-fn fork_target_from_thread_read(
-    response: &Value,
+fn validate_projected_turn(
+    turn: &Value,
     turn_id: &str,
     assistant_message_id: &str,
-) -> Result<ForkTarget, String> {
-    let turns = response
-        .get("thread")
-        .and_then(|thread| thread.get("turns"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| "thread/read response missing thread.turns".to_string())?;
-    let turn_index = turns
-        .iter()
-        .position(|turn| turn.get("id").and_then(Value::as_str) == Some(turn_id))
-        .ok_or_else(|| format!("turnId {turn_id} was not found in source thread"))?;
-    let turn = &turns[turn_index];
-    if !turn_contains_forkable_assistant_message(turn, assistant_message_id) {
-        return Err(format!(
-            "assistantMessageId {assistant_message_id} was not found in turn {turn_id}"
-        ));
+) -> Result<(), String> {
+    if projected_turn_contains_forkable_assistant_message(turn, assistant_message_id) {
+        return Ok(());
     }
 
-    Ok(ForkTarget {
-        rollback_turns_after: turns.len().saturating_sub(turn_index + 1),
-    })
+    Err(format!(
+        "assistantMessageId {assistant_message_id} was not found in turn {turn_id}"
+    ))
 }
 
-fn turn_contains_forkable_assistant_message(turn: &Value, assistant_message_id: &str) -> bool {
-    turn.get("items")
+fn projected_turn_contains_forkable_assistant_message(
+    turn: &Value,
+    assistant_message_id: &str,
+) -> bool {
+    turn.get("segments")
         .and_then(Value::as_array)
-        .is_some_and(|items| {
-            items
+        .is_some_and(|segments| {
+            segments
                 .iter()
-                .any(|item| is_forkable_assistant_message(item, assistant_message_id))
+                .any(|segment| is_forkable_assistant_message(segment, assistant_message_id))
         })
 }
 
 fn is_forkable_assistant_message(item: &Value, assistant_message_id: &str) -> bool {
-    item.get("type").and_then(Value::as_str) == Some("agentMessage")
+    item.get("type").and_then(Value::as_str) == Some("assistantMessage")
         && item.get("id").and_then(Value::as_str) == Some(assistant_message_id)
         && item
             .get("text")
@@ -586,6 +775,8 @@ fn should_retry_legacy_resume(error: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 
@@ -593,6 +784,48 @@ mod tests {
     struct FakeAppServer {
         calls: Mutex<Vec<(String, Value)>>,
         responses: Mutex<VecDeque<Result<Value, String>>>,
+    }
+
+    #[derive(Debug)]
+    struct RecordingForkTargetValidator {
+        calls: Mutex<Vec<(String, String, String)>>,
+        result: Result<(), String>,
+    }
+
+    impl RecordingForkTargetValidator {
+        fn accepting() -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                result: Ok(()),
+            })
+        }
+
+        fn rejecting(error: &str) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                result: Err(error.to_string()),
+            })
+        }
+
+        fn calls(&self) -> Vec<(String, String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl ForkTargetValidator for RecordingForkTargetValidator {
+        fn validate(
+            &self,
+            thread_id: &str,
+            turn_id: &str,
+            assistant_message_id: &str,
+        ) -> Result<(), String> {
+            self.calls.lock().unwrap().push((
+                thread_id.to_string(),
+                turn_id.to_string(),
+                assistant_message_id.to_string(),
+            ));
+            self.result.clone()
+        }
     }
 
     impl FakeAppServer {
@@ -805,22 +1038,21 @@ mod tests {
         let app_server = FakeAppServer::new(vec![
             Ok(json!({ "thread": { "id": "thread-1" } })),
             Ok(json!({
-                "thread": {
-                    "id": "thread-1",
-                    "turns": [
-                        {
-                            "id": "turn-target",
-                            "items": [
-                                {
-                                    "id": "assistant-target",
-                                    "phase": null,
-                                    "text": "Original response",
-                                    "type": "agentMessage"
-                                }
-                            ]
-                        }
-                    ]
-                }
+                "data": [
+                    {
+                        "id": "turn-target",
+                        "items": [
+                            {
+                                "id": "assistant-target",
+                                "phase": null,
+                                "text": "Original response",
+                                "type": "agentMessage"
+                            }
+                        ]
+                    }
+                ],
+                "nextCursor": null,
+                "backwardsCursor": null
             })),
             Ok(json!({ "thread": { "id": "thread-fork" } })),
             Ok(json!({ "turn": { "id": "turn-new" } })),
@@ -844,9 +1076,11 @@ mod tests {
         let calls = app_server.calls();
         assert_eq!(calls.len(), 4);
         assert_eq!(calls[0].0, "thread/resume");
-        assert_eq!(calls[1].0, "thread/read");
+        assert_eq!(calls[1].0, "thread/turns/list");
         assert_eq!(calls[1].1["threadId"], "thread-1");
-        assert_eq!(calls[1].1["includeTurns"], true);
+        assert_eq!(calls[1].1["cursor"], Value::Null);
+        assert_eq!(calls[1].1["limit"], json!(THREAD_TURNS_LIST_PAGE_LIMIT));
+        assert_eq!(calls[1].1["sortDirection"], "desc");
         assert_eq!(calls[2].0, "thread/fork");
         assert_eq!(calls[2].1["threadId"], "thread-1");
         assert_eq!(calls[2].1["excludeTurns"], true);
@@ -861,48 +1095,264 @@ mod tests {
     }
 
     #[test]
+    fn forks_using_projected_assistant_message_id_when_app_server_item_id_differs() {
+        let validator = RecordingForkTargetValidator::accepting();
+        let app_server = FakeAppServer::new(vec![
+            Ok(json!({ "thread": { "id": "thread-1" } })),
+            Ok(json!({
+                "data": [
+                    {
+                        "id": "turn-target",
+                        "items": [
+                            {
+                                "id": "item-48",
+                                "phase": "final_answer",
+                                "text": "Original response",
+                                "type": "agentMessage"
+                            }
+                        ]
+                    }
+                ],
+                "nextCursor": null,
+                "backwardsCursor": null
+            })),
+            Ok(json!({ "thread": { "id": "thread-fork" } })),
+            Ok(json!({ "turn": { "id": "turn-new" } })),
+        ]);
+        let server = CodexThreadCommandServer::with_requester_and_fork_target_validator(
+            app_server.clone(),
+            validator.clone(),
+        );
+
+        let projected_assistant_id =
+            "cxitem:v1:turn-target:id:msg_0c2fa199e980d76e016a415275301c819c933511afd5b56fec";
+        let response = server
+            .fork_message(json!({
+                "threadId": "thread-1",
+                "turnId": "turn-target",
+                "assistantMessageId": projected_assistant_id,
+                "clientMessageId": "client-fork",
+                "parts": [{ "type": "text", "text": "Continue differently" }]
+            }))
+            .unwrap();
+
+        assert_eq!(response["threadId"], "thread-fork");
+        assert_eq!(response["turnId"], "turn-new");
+        assert_eq!(
+            validator.calls(),
+            vec![(
+                "thread-1".to_string(),
+                "turn-target".to_string(),
+                projected_assistant_id.to_string()
+            )]
+        );
+
+        let calls = app_server.calls();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[1].0, "thread/turns/list");
+        assert_eq!(calls[2].0, "thread/fork");
+    }
+
+    #[test]
+    fn fork_target_validator_error_prevents_fork() {
+        let validator = RecordingForkTargetValidator::rejecting(
+            "assistantMessageId projected-assistant was not found in turn turn-target",
+        );
+        let app_server = FakeAppServer::new(vec![
+            Ok(json!({ "thread": { "id": "thread-1" } })),
+            Ok(json!({
+                "data": [
+                    {
+                        "id": "turn-target",
+                        "items": [
+                            {
+                                "id": "item-48",
+                                "phase": "final_answer",
+                                "text": "Original response",
+                                "type": "agentMessage"
+                            }
+                        ]
+                    }
+                ],
+                "nextCursor": null,
+                "backwardsCursor": null
+            })),
+        ]);
+        let server = CodexThreadCommandServer::with_requester_and_fork_target_validator(
+            app_server.clone(),
+            validator,
+        );
+
+        let error = server
+            .fork_message(json!({
+                "threadId": "thread-1",
+                "turnId": "turn-target",
+                "assistantMessageId": "projected-assistant",
+                "parts": [{ "type": "text", "text": "Continue differently" }]
+            }))
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "assistantMessageId projected-assistant was not found in turn turn-target"
+        );
+        let calls = app_server.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "thread/resume");
+        assert_eq!(calls[1].0, "thread/turns/list");
+    }
+
+    #[test]
+    fn projected_turn_forkability_uses_transcript_assistant_segments() {
+        let turn = json!({
+            "id": "turn-1",
+            "segments": [
+                {
+                    "id": "work-1",
+                    "type": "work"
+                },
+                {
+                    "id": "assistant-commentary",
+                    "phase": "commentary",
+                    "text": "Not a final answer",
+                    "type": "assistantMessage"
+                },
+                {
+                    "id": "assistant-empty",
+                    "phase": "final_answer",
+                    "text": "   ",
+                    "type": "assistantMessage"
+                },
+                {
+                    "id": "assistant-final",
+                    "phase": "final_answer",
+                    "text": "Final answer",
+                    "type": "assistantMessage"
+                }
+            ]
+        });
+
+        assert!(projected_turn_contains_forkable_assistant_message(
+            &turn,
+            "assistant-final"
+        ));
+        assert!(!projected_turn_contains_forkable_assistant_message(
+            &turn,
+            "assistant-commentary"
+        ));
+        assert!(!projected_turn_contains_forkable_assistant_message(
+            &turn,
+            "assistant-empty"
+        ));
+        assert!(!projected_turn_contains_forkable_assistant_message(
+            &turn, "missing"
+        ));
+    }
+
+    #[test]
+    fn projected_transcript_validator_falls_back_to_live_turn_when_rollout_file_is_missing() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let codex_home = std::env::temp_dir().join(format!(
+            "remux-codex-fork-validator-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&codex_home).unwrap();
+        let live_transcript = LiveTranscriptStore::default();
+        live_transcript.record_turn(
+            "thread-live",
+            &json!({
+                "id": "turn-live",
+                "itemsView": "full",
+                "status": "completed",
+                "items": [
+                    {
+                        "id": "assistant-live",
+                        "phase": "final_answer",
+                        "text": "Live answer",
+                        "type": "agentMessage"
+                    }
+                ]
+            }),
+        );
+        let projected_assistant_id = live_transcript
+            .projected_turn("thread-live", "turn-live")
+            .and_then(|projected| {
+                projected
+                    .turn
+                    .get("segments")
+                    .and_then(Value::as_array)
+                    .and_then(|segments| {
+                        segments.iter().find_map(|segment| {
+                            (segment.get("type").and_then(Value::as_str)
+                                == Some("assistantMessage"))
+                            .then(|| segment.get("id").and_then(Value::as_str))
+                            .flatten()
+                        })
+                    })
+                    .map(str::to_string)
+            })
+            .unwrap();
+        let validator =
+            ProjectedTranscriptForkTargetValidator::new(codex_home.clone(), live_transcript);
+
+        validator
+            .validate("thread-live", "turn-live", &projected_assistant_id)
+            .unwrap();
+        assert_eq!(
+            validator
+                .validate("thread-live", "turn-live", "missing-assistant")
+                .unwrap_err(),
+            "assistantMessageId missing-assistant was not found in turn turn-live"
+        );
+
+        let _ = fs::remove_dir_all(codex_home);
+    }
+
+    #[test]
     fn forks_from_historical_assistant_message_by_rolling_back_the_clone() {
         let app_server = FakeAppServer::new(vec![
             Ok(json!({ "thread": { "id": "thread-1" } })),
             Ok(json!({
-                "thread": {
-                    "id": "thread-1",
-                    "turns": [
-                        {
-                            "id": "turn-1",
-                            "items": [
-                                {
-                                    "id": "assistant-1",
-                                    "phase": null,
-                                    "text": "Earlier response",
-                                    "type": "agentMessage"
-                                }
-                            ]
-                        },
-                        {
-                            "id": "turn-2",
-                            "items": [
-                                {
-                                    "id": "assistant-2",
-                                    "phase": null,
-                                    "text": "Later response",
-                                    "type": "agentMessage"
-                                }
-                            ]
-                        },
-                        {
-                            "id": "turn-3",
-                            "items": [
-                                {
-                                    "id": "assistant-3",
-                                    "phase": null,
-                                    "text": "Latest response",
-                                    "type": "agentMessage"
-                                }
-                            ]
-                        }
-                    ]
-                }
+                "data": [
+                    {
+                        "id": "turn-3",
+                        "items": [
+                            {
+                                "id": "assistant-3",
+                                "phase": null,
+                                "text": "Latest response",
+                                "type": "agentMessage"
+                            }
+                        ]
+                    },
+                    {
+                        "id": "turn-2",
+                        "items": [
+                            {
+                                "id": "assistant-2",
+                                "phase": null,
+                                "text": "Later response",
+                                "type": "agentMessage"
+                            }
+                        ]
+                    },
+                    {
+                        "id": "turn-1",
+                        "items": [
+                            {
+                                "id": "assistant-1",
+                                "phase": null,
+                                "text": "Earlier response",
+                                "type": "agentMessage"
+                            }
+                        ]
+                    }
+                ],
+                "nextCursor": null,
+                "backwardsCursor": null
             })),
             Ok(json!({ "thread": { "id": "thread-fork" } })),
             Ok(json!({ "thread": { "id": "thread-fork" } })),
@@ -926,7 +1376,8 @@ mod tests {
         let calls = app_server.calls();
         assert_eq!(calls.len(), 5);
         assert_eq!(calls[0].0, "thread/resume");
-        assert_eq!(calls[1].0, "thread/read");
+        assert_eq!(calls[1].0, "thread/turns/list");
+        assert_eq!(calls[1].1["sortDirection"], "desc");
         assert_eq!(calls[2].0, "thread/fork");
         assert_eq!(calls[3].0, "thread/rollback");
         assert_eq!(calls[3].1["threadId"], "thread-fork");
@@ -934,6 +1385,78 @@ mod tests {
         assert_eq!(calls[4].0, "turn/start");
         assert_eq!(calls[4].1["threadId"], "thread-fork");
         assert_eq!(calls[4].1["clientUserMessageId"], "client-fork");
+    }
+
+    #[test]
+    fn forks_from_paginated_historical_assistant_message() {
+        let app_server = FakeAppServer::new(vec![
+            Ok(json!({ "thread": { "id": "thread-1" } })),
+            Ok(json!({
+                "data": [
+                    {
+                        "id": "turn-newer",
+                        "items": [
+                            {
+                                "id": "assistant-newer",
+                                "phase": null,
+                                "text": "Newer response",
+                                "type": "agentMessage"
+                            }
+                        ]
+                    }
+                ],
+                "nextCursor": "cursor-1",
+                "backwardsCursor": null
+            })),
+            Ok(json!({
+                "data": [
+                    {
+                        "id": "turn-target",
+                        "items": [
+                            {
+                                "id": "assistant-target",
+                                "phase": "final_answer",
+                                "text": "Target response",
+                                "type": "agentMessage"
+                            }
+                        ]
+                    }
+                ],
+                "nextCursor": null,
+                "backwardsCursor": null
+            })),
+            Ok(json!({ "thread": { "id": "thread-fork" } })),
+            Ok(json!({ "thread": { "id": "thread-fork" } })),
+            Ok(json!({ "turn": { "id": "turn-new" } })),
+        ]);
+        let server = CodexThreadCommandServer::with_requester(app_server.clone());
+
+        let response = server
+            .fork_message(json!({
+                "threadId": "thread-1",
+                "turnId": "turn-target",
+                "assistantMessageId": "assistant-target",
+                "clientMessageId": "client-fork",
+                "parts": [{ "type": "text", "text": "Branch from paged history" }]
+            }))
+            .unwrap();
+
+        assert_eq!(response["threadId"], "thread-fork");
+        assert_eq!(response["turnId"], "turn-new");
+
+        let calls = app_server.calls();
+        assert_eq!(calls.len(), 6);
+        assert_eq!(calls[0].0, "thread/resume");
+        assert_eq!(calls[1].0, "thread/turns/list");
+        assert_eq!(calls[1].1["cursor"], Value::Null);
+        assert_eq!(calls[2].0, "thread/turns/list");
+        assert_eq!(calls[2].1["cursor"], "cursor-1");
+        assert_eq!(calls[3].0, "thread/fork");
+        assert_eq!(calls[4].0, "thread/rollback");
+        assert_eq!(calls[4].1["threadId"], "thread-fork");
+        assert_eq!(calls[4].1["numTurns"], 1);
+        assert_eq!(calls[5].0, "turn/start");
+        assert_eq!(calls[5].1["threadId"], "thread-fork");
     }
 
     #[test]

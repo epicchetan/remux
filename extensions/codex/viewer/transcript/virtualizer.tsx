@@ -6,7 +6,6 @@ import { AssistantMessage } from './components/assistantMessage';
 import { Compaction } from './components/compaction';
 import { UserMessage } from './components/userMessage';
 import { WorkSection } from './components/work/WorkSection';
-import { transcriptWorkDisclosureKey } from './disclosureKeys';
 import { transcriptLayout } from './layout/constants';
 import type { TranscriptMeasuredRow, TranscriptMeasuredTurn } from './layout/types';
 import { useThreadRuntimeStore } from '../threads/runtimeStore';
@@ -76,7 +75,6 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
   const setAutoScrollMode = useTranscriptViewportStore((state) => state.setAutoScrollMode);
   const setScrollAvailability = useTranscriptViewportStore((state) => state.setScrollAvailability);
   const setScrollNavigationController = useTranscriptViewportStore((state) => state.setScrollNavigationController);
-  const setVisibleWorkKeys = useTranscriptViewportStore((state) => state.setVisibleWorkKeys);
   const turns = useMemo(
     () => turnOrder.map((turnId) => turnsById[turnId]).filter((turn): turn is TranscriptMeasuredTurn => Boolean(turn)),
     [turnOrder, turnsById],
@@ -200,22 +198,6 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     return anchor;
   }, [viewportTopPadding]);
 
-  const updateVisibleWorkKeys = useCallback(() => {
-    const viewport = viewportRef.current;
-    if (!viewport) {
-      setVisibleWorkKeys([]);
-      return;
-    }
-
-    setVisibleWorkKeys(visibleWorkKeysForViewport({
-      expandedRows: expandedRowsRef.current,
-      scrollTop: viewport.scrollTop,
-      topPadding: viewportTopPadding,
-      turns: turnsRef.current,
-      viewportHeight: viewport.clientHeight,
-    }));
-  }, [setVisibleWorkKeys, viewportTopPadding]);
-
   const scheduleRangeUpdate = useCallback(() => {
     if (rafRef.current !== null) {
       return;
@@ -228,7 +210,6 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       const measuredTurns = turnsRef.current;
       if (!viewport || measuredTurns.length === 0) {
         setScrollAvailability({ canScrollDown: false, canScrollUp: false });
-        setVisibleWorkKeys([]);
         return;
       }
 
@@ -243,7 +224,6 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
 
       captureViewportAnchor();
       setScrollAvailability(scrollNavigationAvailability(viewport, navigationAnchorsRef.current));
-      updateVisibleWorkKeys();
 
       if (sameTurnIds(activeTurnIdsRef.current, nextActiveTurnIds)) {
         return;
@@ -256,8 +236,6 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     captureViewportAnchor,
     setActiveTurnIds,
     setScrollAvailability,
-    setVisibleWorkKeys,
-    updateVisibleWorkKeys,
     viewportTopPadding,
   ]);
 
@@ -439,7 +417,6 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
 
     const onScroll = () => {
       updateStickiness();
-      updateVisibleWorkKeys();
       scheduleRangeUpdate();
     };
     const onTouchStart = () => {
@@ -486,7 +463,6 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     scheduleAutoScroll,
     scheduleRangeUpdate,
     setViewportAutoScrollMode,
-    updateVisibleWorkKeys,
   ]);
 
   useEffect(() => {
@@ -898,39 +874,6 @@ function transcriptRowPositions({
   });
 
   return positions;
-}
-
-function visibleWorkKeysForViewport({
-  expandedRows,
-  scrollTop,
-  topPadding,
-  turns,
-  viewportHeight,
-}: {
-  expandedRows: TranscriptExpandedRow[];
-  scrollTop: number;
-  topPadding: number;
-  turns: TranscriptMeasuredTurn[];
-  viewportHeight: number;
-}) {
-  const keys: string[] = [];
-  const viewportTop = scrollTop;
-  const viewportBottom = scrollTop + viewportHeight;
-  const expanded = expandedRowGeometry(turns, expandedRows);
-
-  turns.forEach((turn, turnIndex) => {
-    let rowTop = topPadding + turn.collapsedTop + expanded.heightBeforeTurnIndex(turnIndex);
-
-    for (const row of turn.rows) {
-      const rowBottom = rowTop + row.height + expanded.heightAfterRow(turn.turnId, row.id);
-      if (row.segment.type === 'work' && rowBottom > viewportTop && rowTop < viewportBottom) {
-        keys.push(transcriptWorkDisclosureKey(row.turnId, row.segmentId));
-      }
-      rowTop = rowBottom;
-    }
-  });
-
-  return keys;
 }
 
 function userMessageScrollAnchors({

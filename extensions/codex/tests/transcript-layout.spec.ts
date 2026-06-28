@@ -438,7 +438,7 @@ test.describe('transcript work disclosure', () => {
     });
   });
 
-  test('preserves visible auto-open work when assistant streaming starts after manual scroll break', () => {
+  test('collapses previous auto-open work when assistant streaming starts after manual scroll break', () => {
     const runningTurn = turn('turn-1', workSegment('work-1', { state: 'running' }));
     runningTurn.status = 'inProgress';
     const runningLayout = measureCollapsedTranscript({ turns: [runningTurn], width: 600 });
@@ -453,56 +453,13 @@ test.describe('transcript work disclosure', () => {
     const streamingAnswerLayout = measureCollapsedTranscript({ turns: [streamingAnswerTurn], width: 600 });
     const reconciled = reconcileTranscriptDisclosure(opened, streamingAnswerLayout.turns, 'turn-1', {
       autoWorkManaged: false,
-      visibleWorkKeys: new Set(['turn-1:work-1']),
-    });
-
-    expect(reconciled.autoOpenWorkKey).toBeNull();
-    expect(reconciled.openWorkByKey['turn-1:work-1']).toMatchObject({
-      rowId: 'turn-1:work-1',
-      source: 'user',
-      turnId: 'turn-1',
-    });
-
-    const completedTurn = turn(
-      'turn-1',
-      workSegment('work-1', { state: 'completed' }),
-      assistantSegment('assistant-1', 'done'),
-    );
-    const completedLayout = measureCollapsedTranscript({ turns: [completedTurn], width: 600 });
-    const completed = reconcileTranscriptDisclosure(reconciled, completedLayout.turns, null, {
-      autoWorkManaged: true,
-    });
-
-    expect(completed.openWorkByKey['turn-1:work-1']).toMatchObject({
-      rowId: 'turn-1:work-1',
-      source: 'user',
-      turnId: 'turn-1',
-    });
-  });
-
-  test('collapses auto-open work when assistant streaming starts after manual scroll break away from work', () => {
-    const runningTurn = turn('turn-1', workSegment('work-1', { state: 'running' }));
-    runningTurn.status = 'inProgress';
-    const runningLayout = measureCollapsedTranscript({ turns: [runningTurn], width: 600 });
-    const opened = reconcileTranscriptDisclosure(emptyDisclosure(), runningLayout.turns, 'turn-1');
-
-    const streamingAnswerTurn = turn(
-      'turn-1',
-      workSegment('work-1', { state: 'completed' }),
-      assistantSegment('assistant-1', 'streaming answer'),
-    );
-    streamingAnswerTurn.status = 'inProgress';
-    const streamingAnswerLayout = measureCollapsedTranscript({ turns: [streamingAnswerTurn], width: 600 });
-    const reconciled = reconcileTranscriptDisclosure(opened, streamingAnswerLayout.turns, 'turn-1', {
-      autoWorkManaged: false,
-      visibleWorkKeys: new Set(),
     });
 
     expect(reconciled.autoOpenWorkKey).toBeNull();
     expect(reconciled.openWorkByKey).toEqual({});
   });
 
-  test('preserves visible auto-open work when the turn completes after manual scroll break', () => {
+  test('collapses previous auto-open work when the turn completes after manual scroll break', () => {
     const runningTurn = turn('turn-1', workSegment('work-1', { state: 'running' }));
     runningTurn.status = 'inProgress';
     const runningLayout = measureCollapsedTranscript({ turns: [runningTurn], width: 600 });
@@ -516,32 +473,6 @@ test.describe('transcript work disclosure', () => {
     const completedLayout = measureCollapsedTranscript({ turns: [completedTurn], width: 600 });
     const reconciled = reconcileTranscriptDisclosure(opened, completedLayout.turns, null, {
       autoWorkManaged: false,
-      visibleWorkKeys: new Set(['turn-1:work-1']),
-    });
-
-    expect(reconciled.autoOpenWorkKey).toBeNull();
-    expect(reconciled.openWorkByKey['turn-1:work-1']).toMatchObject({
-      rowId: 'turn-1:work-1',
-      source: 'user',
-      turnId: 'turn-1',
-    });
-  });
-
-  test('collapses auto-open work when the turn completes after manual scroll break away from work', () => {
-    const runningTurn = turn('turn-1', workSegment('work-1', { state: 'running' }));
-    runningTurn.status = 'inProgress';
-    const runningLayout = measureCollapsedTranscript({ turns: [runningTurn], width: 600 });
-    const opened = reconcileTranscriptDisclosure(emptyDisclosure(), runningLayout.turns, 'turn-1');
-
-    const completedTurn = turn(
-      'turn-1',
-      workSegment('work-1', { state: 'completed' }),
-      assistantSegment('assistant-1', 'done'),
-    );
-    const completedLayout = measureCollapsedTranscript({ turns: [completedTurn], width: 600 });
-    const reconciled = reconcileTranscriptDisclosure(opened, completedLayout.turns, null, {
-      autoWorkManaged: false,
-      visibleWorkKeys: new Set(),
     });
 
     expect(reconciled.autoOpenWorkKey).toBeNull();
@@ -558,6 +489,43 @@ test.describe('transcript work disclosure', () => {
     });
 
     expect(disclosure.openWorkByKey).toEqual({});
+  });
+
+  test('preserves previous auto-open work with child disclosure after manual scroll break', () => {
+    const runningTurn = turn('turn-1', workSegment('work-1', { state: 'running' }));
+    runningTurn.status = 'inProgress';
+    const runningLayout = measureCollapsedTranscript({ turns: [runningTurn], width: 600 });
+    const opened = reconcileTranscriptDisclosure(emptyDisclosure(), runningLayout.turns, 'turn-1');
+
+    const openedWithChild = {
+      ...opened,
+      openWorkByKey: {
+        ...opened.openWorkByKey,
+        'turn-1:work-1': {
+          ...opened.openWorkByKey['turn-1:work-1']!,
+          openChildByKey: { 'tool:1': true },
+        },
+      },
+    };
+    const streamingAnswerTurn = turn(
+      'turn-1',
+      workSegment('work-1', { state: 'completed' }),
+      assistantSegment('assistant-1', 'streaming answer'),
+    );
+    streamingAnswerTurn.status = 'inProgress';
+    const streamingAnswerLayout = measureCollapsedTranscript({ turns: [streamingAnswerTurn], width: 600 });
+
+    const reconciled = reconcileTranscriptDisclosure(openedWithChild, streamingAnswerLayout.turns, 'turn-1', {
+      autoWorkManaged: false,
+    });
+
+    expect(reconciled.autoOpenWorkKey).toBeNull();
+    expect(reconciled.openWorkByKey['turn-1:work-1']).toMatchObject({
+      openChildByKey: { 'tool:1': true },
+      rowId: 'turn-1:work-1',
+      source: 'user',
+      turnId: 'turn-1',
+    });
   });
 
   test('preserves auto-open work promoted by child interaction when assistant streaming starts', () => {

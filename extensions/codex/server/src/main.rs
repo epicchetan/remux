@@ -176,6 +176,7 @@ impl CodexExtensionServer {
                 composer_config.clone(),
                 live_transcript.clone(),
                 thread_runtime.clone(),
+                codex_home.clone(),
             ),
             threads: CodexThreadResourcesServer::new(
                 app_server,

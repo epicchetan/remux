@@ -40,7 +40,6 @@ export type TranscriptLayoutResourceSnapshot = {
 
 type TranscriptDisclosureReconcileOptions = {
   autoWorkManaged?: boolean;
-  visibleWorkKeys?: ReadonlySet<string>;
 };
 
 type TranscriptLayoutResourceAdapter = {
@@ -312,7 +311,6 @@ export function reconcileTranscriptLayoutFromResources(
   layoutStore.setState({
     disclosure: reconcileTranscriptDisclosure(previousState.disclosure, layout.turns, autoOpenTurnId, {
       autoWorkManaged: transcriptViewportAllowsAutoWork(previousState.disclosure),
-      visibleWorkKeys: new Set(getTranscriptViewportState().visibleWorkKeys),
     }),
     turnOrder: layout.turns.map((turn) => turn.turnId),
     turnsById: layout.turnsById,
@@ -328,7 +326,6 @@ export function reconcileTranscriptDisclosure(
   options: TranscriptDisclosureReconcileOptions = {},
 ): TranscriptDisclosureState {
   const autoWorkManaged = options.autoWorkManaged ?? true;
-  const visibleWorkKeys = options.visibleWorkKeys ?? new Set<string>();
   const turnsById = Object.fromEntries(turns.map((turn) => [turn.turnId, turn]));
   const manuallyClosedAutoWorkByTurnId = filterManualClosedWorkTurns(
     disclosure.manuallyClosedAutoWorkByTurnId,
@@ -374,7 +371,7 @@ export function reconcileTranscriptDisclosure(
     if (!previousAutoOpenWork || manuallyClosedAutoWorkByTurnId[previousAutoOpenWork.turnId]) {
       return null;
     }
-    if (!visibleWorkKeys.has(previousAutoOpenWork.key) && !hasOpenWorkChild(previousAutoOpenWork)) {
+    if (!hasOpenWorkChild(previousAutoOpenWork)) {
       return null;
     }
 
