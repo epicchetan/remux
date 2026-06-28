@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "Remux Mobile",
+    "name": "Remux",
     "slug": "remux",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -8,9 +8,7 @@
     "userInterfaceStyle": "dark",
     "newArchEnabled": true,
     "splash": {
-      "image": "./assets/splash-icon.png",
-      "resizeMode": "contain",
-      "backgroundColor": "#111111"
+      "backgroundColor": "#000000"
     },
     "ios": {
       "supportsTablet": true,
@@ -41,7 +39,7 @@
       [
         "expo-image-picker",
         {
-          "photosPermission": "Allow Remux Mobile to attach photos to Codex messages."
+          "photosPermission": "Allow Remux to attach photos to Codex messages."
         }
       ],
       "expo-status-bar",
