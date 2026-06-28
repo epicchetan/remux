@@ -20,6 +20,7 @@ type MockHostOptions = {
   commandErrors?: Record<string, string>;
   cwd?: string;
   fuzzyFiles?: Array<{ path: string; isDirectory?: boolean }>;
+  threadCwd?: string;
   tokenUsage?: ThreadTokenUsage | null;
   turns?: CodexTranscriptTurn[];
 };
@@ -37,11 +38,12 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
   const commandErrors = options.commandErrors ?? {};
   const cwd = options.cwd ?? '/tmp/remux';
   const fuzzyFiles = options.fuzzyFiles ?? defaultFuzzyFiles;
+  const threadCwd = options.threadCwd ?? cwd;
   const tokenUsage = options.tokenUsage ?? null;
   const turns = options.turns ?? [];
 
   await page.addInitScript(
-    ({ attachments, commandErrors, cwd, files, tokenUsage, turns }) => {
+    ({ attachments, commandErrors, cwd, files, threadCwd, tokenUsage, turns }) => {
       const capturedMessages: HostRequest[] = [];
 
       function dispatchHostMessage(message: unknown) {
@@ -82,11 +84,11 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
             const mockThread = {
               archived: false,
               createdAt: 1782000000,
-              cwd,
+              cwd: threadCwd,
               id: 'mock-thread-1',
               modelProvider: 'openai',
               name: 'Mock thread',
-              path: `${cwd}/.codex/sessions/mock-thread-1.jsonl`,
+              path: `${threadCwd}/.codex/sessions/mock-thread-1.jsonl`,
               preview: 'Mock thread preview',
               sessionId: 'mock-thread-1',
               source: 'test',
@@ -155,7 +157,7 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
                     status: 'ok',
                     value: {
                       effective: {
-                        cwd,
+                        cwd: threadCwd,
                         model: 'gpt-5.1-codex',
                         modelContextWindow: tokenUsage?.modelContextWindow ?? null,
                         modelProvider: 'openai',
@@ -288,6 +290,31 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
               status: 'accepted',
               threadId: 'mock-thread-1',
               turnId: 'mock-turn-1',
+            };
+          case 'remux/codex/thread/message/start':
+            return {
+              invalidations: [
+                {
+                  key: 'threadHistory:updated_at:desc:50::false:',
+                  reason: 'sendAccepted',
+                  type: 'threadHistory',
+                },
+                {
+                  key: 'threadSummary:mock-new-thread-1',
+                  reason: 'sendAccepted',
+                  threadId: 'mock-new-thread-1',
+                  type: 'threadSummary',
+                },
+                {
+                  key: 'threadTranscript:mock-new-thread-1',
+                  reason: 'sendAccepted',
+                  threadId: 'mock-new-thread-1',
+                  type: 'threadTranscript',
+                },
+              ],
+              status: 'accepted',
+              threadId: 'mock-new-thread-1',
+              turnId: 'mock-new-turn-1',
             };
           case 'remux/codex/thread/message/fork':
             return {
@@ -470,7 +497,7 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
         },
       });
     },
-    { attachments, commandErrors, cwd, files: fuzzyFiles, tokenUsage, turns },
+    { attachments, commandErrors, cwd, files: fuzzyFiles, threadCwd, tokenUsage, turns },
   );
 }
 
@@ -541,24 +568,51 @@ test.describe('codex viewer route', () => {
       .toContain('remux/codex/files');
   });
 
-  test('uses host cwd as the default for new draft directories', async ({ page }) => {
+  test('uses latest thread cwd and settings as new chat defaults', async ({ page }) => {
     const cwd = '/tmp/remux-runtime';
-    await installMockRemuxHost(page, { cwd });
+    const threadCwd = '/tmp/latest-thread-project';
+    await installMockRemuxHost(page, { cwd, threadCwd });
 
     await page.goto('/viewers/codex/?remuxResourceKind=draft&remuxResourceId=codex%3Adraft%3Atest%3A1');
 
-    await expect(page.getByTitle(cwd)).toBeVisible();
+    await expect(page.getByTitle(threadCwd)).toBeVisible();
     await expect
       .poll(async () => {
         const requests = await capturedHostRequests(page);
         return requests.some((request) =>
           request.method === 'remux/codex/files' &&
           hasFileResourceRequest(request.params, {
-            path: cwd,
+            path: threadCwd,
             type: 'directoryListing',
           }));
       })
       .toBe(true);
+
+    await page.getByRole('button', { name: 'Select directory' }).click();
+
+    const editor = page.locator('.remux-composer-contenteditable');
+    await editor.click();
+    await editor.pressSequentially('start with inherited defaults');
+
+    const sendButton = page.getByRole('button', { name: 'Send message' });
+    await expect(sendButton).toBeEnabled();
+    await sendButton.click();
+
+    await expect
+      .poll(() => capturedHostMethods(page))
+      .toContain('remux/codex/thread/message/start');
+
+    const requests = await capturedHostRequests(page);
+    const startRequest = requests.find((request) => request.method === 'remux/codex/thread/message/start');
+    expect(startRequest?.params).toMatchObject({
+      composerConfig: {
+        intelligence: 'medium',
+        reviewMode: 'auto-review',
+        speed: 'fast',
+      },
+      cwd: threadCwd,
+      parts: [{ text: 'start with inherited defaults', type: 'text' }],
+    });
   });
 
   test('sends existing thread composer content through the Remux thread command', async ({ page }) => {

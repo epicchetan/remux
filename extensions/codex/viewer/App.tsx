@@ -10,7 +10,7 @@ import { useHostStore } from './ipc/hostStore';
 import { subscribeCodexResourceInvalidations } from './ipc/resourceInvalidations';
 import type { RemuxHostViewportMetrics } from './ipc/types';
 import { useThreadHistoryStore } from './threads/historyStore';
-import { useThreadComposerStateStore } from './threads/composerStateStore';
+import { readThreadComposerPreference, useThreadComposerStateStore } from './threads/composerStateStore';
 import { useThreadRuntimeStore } from './threads/runtimeStore';
 import { useThreadsStore } from './threads/store';
 import { useCodexResumeSync } from './resumeSync';
@@ -31,6 +31,13 @@ export function App() {
       ? threadTitle(state.threadsById[activeThreadId])
       : null
   ));
+  const latestThread = useThreadHistoryStore((state) => {
+    const threadId = state.threadOrder[0];
+    return threadId ? state.threadsById[threadId] ?? null : null;
+  });
+  const latestThreadDefaultCwd = latestThread?.cwd ?? null;
+  const latestThreadId = latestThread?.id ?? null;
+  const newChatDefaultCwd = latestThreadDefaultCwd ?? hostDefaultCwd;
   const ensureThreadSummary = useThreadHistoryStore((state) => state.ensureThreadSummary);
   const activeThreadComposerPreference = useThreadComposerStateStore((state) => state.preference);
   const setRuntimeThreadId = useThreadRuntimeStore((state) => state.setActiveThreadId);
@@ -310,10 +317,10 @@ export function App() {
   useEffect(() => subscribeCodexResourceInvalidations(), []);
 
   useEffect(() => {
-    if (hostDefaultCwd) {
-      setDefaultCwd(hostDefaultCwd);
+    if (newChatDefaultCwd) {
+      setDefaultCwd(newChatDefaultCwd);
     }
-  }, [hostDefaultCwd, setDefaultCwd]);
+  }, [newChatDefaultCwd, setDefaultCwd]);
 
   useEffect(() => {
     void setRuntimeThreadId(activeThreadId);
@@ -326,10 +333,40 @@ export function App() {
       return;
     }
 
-    if (!activeThreadId) {
+    if (!activeThreadId && !latestThreadId) {
       void loadComposerConfig();
     }
-  }, [activeThreadComposerPreference, activeThreadId, applyServerComposerConfig, loadComposerConfig]);
+  }, [activeThreadComposerPreference, activeThreadId, applyServerComposerConfig, latestThreadId, loadComposerConfig]);
+
+  useEffect(() => {
+    if (activeThreadId || !latestThreadId) {
+      return;
+    }
+
+    let disposed = false;
+    void readThreadComposerPreference(latestThreadId)
+      .then((preference) => {
+        if (disposed) {
+          return;
+        }
+
+        if (preference) {
+          applyServerComposerConfig(preference);
+          return;
+        }
+
+        void loadComposerConfig();
+      })
+      .catch(() => {
+        if (!disposed) {
+          void loadComposerConfig();
+        }
+      });
+
+    return () => {
+      disposed = true;
+    };
+  }, [activeThreadId, applyServerComposerConfig, latestThreadId, loadComposerConfig]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);

@@ -1,11 +1,24 @@
+import type {
+  CodexComposerIntelligence,
+  CodexComposerReviewMode,
+  CodexComposerSpeed,
+} from './composerConfig';
+
 export type CodexThreadMessageSendParams = {
   clientMessageId?: string | null;
   parts: CodexComposerMessagePart[];
   threadId: string;
 };
 
+export type CodexThreadMessageStartConfig = {
+  intelligence: CodexComposerIntelligence;
+  reviewMode: CodexComposerReviewMode;
+  speed: CodexComposerSpeed;
+};
+
 export type CodexThreadMessageStartParams = {
   clientMessageId?: string | null;
+  composerConfig?: CodexThreadMessageStartConfig | null;
   cwd: string;
   parts: CodexComposerMessagePart[];
 };

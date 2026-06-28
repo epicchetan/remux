@@ -130,7 +130,10 @@ type ComposerStoreSet = (
 ) => void;
 
 export const useComposerStore = create<ComposerStoreState>((set, get) => ({
-  applyServerConfig: (config) => set(composerConfigState(config, 'ready')),
+  applyServerConfig: (config) => {
+    latestConfigRequestId += 1;
+    set(composerConfigState(config, 'ready'));
+  },
   beginSubmission: ({ kind, phase, snapshot, threadId = null, turnId = null }) => {
     const submission: ComposerSubmission = {
       id: (get().submission?.id ?? 0) + 1,

@@ -122,10 +122,10 @@ export function ComposerActionButtons() {
 }
 
 function ComposerActionKey({ action }: { action: ComposerAction }) {
-  const lastActivationMsRef = useRef(0);
+  const lastActivationMsRef = useRef<number | null>(null);
   const activateOnce = useCallback(() => {
     const now = performance.now();
-    if (now - lastActivationMsRef.current < 350) {
+    if (lastActivationMsRef.current !== null && now - lastActivationMsRef.current < 350) {
       return;
     }
 

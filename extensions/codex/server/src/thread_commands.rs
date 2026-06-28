@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::app_server::AppServerRuntime;
-use crate::composer_config::ComposerConfigStore;
+use crate::composer_config::{ComposerConfig, ComposerConfigStore};
 use crate::live_transcript::LiveTranscriptStore;
 use crate::resource_invalidations::{command_accepted_invalidations, send_accepted_invalidations};
 use crate::thread_runtime::ThreadRuntimeStore;
@@ -61,6 +61,7 @@ struct ThreadMessageSendParams {
 #[serde(rename_all = "camelCase")]
 struct ThreadMessageStartParams {
     client_message_id: Option<String>,
+    composer_config: Option<ComposerConfig>,
     cwd: String,
     parts: Vec<ComposerMessagePart>,
 }
@@ -267,7 +268,11 @@ impl CodexThreadCommandServer {
         }
 
         let input = composer_parts_to_user_input(params.parts)?;
-        let mut start_params = self.composer_config.thread_start_params()?;
+        let composer_config = params.composer_config;
+        let mut start_params = match composer_config {
+            Some(config) => self.composer_config.thread_start_params_for_config(config),
+            None => self.composer_config.thread_start_params()?,
+        };
         start_params.insert("cwd".to_string(), json!(cwd));
         start_params.insert("experimentalRawEvents".to_string(), json!(false));
         start_params.insert("persistExtendedHistory".to_string(), json!(false));
@@ -281,6 +286,9 @@ impl CodexThreadCommandServer {
             .ok_or_else(|| "thread/start response missing thread.id".to_string())?
             .to_string();
         self.mark_thread_resumed(&thread_id)?;
+        if let Some(config) = composer_config {
+            let _ = self.composer_config.seed_thread_config(&thread_id, config);
+        }
 
         let turn_id = self.start_turn(&thread_id, params.client_message_id, input)?;
 
@@ -699,6 +707,58 @@ mod tests {
         assert_eq!(calls[1].1["effort"], "high");
         assert_eq!(calls[1].1["approvalsReviewer"], "auto_review");
         assert_eq!(calls[2].0, "turn/start");
+    }
+
+    #[test]
+    fn starts_new_thread_with_client_config() {
+        let app_server = FakeAppServer::new(vec![
+            Ok(json!({ "thread": { "id": "thread-new" } })),
+            Ok(json!({ "turn": { "id": "turn-new" } })),
+            Ok(json!({ "turn": { "id": "turn-followup" } })),
+        ]);
+        let server = CodexThreadCommandServer::with_requester(app_server.clone());
+
+        server
+            .start_message(json!({
+                "cwd": "/tmp/project",
+                "clientMessageId": "client-new",
+                "composerConfig": {
+                    "intelligence": "xhigh",
+                    "reviewMode": "full-access",
+                    "speed": "fast",
+                },
+                "parts": [{ "type": "text", "text": "Start here" }]
+            }))
+            .unwrap();
+        server
+            .send_message(json!({
+                "threadId": "thread-new",
+                "parts": [{ "type": "text", "text": "Follow up" }]
+            }))
+            .unwrap();
+
+        let calls = app_server.calls();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].0, "thread/start");
+        assert_eq!(calls[0].1["cwd"], "/tmp/project");
+        assert_eq!(calls[0].1["effort"], "xhigh");
+        assert_eq!(calls[0].1["serviceTier"], "priority");
+        assert_eq!(calls[0].1["approvalPolicy"], "never");
+        assert_eq!(calls[0].1["sandbox"], "danger-full-access");
+        assert_eq!(calls[1].0, "turn/start");
+        assert_eq!(calls[1].1["threadId"], "thread-new");
+        assert_eq!(calls[1].1["effort"], "xhigh");
+        assert_eq!(calls[1].1["serviceTier"], "priority");
+        assert_eq!(calls[1].1["approvalPolicy"], "never");
+        assert_eq!(
+            calls[1].1["sandboxPolicy"],
+            json!({ "type": "dangerFullAccess" })
+        );
+        assert_eq!(calls[2].0, "turn/start");
+        assert_eq!(calls[2].1["threadId"], "thread-new");
+        assert_eq!(calls[2].1["effort"], "xhigh");
+        assert_eq!(calls[2].1["serviceTier"], "priority");
+        assert_eq!(calls[2].1["approvalPolicy"], "never");
     }
 
     #[test]

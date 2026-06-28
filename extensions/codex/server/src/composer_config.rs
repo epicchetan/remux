@@ -284,6 +284,13 @@ impl ComposerConfigStore {
         Ok(thread_params(self.snapshot()?))
     }
 
+    pub(crate) fn thread_start_params_for_config(
+        &self,
+        config: ComposerConfig,
+    ) -> Map<String, Value> {
+        thread_params(config)
+    }
+
     pub(crate) fn turn_start_params_for_thread(
         &self,
         thread_id: &str,

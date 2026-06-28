@@ -28,10 +28,13 @@ export function useComposerTurnAction() {
   const clearSubmission = useComposerStore((state) => state.clearSubmission);
   const editTarget = useComposerStore((state) => state.editTarget);
   const forkTarget = useComposerStore((state) => state.forkTarget);
+  const intelligence = useComposerStore((state) => state.intelligence);
   const beginSubmission = useComposerStore((state) => state.beginSubmission);
   const failSubmission = useComposerStore((state) => state.failSubmission);
   const isSubmitting = useComposerStore((state) => state.isSubmitting);
+  const reviewMode = useComposerStore((state) => state.reviewMode);
   const setSubmissionTurn = useComposerStore((state) => state.setSubmissionTurn);
+  const speed = useComposerStore((state) => state.speed);
   const submission = useComposerStore((state) => state.submission);
   const snapshot = useComposerStore((state) => state.snapshot);
   const runtimeActiveTurnId = useThreadRuntimeStore((state) => state.activeTurnId);
@@ -163,6 +166,11 @@ export function useComposerTurnAction() {
 
       void startThreadMessage({
         clientMessageId: createComposerNodeId(),
+        composerConfig: {
+          intelligence,
+          reviewMode,
+          speed,
+        },
         cwd: activeDraft.cwd,
         parts: projection.parts,
       })
@@ -229,13 +237,16 @@ export function useComposerTurnAction() {
     editTarget,
     failSubmission,
     forkTarget,
+    intelligence,
     isSubmitting,
     isWorking,
+    reviewMode,
     runtimeActiveTurnId,
     runtimeStatus,
     selectThread,
     sendDisabled,
     setSubmissionTurn,
+    speed,
     setAutoScrollMode,
     snapshot,
   ]);

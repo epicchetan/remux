@@ -100,6 +100,16 @@ export async function refreshActiveThreadComposerState(options: ThreadComposerSt
   });
 }
 
+export async function readThreadComposerPreference(threadId: string) {
+  const response = await readThreadResources([
+    {
+      threadId,
+      type: 'threadComposerState',
+    },
+  ]);
+  return parseThreadComposerStateResource(response.resources[0])?.preference ?? null;
+}
+
 function resetThreadComposerState(): Omit<
   ThreadComposerStateStoreState,
   'invalidateThreadComposerStateResources' | 'setActiveThreadId'
