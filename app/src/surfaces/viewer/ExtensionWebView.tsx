@@ -40,7 +40,7 @@ type JsonRpcId = number | string;
 type RemuxViewHostStatus =
   | { type: 'idle' }
   | { type: 'connecting' }
-  | { type: 'connected' }
+  | { cwd: string | null; type: 'connected' }
   | { type: 'reconnecting'; attempt: number }
   | { type: 'closed'; reason?: string }
   | { type: 'error'; message: string };
@@ -1074,7 +1074,7 @@ function mapConnectionStatus(
 ): RemuxViewHostStatus {
   switch (status.type) {
     case 'connected':
-      return { type: 'connected' };
+      return { cwd: status.cwd, type: 'connected' };
     case 'reconnecting':
       return { attempt: status.attempt, type: 'reconnecting' };
     case 'disconnected':

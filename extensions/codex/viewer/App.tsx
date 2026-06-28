@@ -21,6 +21,7 @@ import { CodexTranscript } from './transcript';
 
 export function App() {
   const connectionStatus = useHostStore((state) => state.connectionStatus);
+  const hostDefaultCwd = connectionStatus.type === 'connected' ? connectionStatus.cwd : null;
   const getHostViewportMetrics = useHostStore((state) => state.getHostViewportMetrics);
   const hostViewportMetrics = useHostStore((state) => state.hostViewportMetrics);
   const activeDraftId = useThreadsStore((state) => state.activeDraftId);
@@ -43,6 +44,7 @@ export function App() {
   const applyServerComposerConfig = useComposerStore((state) => state.applyServerConfig);
   const loadComposerConfig = useComposerStore((state) => state.loadServerConfig);
   const saveActiveDraftSnapshot = useThreadsStore((state) => state.saveActiveDraftSnapshot);
+  const setDefaultCwd = useThreadsStore((state) => state.setDefaultCwd);
   const composerPresentationRequest = useComposerStore((state) => state.composerPresentationRequest);
   const editTarget = useComposerStore((state) => state.editTarget);
   const focusComposer = useComposerStore((state) => state.focusComposer);
@@ -306,6 +308,12 @@ export function App() {
   }, [loadThreadHistory]);
 
   useEffect(() => subscribeCodexResourceInvalidations(), []);
+
+  useEffect(() => {
+    if (hostDefaultCwd) {
+      setDefaultCwd(hostDefaultCwd);
+    }
+  }, [hostDefaultCwd, setDefaultCwd]);
 
   useEffect(() => {
     void setRuntimeThreadId(activeThreadId);

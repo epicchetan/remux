@@ -24,6 +24,8 @@ import {
 } from './remuxSettingsStore';
 
 const reconnectDelaysMs = [400, 900, 1800, 3500, 5000];
+const remuxSystemInfoMethod = 'remux/system/info';
+const remuxSystemInfoTimeoutMs = 2_000;
 const requestReconnectWaitMs = 8000;
 const maxRequestReconnectRetries = 1;
 const maxPendingLogEntries = 200;
@@ -36,7 +38,7 @@ type ConnectedWaiter = {
 
 export type RemuxConnectionStatus =
   | { type: 'connecting' }
-  | { type: 'connected' }
+  | { cwd: string | null; type: 'connected' }
   | { attempt: number; type: 'reconnecting' }
   | { type: 'disconnected' };
 
@@ -129,6 +131,19 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
     connectedWaitersRef.current.clear();
   }, []);
 
+  const completeConnection = useCallback(async (client: RemuxRpcClient, generation: number) => {
+    const info = await readRemuxSystemInfo(client);
+    if (clientRef.current !== client || generationRef.current !== generation) {
+      return;
+    }
+
+    reconnectAttemptRef.current = 0;
+    setError(null);
+    setConnectionStatus({ cwd: info.cwd, type: 'connected' });
+    flushPendingLogEntries(client);
+    resolveConnectedWaiters(client);
+  }, [flushPendingLogEntries, resolveConnectedWaiters, setConnectionStatus]);
+
   const scheduleReconnect = useCallback((generation: number, reason: string) => {
     if (!shouldReconnectRef.current || reconnectTimerRef.current !== null) {
       return;
@@ -189,11 +204,7 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
         logRemuxDebug('client:status', nextStatus);
         switch (nextStatus.type) {
           case 'connected':
-            reconnectAttemptRef.current = 0;
-            setError(null);
-            setConnectionStatus({ type: 'connected' });
-            flushPendingLogEntries(client);
-            resolveConnectedWaiters(client);
+            void completeConnection(client, generation);
             break;
           case 'connecting':
             setConnectionStatus(
@@ -237,9 +248,8 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
     }
   }, [
     clearReconnectTimer,
-    flushPendingLogEntries,
+    completeConnection,
     rejectConnectedWaiters,
-    resolveConnectedWaiters,
     scheduleReconnect,
     setConnectionStatus,
     settingsLoaded,
@@ -471,6 +481,29 @@ export function useRemuxConnection() {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+async function readRemuxSystemInfo(client: RemuxRpcClient): Promise<{ cwd: string | null }> {
+  try {
+    const response = await client.request<unknown>(
+      remuxSystemInfoMethod,
+      undefined,
+      remuxSystemInfoTimeoutMs,
+    );
+    if (isRecord(response) && (typeof response.cwd === 'string' || response.cwd === null)) {
+      return {
+        cwd: typeof response.cwd === 'string' && response.cwd.trim().length > 0 ? response.cwd : null,
+      };
+    }
+  } catch {
+    // Older Remux CLIs may not support system info; keep the connection usable.
+  }
+
+  return { cwd: null };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
 function isRetryableRemuxRequest(method: string) {

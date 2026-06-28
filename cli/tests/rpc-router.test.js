@@ -36,6 +36,12 @@ test('createRpcRouter starts all extensions and routes by remux namespace', asyn
       ['files', fixtureServer('files', calls)],
     ]),
     system: {
+      async info() {
+        calls.push('system:info');
+        return {
+          cwd: '/tmp/remux-runtime',
+        };
+      },
       async restart() {
         calls.push('system:restart');
       },
@@ -88,6 +94,10 @@ test('createRpcRouter starts all extensions and routes by remux namespace', asyn
     { extensionId: 'files', restartable: true, started: true, running: true },
   );
   assert.deepEqual(
+    await router.handleRequest({ method: 'remux/system/info' }),
+    { cwd: '/tmp/remux-runtime' },
+  );
+  assert.deepEqual(
     await router.handleRequest({ method: 'remux/system/restart' }),
     { restartable: true, restarting: true },
   );
@@ -101,6 +111,7 @@ test('createRpcRouter starts all extensions and routes by remux namespace', asyn
     'files:start',
     'files:stop',
     'files:start',
+    'system:info',
     'system:restart',
     'codex:stop',
     'fs-extension:stop',

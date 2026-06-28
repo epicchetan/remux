@@ -7,6 +7,7 @@ type ThreadsStoreState = {
   activeDraftId: string | null;
   activeThreadId: string | null;
   completeDraftAsThread: (threadId: string) => void;
+  defaultCwd: string;
   directoryPickerOpen: boolean;
   directoryPickerPath: string | null;
   draft: NewChatDraft | null;
@@ -17,6 +18,7 @@ type ThreadsStoreState = {
   selectDirectoryPickerPath: () => void;
   selectDraft: () => void;
   selectThread: (threadId: string) => void;
+  setDefaultCwd: (cwd: string | null | undefined) => void;
   setDirectoryPickerPath: (path: string) => void;
   startNewChat: (input?: StartNewChatInput | string) => void;
 };
@@ -42,6 +44,7 @@ let draftGeneration = 0;
 export const useThreadsStore = create<ThreadsStoreState>((set) => ({
   activeDraftId: initialDraft?.id ?? null,
   activeThreadId: null,
+  defaultCwd: defaultCodexCwd,
   completeDraftAsThread(threadId) {
     const currentDraftId = useThreadsStore.getState().draft?.id;
     deletePersistedDraft(currentDraftId);
@@ -148,6 +151,28 @@ export const useThreadsStore = create<ThreadsStoreState>((set) => ({
       draft: state.draft?.cwd ? state.draft : null,
     }));
   },
+  setDefaultCwd(cwd) {
+    const nextDefaultCwd = normalizeDefaultCwd(cwd);
+    set((state) => {
+      if (state.defaultCwd === nextDefaultCwd) {
+        return {};
+      }
+
+      const updates: Partial<ThreadsStoreState> = { defaultCwd: nextDefaultCwd };
+      if (state.draft && !state.draft.cwd && state.draft.initialCwd === state.defaultCwd) {
+        updates.draft = {
+          ...state.draft,
+          initialCwd: nextDefaultCwd,
+          updatedAt: Date.now(),
+        };
+        if (!state.directoryPickerPath || state.directoryPickerPath === state.defaultCwd) {
+          updates.directoryPickerPath = nextDefaultCwd;
+        }
+      }
+
+      return updates;
+    });
+  },
   setDirectoryPickerPath(path) {
     set({ directoryPickerPath: path });
   },
@@ -162,7 +187,7 @@ export const useThreadsStore = create<ThreadsStoreState>((set) => ({
         persistedDraft?.initialCwd ??
         state.draft?.cwd ??
         state.draft?.initialCwd ??
-        defaultCodexCwd;
+        state.defaultCwd;
       const draft = persistedDraft
         ? {
             ...persistedDraft,
@@ -190,6 +215,10 @@ export const useThreadsStore = create<ThreadsStoreState>((set) => ({
 function nextDraftId() {
   draftGeneration += 1;
   return `codex:draft:${Date.now()}:${draftGeneration}`;
+}
+
+function normalizeDefaultCwd(cwd: string | null | undefined) {
+  return cwd?.trim() || defaultCodexCwd;
 }
 
 function normalizeStartNewChatInput(input: StartNewChatInput | string | undefined): Required<StartNewChatInput> {

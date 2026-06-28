@@ -5,6 +5,7 @@ const extensionStatusMethod = 'remux/extensions/status';
 const extensionStartMethod = 'remux/extensions/start';
 const extensionStopMethod = 'remux/extensions/stop';
 const extensionRestartMethod = 'remux/extensions/restart';
+const systemInfoMethod = 'remux/system/info';
 const systemRestartMethod = 'remux/system/restart';
 
 function createRpcRouter({
@@ -76,6 +77,16 @@ function createRpcRouter({
 }
 
 async function handleSystemRequest({ request, system }) {
+  if (request.method === systemInfoMethod) {
+    if (typeof system.info === 'function') {
+      return system.info();
+    }
+
+    return {
+      cwd: null,
+    };
+  }
+
   if (request.method === systemRestartMethod) {
     if (typeof system.restart !== 'function') {
       return {
@@ -95,7 +106,7 @@ async function handleSystemRequest({ request, system }) {
 }
 
 function isSystemMethod(method) {
-  return method === systemRestartMethod;
+  return method === systemInfoMethod || method === systemRestartMethod;
 }
 
 async function handleExtensionManagementRequest({ ctx, request, servers }) {

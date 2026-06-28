@@ -1,3 +1,5 @@
+const { resolve } = require('node:path');
+
 const { createRemuxServer } = require('./httpServer.cjs');
 const { createCoreRouter } = require('./core/coreRouter.cjs');
 const { createRpcRouter } = require('./rpcRouter.cjs');
@@ -9,12 +11,15 @@ const { attachRemuxWebSocketServer, remuxWebSocketPath } = require('./wsServer.c
 const { createViewerProvider } = require('./viewerProvider.cjs');
 const { remuxRestartExitCode } = require('./restart.cjs');
 
+const restartForceExitDelayMs = 2000;
+
 async function start({ env = process.env, rootDir = process.cwd() } = {}) {
-  const log = createRemuxLogger({ rootDir });
+  const runtimeRootDir = resolve(rootDir);
+  const log = createRemuxLogger({ rootDir: runtimeRootDir });
   const runtime = loadRuntimeValues(env);
-  const extensions = discoverExtensions({ env, rootDir });
+  const extensions = discoverExtensions({ env, rootDir: runtimeRootDir });
   const defaultExtension = defaultLaunchExtension(extensions);
-  const notifications = createNotificationManager({ log, rootDir });
+  const notifications = createNotificationManager({ log, rootDir: runtimeRootDir });
 
   if (!defaultExtension) {
     throw new Error('No Remux extensions found under extensions/*');
@@ -29,13 +34,29 @@ async function start({ env = process.env, rootDir = process.cwd() } = {}) {
       ]),
   );
   const router = createRpcRouter({
-    coreRouter: createCoreRouter({ rootDir }),
+    coreRouter: createCoreRouter({ rootDir: runtimeRootDir }),
     defaultExtensionId: defaultExtension.id,
     extensionServers,
     system: {
+      async info() {
+        return {
+          cwd: runtimeRootDir,
+        };
+      },
       restart: async () => {
         setTimeout(() => {
-          void shutdown(remuxRestartExitCode);
+          const forceExitTimer = setTimeout(() => {
+            process.exit(remuxRestartExitCode);
+          }, restartForceExitDelayMs);
+          forceExitTimer.unref?.();
+          void shutdown(remuxRestartExitCode)
+            .catch((error) => {
+              console.warn(`[remux] restart shutdown failed: ${errorMessage(error)}`);
+            })
+            .finally(() => {
+              clearTimeout(forceExitTimer);
+              process.exit(remuxRestartExitCode);
+            });
         }, 200);
       },
     },

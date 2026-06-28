@@ -2,7 +2,6 @@ import { expect, type Page, test } from '@playwright/test';
 
 import type { ThreadTokenUsage } from '../shared/protocol/v2/ThreadTokenUsage';
 import type { CodexTranscriptTurn } from '../shared/transcript';
-import { defaultCodexCwd } from '../viewer/config/defaults';
 
 type HostRequest = {
   id?: number | string;
@@ -19,6 +18,7 @@ type MockHostOptions = {
     sizeBytes: number;
   }>;
   commandErrors?: Record<string, string>;
+  cwd?: string;
   fuzzyFiles?: Array<{ path: string; isDirectory?: boolean }>;
   tokenUsage?: ThreadTokenUsage | null;
   turns?: CodexTranscriptTurn[];
@@ -35,6 +35,7 @@ const defaultFuzzyFiles = [
 async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
   const attachments = options.attachments ?? [];
   const commandErrors = options.commandErrors ?? {};
+  const cwd = options.cwd ?? '/tmp/remux';
   const fuzzyFiles = options.fuzzyFiles ?? defaultFuzzyFiles;
   const tokenUsage = options.tokenUsage ?? null;
   const turns = options.turns ?? [];
@@ -469,7 +470,7 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
         },
       });
     },
-    { attachments, commandErrors, cwd: defaultCodexCwd, files: fuzzyFiles, tokenUsage, turns },
+    { attachments, commandErrors, cwd, files: fuzzyFiles, tokenUsage, turns },
   );
 }
 
@@ -485,6 +486,26 @@ async function capturedHostRequests(page: Page) {
   return page.evaluate(() =>
     ((window as unknown as { __remuxWebViewMessages?: HostRequest[] }).__remuxWebViewMessages ?? []),
   );
+}
+
+function hasFileResourceRequest(params: unknown, expected: { path: string; type: string }) {
+  if (!params || typeof params !== 'object') {
+    return false;
+  }
+
+  const requests = (params as { requests?: unknown }).requests;
+  if (!Array.isArray(requests)) {
+    return false;
+  }
+
+  return requests.some((request) => {
+    if (!request || typeof request !== 'object') {
+      return false;
+    }
+
+    const typedRequest = request as { path?: unknown; type?: unknown };
+    return typedRequest.path === expected.path && typedRequest.type === expected.type;
+  });
 }
 
 test.describe('codex viewer route', () => {
@@ -518,6 +539,26 @@ test.describe('codex viewer route', () => {
     await expect
       .poll(() => capturedHostMethods(page))
       .toContain('remux/codex/files');
+  });
+
+  test('uses host cwd as the default for new draft directories', async ({ page }) => {
+    const cwd = '/tmp/remux-runtime';
+    await installMockRemuxHost(page, { cwd });
+
+    await page.goto('/viewers/codex/?remuxResourceKind=draft&remuxResourceId=codex%3Adraft%3Atest%3A1');
+
+    await expect(page.getByTitle(cwd)).toBeVisible();
+    await expect
+      .poll(async () => {
+        const requests = await capturedHostRequests(page);
+        return requests.some((request) =>
+          request.method === 'remux/codex/files' &&
+          hasFileResourceRequest(request.params, {
+            path: cwd,
+            type: 'directoryListing',
+          }));
+      })
+      .toBe(true);
   });
 
   test('sends existing thread composer content through the Remux thread command', async ({ page }) => {
