@@ -1,0 +1,1812 @@
+@layer components {
+  .remux-feed-lane {
+    display: flex;
+    width: 100%;
+    max-width: var(--remux-feed-max-width);
+    min-height: 100%;
+    flex-direction: column;
+    gap: var(--remux-turn-gap);
+    margin-inline: auto;
+    padding: max(var(--remux-block-gap), env(safe-area-inset-top)) var(--remux-feed-pad-x) var(--remux-block-gap);
+  }
+
+  .remux-main-pane {
+    position: relative;
+    display: flex;
+    min-width: 0;
+    min-height: 0;
+    flex: 1;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .remux-transcript-slot {
+    display: flex;
+    min-width: 0;
+    min-height: 0;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  .remux-transcript-viewport {
+    overflow-anchor: none;
+  }
+
+  .remux-new-chat-empty {
+    display: grid;
+    width: 100%;
+    min-width: 0;
+    min-height: 100%;
+    place-items: end center;
+    padding: max(var(--remux-block-gap), env(safe-area-inset-top)) var(--remux-feed-pad-x) var(--remux-block-gap);
+  }
+
+  .remux-new-chat-empty-card {
+    display: grid;
+    width: 100%;
+    max-width: var(--remux-feed-max-width);
+    gap: 4px;
+    border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+    color: var(--muted-foreground);
+    padding-top: 12px;
+  }
+
+  .remux-new-chat-empty-title {
+    color: var(--foreground);
+    font-size: 18px;
+    font-weight: 650;
+    line-height: 24px;
+  }
+
+  .remux-new-chat-empty-path {
+    overflow: hidden;
+    font-family: var(--remux-font-mono);
+    font-size: 13px;
+    line-height: 18px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .remux-bottom-bar-slot {
+    min-width: 0;
+    flex-shrink: 0;
+    margin-bottom: var(--remux-composer-lift, 0px);
+  }
+
+  .remux-file-mention-overlay {
+    position: absolute;
+    top: 0;
+    right: 0;
+    left: 0;
+    z-index: 30;
+    display: flex;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .remux-file-mention-overlay .remux-file-mention-picker {
+    height: 100%;
+    max-height: none;
+    flex: 1 1 auto;
+    margin-top: 0;
+  }
+
+  .remux-turn-stack {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: var(--remux-turn-gap);
+  }
+
+  .codex-work-section {
+    min-width: 0;
+  }
+
+  .codex-work-section-body,
+  .codex-work-group-run-body,
+  .codex-work-group,
+  .codex-work-detail-group {
+    display: grid;
+    min-width: 0;
+  }
+
+  .codex-work-section-body {
+    gap: var(--remux-block-gap);
+    padding-top: var(--remux-work-gap);
+  }
+
+  .codex-work-section-body-collapsed {
+    padding-top: var(--remux-work-boundary-gap);
+  }
+
+  .codex-work-group-run,
+  .codex-work-entry {
+    min-width: 0;
+  }
+
+  .codex-work-group-run-body {
+    gap: var(--remux-work-group-gap);
+    padding-top: var(--remux-work-gap);
+  }
+
+  .codex-work-group {
+    gap: var(--remux-row-gap);
+  }
+
+  .codex-work-text-group {
+    gap: var(--remux-work-gap);
+  }
+
+  .codex-work-detail-group {
+    gap: var(--remux-work-gap);
+  }
+
+  .codex-user-message {
+    display: grid;
+    width: 100%;
+    justify-items: end;
+    min-width: 0;
+  }
+
+  .codex-user-message-work {
+    width: 100%;
+    justify-items: end;
+  }
+
+  .codex-user-steering-label {
+    max-width: 86%;
+    min-width: 0;
+    justify-self: end;
+    color: var(--muted-foreground);
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 18px;
+    padding-bottom: 8px;
+  }
+
+  .codex-user-bubble {
+    box-sizing: border-box;
+    display: flex;
+    width: fit-content;
+    max-width: 100%;
+    min-width: 0;
+    flex-direction: column;
+    gap: 8px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--card) 92%, transparent);
+    color: var(--foreground);
+    font-size: var(--remux-font-work-size);
+    line-height: var(--remux-font-work-line);
+    padding: 10px 16px;
+  }
+
+  .codex-user-message-work .codex-user-bubble {
+    max-width: 86%;
+  }
+
+  .codex-user-bubble-with-rail {
+    width: 100%;
+  }
+
+  .codex-user-message-work .codex-user-bubble-with-rail {
+    width: 86%;
+  }
+
+  .codex-user-rail {
+    box-sizing: border-box;
+    display: flex;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    flex-wrap: nowrap;
+    gap: 8px;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    padding: 0 2px;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .codex-user-rail-card {
+    display: grid;
+    flex: 0 0 min(220px, calc(100vw - 96px));
+    box-sizing: border-box;
+    width: min(220px, calc(100vw - 96px));
+    height: 62px;
+    min-width: 164px;
+    grid-template-columns: 44px minmax(0, 1fr);
+    align-items: center;
+    gap: 10px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--card) 92%, transparent);
+    padding: 8px;
+  }
+
+  .codex-user-rail-thumb {
+    display: grid;
+    width: 44px;
+    height: 44px;
+    place-items: center;
+    overflow: hidden;
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--background) 80%, var(--foreground) 8%);
+    color: var(--muted-foreground);
+  }
+
+  .codex-user-rail-thumb .codex-md-file-icon {
+    width: 24px;
+    height: 24px;
+    transform: none;
+  }
+
+  .codex-user-rail-image {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .codex-user-rail-copy {
+    min-width: 0;
+  }
+
+  .codex-user-rail-title {
+    overflow: hidden;
+    color: var(--foreground);
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 17px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .codex-user-rail-subtitle {
+    overflow: hidden;
+    color: var(--muted-foreground);
+    font-size: 12px;
+    line-height: 16px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .codex-user-actions {
+    display: flex;
+    height: 28px;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 8px;
+  }
+
+  .codex-user-disclosure-button {
+    display: inline-flex;
+    height: 22px;
+    align-items: center;
+    align-self: flex-end;
+    gap: 4px;
+    border: 0;
+    background: transparent;
+    color: color-mix(in srgb, var(--muted-foreground) 92%, transparent);
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 16px;
+    padding: 0;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .codex-user-disclosure-button:active {
+    color: var(--foreground);
+  }
+
+  @media (hover: hover) and (pointer: fine) {
+    .codex-user-disclosure-button:hover {
+      color: var(--foreground);
+    }
+  }
+
+  .codex-assistant-actions {
+    display: flex;
+    height: 28px;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 8px;
+    margin-top: 8px;
+  }
+
+  .codex-user-action-button {
+    display: grid;
+    width: 28px;
+    height: 28px;
+    place-items: center;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: color-mix(in srgb, var(--muted-foreground) 90%, transparent);
+    padding: 0;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .codex-user-action-button:disabled {
+    opacity: 0.34;
+  }
+
+  .codex-user-action-button:not(:disabled):active,
+  .codex-user-action-button:not(:disabled):hover {
+    color: var(--foreground);
+  }
+
+  .codex-work-header-button {
+    display: flex;
+    width: 100%;
+    min-width: 0;
+    min-height: 24px;
+    align-items: center;
+    gap: 8px;
+    color: var(--muted-foreground);
+    font-size: var(--remux-font-work-title-size);
+    font-weight: 600;
+    line-height: var(--remux-font-work-title-line);
+    text-align: left;
+  }
+
+  .codex-work-row-button {
+    display: flex;
+    width: 100%;
+    min-width: 0;
+    min-height: 24px;
+    align-items: center;
+    gap: 10px;
+    color: var(--muted-foreground);
+    font-size: var(--remux-font-work-size);
+    line-height: var(--remux-font-work-line);
+    overflow: hidden;
+    text-align: left;
+  }
+
+  .codex-work-header-button,
+  .codex-work-row-button {
+    border: 0;
+    background: transparent;
+    cursor: pointer;
+    padding: 0;
+  }
+
+  .codex-work-header-button:disabled,
+  .codex-work-row-button:disabled {
+    cursor: default;
+  }
+
+  .codex-work-header-button:focus,
+  .codex-work-row-button:focus {
+    outline: none;
+  }
+
+  .codex-work-header-button:focus-visible,
+  .codex-work-row-button:focus-visible {
+    outline: none;
+  }
+
+  .codex-file-row-button {
+    gap: 8px;
+  }
+
+  .codex-work-summary-button {
+    min-height: 24px;
+    font-size: 15px;
+    line-height: 22px;
+  }
+
+  .codex-work-compaction-divider {
+    min-height: 20px;
+    font-size: var(--remux-font-work-size);
+    line-height: var(--remux-font-work-line);
+  }
+
+  .codex-file-name {
+    min-width: 0;
+    flex: 1 1 auto;
+    overflow: hidden;
+    color: var(--link);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .codex-markdown {
+    min-width: 0;
+    color: color-mix(in srgb, var(--foreground) 88%, var(--muted-foreground));
+    font-size: var(--remux-font-work-size);
+    line-height: var(--remux-font-work-line);
+  }
+
+  .codex-markdown-clipped {
+    overflow: hidden;
+  }
+
+  .codex-markdown-work {
+    font-size: var(--remux-font-work-size);
+    line-height: var(--remux-font-work-line);
+  }
+
+  .codex-markdown-user {
+    font-size: var(--remux-font-work-size);
+    line-height: var(--remux-font-work-line);
+  }
+
+  .codex-md-block {
+    margin: 0;
+    min-width: 0;
+  }
+
+  .codex-md-block-frame {
+    min-width: 0;
+    overflow: visible;
+  }
+
+  .codex-md-paragraph {
+    font-size: 13px;
+    line-height: 18px;
+  }
+
+  .codex-md-heading {
+    color: var(--foreground);
+    font-weight: 700;
+  }
+
+  .codex-md-heading[data-depth="1"] {
+    font-size: 16px;
+    line-height: 22px;
+  }
+
+  .codex-md-heading[data-depth="2"] {
+    font-size: 15px;
+    line-height: 21px;
+  }
+
+  .codex-md-heading[data-depth="3"] {
+    font-size: 14px;
+    line-height: 20px;
+  }
+
+  .codex-md-text-line {
+    min-width: 0;
+    white-space: pre;
+  }
+
+  .codex-md-line-fragment {
+    white-space: pre;
+  }
+
+  .codex-md-line-fragment.codex-md-inline-strong {
+    font-weight: 700;
+  }
+
+  .codex-md-line-fragment.codex-md-inline-emphasis {
+    font-style: italic;
+  }
+
+  .codex-md-line-link {
+    color: color-mix(in srgb, var(--link) 82%, var(--foreground));
+    font-weight: 500;
+    text-decoration: none;
+  }
+
+  .codex-markdown a {
+    color: color-mix(in srgb, var(--link) 82%, var(--foreground));
+    text-decoration: none;
+  }
+
+  .codex-markdown a:hover {
+    text-decoration: underline;
+  }
+
+  .codex-md-file-link {
+    display: inline-flex;
+    max-width: 100%;
+    height: var(--codex-md-file-link-height);
+    align-items: center;
+    border: 1px solid color-mix(in srgb, var(--border) 85%, transparent);
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--muted) 70%, transparent);
+    color: color-mix(in srgb, var(--link) 72%, var(--foreground));
+    font-weight: 500;
+    line-height: inherit;
+    padding: 0 var(--codex-md-file-link-padding-x);
+    text-decoration: none;
+    white-space: nowrap;
+    vertical-align: text-bottom;
+  }
+
+  .codex-md-file-link:hover {
+    border-color: color-mix(in srgb, var(--link) 28%, var(--border));
+    background: color-mix(in srgb, var(--muted) 82%, var(--link) 8%);
+    text-decoration: none;
+  }
+
+  .codex-md-file-link:hover .codex-md-file-link-name {
+    text-decoration: underline;
+  }
+
+  .codex-md-file-icon-frame {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--codex-md-file-icon-size);
+    height: var(--codex-md-file-icon-size);
+    margin-right: var(--codex-md-file-icon-gap);
+    transform: translateY(var(--codex-md-file-icon-baseline-shift));
+    vertical-align: baseline;
+  }
+
+  .codex-md-file-icon {
+    display: block;
+    width: var(--codex-md-file-icon-size);
+    height: var(--codex-md-file-icon-size);
+  }
+
+  .codex-md-file-icon-fallback {
+    color: currentColor;
+    stroke-width: 2;
+  }
+
+  .codex-md-file-iconify {
+    overflow: visible;
+  }
+
+  .codex-md-file-link-name {
+    line-height: inherit;
+  }
+
+  .codex-md-blockquote {
+    box-sizing: border-box;
+    border-left: 3px solid var(--border);
+    color: var(--muted-foreground);
+    padding-left: 16px;
+  }
+
+  .codex-md-code-block {
+    box-sizing: border-box;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: auto;
+    border: 1px solid color-mix(in srgb, var(--border) 84%, transparent);
+    border-radius: 0.75rem;
+    background: color-mix(in srgb, var(--card) 78%, var(--background));
+    color: color-mix(in srgb, var(--foreground) 90%, var(--muted-foreground));
+    font-family: var(--remux-font-mono);
+    font-size: 12px;
+    line-height: 18px;
+    padding: 12px 14px;
+    overflow-wrap: normal;
+    white-space: pre;
+    word-break: normal;
+  }
+
+  .codex-md-code-block code {
+    display: block;
+    width: max-content;
+    min-width: 100%;
+    background: transparent;
+    border-radius: 0;
+    color: inherit;
+    font: inherit;
+    padding: 0;
+    overflow-wrap: normal;
+    white-space: inherit;
+    word-break: normal;
+  }
+
+  .codex-md-code-line {
+    display: block;
+    height: var(--codex-md-code-line-height);
+    line-height: var(--codex-md-code-line-height);
+    min-width: 100%;
+    white-space: pre;
+  }
+
+  .codex-md-code-token {
+    white-space: pre;
+  }
+
+  .codex-md-inline-code {
+    display: inline;
+    border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+    border-radius: 0.375rem;
+    background: color-mix(in srgb, var(--muted) 76%, transparent);
+    color: color-mix(in srgb, var(--foreground) 94%, var(--muted-foreground));
+    font-family: var(--remux-font-mono);
+    font-size: 12px;
+    line-height: inherit;
+    overflow-wrap: anywhere;
+    padding: 0 4px;
+    word-break: break-word;
+  }
+
+  .codex-md-list {
+    min-width: 0;
+  }
+
+  .codex-md-list-item-frame {
+    min-width: 0;
+    overflow: visible;
+  }
+
+  .codex-md-list-item {
+    display: grid;
+    grid-template-columns: 24px minmax(0, 1fr);
+    column-gap: 8px;
+    min-width: 0;
+  }
+
+  .codex-md-list-marker {
+    color: var(--muted-foreground);
+    font-family: var(--remux-font-mono);
+    font-size: 12px;
+    line-height: inherit;
+    text-align: right;
+  }
+
+  .codex-md-list-content {
+    min-width: 0;
+  }
+
+  .codex-md-rule {
+    height: 17px;
+    border: 0;
+    border-top: 1px solid var(--border);
+  }
+
+  .codex-detail-panel {
+    display: grid;
+    gap: 10px;
+    box-sizing: border-box;
+    max-width: 100%;
+    min-width: 0;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 0.75rem;
+    background: var(--card);
+    color: var(--muted-foreground);
+    font-family: var(--remux-font-mono);
+    font-size: 12px;
+    line-height: 18px;
+    padding: 10px 12px;
+  }
+
+  .codex-detail-panel-activity {
+    max-height: 280px;
+  }
+
+  .codex-detail-panel-tool {
+    max-height: 280px;
+  }
+
+  .codex-detail-command {
+    color: var(--foreground);
+    min-width: max-content;
+    white-space: pre;
+    word-break: normal;
+    overflow-wrap: normal;
+  }
+
+  .codex-detail-text,
+  .codex-detail-output {
+    margin: 0;
+    min-width: max-content;
+    white-space: pre;
+    word-break: normal;
+    overflow-wrap: normal;
+  }
+
+  .codex-tool-media-row {
+    display: grid;
+    width: 176px;
+    max-width: 100%;
+    height: 132px;
+    min-width: 0;
+    align-items: center;
+    justify-items: center;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: 0.625rem;
+    background: var(--background);
+  }
+
+  .codex-tool-media-image {
+    display: block;
+    width: auto;
+    max-width: 100%;
+    height: auto;
+    max-height: 100%;
+    object-fit: contain;
+  }
+
+  .codex-tool-media-fallback {
+    display: flex;
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
+    align-items: center;
+    gap: 8px;
+    padding: 0 12px;
+  }
+
+  .codex-tool-media-fallback span {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--muted-foreground);
+    font-family: var(--remux-font-sans);
+    font-size: 13px;
+    line-height: 18px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .codex-diff-block {
+    margin: 0;
+    box-sizing: border-box;
+    max-width: 100%;
+    max-height: 360px;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 0.75rem;
+    background: var(--card);
+    color: var(--muted-foreground);
+    font-family: var(--remux-font-mono);
+    font-size: 13px;
+    line-height: 22px;
+    padding: 8px 0;
+    white-space: pre;
+    word-break: normal;
+    overflow-wrap: normal;
+  }
+
+  .codex-diff-line {
+    width: max-content;
+    min-width: 100%;
+    min-height: 22px;
+    padding: 0 16px;
+    white-space: pre;
+  }
+
+  .codex-diff-line-added {
+    background: color-mix(in srgb, var(--success) 10%, transparent);
+    color: var(--success);
+  }
+
+  .codex-diff-line-removed {
+    background: color-mix(in srgb, var(--destructive) 10%, transparent);
+    color: var(--destructive);
+  }
+
+  .codex-diff-line-hunk {
+    background: color-mix(in srgb, var(--link) 10%, transparent);
+    color: var(--link);
+  }
+
+  .remux-bottom-bar {
+    --remux-composer-bottom-pad: max(12px, env(safe-area-inset-bottom));
+    position: relative;
+    flex-shrink: 0;
+    background: linear-gradient(to bottom, var(--composer) 0%, var(--background) 100%);
+    padding: 10px var(--remux-feed-pad-x) var(--remux-composer-bottom-pad);
+  }
+
+  .remux-composer-panel {
+    display: grid;
+    width: 100%;
+    max-width: var(--remux-feed-max-width);
+    min-width: 0;
+    gap: 8px;
+    margin-inline: auto;
+  }
+
+  .remux-composer-editor {
+    position: relative;
+    display: grid;
+    min-width: 0;
+    gap: 8px;
+  }
+
+  .remux-composer-editor-hidden {
+    display: none;
+  }
+
+  .remux-composer-edit-bar {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+    border-radius: 12px;
+    background: color-mix(in srgb, var(--card) 76%, transparent);
+    color: var(--muted-foreground);
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 18px;
+    padding: 7px 10px;
+  }
+
+  .remux-composer-edit-label {
+    display: inline-flex;
+    min-width: 0;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .remux-new-chat-bar {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: 8px;
+    border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+    border-radius: 12px;
+    background: color-mix(in srgb, var(--card) 76%, transparent);
+    color: var(--muted-foreground);
+    font-size: 13px;
+    line-height: 18px;
+    padding: 6px 8px;
+  }
+
+  .remux-new-chat-cwd-button {
+    display: inline-flex;
+    min-width: 0;
+    flex: 1;
+    align-items: center;
+    gap: 8px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--foreground);
+    padding: 2px 4px;
+    text-align: left;
+  }
+
+  .remux-new-chat-cwd-button:hover {
+    background: color-mix(in srgb, var(--foreground) 8%, transparent);
+  }
+
+  .remux-new-chat-cwd-button:focus {
+    outline: none;
+  }
+
+  .remux-new-chat-cwd-button:focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+
+  .remux-composer-edit-cancel {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--foreground);
+    font-size: 13px;
+    line-height: 18px;
+    padding: 2px 4px;
+  }
+
+  .remux-composer-edit-cancel:active,
+  .remux-composer-edit-cancel:hover {
+    background: color-mix(in srgb, var(--foreground) 8%, transparent);
+  }
+
+  .remux-composer-edit-cancel:focus {
+    outline: none;
+  }
+
+  .remux-composer-edit-cancel:focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+
+  .remux-composer-input-shell {
+    position: relative;
+    min-width: 0;
+  }
+
+  .remux-composer-contenteditable {
+    width: 100%;
+    min-height: 38px;
+    max-height: 126px;
+    overflow-y: auto;
+    border: 0;
+    background: transparent;
+    color: var(--foreground);
+    font-size: 16px;
+    line-height: var(--remux-font-body-line);
+    outline: none;
+    padding: 8px 10px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .remux-composer-contenteditable > p {
+    margin: 0;
+  }
+
+  .remux-composer-contenteditable:focus-visible {
+    outline: none;
+  }
+
+  .remux-composer-placeholder {
+    position: absolute;
+    top: 8px;
+    left: 10px;
+    right: 10px;
+    color: var(--muted-foreground);
+    font-size: 16px;
+    line-height: var(--remux-font-body-line);
+    pointer-events: none;
+  }
+
+  .remux-composer-top-rail {
+    display: flex;
+    min-width: 0;
+    gap: 8px;
+    overflow-x: auto;
+    padding: 0 2px;
+  }
+
+  .remux-composer-attachment-card {
+    position: relative;
+    display: grid;
+    grid-template-columns: 44px minmax(0, 1fr);
+    align-items: center;
+    width: min(220px, calc(100vw - 72px));
+    min-width: 164px;
+    gap: 10px;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background: color-mix(in srgb, var(--card) 92%, transparent);
+    padding: 8px 28px 8px 8px;
+  }
+
+  .remux-composer-attachment-thumb {
+    display: grid;
+    width: 44px;
+    height: 44px;
+    place-items: center;
+    overflow: hidden;
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--background) 80%, var(--foreground) 8%);
+    color: var(--muted-foreground);
+  }
+
+  .remux-composer-attachment-thumb .codex-md-file-icon {
+    width: 24px;
+    height: 24px;
+    transform: none;
+  }
+
+  .remux-composer-attachment-img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .remux-composer-reference-card-copy {
+    min-width: 0;
+  }
+
+  .remux-composer-reference-card-name {
+    overflow: hidden;
+    color: var(--foreground);
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 17px;
+    white-space: nowrap;
+  }
+
+  .remux-composer-reference-card-subtitle {
+    overflow: hidden;
+    color: var(--muted-foreground);
+    font-size: 12px;
+    line-height: 16px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .remux-composer-attachment-card[data-image-state="error"] .remux-composer-reference-card-subtitle {
+    color: var(--destructive);
+  }
+
+  .remux-composer-attachment-error {
+    padding: 0 2px;
+    color: var(--destructive);
+    font-size: 12px;
+    line-height: 16px;
+  }
+
+  .remux-composer-attachment-status {
+    position: absolute;
+    right: 8px;
+    bottom: 8px;
+    color: var(--muted-foreground);
+  }
+
+  .remux-composer-card-remove {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    display: grid;
+    width: 20px;
+    height: 20px;
+    place-items: center;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--background) 80%, transparent);
+    color: var(--foreground);
+  }
+
+  .remux-composer-card-remove:disabled {
+    opacity: 0.36;
+  }
+
+  .remux-composer-token-chip {
+    display: inline-flex;
+    max-width: min(72vw, 280px);
+    align-items: center;
+    gap: 4px;
+    overflow: hidden;
+    border: 1px solid color-mix(in srgb, var(--border) 85%, transparent);
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--muted) 70%, transparent);
+    color: color-mix(in srgb, var(--link) 72%, var(--foreground));
+    font-size: 15px;
+    font-weight: 500;
+    line-height: 20px;
+    margin: 0 2px;
+    padding: 0 6px;
+    vertical-align: baseline;
+    white-space: nowrap;
+  }
+
+  .remux-composer-token-chip::before {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    flex: 0 0 16px;
+    border: 0;
+    background-image: var(--remux-composer-token-icon);
+    background-position: center;
+    background-repeat: no-repeat;
+    background-size: contain;
+    box-sizing: border-box;
+    content: "";
+    opacity: 0.95;
+  }
+
+  .remux-composer-token-chip:not([style*="--remux-composer-token-icon"])::before {
+    width: 12px;
+    height: 14px;
+    flex-basis: 12px;
+    border: 1.4px solid currentColor;
+    border-radius: 2px;
+    background:
+      linear-gradient(135deg, transparent 0 68%, currentColor 68% 76%, transparent 76%),
+      color-mix(in srgb, var(--link) 10%, transparent);
+  }
+
+  .remux-composer-mention-chip {
+    cursor: default;
+    user-select: none;
+  }
+
+  .remux-file-mention-picker {
+    display: flex;
+    width: 100%;
+    height: min(360px, 44dvh);
+    min-height: 0;
+    max-height: min(360px, 44dvh);
+    flex: 0 1 min(360px, 44dvh);
+    margin-top: auto;
+    overflow: hidden;
+    background:
+      linear-gradient(
+        to bottom,
+        color-mix(in srgb, var(--composer) 88%, var(--card) 12%),
+        color-mix(in srgb, var(--composer) 60%, var(--background) 40%)
+      );
+  }
+
+  .remux-directory-picker {
+    display: flex;
+    min-width: 0;
+    min-height: 0;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  .remux-file-mention-lane {
+    display: flex;
+    width: 100%;
+    min-width: 0;
+    min-height: 0;
+    flex-direction: column;
+    padding-top: max(8px, calc(env(safe-area-inset-top) + 8px));
+  }
+
+  .remux-file-mention-header {
+    box-sizing: border-box;
+    display: flex;
+    width: 100%;
+    max-width: var(--remux-feed-max-width);
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+    gap: 12px;
+    margin-inline: auto;
+    padding: 2px 12px 6px;
+  }
+
+  .remux-directory-picker-header {
+    box-sizing: border-box;
+    display: grid;
+    width: 100%;
+    max-width: var(--remux-feed-max-width);
+    flex-shrink: 0;
+    gap: 4px;
+    margin-inline: auto;
+    padding: 4px 12px 10px;
+  }
+
+  .remux-directory-picker-title {
+    overflow: hidden;
+    color: var(--foreground);
+    font-size: 16px;
+    font-weight: 650;
+    line-height: 22px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .remux-directory-picker-description {
+    overflow: hidden;
+    color: var(--muted-foreground);
+    font-family: var(--remux-font-mono);
+    font-size: 12px;
+    line-height: 16px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .remux-file-mention-title {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    flex: 1;
+    gap: 8px;
+    color: var(--foreground);
+    font-size: 15px;
+    font-weight: 600;
+    line-height: 20px;
+  }
+
+  .remux-file-mention-title-path {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .remux-file-mention-list {
+    display: grid;
+    min-height: 0;
+    flex: 1;
+    align-content: start;
+    gap: 2px;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
+  .remux-directory-picker .remux-file-mention-list {
+    gap: 6px;
+    padding-bottom: 8px;
+  }
+
+  .remux-directory-picker-search {
+    box-sizing: border-box;
+    display: flex;
+    width: calc(100% - 16px);
+    max-width: calc(var(--remux-feed-max-width) - 16px);
+    min-width: 0;
+    align-items: center;
+    gap: 8px;
+    margin: 0 auto 8px;
+    border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--background) 72%, transparent);
+    color: var(--muted-foreground);
+    padding: 7px 8px;
+  }
+
+  .remux-directory-picker-search-input {
+    min-width: 0;
+    flex: 1;
+    border: 0;
+    background: transparent;
+    color: var(--foreground);
+    font-size: 16px;
+    line-height: 20px;
+    outline: 0;
+  }
+
+  .remux-directory-picker-search-input::placeholder {
+    color: var(--muted-foreground);
+  }
+
+  .remux-file-mention-row {
+    box-sizing: border-box;
+    display: flex;
+    width: calc(100% - 16px);
+    max-width: calc(var(--remux-feed-max-width) - 16px);
+    min-width: 0;
+    min-height: 34px;
+    align-items: center;
+    gap: 8px;
+    margin-inline: auto;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--foreground);
+    cursor: default;
+    padding: 5px 8px;
+    text-align: left;
+    touch-action: pan-y;
+    user-select: none;
+  }
+
+  .remux-file-mention-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .remux-file-mention-header-button {
+    display: grid;
+    width: 30px;
+    height: 30px;
+    place-items: center;
+    border: 0;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--foreground) 8%, transparent);
+    color: var(--muted-foreground);
+    outline: 0;
+    touch-action: manipulation;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-user-select: none;
+  }
+
+  .remux-file-mention-header-button:disabled {
+    opacity: 0.28;
+  }
+
+  .remux-file-mention-row-active,
+  .remux-file-mention-row[aria-selected="true"] {
+    background: color-mix(in srgb, var(--foreground) 10%, transparent);
+  }
+
+  .remux-file-mention-icon {
+    display: grid;
+    width: 22px;
+    height: 22px;
+    flex: 0 0 22px;
+    place-items: center;
+    color: var(--muted-foreground);
+  }
+
+  .remux-file-mention-icon .codex-md-file-icon {
+    width: 17px;
+    height: 17px;
+    transform: none;
+  }
+
+  .remux-file-mention-name {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    color: var(--foreground);
+    font-size: 14px;
+    line-height: 18px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .remux-file-mention-path {
+    flex: 0 1 auto;
+    margin-left: auto;
+    min-width: 0;
+    overflow: hidden;
+    color: color-mix(in srgb, var(--muted-foreground) 82%, transparent);
+    font-size: 13px;
+    line-height: 18px;
+    text-align: right;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .remux-file-mention-path[data-visible="false"] {
+    display: none;
+  }
+
+  .remux-directory-picker-row {
+    min-height: 42px;
+    border-radius: 10px;
+    padding: 7px 10px;
+  }
+
+  .remux-directory-picker-row-icon {
+    width: 26px;
+    height: 26px;
+    flex-basis: 26px;
+    color: color-mix(in srgb, var(--composer-accent) 82%, var(--foreground) 18%);
+  }
+
+  .remux-directory-picker-row-content {
+    display: grid;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .remux-directory-picker-row-name {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--foreground);
+    font-size: 15px;
+    font-weight: 600;
+    line-height: 20px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .remux-directory-picker-row-meta {
+    flex: 0 1 auto;
+    margin-left: auto;
+    min-width: 0;
+    overflow: hidden;
+    color: color-mix(in srgb, var(--muted-foreground) 86%, transparent);
+    font-size: 12px;
+    line-height: 18px;
+    text-align: right;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .remux-directory-picker-row-chevron {
+    flex: 0 0 auto;
+    color: color-mix(in srgb, var(--muted-foreground) 86%, transparent);
+  }
+
+  .remux-file-mention-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    color: var(--muted-foreground);
+    font-size: 14px;
+    line-height: 20px;
+  }
+
+  .remux-file-mention-error {
+    color: var(--destructive);
+  }
+
+  .remux-composer-actions {
+    display: flex;
+    width: 100%;
+    min-width: 0;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
+  .remux-composer-action-group {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: 7px;
+  }
+
+  .remux-composer-action-group-right {
+    flex-shrink: 0;
+  }
+
+  @media (min-width: 768px) {
+    .remux-composer-overview-button,
+    .remux-composer-sidebar-button {
+      display: none;
+    }
+  }
+
+  .remux-composer-inline-status {
+    position: absolute;
+    right: var(--remux-feed-pad-x);
+    bottom: max(1px, calc((var(--remux-composer-bottom-pad) - 10px) / 2));
+    left: var(--remux-feed-pad-x);
+    display: flex;
+    min-width: 0;
+    max-width: var(--remux-feed-max-width);
+    height: 10px;
+    margin-inline: auto;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 0 3px;
+    color: color-mix(in srgb, var(--muted-foreground) 78%, transparent);
+    font-size: 9px;
+    letter-spacing: 0;
+    line-height: 10px;
+    user-select: none;
+    pointer-events: none;
+  }
+
+  .remux-composer-inline-status .remux-composer-status-group {
+    overflow: hidden;
+  }
+
+  .remux-composer-message-status-row {
+    display: flex;
+    width: 100%;
+    max-width: var(--remux-feed-max-width);
+    min-width: 0;
+    margin: 6px auto 0;
+    align-items: center;
+    padding: 0 3px;
+    color: color-mix(in srgb, var(--muted-foreground) 82%, transparent);
+    font-size: 11px;
+    letter-spacing: 0;
+    line-height: 14px;
+    user-select: none;
+    pointer-events: none;
+  }
+
+  .remux-composer-message-status-row[data-tone="error"] {
+    color: color-mix(in srgb, var(--destructive) 82%, var(--foreground) 18%);
+  }
+
+  .remux-composer-message-status-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .remux-composer-config {
+    position: relative;
+    display: inline-grid;
+    --remux-composer-menu-edge-offset: 46px;
+    --remux-composer-config-panel-offset: 10px;
+  }
+
+  .remux-composer-config-panel {
+    position: absolute;
+    bottom: calc(100% + var(--remux-composer-config-panel-offset));
+    left: 0;
+    z-index: 40;
+    display: grid;
+    width: min(236px, calc(100vw - 28px));
+    gap: 2px;
+    padding: 3px;
+    border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
+    border-radius: 10px;
+    background:
+      linear-gradient(
+        to bottom,
+        color-mix(in srgb, var(--chrome-hover) 70%, var(--background) 30%),
+        color-mix(in srgb, var(--chrome) 90%, black 10%)
+      );
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, var(--foreground) 8%, transparent),
+      inset 0 -2px 0 rgb(0 0 0 / 30%),
+      0 14px 36px rgb(0 0 0 / 38%);
+  }
+
+  .remux-composer-preferences-menu .remux-composer-config-panel {
+    left: calc(-1 * var(--remux-composer-menu-edge-offset));
+  }
+
+  .remux-composer-attachment-panel {
+    right: calc(-1 * var(--remux-composer-menu-edge-offset));
+    left: auto;
+  }
+
+  .remux-composer-config-section {
+    display: grid;
+    gap: 2px;
+  }
+
+  .remux-composer-config-row,
+  .remux-composer-config-option {
+    display: flex;
+    width: 100%;
+    min-width: 0;
+    align-items: center;
+    border: 1px solid transparent;
+    color: var(--foreground);
+    appearance: none;
+    outline: 0 !important;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .remux-composer-config-row {
+    min-height: 34px;
+    gap: 8px;
+    padding: 3px 6px;
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--background) 42%, transparent);
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, var(--foreground) 6%, transparent),
+      inset 0 -1px 0 rgb(0 0 0 / 20%);
+    font-size: 14px;
+    line-height: 18px;
+    text-align: left;
+  }
+
+  .remux-composer-config-row:hover:not(:disabled),
+  .remux-composer-config-row.is-open,
+  .remux-composer-config-option:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--chrome-hover) 80%, var(--foreground) 4%);
+  }
+
+  .remux-composer-config-row:disabled,
+  .remux-composer-config-option:disabled {
+    opacity: 0.42;
+  }
+
+  .remux-composer-config-error {
+    padding: 7px 8px;
+    border: 1px solid color-mix(in srgb, var(--destructive) 52%, transparent);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--destructive) 12%, transparent);
+    color: color-mix(in srgb, var(--destructive) 82%, var(--foreground) 18%);
+    font-size: 12px;
+    line-height: 16px;
+  }
+
+  .remux-composer-config-row:focus,
+  .remux-composer-config-row:focus-within,
+  .remux-composer-config-option:focus,
+  .remux-composer-config-option:focus-within {
+    outline: 0 !important;
+  }
+
+  .remux-composer-config-row:focus-visible,
+  .remux-composer-config-option:focus-visible {
+    outline: 2px solid var(--ring) !important;
+    outline-offset: 2px;
+  }
+
+  .remux-composer-config-icon {
+    display: grid;
+    width: 26px;
+    height: 26px;
+    flex: 0 0 auto;
+    place-items: center;
+    border-radius: 7px;
+    color: color-mix(in srgb, var(--muted-foreground) 86%, var(--foreground) 14%);
+  }
+
+  .remux-composer-config-label {
+    min-width: 0;
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .remux-composer-config-chevron {
+    width: 16px;
+    height: 16px;
+    flex: 0 0 auto;
+    color: color-mix(in srgb, var(--muted-foreground) 86%, transparent);
+    transition: transform 120ms ease;
+  }
+
+  .remux-composer-config-chevron.is-open {
+    transform: rotate(180deg);
+  }
+
+  .remux-composer-config-options {
+    overflow: hidden;
+    border-radius: 8px;
+  }
+
+  .remux-composer-config-option-list {
+    display: grid;
+    gap: 1px;
+    padding: 0;
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--background) 44%, transparent);
+    overflow: hidden;
+  }
+
+  .remux-composer-config-option {
+    min-height: 32px;
+    gap: 7px;
+    padding: 3px 7px;
+    border-radius: 0;
+    background: transparent;
+    text-align: left;
+  }
+
+  .remux-composer-config-option + .remux-composer-config-option {
+    border-top-color: color-mix(in srgb, var(--border) 52%, transparent);
+  }
+
+  .remux-composer-config-check {
+    display: grid;
+    width: 16px;
+    height: 16px;
+    flex: 0 0 auto;
+    place-items: center;
+    color: color-mix(in srgb, var(--muted-foreground) 88%, transparent);
+  }
+
+  .remux-composer-config-option-text {
+    display: grid;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .remux-composer-config-option-label,
+  .remux-composer-config-option-detail {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .remux-composer-config-option-label {
+    color: var(--foreground);
+    font-size: 13px;
+    line-height: 17px;
+  }
+
+  .remux-composer-config-option-detail {
+    color: color-mix(in srgb, var(--muted-foreground) 80%, transparent);
+    font-size: 12px;
+    line-height: 15px;
+  }
+
+  .remux-composer-status-row {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 0 2px;
+    color: color-mix(in srgb, var(--muted-foreground) 78%, transparent);
+    font-size: 10px;
+    letter-spacing: 0;
+    line-height: 12px;
+    user-select: none;
+  }
+
+  .remux-composer-status-group {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: 5px;
+    white-space: nowrap;
+  }
+
+  .remux-composer-status-group-right {
+    justify-content: flex-end;
+    text-align: right;
+  }
+
+  .remux-composer-status-separator {
+    flex: 0 0 auto;
+    color: color-mix(in srgb, var(--muted-foreground) 45%, transparent);
+  }
+
+  .remux-composer-action-button {
+    position: relative;
+    display: inline-grid;
+    width: 39px;
+    height: 36px;
+    place-items: center;
+    border: 1px solid color-mix(in srgb, var(--border) 88%, transparent);
+    border-radius: 8px;
+    background:
+      linear-gradient(
+        to bottom,
+        color-mix(in srgb, var(--chrome-hover) 76%, var(--foreground) 3%),
+        color-mix(in srgb, var(--chrome) 90%, black 10%)
+      );
+    color: color-mix(in srgb, var(--muted-foreground) 86%, var(--foreground) 14%);
+    appearance: none;
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, var(--foreground) 9%, transparent),
+      inset 0 -2px 0 rgb(0 0 0 / 32%),
+      0 2px 0 color-mix(in srgb, var(--background) 78%, black);
+    cursor: default;
+    outline: 0 !important;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+    transition:
+      transform 80ms ease,
+      box-shadow 80ms ease,
+      background-color 120ms ease,
+      color 120ms ease,
+      border-color 120ms ease;
+  }
+
+  .remux-composer-action-button:active:not(:disabled) {
+    box-shadow:
+      inset 0 1px 0 rgb(0 0 0 / 24%),
+      inset 0 -1px 0 rgb(0 0 0 / 22%),
+      0 1px 0 color-mix(in srgb, var(--background) 78%, black);
+    transform: translateY(1px);
+  }
+
+  .remux-composer-action-button:disabled {
+    opacity: 0.34;
+  }
+
+  .remux-composer-action-button.is-busy:disabled {
+    opacity: 1;
+  }
+
+  .remux-composer-action-button:focus,
+  .remux-composer-action-button:focus-within {
+    border-color: color-mix(in srgb, var(--border) 88%, transparent);
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, var(--foreground) 9%, transparent),
+      inset 0 -2px 0 rgb(0 0 0 / 32%),
+      0 2px 0 color-mix(in srgb, var(--background) 78%, black);
+    outline: 0 !important;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .remux-composer-action-button:focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+
+  .remux-composer-send-button {
+    border-color: color-mix(in srgb, #9f3a16 74%, var(--border));
+    background:
+      linear-gradient(
+        to bottom,
+        color-mix(in srgb, #c45424 86%, var(--warning) 14%),
+        color-mix(in srgb, #8f2f13 88%, black 12%)
+      );
+    color: #fff7ed;
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 14%),
+      inset 0 -2px 0 rgb(52 16 6 / 36%),
+      0 2px 0 color-mix(in srgb, #5f1d0d 88%, black);
+  }
+
+  .remux-composer-send-button:focus,
+  .remux-composer-send-button:focus-within {
+    border-color: color-mix(in srgb, #9f3a16 74%, var(--border));
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 14%),
+      inset 0 -2px 0 rgb(52 16 6 / 36%),
+      0 2px 0 color-mix(in srgb, #5f1d0d 88%, black);
+    outline: 0 !important;
+  }
+
+  .remux-composer-send-button:focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+
+  @media (hover: hover) and (pointer: fine) {
+    .remux-composer-action-button:hover:not(:disabled) {
+      color: var(--foreground);
+    }
+
+    .remux-composer-send-button:hover:not(:disabled) {
+      color: #ffffff;
+    }
+  }
+
+}

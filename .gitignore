@@ -1,0 +1,59 @@
+# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+
+# dependencies
+node_modules/
+
+# build output
+dist/
+test-results/
+playwright-report/
+target/
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+*.log
+
+# macOS
+.DS_Store
+Thumbs.db
+
+# credentials and local env files
+.env
+.env.*
+!.env.example
+!.env.*.example
+credentials.json
+*.jks
+*.key
+*.keystore
+*.mobileprovision
+*.p12
+*.p8
+*.pem
+
+# native build output
+*.ipa
+*.jsbundle
+.gradle/
+.kotlin/
+.cxx/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+
+# Expo / Metro
+.expo/
+web-build/
+.metro-health-check*
+
+.codex-mobile/
+.remux/
+extensions/codex/dev/fixtures/captures/*.json
+
+# typescript
+*.tsbuildinfo
+
+/t3*
+/codex*

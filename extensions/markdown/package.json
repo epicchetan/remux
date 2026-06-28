@@ -1,0 +1,33 @@
+{
+  "name": "@remux/markdown",
+  "private": true,
+  "type": "module",
+  "sideEffects": [
+    "./viewer/src/styles.css",
+    "katex/dist/katex.min.css"
+  ],
+  "exports": {
+    ".": "./viewer/src/index.ts"
+  },
+  "scripts": {
+    "build": "vite build --config viewer/vite.config.ts",
+    "watch": "vite build --watch --config viewer/vite.config.ts"
+  },
+  "dependencies": {
+    "@remux/extension-api": "*",
+    "@remux/extension-ui": "*",
+    "katex": "^0.17.0",
+    "lucide-react": "^1.21.0",
+    "mermaid": "^11.15.0",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "react-markdown": "^10.1.0",
+    "rehype-katex": "^7.0.1",
+    "rehype-raw": "^7.0.0",
+    "rehype-sanitize": "^6.0.0",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0",
+    "shiki": "^4.2.0",
+    "zustand": "^5.0.14"
+  }
+}

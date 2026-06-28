@@ -1,0 +1,61 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": false,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true,
+    "jsx": "react-jsx",
+    "lib": [
+      "DOM",
+      "DOM.Iterable",
+      "ES2023"
+    ],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "target": "ES2023",
+    "types": [
+      "node",
+      "vite/client"
+    ],
+    "paths": {
+      "@remux/codex": ["./extensions/codex/viewer/index.ts"],
+      "@remux/codex/config/*": ["./extensions/codex/viewer/config/*"],
+      "@remux/codex/protocol/*": ["./extensions/codex/shared/protocol/*"],
+      "@remux/codex/styles.css": ["./extensions/codex/viewer/styles.css"],
+      "@remux/extension-api": ["./packages/extension-api/src/index.ts"],
+      "@remux/extension-api/*": ["./packages/extension-api/src/*"],
+      "@remux/extension-ui": ["./packages/extension-ui/src/index.ts"],
+      "@remux/extension-ui/*": ["./packages/extension-ui/src/*"],
+      "@/*": [
+        "./*"
+      ]
+    }
+  },
+  "include": [
+    "app/**/*.ts",
+    "app/**/*.tsx",
+    "cli/**/*.js",
+    "cli/**/*.cjs",
+    "extensions/**/*.js",
+    "extensions/**/*.cjs",
+    "extensions/**/*.ts",
+    "extensions/**/*.tsx",
+    "extensions/codex/viewer/vite.config.ts",
+    "packages/**/*.ts",
+    "packages/**/*.tsx",
+    "scripts/**/*.js",
+    "src/**/*.ts",
+    "src/**/*.tsx"
+  ],
+  "exclude": [
+    "dist/**",
+    "extensions/**/viewer/dist/**",
+    "node_modules/**",
+    "refs/**"
+  ]
+}

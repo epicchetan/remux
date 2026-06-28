@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "id": "codex",
+  "name": "Codex",
+  "display": {
+    "title": "Codex",
+    "icon": "assets/codex.png"
+  },
+  "server": {
+    "transport": "stdio",
+    "command": "cargo",
+    "args": [
+      "run",
+      "--manifest-path",
+      "server/Cargo.toml",
+      "--target-dir",
+      "/tmp/remux-codex-server-target",
+      "--offline",
+      "--quiet",
+      "--"
+    ],
+    "cwd": "."
+  },
+  "views": {
+    "main": {
+      "route": "/viewers/codex",
+      "entry": "viewer/dist/index.html"
+    }
+  },
+  "launchers": [
+    {
+      "id": "new-chat",
+      "view": "main",
+      "label": "Codex",
+      "icon": "assets/codex.png",
+      "route": {
+        "kind": "launch",
+        "launch": "new-chat",
+        "resourceKind": "draft"
+      }
+    }
+  ],
+  "fileHandlers": []
+}

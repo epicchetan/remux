@@ -1,0 +1,123 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@source "./**/*.{ts,tsx}";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  color-scheme: dark;
+  --radius: 0.625rem;
+  --background: #171717;
+  --foreground: #ececec;
+  --card: #202020;
+  --card-foreground: #ececec;
+  --popover: #202020;
+  --popover-foreground: #ececec;
+  --primary: #ececec;
+  --primary-foreground: #171717;
+  --secondary: #2a2a2a;
+  --secondary-foreground: #ececec;
+  --muted: #2a2a2a;
+  --muted-foreground: #9ca0a8;
+  --accent: #303030;
+  --accent-foreground: #f2f2f2;
+  --destructive: #f87171;
+  --border: #2a2a2a;
+  --input: #303030;
+  --composer: #202020;
+  --ring: #8ab4f8;
+  --success: #7fd49d;
+  --warning: #f5c56b;
+  --link: #8ab4f8;
+  --sidebar: var(--background);
+  --sidebar-foreground: #ececec;
+  --chrome: #1f232b;
+  --chrome-hover: #272b34;
+  --remux-font-body-size: 15px;
+  --remux-font-body-line: 22px;
+  --remux-font-work-size: 13px;
+  --remux-font-work-line: 18px;
+  --remux-font-work-title-size: var(--remux-font-body-size);
+  --remux-font-work-title-line: var(--remux-font-body-line);
+  --remux-feed-max-width: 900px;
+  --remux-feed-pad-x: 16px;
+  --remux-turn-gap: 20px;
+  --remux-block-gap: 20px;
+  --remux-work-gap: 8px;
+  --remux-work-boundary-gap: 14px;
+  --remux-work-group-gap: 8px;
+  --remux-row-gap: 6px;
+  --remux-font-sans: Arial, "Helvetica Neue", sans-serif;
+  --remux-font-mono: Menlo, Consolas, "Liberation Mono", monospace;
+  font-family: var(--remux-font-sans);
+}
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-link: var(--link);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-chrome: var(--chrome);
+  --color-chrome-hover: var(--chrome-hover);
+}
+
+@layer base {
+  * {
+    box-sizing: border-box;
+    border-color: var(--border);
+    outline-color: color-mix(in srgb, var(--ring) 50%, transparent);
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    min-height: 100%;
+    margin: 0;
+    overflow: hidden;
+  }
+
+  body {
+    background: var(--background);
+    color: var(--foreground);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  button,
+  textarea {
+    font: inherit;
+  }
+
+  code {
+    border-radius: 0.375rem;
+    background: var(--muted);
+    color: var(--foreground);
+    font-family: var(--remux-font-mono);
+    padding: 0.08em 0.28em;
+  }
+}

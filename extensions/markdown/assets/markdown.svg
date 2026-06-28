@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Markdown">
+  <defs>
+    <linearGradient id="markdown-bg" x1="8" x2="56" y1="8" y2="56" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#27272a"/>
+      <stop offset="1" stop-color="#18181b"/>
+    </linearGradient>
+    <linearGradient id="markdown-fg" x1="18" x2="48" y1="18" y2="46" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#93c5fd"/>
+      <stop offset="1" stop-color="#f4f4f5"/>
+    </linearGradient>
+  </defs>
+  <rect width="54" height="54" x="5" y="5" rx="15" fill="url(#markdown-bg)" stroke="#52525b" stroke-width="2"/>
+  <path fill="url(#markdown-fg)" d="M15 21h34a4 4 0 0 1 4 4v14a4 4 0 0 1-4 4H15a4 4 0 0 1-4-4V25a4 4 0 0 1 4-4Zm2.5 16h5v-8.3l4.3 5.3 4.2-5.3V37h5V27h-5.1l-4.1 5.2-4.2-5.2h-5.1v10Zm22.6-10v5.4h-3.2l5.7 5.9 5.7-5.9h-3.2V27h-5Z"/>
+</svg>

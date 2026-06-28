@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "id": "markdown",
+  "name": "Markdown",
+  "display": {
+    "title": "Markdown",
+    "icon": "assets/markdown.svg"
+  },
+  "views": {
+    "main": {
+      "route": "/viewers/markdown",
+      "entry": "viewer/dist/index.html"
+    }
+  },
+  "launchers": [],
+  "fileHandlers": [
+    {
+      "id": "markdown-viewer",
+      "view": "main",
+      "label": "Markdown",
+      "icon": "assets/markdown.svg",
+      "extensions": [
+        "md",
+        "markdown",
+        "mdown"
+      ]
+    }
+  ]
+}

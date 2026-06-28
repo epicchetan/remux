@@ -1,0 +1,19 @@
+import path from 'node:path';
+
+import react from '@vitejs/plugin-react';
+import { defineConfig } from 'vite';
+
+export default defineConfig({
+  base: '/viewers/markdown/',
+  root: __dirname,
+  plugins: [react()],
+  resolve: {
+    alias: [
+      {
+        find: /^@remux\/markdown$/,
+        replacement: path.resolve(__dirname, './src/index.ts'),
+      },
+      { find: '@', replacement: path.resolve(__dirname, '../../..') },
+    ],
+  },
+});

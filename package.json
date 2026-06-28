@@ -1,0 +1,39 @@
+{
+  "name": "remux",
+  "version": "1.0.0",
+  "bin": {
+    "remux": "bin/remux.js"
+  },
+  "workspaces": [
+    "app",
+    "extensions/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "node bin/remux.js start",
+    "app:typecheck": "npm --workspace @remux/app run typecheck",
+    "mobile:typecheck": "npm --workspace @remux/app run typecheck",
+    "viewers:build": "npm --workspaces --if-present run build",
+    "viewers:watch": "node scripts/watch-viewers.cjs",
+    "typecheck": "tsc --noEmit",
+    "lint": "npm run typecheck",
+    "test:cli": "node --test cli/tests/*.test.js",
+    "test:codex-server": "cargo test --manifest-path extensions/codex/server/Cargo.toml --offline",
+    "test:codex": "playwright test -c extensions/codex/playwright.config.ts"
+  },
+  "dependencies": {
+    "ws": "^7.5.10"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1",
+    "@tailwindcss/vite": "^4.3.0",
+    "@types/node": "^25.6.2",
+    "@types/react": "~19.1.0",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^6.0.1",
+    "typescript": "~5.9.2",
+    "vite": "^8.0.11"
+  },
+  "private": true,
+  "packageManager": "npm@11.6.0"
+}

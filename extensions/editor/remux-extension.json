@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "id": "editor",
+  "name": "Editor",
+  "display": {
+    "title": "Editor",
+    "icon": "assets/editor.svg"
+  },
+  "views": {
+    "main": {
+      "route": "/viewers/editor",
+      "entry": "viewer/dist/index.html"
+    }
+  },
+  "launchers": [],
+  "fileHandlers": [
+    {
+      "id": "text-editor",
+      "view": "main",
+      "label": "Editor",
+      "icon": "assets/editor.svg",
+      "extensions": [
+        "*"
+      ]
+    }
+  ]
+}
