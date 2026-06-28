@@ -1,5 +1,9 @@
 # Codex Thread History Read Spec
 
+Status: Archived
+Last verified: 2026-06-28
+Canonical code: `extensions/codex/server/src/thread_resources.rs`, `extensions/codex/server/src/app_server.rs`, `extensions/codex/viewer/threads/historyStore.ts`
+
 ## Purpose
 
 Extend the Rust Codex extension server with server-authoritative thread history reads.

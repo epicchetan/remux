@@ -1,8 +1,12 @@
 # Remux
 
-CLI, Expo shell, and extension runtime for small embeddable Remux viewers. The first extension is Codex.
+Remux is a local-first mobile shell and extension runtime for small embeddable viewers. The runtime runs on your machine, serves extension viewers, proxies JSON-RPC between the mobile app and extension servers, and lets the Expo app host those viewers as native tabs.
 
-## Development
+The first production-focused extension is Codex. The repo also includes markdown and editor viewers that exercise the same extension model.
+
+Remux is early-stage local tooling. The runtime is intended for a trusted local machine or trusted LAN; it currently has no authentication layer and exposes filesystem/RPC capabilities to connected clients.
+
+## Quick Start
 
 Install dependencies:
 
@@ -10,65 +14,77 @@ Install dependencies:
 npm install
 ```
 
-Build the extension viewers:
+Build the bundled extension viewers:
 
 ```bash
 npm run viewers:build
 ```
 
-Start the Remux runtime and extension servers:
+Start the Remux runtime:
 
 ```bash
-npm run dev
+REMUX_HOST=127.0.0.1 npm run dev
 ```
 
-The CLI owns the public Remux websocket at `/ws` and serves built extension viewers under `/viewers/*`. Extensions are discovered from `extensions/*/remux-extension.json` by default. During viewer development, run `npm run viewers:watch` in a separate terminal to keep `viewer/dist/` updated, then use the app reload button to load the latest built files. Start Expo manually from `app/` when changing the native app shell.
-
-Extension manifests use only Node's built-in JSON support. The server side is a command launched by Remux, currently over newline-delimited JSON-RPC on stdio. The Codex extension server is implemented in Rust and exposes a batch read API over that transport:
-
-```json
-{
-  "id": "codex",
-  "server": {
-    "transport": "stdio",
-    "command": "cargo",
-    "args": [
-      "run",
-      "--manifest-path",
-      "server/Cargo.toml",
-      "--offline",
-      "--quiet",
-      "--"
-    ],
-    "cwd": "."
-  },
-  "views": {
-    "main": {
-      "route": "/viewers/codex",
-      "entry": "viewer/dist/index.html"
-    }
-  }
-}
-```
-
-## Structure
-
-- `app/` contains the Expo app shell.
-- `bin/` contains the root Remux CLI entrypoint.
-- `cli/` contains CLI tests and root CLI support code as it is extracted.
-- `extensions/codex/` contains the DOM Codex viewer, transcript renderer, Codex state provider, Codex server adapter, generated protocol bindings, and JSON schemas.
-
-## Testing
+For device testing, use a host address that the device can reach:
 
 ```bash
-npm run typecheck
-npm run test:cli
-npm run test:codex-server
-npm run test:codex
+REMUX_HOST=0.0.0.0 npm run dev
 ```
 
-## Codex Protocol
+Run the mobile app separately from `app/`:
 
-- TypeScript bindings live in `extensions/codex/shared/protocol/`.
-- JSON Schema output lives in `extensions/codex/shared/schema/`.
-- The bundled v2 schema is `extensions/codex/shared/schema/codex_app_server_protocol.v2.schemas.json`.
+```bash
+npm --workspace @remux/app run start
+```
+
+or build to a device:
+
+```bash
+npm --workspace @remux/app run ios
+```
+
+The runtime defaults to port `48123`, serves the extension catalog at `/remux/extensions`, serves viewers under their manifest routes, and exposes the Remux websocket at `/ws`.
+
+## Architecture
+
+Remux has four main pieces:
+
+- `app/`: Expo/React Native mobile shell, browser tabs, WebView host bridge, connection settings, local tab persistence, and push notification registration.
+- `cli/` and `bin/`: Node runtime process, HTTP server, websocket JSON-RPC router, extension discovery, extension process management, logging, and notification delivery.
+- `extensions/`: bundled Remux extensions. Each extension has a `remux-extension.json` manifest, a static viewer, and optionally a stdio JSON-RPC server.
+- `packages/`: shared extension APIs and UI primitives used by viewers.
+
+The high-level flow is:
+
+```text
+Expo app -> WebView host bridge -> Remux websocket /ws -> CLI router -> extension stdio server
+       \-> HTTP viewer assets and extension catalog served by the runtime
+```
+
+See [docs/architecture/remux-runtime.md](docs/architecture/remux-runtime.md) and [docs/architecture/codex-extension.md](docs/architecture/codex-extension.md) for the maintained architecture notes.
+
+## Commands
+
+| Command | Purpose |
+| --- | --- |
+| `npm run dev` | Start the Remux runtime with extension discovery and `/ws`. |
+| `npm run viewers:build` | Build bundled extension viewer assets. |
+| `npm run viewers:watch` | Watch extension viewers during frontend development. |
+| `npm run typecheck` | Typecheck the root TypeScript project. |
+| `npm run app:typecheck` | Typecheck the Expo app workspace. |
+| `npm run test:cli` | Run Node runtime tests. |
+| `npm run test:codex-server` | Run the Rust Codex extension server tests. |
+| `npm run test:codex` | Run Codex viewer Playwright tests. |
+
+## Documentation
+
+Start with [docs/README.md](docs/README.md).
+
+The root README is for orientation and day-one setup. Current architecture and guides live under `docs/architecture/` and `docs/guides/`. Implementation specs and historical phase plans live under `docs/specs/` with lifecycle labels.
+
+## Public Notes
+
+- The root package is private and this repo is source-oriented, not published as an npm package.
+- Native Expo generated folders, build output, local Remux state, credentials, and Rust targets are ignored.
+- `codex/` and `t3code/` are local reference checkouts used during development; they are not part of a fresh clone.

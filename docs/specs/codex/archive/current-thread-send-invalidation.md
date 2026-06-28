@@ -1,5 +1,9 @@
 # Codex Current Thread Send and Invalidation Spec
 
+Status: Archived
+Last verified: 2026-06-28
+Canonical code: `extensions/codex/server/src/thread_commands.rs`, `extensions/codex/server/src/resource_invalidations.rs`, `extensions/codex/viewer/ipc/resourceInvalidations.ts`
+
 ## Purpose
 
 Add the smallest useful send path for an already-selected Codex thread while preserving the server-authoritative read model.
