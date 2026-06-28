@@ -41,11 +41,21 @@ import {
   writeTerminalSession,
   type TerminalSessionOutputFrame,
 } from './terminalRpc';
+import {
+  encodeModifiedKey,
+  encodeTerminalArrow,
+  encodeTerminalEnter,
+  encodeTerminalTab,
+  isModifierKey,
+  terminalControlCBytes,
+  terminalKeySequences,
+  terminalModifierAutoClearMs,
+  type TerminalArrowCode,
+} from './keyEncoding';
 import { setupTouchScroll } from './touchScroll';
 
 const fontFamily = 'Menlo, Consolas, "Liberation Mono", monospace';
 const textEncoder = new TextEncoder();
-const modifierAutoClearMs = 3000;
 const fitDebounceMs = 180;
 
 type TerminalSurfaceProps = {
@@ -70,6 +80,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   const modifierTimerRef = useRef<number | null>(null);
   const [altActive, setAltActive] = useState(false);
   const [ctrlActive, setCtrlActive] = useState(false);
+  const [shiftActive, setShiftActive] = useState(false);
   const [keyboardOffset, setKeyboardOffset] = useState(0);
   const [keyboardOpen, setKeyboardOpen] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -78,6 +89,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   const resetModifiers = useCallback(() => {
     setCtrlActive(false);
     setAltActive(false);
+    setShiftActive(false);
   }, []);
 
   const clearModifierTimer = useCallback(() => {
@@ -89,17 +101,17 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
 
   useEffect(() => {
     clearModifierTimer();
-    if (!ctrlActive && !altActive) {
+    if (!ctrlActive && !altActive && !shiftActive) {
       return undefined;
     }
 
     modifierTimerRef.current = window.setTimeout(() => {
       modifierTimerRef.current = null;
       resetModifiers();
-    }, modifierAutoClearMs);
+    }, terminalModifierAutoClearMs);
 
     return clearModifierTimer;
-  }, [altActive, clearModifierTimer, ctrlActive, resetModifiers]);
+  }, [altActive, clearModifierTimer, ctrlActive, resetModifiers, shiftActive]);
 
   const currentSize = useCallback(() => {
     const terminal = terminalRef.current;
@@ -305,15 +317,29 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     });
   }, [startOrAttachSession]);
 
-  const sendArrow = useCallback((code: 'A' | 'B' | 'C' | 'D') => {
-    const modifier = (altActive ? 2 : 0) + (ctrlActive ? 4 : 0);
-    if (modifier > 0) {
-      sendText(`\x1b[1;${modifier + 1}${code}`, { clearModifiers: true });
-      return;
-    }
+  const sendArrow = useCallback((code: TerminalArrowCode) => {
+    sendBytes(encodeTerminalArrow(code, {
+      alt: altActive,
+      ctrl: ctrlActive,
+      shift: shiftActive,
+    }), { clearModifiers: altActive || ctrlActive || shiftActive });
+  }, [altActive, ctrlActive, sendBytes, shiftActive]);
 
-    sendText(`\x1b[${code}`);
-  }, [altActive, ctrlActive, sendText]);
+  const sendTab = useCallback(() => {
+    sendBytes(encodeTerminalTab({
+      alt: altActive,
+      ctrl: ctrlActive,
+      shift: shiftActive,
+    }), { clearModifiers: altActive || ctrlActive || shiftActive });
+  }, [altActive, ctrlActive, sendBytes, shiftActive]);
+
+  const sendEnter = useCallback(() => {
+    sendBytes(encodeTerminalEnter({
+      alt: altActive,
+      ctrl: ctrlActive,
+      shift: shiftActive,
+    }), { clearModifiers: altActive || ctrlActive || shiftActive });
+  }, [altActive, ctrlActive, sendBytes, shiftActive]);
 
   const pasteClipboard = useCallback(async () => {
     try {
@@ -442,7 +468,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
 
       terminal.attachCustomKeyEventHandler((event) => {
         if (event.type === 'keydown' && event.key === 'Enter' && event.shiftKey) {
-          sendText('\x1b[13;2u', { clearModifiers: true });
+          sendText(terminalKeySequences.shiftEnter, { clearModifiers: true });
           return false;
         }
 
@@ -568,7 +594,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   }, []);
 
   useEffect(() => {
-    if (!ctrlActive && !altActive) {
+    if (!ctrlActive && !altActive && !shiftActive) {
       return undefined;
     }
 
@@ -580,6 +606,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       const encoded = encodeModifiedKey(event, {
         alt: altActive,
         ctrl: ctrlActive,
+        shift: shiftActive,
       });
       if (!encoded) {
         return;
@@ -592,7 +619,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
 
     document.addEventListener('keydown', onKeyDown, true);
     return () => document.removeEventListener('keydown', onKeyDown, true);
-  }, [altActive, ctrlActive, sendBytes]);
+  }, [altActive, ctrlActive, sendBytes, shiftActive]);
 
   return (
     <main className="remux-terminal-shell" style={terminalShellStyle(keyboardOffset)}>
@@ -603,59 +630,73 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       <ExtensionActionBar
         className="remux-terminal-action-bar"
         left={(
-          <div className="remux-terminal-key-scroll">
-            <TerminalKey label="Open tabs" onPress={() => void openHostOverview({ section: 'tabs' })}>
-              <PanelTopOpen />
-            </TerminalKey>
-            <TerminalKey accent label="Escape" onPress={() => sendText('\x1b', { clearModifiers: true })}>
-              <span className="remux-terminal-key-text">Esc</span>
-            </TerminalKey>
-            <TerminalKey label="Tab" onPress={() => sendText('\t', { clearModifiers: true })}>
-              <span className="remux-terminal-key-text">Tab</span>
-            </TerminalKey>
-            <TerminalKey
-              active={ctrlActive}
-              label="Sticky control"
-              onPress={() => setCtrlActive((value) => !value)}
-            >
-              <span className="remux-terminal-key-text">Ctrl</span>
-            </TerminalKey>
-            <TerminalKey
-              active={altActive}
-              label="Sticky alt"
-              onPress={() => setAltActive((value) => !value)}
-            >
-              <span className="remux-terminal-key-text">Alt</span>
-            </TerminalKey>
-            <TerminalKey label="Arrow up" onPress={() => sendArrow('A')}>
-              <ArrowUp />
-            </TerminalKey>
-            <TerminalKey label="Arrow down" onPress={() => sendArrow('B')}>
-              <ArrowDown />
-            </TerminalKey>
-            <TerminalKey label="Arrow left" onPress={() => sendArrow('D')}>
-              <ArrowLeft />
-            </TerminalKey>
-            <TerminalKey label="Arrow right" onPress={() => sendArrow('C')}>
-              <ArrowRight />
-            </TerminalKey>
-            <TerminalKey label="Enter" onPress={() => sendText('\r', { clearModifiers: true })}>
-              <CornerDownLeft />
-            </TerminalKey>
-            <TerminalKey label="Control C" onPress={() => sendBytes(new Uint8Array([3]), { clearModifiers: true })}>
-              <span className="remux-terminal-key-text">^C</span>
-            </TerminalKey>
-            <TerminalKey label="Paste" onPress={() => void pasteClipboard()}>
-              <ClipboardPaste />
-            </TerminalKey>
-            <TerminalKey label={keyboardOpen ? 'Hide keyboard' : 'Show keyboard'} onPress={toggleKeyboard}>
-              {keyboardOpen ? <KeyboardOff /> : <Keyboard />}
-            </TerminalKey>
-            {status.type === 'error' || status.type === 'exited' ? (
-              <TerminalKey label="Start new shell" onPress={restartSession}>
-                <RefreshCw />
+          <div className="remux-terminal-key-row">
+            <div className="remux-terminal-key-fixed">
+              <TerminalKey label="Open tabs" onPress={() => void openHostOverview({ section: 'tabs' })}>
+                <PanelTopOpen />
               </TerminalKey>
-            ) : null}
+              <TerminalKey
+                label={keyboardOpen ? 'Hide keyboard' : 'Show keyboard'}
+                onPress={toggleKeyboard}
+              >
+                {keyboardOpen ? <KeyboardOff /> : <Keyboard />}
+              </TerminalKey>
+            </div>
+            <div className="remux-terminal-key-scroll">
+              <TerminalKey accent label="Escape" onPress={() => sendText(terminalKeySequences.escape, { clearModifiers: true })}>
+                <span className="remux-terminal-key-text">Esc</span>
+              </TerminalKey>
+              <TerminalKey label="Tab" onPress={sendTab}>
+                <span className="remux-terminal-key-text">Tab</span>
+              </TerminalKey>
+              <TerminalKey
+                active={shiftActive}
+                label="Sticky shift"
+                onPress={() => setShiftActive((value) => !value)}
+              >
+                <span className="remux-terminal-key-text">Shift</span>
+              </TerminalKey>
+              <TerminalKey
+                active={ctrlActive}
+                label="Sticky control"
+                onPress={() => setCtrlActive((value) => !value)}
+              >
+                <span className="remux-terminal-key-text">Ctrl</span>
+              </TerminalKey>
+              <TerminalKey
+                active={altActive}
+                label="Sticky alt"
+                onPress={() => setAltActive((value) => !value)}
+              >
+                <span className="remux-terminal-key-text">Alt</span>
+              </TerminalKey>
+              <TerminalKey label="Arrow up" onPress={() => sendArrow('A')}>
+                <ArrowUp />
+              </TerminalKey>
+              <TerminalKey label="Arrow down" onPress={() => sendArrow('B')}>
+                <ArrowDown />
+              </TerminalKey>
+              <TerminalKey label="Arrow left" onPress={() => sendArrow('D')}>
+                <ArrowLeft />
+              </TerminalKey>
+              <TerminalKey label="Arrow right" onPress={() => sendArrow('C')}>
+                <ArrowRight />
+              </TerminalKey>
+              <TerminalKey label="Enter" onPress={sendEnter}>
+                <CornerDownLeft />
+              </TerminalKey>
+              <TerminalKey label="Control C" onPress={() => sendBytes(terminalControlCBytes(), { clearModifiers: true })}>
+                <span className="remux-terminal-key-text">^C</span>
+              </TerminalKey>
+              <TerminalKey label="Paste" onPress={() => void pasteClipboard()}>
+                <ClipboardPaste />
+              </TerminalKey>
+              {status.type === 'error' || status.type === 'exited' ? (
+                <TerminalKey label="Start new shell" onPress={restartSession}>
+                  <RefreshCw />
+                </TerminalKey>
+              ) : null}
+            </div>
           </div>
         )}
         status={statusText(status, sessionId)}
@@ -766,80 +807,6 @@ function visualViewportKeyboardOffset() {
   }
 
   return Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop);
-}
-
-function encodeModifiedKey(
-  event: KeyboardEvent,
-  modifiers: { alt: boolean; ctrl: boolean },
-) {
-  const bytes: number[] = [];
-
-  if (isArrowKey(event.key)) {
-    const code = arrowCode(event.key);
-    const modifier = (modifiers.alt ? 2 : 0) + (modifiers.ctrl ? 4 : 0);
-    return textEncoder.encode(`\x1b[1;${modifier + 1}${code}`);
-  }
-
-  if (modifiers.ctrl) {
-    const byte = ctrlByte(event.key);
-    if (byte !== null) {
-      if (modifiers.alt) {
-        bytes.push(0x1b);
-      }
-      bytes.push(byte);
-      return new Uint8Array(bytes);
-    }
-  }
-
-  if (modifiers.alt && event.key.length === 1) {
-    bytes.push(0x1b, ...textEncoder.encode(event.key));
-    return new Uint8Array(bytes);
-  }
-
-  return null;
-}
-
-function ctrlByte(key: string) {
-  const code = key.toLowerCase().charCodeAt(0);
-  if (code >= 97 && code <= 122) {
-    return code - 96;
-  }
-
-  if (key === '[') {
-    return 27;
-  }
-
-  if (key === '\\') {
-    return 28;
-  }
-
-  if (key === ']') {
-    return 29;
-  }
-
-  return null;
-}
-
-function isArrowKey(key: string) {
-  return key === 'ArrowUp' || key === 'ArrowDown' || key === 'ArrowRight' || key === 'ArrowLeft';
-}
-
-function arrowCode(key: string) {
-  switch (key) {
-    case 'ArrowUp':
-      return 'A';
-    case 'ArrowDown':
-      return 'B';
-    case 'ArrowRight':
-      return 'C';
-    case 'ArrowLeft':
-    default:
-      return 'D';
-  }
-}
-
-function isModifierKey(key: string) {
-  return key === 'Alt' || key === 'Control' || key === 'Meta' || key === 'Shift';
 }
 
 function statusText(status: TerminalStatus, sessionId: string | null) {

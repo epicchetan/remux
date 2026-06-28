@@ -789,7 +789,17 @@ impl JsonRpcError {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_u16, pty_size};
+    use std::path::Path;
+    use std::sync::mpsc::{self, Receiver};
+    use std::time::{Duration, Instant};
+
+    use base64::Engine;
+    use serde_json::{Value, json};
+
+    use super::{
+        BASE64, SESSION_EXITED_NOTIFICATION, SESSION_OUTPUT_NOTIFICATION, TerminalExtensionServer,
+        clamp_u16, pty_size,
+    };
 
     #[test]
     fn pty_size_clamps_to_supported_terminal_bounds() {
@@ -806,5 +816,280 @@ mod tests {
         assert_eq!(clamp_u16(0, 2, 10), 2);
         assert_eq!(clamp_u16(7, 2, 10), 7);
         assert_eq!(clamp_u16(11, 2, 10), 10);
+    }
+
+    #[test]
+    fn pty_session_runs_commands_and_replays_output() {
+        let Some(shell) = test_shell() else {
+            return;
+        };
+        let (server, output_rx) = test_server();
+        let session_id = "terminal-test-run-replay";
+
+        start_test_session(&server, session_id, shell, 80, 24);
+        write_text(&server, session_id, "printf 'remux-terminal-ok'\r");
+
+        read_until_output(&output_rx, session_id, "remux-terminal-ok");
+
+        let attached = server
+            .attach_session(json!({
+                "cols": 80,
+                "replaySeq": 1,
+                "rows": 24,
+                "sessionId": session_id,
+            }))
+            .expect("expected attach to running test session");
+
+        assert_eq!(attached["sessionId"], session_id);
+        assert_eq!(attached["status"], "running");
+        assert_eq!(attached["replayTruncated"], false);
+        assert!(
+            replay_text(&attached).contains("remux-terminal-ok"),
+            "expected replay to include command output: {attached:?}"
+        );
+
+        server.kill_all();
+    }
+
+    #[test]
+    fn pty_resize_is_visible_to_shell() {
+        let Some(shell) = test_shell() else {
+            return;
+        };
+        let (server, output_rx) = test_server();
+        let session_id = "terminal-test-resize";
+
+        start_test_session(&server, session_id, shell, 80, 24);
+        server
+            .resize_session(json!({
+                "cols": 101,
+                "rows": 33,
+                "sessionId": session_id,
+            }))
+            .expect("expected resize to succeed");
+        write_text(&server, session_id, "stty size; printf '\\nresize-done\\n'\r");
+
+        let output = read_until_output(&output_rx, session_id, "resize-done\r\n");
+        assert!(
+            output.contains("33 101"),
+            "expected stty to report resized rows and cols, got: {output:?}"
+        );
+
+        server.kill_all();
+    }
+
+    #[test]
+    fn killing_session_removes_it_from_writable_state() {
+        let Some(shell) = test_shell() else {
+            return;
+        };
+        let (server, _output_rx) = test_server();
+        let session_id = "terminal-test-kill";
+
+        start_test_session(&server, session_id, shell, 80, 24);
+        server
+            .kill_session(json!({ "sessionId": session_id }))
+            .expect("expected kill to succeed");
+
+        let error = server
+            .write_session(json!({
+                "dataBase64": BASE64.encode(b"echo after-kill\r"),
+                "sessionId": session_id,
+            }))
+            .expect_err("expected write to killed session to fail");
+        assert!(
+            error.contains("terminal session not found"),
+            "expected not-found error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn normal_shell_exit_records_exited_state() {
+        let Some(shell) = test_shell() else {
+            return;
+        };
+        let (server, output_rx) = test_server();
+        let session_id = "terminal-test-exit";
+
+        start_test_session(&server, session_id, shell, 80, 24);
+        write_text(&server, session_id, "exit 7\r");
+
+        let exit = wait_for_exit(&output_rx, session_id);
+        assert_eq!(exit.0, Some(7));
+
+        let attached = server
+            .attach_session(json!({
+                "cols": 80,
+                "rows": 24,
+                "sessionId": session_id,
+            }))
+            .expect("expected attach to exited session to succeed");
+        assert_eq!(attached["status"], "exited");
+        assert_eq!(attached["exitCode"], 7);
+
+        server.kill_all();
+    }
+
+    #[test]
+    fn unknown_session_requests_return_errors() {
+        let (server, _output_rx) = test_server();
+
+        let attach_error = server
+            .attach_session(json!({
+                "sessionId": "missing-session",
+            }))
+            .expect_err("expected missing attach to fail");
+        assert!(attach_error.contains("terminal session not found"));
+
+        let write_error = server
+            .write_session(json!({
+                "dataBase64": BASE64.encode(b"x"),
+                "sessionId": "missing-session",
+            }))
+            .expect_err("expected missing write to fail");
+        assert!(write_error.contains("terminal session not found"));
+    }
+
+    fn test_server() -> (TerminalExtensionServer, Receiver<Value>) {
+        let (output_tx, output_rx) = mpsc::channel();
+        (TerminalExtensionServer::new(output_tx), output_rx)
+    }
+
+    fn test_shell() -> Option<&'static str> {
+        if cfg!(windows) {
+            return None;
+        }
+
+        if Path::new("/bin/sh").is_file() {
+            Some("/bin/sh")
+        } else {
+            None
+        }
+    }
+
+    fn start_test_session(
+        server: &TerminalExtensionServer,
+        session_id: &str,
+        shell: &str,
+        cols: u32,
+        rows: u32,
+    ) -> Value {
+        server
+            .start_session(json!({
+                "cols": cols,
+                "cwd": env!("CARGO_MANIFEST_DIR"),
+                "rows": rows,
+                "sessionId": session_id,
+                "shell": shell,
+            }))
+            .expect("expected test PTY session to start")
+    }
+
+    fn write_text(server: &TerminalExtensionServer, session_id: &str, text: &str) {
+        server
+            .write_session(json!({
+                "dataBase64": BASE64.encode(text.as_bytes()),
+                "sessionId": session_id,
+            }))
+            .expect("expected write to test session to succeed");
+    }
+
+    fn read_until_output(
+        output_rx: &Receiver<Value>,
+        session_id: &str,
+        expected: &str,
+    ) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut collected = String::new();
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                panic!("timed out waiting for {expected:?}; collected output: {collected:?}");
+            }
+
+            let message = output_rx
+                .recv_timeout(deadline.saturating_duration_since(now))
+                .expect("expected terminal output notification");
+            if let Some(text) = output_text(&message, session_id) {
+                collected.push_str(&text);
+                if collected.contains(expected) {
+                    return collected;
+                }
+            }
+        }
+    }
+
+    fn wait_for_exit(
+        output_rx: &Receiver<Value>,
+        session_id: &str,
+    ) -> (Option<u32>, Option<String>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                panic!("timed out waiting for exit notification");
+            }
+
+            let message = output_rx
+                .recv_timeout(deadline.saturating_duration_since(now))
+                .expect("expected terminal exit notification");
+            if message.get("method").and_then(Value::as_str) != Some(SESSION_EXITED_NOTIFICATION) {
+                continue;
+            }
+
+            let Some(params) = message.get("params") else {
+                continue;
+            };
+            if params.get("sessionId").and_then(Value::as_str) != Some(session_id) {
+                continue;
+            }
+
+            let exit_code = params
+                .get("exitCode")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32);
+            let exit_signal = params
+                .get("exitSignal")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            return (exit_code, exit_signal);
+        }
+    }
+
+    fn replay_text(attached: &Value) -> String {
+        attached
+            .get("replay")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|frame| {
+                frame
+                    .get("dataBase64")
+                    .and_then(Value::as_str)
+                    .and_then(|data| BASE64.decode(data.as_bytes()).ok())
+            })
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .collect::<String>()
+    }
+
+    fn output_text(message: &Value, session_id: &str) -> Option<String> {
+        if message.get("method").and_then(Value::as_str) != Some(SESSION_OUTPUT_NOTIFICATION) {
+            return None;
+        }
+
+        let params = message.get("params")?;
+        if params.get("sessionId").and_then(Value::as_str) != Some(session_id) {
+            return None;
+        }
+
+        let data = params
+            .get("frame")?
+            .get("dataBase64")?
+            .as_str()
+            .and_then(|data| BASE64.decode(data.as_bytes()).ok())?;
+
+        Some(String::from_utf8_lossy(&data).into_owned())
     }
 }

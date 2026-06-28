@@ -21,7 +21,7 @@ export function ExtensionActionButton({
   preserveFocus,
   tone = 'default',
 }: ExtensionActionButtonProps) {
-  const lastActivationMsRef = useRef(0);
+  const lastActivationMsRef = useRef(Number.NEGATIVE_INFINITY);
   const activateOnce = useCallback(() => {
     const now = performance.now();
     if (now - lastActivationMsRef.current < 350) {

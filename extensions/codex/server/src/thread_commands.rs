@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -18,7 +17,6 @@ pub(crate) struct CodexThreadCommandServer {
     composer_config: ComposerConfigStore,
     fork_target_validator: Arc<dyn ForkTargetValidator>,
     live_transcript: LiveTranscriptStore,
-    resumed_thread_ids: Mutex<HashSet<String>>,
     thread_runtime: ThreadRuntimeStore,
 }
 
@@ -298,7 +296,6 @@ impl CodexThreadCommandServer {
             composer_config,
             fork_target_validator,
             live_transcript,
-            resumed_thread_ids: Mutex::new(HashSet::new()),
             thread_runtime,
         }
     }
@@ -389,8 +386,6 @@ impl CodexThreadCommandServer {
                 }),
             )?;
         }
-        self.mark_thread_resumed(&fork_thread_id)?;
-
         let new_turn_id = self.start_turn(&fork_thread_id, params.client_message_id, input)?;
 
         Ok(json!({
@@ -448,7 +443,6 @@ impl CodexThreadCommandServer {
             .and_then(Value::as_str)
             .ok_or_else(|| "thread/start response missing thread.id".to_string())?
             .to_string();
-        self.mark_thread_resumed(&thread_id)?;
         if let Some(config) = composer_config {
             let _ = self.composer_config.seed_thread_config(&thread_id, config);
         }
@@ -519,27 +513,9 @@ impl CodexThreadCommandServer {
     }
 
     fn ensure_thread_resumed(&self, thread_id: &str) -> Result<(), String> {
-        {
-            let resumed = self
-                .resumed_thread_ids
-                .lock()
-                .map_err(|_| "resumed thread registry poisoned".to_string())?;
-            if resumed.contains(thread_id) {
-                return Ok(());
-            }
-        }
-
+        // App-server can tear down per-thread listeners while this extension keeps running.
+        // Refreshing resume before existing-thread work keeps completion events flowing.
         self.resume_thread(thread_id)?;
-        self.mark_thread_resumed(thread_id)?;
-        Ok(())
-    }
-
-    fn mark_thread_resumed(&self, thread_id: &str) -> Result<(), String> {
-        let mut resumed = self
-            .resumed_thread_ids
-            .lock()
-            .map_err(|_| "resumed thread registry poisoned".to_string())?;
-        resumed.insert(thread_id.to_string());
         Ok(())
     }
 
@@ -904,6 +880,7 @@ mod tests {
         let app_server = FakeAppServer::new(vec![
             Ok(json!({ "thread": { "id": "thread-new" } })),
             Ok(json!({ "turn": { "id": "turn-new" } })),
+            Ok(json!({ "thread": { "id": "thread-new" } })),
             Ok(json!({ "turn": { "id": "turn-followup" } })),
         ]);
         let server = CodexThreadCommandServer::with_requester(app_server.clone());
@@ -927,7 +904,7 @@ mod tests {
         assert_eq!(response["turnId"], "turn-new");
 
         let calls = app_server.calls();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 4);
         assert_eq!(calls[0].0, "thread/start");
         assert_eq!(calls[0].1["cwd"], "/tmp/project");
         assert_eq!(calls[0].1["effort"], "high");
@@ -939,7 +916,10 @@ mod tests {
         assert_eq!(calls[1].1["clientUserMessageId"], "client-new");
         assert_eq!(calls[1].1["effort"], "high");
         assert_eq!(calls[1].1["approvalsReviewer"], "auto_review");
-        assert_eq!(calls[2].0, "turn/start");
+        assert_eq!(calls[2].0, "thread/resume");
+        assert_eq!(calls[2].1["threadId"], "thread-new");
+        assert_eq!(calls[3].0, "turn/start");
+        assert_eq!(calls[3].1["threadId"], "thread-new");
     }
 
     #[test]
@@ -947,6 +927,7 @@ mod tests {
         let app_server = FakeAppServer::new(vec![
             Ok(json!({ "thread": { "id": "thread-new" } })),
             Ok(json!({ "turn": { "id": "turn-new" } })),
+            Ok(json!({ "thread": { "id": "thread-new" } })),
             Ok(json!({ "turn": { "id": "turn-followup" } })),
         ]);
         let server = CodexThreadCommandServer::with_requester(app_server.clone());
@@ -971,7 +952,7 @@ mod tests {
             .unwrap();
 
         let calls = app_server.calls();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 4);
         assert_eq!(calls[0].0, "thread/start");
         assert_eq!(calls[0].1["cwd"], "/tmp/project");
         assert_eq!(calls[0].1["effort"], "xhigh");
@@ -987,11 +968,13 @@ mod tests {
             calls[1].1["sandboxPolicy"],
             json!({ "type": "dangerFullAccess" })
         );
-        assert_eq!(calls[2].0, "turn/start");
+        assert_eq!(calls[2].0, "thread/resume");
         assert_eq!(calls[2].1["threadId"], "thread-new");
-        assert_eq!(calls[2].1["effort"], "xhigh");
-        assert_eq!(calls[2].1["serviceTier"], "priority");
-        assert_eq!(calls[2].1["approvalPolicy"], "never");
+        assert_eq!(calls[3].0, "turn/start");
+        assert_eq!(calls[3].1["threadId"], "thread-new");
+        assert_eq!(calls[3].1["effort"], "xhigh");
+        assert_eq!(calls[3].1["serviceTier"], "priority");
+        assert_eq!(calls[3].1["approvalPolicy"], "never");
     }
 
     #[test]
@@ -1571,10 +1554,11 @@ mod tests {
     }
 
     #[test]
-    fn resumes_each_thread_once_per_runtime() {
+    fn refreshes_thread_resume_before_each_existing_thread_turn() {
         let app_server = FakeAppServer::new(vec![
             Ok(json!({ "thread": { "id": "thread-1" } })),
             Ok(json!({ "turn": { "id": "turn-1" } })),
+            Ok(json!({ "thread": { "id": "thread-1" } })),
             Ok(json!({ "turn": { "id": "turn-2" } })),
         ]);
         let server = CodexThreadCommandServer::with_requester(app_server.clone());
@@ -1597,7 +1581,10 @@ mod tests {
             .into_iter()
             .map(|call| call.0)
             .collect::<Vec<_>>();
-        assert_eq!(methods, vec!["thread/resume", "turn/start", "turn/start"]);
+        assert_eq!(
+            methods,
+            vec!["thread/resume", "turn/start", "thread/resume", "turn/start"]
+        );
     }
 
     #[test]

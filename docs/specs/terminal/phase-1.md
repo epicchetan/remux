@@ -20,7 +20,7 @@ This phase should produce a usable shell with correct PTY behavior, predictable 
 Useful prototype ideas to carry forward:
 
 - xterm with `@xterm/addon-fit`, `@xterm/addon-web-links`, `@xterm/addon-unicode11`, and optional WebGL.
-- Explicit mobile key row: `Esc`, `Tab`, `Ctrl`, `Alt`, arrows, Enter, `^C`, paste, keyboard toggle.
+- Explicit mobile key row: `Esc`, `Tab`, `Shift`, `Ctrl`, `Alt`, arrows, Enter, `^C`, paste, keyboard toggle.
 - Shift+Enter sends CSI-u `\x1b[13;2u` for terminal apps that distinguish it, including Claude-like apps.
 - Resize debounce during keyboard animation to avoid resize storms.
 - Output backpressure and batching; terminal output can overwhelm the client bridge.
@@ -144,6 +144,7 @@ Keep it minimal and functional:
 
 - `Esc`
 - `Tab`
+- `Shift` sticky modifier
 - `Ctrl` sticky modifier
 - `Alt` sticky modifier
 - Up, Down, Left, Right
@@ -164,12 +165,13 @@ Encoding rules:
 - Arrow keys: `\x1b[A`, `\x1b[B`, `\x1b[D`, `\x1b[C`
 - Ctrl + letter: byte `1..26`
 - Alt + printable key: prefix `\x1b`
-- Ctrl/Alt arrows: CSI modifier form, matching the old prototype approach.
+- Shift/Ctrl/Alt arrows: CSI modifier form, matching the old prototype approach.
 - Shift+Enter from hardware/software keyboard interception: `\x1b[13;2u`
+- Shift+Tab: `\x1b[Z`
 
 The action strip should not try to be a full keyboard. Add more keys only when a phase 1 validation task proves they are required.
 
-`Ctrl` and `Alt` should be sticky because mobile users often need to tap a modifier and then tap/type a second key. They reset after a successful encoded input and also auto-clear after 3 seconds of inactivity.
+`Shift`, `Ctrl`, and `Alt` should be sticky because mobile users often need to tap a modifier and then tap/type a second key. They reset after a successful encoded input and also auto-clear after 3 seconds of inactivity. Sticky `Shift` only affects terminal special keys such as Enter, Tab, and arrows; normal text capitalization remains owned by the keyboard/input method.
 
 ## Host API Work
 

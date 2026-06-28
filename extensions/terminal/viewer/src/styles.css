@@ -128,16 +128,36 @@ body {
   bottom: max(1px, calc((var(--remux-extension-bottom-pad) - 10px) / 2));
 }
 
-.remux-terminal-key-scroll {
+.remux-terminal-key-row {
   display: flex;
+  --remux-terminal-key-gap: 7px;
   min-width: 0;
   width: 100%;
-  max-width: none;
+  height: 36px;
   align-items: center;
-  gap: 7px;
+  gap: var(--remux-terminal-key-gap);
+}
+
+.remux-terminal-key-fixed,
+.remux-terminal-key-scroll {
+  display: flex;
+  align-items: center;
+  gap: var(--remux-terminal-key-gap);
+}
+
+.remux-terminal-key-fixed {
+  flex: 0 0 auto;
+}
+
+.remux-terminal-key-scroll {
+  min-width: 0;
+  flex: 1 1 auto;
+  max-width: none;
   overflow-x: auto;
   overflow-y: hidden;
-  padding: 0 1px 3px;
+  padding: 0 1px;
+  overscroll-behavior-x: contain;
+  -ms-overflow-style: none;
   scrollbar-width: none;
   -webkit-overflow-scrolling: touch;
 }
@@ -176,8 +196,8 @@ body {
     padding-left: 6px;
   }
 
-  .remux-terminal-key-scroll {
-    gap: 6px;
+  .remux-terminal-key-row {
+    --remux-terminal-key-gap: 6px;
   }
 
   .remux-terminal-key.remux-extension-action-button {

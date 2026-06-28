@@ -32,3 +32,4 @@ Canonical code: ...
 | Spec | Status | Notes |
 | --- | --- | --- |
 | [terminal/phase-1.md](terminal/phase-1.md) | Active Spec | Phase 1 mobile-first terminal extension design. |
+| [terminal/phase-2-validation.md](terminal/phase-2-validation.md) | Active Spec | Validation harness and hardening plan for terminal reliability. |
