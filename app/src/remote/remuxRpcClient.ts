@@ -18,6 +18,7 @@ type PendingRequest = {
 type RemuxConnectionClosedPhase = 'closed' | 'send';
 
 type RemuxRpcClientOptions = {
+  connectTimeoutMs?: number;
   onMessage?: (message: RemuxRpcMessage) => void;
   onStatus?: (status: RemuxRpcStatus) => void;
   url: string;
@@ -51,6 +52,8 @@ export class RemuxConnectionClosedError extends Error {
 }
 
 export class RemuxRpcClient {
+  private connectAbort: ((reason: string) => void) | null = null;
+  private connectPromise: Promise<void> | null = null;
   private nextId = 1;
   private pending = new Map<JsonRpcId, PendingRequest>();
   private sendBlockedLog = { lastLoggedAtMs: 0, suppressedCount: 0 };
@@ -60,22 +63,78 @@ export class RemuxRpcClient {
 
   connect() {
     if (this.socket) {
-      return Promise.resolve();
+      return this.connectPromise ?? Promise.resolve();
     }
 
     this.options.onStatus?.({ type: 'connecting' });
     logRemuxDebug('socket:connect:start', this.options.url);
 
-    return new Promise<void>((resolve, reject) => {
+    const connectTimeoutMs = this.options.connectTimeoutMs ?? 8000;
+    const promise = new Promise<void>((resolve, reject) => {
       let settled = false;
+      let timeout: ReturnType<typeof setTimeout> | null = null;
       const socket = new WebSocket(this.options.url);
       this.socket = socket;
 
+      const clearConnectTimeout = () => {
+        if (timeout !== null) {
+          clearTimeout(timeout);
+          timeout = null;
+        }
+      };
+
+      const settleConnected = () => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        clearConnectTimeout();
+        this.connectAbort = null;
+        this.connectPromise = null;
+        resolve();
+      };
+
+      const settleRejected = (error: Error) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        clearConnectTimeout();
+        this.connectAbort = null;
+        this.connectPromise = null;
+        reject(error);
+      };
+
+      this.connectAbort = (reason) => {
+        const error = new Error(reason);
+        if (this.socket === socket) {
+          this.socket = null;
+        }
+
+        settleRejected(error);
+        try {
+          socket.close();
+        } catch (closeError) {
+          logRemuxDebug('socket:close-request:failed', errorMessage(closeError));
+        }
+      };
+
+      timeout = setTimeout(() => {
+        const message = `WebSocket connection timed out after ${connectTimeoutMs}ms`;
+        this.options.onStatus?.({ message, type: 'error' });
+        logRemuxDebug('socket:connect:timeout', {
+          timeoutMs: connectTimeoutMs,
+          url: this.options.url,
+        });
+        this.connectAbort?.(message);
+      }, connectTimeoutMs);
+
       socket.onopen = () => {
         logRemuxDebug('socket:open', this.options.url);
-        settled = true;
         this.options.onStatus?.({ type: 'connected' });
-        resolve();
+        settleConnected();
       };
 
       socket.onmessage = (event) => {
@@ -90,15 +149,14 @@ export class RemuxRpcClient {
         const error = new Error('WebSocket connection failed');
         this.options.onStatus?.({ message: error.message, type: 'error' });
         logRemuxDebug('socket:error', error.message);
-        if (!settled) {
-          settled = true;
-          reject(error);
-        }
+        settleRejected(error);
       };
 
       socket.onclose = (event) => {
         this.rejectAll(`WebSocket closed (${event.code})`);
-        this.socket = null;
+        if (this.socket === socket) {
+          this.socket = null;
+        }
         const reason = event.reason || `code ${event.code}`;
         this.options.onStatus?.({ reason, type: 'closed' });
         logRemuxDebug('socket:close', {
@@ -106,20 +164,26 @@ export class RemuxRpcClient {
           reason: event.reason || null,
           wasClean: event.wasClean,
         });
-        if (!settled) {
-          settled = true;
-          reject(new Error(event.reason || `WebSocket closed (${event.code})`));
-        }
+        settleRejected(new Error(event.reason || `WebSocket closed (${event.code})`));
       };
     });
+
+    this.connectPromise = promise;
+    return promise;
   }
 
-  close() {
-    this.rejectAll('WebSocket closed');
-    logRemuxDebug('socket:close-request');
+  close(reason = 'WebSocket closed') {
+    this.rejectAll(reason);
+    logRemuxDebug('socket:close-request', {
+      reason,
+      readyState: this.socket?.readyState ?? null,
+    });
+    this.connectAbort?.(reason);
+    this.connectAbort = null;
+    this.connectPromise = null;
     this.socket?.close();
     this.socket = null;
-    this.options.onStatus?.({ type: 'closed' });
+    this.options.onStatus?.({ reason, type: 'closed' });
   }
 
   isOpen() {
@@ -261,6 +325,10 @@ function jsonRpcError(error: Record<string, unknown>, method: string) {
     message: typeof error.message === 'string' ? error.message : 'Unknown JSON-RPC error',
   };
   return new Error(`${method} failed (${normalized.code}): ${normalized.message}`);
+}
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

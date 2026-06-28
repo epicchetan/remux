@@ -26,9 +26,14 @@ import {
 const reconnectDelaysMs = [400, 900, 1800, 3500, 5000];
 const remuxSystemInfoMethod = 'remux/system/info';
 const remuxSystemInfoTimeoutMs = 2_000;
+const remuxWebSocketConnectTimeoutMs = 6_000;
 const requestReconnectWaitMs = 8000;
 const maxRequestReconnectRetries = 1;
 const maxPendingLogEntries = 200;
+
+type ReconnectOptions = {
+  immediate?: boolean;
+};
 
 type ConnectedWaiter = {
   reject: (error: Error) => void;
@@ -144,9 +149,21 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
     resolveConnectedWaiters(client);
   }, [flushPendingLogEntries, resolveConnectedWaiters, setConnectionStatus]);
 
-  const scheduleReconnect = useCallback((generation: number, reason: string) => {
-    if (!shouldReconnectRef.current || reconnectTimerRef.current !== null) {
+  const scheduleReconnect = useCallback((
+    generation: number,
+    reason: string,
+    options: ReconnectOptions = {},
+  ) => {
+    if (!shouldReconnectRef.current) {
       return;
+    }
+
+    if (reconnectTimerRef.current !== null) {
+      if (!options.immediate) {
+        return;
+      }
+
+      clearReconnectTimer();
     }
 
     const attempt = reconnectAttemptRef.current + 1;
@@ -154,10 +171,12 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
     setError(reason);
     setConnectionStatus({ attempt, type: 'reconnecting' });
 
-    const delay = reconnectDelaysMs[Math.min(attempt - 1, reconnectDelaysMs.length - 1)]!;
+    const baseDelay = reconnectDelaysMs[Math.min(attempt - 1, reconnectDelaysMs.length - 1)]!;
+    const delay = options.immediate ? 0 : baseDelay;
     logRemuxDebug('connection:reconnect:scheduled', {
       attempt,
       delayMs: delay,
+      immediate: options.immediate === true,
       reason,
     });
     reconnectTimerRef.current = setTimeout(() => {
@@ -166,7 +185,7 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
         void openConnectionRef.current?.();
       }
     }, delay);
-  }, [setConnectionStatus]);
+  }, [clearReconnectTimer, setConnectionStatus]);
 
   const openConnection = useCallback(async () => {
     if (!settingsLoaded) {
@@ -234,6 +253,7 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
             break;
         }
       },
+      connectTimeoutMs: remuxWebSocketConnectTimeoutMs,
       url: wsUrl,
     });
 
@@ -258,14 +278,20 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
 
   openConnectionRef.current = openConnection;
 
-  const markClientConnectionLost = useCallback((client: RemuxRpcClient, reason: string) => {
+  const markClientConnectionLost = useCallback((
+    client: RemuxRpcClient,
+    reason: string,
+    options: ReconnectOptions = {},
+  ) => {
     if (clientRef.current !== client) {
       return;
     }
 
     clientRef.current = null;
+    logRemuxDebug('connection:client:discarded', { reason });
+    client.close(reason);
     if (shouldReconnectRef.current) {
-      scheduleReconnect(generationRef.current, reason);
+      scheduleReconnect(generationRef.current, reason, options);
     } else {
       setConnectionStatus({ type: 'disconnected' });
       rejectConnectedWaiters(reason);
@@ -283,14 +309,12 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
     }
 
     if (client) {
-      markClientConnectionLost(client, 'App resumed with closed WebSocket');
+      markClientConnectionLost(client, 'App resumed with closed WebSocket', { immediate: true });
       return;
     }
 
-    if (reconnectTimerRef.current === null) {
-      void openConnectionRef.current?.();
-    }
-  }, [markClientConnectionLost, settingsLoaded]);
+    scheduleReconnect(generationRef.current, 'App resumed without WebSocket', { immediate: true });
+  }, [markClientConnectionLost, scheduleReconnect, settingsLoaded]);
 
   useEffect(() => {
     setRemuxDebugSink((entry) => {
@@ -366,7 +390,7 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
     }
 
     if (client && statusRef.current.type === 'connected' && !client.isOpen()) {
-      markClientConnectionLost(client, 'Connected client socket is closed');
+      markClientConnectionLost(client, 'Connected client socket is closed', { immediate: true });
     }
 
     if (!shouldReconnectRef.current) {
@@ -407,7 +431,7 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
           shouldReconnectRef.current
         ) {
           retryCount += 1;
-          markClientConnectionLost(client, requestError.message);
+          markClientConnectionLost(client, requestError.message, { immediate: true });
           logRemuxDebug('connection:request:retry-after-reconnect', {
             method,
             phase: requestError.phase,
