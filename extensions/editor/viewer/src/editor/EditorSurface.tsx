@@ -1,4 +1,4 @@
-import { openHostOverview, reloadHostView } from '@remux/extension-api/host';
+import { openHostOverview, reloadHostView, updateHostTab } from '@remux/extension-api/host';
 import type { RemuxViewerRoute } from '@remux/extension-api/route';
 import {
   ExtensionActionBar,
@@ -53,6 +53,10 @@ export function EditorSurface({ route }: EditorSurfaceProps) {
       setShowDiff(false);
     }
   }, [hasDiff]);
+
+  useEffect(() => {
+    void updateHostTab(fileTabMetadata({ activeFile, filePath })).catch(() => undefined);
+  }, [activeFile, filePath]);
 
   useEffect(() => () => {
     if (copiedTimeoutRef.current !== null) {
@@ -230,10 +234,62 @@ function fileInfoText({
   return null;
 }
 
+function fileTabMetadata({
+  activeFile,
+  filePath,
+}: {
+  activeFile: ReturnType<typeof useEditorStore.getState>['activeFile'];
+  filePath: string | null;
+}) {
+  if (activeFile.status === 'ready') {
+    return {
+      status: formatSize(activeFile.sizeBytes),
+      subtitle: parentPath(activeFile.path),
+      title: activeFile.name,
+    };
+  }
+
+  if (activeFile.status === 'unsupported') {
+    return {
+      status: activeFile.tooLarge ? 'Too large' : activeFile.isBinary ? 'Binary file' : 'Unsupported',
+      subtitle: parentPath(activeFile.path),
+      title: activeFile.name,
+    };
+  }
+
+  if (activeFile.status === 'loading') {
+    return {
+      status: 'Reading',
+      subtitle: parentPath(activeFile.path),
+      title: basename(activeFile.path),
+    };
+  }
+
+  if (activeFile.status === 'error') {
+    return {
+      status: 'Error',
+      subtitle: parentPath(activeFile.path),
+      title: basename(activeFile.path),
+    };
+  }
+
+  return {
+    status: null,
+    subtitle: filePath ? parentPath(filePath) : null,
+    title: filePath ? basename(filePath) : 'Editor',
+  };
+}
+
 function basename(path: string) {
-  const normalized = path.replace(/\/+$/u, '');
-  const parts = normalized.split('/');
+  const normalized = path.replace(/[\\/]+$/u, '');
+  const parts = normalized.split(/[\\/]/u);
   return parts.at(-1) || normalized;
+}
+
+function parentPath(path: string) {
+  const normalized = path.replace(/[\\/]+$/u, '');
+  const index = Math.max(normalized.lastIndexOf('/'), normalized.lastIndexOf('\\'));
+  return index > 0 ? normalized.slice(0, index) : null;
 }
 
 async function copyText(text: string) {

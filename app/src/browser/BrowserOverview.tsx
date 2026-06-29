@@ -102,7 +102,12 @@ export function BrowserOverview({
                   >
                     <View style={styles.tabHeader}>
                       <TabIcon tab={tab} />
-                      <Text numberOfLines={1} style={styles.tabTitle}>{tab.title}</Text>
+                      <View style={styles.tabTitleBlock}>
+                        <Text numberOfLines={1} style={styles.tabTitle}>{tab.title}</Text>
+                        {tabSecondaryText(tab) ? (
+                          <Text numberOfLines={1} style={styles.tabSubtitle}>{tabSecondaryText(tab)}</Text>
+                        ) : null}
+                      </View>
                       <Pressable
                         accessibilityLabel={`Close ${tab.title}`}
                         accessibilityRole="button"
@@ -278,7 +283,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: '#272729',
     flexDirection: 'row',
-    gap: 4,
+    gap: 6,
     height: tabHeaderHeight,
     paddingHorizontal: 8,
   },
@@ -301,6 +306,17 @@ const styles = StyleSheet.create({
     fontWeight: '900',
     lineHeight: 11,
   },
+  tabSubtitle: {
+    color: '#a7a7ad',
+    fontSize: 10,
+    fontWeight: '500',
+    lineHeight: 12,
+  },
+  tabTitleBlock: {
+    flex: 1,
+    justifyContent: 'center',
+    minWidth: 0,
+  },
   tabPreviewImage: {
     backgroundColor: '#111112',
     bottom: 0,
@@ -311,7 +327,6 @@ const styles = StyleSheet.create({
   },
   tabTitle: {
     color: '#f1f1f3',
-    flex: 1,
     fontSize: 12,
     fontWeight: '700',
     lineHeight: 14,
@@ -320,4 +335,15 @@ const styles = StyleSheet.create({
 
 function tabIconText(title: string) {
   return title.trim().slice(0, 1).toUpperCase() || 'R';
+}
+
+function tabSecondaryText(tab: BrowserTab) {
+  const subtitle = tab.subtitle?.trim() ?? '';
+  const status = tab.status?.trim() ?? '';
+
+  if (subtitle && status && subtitle !== status) {
+    return `${subtitle} - ${status}`;
+  }
+
+  return subtitle || status || null;
 }

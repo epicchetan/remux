@@ -170,6 +170,8 @@ export type ExtensionTabUpdate = {
   launch?: string | null;
   resourceId?: string | null;
   resourceKind?: string | null;
+  status?: string | null;
+  subtitle?: string | null;
   title?: string | null;
 };
 
@@ -190,6 +192,7 @@ true;
 
 const healthPingTimeoutMs = 1500;
 const maxAutomaticReloadAttempts = 2;
+const previewKeyboardSettleTimeoutMs = 600;
 const webViewReadyTimeoutMs = 8000;
 
 type HealthPingWaiter = {
@@ -210,6 +213,7 @@ type ExtensionWebViewProps = {
 
 export type ExtensionWebViewHandle = {
   dismissKeyboard: () => void;
+  prepareForPreviewCapture: () => Promise<boolean>;
 };
 
 export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebViewProps>(function ExtensionWebView(
@@ -400,9 +404,28 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
     setTimeout(postViewportMetrics, 120);
   }, [captureWebViewFrame, postViewportMetrics]);
 
+  const prepareForPreviewCapture = useCallback(async () => {
+    const keyboardWasVisible = keyboardFrameRef.current.visible;
+    dismissKeyboard();
+
+    if (keyboardWasVisible) {
+      const keyboardSettled = await waitForKeyboardToHide(previewKeyboardSettleTimeoutMs);
+      await waitForAnimationFrames(2);
+      captureWebViewFrame();
+      postViewportMetrics();
+      return keyboardSettled && !keyboardFrameRef.current.visible;
+    }
+
+    await waitForAnimationFrames(2);
+    captureWebViewFrame();
+    postViewportMetrics();
+    return true;
+  }, [captureWebViewFrame, dismissKeyboard, postViewportMetrics]);
+
   useImperativeHandle(ref, () => ({
     dismissKeyboard,
-  }), [dismissKeyboard]);
+    prepareForPreviewCapture,
+  }), [dismissKeyboard, prepareForPreviewCapture]);
 
   const pickAttachments = useCallback(async (params?: HostAttachmentPickParams): Promise<HostAttachmentPickResult> => {
     if (params?.picker === 'photo-library') {
@@ -1126,6 +1149,8 @@ function parseTabUpdateParams(params: unknown): ExtensionTabUpdate {
     launch: parseOptionalStringOrNull(params.launch),
     resourceId: parseOptionalStringOrNull(params.resourceId),
     resourceKind: parseOptionalStringOrNull(params.resourceKind),
+    status: parseOptionalStringOrNull(params.status),
+    subtitle: parseOptionalStringOrNull(params.subtitle),
     title: parseOptionalStringOrNull(params.title),
   };
 }
@@ -1171,6 +1196,41 @@ function parseOptionalStringOrNull(value: unknown) {
   }
 
   return typeof value === 'string' ? value : undefined;
+}
+
+function waitForAnimationFrames(count: number) {
+  return new Promise<void>((resolve) => {
+    const wait = (remaining: number) => {
+      if (remaining <= 0) {
+        resolve();
+        return;
+      }
+
+      requestAnimationFrame(() => wait(remaining - 1));
+    };
+
+    wait(count);
+  });
+}
+
+function waitForKeyboardToHide(timeoutMs: number) {
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    let subscription: { remove: () => void };
+    const finish = (hidden: boolean) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      clearTimeout(timer);
+      subscription.remove();
+      resolve(hidden);
+    };
+    timer = setTimeout(() => finish(false), timeoutMs);
+    subscription = Keyboard.addListener('keyboardDidHide', () => finish(true));
+  });
 }
 
 function shouldAllowWebViewNavigation({

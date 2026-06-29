@@ -312,7 +312,6 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
         await updateHostTab({
           resourceId: attached.sessionId,
           resourceKind: 'terminalSession',
-          title: 'Terminal',
         });
 
         if (attached.status === 'exited') {
@@ -344,7 +343,6 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     await updateHostTab({
       resourceId: started.sessionId,
       resourceKind: 'terminalSession',
-      title: 'Terminal',
     });
     setStatus({
       cwd: started.cwd,
@@ -705,6 +703,10 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   useEffect(() => {
     tmuxAttachedRef.current = tmuxContext?.mode === 'attached';
   }, [tmuxContext?.mode]);
+
+  useEffect(() => {
+    void updateHostTab(terminalTabMetadata(status, sessionId, tmuxContext)).catch(() => undefined);
+  }, [sessionId, status, tmuxContext]);
 
   useEffect(() => {
     const unsubscribe = subscribeHostViewportMetrics((metrics) => updateKeyboardOffset(metrics));
@@ -1336,6 +1338,63 @@ function activeTmuxState(context: TerminalTmuxContext): ActiveTmuxState | null {
     socket: preferredSocket,
     window,
   };
+}
+
+function terminalTabMetadata(
+  status: TerminalStatus,
+  sessionId: string | null,
+  tmuxContext: TerminalTmuxContext | null,
+) {
+  const tmux = tmuxContext?.mode === 'attached' ? activeTmuxState(tmuxContext) : null;
+  const pane = tmux?.window?.panes.find((candidate) => candidate.active) ?? tmux?.window?.panes[0] ?? null;
+  const cwd = pane?.currentPath || (status.type === 'running' ? status.cwd : null);
+  const command = pane?.currentCommand || (status.type === 'running' ? shellName(status.shell) : null);
+
+  if (status.type === 'connecting') {
+    return {
+      status: 'Starting',
+      subtitle: sessionId,
+      title: 'Terminal',
+    };
+  }
+
+  if (status.type === 'exited') {
+    return {
+      status: status.signal ? `Exited: ${status.signal}` : `Exited ${status.code ?? 0}`,
+      subtitle: sessionId,
+      title: cwd ? basename(cwd) : 'Terminal',
+    };
+  }
+
+  if (status.type === 'error') {
+    return {
+      status: 'Error',
+      subtitle: status.message,
+      title: 'Terminal',
+    };
+  }
+
+  return {
+    status: tmux ? tmuxTabStatus(tmux, command) : command,
+    subtitle: cwd || sessionId,
+    title: cwd ? basename(cwd) : command || 'Terminal',
+  };
+}
+
+function tmuxTabStatus(tmux: ActiveTmuxState, command: string | null) {
+  const windowName = tmux.window ? `${tmux.window.index}:${tmux.window.name}` : null;
+  const base = windowName ? `tmux ${tmux.session.name}/${windowName}` : `tmux ${tmux.session.name}`;
+  return command ? `${base} - ${command}` : base;
+}
+
+function basename(path: string) {
+  const normalized = path.replace(/[\\/]+$/u, '');
+  const parts = normalized.split(/[\\/]/u);
+  return parts.at(-1) || normalized;
+}
+
+function shellName(shell: string) {
+  return basename(shell) || shell || null;
 }
 
 function preferredTerminalSessionId(route: RemuxViewerRoute) {

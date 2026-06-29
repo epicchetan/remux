@@ -14,6 +14,8 @@ export type HostTabUpdate = {
   launch?: string | null;
   resourceId?: string | null;
   resourceKind?: string | null;
+  status?: string | null;
+  subtitle?: string | null;
   title?: string | null;
 };
 

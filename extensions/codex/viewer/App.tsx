@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent } from 'react';
 
+import type { CodexThreadRuntimeStatus } from '../shared/threads';
 import { ComposerContent } from './composer/content';
 import { composerResourcesFromSnapshot } from './composer/model/userInputInterop';
 import { ComposerMentionPicker } from './composer/mentions/MentionPicker';
@@ -26,11 +27,12 @@ export function App() {
   const hostViewportMetrics = useHostStore((state) => state.hostViewportMetrics);
   const activeDraftId = useThreadsStore((state) => state.activeDraftId);
   const activeThreadId = useThreadsStore((state) => state.activeThreadId);
-  const activeThreadTitle = useThreadHistoryStore((state) => (
+  const activeThreadSummary = useThreadHistoryStore((state) => (
     activeThreadId && state.threadsById[activeThreadId]
-      ? threadTitle(state.threadsById[activeThreadId])
+      ? state.threadsById[activeThreadId]
       : null
   ));
+  const activeThreadTitle = activeThreadSummary ? threadTitle(activeThreadSummary) : null;
   const latestThread = useThreadHistoryStore((state) => {
     const threadId = state.threadOrder[0];
     return threadId ? state.threadsById[threadId] ?? null : null;
@@ -40,6 +42,7 @@ export function App() {
   const newChatDefaultCwd = latestThreadDefaultCwd ?? hostDefaultCwd;
   const ensureThreadSummary = useThreadHistoryStore((state) => state.ensureThreadSummary);
   const activeThreadComposerPreference = useThreadComposerStateStore((state) => state.preference);
+  const activeThreadRuntimeStatus = useThreadRuntimeStore((state) => state.status);
   const setRuntimeThreadId = useThreadRuntimeStore((state) => state.setActiveThreadId);
   const setComposerStateThreadId = useThreadComposerStateStore((state) => state.setActiveThreadId);
   const directoryPickerOpen = useThreadsStore((state) => state.directoryPickerOpen);
@@ -422,9 +425,11 @@ export function App() {
     void syncCodexTabLocation({
       resourceId: activeThreadId,
       resourceKind: 'thread',
-      title: activeThreadTitle,
+      status: codexRuntimeStatusLabel(activeThreadRuntimeStatus),
+      subtitle: activeThreadSummary?.cwd ? shortenPath(activeThreadSummary.cwd) : null,
+      title: activeThreadTitle ?? 'Codex',
     }).catch(() => undefined);
-  }, [activeThreadId, activeThreadTitle, ensureThreadSummary]);
+  }, [activeThreadId, activeThreadRuntimeStatus, activeThreadSummary?.cwd, activeThreadTitle, ensureThreadSummary]);
 
   useEffect(() => {
     if (!activeDraftId) {
@@ -434,9 +439,11 @@ export function App() {
     void syncCodexTabLocation({
       resourceId: activeDraftId,
       resourceKind: 'draft',
-      title: 'Codex',
+      status: 'Draft',
+      subtitle: activeDraftCwd ? shortenPath(activeDraftCwd) : null,
+      title: 'New chat',
     }).catch(() => undefined);
-  }, [activeDraftId]);
+  }, [activeDraftCwd, activeDraftId]);
 
   return (
     <main
@@ -527,12 +534,27 @@ function attachCodexResource(resource: CodexLaunchResource) {
 type CodexTabLocation = {
   resourceId: string;
   resourceKind: string;
+  status?: string | null;
+  subtitle?: string | null;
   title: string | null;
 };
 
 async function syncCodexTabLocation(location: CodexTabLocation) {
   replaceCodexLocation(location);
   await updateHostTab({ ...location, launch: null });
+}
+
+function codexRuntimeStatusLabel(status: CodexThreadRuntimeStatus) {
+  switch (status) {
+    case 'failed':
+      return 'Failed';
+    case 'running':
+      return 'Working';
+    case 'stopping':
+      return 'Stopping';
+    case 'ready':
+      return null;
+  }
 }
 
 function replaceCodexLocation({ resourceId, resourceKind }: CodexTabLocation) {

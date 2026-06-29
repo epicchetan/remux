@@ -18,7 +18,6 @@ import { useBrowserStore } from './browserStore';
 import type { BrowserSection } from './browserTypes';
 
 export function BrowserShell() {
-  const activeTabId = useBrowserStore((state) => state.activeTabId);
   const catalogOrigin = useBrowserStore((state) => state.catalogOrigin);
   const catalogStatus = useBrowserStore((state) => state.catalogStatus);
   const loadExtensions = useBrowserStore((state) => state.loadExtensions);
@@ -30,10 +29,24 @@ export function BrowserShell() {
   const remuxPort = useRemuxSettingsStore((state) => state.port);
   const remuxOrigin = remuxOriginFromSettings({ host: remuxHost, port: remuxPort });
   const activeSurfaceRef = useRef<ExtensionWebViewHandle | null>(null);
+  const previewCaptureSerialRef = useRef(0);
   const surfaceShotRef = useRef<View | null>(null);
 
-  const captureActiveTabPreview = useCallback(async () => {
-    if (!activeTabId || !surfaceShotRef.current) {
+  const refreshTabPreview = useCallback(async (tabId: string) => {
+    const captureSerial = previewCaptureSerialRef.current + 1;
+    previewCaptureSerialRef.current = captureSerial;
+
+    const prepared = await (activeSurfaceRef.current?.prepareForPreviewCapture() ?? Promise.resolve(true));
+    if (!prepared || previewCaptureSerialRef.current !== captureSerial) {
+      return;
+    }
+
+    const currentState = useBrowserStore.getState();
+    if (
+      currentState.activeTabId !== tabId ||
+      !currentState.tabs.some((tab) => tab.id === tabId) ||
+      !surfaceShotRef.current
+    ) {
       return;
     }
 
@@ -44,17 +57,24 @@ export function BrowserShell() {
         quality: 0.72,
         result: 'tmpfile',
       });
-      await setTabPreview(activeTabId, previewUri);
+      if (
+        previewCaptureSerialRef.current === captureSerial &&
+        useBrowserStore.getState().activeTabId === tabId
+      ) {
+        await setTabPreview(tabId, previewUri);
+      }
     } catch {
       // Snapshot support can vary by native view type; the tab card has a fallback.
     }
-  }, [activeTabId, setTabPreview]);
+  }, [setTabPreview]);
 
   const openHostOverview = useCallback(async (section?: BrowserSection) => {
-    activeSurfaceRef.current?.dismissKeyboard();
-    await captureActiveTabPreview();
+    const tabId = useBrowserStore.getState().activeTabId;
     openOverview(section);
-  }, [captureActiveTabPreview, openOverview]);
+    if (tabId) {
+      void refreshTabPreview(tabId);
+    }
+  }, [openOverview, refreshTabPreview]);
 
   useEffect(() => {
     if (
