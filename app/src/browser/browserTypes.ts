@@ -17,7 +17,6 @@ export type ViewerTab = {
   resourceId: string | null;
   resourceKind: string | null;
   status: string | null;
-  subtitle: string | null;
   title: string;
   url: string;
   viewId: string;
@@ -32,7 +31,6 @@ export type BrowserTabTarget = {
   resourceId?: string | null;
   resourceKind?: string | null;
   status?: string | null;
-  subtitle?: string | null;
   title?: string | null;
   viewId?: string | null;
 };

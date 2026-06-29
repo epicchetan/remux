@@ -1353,7 +1353,6 @@ function terminalTabMetadata(
   if (status.type === 'connecting') {
     return {
       status: 'Starting',
-      subtitle: sessionId,
       title: 'Terminal',
     };
   }
@@ -1361,7 +1360,6 @@ function terminalTabMetadata(
   if (status.type === 'exited') {
     return {
       status: status.signal ? `Exited: ${status.signal}` : `Exited ${status.code ?? 0}`,
-      subtitle: sessionId,
       title: cwd ? basename(cwd) : 'Terminal',
     };
   }
@@ -1369,14 +1367,12 @@ function terminalTabMetadata(
   if (status.type === 'error') {
     return {
       status: 'Error',
-      subtitle: status.message,
       title: 'Terminal',
     };
   }
 
   return {
     status: tmux ? tmuxTabStatus(tmux, command) : command,
-    subtitle: cwd || sessionId,
     title: cwd ? basename(cwd) : command || 'Terminal',
   };
 }

@@ -426,10 +426,9 @@ export function App() {
       resourceId: activeThreadId,
       resourceKind: 'thread',
       status: codexRuntimeStatusLabel(activeThreadRuntimeStatus),
-      subtitle: activeThreadSummary?.cwd ? shortenPath(activeThreadSummary.cwd) : null,
       title: activeThreadTitle ?? 'Codex',
     }).catch(() => undefined);
-  }, [activeThreadId, activeThreadRuntimeStatus, activeThreadSummary?.cwd, activeThreadTitle, ensureThreadSummary]);
+  }, [activeThreadId, activeThreadRuntimeStatus, activeThreadTitle, ensureThreadSummary]);
 
   useEffect(() => {
     if (!activeDraftId) {
@@ -440,10 +439,9 @@ export function App() {
       resourceId: activeDraftId,
       resourceKind: 'draft',
       status: 'Draft',
-      subtitle: activeDraftCwd ? shortenPath(activeDraftCwd) : null,
       title: 'New chat',
     }).catch(() => undefined);
-  }, [activeDraftCwd, activeDraftId]);
+  }, [activeDraftId]);
 
   return (
     <main
@@ -535,7 +533,6 @@ type CodexTabLocation = {
   resourceId: string;
   resourceKind: string;
   status?: string | null;
-  subtitle?: string | null;
   title: string | null;
 };
 

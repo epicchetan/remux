@@ -24,7 +24,6 @@ export type PersistedViewerTab = {
   resourceId: string | null;
   resourceKind: string | null;
   status: string | null;
-  subtitle: string | null;
   title: string;
   viewId: string;
 };
@@ -66,7 +65,6 @@ export function browserSessionSnapshot({
       resourceId: tab.resourceId,
       resourceKind: tab.resourceKind,
       status: tab.status,
-      subtitle: tab.subtitle,
       title: tab.title,
       viewId: tab.viewId,
     })),
@@ -124,7 +122,6 @@ function parseViewerTab(value: unknown): PersistedViewerTab | null {
     resourceId: stringOrNull(value.resourceId),
     resourceKind: stringOrNull(value.resourceKind),
     status: stringOrNull(value.status),
-    subtitle: stringOrNull(value.subtitle),
     title,
     viewId,
   };

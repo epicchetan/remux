@@ -104,8 +104,8 @@ export function BrowserOverview({
                       <TabIcon tab={tab} />
                       <View style={styles.tabTitleBlock}>
                         <Text numberOfLines={1} style={styles.tabTitle}>{tab.title}</Text>
-                        {tabSecondaryText(tab) ? (
-                          <Text numberOfLines={1} style={styles.tabSubtitle}>{tabSecondaryText(tab)}</Text>
+                        {tabStatusText(tab) ? (
+                          <Text numberOfLines={1} style={styles.tabStatus}>{tabStatusText(tab)}</Text>
                         ) : null}
                       </View>
                       <Pressable
@@ -306,7 +306,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
     lineHeight: 11,
   },
-  tabSubtitle: {
+  tabStatus: {
     color: '#a7a7ad',
     fontSize: 10,
     fontWeight: '500',
@@ -337,13 +337,7 @@ function tabIconText(title: string) {
   return title.trim().slice(0, 1).toUpperCase() || 'R';
 }
 
-function tabSecondaryText(tab: BrowserTab) {
-  const subtitle = tab.subtitle?.trim() ?? '';
+function tabStatusText(tab: BrowserTab) {
   const status = tab.status?.trim() ?? '';
-
-  if (subtitle && status && subtitle !== status) {
-    return `${subtitle} - ${status}`;
-  }
-
-  return subtitle || status || null;
+  return status || null;
 }

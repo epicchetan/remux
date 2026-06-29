@@ -171,7 +171,6 @@ export type ExtensionTabUpdate = {
   resourceId?: string | null;
   resourceKind?: string | null;
   status?: string | null;
-  subtitle?: string | null;
   title?: string | null;
 };
 
@@ -1150,7 +1149,6 @@ function parseTabUpdateParams(params: unknown): ExtensionTabUpdate {
     resourceId: parseOptionalStringOrNull(params.resourceId),
     resourceKind: parseOptionalStringOrNull(params.resourceKind),
     status: parseOptionalStringOrNull(params.status),
-    subtitle: parseOptionalStringOrNull(params.subtitle),
     title: parseOptionalStringOrNull(params.title),
   };
 }

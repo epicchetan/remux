@@ -50,7 +50,6 @@ export type BrowserOpenExtensionTabOptions = {
   resourceKind?: string | null;
   launch?: string | null;
   status?: string | null;
-  subtitle?: string | null;
   title?: string | null;
   viewId?: string | null;
 };
@@ -70,7 +69,6 @@ type BrowserTabUpdate = {
   resourceId?: string | null;
   resourceKind?: string | null;
   status?: string | null;
-  subtitle?: string | null;
   title?: string | null;
 };
 
@@ -309,7 +307,6 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
           resourceId: patch.resourceId === undefined ? tab.resourceId : patch.resourceId,
           resourceKind: patch.resourceKind === undefined ? tab.resourceKind : patch.resourceKind,
           status: optionalMetadataValue(tab.status, patch.status),
-          subtitle: optionalMetadataValue(tab.subtitle, patch.subtitle),
           title: patch.title?.trim() || tab.title,
         };
 
@@ -351,7 +348,6 @@ function normalizeBrowserTabTarget(
     resourceId: target.resourceId?.trim() || null,
     resourceKind: target.resourceKind?.trim() || null,
     status: target.status?.trim() || null,
-    subtitle: target.subtitle?.trim() || null,
     title: target.title?.trim() || extension.display.title,
     viewId: extension.views[viewId] ? viewId : 'main',
   };
@@ -406,7 +402,6 @@ function createViewerTab(extension: RemuxExtension, options: BrowserOpenExtensio
     resourceId,
     resourceKind,
     status: options.status?.trim() || null,
-    subtitle: options.subtitle?.trim() || null,
     title: options.title?.trim() || extension.display.title,
     viewId: extension.views[viewId] ? viewId : 'main',
   };
@@ -439,7 +434,6 @@ function createRestoredViewerTab(
     resourceId: tab.resourceId,
     resourceKind: tab.resourceKind,
     status: tab.status?.trim() || null,
-    subtitle: tab.subtitle?.trim() || null,
     title: tab.title.trim() || extension.display.title,
     viewId: extension.views[tab.viewId] ? tab.viewId : 'main',
   };

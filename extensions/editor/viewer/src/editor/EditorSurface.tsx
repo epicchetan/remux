@@ -244,7 +244,6 @@ function fileTabMetadata({
   if (activeFile.status === 'ready') {
     return {
       status: formatSize(activeFile.sizeBytes),
-      subtitle: parentPath(activeFile.path),
       title: activeFile.name,
     };
   }
@@ -252,7 +251,6 @@ function fileTabMetadata({
   if (activeFile.status === 'unsupported') {
     return {
       status: activeFile.tooLarge ? 'Too large' : activeFile.isBinary ? 'Binary file' : 'Unsupported',
-      subtitle: parentPath(activeFile.path),
       title: activeFile.name,
     };
   }
@@ -260,7 +258,6 @@ function fileTabMetadata({
   if (activeFile.status === 'loading') {
     return {
       status: 'Reading',
-      subtitle: parentPath(activeFile.path),
       title: basename(activeFile.path),
     };
   }
@@ -268,14 +265,12 @@ function fileTabMetadata({
   if (activeFile.status === 'error') {
     return {
       status: 'Error',
-      subtitle: parentPath(activeFile.path),
       title: basename(activeFile.path),
     };
   }
 
   return {
     status: null,
-    subtitle: filePath ? parentPath(filePath) : null,
     title: filePath ? basename(filePath) : 'Editor',
   };
 }
@@ -284,12 +279,6 @@ function basename(path: string) {
   const normalized = path.replace(/[\\/]+$/u, '');
   const parts = normalized.split(/[\\/]/u);
   return parts.at(-1) || normalized;
-}
-
-function parentPath(path: string) {
-  const normalized = path.replace(/[\\/]+$/u, '');
-  const index = Math.max(normalized.lastIndexOf('/'), normalized.lastIndexOf('\\'));
-  return index > 0 ? normalized.slice(0, index) : null;
 }
 
 async function copyText(text: string) {

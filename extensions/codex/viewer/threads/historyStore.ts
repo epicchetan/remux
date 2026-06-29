@@ -48,22 +48,27 @@ let state: ThreadHistoryStoreState = {
 };
 
 export const useThreadHistoryStore: UseThreadHistoryStore = (selector, isEqual = Object.is) => {
-  const [selected, setSelected] = useState(() => selector(state));
-  const selectedRef = useRef(selected);
+  const selectedRef = useRef<{ value: ReturnType<typeof selector> } | null>(null);
+  const [, setRevision] = useState(0);
   const selectorRef = useRef(selector);
   const isEqualRef = useRef(isEqual);
 
   selectorRef.current = selector;
   isEqualRef.current = isEqual;
 
+  const selected = selector(state);
+  if (selectedRef.current === null || !isEqualRef.current(selectedRef.current.value, selected)) {
+    selectedRef.current = { value: selected };
+  }
+
   useEffect(() => {
     const listener = () => {
       const next = selectorRef.current(state);
-      if (isEqualRef.current(selectedRef.current, next)) {
+      if (selectedRef.current !== null && isEqualRef.current(selectedRef.current.value, next)) {
         return;
       }
-      selectedRef.current = next;
-      setSelected(next);
+      selectedRef.current = { value: next };
+      setRevision((revision) => revision + 1);
     };
 
     listeners.add(listener);
@@ -73,7 +78,7 @@ export const useThreadHistoryStore: UseThreadHistoryStore = (selector, isEqual =
     };
   }, []);
 
-  return selected;
+  return selectedRef.current.value;
 };
 
 async function loadThreadHistory(options: { preserveReady?: boolean } = {}) {
