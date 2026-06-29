@@ -4,7 +4,7 @@ export const bottomBarPaddingTop = 12;
 export const tabCardBorderWidth = 2;
 export const tabGridGap = 16;
 export const tabGridHorizontalPadding = 20;
-export const tabHeaderHeight = 38;
+export const tabHeaderHeight = 24;
 export const tabPreviewAspectRatio = 0.68;
 
 export function getBottomBarHeight(bottomInset: number) {

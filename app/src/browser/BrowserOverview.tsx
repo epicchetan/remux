@@ -100,15 +100,10 @@ export function BrowserOverview({
                       tab.id === hiddenTabId ? styles.hiddenTabCard : null,
                     ]}
                   >
-                    <View style={styles.tabHeader}>
-                      <TabIcon tab={tab} />
-                      <View style={styles.tabTitleBlock}>
-                        <Text numberOfLines={1} style={styles.tabTitle}>{tab.title}</Text>
-                        {tabStatusText(tab) ? (
-                          <Text numberOfLines={1} style={styles.tabStatus}>{tabStatusText(tab)}</Text>
-                        ) : null}
-                      </View>
-                      <Pressable
+	                    <View style={styles.tabHeader}>
+	                      <TabIcon tab={tab} />
+	                      <Text numberOfLines={1} style={styles.tabTitle}>{tab.title}</Text>
+	                      <Pressable
                         accessibilityLabel={`Close ${tab.title}`}
                         accessibilityRole="button"
                         hitSlop={10}
@@ -279,14 +274,14 @@ const styles = StyleSheet.create({
   tabScroller: {
     flex: 1,
   },
-  tabHeader: {
-    alignItems: 'center',
-    backgroundColor: '#272729',
-    flexDirection: 'row',
-    gap: 6,
-    height: tabHeaderHeight,
-    paddingHorizontal: 8,
-  },
+	  tabHeader: {
+	    alignItems: 'center',
+	    backgroundColor: '#272729',
+	    flexDirection: 'row',
+	    gap: 4,
+	    height: tabHeaderHeight,
+	    paddingHorizontal: 8,
+	  },
   tabIcon: {
     alignItems: 'center',
     backgroundColor: '#3a3a3d',
@@ -306,18 +301,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
     lineHeight: 11,
   },
-  tabStatus: {
-    color: '#a7a7ad',
-    fontSize: 10,
-    fontWeight: '500',
-    lineHeight: 12,
-  },
-  tabTitleBlock: {
-    flex: 1,
-    justifyContent: 'center',
-    minWidth: 0,
-  },
-  tabPreviewImage: {
+	  tabPreviewImage: {
     backgroundColor: '#111112',
     bottom: 0,
     left: 0,
@@ -325,19 +309,15 @@ const styles = StyleSheet.create({
     right: 0,
     width: '100%',
   },
-  tabTitle: {
-    color: '#f1f1f3',
-    fontSize: 12,
-    fontWeight: '700',
-    lineHeight: 14,
-  },
+	  tabTitle: {
+	    color: '#f1f1f3',
+	    flex: 1,
+	    fontSize: 12,
+	    fontWeight: '700',
+	    lineHeight: 14,
+	  },
 });
 
 function tabIconText(title: string) {
   return title.trim().slice(0, 1).toUpperCase() || 'R';
-}
-
-function tabStatusText(tab: BrowserTab) {
-  const status = tab.status?.trim() ?? '';
-  return status || null;
 }
