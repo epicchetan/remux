@@ -2,6 +2,7 @@ import {
   dismissHostKeyboard,
   getHostViewportMetrics,
   openHostOverview,
+  readHostClipboardText,
   reloadHostView,
   type RemuxHostViewportMetrics,
   subscribeHostViewportMetrics,
@@ -25,16 +26,20 @@ import {
   ArrowRight,
   ArrowUp,
   Check,
+  Copy,
+  Eraser,
   ClipboardPaste,
   CornerDownLeft,
   Keyboard,
   KeyboardOff,
   LogOut,
+  Menu,
   MoreHorizontal,
   NotebookTabs,
   PanelRightOpen,
   Plus,
   RefreshCw,
+  TextSelect,
   X,
 } from 'lucide-react';
 import {
@@ -112,6 +117,16 @@ type TerminalShellState = {
   title: string | null;
 };
 
+type TerminalSelectionPoint = {
+  column: number;
+  row: number;
+};
+
+type TerminalSelectionDrag = {
+  anchor: TerminalSelectionPoint;
+  pointerId: number;
+};
+
 const emptyShellState: TerminalShellState = {
   command: null,
   commandStartedAt: null,
@@ -133,12 +148,18 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   const modifierTimerRef = useRef<number | null>(null);
   const commandTitleTimerRef = useRef<number | null>(null);
   const suppressedTerminalDataWritesRef = useRef(0);
+  const keyboardOpenRef = useRef(false);
+  const lastTerminalTapMsRef = useRef(Number.NEGATIVE_INFINITY);
+  const selectionDragRef = useRef<TerminalSelectionDrag | null>(null);
+  const selectionModeRef = useRef(false);
   const tmuxAttachedRef = useRef(false);
   const [altActive, setAltActive] = useState(false);
   const [ctrlActive, setCtrlActive] = useState(false);
   const [shiftActive, setShiftActive] = useState(false);
   const [keyboardOffset, setKeyboardOffset] = useState(0);
   const [keyboardOpen, setKeyboardOpen] = useState(false);
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectionText, setSelectionText] = useState('');
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [shellState, setShellState] = useState<TerminalShellState>(emptyShellState);
   const [status, setStatus] = useState<TerminalStatus>({ type: 'connecting' });
@@ -170,6 +191,14 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
 
     return clearModifierTimer;
   }, [altActive, clearModifierTimer, ctrlActive, resetModifiers, shiftActive]);
+
+  useEffect(() => {
+    keyboardOpenRef.current = keyboardOpen;
+  }, [keyboardOpen]);
+
+  useEffect(() => {
+    selectionModeRef.current = selectionMode;
+  }, [selectionMode]);
 
   const currentSize = useCallback(() => {
     const terminal = terminalRef.current;
@@ -451,7 +480,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
 
   const pasteClipboard = useCallback(async () => {
     try {
-      const text = await navigator.clipboard.readText();
+      const text = await readClipboardText();
       if (text) {
         sendText(text, { clearModifiers: true });
       }
@@ -516,14 +545,13 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     void dismissHostKeyboard().catch(() => undefined);
   }, [helperTextarea]);
 
-  const toggleKeyboard = useCallback(() => {
-    const textarea = helperTextarea();
-    if (!textarea) {
+  const openKeyboard = useCallback(() => {
+    if (selectionModeRef.current || keyboardOpenRef.current) {
       return;
     }
 
-    if (keyboardOpen) {
-      closeKeyboard();
+    const textarea = helperTextarea();
+    if (!textarea) {
       return;
     }
 
@@ -538,7 +566,140 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       textarea.style.transform = '';
     }, 0);
     setKeyboardOpen(true);
-  }, [closeKeyboard, helperTextarea, keyboardOpen]);
+  }, [helperTextarea]);
+
+  const toggleKeyboard = useCallback(() => {
+    if (keyboardOpenRef.current) {
+      closeKeyboard();
+      return;
+    }
+
+    openKeyboard();
+  }, [closeKeyboard, openKeyboard]);
+
+  const handleTerminalTap = useCallback(() => {
+    if (selectionModeRef.current) {
+      return;
+    }
+
+    const now = performance.now();
+    if (now - lastTerminalTapMsRef.current < 250) {
+      return;
+    }
+
+    lastTerminalTapMsRef.current = now;
+    toggleKeyboard();
+  }, [toggleKeyboard]);
+
+  const refreshSelectionState = useCallback(() => {
+    const terminal = terminalRef.current;
+    setSelectionText(terminal?.hasSelection() ? terminal.getSelection() : '');
+  }, []);
+
+  const clearTerminalSelection = useCallback(() => {
+    selectionDragRef.current = null;
+    terminalRef.current?.clearSelection();
+    setSelectionText('');
+  }, []);
+
+  const exitSelectionMode = useCallback(() => {
+    selectionDragRef.current = null;
+    setSelectionMode(false);
+    terminalRef.current?.clearSelection();
+    setSelectionText('');
+  }, []);
+
+  const enterSelectionMode = useCallback(() => {
+    closeKeyboard();
+    resetModifiers();
+    selectionDragRef.current = null;
+    terminalRef.current?.clearSelection();
+    setSelectionText('');
+    setSelectionMode(true);
+  }, [closeKeyboard, resetModifiers]);
+
+  const copyTerminalSelection = useCallback(async () => {
+    const text = terminalRef.current?.getSelection() || selectionText;
+    if (!text) {
+      return;
+    }
+
+    await writeClipboardText(text);
+    exitSelectionMode();
+  }, [exitSelectionMode, selectionText]);
+
+  const handleTerminalClick = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    if (selectionModeRef.current || event.defaultPrevented) {
+      return;
+    }
+
+    handleTerminalTap();
+  }, [handleTerminalTap]);
+
+  const handleSelectionPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!selectionModeRef.current || (event.pointerType === 'mouse' && event.button !== 0)) {
+      return;
+    }
+
+    const terminal = terminalRef.current;
+    const container = containerRef.current;
+    const point = terminalSelectionPoint(terminal, container, event.clientX, event.clientY);
+    if (!terminal || !point) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    selectionDragRef.current = {
+      anchor: point,
+      pointerId: event.pointerId,
+    };
+
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Pointer capture is best-effort; move/up handlers still cover normal browsers.
+    }
+
+    selectTerminalRange(terminal, point, point);
+    refreshSelectionState();
+  }, [refreshSelectionState]);
+
+  const handleSelectionPointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = selectionDragRef.current;
+    if (!selectionModeRef.current || !drag || drag.pointerId !== event.pointerId) {
+      return;
+    }
+
+    const terminal = terminalRef.current;
+    const point = terminalSelectionPoint(terminal, containerRef.current, event.clientX, event.clientY);
+    if (!terminal || !point) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    selectTerminalRange(terminal, drag.anchor, point);
+    refreshSelectionState();
+  }, [refreshSelectionState]);
+
+  const handleSelectionPointerEnd = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = selectionDragRef.current;
+    if (!selectionModeRef.current || !drag || drag.pointerId !== event.pointerId) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    selectionDragRef.current = null;
+    try {
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+    } catch {
+      // Ignore browsers that do not expose capture state for synthetic events.
+    }
+  }, []);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -619,6 +780,10 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       fitTerminal();
 
       terminal.attachCustomKeyEventHandler((event) => {
+        if (selectionModeRef.current) {
+          return false;
+        }
+
         if (event.type === 'keydown' && event.key === 'Enter' && event.shiftKey) {
           sendText(terminalKeySequences.shiftEnter, { clearModifiers: true });
           return false;
@@ -628,7 +793,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       });
 
       const dataDisposable = terminal.onData((data) => {
-        if (suppressedTerminalDataWritesRef.current > 0) {
+        if (selectionModeRef.current || suppressedTerminalDataWritesRef.current > 0) {
           return;
         }
 
@@ -637,6 +802,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       const resizeDisposable = terminal.onResize(({ cols, rows }) => {
         sendResize(cols, rows);
       });
+      const selectionDisposable = terminal.onSelectionChange(refreshSelectionState);
       const titleDisposable = terminal.onTitleChange(handleTerminalTitle);
       const osc633Disposable = terminal.parser.registerOscHandler(633, handleShellIntegrationSequence);
       const osc7Disposable = terminal.parser.registerOscHandler(7, (data) => (
@@ -647,7 +813,8 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       ));
 
       cleanupTouch = setupTouchScroll(terminalContainer, terminal, sendBytes, {
-        disabled: () => tmuxAttachedRef.current,
+        disabled: () => tmuxAttachedRef.current || selectionModeRef.current,
+        onTap: handleTerminalTap,
       });
       resizeObserver = new ResizeObserver(() => scheduleFit());
       resizeObserver.observe(terminalContainer);
@@ -659,6 +826,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       if (disposed) {
         dataDisposable.dispose();
         resizeDisposable.dispose();
+        selectionDisposable.dispose();
         titleDisposable.dispose();
         osc633Disposable.dispose();
         osc7Disposable.dispose();
@@ -672,6 +840,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       return () => {
         dataDisposable.dispose();
         resizeDisposable.dispose();
+        selectionDisposable.dispose();
         titleDisposable.dispose();
         osc633Disposable.dispose();
         osc7Disposable.dispose();
@@ -708,8 +877,10 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     fitTerminal,
     handleCurrentDirectory,
     handleShellIntegrationSequence,
+    handleTerminalTap,
     handleTerminalTitle,
     helperTextarea,
+    refreshSelectionState,
     scheduleFit,
     sendBytes,
     sendResize,
@@ -877,11 +1048,25 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   return (
     <main className="remux-terminal-shell" style={terminalShellStyle(keyboardOffset)}>
       <section className="remux-terminal-stage">
-        <div className="remux-terminal-container" ref={containerRef} />
+        <div
+          className={[
+            'remux-terminal-container',
+            selectionMode ? 'is-selecting' : '',
+          ].filter(Boolean).join(' ')}
+          onClickCapture={handleTerminalClick}
+          onPointerCancelCapture={handleSelectionPointerEnd}
+          onPointerDownCapture={handleSelectionPointerDown}
+          onPointerMoveCapture={handleSelectionPointerMove}
+          onPointerUpCapture={handleSelectionPointerEnd}
+          ref={containerRef}
+        />
         <TerminalOverlay status={status} />
       </section>
       <ExtensionActionBar
-        className="remux-terminal-action-bar"
+        className={[
+          'remux-terminal-action-bar',
+          keyboardOffset > 0 ? 'is-keyboard-offset' : '',
+        ].filter(Boolean).join(' ')}
         left={(
           <div className="remux-terminal-action-stack">
             {tmuxContext?.mode === 'attached' ? (
@@ -895,70 +1080,93 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
                 <TerminalKey label="Open tabs" onPress={() => void openHostOverview()}>
                   <PanelRightOpen />
                 </TerminalKey>
-                <TerminalKey
-                  label={keyboardOpen ? 'Hide keyboard' : 'Show keyboard'}
-                  onPress={toggleKeyboard}
-                >
-                  {keyboardOpen ? <KeyboardOff /> : <Keyboard />}
-                </TerminalKey>
+                <TerminalActionMenu
+                  keyboardOpen={keyboardOpen}
+                  onEnterSelectionMode={enterSelectionMode}
+                  onExitSelectionMode={exitSelectionMode}
+                  onPaste={() => void pasteClipboard()}
+                  onReload={() => void reloadHostView()}
+                  onRestart={restartSession}
+                  onToggleKeyboard={toggleKeyboard}
+                  selectionMode={selectionMode}
+                  status={status}
+                />
               </div>
               <div className="remux-terminal-key-scroll">
-                <TerminalKey label="Escape" onPress={() => sendText(terminalKeySequences.escape, { clearModifiers: true })}>
-                  <span className="remux-terminal-key-text">Esc</span>
-                </TerminalKey>
-                <TerminalKey label="Tab" onPress={sendTab}>
-                  <span className="remux-terminal-key-text">Tab</span>
-                </TerminalKey>
-                <TerminalKey
-                  active={shiftActive}
-                  label="Sticky shift"
-                  onPress={() => setShiftActive((value) => !value)}
-                >
-                  <span className="remux-terminal-key-text">Shift</span>
-                </TerminalKey>
-                <TerminalKey
-                  active={ctrlActive}
-                  label="Sticky control"
-                  onPress={() => setCtrlActive((value) => !value)}
-                >
-                  <span className="remux-terminal-key-text">Ctrl</span>
-                </TerminalKey>
-                <TerminalKey
-                  active={altActive}
-                  label="Sticky alt"
-                  onPress={() => setAltActive((value) => !value)}
-                >
-                  <span className="remux-terminal-key-text">Alt</span>
-                </TerminalKey>
-                <TerminalKey label="Arrow up" onPress={() => sendArrow('A')}>
-                  <ArrowUp />
-                </TerminalKey>
-                <TerminalKey label="Arrow down" onPress={() => sendArrow('B')}>
-                  <ArrowDown />
-                </TerminalKey>
-                <TerminalKey label="Arrow left" onPress={() => sendArrow('D')}>
-                  <ArrowLeft />
-                </TerminalKey>
-                <TerminalKey label="Arrow right" onPress={() => sendArrow('C')}>
-                  <ArrowRight />
-                </TerminalKey>
-                <TerminalKey label="Enter" onPress={sendEnter}>
-                  <CornerDownLeft />
-                </TerminalKey>
-                <TerminalKey label="Control C" onPress={() => sendBytes(terminalControlCBytes(), { clearModifiers: true })}>
-                  <span className="remux-terminal-key-text">^C</span>
-                </TerminalKey>
-                <TerminalKey label="Paste" onPress={() => void pasteClipboard()}>
-                  <ClipboardPaste />
-                </TerminalKey>
-                <TerminalKey label="Reload viewer" onPress={() => void reloadHostView()}>
-                  <RefreshCw />
-                </TerminalKey>
-                {status.type === 'error' || status.type === 'exited' ? (
-                  <TerminalKey label="Start new shell" onPress={restartSession}>
-                    <RefreshCw />
-                  </TerminalKey>
-                ) : null}
+                {selectionMode ? (
+                  <>
+                    <TerminalKey
+                      disabled={!selectionText}
+                      label="Copy selection"
+                      onPress={() => void copyTerminalSelection()}
+                    >
+                      <Copy />
+                    </TerminalKey>
+                    <TerminalKey
+                      disabled={!selectionText}
+                      label="Clear selection"
+                      onPress={clearTerminalSelection}
+                    >
+                      <Eraser />
+                    </TerminalKey>
+                    <TerminalKey label="Done selecting" onPress={exitSelectionMode}>
+                      <Check />
+                    </TerminalKey>
+                  </>
+                ) : (
+                  <>
+                    <TerminalKey label="Escape" onPress={() => sendText(terminalKeySequences.escape, { clearModifiers: true })}>
+                      <span className="remux-terminal-key-text">Esc</span>
+                    </TerminalKey>
+                    <TerminalKey label="Tab" onPress={sendTab}>
+                      <span className="remux-terminal-key-text">Tab</span>
+                    </TerminalKey>
+                    <TerminalKey
+                      active={shiftActive}
+                      label="Sticky shift"
+                      onPress={() => setShiftActive((value) => !value)}
+                    >
+                      <span className="remux-terminal-key-text">Shift</span>
+                    </TerminalKey>
+                    <TerminalKey
+                      active={ctrlActive}
+                      label="Sticky control"
+                      onPress={() => setCtrlActive((value) => !value)}
+                    >
+                      <span className="remux-terminal-key-text">Ctrl</span>
+                    </TerminalKey>
+                    <TerminalKey
+                      active={altActive}
+                      label="Sticky alt"
+                      onPress={() => setAltActive((value) => !value)}
+                    >
+                      <span className="remux-terminal-key-text">Alt</span>
+                    </TerminalKey>
+                    <TerminalKey label="Arrow up" onPress={() => sendArrow('A')}>
+                      <ArrowUp />
+                    </TerminalKey>
+                    <TerminalKey label="Arrow down" onPress={() => sendArrow('B')}>
+                      <ArrowDown />
+                    </TerminalKey>
+                    <TerminalKey label="Arrow left" onPress={() => sendArrow('D')}>
+                      <ArrowLeft />
+                    </TerminalKey>
+                    <TerminalKey label="Arrow right" onPress={() => sendArrow('C')}>
+                      <ArrowRight />
+                    </TerminalKey>
+                    <TerminalKey label="Enter" onPress={sendEnter}>
+                      <CornerDownLeft />
+                    </TerminalKey>
+                    <TerminalKey label="Control C" onPress={() => sendBytes(terminalControlCBytes(), { clearModifiers: true })}>
+                      <span className="remux-terminal-key-text">^C</span>
+                    </TerminalKey>
+                    {status.type === 'error' || status.type === 'exited' ? (
+                      <TerminalKey label="Start new shell" onPress={restartSession}>
+                        <RefreshCw />
+                      </TerminalKey>
+                    ) : null}
+                  </>
+                )}
               </div>
             </div>
           </div>
@@ -983,6 +1191,70 @@ type TerminalTmuxRunAction = (
 ) => Promise<void> | void;
 
 type TerminalRepeatPressKind = 'repeat' | 'tap';
+
+function TerminalActionMenu({
+  keyboardOpen,
+  onEnterSelectionMode,
+  onExitSelectionMode,
+  onPaste,
+  onReload,
+  onRestart,
+  onToggleKeyboard,
+  selectionMode,
+  status,
+}: {
+  keyboardOpen: boolean;
+  onEnterSelectionMode: () => void;
+  onExitSelectionMode: () => void;
+  onPaste: () => void;
+  onReload: () => void;
+  onRestart: () => void;
+  onToggleKeyboard: () => void;
+  selectionMode: boolean;
+  status: TerminalStatus;
+}) {
+  return (
+    <ExtensionActionMenu
+      align="start"
+      className="remux-terminal-action-menu"
+      icon={<Menu />}
+      label="Terminal menu"
+      panelClassName="remux-terminal-action-menu-panel"
+      preserveFocus
+      triggerClassName="remux-terminal-key"
+    >
+      <ExtensionActionMenuItem
+        disabled={selectionMode}
+        icon={keyboardOpen ? <KeyboardOff /> : <Keyboard />}
+        label={keyboardOpen ? 'Hide keyboard' : 'Show keyboard'}
+        onSelect={onToggleKeyboard}
+      />
+      <ExtensionActionMenuItem
+        icon={selectionMode ? <X /> : <TextSelect />}
+        label={selectionMode ? 'Exit selection' : 'Select text'}
+        onSelect={selectionMode ? onExitSelectionMode : onEnterSelectionMode}
+      />
+      <ExtensionActionMenuItem
+        disabled={selectionMode}
+        icon={<ClipboardPaste />}
+        label="Paste"
+        onSelect={onPaste}
+      />
+      <ExtensionActionMenuItem
+        icon={<RefreshCw />}
+        label="Reload viewer"
+        onSelect={onReload}
+      />
+      {status.type === 'error' || status.type === 'exited' ? (
+        <ExtensionActionMenuItem
+          icon={<RefreshCw />}
+          label="Start new shell"
+          onSelect={onRestart}
+        />
+      ) : null}
+    </ExtensionActionMenu>
+  );
+}
 
 function TerminalTmuxControls({
   context,
@@ -1212,12 +1484,14 @@ function TerminalKey({
   active,
   children,
   className,
+  disabled,
   label,
   onPress,
 }: {
   active?: boolean;
   children: ReactNode;
   className?: string;
+  disabled?: boolean;
   label: string;
   onPress: () => void;
 }) {
@@ -1228,6 +1502,7 @@ function TerminalKey({
         active ? 'is-active' : '',
         className ?? '',
       ].filter(Boolean).join(' ')}
+      disabled={disabled}
       icon={children}
       label={label}
       onClick={onPress}
@@ -1440,6 +1715,116 @@ function activeTmuxState(context: TerminalTmuxContext): ActiveTmuxState | null {
     socket: preferredSocket,
     window,
   };
+}
+
+function terminalSelectionPoint(
+  terminal: Terminal | null,
+  container: HTMLElement | null,
+  clientX: number,
+  clientY: number,
+): TerminalSelectionPoint | null {
+  if (!terminal || !container || terminal.cols <= 0 || terminal.rows <= 0) {
+    return null;
+  }
+
+  const screen = container.querySelector('.xterm-screen') as HTMLElement | null;
+  const rect = screen?.getBoundingClientRect();
+  if (!rect || rect.width <= 0 || rect.height <= 0) {
+    return null;
+  }
+
+  const cellWidth = rect.width / terminal.cols;
+  const cellHeight = rect.height / terminal.rows;
+  if (cellWidth <= 0 || cellHeight <= 0) {
+    return null;
+  }
+
+  const column = clampSelectionValue(
+    Math.ceil((clientX - rect.left + cellWidth / 2) / cellWidth) - 1,
+    0,
+    terminal.cols,
+  );
+  const visibleRow = clampSelectionValue(
+    Math.ceil((clientY - rect.top) / cellHeight) - 1,
+    0,
+    terminal.rows - 1,
+  );
+
+  return {
+    column,
+    row: terminal.buffer.active.viewportY + visibleRow,
+  };
+}
+
+function selectTerminalRange(
+  terminal: Terminal,
+  anchor: TerminalSelectionPoint,
+  focus: TerminalSelectionPoint,
+) {
+  const cols = terminal.cols;
+  if (cols <= 0) {
+    return;
+  }
+
+  const bufferEnd = Math.max(1, terminal.buffer.active.length * cols);
+  const anchorLinear = clampSelectionValue((anchor.row * cols) + anchor.column, 0, bufferEnd);
+  const focusLinear = clampSelectionValue((focus.row * cols) + focus.column, 0, bufferEnd);
+  const startLinear = Math.min(Math.min(anchorLinear, focusLinear), bufferEnd - 1);
+  const endLinear = Math.max(anchorLinear, focusLinear);
+  const length = Math.max(1, Math.min(bufferEnd - startLinear, endLinear - startLinear || 1));
+
+  terminal.select(startLinear % cols, Math.floor(startLinear / cols), length);
+}
+
+function clampSelectionValue(value: number, min: number, max: number) {
+  if (!Number.isFinite(value)) {
+    return min;
+  }
+
+  return Math.max(min, Math.min(max, Math.floor(value)));
+}
+
+async function writeClipboardText(text: string) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // Fall back for WebView contexts where Clipboard API exists but rejects.
+    }
+  }
+
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', '');
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  textarea.style.pointerEvents = 'none';
+  document.body.append(textarea);
+  textarea.select();
+
+  try {
+    document.execCommand('copy');
+  } finally {
+    textarea.remove();
+  }
+}
+
+async function readClipboardText() {
+  try {
+    const result = await readHostClipboardText();
+    if (result.text) {
+      return result.text;
+    }
+  } catch {
+    // Fall back for browser contexts without a Remux host clipboard bridge.
+  }
+
+  try {
+    return await navigator.clipboard.readText();
+  } catch {
+    return '';
+  }
 }
 
 function terminalTabMetadata(

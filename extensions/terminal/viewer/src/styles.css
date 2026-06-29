@@ -59,6 +59,11 @@ body {
   user-select: none;
 }
 
+.remux-terminal-container.is-selecting,
+.remux-terminal-container.is-selecting .xterm {
+  cursor: crosshair;
+}
+
 .remux-terminal-container .xterm {
   height: 100%;
   padding: 0;
@@ -113,6 +118,10 @@ body {
   justify-content: flex-start;
   margin-bottom: var(--remux-terminal-keyboard-offset);
   transition: margin-bottom 140ms ease;
+}
+
+.remux-terminal-action-bar.is-keyboard-offset {
+  --remux-extension-bottom-pad: 10px;
 }
 
 .remux-terminal-action-bar .remux-extension-action-group {
@@ -247,6 +256,10 @@ body {
 
 .remux-terminal-tmux-action-menu-panel {
   width: min(184px, calc(100vw - 28px));
+}
+
+.remux-terminal-action-menu-panel {
+  width: min(196px, calc(100vw - 28px));
 }
 
 .remux-terminal-tmux-session-menu-panel {

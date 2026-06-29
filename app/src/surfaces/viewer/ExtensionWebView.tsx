@@ -1,4 +1,5 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
+import * as Clipboard from 'expo-clipboard';
 import * as DocumentPicker from 'expo-document-picker';
 import { File } from 'expo-file-system';
 import * as ImagePicker from 'expo-image-picker';
@@ -633,6 +634,28 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
               result: hostViewportMetrics(),
               type: 'remux/response',
             }, { epoch: requestEpoch });
+            break;
+          }
+
+          if (message.method === 'host/clipboard/read') {
+            void Clipboard.getStringAsync()
+              .then((text) => {
+                postToWebView({
+                  id: message.id,
+                  result: { text },
+                  type: 'remux/response',
+                }, { epoch: requestEpoch });
+              })
+              .catch((requestError) => {
+                postToWebView({
+                  error: {
+                    code: -32000,
+                    message: errorMessage(requestError),
+                  },
+                  id: message.id,
+                  type: 'remux/error',
+                }, { epoch: requestEpoch });
+              });
             break;
           }
 

@@ -29,6 +29,7 @@ type TerminalHostMock = {
 declare global {
   interface Window {
     __remuxTerminalAttachReplay?: Array<{ dataBase64: string; seq: number }>;
+    __remuxTerminalClipboardText?: string;
     __remuxTerminalInitialTmuxContext?: unknown;
     __remuxTerminalHost?: TerminalHostMock;
   }
@@ -53,11 +54,11 @@ test.describe('terminal viewer route', () => {
     const fixedKeys = page.locator('.remux-terminal-key-fixed');
     const scrollKeys = page.locator('.remux-terminal-key-scroll');
     await expect(keyRow).toBeVisible();
-    await expect(keyRow.locator('.remux-terminal-key')).toHaveCount(15);
+    await expect(keyRow.locator('.remux-terminal-key')).toHaveCount(13);
     await expect(fixedKeys.locator('.remux-terminal-key')).toHaveCount(2);
     await expect(fixedKeys.locator('.remux-terminal-key').nth(0)).toHaveAttribute('aria-label', 'Open tabs');
-    await expect(fixedKeys.locator('.remux-terminal-key').nth(1)).toHaveAttribute('aria-label', 'Show keyboard');
-    await expect(scrollKeys.locator('.remux-terminal-key')).toHaveCount(13);
+    await expect(fixedKeys.locator('.remux-terminal-key').nth(1)).toHaveAttribute('aria-label', 'Terminal menu');
+    await expect(scrollKeys.locator('.remux-terminal-key')).toHaveCount(11);
 
     const rowMetrics = await scrollKeys.evaluate((element) => ({
       clientWidth: element.clientWidth,
@@ -97,12 +98,76 @@ test.describe('terminal viewer route', () => {
     expect(centerDelta).toBeLessThanOrEqual(1.5);
   });
 
-  test('requests a host reload from the terminal action row', async ({ page }) => {
+  test('requests a host reload from the terminal menu', async ({ page }) => {
     await page.goto('/?remuxLaunch=new-terminal');
     await waitForHostRequest(page, 'remux/terminal/session/start');
 
-    await page.getByLabel('Reload viewer').click();
+    await page.getByLabel('Terminal menu').click();
+    await page.getByRole('menuitem', { name: 'Reload viewer' }).click();
     await waitForHostRequest(page, 'host/view/reload');
+  });
+
+  test('toggles keyboard by tapping the terminal viewport', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+
+    await page.locator('.remux-terminal-container').click({ position: { x: 24, y: 24 } });
+    await page.getByLabel('Terminal menu').click();
+    await expect(page.getByRole('menuitem', { name: 'Hide keyboard' })).toBeVisible();
+
+    await page.getByRole('menuitem', { name: 'Hide keyboard' }).click();
+    await waitForHostRequest(page, 'host/keyboard/dismiss');
+
+    await page.getByLabel('Terminal menu').click();
+    await expect(page.getByRole('menuitem', { name: 'Show keyboard' })).toBeVisible();
+  });
+
+  test('pastes from the terminal menu', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+    await page.evaluate(() => navigator.clipboard.writeText('echo remux'));
+
+    const writeCount = await hostRequestCount(page, 'remux/terminal/session/write');
+    await page.getByLabel('Terminal menu').click();
+    await page.getByRole('menuitem', { name: 'Paste' }).click();
+
+    await waitForHostRequest(page, 'host/clipboard/read');
+    const writeRequest = await waitForHostRequest(page, 'remux/terminal/session/write', writeCount + 1);
+    const writeParams = recordParams(writeRequest);
+    expect(Buffer.from(String(writeParams.dataBase64), 'base64').toString('utf8')).toBe('echo remux');
+  });
+
+  test('selects terminal text and copies it from selection mode', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    const startRequest = await waitForHostRequest(page, 'remux/terminal/session/start');
+    const startParams = recordParams(startRequest);
+
+    await sendTerminalOutput(page, 1, 'hello world\r\n');
+    await page.waitForTimeout(100);
+
+    await page.getByLabel('Terminal menu').click();
+    await page.getByRole('menuitem', { name: 'Select text' }).click();
+    await expect(page.locator('.remux-terminal-container')).toHaveClass(/is-selecting/);
+    await expect(page.getByLabel('Copy selection')).toBeDisabled();
+
+    const screenBox = await page.locator('.xterm-screen').boundingBox();
+    expect(screenBox).not.toBeNull();
+    const cols = Number(startParams.cols);
+    const rows = Number(startParams.rows);
+    expect(cols).toBeGreaterThan(0);
+    expect(rows).toBeGreaterThan(0);
+    const cellWidth = screenBox!.width / cols;
+    const cellHeight = screenBox!.height / rows;
+    const y = screenBox!.y + cellHeight * 0.5;
+    await page.mouse.move(screenBox!.x + cellWidth * 0.1, y);
+    await page.mouse.down();
+    await page.mouse.move(screenBox!.x + cellWidth * 4.6, y, { steps: 5 });
+    await page.mouse.up();
+
+    await expect(page.getByLabel('Copy selection')).toBeEnabled();
+    await page.getByLabel('Copy selection').click();
+    await expect(page.locator('.remux-terminal-container')).not.toHaveClass(/is-selecting/);
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('hello');
   });
 
   test('publishes a compact tab title without action bar footer status', async ({ page }) => {
@@ -170,6 +235,8 @@ test.describe('terminal viewer route', () => {
 
     const actionBar = page.locator('.remux-terminal-action-bar');
     await expect(actionBar).toHaveCSS('margin-bottom', `${keyboardHeight}px`);
+    await expect(actionBar).toHaveCSS('padding-top', '10px');
+    await expect(actionBar).toHaveCSS('padding-bottom', '10px');
     await page.waitForFunction((height) => {
       const bar = document.querySelector('.remux-terminal-action-bar');
       if (!bar) {
@@ -478,6 +545,7 @@ test.describe('terminal viewer route', () => {
 async function installMockRemuxHost(page: Page) {
   await page.addInitScript(() => {
     const state = {
+      clipboardText: '',
       metrics: {
         keyboardHeight: 0,
         keyboardVisible: false,
@@ -490,6 +558,18 @@ async function installMockRemuxHost(page: Page) {
       sessionId: 'mock-terminal-session',
       tmuxContext: null as unknown,
     };
+
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        readText: () => Promise.resolve(state.clipboardText),
+        writeText: (text: string) => {
+          state.clipboardText = text;
+          window.__remuxTerminalClipboardText = text;
+          return Promise.resolve();
+        },
+      },
+    });
 
     function dispatch(message: unknown) {
       const event = new MessageEvent('message', {
@@ -577,6 +657,10 @@ async function installMockRemuxHost(page: Page) {
         case 'remux/terminal/session/resize':
         case 'remux/terminal/session/write':
           postResult(request, { ok: true });
+          return;
+
+        case 'host/clipboard/read':
+          postResult(request, { text: state.clipboardText });
           return;
 
         case 'host/viewport/get':

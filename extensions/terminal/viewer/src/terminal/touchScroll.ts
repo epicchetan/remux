@@ -18,7 +18,7 @@ export function setupTouchScroll(
   container: HTMLElement,
   term: Terminal,
   sendInput: (data: Uint8Array) => void,
-  options: { disabled?: () => boolean } = {},
+  options: { disabled?: () => boolean; onTap?: () => void } = {},
 ) {
   let cellHeight = container.clientHeight / Math.max(term.rows, 1);
   let scrollAccum = 0;
@@ -97,6 +97,10 @@ export function setupTouchScroll(
   }
 
   function onTouchStart(event: TouchEvent) {
+    if (options.disabled?.()) {
+      return;
+    }
+
     const touch = event.touches[0];
     if (!touch) {
       return;
@@ -113,6 +117,10 @@ export function setupTouchScroll(
   }
 
   function onTouchMove(event: TouchEvent) {
+    if (options.disabled?.()) {
+      return;
+    }
+
     const touch = event.touches[0];
     if (!touch) {
       return;
@@ -132,6 +140,10 @@ export function setupTouchScroll(
   }
 
   function onTouchEnd(event: TouchEvent) {
+    if (options.disabled?.()) {
+      return;
+    }
+
     const touch = event.changedTouches[0];
     if (!touch) {
       return;
@@ -140,6 +152,8 @@ export function setupTouchScroll(
     const elapsed = Date.now() - touchStartTime;
     const distance = Math.abs(touch.clientY - touchStartY);
     if (elapsed < tapMaxDurationMs && distance < tapMaxDistancePx) {
+      options.onTap?.();
+      event.preventDefault();
       return;
     }
 

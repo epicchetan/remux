@@ -31,6 +31,10 @@ export function dismissHostKeyboard() {
   return requestIpc('host/keyboard/dismiss', undefined, 1_000);
 }
 
+export function readHostClipboardText() {
+  return requestIpc<{ text: string }>('host/clipboard/read', undefined, 3_000);
+}
+
 export function getHostViewportMetrics() {
   return requestIpc<RemuxHostViewportMetrics>('host/viewport/get', undefined, 1_000);
 }
