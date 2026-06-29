@@ -33,3 +33,4 @@ Canonical code: ...
 | --- | --- | --- |
 | [terminal/phase-1.md](terminal/phase-1.md) | Active Spec | Phase 1 mobile-first terminal extension design. |
 | [terminal/phase-2-validation.md](terminal/phase-2-validation.md) | Active Spec | Validation harness and hardening plan for terminal reliability. |
+| [terminal/phase-3-local-tmux.md](terminal/phase-3-local-tmux.md) | Active Spec | Local tmux detection, session/window/pane context, and mobile tmux controls. |

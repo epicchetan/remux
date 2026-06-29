@@ -1,6 +1,9 @@
 import { useCallback, useRef, type ReactNode } from 'react';
 
 export type ExtensionActionButtonProps = {
+  ariaExpanded?: boolean;
+  ariaHasPopup?: boolean | 'menu';
+  activationDebounceMs?: number;
   busy?: boolean;
   className?: string;
   disabled?: boolean;
@@ -12,6 +15,9 @@ export type ExtensionActionButtonProps = {
 };
 
 export function ExtensionActionButton({
+  ariaExpanded,
+  ariaHasPopup,
+  activationDebounceMs = 350,
   busy,
   className,
   disabled,
@@ -24,16 +30,18 @@ export function ExtensionActionButton({
   const lastActivationMsRef = useRef(Number.NEGATIVE_INFINITY);
   const activateOnce = useCallback(() => {
     const now = performance.now();
-    if (now - lastActivationMsRef.current < 350) {
+    if (now - lastActivationMsRef.current < activationDebounceMs) {
       return;
     }
 
     lastActivationMsRef.current = now;
     onClick?.();
-  }, [onClick]);
+  }, [activationDebounceMs, onClick]);
 
   return (
     <button
+      aria-expanded={ariaExpanded}
+      aria-haspopup={ariaHasPopup}
       aria-label={label}
       className={[
         'remux-extension-action-button',

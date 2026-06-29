@@ -1,6 +1,7 @@
 import { requestIpc, subscribeIpcEvents, type JsonRpcMessage } from '@remux/extension-api/ipc';
 
 const terminalRequestTimeoutMs = 300_000;
+const terminalTmuxRequestTimeoutMs = 5_000;
 
 export type TerminalSessionOutputFrame = {
   dataBase64: string;
@@ -16,6 +17,7 @@ export type TerminalSessionStartResponse = {
   rows: number;
   sessionId: string;
   shell: string;
+  tty?: string | null;
 };
 
 export type TerminalSessionAttachResponse = {
@@ -37,6 +39,90 @@ export type TerminalSessionExitedEvent = {
 export type TerminalSessionOutputEvent = {
   frame: TerminalSessionOutputFrame;
   sessionId: string;
+};
+
+export type TerminalTmuxMode = 'attached' | 'available' | 'none';
+
+export type TerminalTmuxContext = {
+  currentClient: TerminalTmuxClient | null;
+  generatedAt: number;
+  mode: TerminalTmuxMode;
+  sockets: TerminalTmuxSocketState[];
+  terminalSessionId: string;
+  terminalTty: string | null;
+};
+
+export type TerminalTmuxSocketState = {
+  available: boolean;
+  error: string | null;
+  options: {
+    mouse: boolean | null;
+    prefix: string | null;
+    prefix2: string | null;
+  };
+  sessions: TerminalTmuxSession[];
+  socketPath: string | null;
+};
+
+export type TerminalTmuxClient = {
+  controlMode: boolean;
+  height: number | null;
+  pid: number | null;
+  sessionId: string | null;
+  sessionName: string;
+  socketPath: string | null;
+  tty: string;
+  width: number | null;
+};
+
+export type TerminalTmuxSession = {
+  activeWindowId: string | null;
+  attached: number;
+  id: string;
+  name: string;
+  windowCount: number;
+  windows: TerminalTmuxWindow[];
+};
+
+export type TerminalTmuxWindow = {
+  active: boolean;
+  id: string;
+  index: number;
+  last: boolean;
+  layout: string;
+  name: string;
+  paneCount: number;
+  panes: TerminalTmuxPane[];
+  sessionId: string;
+};
+
+export type TerminalTmuxPane = {
+  active: boolean;
+  currentCommand: string;
+  currentPath: string;
+  height: number;
+  id: string;
+  inMode: boolean;
+  index: number;
+  pid: number | null;
+  tty: string;
+  width: number;
+  windowId: string;
+};
+
+export type TerminalTmuxAction =
+  | 'close-window'
+  | 'exit-tmux'
+  | 'new-window'
+  | 'refresh'
+  | 'scroll-down'
+  | 'scroll-up'
+  | 'select-window'
+  | 'switch-session';
+
+export type TerminalTmuxActionTarget = {
+  tmuxSessionId?: string | null;
+  tmuxWindowId?: string | null;
 };
 
 export type TerminalEvent =
@@ -100,6 +186,28 @@ export function killTerminalSession(sessionId: string) {
     'remux/terminal/session/kill',
     { sessionId },
     2_000,
+  );
+}
+
+export function getTerminalTmuxContext(sessionId: string) {
+  return requestIpc<{ context: TerminalTmuxContext }>(
+    'remux/terminal/tmux/context/get',
+    { sessionId },
+    terminalTmuxRequestTimeoutMs,
+  );
+}
+
+export function runTerminalTmuxAction(params: {
+  action: TerminalTmuxAction;
+  lines?: number | null;
+  sessionId: string;
+  socketPath?: string | null;
+  target?: TerminalTmuxActionTarget | null;
+}) {
+  return requestIpc<{ context?: TerminalTmuxContext; ok: boolean }>(
+    'remux/terminal/tmux/action',
+    params,
+    terminalTmuxRequestTimeoutMs,
   );
 }
 

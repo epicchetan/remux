@@ -22,11 +22,14 @@ type ViewportMetrics = {
 type TerminalHostMock = {
   requests: HostRequest[];
   sendTerminalEvent: (message: unknown) => void;
+  setTmuxContext: (context: unknown) => void;
   setViewportMetrics: (metrics: ViewportMetrics) => void;
 };
 
 declare global {
   interface Window {
+    __remuxTerminalAttachReplay?: Array<{ dataBase64: string; seq: number }>;
+    __remuxTerminalInitialTmuxContext?: unknown;
     __remuxTerminalHost?: TerminalHostMock;
   }
 }
@@ -50,11 +53,11 @@ test.describe('terminal viewer route', () => {
     const fixedKeys = page.locator('.remux-terminal-key-fixed');
     const scrollKeys = page.locator('.remux-terminal-key-scroll');
     await expect(keyRow).toBeVisible();
-    await expect(keyRow.locator('.remux-terminal-key')).toHaveCount(14);
+    await expect(keyRow.locator('.remux-terminal-key')).toHaveCount(15);
     await expect(fixedKeys.locator('.remux-terminal-key')).toHaveCount(2);
     await expect(fixedKeys.locator('.remux-terminal-key').nth(0)).toHaveAttribute('aria-label', 'Open tabs');
     await expect(fixedKeys.locator('.remux-terminal-key').nth(1)).toHaveAttribute('aria-label', 'Show keyboard');
-    await expect(scrollKeys.locator('.remux-terminal-key')).toHaveCount(12);
+    await expect(scrollKeys.locator('.remux-terminal-key')).toHaveCount(13);
 
     const rowMetrics = await scrollKeys.evaluate((element) => ({
       clientWidth: element.clientWidth,
@@ -67,7 +70,7 @@ test.describe('terminal viewer route', () => {
     expect(rowMetrics.scrollbarWidth).toBe('none');
     expect(rowMetrics.scrollWidth).toBeGreaterThan(0);
     expect(rowMetrics.clientWidth).toBeGreaterThan(0);
-    expect(rowMetrics.offsetHeight).toBe(36);
+    expect(rowMetrics.offsetHeight).toBe(41);
 
     await scrollKeys.evaluate((element) => {
       element.scrollLeft = element.scrollWidth;
@@ -92,6 +95,14 @@ test.describe('terminal viewer route', () => {
       return Math.max(...centers) - Math.min(...centers);
     });
     expect(centerDelta).toBeLessThanOrEqual(1.5);
+  });
+
+  test('requests a host reload from the terminal action row', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+
+    await page.getByLabel('Reload viewer').click();
+    await waitForHostRequest(page, 'host/view/reload');
   });
 
   test('moves the bottom action bar above host keyboard metrics', async ({ page }) => {
@@ -181,6 +192,243 @@ test.describe('terminal viewer route', () => {
 
     await expect(page.getByLabel('Start new shell')).toBeVisible();
   });
+
+  test('does not forward terminal query responses generated from replay', async ({ page }) => {
+    await page.addInitScript((replay) => {
+      window.__remuxTerminalAttachReplay = replay;
+    }, [
+      replayFrame(1, '\x1b[c\x1b[>c\x1b]10;?\x1b\\\x1b]11;?\x1b\\'),
+    ]);
+    await page.goto('/?remuxResourceKind=terminalSession&remuxResourceId=session-from-host&remuxTabId=tab-1');
+
+    await waitForHostRequest(page, 'remux/terminal/session/attach');
+    await page.waitForTimeout(250);
+
+    expect(await hostRequestCount(page, 'remux/terminal/session/write')).toBe(0);
+  });
+
+  test('shows attached tmux windows with fixed scroll and menu actions', async ({ page }) => {
+    await page.addInitScript((context) => {
+      window.__remuxTerminalInitialTmuxContext = context;
+    }, attachedTmuxContext());
+    await page.goto('/?remuxLaunch=new-terminal');
+
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+    await waitForHostRequest(page, 'remux/terminal/tmux/context/get');
+
+    const actionStack = page.locator('.remux-terminal-action-stack');
+    await expect(actionStack.locator('.remux-terminal-tmux-row')).toHaveCount(1);
+    await expect(actionStack.locator('.remux-terminal-key-row')).toHaveCount(1);
+
+    const tabs = page.locator('.remux-terminal-tmux-tab-key');
+    await expect(tabs).toHaveCount(2);
+    await expect(tabs.nth(0)).toHaveClass(/is-active/);
+    await expect(page.getByLabel('tmux menu')).toHaveCount(0);
+    await expect(page.getByLabel('tmux sessions')).toBeVisible();
+    await expect(page.locator('.remux-terminal-tmux-fixed .remux-terminal-key')).toHaveCount(3);
+    await expect(page.getByLabel('Scroll tmux up')).toBeVisible();
+    await expect(page.getByLabel('Scroll tmux down')).toBeVisible();
+    await expect(page.getByLabel('tmux actions')).toBeVisible();
+
+    await tabs.nth(1).click();
+    const actionRequest = await waitForHostRequest(page, 'remux/terminal/tmux/action');
+    const actionParams = recordParams(actionRequest);
+    expect(actionParams.action).toBe('select-window');
+    expect(actionParams.socketPath).toBeNull();
+    expect(actionParams.target).toMatchObject({ tmuxWindowId: '@1' });
+
+    await page.getByLabel('Scroll tmux up').click();
+    const scrollRequest = await waitForHostRequest(page, 'remux/terminal/tmux/action', 2);
+    const scrollParams = recordParams(scrollRequest);
+    expect(scrollParams.action).toBe('scroll-up');
+    expect(scrollParams.lines).toBe(5);
+    expect(scrollParams.target).toBeNull();
+
+    await page.getByLabel('tmux actions').click();
+    await expect(page.getByRole('menuitem', { name: 'New tab' })).toBeVisible();
+    await expect(page.getByRole('menuitem', { name: 'Close tab' })).toBeVisible();
+    await expect(page.getByRole('menuitem', { name: 'Exit tmux' })).toBeVisible();
+
+    await page.getByRole('menuitem', { name: 'New tab' }).click();
+    const newWindowRequest = await waitForHostRequest(page, 'remux/terminal/tmux/action', 3);
+    const newWindowParams = recordParams(newWindowRequest);
+    expect(newWindowParams.action).toBe('new-window');
+    expect(newWindowParams.target).toMatchObject({ tmuxSessionId: '$0' });
+
+    await page.getByLabel('tmux actions').click();
+    await page.getByRole('menuitem', { name: 'Close tab' }).click();
+    const closeWindowRequest = await waitForHostRequest(page, 'remux/terminal/tmux/action', 4);
+    const closeWindowParams = recordParams(closeWindowRequest);
+    expect(closeWindowParams.action).toBe('close-window');
+    expect(closeWindowParams.target).toMatchObject({ tmuxWindowId: '@0' });
+
+    await page.getByLabel('tmux actions').click();
+    await page.getByRole('menuitem', { name: 'Exit tmux' }).click();
+    const exitTmuxRequest = await waitForHostRequest(page, 'remux/terminal/tmux/action', 5);
+    const exitTmuxParams = recordParams(exitTmuxRequest);
+    expect(exitTmuxParams.action).toBe('exit-tmux');
+    expect(exitTmuxParams.target).toBeNull();
+  });
+
+  test('lists tmux sessions with tab info and switches from the session picker', async ({ page }) => {
+    await page.addInitScript((context) => {
+      window.__remuxTerminalInitialTmuxContext = context;
+    }, attachedTmuxContext());
+    await page.goto('/?remuxLaunch=new-terminal');
+
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+    await waitForHostRequest(page, 'remux/terminal/tmux/context/get');
+    await expect(page.locator('.remux-terminal-tmux-row')).toBeVisible();
+
+    await page.getByLabel('tmux sessions').click();
+    await expect(page.getByRole('menuitem', { name: 'work: shell, logs' })).toBeVisible();
+    await expect(page.getByRole('menuitem', { name: 'api: server' })).toBeVisible();
+
+    await page.getByRole('menuitem', { name: 'api: server' }).click();
+    const switchRequest = await waitForHostRequest(page, 'remux/terminal/tmux/action');
+    const switchParams = recordParams(switchRequest);
+    expect(switchParams.action).toBe('switch-session');
+    expect(switchParams.socketPath).toBeNull();
+    expect(switchParams.target).toMatchObject({ tmuxSessionId: '$1' });
+    expect(switchParams.target).not.toHaveProperty('tmuxWindowId');
+  });
+
+  test('repeats tmux scroll while the scroll button is held', async ({ page }) => {
+    await page.addInitScript((context) => {
+      window.__remuxTerminalInitialTmuxContext = context;
+    }, attachedTmuxContext());
+    await page.goto('/?remuxLaunch=new-terminal');
+
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+    await waitForHostRequest(page, 'remux/terminal/tmux/context/get');
+    await expect(page.locator('.remux-terminal-tmux-row')).toBeVisible();
+
+    const scrollButton = page.getByLabel('Scroll tmux up');
+    const scrollButtonBox = await scrollButton.boundingBox();
+    expect(scrollButtonBox).not.toBeNull();
+
+    const beforeHoldCount = await hostRequestCount(page, 'remux/terminal/tmux/action');
+    await page.mouse.move(
+      scrollButtonBox!.x + scrollButtonBox!.width / 2,
+      scrollButtonBox!.y + scrollButtonBox!.height / 2,
+    );
+    await page.mouse.down();
+    try {
+      await page.waitForFunction(({ count, method }) => {
+        const requests = window.__remuxTerminalHost?.requests ?? [];
+        return requests.filter((request) => request.method === method).length >= count;
+      }, {
+        count: beforeHoldCount + 3,
+        method: 'remux/terminal/tmux/action',
+      }, { timeout: 2_000 });
+    } finally {
+      await page.mouse.up();
+    }
+
+    const afterReleaseCount = await hostRequestCount(page, 'remux/terminal/tmux/action');
+    expect(afterReleaseCount).toBeGreaterThanOrEqual(beforeHoldCount + 3);
+
+    await page.waitForTimeout(260);
+    expect(await hostRequestCount(page, 'remux/terminal/tmux/action')).toBe(afterReleaseCount);
+
+    const scrollRequests = (await hostRequests(page, 'remux/terminal/tmux/action')).slice(beforeHoldCount);
+    expect(scrollRequests.length).toBeGreaterThanOrEqual(3);
+    expect(recordParams(scrollRequests[0]!).lines).toBe(5);
+    for (const request of scrollRequests.slice(1)) {
+      const params = recordParams(request);
+      expect(params.action).toBe('scroll-up');
+      expect(params.lines).toBe(3);
+      expect(params.target).toBeNull();
+    }
+  });
+
+  test('rapid tmux scroll taps send tap-sized scroll actions', async ({ page }) => {
+    await page.addInitScript((context) => {
+      window.__remuxTerminalInitialTmuxContext = context;
+    }, attachedTmuxContext());
+    await page.goto('/?remuxLaunch=new-terminal');
+
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+    await waitForHostRequest(page, 'remux/terminal/tmux/context/get');
+    await expect(page.locator('.remux-terminal-tmux-row')).toBeVisible();
+
+    const beforeTapCount = await hostRequestCount(page, 'remux/terminal/tmux/action');
+    const scrollButton = page.getByLabel('Scroll tmux up');
+    await scrollButton.click();
+    await scrollButton.click();
+    await scrollButton.click();
+
+    await page.waitForFunction(({ count, method }) => {
+      const requests = window.__remuxTerminalHost?.requests ?? [];
+      return requests.filter((request) => request.method === method).length >= count;
+    }, {
+      count: beforeTapCount + 3,
+      method: 'remux/terminal/tmux/action',
+    });
+
+    const scrollRequests = (await hostRequests(page, 'remux/terminal/tmux/action')).slice(beforeTapCount);
+    expect(scrollRequests).toHaveLength(3);
+    for (const request of scrollRequests) {
+      const params = recordParams(request);
+      expect(params.action).toBe('scroll-up');
+      expect(params.lines).toBe(5);
+      expect(params.target).toBeNull();
+    }
+  });
+
+  test('does not show tmux UI for available detached sessions', async ({ page }) => {
+    await page.addInitScript((context) => {
+      window.__remuxTerminalInitialTmuxContext = context;
+    }, availableTmuxContext());
+    await page.goto('/?remuxLaunch=new-terminal');
+
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+    await waitForHostRequest(page, 'remux/terminal/tmux/context/get');
+
+    await expect(page.locator('.remux-terminal-tmux-row')).toHaveCount(0);
+    await expect(page.locator('.remux-terminal-tmux-tab-key')).toHaveCount(0);
+  });
+
+  test('does not send touch-scroll input while attached to tmux', async ({ page }) => {
+    await page.addInitScript((context) => {
+      window.__remuxTerminalInitialTmuxContext = context;
+    }, attachedTmuxContext());
+    await page.goto('/?remuxLaunch=new-terminal');
+
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+    await waitForHostRequest(page, 'remux/terminal/tmux/context/get');
+    await expect(page.locator('.remux-terminal-tmux-row')).toBeVisible();
+
+    const writeCount = await hostRequestCount(page, 'remux/terminal/session/write');
+    await page.evaluate(() => {
+      const container = document.querySelector('.remux-terminal-container');
+      if (!container) {
+        throw new Error('missing terminal container');
+      }
+      const terminalContainer = container;
+
+      function dispatchTouch(type: string, y: number) {
+        const event = new Event(type, {
+          bubbles: true,
+          cancelable: true,
+        });
+        Object.defineProperty(event, 'touches', {
+          value: type === 'touchend' ? [] : [{ clientY: y }],
+        });
+        Object.defineProperty(event, 'changedTouches', {
+          value: [{ clientY: y }],
+        });
+        terminalContainer.dispatchEvent(event);
+      }
+
+      dispatchTouch('touchstart', 180);
+      dispatchTouch('touchmove', 100);
+      dispatchTouch('touchmove', 60);
+      dispatchTouch('touchend', 60);
+    });
+
+    expect(await hostRequestCount(page, 'remux/terminal/session/write')).toBe(writeCount);
+  });
 });
 
 async function installMockRemuxHost(page: Page) {
@@ -196,6 +444,7 @@ async function installMockRemuxHost(page: Page) {
       },
       requests: [] as HostRequest[],
       sessionId: 'mock-terminal-session',
+      tmuxContext: null as unknown,
     };
 
     function dispatch(message: unknown) {
@@ -250,6 +499,9 @@ async function installMockRemuxHost(page: Page) {
           type: 'remux/event',
         });
       },
+      setTmuxContext(context: unknown) {
+        state.tmuxContext = context;
+      },
       setViewportMetrics(metrics: ViewportMetrics) {
         state.metrics = metrics;
         dispatch({
@@ -276,6 +528,7 @@ async function installMockRemuxHost(page: Page) {
         case 'host/keyboard/dismiss':
         case 'host/overview/open':
         case 'host/tab/update':
+        case 'host/view/reload':
         case 'remux/terminal/session/kill':
         case 'remux/terminal/session/resize':
         case 'remux/terminal/session/write':
@@ -290,6 +543,19 @@ async function installMockRemuxHost(page: Page) {
           postResult(request, { cwd: '/workspace/remux' });
           return;
 
+        case 'remux/terminal/tmux/context/get':
+          postResult(request, {
+            context: state.tmuxContext ?? window.__remuxTerminalInitialTmuxContext ?? noneTmuxContext(),
+          });
+          return;
+
+        case 'remux/terminal/tmux/action':
+          postResult(request, {
+            context: state.tmuxContext ?? window.__remuxTerminalInitialTmuxContext ?? noneTmuxContext(),
+            ok: true,
+          });
+          return;
+
         case 'remux/terminal/session/attach': {
           const sessionId = typeof params.sessionId === 'string' ? params.sessionId : state.sessionId;
           state.sessionId = sessionId;
@@ -297,7 +563,7 @@ async function installMockRemuxHost(page: Page) {
             exitCode: null,
             exitSignal: null,
             nextSeq: 1,
-            replay: [],
+            replay: window.__remuxTerminalAttachReplay ?? [],
             replayTruncated: false,
             sessionId,
             status: 'running',
@@ -326,6 +592,17 @@ async function installMockRemuxHost(page: Page) {
 
     function isRecord(value: unknown): value is Record<string, unknown> {
       return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+    }
+
+    function noneTmuxContext() {
+      return {
+        currentClient: null,
+        generatedAt: Date.now(),
+        mode: 'none',
+        sockets: [],
+        terminalSessionId: state.sessionId,
+        terminalTty: '/dev/pts/8',
+      };
     }
   });
 }
@@ -357,4 +634,122 @@ function recordParams(request: HostRequest) {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function replayFrame(seq: number, data: string) {
+  return {
+    dataBase64: Buffer.from(data, 'utf8').toString('base64'),
+    seq,
+  };
+}
+
+function attachedTmuxContext() {
+  return {
+    currentClient: {
+      controlMode: false,
+      height: 24,
+      pid: 456,
+      sessionId: '$0',
+      sessionName: 'work',
+      socketPath: null,
+      tty: '/dev/pts/8',
+      width: 80,
+    },
+    generatedAt: Date.now(),
+    mode: 'attached',
+    sockets: [
+      {
+        available: true,
+        error: null,
+        options: {
+          mouse: false,
+          prefix: 'C-b',
+          prefix2: null,
+        },
+        sessions: [
+          {
+            activeWindowId: '@0',
+            attached: 1,
+            id: '$0',
+            name: 'work',
+            windowCount: 2,
+            windows: [
+              tmuxWindow('@0', '$0', 0, 'shell', true, [tmuxPane('%0', '@0', true)]),
+              tmuxWindow('@1', '$0', 1, 'logs', false, [tmuxPane('%1', '@1', true)]),
+            ],
+          },
+          {
+            activeWindowId: '@2',
+            attached: 0,
+            id: '$1',
+            name: 'api',
+            windowCount: 1,
+            windows: [
+              tmuxWindow('@2', '$1', 0, 'server', true, [tmuxPane('%2', '@2', true)]),
+            ],
+          },
+        ],
+        socketPath: null,
+      },
+    ],
+    terminalSessionId: 'mock-terminal-session',
+    terminalTty: '/dev/pts/8',
+  };
+}
+
+function availableTmuxContext() {
+  const context = attachedTmuxContext();
+  return {
+    ...context,
+    currentClient: null,
+    mode: 'available',
+    sockets: [
+      {
+        ...context.sockets[0],
+        sessions: [
+          {
+            ...context.sockets[0].sessions[0],
+            attached: 0,
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function tmuxWindow(
+  id: string,
+  sessionId: string,
+  index: number,
+  name: string,
+  active: boolean,
+  panes: unknown[],
+) {
+  return {
+    active,
+    id,
+    index,
+    last: false,
+    layout: 'layout',
+    name,
+    paneCount: panes.length,
+    panes,
+    sessionId,
+  };
+}
+
+function tmuxPane(id: string, windowId: string, active: boolean) {
+  return {
+    active,
+    currentCommand: 'bash',
+    currentPath: '/workspace/remux',
+    height: 24,
+    id,
+    inMode: false,
+    index: 0,
+    pid: 789,
+    tty: '/dev/pts/9',
+    width: 80,
+    windowId,
+  };
 }

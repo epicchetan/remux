@@ -2,6 +2,7 @@ import {
   dismissHostKeyboard,
   getHostViewportMetrics,
   openHostOverview,
+  reloadHostView,
   type RemuxHostViewportMetrics,
   subscribeHostViewportMetrics,
   updateHostTab,
@@ -10,6 +11,8 @@ import type { RemuxViewerRoute } from '@remux/extension-api/route';
 import {
   ExtensionActionBar,
   ExtensionActionButton,
+  ExtensionActionMenu,
+  ExtensionActionMenuItem,
 } from '@remux/extension-ui';
 import { FitAddon } from '@xterm/addon-fit';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
@@ -21,24 +24,49 @@ import {
   ArrowLeft,
   ArrowRight,
   ArrowUp,
+  Check,
   ClipboardPaste,
   CornerDownLeft,
   Keyboard,
   KeyboardOff,
-  PanelTopOpen,
+  LogOut,
+  MoreHorizontal,
+  NotebookTabs,
+  PanelRightOpen,
+  Plus,
   RefreshCw,
+  X,
 } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+  type TouchEvent as ReactTouchEvent,
+} from 'react';
 
 import {
   attachTerminalSession,
   bytesFromBase64,
+  getTerminalTmuxContext,
   killTerminalSession,
   readRemuxSystemInfo,
   resizeTerminalSession,
+  runTerminalTmuxAction,
   startTerminalSession,
   subscribeTerminalEvents,
   writeTerminalSession,
+  type TerminalTmuxAction,
+  type TerminalTmuxActionTarget,
+  type TerminalTmuxContext,
+  type TerminalTmuxSession,
+  type TerminalTmuxSocketState,
+  type TerminalTmuxWindow,
   type TerminalSessionOutputFrame,
 } from './terminalRpc';
 import {
@@ -57,6 +85,12 @@ import { setupTouchScroll } from './touchScroll';
 const fontFamily = 'Menlo, Consolas, "Liberation Mono", monospace';
 const textEncoder = new TextEncoder();
 const fitDebounceMs = 180;
+const tmuxPollMs = 2_500;
+const tmuxScrollHoldDelayMs = 260;
+const tmuxScrollMaxQueuedTaps = 6;
+const tmuxScrollRepeatLines = 3;
+const tmuxScrollRepeatMs = 140;
+const tmuxScrollTapLines = 5;
 
 type TerminalSurfaceProps = {
   route: RemuxViewerRoute;
@@ -78,6 +112,8 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   const fitTimerRef = useRef<number | null>(null);
   const hostViewportMetricsRef = useRef<RemuxHostViewportMetrics | null>(null);
   const modifierTimerRef = useRef<number | null>(null);
+  const suppressedTerminalDataWritesRef = useRef(0);
+  const tmuxAttachedRef = useRef(false);
   const [altActive, setAltActive] = useState(false);
   const [ctrlActive, setCtrlActive] = useState(false);
   const [shiftActive, setShiftActive] = useState(false);
@@ -85,6 +121,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   const [keyboardOpen, setKeyboardOpen] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [status, setStatus] = useState<TerminalStatus>({ type: 'connecting' });
+  const [tmuxContext, setTmuxContext] = useState<TerminalTmuxContext | null>(null);
 
   const resetModifiers = useCallback(() => {
     setCtrlActive(false);
@@ -191,18 +228,38 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     scheduleFit(220);
   }, [scheduleFit]);
 
-  const writeFrame = useCallback((frame: TerminalSessionOutputFrame) => {
+  const writeTerminalOutput = useCallback((data: Uint8Array, options: { suppressTerminalData?: boolean } = {}) => {
+    const terminal = terminalRef.current;
+    if (!terminal) {
+      return;
+    }
+
+    if (!options.suppressTerminalData) {
+      terminal.write(data);
+      return;
+    }
+
+    suppressedTerminalDataWritesRef.current += 1;
+    terminal.write(data, () => {
+      suppressedTerminalDataWritesRef.current = Math.max(0, suppressedTerminalDataWritesRef.current - 1);
+    });
+  }, []);
+
+  const writeFrame = useCallback((
+    frame: TerminalSessionOutputFrame,
+    options: { suppressTerminalData?: boolean } = {},
+  ) => {
     if (frame.seq <= lastSeqRef.current) {
       return;
     }
 
     lastSeqRef.current = frame.seq;
-    terminalRef.current?.write(bytesFromBase64(frame.dataBase64));
-  }, []);
+    writeTerminalOutput(bytesFromBase64(frame.dataBase64), options);
+  }, [writeTerminalOutput]);
 
   const writeReplay = useCallback((frames: TerminalSessionOutputFrame[]) => {
     for (const frame of frames) {
-      writeFrame(frame);
+      writeFrame(frame, { suppressTerminalData: true });
     }
   }, [writeFrame]);
 
@@ -352,6 +409,50 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     }
   }, [resetModifiers, sendText]);
 
+  const refreshTmuxContext = useCallback(async () => {
+    const currentSessionId = sessionIdRef.current;
+    if (!currentSessionId) {
+      setTmuxContext(null);
+      return null;
+    }
+
+    const response = await getTerminalTmuxContext(currentSessionId);
+    setTmuxContext(response.context);
+    return response.context;
+  }, []);
+
+  const runTmuxAction = useCallback(async (
+    action: TerminalTmuxAction,
+    options: {
+      lines?: number | null;
+      socketPath?: string | null;
+      target?: TerminalTmuxActionTarget | null;
+    } = {},
+  ) => {
+    const currentSessionId = sessionIdRef.current;
+    if (!currentSessionId) {
+      return;
+    }
+
+    try {
+      const response = await runTerminalTmuxAction({
+        action,
+        lines: options.lines ?? null,
+        sessionId: currentSessionId,
+        socketPath: options.socketPath ?? null,
+        target: options.target ?? null,
+      });
+      if (response.context) {
+        setTmuxContext(response.context);
+      } else {
+        await refreshTmuxContext();
+      }
+    } catch (error) {
+      // Tmux helper failures should not put the terminal itself in an error state.
+      console.warn(errorMessage(error));
+    }
+  }, [refreshTmuxContext]);
+
   const helperTextarea = useCallback(() => {
     return containerRef.current?.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement | null;
   }, []);
@@ -476,13 +577,19 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       });
 
       const dataDisposable = terminal.onData((data) => {
+        if (suppressedTerminalDataWritesRef.current > 0) {
+          return;
+        }
+
         sendBytes(textEncoder.encode(data));
       });
       const resizeDisposable = terminal.onResize(({ cols, rows }) => {
         sendResize(cols, rows);
       });
 
-      cleanupTouch = setupTouchScroll(terminalContainer, terminal, sendBytes);
+      cleanupTouch = setupTouchScroll(terminalContainer, terminal, sendBytes, {
+        disabled: () => tmuxAttachedRef.current,
+      });
       resizeObserver = new ResizeObserver(() => scheduleFit());
       resizeObserver.observe(terminalContainer);
 
@@ -504,6 +611,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
         resizeDisposable.dispose();
         cleanupTouch?.();
         resizeObserver?.disconnect();
+        suppressedTerminalDataWritesRef.current = 0;
         terminal.dispose();
       };
     }
@@ -525,6 +633,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
         fitTimerRef.current = null;
       }
       cleanup?.();
+      suppressedTerminalDataWritesRef.current = 0;
       terminalRef.current = null;
       fitAddonRef.current = null;
     };
@@ -555,8 +664,47 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
         signal: event.event.exitSignal,
         type: 'exited',
       });
+      setTmuxContext(null);
     }
   }), [writeFrame]);
+
+  useEffect(() => {
+    if (!sessionId || status.type !== 'running') {
+      setTmuxContext(null);
+      return undefined;
+    }
+
+    const currentSessionId = sessionId;
+    let disposed = false;
+    async function pollTmuxContext() {
+      try {
+        const response = await getTerminalTmuxContext(currentSessionId);
+        if (disposed) {
+          return;
+        }
+
+        setTmuxContext(response.context);
+      } catch {
+        if (!disposed) {
+          setTmuxContext(null);
+        }
+      }
+    }
+
+    void pollTmuxContext();
+    const interval = window.setInterval(() => {
+      void pollTmuxContext();
+    }, tmuxPollMs);
+
+    return () => {
+      disposed = true;
+      window.clearInterval(interval);
+    };
+  }, [sessionId, status.type]);
+
+  useEffect(() => {
+    tmuxAttachedRef.current = tmuxContext?.mode === 'attached';
+  }, [tmuxContext?.mode]);
 
   useEffect(() => {
     const unsubscribe = subscribeHostViewportMetrics((metrics) => updateKeyboardOffset(metrics));
@@ -630,72 +778,83 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       <ExtensionActionBar
         className="remux-terminal-action-bar"
         left={(
-          <div className="remux-terminal-key-row">
-            <div className="remux-terminal-key-fixed">
-              <TerminalKey label="Open tabs" onPress={() => void openHostOverview({ section: 'tabs' })}>
-                <PanelTopOpen />
-              </TerminalKey>
-              <TerminalKey
-                label={keyboardOpen ? 'Hide keyboard' : 'Show keyboard'}
-                onPress={toggleKeyboard}
-              >
-                {keyboardOpen ? <KeyboardOff /> : <Keyboard />}
-              </TerminalKey>
-            </div>
-            <div className="remux-terminal-key-scroll">
-              <TerminalKey accent label="Escape" onPress={() => sendText(terminalKeySequences.escape, { clearModifiers: true })}>
-                <span className="remux-terminal-key-text">Esc</span>
-              </TerminalKey>
-              <TerminalKey label="Tab" onPress={sendTab}>
-                <span className="remux-terminal-key-text">Tab</span>
-              </TerminalKey>
-              <TerminalKey
-                active={shiftActive}
-                label="Sticky shift"
-                onPress={() => setShiftActive((value) => !value)}
-              >
-                <span className="remux-terminal-key-text">Shift</span>
-              </TerminalKey>
-              <TerminalKey
-                active={ctrlActive}
-                label="Sticky control"
-                onPress={() => setCtrlActive((value) => !value)}
-              >
-                <span className="remux-terminal-key-text">Ctrl</span>
-              </TerminalKey>
-              <TerminalKey
-                active={altActive}
-                label="Sticky alt"
-                onPress={() => setAltActive((value) => !value)}
-              >
-                <span className="remux-terminal-key-text">Alt</span>
-              </TerminalKey>
-              <TerminalKey label="Arrow up" onPress={() => sendArrow('A')}>
-                <ArrowUp />
-              </TerminalKey>
-              <TerminalKey label="Arrow down" onPress={() => sendArrow('B')}>
-                <ArrowDown />
-              </TerminalKey>
-              <TerminalKey label="Arrow left" onPress={() => sendArrow('D')}>
-                <ArrowLeft />
-              </TerminalKey>
-              <TerminalKey label="Arrow right" onPress={() => sendArrow('C')}>
-                <ArrowRight />
-              </TerminalKey>
-              <TerminalKey label="Enter" onPress={sendEnter}>
-                <CornerDownLeft />
-              </TerminalKey>
-              <TerminalKey label="Control C" onPress={() => sendBytes(terminalControlCBytes(), { clearModifiers: true })}>
-                <span className="remux-terminal-key-text">^C</span>
-              </TerminalKey>
-              <TerminalKey label="Paste" onPress={() => void pasteClipboard()}>
-                <ClipboardPaste />
-              </TerminalKey>
-              {status.type === 'error' || status.type === 'exited' ? (
-                <TerminalKey label="Start new shell" onPress={restartSession}>
+          <div className="remux-terminal-action-stack">
+            {tmuxContext?.mode === 'attached' ? (
+              <TerminalTmuxControls
+                context={tmuxContext}
+                onRunAction={runTmuxAction}
+              />
+            ) : null}
+            <div className="remux-terminal-key-row">
+              <div className="remux-terminal-key-fixed">
+                <TerminalKey label="Open tabs" onPress={() => void openHostOverview()}>
+                  <PanelRightOpen />
+                </TerminalKey>
+                <TerminalKey
+                  label={keyboardOpen ? 'Hide keyboard' : 'Show keyboard'}
+                  onPress={toggleKeyboard}
+                >
+                  {keyboardOpen ? <KeyboardOff /> : <Keyboard />}
+                </TerminalKey>
+              </div>
+              <div className="remux-terminal-key-scroll">
+                <TerminalKey label="Escape" onPress={() => sendText(terminalKeySequences.escape, { clearModifiers: true })}>
+                  <span className="remux-terminal-key-text">Esc</span>
+                </TerminalKey>
+                <TerminalKey label="Tab" onPress={sendTab}>
+                  <span className="remux-terminal-key-text">Tab</span>
+                </TerminalKey>
+                <TerminalKey
+                  active={shiftActive}
+                  label="Sticky shift"
+                  onPress={() => setShiftActive((value) => !value)}
+                >
+                  <span className="remux-terminal-key-text">Shift</span>
+                </TerminalKey>
+                <TerminalKey
+                  active={ctrlActive}
+                  label="Sticky control"
+                  onPress={() => setCtrlActive((value) => !value)}
+                >
+                  <span className="remux-terminal-key-text">Ctrl</span>
+                </TerminalKey>
+                <TerminalKey
+                  active={altActive}
+                  label="Sticky alt"
+                  onPress={() => setAltActive((value) => !value)}
+                >
+                  <span className="remux-terminal-key-text">Alt</span>
+                </TerminalKey>
+                <TerminalKey label="Arrow up" onPress={() => sendArrow('A')}>
+                  <ArrowUp />
+                </TerminalKey>
+                <TerminalKey label="Arrow down" onPress={() => sendArrow('B')}>
+                  <ArrowDown />
+                </TerminalKey>
+                <TerminalKey label="Arrow left" onPress={() => sendArrow('D')}>
+                  <ArrowLeft />
+                </TerminalKey>
+                <TerminalKey label="Arrow right" onPress={() => sendArrow('C')}>
+                  <ArrowRight />
+                </TerminalKey>
+                <TerminalKey label="Enter" onPress={sendEnter}>
+                  <CornerDownLeft />
+                </TerminalKey>
+                <TerminalKey label="Control C" onPress={() => sendBytes(terminalControlCBytes(), { clearModifiers: true })}>
+                  <span className="remux-terminal-key-text">^C</span>
+                </TerminalKey>
+                <TerminalKey label="Paste" onPress={() => void pasteClipboard()}>
+                  <ClipboardPaste />
+                </TerminalKey>
+                <TerminalKey label="Reload viewer" onPress={() => void reloadHostView()}>
                   <RefreshCw />
                 </TerminalKey>
-              ) : null}
+                {status.type === 'error' || status.type === 'exited' ? (
+                  <TerminalKey label="Start new shell" onPress={restartSession}>
+                    <RefreshCw />
+                  </TerminalKey>
+                ) : null}
+              </div>
             </div>
           </div>
         )}
@@ -703,6 +862,220 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       />
     </main>
   );
+}
+
+type TerminalTmuxControlsProps = {
+  context: TerminalTmuxContext;
+  onRunAction: TerminalTmuxRunAction;
+};
+
+type TerminalTmuxRunAction = (
+  action: TerminalTmuxAction,
+  options?: {
+    lines?: number | null;
+    socketPath?: string | null;
+    target?: TerminalTmuxActionTarget | null;
+  },
+) => Promise<void> | void;
+
+type TerminalRepeatPressKind = 'repeat' | 'tap';
+
+function TerminalTmuxControls({
+  context,
+  onRunAction,
+}: TerminalTmuxControlsProps) {
+  const active = activeTmuxState(context);
+  if (!active?.session) {
+    return null;
+  }
+
+  return (
+    <TerminalTmuxAttachedControls
+      active={active}
+      onRunAction={onRunAction}
+    />
+  );
+}
+
+function TerminalTmuxAttachedControls({
+  active,
+  onRunAction,
+}: {
+  active: ActiveTmuxState;
+  onRunAction: TerminalTmuxRunAction;
+}) {
+  const socketPath = active.socket.socketPath;
+  const scrollUp = useCallback((pressKind: TerminalRepeatPressKind) => onRunAction('scroll-up', {
+    lines: pressKind === 'tap' ? tmuxScrollTapLines : tmuxScrollRepeatLines,
+    socketPath,
+    target: null,
+  }), [onRunAction, socketPath]);
+  const scrollDown = useCallback((pressKind: TerminalRepeatPressKind) => onRunAction('scroll-down', {
+    lines: pressKind === 'tap' ? tmuxScrollTapLines : tmuxScrollRepeatLines,
+    socketPath,
+    target: null,
+  }), [onRunAction, socketPath]);
+
+  return (
+    <section className="remux-terminal-tmux-row" aria-label="tmux controls">
+      <div className="remux-terminal-tmux-session">
+        <TerminalTmuxSessionMenu
+          active={active}
+          onRunAction={onRunAction}
+          socketPath={socketPath}
+        />
+      </div>
+      <div className="remux-terminal-tmux-tabs" aria-label="tmux windows">
+        {active.session.windows.map((window) => (
+          <TerminalKey
+            active={window.active}
+            className="remux-terminal-tmux-tab-key"
+            key={window.id}
+            label={`tmux window ${window.index}: ${window.name || window.id}`}
+            onPress={() => onRunAction('select-window', {
+              socketPath,
+              target: { tmuxWindowId: window.id },
+            })}
+          >
+            <span className="remux-terminal-tmux-tab-content">
+              <span className="remux-terminal-tmux-tab-index">{window.index}</span>
+              <span className="remux-terminal-tmux-tab-name">{window.name || window.id}</span>
+            </span>
+          </TerminalKey>
+        ))}
+      </div>
+      <div className="remux-terminal-tmux-fixed">
+        <TerminalRepeatKey
+          label="Scroll tmux up"
+          onPress={scrollUp}
+        >
+          <ArrowUp />
+        </TerminalRepeatKey>
+        <TerminalRepeatKey
+          label="Scroll tmux down"
+          onPress={scrollDown}
+        >
+          <ArrowDown />
+        </TerminalRepeatKey>
+        <TerminalTmuxActionMenu
+          active={active}
+          onRunAction={onRunAction}
+          socketPath={socketPath}
+        />
+      </div>
+    </section>
+  );
+}
+
+function TerminalTmuxSessionMenu({
+  active,
+  onRunAction,
+  socketPath,
+}: {
+  active: ActiveTmuxState;
+  onRunAction: TerminalTmuxRunAction;
+  socketPath: string | null;
+}) {
+  return (
+    <ExtensionActionMenu
+      align="start"
+      className="remux-terminal-tmux-session-menu"
+      icon={<NotebookTabs />}
+      label="tmux sessions"
+      panelClassName="remux-terminal-tmux-session-menu-panel"
+      preserveFocus
+      triggerClassName="remux-terminal-key remux-terminal-tmux-session-trigger"
+    >
+      {active.socket.sessions.map((session) => {
+        const isActiveSession = session.id === active.session.id;
+        return (
+          <ExtensionActionMenuItem
+            icon={isActiveSession ? <Check /> : <NotebookTabs />}
+            key={session.id}
+            label={tmuxSessionMenuLabel(session)}
+            onSelect={() => {
+              if (isActiveSession) {
+                return;
+              }
+
+              onRunAction('switch-session', {
+                socketPath,
+                target: { tmuxSessionId: session.id },
+              });
+            }}
+          />
+        );
+      })}
+    </ExtensionActionMenu>
+  );
+}
+
+function TerminalTmuxActionMenu({
+  active,
+  onRunAction,
+  socketPath,
+}: {
+  active: ActiveTmuxState;
+  onRunAction: TerminalTmuxRunAction;
+  socketPath: string | null;
+}) {
+  const activeWindowTarget = active.window ? { tmuxWindowId: active.window.id } : null;
+
+  return (
+    <ExtensionActionMenu
+      align="end"
+      className="remux-terminal-tmux-action-menu"
+      icon={<MoreHorizontal />}
+      label="tmux actions"
+      panelClassName="remux-terminal-tmux-action-menu-panel"
+      preserveFocus
+      triggerClassName="remux-terminal-key"
+    >
+      <ExtensionActionMenuItem
+        icon={<Plus />}
+        label="New tab"
+        onSelect={() => onRunAction('new-window', {
+          socketPath,
+          target: { tmuxSessionId: active.session.id },
+        })}
+      />
+      <ExtensionActionMenuItem
+        disabled={!activeWindowTarget}
+        icon={<X />}
+        label="Close tab"
+        onSelect={() => {
+          if (!activeWindowTarget) {
+            return;
+          }
+
+          onRunAction('close-window', {
+            socketPath,
+            target: activeWindowTarget,
+          });
+        }}
+      />
+      <ExtensionActionMenuItem
+        icon={<LogOut />}
+        label="Exit tmux"
+        onSelect={() => onRunAction('exit-tmux', {
+          socketPath,
+          target: null,
+        })}
+      />
+    </ExtensionActionMenu>
+  );
+}
+
+function tmuxSessionMenuLabel(session: TerminalTmuxSession) {
+  const name = session.name || session.id;
+  const tabs = session.windows
+    .map((window) => window.name || window.id)
+    .filter(Boolean);
+  if (tabs.length === 0) {
+    return name;
+  }
+
+  return `${name}: ${tabs.join(', ')}`;
 }
 
 function TerminalOverlay({ status }: { status: TerminalStatus }) {
@@ -732,15 +1105,15 @@ function TerminalOverlay({ status }: { status: TerminalStatus }) {
 }
 
 function TerminalKey({
-  accent,
   active,
   children,
+  className,
   label,
   onPress,
 }: {
-  accent?: boolean;
   active?: boolean;
-  children: React.ReactNode;
+  children: ReactNode;
+  className?: string;
   label: string;
   onPress: () => void;
 }) {
@@ -749,15 +1122,220 @@ function TerminalKey({
       className={[
         'remux-terminal-key',
         active ? 'is-active' : '',
-        accent ? 'is-accent' : '',
+        className ?? '',
       ].filter(Boolean).join(' ')}
       icon={children}
       label={label}
       onClick={onPress}
       preserveFocus
-      tone={accent ? 'primary' : 'default'}
     />
   );
+}
+
+function TerminalRepeatKey({
+  active,
+  children,
+  className,
+  label,
+  onPress,
+}: {
+  active?: boolean;
+  children: ReactNode;
+  className?: string;
+  label: string;
+  onPress: (pressKind: TerminalRepeatPressKind) => Promise<void> | void;
+}) {
+  const handlers = useRepeatingPress(onPress, {
+    holdDelayMs: tmuxScrollHoldDelayMs,
+    intervalMs: tmuxScrollRepeatMs,
+  });
+
+  return (
+    <button
+      aria-label={label}
+      className={[
+        'remux-extension-action-button',
+        'remux-terminal-key',
+        active ? 'is-active' : '',
+        className ?? '',
+      ].filter(Boolean).join(' ')}
+      data-remux-preserve-focus="true"
+      type="button"
+      {...handlers}
+    >
+      {children}
+    </button>
+  );
+}
+
+function useRepeatingPress(
+  onPress: (pressKind: TerminalRepeatPressKind) => Promise<void> | void,
+  { holdDelayMs, intervalMs }: { holdDelayMs: number; intervalMs: number },
+) {
+  const activeRef = useRef(false);
+  const intervalRef = useRef<number | null>(null);
+  const onPressRef = useRef(onPress);
+  const queuedTapCountRef = useRef(0);
+  const runningRef = useRef(false);
+  const timeoutRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    onPressRef.current = onPress;
+  }, [onPress]);
+
+  const clearTimers = useCallback(() => {
+    if (timeoutRef.current !== null) {
+      window.clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+    if (intervalRef.current !== null) {
+      window.clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+  }, []);
+
+  const runPress = useCallback((pressKind: TerminalRepeatPressKind) => {
+    if (runningRef.current) {
+      if (pressKind === 'tap') {
+        queuedTapCountRef.current = Math.min(
+          queuedTapCountRef.current + 1,
+          tmuxScrollMaxQueuedTaps,
+        );
+      }
+      return;
+    }
+
+    runningRef.current = true;
+    void Promise.resolve(onPressRef.current(pressKind))
+      .catch((error) => console.warn(errorMessage(error)))
+      .finally(() => {
+        runningRef.current = false;
+        if (queuedTapCountRef.current > 0) {
+          queuedTapCountRef.current -= 1;
+          runPress('tap');
+        }
+      });
+  }, []);
+
+  const stopPress = useCallback(() => {
+    activeRef.current = false;
+    clearTimers();
+  }, [clearTimers]);
+
+  const startPress = useCallback(() => {
+    if (activeRef.current) {
+      return;
+    }
+
+    activeRef.current = true;
+    runPress('tap');
+    timeoutRef.current = window.setTimeout(() => {
+      timeoutRef.current = null;
+      intervalRef.current = window.setInterval(() => runPress('repeat'), intervalMs);
+    }, holdDelayMs);
+  }, [holdDelayMs, intervalMs, runPress]);
+
+  useEffect(() => () => {
+    queuedTapCountRef.current = 0;
+    stopPress();
+  }, [stopPress]);
+
+  const onPointerDown = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (event.button !== 0) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Pointer capture is best-effort; the release handlers still cover normal browsers.
+    }
+    startPress();
+  }, [startPress]);
+
+  const onPointerUp = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    try {
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+    } catch {
+      // Ignore browsers that do not expose capture state for synthetic events.
+    }
+    stopPress();
+  }, [stopPress]);
+
+  const onKeyDown = useCallback((event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    if (event.key !== 'Enter' && event.key !== ' ') {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    if (!event.repeat) {
+      startPress();
+    }
+  }, [startPress]);
+
+  const onKeyUp = useCallback((event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    if (event.key !== 'Enter' && event.key !== ' ') {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    stopPress();
+  }, [stopPress]);
+
+  return {
+    onKeyDown,
+    onKeyUp,
+    onMouseDown: (event: ReactMouseEvent<HTMLButtonElement>) => event.preventDefault(),
+    onPointerCancel: onPointerUp,
+    onPointerDown,
+    onPointerUp,
+    onTouchStart: (event: ReactTouchEvent<HTMLButtonElement>) => event.preventDefault(),
+    onLostPointerCapture: stopPress,
+  };
+}
+
+type ActiveTmuxState = {
+  session: TerminalTmuxSession;
+  socket: TerminalTmuxSocketState;
+  window: TerminalTmuxWindow | null;
+};
+
+function activeTmuxState(context: TerminalTmuxContext): ActiveTmuxState | null {
+  const currentClient = context.currentClient;
+  const preferredSocket = context.sockets.find((socket) => (
+    socket.available && socket.socketPath === (currentClient?.socketPath ?? null)
+  ));
+
+  if (!preferredSocket) {
+    return null;
+  }
+
+  const session = preferredSocket.sessions.find((candidate) => (
+    currentClient?.sessionId ? candidate.id === currentClient.sessionId : candidate.attached > 0
+  )) ?? null;
+
+  if (!session) {
+    return null;
+  }
+
+  const window = session.windows.find((candidate) => candidate.active)
+    ?? session.windows.find((candidate) => candidate.id === session.activeWindowId)
+    ?? session.windows[0]
+    ?? null;
+
+  return {
+    session,
+    socket: preferredSocket,
+    window,
+  };
 }
 
 function preferredTerminalSessionId(route: RemuxViewerRoute) {

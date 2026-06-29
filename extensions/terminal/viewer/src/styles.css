@@ -117,7 +117,7 @@ body {
 
 .remux-terminal-action-bar .remux-extension-action-group {
   flex: 1 1 auto;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .remux-terminal-action-bar .remux-extension-action-group-right:empty {
@@ -128,46 +128,81 @@ body {
   bottom: max(1px, calc((var(--remux-extension-bottom-pad) - 10px) / 2));
 }
 
-.remux-terminal-key-row {
+.remux-terminal-action-stack {
+  display: flex;
+  min-width: 0;
+  width: 100%;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.remux-terminal-key-row,
+.remux-terminal-tmux-row {
   display: flex;
   --remux-terminal-key-gap: 7px;
   min-width: 0;
   width: 100%;
-  height: 36px;
+  height: 41px;
   align-items: center;
   gap: var(--remux-terminal-key-gap);
 }
 
 .remux-terminal-key-fixed,
-.remux-terminal-key-scroll {
+.remux-terminal-key-scroll,
+.remux-terminal-tmux-fixed,
+.remux-terminal-tmux-session,
+.remux-terminal-tmux-tabs {
   display: flex;
+  height: 41px;
   align-items: center;
   gap: var(--remux-terminal-key-gap);
+  padding: 1px 1px 4px;
 }
 
-.remux-terminal-key-fixed {
+.remux-terminal-key-fixed,
+.remux-terminal-tmux-fixed,
+.remux-terminal-tmux-session {
   flex: 0 0 auto;
 }
 
-.remux-terminal-key-scroll {
+.remux-terminal-key-scroll,
+.remux-terminal-tmux-tabs {
   min-width: 0;
   flex: 1 1 auto;
   max-width: none;
   overflow-x: auto;
   overflow-y: hidden;
-  padding: 0 1px;
   overscroll-behavior-x: contain;
   -ms-overflow-style: none;
   scrollbar-width: none;
+  scrollbar-gutter: auto;
   -webkit-overflow-scrolling: touch;
 }
 
-.remux-terminal-key-scroll::-webkit-scrollbar {
+.remux-terminal-key-scroll::-webkit-scrollbar,
+.remux-terminal-tmux-tabs::-webkit-scrollbar {
+  width: 0;
+  height: 0;
   display: none;
 }
 
 .remux-terminal-key {
   flex: 0 0 auto;
+}
+
+.remux-terminal-tmux-tab-key.remux-extension-action-button {
+  width: auto;
+  min-width: 70px;
+  max-width: 220px;
+  padding: 0 10px 0 6px;
+}
+
+.remux-terminal-tmux-tab-content {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
+  align-items: center;
+  white-space: nowrap;
 }
 
 .remux-terminal-key.is-active {
@@ -190,13 +225,46 @@ body {
   text-align: center;
 }
 
+.remux-terminal-tmux-tab-index {
+  display: inline-grid;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 4px;
+  background: #27272a;
+  color: #fafafa;
+  font-family: Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.remux-terminal-tmux-tab-name {
+  min-width: 0;
+  overflow: hidden;
+  padding-left: 6px;
+  font-size: 11px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remux-terminal-tmux-action-menu-panel {
+  width: min(184px, calc(100vw - 28px));
+}
+
+.remux-terminal-tmux-session-menu-panel {
+  width: min(232px, calc(100vw - 28px));
+}
+
 @media (max-width: 420px) {
   .remux-terminal-container {
     padding-right: 6px;
     padding-left: 6px;
   }
 
-  .remux-terminal-key-row {
+  .remux-terminal-key-row,
+  .remux-terminal-tmux-row {
     --remux-terminal-key-gap: 6px;
   }
 

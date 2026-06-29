@@ -18,6 +18,7 @@ export function setupTouchScroll(
   container: HTMLElement,
   term: Terminal,
   sendInput: (data: Uint8Array) => void,
+  options: { disabled?: () => boolean } = {},
 ) {
   let cellHeight = container.clientHeight / Math.max(term.rows, 1);
   let scrollAccum = 0;
@@ -42,6 +43,10 @@ export function setupTouchScroll(
   }
 
   function doScroll(deltaPixels: number) {
+    if (options.disabled?.()) {
+      return;
+    }
+
     if (!cellHeight || cellHeight <= 0) {
       return;
     }

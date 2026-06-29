@@ -12,12 +12,16 @@ use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, nativ
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+mod tmux;
+
 const SESSION_LIST_METHOD: &str = "remux/terminal/session/list";
 const SESSION_START_METHOD: &str = "remux/terminal/session/start";
 const SESSION_ATTACH_METHOD: &str = "remux/terminal/session/attach";
 const SESSION_WRITE_METHOD: &str = "remux/terminal/session/write";
 const SESSION_RESIZE_METHOD: &str = "remux/terminal/session/resize";
 const SESSION_KILL_METHOD: &str = "remux/terminal/session/kill";
+const TMUX_CONTEXT_GET_METHOD: &str = "remux/terminal/tmux/context/get";
+const TMUX_ACTION_METHOD: &str = "remux/terminal/tmux/action";
 
 const SESSION_OUTPUT_NOTIFICATION: &str = "remux/terminal/session/output";
 const SESSION_EXITED_NOTIFICATION: &str = "remux/terminal/session/exited";
@@ -70,6 +74,8 @@ fn handle_request(server: &TerminalExtensionServer, request: JsonRpcRequest) -> 
         SESSION_WRITE_METHOD => server.write_session(request.params.unwrap_or(Value::Null)),
         SESSION_RESIZE_METHOD => server.resize_session(request.params.unwrap_or(Value::Null)),
         SESSION_KILL_METHOD => server.kill_session(request.params.unwrap_or(Value::Null)),
+        TMUX_CONTEXT_GET_METHOD => server.tmux_context(request.params.unwrap_or(Value::Null)),
+        TMUX_ACTION_METHOD => server.tmux_action(request.params.unwrap_or(Value::Null)),
         _ => {
             return JsonRpcResponse::error(
                 request.id,
@@ -141,9 +147,7 @@ impl TerminalExtensionServer {
         let portable_pty::PtyPair { master, slave } = pair;
         let mut command = CommandBuilder::new(&shell);
         command.cwd(cwd.as_os_str());
-        command.env("TERM", "xterm-256color");
-        command.env("COLORTERM", "truecolor");
-        command.env("REMUX_TERMINAL", "1");
+        configure_terminal_environment(&mut command);
 
         let child = slave
             .spawn_command(command)
@@ -151,6 +155,9 @@ impl TerminalExtensionServer {
         drop(slave);
 
         let pid = child.process_id();
+        let tty = master
+            .tty_name()
+            .map(|path| path.to_string_lossy().to_string());
         let killer = child.clone_killer();
         let reader = master
             .try_clone_reader()
@@ -172,6 +179,7 @@ impl TerminalExtensionServer {
                     rows: size.rows,
                     session_id: session_id.clone(),
                     shell: shell.clone(),
+                    tty: tty.clone(),
                     writer,
                 }),
             );
@@ -197,6 +205,7 @@ impl TerminalExtensionServer {
             "rows": size.rows,
             "sessionId": session_id,
             "shell": shell,
+            "tty": tty,
         }))
     }
 
@@ -337,7 +346,35 @@ impl TerminalExtensionServer {
             "rows": session.rows,
             "sessionId": session.session_id,
             "shell": session.shell,
+            "tty": session.tty,
         })))
+    }
+
+    fn tmux_context(&self, params: Value) -> Result<Value, String> {
+        let params =
+            parse_params::<tmux::TerminalTmuxContextParams>(params, TMUX_CONTEXT_GET_METHOD)?;
+        let terminal_tty = self.session_tty(&params.session_id)?;
+        let context = tmux::scan_context(&params.session_id, terminal_tty)?;
+
+        serde_json::to_value(json!({ "context": context })).map_err(|error| error.to_string())
+    }
+
+    fn tmux_action(&self, params: Value) -> Result<Value, String> {
+        let params = parse_params::<tmux::TerminalTmuxActionParams>(params, TMUX_ACTION_METHOD)?;
+        let terminal_tty = self.session_tty(&params.session_id)?;
+        let response = tmux::run_tmux_action(params, terminal_tty)?;
+
+        serde_json::to_value(response).map_err(|error| error.to_string())
+    }
+
+    fn session_tty(&self, session_id: &str) -> Result<Option<String>, String> {
+        let state = self.lock_state()?;
+        let session = state
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| format!("terminal session not found: {session_id}"))?;
+
+        Ok(session.tty.clone())
     }
 
     fn remove_session_record(&self, session_id: &str) -> Option<SessionRecord> {
@@ -385,6 +422,7 @@ struct SessionRecord {
     session_id: String,
     shell: String,
     status: SessionStatus,
+    tty: Option<String>,
     writer: Option<Box<dyn Write + Send>>,
 }
 
@@ -397,6 +435,7 @@ struct SessionRecordInit {
     rows: u16,
     session_id: String,
     shell: String,
+    tty: Option<String>,
     writer: Box<dyn Write + Send>,
 }
 
@@ -417,6 +456,7 @@ impl SessionRecord {
             session_id: init.session_id,
             shell: init.shell,
             status: SessionStatus::Running,
+            tty: init.tty,
             writer: Some(init.writer),
         }
     }
@@ -478,6 +518,7 @@ impl SessionRecord {
             session_id: self.session_id.clone(),
             shell: self.shell.clone(),
             status: self.status.as_str().to_string(),
+            tty: self.tty.clone(),
         }
     }
 }
@@ -507,6 +548,7 @@ struct SessionSummary {
     session_id: String,
     shell: String,
     status: String,
+    tty: Option<String>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -730,6 +772,14 @@ fn default_shell() -> String {
         })
 }
 
+fn configure_terminal_environment(command: &mut CommandBuilder) {
+    command.env_remove("TMUX");
+    command.env_remove("TMUX_PANE");
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    command.env("REMUX_TERMINAL", "1");
+}
+
 fn parse_params<T>(params: Value, method: &str) -> Result<T, String>
 where
     T: for<'de> Deserialize<'de>,
@@ -796,9 +846,11 @@ mod tests {
     use base64::Engine;
     use serde_json::{Value, json};
 
+    use portable_pty::CommandBuilder;
+
     use super::{
         BASE64, SESSION_EXITED_NOTIFICATION, SESSION_OUTPUT_NOTIFICATION, TerminalExtensionServer,
-        clamp_u16, pty_size,
+        clamp_u16, configure_terminal_environment, pty_size,
     };
 
     #[test]
@@ -816,6 +868,34 @@ mod tests {
         assert_eq!(clamp_u16(0, 2, 10), 2);
         assert_eq!(clamp_u16(7, 2, 10), 7);
         assert_eq!(clamp_u16(11, 2, 10), 10);
+    }
+
+    #[test]
+    fn terminal_environment_does_not_inherit_host_tmux() {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.env("TMUX", "/tmp/tmux-1000/default,123,0");
+        command.env("TMUX_PANE", "%1");
+
+        configure_terminal_environment(&mut command);
+
+        assert!(command.get_env("TMUX").is_none());
+        assert!(command.get_env("TMUX_PANE").is_none());
+        assert_eq!(
+            command.get_env("TERM").and_then(|value| value.to_str()),
+            Some("xterm-256color")
+        );
+        assert_eq!(
+            command
+                .get_env("COLORTERM")
+                .and_then(|value| value.to_str()),
+            Some("truecolor")
+        );
+        assert_eq!(
+            command
+                .get_env("REMUX_TERMINAL")
+                .and_then(|value| value.to_str()),
+            Some("1")
+        );
     }
 
     #[test]
@@ -867,7 +947,11 @@ mod tests {
                 "sessionId": session_id,
             }))
             .expect("expected resize to succeed");
-        write_text(&server, session_id, "stty size; printf '\\nresize-done\\n'\r");
+        write_text(
+            &server,
+            session_id,
+            "stty size; printf '\\nresize-done\\n'\r",
+        );
 
         let output = read_until_output(&output_rx, session_id, "resize-done\r\n");
         assert!(
@@ -994,11 +1078,7 @@ mod tests {
             .expect("expected write to test session to succeed");
     }
 
-    fn read_until_output(
-        output_rx: &Receiver<Value>,
-        session_id: &str,
-        expected: &str,
-    ) -> String {
+    fn read_until_output(output_rx: &Receiver<Value>, session_id: &str, expected: &str) -> String {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut collected = String::new();
 

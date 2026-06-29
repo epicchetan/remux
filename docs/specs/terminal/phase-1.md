@@ -298,6 +298,7 @@ Replay:
 - Store monotonically increasing `seq` values.
 - Attach may request replay after `replaySeq`.
 - If requested replay is no longer available, return available tail replay and mark that the replay was truncated.
+- Viewer-side replay must not forward xterm-generated terminal query responses back to the PTY. Replayed device-attribute or OSC color queries are historical output, not fresh input from the current terminal instance.
 
 Suggested initial bounds:
 
@@ -493,6 +494,7 @@ Viewer tests:
 - Ctrl/Alt sticky modifiers reset after use and auto-clear after 3 seconds.
 - Host viewport metrics change triggers fit and resize.
 - Output queue drains in order.
+- Replay that contains terminal queries does not emit `session/write` input back to the PTY.
 
 Manual mobile validation:
 
