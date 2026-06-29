@@ -2,6 +2,7 @@ const { mkdirSync, readFileSync, writeFileSync } = require('node:fs');
 const { dirname, join } = require('node:path');
 
 const clientRegisterMethod = 'remux/clients/register';
+const notificationAudienceRemoveMethod = 'remux/notifications/audience/remove';
 const notificationRequestMethod = 'remux/notifications/request';
 const visibilityCheckMethod = 'remux/notifications/visibility/check';
 const notificationDataKey = 'remuxNotificationIntent';
@@ -9,6 +10,9 @@ const notificationChannelId = 'remux-extension-events';
 const visibilityCheckTimeoutMs = 500;
 const expoPushSendUrl = 'https://exp.host/--/api/v2/push/send';
 const codexCompactRequestMethod = 'remux/codex/thread/compact';
+const terminalSessionAttachMethod = 'remux/terminal/session/attach';
+const terminalSessionKillMethod = 'remux/terminal/session/kill';
+const terminalSessionStartMethod = 'remux/terminal/session/start';
 
 const codexTurnRequestMethods = new Set([
   'remux/codex/thread/message/edit',
@@ -24,7 +28,7 @@ function createNotificationManager({
 } = {}) {
   const storePath = join(rootDir, '.remux', 'notifications', 'clients.json');
   const clients = loadPersistedClients(storePath);
-  const pendingAudiences = new Map();
+  const audiences = new Map();
 
   return {
     canHandleClientRequest(method) {
@@ -48,6 +52,26 @@ function createNotificationManager({
     },
 
     async handleExtensionNotification(message) {
+      if (message.method === notificationAudienceRemoveMethod) {
+        const target = parseNotificationAudienceTarget(message.params);
+        if (!target) {
+          logEvent(log, {
+            detail: message.params,
+            label: 'notifications:audience-remove:invalid',
+            level: 'warn',
+          });
+          return true;
+        }
+
+        removeNotificationAudiences({
+          audiences,
+          log,
+          reason: 'extension',
+          target,
+        });
+        return true;
+      }
+
       if (message.method !== notificationRequestMethod) {
         return false;
       }
@@ -63,8 +87,9 @@ function createNotificationManager({
       }
 
       const audienceKey = notificationAudienceKey(intent);
-      const audience = audienceKey ? pendingAudiences.get(audienceKey) : null;
-      if (!audience) {
+      const audienceBucket = audienceKey ? audiences.get(audienceKey) : null;
+      const deliveryAudiences = audienceBucket ? [...audienceBucket.values()] : [];
+      if (deliveryAudiences.length === 0) {
         logEvent(log, {
           detail: notificationLogDetail(intent),
           label: 'notifications:intent:no-audience',
@@ -72,15 +97,23 @@ function createNotificationManager({
         return true;
       }
 
-      pendingAudiences.delete(audienceKey);
-      await deliverNotification({
-        audience,
-        clients,
-        fetchImpl,
-        intent,
-        log,
-        storePath,
-      });
+      for (const audience of deliveryAudiences) {
+        if (audience.lifetime === 'once') {
+          audienceBucket.delete(audience.clientId);
+        }
+
+        await deliverNotification({
+          audience,
+          clients,
+          fetchImpl,
+          intent,
+          log,
+          storePath,
+        });
+      }
+      if (audienceBucket.size === 0) {
+        audiences.delete(audienceKey);
+      }
       return true;
     },
 
@@ -93,43 +126,34 @@ function createNotificationManager({
         return;
       }
 
-      const target = notificationTargetForClientRequest(request, result);
-      if (!target) {
+      const change = notificationAudienceChangeForClientRequest(request, result);
+      if (!change) {
         return;
       }
 
-      const key = notificationAudienceKey({
-        extensionId: 'codex',
-        id: 'pending',
-        target,
-        title: 'pending',
-        viewId: 'main',
-      });
-      if (!key) {
+      if (change.type === 'remove') {
+        removeNotificationAudiences({
+          audiences,
+          log,
+          reason: request.method,
+          target: change.target,
+        });
         return;
       }
 
-      pendingAudiences.set(key, {
-        clientId: client.clientId,
-        createdAt: Date.now(),
-        sessionId: client.sessionId ?? null,
-        target,
-      });
-      logEvent(log, {
-        detail: {
-          clientId: client.clientId,
-          method: request.method,
-          sessionId: client.sessionId ?? null,
-          target,
-        },
-        label: 'notifications:audience:recorded',
-        terminal: 'silent',
+      recordNotificationAudience({
+        audiences,
+        client,
+        lifetime: change.lifetime,
+        log,
+        method: request.method,
+        target: change.target,
       });
     },
   };
 }
 
-function notificationTargetForClientRequest(request, result) {
+function notificationAudienceChangeForClientRequest(request, result) {
   if (codexTurnRequestMethods.has(request.method)) {
     const threadId = requiredString(result?.threadId);
     const turnId = requiredString(result?.turnId);
@@ -138,12 +162,16 @@ function notificationTargetForClientRequest(request, result) {
     }
 
     return {
-      extensionId: 'codex',
-      focusId: turnId,
-      focusKind: 'turn',
-      resourceId: threadId,
-      resourceKind: 'thread',
-      viewId: 'main',
+      lifetime: 'once',
+      target: {
+        extensionId: 'codex',
+        focusId: turnId,
+        focusKind: 'turn',
+        resourceId: threadId,
+        resourceKind: 'thread',
+        viewId: 'main',
+      },
+      type: 'record',
     };
   }
 
@@ -154,16 +182,130 @@ function notificationTargetForClientRequest(request, result) {
     }
 
     return {
-      extensionId: 'codex',
-      focusId: threadId,
-      focusKind: 'thread',
-      resourceId: threadId,
-      resourceKind: 'thread',
-      viewId: 'main',
+      lifetime: 'once',
+      target: {
+        extensionId: 'codex',
+        focusId: threadId,
+        focusKind: 'thread',
+        resourceId: threadId,
+        resourceKind: 'thread',
+        viewId: 'main',
+      },
+      type: 'record',
+    };
+  }
+
+  if (request.method === terminalSessionStartMethod || request.method === terminalSessionAttachMethod) {
+    const sessionId = requiredString(result?.sessionId);
+    const status = optionalString(result?.status);
+    if (!sessionId || status === 'exited') {
+      return null;
+    }
+
+    return {
+      lifetime: 'target',
+      target: terminalNotificationTarget(sessionId),
+      type: 'record',
+    };
+  }
+
+  if (request.method === terminalSessionKillMethod) {
+    const sessionId = requiredString(request.params?.sessionId);
+    if (!sessionId) {
+      return null;
+    }
+
+    return {
+      target: terminalNotificationTarget(sessionId),
+      type: 'remove',
     };
   }
 
   return null;
+}
+
+function terminalNotificationTarget(sessionId) {
+  return {
+    extensionId: 'terminal',
+    focusId: sessionId,
+    focusKind: 'session',
+    resourceId: sessionId,
+    resourceKind: 'terminalSession',
+    viewId: 'main',
+  };
+}
+
+function recordNotificationAudience({
+  audiences,
+  client,
+  lifetime,
+  log,
+  method,
+  target,
+}) {
+  const key = notificationAudienceKey({
+    extensionId: target.extensionId,
+    id: 'pending',
+    target,
+    title: 'pending',
+    viewId: target.viewId,
+  });
+  if (!key) {
+    return;
+  }
+
+  let audienceBucket = audiences.get(key);
+  if (!audienceBucket) {
+    audienceBucket = new Map();
+    audiences.set(key, audienceBucket);
+  }
+
+  audienceBucket.set(client.clientId, {
+    clientId: client.clientId,
+    createdAt: Date.now(),
+    lifetime,
+    sessionId: client.sessionId ?? null,
+    target,
+  });
+  logEvent(log, {
+    detail: {
+      clientId: client.clientId,
+      lifetime,
+      method,
+      sessionId: client.sessionId ?? null,
+      target,
+    },
+    label: 'notifications:audience:recorded',
+    terminal: 'silent',
+  });
+}
+
+function removeNotificationAudiences({
+  audiences,
+  log,
+  reason,
+  target,
+}) {
+  const keys = notificationAudienceRemovalKeys(audiences, target);
+  let removed = 0;
+  for (const key of keys) {
+    const bucket = audiences.get(key);
+    if (!bucket) {
+      continue;
+    }
+    removed += bucket.size;
+    audiences.delete(key);
+  }
+
+  logEvent(log, {
+    detail: {
+      reason,
+      removed,
+      target,
+    },
+    label: 'notifications:audience:removed',
+    terminal: 'silent',
+  });
 }
 
 function registerClientSession({
@@ -454,6 +596,29 @@ function parseNotificationIntent(value) {
   };
 }
 
+function parseNotificationAudienceTarget(value) {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const extensionId = requiredString(value.extensionId);
+  if (!extensionId) {
+    return null;
+  }
+
+  const target = isRecord(value.target) ? value.target : {};
+  return {
+    extensionId,
+    focusId: optionalString(target.focusId),
+    focusKind: optionalString(target.focusKind),
+    handlerId: optionalString(target.handlerId),
+    launch: optionalString(target.launch),
+    resourceId: optionalString(target.resourceId),
+    resourceKind: optionalString(target.resourceKind),
+    viewId: optionalString(value.viewId) ?? 'main',
+  };
+}
+
 function parseBrowserTabTarget(value) {
   if (!isRecord(value)) {
     return null;
@@ -489,11 +654,40 @@ function notificationAudienceKey(intent) {
   return [
     intent.extensionId,
     intent.viewId || 'main',
+    target.handlerId || '',
+    target.launch || '',
     target.resourceKind,
     target.resourceId,
     target.focusKind,
     target.focusId,
   ].join(':');
+}
+
+function notificationAudienceRemovalKeys(audiences, target) {
+  const exactKey = notificationAudienceKey({
+    extensionId: target.extensionId,
+    id: 'pending',
+    target,
+    title: 'pending',
+    viewId: target.viewId,
+  });
+  if (exactKey) {
+    return audiences.has(exactKey) ? [exactKey] : [];
+  }
+
+  return [...audiences.entries()].flatMap(([key, bucket]) => {
+    const audience = bucket.values().next().value;
+    return audience && notificationTargetsShareTabTarget(audience.target, target) ? [key] : [];
+  });
+}
+
+function notificationTargetsShareTabTarget(left, right) {
+  return left.extensionId === right.extensionId &&
+    (left.viewId || 'main') === (right.viewId || 'main') &&
+    nullableString(left.handlerId) === nullableString(right.handlerId) &&
+    nullableString(left.launch) === nullableString(right.launch) &&
+    nullableString(left.resourceKind) === nullableString(right.resourceKind) &&
+    nullableString(left.resourceId) === nullableString(right.resourceId);
 }
 
 function notificationLogDetail(intent) {
@@ -577,6 +771,10 @@ function optionalString(value) {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
 }
 
+function nullableString(value) {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
+}
+
 function isRecord(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
@@ -588,5 +786,6 @@ function errorMessage(error) {
 module.exports = {
   clientRegisterMethod,
   createNotificationManager,
+  notificationAudienceRemoveMethod,
   notificationRequestMethod,
 };

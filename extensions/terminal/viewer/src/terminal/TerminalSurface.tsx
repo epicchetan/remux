@@ -85,6 +85,7 @@ import { setupTouchScroll } from './touchScroll';
 const fontFamily = 'Menlo, Consolas, "Liberation Mono", monospace';
 const textEncoder = new TextEncoder();
 const fitDebounceMs = 180;
+const commandTitleDelayMs = 500;
 const tmuxPollMs = 2_500;
 const tmuxScrollHoldDelayMs = 260;
 const tmuxScrollMaxQueuedTaps = 6;
@@ -102,6 +103,24 @@ type TerminalStatus =
   | { code: number | null; signal: string | null; type: 'exited' }
   | { message: string; type: 'error' };
 
+type TerminalShellState = {
+  command: string | null;
+  commandStartedAt: number | null;
+  commandTitleReady: boolean;
+  cwd: string | null;
+  running: boolean;
+  title: string | null;
+};
+
+const emptyShellState: TerminalShellState = {
+  command: null,
+  commandStartedAt: null,
+  commandTitleReady: false,
+  cwd: null,
+  running: false,
+  title: null,
+};
+
 export function TerminalSurface({ route }: TerminalSurfaceProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -112,6 +131,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   const fitTimerRef = useRef<number | null>(null);
   const hostViewportMetricsRef = useRef<RemuxHostViewportMetrics | null>(null);
   const modifierTimerRef = useRef<number | null>(null);
+  const commandTitleTimerRef = useRef<number | null>(null);
   const suppressedTerminalDataWritesRef = useRef(0);
   const tmuxAttachedRef = useRef(false);
   const [altActive, setAltActive] = useState(false);
@@ -120,6 +140,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   const [keyboardOffset, setKeyboardOffset] = useState(0);
   const [keyboardOpen, setKeyboardOpen] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [shellState, setShellState] = useState<TerminalShellState>(emptyShellState);
   const [status, setStatus] = useState<TerminalStatus>({ type: 'connecting' });
   const [tmuxContext, setTmuxContext] = useState<TerminalTmuxContext | null>(null);
 
@@ -287,12 +308,44 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     sendBytes(textEncoder.encode(value), options);
   }, [sendBytes]);
 
+  const resetShellState = useCallback(() => {
+    setShellState(emptyShellState);
+  }, []);
+
+  const handleShellIntegrationSequence = useCallback((data: string) => {
+    const nextState = shellStateFromOsc633(data);
+    if (!nextState) {
+      return false;
+    }
+
+    setShellState((current) => nextState(current));
+    return true;
+  }, []);
+
+  const handleCurrentDirectory = useCallback((cwd: string | null) => {
+    const normalized = normalizeTerminalMetadataValue(cwd);
+    if (!normalized) {
+      return false;
+    }
+
+    setShellState((current) => ({ ...current, cwd: normalized }));
+    return true;
+  }, []);
+
+  const handleTerminalTitle = useCallback((title: string) => {
+    setShellState((current) => ({
+      ...current,
+      title: normalizeTerminalMetadataValue(title),
+    }));
+  }, []);
+
   const startOrAttachSession = useCallback(async (options: { forceStart?: boolean } = {}) => {
     const terminal = terminalRef.current;
     if (!terminal) {
       return;
     }
 
+    resetShellState();
     setStatus({ type: 'connecting' });
     const size = fitTerminal();
     const preferredSessionId = preferredTerminalSessionId(route);
@@ -350,7 +403,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       type: 'running',
     });
     sendResize(started.cols, started.rows);
-  }, [bindSession, fitTerminal, route, sendResize, writeReplay]);
+  }, [bindSession, fitTerminal, resetShellState, route, sendResize, writeReplay]);
 
   const restartSession = useCallback(() => {
     const currentSessionId = sessionIdRef.current;
@@ -584,6 +637,14 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       const resizeDisposable = terminal.onResize(({ cols, rows }) => {
         sendResize(cols, rows);
       });
+      const titleDisposable = terminal.onTitleChange(handleTerminalTitle);
+      const osc633Disposable = terminal.parser.registerOscHandler(633, handleShellIntegrationSequence);
+      const osc7Disposable = terminal.parser.registerOscHandler(7, (data) => (
+        handleCurrentDirectory(parseOsc7CurrentDirectory(data))
+      ));
+      const osc1337Disposable = terminal.parser.registerOscHandler(1337, (data) => (
+        handleCurrentDirectory(parseOsc1337CurrentDirectory(data))
+      ));
 
       cleanupTouch = setupTouchScroll(terminalContainer, terminal, sendBytes, {
         disabled: () => tmuxAttachedRef.current,
@@ -598,6 +659,10 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       if (disposed) {
         dataDisposable.dispose();
         resizeDisposable.dispose();
+        titleDisposable.dispose();
+        osc633Disposable.dispose();
+        osc7Disposable.dispose();
+        osc1337Disposable.dispose();
         cleanupTouch?.();
         resizeObserver?.disconnect();
         terminal.dispose();
@@ -607,6 +672,10 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       return () => {
         dataDisposable.dispose();
         resizeDisposable.dispose();
+        titleDisposable.dispose();
+        osc633Disposable.dispose();
+        osc7Disposable.dispose();
+        osc1337Disposable.dispose();
         cleanupTouch?.();
         resizeObserver?.disconnect();
         suppressedTerminalDataWritesRef.current = 0;
@@ -637,6 +706,9 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     };
   }, [
     fitTerminal,
+    handleCurrentDirectory,
+    handleShellIntegrationSequence,
+    handleTerminalTitle,
     helperTextarea,
     scheduleFit,
     sendBytes,
@@ -705,8 +777,39 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   }, [tmuxContext?.mode]);
 
   useEffect(() => {
-    void updateHostTab(terminalTabMetadata(status, sessionId, tmuxContext)).catch(() => undefined);
-  }, [sessionId, status, tmuxContext]);
+    if (commandTitleTimerRef.current !== null) {
+      window.clearTimeout(commandTitleTimerRef.current);
+      commandTitleTimerRef.current = null;
+    }
+
+    if (!shellState.running || !shellState.command || shellState.commandTitleReady) {
+      return undefined;
+    }
+
+    const startedAt = shellState.commandStartedAt ?? Date.now();
+    const delayMs = Math.max(0, commandTitleDelayMs - (Date.now() - startedAt));
+    commandTitleTimerRef.current = window.setTimeout(() => {
+      commandTitleTimerRef.current = null;
+      setShellState((current) => {
+        if (!current.running || !current.command) {
+          return current;
+        }
+
+        return { ...current, commandTitleReady: true };
+      });
+    }, delayMs);
+
+    return () => {
+      if (commandTitleTimerRef.current !== null) {
+        window.clearTimeout(commandTitleTimerRef.current);
+        commandTitleTimerRef.current = null;
+      }
+    };
+  }, [shellState.command, shellState.commandStartedAt, shellState.commandTitleReady, shellState.running]);
+
+  useEffect(() => {
+    void updateHostTab(terminalTabMetadata(status, sessionId, tmuxContext, shellState)).catch(() => undefined);
+  }, [sessionId, shellState, status, tmuxContext]);
 
   useEffect(() => {
     const unsubscribe = subscribeHostViewportMetrics((metrics) => updateKeyboardOffset(metrics));
@@ -860,7 +963,6 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
             </div>
           </div>
         )}
-        status={statusText(status, sessionId)}
       />
     </main>
   );
@@ -1344,11 +1446,19 @@ function terminalTabMetadata(
   status: TerminalStatus,
   sessionId: string | null,
   tmuxContext: TerminalTmuxContext | null,
+  shellState: TerminalShellState,
 ) {
   const tmux = tmuxContext?.mode === 'attached' ? activeTmuxState(tmuxContext) : null;
   const pane = tmux?.window?.panes.find((candidate) => candidate.active) ?? tmux?.window?.panes[0] ?? null;
-  const cwd = pane?.currentPath || (status.type === 'running' ? status.cwd : null);
-  const command = pane?.currentCommand || (status.type === 'running' ? shellName(status.shell) : null);
+  const tmuxCwd = pane?.currentPath || null;
+  const tmuxCommand = pane?.currentCommand || null;
+  const initialCwd = status.type === 'running' ? status.cwd : null;
+  const cwd = tmuxCwd || shellState.cwd || initialCwd;
+  const command = tmuxCommand || (status.type === 'running' ? shellName(status.shell) : null);
+  const titleCommand = tmux && command && !isShellCommand(command) ? command : null;
+  const shellCommandTitle = !tmux && shellState.running && shellState.commandTitleReady
+    ? shellState.command
+    : null;
 
   if (status.type === 'connecting') {
     return {
@@ -1360,7 +1470,7 @@ function terminalTabMetadata(
   if (status.type === 'exited') {
     return {
       status: status.signal ? `Exited: ${status.signal}` : `Exited ${status.code ?? 0}`,
-      title: cwd ? basename(cwd) : 'Terminal',
+      title: cwd ? compactPathTitle(cwd) : 'Terminal',
     };
   }
 
@@ -1372,8 +1482,13 @@ function terminalTabMetadata(
   }
 
   return {
-    status: tmux ? tmuxTabStatus(tmux, command) : command,
-    title: cwd ? basename(cwd) : command || 'Terminal',
+    status: tmux ? tmuxTabStatus(tmux, command) : shellCommandTitle || command,
+    title: titleCommand ||
+      shellCommandTitle ||
+      (tmuxCwd ? compactPathTitle(tmuxCwd) : null) ||
+      (shellState.cwd ? compactPathTitle(shellState.cwd) : null) ||
+      shellState.title ||
+      (initialCwd ? compactPathTitle(initialCwd) : command || 'Terminal'),
   };
 }
 
@@ -1389,8 +1504,99 @@ function basename(path: string) {
   return parts.at(-1) || normalized;
 }
 
+function compactPathTitle(path: string) {
+  const normalized = path.replace(/[\\/]+$/u, '');
+  const parts = normalized.split(/[\\/]/u).filter(Boolean);
+  if (parts.length === 0) {
+    return normalized || path;
+  }
+
+  return parts.slice(-2).join('/');
+}
+
 function shellName(shell: string) {
   return basename(shell) || shell || null;
+}
+
+function isShellCommand(command: string) {
+  return /^(?:-|)(?:bash|cmd|fish|nu|pwsh|powershell|sh|tcsh|zsh)$/iu.test(command);
+}
+
+function shellStateFromOsc633(data: string): ((current: TerminalShellState) => TerminalShellState) | null {
+  if (data.startsWith('P;Cwd=')) {
+    const cwd = normalizeTerminalMetadataValue(data.slice('P;Cwd='.length));
+    if (!cwd) {
+      return null;
+    }
+
+    return (current) => ({ ...current, cwd });
+  }
+
+  if (data.startsWith('E;')) {
+    const command = normalizeCommandTitle(data.slice(2));
+    if (!command) {
+      return null;
+    }
+
+    return (current) => ({
+      ...current,
+      command,
+      commandStartedAt: null,
+      commandTitleReady: false,
+    });
+  }
+
+  if (data === 'C') {
+    return (current) => ({
+      ...current,
+      commandStartedAt: Date.now(),
+      commandTitleReady: false,
+      running: true,
+    });
+  }
+
+  if (data === 'D' || data.startsWith('D;')) {
+    return (current) => ({
+      ...current,
+      commandStartedAt: null,
+      commandTitleReady: false,
+      running: false,
+    });
+  }
+
+  return null;
+}
+
+function parseOsc7CurrentDirectory(data: string) {
+  const value = data.trim();
+  if (!value.startsWith('file://')) {
+    return null;
+  }
+
+  try {
+    const url = new URL(value);
+    return url.protocol === 'file:' ? decodeURIComponent(url.pathname) : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseOsc1337CurrentDirectory(data: string) {
+  const prefix = 'CurrentDir=';
+  return data.startsWith(prefix) ? data.slice(prefix.length) : null;
+}
+
+function normalizeTerminalMetadataValue(value: string | null | undefined) {
+  const normalized = value?.replace(/[\u0000-\u001f\u007f]/gu, '').trim();
+  return normalized ? normalized.slice(0, 240) : null;
+}
+
+function normalizeCommandTitle(value: string | null | undefined) {
+  const normalized = value
+    ?.replace(/[\u0000-\u001f\u007f]/gu, '')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  return normalized ? normalized.slice(0, 120) : null;
 }
 
 function preferredTerminalSessionId(route: RemuxViewerRoute) {
@@ -1440,22 +1646,6 @@ function visualViewportKeyboardOffset() {
   }
 
   return Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop);
-}
-
-function statusText(status: TerminalStatus, sessionId: string | null) {
-  if (status.type === 'running') {
-    return status.cwd || status.shell || sessionId || 'Terminal';
-  }
-
-  if (status.type === 'connecting') {
-    return 'Starting shell';
-  }
-
-  if (status.type === 'exited') {
-    return status.signal ? `Exited: ${status.signal}` : `Exited ${status.code ?? 0}`;
-  }
-
-  return status.message;
 }
 
 function clampSize(value: number, min: number, max: number) {

@@ -78,6 +78,7 @@ export function RemuxNotificationProvider({ children }: { children: ReactNode })
     () => activeBrowserTabTarget({ activeTabId, mode, tabs }),
     [activeTabId, mode, tabs],
   );
+  const activeTargetKey = useMemo(() => targetKey(activeTarget), [activeTarget]);
 
   useEffect(() => {
     void loadOrCreateClientId()
@@ -196,6 +197,7 @@ export function RemuxNotificationProvider({ children }: { children: ReactNode })
     }
 
     const result = await useBrowserStore.getState().openNotificationTarget(tabTargetFromIntent(intent));
+    await dismissPresentedNotificationsForTarget(tabTargetFromIntent(intent));
     Notifications.clearLastNotificationResponse();
     logRemuxDebug('notifications:response:opened', {
       ...notificationLogDetail(intent),
@@ -221,6 +223,14 @@ export function RemuxNotificationProvider({ children }: { children: ReactNode })
       subscription.remove();
     };
   }, [handleNotificationResponse, settingsLoaded]);
+
+  useEffect(() => {
+    if (appState !== 'active' || mode !== 'surface' || !activeTarget) {
+      return;
+    }
+
+    void dismissPresentedNotificationsForTarget(activeTarget);
+  }, [activeTargetKey, appState, mode]);
 
   return children;
 }
@@ -353,6 +363,51 @@ function shouldSuppressIntentForCurrentView(intent: RemuxNotificationIntent) {
   return activeTab
     ? matchesBrowserTabTarget(activeTab, intent.extensionId, tabTargetFromIntent(intent))
     : false;
+}
+
+async function dismissPresentedNotificationsForTarget(target: BrowserTabTarget) {
+  try {
+    const notifications = await Notifications.getPresentedNotificationsAsync();
+    await Promise.all(notifications.map(async (notification) => {
+      const intent = parseNotificationIntentFromData(notification.request.content.data);
+      if (!intent || !notificationTargetMatchesBrowserTarget(intent, target)) {
+        return;
+      }
+
+      await Notifications.dismissNotificationAsync(notification.request.identifier);
+    }));
+  } catch (error: unknown) {
+    logRemuxDebug('notifications:dismiss-presented:failed', errorMessage(error));
+  }
+}
+
+function notificationTargetMatchesBrowserTarget(intent: RemuxNotificationIntent, target: BrowserTabTarget) {
+  const notificationTarget = tabTargetFromIntent(intent);
+  return normalizedTargetValue(notificationTarget.extensionId) === normalizedTargetValue(target.extensionId) &&
+    normalizedTargetValue(notificationTarget.viewId) === normalizedTargetValue(target.viewId ?? 'main') &&
+    normalizedTargetValue(notificationTarget.handlerId) === normalizedTargetValue(target.handlerId) &&
+    normalizedTargetValue(notificationTarget.launch) === normalizedTargetValue(target.launch) &&
+    normalizedTargetValue(notificationTarget.resourceKind) === normalizedTargetValue(target.resourceKind) &&
+    normalizedTargetValue(notificationTarget.resourceId) === normalizedTargetValue(target.resourceId);
+}
+
+function targetKey(target: BrowserTabTarget | null) {
+  if (!target) {
+    return null;
+  }
+
+  return [
+    normalizedTargetValue(target.extensionId),
+    normalizedTargetValue(target.viewId ?? 'main'),
+    normalizedTargetValue(target.handlerId),
+    normalizedTargetValue(target.launch),
+    normalizedTargetValue(target.resourceKind),
+    normalizedTargetValue(target.resourceId),
+  ].join('\u0000');
+}
+
+function normalizedTargetValue(value: string | null | undefined) {
+  return value?.trim() || null;
 }
 
 function activeBrowserTabTarget({

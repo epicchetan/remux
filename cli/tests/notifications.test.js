@@ -282,6 +282,182 @@ test('notification manager suppresses compaction push when originating client is
   }
 });
 
+test('notification manager treats codex turn audiences as one-shot', async () => {
+  const fixture = createNotificationFixture();
+  const pushRequests = [];
+  const manager = createNotificationManager({
+    fetchImpl: async (url, request) => {
+      pushRequests.push({ request, url });
+      return jsonResponse({ data: { id: 'ticket-1', status: 'ok' } });
+    },
+    log: silentLog(),
+    rootDir: fixture.root,
+  });
+  const client = createClient({ visible: false });
+
+  try {
+    await manager.handleClientRequest({
+      client,
+      method: 'remux/clients/register',
+      params: {
+        clientId: 'client-1',
+        expoPushToken: 'ExponentPushToken[test]',
+        sessionId: 'session-1',
+      },
+    });
+    manager.recordClientRequest({
+      client,
+      request: { method: 'remux/codex/thread/message/send' },
+      result: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+      },
+    });
+
+    assert.equal(await manager.handleExtensionNotification(turnCompletedIntent()), true);
+    assert.equal(await manager.handleExtensionNotification(turnCompletedIntent()), true);
+    assert.equal(pushRequests.length, 1);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('notification manager keeps terminal session audiences until removed', async () => {
+  const fixture = createNotificationFixture();
+  const pushRequests = [];
+  const manager = createNotificationManager({
+    fetchImpl: async (url, request) => {
+      pushRequests.push({ request, url });
+      return jsonResponse({ data: { id: 'ticket-1', status: 'ok' } });
+    },
+    log: silentLog(),
+    rootDir: fixture.root,
+  });
+  const client = createClient({ visible: false });
+
+  try {
+    await manager.handleClientRequest({
+      client,
+      method: 'remux/clients/register',
+      params: {
+        clientId: 'client-1',
+        expoPushToken: 'ExponentPushToken[test]',
+        sessionId: 'session-1',
+      },
+    });
+    manager.recordClientRequest({
+      client,
+      request: { method: 'remux/terminal/session/start' },
+      result: {
+        sessionId: 'terminal-session-1',
+      },
+    });
+
+    assert.equal(await manager.handleExtensionNotification(terminalNotificationIntent('1')), true);
+    assert.equal(await manager.handleExtensionNotification(terminalNotificationIntent('2')), true);
+    assert.equal(pushRequests.length, 2);
+    assert.deepEqual(
+      JSON.parse(pushRequests[0].request.body).data.remuxNotificationIntent.target,
+      {
+        focusId: 'terminal-session-1',
+        focusKind: 'session',
+        handlerId: null,
+        launch: null,
+        resourceId: 'terminal-session-1',
+        resourceKind: 'terminalSession',
+      },
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('notification manager removes terminal audiences on kill request', async () => {
+  const fixture = createNotificationFixture();
+  const pushRequests = [];
+  const manager = createNotificationManager({
+    fetchImpl: async (url, request) => {
+      pushRequests.push({ request, url });
+      return jsonResponse({ data: { id: 'ticket-1', status: 'ok' } });
+    },
+    log: silentLog(),
+    rootDir: fixture.root,
+  });
+  const client = createClient({ visible: false });
+
+  try {
+    await manager.handleClientRequest({
+      client,
+      method: 'remux/clients/register',
+      params: {
+        clientId: 'client-1',
+        expoPushToken: 'ExponentPushToken[test]',
+        sessionId: 'session-1',
+      },
+    });
+    manager.recordClientRequest({
+      client,
+      request: { method: 'remux/terminal/session/start' },
+      result: {
+        sessionId: 'terminal-session-1',
+      },
+    });
+    manager.recordClientRequest({
+      client,
+      request: {
+        method: 'remux/terminal/session/kill',
+        params: { sessionId: 'terminal-session-1' },
+      },
+      result: { ok: true },
+    });
+
+    assert.equal(await manager.handleExtensionNotification(terminalNotificationIntent('1')), true);
+    assert.equal(pushRequests.length, 0);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('notification manager removes terminal audiences from extension release', async () => {
+  const fixture = createNotificationFixture();
+  const pushRequests = [];
+  const manager = createNotificationManager({
+    fetchImpl: async (url, request) => {
+      pushRequests.push({ request, url });
+      return jsonResponse({ data: { id: 'ticket-1', status: 'ok' } });
+    },
+    log: silentLog(),
+    rootDir: fixture.root,
+  });
+  const client = createClient({ visible: false });
+
+  try {
+    await manager.handleClientRequest({
+      client,
+      method: 'remux/clients/register',
+      params: {
+        clientId: 'client-1',
+        expoPushToken: 'ExponentPushToken[test]',
+        sessionId: 'session-1',
+      },
+    });
+    manager.recordClientRequest({
+      client,
+      request: { method: 'remux/terminal/session/attach' },
+      result: {
+        sessionId: 'terminal-session-1',
+        status: 'running',
+      },
+    });
+
+    assert.equal(await manager.handleExtensionNotification(terminalAudienceRemove()), true);
+    assert.equal(await manager.handleExtensionNotification(terminalNotificationIntent('1')), true);
+    assert.equal(pushRequests.length, 0);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 function turnCompletedIntent() {
   return {
     method: 'remux/notifications/request',
@@ -315,6 +491,41 @@ function threadCompactedIntent() {
         resourceKind: 'thread',
       },
       title: 'Codex compacted context',
+      viewId: 'main',
+    },
+  };
+}
+
+function terminalNotificationIntent(seq) {
+  return {
+    method: 'remux/notifications/request',
+    params: {
+      body: 'Open the terminal to continue.',
+      extensionId: 'terminal',
+      id: `terminal:notification:terminal-session-1:${seq}`,
+      target: {
+        focusId: 'terminal-session-1',
+        focusKind: 'session',
+        resourceId: 'terminal-session-1',
+        resourceKind: 'terminalSession',
+      },
+      title: 'Terminal needs attention',
+      viewId: 'main',
+    },
+  };
+}
+
+function terminalAudienceRemove() {
+  return {
+    method: 'remux/notifications/audience/remove',
+    params: {
+      extensionId: 'terminal',
+      target: {
+        focusId: 'terminal-session-1',
+        focusKind: 'session',
+        resourceId: 'terminal-session-1',
+        resourceKind: 'terminalSession',
+      },
       viewId: 'main',
     },
   };

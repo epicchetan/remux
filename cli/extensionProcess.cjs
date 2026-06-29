@@ -4,7 +4,7 @@ const readline = require('node:readline');
 const { JsonRpcError } = require('./jsonRpc.cjs');
 
 const defaultRequestTimeoutMs = 300_000;
-const remuxNotificationRequestMethod = 'remux/notifications/request';
+const remuxNotificationMethodPrefix = 'remux/notifications/';
 
 function createExtensionProcess({ extension, log = console, requestTimeoutMs = defaultRequestTimeoutMs }) {
   let child = null;
@@ -219,10 +219,18 @@ function createExtensionProcess({ extension, log = console, requestTimeoutMs = d
     if (message && typeof message.method === 'string') {
       const normalized = normalizeExtensionNotification(message, extension.id);
       if (
-        normalized.method === remuxNotificationRequestMethod &&
+        isRemuxNotificationMethod(normalized.method) &&
         typeof ctx?.handleExtensionNotification === 'function'
       ) {
-        void ctx.handleExtensionNotification(normalized);
+        void ctx.handleExtensionNotification(normalized)
+          .then((handled) => {
+            if (!handled) {
+              ctx?.broadcast?.(normalized);
+            }
+          })
+          .catch((error) => {
+            log.warn?.(`[remux] failed to handle notification from extension ${extension.id}: ${errorMessage(error)}`);
+          });
         return;
       }
 
@@ -240,7 +248,7 @@ function createExtensionProcess({ extension, log = console, requestTimeoutMs = d
 }
 
 function normalizeExtensionNotification(message, extensionId) {
-  if (message.method !== remuxNotificationRequestMethod) {
+  if (!isRemuxNotificationMethod(message.method)) {
     return message;
   }
 
@@ -253,8 +261,16 @@ function normalizeExtensionNotification(message, extensionId) {
   };
 }
 
+function isRemuxNotificationMethod(method) {
+  return typeof method === 'string' && method.startsWith(remuxNotificationMethodPrefix);
+}
+
 function isRecord(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function logEvent(log, event) {

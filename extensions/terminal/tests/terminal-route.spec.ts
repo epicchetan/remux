@@ -105,6 +105,50 @@ test.describe('terminal viewer route', () => {
     await waitForHostRequest(page, 'host/view/reload');
   });
 
+  test('publishes a compact tab title without action bar footer status', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+
+    await expect(page.locator('.remux-extension-action-status')).toHaveCount(0);
+    await page.waitForFunction(() => {
+      return (window.__remuxTerminalHost?.requests ?? []).some((request) => {
+        const params = request.params;
+        return (
+          request.method === 'host/tab/update' &&
+          Boolean(params) &&
+          typeof params === 'object' &&
+          !Array.isArray(params) &&
+          (params as Record<string, unknown>).title === 'workspace/remux'
+        );
+      });
+    });
+
+    const metadataUpdate = (await hostRequests(page, 'host/tab/update'))
+      .map(recordParams)
+      .find((params) => params.title === 'workspace/remux');
+    expect(metadataUpdate).toMatchObject({
+      status: 'sh',
+      title: 'workspace/remux',
+    });
+  });
+
+  test('updates tab title from shell integration cwd and command lifecycle', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+
+    let requestCount = await hostRequestCount(page, 'host/tab/update');
+    await sendTerminalOutput(page, 1, '\x1b]633;P;Cwd=/workspace/remux/extensions/terminal\x07');
+    await waitForHostTabTitle(page, 'extensions/terminal', requestCount);
+
+    requestCount = await hostRequestCount(page, 'host/tab/update');
+    await sendTerminalOutput(page, 2, '\x1b]633;E;npm test\x07\x1b]633;C\x07');
+    await waitForHostTabTitle(page, 'npm test', requestCount);
+
+    requestCount = await hostRequestCount(page, 'host/tab/update');
+    await sendTerminalOutput(page, 3, '\x1b]633;D;0\x07\x1b]633;P;Cwd=/workspace/remux/extensions/terminal\x07');
+    await waitForHostTabTitle(page, 'extensions/terminal', requestCount);
+  });
+
   test('moves the bottom action bar above host keyboard metrics', async ({ page }) => {
     await page.goto('/?remuxLaunch=new-terminal');
     await waitForHostRequest(page, 'remux/terminal/session/start');
@@ -615,6 +659,41 @@ async function waitForHostRequest(page: Page, method: string, count = 1) {
 
   const requests = await hostRequests(page, method);
   return requests[count - 1]!;
+}
+
+async function waitForHostTabTitle(page: Page, title: string, afterCount = 0) {
+  await page.waitForFunction(({ afterCount, title }) => {
+    const requests = (window.__remuxTerminalHost?.requests ?? [])
+      .filter((request) => request.method === 'host/tab/update')
+      .slice(afterCount);
+    return requests.some((request) => {
+      const params = request.params;
+      return (
+        Boolean(params) &&
+        typeof params === 'object' &&
+        !Array.isArray(params) &&
+        (params as Record<string, unknown>).title === title
+      );
+    });
+  }, { afterCount, title });
+}
+
+async function sendTerminalOutput(
+  page: Page,
+  seq: number,
+  data: string,
+  sessionId = 'mock-terminal-session',
+) {
+  await page.evaluate(({ frame, sessionId }) => {
+    window.__remuxTerminalHost?.sendTerminalEvent({
+      jsonrpc: '2.0',
+      method: 'remux/terminal/session/output',
+      params: {
+        frame,
+        sessionId,
+      },
+    });
+  }, { frame: replayFrame(seq, data), sessionId });
 }
 
 async function hostRequests(page: Page, method: string) {
