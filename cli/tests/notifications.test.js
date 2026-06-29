@@ -43,6 +43,7 @@ test('notification manager pushes turn completion to the originating client', as
     assert.equal(pushRequests[0].url, 'https://exp.host/--/api/v2/push/send');
     assert.deepEqual(JSON.parse(pushRequests[0].request.body), {
       body: 'Open the thread to review the result.',
+      channelId: 'remux-extension-events',
       data: {
         remuxNotificationIntent: {
           ...turnCompletedIntent().params,
@@ -53,6 +54,9 @@ test('notification manager pushes turn completion to the originating client', as
           },
         },
       },
+      interruptionLevel: 'active',
+      priority: 'high',
+      sound: 'default',
       title: 'Codex finished',
       to: 'ExponentPushToken[test]',
     });
@@ -218,6 +222,7 @@ test('notification manager pushes compaction completion to the originating clien
     assert.equal(pushRequests.length, 1);
     assert.deepEqual(JSON.parse(pushRequests[0].request.body), {
       body: 'Open the thread to continue.',
+      channelId: 'remux-extension-events',
       data: {
         remuxNotificationIntent: {
           ...threadCompactedIntent().params,
@@ -228,6 +233,9 @@ test('notification manager pushes compaction completion to the originating clien
           },
         },
       },
+      interruptionLevel: 'active',
+      priority: 'high',
+      sound: 'default',
       title: 'Codex compacted context',
       to: 'ExponentPushToken[test]',
     });

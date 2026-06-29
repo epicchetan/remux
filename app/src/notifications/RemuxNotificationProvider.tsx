@@ -1,6 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { AppState, Platform } from 'react-native';
+import Constants from 'expo-constants';
 import * as Notifications from 'expo-notifications';
 
 import { useBrowserStore, matchesBrowserTabTarget } from '../browser/browserStore';
@@ -51,7 +52,7 @@ Notifications.setNotificationHandler({
     const suppress = Boolean(intent && shouldSuppressIntentForCurrentView(intent));
 
     return {
-      shouldPlaySound: false,
+      shouldPlaySound: !suppress,
       shouldSetBadge: false,
       shouldShowBanner: !suppress,
       shouldShowList: !suppress,
@@ -71,6 +72,7 @@ export function RemuxNotificationProvider({ children }: { children: ReactNode })
   const handledNotificationResponsesRef = useRef(new Set<string>());
   const lastSuccessfulRegistrationKeyRef = useRef<string | null>(null);
   const pendingRegistrationKeyRef = useRef<string | null>(null);
+  const pushTokenRequestInFlightRef = useRef(false);
   const sessionIdRef = useRef(nextSessionId());
   const activeTarget = useMemo(
     () => activeBrowserTabTarget({ activeTabId, mode, tabs }),
@@ -100,16 +102,24 @@ export function RemuxNotificationProvider({ children }: { children: ReactNode })
   }, []);
 
   useEffect(() => {
-    if (!settingsLoaded || !clientId) {
+    if (!settingsLoaded || !clientId || expoPushToken || pushTokenRequestInFlightRef.current) {
       return;
     }
 
+    if (appState !== 'active') {
+      return;
+    }
+
+    pushTokenRequestInFlightRef.current = true;
     void resolveExpoPushToken()
       .then(setExpoPushToken)
       .catch((error: unknown) => {
         logRemuxDebug('notifications:expo-token:failed', errorMessage(error));
+      })
+      .finally(() => {
+        pushTokenRequestInFlightRef.current = false;
       });
-  }, [clientId, settingsLoaded]);
+  }, [appState, clientId, expoPushToken, settingsLoaded]);
 
   useEffect(() => subscribeVisibilityChecks(remux), [remux]);
 
@@ -262,10 +272,12 @@ async function resolveExpoPushToken() {
 
   const allowed = await ensureNotificationPermission();
   if (!allowed) {
+    logRemuxDebug('notifications:permission:not-allowed');
     return null;
   }
 
-  const token = await Notifications.getExpoPushTokenAsync();
+  const projectId = expoProjectId();
+  const token = await Notifications.getExpoPushTokenAsync(projectId ? { projectId } : undefined);
   return token.data;
 }
 
@@ -290,8 +302,8 @@ async function ensureNotificationPermission() {
     android: {},
     ios: {
       allowAlert: true,
-      allowBadge: false,
-      allowSound: false,
+      allowBadge: true,
+      allowSound: true,
     },
   });
 
@@ -304,6 +316,10 @@ function notificationPermissionAllowsAlerts(permission: Notifications.Notificati
     iosStatus === Notifications.IosAuthorizationStatus.AUTHORIZED ||
     iosStatus === Notifications.IosAuthorizationStatus.PROVISIONAL ||
     iosStatus === Notifications.IosAuthorizationStatus.EPHEMERAL;
+}
+
+function expoProjectId() {
+  return Constants.easConfig?.projectId ?? Constants.expoConfig?.extra?.eas?.projectId ?? null;
 }
 
 function ensureAndroidNotificationChannel() {

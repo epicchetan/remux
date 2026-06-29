@@ -5,6 +5,7 @@ const clientRegisterMethod = 'remux/clients/register';
 const notificationRequestMethod = 'remux/notifications/request';
 const visibilityCheckMethod = 'remux/notifications/visibility/check';
 const notificationDataKey = 'remuxNotificationIntent';
+const notificationChannelId = 'remux-extension-events';
 const visibilityCheckTimeoutMs = 500;
 const expoPushSendUrl = 'https://exp.host/--/api/v2/push/send';
 const codexCompactRequestMethod = 'remux/codex/thread/compact';
@@ -330,9 +331,13 @@ async function sendExpoPush({
   const response = await fetchImpl(expoPushSendUrl, {
     body: JSON.stringify({
       body: intent.body ?? undefined,
+      channelId: notificationChannelId,
       data: {
         [notificationDataKey]: intent,
       },
+      interruptionLevel: 'active',
+      priority: 'high',
+      sound: 'default',
       title: intent.title,
       to: clientState.expoPushToken,
     }),

@@ -2,7 +2,7 @@
   "expo": {
     "name": "Remux",
     "slug": "remux",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
@@ -12,6 +12,7 @@
     },
     "ios": {
       "supportsTablet": true,
+      "buildNumber": "2",
       "bundleIdentifier": "sh.remux.mobile",
       "infoPlist": {
         "NSAppTransportSecurity": {
