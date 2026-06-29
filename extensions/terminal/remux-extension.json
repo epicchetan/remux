@@ -4,7 +4,7 @@
   "name": "Terminal",
   "display": {
     "title": "Terminal",
-    "icon": "assets/terminal.svg"
+    "icon": "assets/terminal.png"
   },
   "server": {
     "transport": "stdio",
@@ -31,7 +31,7 @@
       "id": "new-terminal",
       "view": "main",
       "label": "Terminal",
-      "icon": "assets/terminal.svg",
+      "icon": "assets/terminal.png",
       "route": {
         "kind": "launch",
         "launch": "new-terminal",

@@ -1,6 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Terminal">
-  <rect width="54" height="54" x="5" y="5" rx="14" fill="#18181b" stroke="#3f3f46" stroke-width="2"/>
-  <path d="M16 20h32v24H16z" fill="#09090b" stroke="#52525b" stroke-width="2"/>
-  <path d="m21 27 5 5-5 5" fill="none" stroke="#f97316" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M31 37h12" stroke="#d4d4d8" stroke-width="3" stroke-linecap="round"/>
+<svg height="24" viewBox="0 0 24 24" width="24" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Terminal">
+  <title>Terminal</title>
+  <g fill="none" stroke="#f4f4f5" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" transform="translate(12 12) scale(.87) translate(-12 -12)">
+    <path d="m4 17 6-6-6-6" />
+    <path d="M12 19h8" />
+  </g>
 </svg>
