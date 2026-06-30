@@ -5,7 +5,7 @@ use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -31,6 +31,14 @@ const REMUX_NOTIFICATION_REQUEST_METHOD: &str = "remux/notifications/request";
 
 const MAX_REPLAY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_REPLAY_FRAMES: usize = 10_000;
+// PTY read sizing and burst coalescing. A single read already returns everything
+// currently buffered (up to the buffer size), so reading large keeps the syscall
+// count down. The coalescer then merges a burst of reads triggered by one
+// keystroke (tab-completion, line rewrap, command output) into a single frame so
+// it crosses the wire as one packet instead of a flurry.
+const READ_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_COALESCED_BYTES: usize = 256 * 1024;
+const OUTPUT_COALESCE_WINDOW: Duration = Duration::from_millis(3);
 const MAX_NOTIFICATION_OSC_BYTES: usize = 16 * 1024;
 const MAX_PENDING_KITTY_NOTIFICATIONS: usize = 64;
 const NOTIFICATION_TITLE_MAX_CHARS: usize = 120;
@@ -1013,25 +1021,66 @@ fn spawn_reader_thread(
     session_id: String,
     mut reader: Box<dyn Read + Send>,
 ) {
+    // Stage 1: block on the PTY and forward raw chunks as they arrive.
+    let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>();
     thread::spawn(move || {
-        let mut buffer = [0_u8; 8192];
+        let mut buffer = vec![0_u8; READ_BUFFER_BYTES];
         loop {
             let bytes_read = match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(bytes_read) => bytes_read,
                 Err(_) => break,
             };
+            if chunk_tx.send(buffer[..bytes_read].to_vec()).is_err() {
+                break;
+            }
+        }
+        // Dropping chunk_tx closes the channel, letting the coalescer drain
+        // anything still queued and exit.
+    });
+
+    // Stage 2: coalesce a burst of chunks into a single frame before emitting.
+    // A lone keystroke echo has nothing queued behind it, so it flushes
+    // immediately with no added latency; only an active burst (where more chunks
+    // are already waiting) waits out the short coalescing window to merge its tail.
+    thread::spawn(move || {
+        while let Ok(mut acc) = chunk_rx.recv() {
+            // Pull everything already queued without waiting.
+            let mut bursting = false;
+            while acc.len() < MAX_COALESCED_BYTES {
+                match chunk_rx.try_recv() {
+                    Ok(chunk) => {
+                        acc.extend_from_slice(&chunk);
+                        bursting = true;
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            // A burst is in progress: briefly gather its tail so it lands as one frame.
+            if bursting && acc.len() < MAX_COALESCED_BYTES {
+                let deadline = Instant::now() + OUTPUT_COALESCE_WINDOW;
+                while acc.len() < MAX_COALESCED_BYTES {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    match chunk_rx.recv_timeout(deadline - now) {
+                        Ok(chunk) => acc.extend_from_slice(&chunk),
+                        Err(_) => break,
+                    }
+                }
+            }
 
             let (output_notification, terminal_notifications) = {
                 let Ok(mut state) = state.lock() else {
-                    break;
+                    return;
                 };
                 let Some(session) = state.sessions.get_mut(&session_id) else {
-                    break;
+                    return;
                 };
-                let terminal_notifications =
-                    session.notification_requests_for_output(&buffer[..bytes_read]);
-                let frame = session.append_output(&buffer[..bytes_read]);
+                let terminal_notifications = session.notification_requests_for_output(&acc);
+                let frame = session.append_output(&acc);
                 let output_notification = json!({
                     "jsonrpc": "2.0",
                     "method": SESSION_OUTPUT_NOTIFICATION,
@@ -1044,7 +1093,7 @@ fn spawn_reader_thread(
             };
 
             if output_tx.send(output_notification).is_err() {
-                break;
+                return;
             }
             for notification in terminal_notifications {
                 if output_tx.send(notification).is_err() {
