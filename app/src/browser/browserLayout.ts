@@ -14,30 +14,3 @@ export function getBottomBarHeight(bottomInset: number) {
 export function getTabCardWidth(screenWidth: number) {
   return (screenWidth - tabGridHorizontalPadding * 2 - tabGridGap) / 2;
 }
-
-export function getTabCardHeight(cardWidth: number, previewAspectRatio = tabPreviewAspectRatio) {
-  const previewWidth = Math.max(cardWidth - tabCardBorderWidth * 2, 1);
-  return tabHeaderHeight + previewWidth / previewAspectRatio + tabCardBorderWidth * 2;
-}
-
-export function getBottomLeftTabTarget({
-  bottomInset,
-  screenHeight,
-  screenWidth,
-}: {
-  bottomInset: number;
-  screenHeight: number;
-  screenWidth: number;
-}) {
-  const width = getTabCardWidth(screenWidth);
-  const height = getTabCardHeight(width);
-  const left = tabGridHorizontalPadding;
-  const top = screenHeight - getBottomBarHeight(bottomInset) - tabGridGap - height;
-
-  return {
-    height,
-    left,
-    top,
-    width,
-  };
-}

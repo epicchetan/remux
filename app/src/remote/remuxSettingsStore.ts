@@ -84,10 +84,6 @@ export function currentRemuxOrigin() {
   });
 }
 
-export function currentRemuxWebSocketUrl() {
-  return websocketUrl(currentRemuxOrigin(), '/ws');
-}
-
 export function remuxOriginFromSettings({ host, port }: { host: string; port: number }) {
   const normalizedHost = host.includes(':') && !host.startsWith('[') && !host.endsWith(']')
     ? `[${host}]`

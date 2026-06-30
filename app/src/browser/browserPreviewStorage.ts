@@ -1,7 +1,6 @@
 import { Directory, File, Paths } from 'expo-file-system';
 
 const previewDirectory = new Directory(Paths.cache, 'remux', 'tab-previews');
-const legacyPreviewDirectory = new Directory(Paths.document, 'remux', 'tab-previews');
 
 export type PersistedTabPreview = {
   previewFileName: string;
@@ -34,12 +33,7 @@ export async function deleteTabPreview(previewFileName: string | null | undefine
     return;
   }
 
-  try {
-    deletePreviewFile(previewDirectory, previewFileName);
-    deletePreviewFile(legacyPreviewDirectory, previewFileName);
-  } catch {
-    // Preview cleanup is best effort; the tab metadata is the source of truth.
-  }
+  deletePreviewFile(previewFileName);
 }
 
 export function resolveTabPreview(previewFileName: string | null | undefined): PersistedTabPreview | null {
@@ -50,11 +44,8 @@ export function resolveTabPreview(previewFileName: string | null | undefined): P
   try {
     const previewFile = new File(previewDirectory, previewFileName);
     if (!previewFile.exists) {
-      deletePreviewFile(legacyPreviewDirectory, previewFileName);
       return null;
     }
-
-    deletePreviewFile(legacyPreviewDirectory, previewFileName);
 
     return {
       previewFileName,
@@ -70,9 +61,9 @@ function previewFileNameForTab(tabId: string) {
   return `${safeTabId}.jpg`;
 }
 
-function deletePreviewFile(directory: Directory, previewFileName: string) {
+function deletePreviewFile(previewFileName: string) {
   try {
-    const previewFile = new File(directory, previewFileName);
+    const previewFile = new File(previewDirectory, previewFileName);
     if (previewFile.exists) {
       previewFile.delete();
     }
