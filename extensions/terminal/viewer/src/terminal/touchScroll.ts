@@ -6,26 +6,25 @@ const momentumStartVelocity = 50;
 const tapMaxDurationMs = 300;
 const tapMaxDistancePx = 10;
 const velocitySampleCount = 5;
+const maxTicksPerEmit = 8;
 
 type TouchSample = {
   time: number;
   y: number;
 };
 
-const textEncoder = new TextEncoder();
-
 export function setupTouchScroll(
   container: HTMLElement,
   term: Terminal,
-  sendInput: (data: Uint8Array) => void,
   options: { disabled?: () => boolean; onTap?: () => void } = {},
 ) {
   let cellHeight = container.clientHeight / Math.max(term.rows, 1);
   let scrollAccum = 0;
-  let altBufferAccum = 0;
+  let wheelAccum = 0;
   let momentumId: number | null = null;
   let velocity = 0;
 
+  let lastTouchX = 0;
   let lastTouchY = 0;
   let touchStartY = 0;
   let touchStartTime = 0;
@@ -35,6 +34,41 @@ export function setupTouchScroll(
     cellHeight = container.clientHeight / Math.max(term.rows, 1);
   });
 
+  function screenElement() {
+    return container.querySelector('.xterm-screen') as HTMLElement | null;
+  }
+
+  // Hand the gesture to xterm as a real wheel event so it picks the wire format:
+  // a mouse report in the app's negotiated protocol (SGR/X10/urxvt) when mouse
+  // tracking is on, or DECCKM-correct arrow keys on the alternate buffer.
+  function dispatchWheelTick(up: boolean, clientX: number, clientY: number) {
+    const element = screenElement();
+    if (!element) {
+      return;
+    }
+
+    element.dispatchEvent(new WheelEvent('wheel', {
+      bubbles: true,
+      cancelable: true,
+      clientX,
+      clientY,
+      deltaMode: WheelEvent.DOM_DELTA_LINE,
+      deltaY: up ? -1 : 1,
+    }));
+  }
+
+  function clampToScreen(clientX: number, clientY: number) {
+    const rect = screenElement()?.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) {
+      return { x: clientX, y: clientY };
+    }
+
+    return {
+      x: Math.min(Math.max(clientX, rect.left + 1), rect.right - 1),
+      y: Math.min(Math.max(clientY, rect.top + 1), rect.bottom - 1),
+    };
+  }
+
   function cancelMomentum() {
     if (momentumId !== null) {
       window.cancelAnimationFrame(momentumId);
@@ -42,7 +76,7 @@ export function setupTouchScroll(
     }
   }
 
-  function doScroll(deltaPixels: number) {
+  function doScroll(deltaPixels: number, clientX: number, clientY: number) {
     if (options.disabled?.()) {
       return;
     }
@@ -52,25 +86,30 @@ export function setupTouchScroll(
     }
 
     const lines = -deltaPixels / cellHeight;
+    const mouseMode = term.modes.mouseTrackingMode !== 'none';
+    const alternate = term.buffer.active.type === 'alternate';
 
-    if (term.buffer.active.type === 'alternate') {
-      altBufferAccum += lines;
-      const wholeLines = Math.trunc(altBufferAccum);
+    if (!mouseMode && !alternate) {
+      scrollAccum += lines;
+      const wholeLines = Math.trunc(scrollAccum);
       if (wholeLines !== 0) {
-        altBufferAccum -= wholeLines;
-        const key = wholeLines < 0 ? '\x1b[A' : '\x1b[B';
-        for (let index = 0; index < Math.abs(wholeLines); index += 1) {
-          sendInput(textEncoder.encode(key));
-        }
+        scrollAccum -= wholeLines;
+        term.scrollLines(wholeLines);
       }
       return;
     }
 
-    scrollAccum += lines;
-    const wholeLines = Math.trunc(scrollAccum);
-    if (wholeLines !== 0) {
-      scrollAccum -= wholeLines;
-      term.scrollLines(wholeLines);
+    wheelAccum += lines;
+    const wholeLines = Math.trunc(wheelAccum);
+    if (wholeLines === 0) {
+      return;
+    }
+
+    wheelAccum -= wholeLines;
+    const point = clampToScreen(clientX, clientY);
+    const ticks = Math.min(Math.abs(wholeLines), maxTicksPerEmit);
+    for (let index = 0; index < ticks; index += 1) {
+      dispatchWheelTick(wholeLines < 0, point.x, point.y);
     }
   }
 
@@ -89,7 +128,7 @@ export function setupTouchScroll(
         return;
       }
 
-      doScroll(velocity * (elapsed / 1000));
+      doScroll(velocity * (elapsed / 1000), lastTouchX, lastTouchY);
       momentumId = window.requestAnimationFrame(frame);
     }
 
@@ -108,7 +147,8 @@ export function setupTouchScroll(
 
     cancelMomentum();
     scrollAccum = 0;
-    altBufferAccum = 0;
+    wheelAccum = 0;
+    lastTouchX = touch.clientX;
     lastTouchY = touch.clientY;
     touchStartY = touch.clientY;
     touchStartTime = Date.now();
@@ -128,6 +168,7 @@ export function setupTouchScroll(
 
     const y = touch.clientY;
     const deltaY = y - lastTouchY;
+    lastTouchX = touch.clientX;
     lastTouchY = y;
 
     recentMoves.push({ time: Date.now(), y });
@@ -135,7 +176,7 @@ export function setupTouchScroll(
       recentMoves.shift();
     }
 
-    doScroll(deltaY);
+    doScroll(deltaY, touch.clientX, touch.clientY);
     event.preventDefault();
   }
 

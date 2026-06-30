@@ -540,6 +540,97 @@ test.describe('terminal viewer route', () => {
 
     expect(await hostRequestCount(page, 'remux/terminal/session/write')).toBe(writeCount);
   });
+
+  test('sends SGR wheel reports for touch scroll while an app holds mouse mode', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+
+    await sendTerminalOutput(page, 1, 'ready\r\n');
+    // Negotiate VT200 mouse tracking + SGR encoding, like vim/htop/lazygit do.
+    await sendTerminalOutput(page, 2, '\x1b[?1000h\x1b[?1006h');
+    await page.waitForTimeout(150);
+
+    const screenBox = await page.locator('.xterm-screen').boundingBox();
+    expect(screenBox).not.toBeNull();
+    const x = screenBox!.x + screenBox!.width / 2;
+    const top = screenBox!.y + screenBox!.height * 0.25;
+    const bottom = screenBox!.y + screenBox!.height * 0.85;
+
+    const writeCount = await hostRequestCount(page, 'remux/terminal/session/write');
+    // Finger drags down -> wheel up -> SGR button 64.
+    await dispatchTouchDrag(page, [
+      { x, y: top },
+      { x, y: (top + bottom) / 2 },
+      { x, y: bottom },
+    ]);
+
+    await expect.poll(async () => {
+      const writes = (await hostRequests(page, 'remux/terminal/session/write')).slice(writeCount);
+      return decodeWrites(writes).some((data) => /\x1b\[<64;\d+;\d+M/.test(data));
+    }).toBe(true);
+  });
+
+  test('routes alternate-buffer touch scroll to cursor keys honoring DECCKM', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+
+    await sendTerminalOutput(page, 1, 'ready\r\n');
+    // Enter the alternate screen with application cursor keys (a full-screen pager, no mouse).
+    await sendTerminalOutput(page, 2, '\x1b[?1049h\x1b[?1h');
+    await page.waitForTimeout(150);
+
+    const screenBox = await page.locator('.xterm-screen').boundingBox();
+    expect(screenBox).not.toBeNull();
+    const x = screenBox!.x + screenBox!.width / 2;
+    const top = screenBox!.y + screenBox!.height * 0.25;
+    const bottom = screenBox!.y + screenBox!.height * 0.85;
+
+    const writeCount = await hostRequestCount(page, 'remux/terminal/session/write');
+    await dispatchTouchDrag(page, [
+      { x, y: top },
+      { x, y: (top + bottom) / 2 },
+      { x, y: bottom },
+    ]);
+
+    await expect.poll(async () => {
+      const decoded = decodeWrites(
+        (await hostRequests(page, 'remux/terminal/session/write')).slice(writeCount),
+      );
+      return {
+        appCursorUp: decoded.some((data) => data.includes('\x1bOA')),
+        csiUp: decoded.some((data) => data.includes('\x1b[A')),
+      };
+    }).toEqual({ appCursorUp: true, csiUp: false });
+  });
+
+  test('keeps the keyboard up on a single tap and dismisses on a double tap', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+
+    const container = page.locator('.remux-terminal-container');
+    const keyboardFocused = () => page.evaluate(() =>
+      document.activeElement?.classList.contains('xterm-helper-textarea') ?? false);
+
+    // Single tap brings the keyboard up.
+    await container.click({ position: { x: 24, y: 24 } });
+    await expect.poll(keyboardFocused).toBe(true);
+
+    // A lone tap while the keyboard is up must not dismiss it.
+    const dismissBefore = await hostRequestCount(page, 'host/keyboard/dismiss');
+    await page.waitForTimeout(400);
+    await container.click({ position: { x: 24, y: 24 } });
+    await page.waitForTimeout(80);
+    expect(await keyboardFocused()).toBe(true);
+    expect(await hostRequestCount(page, 'host/keyboard/dismiss')).toBe(dismissBefore);
+
+    // A deliberate double tap dismisses it.
+    await page.waitForTimeout(400);
+    await container.click({ position: { x: 24, y: 24 } });
+    await page.waitForTimeout(150);
+    await container.click({ position: { x: 24, y: 24 } });
+    await waitForHostRequest(page, 'host/keyboard/dismiss', dismissBefore + 1);
+    await expect.poll(keyboardFocused).toBe(false);
+  });
 });
 
 async function installMockRemuxHost(page: Page) {
@@ -797,6 +888,35 @@ function recordParams(request: HostRequest) {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+async function dispatchTouchDrag(page: Page, points: Array<{ x: number; y: number }>) {
+  await page.evaluate((points) => {
+    const container = document.querySelector('.remux-terminal-container');
+    if (!container) {
+      throw new Error('missing terminal container');
+    }
+    const terminalContainer = container;
+
+    function dispatchTouch(type: string, point: { x: number; y: number }, ended = false) {
+      const event = new Event(type, { bubbles: true, cancelable: true });
+      const touch = { clientX: point.x, clientY: point.y };
+      Object.defineProperty(event, 'touches', { value: ended ? [] : [touch] });
+      Object.defineProperty(event, 'changedTouches', { value: [touch] });
+      terminalContainer.dispatchEvent(event);
+    }
+
+    dispatchTouch('touchstart', points[0]!);
+    for (let index = 1; index < points.length; index += 1) {
+      dispatchTouch('touchmove', points[index]!);
+    }
+    dispatchTouch('touchend', points[points.length - 1]!, true);
+  }, points);
+}
+
+function decodeWrites(writes: HostRequest[]) {
+  return writes.map((request) =>
+    Buffer.from(String(recordParams(request).dataBase64), 'base64').toString('latin1'));
 }
 
 function replayFrame(seq: number, data: string) {

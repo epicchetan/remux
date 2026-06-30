@@ -91,6 +91,8 @@ const fontFamily = 'Menlo, Consolas, "Liberation Mono", monospace';
 const textEncoder = new TextEncoder();
 const fitDebounceMs = 180;
 const commandTitleDelayMs = 500;
+const terminalTapEchoMs = 90;
+const terminalDoubleTapMs = 300;
 const tmuxPollMs = 2_500;
 const tmuxScrollHoldDelayMs = 260;
 const tmuxScrollMaxQueuedTaps = 6;
@@ -583,13 +585,25 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     }
 
     const now = performance.now();
-    if (now - lastTerminalTapMsRef.current < 250) {
+    const sinceLastTap = now - lastTerminalTapMsRef.current;
+    // Collapse the touchend + synthetic-click pair fired by a single physical tap.
+    if (sinceLastTap < terminalTapEchoMs) {
       return;
     }
 
     lastTerminalTapMsRef.current = now;
-    toggleKeyboard();
-  }, [toggleKeyboard]);
+
+    // Single tap brings the keyboard up; only a deliberate double tap dismisses it,
+    // so a stray tap while typing can't drop the keyboard.
+    if (keyboardOpenRef.current) {
+      if (sinceLastTap < terminalDoubleTapMs) {
+        closeKeyboard();
+      }
+      return;
+    }
+
+    openKeyboard();
+  }, [closeKeyboard, openKeyboard]);
 
   const refreshSelectionState = useCallback(() => {
     const terminal = terminalRef.current;
@@ -812,8 +826,14 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
         handleCurrentDirectory(parseOsc1337CurrentDirectory(data))
       ));
 
-      cleanupTouch = setupTouchScroll(terminalContainer, terminal, sendBytes, {
-        disabled: () => tmuxAttachedRef.current || selectionModeRef.current,
+      cleanupTouch = setupTouchScroll(terminalContainer, terminal, {
+        // Touch scroll now routes through xterm's wheel pipeline, so it works inside
+        // tmux when its mouse mode is on. Tmux without mouse keeps the copy-mode
+        // buttons (bare arrows would just move the cursor), and selection owns the pointer.
+        disabled: () => (
+          selectionModeRef.current
+          || (tmuxAttachedRef.current && terminal.modes.mouseTrackingMode === 'none')
+        ),
         onTap: handleTerminalTap,
       });
       resizeObserver = new ResizeObserver(() => scheduleFit());
