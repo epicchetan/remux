@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
@@ -46,6 +46,7 @@ const NOTIFICATION_BODY_MAX_CHARS: usize = 240;
 const BELL_NOTIFICATION_MIN_INTERVAL_MS: u64 = 10_000;
 const DUPLICATE_NOTIFICATION_MIN_INTERVAL_MS: u64 = 2_000;
 const SHELL_INTEGRATION_ENV: &str = "REMUX_TERMINAL_SHELL_INTEGRATION";
+const TMUX_CONTEXT_CACHE_FRESH_MS: u64 = 1_000;
 
 fn main() {
     if let Err(error) = run_stdio_server() {
@@ -66,52 +67,131 @@ fn run_stdio_server() -> Result<(), String> {
             continue;
         }
 
-        let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
-            Ok(request) => handle_request(&server, request),
-            Err(error) => JsonRpcResponse::error(
-                Value::Null,
-                JsonRpcError::new(-32700, format!("Parse error: {error}")),
-            ),
-        };
-
-        let response = serde_json::to_value(response).map_err(|error| error.to_string())?;
-        output_tx
-            .send(response)
-            .map_err(|error| format!("failed to write response: {error}"))?;
+        match serde_json::from_str::<JsonRpcEnvelope>(&line) {
+            Ok(envelope) => handle_envelope(&server, envelope, &output_tx)?,
+            Err(error) => {
+                eprintln!("ignored invalid terminal protocol frame: {error}");
+            }
+        }
     }
 
     server.kill_all();
     Ok(())
 }
 
-fn handle_request(server: &TerminalExtensionServer, request: JsonRpcRequest) -> JsonRpcResponse {
+fn handle_envelope(
+    server: &TerminalExtensionServer,
+    envelope: JsonRpcEnvelope,
+    output_tx: &mpsc::Sender<Value>,
+) -> Result<(), String> {
+    let JsonRpcEnvelope { id, method, params } = envelope;
+    if method == TMUX_ACTION_METHOD {
+        match server.spawn_tmux_action(params.unwrap_or(Value::Null), id.clone(), output_tx.clone())
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                respond_or_log(id, Err(JsonRpcError::new(-32000, error)), output_tx)?;
+                return Ok(());
+            }
+        }
+    }
+
+    let result = handle_request(server, JsonRpcRequest {
+        method,
+        params,
+    });
+    if let Some(id) = id {
+        let response = match result {
+            Ok(value) => JsonRpcResponse::result(id, value),
+            Err(error) => JsonRpcResponse::error(id, error),
+        };
+        send_jsonrpc_response(output_tx, response)?;
+    } else if let Err(error) = result {
+        eprintln!("ignored terminal notification error: {}", error.message);
+    }
+
+    Ok(())
+}
+
+fn handle_request(
+    server: &TerminalExtensionServer,
+    request: JsonRpcRequest,
+) -> Result<Value, JsonRpcError> {
     let result = match request.method.as_str() {
-        SESSION_LIST_METHOD => server.list_sessions(),
-        SESSION_START_METHOD => server.start_session(request.params.unwrap_or(Value::Null)),
-        SESSION_ATTACH_METHOD => server.attach_session(request.params.unwrap_or(Value::Null)),
-        SESSION_WRITE_METHOD => server.write_session(request.params.unwrap_or(Value::Null)),
-        SESSION_RESIZE_METHOD => server.resize_session(request.params.unwrap_or(Value::Null)),
-        SESSION_KILL_METHOD => server.kill_session(request.params.unwrap_or(Value::Null)),
-        TMUX_CONTEXT_GET_METHOD => server.tmux_context(request.params.unwrap_or(Value::Null)),
-        TMUX_ACTION_METHOD => server.tmux_action(request.params.unwrap_or(Value::Null)),
+        SESSION_LIST_METHOD => server.list_sessions().map_err(internal_rpc_error),
+        SESSION_START_METHOD => server
+            .start_session(request.params.unwrap_or(Value::Null))
+            .map_err(internal_rpc_error),
+        SESSION_ATTACH_METHOD => server
+            .attach_session(request.params.unwrap_or(Value::Null))
+            .map_err(internal_rpc_error),
+        SESSION_WRITE_METHOD => server
+            .write_session(request.params.unwrap_or(Value::Null))
+            .map_err(internal_rpc_error),
+        SESSION_RESIZE_METHOD => server
+            .resize_session(request.params.unwrap_or(Value::Null))
+            .map_err(internal_rpc_error),
+        SESSION_KILL_METHOD => server
+            .kill_session(request.params.unwrap_or(Value::Null))
+            .map_err(internal_rpc_error),
+        TMUX_CONTEXT_GET_METHOD => server
+            .tmux_context(request.params.unwrap_or(Value::Null))
+            .map_err(internal_rpc_error),
+        TMUX_ACTION_METHOD => Err(internal_rpc_error(
+            "tmux action requests are handled asynchronously".to_string(),
+        )),
         _ => {
-            return JsonRpcResponse::error(
-                request.id,
-                JsonRpcError::new(-32601, format!("Unknown method: {}", request.method)),
-            );
+            return Err(JsonRpcError::new(
+                -32601,
+                format!("Unknown method: {}", request.method),
+            ));
         }
     };
 
-    match result {
-        Ok(value) => JsonRpcResponse::result(request.id, value),
-        Err(error) => JsonRpcResponse::error(request.id, JsonRpcError::new(-32000, error)),
+    result
+}
+
+fn respond_or_log(
+    id: Option<Value>,
+    result: Result<Value, JsonRpcError>,
+    output_tx: &mpsc::Sender<Value>,
+) -> Result<(), String> {
+    match id {
+        Some(id) => {
+            let response = match result {
+                Ok(value) => JsonRpcResponse::result(id, value),
+                Err(error) => JsonRpcResponse::error(id, error),
+            };
+            send_jsonrpc_response(output_tx, response)
+        }
+        None => {
+            if let Err(error) = result {
+                eprintln!("ignored terminal notification error: {}", error.message);
+            }
+            Ok(())
+        }
     }
+}
+
+fn internal_rpc_error(message: String) -> JsonRpcError {
+    JsonRpcError::new(-32000, message)
+}
+
+fn send_jsonrpc_response(
+    output_tx: &mpsc::Sender<Value>,
+    response: JsonRpcResponse,
+) -> Result<(), String> {
+    let response = serde_json::to_value(response).map_err(|error| error.to_string())?;
+    output_tx
+        .send(response)
+        .map_err(|error| format!("failed to write response: {error}"))
 }
 
 #[derive(Clone)]
 struct TerminalExtensionServer {
     output_tx: mpsc::Sender<Value>,
     state: Arc<Mutex<TerminalState>>,
+    tmux_cache: Arc<Mutex<TmuxCacheState>>,
 }
 
 impl TerminalExtensionServer {
@@ -119,6 +199,7 @@ impl TerminalExtensionServer {
         Self {
             output_tx,
             state: Arc::new(Mutex::new(TerminalState::default())),
+            tmux_cache: Arc::new(Mutex::new(TmuxCacheState::default())),
         }
     }
 
@@ -384,17 +465,88 @@ impl TerminalExtensionServer {
         let params =
             parse_params::<tmux::TerminalTmuxContextParams>(params, TMUX_CONTEXT_GET_METHOD)?;
         let terminal_tty = self.session_tty(&params.session_id)?;
-        let context = tmux::scan_context(&params.session_id, terminal_tty)?;
+        let context = self.cached_tmux_context(params.session_id, terminal_tty);
 
         serde_json::to_value(json!({ "context": context })).map_err(|error| error.to_string())
     }
 
-    fn tmux_action(&self, params: Value) -> Result<Value, String> {
+    fn spawn_tmux_action(
+        &self,
+        params: Value,
+        response_id: Option<Value>,
+        output_tx: mpsc::Sender<Value>,
+    ) -> Result<(), String> {
         let params = parse_params::<tmux::TerminalTmuxActionParams>(params, TMUX_ACTION_METHOD)?;
+        let session_id = params.session_id.clone();
         let terminal_tty = self.session_tty(&params.session_id)?;
-        let response = tmux::run_tmux_action(params, terminal_tty)?;
+        let cache = self.tmux_cache.clone();
 
-        serde_json::to_value(response).map_err(|error| error.to_string())
+        thread::spawn(move || {
+            let result = tmux::run_tmux_action(params, terminal_tty)
+                .and_then(|response| {
+                    if let Some(context) = response.context.clone() {
+                        update_tmux_context_cache(&cache, &session_id, context);
+                    }
+                    serde_json::to_value(response).map_err(|error| error.to_string())
+                })
+                .map_err(internal_rpc_error);
+            let _ = respond_or_log(response_id, result, &output_tx);
+        });
+
+        Ok(())
+    }
+
+    fn cached_tmux_context(
+        &self,
+        session_id: String,
+        terminal_tty: Option<String>,
+    ) -> tmux::TmuxContext {
+        let now = unix_millis();
+        let cached = self
+            .tmux_cache
+            .lock()
+            .ok()
+            .and_then(|state| state.contexts.get(&session_id).cloned())
+            .filter(|context| context.terminal_tty == terminal_tty);
+
+        let fresh = cached
+            .as_ref()
+            .is_some_and(|context| now.saturating_sub(context.generated_at) <= TMUX_CONTEXT_CACHE_FRESH_MS);
+        if !fresh {
+            self.schedule_tmux_context_refresh(session_id.clone(), terminal_tty.clone());
+        }
+
+        cached.unwrap_or_else(|| empty_tmux_context(&session_id, terminal_tty, now))
+    }
+
+    fn schedule_tmux_context_refresh(&self, session_id: String, terminal_tty: Option<String>) {
+        let should_spawn = {
+            let Ok(mut state) = self.tmux_cache.lock() else {
+                return;
+            };
+            state.refreshes.insert(session_id.clone())
+        };
+
+        if !should_spawn {
+            return;
+        }
+
+        let cache = self.tmux_cache.clone();
+        thread::spawn(move || {
+            let result = tmux::scan_context(&session_id, terminal_tty);
+            let Ok(mut state) = cache.lock() else {
+                return;
+            };
+            state.refreshes.remove(&session_id);
+            match result {
+                Ok(context) => {
+                    state.contexts.insert(session_id, context);
+                }
+                Err(error) => {
+                    eprintln!("failed to refresh tmux context: {error}");
+                }
+            }
+        });
     }
 
     fn session_tty(&self, session_id: &str) -> Result<Option<String>, String> {
@@ -435,6 +587,12 @@ impl TerminalExtensionServer {
 struct TerminalState {
     next_generated_id: u64,
     sessions: HashMap<String, SessionRecord>,
+}
+
+#[derive(Default)]
+struct TmuxCacheState {
+    contexts: HashMap<String, tmux::TmuxContext>,
+    refreshes: HashSet<String>,
 }
 
 struct SessionRecord {
@@ -1422,6 +1580,33 @@ fn unix_millis() -> u64 {
         .unwrap_or(0)
 }
 
+fn empty_tmux_context(
+    session_id: &str,
+    terminal_tty: Option<String>,
+    generated_at: u64,
+) -> tmux::TmuxContext {
+    tmux::TmuxContext {
+        mode: tmux::TmuxMode::None,
+        terminal_session_id: session_id.to_string(),
+        terminal_tty,
+        current_client: None,
+        sockets: Vec::new(),
+        generated_at,
+    }
+}
+
+fn update_tmux_context_cache(
+    cache: &Arc<Mutex<TmuxCacheState>>,
+    session_id: &str,
+    context: tmux::TmuxContext,
+) {
+    let Ok(mut state) = cache.lock() else {
+        return;
+    };
+
+    state.contexts.insert(session_id.to_string(), context);
+}
+
 const BASH_INTEGRATION_SCRIPT: &str = r#"
 if [ -n "${__REMUX_TERMINAL_SHELL_INTEGRATION_LOADED:-}" ]; then
   return
@@ -1544,10 +1729,17 @@ where
 }
 
 #[derive(Debug, Deserialize)]
-struct JsonRpcRequest {
-    id: Value,
+struct JsonRpcEnvelope {
+    #[serde(default)]
+    id: Option<Value>,
     method: String,
     #[serde(default)]
+    params: Option<Value>,
+}
+
+#[derive(Debug)]
+struct JsonRpcRequest {
+    method: String,
     params: Option<Value>,
 }
 
@@ -1606,8 +1798,10 @@ mod tests {
     use portable_pty::CommandBuilder;
 
     use super::{
+        handle_envelope, JsonRpcEnvelope,
         BASE64, REMUX_NOTIFICATION_REQUEST_METHOD, SESSION_EXITED_NOTIFICATION,
-        SESSION_OUTPUT_NOTIFICATION, SHELL_INTEGRATION_ENV, TerminalExtensionServer,
+        SESSION_OUTPUT_NOTIFICATION, SESSION_WRITE_METHOD, SHELL_INTEGRATION_ENV,
+        TerminalExtensionServer,
         TerminalNotificationEvent, TerminalNotificationParser, clamp_u16,
         configure_shell_integration, configure_terminal_environment, pty_size,
     };
@@ -1823,6 +2017,59 @@ mod tests {
     }
 
     #[test]
+    fn idless_session_write_writes_to_pty_without_response() {
+        let Some(shell) = test_shell() else {
+            return;
+        };
+        let (server, output_rx) = test_server();
+        let session_id = "terminal-test-idless-write";
+
+        start_test_session(&server, session_id, shell, 80, 24);
+        let output_tx = server.output_tx.clone();
+        handle_envelope(
+            &server,
+            JsonRpcEnvelope {
+                id: None,
+                method: SESSION_WRITE_METHOD.to_string(),
+                params: Some(json!({
+                    "dataBase64": BASE64.encode(b"printf 'idless-write-ok'\r"),
+                    "sessionId": session_id,
+                })),
+            },
+            &output_tx,
+        )
+        .expect("expected id-less write notification to be handled");
+
+        read_until_output_without_response(&output_rx, session_id, "idless-write-ok");
+        server.kill_all();
+    }
+
+    #[test]
+    fn tmux_context_returns_empty_context_without_waiting_for_scan() {
+        let Some(shell) = test_shell() else {
+            return;
+        };
+        let (server, _output_rx) = test_server();
+        let session_id = "terminal-test-tmux-cache";
+
+        start_test_session(&server, session_id, shell, 80, 24);
+        let started_at = Instant::now();
+        let response = server
+            .tmux_context(json!({ "sessionId": session_id }))
+            .expect("expected tmux context request to return");
+
+        assert!(
+            started_at.elapsed() < Duration::from_millis(100),
+            "expected first tmux context response to avoid waiting for scan"
+        );
+        assert_eq!(response["context"]["terminalSessionId"], session_id);
+        assert_eq!(response["context"]["mode"], "none");
+        assert_eq!(response["context"]["sockets"].as_array().map(Vec::len), Some(0));
+
+        server.kill_all();
+    }
+
+    #[test]
     fn pty_session_emits_remux_notification_for_osc9() {
         let Some(shell) = test_shell() else {
             return;
@@ -2008,6 +2255,36 @@ mod tests {
             let message = output_rx
                 .recv_timeout(deadline.saturating_duration_since(now))
                 .expect("expected terminal output notification");
+            if let Some(text) = output_text(&message, session_id) {
+                collected.push_str(&text);
+                if collected.contains(expected) {
+                    return collected;
+                }
+            }
+        }
+    }
+
+    fn read_until_output_without_response(
+        output_rx: &Receiver<Value>,
+        session_id: &str,
+        expected: &str,
+    ) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut collected = String::new();
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                panic!("timed out waiting for {expected:?}; collected output: {collected:?}");
+            }
+
+            let message = output_rx
+                .recv_timeout(deadline.saturating_duration_since(now))
+                .expect("expected terminal output notification");
+            assert!(
+                !message.get("result").is_some() && !message.get("error").is_some(),
+                "id-less write unexpectedly emitted a response: {message:?}",
+            );
             if let Some(text) = output_text(&message, session_id) {
                 collected.push_str(&text);
                 if collected.contains(expected) {

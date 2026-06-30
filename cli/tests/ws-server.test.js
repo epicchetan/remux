@@ -63,6 +63,66 @@ test('logs app diagnostics notifications without routing them as RPC requests', 
   await close(server);
 });
 
+test('routes downstream notifications without sending a response', async () => {
+  const warnings = [];
+  let resolveRouted;
+  const routed = new Promise((resolve) => {
+    resolveRouted = resolve;
+  });
+
+  const server = http.createServer();
+  const remux = attachRemuxWebSocketServer({
+    log: {
+      log() {},
+      warn(message) {
+        warnings.push(String(message));
+      },
+    },
+    router: {
+      async handleNotification(message) {
+        resolveRouted(message);
+      },
+      async handleRequest() {
+        throw new Error('Notifications should not be routed as RPC requests');
+      },
+    },
+    server,
+  });
+
+  await listen(server);
+
+  const socket = await connect(`ws://127.0.0.1:${server.address().port}/ws`);
+  const unexpectedResponse = new Promise((_, reject) => {
+    socket.once('message', (message) => {
+      reject(new Error(`Unexpected response: ${message}`));
+    });
+  });
+  socket.send(JSON.stringify({
+    jsonrpc: '2.0',
+    method: 'remux/terminal/session/write',
+    params: {
+      dataBase64: 'YQ==',
+      sessionId: 'session-1',
+    },
+  }));
+
+  assert.deepEqual(
+    await withTimeout(Promise.race([routed, unexpectedResponse]), 1000),
+    {
+      method: 'remux/terminal/session/write',
+      params: {
+        dataBase64: 'YQ==',
+        sessionId: 'session-1',
+      },
+    },
+  );
+  assert.deepEqual(warnings, []);
+
+  socket.close();
+  remux.close();
+  await close(server);
+});
+
 function listen(server) {
   return new Promise((resolve) => {
     server.listen(0, '127.0.0.1', resolve);

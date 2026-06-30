@@ -63,6 +63,14 @@ function createRpcRouter({
       return server.handleRpc(request);
     },
 
+    async handleNotification({ method, params }) {
+      const extensionId = extensionIdFromMethod(method) || defaultExtensionId;
+      const server = extensionId ? servers.get(extensionId) : null;
+      if (typeof server?.handleNotification === 'function') {
+        server.handleNotification({ method, params });
+      }
+    },
+
     async stop() {
       await Promise.all([...servers.entries()].map(async ([extensionId, server]) => {
         try {

@@ -124,6 +124,16 @@ async function handleDownstreamFrame({ client, frame, log, notifications, router
         return;
       }
 
+      if (typeof router?.handleNotification === 'function') {
+        void router.handleNotification({
+          method: message.method,
+          params: message.params,
+        }).catch((error) => {
+          log.warn?.(`[remux] downstream notification failed: ${message.method}: ${errorMessageForLog(error)}`);
+        });
+        return;
+      }
+
       log.warn?.(`[remux] ignored downstream notification: ${message.method}`);
       return;
     }
@@ -149,6 +159,10 @@ async function handleDownstreamFrame({ client, frame, log, notifications, router
   } catch (error) {
     sendJsonRpcMessage(client.socket, errorMessage(message.id, error));
   }
+}
+
+function errorMessageForLog(error) {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function createDownstreamClient(socket) {

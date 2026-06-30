@@ -1,4 +1,9 @@
-import { requestIpc, subscribeIpcEvents, type JsonRpcMessage } from '@remux/viewer-kit/ipc';
+import {
+  notifyIpc,
+  requestIpc,
+  subscribeIpcEvents,
+  type JsonRpcMessage,
+} from '@remux/viewer-kit/ipc';
 
 const terminalRequestTimeoutMs = 300_000;
 const terminalTmuxRequestTimeoutMs = 5_000;
@@ -165,6 +170,13 @@ export function writeTerminalSession(sessionId: string, data: Uint8Array) {
     },
     terminalRequestTimeoutMs,
   );
+}
+
+export function writeTerminalSessionInput(sessionId: string, data: Uint8Array) {
+  notifyIpc('remux/terminal/session/write', {
+    dataBase64: bytesToBase64(data),
+    sessionId,
+  });
 }
 
 export function resizeTerminalSession(params: {

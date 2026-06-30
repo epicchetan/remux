@@ -61,6 +61,7 @@ export function ActiveSurface({ onOpenOverview, surfaceRef }: ActiveSurfaceProps
             ]}
           >
             <ViewerSurface
+              active={visible}
               onOpenOverview={onOpenOverview}
               surfaceRef={visible ? surfaceRef : undefined}
               tab={tab}

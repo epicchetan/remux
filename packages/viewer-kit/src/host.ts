@@ -27,6 +27,8 @@ export type RemuxHostViewportMetrics = {
   viewportWidth: number;
 };
 
+export type RemuxHostConnectionStatus = 'connected' | 'connecting' | 'reconnecting' | 'disconnected';
+
 export function dismissHostKeyboard() {
   return requestIpc('host/keyboard/dismiss', undefined, 1_000);
 }
@@ -60,6 +62,36 @@ export function subscribeHostViewportMetrics(subscriber: (metrics: RemuxHostView
     for (const event of events) {
       if (event.method === 'host/viewport/changed') {
         subscriber(paramsOf<RemuxHostViewportMetrics>(event));
+      }
+    }
+  });
+}
+
+export function subscribeHostConnection(subscriber: (status: RemuxHostConnectionStatus) => void) {
+  return subscribeIpcEvents((events) => {
+    for (const event of events) {
+      if (event.method !== 'host/connection') {
+        continue;
+      }
+
+      const status = paramsOf<{ status?: unknown }>(event).status;
+      if (
+        status === 'connected' ||
+        status === 'connecting' ||
+        status === 'reconnecting' ||
+        status === 'disconnected'
+      ) {
+        subscriber(status);
+      }
+    }
+  });
+}
+
+export function subscribeHostActive(subscriber: (active: boolean) => void) {
+  return subscribeIpcEvents((events) => {
+    for (const event of events) {
+      if (event.method === 'host/active') {
+        subscriber(paramsOf<{ active?: unknown }>(event).active === true);
       }
     }
   });

@@ -1,8 +1,10 @@
 # Viewer Kit SDK
 
-Status: Active Spec
+Status: Active Spec (Phase 1 — foundation)
 Last verified: 2026-06-30
-Canonical code: Planned under `packages/viewer-kit/`. Consumers: `extensions/*/viewer`, with the app emit side under `app/src/browser/`.
+Canonical code: `packages/viewer-kit/`. Consumers: `extensions/*/viewer`.
+Continued by: [viewer-kit-phase-2.md](viewer-kit-phase-2.md) (frame depth: dual-substrate theme, codex onboarding, component library).
+Progress: slices 0–5 landed; satellites migrated and on the near-black surface ladder. Slice 6 (lifecycle/resume) is **deferred** into a future terminal-lifecycle + stability effort, not done here.
 
 ## Purpose
 
@@ -106,10 +108,13 @@ Vertical slices. Each ends with `npm run typecheck` and `npm run viewers:build` 
 4. UI + tokens     ActionBar/Button/Menu into /ui on semantic tokens;
                    terminal adopts; extension-ui becomes a shim.           [terminal visually unchanged or improved]
 5. Roll out        editor + markdown repeat the terminal pattern.          [all satellites on kit; shims still pass]
-6. Lifecycle       app emits host/lifecycle/resume; useViewerResume;
-                   rewire codex resumeSync; fixes tab-switch resume.       [codex resyncs on intra-app tab switch]
--- deferred --     codex styling + spacing migration; light mode;
-                   RN app-shell token source; drop the compat shims.
+6. Lifecycle       DEFERRED — moved to a future terminal-lifecycle +
+                   stability spec (app emits host/lifecycle/resume;
+                   useViewerResume; rewire codex resumeSync).             [planned outside this spec]
+-- next --         codex color onboarding + component library: see
+                   viewer-kit-phase-2.md.
+-- deferred --     codex spacing migration; light mode; RN app-shell
+                   token source.
 ```
 
 The shim in slice 1 is what makes the work safe across sessions: consumers move one at a time and `main` stays green throughout. Resume work at any time by reading this spec and the slice checklist.

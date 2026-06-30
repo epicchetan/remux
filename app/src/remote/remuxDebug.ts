@@ -6,6 +6,12 @@ export type RemuxDebugEntry = {
 
 type RemuxDebugSink = (entry: RemuxDebugEntry) => void;
 
+const highVolumeLabels = new Set([
+  'rpc:request',
+  'rpc:result',
+  'socket:message',
+]);
+
 let debugSink: RemuxDebugSink | null = null;
 
 export function setRemuxDebugSink(sink: RemuxDebugSink | null) {
@@ -13,6 +19,10 @@ export function setRemuxDebugSink(sink: RemuxDebugSink | null) {
 }
 
 export function logRemuxDebug(label: string, detail?: unknown) {
+  if (!isVerboseDebugEnabled() && highVolumeLabels.has(label)) {
+    return;
+  }
+
   const entry = {
     detail: normalizeDetail(detail),
     label,
@@ -35,6 +45,12 @@ export function logRemuxDebug(label: string, detail?: unknown) {
 
 function isDevRuntime() {
   return typeof __DEV__ !== 'undefined' && __DEV__;
+}
+
+function isVerboseDebugEnabled() {
+  return isDevRuntime() && (
+    globalThis as typeof globalThis & { __REMUX_VERBOSE_DEBUG__?: boolean }
+  ).__REMUX_VERBOSE_DEBUG__ === true;
 }
 
 function shouldForwardToCli(label: string) {

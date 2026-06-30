@@ -49,6 +49,7 @@ export type RemuxConnectionStatus =
 
 export type RemuxConnection = {
   error: string | null;
+  notify: (method: string, params?: unknown) => void;
   request: <T>(method: string, params?: unknown, timeoutMs?: number) => Promise<T>;
   respond: (id: JsonRpcId, result: unknown) => void;
   respondError: (id: JsonRpcId, error: { code: number; data?: unknown; message: string }) => void;
@@ -445,6 +446,10 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
     }
   }, [markClientConnectionLost, waitForConnectedClient]);
 
+  const notify = useCallback<RemuxConnection['notify']>((method, params) => {
+    clientRef.current?.tryNotify(method, params);
+  }, []);
+
   const respond = useCallback<RemuxConnection['respond']>((id, result) => {
     try {
       clientRef.current?.respond(id, result);
@@ -477,13 +482,14 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
   const value = useMemo<RemuxConnection>(
     () => ({
       error,
+      notify,
       request,
       respond,
       respondError,
       status,
       subscribe,
     }),
-    [error, request, respond, respondError, status, subscribe],
+    [error, notify, request, respond, respondError, status, subscribe],
   );
 
   return (

@@ -111,6 +111,57 @@ test('createExtensionProcess turns extension error responses into JsonRpcError',
   }
 });
 
+test('createExtensionProcess writes notifications without registering an RPC request', async () => {
+  const fixture = createProcessFixture();
+  const processServer = createExtensionProcess({
+    extension: {
+      id: 'fixture',
+      server: {
+        args: [fixture.script],
+        command: process.execPath,
+        cwd: fixture.root,
+      },
+    },
+    log: silentLog(),
+    requestTimeoutMs: 1_000,
+  });
+
+  try {
+    await processServer.start({
+      broadcast() {},
+      fatal(error) {
+        throw new Error(error);
+      },
+    });
+
+    processServer.handleNotification({
+      method: 'typed-input',
+      params: { value: 'a' },
+    });
+
+    await waitFor(async () => {
+      const result = await processServer.handleRpc({ method: 'notifications' });
+      return result.notifications.length === 1;
+    });
+
+    assert.deepEqual(
+      await processServer.handleRpc({ method: 'notifications' }),
+      {
+        notifications: [
+          {
+            hasId: false,
+            method: 'typed-input',
+            params: { value: 'a' },
+          },
+        ],
+      },
+    );
+  } finally {
+    await processServer.stop();
+    fixture.cleanup();
+  }
+});
+
 test('createExtensionProcess logs extension stderr diagnostics', async () => {
   const fixture = createProcessFixture();
   const events = [];
@@ -157,9 +208,18 @@ function createProcessFixture() {
   const script = join(root, 'extension.cjs');
   writeFileSync(script, [
     "const readline = require('node:readline');",
+    'const notifications = [];',
     "const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });",
     "input.on('line', (line) => {",
     "  const request = JSON.parse(line);",
+    "  if (!Object.prototype.hasOwnProperty.call(request, 'id')) {",
+    "    notifications.push({ hasId: false, method: request.method, params: request.params });",
+    '    return;',
+    '  }',
+    "  if (request.method === 'notifications') {",
+    "    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { notifications } }) + '\\n');",
+    '    return;',
+    '  }',
     "  if (request.method === 'fail') {",
     "    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: -32010, message: 'fixture failed' } }) + '\\n');",
     '    return;',
@@ -195,7 +255,7 @@ function silentLog() {
 async function waitFor(predicate, timeoutMs = 1_000) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    if (predicate()) {
+    if (await predicate()) {
       return;
     }
     await new Promise((resolve) => {

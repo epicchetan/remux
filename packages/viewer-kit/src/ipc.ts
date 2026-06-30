@@ -13,6 +13,11 @@ type WebViewReady = { type: 'remux/ready' };
 type WebViewRequest =
   | WebViewReady
   | {
+      method: string;
+      params?: unknown;
+      type: 'remux/notify';
+    }
+  | {
       id: JsonRpcId;
       method: string;
       params?: unknown;
@@ -56,7 +61,7 @@ const defaultRequestTimeoutMs = 300_000;
 
 let initialized = false;
 let nextId = 1;
-let eventFlushHandle: number | null = null;
+let eventFlushScheduled = false;
 const eventQueue: JsonRpcMessage[] = [];
 const eventSubscribers = new Set<IpcEventSubscriber>();
 const pendingRequests = new Map<JsonRpcId, PendingRequest>();
@@ -98,6 +103,15 @@ export function requestIpc<T>(method: string, params?: unknown, timeoutMs = defa
       reject(errorFromUnknown(error));
     }
   });
+}
+
+export function notifyIpc(method: string, params?: unknown) {
+  initializeIpc();
+  postMessage(
+    params === undefined
+      ? { method, type: 'remux/notify' }
+      : { method, params, type: 'remux/notify' },
+  );
 }
 
 export function subscribeIpcEvents(subscriber: IpcEventSubscriber) {
@@ -154,12 +168,13 @@ function handleNativeMessage(event: MessageEvent) {
 function enqueueEvent(message: JsonRpcMessage) {
   eventQueue.push(message);
 
-  if (eventFlushHandle !== null) {
+  if (eventFlushScheduled) {
     return;
   }
 
-  eventFlushHandle = window.requestAnimationFrame(() => {
-    eventFlushHandle = null;
+  eventFlushScheduled = true;
+  queueMicrotask(() => {
+    eventFlushScheduled = false;
     const events = eventQueue.splice(0);
     for (const subscriber of eventSubscribers) {
       subscriber(events);

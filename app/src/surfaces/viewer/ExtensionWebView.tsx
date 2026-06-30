@@ -62,6 +62,11 @@ type WebViewToNativeMessage =
       type: 'remux/ready';
     }
   | {
+      method: string;
+      params?: unknown;
+      type: 'remux/notify';
+    }
+  | {
       level: 'debug' | 'error' | 'info' | 'log' | 'warn';
       message: string;
       type: 'remux/webview-log';
@@ -203,6 +208,7 @@ type HealthPingWaiter = {
 };
 
 type ExtensionWebViewProps = {
+  active: boolean;
   onOpenFile?: (params: HostFileOpenParams) => HostFileOpenResult | Promise<HostFileOpenResult>;
   onOpenOverview?: (section?: BrowserSection) => Promise<void> | void;
   onTabUpdate?: (patch: ExtensionTabUpdate) => void;
@@ -217,7 +223,7 @@ export type ExtensionWebViewHandle = {
 };
 
 export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebViewProps>(function ExtensionWebView(
-  { onOpenFile, onOpenOverview, onTabUpdate, reloadSourceUrl, sourceUrl, title },
+  { active, onOpenFile, onOpenOverview, onTabUpdate, reloadSourceUrl, sourceUrl, title },
   ref,
 ) {
   const remux = useRemuxConnection();
@@ -225,6 +231,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
   const [reloadNonce, setReloadNonce] = useState(0);
   const [reloadTargetUrl, setReloadTargetUrl] = useState(sourceUrl);
   const automaticReloadAttemptsRef = useRef(0);
+  const activeRef = useRef(active);
   const healthPingIdRef = useRef(0);
   const healthPingWaitersRef = useRef(new Map<string, HealthPingWaiter>());
   const pageEpochRef = useRef(0);
@@ -360,6 +367,26 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
 
     postToWebView(message);
   }, [postToWebView, remux.error, remux.status]);
+
+  const postConnection = useCallback(() => {
+    postToWebView({
+      message: {
+        method: 'host/connection',
+        params: { status: remux.status.type },
+      },
+      type: 'remux/event',
+    });
+  }, [postToWebView, remux.status.type]);
+
+  const postActive = useCallback((nextActive: boolean) => {
+    postToWebView({
+      message: {
+        method: 'host/active',
+        params: { active: nextActive },
+      },
+      type: 'remux/event',
+    });
+  }, [postToWebView]);
 
   const captureWebViewFrame = useCallback(() => {
     requestAnimationFrame(() => {
@@ -580,6 +607,8 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
           readyRef.current = true;
           setPageState({ type: 'ready' });
           postStatus();
+          postConnection();
+          postActive(active);
           break;
         case 'remux/health/pong': {
           const waiter = healthPingWaitersRef.current.get(message.id);
@@ -603,6 +632,9 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
         }
         case 'remux/webview-log':
           logRemuxDebug(`webview:console:${message.level}`, message.message);
+          break;
+        case 'remux/notify':
+          remux.notify(message.method, message.params);
           break;
         case 'remux/invalid-request':
           if (message.id !== undefined) {
@@ -791,6 +823,9 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
       onOpenOverview,
       onTabUpdate,
       pickAttachments,
+      active,
+      postActive,
+      postConnection,
       postStatus,
       postToWebView,
       reloadWebView,
@@ -799,6 +834,10 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
   );
 
   useEffect(() => remux.subscribe((message) => {
+    if (!activeRef.current) {
+      return;
+    }
+
     postToWebView(
       {
         message,
@@ -808,8 +847,18 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
   }), [postToWebView, remux]);
 
   useEffect(() => {
+    const wasActive = activeRef.current;
+    activeRef.current = active;
+    postActive(active);
+    if (active && !wasActive) {
+      postConnection();
+    }
+  }, [active, postActive, postConnection]);
+
+  useEffect(() => {
     postStatus();
-  }, [postStatus]);
+    postConnection();
+  }, [postConnection, postStatus]);
 
   useEffect(() => {
     if (remux.status.type === 'connected') {
@@ -1070,6 +1119,18 @@ function parseWebViewMessage(data: string): WebViewToNativeMessage | InvalidWebV
         level: parsed.level,
         message: parsed.message,
         type: 'remux/webview-log',
+      };
+    }
+
+    if (parsed.type === 'remux/notify') {
+      if (typeof parsed.method !== 'string') {
+        return null;
+      }
+
+      return {
+        method: parsed.method,
+        params: parsed.params,
+        type: 'remux/notify',
       };
     }
 
@@ -1342,12 +1403,15 @@ function isWebViewLogLevel(value: unknown): value is Extract<WebViewToNativeMess
   return value === 'debug' || value === 'error' || value === 'info' || value === 'log' || value === 'warn';
 }
 
+const webViewDiagnosticsVerboseConsole = false;
+
 const webViewDiagnosticsScript = `
   (function () {
     if (window.__remuxDiagnosticsInstalled) {
       return true;
     }
     window.__remuxDiagnosticsInstalled = true;
+    var verboseConsole = ${webViewDiagnosticsVerboseConsole ? 'true' : 'false'};
 
     function post(level, value) {
       try {
@@ -1379,13 +1443,15 @@ const webViewDiagnosticsScript = `
       }
     }
 
-    ['debug', 'error', 'info', 'log', 'warn'].forEach(function (level) {
-      var original = console[level];
-      console[level] = function () {
-        post(level, Array.prototype.slice.call(arguments).join(' '));
-        return original && original.apply(console, arguments);
-      };
-    });
+    if (verboseConsole) {
+      ['debug', 'error', 'info', 'log', 'warn'].forEach(function (level) {
+        var original = console[level];
+        console[level] = function () {
+          post(level, Array.prototype.slice.call(arguments).join(' '));
+          return original && original.apply(console, arguments);
+        };
+      });
+    }
 
     window.addEventListener('error', function (event) {
       post('error', event.message || 'Unhandled WebView error');

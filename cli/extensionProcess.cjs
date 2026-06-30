@@ -155,6 +155,22 @@ function createExtensionProcess({ extension, log = console, requestTimeoutMs = d
       });
     },
 
+    handleNotification({ method, params }) {
+      if (!child || !child.stdin.writable) {
+        return;
+      }
+
+      const message = params === undefined
+        ? { jsonrpc: '2.0', method }
+        : { jsonrpc: '2.0', method, params };
+
+      child.stdin.write(`${JSON.stringify(message)}\n`, (error) => {
+        if (error) {
+          log.warn?.(`[remux] failed to send notification to extension ${extension.id}: ${error.message}`);
+        }
+      });
+    },
+
     async stop() {
       logEvent(log, {
         label: 'extension:stop',

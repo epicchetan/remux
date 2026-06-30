@@ -7,12 +7,13 @@ import { logRemuxDebug } from '../../remote/remuxDebug';
 import { ExtensionWebView, type ExtensionWebViewHandle } from './ExtensionWebView';
 
 type ViewerSurfaceProps = {
+  active: boolean;
   onOpenOverview?: (section?: BrowserSection) => Promise<void> | void;
   surfaceRef?: Ref<ExtensionWebViewHandle>;
   tab: ViewerTab;
 };
 
-export function ViewerSurface({ onOpenOverview, surfaceRef, tab }: ViewerSurfaceProps) {
+export function ViewerSurface({ active, onOpenOverview, surfaceRef, tab }: ViewerSurfaceProps) {
   const extensions = useBrowserStore((state) => state.extensions);
   const openExtensionTab = useBrowserStore((state) => state.openExtensionTab);
   const updateTab = useBrowserStore((state) => state.updateTab);
@@ -57,6 +58,7 @@ export function ViewerSurface({ onOpenOverview, surfaceRef, tab }: ViewerSurface
 
   return (
     <ExtensionWebView
+      active={active}
       onOpenFile={openFile}
       onOpenOverview={onOpenOverview}
       ref={surfaceRef}

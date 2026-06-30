@@ -1,7 +1,7 @@
 :root {
   color-scheme: dark;
   font-family: Arial, "Helvetica Neue", sans-serif;
-  background: #18181b;
+  background: var(--rmx-surface);
   color: #f4f4f5;
 }
 
@@ -21,7 +21,7 @@ body,
 }
 
 body {
-  background: #18181b;
+  background: var(--rmx-surface);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
@@ -31,9 +31,7 @@ body {
   height: 100%;
   min-height: 0;
   flex-direction: column;
-  background:
-    linear-gradient(180deg, rgba(39, 39, 42, 0.78), transparent 180px),
-    #18181b;
+  background: var(--rmx-surface);
 }
 
 .remux-markdown-empty {
@@ -78,7 +76,7 @@ body {
   flex: 1;
   overflow-x: hidden;
   overflow-y: auto;
-  background: #18181b;
+  background: var(--rmx-surface);
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
 }
@@ -280,7 +278,7 @@ body {
   overflow-x: auto;
   border: 1px solid rgb(255 255 255 / 8%);
   border-radius: 8px;
-  background: #111113;
+  background: var(--rmx-surface-raised);
   -webkit-overflow-scrolling: touch;
 }
 
@@ -309,7 +307,7 @@ body {
   overflow-x: auto;
   border: 1px solid rgb(255 255 255 / 8%);
   border-radius: 8px;
-  background: #111113;
+  background: var(--rmx-surface-raised);
   -webkit-overflow-scrolling: touch;
 }
 
@@ -462,7 +460,7 @@ body {
   padding: 12px;
   border: 1px solid rgb(255 255 255 / 8%);
   border-radius: 8px;
-  background: #111113;
+  background: var(--rmx-surface-raised);
   -webkit-overflow-scrolling: touch;
 }
 

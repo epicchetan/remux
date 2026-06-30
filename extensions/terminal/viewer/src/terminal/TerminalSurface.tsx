@@ -4,7 +4,10 @@ import {
   openHostOverview,
   readHostClipboardText,
   reloadHostView,
+  subscribeHostActive,
+  subscribeHostConnection,
   type RemuxHostViewportMetrics,
+  type RemuxHostConnectionStatus,
   subscribeHostViewportMetrics,
   updateHostTab,
 } from '@remux/viewer-kit/host';
@@ -65,7 +68,7 @@ import {
   runTerminalTmuxAction,
   startTerminalSession,
   subscribeTerminalEvents,
-  writeTerminalSession,
+  writeTerminalSessionInput,
   type TerminalTmuxAction,
   type TerminalTmuxActionTarget,
   type TerminalTmuxContext,
@@ -144,9 +147,13 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   const lastResizeRef = useRef<{ cols: number; rows: number } | null>(null);
   const lastSeqRef = useRef(0);
   const sessionIdRef = useRef<string | null>(null);
+  const connectedEventSeenRef = useRef(false);
+  const connectionRef = useRef<RemuxHostConnectionStatus>('connecting');
   const terminalRef = useRef<Terminal | null>(null);
   const fitTimerRef = useRef<number | null>(null);
   const hostViewportMetricsRef = useRef<RemuxHostViewportMetrics | null>(null);
+  const initialAttachCompletedRef = useRef(false);
+  const resyncInFlightRef = useRef(false);
   const modifierTimerRef = useRef<number | null>(null);
   const commandTitleTimerRef = useRef<number | null>(null);
   const suppressedTerminalDataWritesRef = useRef(0);
@@ -157,6 +164,8 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   const tmuxAttachedRef = useRef(false);
   const [altActive, setAltActive] = useState(false);
   const [ctrlActive, setCtrlActive] = useState(false);
+  const [connected, setConnected] = useState(true);
+  const [hostActive, setHostActive] = useState(true);
   const [shiftActive, setShiftActive] = useState(false);
   const [keyboardOffset, setKeyboardOffset] = useState(0);
   const [keyboardOpen, setKeyboardOpen] = useState(false);
@@ -165,6 +174,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [shellState, setShellState] = useState<TerminalShellState>(emptyShellState);
   const [status, setStatus] = useState<TerminalStatus>({ type: 'connecting' });
+  const [replayGap, setReplayGap] = useState(false);
   const [tmuxContext, setTmuxContext] = useState<TerminalTmuxContext | null>(null);
 
   const resetModifiers = useCallback(() => {
@@ -326,9 +336,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       return;
     }
 
-    void writeTerminalSession(currentSessionId, data).catch((error) => {
-      setStatus({ message: errorMessage(error), type: 'error' });
-    });
+    writeTerminalSessionInput(currentSessionId, data);
 
     if (options.clearModifiers) {
       resetModifiers();
@@ -376,6 +384,8 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       return;
     }
 
+    initialAttachCompletedRef.current = false;
+    setReplayGap(false);
     resetShellState();
     setStatus({ type: 'connecting' });
     const size = fitTerminal();
@@ -393,6 +403,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
 
         bindSession(attached.sessionId);
         writeReplay(attached.replay);
+        initialAttachCompletedRef.current = true;
         await updateHostTab({
           resourceId: attached.sessionId,
           resourceKind: 'terminalSession',
@@ -424,6 +435,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     });
 
     bindSession(started.sessionId);
+    initialAttachCompletedRef.current = true;
     await updateHostTab({
       resourceId: started.sessionId,
       resourceKind: 'terminalSession',
@@ -436,10 +448,50 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     sendResize(started.cols, started.rows);
   }, [bindSession, fitTerminal, resetShellState, route, sendResize, writeReplay]);
 
+  const resyncSession = useCallback(async () => {
+    const currentSessionId = sessionIdRef.current;
+    if (!currentSessionId || resyncInFlightRef.current) {
+      return;
+    }
+
+    resyncInFlightRef.current = true;
+    try {
+      const size = currentSize();
+      const attached = await attachTerminalSession({
+        cols: size.cols,
+        replaySeq: lastSeqRef.current > 0 ? lastSeqRef.current + 1 : null,
+        rows: size.rows,
+        sessionId: currentSessionId,
+      });
+
+      if (attached.replayTruncated) {
+        terminalRef.current?.clear();
+        lastSeqRef.current = 0;
+        setReplayGap(true);
+        return;
+      }
+
+      setReplayGap(false);
+      writeReplay(attached.replay);
+      if (attached.status === 'exited') {
+        setStatus({
+          code: attached.exitCode ?? null,
+          signal: attached.exitSignal ?? null,
+          type: 'exited',
+        });
+      }
+    } catch {
+      // A server restart can make the previously bound session disappear.
+    } finally {
+      resyncInFlightRef.current = false;
+    }
+  }, [currentSize, writeReplay]);
+
   const restartSession = useCallback(() => {
     const currentSessionId = sessionIdRef.current;
     terminalRef.current?.clear();
     lastSeqRef.current = 0;
+    setReplayGap(false);
     if (currentSessionId) {
       void killTerminalSession(currentSessionId)
         .catch(() => undefined)
@@ -916,6 +968,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
 
     if (event.type === 'output' && event.event.sessionId === currentSessionId) {
       writeFrame(event.event.frame);
+      setReplayGap(false);
       return;
     }
 
@@ -929,8 +982,34 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     }
   }), [writeFrame]);
 
+  useEffect(() => subscribeHostConnection((nextStatus) => {
+    setConnected(nextStatus === 'connected');
+
+    const previousStatus = connectionRef.current;
+    connectionRef.current = nextStatus;
+    const hadSeenConnected = connectedEventSeenRef.current;
+    if (nextStatus === 'connected') {
+      connectedEventSeenRef.current = true;
+    }
+    if (
+      nextStatus === 'connected' &&
+      hadSeenConnected &&
+      previousStatus !== 'connected' &&
+      initialAttachCompletedRef.current
+    ) {
+      void resyncSession();
+    }
+  }), [resyncSession]);
+
+  useEffect(() => subscribeHostActive((active) => {
+    setHostActive(active);
+    if (active) {
+      void resyncSession();
+    }
+  }), [resyncSession]);
+
   useEffect(() => {
-    if (!sessionId || status.type !== 'running') {
+    if (!sessionId || status.type !== 'running' || !hostActive || !connected) {
       setTmuxContext(null);
       return undefined;
     }
@@ -961,7 +1040,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       disposed = true;
       window.clearInterval(interval);
     };
-  }, [sessionId, status.type]);
+  }, [connected, hostActive, sessionId, status.type]);
 
   useEffect(() => {
     tmuxAttachedRef.current = tmuxContext?.mode === 'attached';
@@ -1080,7 +1159,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
           onPointerUpCapture={handleSelectionPointerEnd}
           ref={containerRef}
         />
-        <TerminalOverlay status={status} />
+        <TerminalOverlay replayGap={replayGap} status={status} />
       </section>
       <ExtensionActionBar
         className={[
@@ -1474,7 +1553,15 @@ function tmuxSessionMenuLabel(session: TerminalTmuxSession) {
   return `${name}: ${tabs.join(', ')}`;
 }
 
-function TerminalOverlay({ status }: { status: TerminalStatus }) {
+function TerminalOverlay({ replayGap, status }: { replayGap: boolean; status: TerminalStatus }) {
+  if (replayGap) {
+    return (
+      <div className="remux-terminal-overlay remux-terminal-overlay-bottom">
+        <span>Terminal output replay was truncated; waiting for fresh output.</span>
+      </div>
+    );
+  }
+
   if (status.type === 'running') {
     return null;
   }
