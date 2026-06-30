@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
 
-import { ExtensionActionButton } from './ActionButton';
+import { ActionButton } from './ActionButton';
 
 type ActionMenuContextValue = {
   close: () => void;
@@ -9,7 +9,7 @@ type ActionMenuContextValue = {
 
 const ActionMenuContext = createContext<ActionMenuContextValue | null>(null);
 
-export type ExtensionActionMenuProps = {
+export type ActionMenuProps = {
   align?: 'end' | 'start';
   children: ReactNode;
   className?: string;
@@ -21,7 +21,7 @@ export type ExtensionActionMenuProps = {
   triggerClassName?: string;
 };
 
-export function ExtensionActionMenu({
+export function ActionMenu({
   align = 'end',
   children,
   className,
@@ -31,7 +31,7 @@ export function ExtensionActionMenu({
   panelClassName,
   preserveFocus = false,
   triggerClassName,
-}: ExtensionActionMenuProps) {
+}: ActionMenuProps) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
 
@@ -78,7 +78,7 @@ export function ExtensionActionMenu({
       ].filter(Boolean).join(' ')}
       ref={rootRef}
     >
-      <ExtensionActionButton
+      <ActionButton
         activationDebounceMs={80}
         ariaExpanded={open}
         ariaHasPopup="menu"
@@ -111,7 +111,7 @@ export function ExtensionActionMenu({
   );
 }
 
-export type ExtensionActionMenuItemProps = {
+export type ActionMenuItemProps = {
   disabled?: boolean;
   icon: ReactNode;
   label: string;
@@ -119,13 +119,13 @@ export type ExtensionActionMenuItemProps = {
   tone?: 'danger' | 'default';
 };
 
-export function ExtensionActionMenuItem({
+export function ActionMenuItem({
   disabled = false,
   icon,
   label,
   onSelect,
   tone = 'default',
-}: ExtensionActionMenuItemProps) {
+}: ActionMenuItemProps) {
   const menu = useContext(ActionMenuContext);
   const preserveFocus = menu?.preserveFocus ?? false;
 
@@ -159,3 +159,15 @@ export function ExtensionActionMenuItem({
     </button>
   );
 }
+
+/** @deprecated Use ActionMenu instead. */
+export const ExtensionActionMenu = ActionMenu;
+
+/** @deprecated Use ActionMenuItem instead. */
+export const ExtensionActionMenuItem = ActionMenuItem;
+
+/** @deprecated Use ActionMenuProps instead. */
+export type ExtensionActionMenuProps = ActionMenuProps;
+
+/** @deprecated Use ActionMenuItemProps instead. */
+export type ExtensionActionMenuItemProps = ActionMenuItemProps;

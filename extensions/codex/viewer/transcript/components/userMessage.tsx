@@ -15,7 +15,7 @@ import {
 } from '../model/userMessageContent';
 import { FileTypeIcon } from './file/fileTypeIcons';
 import { MarkdownBlock } from './markdown/MarkdownBlock';
-import { cn } from '../../ui/cn';
+import { cn } from '@remux/viewer-kit/shadcn';
 import { userBubbleContentWidth } from '../layout/constants';
 import { useTranscriptLayoutStore } from '../layoutStore';
 import type { TranscriptUserMessageDisclosure } from '../layout/types';

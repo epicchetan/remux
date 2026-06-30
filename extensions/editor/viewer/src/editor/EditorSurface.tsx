@@ -1,8 +1,8 @@
 import { openHostOverview, reloadHostView, updateHostTab } from '@remux/viewer-kit/host';
 import type { RemuxViewerRoute } from '@remux/viewer-kit/route';
 import {
-  ExtensionActionBar,
-  ExtensionActionButton,
+  ActionBar,
+  ActionButton,
 } from '@remux/viewer-kit/ui';
 import { PanelRightOpen } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
@@ -88,24 +88,24 @@ export function EditorSurface({ route }: EditorSurfaceProps) {
         filePath={filePath}
         showDiff={showDiff}
       />
-      <ExtensionActionBar
+      <ActionBar
         left={(
           <>
-            <ExtensionActionButton
+            <ActionButton
               icon={<TabsIcon />}
               label="Open tabs"
               onClick={() => {
                 void openHostOverview();
               }}
             />
-            <ExtensionActionButton
+            <ActionButton
               icon={<ReloadIcon />}
               label="Reload viewer"
               onClick={() => {
                 void reloadHostView();
               }}
             />
-            <ExtensionActionButton
+            <ActionButton
               disabled={activeFile.status !== 'ready'}
               icon={copied ? <CheckIcon /> : <CopyIcon />}
               label={copied ? 'Copied file contents' : 'Copy file contents'}
@@ -114,7 +114,7 @@ export function EditorSurface({ route }: EditorSurfaceProps) {
           </>
         )}
         right={(
-          <ExtensionActionButton
+          <ActionButton
             disabled={!hasDiff}
             icon={<DiffIcon />}
             label={diffUnavailableReason ?? (showDiff ? 'Hide git diff' : 'Show git diff')}

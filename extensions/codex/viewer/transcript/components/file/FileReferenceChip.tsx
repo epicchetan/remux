@@ -1,6 +1,6 @@
 import type { CSSProperties } from 'react';
 
-import { cn } from '../../../ui/cn';
+import { cn } from '@remux/viewer-kit/shadcn';
 import { markdownMetrics } from '../markdown/markdownModel';
 import { FileTypeIcon } from './fileTypeIcons';
 

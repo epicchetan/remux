@@ -9,16 +9,24 @@
     "./ipc": "./src/ipc.ts",
     "./route": "./src/route.ts",
     "./react": "./src/react/index.ts",
+    "./shadcn": "./src/shadcn/index.ts",
     "./ui": "./src/ui/index.ts",
     "./tokens.css": "./src/tokens/tokens.css",
+    "./theme.css": "./src/tokens/theme.css",
     "./ui/styles.css": "./src/ui/styles.css"
   },
   "sideEffects": [
     "./src/tokens/tokens.css",
+    "./src/tokens/theme.css",
     "./src/ui/styles.css"
   ],
   "scripts": {
     "tokens:build": "node scripts/build-tokens.mjs"
+  },
+  "dependencies": {
+    "@radix-ui/react-dialog": "^1.1.15",
+    "clsx": "^2.1.1",
+    "tailwind-merge": "^3.6.0"
   },
   "peerDependencies": {
     "react": "^19.2.0",

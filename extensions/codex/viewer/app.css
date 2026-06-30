@@ -1,37 +1,15 @@
 @import "tailwindcss";
 @import "tw-animate-css";
+@import "@remux/viewer-kit/tokens.css";
+@import "@remux/viewer-kit/theme.css";
 
 @source "./**/*.{ts,tsx}";
+@source "../../../packages/viewer-kit/src/shadcn/**/*.{ts,tsx}";
 
 @custom-variant dark (&:is(.dark *));
 
 :root {
-  color-scheme: dark;
-  --radius: 0.625rem;
-  --background: #171717;
-  --foreground: #ececec;
-  --card: #202020;
-  --card-foreground: #ececec;
-  --popover: #202020;
-  --popover-foreground: #ececec;
-  --primary: #ececec;
-  --primary-foreground: #171717;
-  --secondary: #2a2a2a;
-  --secondary-foreground: #ececec;
-  --muted: #2a2a2a;
-  --muted-foreground: #9ca0a8;
-  --accent: #303030;
-  --accent-foreground: #f2f2f2;
-  --destructive: #f87171;
-  --border: #2a2a2a;
-  --input: #303030;
-  --composer: #202020;
-  --ring: #8ab4f8;
-  --success: #7fd49d;
-  --warning: #f5c56b;
-  --link: #8ab4f8;
-  --sidebar: var(--background);
-  --sidebar-foreground: #ececec;
+  --composer: var(--card);
   --chrome: #1f232b;
   --chrome-hover: #272b34;
   --remux-font-body-size: 15px;
@@ -54,33 +32,6 @@
 }
 
 @theme inline {
-  --radius-sm: calc(var(--radius) - 4px);
-  --radius-md: calc(var(--radius) - 2px);
-  --radius-lg: var(--radius);
-  --radius-xl: calc(var(--radius) + 4px);
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --color-card: var(--card);
-  --color-card-foreground: var(--card-foreground);
-  --color-popover: var(--popover);
-  --color-popover-foreground: var(--popover-foreground);
-  --color-primary: var(--primary);
-  --color-primary-foreground: var(--primary-foreground);
-  --color-secondary: var(--secondary);
-  --color-secondary-foreground: var(--secondary-foreground);
-  --color-muted: var(--muted);
-  --color-muted-foreground: var(--muted-foreground);
-  --color-accent: var(--accent);
-  --color-accent-foreground: var(--accent-foreground);
-  --color-destructive: var(--destructive);
-  --color-border: var(--border);
-  --color-input: var(--input);
-  --color-ring: var(--ring);
-  --color-success: var(--success);
-  --color-warning: var(--warning);
-  --color-link: var(--link);
-  --color-sidebar: var(--sidebar);
-  --color-sidebar-foreground: var(--sidebar-foreground);
   --color-chrome: var(--chrome);
   --color-chrome-hover: var(--chrome-hover);
 }

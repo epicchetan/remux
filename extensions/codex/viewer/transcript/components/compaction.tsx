@@ -1,7 +1,7 @@
 import { CircleSlash, FileArchive, Loader2 } from 'lucide-react';
 
 import type { CodexCompactionSegment } from '../../../shared/transcript';
-import { cn } from '../../ui/cn';
+import { cn } from '@remux/viewer-kit/shadcn';
 
 export function Compaction({
   density = 'default',

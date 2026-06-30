@@ -15,7 +15,7 @@ import { searchComposerMentionFiles } from '../../ipc/files';
 import { useThreadHistoryStore } from '../../threads/historyStore';
 import { useThreadsStore } from '../../threads/store';
 import { FileTypeIcon } from '../../transcript/components/file/fileTypeIcons';
-import { cn } from '../../ui/cn';
+import { cn } from '@remux/viewer-kit/shadcn';
 import { KeyboardPickerFrame, KeyboardPickerList, KeyboardPickerRow } from '../../ui/KeyboardPicker';
 import {
   fileExtension,

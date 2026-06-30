@@ -1,8 +1,8 @@
 import { openHostOverview, reloadHostView, updateHostTab } from '@remux/viewer-kit/host';
 import type { RemuxViewerRoute } from '@remux/viewer-kit/route';
 import {
-  ExtensionActionBar,
-  ExtensionActionButton,
+  ActionBar,
+  ActionButton,
 } from '@remux/viewer-kit/ui';
 import { Copy, PanelRightOpen, RefreshCw } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
@@ -59,24 +59,24 @@ export function MarkdownSurface({ route }: MarkdownSurfaceProps) {
   return (
     <main className="remux-markdown-shell">
       <MarkdownBody activeFile={activeFile} filePath={filePath} />
-      <ExtensionActionBar
+      <ActionBar
         left={(
           <>
-            <ExtensionActionButton
+            <ActionButton
               icon={<PanelRightOpen aria-hidden="true" />}
               label="Open tabs"
               onClick={() => {
                 void openHostOverview();
               }}
             />
-            <ExtensionActionButton
+            <ActionButton
               icon={<RefreshCw aria-hidden="true" />}
               label="Reload viewer"
               onClick={() => {
                 void reloadHostView();
               }}
             />
-            <ExtensionActionButton
+            <ActionButton
               disabled={activeFile.status !== 'ready'}
               icon={copied ? <CheckIcon /> : <Copy aria-hidden="true" />}
               label={copied ? 'Copied markdown' : 'Copy markdown'}

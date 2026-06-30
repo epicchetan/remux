@@ -13,10 +13,10 @@ import {
 } from '@remux/viewer-kit/host';
 import type { RemuxViewerRoute } from '@remux/viewer-kit/route';
 import {
-  ExtensionActionBar,
-  ExtensionActionButton,
-  ExtensionActionMenu,
-  ExtensionActionMenuItem,
+  ActionBar,
+  ActionButton,
+  ActionMenu,
+  ActionMenuItem,
 } from '@remux/viewer-kit/ui';
 import { FitAddon } from '@xterm/addon-fit';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
@@ -1167,7 +1167,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
         />
         <TerminalOverlay replayGap={replayGap} status={status} />
       </section>
-      <ExtensionActionBar
+      <ActionBar
         className={[
           'remux-terminal-action-bar',
           keyboardOffset > 0 ? 'is-keyboard-offset' : '',
@@ -1319,7 +1319,7 @@ function TerminalActionMenu({
   status: TerminalStatus;
 }) {
   return (
-    <ExtensionActionMenu
+    <ActionMenu
       align="start"
       className="remux-terminal-action-menu"
       icon={<Menu />}
@@ -1328,36 +1328,36 @@ function TerminalActionMenu({
       preserveFocus
       triggerClassName="remux-terminal-key"
     >
-      <ExtensionActionMenuItem
+      <ActionMenuItem
         disabled={selectionMode}
         icon={keyboardOpen ? <KeyboardOff /> : <Keyboard />}
         label={keyboardOpen ? 'Hide keyboard' : 'Show keyboard'}
         onSelect={onToggleKeyboard}
       />
-      <ExtensionActionMenuItem
+      <ActionMenuItem
         icon={selectionMode ? <X /> : <TextSelect />}
         label={selectionMode ? 'Exit selection' : 'Select text'}
         onSelect={selectionMode ? onExitSelectionMode : onEnterSelectionMode}
       />
-      <ExtensionActionMenuItem
+      <ActionMenuItem
         disabled={selectionMode}
         icon={<ClipboardPaste />}
         label="Paste"
         onSelect={onPaste}
       />
-      <ExtensionActionMenuItem
+      <ActionMenuItem
         icon={<RefreshCw />}
         label="Reload viewer"
         onSelect={onReload}
       />
       {status.type === 'error' || status.type === 'exited' ? (
-        <ExtensionActionMenuItem
+        <ActionMenuItem
           icon={<RefreshCw />}
           label="Start new shell"
           onSelect={onRestart}
         />
       ) : null}
-    </ExtensionActionMenu>
+    </ActionMenu>
   );
 }
 
@@ -1458,7 +1458,7 @@ function TerminalTmuxSessionMenu({
   socketPath: string | null;
 }) {
   return (
-    <ExtensionActionMenu
+    <ActionMenu
       align="start"
       className="remux-terminal-tmux-session-menu"
       icon={<NotebookTabs />}
@@ -1470,7 +1470,7 @@ function TerminalTmuxSessionMenu({
       {active.socket.sessions.map((session) => {
         const isActiveSession = session.id === active.session.id;
         return (
-          <ExtensionActionMenuItem
+          <ActionMenuItem
             icon={isActiveSession ? <Check /> : <NotebookTabs />}
             key={session.id}
             label={tmuxSessionMenuLabel(session)}
@@ -1487,7 +1487,7 @@ function TerminalTmuxSessionMenu({
           />
         );
       })}
-    </ExtensionActionMenu>
+    </ActionMenu>
   );
 }
 
@@ -1503,7 +1503,7 @@ function TerminalTmuxActionMenu({
   const activeWindowTarget = active.window ? { tmuxWindowId: active.window.id } : null;
 
   return (
-    <ExtensionActionMenu
+    <ActionMenu
       align="end"
       className="remux-terminal-tmux-action-menu"
       icon={<MoreHorizontal />}
@@ -1512,7 +1512,7 @@ function TerminalTmuxActionMenu({
       preserveFocus
       triggerClassName="remux-terminal-key"
     >
-      <ExtensionActionMenuItem
+      <ActionMenuItem
         icon={<Plus />}
         label="New tab"
         onSelect={() => onRunAction('new-window', {
@@ -1520,7 +1520,7 @@ function TerminalTmuxActionMenu({
           target: { tmuxSessionId: active.session.id },
         })}
       />
-      <ExtensionActionMenuItem
+      <ActionMenuItem
         disabled={!activeWindowTarget}
         icon={<X />}
         label="Close tab"
@@ -1535,7 +1535,7 @@ function TerminalTmuxActionMenu({
           });
         }}
       />
-      <ExtensionActionMenuItem
+      <ActionMenuItem
         icon={<LogOut />}
         label="Exit tmux"
         onSelect={() => onRunAction('exit-tmux', {
@@ -1543,7 +1543,7 @@ function TerminalTmuxActionMenu({
           target: null,
         })}
       />
-    </ExtensionActionMenu>
+    </ActionMenu>
   );
 }
 
@@ -1609,7 +1609,7 @@ function TerminalKey({
   onPress: () => void;
 }) {
   return (
-    <ExtensionActionButton
+    <ActionButton
       className={[
         'remux-terminal-key',
         active ? 'is-active' : '',

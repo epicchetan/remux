@@ -1,8 +1,15 @@
 import { AlertTriangle, History, LoaderCircle, Plus, RefreshCw } from 'lucide-react';
 
-import { Sheet, SheetContent, SheetDescription, SheetTitle } from '../ui/Sheet';
-import { Sidebar, SidebarContent, SidebarHeader } from '../ui/Sidebar';
-import { cn } from '../ui/cn';
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetTitle,
+  Sidebar,
+  SidebarContent,
+  SidebarHeader,
+  cn,
+} from '@remux/viewer-kit/shadcn';
 import { useComposerStore } from '../composer/store';
 
 import type { CodexThreadSummary } from '../../shared/threads';

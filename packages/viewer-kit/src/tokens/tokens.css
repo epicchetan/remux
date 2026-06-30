@@ -70,4 +70,34 @@
   --rmx-shadow-raised: inset 0 1px 0 rgb(255 255 255 / 9%), inset 0 -2px 0 rgb(0 0 0 / 32%), 0 2px 0 color-mix(in srgb, var(--rmx-surface) 78%, black);
   --rmx-shadow-pressed: inset 0 1px 0 rgb(0 0 0 / 24%), inset 0 -1px 0 rgb(0 0 0 / 22%), 0 1px 0 color-mix(in srgb, var(--rmx-surface) 78%, black);
   --rmx-shadow-menu: inset 0 1px 0 rgb(255 255 255 / 8%), inset 0 -2px 0 rgb(0 0 0 / 30%), 0 14px 36px rgb(0 0 0 / 38%);
+
+  /* ===================== Theme bindings ===================== */
+
+  /* shadcn radius bindings */
+  --radius: var(--rmx-radius-lg);
+
+  /* shadcn color bindings */
+  --background: var(--rmx-surface);
+  --foreground: var(--rmx-text);
+  --card: var(--rmx-surface-raised);
+  --card-foreground: var(--rmx-text);
+  --popover: var(--rmx-surface-raised);
+  --popover-foreground: var(--rmx-text);
+  --primary: var(--rmx-accent);
+  --primary-foreground: var(--rmx-accent-foreground);
+  --secondary: var(--rmx-surface-hover);
+  --secondary-foreground: var(--rmx-text);
+  --muted: var(--rmx-surface-hover);
+  --muted-foreground: var(--rmx-text-muted);
+  --accent: var(--rmx-surface-hover);
+  --accent-foreground: var(--rmx-text);
+  --destructive: var(--rmx-danger);
+  --border: var(--rmx-border);
+  --input: var(--rmx-border);
+  --ring: var(--rmx-focus-ring);
+  --success: var(--rmx-success);
+  --warning: var(--rmx-warning);
+  --link: var(--rmx-focus-ring);
+  --sidebar: var(--rmx-surface);
+  --sidebar-foreground: var(--rmx-text);
 }

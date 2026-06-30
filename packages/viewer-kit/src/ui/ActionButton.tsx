@@ -1,6 +1,6 @@
 import { useCallback, useRef, type ReactNode } from 'react';
 
-export type ExtensionActionButtonProps = {
+export type ActionButtonProps = {
   ariaExpanded?: boolean;
   ariaHasPopup?: boolean | 'menu';
   activationDebounceMs?: number;
@@ -14,7 +14,7 @@ export type ExtensionActionButtonProps = {
   tone?: 'default' | 'primary';
 };
 
-export function ExtensionActionButton({
+export function ActionButton({
   ariaExpanded,
   ariaHasPopup,
   activationDebounceMs = 350,
@@ -26,7 +26,7 @@ export function ExtensionActionButton({
   onClick,
   preserveFocus,
   tone = 'default',
-}: ExtensionActionButtonProps) {
+}: ActionButtonProps) {
   const lastActivationMsRef = useRef(Number.NEGATIVE_INFINITY);
   const activateOnce = useCallback(() => {
     const now = performance.now();
@@ -87,3 +87,9 @@ export function ExtensionActionButton({
     </button>
   );
 }
+
+/** @deprecated Use ActionButton instead. */
+export const ExtensionActionButton = ActionButton;
+
+/** @deprecated Use ActionButtonProps instead. */
+export type ExtensionActionButtonProps = ActionButtonProps;

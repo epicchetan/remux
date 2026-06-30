@@ -1,18 +1,18 @@
 import type { ReactNode } from 'react';
 
-export type ExtensionActionBarProps = {
+export type ActionBarProps = {
   className?: string;
   left?: ReactNode;
   right?: ReactNode;
   status?: ReactNode;
 };
 
-export function ExtensionActionBar({
+export function ActionBar({
   className,
   left,
   right,
   status,
-}: ExtensionActionBarProps) {
+}: ActionBarProps) {
   return (
     <div className={className ? `remux-extension-action-bar ${className}` : 'remux-extension-action-bar'}>
       <div className="remux-extension-action-group">{left}</div>
@@ -21,3 +21,9 @@ export function ExtensionActionBar({
     </div>
   );
 }
+
+/** @deprecated Use ActionBar instead. */
+export const ExtensionActionBar = ActionBar;
+
+/** @deprecated Use ActionBarProps instead. */
+export type ExtensionActionBarProps = ActionBarProps;
