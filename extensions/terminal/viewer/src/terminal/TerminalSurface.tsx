@@ -149,6 +149,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   const sessionIdRef = useRef<string | null>(null);
   const connectedEventSeenRef = useRef(false);
   const connectionRef = useRef<RemuxHostConnectionStatus>('connecting');
+  const hostActiveRef = useRef(true);
   const terminalRef = useRef<Terminal | null>(null);
   const fitTimerRef = useRef<number | null>(null);
   const hostViewportMetricsRef = useRef<RemuxHostViewportMetrics | null>(null);
@@ -1002,8 +1003,13 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   }), [resyncSession]);
 
   useEffect(() => subscribeHostActive((active) => {
+    const wasActive = hostActiveRef.current;
+    hostActiveRef.current = active;
     setHostActive(active);
-    if (active) {
+    // Resync only on a real background→foreground transition. Reconnects are
+    // owned by the connection handler, which re-posts active and would otherwise
+    // trigger a redundant attach here.
+    if (active && !wasActive) {
       void resyncSession();
     }
   }), [resyncSession]);

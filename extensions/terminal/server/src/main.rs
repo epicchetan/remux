@@ -533,14 +533,17 @@ impl TerminalExtensionServer {
 
         let cache = self.tmux_cache.clone();
         thread::spawn(move || {
-            let result = tmux::scan_context(&session_id, terminal_tty);
-            let Ok(mut state) = cache.lock() else {
-                return;
+            // The guard clears the in-flight marker on every exit path, including a
+            // panic in scan_context, so one failed scan can't wedge future refreshes.
+            let _refresh_guard = TmuxRefreshGuard {
+                cache: cache.clone(),
+                session_id: session_id.clone(),
             };
-            state.refreshes.remove(&session_id);
-            match result {
+            match tmux::scan_context(&session_id, terminal_tty) {
                 Ok(context) => {
-                    state.contexts.insert(session_id, context);
+                    if let Ok(mut state) = cache.lock() {
+                        state.contexts.insert(session_id.clone(), context);
+                    }
                 }
                 Err(error) => {
                     eprintln!("failed to refresh tmux context: {error}");
@@ -593,6 +596,19 @@ struct TerminalState {
 struct TmuxCacheState {
     contexts: HashMap<String, tmux::TmuxContext>,
     refreshes: HashSet<String>,
+}
+
+struct TmuxRefreshGuard {
+    cache: Arc<Mutex<TmuxCacheState>>,
+    session_id: String,
+}
+
+impl Drop for TmuxRefreshGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.cache.lock() {
+            state.refreshes.remove(&self.session_id);
+        }
+    }
 }
 
 struct SessionRecord {
