@@ -41,7 +41,7 @@ Manifest version `1` is required.
 
 Viewers are static web apps served by the Remux runtime. The runtime serves assets from the directory that contains the manifest entry file and falls back to the entry HTML for routes under the viewer route.
 
-Viewer code can use `@remux/extension-api` for host IPC helpers:
+Viewer code can use `@remux/viewer-kit/host` for host IPC helpers:
 
 - `openHostOverview`
 - `openHostFile`

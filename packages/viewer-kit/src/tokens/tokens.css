@@ -1,0 +1,73 @@
+/* GENERATED from src/tokens/primitives.ts — do not edit by hand. */
+/* Regenerate: npm run tokens:build (in packages/viewer-kit). */
+
+:root {
+  color-scheme: dark;
+
+  /* Neutral ramp (zinc) — terminal-derived reference palette */
+  --rmx-neutral-950: #09090b;
+  --rmx-neutral-900: #18181b;
+  --rmx-neutral-800: #27272a;
+  --rmx-neutral-700: #3f3f46;
+  --rmx-neutral-400: #a1a1aa;
+  --rmx-neutral-100: #f4f4f5;
+
+  /* Accent — orange (brand / primary action) */
+  --rmx-orange-700: #c45424;
+  --rmx-orange-500: #f97316;
+  --rmx-orange-50: #fff7ed;
+
+  /* Status hues */
+  --rmx-blue-400: #60a5fa;
+  --rmx-red-400: #f87171;
+  --rmx-green-400: #7fd49d;
+  --rmx-amber-400: #f5c56b;
+
+  /* Spacing scale */
+  --rmx-space-1: 4px;
+  --rmx-space-2: 6px;
+  --rmx-space-3: 8px;
+  --rmx-space-4: 10px;
+  --rmx-space-5: 12px;
+  --rmx-space-6: 16px;
+  --rmx-space-7: 20px;
+
+  /* Radius scale */
+  --rmx-radius-sm: 6px;
+  --rmx-radius-md: 8px;
+  --rmx-radius-lg: 10px;
+  --rmx-radius-full: 999px;
+
+  /* Typography */
+  --rmx-text-xs: 11px;
+  --rmx-text-sm: 13px;
+  --rmx-text-base: 15px;
+  --rmx-font-sans: Arial, "Helvetica Neue", sans-serif;
+  --rmx-font-mono: Menlo, Consolas, "Liberation Mono", monospace;
+
+  /* ===================== Semantic (dark theme) ===================== */
+
+  /* Surfaces */
+  --rmx-surface: var(--rmx-neutral-950);
+  --rmx-surface-raised: var(--rmx-neutral-900);
+  --rmx-surface-hover: var(--rmx-neutral-800);
+  --rmx-border: var(--rmx-neutral-700);
+
+  /* Text */
+  --rmx-text: var(--rmx-neutral-100);
+  --rmx-text-muted: var(--rmx-neutral-400);
+
+  /* Accent & status roles */
+  --rmx-accent: var(--rmx-orange-500);
+  --rmx-accent-strong: var(--rmx-orange-700);
+  --rmx-accent-foreground: var(--rmx-orange-50);
+  --rmx-focus-ring: var(--rmx-blue-400);
+  --rmx-danger: var(--rmx-red-400);
+  --rmx-success: var(--rmx-green-400);
+  --rmx-warning: var(--rmx-amber-400);
+
+  /* Elevation (button physicality — references --rmx-surface) */
+  --rmx-shadow-raised: inset 0 1px 0 rgb(255 255 255 / 9%), inset 0 -2px 0 rgb(0 0 0 / 32%), 0 2px 0 color-mix(in srgb, var(--rmx-surface) 78%, black);
+  --rmx-shadow-pressed: inset 0 1px 0 rgb(0 0 0 / 24%), inset 0 -1px 0 rgb(0 0 0 / 22%), 0 1px 0 color-mix(in srgb, var(--rmx-surface) 78%, black);
+  --rmx-shadow-menu: inset 0 1px 0 rgb(255 255 255 / 8%), inset 0 -2px 0 rgb(0 0 0 / 30%), 0 14px 36px rgb(0 0 0 / 38%);
+}

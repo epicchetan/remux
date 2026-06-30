@@ -1,4 +1,4 @@
-import { requestIpc, subscribeIpcEvents, type JsonRpcMessage } from '@remux/extension-api/ipc';
+import { requestIpc, subscribeIpcEvents, type JsonRpcMessage } from '@remux/viewer-kit/ipc';
 
 const terminalRequestTimeoutMs = 300_000;
 const terminalTmuxRequestTimeoutMs = 5_000;

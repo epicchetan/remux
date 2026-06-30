@@ -1,4 +1,4 @@
-import { readFileDataUrl } from '@remux/extension-api/fs';
+import { readFileDataUrl } from '@remux/viewer-kit/fs';
 import { useEffect, useMemo, useState, type ComponentPropsWithoutRef } from 'react';
 
 type MarkdownImageProps = ComponentPropsWithoutRef<'img'> & {

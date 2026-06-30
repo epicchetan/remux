@@ -1,9 +1,9 @@
-import { openHostOverview, reloadHostView, updateHostTab } from '@remux/extension-api/host';
-import type { RemuxViewerRoute } from '@remux/extension-api/route';
+import { openHostOverview, reloadHostView, updateHostTab } from '@remux/viewer-kit/host';
+import type { RemuxViewerRoute } from '@remux/viewer-kit/route';
 import {
   ExtensionActionBar,
   ExtensionActionButton,
-} from '@remux/extension-ui';
+} from '@remux/viewer-kit/ui';
 import { PanelRightOpen } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 

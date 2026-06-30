@@ -1,4 +1,4 @@
-import { parseRemuxViewerRoute } from '@remux/extension-api/route';
+import { parseRemuxViewerRoute } from '@remux/viewer-kit/route';
 
 import { EditorSurface } from './editor/EditorSurface';
 

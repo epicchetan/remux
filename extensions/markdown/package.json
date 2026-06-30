@@ -14,8 +14,7 @@
     "watch": "vite build --watch --config viewer/vite.config.ts"
   },
   "dependencies": {
-    "@remux/extension-api": "*",
-    "@remux/extension-ui": "*",
+    "@remux/viewer-kit": "*",
     "katex": "^0.17.0",
     "lucide-react": "^1.21.0",
     "mermaid": "^11.15.0",

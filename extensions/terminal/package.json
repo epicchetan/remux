@@ -15,8 +15,7 @@
     "watch": "vite build --watch --config viewer/vite.config.ts"
   },
   "dependencies": {
-    "@remux/extension-api": "*",
-    "@remux/extension-ui": "*",
+    "@remux/viewer-kit": "*",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-unicode11": "^0.9.0",
     "@xterm/addon-web-links": "^0.12.0",

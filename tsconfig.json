@@ -27,10 +27,10 @@
       "@remux/codex/config/*": ["./extensions/codex/viewer/config/*"],
       "@remux/codex/protocol/*": ["./extensions/codex/shared/protocol/*"],
       "@remux/codex/styles.css": ["./extensions/codex/viewer/styles.css"],
-      "@remux/extension-api": ["./packages/extension-api/src/index.ts"],
-      "@remux/extension-api/*": ["./packages/extension-api/src/*"],
-      "@remux/extension-ui": ["./packages/extension-ui/src/index.ts"],
-      "@remux/extension-ui/*": ["./packages/extension-ui/src/*"],
+      "@remux/viewer-kit": ["./packages/viewer-kit/src/index.ts"],
+      "@remux/viewer-kit/tokens.css": ["./packages/viewer-kit/src/tokens/tokens.css"],
+      "@remux/viewer-kit/ui/styles.css": ["./packages/viewer-kit/src/ui/styles.css"],
+      "@remux/viewer-kit/*": ["./packages/viewer-kit/src/*"],
       "@/*": [
         "./*"
       ]

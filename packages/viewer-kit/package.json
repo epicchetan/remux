@@ -1,0 +1,27 @@
+{
+  "name": "@remux/viewer-kit",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./fs": "./src/fs.ts",
+    "./host": "./src/host.ts",
+    "./ipc": "./src/ipc.ts",
+    "./route": "./src/route.ts",
+    "./react": "./src/react/index.ts",
+    "./ui": "./src/ui/index.ts",
+    "./tokens.css": "./src/tokens/tokens.css",
+    "./ui/styles.css": "./src/ui/styles.css"
+  },
+  "sideEffects": [
+    "./src/tokens/tokens.css",
+    "./src/ui/styles.css"
+  ],
+  "scripts": {
+    "tokens:build": "node scripts/build-tokens.mjs"
+  },
+  "peerDependencies": {
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  }
+}

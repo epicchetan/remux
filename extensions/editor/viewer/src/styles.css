@@ -31,11 +31,6 @@ body {
   height: 100%;
   min-height: 0;
   flex-direction: column;
-  --remux-extension-background: #18181b;
-  --remux-extension-border: #3f3f46;
-  --remux-extension-chrome: #27272a;
-  --remux-extension-chrome-hover: #3f3f46;
-  --remux-extension-muted-foreground: #a1a1aa;
   background:
     linear-gradient(180deg, rgba(39, 39, 42, 0.78), transparent 180px),
     #18181b;

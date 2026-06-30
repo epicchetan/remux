@@ -2,7 +2,7 @@ import {
   readFile,
   type ReadFileGitMetadata,
   type ReadFileResult,
-} from '@remux/extension-api/fs';
+} from '@remux/viewer-kit/fs';
 import { create } from 'zustand';
 
 type EditorFileState =

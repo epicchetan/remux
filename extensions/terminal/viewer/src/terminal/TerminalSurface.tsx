@@ -7,14 +7,14 @@ import {
   type RemuxHostViewportMetrics,
   subscribeHostViewportMetrics,
   updateHostTab,
-} from '@remux/extension-api/host';
-import type { RemuxViewerRoute } from '@remux/extension-api/route';
+} from '@remux/viewer-kit/host';
+import type { RemuxViewerRoute } from '@remux/viewer-kit/route';
 import {
   ExtensionActionBar,
   ExtensionActionButton,
   ExtensionActionMenu,
   ExtensionActionMenuItem,
-} from '@remux/extension-ui';
+} from '@remux/viewer-kit/ui';
 import { FitAddon } from '@xterm/addon-fit';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import { WebLinksAddon } from '@xterm/addon-web-links';

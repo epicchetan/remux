@@ -6,7 +6,7 @@ import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import { createElement, type ComponentPropsWithoutRef, type MouseEvent, type ReactNode } from 'react';
 
-import { openHostFile } from '@remux/extension-api/host';
+import { openHostFile } from '@remux/viewer-kit/host';
 
 import { MarkdownCodeBlock } from './MarkdownCodeBlock';
 import { MarkdownImage } from './MarkdownImage';

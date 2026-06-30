@@ -1,3 +1,12 @@
+/*
+ * Remux viewer UI primitives (ActionBar / ActionButton / ActionMenu).
+ *
+ * Color & elevation read semantic tokens with a migration fallback:
+ *   var(--rmx-<role>, var(--remux-extension-<old>, <literal>))
+ * Viewers that import @remux/viewer-kit/tokens.css drive these from --rmx-*;
+ * not-yet-migrated viewers keep their look via the legacy --remux-extension-* vars.
+ * Class names stay .remux-extension-* so existing per-viewer overrides keep matching.
+ */
 .remux-extension-action-bar {
   position: relative;
   display: flex;
@@ -32,7 +41,7 @@
   bottom: max(1px, calc((var(--remux-extension-bottom-pad) - 10px) / 2));
   left: 18px;
   overflow: hidden;
-  color: color-mix(in srgb, var(--remux-extension-muted-foreground, #a1a1aa) 78%, transparent);
+  color: color-mix(in srgb, var(--rmx-text-muted, var(--remux-extension-muted-foreground, #a1a1aa)) 78%, transparent);
   font-size: 9px;
   line-height: 10px;
   text-align: center;
@@ -48,20 +57,20 @@
   width: 39px;
   height: 36px;
   place-items: center;
-  border: 1px solid color-mix(in srgb, var(--remux-extension-border, #3f3f46) 88%, transparent);
+  border: 1px solid color-mix(in srgb, var(--rmx-border, var(--remux-extension-border, #3f3f46)) 88%, transparent);
   border-radius: 8px;
   background:
     linear-gradient(
       to bottom,
-      color-mix(in srgb, var(--remux-extension-chrome-hover, #3f3f46) 76%, #ffffff 3%),
-      color-mix(in srgb, var(--remux-extension-chrome, #27272a) 90%, black 10%)
+      color-mix(in srgb, var(--rmx-surface-hover, var(--remux-extension-chrome-hover, #3f3f46)) 76%, #ffffff 3%),
+      color-mix(in srgb, var(--rmx-surface-raised, var(--remux-extension-chrome, #27272a)) 90%, black 10%)
     );
-  color: color-mix(in srgb, var(--remux-extension-muted-foreground, #a1a1aa) 86%, #ffffff 14%);
+  color: color-mix(in srgb, var(--rmx-text-muted, var(--remux-extension-muted-foreground, #a1a1aa)) 86%, #ffffff 14%);
   appearance: none;
   box-shadow:
     inset 0 1px 0 rgb(255 255 255 / 9%),
     inset 0 -2px 0 rgb(0 0 0 / 32%),
-    0 2px 0 color-mix(in srgb, var(--remux-extension-background, #18181b) 78%, black);
+    0 2px 0 color-mix(in srgb, var(--rmx-surface, var(--remux-extension-background, #18181b)) 78%, black);
   cursor: default;
   outline: 0 !important;
   -webkit-tap-highlight-color: transparent;
@@ -82,7 +91,7 @@
   box-shadow:
     inset 0 1px 0 rgb(0 0 0 / 24%),
     inset 0 -1px 0 rgb(0 0 0 / 22%),
-    0 1px 0 color-mix(in srgb, var(--remux-extension-background, #18181b) 78%, black);
+    0 1px 0 color-mix(in srgb, var(--rmx-surface, var(--remux-extension-background, #18181b)) 78%, black);
   transform: translateY(1px);
 }
 
@@ -96,21 +105,21 @@
 
 .remux-extension-action-button:focus,
 .remux-extension-action-button:focus-within {
-  border-color: color-mix(in srgb, var(--remux-extension-border, #3f3f46) 88%, transparent);
+  border-color: color-mix(in srgb, var(--rmx-border, var(--remux-extension-border, #3f3f46)) 88%, transparent);
   box-shadow:
     inset 0 1px 0 rgb(255 255 255 / 9%),
     inset 0 -2px 0 rgb(0 0 0 / 32%),
-    0 2px 0 color-mix(in srgb, var(--remux-extension-background, #18181b) 78%, black);
+    0 2px 0 color-mix(in srgb, var(--rmx-surface, var(--remux-extension-background, #18181b)) 78%, black);
   outline: 0 !important;
 }
 
 .remux-extension-action-button:focus-visible {
-  outline: 2px solid var(--remux-extension-ring, #60a5fa);
+  outline: 2px solid var(--rmx-focus-ring, var(--remux-extension-ring, #60a5fa));
   outline-offset: 2px;
 }
 
 .remux-extension-action-button-primary {
-  border-color: color-mix(in srgb, #9f3a16 74%, var(--remux-extension-border, #3f3f46));
+  border-color: color-mix(in srgb, #9f3a16 74%, var(--rmx-border, var(--remux-extension-border, #3f3f46)));
   background:
     linear-gradient(
       to bottom,
@@ -126,7 +135,7 @@
 
 .remux-extension-action-button-primary:focus,
 .remux-extension-action-button-primary:focus-within {
-  border-color: color-mix(in srgb, #9f3a16 74%, var(--remux-extension-border, #3f3f46));
+  border-color: color-mix(in srgb, #9f3a16 74%, var(--rmx-border, var(--remux-extension-border, #3f3f46)));
   box-shadow:
     inset 0 1px 0 rgb(255 255 255 / 14%),
     inset 0 -2px 0 rgb(52 16 6 / 36%),
@@ -148,13 +157,13 @@
   width: min(232px, calc(100vw - 28px));
   gap: 2px;
   padding: 3px;
-  border: 1px solid color-mix(in srgb, var(--remux-extension-border, #3f3f46) 82%, transparent);
+  border: 1px solid color-mix(in srgb, var(--rmx-border, var(--remux-extension-border, #3f3f46)) 82%, transparent);
   border-radius: 10px;
   background:
     linear-gradient(
       to bottom,
-      color-mix(in srgb, var(--remux-extension-chrome-hover, #3f3f46) 70%, var(--remux-extension-background, #18181b) 30%),
-      color-mix(in srgb, var(--remux-extension-chrome, #27272a) 90%, black 10%)
+      color-mix(in srgb, var(--rmx-surface-hover, var(--remux-extension-chrome-hover, #3f3f46)) 70%, var(--rmx-surface, var(--remux-extension-background, #18181b)) 30%),
+      color-mix(in srgb, var(--rmx-surface-raised, var(--remux-extension-chrome, #27272a)) 90%, black 10%)
     );
   box-shadow:
     inset 0 1px 0 rgb(255 255 255 / 8%),
@@ -180,8 +189,8 @@
   padding: 3px 6px;
   border: 1px solid transparent;
   border-radius: 8px;
-  background: color-mix(in srgb, var(--remux-extension-background, #18181b) 42%, transparent);
-  color: color-mix(in srgb, var(--remux-extension-foreground, #f4f4f5) 94%, transparent);
+  background: color-mix(in srgb, var(--rmx-surface, var(--remux-extension-background, #18181b)) 42%, transparent);
+  color: color-mix(in srgb, var(--rmx-text, var(--remux-extension-foreground, #f4f4f5)) 94%, transparent);
   appearance: none;
   box-shadow:
     inset 0 1px 0 rgb(255 255 255 / 6%),
@@ -194,7 +203,7 @@
 }
 
 .remux-extension-action-menu-item:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--remux-extension-chrome-hover, #3f3f46) 80%, #ffffff 4%);
+  background: color-mix(in srgb, var(--rmx-surface-hover, var(--remux-extension-chrome-hover, #3f3f46)) 80%, #ffffff 4%);
 }
 
 .remux-extension-action-menu-item:disabled {
@@ -207,7 +216,7 @@
 }
 
 .remux-extension-action-menu-item:focus-visible {
-  outline: 2px solid var(--remux-extension-ring, #60a5fa) !important;
+  outline: 2px solid var(--rmx-focus-ring, var(--remux-extension-ring, #60a5fa)) !important;
   outline-offset: 2px;
 }
 
@@ -218,7 +227,7 @@
   flex: 0 0 auto;
   place-items: center;
   border-radius: 7px;
-  color: color-mix(in srgb, var(--remux-extension-muted-foreground, #a1a1aa) 86%, #ffffff 14%);
+  color: color-mix(in srgb, var(--rmx-text-muted, var(--remux-extension-muted-foreground, #a1a1aa)) 86%, #ffffff 14%);
 }
 
 .remux-extension-action-menu-item-icon svg {

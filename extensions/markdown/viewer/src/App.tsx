@@ -1,4 +1,4 @@
-import { parseRemuxViewerRoute } from '@remux/extension-api/route';
+import { parseRemuxViewerRoute } from '@remux/viewer-kit/route';
 
 import { MarkdownSurface } from './markdown/MarkdownSurface';
 
