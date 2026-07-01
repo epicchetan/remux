@@ -36,7 +36,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { getBottomBarHeight, tabGridGap, tabGridHorizontalPadding } from '../browser/browserLayout';
 import { useBrowserStore } from '../browser/browserStore';
 import { useRemuxConnection } from '../remote/RemuxConnectionProvider';
-import { colors } from '../theme/tokens';
+import { alpha, useTheme, type RemuxTheme } from '../theme/ThemeProvider';
 import { NativeGlassIconButton } from '../ui/NativeGlassIconButton';
 import {
   fileExtensionForName,
@@ -65,19 +65,6 @@ const preloadDirectoryDelayMs = 60;
 
 const navigationButtonModifiers = [
   buttonStyle('plain'),
-];
-
-const headerTitleTextModifiers = [
-  font({
-    size: 15,
-    weight: 'bold',
-  }),
-  foregroundStyle('#f4f4f5'),
-  lineLimit(1),
-  truncationMode('head'),
-  padding({
-    horizontal: 14,
-  }),
 ];
 
 export function FilesOverview() {
@@ -137,6 +124,7 @@ export function FilesOverview() {
   const currentParentPath = currentRecord?.parentPath ?? null;
   const currentLoading = currentRecord?.refreshStatus === 'loading';
   const currentError = currentRecord?.error ?? null;
+  const { styles } = useFilesTheme();
   const listTopPadding =
     insets.top +
     headerTopPadding +
@@ -218,6 +206,7 @@ function FilesHeader({
   onBackPress: () => void;
   topInset: number;
 }) {
+  const { styles } = useFilesTheme();
   const { width } = useWindowDimensions();
   const titleWidth = Math.max(
     0,
@@ -252,6 +241,21 @@ function NativeTitleButton({
   title: string;
   width: number;
 }) {
+  const theme = useTheme();
+  const titleTextModifiers = useMemo(() => [
+    font({
+      size: 15,
+      weight: 'bold',
+    }),
+    foregroundStyle(theme.text),
+    lineLimit(1),
+    truncationMode('head'),
+    padding({
+      horizontal: 14,
+    }),
+  ], [theme.text]);
+  const { styles } = useFilesTheme();
+
   return (
     <Host style={[styles.headerTitleHost, { width }]}>
       <Button
@@ -277,7 +281,7 @@ function NativeTitleButton({
             }),
           ]}
         >
-          <SwiftText modifiers={headerTitleTextModifiers}>{title}</SwiftText>
+          <SwiftText modifiers={titleTextModifiers}>{title}</SwiftText>
         </ZStack>
       </Button>
     </Host>
@@ -285,6 +289,7 @@ function NativeTitleButton({
 }
 
 function FileTreeRow({ row }: { row: VisibleFileTreeRow }) {
+  const { styles, theme } = useFilesTheme();
   const extensions = useBrowserStore((state) => state.extensions);
   const openExtensionTab = useBrowserStore((state) => state.openExtensionTab);
   const request = useRemuxConnection().request;
@@ -317,9 +322,9 @@ function FileTreeRow({ row }: { row: VisibleFileTreeRow }) {
           ]}
         >
           {showSpinner ? (
-            <ActivityIndicator color="#6aa8ff" size="small" />
+            <ActivityIndicator color={theme.focusRing} size="small" />
           ) : showChevron ? (
-            <ChevronIcon direction={row.isExpanded ? 'down' : 'right'} />
+            <ChevronIcon direction={row.isExpanded ? 'down' : 'right'} styles={styles} />
           ) : null}
         </Pressable>
 
@@ -349,7 +354,9 @@ function FileTreeRow({ row }: { row: VisibleFileTreeRow }) {
           ]}
         >
           <View style={styles.iconSlot}>
-            {row.kind === 'directory' ? <FolderIcon /> : <FileIcon fileName={row.name} />}
+            {row.kind === 'directory'
+              ? <FolderIcon styles={styles} />
+              : <FileIcon fileName={row.name} styles={styles} theme={theme} />}
           </View>
 
           <View style={styles.rowText}>
@@ -357,7 +364,7 @@ function FileTreeRow({ row }: { row: VisibleFileTreeRow }) {
               <Text numberOfLines={1} style={styles.rowTitle}>{row.name}</Text>
               {meta ? <Text numberOfLines={1} style={styles.rowMeta}>{meta}</Text> : null}
             </View>
-            <GitStatusBadge git={row.git} />
+            <GitStatusBadge git={row.git} styles={styles} theme={theme} />
           </View>
         </Pressable>
       </View>
@@ -365,12 +372,22 @@ function FileTreeRow({ row }: { row: VisibleFileTreeRow }) {
   );
 }
 
-function GitStatusBadge({ git }: { git: VisibleFileTreeRow['git'] }) {
+type FilesStyles = ReturnType<typeof createStyles>;
+
+function GitStatusBadge({
+  git,
+  styles,
+  theme,
+}: {
+  git: VisibleFileTreeRow['git'];
+  styles: FilesStyles;
+  theme: RemuxTheme;
+}) {
   if (!git) {
     return null;
   }
 
-  const tone = gitStatusTone(git.status);
+  const tone = gitStatusTone(git.status, theme);
   return (
     <View
       accessibilityLabel={`Git ${git.status}`}
@@ -396,6 +413,8 @@ function FilesStatus({
   error: string | null;
   loading: boolean;
 }) {
+  const { styles } = useFilesTheme();
+
   if (!loading && !error) {
     return null;
   }
@@ -407,7 +426,7 @@ function FilesStatus({
   );
 }
 
-function FolderIcon() {
+function FolderIcon({ styles }: { styles: FilesStyles }) {
   return (
     <View style={styles.folderIcon}>
       <View style={styles.folderTab} />
@@ -416,7 +435,13 @@ function FolderIcon() {
   );
 }
 
-function ChevronIcon({ direction }: { direction: 'down' | 'right' }) {
+function ChevronIcon({
+  direction,
+  styles,
+}: {
+  direction: 'down' | 'right';
+  styles: FilesStyles;
+}) {
   return (
     <View
       style={[
@@ -427,9 +452,17 @@ function ChevronIcon({ direction }: { direction: 'down' | 'right' }) {
   );
 }
 
-function FileIcon({ fileName }: { fileName: string }) {
+function FileIcon({
+  fileName,
+  styles,
+  theme,
+}: {
+  fileName: string;
+  styles: FilesStyles;
+  theme: RemuxTheme;
+}) {
   const extension = fileNameExtension(fileName);
-  const accent = fileAccentColor(extension);
+  const accent = fileAccentColor(extension, theme);
 
   return (
     <View style={styles.fileIcon}>
@@ -519,19 +552,19 @@ function formatSize(sizeBytes: number | null | undefined) {
   return `${(sizeBytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
-function fileAccentColor(extension: string) {
+function fileAccentColor(extension: string, theme: RemuxTheme) {
   switch (extension) {
     case 'js':
     case 'json':
-      return '#d6a84f';
+      return theme.warning;
     case 'md':
     case 'mdx':
-      return '#7b8ca8';
+      return theme.textMuted;
     case 'ts':
     case 'tsx':
-      return '#4c7fd6';
+      return theme.focusRing;
     default:
-      return '#8b8b93';
+      return theme.textMuted;
   }
 }
 
@@ -553,39 +586,46 @@ function gitStatusLabel(status: NonNullable<VisibleFileTreeRow['git']>['status']
   }
 }
 
-function gitStatusTone(status: NonNullable<VisibleFileTreeRow['git']>['status']) {
+function gitStatusTone(status: NonNullable<VisibleFileTreeRow['git']>['status'], theme: RemuxTheme) {
   switch (status) {
     case 'added':
     case 'untracked':
       return {
-        backgroundColor: 'rgba(34, 197, 94, 0.14)',
-        borderColor: 'rgba(134, 239, 172, 0.28)',
-        color: '#86efac',
+        backgroundColor: alpha(theme.success, 0.14),
+        borderColor: alpha(theme.success, 0.32),
+        color: theme.success,
       };
     case 'deleted':
     case 'conflicted':
       return {
-        backgroundColor: 'rgba(248, 113, 113, 0.14)',
-        borderColor: 'rgba(248, 113, 113, 0.32)',
-        color: '#fca5a5',
+        backgroundColor: alpha(theme.danger, 0.14),
+        borderColor: alpha(theme.danger, 0.32),
+        color: theme.danger,
       };
     case 'renamed':
       return {
-        backgroundColor: 'rgba(96, 165, 250, 0.14)',
-        borderColor: 'rgba(147, 197, 253, 0.3)',
-        color: '#93c5fd',
+        backgroundColor: alpha(theme.focusRing, 0.14),
+        borderColor: alpha(theme.focusRing, 0.3),
+        color: theme.focusRing,
       };
     case 'modified':
     default:
       return {
-        backgroundColor: 'rgba(245, 158, 11, 0.14)',
-        borderColor: 'rgba(251, 191, 36, 0.3)',
-        color: '#fbbf24',
+        backgroundColor: alpha(theme.warning, 0.14),
+        borderColor: alpha(theme.warning, 0.3),
+        color: theme.warning,
       };
   }
 }
 
-const styles = StyleSheet.create({
+function useFilesTheme() {
+  const theme = useTheme();
+  const styles = useMemo(() => createStyles(theme), [theme]);
+  return { styles, theme };
+}
+
+function createStyles(theme: RemuxTheme) {
+  return StyleSheet.create({
   chevronButton: {
     alignItems: 'center',
     height: 32,
@@ -596,9 +636,9 @@ const styles = StyleSheet.create({
     opacity: 0,
   },
   chevronIcon: {
-    borderBottomColor: '#6aa8ff',
+    borderBottomColor: theme.focusRing,
     borderBottomWidth: 2.5,
-    borderRightColor: '#6aa8ff',
+    borderRightColor: theme.focusRing,
     borderRightWidth: 2.5,
     height: 11,
     width: 11,
@@ -610,7 +650,7 @@ const styles = StyleSheet.create({
     transform: [{ rotate: '-45deg' }, { translateX: -2 }],
   },
   container: {
-    backgroundColor: colors.background,
+    backgroundColor: theme.surface,
     flex: 1,
   },
   fileAccent: {
@@ -622,7 +662,7 @@ const styles = StyleSheet.create({
     top: 7,
   },
   fileExtension: {
-    color: '#d4d4d8',
+    color: theme.textMuted,
     fontSize: 8,
     fontWeight: '800',
     lineHeight: 10,
@@ -631,8 +671,8 @@ const styles = StyleSheet.create({
   },
   fileIcon: {
     alignItems: 'center',
-    backgroundColor: '#252528',
-    borderColor: '#3a3a3d',
+    backgroundColor: theme.surfaceRaised,
+    borderColor: theme.border,
     borderRadius: 6,
     borderWidth: 1,
     height: 30,
@@ -640,8 +680,8 @@ const styles = StyleSheet.create({
     width: 28,
   },
   folderBody: {
-    backgroundColor: '#6fb8df',
-    borderColor: '#8ed0ef',
+    backgroundColor: alpha(theme.focusRing, 0.58),
+    borderColor: alpha(theme.focusRing, 0.78),
     borderRadius: 4,
     borderTopLeftRadius: 2,
     borderTopRightRadius: 5,
@@ -658,8 +698,8 @@ const styles = StyleSheet.create({
     width: 36,
   },
   folderTab: {
-    backgroundColor: '#6fb8df',
-    borderColor: '#8ed0ef',
+    backgroundColor: alpha(theme.focusRing, 0.58),
+    borderColor: alpha(theme.focusRing, 0.78),
     borderRadius: 4,
     borderWidth: 1,
     height: 12,
@@ -737,14 +777,14 @@ const styles = StyleSheet.create({
     height: rowHeight,
   },
   rowMeta: {
-    color: colors.muted,
+    color: theme.textMuted,
     fontSize: 13,
     lineHeight: 18,
     marginTop: 1,
   },
   rowText: {
     alignItems: 'center',
-    borderBottomColor: '#242426',
+    borderBottomColor: theme.borderSubtle,
     borderBottomWidth: StyleSheet.hairlineWidth,
     flex: 1,
     flexDirection: 'row',
@@ -757,7 +797,7 @@ const styles = StyleSheet.create({
     minWidth: 0,
   },
   rowTitle: {
-    color: colors.text,
+    color: theme.text,
     fontSize: 17,
     fontWeight: '500',
     lineHeight: 22,
@@ -769,9 +809,10 @@ const styles = StyleSheet.create({
     paddingHorizontal: tabGridHorizontalPadding,
   },
   statusText: {
-    color: colors.muted,
+    color: theme.textMuted,
     fontSize: 15,
     lineHeight: 20,
     textAlign: 'center',
   },
-});
+  });
+}

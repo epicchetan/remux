@@ -1,11 +1,10 @@
-import type { BundledLanguage, BundledTheme, Highlighter, ThemedToken } from 'shiki';
-
-export type CodeHighlightTheme = 'dark';
+import type { BundledLanguage, BundledTheme, Highlighter, ThemedTokenWithVariants } from 'shiki';
 
 export type CodeHighlightToken = {
   color: string | null;
   fontStyle: 'italic' | null;
   fontWeight: 'bold' | null;
+  lightColor: string | null;
   text: string;
 };
 
@@ -18,9 +17,11 @@ export type CodeHighlightResult = {
 };
 
 const codexShikiThemeDark = 'github-dark-default';
+const codexShikiThemeLight = 'github-light-default';
 const codeThemes = {
   dark: codexShikiThemeDark,
-} as const satisfies Record<CodeHighlightTheme, BundledTheme>;
+  light: codexShikiThemeLight,
+} as const satisfies Record<'dark' | 'light', BundledTheme>;
 
 const bundledLanguages = [
   'bash',
@@ -69,25 +70,21 @@ export function normalizeCodeLanguage(language: string | null): BundledLanguage 
 export function cachedCodeHighlight({
   code,
   language,
-  theme,
 }: {
   code: string;
   language: string | null;
-  theme: CodeHighlightTheme;
 }): CodeHighlightResult | null {
-  return highlightCache.get(highlightCacheKey({ code, language, theme })) ?? null;
+  return highlightCache.get(highlightCacheKey({ code, language })) ?? null;
 }
 
 export async function highlightCode({
   code,
   language,
-  theme,
 }: {
   code: string;
   language: string | null;
-  theme: CodeHighlightTheme;
 }): Promise<CodeHighlightResult> {
-  const key = highlightCacheKey({ code, language, theme });
+  const key = highlightCacheKey({ code, language });
   const cached = highlightCache.get(key);
   if (cached) {
     return cached;
@@ -95,11 +92,11 @@ export async function highlightCode({
 
   const highlighter = await getHighlighter();
   const normalizedLanguage = normalizeCodeLanguage(language);
-  const result = highlighter.codeToTokens(code, {
+  const tokens = highlighter.codeToTokensWithThemes(code, {
     lang: normalizedLanguage,
-    theme: codeThemes[theme],
+    themes: codeThemes,
   });
-  const highlighted = normalizeHighlightLines(code, result.tokens);
+  const highlighted = normalizeHighlightLines(code, tokens);
   highlightCache.set(key, highlighted);
   return highlighted;
 }
@@ -117,33 +114,36 @@ function getHighlighter(): Promise<Highlighter> {
 function highlightCacheKey({
   code,
   language,
-  theme,
 }: {
   code: string;
   language: string | null;
-  theme: CodeHighlightTheme;
 }) {
-  return `${theme}\0${normalizeCodeLanguage(language)}\0${code}`;
+  return `${normalizeCodeLanguage(language)}\0${code}`;
 }
 
-function normalizeHighlightLines(code: string, tokenLines: ThemedToken[][]): CodeHighlightResult {
+function normalizeHighlightLines(code: string, tokenLines: ThemedTokenWithVariants[][]): CodeHighlightResult {
   const sourceLines = code.length > 0 ? code.split('\n') : [''];
   return {
     lines: sourceLines.map((line, index) => {
       const tokens = tokenLines[index] ?? [];
       return {
-        tokens: tokens.length > 0 ? tokens.map(mapToken) : line ? [{ color: null, fontStyle: null, fontWeight: null, text: line }] : [],
+        tokens: tokens.length > 0
+          ? tokens.map(mapToken)
+          : line ? [{ color: null, fontStyle: null, fontWeight: null, lightColor: null, text: line }] : [],
       };
     }),
   };
 }
 
-function mapToken(token: ThemedToken): CodeHighlightToken {
-  const fontStyle = token.fontStyle ?? 0;
+function mapToken(token: ThemedTokenWithVariants): CodeHighlightToken {
+  const dark = token.variants.dark ?? {};
+  const light = token.variants.light ?? {};
+  const fontStyle = dark.fontStyle ?? light.fontStyle ?? 0;
   return {
-    color: token.color ?? null,
+    color: dark.color ?? null,
     fontStyle: fontStyle & 1 ? 'italic' : null,
     fontWeight: fontStyle & 2 ? 'bold' : null,
+    lightColor: light.color ?? null,
     text: token.content,
   };
 }

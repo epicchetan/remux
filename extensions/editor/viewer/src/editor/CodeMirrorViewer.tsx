@@ -4,6 +4,11 @@ import { javascript } from '@codemirror/lang-javascript';
 import { json } from '@codemirror/lang-json';
 import { markdown } from '@codemirror/lang-markdown';
 import { python } from '@codemirror/lang-python';
+import {
+  getHostTheme,
+  subscribeHostTheme,
+  type RemuxHostTheme,
+} from '@remux/viewer-kit/host';
 import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
 import { Chunk, unifiedMergeView } from '@codemirror/merge';
 import {
@@ -38,8 +43,9 @@ const codeMirrorDiffConfig = {
 } as const;
 
 const remuxCodeMirrorThemeDark = EditorView.theme({}, { dark: true });
+const remuxCodeMirrorThemeLight = EditorView.theme({}, { dark: false });
 
-const remuxHighlightStyleDark = HighlightStyle.define([
+const remuxHighlightStyle = HighlightStyle.define([
   { tag: tags.comment, color: 'var(--remux-editor-syntax-comment)', fontStyle: 'italic' },
   { tag: tags.keyword, color: 'var(--remux-editor-syntax-keyword)' },
   { tag: [tags.atom, tags.bool, tags.null], color: 'var(--remux-editor-syntax-atom)' },
@@ -66,6 +72,7 @@ export function CodeMirrorViewer({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const lineNumbersCompartmentRef = useRef(new Compartment());
   const mergeCompartmentRef = useRef(new Compartment());
+  const themeCompartmentRef = useRef(new Compartment());
   const viewRef = useRef<EditorView | null>(null);
   const language = useMemo(() => languageForFileName(fileName), [fileName]);
   const mergeEnabled = showDiff && baseContent != null;
@@ -100,8 +107,8 @@ export function CodeMirrorViewer({
         minimalSetup,
         EditorState.readOnly.of(true),
         EditorView.editable.of(false),
-        remuxCodeMirrorThemeDark,
-        syntaxHighlighting(remuxHighlightStyleDark),
+        themeCompartmentRef.current.of(codeMirrorThemeExtension(getHostTheme())),
+        syntaxHighlighting(remuxHighlightStyle),
         mergeCompartmentRef.current.of(mergeExtension),
         language,
       ].filter(Boolean) as Extension[],
@@ -119,6 +126,12 @@ export function CodeMirrorViewer({
     };
   }, [content, language]);
 
+  useEffect(() => subscribeHostTheme((theme) => {
+    viewRef.current?.dispatch({
+      effects: themeCompartmentRef.current.reconfigure(codeMirrorThemeExtension(theme)),
+    });
+  }), []);
+
   useEffect(() => {
     viewRef.current?.dispatch({
       effects: [
@@ -129,6 +142,10 @@ export function CodeMirrorViewer({
   }, [lineNumbersExtension, mergeExtension]);
 
   return <div className="remux-editor-codemirror" ref={containerRef} />;
+}
+
+function codeMirrorThemeExtension(theme: RemuxHostTheme) {
+  return theme === 'light' ? remuxCodeMirrorThemeLight : remuxCodeMirrorThemeDark;
 }
 
 class RemuxLineNumberMarker extends GutterMarker {

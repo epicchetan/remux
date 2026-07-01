@@ -1,14 +1,24 @@
+import {
+  getHostTheme,
+  subscribeHostTheme,
+  type RemuxHostTheme,
+} from '@remux/viewer-kit/host';
 import { useEffect, useMemo, useState } from 'react';
 
 type MermaidBlockProps = {
   source: string;
 };
 
-let initialized = false;
 let mermaidModulePromise: Promise<typeof import('mermaid')> | null = null;
-const mermaidThemeConfigDark = {
-  darkMode: true,
-  theme: 'dark',
+const mermaidThemeConfigs = {
+  dark: {
+    darkMode: true,
+    theme: 'dark',
+  },
+  light: {
+    darkMode: false,
+    theme: 'default',
+  },
 } as const;
 
 type MermaidRenderState =
@@ -17,8 +27,11 @@ type MermaidRenderState =
   | { message: string; status: 'error' };
 
 export function MermaidBlock({ source }: MermaidBlockProps) {
+  const [theme, setTheme] = useState<RemuxHostTheme>(() => getHostTheme());
   const [state, setState] = useState<MermaidRenderState>({ status: 'loading' });
-  const id = useMemo(() => `remux-mermaid-${hashString(source)}`, [source]);
+  const id = useMemo(() => `remux-mermaid-${theme}-${hashString(source)}`, [source, theme]);
+
+  useEffect(() => subscribeHostTheme(setTheme), []);
 
   useEffect(() => {
     let cancelled = false;
@@ -27,7 +40,7 @@ export function MermaidBlock({ source }: MermaidBlockProps) {
     void loadMermaid()
       .then((mermaidModule) => {
         const mermaid = mermaidModule.default;
-        initializeMermaid(mermaid);
+        configureMermaid(mermaid, theme);
         return mermaid.render(id, source);
       })
       .then(({ svg }) => {
@@ -47,7 +60,7 @@ export function MermaidBlock({ source }: MermaidBlockProps) {
     return () => {
       cancelled = true;
     };
-  }, [id, source]);
+  }, [id, source, theme]);
 
   if (state.status === 'loading') {
     return (
@@ -83,18 +96,13 @@ function loadMermaid() {
   return mermaidModulePromise;
 }
 
-function initializeMermaid(mermaid: typeof import('mermaid').default) {
-  if (initialized) {
-    return;
-  }
-
+function configureMermaid(mermaid: typeof import('mermaid').default, theme: RemuxHostTheme) {
   mermaid.initialize({
     fontFamily: 'Arial, "Helvetica Neue", sans-serif',
     securityLevel: 'strict',
     startOnLoad: false,
-    ...mermaidThemeConfigDark,
+    ...mermaidThemeConfigs[theme],
   });
-  initialized = true;
 }
 
 function hashString(value: string) {

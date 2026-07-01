@@ -9,6 +9,8 @@ import {
 } from '@expo/ui/swift-ui/modifiers';
 import type { StyleProp, ViewStyle } from 'react-native';
 
+import { useTheme } from '../theme/ThemeProvider';
+
 type NativeGlassIconButtonProps = {
   accessibilityLabel: string;
   color?: string;
@@ -22,7 +24,7 @@ type NativeGlassIconButtonProps = {
 
 export function NativeGlassIconButton({
   accessibilityLabel,
-  color = '#f4f4f5',
+  color,
   disabled = false,
   iconSize = 16,
   onPress,
@@ -30,6 +32,9 @@ export function NativeGlassIconButton({
   style,
   systemImage,
 }: NativeGlassIconButtonProps) {
+  const theme = useTheme();
+  const iconColor = color ?? theme.text;
+
   return (
     <Host matchContents style={[{ height: size, width: size }, style]}>
       <Button
@@ -56,7 +61,7 @@ export function NativeGlassIconButton({
             }),
           ]}
         >
-          <SwiftImage color={color} size={iconSize} systemName={systemImage} />
+          <SwiftImage color={iconColor} size={iconSize} systemName={systemImage} />
         </ZStack>
       </Button>
     </Host>

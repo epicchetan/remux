@@ -17,6 +17,18 @@
   color: var(--rmx-text);
 }
 
+:root[data-remux-theme="light"] {
+  --remux-editor-syntax-comment: #8a8f98;
+  --remux-editor-syntax-keyword: #8250df;
+  --remux-editor-syntax-number: #b45309;
+  --remux-editor-syntax-string: #0a7b34;
+  --remux-editor-syntax-regexp: #c2185b;
+  --remux-editor-syntax-function: #0550ae;
+  --remux-editor-syntax-type: #953800;
+  --remux-editor-syntax-property: #0550ae;
+  --remux-editor-syntax-tag: #c2185b;
+}
+
 * {
   box-sizing: border-box;
 }

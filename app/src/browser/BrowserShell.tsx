@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
 import {
   StyleSheet,
   View,
@@ -11,7 +11,7 @@ import {
   useRemuxSettingsStore,
 } from '../remote/remuxSettingsStore';
 import type { ExtensionWebViewHandle } from '../surfaces/viewer/ExtensionWebView';
-import { colors } from '../theme/tokens';
+import { useTheme, type RemuxTheme } from '../theme/ThemeProvider';
 import { ActiveSurface } from './ActiveSurface';
 import { BrowserOverview } from './BrowserOverview';
 import { useBrowserStore } from './browserStore';
@@ -28,9 +28,11 @@ export function BrowserShell() {
   const remuxHost = useRemuxSettingsStore((state) => state.host);
   const remuxPort = useRemuxSettingsStore((state) => state.port);
   const remuxOrigin = remuxOriginFromSettings({ host: remuxHost, port: remuxPort });
+  const theme = useTheme();
   const activeSurfaceRef = useRef<ExtensionWebViewHandle | null>(null);
   const previewCaptureSerialRef = useRef(0);
   const surfaceShotRef = useRef<View | null>(null);
+  const styles = useMemo(() => createStyles(theme), [theme]);
 
   const refreshTabPreview = useCallback(async (tabId: string) => {
     const captureSerial = previewCaptureSerialRef.current + 1;
@@ -103,18 +105,20 @@ export function BrowserShell() {
   );
 }
 
-const styles = StyleSheet.create({
+function createStyles(theme: RemuxTheme) {
+  return StyleSheet.create({
   screen: {
-    backgroundColor: colors.background,
+    backgroundColor: theme.surface,
     flex: 1,
   },
   surface: {
-    backgroundColor: colors.background,
+    backgroundColor: theme.surface,
     flex: 1,
     overflow: 'hidden',
   },
   surfaceShot: {
-    backgroundColor: colors.background,
+    backgroundColor: theme.surface,
     flex: 1,
   },
-});
+  });
+}

@@ -3,13 +3,16 @@
     "name": "Remux",
     "slug": "remux",
     "version": "1.0.1",
+    "runtimeVersion": {
+      "policy": "fingerprint"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/abbeb2c1-3062-4613-a034-3b7502d8b855"
+    },
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "dark",
+    "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
-    "splash": {
-      "backgroundColor": "#000000"
-    },
     "ios": {
       "supportsTablet": true,
       "buildNumber": "2",
@@ -23,8 +26,9 @@
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#111111"
+        "backgroundColor": "#fafafa"
       },
+      "backgroundColor": "#09090b",
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
       "permissions": [
@@ -43,6 +47,16 @@
           "photosPermission": "Allow Remux to attach photos to Codex messages."
         }
       ],
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#fafafa",
+          "dark": {
+            "backgroundColor": "#09090b"
+          }
+        }
+      ],
+      "expo-system-ui",
       "expo-status-bar",
       "expo-notifications"
     ],

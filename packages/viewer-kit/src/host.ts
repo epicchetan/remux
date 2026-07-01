@@ -28,6 +28,7 @@ export type RemuxHostViewportMetrics = {
 };
 
 export type RemuxHostConnectionStatus = 'connected' | 'connecting' | 'reconnecting' | 'disconnected';
+export type RemuxHostTheme = 'light' | 'dark';
 
 export function dismissHostKeyboard() {
   return requestIpc('host/keyboard/dismiss', undefined, 1_000);
@@ -39,6 +40,14 @@ export function readHostClipboardText() {
 
 export function getHostViewportMetrics() {
   return requestIpc<RemuxHostViewportMetrics>('host/viewport/get', undefined, 1_000);
+}
+
+export function getHostTheme(): RemuxHostTheme {
+  if (typeof document === 'undefined') {
+    return 'dark';
+  }
+
+  return parseHostTheme(document.documentElement.dataset.remuxTheme);
 }
 
 export function openHostOverview(params: HostOverviewOpenParams = {}) {
@@ -97,6 +106,20 @@ export function subscribeHostActive(subscriber: (active: boolean) => void) {
   });
 }
 
+export function subscribeHostTheme(subscriber: (theme: RemuxHostTheme) => void) {
+  return subscribeIpcEvents((events) => {
+    for (const event of events) {
+      if (event.method === 'host/theme') {
+        subscriber(parseHostTheme(paramsOf<{ theme?: unknown }>(event).theme));
+      }
+    }
+  });
+}
+
 function paramsOf<T>(message: JsonRpcMessage): T {
   return ('params' in message ? message.params : {}) as T;
+}
+
+function parseHostTheme(value: unknown): RemuxHostTheme {
+  return value === 'light' ? 'light' : 'dark';
 }

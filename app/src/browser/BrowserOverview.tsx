@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Image, Pressable, ScrollView, StyleSheet, Text, View, useWindowDimensions } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { FilesOverview } from '../files/FilesOverview';
 import { useRemuxConnection } from '../remote/RemuxConnectionProvider';
 import { SettingsOverview } from '../settings/SettingsOverview';
+import { useTheme, type RemuxTheme } from '../theme/ThemeProvider';
 import { BrowserBottomBar } from './BrowserBottomBar';
 import {
   getBottomBarHeight,
@@ -35,6 +36,7 @@ export function BrowserOverview({
   const section = useBrowserStore((state) => state.section);
   const selectTab = useBrowserStore((state) => state.selectTab);
   const tabs = useBrowserStore((state) => state.tabs);
+  const theme = useTheme();
   const { height, width } = useWindowDimensions();
   const previewSourceAspectRatio = width / Math.max(height, 1);
   const orderedTabs = [...tabs].sort((first, second) => {
@@ -50,6 +52,7 @@ export function BrowserOverview({
   const tabCardWidth = getTabCardWidth(width);
   const tabRows = bottomAnchoredRows(orderedTabs, 2);
   const bottomChromePadding = getBottomBarHeight(insets.bottom) + tabGridGap;
+  const styles = useMemo(() => createStyles(theme), [theme]);
 
   useEffect(() => {
     if (section !== 'tabs') {
@@ -101,7 +104,7 @@ export function BrowserOverview({
                     ]}
                   >
 	                    <View style={styles.tabHeader}>
-	                      <TabIcon tab={tab} />
+	                      <TabIcon styles={styles} tab={tab} />
 	                      <Text numberOfLines={1} style={styles.tabTitle}>{tab.title}</Text>
 	                      <Pressable
                         accessibilityLabel={`Close ${tab.title}`}
@@ -119,7 +122,7 @@ export function BrowserOverview({
                         <Text style={styles.tabCloseText}>×</Text>
                       </Pressable>
                     </View>
-                    <TabPreview previewSourceAspectRatio={previewSourceAspectRatio} tab={tab} />
+                    <TabPreview previewSourceAspectRatio={previewSourceAspectRatio} styles={styles} tab={tab} />
                   </Pressable>
                 ))}
               </View>
@@ -160,7 +163,9 @@ function bottomAnchoredRows<T>(items: T[], columns: number) {
   return rows.reverse();
 }
 
-function TabIcon({ tab }: { tab: BrowserTab }) {
+type BrowserOverviewStyles = ReturnType<typeof createStyles>;
+
+function TabIcon({ styles, tab }: { styles: BrowserOverviewStyles; tab: BrowserTab }) {
   const [imageFailed, setImageFailed] = useState(false);
 
   return (
@@ -182,9 +187,11 @@ function TabIcon({ tab }: { tab: BrowserTab }) {
 
 function TabPreview({
   previewSourceAspectRatio,
+  styles,
   tab,
 }: {
   previewSourceAspectRatio: number;
+  styles: BrowserOverviewStyles;
   tab: BrowserTab;
 }) {
   const [imageFailed, setImageFailed] = useState(false);
@@ -204,17 +211,18 @@ function TabPreview({
 
   return (
     <View style={[styles.tabBody, styles.tabFallbackBody, { aspectRatio: tabPreviewAspectRatio }]}>
-      <TabIcon tab={tab} />
+      <TabIcon styles={styles} tab={tab} />
     </View>
   );
 }
 
-const styles = StyleSheet.create({
+function createStyles(theme: RemuxTheme) {
+  return StyleSheet.create({
   activeTabCard: {
-    borderColor: '#5f97ff',
+    borderColor: theme.focusRing,
   },
   overview: {
-    backgroundColor: '#000000',
+    backgroundColor: theme.surface,
     bottom: 0,
     left: 0,
     position: 'absolute',
@@ -229,13 +237,13 @@ const styles = StyleSheet.create({
   },
   tabBody: {
     alignItems: 'center',
-    backgroundColor: '#111112',
+    backgroundColor: theme.surface,
     justifyContent: 'center',
     overflow: 'hidden',
   },
   tabCard: {
-    backgroundColor: '#272729',
-    borderColor: '#272729',
+    backgroundColor: theme.surfaceRaised,
+    borderColor: theme.surfaceRaised,
     borderRadius: 20,
     borderWidth: tabCardBorderWidth,
     overflow: 'hidden',
@@ -244,7 +252,7 @@ const styles = StyleSheet.create({
     opacity: 0,
   },
   tabCloseText: {
-    color: '#c9c9ce',
+    color: theme.textMuted,
     fontSize: 18,
     fontWeight: '300',
     lineHeight: 20,
@@ -276,7 +284,7 @@ const styles = StyleSheet.create({
   },
 	  tabHeader: {
 	    alignItems: 'center',
-	    backgroundColor: '#272729',
+	    backgroundColor: theme.surfaceRaised,
 	    flexDirection: 'row',
 	    gap: 4,
 	    height: tabHeaderHeight,
@@ -284,7 +292,7 @@ const styles = StyleSheet.create({
 	  },
   tabIcon: {
     alignItems: 'center',
-    backgroundColor: '#3a3a3d',
+    backgroundColor: theme.surfaceHover,
     borderRadius: 6,
     height: 16,
     justifyContent: 'center',
@@ -296,13 +304,13 @@ const styles = StyleSheet.create({
     width: 12,
   },
   tabIconText: {
-    color: '#ffffff',
+    color: theme.text,
     fontSize: 9,
     fontWeight: '900',
     lineHeight: 11,
   },
 	  tabPreviewImage: {
-    backgroundColor: '#111112',
+    backgroundColor: theme.surface,
     bottom: 0,
     left: 0,
     position: 'absolute',
@@ -310,13 +318,14 @@ const styles = StyleSheet.create({
     width: '100%',
   },
 	  tabTitle: {
-	    color: '#f1f1f3',
+	    color: theme.text,
 	    flex: 1,
 	    fontSize: 12,
 	    fontWeight: '700',
 	    lineHeight: 14,
 	  },
-});
+  });
+}
 
 function tabIconText(title: string) {
   return title.trim().slice(0, 1).toUpperCase() || 'R';

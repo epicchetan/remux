@@ -1,13 +1,16 @@
 import {
   dismissHostKeyboard,
+  getHostTheme,
   getHostViewportMetrics,
   openHostOverview,
   readHostClipboardText,
   reloadHostView,
   subscribeHostActive,
   subscribeHostConnection,
-  type RemuxHostViewportMetrics,
+  subscribeHostTheme,
   type RemuxHostConnectionStatus,
+  type RemuxHostTheme,
+  type RemuxHostViewportMetrics,
   subscribeHostViewportMetrics,
   updateHostTab,
 } from '@remux/viewer-kit/host';
@@ -112,6 +115,28 @@ const terminalThemeDark = {
   selectionBackground: '#3f3f46',
   white: '#e4e4e7',
   yellow: '#facc15',
+} as const;
+const terminalThemeLight = {
+  background: '#fafafa',
+  black: '#24292f',
+  blue: '#0550ae',
+  brightBlack: '#6e7781',
+  brightBlue: '#0969da',
+  brightCyan: '#1b7c83',
+  brightGreen: '#1a7f37',
+  brightMagenta: '#8250df',
+  brightRed: '#cf222e',
+  brightWhite: '#ffffff',
+  brightYellow: '#9a6700',
+  cursor: '#f97316',
+  cyan: '#1b7c83',
+  foreground: '#24292f',
+  green: '#1a7f37',
+  magenta: '#8250df',
+  red: '#cf222e',
+  selectionBackground: '#d0d7de',
+  white: '#57606a',
+  yellow: '#9a6700',
 } as const;
 const textEncoder = new TextEncoder();
 const fitDebounceMs = 180;
@@ -820,7 +845,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
         lineHeight: 1.16,
         rescaleOverlappingGlyphs: true,
         scrollback: 5000,
-        theme: terminalThemeDark,
+        theme: terminalThemeForHost(getHostTheme()),
       });
 
       const unicode11 = new Unicode11Addon();
@@ -1014,6 +1039,13 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       void resyncSession();
     }
   }), [resyncSession]);
+
+  useEffect(() => subscribeHostTheme((theme) => {
+    const terminal = terminalRef.current;
+    if (terminal) {
+      terminal.options.theme = terminalThemeForHost(theme);
+    }
+  }), []);
 
   useEffect(() => {
     if (!sessionId || status.type !== 'running' || !hostActive || !connected) {
@@ -2122,6 +2154,10 @@ function terminalShellStyle(keyboardOffset: number) {
   return {
     '--remux-terminal-keyboard-offset': `${keyboardOffset}px`,
   } as CSSProperties;
+}
+
+function terminalThemeForHost(theme: RemuxHostTheme) {
+  return theme === 'light' ? terminalThemeLight : terminalThemeDark;
 }
 
 function normalizedKeyboardOffset(hostMetrics: RemuxHostViewportMetrics | null) {

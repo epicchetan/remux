@@ -29,6 +29,7 @@
       "@remux/codex/styles.css": ["./extensions/codex/viewer/styles.css"],
       "@remux/viewer-kit": ["./packages/viewer-kit/src/index.ts"],
       "@remux/viewer-kit/shadcn": ["./packages/viewer-kit/src/shadcn/index.ts"],
+      "@remux/viewer-kit/tokens.native": ["./packages/viewer-kit/src/tokens/tokens.native.ts"],
       "@remux/viewer-kit/tokens.css": ["./packages/viewer-kit/src/tokens/tokens.css"],
       "@remux/viewer-kit/theme.css": ["./packages/viewer-kit/src/tokens/theme.css"],
       "@remux/viewer-kit/ui/styles.css": ["./packages/viewer-kit/src/ui/styles.css"],

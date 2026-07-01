@@ -6,10 +6,9 @@
 @source "./**/*.{ts,tsx}";
 @source "../../../packages/viewer-kit/src/shadcn/**/*.{ts,tsx}";
 
-@custom-variant dark (&:is(.dark *));
-
 :root {
   --composer: var(--card);
+  --composer-accent: var(--rmx-accent);
   --chrome: #1f232b;
   --chrome-hover: #272b34;
   --remux-font-body-size: 15px;
@@ -29,6 +28,11 @@
   --remux-font-sans: Arial, "Helvetica Neue", sans-serif;
   --remux-font-mono: Menlo, Consolas, "Liberation Mono", monospace;
   font-family: var(--remux-font-sans);
+}
+
+:root[data-remux-theme="light"] {
+  --chrome: var(--rmx-surface-raised);
+  --chrome-hover: var(--rmx-surface-hover);
 }
 
 @theme inline {

@@ -15,8 +15,6 @@ type HighlightState =
   | { status: 'loading' }
   | { status: 'plain' };
 
-const codeHighlightTheme = 'dark' as const;
-
 export function CodeBlock({
   block,
   style,
@@ -28,7 +26,6 @@ export function CodeBlock({
     () => ({
       code: block.text,
       language: block.language,
-      theme: codeHighlightTheme,
     }),
     [block.language, block.text],
   );
@@ -108,10 +105,11 @@ function CodeLineText({
           className="codex-md-code-token"
           key={`${index}:${token.text}`}
           style={{
+            '--shiki-light': token.lightColor ?? undefined,
             color: token.color ?? undefined,
             fontStyle: token.fontStyle ?? undefined,
             fontWeight: token.fontWeight ?? undefined,
-          }}
+          } as CSSProperties}
         >
           {token.text}
         </span>

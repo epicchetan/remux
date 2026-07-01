@@ -17,7 +17,20 @@ export type TokenGroup = {
   tokens: Record<string, string>;
 };
 
+type ThemeName = 'dark' | 'light';
+
+type ThemedTokenValue = string | {
+  dark: string;
+  light: string;
+};
+
+type ThemedTokenGroup = {
+  label: string;
+  tokens: Record<string, ThemedTokenValue>;
+};
+
 const VAR_PREFIX = '--rmx-';
+const LIGHT_THEME_SELECTOR = ':root[data-remux-theme="light"]';
 
 // ---------------------------------------------------------------------------
 // Tier 1 — primitives (raw, theme-independent)
@@ -27,12 +40,18 @@ export const primitiveGroups: TokenGroup[] = [
   {
     label: 'Neutral ramp (zinc) — terminal-derived reference palette',
     tokens: {
-      'neutral-950': '#09090b',
-      'neutral-900': '#18181b',
-      'neutral-800': '#27272a',
-      'neutral-700': '#3f3f46',
-      'neutral-400': '#a1a1aa',
+      'neutral-0': '#ffffff',
+      'neutral-50': '#fafafa',
       'neutral-100': '#f4f4f5',
+      'neutral-200': '#e4e4e7',
+      'neutral-300': '#d4d4d8',
+      'neutral-400': '#a1a1aa',
+      'neutral-500': '#71717a',
+      'neutral-600': '#52525b',
+      'neutral-700': '#3f3f46',
+      'neutral-800': '#27272a',
+      'neutral-900': '#18181b',
+      'neutral-950': '#09090b',
     },
   },
   {
@@ -50,9 +69,13 @@ export const primitiveGroups: TokenGroup[] = [
     label: 'Status hues',
     tokens: {
       'blue-400': '#60a5fa',
+      'blue-600': '#2563eb',
       'red-400': '#f87171',
+      'red-600': '#dc2626',
       'green-400': '#7fd49d',
+      'green-700': '#15803d',
       'amber-400': '#f5c56b',
+      'amber-700': '#b45309',
     },
   },
   {
@@ -93,26 +116,26 @@ export const primitiveGroups: TokenGroup[] = [
 // light theme only has to remap this layer.
 // ---------------------------------------------------------------------------
 
-export const semanticGroups: TokenGroup[] = [
+export const semanticGroups: ThemedTokenGroup[] = [
   {
     label: 'Surfaces',
     tokens: {
-      surface: 'var(--rmx-neutral-950)',
-      'surface-raised': 'var(--rmx-neutral-900)',
-      'surface-hover': 'var(--rmx-neutral-800)',
-      border: 'var(--rmx-neutral-700)',
-      'border-subtle': 'rgb(255 255 255 / 8%)',
-      overlay: 'rgb(255 255 255 / 10%)',
-      'code-bg': 'var(--rmx-surface-raised)',
-      'code-border': 'var(--rmx-border-subtle)',
-      'code-text': 'var(--rmx-text)',
+      surface: { dark: 'var(--rmx-neutral-950)', light: 'var(--rmx-neutral-50)' },
+      'surface-raised': { dark: 'var(--rmx-neutral-900)', light: 'var(--rmx-neutral-0)' },
+      'surface-hover': { dark: 'var(--rmx-neutral-800)', light: 'var(--rmx-neutral-100)' },
+      border: { dark: 'var(--rmx-neutral-700)', light: 'var(--rmx-neutral-200)' },
+      'border-subtle': { dark: 'rgb(255 255 255 / 8%)', light: 'rgb(0 0 0 / 8%)' },
+      overlay: { dark: 'rgb(255 255 255 / 10%)', light: 'rgb(0 0 0 / 8%)' },
+      'code-bg': { dark: 'var(--rmx-surface-raised)', light: 'var(--rmx-surface-hover)' },
+      'code-border': { dark: 'var(--rmx-border-subtle)', light: 'var(--rmx-border-subtle)' },
+      'code-text': { dark: 'var(--rmx-text)', light: 'var(--rmx-text)' },
     },
   },
   {
     label: 'Text',
     tokens: {
-      text: 'var(--rmx-neutral-100)',
-      'text-muted': 'var(--rmx-neutral-400)',
+      text: { dark: 'var(--rmx-neutral-100)', light: 'var(--rmx-neutral-900)' },
+      'text-muted': { dark: 'var(--rmx-neutral-400)', light: 'var(--rmx-neutral-600)' },
     },
   },
   {
@@ -121,32 +144,41 @@ export const semanticGroups: TokenGroup[] = [
       accent: 'var(--rmx-orange-500)',
       'accent-strong': 'var(--rmx-orange-700)',
       'accent-foreground': 'var(--rmx-orange-50)',
-      'focus-ring': 'var(--rmx-blue-400)',
-      danger: 'var(--rmx-red-400)',
-      success: 'var(--rmx-green-400)',
-      warning: 'var(--rmx-amber-400)',
+      'focus-ring': { dark: 'var(--rmx-blue-400)', light: 'var(--rmx-blue-600)' },
+      danger: { dark: 'var(--rmx-red-400)', light: 'var(--rmx-red-600)' },
+      success: { dark: 'var(--rmx-green-400)', light: 'var(--rmx-green-700)' },
+      warning: { dark: 'var(--rmx-amber-400)', light: 'var(--rmx-amber-700)' },
     },
   },
   {
     label: 'Primary raised button recipe',
     tokens: {
-      'primary-border': 'var(--rmx-orange-800)',
-      'primary-edge': 'var(--rmx-orange-900)',
-      'primary-shadow': 'var(--rmx-orange-950)',
-      'primary-highlight': 'rgb(255 255 255 / 14%)',
-      'primary-shadow-inset': 'rgb(52 16 6 / 36%)',
-      'primary-shadow-drop': 'color-mix(in srgb, var(--rmx-primary-shadow) 88%, black)',
+      'primary-border': { dark: 'var(--rmx-orange-800)', light: 'var(--rmx-orange-700)' },
+      'primary-edge': { dark: 'var(--rmx-orange-900)', light: 'var(--rmx-orange-800)' },
+      'primary-shadow': { dark: 'var(--rmx-orange-950)', light: 'var(--rmx-orange-900)' },
+      'primary-highlight': { dark: 'rgb(255 255 255 / 14%)', light: 'rgb(255 255 255 / 22%)' },
+      'primary-shadow-inset': { dark: 'rgb(52 16 6 / 36%)', light: 'rgb(95 29 13 / 22%)' },
+      'primary-shadow-drop': {
+        dark: 'color-mix(in srgb, var(--rmx-primary-shadow) 88%, black)',
+        light: 'color-mix(in srgb, var(--rmx-orange-700) 26%, transparent)',
+      },
     },
   },
   {
     label: 'Elevation (button physicality — references --rmx-surface)',
     tokens: {
-      'shadow-raised':
-        'inset 0 1px 0 rgb(255 255 255 / 9%), inset 0 -2px 0 rgb(0 0 0 / 32%), 0 2px 0 color-mix(in srgb, var(--rmx-surface) 78%, black)',
-      'shadow-pressed':
-        'inset 0 1px 0 rgb(0 0 0 / 24%), inset 0 -1px 0 rgb(0 0 0 / 22%), 0 1px 0 color-mix(in srgb, var(--rmx-surface) 78%, black)',
-      'shadow-menu':
-        'inset 0 1px 0 rgb(255 255 255 / 8%), inset 0 -2px 0 rgb(0 0 0 / 30%), 0 14px 36px rgb(0 0 0 / 38%)',
+      'shadow-raised': {
+        dark: 'inset 0 1px 0 rgb(255 255 255 / 9%), inset 0 -2px 0 rgb(0 0 0 / 32%), 0 2px 0 color-mix(in srgb, var(--rmx-surface) 78%, black)',
+        light: '0 1px 2px rgb(0 0 0 / 0.06), 0 1px 1px rgb(0 0 0 / 0.04)',
+      },
+      'shadow-pressed': {
+        dark: 'inset 0 1px 0 rgb(0 0 0 / 24%), inset 0 -1px 0 rgb(0 0 0 / 22%), 0 1px 0 color-mix(in srgb, var(--rmx-surface) 78%, black)',
+        light: 'inset 0 1px 2px rgb(0 0 0 / 0.10)',
+      },
+      'shadow-menu': {
+        dark: 'inset 0 1px 0 rgb(255 255 255 / 8%), inset 0 -2px 0 rgb(0 0 0 / 30%), 0 14px 36px rgb(0 0 0 / 38%)',
+        light: '0 4px 16px rgb(0 0 0 / 0.12), 0 2px 6px rgb(0 0 0 / 0.08)',
+      },
     },
   },
 ];
@@ -247,12 +279,39 @@ function renderGroup(group: TokenGroup, prefix = VAR_PREFIX): string {
   return lines.join('\n');
 }
 
+function renderThemedGroup(group: ThemedTokenGroup, theme: ThemeName, prefix = VAR_PREFIX): string {
+  const lines = [`  /* ${group.label} */`];
+  for (const [name, value] of Object.entries(group.tokens)) {
+    lines.push(`  ${prefix}${name}: ${tokenValueForTheme(value, theme)};`);
+  }
+  return lines.join('\n');
+}
+
+function renderLightOverrideGroup(group: ThemedTokenGroup, prefix = VAR_PREFIX): string | null {
+  const lines = [`  /* ${group.label} */`];
+  for (const [name, value] of Object.entries(group.tokens)) {
+    if (typeof value === 'string') {
+      continue;
+    }
+    lines.push(`  ${prefix}${name}: ${value.light};`);
+  }
+  return lines.length > 1 ? lines.join('\n') : null;
+}
+
+function tokenValueForTheme(value: ThemedTokenValue, theme: ThemeName): string {
+  return typeof value === 'string' ? value : value[theme];
+}
+
 export function renderTokensCss(): string {
   const header =
     '/* GENERATED from src/tokens/primitives.ts — do not edit by hand. */\n' +
     '/* Regenerate: npm run tokens:build (in packages/viewer-kit). */';
   const primitives = primitiveGroups.map((group) => renderGroup(group)).join('\n\n');
-  const semantic = semanticGroups.map((group) => renderGroup(group)).join('\n\n');
+  const semantic = semanticGroups.map((group) => renderThemedGroup(group, 'dark')).join('\n\n');
+  const lightSemantic = semanticGroups.flatMap((group) => {
+    const rendered = renderLightOverrideGroup(group);
+    return rendered ? [rendered] : [];
+  }).join('\n\n');
   const themeBindings = themeBindingGroups.map((group) => renderGroup(group, '--')).join('\n\n');
   return (
     `${header}\n\n` +
@@ -264,6 +323,17 @@ export function renderTokensCss(): string {
     '\n' +
     '  /* ===================== Theme bindings ===================== */\n\n' +
     `${themeBindings}\n` +
+    '}\n\n' +
+    `${LIGHT_THEME_SELECTOR} {\n` +
+    '  color-scheme: light;\n\n' +
+    `${lightSemantic}\n` +
+    '}\n\n' +
+    '@media (prefers-color-scheme: light) {\n' +
+    '  :root:not([data-remux-theme]) {\n' +
+    '    color-scheme: light;\n\n' +
+    indentCss(lightSemantic, '    ') +
+    '\n' +
+    '  }\n' +
     '}\n'
   );
 }
@@ -274,4 +344,207 @@ export function renderThemeCss(): string {
     '/* Regenerate: npm run tokens:build (in packages/viewer-kit). */';
   const theme = tailwindThemeGroups.map((group) => renderGroup(group, '--')).join('\n\n');
   return `${header}\n\n@theme inline {\n${theme}\n}\n`;
+}
+
+const nativeTokenNames = {
+  accent: 'accent',
+  accentForeground: 'accent-foreground',
+  accentStrong: 'accent-strong',
+  border: 'border',
+  borderSubtle: 'border-subtle',
+  codeBg: 'code-bg',
+  codeBorder: 'code-border',
+  codeText: 'code-text',
+  danger: 'danger',
+  focusRing: 'focus-ring',
+  link: 'focus-ring',
+  overlay: 'overlay',
+  success: 'success',
+  surface: 'surface',
+  surfaceHover: 'surface-hover',
+  surfaceRaised: 'surface-raised',
+  text: 'text',
+  textMuted: 'text-muted',
+  warning: 'warning',
+} as const;
+
+type Color = {
+  a: number;
+  b: number;
+  g: number;
+  r: number;
+};
+
+export function renderNativeTokensTs(): string {
+  const header =
+    '// GENERATED from src/tokens/primitives.ts — do not edit by hand.\n' +
+    '// Regenerate: npm run tokens:build (in packages/viewer-kit).';
+  const nativeTokens = {
+    light: resolveNativeTheme('light'),
+    dark: resolveNativeTheme('dark'),
+  };
+
+  return (
+    `${header}\n\n` +
+    `export const nativeTokens = ${JSON.stringify(nativeTokens, null, 2)} as const;\n\n` +
+    'export type NativeRemuxThemeName = keyof typeof nativeTokens;\n' +
+    'export type NativeRemuxTokens = typeof nativeTokens[NativeRemuxThemeName];\n'
+  );
+}
+
+function resolveNativeTheme(theme: ThemeName) {
+  return Object.fromEntries(
+    Object.entries(nativeTokenNames).map(([nativeName, tokenName]) => [
+      nativeName,
+      resolveCssColor(`var(--rmx-${tokenName})`, theme),
+    ]),
+  );
+}
+
+function resolveCssColor(value: string, theme: ThemeName, seen = new Set<string>()): string {
+  return colorToNativeString(resolveColor(resolveCssValue(value, theme, seen), theme, seen));
+}
+
+function resolveColor(value: string, theme: ThemeName, seen: Set<string>): Color {
+  const resolved = resolveCssValue(value, theme, seen).trim();
+
+  if (resolved === 'black') {
+    return { r: 0, g: 0, b: 0, a: 1 };
+  }
+
+  if (resolved === 'white') {
+    return { r: 255, g: 255, b: 255, a: 1 };
+  }
+
+  if (resolved === 'transparent') {
+    return { r: 0, g: 0, b: 0, a: 0 };
+  }
+
+  const hex = /^#([\da-f]{3}|[\da-f]{6})$/iu.exec(resolved);
+  if (hex) {
+    const value = hex[1].length === 3
+      ? hex[1].split('').map((part) => `${part}${part}`).join('')
+      : hex[1];
+    const integer = Number.parseInt(value, 16);
+    return {
+      r: (integer >> 16) & 255,
+      g: (integer >> 8) & 255,
+      b: integer & 255,
+      a: 1,
+    };
+  }
+
+  const rgb = /^rgb\(\s*(\d+)\s+(\d+)\s+(\d+)(?:\s*\/\s*([\d.]+%?))?\s*\)$/u.exec(resolved);
+  if (rgb) {
+    return {
+      r: Number(rgb[1]),
+      g: Number(rgb[2]),
+      b: Number(rgb[3]),
+      a: rgb[4] ? parseAlpha(rgb[4]) : 1,
+    };
+  }
+
+  const mix = /^color-mix\(in srgb,\s*(.+?)\s+([\d.]+)%\s*,\s*(.+?)(?:\s+([\d.]+)%)?\s*\)$/u.exec(resolved);
+  if (mix) {
+    const firstWeight = Number(mix[2]) / 100;
+    const secondWeight = mix[4] ? Number(mix[4]) / 100 : 1 - firstWeight;
+    return mixColors(
+      resolveColor(mix[1], theme, seen),
+      firstWeight,
+      resolveColor(mix[3], theme, seen),
+      secondWeight,
+    );
+  }
+
+  throw new Error(`Cannot resolve native color token value: ${value}`);
+}
+
+function resolveCssValue(value: string, theme: ThemeName, seen: Set<string>): string {
+  const trimmed = value.trim();
+  const variable = /^var\(--rmx-([^)]+)\)$/u.exec(trimmed);
+  if (!variable) {
+    return trimmed;
+  }
+
+  const tokenName = variable[1];
+  if (seen.has(tokenName)) {
+    throw new Error(`Circular token reference: ${Array.from(seen).join(' -> ')} -> ${tokenName}`);
+  }
+
+  const primitive = primitiveValue(tokenName);
+  if (primitive) {
+    return primitive;
+  }
+
+  const semantic = semanticValue(tokenName, theme);
+  if (!semantic) {
+    throw new Error(`Unknown token reference: ${trimmed}`);
+  }
+
+  seen.add(tokenName);
+  const resolved = resolveCssValue(semantic, theme, seen);
+  seen.delete(tokenName);
+  return resolved;
+}
+
+function primitiveValue(name: string) {
+  for (const group of primitiveGroups) {
+    const value = group.tokens[name];
+    if (value) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function semanticValue(name: string, theme: ThemeName) {
+  for (const group of semanticGroups) {
+    const value = group.tokens[name];
+    if (value) {
+      return tokenValueForTheme(value, theme);
+    }
+  }
+  return null;
+}
+
+function parseAlpha(value: string) {
+  return value.endsWith('%') ? Number(value.slice(0, -1)) / 100 : Number(value);
+}
+
+function mixColors(first: Color, firstWeight: number, second: Color, secondWeight: number): Color {
+  const totalWeight = firstWeight + secondWeight;
+  const normalizedFirstWeight = totalWeight === 0 ? 0 : firstWeight / totalWeight;
+  const normalizedSecondWeight = totalWeight === 0 ? 0 : secondWeight / totalWeight;
+  const a = first.a * normalizedFirstWeight + second.a * normalizedSecondWeight;
+
+  if (a === 0) {
+    return { r: 0, g: 0, b: 0, a: 0 };
+  }
+
+  return {
+    r: Math.round(((first.r * first.a * normalizedFirstWeight) + (second.r * second.a * normalizedSecondWeight)) / a),
+    g: Math.round(((first.g * first.a * normalizedFirstWeight) + (second.g * second.a * normalizedSecondWeight)) / a),
+    b: Math.round(((first.b * first.a * normalizedFirstWeight) + (second.b * second.a * normalizedSecondWeight)) / a),
+    a,
+  };
+}
+
+function colorToNativeString(color: Color) {
+  if (color.a >= 1) {
+    return `#${toHex(color.r)}${toHex(color.g)}${toHex(color.b)}`;
+  }
+
+  return `rgba(${color.r}, ${color.g}, ${color.b}, ${trimAlpha(color.a)})`;
+}
+
+function toHex(value: number) {
+  return value.toString(16).padStart(2, '0');
+}
+
+function trimAlpha(value: number) {
+  return Number(value.toFixed(4)).toString();
+}
+
+function indentCss(css: string, indent: string) {
+  return css.split('\n').map((line) => (line.trim() ? `${indent}${line.trimStart()}` : '')).join('\n');
 }

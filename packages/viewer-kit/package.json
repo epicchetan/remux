@@ -11,6 +11,7 @@
     "./react": "./src/react/index.ts",
     "./shadcn": "./src/shadcn/index.ts",
     "./ui": "./src/ui/index.ts",
+    "./tokens.native": "./src/tokens/tokens.native.ts",
     "./tokens.css": "./src/tokens/tokens.css",
     "./theme.css": "./src/tokens/theme.css",
     "./ui/styles.css": "./src/ui/styles.css"

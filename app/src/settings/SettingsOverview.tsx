@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useMemo,
   useState,
   type ComponentProps,
   type ReactNode,
@@ -22,7 +23,7 @@ import { getBottomBarHeight, tabGridGap, tabGridHorizontalPadding } from '../bro
 import { useBrowserStore } from '../browser/browserStore';
 import { useRemuxConnection } from '../remote/RemuxConnectionProvider';
 import { useRemuxSettingsStore } from '../remote/remuxSettingsStore';
-import { colors } from '../theme/tokens';
+import { alpha, useTheme, type RemuxTheme } from '../theme/ThemeProvider';
 import {
   readExtensionServerStatuses,
   restartExtensionServer,
@@ -55,6 +56,7 @@ export function SettingsOverview() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const bottomPadding = getBottomBarHeight(insets.bottom) + tabGridGap;
+  const { styles, theme } = useSettingsTheme();
 
   useEffect(() => {
     void loadSettings();
@@ -220,7 +222,7 @@ export function SettingsOverview() {
           {extensionStatusError ? <Text style={styles.errorText}>{extensionStatusError}</Text> : null}
           {extensionStatusLoading ? (
             <View style={styles.extensionLoadingRow}>
-              <ActivityIndicator color={colors.muted} size="small" />
+              <ActivityIndicator color={theme.textMuted} size="small" />
               <Text style={styles.extensionMeta}>Checking extension servers</Text>
             </View>
           ) : null}
@@ -248,6 +250,8 @@ export function SettingsOverview() {
 }
 
 function Section({ children, title }: { children: ReactNode; title: string }) {
+  const { styles } = useSettingsTheme();
+
   return (
     <View style={styles.section}>
       <Text style={styles.sectionTitle}>{title}</Text>
@@ -262,13 +266,15 @@ function LabeledInput({
 }: ComponentProps<typeof TextInput> & {
   label: string;
 }) {
+  const { styles, theme } = useSettingsTheme();
+
   return (
     <View style={styles.inputShell}>
       <Text style={styles.inputLabel}>{label}</Text>
       <TextInput
         {...props}
-        placeholderTextColor="#696971"
-        selectionColor="#7aa2ff"
+        placeholderTextColor={alpha(theme.textMuted, 0.72)}
+        selectionColor={theme.focusRing}
         style={styles.input}
       />
     </View>
@@ -276,6 +282,8 @@ function LabeledInput({
 }
 
 function ConnectionPill({ status }: { status: string }) {
+  const { styles } = useSettingsTheme();
+
   return (
     <View style={styles.connectionPill}>
       <View style={[styles.connectionDot, status === 'connected' ? styles.connectionDotConnected : null]} />
@@ -297,6 +305,8 @@ function SettingsButton({
   onPress: () => void | Promise<void>;
   variant?: 'primary' | 'secondary';
 }) {
+  const { styles, theme } = useSettingsTheme();
+
   return (
     <Pressable
       accessibilityRole="button"
@@ -312,7 +322,7 @@ function SettingsButton({
         disabled ? styles.buttonDisabled : null,
       ]}
     >
-      {loading ? <ActivityIndicator color="#f4f4f5" size="small" /> : null}
+      {loading ? <ActivityIndicator color={variant === 'primary' ? theme.accentForeground : theme.text} size="small" /> : null}
       <Text style={styles.buttonText}>{label}</Text>
     </Pressable>
   );
@@ -335,6 +345,7 @@ function ExtensionRow({
   status: ExtensionServerStatus | null;
   toggling: boolean;
 }) {
+  const { styles, theme } = useSettingsTheme();
   const [imageFailed, setImageFailed] = useState(false);
   const controllable = Boolean(status?.restartable);
   const busy = restarting || toggling;
@@ -363,15 +374,15 @@ function ExtensionRow({
         <View style={styles.extensionActions}>
           {toggling ? (
             <View style={styles.extensionToggleBusy}>
-              <ActivityIndicator color={colors.muted} size="small" />
+              <ActivityIndicator color={theme.textMuted} size="small" />
             </View>
           ) : (
             <Switch
               disabled={!controllable || busy}
-              ios_backgroundColor="#2b2c31"
+              ios_backgroundColor={theme.surfaceHover}
               onValueChange={onToggle}
-              thumbColor="#f4f4f5"
-              trackColor={{ false: '#2b2c31', true: '#3a5f9f' }}
+              thumbColor={theme.surfaceRaised}
+              trackColor={{ false: theme.surfaceHover, true: theme.focusRing }}
               value={status?.running === true}
             />
           )}
@@ -408,7 +419,14 @@ function statusLabel(status: string) {
   }
 }
 
-const styles = StyleSheet.create({
+function useSettingsTheme() {
+  const theme = useTheme();
+  const styles = useMemo(() => createStyles(theme), [theme]);
+  return { styles, theme };
+}
+
+function createStyles(theme: RemuxTheme) {
+  return StyleSheet.create({
   actionRow: {
     alignItems: 'center',
     flexDirection: 'row',
@@ -417,8 +435,8 @@ const styles = StyleSheet.create({
   },
   button: {
     alignItems: 'center',
-    backgroundColor: '#202126',
-    borderColor: '#32343a',
+    backgroundColor: theme.surfaceHover,
+    borderColor: theme.border,
     borderRadius: 999,
     borderWidth: 1,
     flexDirection: 'row',
@@ -433,24 +451,24 @@ const styles = StyleSheet.create({
     opacity: 0.72,
   },
   buttonText: {
-    color: colors.text,
+    color: theme.text,
     fontSize: 13,
     fontWeight: '700',
     lineHeight: 18,
   },
   connectionDot: {
-    backgroundColor: '#ef4444',
+    backgroundColor: theme.danger,
     borderRadius: 4,
     height: 8,
     width: 8,
   },
   connectionDotConnected: {
-    backgroundColor: '#22c55e',
+    backgroundColor: theme.success,
   },
   connectionPill: {
     alignItems: 'center',
-    backgroundColor: '#18181b',
-    borderColor: '#2b2b31',
+    backgroundColor: theme.surfaceRaised,
+    borderColor: theme.border,
     borderRadius: 999,
     borderWidth: 1,
     flexDirection: 'row',
@@ -459,13 +477,13 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
   },
   connectionText: {
-    color: colors.text,
+    color: theme.text,
     fontSize: 12,
     fontWeight: '700',
     lineHeight: 16,
   },
   container: {
-    backgroundColor: colors.background,
+    backgroundColor: theme.surface,
     flex: 1,
   },
   content: {
@@ -473,13 +491,13 @@ const styles = StyleSheet.create({
     paddingHorizontal: tabGridHorizontalPadding,
   },
   errorText: {
-    color: '#fca5a5',
+    color: theme.danger,
     fontSize: 12,
     lineHeight: 17,
     marginTop: 10,
   },
   extensionFallback: {
-    color: colors.text,
+    color: theme.text,
     fontSize: 17,
     fontWeight: '800',
     lineHeight: 22,
@@ -495,8 +513,8 @@ const styles = StyleSheet.create({
   },
   extensionIconFrame: {
     alignItems: 'center',
-    backgroundColor: '#24252b',
-    borderColor: '#33353d',
+    backgroundColor: theme.surfaceHover,
+    borderColor: theme.border,
     borderRadius: 12,
     borderWidth: 1,
     height: 44,
@@ -513,12 +531,12 @@ const styles = StyleSheet.create({
     marginBottom: 10,
   },
   extensionMeta: {
-    color: colors.muted,
+    color: theme.textMuted,
     fontSize: 12,
     lineHeight: 16,
   },
   extensionName: {
-    color: colors.text,
+    color: theme.text,
     fontSize: 16,
     fontWeight: '700',
     lineHeight: 21,
@@ -548,7 +566,7 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   input: {
-    color: colors.text,
+    color: theme.text,
     flex: 1,
     fontSize: 16,
     fontWeight: '600',
@@ -556,7 +574,7 @@ const styles = StyleSheet.create({
     padding: 0,
   },
   inputLabel: {
-    color: colors.muted,
+    color: theme.textMuted,
     fontSize: 12,
     fontWeight: '700',
     lineHeight: 16,
@@ -564,8 +582,8 @@ const styles = StyleSheet.create({
   },
   inputShell: {
     alignItems: 'center',
-    backgroundColor: '#151518',
-    borderColor: '#2a2a2f',
+    backgroundColor: theme.surfaceRaised,
+    borderColor: theme.border,
     borderRadius: 14,
     borderWidth: 1,
     flexDirection: 'row',
@@ -574,21 +592,21 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
   },
   primaryButton: {
-    backgroundColor: '#26324c',
-    borderColor: '#3a5f9f',
+    backgroundColor: alpha(theme.focusRing, 0.16),
+    borderColor: theme.focusRing,
   },
   section: {
     gap: 8,
   },
   sectionPanel: {
-    backgroundColor: '#0f0f11',
-    borderColor: '#242429',
+    backgroundColor: theme.surfaceRaised,
+    borderColor: theme.border,
     borderRadius: 18,
     borderWidth: 1,
     padding: 14,
   },
   sectionTitle: {
-    color: colors.text,
+    color: theme.text,
     fontSize: 13,
     fontWeight: '800',
     letterSpacing: 0.6,
@@ -596,15 +614,16 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
   },
   subtitle: {
-    color: colors.muted,
+    color: theme.textMuted,
     fontSize: 13,
     lineHeight: 18,
     marginTop: 2,
   },
   title: {
-    color: colors.text,
+    color: theme.text,
     fontSize: 24,
     fontWeight: '800',
     lineHeight: 30,
   },
-});
+  });
+}

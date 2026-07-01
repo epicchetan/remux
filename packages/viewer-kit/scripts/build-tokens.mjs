@@ -5,13 +5,16 @@ import { writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { renderThemeCss, renderTokensCss } from '../src/tokens/primitives.ts';
+import { renderNativeTokensTs, renderThemeCss, renderTokensCss } from '../src/tokens/primitives.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const tokensPath = resolve(here, '../src/tokens/tokens.css');
 const themePath = resolve(here, '../src/tokens/theme.css');
+const nativeTokensPath = resolve(here, '../src/tokens/tokens.native.ts');
 
 writeFileSync(tokensPath, renderTokensCss());
 writeFileSync(themePath, renderThemeCss());
+writeFileSync(nativeTokensPath, renderNativeTokensTs());
 console.log(`wrote ${tokensPath}`);
 console.log(`wrote ${themePath}`);
+console.log(`wrote ${nativeTokensPath}`);

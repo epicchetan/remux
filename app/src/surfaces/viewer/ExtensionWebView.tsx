@@ -31,7 +31,7 @@ import {
   type RemuxConnectionStatus,
 } from '../../remote/RemuxConnectionProvider';
 import type { RemuxRpcMessage } from '../../remote/remuxRpcClient';
-import { colors } from '../../theme/tokens';
+import { useTheme, type RemuxTheme, type RemuxThemeName } from '../../theme/ThemeProvider';
 import type { BrowserSection } from '../../browser/browserTypes';
 
 let nextWebViewInstanceId = 1;
@@ -101,6 +101,13 @@ type NativeToWebViewMessage =
       message: {
         method: 'host/viewport/changed';
         params: HostViewportMetrics;
+      };
+      type: 'remux/event';
+    }
+  | {
+      message: {
+        method: 'host/theme';
+        params: { theme: RemuxThemeName };
       };
       type: 'remux/event';
     }
@@ -227,6 +234,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
   ref,
 ) {
   const remux = useRemuxConnection();
+  const theme = useTheme();
   const [pageState, setPageState] = useState<WebViewPageState>({ type: 'loading' });
   const [reloadNonce, setReloadNonce] = useState(0);
   const [reloadTargetUrl, setReloadTargetUrl] = useState(sourceUrl);
@@ -249,6 +257,11 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
   });
   const webViewFrameRef = useRef<WebViewFrame>({ height: 0, width: 0, x: 0, y: 0 });
   const keyboardFrameRef = useRef<KeyboardFrame>({ height: 0, screenY: 0, visible: false });
+  const styles = useMemo(() => createStyles(theme), [theme]);
+  const injectedBeforeContentLoaded = useMemo(
+    () => createWebViewBeforeContentLoadedScript(theme.name),
+    [theme.name],
+  );
 
   const clearReadyTimeout = useCallback(() => {
     if (readyTimeoutRef.current !== null) {
@@ -422,6 +435,16 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
       type: 'remux/event',
     });
   }, [hostViewportMetrics, postToWebView]);
+
+  const postTheme = useCallback(() => {
+    postToWebView({
+      message: {
+        method: 'host/theme',
+        params: { theme: theme.name },
+      },
+      type: 'remux/event',
+    });
+  }, [postToWebView, theme.name]);
 
   const dismissKeyboard = useCallback(() => {
     webViewRef.current?.injectJavaScript(dismissKeyboardScript);
@@ -609,6 +632,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
           postStatus();
           postConnection();
           postActive(active);
+          postTheme();
           break;
         case 'remux/health/pong': {
           const waiter = healthPingWaitersRef.current.get(message.id);
@@ -654,6 +678,15 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
             postToWebView({
               id: message.id,
               result: hostViewportMetrics(),
+              type: 'remux/response',
+            }, { epoch: requestEpoch });
+            break;
+          }
+
+          if (message.method === 'host/theme/get') {
+            postToWebView({
+              id: message.id,
+              result: { theme: theme.name },
               type: 'remux/response',
             }, { epoch: requestEpoch });
             break;
@@ -827,9 +860,11 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
       postActive,
       postConnection,
       postStatus,
+      postTheme,
       postToWebView,
       reloadWebView,
       remux,
+      theme.name,
     ],
   );
 
@@ -858,7 +893,13 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
   useEffect(() => {
     postStatus();
     postConnection();
-  }, [postConnection, postStatus]);
+    postTheme();
+  }, [postConnection, postStatus, postTheme]);
+
+  useEffect(() => {
+    webViewRef.current?.injectJavaScript(createWebViewThemeUpdateScript(theme.name));
+    postTheme();
+  }, [postTheme, theme.name]);
 
   useEffect(() => {
     if (remux.status.type === 'connected') {
@@ -1029,7 +1070,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
         hideKeyboardAccessoryView
         javaScriptEnabled
         keyboardDisplayRequiresUserAction={false}
-        injectedJavaScriptBeforeContentLoaded={webViewDiagnosticsScript}
+        injectedJavaScriptBeforeContentLoaded={injectedBeforeContentLoaded}
         onContentProcessDidTerminate={handleContentProcessTerminated}
         onError={handleLoadError}
         onHttpError={handleHttpError}
@@ -1048,7 +1089,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
       />
       {pageState.type === 'loading' ? (
         <View style={styles.loadingOverlay}>
-          <ActivityIndicator color={colors.muted} />
+          <ActivityIndicator color={theme.textMuted} />
           <Text style={styles.loadingTitle}>Loading {title}</Text>
           <Text style={styles.loadingMessage}>{webViewSourceUrl}</Text>
           <Pressable
@@ -1405,6 +1446,30 @@ function isWebViewLogLevel(value: unknown): value is Extract<WebViewToNativeMess
 
 const webViewDiagnosticsVerboseConsole = false;
 
+function createWebViewBeforeContentLoadedScript(theme: RemuxThemeName) {
+  return `${createWebViewThemeScript(theme, false)}\n${webViewDiagnosticsScript}`;
+}
+
+function createWebViewThemeUpdateScript(theme: RemuxThemeName) {
+  return createWebViewThemeScript(theme, true);
+}
+
+function createWebViewThemeScript(theme: RemuxThemeName, dispatch: boolean) {
+  const serializedTheme = JSON.stringify(theme);
+  return `
+  (function () {
+    var theme = ${serializedTheme};
+    var root = document.documentElement;
+    root.setAttribute('data-remux-theme', theme);
+    root.style.colorScheme = theme;
+    window.__remuxHostTheme = theme;
+    ${dispatch ? "window.dispatchEvent(new CustomEvent('remux:theme', { detail: { theme: theme } }));" : ''}
+    return true;
+  })();
+  true;
+`;
+}
+
 const webViewDiagnosticsScript = `
   (function () {
     if (window.__remuxDiagnosticsInstalled) {
@@ -1518,13 +1583,14 @@ const webViewDiagnosticsScript = `
   })();
 `;
 
-const styles = StyleSheet.create({
+function createStyles(theme: RemuxTheme) {
+  return StyleSheet.create({
   container: {
-    backgroundColor: colors.background,
+    backgroundColor: theme.surface,
     flex: 1,
   },
   failureMessage: {
-    color: colors.muted,
+    color: theme.textMuted,
     fontSize: 15,
     lineHeight: 21,
     marginTop: 8,
@@ -1533,7 +1599,7 @@ const styles = StyleSheet.create({
   },
   failureOverlay: {
     alignItems: 'center',
-    backgroundColor: colors.background,
+    backgroundColor: theme.surface,
     bottom: 0,
     justifyContent: 'center',
     left: 0,
@@ -1543,14 +1609,14 @@ const styles = StyleSheet.create({
     top: 0,
   },
   failureTitle: {
-    color: colors.text,
+    color: theme.text,
     fontSize: 20,
     fontWeight: '700',
     lineHeight: 26,
     textAlign: 'center',
   },
   loadingMessage: {
-    color: colors.muted,
+    color: theme.textMuted,
     fontSize: 12,
     lineHeight: 17,
     marginTop: 6,
@@ -1559,7 +1625,7 @@ const styles = StyleSheet.create({
   },
   loadingOverlay: {
     alignItems: 'center',
-    backgroundColor: colors.background,
+    backgroundColor: theme.surface,
     bottom: 0,
     justifyContent: 'center',
     left: 0,
@@ -1569,7 +1635,7 @@ const styles = StyleSheet.create({
     top: 0,
   },
   loadingTitle: {
-    color: colors.text,
+    color: theme.text,
     fontSize: 17,
     fontWeight: '700',
     lineHeight: 23,
@@ -1577,8 +1643,8 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   overlayButton: {
-    backgroundColor: colors.button,
-    borderColor: colors.buttonBorder,
+    backgroundColor: theme.surfaceHover,
+    borderColor: theme.border,
     borderRadius: 999,
     borderWidth: 1,
     paddingHorizontal: 18,
@@ -1590,7 +1656,7 @@ const styles = StyleSheet.create({
     marginTop: 20,
   },
   overlayButtonText: {
-    color: colors.text,
+    color: theme.text,
     fontSize: 15,
     fontWeight: '600',
     lineHeight: 20,
@@ -1599,7 +1665,8 @@ const styles = StyleSheet.create({
     marginTop: 20,
   },
   webView: {
-    backgroundColor: colors.background,
+    backgroundColor: theme.surface,
     flex: 1,
   },
-});
+  });
+}

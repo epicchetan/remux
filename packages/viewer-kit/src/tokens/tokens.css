@@ -5,12 +5,18 @@
   color-scheme: dark;
 
   /* Neutral ramp (zinc) — terminal-derived reference palette */
-  --rmx-neutral-950: #09090b;
-  --rmx-neutral-900: #18181b;
-  --rmx-neutral-800: #27272a;
-  --rmx-neutral-700: #3f3f46;
-  --rmx-neutral-400: #a1a1aa;
+  --rmx-neutral-0: #ffffff;
+  --rmx-neutral-50: #fafafa;
   --rmx-neutral-100: #f4f4f5;
+  --rmx-neutral-200: #e4e4e7;
+  --rmx-neutral-300: #d4d4d8;
+  --rmx-neutral-400: #a1a1aa;
+  --rmx-neutral-500: #71717a;
+  --rmx-neutral-600: #52525b;
+  --rmx-neutral-700: #3f3f46;
+  --rmx-neutral-800: #27272a;
+  --rmx-neutral-900: #18181b;
+  --rmx-neutral-950: #09090b;
 
   /* Accent — orange (brand / primary action) */
   --rmx-orange-700: #c45424;
@@ -22,9 +28,13 @@
 
   /* Status hues */
   --rmx-blue-400: #60a5fa;
+  --rmx-blue-600: #2563eb;
   --rmx-red-400: #f87171;
+  --rmx-red-600: #dc2626;
   --rmx-green-400: #7fd49d;
+  --rmx-green-700: #15803d;
   --rmx-amber-400: #f5c56b;
+  --rmx-amber-700: #b45309;
 
   /* Spacing scale */
   --rmx-space-1: 4px;
@@ -116,4 +126,82 @@
   --link: var(--rmx-focus-ring);
   --sidebar: var(--rmx-surface);
   --sidebar-foreground: var(--rmx-text);
+}
+
+:root[data-remux-theme="light"] {
+  color-scheme: light;
+
+  /* Surfaces */
+  --rmx-surface: var(--rmx-neutral-50);
+  --rmx-surface-raised: var(--rmx-neutral-0);
+  --rmx-surface-hover: var(--rmx-neutral-100);
+  --rmx-border: var(--rmx-neutral-200);
+  --rmx-border-subtle: rgb(0 0 0 / 8%);
+  --rmx-overlay: rgb(0 0 0 / 8%);
+  --rmx-code-bg: var(--rmx-surface-hover);
+  --rmx-code-border: var(--rmx-border-subtle);
+  --rmx-code-text: var(--rmx-text);
+
+  /* Text */
+  --rmx-text: var(--rmx-neutral-900);
+  --rmx-text-muted: var(--rmx-neutral-600);
+
+  /* Accent & status roles */
+  --rmx-focus-ring: var(--rmx-blue-600);
+  --rmx-danger: var(--rmx-red-600);
+  --rmx-success: var(--rmx-green-700);
+  --rmx-warning: var(--rmx-amber-700);
+
+  /* Primary raised button recipe */
+  --rmx-primary-border: var(--rmx-orange-700);
+  --rmx-primary-edge: var(--rmx-orange-800);
+  --rmx-primary-shadow: var(--rmx-orange-900);
+  --rmx-primary-highlight: rgb(255 255 255 / 22%);
+  --rmx-primary-shadow-inset: rgb(95 29 13 / 22%);
+  --rmx-primary-shadow-drop: color-mix(in srgb, var(--rmx-orange-700) 26%, transparent);
+
+  /* Elevation (button physicality — references --rmx-surface) */
+  --rmx-shadow-raised: 0 1px 2px rgb(0 0 0 / 0.06), 0 1px 1px rgb(0 0 0 / 0.04);
+  --rmx-shadow-pressed: inset 0 1px 2px rgb(0 0 0 / 0.10);
+  --rmx-shadow-menu: 0 4px 16px rgb(0 0 0 / 0.12), 0 2px 6px rgb(0 0 0 / 0.08);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-remux-theme]) {
+    color-scheme: light;
+
+    /* Surfaces */
+    --rmx-surface: var(--rmx-neutral-50);
+    --rmx-surface-raised: var(--rmx-neutral-0);
+    --rmx-surface-hover: var(--rmx-neutral-100);
+    --rmx-border: var(--rmx-neutral-200);
+    --rmx-border-subtle: rgb(0 0 0 / 8%);
+    --rmx-overlay: rgb(0 0 0 / 8%);
+    --rmx-code-bg: var(--rmx-surface-hover);
+    --rmx-code-border: var(--rmx-border-subtle);
+    --rmx-code-text: var(--rmx-text);
+
+    /* Text */
+    --rmx-text: var(--rmx-neutral-900);
+    --rmx-text-muted: var(--rmx-neutral-600);
+
+    /* Accent & status roles */
+    --rmx-focus-ring: var(--rmx-blue-600);
+    --rmx-danger: var(--rmx-red-600);
+    --rmx-success: var(--rmx-green-700);
+    --rmx-warning: var(--rmx-amber-700);
+
+    /* Primary raised button recipe */
+    --rmx-primary-border: var(--rmx-orange-700);
+    --rmx-primary-edge: var(--rmx-orange-800);
+    --rmx-primary-shadow: var(--rmx-orange-900);
+    --rmx-primary-highlight: rgb(255 255 255 / 22%);
+    --rmx-primary-shadow-inset: rgb(95 29 13 / 22%);
+    --rmx-primary-shadow-drop: color-mix(in srgb, var(--rmx-orange-700) 26%, transparent);
+
+    /* Elevation (button physicality — references --rmx-surface) */
+    --rmx-shadow-raised: 0 1px 2px rgb(0 0 0 / 0.06), 0 1px 1px rgb(0 0 0 / 0.04);
+    --rmx-shadow-pressed: inset 0 1px 2px rgb(0 0 0 / 0.10);
+    --rmx-shadow-menu: 0 4px 16px rgb(0 0 0 / 0.12), 0 2px 6px rgb(0 0 0 / 0.08);
+  }
 }

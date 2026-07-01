@@ -1,6 +1,7 @@
 import { Image, Pressable, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { useMemo } from 'react';
 import {
   bottomBarControlHeight,
   bottomBarMinPaddingBottom,
@@ -14,6 +15,7 @@ import {
   NativeGlassCircle,
   NativeGlassIconButton,
 } from '../ui/NativeGlassIconButton';
+import { useTheme, type RemuxTheme } from '../theme/ThemeProvider';
 
 const sectionControlHeight = 30;
 const sectionControlWidth = 132;
@@ -29,8 +31,10 @@ export function BrowserBottomBar() {
   const openExtensionTab = useBrowserStore((state) => state.openExtensionTab);
   const section = useBrowserStore((state) => state.section);
   const setSection = useBrowserStore((state) => state.setSection);
+  const theme = useTheme();
   const visibleLaunchers = extensions.flatMap((extension) => extension.launchers).slice(0, 4);
   const selectedOverviewSection = section === 'tabs' || section === 'files' ? section : null;
+  const styles = useMemo(() => createStyles(theme), [theme]);
 
   return (
     <View
@@ -135,7 +139,8 @@ export function BrowserBottomBar() {
   );
 }
 
-const styles = StyleSheet.create({
+function createStyles(theme: RemuxTheme) {
+  return StyleSheet.create({
   actions: {
     alignItems: 'center',
     flexDirection: 'row',
@@ -184,7 +189,7 @@ const styles = StyleSheet.create({
     top: 0,
   },
   sectionLabel: {
-    color: '#f4f4f5',
+    color: theme.text,
     fontSize: 16,
     fontWeight: '700',
     lineHeight: 20,
@@ -215,7 +220,7 @@ const styles = StyleSheet.create({
     opacity: 0.58,
   },
   extensionFallback: {
-    color: '#f4f4f5',
+    color: theme.text,
     fontSize: 17,
     fontWeight: '800',
     lineHeight: 22,
@@ -232,4 +237,5 @@ const styles = StyleSheet.create({
     right: 0,
     top: 0,
   },
-});
+  });
+}

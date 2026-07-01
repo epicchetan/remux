@@ -20,6 +20,21 @@
   color: var(--rmx-text);
 }
 
+:root[data-remux-theme="light"] {
+  --remux-markdown-alert-fg: color-mix(in srgb, var(--rmx-text) 88%, var(--rmx-text-muted) 12%);
+  --remux-markdown-alert-note-bg: color-mix(in srgb, var(--rmx-focus-ring) 10%, transparent);
+  --remux-markdown-alert-note-title: color-mix(in srgb, var(--rmx-focus-ring) 86%, var(--rmx-text) 14%);
+  --remux-markdown-alert-tip-bg: color-mix(in srgb, var(--rmx-success) 10%, transparent);
+  --remux-markdown-alert-tip-title: color-mix(in srgb, var(--rmx-success) 88%, var(--rmx-text) 12%);
+  --remux-markdown-alert-important-border: #8250df;
+  --remux-markdown-alert-important-bg: rgb(130 80 223 / 10%);
+  --remux-markdown-alert-important-title: #8250df;
+  --remux-markdown-alert-warning-bg: color-mix(in srgb, var(--rmx-warning) 11%, transparent);
+  --remux-markdown-alert-warning-title: color-mix(in srgb, var(--rmx-warning) 88%, var(--rmx-text) 12%);
+  --remux-markdown-alert-caution-bg: color-mix(in srgb, var(--rmx-danger) 10%, transparent);
+  --remux-markdown-alert-caution-title: color-mix(in srgb, var(--rmx-danger) 88%, var(--rmx-text) 12%);
+}
+
 * {
   box-sizing: border-box;
 }
@@ -345,6 +360,15 @@ body {
 .remux-markdown-code-highlight-pending pre {
   color: var(--rmx-code-text);
   font-family: var(--rmx-font-mono);
+}
+
+:root[data-remux-theme="light"] .remux-markdown-code-highlight .shiki {
+  background-color: var(--shiki-light-bg, var(--rmx-code-bg)) !important;
+  color: var(--shiki-light, var(--rmx-code-text)) !important;
+}
+
+:root[data-remux-theme="light"] .remux-markdown-code-highlight .shiki span {
+  color: var(--shiki-light, var(--rmx-code-text)) !important;
 }
 
 .remux-markdown-table-scroll {

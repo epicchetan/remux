@@ -1,7 +1,7 @@
 # Extension Authoring
 
 Status: Current
-Last verified: 2026-06-28
+Last verified: 2026-07-01
 
 Remux extensions live under an extension root and are discovered by `remux-extension.json`. By default the runtime scans `extensions/*`; `REMUX_EXTENSION_ROOTS` can override the roots.
 
@@ -50,6 +50,28 @@ Viewer code can use `@remux/viewer-kit/host` for host IPC helpers:
 - `dismissHostKeyboard`
 
 The mobile host bridge handles native file/media pickers, viewport metrics, tab updates, and forwarded Remux RPC requests.
+
+### Theming Your Viewer
+
+The mobile host drives viewer theme from the OS. Before first paint it sets these on `<html>`:
+
+```html
+data-remux-theme="light"
+style="color-scheme: light"
+```
+
+Dark is the safe default if the attribute is absent. Viewer CSS should keep dark values in `:root` and put light overrides under `:root[data-remux-theme="light"]`.
+
+Engines or canvas/SVG renderers that need JavaScript updates can listen for the host event:
+
+```ts
+window.addEventListener('remux:theme', (event) => {
+  const theme = event instanceof CustomEvent && event.detail?.theme === 'light' ? 'light' : 'dark';
+  // Reconfigure engine theme here.
+});
+```
+
+Viewer-kit users can instead import `getHostTheme` and `subscribeHostTheme` from `@remux/viewer-kit/host`; those helpers are thin wrappers over the same host signal.
 
 ## Extension Servers
 
