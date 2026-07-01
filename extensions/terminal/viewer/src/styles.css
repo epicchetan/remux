@@ -205,13 +205,18 @@ body {
 }
 
 .remux-terminal-key.is-active {
-  border-color: color-mix(in srgb, var(--rmx-accent) 82%, var(--rmx-border));
+  border-color: color-mix(in srgb, var(--rmx-primary-border) 74%, var(--rmx-border));
+  background:
+    linear-gradient(
+      to bottom,
+      color-mix(in srgb, var(--rmx-accent-strong) 86%, var(--rmx-accent) 14%),
+      color-mix(in srgb, var(--rmx-primary-edge) 88%, var(--rmx-primary-shadow) 12%)
+    );
   color: var(--rmx-accent-foreground);
   box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--rmx-text) 12%, transparent),
-    inset 0 -2px 0 color-mix(in srgb, black 36%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--rmx-accent) 24%, transparent),
-    0 2px 0 color-mix(in srgb, black 36%, transparent);
+    inset 0 1px 0 var(--rmx-primary-highlight),
+    inset 0 -2px 0 var(--rmx-primary-shadow-inset),
+    0 2px 0 var(--rmx-primary-shadow-drop);
 }
 
 .remux-terminal-key-text {
