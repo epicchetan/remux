@@ -1,7 +1,7 @@
 import { useCallback, useRef, type ReactNode } from 'react';
 import { ArrowDown, ArrowLeft, ArrowUp, Check, History, Loader2, PanelRightOpen, Send, Square } from 'lucide-react';
 
-import { openHostOverview } from '../../ipc/host';
+import { openHostOverview } from '@remux/viewer-kit/host';
 import { useSidebarStore } from '../../threads/sidebarStore';
 import { parentDirectory, useThreadsStore } from '../../threads/store';
 import { useTranscriptViewportControls } from '../../transcript';

@@ -28,7 +28,7 @@ export function BrowserBottomBar() {
   const activeTabId = useBrowserStore((state) => state.activeTabId);
   const closeOverview = useBrowserStore((state) => state.closeOverview);
   const extensions = useBrowserStore((state) => state.extensions);
-  const openExtensionTab = useBrowserStore((state) => state.openExtensionTab);
+  const openResource = useBrowserStore((state) => state.openResource);
   const section = useBrowserStore((state) => state.section);
   const setSection = useBrowserStore((state) => state.setSection);
   const theme = useTheme();
@@ -102,12 +102,15 @@ export function BrowserBottomBar() {
             accessibilityLabel={`Open ${launcher.label}`}
             accessibilityRole="button"
             key={`${launcher.extensionId}:${launcher.id}`}
-            onPress={() => openExtensionTab(launcher.extensionId, {
-              launch: launcher.route?.launch ?? null,
-              resourceKind: launcher.route?.resourceKind ?? null,
-              title: launcher.label,
-              viewId: launcher.view,
-            })}
+            onPress={() => {
+              void openResource({
+                extensionId: launcher.extensionId,
+                launch: launcher.route?.launch ?? null,
+                resourceKind: launcher.route?.resourceKind ?? null,
+                title: launcher.label,
+                viewId: launcher.view,
+              }, { disposition: 'new' });
+            }}
             style={({ pressed }) => [
               styles.extensionButton,
               pressed ? styles.extensionButtonPressed : null,

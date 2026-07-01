@@ -32,6 +32,7 @@ type CodeMirrorViewerProps = {
   baseContent?: string | null;
   content: string;
   fileName: string;
+  focusLine?: number | null;
   showDiff?: boolean;
 };
 
@@ -67,6 +68,7 @@ export function CodeMirrorViewer({
   baseContent = null,
   content,
   fileName,
+  focusLine = null,
   showDiff = false,
 }: CodeMirrorViewerProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -140,6 +142,20 @@ export function CodeMirrorViewer({
       ],
     });
   }, [lineNumbersExtension, mergeExtension]);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view || !focusLine) {
+      return;
+    }
+
+    const line = Math.min(Math.max(1, focusLine), view.state.doc.lines);
+    const position = view.state.doc.line(line).from;
+    view.dispatch({
+      effects: EditorView.scrollIntoView(position, { y: 'center' }),
+      selection: { anchor: position },
+    });
+  }, [content, focusLine]);
 
   return <div className="remux-editor-codemirror" ref={containerRef} />;
 }

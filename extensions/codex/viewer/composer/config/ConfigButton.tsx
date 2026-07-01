@@ -4,7 +4,7 @@ import { Archive, Check, ChevronDown, Gauge, Loader2, Play, RefreshCw, Shield, S
 
 import { applyCodexResourceInvalidations } from '../../ipc/resourceInvalidations';
 import { compactThread } from '../../ipc/threadCommands';
-import { reloadHostView } from '../../ipc/host';
+import { reloadHostView } from '@remux/viewer-kit/host';
 import { useThreadRuntimeStore } from '../../threads/runtimeStore';
 import { useThreadsStore } from '../../threads/store';
 import { useComposerStore } from '../store';

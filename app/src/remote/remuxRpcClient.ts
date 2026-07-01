@@ -17,6 +17,11 @@ type PendingRequest = {
 
 type RemuxConnectionClosedPhase = 'closed' | 'send';
 
+export type RemuxRpcRequestContext = {
+  resourceKey: string | null;
+  tabId: string | null;
+};
+
 type RemuxRpcClientOptions = {
   connectTimeoutMs?: number;
   onMessage?: (message: RemuxRpcMessage) => void;
@@ -190,10 +195,20 @@ export class RemuxRpcClient {
     return this.socket?.readyState === WebSocket.OPEN;
   }
 
-  request<T>(method: string, params?: unknown, timeoutMs = 300_000): Promise<T> {
+  request<T>(
+    method: string,
+    params?: unknown,
+    timeoutMs = 300_000,
+    context?: RemuxRpcRequestContext | null,
+  ): Promise<T> {
     const id = this.nextId++;
     logRemuxDebug('rpc:request', `${method}#${id}`);
-    this.send(params === undefined ? { id, method } : { id, method, params });
+    this.send(requestMessage({
+      context,
+      id,
+      method,
+      params,
+    }));
 
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -316,6 +331,26 @@ export class RemuxRpcClient {
       return false;
     }
   }
+}
+
+function requestMessage({
+  context,
+  id,
+  method,
+  params,
+}: {
+  context?: RemuxRpcRequestContext | null;
+  id: JsonRpcId;
+  method: string;
+  params?: unknown;
+}) {
+  return {
+    jsonrpc: '2.0',
+    id,
+    method,
+    ...(params === undefined ? {} : { params }),
+    ...(context ? { remuxContext: context } : {}),
+  };
 }
 
 function jsonRpcError(error: Record<string, unknown>, method: string) {

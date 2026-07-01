@@ -22,7 +22,7 @@ import {
 } from '../model/composerModel';
 import { readComposerDocument } from './ComposerEditor';
 import { digestDataUrl, readFileAsDataUrl } from '../attachments/readFileAsDataUrl';
-import { pickHostAttachments, type HostAttachmentPickResult } from '../../ipc/host';
+import { pickHostAttachments, type HostAttachmentPickResult } from '@remux/viewer-kit/host';
 import { type ComposerAttachmentPickerKind, useComposerStore } from '../store';
 
 export function ComposerLexicalInput({ hidden = false }: { hidden?: boolean }) {

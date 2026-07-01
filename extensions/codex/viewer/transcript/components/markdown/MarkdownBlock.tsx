@@ -13,7 +13,7 @@ import {
 import { CodeBlock } from './CodeBlock';
 import { FileTypeIcon } from '../file/fileTypeIcons';
 import { cn } from '@remux/viewer-kit/shadcn';
-import { openHostFile } from '../../../ipc/host';
+import { openHostFile } from '@remux/viewer-kit/host';
 
 const fallbackMarkdownWidth = 868;
 

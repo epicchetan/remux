@@ -53,6 +53,7 @@ type TranscriptViewportModeChangeReason =
   | 'manual-scroll'
   | 'scroll-navigation'
   | 'scroll-navigation-bottom'
+  | 'host-navigate'
   | 'streaming-turn'
   | 'touch-end-bottom'
   | 'touch-start';
@@ -75,6 +76,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
   const setAutoScrollMode = useTranscriptViewportStore((state) => state.setAutoScrollMode);
   const setScrollAvailability = useTranscriptViewportStore((state) => state.setScrollAvailability);
   const setScrollNavigationController = useTranscriptViewportStore((state) => state.setScrollNavigationController);
+  const requestedTurnScroll = useTranscriptViewportStore((state) => state.requestedTurnScroll);
   const turns = useMemo(
     () => turnOrder.map((turnId) => turnsById[turnId]).filter((turn): turn is TranscriptMeasuredTurn => Boolean(turn)),
     [turnOrder, turnsById],
@@ -101,6 +103,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
   const scrollAnimationRafRef = useRef<number | null>(null);
   const activeTurnIdsRef = useRef(activeTurnIds);
   const initialScrollThreadIdRef = useRef<string | null>(null);
+  const handledTurnScrollRequestIdRef = useRef(0);
   const lastScrollTopRef = useRef(0);
   const navigationAnchorsRef = useRef(navigationAnchors);
   const expandedRowsRef = useRef(expandedRows);
@@ -388,6 +391,45 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     setScrollNavigationController({ scrollDown, scrollUp });
     return () => setScrollNavigationController(null);
   }, [scrollDown, scrollUp, setScrollNavigationController]);
+
+  useLayoutEffect(() => {
+    if (
+      !requestedTurnScroll ||
+      requestedTurnScroll.id === handledTurnScrollRequestIdRef.current ||
+      requestedTurnScroll.threadId !== activeThreadId ||
+      status !== 'ready' ||
+      width === null
+    ) {
+      return;
+    }
+
+    const viewport = viewportRef.current;
+    if (!viewport) {
+      return;
+    }
+
+    const desiredScrollTop = anchorTurnUserMessageScrollTop({
+      expandedRows,
+      topPadding: viewportTopPadding,
+      turns,
+      turnId: requestedTurnScroll.turnId,
+    });
+    if (desiredScrollTop === null) {
+      return;
+    }
+
+    handledTurnScrollRequestIdRef.current = requestedTurnScroll.id;
+    scrollToPosition(desiredScrollTop, { type: 'off' }, 'host-navigate');
+  }, [
+    expandedRows,
+    activeThreadId,
+    requestedTurnScroll,
+    scrollToPosition,
+    status,
+    turns,
+    viewportTopPadding,
+    width,
+  ]);
 
   useEffect(() => {
     const viewport = viewportRef.current;

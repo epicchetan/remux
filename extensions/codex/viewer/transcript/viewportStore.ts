@@ -17,6 +17,8 @@ type TranscriptViewportStoreState = {
   autoScrollMode: TranscriptAutoScrollMode;
   canScrollDown: boolean;
   canScrollUp: boolean;
+  requestedTurnScroll: TranscriptTurnScrollRequest | null;
+  requestTurnScroll: (threadId: string, turnId: string) => void;
   scrollDown: () => void;
   scrollUp: () => void;
   setActiveTurnIds: (activeTurnIds: string[]) => void;
@@ -25,15 +27,39 @@ type TranscriptViewportStoreState = {
   setScrollNavigationController: (controller: TranscriptScrollNavigationController | null) => void;
 };
 
+type TranscriptTurnScrollRequest = {
+  id: number;
+  threadId: string;
+  turnId: string;
+};
+
 const noopScrollNavigation = () => undefined;
+let turnScrollRequestId = 0;
 
 const actions: Pick<
   TranscriptViewportStoreState,
+  | 'requestTurnScroll'
   | 'setActiveTurnIds'
   | 'setAutoScrollMode'
   | 'setScrollAvailability'
   | 'setScrollNavigationController'
 > = {
+  requestTurnScroll(threadId, turnId) {
+    const normalizedThreadId = threadId.trim();
+    const normalizedTurnId = turnId.trim();
+    if (!normalizedThreadId || !normalizedTurnId) {
+      return;
+    }
+
+    turnScrollRequestId += 1;
+    viewportStore.setState({
+      requestedTurnScroll: {
+        id: turnScrollRequestId,
+        threadId: normalizedThreadId,
+        turnId: normalizedTurnId,
+      },
+    });
+  },
   setActiveTurnIds(activeTurnIds) {
     if (sameTurnIds(viewportStore.getState().activeTurnIds, activeTurnIds)) {
       return;
@@ -75,6 +101,7 @@ const viewportStore = createExternalStore<TranscriptViewportStoreState>({
   autoScrollMode: { type: 'off' },
   canScrollDown: false,
   canScrollUp: false,
+  requestedTurnScroll: null,
   scrollDown: noopScrollNavigation,
   scrollUp: noopScrollNavigation,
   ...actions,
@@ -86,13 +113,24 @@ export function getTranscriptViewportState() {
   return viewportStore.getState();
 }
 
-export function resetTranscriptViewportForThread() {
+export function resetTranscriptViewportForThread(threadId?: string | null) {
+  const normalizedThreadId = threadId?.trim() || null;
+  const requestedTurnScroll = viewportStore.getState().requestedTurnScroll;
+
   viewportStore.setState({
     activeTurnIds: [],
     autoScrollMode: { type: 'off' },
     canScrollDown: false,
     canScrollUp: false,
+    requestedTurnScroll:
+      normalizedThreadId && requestedTurnScroll?.threadId === normalizedThreadId
+        ? requestedTurnScroll
+        : null,
   });
+}
+
+export function requestTranscriptTurnScroll(threadId: string, turnId: string) {
+  viewportStore.getState().requestTurnScroll(threadId, turnId);
 }
 
 export function reconcileTranscriptViewportForLayout(

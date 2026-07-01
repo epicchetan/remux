@@ -12,7 +12,7 @@ import type {
   CodexThreadTurnInterruptParams,
   CodexThreadTurnInterruptResponse,
 } from '../../shared/threadCommands';
-import { requestIpc } from './client';
+import { requestIpc } from '@remux/viewer-kit/ipc';
 
 export const threadCompactMethod = 'remux/codex/thread/compact';
 export const threadMessageEditMethod = 'remux/codex/thread/message/edit';

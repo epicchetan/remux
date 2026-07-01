@@ -1,6 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-import type { BrowserSection } from './browserTypes';
+import type { BrowserPendingNavigation, BrowserSection } from './browserTypes';
 
 const browserSessionVersion = 1;
 const browserSessionKey = 'remux.browser.session.v1';
@@ -20,6 +20,7 @@ export type PersistedViewerTab = {
   id: string;
   launch: string | null;
   lastActiveAt: number;
+  pendingNavigation: BrowserPendingNavigation | null;
   previewFileName: string | null;
   resourceId: string | null;
   resourceKind: string | null;
@@ -61,6 +62,7 @@ export function browserSessionSnapshot({
       id: tab.id,
       launch: tab.launch,
       lastActiveAt: tab.lastActiveAt,
+      pendingNavigation: tab.pendingNavigation ?? null,
       previewFileName: tab.previewFileName,
       resourceId: tab.resourceId,
       resourceKind: tab.resourceKind,
@@ -118,6 +120,7 @@ function parseViewerTab(value: unknown): PersistedViewerTab | null {
     id,
     launch: stringOrNull(value.launch),
     lastActiveAt,
+    pendingNavigation: parsePendingNavigation(value.pendingNavigation),
     previewFileName: stringOrNull(value.previewFileName),
     resourceId: stringOrNull(value.resourceId),
     resourceKind: stringOrNull(value.resourceKind),
@@ -133,6 +136,25 @@ function numberOrNow(value: unknown) {
 
 function stringOrNull(value: unknown) {
   return typeof value === 'string' ? value : null;
+}
+
+function parsePendingNavigation(value: unknown): BrowserPendingNavigation | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const nonce = stringOrNull(value.nonce);
+  if (!nonce) {
+    return null;
+  }
+
+  return {
+    focusId: stringOrNull(value.focusId),
+    focusKind: stringOrNull(value.focusKind),
+    nonce,
+    resourceId: stringOrNull(value.resourceId),
+    resourceKind: stringOrNull(value.resourceKind),
+  };
 }
 
 function parseSection(value: unknown): BrowserSection {

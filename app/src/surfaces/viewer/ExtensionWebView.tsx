@@ -32,7 +32,8 @@ import {
 } from '../../remote/RemuxConnectionProvider';
 import type { RemuxRpcMessage } from '../../remote/remuxRpcClient';
 import { useTheme, type RemuxTheme, type RemuxThemeName } from '../../theme/ThemeProvider';
-import type { BrowserSection } from '../../browser/browserTypes';
+import type { BrowserPendingNavigation, BrowserSection, ViewerTab } from '../../browser/browserTypes';
+import { serializedResourceKey } from '../../browser/resourceKeys';
 
 let nextWebViewInstanceId = 1;
 
@@ -216,11 +217,14 @@ type HealthPingWaiter = {
 
 type ExtensionWebViewProps = {
   active: boolean;
+  onNavigationDelivered?: (nonce: string) => void;
   onOpenFile?: (params: HostFileOpenParams) => HostFileOpenResult | Promise<HostFileOpenResult>;
   onOpenOverview?: (section?: BrowserSection) => Promise<void> | void;
   onTabUpdate?: (patch: ExtensionTabUpdate) => void;
+  pendingNavigation?: BrowserPendingNavigation | null;
   reloadSourceUrl?: string;
   sourceUrl: string;
+  tab: ViewerTab;
   title: string;
 };
 
@@ -230,7 +234,18 @@ export type ExtensionWebViewHandle = {
 };
 
 export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebViewProps>(function ExtensionWebView(
-  { active, onOpenFile, onOpenOverview, onTabUpdate, reloadSourceUrl, sourceUrl, title },
+  {
+    active,
+    onNavigationDelivered,
+    onOpenFile,
+    onOpenOverview,
+    onTabUpdate,
+    pendingNavigation = null,
+    reloadSourceUrl,
+    sourceUrl,
+    tab,
+    title,
+  },
   ref,
 ) {
   const remux = useRemuxConnection();
@@ -258,6 +273,10 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
   const webViewFrameRef = useRef<WebViewFrame>({ height: 0, width: 0, x: 0, y: 0 });
   const keyboardFrameRef = useRef<KeyboardFrame>({ height: 0, screenY: 0, visible: false });
   const styles = useMemo(() => createStyles(theme), [theme]);
+  const remuxRequestContext = useMemo(() => ({
+    resourceKey: serializedResourceKey(tab),
+    tabId: tab.id,
+  }), [tab.extensionId, tab.id, tab.resourceId, tab.resourceKind, tab.viewId]);
   const injectedBeforeContentLoaded = useMemo(
     () => createWebViewBeforeContentLoadedScript(theme.name),
     [theme.name],
@@ -445,6 +464,24 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
       type: 'remux/event',
     });
   }, [postToWebView, theme.name]);
+
+  const postPendingNavigation = useCallback(() => {
+    if (!active || !pendingNavigation) {
+      return;
+    }
+
+    const posted = postToWebView({
+      message: {
+        method: 'host/navigate',
+        params: pendingNavigation,
+      },
+      type: 'remux/event',
+    });
+
+    if (posted) {
+      onNavigationDelivered?.(pendingNavigation.nonce);
+    }
+  }, [active, onNavigationDelivered, pendingNavigation, postToWebView]);
 
   const dismissKeyboard = useCallback(() => {
     webViewRef.current?.injectJavaScript(dismissKeyboardScript);
@@ -824,7 +861,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
           }
 
           void remux
-            .request(message.method, message.params, message.timeoutMs)
+            .request(message.method, message.params, message.timeoutMs, remuxRequestContext)
             .then((result) => {
               postToWebView({
                 id: message.id,
@@ -864,6 +901,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
       postToWebView,
       reloadWebView,
       remux,
+      remuxRequestContext,
       theme.name,
     ],
   );
@@ -895,6 +933,10 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
     postConnection();
     postTheme();
   }, [postConnection, postStatus, postTheme]);
+
+  useEffect(() => {
+    postPendingNavigation();
+  }, [pageState.type, postPendingNavigation]);
 
   useEffect(() => {
     webViewRef.current?.injectJavaScript(createWebViewThemeUpdateScript(theme.name));

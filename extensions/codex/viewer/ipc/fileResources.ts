@@ -2,7 +2,7 @@ import type {
   CodexFileResourceRequest,
   CodexFilesReadResponse,
 } from '../../shared/files';
-import { requestIpc } from './client';
+import { requestIpc } from '@remux/viewer-kit/ipc';
 
 export const codexFilesMethod = 'remux/codex/files';
 

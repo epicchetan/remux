@@ -1,11 +1,12 @@
 import { create } from 'zustand';
 
-import { getHostViewportMetrics, subscribeHostViewportMetrics } from './host';
 import {
-  getIpcStatusSnapshot,
-  initializeIpc,
-  subscribeIpcStatus,
-} from './client';
+  getHostStatusSnapshot,
+  getHostViewportMetrics,
+  subscribeHostStatus,
+  subscribeHostViewportMetrics,
+} from '@remux/viewer-kit/host';
+import { initializeIpc } from '@remux/viewer-kit/ipc';
 import type { CodexViewHostStatus, RemuxHostViewportMetrics } from './types';
 
 type HostStoreState = {
@@ -19,8 +20,8 @@ type HostStoreState = {
 let initialized = false;
 
 export const useHostStore = create<HostStoreState>((set) => ({
-  connectionStatus: getIpcStatusSnapshot().status,
-  error: getIpcStatusSnapshot().error,
+  connectionStatus: getHostStatusSnapshot().status,
+  error: getHostStatusSnapshot().error,
   hostViewportMetrics: null,
   async getHostViewportMetrics() {
     const metrics = await getHostViewportMetrics();
@@ -33,13 +34,13 @@ export const useHostStore = create<HostStoreState>((set) => ({
     }
 
     initializeIpc();
-    const status = getIpcStatusSnapshot();
+    const status = getHostStatusSnapshot();
     set({
       connectionStatus: status.status,
       error: status.error,
     });
 
-    subscribeIpcStatus((status) => {
+    subscribeHostStatus((status) => {
       set({
         connectionStatus: status.status,
         error: status.error,

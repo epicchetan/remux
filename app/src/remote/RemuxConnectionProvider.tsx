@@ -16,6 +16,7 @@ import {
   RemuxRpcClient,
   type JsonRpcId,
   type RemuxRpcMessage,
+  type RemuxRpcRequestContext,
 } from './remuxRpcClient';
 import {
   remuxOriginFromSettings,
@@ -50,7 +51,12 @@ export type RemuxConnectionStatus =
 export type RemuxConnection = {
   error: string | null;
   notify: (method: string, params?: unknown) => void;
-  request: <T>(method: string, params?: unknown, timeoutMs?: number) => Promise<T>;
+  request: <T>(
+    method: string,
+    params?: unknown,
+    timeoutMs?: number,
+    context?: RemuxRpcRequestContext | null,
+  ) => Promise<T>;
   respond: (id: JsonRpcId, result: unknown) => void;
   respondError: (id: JsonRpcId, error: { code: number; data?: unknown; message: string }) => void;
   status: RemuxConnectionStatus;
@@ -416,14 +422,14 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
     });
   }, [markClientConnectionLost]);
 
-  const request = useCallback<RemuxConnection['request']>(async (method, params, timeoutMs) => {
+  const request = useCallback<RemuxConnection['request']>(async (method, params, timeoutMs, context) => {
     const retryable = isRetryableRemuxRequest(method);
     let retryCount = 0;
 
     for (;;) {
       const client = await waitForConnectedClient(timeoutMs);
       try {
-        return await client.request(method, params, timeoutMs);
+        return await client.request(method, params, timeoutMs, context);
       } catch (requestError) {
         if (
           retryable &&

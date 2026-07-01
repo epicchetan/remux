@@ -137,7 +137,7 @@ const actions: Pick<
     workItemRequests.clear();
     dirtyWorkItemRequestKeys.clear();
     workItemRequestResults.clear();
-    resetTranscriptLayoutForThread();
+    resetTranscriptLayoutForThread(activeThreadId);
 
     if (!activeThreadId) {
       resourceStore.setState(resetTranscriptResourceState());

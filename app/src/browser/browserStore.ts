@@ -17,7 +17,15 @@ import {
   type PersistedBrowserSession,
   type PersistedViewerTab,
 } from './browserSessionPersistence';
-import type { BrowserMode, BrowserSection, BrowserTab, BrowserTabTarget, ViewerTab } from './browserTypes';
+import type {
+  BrowserMode,
+  BrowserPendingNavigation,
+  BrowserResourceTarget,
+  BrowserSection,
+  BrowserTab,
+  ViewerTab,
+} from './browserTypes';
+import { serializedResourceKey } from './resourceKeys';
 
 type BrowserCatalogStatus = 'error' | 'idle' | 'loading' | 'ready';
 
@@ -26,14 +34,14 @@ type BrowserStore = {
   catalogError: string | null;
   catalogOrigin: string | null;
   catalogStatus: BrowserCatalogStatus;
+  clearPendingNavigation: (tabId: string, nonce: string) => void;
   closeOverview: () => void;
   closeTab: (tabId: string) => void;
   defaultExtensionId: string | null;
   extensions: RemuxExtension[];
   loadExtensions: (options?: { force?: boolean }) => Promise<void>;
   mode: BrowserMode;
-  openExtensionTab: (extensionId: string, options?: BrowserOpenExtensionTabOptions) => void;
-  openNotificationTarget: (target: BrowserTabTarget) => Promise<BrowserOpenNotificationTargetResult>;
+  openResource: (target: BrowserResourceTarget, options?: BrowserOpenResourceOptions) => Promise<BrowserOpenResourceResult>;
   openOverview: (section?: BrowserSection) => void;
   reloadExtensionTabs: (extensionId: string) => void;
   section: BrowserSection;
@@ -44,23 +52,30 @@ type BrowserStore = {
   updateTab: (tabId: string, patch: BrowserTabUpdate) => void;
 };
 
-export type BrowserOpenExtensionTabOptions = {
+export type BrowserOpenResourceOptions = {
+  disposition?: 'new' | 'reuse';
+};
+
+export type BrowserOpenResourceTargetOptions = {
+  focusId?: string | null;
+  focusKind?: string | null;
   handlerId?: string | null;
+  launch?: string | null;
   resourceId?: string | null;
   resourceKind?: string | null;
-  launch?: string | null;
   status?: string | null;
   title?: string | null;
   viewId?: string | null;
 };
 
-export type BrowserOpenNotificationTargetResult =
+export type BrowserOpenResourceResult =
   | { tabId: string; type: 'created' | 'selected' }
   | { reason: 'extension-not-found' | 'invalid-target'; type: 'ignored' };
 
 let extensionLoadPromise: Promise<void> | null = null;
 let extensionLoadOrigin: string | null = null;
 let tabSequence = 0;
+let pendingNavigationSequence = 0;
 let sessionLoadPromise: Promise<PersistedBrowserSession | null> | null = null;
 
 type BrowserTabUpdate = {
@@ -77,6 +92,16 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
   catalogError: null,
   catalogOrigin: null,
   catalogStatus: 'idle',
+  clearPendingNavigation: (tabId, nonce) => {
+    set((state) => ({
+      tabs: state.tabs.map((tab) => (
+        tab.id === tabId && tab.pendingNavigation?.nonce === nonce
+          ? { ...tab, pendingNavigation: null }
+          : tab
+      )),
+    }));
+    persistCurrentBrowserSession(get());
+  },
   closeOverview: () => {
     set((state) => ({ mode: state.activeTabId ? 'surface' : 'overview' }));
     persistCurrentBrowserSession(get());
@@ -159,23 +184,7 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
     return extensionLoadPromise;
   },
   mode: 'overview',
-  openExtensionTab: (extensionId, options = {}) => {
-    set((state) => {
-      const extension = state.extensions.find((candidate) => candidate.id === extensionId);
-      if (!extension) {
-        return {};
-      }
-
-      const tab = createViewerTab(extension, options);
-      return {
-        activeTabId: tab.id,
-        mode: 'surface',
-        tabs: [...state.tabs, tab],
-      };
-    });
-    persistCurrentBrowserSession(get());
-  },
-  openNotificationTarget: async (target) => {
+  openResource: async (target, openOptions = {}) => {
     const extensionId = target.extensionId.trim();
     if (!extensionId) {
       return { reason: 'invalid-target', type: 'ignored' };
@@ -186,7 +195,7 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
       await state.loadExtensions();
     }
 
-    let result: BrowserOpenNotificationTargetResult = {
+    let result: BrowserOpenResourceResult = {
       reason: 'extension-not-found',
       type: 'ignored',
     };
@@ -197,24 +206,58 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
         return {};
       }
 
-      const options = normalizeBrowserTabTarget(target, extension);
-      const existingTab = currentState.tabs.find((tab) => matchesBrowserTabTarget(tab, extensionId, options));
+      const options = normalizeBrowserResourceTarget(target, extension);
+      const disposition = openOptions.disposition ?? 'reuse';
+      const targetKey = serializedResourceKey({
+        extensionId,
+        resourceId: options.resourceId,
+        resourceKind: options.resourceKind,
+        viewId: options.viewId,
+      });
       const now = Date.now();
 
-      if (existingTab) {
-        result = { tabId: existingTab.id, type: 'selected' };
-        return {
-          activeTabId: existingTab.id,
-          mode: 'surface',
-          tabs: currentState.tabs.map((tab) => (
-            tab.id === existingTab.id
-              ? { ...tab, lastActiveAt: now }
-              : tab
-          )),
-        };
+      if (disposition === 'reuse' && targetKey) {
+        const existingTab = mostRecentlyActiveTabWithKey(currentState.tabs, targetKey);
+        if (existingTab) {
+          result = { tabId: existingTab.id, type: 'selected' };
+          return {
+            activeTabId: existingTab.id,
+            mode: 'surface',
+            tabs: currentState.tabs.map((tab) => (
+              tab.id === existingTab.id
+                ? {
+                    ...tab,
+                    lastActiveAt: now,
+                    pendingNavigation: pendingNavigationFromTarget(options),
+                  }
+                : tab
+            )),
+          };
+        }
       }
 
-      const tab = createViewerTab(extension, options);
+      if (disposition === 'reuse' && target.origin?.tabId && target.origin.resourceKey && targetKey) {
+        const originTab = currentState.tabs.find((tab) => tab.id === target.origin?.tabId);
+        if (originTab && serializedResourceKey(originTab) === target.origin.resourceKey) {
+          const nextTab = applyTabResourceTarget(originTab, options, extension);
+          result = { tabId: originTab.id, type: 'selected' };
+          return {
+            activeTabId: originTab.id,
+            mode: 'surface',
+            tabs: currentState.tabs.map((tab) => (
+              tab.id === originTab.id
+                ? {
+                    ...nextTab,
+                    lastActiveAt: now,
+                    pendingNavigation: pendingNavigationFromTarget(options),
+                  }
+                : tab
+            )),
+          };
+        }
+      }
+
+      const tab = createViewerTab(extension, options, initialNavigationFromTarget(options));
       result = { tabId: tab.id, type: 'created' };
       return {
         activeTabId: tab.id,
@@ -300,9 +343,7 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
 
         const nextTab = {
           ...tab,
-          launch: patch.launch === undefined
-            ? (patch.resourceKind === 'thread' ? null : tab.launch)
-            : patch.launch,
+          launch: patch.launch === undefined ? tab.launch : patch.launch,
           handlerId: patch.handlerId === undefined ? tab.handlerId : patch.handlerId,
           resourceId: patch.resourceId === undefined ? tab.resourceId : patch.resourceId,
           resourceKind: patch.resourceKind === undefined ? tab.resourceKind : patch.resourceKind,
@@ -320,29 +361,15 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
   },
 }));
 
-export function matchesBrowserTabTarget(
-  tab: ViewerTab,
-  extensionId: string,
-  target: BrowserOpenExtensionTabOptions,
-) {
-  const viewId = target.viewId?.trim() || 'main';
-  if (tab.extensionId !== extensionId || tab.viewId !== viewId) {
-    return false;
-  }
-
-  return nullableStringMatches(tab.handlerId, target.handlerId) &&
-    nullableStringMatches(tab.launch, target.launch) &&
-    nullableStringMatches(tab.resourceKind, target.resourceKind) &&
-    nullableStringMatches(tab.resourceId, target.resourceId);
-}
-
-function normalizeBrowserTabTarget(
-  target: BrowserTabTarget,
+function normalizeBrowserResourceTarget(
+  target: BrowserResourceTarget,
   extension: RemuxExtension,
-): BrowserOpenExtensionTabOptions {
+): BrowserOpenResourceTargetOptions {
   const viewId = target.viewId?.trim() || 'main';
 
   return {
+    focusId: target.focusId?.trim() || null,
+    focusKind: target.focusKind?.trim() || null,
     handlerId: target.handlerId?.trim() || null,
     launch: target.launch?.trim() || null,
     resourceId: target.resourceId?.trim() || null,
@@ -353,8 +380,44 @@ function normalizeBrowserTabTarget(
   };
 }
 
-function nullableStringMatches(actual: string | null, expected: string | null | undefined) {
-  return (expected?.trim() || null) === actual;
+function mostRecentlyActiveTabWithKey(tabs: BrowserTab[], key: string) {
+  return tabs
+    .filter((tab) => serializedResourceKey(tab) === key)
+    .sort((first, second) => second.lastActiveAt - first.lastActiveAt)[0] ?? null;
+}
+
+function pendingNavigationFromTarget(target: BrowserOpenResourceTargetOptions): BrowserPendingNavigation | null {
+  const resourceKind = target.resourceKind?.trim() || null;
+  const resourceId = target.resourceId?.trim() || null;
+  const focusKind = target.focusKind?.trim() || null;
+  const focusId = target.focusId?.trim() || null;
+
+  if (!resourceKind && !resourceId && !focusKind && !focusId) {
+    return null;
+  }
+
+  return {
+    focusId,
+    focusKind,
+    nonce: nextPendingNavigationNonce(),
+    resourceId,
+    resourceKind,
+  };
+}
+
+function initialNavigationFromTarget(target: BrowserOpenResourceTargetOptions): BrowserPendingNavigation | null {
+  const focusKind = target.focusKind?.trim() || null;
+  const focusId = target.focusId?.trim() || null;
+  if (!focusKind && !focusId) {
+    return null;
+  }
+
+  return pendingNavigationFromTarget(target);
+}
+
+function nextPendingNavigationNonce() {
+  pendingNavigationSequence += 1;
+  return `nav:${Date.now()}:${pendingNavigationSequence}`;
 }
 
 function optionalMetadataValue(current: string | null, next: string | null | undefined) {
@@ -369,7 +432,11 @@ function nextActiveTabId(tabs: BrowserTab[]) {
   return [...tabs].sort((first, second) => second.lastActiveAt - first.lastActiveAt)[0]?.id ?? null;
 }
 
-function createViewerTab(extension: RemuxExtension, options: BrowserOpenExtensionTabOptions = {}): ViewerTab {
+function createViewerTab(
+  extension: RemuxExtension,
+  options: BrowserOpenResourceTargetOptions = {},
+  initialNavigation: BrowserPendingNavigation | null = null,
+): ViewerTab {
   const createdAt = Date.now();
   const sequence = nextTabSequence();
   const launch = options.launch?.trim() || null;
@@ -396,6 +463,7 @@ function createViewerTab(extension: RemuxExtension, options: BrowserOpenExtensio
     kind: 'viewer',
     launch,
     lastActiveAt: createdAt,
+    pendingNavigation: null,
     previewFileName: null,
     previewUri: null,
     reloadNonce: 0,
@@ -408,7 +476,31 @@ function createViewerTab(extension: RemuxExtension, options: BrowserOpenExtensio
 
   return {
     ...tab,
-    url: withViewerTabParams(view.url, tab),
+    url: withViewerTabParams(view.url, tab, initialNavigation),
+  };
+}
+
+function applyTabResourceTarget(
+  tab: ViewerTab,
+  target: BrowserOpenResourceTargetOptions,
+  extension: RemuxExtension,
+): ViewerTab {
+  const viewId = target.viewId?.trim() || 'main';
+  const view = extension.views[viewId] ?? extension.views.main;
+  const nextTab = {
+    ...tab,
+    handlerId: target.handlerId?.trim() || tab.handlerId,
+    launch: target.launch?.trim() || tab.launch,
+    resourceId: target.resourceId?.trim() || null,
+    resourceKind: target.resourceKind?.trim() || null,
+    status: target.status?.trim() || tab.status,
+    title: target.title?.trim() || tab.title,
+    viewId: extension.views[viewId] ? viewId : 'main',
+  };
+
+  return {
+    ...nextTab,
+    url: withViewerTabParams(view.url, nextTab),
   };
 }
 
@@ -428,6 +520,7 @@ function createRestoredViewerTab(
     kind: 'viewer',
     launch: tab.launch,
     lastActiveAt: tab.lastActiveAt,
+    pendingNavigation: tab.pendingNavigation ?? null,
     previewFileName: preview?.previewFileName ?? null,
     previewUri: preview?.previewUri ?? null,
     reloadNonce: tab.reloadNonce ?? 0,
@@ -473,7 +566,11 @@ function defaultResourceId({
   return null;
 }
 
-function withViewerTabParams(url: string, tab: Omit<ViewerTab, 'url'>) {
+function withViewerTabParams(
+  url: string,
+  tab: Omit<ViewerTab, 'url'>,
+  navigation: BrowserPendingNavigation | null = null,
+) {
   const target = new URL(url);
   target.searchParams.set('remuxTabId', tab.id);
 
@@ -499,6 +596,18 @@ function withViewerTabParams(url: string, tab: Omit<ViewerTab, 'url'>) {
     target.searchParams.set('remuxResourceId', tab.resourceId);
   } else {
     target.searchParams.delete('remuxResourceId');
+  }
+
+  if (navigation?.focusKind) {
+    target.searchParams.set('remuxFocusKind', navigation.focusKind);
+  } else {
+    target.searchParams.delete('remuxFocusKind');
+  }
+
+  if (navigation?.focusId) {
+    target.searchParams.set('remuxFocusId', navigation.focusId);
+  } else {
+    target.searchParams.delete('remuxFocusId');
   }
 
   return target.toString();

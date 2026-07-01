@@ -51,6 +51,8 @@ test('notification manager pushes turn completion to the originating client', as
             ...turnCompletedIntent().params.target,
             handlerId: null,
             launch: null,
+            originResourceKey: null,
+            originTabId: null,
           },
         },
       },
@@ -60,6 +62,62 @@ test('notification manager pushes turn completion to the originating client', as
       title: 'Codex finished',
       to: 'ExponentPushToken[test]',
     });
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('notification manager records request origin and enriches delivered intents', async () => {
+  const fixture = createNotificationFixture();
+  const pushRequests = [];
+  const visibilityChecks = [];
+  const manager = createNotificationManager({
+    fetchImpl: async (url, request) => {
+      pushRequests.push({ request, url });
+      return jsonResponse({ data: { id: 'ticket-1', status: 'ok' } });
+    },
+    log: silentLog(),
+    rootDir: fixture.root,
+  });
+  const client = createClient({
+    onVisibilityCheck: (intent) => visibilityChecks.push(intent),
+    visible: false,
+  });
+
+  try {
+    await manager.handleClientRequest({
+      client,
+      method: 'remux/clients/register',
+      params: {
+        clientId: 'client-1',
+        expoPushToken: 'ExponentPushToken[test]',
+        sessionId: 'session-1',
+      },
+    });
+    manager.recordClientRequest({
+      client,
+      request: {
+        method: 'remux/codex/thread/message/send',
+        remuxContext: {
+          resourceKey: '["codex","main","draft","draft-1"]',
+          tabId: 'codex-tab-1',
+        },
+      },
+      result: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+      },
+    });
+
+    assert.equal(await manager.handleExtensionNotification(turnCompletedIntent()), true);
+    assert.equal(pushRequests.length, 1);
+    assert.equal(visibilityChecks.length, 1);
+
+    const deliveredIntent = JSON.parse(pushRequests[0].request.body).data.remuxNotificationIntent;
+    assert.equal(deliveredIntent.target.originResourceKey, '["codex","main","draft","draft-1"]');
+    assert.equal(deliveredIntent.target.originTabId, 'codex-tab-1');
+    assert.equal(visibilityChecks[0].target.originResourceKey, '["codex","main","draft","draft-1"]');
+    assert.equal(visibilityChecks[0].target.originTabId, 'codex-tab-1');
   } finally {
     fixture.cleanup();
   }
@@ -230,6 +288,8 @@ test('notification manager pushes compaction completion to the originating clien
             ...threadCompactedIntent().params.target,
             handlerId: null,
             launch: null,
+            originResourceKey: null,
+            originTabId: null,
           },
         },
       },
@@ -363,6 +423,8 @@ test('notification manager keeps terminal session audiences until removed', asyn
         focusKind: 'session',
         handlerId: null,
         launch: null,
+        originResourceKey: null,
+        originTabId: null,
         resourceId: 'terminal-session-1',
         resourceKind: 'terminalSession',
       },
@@ -531,10 +593,11 @@ function terminalAudienceRemove() {
   };
 }
 
-function createClient({ visible }) {
+function createClient({ onVisibilityCheck, visible }) {
   return {
-    async request(method) {
+    async request(method, params) {
       assert.equal(method, 'remux/notifications/visibility/check');
+      onVisibilityCheck?.(params);
       return { visible };
     },
   };

@@ -46,7 +46,21 @@ type WebViewEvent = {
   type: 'remux/event';
 };
 
-type NativeMessage = WebViewEvent | WebViewResponse;
+export type RemuxViewHostStatus =
+  | { type: 'idle' }
+  | { type: 'connecting' }
+  | { cwd: string | null; type: 'connected' }
+  | { type: 'reconnecting'; attempt: number }
+  | { type: 'closed'; reason?: string }
+  | { type: 'error'; message: string };
+
+type WebViewStatus = {
+  error: string | null;
+  status: RemuxViewHostStatus;
+  type: 'remux/status';
+};
+
+type NativeMessage = WebViewEvent | WebViewResponse | WebViewStatus;
 
 type PendingRequest = {
   reject: (error: Error) => void;
@@ -55,6 +69,12 @@ type PendingRequest = {
 };
 
 type IpcEventSubscriber = (events: JsonRpcMessage[]) => void;
+type IpcStatusSubscriber = (status: IpcStatusSnapshot) => void;
+
+export type IpcStatusSnapshot = {
+  error: string | null;
+  status: RemuxViewHostStatus;
+};
 
 const requestIdPrefix = 'remux-extension-viewer';
 const defaultRequestTimeoutMs = 300_000;
@@ -62,9 +82,14 @@ const defaultRequestTimeoutMs = 300_000;
 let initialized = false;
 let nextId = 1;
 let eventFlushScheduled = false;
+let statusSnapshot: IpcStatusSnapshot = {
+  error: null,
+  status: { type: 'connecting' },
+};
 const eventQueue: JsonRpcMessage[] = [];
 const eventSubscribers = new Set<IpcEventSubscriber>();
 const pendingRequests = new Map<JsonRpcId, PendingRequest>();
+const statusSubscribers = new Set<IpcStatusSubscriber>();
 
 declare global {
   interface Window {
@@ -122,6 +147,19 @@ export function subscribeIpcEvents(subscriber: IpcEventSubscriber) {
   };
 }
 
+export function subscribeIpcStatus(subscriber: IpcStatusSubscriber) {
+  initializeIpc();
+  statusSubscribers.add(subscriber);
+  subscriber(statusSnapshot);
+  return () => {
+    statusSubscribers.delete(subscriber);
+  };
+}
+
+export function getIpcStatusSnapshot() {
+  return statusSnapshot;
+}
+
 export function initializeIpc() {
   if (initialized) {
     return;
@@ -145,12 +183,39 @@ function handleNativeMessage(event: MessageEvent) {
     return;
   }
 
+  if (message.type === 'remux/status') {
+    updateStatus({
+      error: message.error,
+      status: message.status,
+    });
+    if (message.status.type === 'closed') {
+      rejectPendingRequests(message.status.reason ?? 'Remux is not connected');
+    } else if (message.status.type === 'error') {
+      rejectPendingRequests(message.status.message);
+    }
+    return;
+  }
+
   if (!message.id || !isRequestId(message.id)) {
+    if (message.type === 'remux/error') {
+      updateStatus({
+        error: message.error.message,
+        status: { message: message.error.message, type: 'error' },
+      });
+      rejectPendingRequests(message.error.message);
+    }
     return;
   }
 
   const pending = pendingRequests.get(message.id);
   if (!pending) {
+    if (message.type === 'remux/error') {
+      updateStatus({
+        error: message.error.message,
+        status: { message: message.error.message, type: 'error' },
+      });
+      rejectPendingRequests(message.error.message);
+    }
     return;
   }
 
@@ -163,6 +228,21 @@ function handleNativeMessage(event: MessageEvent) {
   }
 
   pending.resolve(message.result);
+}
+
+function updateStatus(snapshot: IpcStatusSnapshot) {
+  statusSnapshot = snapshot;
+  for (const subscriber of statusSubscribers) {
+    subscriber(statusSnapshot);
+  }
+}
+
+function rejectPendingRequests(reason: string) {
+  for (const [id, pending] of pendingRequests) {
+    window.clearTimeout(pending.timer);
+    pending.reject(new Error(reason));
+    pendingRequests.delete(id);
+  }
 }
 
 function enqueueEvent(message: JsonRpcMessage) {
@@ -190,7 +270,12 @@ function parseNativeMessage(data: unknown): NativeMessage | null {
     }
 
     const message = parsed as NativeMessage;
-    if (message.type === 'remux/response' || message.type === 'remux/error' || message.type === 'remux/event') {
+    if (
+      message.type === 'remux/response' ||
+      message.type === 'remux/error' ||
+      message.type === 'remux/event' ||
+      message.type === 'remux/status'
+    ) {
       return message;
     }
   } catch {

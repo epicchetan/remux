@@ -291,7 +291,7 @@ function NativeTitleButton({
 function FileTreeRow({ row }: { row: VisibleFileTreeRow }) {
   const { styles, theme } = useFilesTheme();
   const extensions = useBrowserStore((state) => state.extensions);
-  const openExtensionTab = useBrowserStore((state) => state.openExtensionTab);
+  const openResource = useBrowserStore((state) => state.openResource);
   const request = useRemuxConnection().request;
   const record = useFilesStore((state) => state.directoriesByPath[row.path]);
   const error = record?.error ?? null;
@@ -339,7 +339,8 @@ function FileTreeRow({ row }: { row: VisibleFileTreeRow }) {
             }
 
             if (fileHandler) {
-              openExtensionTab(fileHandler.extensionId, {
+              void openResource({
+                extensionId: fileHandler.extensionId,
                 handlerId: fileHandler.id,
                 resourceId: row.path,
                 resourceKind: 'file',

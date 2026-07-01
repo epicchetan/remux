@@ -1,4 +1,4 @@
-import { openHostOverview, reloadHostView, updateHostTab } from '@remux/viewer-kit/host';
+import { openHostOverview, reloadHostView, subscribeHostNavigate, updateHostTab } from '@remux/viewer-kit/host';
 import type { RemuxViewerRoute } from '@remux/viewer-kit/route';
 import {
   ActionBar,
@@ -15,7 +15,8 @@ type EditorSurfaceProps = {
 };
 
 export function EditorSurface({ route }: EditorSurfaceProps) {
-  const filePath = route.resourceKind === 'file' ? route.resourceId : null;
+  const [filePath, setFilePath] = useState(route.resourceKind === 'file' ? route.resourceId : null);
+  const [focusLine, setFocusLine] = useState(() => route.focusKind === 'line' ? parseLineNumber(route.focusId) : null);
   const activeFile = useEditorStore((state) => state.activeFile);
   const loadFile = useEditorStore((state) => state.loadFile);
   const fileInfo = fileInfoText({ activeFile, filePath });
@@ -43,6 +44,15 @@ export function EditorSurface({ route }: EditorSurfaceProps) {
 
     void loadFile(filePath);
   }, [filePath, loadFile]);
+
+  useEffect(() => subscribeHostNavigate((navigation) => {
+    if (navigation.resourceKind !== 'file' || !navigation.resourceId) {
+      return;
+    }
+
+    setFilePath(navigation.resourceId);
+    setFocusLine(navigation.focusKind === 'line' ? parseLineNumber(navigation.focusId) : null);
+  }), []);
 
   useEffect(() => {
     setShowDiff(false);
@@ -86,6 +96,7 @@ export function EditorSurface({ route }: EditorSurfaceProps) {
         activeBaseContent={hasDiff ? activeBase?.content ?? null : null}
         activeFile={activeFile}
         filePath={filePath}
+        focusLine={focusLine}
         showDiff={showDiff}
       />
       <ActionBar
@@ -133,11 +144,13 @@ function EditorBody({
   activeBaseContent,
   activeFile,
   filePath,
+  focusLine,
   showDiff,
 }: {
   activeBaseContent: string | null;
   activeFile: ReturnType<typeof useEditorStore.getState>['activeFile'];
   filePath: string | null;
+  focusLine: number | null;
   showDiff: boolean;
 }) {
   if (!filePath || activeFile.status === 'idle') {
@@ -194,6 +207,7 @@ function EditorBody({
         baseContent={activeBaseContent}
         content={activeFile.content}
         fileName={activeFile.name}
+        focusLine={focusLine}
         showDiff={showDiff}
       />
     </section>
@@ -243,6 +257,8 @@ function fileTabMetadata({
 }) {
   if (activeFile.status === 'ready') {
     return {
+      resourceId: filePath,
+      resourceKind: filePath ? 'file' : null,
       status: formatSize(activeFile.sizeBytes),
       title: activeFile.name,
     };
@@ -250,6 +266,8 @@ function fileTabMetadata({
 
   if (activeFile.status === 'unsupported') {
     return {
+      resourceId: filePath,
+      resourceKind: filePath ? 'file' : null,
       status: activeFile.tooLarge ? 'Too large' : activeFile.isBinary ? 'Binary file' : 'Unsupported',
       title: activeFile.name,
     };
@@ -257,6 +275,8 @@ function fileTabMetadata({
 
   if (activeFile.status === 'loading') {
     return {
+      resourceId: filePath,
+      resourceKind: filePath ? 'file' : null,
       status: 'Reading',
       title: basename(activeFile.path),
     };
@@ -264,15 +284,24 @@ function fileTabMetadata({
 
   if (activeFile.status === 'error') {
     return {
+      resourceId: filePath,
+      resourceKind: filePath ? 'file' : null,
       status: 'Error',
       title: basename(activeFile.path),
     };
   }
 
   return {
+    resourceId: filePath,
+    resourceKind: filePath ? 'file' : null,
     status: null,
     title: filePath ? basename(filePath) : 'Editor',
   };
+}
+
+function parseLineNumber(value: string | null | undefined) {
+  const line = Number(value);
+  return Number.isFinite(line) && line > 0 ? Math.floor(line) : null;
 }
 
 function basename(path: string) {

@@ -147,6 +147,7 @@ function createNotificationManager({
         lifetime: change.lifetime,
         log,
         method: request.method,
+        origin: parseRemuxContext(request.remuxContext),
         target: change.target,
       });
     },
@@ -241,6 +242,7 @@ function recordNotificationAudience({
   lifetime,
   log,
   method,
+  origin,
   target,
 }) {
   const key = notificationAudienceKey({
@@ -264,6 +266,8 @@ function recordNotificationAudience({
     clientId: client.clientId,
     createdAt: Date.now(),
     lifetime,
+    originResourceKey: origin.resourceKey,
+    originTabId: origin.tabId,
     sessionId: client.sessionId ?? null,
     target,
   });
@@ -272,6 +276,7 @@ function recordNotificationAudience({
       clientId: client.clientId,
       lifetime,
       method,
+      origin,
       sessionId: client.sessionId ?? null,
       target,
     },
@@ -403,9 +408,11 @@ async function deliverNotification({
     return;
   }
 
-  if (await isClientViewingIntent(clientState, intent, log)) {
+  const deliveredIntent = intentForAudience(intent, audience);
+
+  if (await isClientViewingIntent(clientState, deliveredIntent, log)) {
     logEvent(log, {
-      detail: notificationLogDetail(intent),
+      detail: notificationLogDetail(deliveredIntent),
       label: 'notifications:push:suppressed-visible',
       terminal: 'silent',
     });
@@ -416,10 +423,21 @@ async function deliverNotification({
     clients,
     clientState,
     fetchImpl,
-    intent,
+    intent: deliveredIntent,
     log,
     storePath,
   });
+}
+
+function intentForAudience(intent, audience) {
+  return {
+    ...intent,
+    target: {
+      ...intent.target,
+      originResourceKey: audience.originResourceKey ?? null,
+      originTabId: audience.originTabId ?? null,
+    },
+  };
 }
 
 async function isClientViewingIntent(clientState, intent, log) {
@@ -557,7 +575,7 @@ function parseClientRegistration(value) {
   }
 
   return {
-    activeTarget: parseBrowserTabTarget(value.activeTarget),
+    activeTarget: parseBrowserResourceTarget(value.activeTarget),
     appState: optionalString(value.appState) ?? 'unknown',
     clientId,
     expoPushToken: optionalString(value.expoPushToken),
@@ -588,11 +606,27 @@ function parseNotificationIntent(value) {
       focusKind: optionalString(target.focusKind),
       handlerId: optionalString(target.handlerId),
       launch: optionalString(target.launch),
+      originResourceKey: optionalString(target.originResourceKey),
+      originTabId: optionalString(target.originTabId),
       resourceId: optionalString(target.resourceId),
       resourceKind: optionalString(target.resourceKind),
     },
     title,
     viewId: optionalString(value.viewId) ?? 'main',
+  };
+}
+
+function parseRemuxContext(value) {
+  if (!isRecord(value)) {
+    return {
+      resourceKey: null,
+      tabId: null,
+    };
+  }
+
+  return {
+    resourceKey: optionalString(value.resourceKey),
+    tabId: optionalString(value.tabId),
   };
 }
 
@@ -619,7 +653,7 @@ function parseNotificationAudienceTarget(value) {
   };
 }
 
-function parseBrowserTabTarget(value) {
+function parseBrowserResourceTarget(value) {
   if (!isRecord(value)) {
     return null;
   }

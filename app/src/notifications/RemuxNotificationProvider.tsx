@@ -4,8 +4,9 @@ import { AppState, Platform } from 'react-native';
 import Constants from 'expo-constants';
 import * as Notifications from 'expo-notifications';
 
-import { useBrowserStore, matchesBrowserTabTarget } from '../browser/browserStore';
-import type { BrowserTabTarget, ViewerTab } from '../browser/browserTypes';
+import { useBrowserStore } from '../browser/browserStore';
+import type { BrowserResourceTarget, ViewerTab } from '../browser/browserTypes';
+import { serializedResourceKey } from '../browser/resourceKeys';
 import { logRemuxDebug } from '../remote/remuxDebug';
 import { useRemuxConnection, type RemuxConnection } from '../remote/RemuxConnectionProvider';
 import { useRemuxSettingsStore } from '../remote/remuxSettingsStore';
@@ -31,12 +32,14 @@ type RemuxNotificationTarget = {
   focusKind: string | null;
   handlerId: string | null;
   launch: string | null;
+  originResourceKey: string | null;
+  originTabId: string | null;
   resourceId: string | null;
   resourceKind: string | null;
 };
 
 type RemuxClientRegistration = {
-  activeTarget: BrowserTabTarget | null;
+  activeTarget: BrowserResourceTarget | null;
   appState: string;
   clientId: string;
   expoPushToken?: string;
@@ -75,7 +78,7 @@ export function RemuxNotificationProvider({ children }: { children: ReactNode })
   const pushTokenRequestInFlightRef = useRef(false);
   const sessionIdRef = useRef(nextSessionId());
   const activeTarget = useMemo(
-    () => activeBrowserTabTarget({ activeTabId, mode, tabs }),
+    () => activeBrowserResourceTarget({ activeTabId, mode, tabs }),
     [activeTabId, mode, tabs],
   );
   const activeTargetKey = useMemo(() => targetKey(activeTarget), [activeTarget]);
@@ -196,8 +199,9 @@ export function RemuxNotificationProvider({ children }: { children: ReactNode })
       return;
     }
 
-    const result = await useBrowserStore.getState().openNotificationTarget(tabTargetFromIntent(intent));
-    await dismissPresentedNotificationsForTarget(tabTargetFromIntent(intent));
+    const target = resourceTargetFromIntent(intent);
+    const result = await useBrowserStore.getState().openResource(target);
+    await dismissPresentedNotificationsForTarget(target);
     Notifications.clearLastNotificationResponse();
     logRemuxDebug('notifications:response:opened', {
       ...notificationLogDetail(intent),
@@ -361,11 +365,11 @@ function shouldSuppressIntentForCurrentView(intent: RemuxNotificationIntent) {
 
   const activeTab = state.tabs.find((tab) => tab.id === state.activeTabId);
   return activeTab
-    ? matchesBrowserTabTarget(activeTab, intent.extensionId, tabTargetFromIntent(intent))
+    ? notificationTargetMatchesBrowserTarget(intent, activeTab)
     : false;
 }
 
-async function dismissPresentedNotificationsForTarget(target: BrowserTabTarget) {
+async function dismissPresentedNotificationsForTarget(target: BrowserResourceTarget) {
   try {
     const notifications = await Notifications.getPresentedNotificationsAsync();
     await Promise.all(notifications.map(async (notification) => {
@@ -381,36 +385,20 @@ async function dismissPresentedNotificationsForTarget(target: BrowserTabTarget) 
   }
 }
 
-function notificationTargetMatchesBrowserTarget(intent: RemuxNotificationIntent, target: BrowserTabTarget) {
-  const notificationTarget = tabTargetFromIntent(intent);
-  return normalizedTargetValue(notificationTarget.extensionId) === normalizedTargetValue(target.extensionId) &&
-    normalizedTargetValue(notificationTarget.viewId) === normalizedTargetValue(target.viewId ?? 'main') &&
-    normalizedTargetValue(notificationTarget.handlerId) === normalizedTargetValue(target.handlerId) &&
-    normalizedTargetValue(notificationTarget.launch) === normalizedTargetValue(target.launch) &&
-    normalizedTargetValue(notificationTarget.resourceKind) === normalizedTargetValue(target.resourceKind) &&
-    normalizedTargetValue(notificationTarget.resourceId) === normalizedTargetValue(target.resourceId);
+function notificationTargetMatchesBrowserTarget(intent: RemuxNotificationIntent, target: BrowserResourceTarget) {
+  const intentKey = serializedResourceKey(resourceTargetFromIntent(intent));
+  return intentKey !== null && intentKey === serializedResourceKey(target);
 }
 
-function targetKey(target: BrowserTabTarget | null) {
+function targetKey(target: BrowserResourceTarget | null) {
   if (!target) {
     return null;
   }
 
-  return [
-    normalizedTargetValue(target.extensionId),
-    normalizedTargetValue(target.viewId ?? 'main'),
-    normalizedTargetValue(target.handlerId),
-    normalizedTargetValue(target.launch),
-    normalizedTargetValue(target.resourceKind),
-    normalizedTargetValue(target.resourceId),
-  ].join('\u0000');
+  return serializedResourceKey(target);
 }
 
-function normalizedTargetValue(value: string | null | undefined) {
-  return value?.trim() || null;
-}
-
-function activeBrowserTabTarget({
+function activeBrowserResourceTarget({
   activeTabId,
   mode,
   tabs,
@@ -418,7 +406,7 @@ function activeBrowserTabTarget({
   activeTabId: string | null;
   mode: string;
   tabs: ViewerTab[];
-}): BrowserTabTarget | null {
+}): BrowserResourceTarget | null {
   if (mode !== 'surface' || !activeTabId) {
     return null;
   }
@@ -438,11 +426,17 @@ function activeBrowserTabTarget({
   };
 }
 
-function tabTargetFromIntent(intent: RemuxNotificationIntent): BrowserTabTarget {
+function resourceTargetFromIntent(intent: RemuxNotificationIntent): BrowserResourceTarget {
   return {
     extensionId: intent.extensionId,
+    focusId: intent.target.focusId,
+    focusKind: intent.target.focusKind,
     handlerId: intent.target.handlerId,
     launch: intent.target.launch,
+    origin: {
+      resourceKey: intent.target.originResourceKey,
+      tabId: intent.target.originTabId,
+    },
     resourceId: intent.target.resourceId,
     resourceKind: intent.target.resourceKind,
     viewId: intent.viewId,
@@ -479,6 +473,8 @@ function parseNotificationIntent(value: unknown): RemuxNotificationIntent | null
       focusKind: optionalString(target.focusKind),
       handlerId: optionalString(target.handlerId),
       launch: optionalString(target.launch),
+      originResourceKey: optionalString(target.originResourceKey),
+      originTabId: optionalString(target.originTabId),
       resourceId: optionalString(target.resourceId),
       resourceKind: optionalString(target.resourceKind),
     },

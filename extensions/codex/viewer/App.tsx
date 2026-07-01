@@ -6,7 +6,7 @@ import { composerResourcesFromSnapshot } from './composer/model/userInputInterop
 import { ComposerMentionPicker } from './composer/mentions/MentionPicker';
 import { parseComposerMentionQuery } from './composer/mentions/mentionSearch';
 import { useComposerStore } from './composer/store';
-import { updateHostTab } from './ipc/host';
+import { subscribeHostNavigate, updateHostTab } from '@remux/viewer-kit/host';
 import { useHostStore } from './ipc/hostStore';
 import { subscribeCodexResourceInvalidations } from './ipc/resourceInvalidations';
 import type { RemuxHostViewportMetrics } from './ipc/types';
@@ -19,6 +19,7 @@ import { NewChatDirectoryPicker } from './threads/newChat/DirectoryPicker';
 import { CodexSidebar } from './threads/Sidebar';
 import { shortenPath, threadTitle } from './threads/threadFormat';
 import { CodexTranscript } from './transcript';
+import { requestTranscriptTurnScroll } from './transcript/viewportStore';
 
 export function App() {
   const connectionStatus = useHostStore((state) => state.connectionStatus);
@@ -319,6 +320,17 @@ export function App() {
 
   useEffect(() => subscribeCodexResourceInvalidations(), []);
 
+  useEffect(() => subscribeHostNavigate((navigation) => {
+    if (navigation.resourceKind !== 'thread' || !navigation.resourceId) {
+      return;
+    }
+
+    void useThreadsStore.getState().selectThread(navigation.resourceId);
+    if (navigation.focusKind === 'turn' && navigation.focusId) {
+      requestTranscriptTurnScroll(navigation.resourceId, navigation.focusId);
+    }
+  }), []);
+
   useEffect(() => {
     if (newChatDefaultCwd) {
       setDefaultCwd(newChatDefaultCwd);
@@ -490,6 +502,8 @@ function NewChatEmptyState({ cwd }: { cwd: string | null }) {
 }
 
 type CodexLaunchResource = {
+  focusId: string | null;
+  focusKind: string | null;
   launch: string | null;
   resourceId: string | null;
   resourceKind: string | null;
@@ -505,6 +519,8 @@ function resourceFromLocationParams(params: URLSearchParams): CodexLaunchResourc
   }
 
   return {
+    focusId: params.get('remuxFocusId'),
+    focusKind: params.get('remuxFocusKind'),
     launch,
     resourceId,
     resourceKind,
@@ -514,6 +530,9 @@ function resourceFromLocationParams(params: URLSearchParams): CodexLaunchResourc
 function attachCodexResource(resource: CodexLaunchResource) {
   if (resource.resourceKind === 'thread' && resource.resourceId) {
     void useThreadsStore.getState().selectThread(resource.resourceId);
+    if (resource.focusKind === 'turn' && resource.focusId) {
+      requestTranscriptTurnScroll(resource.resourceId, resource.focusId);
+    }
     return;
   }
 

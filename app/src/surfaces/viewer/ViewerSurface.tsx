@@ -15,7 +15,8 @@ type ViewerSurfaceProps = {
 
 export function ViewerSurface({ active, onOpenOverview, surfaceRef, tab }: ViewerSurfaceProps) {
   const extensions = useBrowserStore((state) => state.extensions);
-  const openExtensionTab = useBrowserStore((state) => state.openExtensionTab);
+  const clearPendingNavigation = useBrowserStore((state) => state.clearPendingNavigation);
+  const openResource = useBrowserStore((state) => state.openResource);
   const updateTab = useBrowserStore((state) => state.updateTab);
   const sourceUrlRef = useRef(tab.url);
   const descriptorRef = useRef({
@@ -25,7 +26,7 @@ export function ViewerSurface({ active, onOpenOverview, surfaceRef, tab }: Viewe
     title: tab.title,
     url: tab.url,
   });
-  const openFile = useCallback(({ path }: { line?: number | null; path: string }) => {
+  const openFile = useCallback(({ line, path }: { line?: number | null; path: string }) => {
     const name = fileNameFromPath(path);
     const fileHandler = matchingFileHandlers(extensions, { kind: 'file', name })[0] ?? null;
     if (!fileHandler) {
@@ -35,7 +36,10 @@ export function ViewerSurface({ active, onOpenOverview, surfaceRef, tab }: Viewe
       };
     }
 
-    openExtensionTab(fileHandler.extensionId, {
+    void openResource({
+      extensionId: fileHandler.extensionId,
+      focusId: line ? String(line) : null,
+      focusKind: line ? 'line' : null,
       handlerId: fileHandler.id,
       resourceId: path,
       resourceKind: 'file',
@@ -45,7 +49,7 @@ export function ViewerSurface({ active, onOpenOverview, surfaceRef, tab }: Viewe
     return {
       ok: true,
     };
-  }, [extensions, openExtensionTab]);
+  }, [extensions, openResource]);
 
   useEffect(() => {
     const descriptor = descriptorRef.current;
@@ -61,10 +65,13 @@ export function ViewerSurface({ active, onOpenOverview, surfaceRef, tab }: Viewe
       active={active}
       onOpenFile={openFile}
       onOpenOverview={onOpenOverview}
+      onNavigationDelivered={(nonce) => clearPendingNavigation(tab.id, nonce)}
       ref={surfaceRef}
       onTabUpdate={(patch) => updateTab(tab.id, patch)}
+      pendingNavigation={tab.pendingNavigation}
       reloadSourceUrl={tab.url}
       sourceUrl={sourceUrlRef.current}
+      tab={tab}
       title={tab.title}
     />
   );

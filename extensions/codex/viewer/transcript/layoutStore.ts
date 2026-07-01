@@ -269,13 +269,13 @@ export function configureTranscriptLayoutResourceAdapter(adapter: TranscriptLayo
   resourceAdapter = adapter;
 }
 
-export function resetTranscriptLayoutForThread() {
+export function resetTranscriptLayoutForThread(threadId?: string | null) {
   layoutStore.setState({
     disclosure: emptyDisclosureState(),
     turnOrder: [],
     turnsById: {},
   });
-  resetTranscriptViewportForThread();
+  resetTranscriptViewportForThread(threadId);
 }
 
 export function reconcileTranscriptLayoutFromResources(

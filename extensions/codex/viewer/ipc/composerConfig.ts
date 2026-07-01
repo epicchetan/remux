@@ -3,7 +3,7 @@ import type {
   CodexComposerConfigWriteParams,
   CodexComposerConfigWriteResponse,
 } from '../../shared/composerConfig';
-import { requestIpc } from './client';
+import { requestIpc } from '@remux/viewer-kit/ipc';
 
 export const composerConfigReadMethod = 'remux/codex/composer/config/read';
 export const composerConfigWriteMethod = 'remux/codex/composer/config/write';

@@ -6,7 +6,7 @@ import { invalidateThreadResources } from '../threads/historyStore';
 import { invalidateThreadComposerStateResources } from '../threads/composerStateStore';
 import { invalidateThreadRuntimeResources } from '../threads/runtimeStore';
 import { invalidateTranscriptResources } from '../transcript/store';
-import { subscribeIpcEvents } from './client';
+import { subscribeIpcEvents } from '@remux/viewer-kit/ipc';
 
 export const resourcesInvalidatedMethod = 'remux/codex/resources/invalidated';
 
