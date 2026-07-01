@@ -1,8 +1,20 @@
 :root {
-  color-scheme: dark;
-  font-family: Arial, "Helvetica Neue", sans-serif;
+  --remux-editor-syntax-comment: #71717a;
+  --remux-editor-syntax-keyword: #c084fc;
+  --remux-editor-syntax-atom: var(--rmx-accent);
+  --remux-editor-syntax-number: #f59e0b;
+  --remux-editor-syntax-string: #86efac;
+  --remux-editor-syntax-regexp: #fca5a5;
+  --remux-editor-syntax-name: var(--rmx-code-text);
+  --remux-editor-syntax-function: #7dd3fc;
+  --remux-editor-syntax-type: #fbbf24;
+  --remux-editor-syntax-property: #93c5fd;
+  --remux-editor-syntax-operator: var(--rmx-text-muted);
+  --remux-editor-syntax-tag: #fb7185;
+  --remux-editor-syntax-link: var(--rmx-focus-ring);
+  font-family: var(--rmx-font-sans);
   background: var(--rmx-surface);
-  color: #f4f4f5;
+  color: var(--rmx-text);
 }
 
 * {
@@ -48,7 +60,7 @@ body {
 }
 
 .remux-editor-empty-title {
-  color: #f4f4f5;
+  color: var(--rmx-text);
   font-size: 18px;
   font-weight: 800;
   line-height: 24px;
@@ -56,7 +68,7 @@ body {
 
 .remux-editor-empty-copy {
   margin-top: 8px;
-  color: #a1a1aa;
+  color: var(--rmx-text-muted);
   font-size: 14px;
   line-height: 20px;
 }
@@ -65,8 +77,8 @@ body {
   width: 18px;
   height: 18px;
   margin: 0 auto 10px;
-  border: 2px solid rgba(244, 244, 245, 0.18);
-  border-top-color: #f97316;
+  border: 2px solid color-mix(in srgb, var(--rmx-text) 18%, transparent);
+  border-top-color: var(--rmx-accent);
   border-radius: 999px;
   animation: remux-editor-spin 800ms linear infinite;
 }
@@ -87,13 +99,13 @@ body {
 .remux-editor-codemirror .cm-editor {
   height: 100%;
   background: var(--rmx-surface);
-  color: #e4e4e7;
+  color: var(--rmx-code-text);
   font-size: 13px;
   outline: none !important;
 }
 
 .remux-editor-codemirror .cm-scroller {
-  font-family: Menlo, Consolas, "Liberation Mono", monospace;
+  font-family: var(--rmx-font-mono);
   line-height: 20px;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
@@ -113,7 +125,7 @@ body {
 .remux-editor-codemirror .cm-gutters {
   border-right: 0;
   background: var(--rmx-surface);
-  color: #71717a;
+  color: var(--rmx-text-muted);
   user-select: none;
 }
 
@@ -128,11 +140,11 @@ body {
 }
 
 .remux-editor-codemirror .cm-remux-line-number-cell-added {
-  background: rgb(34 197 94 / 28%);
+  background: color-mix(in srgb, var(--rmx-success) 28%, transparent);
 }
 
 .remux-editor-codemirror .cm-remux-line-number-cell-deleted {
-  background: rgb(239 68 68 / 28%);
+  background: color-mix(in srgb, var(--rmx-danger) 28%, transparent);
 }
 
 .remux-editor-codemirror .cm-activeLine,
@@ -142,7 +154,7 @@ body {
 
 .remux-editor-codemirror .cm-selectionBackground,
 .remux-editor-codemirror .cm-focused .cm-selectionBackground {
-  background: rgb(96 165 250 / 28%);
+  background: color-mix(in srgb, var(--rmx-focus-ring) 28%, transparent);
 }
 
 .remux-editor-codemirror .cm-cursor {
@@ -157,12 +169,12 @@ body {
 }
 
 .remux-editor-codemirror .cm-searchMatch {
-  background: rgb(249 115 22 / 25%);
+  background: color-mix(in srgb, var(--rmx-accent) 25%, transparent);
 }
 
 .remux-editor-codemirror .cm-changedLine,
 .remux-editor-codemirror .cm-inlineChangedLine {
-  background: rgb(34 197 94 / 17%);
+  background: color-mix(in srgb, var(--rmx-success) 17%, transparent);
 }
 
 .remux-editor-codemirror .cm-deletedChunk {
@@ -173,8 +185,8 @@ body {
 
 .remux-editor-codemirror .cm-deletedLine {
   display: block;
-  color: #fecaca;
-  background: rgb(239 68 68 / 14%);
+  color: color-mix(in srgb, var(--rmx-danger) 76%, var(--rmx-text) 24%);
+  background: color-mix(in srgb, var(--rmx-danger) 14%, transparent);
 }
 
 .remux-editor-codemirror .cm-insertedLine,
@@ -185,20 +197,20 @@ body {
 }
 
 .remux-editor-codemirror .cm-changedText {
-  background: rgb(34 197 94 / 26%);
+  background: color-mix(in srgb, var(--rmx-success) 26%, transparent);
 }
 
 .remux-editor-codemirror .cm-deletedText {
-  background: rgb(239 68 68 / 20%);
+  background: color-mix(in srgb, var(--rmx-danger) 20%, transparent);
 }
 
 .remux-editor-codemirror .cm-editor.cm-merge-b .cm-changedText {
-  background: rgb(34 197 94 / 26%) !important;
+  background: color-mix(in srgb, var(--rmx-success) 26%, transparent) !important;
 }
 
 .remux-editor-codemirror .cm-editor.cm-merge-b .cm-deletedText,
 .remux-editor-codemirror .cm-deletedChunk .cm-deletedText {
-  background: rgb(239 68 68 / 20%) !important;
+  background: color-mix(in srgb, var(--rmx-danger) 20%, transparent) !important;
 }
 
 @keyframes remux-editor-spin {

@@ -8,6 +8,7 @@ type MarkdownCodeBlockProps = ComponentPropsWithoutRef<'code'> & {
 
 const maxHighlightedCodeLength = 80_000;
 const highlightedCodeCache = new Map<string, string>();
+const markdownShikiThemeDark = 'github-dark';
 
 export function MarkdownCodeBlock({
   children,
@@ -39,7 +40,7 @@ function HighlightedCodeBlock({
 }) {
   const [html, setHtml] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
-  const cacheKey = useMemo(() => `github-dark:${language}:${source}`, [language, source]);
+  const cacheKey = useMemo(() => `${markdownShikiThemeDark}:${language}:${source}`, [language, source]);
   const shouldHighlight = source.length <= maxHighlightedCodeLength;
 
   useEffect(() => {
@@ -55,7 +56,7 @@ function HighlightedCodeBlock({
     void import('shiki')
       .then(({ codeToHtml }) => codeToHtml(source, {
         lang: language,
-        theme: 'github-dark',
+        theme: markdownShikiThemeDark,
       }))
       .then((value) => {
         highlightedCodeCache.set(cacheKey, value);

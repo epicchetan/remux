@@ -40,6 +40,9 @@ export const primitiveGroups: TokenGroup[] = [
     tokens: {
       'orange-700': '#c45424',
       'orange-500': '#f97316',
+      'orange-800': '#9f3a16',
+      'orange-900': '#8f2f13',
+      'orange-950': '#5f1d0d',
       'orange-50': '#fff7ed',
     },
   },
@@ -98,6 +101,11 @@ export const semanticGroups: TokenGroup[] = [
       'surface-raised': 'var(--rmx-neutral-900)',
       'surface-hover': 'var(--rmx-neutral-800)',
       border: 'var(--rmx-neutral-700)',
+      'border-subtle': 'rgb(255 255 255 / 8%)',
+      overlay: 'rgb(255 255 255 / 10%)',
+      'code-bg': 'var(--rmx-surface-raised)',
+      'code-border': 'var(--rmx-border-subtle)',
+      'code-text': 'var(--rmx-text)',
     },
   },
   {
@@ -117,6 +125,17 @@ export const semanticGroups: TokenGroup[] = [
       danger: 'var(--rmx-red-400)',
       success: 'var(--rmx-green-400)',
       warning: 'var(--rmx-amber-400)',
+    },
+  },
+  {
+    label: 'Primary raised button recipe',
+    tokens: {
+      'primary-border': 'var(--rmx-orange-800)',
+      'primary-edge': 'var(--rmx-orange-900)',
+      'primary-shadow': 'var(--rmx-orange-950)',
+      'primary-highlight': 'rgb(255 255 255 / 14%)',
+      'primary-shadow-inset': 'rgb(52 16 6 / 36%)',
+      'primary-shadow-drop': 'color-mix(in srgb, var(--rmx-primary-shadow) 88%, black)',
     },
   },
   {

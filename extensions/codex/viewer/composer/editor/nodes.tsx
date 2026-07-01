@@ -260,7 +260,7 @@ function applyReferenceElement(
   element.setAttribute('spellcheck', 'false');
 
   const icon = reference.media === 'folder'
-    ? folderIconDataUri()
+    ? null
     : fileTypeIconDataUri({
         extension: fileExtensionFromName(reference.name),
         fileName: reference.name,
@@ -271,12 +271,17 @@ function applyReferenceElement(
   } else {
     element.style.removeProperty('--remux-composer-token-icon');
   }
+  if (reference.media === 'folder') {
+    element.style.setProperty('--remux-composer-token-mask', folderIconMaskDataUri());
+  } else {
+    element.style.removeProperty('--remux-composer-token-mask');
+  }
 
   element.title = reference.title;
 }
 
-function folderIconDataUri() {
-  const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#a8b0bf" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3.75 6.75A2.25 2.25 0 0 1 6 4.5h4.1c.55 0 1.06.25 1.4.68l1.03 1.32H18A2.25 2.25 0 0 1 20.25 8.75v8.5A2.25 2.25 0 0 1 18 19.5H6a2.25 2.25 0 0 1-2.25-2.25V6.75Z"/></svg>';
+function folderIconMaskDataUri() {
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3.75 6.75A2.25 2.25 0 0 1 6 4.5h4.1c.55 0 1.06.25 1.4.68l1.03 1.32H18A2.25 2.25 0 0 1 20.25 8.75v8.5A2.25 2.25 0 0 1 18 19.5H6a2.25 2.25 0 0 1-2.25-2.25V6.75Z"/></svg>';
   return `url("data:image/svg+xml,${encodeURIComponent(svg)}")`;
 }
 

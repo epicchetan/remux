@@ -37,22 +37,22 @@ const codeMirrorDiffConfig = {
   timeout: 500,
 } as const;
 
-const remuxCodeMirrorTheme = EditorView.theme({}, { dark: true });
+const remuxCodeMirrorThemeDark = EditorView.theme({}, { dark: true });
 
-const remuxHighlightStyle = HighlightStyle.define([
-  { tag: tags.comment, color: '#71717a', fontStyle: 'italic' },
-  { tag: tags.keyword, color: '#c084fc' },
-  { tag: [tags.atom, tags.bool, tags.null], color: '#f97316' },
-  { tag: [tags.number, tags.integer, tags.float], color: '#f59e0b' },
-  { tag: [tags.string, tags.special(tags.string)], color: '#86efac' },
-  { tag: tags.regexp, color: '#fca5a5' },
-  { tag: [tags.name, tags.variableName], color: '#e4e4e7' },
-  { tag: [tags.definition(tags.variableName), tags.function(tags.variableName)], color: '#7dd3fc' },
-  { tag: [tags.typeName, tags.className], color: '#fbbf24' },
-  { tag: [tags.propertyName, tags.attributeName], color: '#93c5fd' },
-  { tag: tags.operator, color: '#a1a1aa' },
-  { tag: [tags.tagName, tags.heading], color: '#fb7185' },
-  { tag: tags.link, color: '#60a5fa' },
+const remuxHighlightStyleDark = HighlightStyle.define([
+  { tag: tags.comment, color: 'var(--remux-editor-syntax-comment)', fontStyle: 'italic' },
+  { tag: tags.keyword, color: 'var(--remux-editor-syntax-keyword)' },
+  { tag: [tags.atom, tags.bool, tags.null], color: 'var(--remux-editor-syntax-atom)' },
+  { tag: [tags.number, tags.integer, tags.float], color: 'var(--remux-editor-syntax-number)' },
+  { tag: [tags.string, tags.special(tags.string)], color: 'var(--remux-editor-syntax-string)' },
+  { tag: tags.regexp, color: 'var(--remux-editor-syntax-regexp)' },
+  { tag: [tags.name, tags.variableName], color: 'var(--remux-editor-syntax-name)' },
+  { tag: [tags.definition(tags.variableName), tags.function(tags.variableName)], color: 'var(--remux-editor-syntax-function)' },
+  { tag: [tags.typeName, tags.className], color: 'var(--remux-editor-syntax-type)' },
+  { tag: [tags.propertyName, tags.attributeName], color: 'var(--remux-editor-syntax-property)' },
+  { tag: tags.operator, color: 'var(--remux-editor-syntax-operator)' },
+  { tag: [tags.tagName, tags.heading], color: 'var(--remux-editor-syntax-tag)' },
+  { tag: tags.link, color: 'var(--remux-editor-syntax-link)' },
   { tag: tags.emphasis, fontStyle: 'italic' },
   { tag: tags.strong, fontWeight: '700' },
 ]);
@@ -100,8 +100,8 @@ export function CodeMirrorViewer({
         minimalSetup,
         EditorState.readOnly.of(true),
         EditorView.editable.of(false),
-        remuxCodeMirrorTheme,
-        syntaxHighlighting(remuxHighlightStyle),
+        remuxCodeMirrorThemeDark,
+        syntaxHighlighting(remuxHighlightStyleDark),
         mergeCompartmentRef.current.of(mergeExtension),
         language,
       ].filter(Boolean) as Extension[],

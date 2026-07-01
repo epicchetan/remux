@@ -42,3 +42,5 @@ Canonical code: ...
 | --- | --- | --- |
 | [viewer-kit.md](viewer-kit.md) | Active Spec | `@remux/viewer-kit` SDK Phase 1: host bridge, bootstrap, UI primitives, and the shared design-token contract. Satellites migrated; lifecycle deferred. |
 | [viewer-kit-phase-2.md](viewer-kit-phase-2.md) | Active Spec | Phase 2 frame depth: dual-substrate theme system, codex color onboarding, and the component library. Chat primitives + lifecycle out of scope. |
+| [viewer-kit-phase-3.md](viewer-kit-phase-3.md) | Active Spec | Theme-readiness & ownership: classify every theme-sensitive color as kit role / viewer extension / engine palette and tokenize the dark side. Substrate-neutral; Tailwind convergence is an optional Phase 4. Prerequisite for light mode. |
+| [viewer-kit-light-mode.md](viewer-kit-light-mode.md) | Active Spec | System-tied (`prefers-color-scheme`) light theme: semantic-tier remap + engine light palettes (xterm/CodeMirror/Shiki/Mermaid) + RN shell flash-fix. |

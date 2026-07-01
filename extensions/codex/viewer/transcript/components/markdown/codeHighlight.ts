@@ -17,8 +17,9 @@ export type CodeHighlightResult = {
   lines: CodeHighlightLine[];
 };
 
+const codexShikiThemeDark = 'github-dark-default';
 const codeThemes = {
-  dark: 'github-dark-default',
+  dark: codexShikiThemeDark,
 } as const satisfies Record<CodeHighlightTheme, BundledTheme>;
 
 const bundledLanguages = [

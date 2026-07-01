@@ -91,6 +91,28 @@ import {
 import { setupTouchScroll } from './touchScroll';
 
 const fontFamily = 'Menlo, Consolas, "Liberation Mono", monospace';
+const terminalThemeDark = {
+  background: '#09090b',
+  black: '#18181b',
+  blue: '#60a5fa',
+  brightBlack: '#71717a',
+  brightBlue: '#93c5fd',
+  brightCyan: '#67e8f9',
+  brightGreen: '#86efac',
+  brightMagenta: '#f0abfc',
+  brightRed: '#fca5a5',
+  brightWhite: '#fafafa',
+  brightYellow: '#fde68a',
+  cursor: '#f97316',
+  cyan: '#22d3ee',
+  foreground: '#e4e4e7',
+  green: '#4ade80',
+  magenta: '#e879f9',
+  red: '#f87171',
+  selectionBackground: '#3f3f46',
+  white: '#e4e4e7',
+  yellow: '#facc15',
+} as const;
 const textEncoder = new TextEncoder();
 const fitDebounceMs = 180;
 const commandTitleDelayMs = 500;
@@ -798,28 +820,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
         lineHeight: 1.16,
         rescaleOverlappingGlyphs: true,
         scrollback: 5000,
-        theme: {
-          background: '#09090b',
-          black: '#18181b',
-          blue: '#60a5fa',
-          brightBlack: '#71717a',
-          brightBlue: '#93c5fd',
-          brightCyan: '#67e8f9',
-          brightGreen: '#86efac',
-          brightMagenta: '#f0abfc',
-          brightRed: '#fca5a5',
-          brightWhite: '#fafafa',
-          brightYellow: '#fde68a',
-          cursor: '#f97316',
-          cyan: '#22d3ee',
-          foreground: '#e4e4e7',
-          green: '#4ade80',
-          magenta: '#e879f9',
-          red: '#f87171',
-          selectionBackground: '#3f3f46',
-          white: '#e4e4e7',
-          yellow: '#facc15',
-        },
+        theme: terminalThemeDark,
       });
 
       const unicode11 = new Unicode11Addon();

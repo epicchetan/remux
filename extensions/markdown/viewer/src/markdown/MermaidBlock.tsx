@@ -6,6 +6,10 @@ type MermaidBlockProps = {
 
 let initialized = false;
 let mermaidModulePromise: Promise<typeof import('mermaid')> | null = null;
+const mermaidThemeConfigDark = {
+  darkMode: true,
+  theme: 'dark',
+} as const;
 
 type MermaidRenderState =
   | { status: 'loading' }
@@ -85,11 +89,10 @@ function initializeMermaid(mermaid: typeof import('mermaid').default) {
   }
 
   mermaid.initialize({
-    darkMode: true,
     fontFamily: 'Arial, "Helvetica Neue", sans-serif',
     securityLevel: 'strict',
     startOnLoad: false,
-    theme: 'dark',
+    ...mermaidThemeConfigDark,
   });
   initialized = true;
 }

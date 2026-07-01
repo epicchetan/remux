@@ -1,8 +1,23 @@
 :root {
-  color-scheme: dark;
-  font-family: Arial, "Helvetica Neue", sans-serif;
+  --remux-markdown-alert-fg: color-mix(in srgb, var(--rmx-text) 86%, var(--rmx-text-muted) 14%);
+  --remux-markdown-alert-note-border: var(--rmx-focus-ring);
+  --remux-markdown-alert-note-bg: color-mix(in srgb, var(--rmx-focus-ring) 8%, transparent);
+  --remux-markdown-alert-note-title: color-mix(in srgb, var(--rmx-focus-ring) 72%, var(--rmx-text));
+  --remux-markdown-alert-tip-border: var(--rmx-success);
+  --remux-markdown-alert-tip-bg: color-mix(in srgb, var(--rmx-success) 8%, transparent);
+  --remux-markdown-alert-tip-title: color-mix(in srgb, var(--rmx-success) 72%, var(--rmx-text));
+  --remux-markdown-alert-important-border: #a78bfa;
+  --remux-markdown-alert-important-bg: rgb(167 139 250 / 9%);
+  --remux-markdown-alert-important-title: #c4b5fd;
+  --remux-markdown-alert-warning-border: var(--rmx-warning);
+  --remux-markdown-alert-warning-bg: color-mix(in srgb, var(--rmx-warning) 9%, transparent);
+  --remux-markdown-alert-warning-title: color-mix(in srgb, var(--rmx-warning) 78%, var(--rmx-text));
+  --remux-markdown-alert-caution-border: var(--rmx-danger);
+  --remux-markdown-alert-caution-bg: color-mix(in srgb, var(--rmx-danger) 9%, transparent);
+  --remux-markdown-alert-caution-title: color-mix(in srgb, var(--rmx-danger) 76%, var(--rmx-text));
+  font-family: var(--rmx-font-sans);
   background: var(--rmx-surface);
-  color: #f4f4f5;
+  color: var(--rmx-text);
 }
 
 * {
@@ -48,7 +63,7 @@ body {
 }
 
 .remux-markdown-empty-title {
-  color: #f4f4f5;
+  color: var(--rmx-text);
   font-size: 18px;
   font-weight: 800;
   line-height: 24px;
@@ -56,7 +71,7 @@ body {
 
 .remux-markdown-empty-copy {
   margin-top: 8px;
-  color: #a1a1aa;
+  color: var(--rmx-text-muted);
   font-size: 14px;
   line-height: 20px;
 }
@@ -65,8 +80,8 @@ body {
   width: 18px;
   height: 18px;
   margin: 0 auto 10px;
-  border: 2px solid rgba(244, 244, 245, 0.18);
-  border-top-color: #60a5fa;
+  border: 2px solid color-mix(in srgb, var(--rmx-text) 18%, transparent);
+  border-top-color: var(--rmx-focus-ring);
   border-radius: 999px;
   animation: remux-markdown-spin 800ms linear infinite;
 }
@@ -87,7 +102,7 @@ body {
   min-width: 0;
   margin: 0 auto;
   padding: calc(env(safe-area-inset-top) + 22px) 20px 34px;
-  color: #e4e4e7;
+  color: var(--rmx-text);
   font-size: 16px;
   line-height: 1.58;
   overflow-wrap: break-word;
@@ -108,7 +123,7 @@ body {
 .remux-markdown-document h5,
 .remux-markdown-document h6 {
   margin: 1.45em 0 0.55em;
-  color: #fafafa;
+  color: var(--rmx-text);
   font-weight: 800;
   letter-spacing: 0;
   line-height: 1.18;
@@ -121,7 +136,7 @@ body {
 
 .remux-markdown-document h2 {
   padding-bottom: 8px;
-  border-bottom: 1px solid rgb(255 255 255 / 9%);
+  border-bottom: 1px solid var(--rmx-border-subtle);
   font-size: 24px;
 }
 
@@ -147,38 +162,38 @@ body {
 }
 
 .remux-markdown-document a {
-  color: #93c5fd;
+  color: var(--rmx-focus-ring);
   text-decoration: none;
   overflow-wrap: anywhere;
 }
 
 .remux-markdown-document a:active {
-  color: #bfdbfe;
+  color: color-mix(in srgb, var(--rmx-focus-ring) 78%, var(--rmx-text) 22%);
 }
 
 .remux-markdown-document strong {
-  color: #f4f4f5;
+  color: var(--rmx-text);
   font-weight: 800;
 }
 
 .remux-markdown-document blockquote {
   padding: 2px 0 2px 14px;
-  border-left: 3px solid #3f3f46;
-  color: #c4c4cc;
+  border-left: 3px solid var(--rmx-border);
+  color: color-mix(in srgb, var(--rmx-text-muted) 72%, var(--rmx-text) 28%);
 }
 
 .remux-markdown-document blockquote.remux-markdown-alert {
   padding: 12px 14px;
-  border: 1px solid rgb(255 255 255 / 8%);
-  border-left: 4px solid #60a5fa;
+  border: 1px solid var(--rmx-border-subtle);
+  border-left: 4px solid var(--remux-markdown-alert-note-border);
   border-radius: 8px;
-  background: rgb(96 165 250 / 8%);
-  color: #d4d4d8;
+  background: var(--remux-markdown-alert-note-bg);
+  color: var(--remux-markdown-alert-fg);
 }
 
 .remux-markdown-alert-title {
   margin-bottom: 6px;
-  color: #bfdbfe;
+  color: var(--remux-markdown-alert-note-title);
   font-size: 13px;
   font-weight: 800;
   letter-spacing: 0.02em;
@@ -190,44 +205,44 @@ body {
 }
 
 .remux-markdown-document blockquote.remux-markdown-alert-note {
-  border-left-color: #60a5fa;
-  background: rgb(96 165 250 / 8%);
+  border-left-color: var(--remux-markdown-alert-note-border);
+  background: var(--remux-markdown-alert-note-bg);
 }
 
 .remux-markdown-document blockquote.remux-markdown-alert-tip {
-  border-left-color: #22c55e;
-  background: rgb(34 197 94 / 8%);
+  border-left-color: var(--remux-markdown-alert-tip-border);
+  background: var(--remux-markdown-alert-tip-bg);
 }
 
 .remux-markdown-document blockquote.remux-markdown-alert-tip .remux-markdown-alert-title {
-  color: #86efac;
+  color: var(--remux-markdown-alert-tip-title);
 }
 
 .remux-markdown-document blockquote.remux-markdown-alert-important {
-  border-left-color: #a78bfa;
-  background: rgb(167 139 250 / 9%);
+  border-left-color: var(--remux-markdown-alert-important-border);
+  background: var(--remux-markdown-alert-important-bg);
 }
 
 .remux-markdown-document blockquote.remux-markdown-alert-important .remux-markdown-alert-title {
-  color: #c4b5fd;
+  color: var(--remux-markdown-alert-important-title);
 }
 
 .remux-markdown-document blockquote.remux-markdown-alert-warning {
-  border-left-color: #f59e0b;
-  background: rgb(245 158 11 / 9%);
+  border-left-color: var(--remux-markdown-alert-warning-border);
+  background: var(--remux-markdown-alert-warning-bg);
 }
 
 .remux-markdown-document blockquote.remux-markdown-alert-warning .remux-markdown-alert-title {
-  color: #fbbf24;
+  color: var(--remux-markdown-alert-warning-title);
 }
 
 .remux-markdown-document blockquote.remux-markdown-alert-caution {
-  border-left-color: #ef4444;
-  background: rgb(239 68 68 / 9%);
+  border-left-color: var(--remux-markdown-alert-caution-border);
+  background: var(--remux-markdown-alert-caution-bg);
 }
 
 .remux-markdown-document blockquote.remux-markdown-alert-caution .remux-markdown-alert-title {
-  color: #fca5a5;
+  color: var(--remux-markdown-alert-caution-title);
 }
 
 .remux-markdown-document ul,
@@ -252,7 +267,7 @@ body {
   height: 16px;
   margin: 0 7px 0 -20px;
   vertical-align: -2px;
-  accent-color: #60a5fa;
+  accent-color: var(--rmx-focus-ring);
 }
 
 .remux-markdown-document input[type="checkbox"][disabled] {
@@ -261,9 +276,9 @@ body {
 
 .remux-markdown-document code {
   border-radius: 6px;
-  background: rgb(255 255 255 / 7%);
-  color: #f4f4f5;
-  font-family: Menlo, Consolas, "Liberation Mono", monospace;
+  background: var(--rmx-code-bg);
+  color: var(--rmx-code-text);
+  font-family: var(--rmx-font-mono);
   font-size: 0.88em;
   padding: 0.16em 0.36em;
 }
@@ -276,17 +291,17 @@ body {
 .remux-markdown-pre-block > code,
 .remux-markdown-document pre {
   overflow-x: auto;
-  border: 1px solid rgb(255 255 255 / 8%);
+  border: 1px solid var(--rmx-code-border);
   border-radius: 8px;
-  background: var(--rmx-surface-raised);
+  background: var(--rmx-code-bg);
   -webkit-overflow-scrolling: touch;
 }
 
 .remux-markdown-pre-block > code {
   display: block;
   padding: 14px;
-  color: #f4f4f5;
-  font-family: Menlo, Consolas, "Liberation Mono", monospace;
+  color: var(--rmx-code-text);
+  font-family: var(--rmx-font-mono);
   font-size: 13px;
   line-height: 20px;
   white-space: pre;
@@ -305,9 +320,9 @@ body {
 .remux-markdown-code-highlight {
   max-width: 100%;
   overflow-x: auto;
-  border: 1px solid rgb(255 255 255 / 8%);
+  border: 1px solid var(--rmx-code-border);
   border-radius: 8px;
-  background: var(--rmx-surface-raised);
+  background: var(--rmx-code-bg);
   -webkit-overflow-scrolling: touch;
 }
 
@@ -328,14 +343,14 @@ body {
 }
 
 .remux-markdown-code-highlight-pending pre {
-  color: #f4f4f5;
-  font-family: Menlo, Consolas, "Liberation Mono", monospace;
+  color: var(--rmx-code-text);
+  font-family: var(--rmx-font-mono);
 }
 
 .remux-markdown-table-scroll {
   max-width: 100%;
   overflow-x: auto;
-  border: 1px solid rgb(255 255 255 / 8%);
+  border: 1px solid var(--rmx-border-subtle);
   border-radius: 8px;
   -webkit-overflow-scrolling: touch;
 }
@@ -350,8 +365,8 @@ body {
 .remux-markdown-document th,
 .remux-markdown-document td {
   padding: 8px 10px;
-  border-right: 1px solid rgb(255 255 255 / 8%);
-  border-bottom: 1px solid rgb(255 255 255 / 8%);
+  border-right: 1px solid var(--rmx-border-subtle);
+  border-bottom: 1px solid var(--rmx-border-subtle);
   text-align: left;
   vertical-align: top;
 }
@@ -366,16 +381,16 @@ body {
 }
 
 .remux-markdown-document th {
-  background: rgb(255 255 255 / 7%);
-  color: #f4f4f5;
+  background: color-mix(in srgb, var(--rmx-overlay) 70%, transparent);
+  color: var(--rmx-text);
   font-weight: 800;
 }
 
 .remux-markdown-document .footnotes {
   margin-top: 28px;
   padding-top: 16px;
-  border-top: 1px solid rgb(255 255 255 / 10%);
-  color: #a1a1aa;
+  border-top: 1px solid var(--rmx-overlay);
+  color: var(--rmx-text-muted);
   font-size: 14px;
   line-height: 1.5;
 }
@@ -384,7 +399,7 @@ body {
   margin-top: 0;
   padding-bottom: 0;
   border-bottom: 0;
-  color: #d4d4d8;
+  color: color-mix(in srgb, var(--rmx-text) 80%, var(--rmx-text-muted) 20%);
   font-size: 15px;
   line-height: 20px;
 }
@@ -399,21 +414,21 @@ body {
 }
 
 .remux-markdown-document a[data-footnote-backref] {
-  color: #71717a;
+  color: var(--rmx-text-muted);
 }
 
 .remux-markdown-document hr {
   height: 1px;
   margin: 24px 0;
   border: 0;
-  background: rgb(255 255 255 / 10%);
+  background: var(--rmx-overlay);
 }
 
 .remux-markdown-image-wrap {
   display: block;
   overflow: hidden;
   border-radius: 8px;
-  background: rgb(255 255 255 / 3%);
+  background: color-mix(in srgb, var(--rmx-overlay) 30%, transparent);
 }
 
 .remux-markdown-image-wrap img {
@@ -432,24 +447,24 @@ body {
   place-items: center;
   gap: 4px;
   padding: 16px;
-  border: 1px solid rgb(255 255 255 / 8%);
+  border: 1px solid var(--rmx-border-subtle);
   border-radius: 8px;
-  background: rgb(255 255 255 / 4%);
-  color: #a1a1aa;
+  background: color-mix(in srgb, var(--rmx-overlay) 40%, transparent);
+  color: var(--rmx-text-muted);
   font-size: 13px;
   line-height: 18px;
   text-align: center;
 }
 
 .remux-markdown-image-placeholder-title {
-  color: #d4d4d8;
+  color: color-mix(in srgb, var(--rmx-text) 80%, var(--rmx-text-muted) 20%);
   font-weight: 700;
 }
 
 .remux-markdown-image-placeholder-alt {
   max-width: 100%;
   overflow: hidden;
-  color: #71717a;
+  color: var(--rmx-text-muted);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -458,9 +473,9 @@ body {
   max-width: 100%;
   overflow-x: auto;
   padding: 12px;
-  border: 1px solid rgb(255 255 255 / 8%);
+  border: 1px solid var(--rmx-code-border);
   border-radius: 8px;
-  background: var(--rmx-surface-raised);
+  background: var(--rmx-code-bg);
   -webkit-overflow-scrolling: touch;
 }
 
@@ -474,20 +489,20 @@ body {
 }
 
 .remux-markdown-mermaid-title {
-  color: #f4f4f5;
+  color: var(--rmx-text);
   font-size: 14px;
   font-weight: 800;
   line-height: 20px;
 }
 
 .remux-markdown-mermaid-muted {
-  color: #a1a1aa;
+  color: var(--rmx-text-muted);
   font-size: 13px;
   line-height: 18px;
 }
 
 .remux-markdown-mermaid-error {
-  border-color: rgb(239 68 68 / 35%);
+  border-color: color-mix(in srgb, var(--rmx-danger) 35%, transparent);
 }
 
 .remux-markdown-mermaid-error pre {

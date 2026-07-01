@@ -15,6 +15,9 @@
   /* Accent — orange (brand / primary action) */
   --rmx-orange-700: #c45424;
   --rmx-orange-500: #f97316;
+  --rmx-orange-800: #9f3a16;
+  --rmx-orange-900: #8f2f13;
+  --rmx-orange-950: #5f1d0d;
   --rmx-orange-50: #fff7ed;
 
   /* Status hues */
@@ -52,6 +55,11 @@
   --rmx-surface-raised: var(--rmx-neutral-900);
   --rmx-surface-hover: var(--rmx-neutral-800);
   --rmx-border: var(--rmx-neutral-700);
+  --rmx-border-subtle: rgb(255 255 255 / 8%);
+  --rmx-overlay: rgb(255 255 255 / 10%);
+  --rmx-code-bg: var(--rmx-surface-raised);
+  --rmx-code-border: var(--rmx-border-subtle);
+  --rmx-code-text: var(--rmx-text);
 
   /* Text */
   --rmx-text: var(--rmx-neutral-100);
@@ -65,6 +73,14 @@
   --rmx-danger: var(--rmx-red-400);
   --rmx-success: var(--rmx-green-400);
   --rmx-warning: var(--rmx-amber-400);
+
+  /* Primary raised button recipe */
+  --rmx-primary-border: var(--rmx-orange-800);
+  --rmx-primary-edge: var(--rmx-orange-900);
+  --rmx-primary-shadow: var(--rmx-orange-950);
+  --rmx-primary-highlight: rgb(255 255 255 / 14%);
+  --rmx-primary-shadow-inset: rgb(52 16 6 / 36%);
+  --rmx-primary-shadow-drop: color-mix(in srgb, var(--rmx-primary-shadow) 88%, black);
 
   /* Elevation (button physicality — references --rmx-surface) */
   --rmx-shadow-raised: inset 0 1px 0 rgb(255 255 255 / 9%), inset 0 -2px 0 rgb(0 0 0 / 32%), 0 2px 0 color-mix(in srgb, var(--rmx-surface) 78%, black);
