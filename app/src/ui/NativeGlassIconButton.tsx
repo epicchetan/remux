@@ -104,6 +104,47 @@ export function NativeGlassCircle({
   );
 }
 
+type NativeGlassRoundedRectProps = {
+  cornerRadius: number;
+  height: number;
+  style?: StyleProp<ViewStyle>;
+  tint?: string;
+  width: number;
+};
+
+export function NativeGlassRoundedRect({
+  cornerRadius,
+  height,
+  style,
+  tint,
+  width,
+}: NativeGlassRoundedRectProps) {
+  return (
+    <Host matchContents style={[{ height, width }, style]}>
+      <ZStack
+        modifiers={[
+          frame({
+            alignment: 'center',
+            height,
+            width,
+          }),
+          glassEffect({
+            cornerRadius,
+            glass: {
+              interactive: true,
+              tint,
+              variant: 'regular',
+            },
+            shape: 'roundedRectangle',
+          }),
+        ]}
+      >
+        <SwiftImage color="transparent" size={1} systemName="circle" />
+      </ZStack>
+    </Host>
+  );
+}
+
 type NativeGlassCapsuleProps = {
   height: number;
   style?: StyleProp<ViewStyle>;

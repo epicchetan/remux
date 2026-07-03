@@ -1,8 +1,13 @@
 const assert = require('node:assert/strict');
 const http = require('node:http');
+const { join } = require('node:path');
 const test = require('node:test');
 
 const { createRemuxServer } = require('../httpServer.cjs');
+
+// Two distinct real files so light/dark responses can be told apart by body.
+const lightIconPath = __filename;
+const darkIconPath = join(__dirname, 'extension-registry.test.js');
 
 test('createRemuxServer serves health, root redirect, and viewer providers', async () => {
   const server = createRemuxServer({
@@ -16,10 +21,28 @@ test('createRemuxServer serves health, root redirect, and viewer providers', asy
     extensions: [
       {
         display: {
-          icon: __filename,
+          icon: lightIconPath,
+          iconDark: darkIconPath,
           title: 'Codex Mobile',
         },
         id: 'codex',
+        launchers: [
+          {
+            icon: lightIconPath,
+            iconDark: darkIconPath,
+            id: 'new-chat',
+            label: 'New Chat',
+            route: null,
+            view: 'main',
+          },
+          {
+            icon: lightIconPath,
+            id: 'plain',
+            label: 'Plain',
+            route: null,
+            view: 'main',
+          },
+        ],
         name: 'Codex',
         views: {
           main: { route: '/viewers/codex' },
@@ -55,12 +78,32 @@ test('createRemuxServer serves health, root redirect, and viewer providers', asy
       extensions: [
         {
           display: {
+            iconDarkUrl: '/remux/extensions/codex/icon?format=js&variant=dark',
             iconUrl: '/remux/extensions/codex/icon?format=js',
             title: 'Codex Mobile',
           },
           fileHandlers: [],
           id: 'codex',
-          launchers: [],
+          launchers: [
+            {
+              extensionId: 'codex',
+              iconDarkUrl: '/remux/extensions/codex/icon?format=js&kind=launcher&id=new-chat&variant=dark',
+              iconUrl: '/remux/extensions/codex/icon?format=js&kind=launcher&id=new-chat',
+              id: 'new-chat',
+              label: 'New Chat',
+              route: null,
+              view: 'main',
+            },
+            {
+              extensionId: 'codex',
+              iconDarkUrl: null,
+              iconUrl: '/remux/extensions/codex/icon?format=js&kind=launcher&id=plain',
+              id: 'plain',
+              label: 'Plain',
+              route: null,
+              view: 'main',
+            },
+          ],
           name: 'Codex',
           views: {
             main: {
@@ -80,6 +123,19 @@ test('createRemuxServer serves health, root redirect, and viewer providers', asy
     assert.equal(icon.statusCode, 200);
     assert.equal(icon.headers['content-type'], 'application/octet-stream');
     assert.match(icon.body, /createRemuxServer serves health/u);
+
+    const darkIcon = await request(server, '/remux/extensions/codex/icon?variant=dark');
+    assert.equal(darkIcon.statusCode, 200);
+    assert.match(darkIcon.body, /discoverExtensions loads JSON manifests/u);
+
+    const launcherIcon = await request(server, '/remux/extensions/codex/icon?kind=launcher&id=new-chat&variant=dark');
+    assert.equal(launcherIcon.statusCode, 200);
+    assert.match(launcherIcon.body, /discoverExtensions loads JSON manifests/u);
+
+    // A dark request for an entry without iconDark falls back to the light icon.
+    const fallbackIcon = await request(server, '/remux/extensions/codex/icon?kind=launcher&id=plain&variant=dark');
+    assert.equal(fallbackIcon.statusCode, 200);
+    assert.match(fallbackIcon.body, /createRemuxServer serves health/u);
 
     const viewer = await request(server, '/viewers/codex/');
     assert.equal(viewer.statusCode, 200);

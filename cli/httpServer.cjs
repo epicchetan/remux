@@ -76,12 +76,14 @@ function extensionCatalog({ defaultExtension, extensions }) {
 
       return {
         display: {
+          iconDarkUrl: normalizedExtension.display?.iconDark ? extensionIconRoute(normalizedExtension, null, 'dark') : null,
           iconUrl: normalizedExtension.display?.icon ? extensionIconRoute(normalizedExtension) : null,
           title: normalizedExtension.display?.title ?? normalizedExtension.name,
         },
         fileHandlers: normalizedExtension.fileHandlers.map((handler) => ({
           extensionId: normalizedExtension.id,
           extensions: handler.extensions,
+          iconDarkUrl: handler.iconDark ? extensionIconRoute(normalizedExtension, { id: handler.id, kind: 'fileHandler' }, 'dark') : null,
           iconUrl: handler.icon ? extensionIconRoute(normalizedExtension, { id: handler.id, kind: 'fileHandler' }) : null,
           id: handler.id,
           label: handler.label,
@@ -90,6 +92,7 @@ function extensionCatalog({ defaultExtension, extensions }) {
         id: normalizedExtension.id,
         launchers: normalizedExtension.launchers.map((launcher) => ({
           extensionId: normalizedExtension.id,
+          iconDarkUrl: launcher.iconDark ? extensionIconRoute(normalizedExtension, { id: launcher.id, kind: 'launcher' }, 'dark') : null,
           iconUrl: launcher.icon ? extensionIconRoute(normalizedExtension, { id: launcher.id, kind: 'launcher' }) : null,
           id: launcher.id,
           label: launcher.label,
@@ -133,18 +136,37 @@ function iconForIconPath(url, extensions) {
   const params = searchParamsOf(url);
   const kind = params.get('kind');
   const id = params.get('id');
+  const variant = params.get('variant') === 'dark' ? 'dark' : null;
 
   if (kind === 'launcher' && id) {
     const launcher = normalizedExtension.launchers.find((candidate) => candidate.id === id);
-    return launcher?.icon ? { path: launcher.icon } : null;
+    const iconPath = iconVariantPath(launcher, variant);
+    return iconPath ? { path: iconPath } : null;
   }
 
   if (kind === 'fileHandler' && id) {
     const handler = normalizedExtension.fileHandlers.find((candidate) => candidate.id === id);
-    return handler?.icon ? { path: handler.icon } : null;
+    const iconPath = iconVariantPath(handler, variant);
+    return iconPath ? { path: iconPath } : null;
   }
 
-  return typeof normalizedExtension.display?.icon === 'string' ? { path: normalizedExtension.display.icon } : null;
+  const displayPath = iconVariantPath(normalizedExtension.display, variant);
+  return displayPath ? { path: displayPath } : null;
+}
+
+// Falls back to the light icon when a dark variant is requested but missing,
+// so a stale variant URL still resolves to something renderable.
+function iconVariantPath(entry, variant) {
+  if (!entry) {
+    return null;
+  }
+
+  const icon = typeof entry.icon === 'string' ? entry.icon : null;
+  if (variant !== 'dark') {
+    return icon;
+  }
+
+  return typeof entry.iconDark === 'string' ? entry.iconDark : icon;
 }
 
 async function serveExtensionIcon({ iconPath, response }) {
@@ -161,8 +183,8 @@ async function serveExtensionIcon({ iconPath, response }) {
   }
 }
 
-function extensionIconRoute(extension, source) {
-  const iconPath = source ? iconPathForSource(extension, source) : extension.display.icon;
+function extensionIconRoute(extension, source, variant) {
+  const iconPath = iconPathForSource(extension, source, variant);
   const format = extname(iconPath).slice(1) || 'asset';
   const params = new URLSearchParams({ format });
 
@@ -171,19 +193,25 @@ function extensionIconRoute(extension, source) {
     params.set('id', source.id);
   }
 
+  if (variant === 'dark') {
+    params.set('variant', 'dark');
+  }
+
   return `/remux/extensions/${encodeURIComponent(extension.id)}/icon?${params.toString()}`;
 }
 
-function iconPathForSource(extension, source) {
-  if (source.kind === 'launcher') {
-    return extension.launchers.find((launcher) => launcher.id === source.id)?.icon ?? extension.display.icon;
+function iconPathForSource(extension, source, variant) {
+  if (source?.kind === 'launcher') {
+    const launcher = extension.launchers.find((candidate) => candidate.id === source.id);
+    return iconVariantPath(launcher, variant) ?? iconVariantPath(extension.display, variant);
   }
 
-  if (source.kind === 'fileHandler') {
-    return extension.fileHandlers.find((handler) => handler.id === source.id)?.icon ?? extension.display.icon;
+  if (source?.kind === 'fileHandler') {
+    const handler = extension.fileHandlers.find((candidate) => candidate.id === source.id);
+    return iconVariantPath(handler, variant) ?? iconVariantPath(extension.display, variant);
   }
 
-  return extension.display.icon;
+  return iconVariantPath(extension.display, variant);
 }
 
 function publicViews(views) {

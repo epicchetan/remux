@@ -4,7 +4,8 @@
   "name": "Editor",
   "display": {
     "title": "Editor",
-    "icon": "assets/editor.svg"
+    "icon": "assets/editor.png",
+    "iconDark": "assets/editor-dark.png"
   },
   "views": {
     "main": {
@@ -18,7 +19,6 @@
       "id": "text-editor",
       "view": "main",
       "label": "Editor",
-      "icon": "assets/editor.svg",
       "extensions": [
         "*"
       ]

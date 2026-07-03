@@ -25,6 +25,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { getBottomBarHeight, tabGridGap, tabGridHorizontalPadding } from '../browser/browserLayout';
 import { useBrowserStore } from '../browser/browserStore';
 import { useRemuxConnection } from '../remote/RemuxConnectionProvider';
+import { themedIconUrl } from '../remote/remuxExtensions';
 import { useRemuxSettingsStore } from '../remote/remuxSettingsStore';
 import { alpha, useTheme, type RemuxTheme } from '../theme/ThemeProvider';
 import {
@@ -264,6 +265,7 @@ export function SettingsOverview() {
           <View style={styles.extensionList}>
             {extensions.map((extension) => (
               <ExtensionRow
+                iconDarkUrl={extension.display.iconDarkUrl}
                 iconUrl={extension.display.iconUrl}
                 key={extension.id}
                 name={extension.display.title}
@@ -402,6 +404,7 @@ function SettingsButton({
 }
 
 function ExtensionRow({
+  iconDarkUrl,
   iconUrl,
   name,
   onRestart,
@@ -410,6 +413,7 @@ function ExtensionRow({
   status,
   toggling,
 }: {
+  iconDarkUrl: string | null;
   iconUrl: string | null;
   name: string;
   onRestart: () => void;
@@ -423,16 +427,17 @@ function ExtensionRow({
   const controllable = Boolean(status?.restartable);
   const busy = restarting || toggling;
   const hasServer = Boolean(status);
+  const themedUrl = themedIconUrl({ iconDarkUrl, iconUrl }, theme.isDark);
 
   return (
     <View style={styles.extensionRow}>
       <View style={styles.extensionIconFrame}>
-        {iconUrl && !imageFailed ? (
+        {themedUrl && !imageFailed ? (
           <Image
             accessibilityIgnoresInvertColors
             onError={() => setImageFailed(true)}
             resizeMode="contain"
-            source={{ uri: iconUrl }}
+            source={{ uri: themedUrl }}
             style={styles.extensionIcon}
           />
         ) : (

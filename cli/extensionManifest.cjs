@@ -14,6 +14,7 @@ function loadExtensionManifest(manifestPath) {
   const extension = {
     display: {
       icon: typeof display.icon === 'string' ? resolveManifestPath(rootDir, display.icon) : null,
+      iconDark: typeof display.iconDark === 'string' ? resolveManifestPath(rootDir, display.iconDark) : null,
       title: typeof display.title === 'string' && display.title.trim().length > 0
         ? display.title
         : raw.name || raw.id,
@@ -144,10 +145,25 @@ function validateDisplay(manifest) {
     throw new Error(`Invalid Remux extension ${manifest.id}: display.title must be a non-empty string`);
   }
 
-  if (manifest.display.icon !== undefined && (
-    typeof manifest.display.icon !== 'string' || manifest.display.icon.length === 0
-  )) {
-    throw new Error(`Invalid Remux extension ${manifest.id}: display.icon must be a non-empty string`);
+  validateIconField({ extensionId: manifest.id, field: 'display.icon', value: manifest.display.icon });
+  validateIconField({ extensionId: manifest.id, field: 'display.iconDark', value: manifest.display.iconDark });
+
+  if (manifest.display.iconDark !== undefined && manifest.display.icon === undefined) {
+    throw new Error(`Invalid Remux extension ${manifest.id}: display.iconDark requires display.icon`);
+  }
+}
+
+function validateIconField({ extensionId, field, value }) {
+  if (value === undefined) {
+    return;
+  }
+
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error(`Invalid Remux extension ${extensionId}: ${field} must be a non-empty string`);
+  }
+
+  if (value.toLowerCase().endsWith('.svg')) {
+    throw new Error(`Invalid Remux extension ${extensionId}: ${field} must be a raster image (png, jpg, or webp) — the app cannot render svg icons`);
   }
 }
 
@@ -239,8 +255,11 @@ function validateEntryPoint({
     throw new Error(`Invalid Remux extension ${extensionId}: ${field}.label must be a non-empty string`);
   }
 
-  if (entry.icon !== undefined && (typeof entry.icon !== 'string' || entry.icon.length === 0)) {
-    throw new Error(`Invalid Remux extension ${extensionId}: ${field}.icon must be a non-empty string`);
+  validateIconField({ extensionId, field: `${field}.icon`, value: entry.icon });
+  validateIconField({ extensionId, field: `${field}.iconDark`, value: entry.iconDark });
+
+  if (entry.iconDark !== undefined && entry.icon === undefined) {
+    throw new Error(`Invalid Remux extension ${extensionId}: ${field}.iconDark requires ${field}.icon`);
   }
 }
 
@@ -313,11 +332,7 @@ function parseLaunchers({
   return rawLaunchers.map((launcher) => {
     const view = launcher.view || 'main';
     return {
-      icon: typeof launcher.icon === 'string'
-        ? resolveManifestPath(rootDir, launcher.icon)
-        : typeof extensionDisplay.icon === 'string'
-          ? resolveManifestPath(rootDir, extensionDisplay.icon)
-          : null,
+      ...iconPair({ entry: launcher, extensionDisplay, rootDir }),
       id: launcher.id,
       label: typeof launcher.label === 'string' && launcher.label.trim().length > 0
         ? launcher.label
@@ -361,11 +376,7 @@ function parseFileHandlers({
       extensions: Array.isArray(handler.extensions)
         ? handler.extensions.map((extension) => extension.toLowerCase())
         : [],
-      icon: typeof handler.icon === 'string'
-        ? resolveManifestPath(rootDir, handler.icon)
-        : typeof extensionDisplay.icon === 'string'
-          ? resolveManifestPath(rootDir, extensionDisplay.icon)
-          : null,
+      ...iconPair({ entry: handler, extensionDisplay, rootDir }),
       id: handler.id,
       label: typeof handler.label === 'string' && handler.label.trim().length > 0
         ? handler.label
@@ -374,6 +385,22 @@ function parseFileHandlers({
       viewRoute: views[view].route,
     };
   });
+}
+
+// An entry with its own icon never inherits display.iconDark — both variants
+// must come from the same source so light/dark stay a matched pair.
+function iconPair({ entry, extensionDisplay, rootDir }) {
+  if (typeof entry.icon === 'string') {
+    return {
+      icon: resolveManifestPath(rootDir, entry.icon),
+      iconDark: typeof entry.iconDark === 'string' ? resolveManifestPath(rootDir, entry.iconDark) : null,
+    };
+  }
+
+  return {
+    icon: typeof extensionDisplay.icon === 'string' ? resolveManifestPath(rootDir, extensionDisplay.icon) : null,
+    iconDark: typeof extensionDisplay.iconDark === 'string' ? resolveManifestPath(rootDir, extensionDisplay.iconDark) : null,
+  };
 }
 
 function normalizeRoute(route) {

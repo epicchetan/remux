@@ -15,6 +15,7 @@ export type ViewerTab = {
   handlerId: string | null;
   hostId: string | null;
   id: string;
+  iconDarkUrl: string | null;
   iconUrl: string | null;
   kind: 'viewer';
   launch: string | null;

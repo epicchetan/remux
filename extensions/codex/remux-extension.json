@@ -4,7 +4,8 @@
   "name": "Codex",
   "display": {
     "title": "Codex",
-    "icon": "assets/codex.png"
+    "icon": "assets/codex.png",
+    "iconDark": "assets/codex-dark.png"
   },
   "server": {
     "transport": "stdio",
@@ -32,7 +33,6 @@
       "id": "new-chat",
       "view": "main",
       "label": "Codex",
-      "icon": "assets/codex.png",
       "route": {
         "kind": "launch",
         "launch": "new-chat",

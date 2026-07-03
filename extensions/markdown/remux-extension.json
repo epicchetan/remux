@@ -4,7 +4,8 @@
   "name": "Markdown",
   "display": {
     "title": "Markdown",
-    "icon": "assets/markdown.svg"
+    "icon": "assets/markdown.png",
+    "iconDark": "assets/markdown-dark.png"
   },
   "views": {
     "main": {
@@ -18,7 +19,6 @@
       "id": "markdown-viewer",
       "view": "main",
       "label": "Markdown",
-      "icon": "assets/markdown.svg",
       "extensions": [
         "md",
         "markdown",

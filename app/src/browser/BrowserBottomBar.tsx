@@ -1,4 +1,4 @@
-import { Image, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { useMemo } from 'react';
@@ -12,7 +12,6 @@ import type { BrowserSection } from './browserTypes';
 import { useBrowserStore } from './browserStore';
 import {
   NativeGlassCapsule,
-  NativeGlassCircle,
   NativeGlassIconButton,
 } from '../ui/NativeGlassIconButton';
 import { useTheme, type RemuxTheme } from '../theme/ThemeProvider';
@@ -23,16 +22,19 @@ const sectionOptionWidth = sectionControlWidth / 2;
 const sectionSelectedInset = 2;
 const sections: BrowserSection[] = ['tabs', 'files'];
 
-export function BrowserBottomBar() {
+type BrowserBottomBarProps = {
+  onOpenLaunchers: () => void;
+};
+
+export function BrowserBottomBar({ onOpenLaunchers }: BrowserBottomBarProps) {
   const insets = useSafeAreaInsets();
   const activeTabId = useBrowserStore((state) => state.activeTabId);
   const closeOverview = useBrowserStore((state) => state.closeOverview);
   const extensions = useBrowserStore((state) => state.extensions);
-  const openResource = useBrowserStore((state) => state.openResource);
   const section = useBrowserStore((state) => state.section);
   const setSection = useBrowserStore((state) => state.setSection);
   const theme = useTheme();
-  const visibleLaunchers = extensions.flatMap((extension) => extension.launchers).slice(0, 4);
+  const hasLaunchers = extensions.some((extension) => extension.launchers.length > 0);
   const selectedOverviewSection = section === 'tabs' || section === 'files' ? section : null;
   const styles = useMemo(() => createStyles(theme), [theme]);
 
@@ -97,39 +99,15 @@ export function BrowserBottomBar() {
       </View>
 
       <View style={styles.actions}>
-        {visibleLaunchers.map((launcher) => (
-          <Pressable
-            accessibilityLabel={`Open ${launcher.label}`}
-            accessibilityRole="button"
-            key={`${launcher.extensionId}:${launcher.id}`}
-            onPress={() => {
-              void openResource({
-                extensionId: launcher.extensionId,
-                launch: launcher.route?.launch ?? null,
-                resourceKind: launcher.route?.resourceKind ?? null,
-                title: launcher.label,
-                viewId: launcher.view,
-              }, { disposition: 'new' });
-            }}
-            style={({ pressed }) => [
-              styles.extensionButton,
-              pressed ? styles.extensionButtonPressed : null,
-            ]}
-          >
-            <View pointerEvents="none" style={styles.extensionGlass}>
-              <NativeGlassCircle size={bottomBarControlHeight} />
-            </View>
-            {launcher.iconUrl ? (
-              <Image
-                accessibilityIgnoresInvertColors
-                source={{ uri: launcher.iconUrl }}
-                style={styles.extensionIcon}
-              />
-            ) : (
-              <Text style={styles.extensionFallback}>{launcher.label.slice(0, 1)}</Text>
-            )}
-          </Pressable>
-        ))}
+        {hasLaunchers ? (
+          <NativeGlassIconButton
+            accessibilityLabel="New tab"
+            iconSize={17}
+            onPress={onOpenLaunchers}
+            size={bottomBarControlHeight}
+            systemImage="plus"
+          />
+        ) : null}
         <NativeGlassIconButton
           accessibilityLabel="Settings"
           iconSize={17}
@@ -210,35 +188,6 @@ function createStyles(theme: RemuxTheme) {
   },
   sectionSelectedFiles: {
     left: sectionOptionWidth + sectionSelectedInset,
-  },
-  extensionButton: {
-    alignItems: 'center',
-    height: bottomBarControlHeight,
-    justifyContent: 'center',
-    opacity: 0.88,
-    position: 'relative',
-    width: bottomBarControlHeight,
-  },
-  extensionButtonPressed: {
-    opacity: 0.58,
-  },
-  extensionFallback: {
-    color: theme.text,
-    fontSize: 17,
-    fontWeight: '800',
-    lineHeight: 22,
-  },
-  extensionIcon: {
-    borderRadius: 6,
-    height: 22,
-    width: 22,
-  },
-  extensionGlass: {
-    bottom: 0,
-    left: 0,
-    position: 'absolute',
-    right: 0,
-    top: 0,
   },
   });
 }

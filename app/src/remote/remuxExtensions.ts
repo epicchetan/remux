@@ -7,6 +7,7 @@ export type RemuxExtensionView = {
 
 export type RemuxExtension = {
   display: {
+    iconDarkUrl: string | null;
     iconUrl: string | null;
     title: string;
   };
@@ -21,6 +22,7 @@ export type RemuxExtension = {
 
 export type RemuxExtensionLauncher = {
   extensionId: string;
+  iconDarkUrl: string | null;
   iconUrl: string | null;
   id: string;
   label: string;
@@ -37,6 +39,7 @@ export type RemuxLauncherRoute = {
 export type RemuxFileHandler = {
   extensionId: string;
   extensions: string[];
+  iconDarkUrl: string | null;
   iconUrl: string | null;
   id: string;
   label: string;
@@ -63,6 +66,7 @@ type RawExtension = {
 };
 
 type RawExtensionDisplay = {
+  iconDarkUrl?: unknown;
   iconUrl?: unknown;
   title?: unknown;
 };
@@ -73,6 +77,7 @@ type RawView = {
 
 type RawLauncher = {
   extensionId?: unknown;
+  iconDarkUrl?: unknown;
   iconUrl?: unknown;
   id?: unknown;
   label?: unknown;
@@ -83,6 +88,7 @@ type RawLauncher = {
 type RawFileHandler = {
   extensionId?: unknown;
   extensions?: unknown;
+  iconDarkUrl?: unknown;
   iconUrl?: unknown;
   id?: unknown;
   label?: unknown;
@@ -130,6 +136,7 @@ function parseRemuxExtension(raw: unknown, origin: string): RemuxExtension[] {
 
   return [{
     display: {
+      iconDarkUrl: typeof display.iconDarkUrl === 'string' ? remuxPublicUrl(display.iconDarkUrl, origin) : null,
       iconUrl: typeof display.iconUrl === 'string' ? remuxPublicUrl(display.iconUrl, origin) : null,
       title: typeof display.title === 'string' && display.title.trim().length > 0
         ? display.title
@@ -184,6 +191,7 @@ function parseLaunchers(raw: unknown, fallbackExtensionId: string, origin: strin
 
     return [{
       extensionId: typeof launcher.extensionId === 'string' ? launcher.extensionId : fallbackExtensionId,
+      iconDarkUrl: typeof launcher.iconDarkUrl === 'string' ? remuxPublicUrl(launcher.iconDarkUrl, origin) : null,
       iconUrl: typeof launcher.iconUrl === 'string' ? remuxPublicUrl(launcher.iconUrl, origin) : null,
       id: launcher.id,
       label: launcher.label,
@@ -230,12 +238,20 @@ function parseFileHandlers(raw: unknown, fallbackExtensionId: string, origin: st
     return [{
       extensionId: typeof handler.extensionId === 'string' ? handler.extensionId : fallbackExtensionId,
       extensions: stringArray(handler.extensions),
+      iconDarkUrl: typeof handler.iconDarkUrl === 'string' ? remuxPublicUrl(handler.iconDarkUrl, origin) : null,
       iconUrl: typeof handler.iconUrl === 'string' ? remuxPublicUrl(handler.iconUrl, origin) : null,
       id: handler.id,
       label: handler.label,
       view: typeof handler.view === 'string' ? handler.view : 'main',
     }];
   });
+}
+
+export function themedIconUrl(
+  source: { iconDarkUrl: string | null; iconUrl: string | null },
+  isDark: boolean,
+) {
+  return isDark ? source.iconDarkUrl ?? source.iconUrl : source.iconUrl;
 }
 
 function remuxViewerUrl(route: string, origin: string) {

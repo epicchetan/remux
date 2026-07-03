@@ -4,9 +4,11 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { FilesOverview } from '../files/FilesOverview';
 import { useRemuxConnection } from '../remote/RemuxConnectionProvider';
+import { themedIconUrl } from '../remote/remuxExtensions';
 import { SettingsOverview } from '../settings/SettingsOverview';
 import { useTheme, type RemuxTheme } from '../theme/ThemeProvider';
 import { BrowserBottomBar } from './BrowserBottomBar';
+import { LauncherMenu } from './LauncherMenu';
 import {
   getBottomBarHeight,
   getTabCardWidth,
@@ -37,6 +39,7 @@ export function BrowserOverview({
   const selectTab = useBrowserStore((state) => state.selectTab);
   const tabs = useBrowserStore((state) => state.tabs);
   const theme = useTheme();
+  const [launchersOpen, setLaunchersOpen] = useState(false);
   const { height, width } = useWindowDimensions();
   const previewSourceAspectRatio = width / Math.max(height, 1);
   const orderedTabs = [...tabs].sort((first, second) => {
@@ -131,7 +134,8 @@ export function BrowserOverview({
         </ScrollView>
       ) : section === 'files' ? <FilesOverview /> : <SettingsOverview />}
 
-      <BrowserBottomBar />
+      <BrowserBottomBar onOpenLaunchers={() => setLaunchersOpen(true)} />
+      <LauncherMenu onClose={() => setLaunchersOpen(false)} visible={launchersOpen} />
     </View>
   );
 }
@@ -166,16 +170,18 @@ function bottomAnchoredRows<T>(items: T[], columns: number) {
 type BrowserOverviewStyles = ReturnType<typeof createStyles>;
 
 function TabIcon({ styles, tab }: { styles: BrowserOverviewStyles; tab: BrowserTab }) {
+  const theme = useTheme();
   const [imageFailed, setImageFailed] = useState(false);
+  const iconUrl = themedIconUrl(tab, theme.isDark);
 
   return (
     <View style={styles.tabIcon}>
-      {tab.iconUrl && !imageFailed ? (
+      {iconUrl && !imageFailed ? (
         <Image
           accessibilityIgnoresInvertColors
           onError={() => setImageFailed(true)}
           resizeMode="contain"
-          source={{ uri: tab.iconUrl }}
+          source={{ uri: iconUrl }}
           style={styles.tabIconImage}
         />
       ) : (
