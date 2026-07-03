@@ -17,6 +17,10 @@ export type HostFileOpenParams = {
   path: string;
 };
 
+export type HostLinkOpenParams = {
+  url: string;
+};
+
 export type HostAttachmentPickParams = {
   multiple?: boolean;
   picker?: 'files' | 'photo-library';
@@ -95,6 +99,13 @@ export function openHostOverview(params: HostOverviewOpenParams = {}) {
 
 export function openHostFile(params: HostFileOpenParams) {
   return requestIpc<{ ok: boolean; reason?: string }>('host/file/open', params, 3_000);
+}
+
+// Opens a url in the device's default browser. In-page escapes like
+// window.open are swallowed by the app's WebView, so this is the host's job
+// (e.g. Linking.openURL on React Native).
+export function openHostLink(params: HostLinkOpenParams) {
+  return requestIpc<{ ok: boolean; reason?: string }>('host/link/open', params, 3_000);
 }
 
 export function pickHostAttachments(params: HostAttachmentPickParams = {}) {

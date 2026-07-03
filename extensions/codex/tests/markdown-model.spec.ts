@@ -157,6 +157,43 @@ test.describe('markdownModel', () => {
     });
   });
 
+  test('classifies file urls and local hash line anchors as file links', () => {
+    const blocks = parseMarkdownDocument(
+      '[App](file:///workspace/remux/src/App.tsx#L12) and [Guide](./docs/Guide.md#line-7)',
+    );
+
+    expect(blocks[0]).toMatchObject({
+      lines: [
+        [
+          {
+            file: {
+              displayName: 'App (line 12)',
+              extension: 'tsx',
+              fileName: 'App.tsx',
+              line: 12,
+              path: '/workspace/remux/src/App.tsx',
+            },
+            href: 'file:///workspace/remux/src/App.tsx#L12',
+            type: 'fileLink',
+          },
+          { text: ' and ', type: 'text' },
+          {
+            file: {
+              displayName: 'Guide (line 7)',
+              extension: 'md',
+              fileName: 'Guide.md',
+              line: 7,
+              path: 'docs/Guide.md',
+            },
+            href: './docs/Guide.md#line-7',
+            type: 'fileLink',
+          },
+        ],
+      ],
+      type: 'paragraph',
+    });
+  });
+
   test('can keep local markdown links plain while streaming', () => {
     const blocks = parseMarkdownDocument(
       '[apps/web/src/styles.css](/Users/calla/Documents/remote-in/mobile/apps/web/src/styles.css:38)',

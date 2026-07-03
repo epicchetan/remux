@@ -13,6 +13,8 @@ import {
 import { fromMarkdown } from 'mdast-util-from-markdown';
 import type { BlockContent, DefinitionContent, PhrasingContent, RootContent } from 'mdast';
 
+import { hostFileHrefInfoFromHref, webUrlFromHref } from '@remux/viewer-kit/links';
+
 export type MarkdownDensity = 'default' | 'user' | 'work';
 
 export type MarkdownRenderOptions = {
@@ -934,12 +936,7 @@ function sanitizeHref(href: string) {
     return href;
   }
 
-  try {
-    const url = new URL(href);
-    return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null;
-  } catch {
-    return null;
-  }
+  return webUrlFromHref(href);
 }
 
 function rootContentToRawBlocks(nodes: readonly RootContent[], options: MarkdownParseOptions): RawMarkdownBlock[] {
@@ -1189,35 +1186,28 @@ function trimTrailingUrlPunctuation(url: string) {
 }
 
 function fileLinkFromHref(href: string, label?: string): MarkdownFileLink | null {
-  if (/^[a-z][a-z0-9+.-]*:/i.test(href)) {
+  const file = hostFileHrefInfoFromHref(href, {
+    parseLine: true,
+    requireFileExtension: true,
+  });
+  if (!file) {
     return null;
   }
 
-  const withoutQuery = href.split(/[?#]/, 1)[0] ?? href;
-  const lineMatch = withoutQuery.match(/:(\d+)(?::\d+)?$/);
-  const pathWithoutLine = lineMatch ? withoutQuery.slice(0, -lineMatch[0].length) : withoutQuery;
-  const fileName = pathWithoutLine.split('/').filter(Boolean).at(-1);
-
-  if (!fileName || !fileName.includes('.')) {
-    return null;
-  }
-
-  const extensionMatch = fileName.match(/\.([a-z0-9]+)$/i);
-  const line = lineMatch ? Number.parseInt(lineMatch[1], 10) : null;
   const displayName = fileLinkDisplayName({
-    fileName,
+    fileName: file.fileName,
     href,
     label,
-    line,
-    path: pathWithoutLine,
+    line: file.line ?? null,
+    path: file.path,
   });
 
   return {
     displayName,
-    extension: extensionMatch ? extensionMatch[1].toLowerCase() : null,
-    fileName,
-    line,
-    path: pathWithoutLine,
+    extension: file.extension,
+    fileName: file.fileName,
+    line: file.line ?? null,
+    path: file.path,
   };
 }
 

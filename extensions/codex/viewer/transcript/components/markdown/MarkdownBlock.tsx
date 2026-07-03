@@ -13,7 +13,7 @@ import {
 import { CodeBlock } from './CodeBlock';
 import { FileTypeIcon } from '../file/fileTypeIcons';
 import { cn } from '@remux/viewer-kit/shadcn';
-import { openHostFile } from '@remux/viewer-kit/host';
+import { openHostHref, openHostTarget } from '@remux/viewer-kit/links';
 
 const fallbackMarkdownWidth = 868;
 
@@ -240,7 +240,7 @@ function FileLink({
       href={href}
       onClick={(event) => {
         event.preventDefault();
-        void openHostFile({ line: file.line, path: file.path });
+        void openHostTarget({ kind: 'file', line: file.line, path: file.path });
       }}
       style={linkStyle}
       title={title}
@@ -259,43 +259,5 @@ function FileLinkIcon({ file }: { file: MarkdownFileLink }) {
 
 function handleCodexLinkClick(event: MouseEvent<HTMLAnchorElement>, href: string) {
   event.preventDefault();
-  const target = fileOpenTargetFromHref(href);
-  if (!target) {
-    return;
-  }
-
-  void openHostFile(target);
-}
-
-function fileOpenTargetFromHref(href: string) {
-  if (isExternalHref(href)) {
-    return null;
-  }
-
-  const pathPart = href.split(/[?#]/u, 1)[0] ?? href;
-  const lineMatch = pathPart.match(/:(\d+)(?::\d+)?$/u);
-  const path = lineMatch ? pathPart.slice(0, -lineMatch[0].length) : pathPart;
-  if (!path.trim()) {
-    return null;
-  }
-
-  return {
-    line: lineMatch ? Number.parseInt(lineMatch[1], 10) : null,
-    path: decodePathPart(path),
-  };
-}
-
-function isExternalHref(href: string) {
-  return !/^[a-z]:[\\/]/iu.test(href)
-    && (/^(?:[a-z][a-z\d+.-]*:)?\/\//iu.test(href)
-    || /^(?:mailto:|tel:)/iu.test(href)
-    || /^[a-z][a-z\d+.-]*:/iu.test(href));
-}
-
-function decodePathPart(path: string) {
-  try {
-    return decodeURIComponent(path);
-  } catch {
-    return path;
-  }
+  void openHostHref(href, { parseLine: true });
 }

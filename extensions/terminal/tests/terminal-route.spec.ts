@@ -170,6 +170,378 @@ test.describe('terminal viewer route', () => {
     await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('hello');
   });
 
+  test('replaces the key row with a selection bar and exits from the pinned key', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+
+    await page.getByLabel('Terminal menu').click();
+    await page.getByRole('menuitem', { name: 'Select text' }).click();
+
+    await expect(page.locator('.remux-terminal-selection-status')).toHaveText('Drag or tap to select text');
+    await expect(page.getByLabel('Open tabs')).toBeVisible();
+    await expect(page.getByLabel('Exit selection')).toBeVisible();
+    await expect(page.getByLabel('Copy selection')).toBeDisabled();
+    await expect(page.getByLabel('Clear selection')).toBeDisabled();
+    await expect(page.getByLabel('Escape')).toHaveCount(0);
+    await expect(page.getByLabel('Terminal menu')).toHaveCount(0);
+
+    await page.getByLabel('Exit selection').click();
+    await expect(page.locator('.remux-terminal-container')).not.toHaveClass(/is-selecting/);
+    await expect(page.getByLabel('Escape')).toBeVisible();
+  });
+
+  test('snaps a tap to the word under it and adjusts with the selection handles', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    const startRequest = await waitForHostRequest(page, 'remux/terminal/session/start');
+    const startParams = recordParams(startRequest);
+
+    await sendTerminalOutput(page, 1, 'alpha beta gamma\r\n');
+    await page.waitForTimeout(100);
+
+    await page.getByLabel('Terminal menu').click();
+    await page.getByRole('menuitem', { name: 'Select text' }).click();
+
+    const screenBox = await page.locator('.xterm-screen').boundingBox();
+    expect(screenBox).not.toBeNull();
+    const cellWidth = screenBox!.width / Number(startParams.cols);
+    const cellHeight = screenBox!.height / Number(startParams.rows);
+    const rowCenterY = screenBox!.y + cellHeight * 0.5;
+
+    // Tap the middle of "beta" (cells 6-9): the word snaps into the selection.
+    await page.mouse.click(screenBox!.x + cellWidth * 7.5, rowCenterY);
+    await expect(page.locator('.remux-terminal-selection-status')).toHaveText('4 characters selected');
+
+    // Erase resets to the empty-selection hint; tap the word again to continue.
+    await page.getByLabel('Clear selection').click();
+    await expect(page.locator('.remux-terminal-selection-status')).toHaveText('Drag or tap to select text');
+    await page.mouse.click(screenBox!.x + cellWidth * 7.5, rowCenterY);
+    await expect(page.locator('.remux-terminal-selection-status')).toHaveText('4 characters selected');
+
+    const endHandle = page.locator('.remux-terminal-selection-handle.is-end');
+    await expect(page.locator('.remux-terminal-selection-handle.is-start')).toBeVisible();
+    await expect(endHandle).toBeVisible();
+
+    // Drag the end handle past "gamma" (end boundary at cell 16).
+    const handleBox = await endHandle.boundingBox();
+    expect(handleBox).not.toBeNull();
+    await page.mouse.move(handleBox!.x + handleBox!.width / 2, handleBox!.y + handleBox!.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(screenBox!.x + cellWidth * 16, rowCenterY, { steps: 4 });
+    await page.mouse.up();
+
+    await expect(page.locator('.remux-terminal-selection-status')).toHaveText('10 characters selected');
+    await page.getByLabel('Copy selection').click();
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('beta gamma');
+  });
+
+  test('extends a selection across the viewport with edge auto-scroll', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    const startRequest = await waitForHostRequest(page, 'remux/terminal/session/start');
+    const startParams = recordParams(startRequest);
+    const rows = Number(startParams.rows);
+
+    const lines = Array.from({ length: 120 }, (_, index) => `line-${index}`).join('\r\n');
+    await sendTerminalOutput(page, 1, `${lines}\r\n`);
+    await page.waitForTimeout(100);
+
+    await page.getByLabel('Terminal menu').click();
+    await page.getByRole('menuitem', { name: 'Select text' }).click();
+
+    const screenBox = await page.locator('.xterm-screen').boundingBox();
+    expect(screenBox).not.toBeNull();
+    const cellWidth = screenBox!.width / Number(startParams.cols);
+    const cellHeight = screenBox!.height / rows;
+
+    // Anchor near the bottom, then hold the pointer above the top-left corner;
+    // the buffer auto-scrolls up while the selection keeps extending into
+    // scrollback, ending at row 0 column 0.
+    await page.mouse.move(screenBox!.x + cellWidth * 10, screenBox!.y + cellHeight * (rows - 5));
+    await page.mouse.down();
+    await page.mouse.move(screenBox!.x + 2, screenBox!.y - 40, { steps: 6 });
+    await page.waitForTimeout(2500);
+    await page.mouse.up();
+
+    await page.getByLabel('Copy selection').click();
+    const copied = await page.evaluate(() => navigator.clipboard.readText());
+    expect(copied.startsWith('line-0')).toBeTruthy();
+    expect(copied).toContain('line-60');
+  });
+
+  test('copies the last command output and the visible screen from the terminal menu', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+
+    await page.getByLabel('Terminal menu').click();
+    await expect(page.getByRole('menuitem', { name: 'Copy last output' })).toBeDisabled();
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('menuitem', { name: 'Copy last output' })).toHaveCount(0);
+
+    await sendTerminalOutput(
+      page,
+      1,
+      '$ ls\r\n\x1b]633;C\x07file-a\r\nfile-b\r\n\x1b]633;D;0\x07$ ',
+    );
+    await page.waitForTimeout(100);
+
+    await page.getByLabel('Terminal menu').click();
+    const lastOutputItem = page.getByRole('menuitem', { name: 'Copy last output' });
+    await expect(lastOutputItem).toBeEnabled();
+    await lastOutputItem.click();
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('file-a\nfile-b');
+
+    await page.getByLabel('Terminal menu').click();
+    await page.getByRole('menuitem', { name: 'Copy screen' }).click();
+    await expect.poll(async () => {
+      const screenText = await page.evaluate(() => navigator.clipboard.readText());
+      return screenText.includes('$ ls') && screenText.includes('file-a') && screenText.includes('file-b');
+    }).toBeTruthy();
+  });
+
+  test('bridges OSC 52 clipboard writes into the system clipboard', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+
+    // 'git push origin main ✓' — the multibyte check mark exercises UTF-8
+    // decoding of the base64 payload.
+    await sendTerminalOutput(page, 1, '\x1b]52;c;Z2l0IHB1c2ggb3JpZ2luIG1haW4g4pyT\x07');
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe('git push origin main ✓');
+
+    // Read queries and malformed payloads must leave the clipboard untouched.
+    await sendTerminalOutput(page, 2, '\x1b]52;c;?\x07\x1b]52;c;not-base64!\x07');
+    await page.waitForTimeout(100);
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe('git push origin main ✓');
+  });
+
+  test('opens a tapped url in the browser and offers copy from the link row', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    const startRequest = await waitForHostRequest(page, 'remux/terminal/session/start');
+    const startParams = recordParams(startRequest);
+
+    await page.evaluate(() => {
+      const opened: string[] = [];
+      (window as unknown as { __remuxOpenedLinks: string[] }).__remuxOpenedLinks = opened;
+      window.open = ((url?: string | URL) => {
+        opened.push(String(url));
+        return {} as Window;
+      }) as typeof window.open;
+    });
+
+    await sendTerminalOutput(page, 1, 'docs at https://example.com/guide for setup\r\n');
+    await page.waitForTimeout(100);
+
+    const screenBox = await page.locator('.xterm-screen').boundingBox();
+    expect(screenBox).not.toBeNull();
+    const cellWidth = screenBox!.width / Number(startParams.cols);
+    const cellHeight = screenBox!.height / Number(startParams.rows);
+    // 'docs at ' spans columns 0-7, so column 20 is inside the url.
+    const linkX = screenBox!.x + cellWidth * 20.5;
+    const linkY = screenBox!.y + cellHeight * 0.5;
+
+    // A tap raises the link row without opening anything yet.
+    const linkRow = page.locator('.remux-terminal-link-row');
+    await page.mouse.click(linkX, linkY);
+    await expect(linkRow).toContainText('https://example.com/guide');
+    expect(await page.evaluate(() => (
+      (window as unknown as { __remuxOpenedLinks: string[] }).__remuxOpenedLinks
+    ))).toEqual([]);
+
+    // Open asks the host to launch the default browser and drops the row;
+    // the in-page window.open fallback stays untouched.
+    await page.getByLabel('Open link').click();
+    await expect(linkRow).toHaveCount(0);
+    const linkOpenRequest = await waitForHostRequest(page, 'host/link/open');
+    expect(recordParams(linkOpenRequest).url).toBe('https://example.com/guide');
+    expect(await page.evaluate(() => (
+      (window as unknown as { __remuxOpenedLinks: string[] }).__remuxOpenedLinks
+    ))).toEqual([]);
+
+    await page.mouse.click(linkX, linkY);
+    await expect(linkRow).toContainText('https://example.com/guide');
+    await page.getByLabel('Copy link').click();
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('https://example.com/guide');
+    await expect(linkRow).toContainText('Link copied');
+    await expect(linkRow).toHaveCount(0);
+
+    // Left alone, the row expires on its own.
+    await page.mouse.click(linkX, linkY);
+    await expect(linkRow).toContainText('https://example.com/guide');
+    await expect(linkRow).toHaveCount(0, { timeout: 8_000 });
+  });
+
+  test('opens OSC 8 hyperlinks from a tap and dismisses the link row', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    const startRequest = await waitForHostRequest(page, 'remux/terminal/session/start');
+    const startParams = recordParams(startRequest);
+
+    await page.evaluate(() => {
+      const opened: string[] = [];
+      (window as unknown as { __remuxOpenedLinks: string[] }).__remuxOpenedLinks = opened;
+      window.open = ((url?: string | URL) => {
+        opened.push(String(url));
+        return {} as Window;
+      }) as typeof window.open;
+    });
+
+    await sendTerminalOutput(
+      page,
+      1,
+      'run \x1b]8;;https://remux.dev/help\x07the help guide\x1b]8;;\x07 now\r\n',
+    );
+    await page.waitForTimeout(100);
+
+    const screenBox = await page.locator('.xterm-screen').boundingBox();
+    expect(screenBox).not.toBeNull();
+    const cellWidth = screenBox!.width / Number(startParams.cols);
+    const cellHeight = screenBox!.height / Number(startParams.rows);
+
+    // 'the help guide' spans columns 4-17; the uri itself is never visible.
+    const linkRow = page.locator('.remux-terminal-link-row');
+    await page.mouse.click(screenBox!.x + cellWidth * 10.5, screenBox!.y + cellHeight * 0.5);
+    await expect(linkRow).toContainText('https://remux.dev/help');
+    expect(await page.evaluate(() => (
+      (window as unknown as { __remuxOpenedLinks: string[] }).__remuxOpenedLinks
+    ))).toEqual([]);
+
+    await page.getByLabel('Dismiss link').click();
+    await expect(linkRow).toHaveCount(0);
+
+    // Taps outside any link fall through to the keyboard, never the link row.
+    await page.mouse.click(screenBox!.x + cellWidth * 30.5, screenBox!.y + cellHeight * 2.5);
+    await page.waitForTimeout(150);
+    await expect(linkRow).toHaveCount(0);
+  });
+
+  test('opens tapped file references relative to the terminal cwd', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    const startRequest = await waitForHostRequest(page, 'remux/terminal/session/start');
+    const startParams = recordParams(startRequest);
+
+    await sendTerminalOutput(page, 1, 'edit extensions/codex/viewer/App.tsx:577 now\r\n');
+    await page.waitForTimeout(100);
+
+    const screenBox = await page.locator('.xterm-screen').boundingBox();
+    expect(screenBox).not.toBeNull();
+    const cellWidth = screenBox!.width / Number(startParams.cols);
+    const cellHeight = screenBox!.height / Number(startParams.rows);
+    // 'edit ' spans columns 0-4, so column 18 is inside the file path.
+    const fileX = screenBox!.x + cellWidth * 18.5;
+    const fileY = screenBox!.y + cellHeight * 0.5;
+
+    const linkRow = page.locator('.remux-terminal-link-row');
+    await page.mouse.click(fileX, fileY);
+    await expect(linkRow).toContainText('extensions/codex/viewer/App.tsx:577');
+
+    await page.getByLabel('Open file').click();
+    await expect(linkRow).toHaveCount(0);
+    const fileOpenRequest = await waitForHostRequest(page, 'host/file/open');
+    expect(recordParams(fileOpenRequest)).toMatchObject({
+      line: 577,
+      path: '/workspace/remux/extensions/codex/viewer/App.tsx',
+    });
+
+    await page.mouse.click(fileX, fileY);
+    await expect(linkRow).toContainText('extensions/codex/viewer/App.tsx:577');
+    await page.getByLabel('Copy file').click();
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe('extensions/codex/viewer/App.tsx:577');
+    await expect(linkRow).toContainText('File copied');
+    await expect(linkRow).toHaveCount(0);
+  });
+
+  test('opens OSC 8 file hyperlinks from a tap', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    const startRequest = await waitForHostRequest(page, 'remux/terminal/session/start');
+    const startParams = recordParams(startRequest);
+
+    await sendTerminalOutput(
+      page,
+      1,
+      'open \x1b]8;;file:///workspace/remux/packages/viewer-kit/src/links.ts:12\x07links.ts:12\x1b]8;;\x07 now\r\n',
+    );
+    await page.waitForTimeout(100);
+
+    const screenBox = await page.locator('.xterm-screen').boundingBox();
+    expect(screenBox).not.toBeNull();
+    const cellWidth = screenBox!.width / Number(startParams.cols);
+    const cellHeight = screenBox!.height / Number(startParams.rows);
+
+    // 'links.ts:12' spans columns 5-15; the file URI itself is never visible.
+    const linkRow = page.locator('.remux-terminal-link-row');
+    await page.mouse.click(screenBox!.x + cellWidth * 10.5, screenBox!.y + cellHeight * 0.5);
+    await expect(linkRow).toContainText('/workspace/remux/packages/viewer-kit/src/links.ts:12');
+
+    await page.getByLabel('Open file').click();
+    await expect(linkRow).toHaveCount(0);
+    const fileOpenRequest = await waitForHostRequest(page, 'host/file/open');
+    expect(recordParams(fileOpenRequest)).toMatchObject({
+      line: 12,
+      path: '/workspace/remux/packages/viewer-kit/src/links.ts',
+    });
+  });
+
+  test('keeps the link row alive and expiring when the host rejects a file open', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    const startRequest = await waitForHostRequest(page, 'remux/terminal/session/start');
+    const startParams = recordParams(startRequest);
+
+    await sendTerminalOutput(page, 1, 'edit src/unopenable.ts:3 now\r\n');
+    await page.waitForTimeout(100);
+
+    const screenBox = await page.locator('.xterm-screen').boundingBox();
+    expect(screenBox).not.toBeNull();
+    const cellWidth = screenBox!.width / Number(startParams.cols);
+    const cellHeight = screenBox!.height / Number(startParams.rows);
+
+    // 'edit ' spans columns 0-4, so column 12 is inside the file path.
+    const linkRow = page.locator('.remux-terminal-link-row');
+    await page.mouse.click(screenBox!.x + cellWidth * 12.5, screenBox!.y + cellHeight * 0.5);
+    await expect(linkRow).toContainText('src/unopenable.ts:3');
+
+    await page.getByLabel('Open file').click();
+    await waitForHostRequest(page, 'host/file/open');
+
+    // The rejected open leaves the row in place, and the expiry timer is
+    // re-armed rather than lost — the row must still time out on its own.
+    await expect(linkRow).toContainText('src/unopenable.ts:3');
+    await expect(linkRow).toHaveCount(0, { timeout: 8_000 });
+  });
+
+  test('ignores link taps that stop a scroll fling', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+
+    const lines = Array.from({ length: 200 }, (_, index) => `https://example.com/line-${index}`).join('\r\n');
+    await sendTerminalOutput(page, 1, `${lines}\r\n`);
+    await page.waitForTimeout(100);
+
+    const screenBox = await page.locator('.xterm-screen').boundingBox();
+    expect(screenBox).not.toBeNull();
+    const tapPoint = { x: screenBox!.x + 40, y: screenBox!.y + 60 };
+
+    // Fling the buffer up into scrollback, leaving momentum running.
+    const dragX = screenBox!.x + 150;
+    const dragStartY = screenBox!.y + 100;
+    await dispatchTouchDrag(page, [
+      { x: dragX, y: dragStartY },
+      { x: dragX, y: dragStartY + 60 },
+      { x: dragX, y: dragStartY + 120 },
+      { x: dragX, y: dragStartY + 180 },
+    ], 20);
+
+    // Every buffer row starts with a url, so this lands on one — but it is a
+    // fling-stop, not a tap.
+    const linkRow = page.locator('.remux-terminal-link-row');
+    await dispatchTouchDrag(page, [tapPoint]);
+    await page.waitForTimeout(300);
+    await expect(linkRow).toHaveCount(0);
+
+    // Once the buffer has settled, the same tap raises the link row.
+    await page.waitForTimeout(700);
+    await dispatchTouchDrag(page, [tapPoint]);
+    await expect(linkRow).toContainText('https://example.com/line-');
+  });
+
   test('publishes a compact tab title without action bar footer status', async ({ page }) => {
     await page.goto('/?remuxLaunch=new-terminal');
     await waitForHostRequest(page, 'remux/terminal/session/start');
@@ -270,7 +642,8 @@ test.describe('terminal viewer route', () => {
     await expect(shiftButton).toHaveClass(/is-active/);
 
     const shiftWriteCount = await hostRequestCount(page, 'remux/terminal/session/write');
-    await page.getByLabel('Enter').click();
+    const enterKey = await settledTerminalKey(page, 'Enter');
+    await enterKey.click();
     const shiftWriteRequest = await waitForHostRequest(page, 'remux/terminal/session/write', shiftWriteCount + 1);
     const shiftWriteParams = recordParams(shiftWriteRequest);
     expect(Buffer.from(String(shiftWriteParams.dataBase64), 'base64').toString('utf8')).toBe('\x1b[13;2u');
@@ -281,6 +654,63 @@ test.describe('terminal viewer route', () => {
     await expect(altButton).toHaveClass(/is-active/);
     await page.waitForTimeout(terminalModifierAutoClearMs + 250);
     await expect(altButton).not.toHaveClass(/is-active/);
+  });
+
+  test('fires a key press for every rapid tap without debouncing', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+
+    const writeCount = await hostRequestCount(page, 'remux/terminal/session/write');
+    const enterKey = await settledTerminalKey(page, 'Enter');
+    for (let index = 0; index < 5; index += 1) {
+      await enterKey.click();
+    }
+
+    await waitForHostRequest(page, 'remux/terminal/session/write', writeCount + 5);
+    const decoded = decodeWrites(
+      (await hostRequests(page, 'remux/terminal/session/write')).slice(writeCount),
+    );
+    expect(decoded).toEqual(['\r', '\r', '\r', '\r', '\r']);
+  });
+
+  test('does not fire a key press when the pointer drags across the key row', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+
+    const writeCount = await hostRequestCount(page, 'remux/terminal/session/write');
+    const escapeBox = await page.getByLabel('Escape').boundingBox();
+    expect(escapeBox).not.toBeNull();
+    const startX = escapeBox!.x + escapeBox!.width / 2;
+    const startY = escapeBox!.y + escapeBox!.height / 2;
+    await page.mouse.move(startX, startY);
+    await page.mouse.down();
+    await page.mouse.move(startX + 40, startY, { steps: 4 });
+    await page.mouse.up();
+
+    await page.waitForTimeout(150);
+    expect(await hostRequestCount(page, 'remux/terminal/session/write')).toBe(writeCount);
+  });
+
+  test('repeats arrow keys while held', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+
+    const writeCount = await hostRequestCount(page, 'remux/terminal/session/write');
+    const arrowBox = await page.getByLabel('Arrow up').boundingBox();
+    expect(arrowBox).not.toBeNull();
+    await page.mouse.move(arrowBox!.x + arrowBox!.width / 2, arrowBox!.y + arrowBox!.height / 2);
+    await page.mouse.down();
+    await page.waitForTimeout(700);
+    await page.mouse.up();
+
+    await waitForHostRequest(page, 'remux/terminal/session/write', writeCount + 2);
+    const decoded = decodeWrites(
+      (await hostRequests(page, 'remux/terminal/session/write')).slice(writeCount),
+    );
+    expect(decoded.length).toBeGreaterThanOrEqual(2);
+    for (const write of decoded) {
+      expect(write).toBe('\x1b[A');
+    }
   });
 
   test('attaches to an existing terminal resource and shows restart after exit', async ({ page }) => {
@@ -732,7 +1162,18 @@ async function installMockRemuxHost(page: Page) {
 
     window.addEventListener('message', (event) => {
       const request = parseMessage(event.data);
-      if (!request || request.type !== 'remux/request') {
+      if (!request) {
+        return;
+      }
+
+      // Notifications (e.g. session writes) carry no id and expect no response,
+      // but tests still assert on them via the recorded request log.
+      if (request.type === 'remux/notify') {
+        state.requests.push(request);
+        return;
+      }
+
+      if (request.type !== 'remux/request') {
         return;
       }
 
@@ -740,7 +1181,18 @@ async function installMockRemuxHost(page: Page) {
       const params = paramsOf(request);
 
       switch (request.method) {
+        case 'host/file/open':
+          // Paths named "unopenable" reject, covering hosts without the
+          // handler (or a dropped connection) where the RPC promise rejects.
+          if (String(params.path ?? '').includes('unopenable')) {
+            postError(request, 'File open failed in test host');
+            return;
+          }
+          postResult(request, { ok: true });
+          return;
+
         case 'host/keyboard/dismiss':
+        case 'host/link/open':
         case 'host/overview/open':
         case 'host/tab/update':
         case 'host/view/reload':
@@ -826,6 +1278,15 @@ async function installMockRemuxHost(page: Page) {
   });
 }
 
+// Keys ignore taps that land within the fling-stop window after the row
+// scrolls, so bring the key into view and let the row settle before tapping.
+async function settledTerminalKey(page: Page, label: string) {
+  const key = page.getByLabel(label);
+  await key.scrollIntoViewIfNeeded();
+  await page.waitForTimeout(250);
+  return key;
+}
+
 async function waitForHostRequest(page: Page, method: string, count = 1) {
   await page.waitForFunction(({ method, count }) => {
     const requests = window.__remuxTerminalHost?.requests ?? [];
@@ -890,8 +1351,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
-async function dispatchTouchDrag(page: Page, points: Array<{ x: number; y: number }>) {
-  await page.evaluate((points) => {
+async function dispatchTouchDrag(
+  page: Page,
+  points: Array<{ x: number; y: number }>,
+  stepDelayMs = 0,
+) {
+  await page.evaluate(async ({ points, stepDelayMs }) => {
     const container = document.querySelector('.remux-terminal-container');
     if (!container) {
       throw new Error('missing terminal container');
@@ -908,10 +1373,13 @@ async function dispatchTouchDrag(page: Page, points: Array<{ x: number; y: numbe
 
     dispatchTouch('touchstart', points[0]!);
     for (let index = 1; index < points.length; index += 1) {
+      if (stepDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, stepDelayMs));
+      }
       dispatchTouch('touchmove', points[index]!);
     }
     dispatchTouch('touchend', points[points.length - 1]!, true);
-  }, points);
+  }, { points, stepDelayMs });
 }
 
 function decodeWrites(writes: HostRequest[]) {

@@ -5,6 +5,8 @@ const momentumStopVelocity = 100;
 const momentumStartVelocity = 50;
 const tapMaxDurationMs = 300;
 const tapMaxDistancePx = 10;
+const tapScrollSuppressMs = 150;
+const longPressMs = 500;
 const velocitySampleCount = 5;
 const maxTicksPerEmit = 8;
 
@@ -16,7 +18,14 @@ type TouchSample = {
 export function setupTouchScroll(
   container: HTMLElement,
   term: Terminal,
-  options: { disabled?: () => boolean; onTap?: () => void } = {},
+  options: {
+    disabled?: () => boolean;
+    // When true, always scroll the xterm buffer directly instead of handing the
+    // gesture to the app via wheel reports (used while selecting text).
+    forcePlainScroll?: () => boolean;
+    onLongPress?: (clientX: number, clientY: number) => void;
+    onTap?: (clientX: number, clientY: number) => void;
+  } = {},
 ) {
   let cellHeight = container.clientHeight / Math.max(term.rows, 1);
   let scrollAccum = 0;
@@ -26,9 +35,21 @@ export function setupTouchScroll(
 
   let lastTouchX = 0;
   let lastTouchY = 0;
+  let touchStartX = 0;
   let touchStartY = 0;
   let touchStartTime = 0;
+  let longPressTimer: number | null = null;
+  let longPressFired = false;
+  let lastScrollMs = Number.NEGATIVE_INFINITY;
+  let flingStopTouch = false;
   const recentMoves: TouchSample[] = [];
+
+  function clearLongPressTimer() {
+    if (longPressTimer !== null) {
+      window.clearTimeout(longPressTimer);
+      longPressTimer = null;
+    }
+  }
 
   const resizeDisposable = term.onResize(() => {
     cellHeight = container.clientHeight / Math.max(term.rows, 1);
@@ -86,14 +107,16 @@ export function setupTouchScroll(
     }
 
     const lines = -deltaPixels / cellHeight;
-    const mouseMode = term.modes.mouseTrackingMode !== 'none';
-    const alternate = term.buffer.active.type === 'alternate';
+    const plain = options.forcePlainScroll?.() ?? false;
+    const mouseMode = !plain && term.modes.mouseTrackingMode !== 'none';
+    const alternate = !plain && term.buffer.active.type === 'alternate';
 
     if (!mouseMode && !alternate) {
       scrollAccum += lines;
       const wholeLines = Math.trunc(scrollAccum);
       if (wholeLines !== 0) {
         scrollAccum -= wholeLines;
+        lastScrollMs = performance.now();
         term.scrollLines(wholeLines);
       }
       return;
@@ -106,6 +129,7 @@ export function setupTouchScroll(
     }
 
     wheelAccum -= wholeLines;
+    lastScrollMs = performance.now();
     const point = clampToScreen(clientX, clientY);
     const ticks = Math.min(Math.abs(wholeLines), maxTicksPerEmit);
     for (let index = 0; index < ticks; index += 1) {
@@ -136,6 +160,8 @@ export function setupTouchScroll(
   }
 
   function onTouchStart(event: TouchEvent) {
+    clearLongPressTimer();
+    longPressFired = false;
     if (options.disabled?.()) {
       return;
     }
@@ -145,18 +171,34 @@ export function setupTouchScroll(
       return;
     }
 
+    flingStopTouch = momentumId !== null;
     cancelMomentum();
     scrollAccum = 0;
     wheelAccum = 0;
     lastTouchX = touch.clientX;
     lastTouchY = touch.clientY;
+    touchStartX = touch.clientX;
     touchStartY = touch.clientY;
     touchStartTime = Date.now();
     recentMoves.length = 0;
+    if (options.onLongPress && event.touches.length === 1) {
+      const { clientX, clientY } = touch;
+      longPressTimer = window.setTimeout(() => {
+        longPressTimer = null;
+        longPressFired = true;
+        options.onLongPress?.(clientX, clientY);
+      }, longPressMs);
+    }
     event.preventDefault();
   }
 
   function onTouchMove(event: TouchEvent) {
+    // A fired long-press owns the rest of the gesture; don't also scroll.
+    if (longPressFired) {
+      event.preventDefault();
+      return;
+    }
+
     if (options.disabled?.()) {
       return;
     }
@@ -171,6 +213,13 @@ export function setupTouchScroll(
     lastTouchX = touch.clientX;
     lastTouchY = y;
 
+    if (
+      longPressTimer !== null
+      && Math.hypot(touch.clientX - touchStartX, y - touchStartY) > tapMaxDistancePx
+    ) {
+      clearLongPressTimer();
+    }
+
     recentMoves.push({ time: Date.now(), y });
     if (recentMoves.length > velocitySampleCount) {
       recentMoves.shift();
@@ -181,6 +230,13 @@ export function setupTouchScroll(
   }
 
   function onTouchEnd(event: TouchEvent) {
+    clearLongPressTimer();
+    if (longPressFired) {
+      longPressFired = false;
+      event.preventDefault();
+      return;
+    }
+
     if (options.disabled?.()) {
       return;
     }
@@ -193,7 +249,11 @@ export function setupTouchScroll(
     const elapsed = Date.now() - touchStartTime;
     const distance = Math.abs(touch.clientY - touchStartY);
     if (elapsed < tapMaxDurationMs && distance < tapMaxDistancePx) {
-      options.onTap?.();
+      // A touch landing while the buffer is (or was just) scrolling is a
+      // fling-stop, not a tap — mirror the key rows' scroll suppression.
+      if (!flingStopTouch && performance.now() - lastScrollMs > tapScrollSuppressMs) {
+        options.onTap?.(touch.clientX, touch.clientY);
+      }
       event.preventDefault();
       return;
     }
@@ -219,6 +279,7 @@ export function setupTouchScroll(
     container.removeEventListener('touchstart', onTouchStart);
     container.removeEventListener('touchmove', onTouchMove);
     container.removeEventListener('touchend', onTouchEnd);
+    clearLongPressTimer();
     cancelMomentum();
     resizeDisposable.dispose();
   };

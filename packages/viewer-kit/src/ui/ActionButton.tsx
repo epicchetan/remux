@@ -14,6 +14,8 @@ export type ActionButtonProps = {
   tone?: 'default' | 'primary';
 };
 
+const syntheticClickWindowMs = 500;
+
 export function ActionButton({
   ariaExpanded,
   ariaHasPopup,
@@ -28,6 +30,7 @@ export function ActionButton({
   tone = 'default',
 }: ActionButtonProps) {
   const lastActivationMsRef = useRef(Number.NEGATIVE_INFINITY);
+  const lastPointerUpMsRef = useRef(Number.NEGATIVE_INFINITY);
   const activateOnce = useCallback(() => {
     const now = performance.now();
     if (now - lastActivationMsRef.current < activationDebounceMs) {
@@ -55,7 +58,13 @@ export function ActionButton({
         if (preserveFocus) {
           event.preventDefault();
           event.stopPropagation();
-          activateOnce();
+          // Pointer gestures already activated on pointerup; the browser's
+          // synthetic click can arrive arbitrarily late, so gate it on recent
+          // pointer activity instead of the activation debounce alone. Clicks
+          // with no pointer history (keyboard, assistive tech) still activate.
+          if (performance.now() - lastPointerUpMsRef.current > syntheticClickWindowMs) {
+            activateOnce();
+          }
           return;
         }
 
@@ -66,20 +75,29 @@ export function ActionButton({
       onPointerDown={preserveFocus ? (event) => {
         event.preventDefault();
         event.stopPropagation();
+        // A fresh press starts a new gesture: the activation debounce only
+        // dedupes the pointerup/touchend/click fan-out of a single tap, so it
+        // must never carry across into the next deliberate tap.
+        lastActivationMsRef.current = Number.NEGATIVE_INFINITY;
       } : undefined}
       onPointerUp={preserveFocus ? (event) => {
         event.preventDefault();
         event.stopPropagation();
+        lastPointerUpMsRef.current = performance.now();
         activateOnce();
       } : undefined}
       onTouchEnd={preserveFocus ? (event) => {
         event.preventDefault();
         event.stopPropagation();
+        lastPointerUpMsRef.current = performance.now();
         activateOnce();
       } : undefined}
       onTouchStart={preserveFocus ? (event) => {
         event.preventDefault();
         event.stopPropagation();
+        if (event.touches.length === 1) {
+          lastActivationMsRef.current = Number.NEGATIVE_INFINITY;
+        }
       } : undefined}
       type="button"
     >

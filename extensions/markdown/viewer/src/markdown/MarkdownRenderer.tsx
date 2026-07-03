@@ -6,7 +6,7 @@ import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import { createElement, type ComponentPropsWithoutRef, type MouseEvent, type ReactNode } from 'react';
 
-import { openHostFile } from '@remux/viewer-kit/host';
+import { openHostHref } from '@remux/viewer-kit/links';
 
 import { MarkdownCodeBlock } from './MarkdownCodeBlock';
 import { MarkdownImage } from './MarkdownImage';
@@ -176,68 +176,7 @@ function handleMarkdownLinkClick(
   }
 
   event.preventDefault();
-  if (isExternalUrl(href)) {
-    return;
-  }
-
-  const targetPath = filePathFromHref(href, filePath);
-  if (!targetPath) {
-    return;
-  }
-
-  void openHostFile({ path: targetPath });
-}
-
-function isExternalUrl(href: string) {
-  return !/^[a-z]:[\\/]/iu.test(href)
-    && (/^(?:[a-z][a-z\d+.-]*:)?\/\//iu.test(href) || /^(?:mailto:|tel:)/iu.test(href));
-}
-
-function filePathFromHref(href: string, filePath: string) {
-  const pathPart = href.split(/[?#]/u, 1)[0];
-  if (!pathPart) {
-    return null;
-  }
-
-  const decodedPath = decodePathPart(pathPart);
-  return decodedPath.startsWith('/')
-    ? normalizePath(decodedPath)
-    : normalizePath(`${dirname(filePath)}/${decodedPath}`);
-}
-
-function decodePathPart(pathPart: string) {
-  try {
-    return decodeURIComponent(pathPart);
-  } catch {
-    return pathPart;
-  }
-}
-
-function dirname(filePath: string) {
-  const normalized = filePath.replace(/\/+$/u, '');
-  const index = normalized.lastIndexOf('/');
-  return index > 0 ? normalized.slice(0, index) : '/';
-}
-
-function normalizePath(filePath: string) {
-  const absolute = filePath.startsWith('/');
-  const parts = filePath.split('/');
-  const stack: string[] = [];
-
-  for (const part of parts) {
-    if (!part || part === '.') {
-      continue;
-    }
-
-    if (part === '..') {
-      stack.pop();
-      continue;
-    }
-
-    stack.push(part);
-  }
-
-  return `${absolute ? '/' : ''}${stack.join('/')}`;
+  void openHostHref(href, { baseFilePath: filePath, parseLine: true });
 }
 
 function uniqueSlug(text: string, counts: Map<string, number>) {
@@ -341,6 +280,10 @@ function visitMarkdownAst(node: MarkdownAstNode, visitor: (node: MarkdownAstNode
 
 const remuxMarkdownSanitizeSchema = {
   ...defaultSchema,
+  protocols: {
+    ...defaultSchema.protocols,
+    href: ['http', 'https', 'file'],
+  },
   attributes: {
     ...defaultSchema.attributes,
     a: [

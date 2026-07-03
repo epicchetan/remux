@@ -44,6 +44,9 @@ body {
 .remux-terminal-container {
   position: absolute;
   inset: calc(env(safe-area-inset-top) + 8px) 0 0;
+  /* Contain xterm's internal z-indexes so overlays that follow in the DOM
+     (selection handles, status) reliably paint and hit-test above the canvas. */
+  z-index: 0;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -56,6 +59,85 @@ body {
 .remux-terminal-container.is-selecting,
 .remux-terminal-container.is-selecting .xterm {
   cursor: crosshair;
+}
+
+.remux-terminal-selection-status {
+  position: absolute;
+  top: calc(env(safe-area-inset-top) + 16px);
+  left: 50%;
+  z-index: 3;
+  max-width: min(320px, calc(100% - 48px));
+  padding: 5px 14px;
+  border: 1px solid var(--rmx-border);
+  border-radius: 999px;
+  background: var(--rmx-surface-hover);
+  color: var(--rmx-text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 16px;
+  overflow: hidden;
+  pointer-events: none;
+  text-overflow: ellipsis;
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+
+.remux-terminal-selection-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.remux-terminal-selection-handle {
+  position: absolute;
+  width: 32px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: grab;
+  pointer-events: auto;
+  touch-action: none;
+  visibility: hidden;
+}
+
+.remux-terminal-selection-handle-knob {
+  position: absolute;
+  left: 50%;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--rmx-surface);
+  border-radius: 50%;
+  background: var(--rmx-accent);
+  box-shadow: 0 1px 4px rgb(0 0 0 / 35%);
+  transform: translateX(-50%);
+}
+
+.remux-terminal-selection-handle-bar {
+  position: absolute;
+  left: 50%;
+  width: 2px;
+  height: var(--remux-terminal-selection-bar-height, 16px);
+  background: var(--rmx-accent);
+  transform: translateX(-50%);
+}
+
+.remux-terminal-selection-handle.is-start .remux-terminal-selection-handle-knob {
+  top: 0;
+}
+
+.remux-terminal-selection-handle.is-start .remux-terminal-selection-handle-bar {
+  bottom: 0;
+}
+
+.remux-terminal-selection-handle.is-end .remux-terminal-selection-handle-knob {
+  bottom: 0;
+}
+
+.remux-terminal-selection-handle.is-end .remux-terminal-selection-handle-bar {
+  top: 0;
 }
 
 .remux-terminal-container .xterm {
@@ -136,6 +218,7 @@ body {
 }
 
 .remux-terminal-key-row,
+.remux-terminal-link-row,
 .remux-terminal-tmux-row {
   display: flex;
   --remux-terminal-key-gap: 7px;
@@ -144,6 +227,18 @@ body {
   height: 41px;
   align-items: center;
   gap: var(--remux-terminal-key-gap);
+}
+
+.remux-terminal-link-row-text {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  padding: 0 2px 3px 6px;
+  color: var(--rmx-text);
+  font-size: 12px;
+  line-height: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .remux-terminal-key-fixed,
@@ -189,6 +284,13 @@ body {
   flex: 0 0 auto;
 }
 
+/* Horizontal pans starting on a key hand the gesture to the scrolling row
+   (firing pointercancel, which voids the press) instead of tapping the key. */
+.remux-terminal-key-scroll .remux-terminal-key,
+.remux-terminal-tmux-tabs .remux-terminal-key {
+  touch-action: pan-x;
+}
+
 .remux-terminal-tmux-tab-key.remux-extension-action-button {
   width: auto;
   min-width: 70px;
@@ -217,6 +319,13 @@ body {
     inset 0 1px 0 var(--rmx-primary-highlight),
     inset 0 -2px 0 var(--rmx-primary-shadow-inset),
     0 2px 0 var(--rmx-primary-shadow-drop);
+}
+
+/* Pointerdown is canceled to preserve terminal focus, which also suppresses
+   :active on touch, so pressed feedback is driven by this class instead. */
+.remux-terminal-key.is-pressed:not(:disabled) {
+  box-shadow: var(--rmx-shadow-pressed);
+  transform: translateY(1px);
 }
 
 .remux-terminal-key-text {

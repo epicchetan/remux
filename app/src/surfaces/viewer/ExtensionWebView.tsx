@@ -7,6 +7,7 @@ import {
   ActivityIndicator,
   AppState,
   Keyboard,
+  Linking,
   Pressable,
   StyleSheet,
   Text,
@@ -860,6 +861,42 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
             break;
           }
 
+          if (message.method === 'host/link/open') {
+            const url = parseLinkOpenUrl(message.params);
+            if (!url) {
+              postToWebView({
+                error: {
+                  code: -32602,
+                  message: 'Invalid link open params',
+                },
+                id: message.id,
+                type: 'remux/error',
+              }, { epoch: requestEpoch });
+              break;
+            }
+
+            logRemuxDebug('webview:link-open', url);
+            void Linking.openURL(url)
+              .then(() => {
+                postToWebView({
+                  id: message.id,
+                  result: { ok: true },
+                  type: 'remux/response',
+                }, { epoch: requestEpoch });
+              })
+              .catch((requestError) => {
+                postToWebView({
+                  error: {
+                    code: -32000,
+                    message: errorMessage(requestError),
+                  },
+                  id: message.id,
+                  type: 'remux/error',
+                }, { epoch: requestEpoch });
+              });
+            break;
+          }
+
           void remux
             .request(message.method, message.params, message.timeoutMs, remuxRequestContext)
             .then((result) => {
@@ -1051,16 +1088,32 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
   }, [autoReloadWebView, title]);
 
   const handleShouldStartLoadWithRequest = useCallback((request: ShouldStartLoadRequest) => {
-    const shouldAllow = shouldAllowWebViewNavigation({
+    const decision = webViewNavigationDecision({
+      isTopFrame: request.isTopFrame !== false,
       requestUrl: request.url,
       sourceUrl: webViewSourceUrl,
     });
 
-    if (!shouldAllow) {
-      logRemuxDebug('webview:navigation-blocked', request.url);
+    if (decision.type === 'open-external') {
+      logRemuxDebug('webview:navigation-open-external', decision.url);
+      void Linking.openURL(decision.url).catch((error) => {
+        logRemuxDebug('webview:navigation-open-external:failed', {
+          message: errorMessage(error),
+          url: decision.url,
+        });
+      });
+      return false;
     }
 
-    return shouldAllow;
+    if (decision.type === 'blocked') {
+      logRemuxDebug('webview:navigation-blocked', {
+        reason: decision.reason,
+        url: request.url,
+      });
+      return false;
+    }
+
+    return true;
   }, [webViewSourceUrl]);
 
   useEffect(() => () => {
@@ -1348,6 +1401,21 @@ function parseFileOpenParams(params: unknown): HostFileOpenParams | null {
   };
 }
 
+// Only web urls may leave the app; viewers must never reach Linking with
+// custom schemes (javascript:, tel:, app schemes).
+function parseLinkOpenUrl(params: unknown): string | null {
+  if (!isRecord(params) || typeof params.url !== 'string') {
+    return null;
+  }
+
+  try {
+    const url = new URL(params.url.trim());
+    return isWebProtocol(url.protocol) ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
 function isHostFilePath(filePath: string) {
   return /^[a-z]:[\\/]/iu.test(filePath)
     || (!/^(?:[a-z][a-z\d+.-]*:)?\/\//iu.test(filePath)
@@ -1398,15 +1466,22 @@ function waitForKeyboardToHide(timeoutMs: number) {
   });
 }
 
-function shouldAllowWebViewNavigation({
+type WebViewNavigationDecision =
+  | { type: 'allow' }
+  | { reason: string; type: 'blocked' }
+  | { type: 'open-external'; url: string };
+
+function webViewNavigationDecision({
+  isTopFrame,
   requestUrl,
   sourceUrl,
 }: {
+  isTopFrame: boolean;
   requestUrl: string;
   sourceUrl: string;
-}) {
+}): WebViewNavigationDecision {
   if (!requestUrl || requestUrl === 'about:blank') {
-    return true;
+    return { type: 'allow' };
   }
 
   let request;
@@ -1415,17 +1490,31 @@ function shouldAllowWebViewNavigation({
     request = new URL(requestUrl);
     source = new URL(sourceUrl);
   } catch {
-    return false;
+    return { reason: 'invalid-url', type: 'blocked' };
   }
 
   if (request.protocol !== source.protocol || request.host !== source.host) {
-    return false;
+    // Only deliberate top-frame navigations may escape to the browser; an
+    // iframe navigating cross-origin must not be able to pop Safari.
+    if (!isTopFrame) {
+      return { reason: 'external-subframe', type: 'blocked' };
+    }
+
+    return isWebProtocol(request.protocol)
+      ? { type: 'open-external', url: request.href }
+      : { reason: 'unsupported-external-scheme', type: 'blocked' };
   }
 
   const sourcePath = source.pathname.endsWith('/')
     ? source.pathname
     : source.pathname.slice(0, source.pathname.lastIndexOf('/') + 1);
-  return request.pathname.startsWith(sourcePath);
+  return request.pathname.startsWith(sourcePath)
+    ? { type: 'allow' }
+    : { reason: 'outside-viewer-route', type: 'blocked' };
+}
+
+function isWebProtocol(protocol: string) {
+  return protocol === 'http:' || protocol === 'https:';
 }
 
 async function imagePickerAssetToHostAttachment(

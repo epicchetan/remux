@@ -6,9 +6,12 @@ import {
   type ComponentProps,
   type ReactNode,
 } from 'react';
+import Constants from 'expo-constants';
+import * as Updates from 'expo-updates';
 import {
   ActivityIndicator,
   Image,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -57,6 +60,11 @@ export function SettingsOverview() {
   const [saving, setSaving] = useState(false);
   const bottomPadding = getBottomBarHeight(insets.bottom) + tabGridGap;
   const { styles, theme } = useSettingsTheme();
+  const { availableUpdate, currentlyRunning, isUpdatePending } = Updates.useUpdates();
+  const [updateAction, setUpdateAction] = useState<'idle' | 'checking' | 'downloading' | 'restarting'>('idle');
+  const [updateStatus, setUpdateStatus] = useState<string | null>(null);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+  const updateInfo = useMemo(() => deployedUpdateInfo(currentlyRunning), [currentlyRunning]);
 
   useEffect(() => {
     void loadSettings();
@@ -158,6 +166,33 @@ export function SettingsOverview() {
     }
   };
 
+  // One button drives the whole flow: an already-downloaded update restarts
+  // straight into place, otherwise check, download, and restart.
+  const applyUpdate = async () => {
+    setUpdateError(null);
+    setUpdateStatus(null);
+    try {
+      if (!isUpdatePending) {
+        setUpdateAction('checking');
+        const check = await Updates.checkForUpdateAsync();
+        if (!check.isAvailable) {
+          setUpdateStatus('Already up to date.');
+          return;
+        }
+
+        setUpdateAction('downloading');
+        await Updates.fetchUpdateAsync();
+      }
+
+      setUpdateAction('restarting');
+      await Updates.reloadAsync();
+    } catch (error) {
+      setUpdateError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setUpdateAction('idle');
+    }
+  };
+
   return (
     <View style={styles.container}>
       <ScrollView
@@ -244,7 +279,45 @@ export function SettingsOverview() {
             ) : null}
           </View>
         </Section>
+
+        <Section title="Updates">
+          <View style={styles.infoList}>
+            {updateInfo.map((item) => (
+              <InfoRow key={item.label} label={item.label} value={item.value} />
+            ))}
+          </View>
+          <View style={styles.actionRow}>
+            <SettingsButton
+              disabled={!Updates.isEnabled || updateAction !== 'idle'}
+              label={updateButtonLabel(updateAction, isUpdatePending)}
+              loading={updateAction !== 'idle'}
+              onPress={applyUpdate}
+              variant="primary"
+            />
+          </View>
+          {availableUpdate ? (
+            <Text style={styles.updateStatusText}>
+              {`Available: ${updateMessageFromManifest(availableUpdate.manifest) ?? availableUpdate.updateId ?? 'new update'}`}
+            </Text>
+          ) : null}
+          {!Updates.isEnabled ? (
+            <Text style={styles.updateStatusText}>Updates are disabled in this build.</Text>
+          ) : null}
+          {updateStatus ? <Text style={styles.updateStatusText}>{updateStatus}</Text> : null}
+          {updateError ? <Text style={styles.errorText}>{updateError}</Text> : null}
+        </Section>
       </ScrollView>
+    </View>
+  );
+}
+
+function InfoRow({ label, value }: { label: string; value: string }) {
+  const { styles } = useSettingsTheme();
+
+  return (
+    <View style={styles.infoRow}>
+      <Text style={styles.infoLabel}>{label}</Text>
+      <Text selectable style={styles.infoValue}>{value}</Text>
     </View>
   );
 }
@@ -419,6 +492,84 @@ function statusLabel(status: string) {
   }
 }
 
+function deployedUpdateInfo(currentlyRunning: Updates.CurrentlyRunningInfo) {
+  const message = updateMessageFromManifest(currentlyRunning.manifest)
+    ?? configExtraString(Constants.expoConfig?.extra, 'updateMessage');
+  const rows = [
+    { label: 'Message', value: message ?? (currentlyRunning.isEmbeddedLaunch ? 'Embedded build' : 'None') },
+    { label: 'Published', value: currentlyRunning.createdAt ? formatDateTime(currentlyRunning.createdAt) : 'Unknown' },
+    { label: 'Source', value: currentlyRunning.isEmbeddedLaunch ? 'Embedded bundle' : 'OTA update' },
+    { label: 'Channel', value: currentlyRunning.channel ?? 'None' },
+    { label: 'Runtime', value: currentlyRunning.runtimeVersion ?? 'Unknown' },
+    { label: 'Update ID', value: currentlyRunning.updateId ?? 'None' },
+    { label: 'App version', value: `${Constants.expoConfig?.version ?? 'Unknown'} (${nativeBuildText()})` },
+  ];
+
+  if (currentlyRunning.isEmergencyLaunch) {
+    rows.push({
+      label: 'Emergency',
+      value: currentlyRunning.emergencyLaunchReason ?? 'Fell back to the embedded bundle',
+    });
+  }
+
+  return rows;
+}
+
+// The publish flow embeds `--message` at extra.updateMessage via app.config.js;
+// EAS itself never delivers the message to devices.
+function updateMessageFromManifest(manifest: Partial<Updates.Manifest> | undefined) {
+  if (!manifest || !('extra' in manifest)) {
+    return null;
+  }
+
+  return configExtraString(manifest.extra?.expoClient?.extra, 'updateMessage');
+}
+
+function configExtraString(extra: Record<string, unknown> | null | undefined, key: string) {
+  const value = extra?.[key];
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function updateButtonLabel(action: 'idle' | 'checking' | 'downloading' | 'restarting', isUpdatePending: boolean) {
+  switch (action) {
+    case 'checking':
+      return 'Checking';
+    case 'downloading':
+      return 'Downloading';
+    case 'restarting':
+      return 'Restarting';
+    default:
+      return isUpdatePending ? 'Restart to update' : 'Check for updates';
+  }
+}
+
+// Local time without Intl (Hermes builds vary in locale support).
+function formatDateTime(date: Date) {
+  if (Number.isNaN(date.getTime())) {
+    return 'Unknown';
+  }
+
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function nativeBuildText() {
+  if (Platform.OS === 'ios') {
+    return Constants.platform?.ios?.buildNumber
+      ?? Constants.expoConfig?.ios?.buildNumber
+      ?? 'Unavailable';
+  }
+
+  if (Platform.OS === 'android') {
+    const versionCode = Constants.platform?.android?.versionCode
+      ?? Constants.expoConfig?.android?.versionCode
+      ?? null;
+    return versionCode === null || versionCode === undefined ? 'Unavailable' : String(versionCode);
+  }
+
+  return 'Unavailable';
+}
+
 function useSettingsTheme() {
   const theme = useTheme();
   const styles = useMemo(() => createStyles(theme), [theme]);
@@ -591,6 +742,29 @@ function createStyles(theme: RemuxTheme) {
     minHeight: 48,
     paddingHorizontal: 14,
   },
+  infoLabel: {
+    color: theme.textMuted,
+    flexShrink: 0,
+    fontSize: 12,
+    fontWeight: '700',
+    lineHeight: 16,
+    width: 116,
+  },
+  infoList: {
+    gap: 10,
+  },
+  infoRow: {
+    alignItems: 'flex-start',
+    flexDirection: 'row',
+    gap: 12,
+  },
+  infoValue: {
+    color: theme.text,
+    flex: 1,
+    fontSize: 13,
+    fontWeight: '600',
+    lineHeight: 18,
+  },
   primaryButton: {
     backgroundColor: alpha(theme.focusRing, 0.16),
     borderColor: theme.focusRing,
@@ -624,6 +798,12 @@ function createStyles(theme: RemuxTheme) {
     fontSize: 24,
     fontWeight: '800',
     lineHeight: 30,
+  },
+  updateStatusText: {
+    color: theme.textMuted,
+    fontSize: 12,
+    lineHeight: 17,
+    marginTop: 10,
   },
   });
 }

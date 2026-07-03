@@ -50,6 +50,19 @@ if (args.length === 0) {
   process.exit(1);
 }
 
+// EAS keeps `--message` server-side and never delivers it to devices. Mirror
+// it into the config evaluation (app.config.js reads REMUX_UPDATE_MESSAGE
+// into extra.updateMessage) so the app can show what's deployed in Settings.
+if (!process.env.REMUX_UPDATE_MESSAGE) {
+  const flagIndex = args.findIndex((arg) => arg === '--message' || arg === '-m');
+  const message = flagIndex >= 0
+    ? args[flagIndex + 1]
+    : args.find((arg) => arg.startsWith('--message='))?.slice('--message='.length);
+  if (message) {
+    process.env.REMUX_UPDATE_MESSAGE = message;
+  }
+}
+
 const child = spawn('npx', ['--yes', 'eas-cli@latest', ...args], {
   env: process.env,
   stdio: 'inherit',
