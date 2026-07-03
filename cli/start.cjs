@@ -7,6 +7,7 @@ const { createExtensionProcess } = require('./extensionProcess.cjs');
 const { discoverExtensions } = require('./extensionRegistry.cjs');
 const { createRemuxLogger } = require('./logger.cjs');
 const { createNotificationManager } = require('./notifications.cjs');
+const { createPreviewRelay } = require('./previewRelay.cjs');
 const { attachRemuxWebSocketServer, remuxWebSocketPath } = require('./wsServer.cjs');
 const { createViewerProvider } = require('./viewerProvider.cjs');
 const { remuxRestartExitCode } = require('./restart.cjs');
@@ -20,6 +21,7 @@ async function start({ env = process.env, rootDir = process.cwd() } = {}) {
   const extensions = discoverExtensions({ env, rootDir: runtimeRootDir });
   const defaultExtension = defaultLaunchExtension(extensions);
   const notifications = createNotificationManager({ log, rootDir: runtimeRootDir });
+  const previews = createPreviewRelay({ log });
 
   if (!defaultExtension) {
     throw new Error('No Remux extensions found under extensions/*');
@@ -83,6 +85,7 @@ async function start({ env = process.env, rootDir = process.cwd() } = {}) {
       },
       log,
       notifications,
+      previews,
       router,
       server,
     });
@@ -90,6 +93,7 @@ async function start({ env = process.env, rootDir = process.cwd() } = {}) {
     await router.start(remuxWs.ctx);
     await listen(server, runtime, log);
   } catch (error) {
+    previews.close();
     remuxWs?.close();
     await router.stop();
     await stopViewerProviders(viewerProviders, server);
@@ -110,6 +114,7 @@ async function start({ env = process.env, rootDir = process.cwd() } = {}) {
     }
     shuttingDown = true;
 
+    previews.close();
     remuxWs?.close();
     await router.stop();
     await stopViewerProviders(viewerProviders, server);

@@ -28,6 +28,7 @@ const SESSION_OUTPUT_NOTIFICATION: &str = "remux/terminal/session/output";
 const SESSION_EXITED_NOTIFICATION: &str = "remux/terminal/session/exited";
 const REMUX_NOTIFICATION_AUDIENCE_REMOVE_METHOD: &str = "remux/notifications/audience/remove";
 const REMUX_NOTIFICATION_REQUEST_METHOD: &str = "remux/notifications/request";
+const PREVIEW_INVALIDATE_NOTIFICATION: &str = "remux/previews/invalidate";
 
 const MAX_REPLAY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_REPLAY_FRAMES: usize = 10_000;
@@ -45,6 +46,10 @@ const NOTIFICATION_TITLE_MAX_CHARS: usize = 120;
 const NOTIFICATION_BODY_MAX_CHARS: usize = 240;
 const BELL_NOTIFICATION_MIN_INTERVAL_MS: u64 = 10_000;
 const DUPLICATE_NOTIFICATION_MIN_INTERVAL_MS: u64 = 2_000;
+// Preview invalidations tell clients a session's rendered content changed so
+// they can refresh tab screenshots. One per second per session is plenty;
+// the burst tail is delivered by a trailing send.
+const PREVIEW_INVALIDATE_MIN_INTERVAL: Duration = Duration::from_millis(1_000);
 const SHELL_INTEGRATION_ENV: &str = "REMUX_TERMINAL_SHELL_INTEGRATION";
 const TMUX_CONTEXT_CACHE_FRESH_MS: u64 = 1_000;
 
@@ -1189,6 +1194,18 @@ fn terminal_notification_target(session_id: &str) -> Value {
     })
 }
 
+fn preview_invalidate_notification(session_id: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": PREVIEW_INVALIDATE_NOTIFICATION,
+        "params": {
+            "resourceId": session_id,
+            "resourceKind": "terminalSession",
+            "viewId": "main",
+        },
+    })
+}
+
 fn spawn_reader_thread(
     state: Arc<Mutex<TerminalState>>,
     output_tx: mpsc::Sender<Value>,
@@ -1218,7 +1235,36 @@ fn spawn_reader_thread(
     // immediately with no added latency; only an active burst (where more chunks
     // are already waiting) waits out the short coalescing window to merge its tail.
     thread::spawn(move || {
-        while let Ok(mut acc) = chunk_rx.recv() {
+        let mut last_preview_invalidate: Option<Instant> = None;
+        let mut preview_invalidate_pending = false;
+        loop {
+            // While a trailing preview invalidation is pending, wake at its
+            // deadline so the final frame of a burst still gets announced.
+            let received = if preview_invalidate_pending {
+                let deadline = last_preview_invalidate
+                    .map_or_else(Instant::now, |at| at + PREVIEW_INVALIDATE_MIN_INTERVAL);
+                let now = Instant::now();
+                if now >= deadline {
+                    preview_invalidate_pending = false;
+                    last_preview_invalidate = Some(now);
+                    if output_tx.send(preview_invalidate_notification(&session_id)).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                match chunk_rx.recv_timeout(deadline - now) {
+                    Ok(chunk) => chunk,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            } else {
+                match chunk_rx.recv() {
+                    Ok(chunk) => chunk,
+                    Err(_) => return,
+                }
+            };
+
+            let mut acc = received;
             // Pull everything already queued without waiting.
             let mut bursting = false;
             while acc.len() < MAX_COALESCED_BYTES {
@@ -1274,6 +1320,19 @@ fn spawn_reader_thread(
                     return;
                 }
             }
+
+            let now = Instant::now();
+            let invalidate_due = last_preview_invalidate
+                .is_none_or(|at| now.duration_since(at) >= PREVIEW_INVALIDATE_MIN_INTERVAL);
+            if invalidate_due {
+                last_preview_invalidate = Some(now);
+                preview_invalidate_pending = false;
+                if output_tx.send(preview_invalidate_notification(&session_id)).is_err() {
+                    return;
+                }
+            } else {
+                preview_invalidate_pending = true;
+            }
         }
     });
 }
@@ -1313,6 +1372,7 @@ fn spawn_wait_thread(
                     },
                 }),
                 terminal_audience_remove_notification(&session_id),
+                preview_invalidate_notification(&session_id),
             ]
         };
 

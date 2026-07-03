@@ -17,11 +17,13 @@ mod thread_usage;
 mod transcript;
 mod util;
 
+use std::collections::HashMap;
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -51,6 +53,11 @@ const THREAD_MESSAGE_FORK_METHOD: &str = "remux/codex/thread/message/fork";
 const THREAD_MESSAGE_SEND_METHOD: &str = "remux/codex/thread/message/send";
 const THREAD_MESSAGE_START_METHOD: &str = "remux/codex/thread/message/start";
 const THREAD_TURN_INTERRUPT_METHOD: &str = "remux/codex/thread/turn/interrupt";
+const PREVIEW_INVALIDATE_NOTIFICATION: &str = "remux/previews/invalidate";
+// Preview invalidations tell clients a thread's rendered content changed so
+// they can refresh tab screenshots. Streaming updates are throttled per
+// thread; turn boundaries always emit so the final state is never missed.
+const PREVIEW_INVALIDATE_MIN_INTERVAL: Duration = Duration::from_millis(1_000);
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -217,6 +224,7 @@ fn spawn_app_server_event_forwarder(
     thread_usage: ThreadUsageStore,
 ) {
     thread::spawn(move || {
+        let mut preview_invalidated_at: HashMap<String, Instant> = HashMap::new();
         for event in event_rx {
             let AppServerEvent::Notification(notification) = event else {
                 continue;
@@ -239,10 +247,65 @@ fn spawn_app_server_event_forwarder(
             }
 
             if !invalidations.is_empty() {
+                let preview_threads = preview_invalidation_threads(
+                    &invalidations,
+                    is_turn_boundary(&notification),
+                    &mut preview_invalidated_at,
+                );
                 let _ = output_tx.send(resources_invalidated_notification(invalidations));
+                for thread_id in preview_threads {
+                    let _ = output_tx.send(preview_invalidate_notification(&thread_id));
+                }
             }
         }
     });
+}
+
+fn is_turn_boundary(notification: &Value) -> bool {
+    matches!(
+        notification.get("method").and_then(Value::as_str),
+        Some("turn/started" | "turn/completed" | "turn/failed" | "turn/aborted")
+    )
+}
+
+fn preview_invalidation_threads(
+    invalidations: &[Value],
+    turn_boundary: bool,
+    invalidated_at: &mut HashMap<String, Instant>,
+) -> Vec<String> {
+    let now = Instant::now();
+    let mut thread_ids = Vec::new();
+    for invalidation in invalidations {
+        let Some(thread_id) = invalidation.get("threadId").and_then(Value::as_str) else {
+            continue;
+        };
+        if thread_ids.iter().any(|seen| seen == thread_id) {
+            continue;
+        }
+
+        let due = turn_boundary
+            || invalidated_at
+                .get(thread_id)
+                .is_none_or(|at| now.duration_since(*at) >= PREVIEW_INVALIDATE_MIN_INTERVAL);
+        if due {
+            invalidated_at.insert(thread_id.to_owned(), now);
+            thread_ids.push(thread_id.to_owned());
+        }
+    }
+
+    thread_ids
+}
+
+fn preview_invalidate_notification(thread_id: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": PREVIEW_INVALIDATE_NOTIFICATION,
+        "params": {
+            "resourceId": thread_id,
+            "resourceKind": "thread",
+            "viewId": "main",
+        },
+    })
 }
 
 fn completed_turn_target(notification: &Value) -> Option<(&str, &str)> {

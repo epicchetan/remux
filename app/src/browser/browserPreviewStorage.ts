@@ -2,6 +2,8 @@ import { Directory, File, Paths } from 'expo-file-system';
 
 const previewDirectory = new Directory(Paths.cache, 'remux', 'tab-previews');
 
+let previewSequence = 0;
+
 export type PersistedTabPreview = {
   previewFileName: string;
   previewUri: string;
@@ -56,9 +58,12 @@ export function resolveTabPreview(previewFileName: string | null | undefined): P
   }
 }
 
+// Each capture gets a fresh file name: the overview stays mounted while
+// previews refresh, and Image only reloads a file URI when the URI changes.
 function previewFileNameForTab(tabId: string) {
   const safeTabId = tabId.replace(/[^A-Za-z0-9._-]/g, '_');
-  return `${safeTabId}.jpg`;
+  previewSequence += 1;
+  return `${safeTabId}-${Date.now().toString(36)}-${previewSequence}.jpg`;
 }
 
 function deletePreviewFile(previewFileName: string) {

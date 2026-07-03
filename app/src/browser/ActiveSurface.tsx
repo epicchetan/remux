@@ -6,6 +6,7 @@ import { ViewerSurface } from '../surfaces/viewer/ViewerSurface';
 import { useTheme, type RemuxTheme } from '../theme/ThemeProvider';
 import { useBrowserStore } from './browserStore';
 import type { BrowserSection } from './browserTypes';
+import { setTabPreviewCaptureTarget } from './tabPreviewCapture';
 
 type ActiveSurfaceProps = {
   onOpenOverview?: (section?: BrowserSection) => Promise<void> | void;
@@ -62,12 +63,22 @@ export function ActiveSurface({ onOpenOverview, surfaceRef }: ActiveSurfaceProps
               visible ? styles.visibleSurface : styles.hiddenSurface,
             ]}
           >
-            <ViewerSurface
-              active={visible}
-              onOpenOverview={onOpenOverview}
-              surfaceRef={visible ? surfaceRef : undefined}
-              tab={tab}
-            />
+            {/* Preview snapshots target this inner view: capturing a subtree
+                ignores the ancestor's opacity, so hidden tabs photograph too. */}
+            <View
+              collapsable={false}
+              ref={(view) => {
+                setTabPreviewCaptureTarget(tab.id, view);
+              }}
+              style={styles.captureTarget}
+            >
+              <ViewerSurface
+                active={visible}
+                onOpenOverview={onOpenOverview}
+                surfaceRef={visible ? surfaceRef : undefined}
+                tab={tab}
+              />
+            </View>
           </View>
         );
       })}
@@ -96,6 +107,10 @@ function createStyles(theme: RemuxTheme) {
     marginTop: 8,
     maxWidth: 280,
     textAlign: 'center',
+  },
+  captureTarget: {
+    backgroundColor: theme.surface,
+    flex: 1,
   },
   extensionSurface: {
     backgroundColor: theme.surface,

@@ -943,18 +943,24 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
     ],
   );
 
-  useEffect(() => remux.subscribe((message) => {
-    if (!activeRef.current) {
-      return;
-    }
+  useEffect(() => {
+    // Hidden tabs keep rendering their own extension's events so previews stay
+    // truthful; only the active tab receives the full event stream.
+    const ownEventPrefix = `remux/${tab.extensionId}/`;
 
-    postToWebView(
-      {
-        message,
-        type: 'remux/event',
-      },
-    );
-  }), [postToWebView, remux]);
+    return remux.subscribe((message) => {
+      if (!activeRef.current && !message.method?.startsWith(ownEventPrefix)) {
+        return;
+      }
+
+      postToWebView(
+        {
+          message,
+          type: 'remux/event',
+        },
+      );
+    });
+  }, [postToWebView, remux, tab.extensionId]);
 
   useEffect(() => {
     const wasActive = activeRef.current;

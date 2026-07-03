@@ -41,6 +41,7 @@ type BrowserStore = {
   extensions: RemuxExtension[];
   loadExtensions: (options?: { force?: boolean }) => Promise<void>;
   mode: BrowserMode;
+  moveTab: (tabId: string, toIndex: number) => void;
   openResource: (target: BrowserResourceTarget, options?: BrowserOpenResourceOptions) => Promise<BrowserOpenResourceResult>;
   openOverview: (section?: BrowserSection) => void;
   reloadExtensionTabs: (extensionId: string) => void;
@@ -184,6 +185,26 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
     return extensionLoadPromise;
   },
   mode: 'overview',
+  moveTab: (tabId, toIndex) => {
+    set((state) => {
+      const fromIndex = state.tabs.findIndex((tab) => tab.id === tabId);
+      if (fromIndex === -1) {
+        return {};
+      }
+
+      const targetIndex = Math.max(0, Math.min(toIndex, state.tabs.length - 1));
+      if (targetIndex === fromIndex) {
+        return {};
+      }
+
+      const tabs = [...state.tabs];
+      const [movedTab] = tabs.splice(fromIndex, 1);
+      tabs.splice(targetIndex, 0, movedTab);
+
+      return { tabs };
+    });
+    persistCurrentBrowserSession(get());
+  },
   openResource: async (target, openOptions = {}) => {
     const extensionId = target.extensionId.trim();
     if (!extensionId) {
@@ -314,12 +335,13 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
       return;
     }
 
-    const tabStillExists = get().tabs.some((tab) => tab.id === tabId);
-    if (!tabStillExists) {
+    const currentTab = get().tabs.find((tab) => tab.id === tabId);
+    if (!currentTab) {
       await deleteTabPreview(preview.previewFileName);
       return;
     }
 
+    const replacedFileName = currentTab.previewFileName;
     set((state) => ({
       tabs: state.tabs.map((tab) => (
         tab.id === tabId
@@ -332,6 +354,9 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
       )),
     }));
     persistCurrentBrowserSession(get());
+    if (replacedFileName && replacedFileName !== preview.previewFileName) {
+      void deleteTabPreview(replacedFileName).catch(() => undefined);
+    }
   },
   tabs: [],
   updateTab: (tabId, patch) => {
