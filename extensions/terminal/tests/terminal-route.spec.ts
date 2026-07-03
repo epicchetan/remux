@@ -234,6 +234,95 @@ test.describe('terminal viewer route', () => {
     await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('beta gamma');
   });
 
+  test('a hold selects the whole trimmed line and enters selection mode', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    const startRequest = await waitForHostRequest(page, 'remux/terminal/session/start');
+    const startParams = recordParams(startRequest);
+
+    await sendTerminalOutput(page, 1, 'alpha beta gamma    \r\n');
+    await page.waitForTimeout(100);
+
+    const screenBox = await page.locator('.xterm-screen').boundingBox();
+    expect(screenBox).not.toBeNull();
+    const cellWidth = screenBox!.width / Number(startParams.cols);
+    const cellHeight = screenBox!.height / Number(startParams.rows);
+
+    // Hold the middle of "beta": the whole line is selected without the
+    // trailing blank padding, and the viewer enters selection mode.
+    await dispatchTouchHold(page, {
+      x: screenBox!.x + cellWidth * 7.5,
+      y: screenBox!.y + cellHeight * 0.5,
+    });
+    await expect(page.locator('.remux-terminal-container')).toHaveClass(/is-selecting/);
+    await expect(page.locator('.remux-terminal-selection-status')).toHaveText('16 characters selected');
+
+    await page.getByLabel('Copy selection').click();
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('alpha beta gamma');
+  });
+
+  test('a hold joins a soft-wrapped line without inserting spacing', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    const startRequest = await waitForHostRequest(page, 'remux/terminal/session/start');
+    const startParams = recordParams(startRequest);
+    const cols = Number(startParams.cols);
+
+    const wrapped = Array.from({ length: cols + 12 }, (_, index) => (
+      String.fromCharCode(97 + (index % 26))
+    )).join('');
+    await sendTerminalOutput(page, 1, `${wrapped}\r\n`);
+    await page.waitForTimeout(100);
+
+    const screenBox = await page.locator('.xterm-screen').boundingBox();
+    expect(screenBox).not.toBeNull();
+    const cellWidth = screenBox!.width / cols;
+    const cellHeight = screenBox!.height / Number(startParams.rows);
+
+    // Hold the first visual row: the logical line spans the wrap, and the
+    // copy joins the rows with no newline or padding in between.
+    await dispatchTouchHold(page, {
+      x: screenBox!.x + cellWidth * 5.5,
+      y: screenBox!.y + cellHeight * 0.5,
+    });
+    await expect(page.locator('.remux-terminal-selection-status'))
+      .toHaveText(`${cols + 12} characters selected`);
+
+    await page.getByLabel('Copy selection').click();
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(wrapped);
+  });
+
+  test('a selection persists through taps until cleared, then a hold picks the line', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    const startRequest = await waitForHostRequest(page, 'remux/terminal/session/start');
+    const startParams = recordParams(startRequest);
+
+    await sendTerminalOutput(page, 1, 'alpha beta gamma\r\n');
+    await page.waitForTimeout(100);
+
+    await page.getByLabel('Terminal menu').click();
+    await page.getByRole('menuitem', { name: 'Select text' }).click();
+
+    const screenBox = await page.locator('.xterm-screen').boundingBox();
+    expect(screenBox).not.toBeNull();
+    const cellWidth = screenBox!.width / Number(startParams.cols);
+    const cellHeight = screenBox!.height / Number(startParams.rows);
+    const rowCenterY = screenBox!.y + cellHeight * 0.5;
+
+    await page.mouse.click(screenBox!.x + cellWidth * 7.5, rowCenterY);
+    await expect(page.locator('.remux-terminal-selection-status')).toHaveText('4 characters selected');
+
+    // A tap elsewhere must not replace the selection — it persists until Clear.
+    await page.mouse.click(screenBox!.x + cellWidth * 2.5, rowCenterY);
+    await expect(page.locator('.remux-terminal-selection-status')).toHaveText('4 characters selected');
+    await expect(page.locator('.remux-terminal-selection-handle.is-start')).toBeVisible();
+
+    // After Clear, a hold picks the whole line. The pointer-based hold covers
+    // the on-device path where the pointer handlers claim the touch before
+    // touchScroll can arm its own long-press.
+    await page.getByLabel('Clear selection').click();
+    await dispatchPointerHold(page, { x: screenBox!.x + cellWidth * 7.5, y: rowCenterY });
+    await expect(page.locator('.remux-terminal-selection-status')).toHaveText('16 characters selected');
+  });
+
   test('extends a selection across the viewport with edge auto-scroll', async ({ page }) => {
     await page.goto('/?remuxLaunch=new-terminal');
     const startRequest = await waitForHostRequest(page, 'remux/terminal/session/start');
@@ -1380,6 +1469,53 @@ async function dispatchTouchDrag(
     }
     dispatchTouch('touchend', points[points.length - 1]!, true);
   }, { points, stepDelayMs });
+}
+
+// A motionless touch hold, driven through the touch handlers (touchScroll's
+// long-press path — synthetic touch events produce no pointer events).
+async function dispatchTouchHold(page: Page, point: { x: number; y: number }) {
+  await page.evaluate(async ({ point }) => {
+    const container = document.querySelector('.remux-terminal-container');
+    if (!container) {
+      throw new Error('missing terminal container');
+    }
+    const terminalContainer = container;
+
+    function dispatchTouch(type: string, ended = false) {
+      const event = new Event(type, { bubbles: true, cancelable: true });
+      const touch = { clientX: point.x, clientY: point.y };
+      Object.defineProperty(event, 'touches', { value: ended ? [] : [touch] });
+      Object.defineProperty(event, 'changedTouches', { value: [touch] });
+      terminalContainer.dispatchEvent(event);
+    }
+
+    dispatchTouch('touchstart');
+    await new Promise((resolve) => setTimeout(resolve, 650));
+    dispatchTouch('touchend', true);
+  }, { point });
+}
+
+// A motionless touch hold, driven through the pointer handlers (the path real
+// devices take when a selection-mode drag claims the gesture).
+async function dispatchPointerHold(page: Page, point: { x: number; y: number }) {
+  await page.evaluate(async ({ point }) => {
+    const container = document.querySelector('.remux-terminal-container');
+    if (!container) {
+      throw new Error('missing terminal container');
+    }
+
+    const init = {
+      bubbles: true,
+      cancelable: true,
+      clientX: point.x,
+      clientY: point.y,
+      pointerId: 7,
+      pointerType: 'touch',
+    };
+    container.dispatchEvent(new PointerEvent('pointerdown', init));
+    await new Promise((resolve) => setTimeout(resolve, 650));
+    container.dispatchEvent(new PointerEvent('pointerup', init));
+  }, { point });
 }
 
 function decodeWrites(writes: HostRequest[]) {

@@ -6,7 +6,9 @@ const momentumStartVelocity = 50;
 const tapMaxDurationMs = 300;
 const tapMaxDistancePx = 10;
 const tapScrollSuppressMs = 150;
-const longPressMs = 500;
+// Shared with the selection drag's hold-to-select-line timer so a hold means
+// the same thing whichever layer owns the gesture.
+export const longPressMs = 500;
 const velocitySampleCount = 5;
 const maxTicksPerEmit = 8;
 
@@ -162,6 +164,12 @@ export function setupTouchScroll(
   function onTouchStart(event: TouchEvent) {
     clearLongPressTimer();
     longPressFired = false;
+    // Stop any fling and drop stale velocity samples even when another layer
+    // (a selection drag) claims the gesture — otherwise momentum keeps
+    // scrolling the buffer underneath it.
+    flingStopTouch = momentumId !== null;
+    cancelMomentum();
+    recentMoves.length = 0;
     if (options.disabled?.()) {
       return;
     }
@@ -171,8 +179,6 @@ export function setupTouchScroll(
       return;
     }
 
-    flingStopTouch = momentumId !== null;
-    cancelMomentum();
     scrollAccum = 0;
     wheelAccum = 0;
     lastTouchX = touch.clientX;
@@ -180,7 +186,6 @@ export function setupTouchScroll(
     touchStartX = touch.clientX;
     touchStartY = touch.clientY;
     touchStartTime = Date.now();
-    recentMoves.length = 0;
     if (options.onLongPress && event.touches.length === 1) {
       const { clientX, clientY } = touch;
       longPressTimer = window.setTimeout(() => {

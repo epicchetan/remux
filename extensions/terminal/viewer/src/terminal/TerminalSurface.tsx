@@ -107,13 +107,15 @@ import {
   applyTerminalSelectionRange,
   describeTerminalSelection,
   terminalBufferText,
+  terminalLineRangeAt,
   terminalSelectionCell,
+  terminalSelectionCopyText,
   terminalSelectionPoint,
   terminalWordRangeAt,
   type TerminalSelectionPoint,
   type TerminalSelectionRange,
 } from './selection';
-import { setupTouchScroll } from './touchScroll';
+import { longPressMs, setupTouchScroll } from './touchScroll';
 
 const fontFamily = 'Menlo, Consolas, "Liberation Mono", monospace';
 const terminalThemeDark = {
@@ -203,6 +205,10 @@ type TerminalShellState = {
 
 type TerminalSelectionDrag = {
   anchor: TerminalSelectionPoint;
+  // A fired hold consumed the gesture (the line under it got selected);
+  // later moves and the release must not touch the selection again.
+  held: boolean;
+  holdTimer: number | null;
   kind: 'end' | 'range' | 'start';
   lastClientX: number;
   lastClientY: number;
@@ -827,14 +833,45 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
 
   const refreshSelectionState = useCallback(() => {
     const terminal = terminalRef.current;
-    if (terminal?.hasSelection()) {
+    if (!terminal) {
+      setSelectionText('');
+      setSelectionRange(null);
+      selectionRangeRef.current = null;
+      return;
+    }
+
+    // Selection is a mode-only feature: discard anything xterm selects on its
+    // own outside the mode (e.g. shift-drag overriding mouse tracking).
+    if (!selectionModeRef.current) {
+      if (terminal.hasSelection()) {
+        terminal.clearSelection();
+      }
+      setSelectionText('');
+      setSelectionRange(null);
+      selectionRangeRef.current = null;
+      return;
+    }
+
+    if (terminal.hasSelection()) {
+      setSelectionText(terminal.getSelection());
+      return;
+    }
+
+    // xterm dropped the selection on its own (a resize when the keyboard
+    // closes, for instance). The mode's contract is that a selection persists
+    // until Copy or Clear, so re-apply the range we still hold; the re-select
+    // re-enters this handler with a selection present and settles.
+    const range = selectionRangeRef.current;
+    if (range) {
+      const reapplied = applyTerminalSelectionRange(terminal, range.start, range.end);
+      selectionRangeRef.current = reapplied;
+      setSelectionRange(reapplied);
       setSelectionText(terminal.getSelection());
       return;
     }
 
     setSelectionText('');
     setSelectionRange(null);
-    selectionRangeRef.current = null;
   }, []);
 
   const stopSelectionAutoScroll = useCallback(() => {
@@ -866,6 +903,22 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     const range = terminalWordRangeAt(terminal, cell);
     applySelection(range.start, range.end);
   }, [applySelection]);
+
+  const lineRangeAtClient = useCallback((clientX: number, clientY: number) => {
+    const terminal = terminalRef.current;
+    const cell = terminalSelectionCell(terminal, containerRef.current, clientX, clientY);
+    return terminal && cell ? terminalLineRangeAt(terminal, cell) : null;
+  }, []);
+
+  // Taps inside selection mode only ever create the initial word selection;
+  // an existing selection persists until Copy or Clear.
+  const handleSelectionTap = useCallback((clientX: number, clientY: number) => {
+    if (selectionRangeRef.current) {
+      return;
+    }
+
+    selectWordAtClient(clientX, clientY);
+  }, [selectWordAtClient]);
 
   const selectionAutoScrollTick = useCallback(() => {
     const state = selectionAutoScrollRef.current;
@@ -920,8 +973,10 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   ) => {
     event.preventDefault();
     event.stopPropagation();
-    selectionDragRef.current = {
+    const drag: TerminalSelectionDrag = {
       anchor,
+      held: false,
+      holdTimer: null,
       kind,
       lastClientX: event.clientX,
       lastClientY: event.clientY,
@@ -930,12 +985,15 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       startClientX: event.clientX,
       startClientY: event.clientY,
     };
+    selectionDragRef.current = drag;
 
     try {
       event.currentTarget.setPointerCapture(event.pointerId);
     } catch {
       // Pointer capture is best-effort; move/up handlers still cover normal browsers.
     }
+
+    return drag;
   }, []);
 
   const moveSelectionDrag = useCallback((event: ReactPointerEvent<HTMLElement>) => {
@@ -946,6 +1004,11 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
 
     event.preventDefault();
     event.stopPropagation();
+    // A fired hold owns the rest of the gesture; its line selection stays.
+    if (drag.held) {
+      return;
+    }
+
     drag.lastClientX = event.clientX;
     drag.lastClientY = event.clientY;
 
@@ -960,6 +1023,10 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       }
 
       drag.moved = true;
+      if (drag.holdTimer !== null) {
+        window.clearTimeout(drag.holdTimer);
+        drag.holdTimer = null;
+      }
     }
 
     const terminal = terminalRef.current;
@@ -980,6 +1047,10 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     event.preventDefault();
     event.stopPropagation();
     selectionDragRef.current = null;
+    if (drag.holdTimer !== null) {
+      window.clearTimeout(drag.holdTimer);
+      drag.holdTimer = null;
+    }
     stopSelectionAutoScroll();
     try {
       if (event.currentTarget.hasPointerCapture(event.pointerId)) {
@@ -989,10 +1060,13 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       // Ignore browsers that do not expose capture state for synthetic events.
     }
 
-    if (drag.kind === 'range' && !drag.moved) {
-      selectWordAtClient(drag.startClientX, drag.startClientY);
+    // A no-move press that wasn't consumed by a hold is a tap, even when it
+    // lands on a handle (they hover over the text); the tap logic decides
+    // whether it may touch the selection, so a stray handle tap stays inert.
+    if (!drag.moved && !drag.held) {
+      handleSelectionTap(drag.startClientX, drag.startClientY);
     }
-  }, [selectWordAtClient, stopSelectionAutoScroll]);
+  }, [handleSelectionTap, stopSelectionAutoScroll]);
 
   const cancelSelectionDrag = useCallback((event: ReactPointerEvent<HTMLElement>) => {
     const drag = selectionDragRef.current;
@@ -1001,16 +1075,23 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     }
 
     selectionDragRef.current = null;
+    if (drag.holdTimer !== null) {
+      window.clearTimeout(drag.holdTimer);
+      drag.holdTimer = null;
+    }
     stopSelectionAutoScroll();
   }, [stopSelectionAutoScroll]);
 
   const clearTerminalSelection = useCallback(() => {
     selectionDragRef.current = null;
     stopSelectionAutoScroll();
+    // Null the range before clearing: refreshSelectionState re-applies a held
+    // range when xterm reports an empty selection, and this clear is the one
+    // path that must actually stick.
+    selectionRangeRef.current = null;
     terminalRef.current?.clearSelection();
     setSelectionText('');
     setSelectionRange(null);
-    selectionRangeRef.current = null;
   }, [stopSelectionAutoScroll]);
 
   const exitSelectionMode = useCallback(() => {
@@ -1028,8 +1109,28 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     setSelectionMode(true);
   }, [clearTerminalSelection, closeKeyboard, hideLinkNotice, resetModifiers]);
 
+  // A hold picks the whole trimmed line under the finger. Outside selection
+  // mode it is the one gesture that starts selecting (entering the mode);
+  // inside, it works only while nothing is selected — an existing selection
+  // persists until Copy or Clear. A hold on blank space does nothing.
+  const handleTerminalHold = useCallback((clientX: number, clientY: number) => {
+    if (selectionModeRef.current && selectionRangeRef.current) {
+      return;
+    }
+
+    const lineRange = lineRangeAtClient(clientX, clientY);
+    if (!lineRange) {
+      return;
+    }
+
+    if (!selectionModeRef.current) {
+      enterSelectionMode();
+    }
+    applySelection(lineRange.start, lineRange.end);
+  }, [applySelection, enterSelectionMode, lineRangeAtClient]);
+
   const copyTerminalSelection = useCallback(async () => {
-    const text = terminalRef.current?.getSelection() || selectionText;
+    const text = terminalSelectionCopyText(terminalRef.current?.getSelection() || selectionText);
     if (!text) {
       return;
     }
@@ -1087,10 +1188,11 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
 
   // Taps come from touchScroll (touch) and the container click handler
   // (mouse). A tap on a link raises the link row; anywhere else it drives the
-  // keyboard, or in selection mode snaps the selection to the tapped word.
+  // keyboard. Selection never starts from a tap outside selection mode —
+  // holding is the gesture that selects.
   const handleSurfaceTap = useCallback((clientX: number, clientY: number) => {
     if (selectionModeRef.current) {
-      selectWordAtClient(clientX, clientY);
+      handleSelectionTap(clientX, clientY);
       return;
     }
 
@@ -1118,7 +1220,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     }
 
     openKeyboard();
-  }, [closeKeyboard, openKeyboard, selectWordAtClient, showLinkNotice]);
+  }, [closeKeyboard, handleSelectionTap, openKeyboard, showLinkNotice]);
 
   const handleTerminalClick = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
     if (selectionModeRef.current || event.defaultPrevented) {
@@ -1134,13 +1236,27 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     handleSurfaceTap(event.clientX, event.clientY);
   }, [handleSurfaceTap]);
 
-  const handleTerminalLongPress = useCallback((clientX: number, clientY: number) => {
-    if (!selectionModeRef.current) {
-      enterSelectionMode();
+  // Mousedown reaching xterm is what feeds its built-in mouse selection; keep
+  // it away so selection exists only through selection mode. TUIs with mouse
+  // tracking on still get their reports; in selection mode the custom pointer
+  // handlers own the gesture and xterm must not fight them.
+  const handleTerminalMouseDown = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    if (selectionModeRef.current) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
     }
 
-    selectWordAtClient(clientX, clientY);
-  }, [enterSelectionMode, selectWordAtClient]);
+    if (terminalRef.current?.modes.mouseTrackingMode === 'none') {
+      event.stopPropagation();
+      // xterm's swallowed mousedown also kept its hidden textarea focused;
+      // keep doing that, or every click blurs it and reads as the keyboard
+      // closing.
+      if (keyboardOpenRef.current) {
+        event.preventDefault();
+      }
+    }
+  }, []);
 
   const handleSelectionPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     if (!selectionModeRef.current || selectionDragRef.current) {
@@ -1160,8 +1276,21 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       return;
     }
 
-    beginSelectionDrag(event, 'range', point);
-  }, [beginSelectionDrag]);
+    const drag = beginSelectionDrag(event, 'range', point);
+
+    // Fresh touch drags claim the gesture before touchScroll can arm its
+    // long-press, so run the hold-to-select-line timer here too. Mouse users
+    // pausing mid-drag must not be hijacked — touch only.
+    if (event.pointerType !== 'mouse') {
+      drag.holdTimer = window.setTimeout(() => {
+        drag.holdTimer = null;
+        if (selectionDragRef.current === drag && !drag.moved) {
+          drag.held = true;
+          handleTerminalHold(drag.startClientX, drag.startClientY);
+        }
+      }, longPressMs);
+    }
+  }, [beginSelectionDrag, handleTerminalHold]);
 
   const handleStartHandlePointerDown = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
     const range = selectionRangeRef.current;
@@ -1314,7 +1443,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
           )
         ),
         forcePlainScroll: () => selectionModeRef.current,
-        onLongPress: handleTerminalLongPress,
+        onLongPress: handleTerminalHold,
         onTap: (clientX, clientY) => {
           lastTouchTapMsRef.current = performance.now();
           handleSurfaceTap(clientX, clientY);
@@ -1391,7 +1520,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     handleCurrentDirectory,
     handleShellIntegrationSequence,
     handleSurfaceTap,
-    handleTerminalLongPress,
+    handleTerminalHold,
     handleTerminalTitle,
     helperTextarea,
     hideLinkNotice,
@@ -1637,6 +1766,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
           ].filter(Boolean).join(' ')}
           onClickCapture={handleTerminalClick}
           onLostPointerCapture={cancelSelectionDrag}
+          onMouseDownCapture={handleTerminalMouseDown}
           onPointerCancelCapture={cancelSelectionDrag}
           onPointerDownCapture={handleSelectionPointerDown}
           onPointerMoveCapture={moveSelectionDrag}

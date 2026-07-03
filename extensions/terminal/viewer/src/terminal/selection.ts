@@ -1,4 +1,4 @@
-import type { Terminal } from '@xterm/xterm';
+import type { IBufferLine, Terminal } from '@xterm/xterm';
 
 // Characters that end a word for tap-to-select. Whitespace-adjacent runs stay
 // whole so paths, URLs, and flags come out as one selection.
@@ -155,6 +155,73 @@ export function terminalWordRangeAt(
     end: { column: right + 1, row },
     start: { column: left, row },
   };
+}
+
+// Logical-line range around a cell for double-tap line selection: follows soft
+// wraps in both directions and ends after the last non-blank cell, so the
+// padded tail of the row stays out of both the highlight and the copied text.
+// Returns null when the whole logical line is blank (nothing to select).
+export function terminalLineRangeAt(
+  terminal: Terminal,
+  cell: TerminalSelectionPoint,
+): TerminalSelectionRange | null {
+  const buffer = terminal.buffer.active;
+  if (terminal.cols <= 0 || buffer.length === 0) {
+    return null;
+  }
+
+  const row = clampSelectionValue(cell.row, 0, buffer.length - 1);
+  let startRow = row;
+  while (startRow > 0 && buffer.getLine(startRow)?.isWrapped) {
+    startRow -= 1;
+  }
+  let endRow = row;
+  while (endRow + 1 < buffer.length && buffer.getLine(endRow + 1)?.isWrapped) {
+    endRow += 1;
+  }
+
+  for (let y = endRow; y >= startRow; y -= 1) {
+    const endColumn = lineContentEndColumn(terminal, buffer.getLine(y));
+    if (endColumn !== null) {
+      return {
+        end: { column: endColumn, row: y },
+        start: { column: 0, row: startRow },
+      };
+    }
+  }
+
+  return null;
+}
+
+// Boundary column just past the last non-blank cell, or null for a blank row.
+function lineContentEndColumn(terminal: Terminal, line: IBufferLine | undefined) {
+  if (!line) {
+    return null;
+  }
+
+  for (let x = Math.min(terminal.cols, line.length) - 1; x >= 0; x -= 1) {
+    const bufferCell = line.getCell(x);
+    if (!bufferCell || bufferCell.getWidth() === 0) {
+      // Zero-width cells trail wide characters; the wide cell decides.
+      continue;
+    }
+
+    const chars = bufferCell.getChars();
+    if (chars && chars !== ' ') {
+      return Math.min(terminal.cols, x + Math.max(1, bufferCell.getWidth()));
+    }
+  }
+
+  return null;
+}
+
+// Selections spanning full rows pick up the blank cells padding each row
+// (TUIs pad to the terminal width); drop that trailing run from every line.
+export function terminalSelectionCopyText(text: string) {
+  return text
+    .split('\n')
+    .map((line) => line.replace(/\s+$/u, ''))
+    .join('\n');
 }
 
 // Extracts buffer text for [startRow, endRowExclusive), joining wrapped rows
