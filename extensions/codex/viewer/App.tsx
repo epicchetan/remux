@@ -85,7 +85,6 @@ export function App() {
 
   useCodexResumeSync({
     activeThreadId,
-    connectionStatus,
     ensureThreadSummary,
     loadComposerConfig,
     loadThreadHistory,

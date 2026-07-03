@@ -4,11 +4,17 @@ import type { RemuxConnection } from '../remote/RemuxConnectionProvider';
 import {
   readRemuxDirectories,
   readRemuxDirectory,
+  type RemuxFsDidChangeParams,
   type RemuxReadDirectoryResponse,
 } from './filesApi';
-import type { FileTreeEntry, VisibleFileTreeRow } from './filesTypes';
+import { isDirectoryLikeEntry, type FileTreeEntry, type VisibleFileTreeRow } from './filesTypes';
 
 type DirectoryRefreshStatus = 'error' | 'idle' | 'loading' | 'refreshing';
+
+type SetFilesStore = (
+  partial: FilesStore | Partial<FilesStore> | ((state: FilesStore) => FilesStore | Partial<FilesStore>),
+  replace?: false,
+) => void;
 
 export type DirectoryRecord = {
   entries: FileTreeEntry[] | null;
@@ -24,6 +30,9 @@ type FilesStore = {
   currentPath: string | null;
   directoriesByPath: Record<string, DirectoryRecord>;
   expandedPaths: Record<string, boolean>;
+  isRefreshingAll: boolean;
+  refreshError: string | null;
+  applyFsDidChange: (request: RemuxConnection['request'], params: RemuxFsDidChangeParams) => void;
   loadDirectory: (request: RemuxConnection['request'], path?: string | null) => Promise<void>;
   loadRootDirectory: (request: RemuxConnection['request']) => Promise<void>;
   navigateToDirectory: (
@@ -33,19 +42,75 @@ type FilesStore = {
   ) => Promise<void>;
   navigateToParentDirectory: (request: RemuxConnection['request']) => Promise<void>;
   preloadDirectories: (request: RemuxConnection['request'], paths: string[]) => Promise<void>;
+  refreshVisibleDirectories: (
+    request: RemuxConnection['request'],
+    options?: { spinner?: boolean },
+  ) => Promise<void>;
   toggleFolder: (request: RemuxConnection['request'], path: string) => Promise<void>;
 };
 
 export const filesRootKey = '__root__';
 const maxConcurrentPreloadDirectories = 4;
 const directoryStaleMs = 5000;
+const fsDirtyRefreshDelayMs = 300;
 
 let directoryRequestId = 0;
+let dirtyRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+const pendingDirtyRefreshPaths = new Set<string>();
 
 export const useFilesStore = create<FilesStore>((set, get) => ({
   currentPath: null,
   directoriesByPath: {},
   expandedPaths: {},
+  isRefreshingAll: false,
+  refreshError: null,
+  applyFsDidChange: (request, { changedPaths, gitDirtyRoots }) => {
+    const state = get();
+    const changedPathSet = new Set(changedPaths);
+    const dirtyPaths = Object.keys(state.directoriesByPath).filter((path) => {
+      if (!state.directoriesByPath[path]?.entries) {
+        return false;
+      }
+
+      return (
+        changedPathSet.has(path) ||
+        gitDirtyRoots.some((root) => isPathWithinServerPath(root, path))
+      );
+    });
+
+    if (dirtyPaths.length === 0) {
+      return;
+    }
+
+    const renderablePaths = new Set(
+      state.currentPath ? collectExpandedSubtreePaths(state, state.currentPath) : [],
+    );
+    const renderableDirty = dirtyPaths.filter((path) => renderablePaths.has(path));
+    const backgroundDirty = dirtyPaths.filter((path) => !renderablePaths.has(path));
+
+    if (backgroundDirty.length > 0) {
+      set((current) => ({
+        directoriesByPath: backgroundDirty.reduce((directoriesByPath, path) => {
+          const record = directoriesByPath[path];
+          if (!record) {
+            return directoriesByPath;
+          }
+
+          return {
+            ...directoriesByPath,
+            [path]: {
+              ...record,
+              loadedAt: null,
+            },
+          };
+        }, current.directoriesByPath),
+      }));
+    }
+
+    if (renderableDirty.length > 0) {
+      scheduleDirtyPathsRefresh({ get, paths: renderableDirty, request, set });
+    }
+  },
   loadDirectory: async (request, path = null) => {
     const key = path ?? filesRootKey;
     const state = get();
@@ -80,8 +145,12 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
   },
   loadRootDirectory: async (request) => {
     const state = get();
-    const rootRecord = state.directoriesByPath[filesRootKey];
-    if (state.currentPath || isDirectoryFetching(rootRecord)) {
+    if (state.currentPath) {
+      await get().refreshVisibleDirectories(request);
+      return;
+    }
+
+    if (isDirectoryFetching(state.directoriesByPath[filesRootKey])) {
       return;
     }
 
@@ -100,11 +169,17 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
           parentPath,
         },
       },
+      refreshError: null,
     }));
 
     if (record?.entries) {
       if (shouldRefreshDirectory(record)) {
-        void refreshDirectory({ force: true, get, path, request, set, visible: false });
+        void refreshDirectoryPaths({
+          get,
+          paths: collectExpandedSubtreePaths(get(), path),
+          request,
+          set,
+        });
       }
       return;
     }
@@ -126,11 +201,16 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
     }
 
     const parentRecord = state.directoriesByPath[parentPath];
-    set({ currentPath: parentPath });
+    set({ currentPath: parentPath, refreshError: null });
 
     if (parentRecord?.entries) {
       if (shouldRefreshDirectory(parentRecord)) {
-        void refreshDirectory({ force: true, get, path: parentPath, request, set, visible: false });
+        void refreshDirectoryPaths({
+          get,
+          paths: collectExpandedSubtreePaths(get(), parentPath),
+          request,
+          set,
+        });
       }
       return;
     }
@@ -194,6 +274,42 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
       ), state));
     }
   },
+  refreshVisibleDirectories: async (request, options = {}) => {
+    const spinner = options.spinner === true;
+    const state = get();
+    if (!state.currentPath || (spinner && state.isRefreshingAll)) {
+      return;
+    }
+
+    const paths = collectExpandedSubtreePaths(state, state.currentPath);
+    if (paths.length === 0) {
+      return;
+    }
+
+    if (spinner) {
+      set({ isRefreshingAll: true });
+    }
+
+    try {
+      const { failedCount, requestedCount } = await refreshDirectoryPaths({
+        get,
+        paths,
+        request,
+        set,
+      });
+      if (requestedCount > 0) {
+        set({
+          refreshError: failedCount === 0
+            ? null
+            : `Couldn't refresh ${failedCount} of ${requestedCount} ${requestedCount === 1 ? 'directory' : 'directories'}`,
+        });
+      }
+    } finally {
+      if (spinner) {
+        set({ isRefreshingAll: false });
+      }
+    }
+  },
   toggleFolder: async (request, path) => {
     const state = get();
     const record = state.directoriesByPath[path];
@@ -212,7 +328,12 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
 
     if (record?.entries) {
       if (shouldRefreshDirectory(record)) {
-        void refreshDirectory({ force: true, get, path, request, set, visible: false });
+        void refreshDirectoryPaths({
+          get,
+          paths: collectExpandedSubtreePaths(get(), path),
+          request,
+          set,
+        });
       }
       return;
     }
@@ -262,7 +383,7 @@ function flattenRows({
   parentPath: string | null;
 }): VisibleFileTreeRow[] {
   return entries.flatMap((entry) => {
-    const isDirectory = entry.kind === 'directory';
+    const isDirectory = isDirectoryLikeEntry(entry);
     const isExpanded = Boolean(expandedPaths[entry.path]);
     const children = directoriesByPath[entry.path]?.entries ?? null;
     const childrenLoaded = Array.isArray(children);
@@ -272,6 +393,7 @@ function flattenRows({
       depth,
       hasChildren: isDirectory && (!childrenLoaded || children.length > 0),
       isExpanded,
+      itemCount: entry.itemCount ?? (isDirectory && childrenLoaded ? children.length : null),
       parentPath,
     };
 
@@ -292,51 +414,140 @@ function flattenRows({
   });
 }
 
-async function refreshDirectory({
-  force,
+// Client-side path containment over server-sent paths: compares the strings
+// verbatim (the server is the canonical resolver). Includes the root itself
+// and is boundary-safe ('/repo2' is not within '/repo').
+export function isPathWithinServerPath(rootPath: string, targetPath: string) {
+  return targetPath === rootPath || targetPath.startsWith(`${rootPath}/`);
+}
+
+function scheduleDirtyPathsRefresh({
   get,
-  path,
+  paths,
   request,
   set,
-  visible,
 }: {
-  force: boolean;
   get: () => FilesStore;
-  path: string;
+  paths: string[];
   request: RemuxConnection['request'];
-  set: (
-    partial: FilesStore | Partial<FilesStore> | ((state: FilesStore) => FilesStore | Partial<FilesStore>),
-    replace?: false,
-  ) => void;
-  visible: boolean;
+  set: SetFilesStore;
 }) {
-  const record = get().directoriesByPath[path];
-  if (isDirectoryFetching(record)) {
+  for (const path of paths) {
+    pendingDirtyRefreshPaths.add(path);
+  }
+
+  if (dirtyRefreshTimer !== null) {
     return;
   }
 
-  const requestId = nextDirectoryRequestId();
-  const hasEntries = Boolean(record?.entries);
+  dirtyRefreshTimer = setTimeout(() => {
+    dirtyRefreshTimer = null;
+    const batch = Array.from(pendingDirtyRefreshPaths);
+    pendingDirtyRefreshPaths.clear();
+    void refreshDirectoryPaths({ get, paths: batch, request, set });
+  }, fsDirtyRefreshDelayMs);
+}
+
+function collectExpandedSubtreePaths(
+  {
+    directoriesByPath,
+    expandedPaths,
+  }: Pick<FilesStore, 'directoriesByPath' | 'expandedPaths'>,
+  rootPath: string,
+): string[] {
+  const paths: string[] = [];
+  const queue = [rootPath];
+
+  while (queue.length > 0) {
+    const path = queue.shift() as string;
+    const record = directoriesByPath[path];
+    if (!record?.entries) {
+      continue;
+    }
+
+    paths.push(path);
+    for (const entry of record.entries) {
+      if (isDirectoryLikeEntry(entry) && expandedPaths[entry.path]) {
+        queue.push(entry.path);
+      }
+    }
+  }
+
+  return paths;
+}
+
+async function refreshDirectoryPaths({
+  get,
+  paths,
+  request,
+  set,
+}: {
+  get: () => FilesStore;
+  paths: string[];
+  request: RemuxConnection['request'];
+  set: SetFilesStore;
+}): Promise<{ failedCount: number; requestedCount: number }> {
+  const refreshablePaths = Array.from(new Set(paths)).filter((path) => {
+    const record = get().directoriesByPath[path];
+    return Boolean(record?.entries) && !isDirectoryFetching(record);
+  });
+
+  if (refreshablePaths.length === 0) {
+    return { failedCount: 0, requestedCount: 0 };
+  }
+
+  const requestIds = Object.fromEntries(
+    refreshablePaths.map((path) => [path, nextDirectoryRequestId()]),
+  );
+
   set((state) => ({
-    directoriesByPath: {
-      ...state.directoriesByPath,
-      [path]: {
-        ...(record ?? emptyDirectoryRecord()),
-        error: visible ? null : record?.error ?? null,
-        requestId,
-        refreshStatus: hasEntries ? 'refreshing' : 'loading',
-      },
-    },
+    directoriesByPath: refreshablePaths.reduce((directoriesByPath, path) => {
+      const record = directoriesByPath[path];
+      if (!record) {
+        return directoriesByPath;
+      }
+
+      return {
+        ...directoriesByPath,
+        [path]: {
+          ...record,
+          requestId: requestIds[path],
+          refreshStatus: 'refreshing',
+        },
+      };
+    }, state.directoriesByPath),
   }));
 
   try {
-    const response = await readRemuxDirectory(request, path, { force });
-    set((state) => applyDirectoryResult(state, response, {
-      requestId,
-      requestKey: path,
-    }));
+    const response = await readRemuxDirectories(request, refreshablePaths, { force: true });
+    set((state) => response.results.reduce((nextState, result) => {
+      if (result.ok) {
+        return applyDirectoryResult(nextState, result.value, {
+          requestId: requestIds[result.path],
+          requestKey: result.path,
+        });
+      }
+
+      return applyDirectoryError(nextState, result.path, requestIds[result.path], result.message, {
+        visible: false,
+      });
+    }, state));
+    return {
+      failedCount: response.results.filter((result) => !result.ok).length,
+      requestedCount: refreshablePaths.length,
+    };
   } catch (error) {
-    set((state) => applyDirectoryError(state, path, requestId, error, { visible }));
+    set((state) => refreshablePaths.reduce((nextState, path) => applyDirectoryError(
+      nextState,
+      path,
+      requestIds[path],
+      error,
+      { visible: false },
+    ), state));
+    return {
+      failedCount: refreshablePaths.length,
+      requestedCount: refreshablePaths.length,
+    };
   }
 }
 
@@ -428,13 +639,7 @@ function applyDirectoryError(
   };
 }
 
-function promoteDirectoryLoading(
-  set: (
-    partial: FilesStore | Partial<FilesStore> | ((state: FilesStore) => FilesStore | Partial<FilesStore>),
-    replace?: false,
-  ) => void,
-  path: string,
-) {
+function promoteDirectoryLoading(set: SetFilesStore, path: string) {
   set((state) => {
     const record = state.directoriesByPath[path];
     if (!record || record.entries || record.refreshStatus !== 'refreshing') {

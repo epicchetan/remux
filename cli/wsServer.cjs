@@ -14,6 +14,7 @@ const {
 const remuxWebSocketPath = '/ws';
 
 function attachRemuxWebSocketServer({
+  fsWatch,
   log = console,
   onFatal,
   notifications,
@@ -67,6 +68,7 @@ function attachRemuxWebSocketServer({
     wss.handleUpgrade(request, socket, head, (downstream) => {
       const client = createDownstreamClient(downstream);
       clients.add(client);
+      fsWatch?.onClientCountChanged?.(clients.size);
       log.log?.(`[remux] websocket opened ${request.socket.remoteAddress || 'unknown-remote'}`);
 
       downstream.on('message', (frame) => {
@@ -75,6 +77,7 @@ function attachRemuxWebSocketServer({
 
       downstream.on('close', (code, reason) => {
         clients.delete(client);
+        fsWatch?.onClientCountChanged?.(clients.size);
         client.rejectPendingRequests(new Error(`WebSocket closed (${code})`));
         notifications?.onClientDisconnected?.(client);
         log.log?.(`[remux] websocket closed code=${code} reason=${reason || '(empty)'}`);
@@ -82,6 +85,7 @@ function attachRemuxWebSocketServer({
 
       downstream.on('error', () => {
         clients.delete(client);
+        fsWatch?.onClientCountChanged?.(clients.size);
         client.rejectPendingRequests(new Error('WebSocket error'));
         notifications?.onClientDisconnected?.(client);
       });

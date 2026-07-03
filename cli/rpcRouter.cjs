@@ -6,6 +6,7 @@ const extensionStartMethod = 'remux/extensions/start';
 const extensionStopMethod = 'remux/extensions/stop';
 const extensionRestartMethod = 'remux/extensions/restart';
 const systemInfoMethod = 'remux/system/info';
+const systemPingMethod = 'remux/system/ping';
 const systemRestartMethod = 'remux/system/restart';
 
 function createRpcRouter({
@@ -85,6 +86,12 @@ function createRpcRouter({
 }
 
 async function handleSystemRequest({ request, system }) {
+  // Liveness probe: the app pings after foregrounding to detect half-open
+  // sockets that still report OPEN. Any reply works; this one is cheapest.
+  if (request.method === systemPingMethod) {
+    return { ok: true };
+  }
+
   if (request.method === systemInfoMethod) {
     if (typeof system.info === 'function') {
       return system.info();
@@ -114,7 +121,11 @@ async function handleSystemRequest({ request, system }) {
 }
 
 function isSystemMethod(method) {
-  return method === systemInfoMethod || method === systemRestartMethod;
+  return (
+    method === systemInfoMethod ||
+    method === systemPingMethod ||
+    method === systemRestartMethod
+  );
 }
 
 async function handleExtensionManagementRequest({ ctx, request, servers }) {

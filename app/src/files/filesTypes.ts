@@ -6,6 +6,7 @@ export type FileTreeEntry = {
   name: string;
   path: string;
   sizeBytes?: number | null;
+  targetKind?: 'directory' | 'file' | 'other' | null;
 };
 
 export type FileTreeGitStatus = {
@@ -20,3 +21,8 @@ export type VisibleFileTreeRow = FileTreeEntry & {
   isExpanded: boolean;
   parentPath: string | null;
 };
+
+// Symlinked directories navigate like directories (F8).
+export function isDirectoryLikeEntry(entry: Pick<FileTreeEntry, 'kind' | 'targetKind'>) {
+  return entry.kind === 'directory' || (entry.kind === 'symlink' && entry.targetKind === 'directory');
+}

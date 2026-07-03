@@ -8,8 +8,8 @@ import {
   signalHostPreviewChanged,
   subscribeHostActive,
   subscribeHostConnection,
+  subscribeHostResume,
   subscribeHostTheme,
-  type RemuxHostConnectionStatus,
   type RemuxHostTheme,
   type RemuxHostViewportMetrics,
   subscribeHostViewportMetrics,
@@ -241,8 +241,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   const lastResizeRef = useRef<{ cols: number; rows: number } | null>(null);
   const lastSeqRef = useRef(0);
   const sessionIdRef = useRef<string | null>(null);
-  const connectedEventSeenRef = useRef(false);
-  const connectionRef = useRef<RemuxHostConnectionStatus>('connecting');
+  const resyncPendingFramesRef = useRef<TerminalSessionOutputFrame[] | null>(null);
   const hostActiveRef = useRef(true);
   const terminalRef = useRef<Terminal | null>(null);
   const fitTimerRef = useRef<number | null>(null);
@@ -590,6 +589,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     }
 
     resyncInFlightRef.current = true;
+    resyncPendingFramesRef.current = [];
     try {
       const size = currentSize();
       const attached = await attachTerminalSession({
@@ -615,12 +615,25 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
           type: 'exited',
         });
       }
-    } catch {
-      // A server restart can make the previously bound session disappear.
+    } catch (error) {
+      // A daemon restart makes the bound session disappear; say so instead of
+      // leaving a "running" terminal that silently ignores input. Transient
+      // failures stay quiet — the next resume or reconnect retries.
+      if (errorMessage(error).includes('terminal session not found')) {
+        setStatus({ message: 'Terminal session ended while remux was away.', type: 'error' });
+      }
     } finally {
+      const pendingFrames = resyncPendingFramesRef.current;
+      resyncPendingFramesRef.current = null;
       resyncInFlightRef.current = false;
+      if (pendingFrames && pendingFrames.length > 0) {
+        for (const frame of pendingFrames) {
+          writeFrame(frame);
+        }
+        setReplayGap(false);
+      }
     }
-  }, [currentSize, writeReplay]);
+  }, [currentSize, writeFrame, writeReplay]);
 
   const restartSession = useCallback(() => {
     const currentSessionId = sessionIdRef.current;
@@ -1547,6 +1560,15 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     }
 
     if (event.type === 'output' && event.event.sessionId === currentSessionId) {
+      // Frames landing while a resync attach is in flight wait for its
+      // replay: writing them first would advance the seq cursor past the
+      // replay and silently drop the frames the resync went to fetch.
+      const pendingResyncFrames = resyncPendingFramesRef.current;
+      if (pendingResyncFrames) {
+        pendingResyncFrames.push(event.event.frame);
+        return;
+      }
+
       writeFrame(event.event.frame);
       setReplayGap(false);
       return;
@@ -1562,33 +1584,30 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     }
   }), [writeFrame]);
 
+  // Reconnect and foreground resyncs are owned by the resume subscription
+  // below; this only tracks the connected flag for input gating.
   useEffect(() => subscribeHostConnection((nextStatus) => {
     setConnected(nextStatus === 'connected');
-
-    const previousStatus = connectionRef.current;
-    connectionRef.current = nextStatus;
-    const hadSeenConnected = connectedEventSeenRef.current;
-    if (nextStatus === 'connected') {
-      connectedEventSeenRef.current = true;
-    }
-    if (
-      nextStatus === 'connected' &&
-      hadSeenConnected &&
-      previousStatus !== 'connected' &&
-      initialAttachCompletedRef.current
-    ) {
-      void resyncSession();
-    }
-  }), [resyncSession]);
+  }), []);
 
   useEffect(() => subscribeHostActive((active) => {
     const wasActive = hostActiveRef.current;
     hostActiveRef.current = active;
     setHostActive(active);
-    // Resync only on a real background→foreground transition. Reconnects are
-    // owned by the connection handler, which re-posts active and would otherwise
-    // trigger a redundant attach here.
+    // host/active tracks tab activation, not app foregrounding (the resume
+    // subscription owns that). Re-verify when this tab comes back anyway:
+    // frames posted to it are dropped while the host reloads the webview.
     if (active && !wasActive) {
+      void resyncSession();
+    }
+  }), [resyncSession]);
+
+  useEffect(() => subscribeHostResume(() => {
+    // Foregrounding resumes this webview after a suspension in which every
+    // posted event was dropped; a reconnect means the daemon broadcast to a
+    // dead socket. Both look the same from here: re-attach and replay the
+    // missed seq range.
+    if (initialAttachCompletedRef.current) {
       void resyncSession();
     }
   }), [resyncSession]);

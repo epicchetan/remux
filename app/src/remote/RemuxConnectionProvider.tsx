@@ -27,6 +27,8 @@ import {
 const reconnectDelaysMs = [400, 900, 1800, 3500, 5000];
 const remuxSystemInfoMethod = 'remux/system/info';
 const remuxSystemInfoTimeoutMs = 2_000;
+const remuxSystemPingMethod = 'remux/system/ping';
+const resumePingTimeoutMs = 3_000;
 const remuxWebSocketConnectTimeoutMs = 6_000;
 const requestReconnectWaitMs = 8000;
 const maxRequestReconnectRetries = 1;
@@ -79,6 +81,7 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
   const pendingLogEntriesRef = useRef<RemuxDebugEntry[]>([]);
   const reconnectAttemptRef = useRef(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const resumePingInFlightRef = useRef(false);
   const shouldReconnectRef = useRef(false);
   const statusRef = useRef<RemuxConnectionStatus>({ type: 'connecting' });
   const subscribersRef = useRef(new Set<(message: RemuxRpcMessage) => void>());
@@ -305,6 +308,33 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
     }
   }, [rejectConnectedWaiters, scheduleReconnect, setConnectionStatus]);
 
+  const verifyResumedConnection = useCallback((client: RemuxRpcClient) => {
+    if (resumePingInFlightRef.current) {
+      return;
+    }
+
+    resumePingInFlightRef.current = true;
+    client.request(remuxSystemPingMethod, undefined, resumePingTimeoutMs)
+      .then(() => {
+        logRemuxDebug('connection:resume-ping:ok');
+      })
+      .catch((pingError) => {
+        // Any response — even an error from an older daemon without the ping
+        // route — proves the socket is alive; only silence means it is dead.
+        const timedOut = pingError instanceof Error &&
+          pingError.message === `${remuxSystemPingMethod} timed out`;
+        if (!timedOut) {
+          logRemuxDebug('connection:resume-ping:ok', { error: errorMessage(pingError) });
+          return;
+        }
+
+        markClientConnectionLost(client, 'App resumed with unresponsive WebSocket', { immediate: true });
+      })
+      .finally(() => {
+        resumePingInFlightRef.current = false;
+      });
+  }, [markClientConnectionLost]);
+
   const ensureConnectionAfterResume = useCallback(() => {
     if (!settingsLoaded || !shouldReconnectRef.current) {
       return;
@@ -312,6 +342,11 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
 
     const client = clientRef.current;
     if (client?.isOpen()) {
+      // readyState still reports OPEN on a half-open socket (TCP died without
+      // a close frame while backgrounded — common across network changes).
+      // Trusting it would leave the app "connected" while the daemon
+      // broadcasts into the void, so prove liveness before moving on.
+      verifyResumedConnection(client);
       return;
     }
 
@@ -321,7 +356,7 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
     }
 
     scheduleReconnect(generationRef.current, 'App resumed without WebSocket', { immediate: true });
-  }, [markClientConnectionLost, scheduleReconnect, settingsLoaded]);
+  }, [markClientConnectionLost, scheduleReconnect, settingsLoaded, verifyResumedConnection]);
 
   useEffect(() => {
     setRemuxDebugSink((entry) => {

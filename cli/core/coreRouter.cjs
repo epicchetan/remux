@@ -10,6 +10,7 @@ function createCoreRouter({ rootDir = process.cwd() } = {}) {
   const fsCore = createFsCore({ rootDir });
 
   return {
+    fs: fsCore,
     async handleRpc(request) {
       if (isCoreMethod(request.method)) {
         return fsCore.handleRpc(request);

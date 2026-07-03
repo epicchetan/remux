@@ -34,6 +34,16 @@ export function fileExtensionForName(fileName: string) {
   return extension.toLowerCase();
 }
 
+// Icon-only variant: dotfiles like `.gitignore` have no visual extension.
+// Handler matching keeps using fileExtensionForName so viewers still open them.
+export function iconExtensionForName(fileName: string) {
+  if (fileName.startsWith('.')) {
+    return null;
+  }
+
+  return fileExtensionForName(fileName);
+}
+
 function fileHandlerMatchScore(handler: RemuxFileHandler, extension: string | null) {
   const handlerExtensions = handler.extensions.map((candidate) => candidate.toLowerCase());
 

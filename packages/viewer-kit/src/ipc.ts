@@ -179,6 +179,72 @@ function observePreviewMutations() {
   });
 }
 
+// Fires when this view has plausibly missed events: the webview became
+// visible again after a suspension, the page was restored, or the host's
+// socket (re)connected. A suspended webview receives nothing and there is no
+// replay, so views that stream state (rather than re-reading it) must treat
+// resume as "verify against the server". Bursts coalesce: a leading fire,
+// then at most one trailing fire per throttle window.
+export function subscribeIpcResume(subscriber: IpcResumeSubscriber) {
+  initializeIpc();
+  resumeSubscribers.add(subscriber);
+  return () => {
+    resumeSubscribers.delete(subscriber);
+  };
+}
+
+export type IpcResumeReason = 'connected' | 'pageshow' | 'visible';
+
+type IpcResumeSubscriber = (reason: IpcResumeReason) => void;
+
+const resumeThrottleMs = 2_500;
+const resumeSubscribers = new Set<IpcResumeSubscriber>();
+let resumeLastDispatchedAt = 0;
+let resumeTrailingTimer: number | null = null;
+let resumeTrailingReason: IpcResumeReason | null = null;
+
+function dispatchResume(reason: IpcResumeReason) {
+  if (resumeSubscribers.size === 0) {
+    return;
+  }
+
+  const elapsed = Date.now() - resumeLastDispatchedAt;
+  if (elapsed < resumeThrottleMs) {
+    resumeTrailingReason = reason;
+    if (resumeTrailingTimer === null) {
+      resumeTrailingTimer = window.setTimeout(() => {
+        resumeTrailingTimer = null;
+        const trailing = resumeTrailingReason;
+        resumeTrailingReason = null;
+        if (trailing !== null) {
+          dispatchResume(trailing);
+        }
+      }, resumeThrottleMs - elapsed);
+    }
+    return;
+  }
+
+  resumeLastDispatchedAt = Date.now();
+  for (const subscriber of resumeSubscribers) {
+    subscriber(reason);
+  }
+}
+
+function observeResumeSignals() {
+  if (typeof document === 'undefined') {
+    return;
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      dispatchResume('visible');
+    }
+  });
+  window.addEventListener('pageshow', () => {
+    dispatchResume('pageshow');
+  });
+}
+
 export function subscribeIpcEvents(subscriber: IpcEventSubscriber) {
   initializeIpc();
   eventSubscribers.add(subscriber);
@@ -210,6 +276,7 @@ export function initializeIpc() {
   initialized = true;
 
   observePreviewMutations();
+  observeResumeSignals();
   postMessage({ type: 'remux/ready' });
 }
 
@@ -272,9 +339,16 @@ function handleNativeMessage(event: MessageEvent) {
 }
 
 function updateStatus(snapshot: IpcStatusSnapshot) {
+  const wasConnected = statusSnapshot.status.type === 'connected';
   statusSnapshot = snapshot;
   for (const subscriber of statusSubscribers) {
     subscriber(statusSnapshot);
+  }
+
+  // Dispatched after the status subscribers so a resume handler that reads
+  // the snapshot sees the connected state it is reacting to.
+  if (!wasConnected && snapshot.status.type === 'connected') {
+    dispatchResume('connected');
   }
 }
 

@@ -3,7 +3,9 @@ import {
   requestIpc,
   signalIpcPreviewChanged,
   subscribeIpcEvents,
+  subscribeIpcResume,
   subscribeIpcStatus,
+  type IpcResumeReason,
   type IpcStatusSnapshot,
   type JsonRpcMessage,
   type RemuxViewHostStatus,
@@ -163,6 +165,17 @@ export function subscribeHostConnection(subscriber: (status: RemuxHostConnection
       }
     }
   });
+}
+
+export type RemuxHostResumeReason = IpcResumeReason;
+
+// The view may have missed events while iOS had the webview suspended or the
+// host's socket was down — neither is replayed. Fires (coalesced) when the
+// page becomes visible again, is restored, or the socket (re)connects, so
+// views that stream state can re-verify against the server. Views that
+// re-read full state on invalidation generally don't need this.
+export function subscribeHostResume(subscriber: (reason: RemuxHostResumeReason) => void) {
+  return subscribeIpcResume(subscriber);
 }
 
 export function subscribeHostActive(subscriber: (active: boolean) => void) {

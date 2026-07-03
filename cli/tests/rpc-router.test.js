@@ -94,6 +94,10 @@ test('createRpcRouter starts all extensions and routes by remux namespace', asyn
     { extensionId: 'files', restartable: true, started: true, running: true },
   );
   assert.deepEqual(
+    await router.handleRequest({ method: 'remux/system/ping' }),
+    { ok: true },
+  );
+  assert.deepEqual(
     await router.handleRequest({ method: 'remux/system/info' }),
     { cwd: '/tmp/remux-runtime' },
   );

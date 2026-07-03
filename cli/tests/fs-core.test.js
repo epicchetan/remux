@@ -339,3 +339,85 @@ test('remux fs core does not return oversized file content', async () => {
   assert.equal(result.sizeBytes, (1024 * 1024) + 1);
   assert.equal(result.tooLarge, true);
 });
+
+test('remux fs core emits directoryServed on fresh reads and honors unsubscribe', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'remux-fs-'));
+  await fs.mkdir(path.join(root, 'src'));
+
+  const fsCore = createFsCore({ rootDir: root });
+  const served = [];
+  const unsubscribe = fsCore.subscribe((event) => served.push(event));
+
+  await fsCore.handleRpc({ method: 'remux/fs/readDirectory' });
+  assert.equal(served.length, 1);
+  assert.deepEqual(served[0], {
+    path: root,
+    repoRoot: null,
+    type: 'directoryServed',
+  });
+
+  // A cached re-read does not emit again.
+  await fsCore.handleRpc({ method: 'remux/fs/readDirectory' });
+  assert.equal(served.length, 1);
+
+  unsubscribe();
+  await fsCore.handleRpc({ method: 'remux/fs/readDirectory', params: { force: true } });
+  assert.equal(served.length, 1);
+});
+
+test('remux fs core invalidate({paths}) drops the cached listing', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'remux-fs-'));
+  const fsCore = createFsCore({ rootDir: root });
+
+  const before = await fsCore.handleRpc({ method: 'remux/fs/readDirectory' });
+  assert.equal(before.entries.length, 0);
+
+  await fs.writeFile(path.join(root, 'fresh.txt'), 'hi');
+  const cached = await fsCore.handleRpc({ method: 'remux/fs/readDirectory' });
+  assert.equal(cached.entries.length, 0, 'non-force read within TTL serves the cache');
+
+  fsCore.invalidate({ paths: [root] });
+  const after = await fsCore.handleRpc({ method: 'remux/fs/readDirectory' });
+  assert.deepEqual(after.entries.map((entry) => entry.name), ['fresh.txt']);
+});
+
+test('remux fs core invalidate({underRoots}) drops every listing under the root, including the root', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'remux-fs-'));
+  const child = path.join(root, 'child');
+  await fs.mkdir(child);
+
+  const fsCore = createFsCore({ rootDir: root });
+  await fsCore.handleRpc({ method: 'remux/fs/readDirectory' });
+  await fsCore.handleRpc({ method: 'remux/fs/readDirectory', params: { path: child } });
+
+  await fs.writeFile(path.join(root, 'root.txt'), 'r');
+  await fs.writeFile(path.join(child, 'child.txt'), 'c');
+
+  fsCore.invalidate({ underRoots: [root] });
+
+  const rootResult = await fsCore.handleRpc({ method: 'remux/fs/readDirectory' });
+  const childResult = await fsCore.handleRpc({ method: 'remux/fs/readDirectory', params: { path: child } });
+  assert.ok(rootResult.entries.some((entry) => entry.name === 'root.txt'));
+  assert.deepEqual(childResult.entries.map((entry) => entry.name), ['child.txt']);
+});
+
+test('remux fs core reports symlink target kinds', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'remux-fs-'));
+  await fs.mkdir(path.join(root, 'real-dir'));
+  await fs.writeFile(path.join(root, 'real-file.txt'), 'hi');
+  await fs.symlink(path.join(root, 'real-dir'), path.join(root, 'dir-link'));
+  await fs.symlink(path.join(root, 'real-file.txt'), path.join(root, 'file-link'));
+  await fs.symlink(path.join(root, 'missing'), path.join(root, 'broken-link'));
+
+  const fsCore = createFsCore({ rootDir: root });
+  const result = await fsCore.handleRpc({ method: 'remux/fs/readDirectory' });
+  const byName = new Map(result.entries.map((entry) => [entry.name, entry]));
+
+  assert.equal(byName.get('dir-link').kind, 'symlink');
+  assert.equal(byName.get('dir-link').targetKind, 'directory');
+  assert.equal(byName.get('file-link').kind, 'symlink');
+  assert.equal(byName.get('file-link').targetKind, 'file');
+  assert.equal(byName.get('broken-link').kind, 'symlink');
+  assert.equal(byName.get('broken-link').targetKind, null);
+  assert.equal(byName.get('real-dir').targetKind, null);
+});

@@ -25,6 +25,17 @@ function createFsCore({ rootDir = process.cwd() } = {}) {
   const directoryInflight = new Map();
   const gitRepoRootCache = new Map();
   const gitStatusCache = new Map();
+  const servedListeners = new Set();
+
+  const notifyDirectoryServed = (event) => {
+    for (const listener of servedListeners) {
+      try {
+        listener(event);
+      } catch {
+        // Listener failures must never break reads.
+      }
+    }
+  };
 
   return {
     async handleRpc({ method, params }) {
@@ -35,6 +46,7 @@ function createFsCore({ rootDir = process.cwd() } = {}) {
           directoryInflight,
           gitRepoRootCache,
           gitStatusCache,
+          notifyDirectoryServed,
           params,
         });
       }
@@ -46,6 +58,7 @@ function createFsCore({ rootDir = process.cwd() } = {}) {
           directoryInflight,
           gitRepoRootCache,
           gitStatusCache,
+          notifyDirectoryServed,
           params,
         });
       }
@@ -61,6 +74,27 @@ function createFsCore({ rootDir = process.cwd() } = {}) {
 
       throw new JsonRpcError(-32601, `Method not found: ${method}`);
     },
+    invalidate({ paths = [], underRoots = [] } = {}) {
+      for (const targetPath of paths) {
+        directoryCache.delete(path.resolve(targetPath));
+      }
+
+      for (const root of underRoots) {
+        const resolvedRoot = path.resolve(root);
+        for (const key of Array.from(directoryCache.keys())) {
+          if (isPathWithin(resolvedRoot, key)) {
+            directoryCache.delete(key);
+          }
+        }
+        gitStatusCache.delete(resolvedRoot);
+      }
+    },
+    subscribe(listener) {
+      servedListeners.add(listener);
+      return () => {
+        servedListeners.delete(listener);
+      };
+    },
   };
 }
 
@@ -70,6 +104,7 @@ async function readDirectory({
   directoryInflight,
   gitRepoRootCache,
   gitStatusCache,
+  notifyDirectoryServed,
   params,
 }) {
   const targetPath = resolveRequestedPath(defaultPath, params);
@@ -80,6 +115,7 @@ async function readDirectory({
     force,
     gitRepoRootCache,
     gitStatusCache,
+    notifyDirectoryServed,
     targetPath,
   });
 }
@@ -90,6 +126,7 @@ async function readDirectories({
   directoryInflight,
   gitRepoRootCache,
   gitStatusCache,
+  notifyDirectoryServed,
   params,
 }) {
   if (!isRecord(params) || !Array.isArray(params.paths)) {
@@ -114,6 +151,7 @@ async function readDirectories({
         force,
         gitRepoRootCache,
         gitStatusCache,
+        notifyDirectoryServed,
         targetPath,
       });
       return {
@@ -139,6 +177,7 @@ async function readDirectoryCached({
   force = false,
   gitRepoRootCache,
   gitStatusCache,
+  notifyDirectoryServed,
   targetPath,
 }) {
   const cached = directoryCache.get(targetPath);
@@ -155,6 +194,7 @@ async function readDirectoryCached({
   const promise = readDirectoryFresh({
     gitRepoRootCache,
     gitStatusCache,
+    notifyDirectoryServed,
     targetPath,
   })
     .then((result) => {
@@ -172,7 +212,12 @@ async function readDirectoryCached({
   return promise;
 }
 
-async function readDirectoryFresh({ gitRepoRootCache, gitStatusCache, targetPath }) {
+async function readDirectoryFresh({
+  gitRepoRootCache,
+  gitStatusCache,
+  notifyDirectoryServed,
+  targetPath,
+}) {
   let dirents;
 
   try {
@@ -198,6 +243,12 @@ async function readDirectoryFresh({ gitRepoRootCache, gitStatusCache, targetPath
         git: gitStatusForEntry(gitStatus, entry),
       }))
     : sortedEntries;
+
+  notifyDirectoryServed?.({
+    path: targetPath,
+    repoRoot: gitStatus?.repoRoot ?? null,
+    type: 'directoryServed',
+  });
 
   return {
     entries: annotatedEntries,
@@ -595,18 +646,36 @@ async function directoryEntry(parent, dirent) {
     name: dirent.name,
     path: entryPath,
     sizeBytes: null,
+    targetKind: null,
   };
 
   try {
     const stats = await fs.lstat(entryPath);
+    const kind = kindFromStats(stats, dirent);
     return {
       ...fallback,
-      kind: kindFromStats(stats, dirent),
+      kind,
       modifiedAtMs: Number.isFinite(stats.mtimeMs) ? Math.trunc(stats.mtimeMs) : null,
       sizeBytes: stats.isFile() ? stats.size : null,
+      targetKind: kind === 'symlink' ? await symlinkTargetKind(entryPath) : null,
     };
   } catch {
     return fallback;
+  }
+}
+
+async function symlinkTargetKind(entryPath) {
+  try {
+    const stats = await fs.stat(entryPath);
+    if (stats.isDirectory()) {
+      return 'directory';
+    }
+    if (stats.isFile()) {
+      return 'file';
+    }
+    return 'other';
+  } catch {
+    return null;
   }
 }
 
@@ -680,6 +749,7 @@ function directoryVersion(entries) {
       name: entry.name,
       path: entry.path,
       sizeBytes: entry.sizeBytes ?? null,
+      targetKind: entry.targetKind ?? null,
     }));
     hash.update('\n');
   }
@@ -961,6 +1031,24 @@ function gitStatusRank(status) {
   }
 }
 
+// Path containment with the root itself included: isPathWithin(x, x) === true.
+// Boundary-safe: '/repo2' is not within '/repo'. Uses pathComparisonCandidates
+// so the macOS /var <-> /private/var duality cannot split root and target.
+function isPathWithin(rootPath, targetPath) {
+  for (const candidateRoot of pathComparisonCandidates(rootPath)) {
+    for (const candidateTarget of pathComparisonCandidates(targetPath)) {
+      if (
+        candidateTarget === candidateRoot ||
+        candidateTarget.startsWith(candidateRoot + path.sep)
+      ) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 function relativeGitPath(repoRoot, entryPath) {
   for (const candidateRoot of pathComparisonCandidates(repoRoot)) {
     for (const candidateEntryPath of pathComparisonCandidates(entryPath)) {
@@ -1009,6 +1097,7 @@ function formatBytes(bytes) {
 
 module.exports = {
   createFsCore,
+  isPathWithin,
   readDirectoriesMethod,
   readDirectoryMethod,
   readFileMethod,

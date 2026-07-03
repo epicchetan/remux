@@ -25,6 +25,7 @@ import {
   ActivityIndicator,
   FlatList,
   Pressable,
+  RefreshControl,
   StyleSheet,
   Text,
   type ViewToken,
@@ -38,17 +39,19 @@ import { useBrowserStore } from '../browser/browserStore';
 import { useRemuxConnection } from '../remote/RemuxConnectionProvider';
 import { alpha, useTheme, type RemuxTheme } from '../theme/ThemeProvider';
 import { NativeGlassIconButton } from '../ui/NativeGlassIconButton';
+import { matchingFileHandlers } from './fileHandlers';
 import {
-  fileExtensionForName,
-  matchingFileHandlers,
-} from './fileHandlers';
+  fsDidChangeMethod,
+  parseFsDidChangeParams,
+} from './filesApi';
+import { FileGlyph, FolderGlyph } from './filesIcons';
 import {
   filesRootKey,
   useFilesStore,
   visibleFileTreeRows,
   type DirectoryRecord,
 } from './filesStore';
-import type { VisibleFileTreeRow } from './filesTypes';
+import { isDirectoryLikeEntry, type VisibleFileTreeRow } from './filesTypes';
 
 const rowHeight = 64;
 const rowIndent = 20;
@@ -68,14 +71,20 @@ const navigationButtonModifiers = [
 ];
 
 export function FilesOverview() {
+  const applyFsDidChange = useFilesStore((state) => state.applyFsDidChange);
   const currentPath = useFilesStore((state) => state.currentPath);
   const directoriesByPath = useFilesStore((state) => state.directoriesByPath);
   const expandedPaths = useFilesStore((state) => state.expandedPaths);
   const insets = useSafeAreaInsets();
+  const isRefreshingAll = useFilesStore((state) => state.isRefreshingAll);
   const loadRootDirectory = useFilesStore((state) => state.loadRootDirectory);
   const navigateToParentDirectory = useFilesStore((state) => state.navigateToParentDirectory);
   const preloadDirectories = useFilesStore((state) => state.preloadDirectories);
-  const request = useRemuxConnection().request;
+  const refreshError = useFilesStore((state) => state.refreshError);
+  const refreshVisibleDirectories = useFilesStore((state) => state.refreshVisibleDirectories);
+  const toggleFolder = useFilesStore((state) => state.toggleFolder);
+  const { request, subscribe } = useRemuxConnection();
+  const listRef = useRef<FlatList<VisibleFileTreeRow>>(null);
   const preloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [viewablePaths, setViewablePaths] = useState<string[]>([]);
   const rows = useMemo(
@@ -94,7 +103,7 @@ export function FilesOverview() {
     () => preloadRows
       .filter((row) => {
         return (
-          row.kind === 'directory' &&
+          isDirectoryLikeEntry(row) &&
           isAutoPreloadCandidate(row) &&
           !row.childrenLoaded &&
           !isDirectoryFetching(directoriesByPath[row.path]) &&
@@ -118,13 +127,36 @@ export function FilesOverview() {
       item.item?.path ? [item.item.path] : []
     )));
   });
+  // Nearest expanded ancestor of the topmost visible row whose own row has
+  // scrolled off-screen: surfaced as a header collapse button so large
+  // folders can be closed without scrolling back up.
+  const collapseTarget = useMemo(() => {
+    const firstViewablePath = viewablePaths[0];
+    if (!firstViewablePath) {
+      return null;
+    }
+
+    const firstRow = rows.find((row) => row.path === firstViewablePath);
+    if (
+      !firstRow?.parentPath ||
+      firstRow.parentPath === currentPath ||
+      viewablePathSet.has(firstRow.parentPath)
+    ) {
+      return null;
+    }
+
+    return {
+      name: firstRow.parentPath.split('/').filter(Boolean).pop() ?? firstRow.parentPath,
+      path: firstRow.parentPath,
+    };
+  }, [currentPath, rows, viewablePaths, viewablePathSet]);
   const currentRecord = currentPath
     ? directoriesByPath[currentPath]
     : directoriesByPath[filesRootKey];
   const currentParentPath = currentRecord?.parentPath ?? null;
   const currentLoading = currentRecord?.refreshStatus === 'loading';
   const currentError = currentRecord?.error ?? null;
-  const { styles } = useFilesTheme();
+  const { styles, theme } = useFilesTheme();
   const listTopPadding =
     insets.top +
     headerTopPadding +
@@ -136,6 +168,20 @@ export function FilesOverview() {
   useEffect(() => {
     void loadRootDirectory(request);
   }, [loadRootDirectory, request]);
+
+  // Only mounted while the files section is active, so push invalidations are
+  // applied exactly while the tree is on screen; loadRootDirectory covers
+  // anything missed while unmounted via the re-entry refresh.
+  useEffect(() => subscribe((message) => {
+    if (message.method !== fsDidChangeMethod) {
+      return;
+    }
+
+    const params = parseFsDidChangeParams(message.params);
+    if (params) {
+      applyFsDidChange(request, params);
+    }
+  }), [applyFsDidChange, request, subscribe]);
 
   useEffect(() => {
     if (preloadPaths.length === 0) {
@@ -162,6 +208,7 @@ export function FilesOverview() {
   return (
     <View style={styles.container}>
       <FlatList
+        ref={listRef}
         contentInsetAdjustmentBehavior="never"
         contentContainerStyle={[
           {
@@ -170,6 +217,11 @@ export function FilesOverview() {
           },
         ]}
         data={rows}
+        getItemLayout={(data, index) => ({
+          index,
+          length: rowHeight,
+          offset: rowHeight * index,
+        })}
         ListEmptyComponent={
           <FilesStatus
             error={currentError}
@@ -179,16 +231,45 @@ export function FilesOverview() {
         keyboardShouldPersistTaps="handled"
         keyExtractor={(row) => row.path}
         onViewableItemsChanged={onViewableItemsChanged.current}
+        refreshControl={
+          <RefreshControl
+            onRefresh={() => {
+              void refreshVisibleDirectories(request, { spinner: true });
+            }}
+            progressViewOffset={listTopPadding}
+            refreshing={isRefreshingAll}
+            tintColor={theme.textMuted}
+          />
+        }
         renderItem={({ item }) => <FileTreeRow row={item} />}
         showsVerticalScrollIndicator={false}
         viewabilityConfig={viewabilityConfig.current}
       />
       <FilesHeader
         canNavigateBack={Boolean(currentParentPath)}
+        collapseTarget={collapseTarget}
         currentPath={currentPath}
         onBackPress={() => {
           void navigateToParentDirectory(request);
         }}
+        onCollapsePress={() => {
+          if (!collapseTarget) {
+            return;
+          }
+
+          // Rows above the folder are unchanged by the collapse, so its
+          // index is stable; paddingTop equals listTopPadding, which cancels
+          // getItemLayout's padding-blind offset and lands the row right
+          // below the header.
+          const index = rows.findIndex((row) => row.path === collapseTarget.path);
+          void toggleFolder(request, collapseTarget.path);
+          if (index >= 0) {
+            requestAnimationFrame(() => {
+              listRef.current?.scrollToIndex({ animated: true, index });
+            });
+          }
+        }}
+        refreshError={refreshError}
         topInset={insets.top}
       />
     </View>
@@ -197,20 +278,26 @@ export function FilesOverview() {
 
 function FilesHeader({
   canNavigateBack,
+  collapseTarget,
   currentPath,
   onBackPress,
+  onCollapsePress,
+  refreshError,
   topInset,
 }: {
   canNavigateBack: boolean;
+  collapseTarget: { name: string; path: string } | null;
   currentPath: string | null;
   onBackPress: () => void;
+  onCollapsePress: () => void;
+  refreshError: string | null;
   topInset: number;
 }) {
   const { styles } = useFilesTheme();
   const { width } = useWindowDimensions();
   const titleWidth = Math.max(
     0,
-    width - (tabGridHorizontalPadding * 2) - headerSideWidth - headerTitleGap,
+    width - (tabGridHorizontalPadding * 2) - (headerSideWidth * 2) - headerTitleGap,
   );
 
   return (
@@ -229,7 +316,23 @@ function FilesHeader({
 
         <NativeTitleButton title={currentPath ?? 'Files'} width={titleWidth} />
 
+        <View style={[styles.headerSide, styles.headerSideRight]}>
+          {collapseTarget ? (
+            <NativeGlassIconButton
+              accessibilityLabel={`Collapse ${collapseTarget.name}`}
+              iconSize={navigationIconSize}
+              onPress={onCollapsePress}
+              size={navigationButtonSize}
+              systemImage="chevron.up"
+            />
+          ) : null}
+        </View>
       </View>
+      {refreshError ? (
+        <View style={styles.refreshErrorPill}>
+          <Text numberOfLines={1} style={styles.refreshErrorText}>{refreshError}</Text>
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -298,11 +401,12 @@ function FileTreeRow({ row }: { row: VisibleFileTreeRow }) {
   const loading = record?.refreshStatus === 'loading';
   const navigateToDirectory = useFilesStore((state) => state.navigateToDirectory);
   const toggleFolder = useFilesStore((state) => state.toggleFolder);
+  const isDirectoryLike = isDirectoryLikeEntry(row);
   const fileHandler = matchingFileHandlers(extensions, row)[0] ?? null;
-  const showSpinner = row.kind === 'directory' && loading && !row.childrenLoaded && !error;
-  const showChevron = row.kind === 'directory' && !showSpinner && row.hasChildren && !error;
+  const showSpinner = isDirectoryLike && loading && !row.childrenLoaded && !error;
+  const showChevron = isDirectoryLike && !showSpinner && row.hasChildren && !error;
   const canToggle = showChevron;
-  const canOpen = row.kind === 'directory' || Boolean(fileHandler);
+  const canOpen = isDirectoryLike || Boolean(fileHandler);
   const meta = fileRowMeta(row, loading, error);
 
   return (
@@ -329,11 +433,11 @@ function FileTreeRow({ row }: { row: VisibleFileTreeRow }) {
         </Pressable>
 
         <Pressable
-          accessibilityLabel={row.kind === 'directory' ? `Open ${row.name}` : row.name}
+          accessibilityLabel={isDirectoryLike ? `Open ${row.name}` : row.name}
           accessibilityRole={canOpen ? 'button' : undefined}
           disabled={!canOpen}
           onPress={() => {
-            if (row.kind === 'directory') {
+            if (isDirectoryLike) {
               void navigateToDirectory(request, row.path, row.parentPath);
               return;
             }
@@ -355,9 +459,7 @@ function FileTreeRow({ row }: { row: VisibleFileTreeRow }) {
           ]}
         >
           <View style={styles.iconSlot}>
-            {row.kind === 'directory'
-              ? <FolderIcon styles={styles} />
-              : <FileIcon fileName={row.name} styles={styles} theme={theme} />}
+            {isDirectoryLike ? <FolderGlyph /> : <FileGlyph fileName={row.name} />}
           </View>
 
           <View style={styles.rowText}>
@@ -427,15 +529,6 @@ function FilesStatus({
   );
 }
 
-function FolderIcon({ styles }: { styles: FilesStyles }) {
-  return (
-    <View style={styles.folderIcon}>
-      <View style={styles.folderTab} />
-      <View style={styles.folderBody} />
-    </View>
-  );
-}
-
 function ChevronIcon({
   direction,
   styles,
@@ -453,26 +546,6 @@ function ChevronIcon({
   );
 }
 
-function FileIcon({
-  fileName,
-  styles,
-  theme,
-}: {
-  fileName: string;
-  styles: FilesStyles;
-  theme: RemuxTheme;
-}) {
-  const extension = fileNameExtension(fileName);
-  const accent = fileAccentColor(extension, theme);
-
-  return (
-    <View style={styles.fileIcon}>
-      <View style={[styles.fileAccent, { backgroundColor: accent }]} />
-      <Text numberOfLines={1} style={styles.fileExtension}>{extension || 'file'}</Text>
-    </View>
-  );
-}
-
 function fileRowMeta(row: VisibleFileTreeRow, isLoading: boolean, error?: string | null) {
   if (error) {
     return error;
@@ -482,7 +555,7 @@ function fileRowMeta(row: VisibleFileTreeRow, isLoading: boolean, error?: string
     return 'Reading directory';
   }
 
-  if (row.kind === 'directory') {
+  if (isDirectoryLikeEntry(row)) {
     const itemCount = row.itemCount == null ? null : `${row.itemCount} ${row.itemCount === 1 ? 'item' : 'items'}`;
     return [formatModifiedAt(row.modifiedAtMs), itemCount].filter(Boolean).join(' - ');
   }
@@ -510,10 +583,6 @@ function isAutoPreloadCandidate(row: VisibleFileTreeRow) {
     default:
       return true;
   }
-}
-
-function fileNameExtension(fileName: string) {
-  return fileExtensionForName(fileName)?.slice(0, 4) ?? '';
 }
 
 function formatModifiedAt(modifiedAtMs: number | null | undefined) {
@@ -551,22 +620,6 @@ function formatSize(sizeBytes: number | null | undefined) {
   }
 
   return `${(sizeBytes / 1024 / 1024).toFixed(1)} MB`;
-}
-
-function fileAccentColor(extension: string, theme: RemuxTheme) {
-  switch (extension) {
-    case 'js':
-    case 'json':
-      return theme.warning;
-    case 'md':
-    case 'mdx':
-      return theme.textMuted;
-    case 'ts':
-    case 'tsx':
-      return theme.focusRing;
-    default:
-      return theme.textMuted;
-  }
 }
 
 function gitStatusLabel(status: NonNullable<VisibleFileTreeRow['git']>['status']) {
@@ -654,61 +707,6 @@ function createStyles(theme: RemuxTheme) {
     backgroundColor: theme.surface,
     flex: 1,
   },
-  fileAccent: {
-    borderRadius: 2,
-    height: 4,
-    left: 6,
-    position: 'absolute',
-    right: 6,
-    top: 7,
-  },
-  fileExtension: {
-    color: theme.textMuted,
-    fontSize: 8,
-    fontWeight: '800',
-    lineHeight: 10,
-    maxWidth: 28,
-    textTransform: 'uppercase',
-  },
-  fileIcon: {
-    alignItems: 'center',
-    backgroundColor: theme.surfaceRaised,
-    borderColor: theme.border,
-    borderRadius: 6,
-    borderWidth: 1,
-    height: 30,
-    justifyContent: 'center',
-    width: 28,
-  },
-  folderBody: {
-    backgroundColor: alpha(theme.focusRing, 0.58),
-    borderColor: alpha(theme.focusRing, 0.78),
-    borderRadius: 4,
-    borderTopLeftRadius: 2,
-    borderTopRightRadius: 5,
-    borderWidth: 1,
-    bottom: 0,
-    left: 0,
-    position: 'absolute',
-    right: 0,
-    top: 7,
-  },
-  folderIcon: {
-    height: 30,
-    position: 'relative',
-    width: 36,
-  },
-  folderTab: {
-    backgroundColor: alpha(theme.focusRing, 0.58),
-    borderColor: alpha(theme.focusRing, 0.78),
-    borderRadius: 4,
-    borderWidth: 1,
-    height: 12,
-    left: 0,
-    position: 'absolute',
-    top: 1,
-    width: 20,
-  },
   gitStatusBadge: {
     alignItems: 'center',
     borderRadius: 5,
@@ -735,6 +733,7 @@ function createStyles(theme: RemuxTheme) {
     left: 0,
     paddingBottom: 2,
     paddingHorizontal: tabGridHorizontalPadding,
+    pointerEvents: 'box-none',
     position: 'absolute',
     right: 0,
     top: 0,
@@ -796,6 +795,24 @@ function createStyles(theme: RemuxTheme) {
     flex: 1,
     justifyContent: 'center',
     minWidth: 0,
+  },
+  refreshErrorPill: {
+    alignSelf: 'center',
+    backgroundColor: alpha(theme.danger, 0.14),
+    borderColor: alpha(theme.danger, 0.32),
+    borderRadius: 10,
+    borderWidth: 1,
+    marginTop: 6,
+    maxWidth: '90%',
+    paddingHorizontal: 10,
+    paddingVertical: 3,
+    pointerEvents: 'none',
+  },
+  refreshErrorText: {
+    color: theme.danger,
+    fontSize: 12,
+    fontWeight: '600',
+    lineHeight: 16,
   },
   rowTitle: {
     color: theme.text,

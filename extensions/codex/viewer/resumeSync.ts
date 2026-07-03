@@ -1,11 +1,16 @@
 import { useCallback, useEffect, useRef } from 'react';
 
-import type { CodexViewHostStatus } from './ipc/types';
+import {
+  getHostStatusSnapshot,
+  subscribeHostResume,
+  type RemuxHostResumeReason,
+} from '@remux/viewer-kit/host';
+
 import { refreshActiveThreadComposerState } from './threads/composerStateStore';
 import { refreshActiveThreadRuntime } from './threads/runtimeStore';
 import { refreshActiveTranscriptResources } from './transcript/store';
 
-export type CodexResumeSyncReason = 'connected' | 'pageshow' | 'visible';
+export type CodexResumeSyncReason = RemuxHostResumeReason;
 
 type CodexResumeSyncParams = {
   activeThreadId: string | null;
@@ -15,11 +20,7 @@ type CodexResumeSyncParams = {
   reason: CodexResumeSyncReason;
 };
 
-type UseCodexResumeSyncParams = Omit<CodexResumeSyncParams, 'reason'> & {
-  connectionStatus: CodexViewHostStatus;
-};
-
-const resumeSyncThrottleMs = 2500;
+type UseCodexResumeSyncParams = Omit<CodexResumeSyncParams, 'reason'>;
 
 export async function syncCodexViewerAfterResume(params: CodexResumeSyncParams) {
   const startMs = Date.now();
@@ -71,29 +72,24 @@ export async function syncCodexViewerAfterResume(params: CodexResumeSyncParams) 
 export function useCodexResumeSync(params: UseCodexResumeSyncParams) {
   const latestParamsRef = useRef(params);
   const inFlightRef = useRef(false);
-  const lastSyncStartedAtRef = useRef(0);
   const mountedRef = useRef(true);
   const pendingReasonRef = useRef<CodexResumeSyncReason | null>(null);
-  const previousConnectionTypeRef = useRef(params.connectionStatus.type);
-  const throttleTimerRef = useRef<number | null>(null);
+  const wasConnectedAtFirstRenderRef = useRef(
+    getHostStatusSnapshot().status.type === 'connected',
+  );
 
   latestParamsRef.current = params;
-
-  const clearThrottleTimer = useCallback(() => {
-    if (throttleTimerRef.current !== null) {
-      window.clearTimeout(throttleTimerRef.current);
-      throttleTimerRef.current = null;
-    }
-  }, []);
 
   const runResumeSync = useCallback((reason: CodexResumeSyncReason) => {
     if (!mountedRef.current) {
       return;
     }
 
-    const latestParams = latestParamsRef.current;
-    if (latestParams.connectionStatus.type !== 'connected') {
-      pendingReasonRef.current = reason;
+    // Gate on the live snapshot, not React state: the 'connected' resume is
+    // dispatched synchronously with the status update, before any re-render.
+    // A sync skipped while disconnected needs no bookkeeping — viewer-kit
+    // fires 'connected' when the socket comes back.
+    if (getHostStatusSnapshot().status.type !== 'connected') {
       return;
     }
 
@@ -102,24 +98,8 @@ export function useCodexResumeSync(params: UseCodexResumeSyncParams) {
       return;
     }
 
-    const elapsedMs = Date.now() - lastSyncStartedAtRef.current;
-    if (elapsedMs < resumeSyncThrottleMs) {
-      pendingReasonRef.current = reason;
-      if (throttleTimerRef.current === null) {
-        throttleTimerRef.current = window.setTimeout(() => {
-          throttleTimerRef.current = null;
-          const pendingReason = pendingReasonRef.current ?? reason;
-          pendingReasonRef.current = null;
-          runResumeSync(pendingReason);
-        }, resumeSyncThrottleMs - elapsedMs);
-      }
-      return;
-    }
-
-    clearThrottleTimer();
     inFlightRef.current = true;
-    lastSyncStartedAtRef.current = Date.now();
-
+    const latestParams = latestParamsRef.current;
     void syncCodexViewerAfterResume({
       activeThreadId: latestParams.activeThreadId,
       ensureThreadSummary: latestParams.ensureThreadSummary,
@@ -138,51 +118,29 @@ export function useCodexResumeSync(params: UseCodexResumeSyncParams) {
         runResumeSync(pendingReason);
       }
     });
-  }, [clearThrottleTimer]);
+  }, []);
 
   useEffect(() => {
     return () => {
       mountedRef.current = false;
-      clearThrottleTimer();
     };
-  }, [clearThrottleTimer]);
+  }, []);
 
   useEffect(() => {
-    const previousConnectionType = previousConnectionTypeRef.current;
-    previousConnectionTypeRef.current = params.connectionStatus.type;
+    // The visible/pageshow/connected triggers and their coalescing live in
+    // viewer-kit (subscribeHostResume); this hook only owns what to refetch.
+    const unsubscribe = subscribeHostResume(runResumeSync);
 
-    if (params.connectionStatus.type !== 'connected') {
-      return;
-    }
-
-    const pendingReason = pendingReasonRef.current;
-    pendingReasonRef.current = null;
-    if (pendingReason) {
-      runResumeSync(pendingReason);
-      return;
-    }
-
-    if (previousConnectionType !== 'connected') {
+    // A connect landing between the first render and this effect is
+    // dispatched to nobody; catch it from the snapshot.
+    if (
+      !wasConnectedAtFirstRenderRef.current &&
+      getHostStatusSnapshot().status.type === 'connected'
+    ) {
       runResumeSync('connected');
     }
-  }, [params.connectionStatus.type, runResumeSync]);
 
-  useEffect(() => {
-    const handlePageShow = () => {
-      runResumeSync('pageshow');
-    };
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        runResumeSync('visible');
-      }
-    };
-
-    window.addEventListener('pageshow', handlePageShow);
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => {
-      window.removeEventListener('pageshow', handlePageShow);
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-    };
+    return unsubscribe;
   }, [runResumeSync]);
 }
 

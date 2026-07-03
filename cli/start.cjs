@@ -2,6 +2,7 @@ const { resolve } = require('node:path');
 
 const { createRemuxServer } = require('./httpServer.cjs');
 const { createCoreRouter } = require('./core/coreRouter.cjs');
+const { createFsRelay } = require('./fsRelay.cjs');
 const { createRpcRouter } = require('./rpcRouter.cjs');
 const { createExtensionProcess } = require('./extensionProcess.cjs');
 const { discoverExtensions } = require('./extensionRegistry.cjs');
@@ -33,8 +34,11 @@ async function start({ env = process.env, rootDir = process.cwd() } = {}) {
         createExtensionProcess({ extension, log }),
       ]),
   );
+  const coreRouter = createCoreRouter({ rootDir: runtimeRootDir });
+  const fsWatch = createFsRelay({ log });
+  coreRouter.fs.subscribe(fsWatch.onDirectoryServed);
   const router = createRpcRouter({
-    coreRouter: createCoreRouter({ rootDir: runtimeRootDir }),
+    coreRouter,
     defaultExtensionId: defaultExtension.id,
     extensionServers,
     system: {
@@ -77,6 +81,7 @@ async function start({ env = process.env, rootDir = process.cwd() } = {}) {
     }
 
     remuxWs = attachRemuxWebSocketServer({
+      fsWatch,
       onFatal: (reason, code = 1) => {
         log.error(reason);
         void shutdown(code).then(() => process.exit(code));
@@ -86,10 +91,12 @@ async function start({ env = process.env, rootDir = process.cwd() } = {}) {
       router,
       server,
     });
+    fsWatch.start({ broadcast: remuxWs.broadcast, fs: coreRouter.fs });
 
     await router.start(remuxWs.ctx);
     await listen(server, runtime, log);
   } catch (error) {
+    fsWatch.close();
     remuxWs?.close();
     await router.stop();
     await stopViewerProviders(viewerProviders, server);
@@ -110,6 +117,7 @@ async function start({ env = process.env, rootDir = process.cwd() } = {}) {
     }
     shuttingDown = true;
 
+    fsWatch.close();
     remuxWs?.close();
     await router.stop();
     await stopViewerProviders(viewerProviders, server);

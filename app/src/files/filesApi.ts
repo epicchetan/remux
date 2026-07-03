@@ -4,6 +4,13 @@ import type { FileTreeEntry, FileTreeGitStatus } from './filesTypes';
 const readDirectoryMethod = 'remux/fs/readDirectory';
 const readDirectoriesMethod = 'remux/fs/readDirectories';
 
+export const fsDidChangeMethod = 'remux/fs/didChange';
+
+export type RemuxFsDidChangeParams = {
+  changedPaths: string[];
+  gitDirtyRoots: string[];
+};
+
 export type RemuxReadDirectoryResponse = {
   entries: FileTreeEntry[];
   parentPath: string | null;
@@ -50,6 +57,28 @@ export async function readRemuxDirectories(
   );
 
   return parseReadDirectoriesResponse(response);
+}
+
+export function parseFsDidChangeParams(params: unknown): RemuxFsDidChangeParams | null {
+  if (!isRecord(params)) {
+    return null;
+  }
+
+  const changedPaths = stringArray(params.changedPaths);
+  const gitDirtyRoots = stringArray(params.gitDirtyRoots);
+  if (changedPaths.length === 0 && gitDirtyRoots.length === 0) {
+    return null;
+  }
+
+  return { changedPaths, gitDirtyRoots };
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.filter((item): item is string => typeof item === 'string' && item.length > 0);
 }
 
 function parseReadDirectoryResponse(response: unknown): RemuxReadDirectoryResponse {
@@ -111,7 +140,19 @@ function parseEntry(raw: unknown): FileTreeEntry[] {
     name: raw.name,
     path: raw.path,
     sizeBytes: typeof raw.sizeBytes === 'number' ? raw.sizeBytes : null,
+    targetKind: parseTargetKind(raw.targetKind),
   }];
+}
+
+function parseTargetKind(targetKind: unknown): FileTreeEntry['targetKind'] {
+  switch (targetKind) {
+    case 'directory':
+    case 'file':
+    case 'other':
+      return targetKind;
+    default:
+      return null;
+  }
 }
 
 function parseGitStatus(raw: unknown): FileTreeEntry['git'] {
