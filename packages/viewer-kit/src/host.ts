@@ -1,6 +1,7 @@
 import {
   getIpcStatusSnapshot,
   requestIpc,
+  signalIpcPreviewChanged,
   subscribeIpcEvents,
   subscribeIpcStatus,
   type IpcStatusSnapshot,
@@ -73,6 +74,12 @@ export function dismissHostKeyboard() {
   return requestIpc('host/keyboard/dismiss', undefined, 1_000);
 }
 
+// DOM mutations signal automatically (see viewer-kit ipc); views that render
+// to canvas call this from their own render hook instead.
+export function signalHostPreviewChanged() {
+  signalIpcPreviewChanged();
+}
+
 export function readHostClipboardText() {
   return requestIpc<{ text: string }>('host/clipboard/read', undefined, 3_000);
 }
@@ -114,6 +121,10 @@ export function pickHostAttachments(params: HostAttachmentPickParams = {}) {
 
 export function reloadHostView() {
   return requestIpc<{ ok: boolean }>('host/view/reload', undefined, 1_000);
+}
+
+export function closeHostTab() {
+  return requestIpc<{ ok: boolean }>('host/tab/close', undefined, 1_000);
 }
 
 export function updateHostTab(params: HostTabUpdate) {

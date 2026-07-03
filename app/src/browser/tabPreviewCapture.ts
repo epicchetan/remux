@@ -62,6 +62,16 @@ export function requestTabPreviewCapture(tabId: string) {
   }, wait);
 }
 
+// A viewer announced that its rendered content changed (fired after paint,
+// so a capture taken now photographs the new state). Cards only matter in
+// the overview; elsewhere the dirty mark defers the capture.
+export function noteTabPreviewContentChanged(tabId: string) {
+  markTabPreviewDirty(tabId);
+  if (useBrowserStore.getState().mode === 'overview') {
+    requestTabPreviewCapture(tabId);
+  }
+}
+
 export function flushDirtyTabPreviews(skipTabId?: string | null) {
   for (const tabId of [...dirtyTabIds]) {
     if (tabId !== skipTabId) {

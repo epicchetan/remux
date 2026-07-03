@@ -5,6 +5,7 @@ import {
   openHostOverview,
   readHostClipboardText,
   reloadHostView,
+  signalHostPreviewChanged,
   subscribeHostActive,
   subscribeHostConnection,
   subscribeHostTheme,
@@ -408,14 +409,18 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       return;
     }
 
+    // The terminal draws to canvas, which the viewer-kit mutation observer
+    // can't see; announce processed output so tab previews stay fresh. The
+    // write callback fires after xterm has parsed and rendered the data.
     if (!options.suppressTerminalData) {
-      terminal.write(data);
+      terminal.write(data, () => signalHostPreviewChanged());
       return;
     }
 
     suppressedTerminalDataWritesRef.current += 1;
     terminal.write(data, () => {
       suppressedTerminalDataWritesRef.current = Math.max(0, suppressedTerminalDataWritesRef.current - 1);
+      signalHostPreviewChanged();
     });
   }, []);
 
@@ -1592,6 +1597,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     const terminal = terminalRef.current;
     if (terminal) {
       terminal.options.theme = terminalThemeForHost(theme);
+      signalHostPreviewChanged();
     }
   }), []);
 

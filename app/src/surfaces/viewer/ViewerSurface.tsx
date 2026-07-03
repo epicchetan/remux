@@ -16,6 +16,7 @@ type ViewerSurfaceProps = {
 export function ViewerSurface({ active, onOpenOverview, surfaceRef, tab }: ViewerSurfaceProps) {
   const extensions = useBrowserStore((state) => state.extensions);
   const clearPendingNavigation = useBrowserStore((state) => state.clearPendingNavigation);
+  const closeTab = useBrowserStore((state) => state.closeTab);
   const openResource = useBrowserStore((state) => state.openResource);
   const updateTab = useBrowserStore((state) => state.updateTab);
   const sourceUrlRef = useRef(tab.url);
@@ -50,6 +51,9 @@ export function ViewerSurface({ active, onOpenOverview, surfaceRef, tab }: Viewe
       ok: true,
     };
   }, [extensions, openResource]);
+  const closeCurrentTab = useCallback(() => {
+    closeTab(tab.id, { returnToOverview: true });
+  }, [closeTab, tab.id]);
 
   useEffect(() => {
     const descriptor = descriptorRef.current;
@@ -63,6 +67,7 @@ export function ViewerSurface({ active, onOpenOverview, surfaceRef, tab }: Viewe
   return (
     <ExtensionWebView
       active={active}
+      onCloseTab={closeCurrentTab}
       onOpenFile={openFile}
       onOpenOverview={onOpenOverview}
       onNavigationDelivered={(nonce) => clearPendingNavigation(tab.id, nonce)}

@@ -35,6 +35,7 @@ import type { RemuxRpcMessage } from '../../remote/remuxRpcClient';
 import { useTheme, type RemuxTheme, type RemuxThemeName } from '../../theme/ThemeProvider';
 import type { BrowserPendingNavigation, BrowserSection, ViewerTab } from '../../browser/browserTypes';
 import { serializedResourceKey } from '../../browser/resourceKeys';
+import { noteTabPreviewContentChanged } from '../../browser/tabPreviewCapture';
 
 let nextWebViewInstanceId = 1;
 
@@ -218,6 +219,7 @@ type HealthPingWaiter = {
 
 type ExtensionWebViewProps = {
   active: boolean;
+  onCloseTab?: () => void;
   onNavigationDelivered?: (nonce: string) => void;
   onOpenFile?: (params: HostFileOpenParams) => HostFileOpenResult | Promise<HostFileOpenResult>;
   onOpenOverview?: (section?: BrowserSection) => Promise<void> | void;
@@ -237,6 +239,7 @@ export type ExtensionWebViewHandle = {
 export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebViewProps>(function ExtensionWebView(
   {
     active,
+    onCloseTab,
     onNavigationDelivered,
     onOpenFile,
     onOpenOverview,
@@ -696,6 +699,13 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
           logRemuxDebug(`webview:console:${message.level}`, message.message);
           break;
         case 'remux/notify':
+          // The viewer's own render signal: handled host-side, never
+          // forwarded to the socket.
+          if (message.method === 'host/preview/invalidate') {
+            noteTabPreviewContentChanged(tab.id);
+            break;
+          }
+
           remux.notify(message.method, message.params);
           break;
         case 'remux/invalid-request':
@@ -801,6 +811,16 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
               result: { ok: true },
               type: 'remux/response',
             }, { epoch: requestEpoch });
+            break;
+          }
+
+          if (message.method === 'host/tab/close') {
+            postToWebView({
+              id: message.id,
+              result: { ok: true },
+              type: 'remux/response',
+            }, { epoch: requestEpoch });
+            setTimeout(() => onCloseTab?.(), 0);
             break;
           }
 
@@ -926,6 +946,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
       clearReadyTimeout,
       dismissKeyboard,
       hostViewportMetrics,
+      onCloseTab,
       onOpenFile,
       onOpenOverview,
       onTabUpdate,
@@ -939,6 +960,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
       reloadWebView,
       remux,
       remuxRequestContext,
+      tab.id,
       theme.name,
     ],
   );

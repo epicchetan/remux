@@ -17,7 +17,6 @@ function attachRemuxWebSocketServer({
   log = console,
   onFatal,
   notifications,
-  previews,
   router,
   server,
 }) {
@@ -56,11 +55,7 @@ function attachRemuxWebSocketServer({
       },
     },
     async handleExtensionNotification(message) {
-      if (await (notifications?.handleExtensionNotification?.(message) ?? false)) {
-        return true;
-      }
-
-      return previews?.handleExtensionNotification?.({ broadcast, message }) ?? false;
+      return notifications?.handleExtensionNotification?.(message) ?? false;
     },
   };
 

@@ -1,10 +1,10 @@
-import { openHostOverview, reloadHostView, subscribeHostNavigate, updateHostTab } from '@remux/viewer-kit/host';
+import { closeHostTab, openHostOverview, reloadHostView, subscribeHostNavigate, updateHostTab } from '@remux/viewer-kit/host';
 import type { RemuxViewerRoute } from '@remux/viewer-kit/route';
 import {
   ActionBar,
   ActionButton,
 } from '@remux/viewer-kit/ui';
-import { Copy, PanelRightOpen, RefreshCw } from 'lucide-react';
+import { Copy, PanelRightOpen, RefreshCw, X } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 
 import { MarkdownRenderer } from './MarkdownRenderer';
@@ -89,6 +89,15 @@ export function MarkdownSurface({ route }: MarkdownSurfaceProps) {
               onClick={copyMarkdown}
             />
           </>
+        )}
+        right={(
+          <ActionButton
+            icon={<X aria-hidden="true" />}
+            label="Close tab"
+            onClick={() => {
+              void closeHostTab();
+            }}
+          />
         )}
         status={copied ? 'Copied' : fileInfo}
       />

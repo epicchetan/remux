@@ -139,6 +139,46 @@ export function notifyIpc(method: string, params?: unknown) {
   );
 }
 
+// Tells the host this view's rendered content changed so it can refresh the
+// tab's preview snapshot. Throttled, and aligned to the frame after paint so
+// the host photographs settled pixels — never a mid-render state.
+export function signalIpcPreviewChanged() {
+  if (previewSignalTimer !== null) {
+    return;
+  }
+
+  previewSignalTimer = window.setTimeout(() => {
+    previewSignalTimer = null;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        notifyIpc('host/preview/invalidate');
+      });
+    });
+  }, previewSignalThrottleMs);
+}
+
+const previewSignalThrottleMs = 300;
+let previewSignalTimer: number | null = null;
+
+// DOM-rendered views get preview signals for free; canvas-rendered content
+// (e.g. xterm) is invisible to mutation observers and must call
+// signalIpcPreviewChanged from its own render hook.
+function observePreviewMutations() {
+  if (typeof MutationObserver === 'undefined' || !document.documentElement) {
+    return;
+  }
+
+  const observer = new MutationObserver(() => {
+    signalIpcPreviewChanged();
+  });
+  observer.observe(document.documentElement, {
+    attributes: true,
+    characterData: true,
+    childList: true,
+    subtree: true,
+  });
+}
+
 export function subscribeIpcEvents(subscriber: IpcEventSubscriber) {
   initializeIpc();
   eventSubscribers.add(subscriber);
@@ -169,6 +209,7 @@ export function initializeIpc() {
   document.addEventListener('message', handleNativeMessage as EventListener);
   initialized = true;
 
+  observePreviewMutations();
   postMessage({ type: 'remux/ready' });
 }
 

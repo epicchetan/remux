@@ -67,15 +67,6 @@ test('createExtensionProcess proxies requests and broadcasts extension notificat
       title: 'Fixture complete',
     });
 
-    await processServer.handleRpc({ method: 'notify-preview' });
-    assert.equal(broadcasts.length, 1);
-    assert.equal(notifications.length, 2);
-    assert.equal(notifications[1].method, 'remux/previews/invalidate');
-    assert.deepEqual(notifications[1].params, {
-      extensionId: 'fixture',
-      resourceId: 'thread-1',
-      resourceKind: 'thread',
-    });
     assert.deepEqual(fatals, []);
   } finally {
     await processServer.stop();
@@ -239,9 +230,6 @@ function createProcessFixture() {
     '  }',
     "  if (request.method === 'notify-remux') {",
     "    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'remux/notifications/request', params: { extensionId: 'spoofed', id: 'notification-1', target: { resourceId: 'thread-1', resourceKind: 'thread' }, title: 'Fixture complete' } }) + '\\n');",
-    '  }',
-    "  if (request.method === 'notify-preview') {",
-    "    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'remux/previews/invalidate', params: { extensionId: 'spoofed', resourceId: 'thread-1', resourceKind: 'thread' } }) + '\\n');",
     '  }',
     "  if (request.method === 'stderr') {",
     "    process.stderr.write('fixture diagnostic\\n');",

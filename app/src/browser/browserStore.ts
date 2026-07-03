@@ -36,7 +36,7 @@ type BrowserStore = {
   catalogStatus: BrowserCatalogStatus;
   clearPendingNavigation: (tabId: string, nonce: string) => void;
   closeOverview: () => void;
-  closeTab: (tabId: string) => void;
+  closeTab: (tabId: string, options?: BrowserCloseTabOptions) => void;
   defaultExtensionId: string | null;
   extensions: RemuxExtension[];
   loadExtensions: (options?: { force?: boolean }) => Promise<void>;
@@ -55,6 +55,10 @@ type BrowserStore = {
 
 export type BrowserOpenResourceOptions = {
   disposition?: 'new' | 'reuse';
+};
+
+export type BrowserCloseTabOptions = {
+  returnToOverview?: boolean;
 };
 
 export type BrowserOpenResourceTargetOptions = {
@@ -107,17 +111,20 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
     set((state) => ({ mode: state.activeTabId ? 'surface' : 'overview' }));
     persistCurrentBrowserSession(get());
   },
-  closeTab: (tabId) => {
+  closeTab: (tabId, options = {}) => {
     const closedTab = get().tabs.find((tab) => tab.id === tabId);
     set((state) => {
       const tabs = state.tabs.filter((tab) => tab.id !== tabId);
+      const activeTabClosed = state.activeTabId === tabId;
       const activeTabId = state.activeTabId === tabId
         ? nextActiveTabId(tabs)
         : state.activeTabId;
 
       return {
         activeTabId,
-        mode: activeTabId ? state.mode : 'overview',
+        mode: activeTabClosed && options.returnToOverview
+          ? 'overview'
+          : activeTabId ? state.mode : 'overview',
         tabs,
       };
     });

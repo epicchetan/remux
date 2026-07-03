@@ -5,7 +5,6 @@ const { JsonRpcError } = require('./jsonRpc.cjs');
 
 const defaultRequestTimeoutMs = 300_000;
 const remuxNotificationMethodPrefix = 'remux/notifications/';
-const remuxPreviewMethodPrefix = 'remux/previews/';
 
 function createExtensionProcess({ extension, log = console, requestTimeoutMs = defaultRequestTimeoutMs }) {
   let child = null;
@@ -236,7 +235,7 @@ function createExtensionProcess({ extension, log = console, requestTimeoutMs = d
     if (message && typeof message.method === 'string') {
       const normalized = normalizeExtensionNotification(message, extension.id);
       if (
-        isManagedExtensionNotificationMethod(normalized.method) &&
+        isRemuxNotificationMethod(normalized.method) &&
         typeof ctx?.handleExtensionNotification === 'function'
       ) {
         void ctx.handleExtensionNotification(normalized)
@@ -265,7 +264,7 @@ function createExtensionProcess({ extension, log = console, requestTimeoutMs = d
 }
 
 function normalizeExtensionNotification(message, extensionId) {
-  if (!isManagedExtensionNotificationMethod(message.method)) {
+  if (!isRemuxNotificationMethod(message.method)) {
     return message;
   }
 
@@ -278,14 +277,8 @@ function normalizeExtensionNotification(message, extensionId) {
   };
 }
 
-// Managed notifications get the sending extension's id stamped into params
-// (extensions cannot claim another extension's identity) and are routed
-// through the host's notification handlers instead of raw broadcast.
-function isManagedExtensionNotificationMethod(method) {
-  return typeof method === 'string' && (
-    method.startsWith(remuxNotificationMethodPrefix) ||
-    method.startsWith(remuxPreviewMethodPrefix)
-  );
+function isRemuxNotificationMethod(method) {
+  return typeof method === 'string' && method.startsWith(remuxNotificationMethodPrefix);
 }
 
 function isRecord(value) {

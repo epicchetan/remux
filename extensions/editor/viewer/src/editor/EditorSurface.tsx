@@ -1,10 +1,10 @@
-import { openHostOverview, reloadHostView, subscribeHostNavigate, updateHostTab } from '@remux/viewer-kit/host';
+import { closeHostTab, openHostOverview, reloadHostView, subscribeHostNavigate, updateHostTab } from '@remux/viewer-kit/host';
 import type { RemuxViewerRoute } from '@remux/viewer-kit/route';
 import {
   ActionBar,
   ActionButton,
 } from '@remux/viewer-kit/ui';
-import { PanelRightOpen } from 'lucide-react';
+import { PanelRightOpen, X } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 
 import { CodeMirrorViewer } from './CodeMirrorViewer';
@@ -125,14 +125,23 @@ export function EditorSurface({ route }: EditorSurfaceProps) {
           </>
         )}
         right={(
-          <ActionButton
-            disabled={!hasDiff}
-            icon={<DiffIcon />}
-            label={diffUnavailableReason ?? (showDiff ? 'Hide git diff' : 'Show git diff')}
-            onClick={() => {
-              setShowDiff((value) => !value);
-            }}
-          />
+          <>
+            <ActionButton
+              disabled={!hasDiff}
+              icon={<DiffIcon />}
+              label={diffUnavailableReason ?? (showDiff ? 'Hide git diff' : 'Show git diff')}
+              onClick={() => {
+                setShowDiff((value) => !value);
+              }}
+            />
+            <ActionButton
+              icon={<X aria-hidden="true" />}
+              label="Close tab"
+              onClick={() => {
+                void closeHostTab();
+              }}
+            />
+          </>
         )}
         status={copied ? 'Copied' : diffUnavailableReason ?? fileInfo}
       />

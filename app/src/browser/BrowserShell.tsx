@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react';
 import {
+  AppState,
   StyleSheet,
   View,
 } from 'react-native';
@@ -14,15 +15,13 @@ import { useTheme, type RemuxTheme } from '../theme/ThemeProvider';
 import { ActiveSurface } from './ActiveSurface';
 import { BrowserOverview } from './BrowserOverview';
 import { useBrowserStore } from './browserStore';
-import type { BrowserSection, BrowserTab } from './browserTypes';
+import type { BrowserSection } from './browserTypes';
 import {
   flushDirtyTabPreviews,
   markAllTabPreviewsDirty,
-  markTabPreviewDirty,
   requestTabPreviewCapture,
 } from './tabPreviewCapture';
 
-const previewInvalidateMethod = 'remux/previews/invalidate';
 // Webviews re-theme via an injected script; give them a beat to repaint
 // before photographing the new appearance.
 const themeRepaintGraceMs = 300;
@@ -101,28 +100,24 @@ export function BrowserShell() {
     flushDirtyTabPreviews(useBrowserStore.getState().activeTabId);
   }, [mode]);
 
-  useEffect(() => remux.subscribe((message) => {
-    if (message.method !== previewInvalidateMethod) {
-      return;
-    }
-
-    const target = parsePreviewInvalidation(message.params);
-    if (!target) {
-      return;
-    }
-
-    const state = useBrowserStore.getState();
-    for (const tab of state.tabs) {
-      if (!previewInvalidationMatchesTab(target, tab)) {
-        continue;
+  // Captures are skipped while the app isn't foregrounded (theme flips from
+  // Control Center or Settings land exactly then), so re-shoot whatever went
+  // stale once the app is active again with the overview showing.
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state !== 'active') {
+        return;
       }
 
-      markTabPreviewDirty(tab.id);
-      if (state.mode === 'overview') {
-        requestTabPreviewCapture(tab.id);
-      }
-    }
-  }), [remux]);
+      setTimeout(() => {
+        if (AppState.currentState === 'active' && useBrowserStore.getState().mode === 'overview') {
+          flushDirtyTabPreviews();
+        }
+      }, themeRepaintGraceMs);
+    });
+
+    return () => subscription.remove();
+  }, []);
 
   return (
     <View style={styles.screen}>
@@ -133,43 +128,6 @@ export function BrowserShell() {
       {mode === 'overview' ? <BrowserOverview /> : null}
     </View>
   );
-}
-
-type PreviewInvalidationTarget = {
-  extensionId: string;
-  resourceId: string | null;
-  resourceKind: string | null;
-  viewId: string | null;
-};
-
-function parsePreviewInvalidation(params: unknown): PreviewInvalidationTarget | null {
-  if (!params || typeof params !== 'object' || Array.isArray(params)) {
-    return null;
-  }
-
-  const record = params as Record<string, unknown>;
-  const extensionId = optionalString(record.extensionId);
-  if (!extensionId) {
-    return null;
-  }
-
-  return {
-    extensionId,
-    resourceId: optionalString(record.resourceId),
-    resourceKind: optionalString(record.resourceKind),
-    viewId: optionalString(record.viewId),
-  };
-}
-
-function previewInvalidationMatchesTab(target: PreviewInvalidationTarget, tab: BrowserTab) {
-  return tab.extensionId === target.extensionId
-    && (!target.viewId || tab.viewId === target.viewId)
-    && (!target.resourceKind || tab.resourceKind === target.resourceKind)
-    && (!target.resourceId || tab.resourceId === target.resourceId);
-}
-
-function optionalString(value: unknown) {
-  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
 }
 
 function createStyles(theme: RemuxTheme) {
