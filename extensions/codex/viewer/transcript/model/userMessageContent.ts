@@ -61,6 +61,8 @@ export function buildUserMessageLayout(
   for (const [index, part] of item.content.entries()) {
     switch (part.type) {
       case 'text':
+        // Mention spans inside the text render as inline chips via
+        // normalizeUserTextToMarkdown, so they do not add rail items.
         appendTextMarkdown(markdownParts, part, structuredAttachmentPaths);
         break;
       case 'image':

@@ -15,6 +15,8 @@ import type { BlockContent, DefinitionContent, PhrasingContent, RootContent } fr
 
 import { hostFileHrefInfoFromHref, webUrlFromHref } from '@remux/viewer-kit/links';
 
+import { mentionPathFromHref } from '../../model/userMessageMarkdown';
+
 export type MarkdownDensity = 'default' | 'user' | 'work';
 
 export type MarkdownRenderOptions = {
@@ -932,7 +934,7 @@ function parseMarkdownBlocks(markdown: string, options: MarkdownParseOptions): R
 }
 
 function sanitizeHref(href: string) {
-  if (fileLinkFromHref(href)) {
+  if (mentionPathFromHref(href) !== null || fileLinkFromHref(href)) {
     return href;
   }
 
@@ -1085,7 +1087,10 @@ function appendPhrasingNode(lines: MarkdownInline[][], node: PhrasingContent, op
     case 'link': {
       const href = sanitizeHref(node.url);
       if (href) {
-        const file = options.richFileLinks ? fileLinkFromHref(href, phrasingNodesText(node.children)) : null;
+        const label = phrasingNodesText(node.children);
+        const file =
+          mentionLinkFromHref(href, label) ??
+          (options.richFileLinks ? fileLinkFromHref(href, label) : null);
         if (file) {
           appendInline(lines, {
             file,
@@ -1183,6 +1188,44 @@ function trimTrailingUrlPunctuation(url: string) {
   }
 
   return url.slice(0, end);
+}
+
+// User-message file mentions arrive as `remux-mention://` links (see
+// userMessageMarkdown). They reuse the inline file-chip rendering so mentions
+// look the same as composer chips, scaled to the transcript type size.
+function mentionLinkFromHref(href: string, label?: string): MarkdownFileLink | null {
+  const path = mentionPathFromHref(href);
+  if (path === null || !path.trim()) {
+    return null;
+  }
+
+  const fileName = path.split('/').filter(Boolean).at(-1) ?? path;
+  const rawLabel = label?.replace(/\s+/g, ' ').trim() ?? '';
+  const displayName = compactMentionLabel(rawLabel || fileName);
+
+  return {
+    displayName,
+    extension: mentionExtension(rawLabel || fileName),
+    fileName,
+    line: null,
+    path,
+  };
+}
+
+function mentionExtension(name: string) {
+  const match = /\.([a-z0-9]+)$/i.exec(name);
+  return match?.[1]?.toLowerCase() ?? null;
+}
+
+// Mirrors the composer chip label compaction (compactComposerReferenceLabel)
+// so a mention reads identically in the bubble and the composer.
+function compactMentionLabel(name: string) {
+  const trimmed = name.trim();
+  if (trimmed.length <= 28) {
+    return trimmed;
+  }
+
+  return `${trimmed.slice(0, 18)}…${trimmed.slice(-7)}`;
 }
 
 function fileLinkFromHref(href: string, label?: string): MarkdownFileLink | null {

@@ -9,6 +9,11 @@ import {
   type ComposerSnapshot,
 } from './composerModel';
 import { digestDataUrl } from '../attachments/readFileAsDataUrl';
+import {
+  mentionNameFromSpan,
+  mentionPathFromSpan,
+  mentionSpansFromText,
+} from '../../transcript/model/userMessageMarkdown';
 
 export type ComposerDocumentLoad = {
   document: ComposerDocument;
@@ -22,10 +27,7 @@ export function composerDocumentFromUserInput(input: UserInput[]): ComposerDocum
   for (const item of input) {
     switch (item.type) {
       case 'text':
-        parts.push({
-          text: item.text,
-          type: 'text',
-        });
+        parts.push(...composerPartsFromTextInput(item));
         break;
       case 'mention':
         parts.push({
@@ -78,6 +80,43 @@ export function composerDocumentFromUserInput(input: UserInput[]): ComposerDocum
     document: { parts },
     resources,
   };
+}
+
+// Text-backed file mentions arrive as literal path text plus an `@name`
+// placeholder span; rebuild composer mention chips from those spans so edit
+// and fork keep the mention UI.
+function composerPartsFromTextInput(
+  item: Extract<UserInput, { type: 'text' }>,
+): ComposerDocument['parts'] {
+  const spans = mentionSpansFromText(item.text, item.text_elements);
+  if (spans.length === 0) {
+    return [{ text: item.text, type: 'text' }];
+  }
+
+  const parts: ComposerDocument['parts'] = [];
+  let cursor = 0;
+
+  for (const span of spans) {
+    if (span.jsStart > cursor) {
+      parts.push({ text: item.text.slice(cursor, span.jsStart), type: 'text' });
+    }
+
+    const path = mentionPathFromSpan(span, item.text);
+    parts.push({
+      id: createComposerNodeId(),
+      kind: path.endsWith('/') ? 'directory' : 'file',
+      name: mentionNameFromSpan(span, path),
+      path,
+      type: 'mention',
+    });
+    cursor = span.jsEnd;
+  }
+
+  if (cursor < item.text.length) {
+    parts.push({ text: item.text.slice(cursor), type: 'text' });
+  }
+
+  return parts;
 }
 
 export function composerUserInputCanLoad(input: UserInput[]) {

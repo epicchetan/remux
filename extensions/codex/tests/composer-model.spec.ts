@@ -170,6 +170,60 @@ test.describe('composerModel', () => {
     ])).toBe(true);
   });
 
+  test('rebuilds mention chips from text-backed mention spans', () => {
+    const load = composerDocumentFromUserInput([
+      {
+        text: 'Review viewer/App.tsx please',
+        text_elements: [{ byteRange: { start: 7, end: 21 }, placeholder: '@App.tsx' }],
+        type: 'text',
+      },
+    ]);
+
+    expect(load.document.parts).toEqual([
+      { text: 'Review ', type: 'text' },
+      {
+        id: expect.any(String),
+        kind: 'file',
+        name: 'App.tsx',
+        path: 'viewer/App.tsx',
+        type: 'mention',
+      },
+      { text: ' please', type: 'text' },
+    ]);
+  });
+
+  test('rebuilds directory and quoted mention chips from spans', () => {
+    const load = composerDocumentFromUserInput([
+      {
+        text: 'compare docs/ and "my docs/notes.md"',
+        text_elements: [
+          { byteRange: { start: 8, end: 13 }, placeholder: '@docs' },
+          { byteRange: { start: 18, end: 36 }, placeholder: '@notes.md' },
+        ],
+        type: 'text',
+      },
+    ]);
+
+    expect(load.document.parts).toEqual([
+      { text: 'compare ', type: 'text' },
+      {
+        id: expect.any(String),
+        kind: 'directory',
+        name: 'docs',
+        path: 'docs/',
+        type: 'mention',
+      },
+      { text: ' and ', type: 'text' },
+      {
+        id: expect.any(String),
+        kind: 'file',
+        name: 'notes.md',
+        path: 'my docs/notes.md',
+        type: 'mention',
+      },
+    ]);
+  });
+
   test('normalizes user input text for copy and falls back for unsupported edit inputs', () => {
     expect(plainTextFromUserInput([
       { text: 'Open ', text_elements: [], type: 'text' },

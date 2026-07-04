@@ -568,6 +568,91 @@ test.describe('codex viewer route', () => {
       .toContain('remux/codex/files');
   });
 
+  test('sends selected file mentions as structured message parts', async ({ page }) => {
+    await installMockRemuxHost(page);
+
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+
+    const editor = page.locator('.remux-composer-contenteditable');
+    await editor.click();
+    await editor.pressSequentially('Please review @pac');
+    await expect(page.getByText('package.json').first()).toBeVisible();
+    await page.keyboard.press('Enter');
+    await editor.pressSequentially(' before sending');
+
+    const sendButton = page.getByRole('button', { name: 'Send message' });
+    await expect(sendButton).toBeEnabled();
+    await sendButton.click();
+
+    await expect
+      .poll(() => capturedHostMethods(page))
+      .toContain('remux/codex/thread/message/send');
+
+    const requests = await capturedHostRequests(page);
+    const sendRequest = requests.find((request) => request.method === 'remux/codex/thread/message/send');
+    expect(sendRequest?.params).toMatchObject({
+      parts: [
+        { text: 'Please review ', type: 'text' },
+        { name: 'package.json', path: 'package.json', type: 'mention' },
+        { text: '  before sending', type: 'text' },
+      ],
+      threadId: 'mock-thread-1',
+    });
+  });
+
+  test('renders text-backed mention spans as chips and rebuilds them on edit', async ({ page }) => {
+    const mentionTurn: CodexTranscriptTurn = {
+      completedAt: 1782000001000,
+      durationMs: 1000,
+      error: null,
+      id: 'turn-mention',
+      revision: 'turn-mention-revision',
+      segments: [
+        {
+          content: [
+            {
+              text: 'Please review viewer/App.tsx before sending',
+              text_elements: [
+                { byteRange: { end: 28, start: 14 }, placeholder: '@App.tsx' },
+              ],
+              type: 'text',
+            },
+          ],
+          id: 'user-message-mention',
+          revision: 'user-message-mention-revision',
+          type: 'userMessage',
+        },
+        {
+          id: 'assistant-message-mention',
+          phase: null,
+          revision: 'assistant-message-mention-revision',
+          text: 'mock assistant response',
+          type: 'assistantMessage',
+        },
+      ],
+      startedAt: 1782000000000,
+      status: 'completed',
+    };
+    await installMockRemuxHost(page, { turns: [mentionTurn] });
+
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+
+    const bubble = page.locator('.codex-user-bubble');
+    const inlineChip = bubble.locator('.codex-md-file-link');
+    await expect(inlineChip).toHaveCount(1);
+    await expect(inlineChip).toHaveText('App.tsx');
+    await expect(inlineChip).toHaveAttribute('title', 'viewer/App.tsx');
+    await expect(page.locator('.codex-user-rail-card')).toHaveCount(0);
+    await expect(bubble).toContainText('Please review');
+    await expect(bubble).toContainText('before sending');
+
+    await page.getByRole('button', { name: 'Edit message' }).click();
+    const chip = page.locator('.remux-composer-mention-chip');
+    await expect(chip).toHaveCount(1);
+    await expect(chip).toHaveAttribute('data-path', 'viewer/App.tsx');
+    await expect(page.locator('.remux-composer-contenteditable')).toContainText('Please review');
+  });
+
   test('uses latest thread cwd and settings as new chat defaults', async ({ page }) => {
     const cwd = '/tmp/remux-runtime';
     const threadCwd = '/tmp/latest-thread-project';

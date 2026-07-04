@@ -51,7 +51,12 @@ fn normalize_user_input(part: &Value) -> Option<Value> {
             "text_elements": part
                 .get("text_elements")
                 .and_then(Value::as_array)
-                .cloned()
+                .map(|elements| {
+                    elements
+                        .iter()
+                        .filter_map(normalize_text_element)
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default(),
             "type": "text",
         })),
@@ -86,10 +91,53 @@ fn normalize_user_input(part: &Value) -> Option<Value> {
     }
 }
 
+/// Rollout `user_message` events serialize element ranges as snake_case
+/// `byte_range` (core types), while the v2 thread items the viewer consumes
+/// use camelCase `byteRange`. Normalize both spellings to the v2 shape.
+fn normalize_text_element(element: &Value) -> Option<Value> {
+    let byte_range = element
+        .get("byteRange")
+        .or_else(|| element.get("byte_range"))?;
+    let start = byte_range.get("start").and_then(number_as_i64)?;
+    let end = byte_range.get("end").and_then(number_as_i64)?;
+
+    Some(json!({
+        "byteRange": { "start": start, "end": end },
+        "placeholder": element.get("placeholder").cloned().unwrap_or(Value::Null),
+    }))
+}
+
 fn user_message_key(item: &Value) -> String {
     format!(
         "user:{}",
-        stable_revision_value(item.get("content").unwrap_or(&Value::Null))
+        stable_revision_value(&content_without_text_elements(
+            item.get("content").unwrap_or(&Value::Null)
+        ))
+    )
+}
+
+/// The same user message reaches the projection twice on disk replay: once as
+/// the raw response item (never has `text_elements`) and once as the
+/// `user_message` event (may carry them). Key on element-free content so both
+/// rows collapse into one item; `merge_disk_item` keeps the richer content.
+fn content_without_text_elements(content: &Value) -> Value {
+    let Some(parts) = content.as_array() else {
+        return content.clone();
+    };
+
+    Value::Array(
+        parts
+            .iter()
+            .map(|part| {
+                let mut part = part.clone();
+                if part.get("type").and_then(Value::as_str) == Some("text") {
+                    if let Some(object) = part.as_object_mut() {
+                        object.remove("text_elements");
+                    }
+                }
+                part
+            })
+            .collect(),
     )
 }
 

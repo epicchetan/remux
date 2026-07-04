@@ -115,6 +115,74 @@ test.describe('userMessageMarkdown', () => {
     ]);
   });
 
+  test('renders mention spans as inline mention links without rail items', () => {
+    const layout = buildUserMessageLayout(
+      {
+        content: [
+          {
+            text: 'Please review viewer/App.tsx before sending',
+            text_elements: [
+              { byteRange: { start: 14, end: 28 }, placeholder: '@App.tsx' },
+            ],
+            type: 'text',
+          },
+        ],
+        id: 'fixture-user',
+        type: 'userMessage',
+      },
+      'topLevel',
+    );
+
+    expect(layout.bodyMarkdown).toBe(
+      'Please review [App\\.tsx](remux-mention://viewer/App.tsx) before sending',
+    );
+    expect(layout.railItems).toEqual([]);
+  });
+
+  test('unquotes and url-encodes mention span paths containing whitespace', () => {
+    const layout = buildUserMessageLayout(
+      {
+        content: [
+          {
+            text: 'check "my docs/notes.md" now',
+            text_elements: [
+              { byteRange: { start: 6, end: 24 }, placeholder: '@notes.md' },
+            ],
+            type: 'text',
+          },
+        ],
+        id: 'fixture-user',
+        type: 'userMessage',
+      },
+      'topLevel',
+    );
+
+    expect(layout.bodyMarkdown).toBe('check [notes\\.md](remux-mention://my%20docs/notes.md) now');
+    expect(layout.railItems).toEqual([]);
+  });
+
+  test('keeps non-mention placeholders as literal text', () => {
+    const layout = buildUserMessageLayout(
+      {
+        content: [
+          {
+            text: 'Pasted content follows here',
+            text_elements: [
+              { byteRange: { start: 0, end: 14 }, placeholder: '[Pasted content]' },
+            ],
+            type: 'text',
+          },
+        ],
+        id: 'fixture-user',
+        type: 'userMessage',
+      },
+      'topLevel',
+    );
+
+    expect(layout.bodyMarkdown).toBe('\\[Pasted content\\] follows here');
+    expect(layout.railItems).toEqual([]);
+  });
+
   test('keeps user attachments in the rail instead of splitting body text', () => {
     const layout = buildUserMessageLayout(
       {

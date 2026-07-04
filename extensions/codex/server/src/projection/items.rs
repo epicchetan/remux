@@ -8,7 +8,18 @@ pub(super) fn user_message_item(payload: &Value, id: &str) -> Value {
     let mut content = Vec::new();
     if let Some(message) = payload.get("message").and_then(Value::as_str) {
         if !message.is_empty() {
-            content.push(json!({ "type": "text", "text": message }));
+            // The legacy `user_message` event carries element ranges rebased
+            // onto the flattened message text, so they belong on this part.
+            let text_elements = payload
+                .get("text_elements")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            content.push(json!({
+                "type": "text",
+                "text": message,
+                "text_elements": text_elements,
+            }));
         }
     }
     for image in payload
@@ -26,14 +37,6 @@ pub(super) fn user_message_item(payload: &Value, id: &str) -> Value {
         .flatten()
     {
         content.push(image.clone());
-    }
-    for element in payload
-        .get("text_elements")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        content.push(element.clone());
     }
 
     json!({

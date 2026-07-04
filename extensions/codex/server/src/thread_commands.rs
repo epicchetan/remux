@@ -680,42 +680,46 @@ fn is_forkable_assistant_message(item: &Value, assistant_message_id: &str) -> bo
         )
 }
 
+/// Codex reserves `UserInput::Mention` for app/plugin connector targets
+/// (`app://…`, `plugin://…`) and drops it from the model prompt entirely, so
+/// filesystem mentions must be rendered into the text stream. Each mention
+/// becomes a `text_elements` span over the literal path so viewers can keep
+/// rendering it as a chip; the span survives resume because Codex rebases
+/// `text_elements` onto the flattened `user_message` event text.
 fn composer_parts_to_user_input(parts: Vec<ComposerMessagePart>) -> Result<Vec<Value>, String> {
     let mut input = Vec::new();
+    let mut run = MentionTextRun::default();
 
     for part in parts {
         match part {
             ComposerMessagePart::Text { text } => {
-                if text.trim().is_empty() {
-                    continue;
-                }
-                push_text_input(&mut input, text);
+                run.push_text(&text);
             }
             ComposerMessagePart::Image { data_url, .. } => {
                 if data_url.trim().is_empty() {
                     continue;
                 }
+                run.flush_into(&mut input);
                 input.push(json!({
                     "type": "image",
                     "url": data_url,
                 }));
             }
             ComposerMessagePart::Mention { name, path } => {
-                let path = path.trim().to_string();
+                let path = path.trim();
                 if path.is_empty() {
                     continue;
                 }
-                input.push(json!({
-                    "type": "mention",
-                    "name": name
-                        .map(|value| value.trim().to_string())
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or_else(|| path.clone()),
-                    "path": path,
-                }));
+                let name = name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(path);
+                run.push_mention(name, path);
             }
         }
     }
+    run.flush_into(&mut input);
 
     if input.is_empty() {
         return Err("message parts must include text, an image, or a mention".to_string());
@@ -724,23 +728,44 @@ fn composer_parts_to_user_input(parts: Vec<ComposerMessagePart>) -> Result<Vec<V
     Ok(input)
 }
 
-fn push_text_input(input: &mut Vec<Value>, text: String) {
-    if let Some(previous) = input.last_mut() {
-        if previous.get("type").and_then(Value::as_str) == Some("text") {
-            if let Some(previous_text) = previous.get("text").and_then(Value::as_str) {
-                let mut merged = previous_text.to_string();
-                merged.push_str(&text);
-                previous["text"] = Value::String(merged);
-                return;
-            }
-        }
+#[derive(Default)]
+struct MentionTextRun {
+    text: String,
+    elements: Vec<Value>,
+}
+
+impl MentionTextRun {
+    fn push_text(&mut self, text: &str) {
+        self.text.push_str(text);
     }
 
-    input.push(json!({
-        "type": "text",
-        "text": text,
-        "text_elements": [],
-    }));
+    fn push_mention(&mut self, name: &str, path: &str) {
+        // Quote paths containing whitespace so the model reads them as one
+        // token, mirroring the Codex TUI file-mention insertion.
+        let rendered = if path.chars().any(char::is_whitespace) && !path.contains('"') {
+            format!("\"{path}\"")
+        } else {
+            path.to_string()
+        };
+        let start = self.text.len();
+        self.text.push_str(&rendered);
+        self.elements.push(json!({
+            "byteRange": { "start": start, "end": self.text.len() },
+            "placeholder": format!("@{name}"),
+        }));
+    }
+
+    fn flush_into(&mut self, input: &mut Vec<Value>) {
+        if self.elements.is_empty() && self.text.trim().is_empty() {
+            self.text.clear();
+            return;
+        }
+        input.push(json!({
+            "type": "text",
+            "text": std::mem::take(&mut self.text),
+            "text_elements": std::mem::take(&mut self.elements),
+        }));
+    }
 }
 
 fn should_retry_legacy_resume(error: &str) -> bool {
@@ -868,8 +893,13 @@ mod tests {
         assert_eq!(
             calls[1].1["input"],
             json!([
-                { "type": "text", "text": "Hello ", "text_elements": [] },
-                { "type": "mention", "name": "main.rs", "path": "src/main.rs" },
+                {
+                    "type": "text",
+                    "text": "Hello src/main.rs",
+                    "text_elements": [
+                        { "byteRange": { "start": 6, "end": 17 }, "placeholder": "@main.rs" }
+                    ]
+                },
                 { "type": "image", "url": "data:image/png;base64,aGVsbG8=" }
             ])
         );
@@ -1622,7 +1652,141 @@ mod tests {
 
         assert_eq!(
             input,
-            vec![json!({ "type": "mention", "name": "src/lib.rs", "path": "src/lib.rs" })]
+            vec![json!({
+                "type": "text",
+                "text": "src/lib.rs",
+                "text_elements": [
+                    { "byteRange": { "start": 0, "end": 10 }, "placeholder": "@src/lib.rs" }
+                ]
+            })]
+        );
+    }
+
+    #[test]
+    fn mention_renders_between_text_parts_as_single_text_input() {
+        let input = composer_parts_to_user_input(vec![
+            ComposerMessagePart::Text {
+                text: "Please review ".to_string(),
+            },
+            ComposerMessagePart::Mention {
+                name: Some("App.tsx".to_string()),
+                path: "viewer/App.tsx".to_string(),
+            },
+            ComposerMessagePart::Text {
+                text: " before sending".to_string(),
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(
+            input,
+            vec![json!({
+                "type": "text",
+                "text": "Please review viewer/App.tsx before sending",
+                "text_elements": [
+                    { "byteRange": { "start": 14, "end": 28 }, "placeholder": "@App.tsx" }
+                ]
+            })]
+        );
+    }
+
+    #[test]
+    fn mention_path_with_whitespace_is_quoted() {
+        let input = composer_parts_to_user_input(vec![ComposerMessagePart::Mention {
+            name: Some("notes.md".to_string()),
+            path: "my docs/notes.md".to_string(),
+        }])
+        .unwrap();
+
+        assert_eq!(
+            input,
+            vec![json!({
+                "type": "text",
+                "text": "\"my docs/notes.md\"",
+                "text_elements": [
+                    { "byteRange": { "start": 0, "end": 18 }, "placeholder": "@notes.md" }
+                ]
+            })]
+        );
+    }
+
+    #[test]
+    fn mention_byte_ranges_use_utf8_offsets() {
+        let input = composer_parts_to_user_input(vec![
+            ComposerMessagePart::Text {
+                text: "héllo ".to_string(),
+            },
+            ComposerMessagePart::Mention {
+                name: Some("lib.rs".to_string()),
+                path: "src/lib.rs".to_string(),
+            },
+        ])
+        .unwrap();
+
+        // "héllo " is 7 bytes in UTF-8 (é is 2 bytes).
+        assert_eq!(
+            input,
+            vec![json!({
+                "type": "text",
+                "text": "héllo src/lib.rs",
+                "text_elements": [
+                    { "byteRange": { "start": 7, "end": 17 }, "placeholder": "@lib.rs" }
+                ]
+            })]
+        );
+    }
+
+    #[test]
+    fn image_between_mentions_splits_text_runs() {
+        let input = composer_parts_to_user_input(vec![
+            ComposerMessagePart::Mention {
+                name: Some("a.rs".to_string()),
+                path: "src/a.rs".to_string(),
+            },
+            ComposerMessagePart::Image {
+                data_url: "data:image/png;base64,aGVsbG8=".to_string(),
+                mime_type: None,
+                name: None,
+            },
+            ComposerMessagePart::Mention {
+                name: Some("b.rs".to_string()),
+                path: "src/b.rs".to_string(),
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(
+            input,
+            vec![
+                json!({
+                    "type": "text",
+                    "text": "src/a.rs",
+                    "text_elements": [
+                        { "byteRange": { "start": 0, "end": 8 }, "placeholder": "@a.rs" }
+                    ]
+                }),
+                json!({ "type": "image", "url": "data:image/png;base64,aGVsbG8=" }),
+                json!({
+                    "type": "text",
+                    "text": "src/b.rs",
+                    "text_elements": [
+                        { "byteRange": { "start": 0, "end": 8 }, "placeholder": "@b.rs" }
+                    ]
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn whitespace_only_parts_without_mentions_are_rejected() {
+        let error = composer_parts_to_user_input(vec![ComposerMessagePart::Text {
+            text: "   ".to_string(),
+        }])
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "message parts must include text, an image, or a mention"
         );
     }
 

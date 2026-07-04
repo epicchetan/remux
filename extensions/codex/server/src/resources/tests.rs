@@ -222,6 +222,53 @@ fn user_message_text_parts_include_text_elements() {
 }
 
 #[test]
+fn mention_text_elements_survive_replay_and_dedupe_with_response_item() {
+    // Real rollout order for one message: the model-facing response item
+    // (no text_elements) is written before the user_message event (which
+    // carries rebased element spans). Both rows must collapse into a single
+    // user message that keeps the spans.
+    let (home, _path) = write_temp_session(
+        r#"{"type":"session_meta","payload":{"id":"019test"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","started_at":1}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"review src/main.rs please"}]}}
+{"type":"event_msg","payload":{"type":"user_message","message":"review src/main.rs please","text_elements":[{"byte_range":{"start":7,"end":18},"placeholder":"@main.rs"}]}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":2,"duration_ms":1}}
+"#,
+    );
+    let mut server = CodexTranscriptServer::new(home.clone());
+    let response = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [
+                { "type": "turn", "turnId": "turn-1" }
+            ]
+        }))
+        .expect("read should succeed");
+
+    let segments = response["resources"][0]["value"]["turn"]["segments"]
+        .as_array()
+        .expect("segments");
+    let user_segments = segments
+        .iter()
+        .filter(|segment| segment["type"] == json!("userMessage"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(user_segments.len(), 1);
+    assert_eq!(
+        user_segments[0]["content"],
+        json!([{
+            "text": "review src/main.rs please",
+            "text_elements": [
+                { "byteRange": { "start": 7, "end": 18 }, "placeholder": "@main.rs" }
+            ],
+            "type": "text",
+        }])
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
 fn turn_aborted_marker_is_not_projected_as_user_message() {
     let (home, _path) = write_temp_session(
         r#"{"type":"session_meta","payload":{"id":"019test"}}

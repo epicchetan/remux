@@ -194,6 +194,72 @@ test.describe('markdownModel', () => {
     });
   });
 
+  test('classifies remux-mention links as file chips', () => {
+    const blocks = parseMarkdownDocument(
+      '[App.tsx](remux-mention://viewer/App.tsx) and [notes.md](remux-mention://my%20docs/notes.md) and [docs](remux-mention://docs/)',
+    );
+
+    expect(blocks[0]).toMatchObject({
+      lines: [
+        [
+          {
+            file: {
+              displayName: 'App.tsx',
+              extension: 'tsx',
+              fileName: 'App.tsx',
+              line: null,
+              path: 'viewer/App.tsx',
+            },
+            href: 'remux-mention://viewer/App.tsx',
+            type: 'fileLink',
+          },
+          { text: ' and ', type: 'text' },
+          {
+            file: {
+              displayName: 'notes.md',
+              extension: 'md',
+              fileName: 'notes.md',
+              line: null,
+              path: 'my docs/notes.md',
+            },
+            href: 'remux-mention://my%20docs/notes.md',
+            type: 'fileLink',
+          },
+          { text: ' and ', type: 'text' },
+          {
+            file: {
+              displayName: 'docs',
+              extension: null,
+              fileName: 'docs',
+              line: null,
+              path: 'docs/',
+            },
+            href: 'remux-mention://docs/',
+            type: 'fileLink',
+          },
+        ],
+      ],
+      type: 'paragraph',
+    });
+  });
+
+  test('renders mention chips even when rich file links are disabled', () => {
+    const blocks = parseMarkdownDocument('[App.tsx](remux-mention://viewer/App.tsx)', {
+      richFileLinks: false,
+    });
+
+    expect(blocks[0]).toMatchObject({
+      lines: [
+        [
+          {
+            file: { path: 'viewer/App.tsx' },
+            type: 'fileLink',
+          },
+        ],
+      ],
+    });
+  });
+
   test('can keep local markdown links plain while streaming', () => {
     const blocks = parseMarkdownDocument(
       '[apps/web/src/styles.css](/Users/calla/Documents/remote-in/mobile/apps/web/src/styles.css:38)',
