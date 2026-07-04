@@ -1,4 +1,6 @@
 # Remux Agent Notes
 
 - Work directly on `main` for this repository unless the user explicitly asks for a feature branch, pull request, or a different branch workflow.
-- When asked to commit and push routine changes, commit on `main` and push `main` directly unless instructed otherwise.
+- When asked to commit and push routine changes, commit on `main` and push `main` directly.
+- Do not open pull requests unless the user explicitly asks for one.
+- If work has already happened on a temporary branch, fast-forward or otherwise land it on `main` and push `main`.
