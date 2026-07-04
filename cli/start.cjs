@@ -11,14 +11,16 @@ const { createNotificationManager } = require('./notifications.cjs');
 const { attachRemuxWebSocketServer, remuxWebSocketPath } = require('./wsServer.cjs');
 const { createViewerProvider } = require('./viewerProvider.cjs');
 const { remuxRestartExitCode } = require('./restart.cjs');
+const { loadRemuxConfig } = require('./config.cjs');
 
 const restartForceExitDelayMs = 2000;
 
 async function start({ env = process.env, rootDir = process.cwd() } = {}) {
   const runtimeRootDir = resolve(rootDir);
+  const config = loadRemuxConfig({ rootDir: runtimeRootDir });
   const log = createRemuxLogger({ rootDir: runtimeRootDir });
-  const runtime = loadRuntimeValues(env);
-  const extensions = discoverExtensions({ env, rootDir: runtimeRootDir });
+  const runtime = loadRuntimeValues(env, { config });
+  const extensions = discoverExtensions({ config, env, rootDir: runtimeRootDir });
   const defaultExtension = defaultLaunchExtension(extensions);
   const notifications = createNotificationManager({ log, rootDir: runtimeRootDir });
 
@@ -126,10 +128,10 @@ async function start({ env = process.env, rootDir = process.cwd() } = {}) {
   }
 }
 
-function loadRuntimeValues(env = process.env) {
+function loadRuntimeValues(env = process.env, { config = {} } = {}) {
   return {
-    host: env.REMUX_HOST || '0.0.0.0',
-    port: parsePort(env.REMUX_PORT || '48123', 'REMUX_PORT'),
+    host: env.REMUX_HOST || config.host || '0.0.0.0',
+    port: parsePort(env.REMUX_PORT ?? config.port ?? '48123', env.REMUX_PORT === undefined && config.port !== undefined ? 'port' : 'REMUX_PORT'),
   };
 }
 

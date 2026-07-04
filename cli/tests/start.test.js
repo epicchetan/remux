@@ -24,6 +24,33 @@ test('loadRuntimeValues reads Remux host and port env values', () => {
   });
 });
 
+test('loadRuntimeValues reads config values when env values are absent', () => {
+  assert.deepEqual(loadRuntimeValues({}, {
+    config: {
+      host: '127.0.0.1',
+      port: 5999,
+    },
+  }), {
+    host: '127.0.0.1',
+    port: 5999,
+  });
+});
+
+test('loadRuntimeValues lets env override config values', () => {
+  assert.deepEqual(loadRuntimeValues({
+    REMUX_HOST: '0.0.0.0',
+    REMUX_PORT: '6000',
+  }, {
+    config: {
+      host: '127.0.0.1',
+      port: 5999,
+    },
+  }), {
+    host: '0.0.0.0',
+    port: 6000,
+  });
+});
+
 test('loadRuntimeValues rejects invalid ports', () => {
   assert.throws(
     () => loadRuntimeValues({ REMUX_PORT: 'nope' }),

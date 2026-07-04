@@ -5,11 +5,15 @@ const {
   loadExtensionManifest,
   manifestFilename,
 } = require('./extensionManifest.cjs');
+const {
+  loadRemuxConfig,
+  resolveExtensionRoots,
+} = require('./config.cjs');
 
-function discoverExtensions({ env = process.env, rootDir = process.cwd() } = {}) {
+function discoverExtensions({ config, env = process.env, rootDir = process.cwd() } = {}) {
   const extensions = [];
 
-  for (const extensionsDir of extensionRoots({ env, rootDir })) {
+  for (const extensionsDir of extensionRoots({ config, env, rootDir })) {
     if (!existsSync(extensionsDir)) {
       continue;
     }
@@ -31,10 +35,15 @@ function discoverExtensions({ env = process.env, rootDir = process.cwd() } = {})
   return extensions.sort((left, right) => left.id.localeCompare(right.id));
 }
 
-function extensionRoots({ env = process.env, rootDir = process.cwd() } = {}) {
+function extensionRoots({ config, env = process.env, rootDir = process.cwd() } = {}) {
   const raw = env.REMUX_EXTENSION_ROOTS;
   if (typeof raw === 'string' && raw.trim().length > 0) {
     return raw.split(delimiter).filter((candidate) => candidate.length > 0);
+  }
+
+  const loadedConfig = config ?? loadRemuxConfig({ rootDir });
+  if (Array.isArray(loadedConfig.extensionRoots) && loadedConfig.extensionRoots.length > 0) {
+    return resolveExtensionRoots(loadedConfig.extensionRoots, rootDir);
   }
 
   return [join(rootDir, 'extensions')];

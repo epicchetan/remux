@@ -3,7 +3,13 @@
 Status: Current
 Last verified: 2026-07-01
 
-Remux extensions live under an extension root and are discovered by `remux-extension.json`. By default the runtime scans `extensions/*`; `REMUX_EXTENSION_ROOTS` can override the roots.
+Remux extensions live under an extension root and are discovered by `remux-extension.json`. By default the runtime scans `extensions/*`. Add out-of-tree roots in `.remux/config.toml`:
+
+```toml
+extension_roots = ["extensions", "/path/to/parent-of-extension"]
+```
+
+`extension_roots` entries are parent directories scanned for child folders that contain `remux-extension.json`. Relative entries resolve from the Remux checkout root. `REMUX_EXTENSION_ROOTS` remains available as an environment override.
 
 ## Manifest
 

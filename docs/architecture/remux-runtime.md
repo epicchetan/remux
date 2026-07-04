@@ -12,7 +12,8 @@ Remux is split between a local Node runtime and an Expo mobile shell. The runtim
 `cli/start.cjs` assembles the runtime:
 
 - reads `REMUX_HOST` and `REMUX_PORT`
-- discovers extensions from `extensions/` or `REMUX_EXTENSION_ROOTS`
+- reads `.remux/config.toml`, with environment variables as overrides
+- discovers extensions from configured roots, defaulting to `extensions/`
 - starts stdio extension servers when manifests define one
 - creates viewer providers for extension main views
 - starts the HTTP server

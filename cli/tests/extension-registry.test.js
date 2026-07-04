@@ -136,6 +136,59 @@ test('discoverExtensions can read extension roots from REMUX_EXTENSION_ROOTS', (
   }
 });
 
+test('discoverExtensions can read extension roots from config', () => {
+  const fixture = createRegistryFixture();
+
+  try {
+    const firstRoot = join(fixture.root, 'one');
+    const secondRoot = join(fixture.root, 'two');
+    writeManifest(join(firstRoot, 'beta'), validManifest({ id: 'beta' }));
+    writeManifest(join(secondRoot, 'alpha'), validManifest({ id: 'alpha' }));
+
+    const extensions = discoverExtensions({
+      config: {
+        extensionRoots: ['one', secondRoot],
+      },
+      rootDir: fixture.root,
+    });
+
+    assert.deepEqual(extensions.map((extension) => extension.id), ['alpha', 'beta']);
+    assert.deepEqual(extensionRoots({
+      config: {
+        extensionRoots: ['one', secondRoot],
+      },
+      rootDir: fixture.root,
+    }), [firstRoot, secondRoot]);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('REMUX_EXTENSION_ROOTS overrides config extension roots', () => {
+  const fixture = createRegistryFixture();
+
+  try {
+    const envRoot = join(fixture.root, 'env');
+    const configRoot = join(fixture.root, 'config');
+    writeManifest(join(envRoot, 'env-extension'), validManifest({ id: 'env-extension' }));
+    writeManifest(join(configRoot, 'config-extension'), validManifest({ id: 'config-extension' }));
+
+    const extensions = discoverExtensions({
+      config: {
+        extensionRoots: [configRoot],
+      },
+      env: {
+        REMUX_EXTENSION_ROOTS: envRoot,
+      },
+      rootDir: fixture.root,
+    });
+
+    assert.deepEqual(extensions.map((extension) => extension.id), ['env-extension']);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test('loadExtensionManifest defaults route, name, and optional arrays', () => {
   const fixture = createRegistryFixture();
 

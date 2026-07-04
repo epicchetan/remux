@@ -48,13 +48,26 @@ Device/LAN testing:
 REMUX_HOST=0.0.0.0 npm run dev
 ```
 
-Useful environment variables:
+Local runtime configuration can live in `.remux/config.toml`:
+
+```toml
+host = "0.0.0.0"
+port = 48123
+extension_roots = ["extensions"]
+```
+
+`extension_roots` entries are parent directories scanned for child folders that
+contain `remux-extension.json`. Relative entries resolve from the Remux checkout
+root. Include `"extensions"` when adding out-of-tree roots, because configured
+roots replace the default.
+
+Environment variables override `.remux/config.toml` when present:
 
 | Variable | Purpose |
 | --- | --- |
 | `REMUX_HOST` | Runtime bind host. Defaults to `0.0.0.0`. |
 | `REMUX_PORT` | Runtime port. Defaults to `48123`. |
-| `REMUX_EXTENSION_ROOTS` | Path-list override for extension discovery roots. |
+| `REMUX_EXTENSION_ROOTS` | Path-list override for configured extension discovery roots. |
 | `EXPO_PUBLIC_REMUX_ORIGIN` | Build-time fallback origin used by the Expo app before local settings are saved. |
 | `CODEX_HOME` | Codex home used by the Codex extension server. |
 | `CODEX_BIN` | Codex binary override for app-server startup. |
