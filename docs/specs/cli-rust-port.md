@@ -193,13 +193,14 @@ Unchanged: all `remux/system/*`, `remux/extensions/{status,start,stop,restart}`,
 
 ## Phases
 
-> **Superseded by the pass plan.** Implementation proceeds as a single pass per
-> [cli-rust-port-pass-1.md](cli-rust-port-pass-1.md), which covers L1 + L2 + an
-> EOF-first stop sequence ("L3-lite"), extension logs, and cutover. Punted to
-> pass 2: L0 (systemd), full L3 process hygiene, resource monitoring, the
-> manifest `build` phase, and the app Settings UI. Phase 0 below was skipped in
-> favor of going straight to the port. The phase breakdown is kept for the
-> pass-2 backlog and rationale.
+> **Superseded by the pass plan.** Implementation proceeds in passes.
+> [cli-rust-port-pass-1.md](cli-rust-port-pass-1.md) (Implemented) covered
+> L1 + L2 + an EOF-first stop sequence ("L3-lite"), extension logs, and the
+> cutover that deleted the Node CLI. [cli-rust-port-pass-2.md](cli-rust-port-pass-2.md)
+> covers L0 (systemd), the worker hang watchdog, full L3 process hygiene, the
+> manifest `build` phase, resource monitoring, and the app Settings UI. Phase 0
+> below was skipped in favor of going straight to the port. The phase breakdown
+> is kept for rationale; the auth token and CLI subcommands remain for pass 3.
 
 **Phase 0 — stop the bleeding (Node, ~1 hour, do now).** The port will take a while; these four small changes remove the current outage class immediately:
 
