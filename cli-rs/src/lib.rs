@@ -1,6 +1,7 @@
 pub mod config;
 pub mod extensions;
 pub mod http;
+pub mod logs;
 pub mod paths;
 pub mod rpc;
 pub mod time;

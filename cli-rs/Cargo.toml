@@ -8,6 +8,11 @@ publish = false
 name = "remux"
 path = "src/main.rs"
 
+# Scriptable line-JSON-RPC extension server used by integration/chaos tests.
+[[bin]]
+name = "remux-fixture-ext"
+path = "src/bin/remux-fixture-ext.rs"
+
 [lib]
 name = "remux"
 path = "src/lib.rs"
