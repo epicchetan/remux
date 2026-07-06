@@ -59,3 +59,22 @@ pub fn resolve_manifest_path(root_dir: &Path, value: &str) -> PathBuf {
     }
     PathBuf::from(join(&root_dir.to_string_lossy(), value))
 }
+
+/// Node `path.resolve(value)`: absolute inputs are normalized; relative
+/// inputs resolve against the current working directory.
+pub fn resolve(value: &Path) -> PathBuf {
+    let text = value.to_string_lossy();
+    if text.starts_with('/') {
+        return PathBuf::from(normalize(&text));
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    PathBuf::from(join(&cwd.to_string_lossy(), &text))
+}
+
+/// Node `path.resolve(base, value)` for an absolute base.
+pub fn resolve_from(base: &Path, value: &str) -> PathBuf {
+    if value.starts_with('/') {
+        return PathBuf::from(normalize(value));
+    }
+    PathBuf::from(join(&base.to_string_lossy(), value))
+}
