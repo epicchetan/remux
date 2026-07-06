@@ -1,0 +1,30 @@
+[package]
+name = "remux"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "remux"
+path = "src/main.rs"
+
+[lib]
+name = "remux"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "sync", "time", "io-util", "fs", "net"] }
+axum = { version = "0.8", features = ["ws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "0.8"
+notify = "8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+sha1 = "0.10"
+nix = { version = "0.29", features = ["signal"] }
+signal-hook = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

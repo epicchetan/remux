@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = ["cli-rs"]
+# Extension server crates keep their standalone builds (codex builds --offline;
+# do not perturb its lockfile).
+exclude = ["extensions/codex/server", "extensions/terminal/server", "extensions/*"]
