@@ -1,8 +1,8 @@
 # CLI Rust Port — Pass 1 Implementation Spec
 
-Status: Active Spec
+Status: Implemented
 Last verified: 2026-07-06
-Canonical code: `bin/remux.js`, `cli/*.cjs`, `cli/core/*.cjs`, `cli/tests/*.test.js` (source of truth being replaced); new code lands in `cli-rs/`
+Canonical code: `cli/` (Rust runtime crate — `cli/src/`, `cli/tests/`). The Node CLI (`bin/remux.js`, `cli/*.cjs`) it replaced was deleted in the cutover commit; body references to `cli-rs/` are the pre-rename path of the same crate.
 
 Parent: [cli-rust-port.md](cli-rust-port.md) (audit + full roadmap). This spec is the buildable plan for pass 1: a single pass that replaces the Node CLI with a Rust runtime and ends with the Node CLI deleted.
 

@@ -42,8 +42,6 @@
   "include": [
     "app/**/*.ts",
     "app/**/*.tsx",
-    "cli/**/*.js",
-    "cli/**/*.cjs",
     "extensions/**/*.js",
     "extensions/**/*.cjs",
     "extensions/**/*.ts",

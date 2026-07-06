@@ -1,30 +1,37 @@
 # Remux Runtime Architecture
 
 Status: Current
-Last verified: 2026-06-28
+Last verified: 2026-07-06
 
-Remux is split between a local Node runtime and an Expo mobile shell. The runtime owns extension discovery, HTTP serving, websocket JSON-RPC, stdio extension servers, filesystem APIs, logging, restart behavior, and push notification delivery. The mobile shell owns tabs, WebViews, connection state, native file/media pickers, viewport metrics, keyboard behavior, and notification registration.
+Remux is split between a local Rust runtime and an Expo mobile shell. The runtime owns extension discovery, HTTP serving, websocket JSON-RPC, stdio extension servers, filesystem APIs, logging, restart behavior, and push notification delivery. The mobile shell owns tabs, WebViews, connection state, native file/media pickers, viewport metrics, keyboard behavior, and notification registration.
 
 ## Runtime Process
 
-`bin/remux.js` is the CLI entrypoint. `remux start` supervises the runtime worker; exit code `75` requests a restart.
+The runtime is the `remux` binary built from the `cli/` Cargo crate. `remux start` runs a two-process tree:
 
-`cli/start.cjs` assembles the runtime:
+- **Supervisor** (`cli/src/supervise.rs`): a minimal, std-only parent that spawns the worker and restarts it on *any* abnormal exit with capped backoff. Exit `75` is a deliberate restart request (`remux/system/restart`); exit `0` shuts the tree down. The supervisor never gives up, so the runtime stays remotely recoverable even after a worker crash.
+- **Worker** (`cli/src/runtime.rs`): the actual runtime, marked by `REMUX_WORKER=<supervisor pid>` (honored only when it matches the parent pid, so shells spawned inside remux terminal sessions cannot accidentally start supervisor-less workers).
 
-- reads `REMUX_HOST` and `REMUX_PORT`
-- reads `.remux/config.toml`, with environment variables as overrides
-- discovers extensions from configured roots, defaulting to `extensions/`
-- starts stdio extension servers when manifests define one
-- creates viewer providers for extension main views
-- starts the HTTP server
-- attaches the websocket server at `/ws`
-- wires notification handling and graceful shutdown
+The worker assembles:
+
+- `REMUX_HOST` / `REMUX_PORT`, with `.remux/config.toml` as the fallback (`cli/src/config.rs`)
+- extension discovery from configured roots, defaulting to `extensions/` (`cli/src/extensions/`)
+- one supervised stdio server per extension manifest that defines one
+- viewer static serving for extension main views
+- the HTTP server and the websocket server at `/ws`
+- notification handling, the runtime journal, and graceful shutdown
 
 The default bind is `0.0.0.0:48123`. Use `REMUX_HOST=127.0.0.1` for local-only development.
 
+## Extension Supervision
+
+`cli/src/extensions/supervisor.rs` runs one actor per extension with a state machine (`stopped`, `starting`, `running`, `stopping`, `backingOff`, `failed`). Crashes restart with capped backoff; five crashes in sixty seconds marks the extension `failed` until a manual start. An extension crash never terminates the runtime. Stop is stdin-EOF first, then SIGTERM, then SIGKILL, and stop/restart RPCs only respond after the process is confirmed reaped.
+
+Extension stderr goes to rotated per-extension files under `.remux/logs/extensions/` plus an in-memory ring served over `remux/extensions/logs` (with subscribe/follow variants). The runtime journal is written to `.remux/logs/runtime-<runId>.jsonl` with retention controlled by `log_retention_days`.
+
 ## HTTP Surface
 
-`cli/httpServer.cjs` serves:
+`cli/src/http/` serves:
 
 - `/health`, `/healthz`, `/readyz`
 - `/remux/extensions`
@@ -32,23 +39,24 @@ The default bind is `0.0.0.0:48123`. Use `REMUX_HOST=127.0.0.1` for local-only d
 - `/`, which redirects to the default extension viewer
 - extension viewer routes such as `/viewers/codex`
 
-`cli/viewerProvider.cjs` serves built static viewer assets from each manifest's `views.main.entry`. It blocks path traversal and falls back to the entry HTML for viewer routes.
+The viewer provider serves built static viewer assets from each manifest's `views.main.entry`. It blocks path traversal and falls back to the entry HTML for viewer routes.
 
 ## Websocket And RPC
 
-`cli/wsServer.cjs` accepts JSON-RPC websocket connections at `/ws`.
+`cli/src/rpc/ws.rs` accepts JSON-RPC websocket connections at `/ws`.
 
-`cli/rpcRouter.cjs` routes:
+`cli/src/rpc/router.rs` routes:
 
 - `remux/system/restart`
 - `remux/extensions/status`
 - `remux/extensions/start`
 - `remux/extensions/stop`
 - `remux/extensions/restart`
+- `remux/extensions/logs` (plus `logs/subscribe` and `logs/unsubscribe`)
 - `remux/fs/*`
 - extension-prefixed methods such as `remux/codex/*`
 
-`cli/extensionProcess.cjs` launches stdio extension servers and forwards newline-delimited JSON-RPC to them.
+`cli/src/extensions/process.rs` launches stdio extension servers and forwards newline-delimited JSON-RPC to them through a single writer task, so a dying extension's closed pipe can never crash the runtime.
 
 ## Mobile Shell
 
@@ -66,7 +74,7 @@ Hidden viewer tabs remain mounted so tab state survives switching. That is good 
 
 ## Notifications
 
-`cli/notifications.cjs` receives extension notification requests, correlates them with earlier client requests, checks whether a registered client is already viewing the target, and sends Expo push notifications when needed.
+`cli/src/notifications.rs` receives extension notification requests, correlates them with earlier client requests, checks whether a registered client is already viewing the target, and sends Expo push notifications when needed.
 
 `app/src/notifications/RemuxNotificationProvider.tsx` registers a persistent client id, obtains an Expo push token, reports the active tab target to the runtime, suppresses foreground notifications for the visible target, and opens the matching tab when a notification is tapped.
 

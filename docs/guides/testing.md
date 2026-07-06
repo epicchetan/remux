@@ -1,7 +1,7 @@
 # Testing
 
 Status: Current
-Last verified: 2026-06-28
+Last verified: 2026-07-06
 
 ## Root Typecheck
 
@@ -21,7 +21,7 @@ npm run app:typecheck
 npm run test:cli
 ```
 
-These use Node's built-in test runner against `cli/tests/*.test.js`.
+This runs the Cargo test suite for the Rust runtime in `cli/`: unit tests, integration tests (HTTP, WS, fs core, fs relay, notifications), the chaos suite (extension crash loops, kill-resistant extensions, dead-pipe writes), and process-level e2e tests (restart round-trip, `kill -9` self-healing, full-tree shutdown).
 
 ## Codex Rust Server Tests
 

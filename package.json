@@ -1,31 +1,26 @@
 {
   "name": "remux",
   "version": "1.0.0",
-  "bin": {
-    "remux": "bin/remux.js"
-  },
   "workspaces": [
     "app",
     "extensions/*",
     "packages/*"
   ],
   "scripts": {
-    "dev": "node bin/remux.js start",
+    "dev": "cargo run --manifest-path cli/Cargo.toml -- start",
+    "build:cli": "cargo build --release --manifest-path cli/Cargo.toml",
     "app:typecheck": "npm --workspace @remux/app run typecheck",
     "mobile:typecheck": "npm --workspace @remux/app run typecheck",
     "viewers:build": "npm --workspaces --if-present run build",
     "viewers:watch": "node scripts/watch-viewers.cjs",
     "typecheck": "tsc --noEmit",
     "lint": "npm run typecheck",
-    "test:cli": "node --test cli/tests/*.test.js",
+    "test:cli": "cargo test --manifest-path cli/Cargo.toml",
     "test:codex-server": "cargo test --manifest-path extensions/codex/server/Cargo.toml --offline",
     "test:codex": "playwright test -c extensions/codex/playwright.config.ts",
     "test:terminal-server": "cargo test --manifest-path extensions/terminal/server/Cargo.toml",
     "test:terminal-smoke": "node extensions/terminal/tests/ws-smoke.cjs",
     "test:terminal": "playwright test -c extensions/terminal/playwright.config.ts"
-  },
-  "dependencies": {
-    "ws": "^7.5.10"
   },
   "devDependencies": {
     "@playwright/test": "^1.59.1",

@@ -24,5 +24,8 @@
     "lucide-react": "^1.21.0",
     "react": "^19.2.3",
     "react-dom": "^19.2.3"
+  },
+  "devDependencies": {
+    "ws": "^7.5.10"
   }
 }

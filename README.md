@@ -51,14 +51,14 @@ The runtime defaults to port `48123`, serves the extension catalog at `/remux/ex
 Remux has four main pieces:
 
 - `app/`: Expo/React Native mobile shell, browser tabs, WebView host bridge, connection settings, local tab persistence, and push notification registration.
-- `cli/` and `bin/`: Node runtime process, HTTP server, websocket JSON-RPC router, extension discovery, extension process management, logging, and notification delivery.
+- `cli/`: Rust runtime (crash-restart supervisor + worker), HTTP server, websocket JSON-RPC router, extension discovery, extension process supervision, filesystem APIs, logging, and notification delivery.
 - `extensions/`: bundled Remux extensions. Each extension has a `remux-extension.json` manifest, a static viewer, and optionally a stdio JSON-RPC server.
 - `packages/`: shared extension APIs and UI primitives used by viewers.
 
 The high-level flow is:
 
 ```text
-Expo app -> WebView host bridge -> Remux websocket /ws -> CLI router -> extension stdio server
+Expo app -> WebView host bridge -> Remux websocket /ws -> runtime router -> extension stdio server
        \-> HTTP viewer assets and extension catalog served by the runtime
 ```
 
@@ -68,12 +68,13 @@ See [docs/architecture/remux-runtime.md](docs/architecture/remux-runtime.md) and
 
 | Command | Purpose |
 | --- | --- |
-| `npm run dev` | Start the Remux runtime with extension discovery and `/ws`. |
+| `npm run dev` | Start the Remux runtime (cargo run) with extension discovery and `/ws`. |
+| `npm run build:cli` | Build the release runtime binary at `target/release/remux`. |
 | `npm run viewers:build` | Build bundled extension viewer assets. |
 | `npm run viewers:watch` | Watch extension viewers during frontend development. |
 | `npm run typecheck` | Typecheck the root TypeScript project. |
 | `npm run app:typecheck` | Typecheck the Expo app workspace. |
-| `npm run test:cli` | Run Node runtime tests. |
+| `npm run test:cli` | Run the Rust runtime tests (unit, chaos, and e2e). |
 | `npm run test:codex-server` | Run the Rust Codex extension server tests. |
 | `npm run test:codex` | Run Codex viewer Playwright tests. |
 
