@@ -3,6 +3,7 @@ pub mod extensions;
 pub mod fs;
 pub mod http;
 pub mod logs;
+pub mod notifications;
 pub mod paths;
 pub mod rpc;
 pub mod time;
