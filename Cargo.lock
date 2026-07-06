@@ -902,6 +902,7 @@ name = "remux"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "nix",
  "notify",
  "reqwest",
@@ -911,6 +912,7 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "toml",
  "tracing",
  "tracing-subscriber",
