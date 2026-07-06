@@ -6,4 +6,6 @@ pub mod logs;
 pub mod notifications;
 pub mod paths;
 pub mod rpc;
+pub mod runtime;
+pub mod supervise;
 pub mod time;

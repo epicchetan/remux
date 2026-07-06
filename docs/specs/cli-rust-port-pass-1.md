@@ -61,7 +61,9 @@ Rust hygiene: `#![deny(warnings)]` in CI mood but not in code; `clippy` clean; n
 
 ## L1 — supervisor (`main.rs` + `supervise.rs`)
 
-Same two-process shape as `bin/remux.js`: `remux start` without `REMUX_WORKER=1` supervises; with it, runs the worker. The supervisor is **std-only** (no tokio): spawn `current_exe()` with `REMUX_WORKER=1`, stdio inherited, block on `wait()`.
+Same two-process shape as `bin/remux.js`: `remux start` without the worker marker supervises; with it, runs the worker. The supervisor is **std-only** (no tokio): spawn `current_exe()` with the marker, stdio inherited, block on `wait()`.
+
+> **Implementation deviation:** the marker is `REMUX_WORKER=<supervisor pid>`, honored only when `getppid()` matches — not a bare `1`. Shells spawned inside a remux terminal session inherit the worker's environment, so with the Node-style `REMUX_WORKER=1` a user running `remux start` from one becomes a bare worker with no L1 above it (observed during pass-1 testing). Legacy `1` values are ignored.
 
 Restart policy (replaces `bin/remux.js:41-60`):
 
