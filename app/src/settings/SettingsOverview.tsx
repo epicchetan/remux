@@ -15,7 +15,6 @@ import {
   Pressable,
   ScrollView,
   StyleSheet,
-  Switch,
   Text,
   TextInput,
   View,
@@ -28,7 +27,7 @@ import { useRemuxConnection, type RemuxConnection } from '../remote/RemuxConnect
 import { themedIconUrl } from '../remote/remuxExtensions';
 import { useRemuxSettingsStore } from '../remote/remuxSettingsStore';
 import { alpha, useTheme, type RemuxTheme } from '../theme/ThemeProvider';
-import { ExtensionDetailSheet, StateBadge, type ExtensionDetailAction } from './ExtensionDetailSheet';
+import { ExtensionDetailSheet, type ExtensionDetailAction } from './ExtensionDetailSheet';
 import {
   extensionDidChangeStatusMethod,
   parseExtensionServerStatus,
@@ -37,7 +36,7 @@ import {
   setExtensionServerRunning,
   type ExtensionServerStatus,
 } from './extensionServerApi';
-import { formatBytes, formatDurationMs, formatLastExit, formatUptime, serverStateLabel } from './formatters';
+import { formatBytes, formatDurationMs, formatLastExit, formatUptime, serverStateLabel, serverStateTone } from './formatters';
 import { restartRemuxCli } from './remuxSystemApi';
 import {
   parseSystemResourcesSample,
@@ -64,9 +63,7 @@ export function SettingsOverview() {
   const [extensionStatuses, setExtensionStatuses] = useState<Record<string, ExtensionServerStatus>>({});
   const [extensionStatusError, setExtensionStatusError] = useState<string | null>(null);
   const [extensionStatusLoading, setExtensionStatusLoading] = useState(false);
-  const [restartingExtensionId, setRestartingExtensionId] = useState<string | null>(null);
   const [restartingRemux, setRestartingRemux] = useState(false);
-  const [togglingExtensionId, setTogglingExtensionId] = useState<string | null>(null);
   const [detailExtensionId, setDetailExtensionId] = useState<string | null>(null);
   const [detailBusyAction, setDetailBusyAction] = useState<ExtensionDetailAction | null>(null);
   const resources = useSystemResources(connection);
@@ -160,44 +157,6 @@ export function SettingsOverview() {
       [status.extensionId]: status,
     }));
   }), [connection]);
-
-  const restartExtension = async (extensionId: string) => {
-    setActionError(null);
-    setExtensionStatusError(null);
-    setRestartingExtensionId(extensionId);
-    try {
-      const status = await restartExtensionServer(connection.request, extensionId);
-      setExtensionStatuses((current) => ({
-        ...current,
-        [extensionId]: status,
-      }));
-      reloadExtensionTabs(extensionId);
-    } catch (error) {
-      setExtensionStatusError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setRestartingExtensionId(null);
-    }
-  };
-
-  const toggleExtension = async (extensionId: string, running: boolean) => {
-    setActionError(null);
-    setExtensionStatusError(null);
-    setTogglingExtensionId(extensionId);
-    try {
-      const status = await setExtensionServerRunning(connection.request, extensionId, running);
-      setExtensionStatuses((current) => ({
-        ...current,
-        [extensionId]: status,
-      }));
-      if (status.running) {
-        reloadExtensionTabs(extensionId);
-      }
-    } catch (error) {
-      setExtensionStatusError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setTogglingExtensionId(null);
-    }
-  };
 
   const runDetailAction = async (extensionId: string, action: ExtensionDetailAction) => {
     setActionError(null);
@@ -325,11 +284,7 @@ export function SettingsOverview() {
                 name={extension.display.title}
                 nowMs={nowMinuteMs}
                 onOpenDetails={() => setDetailExtensionId(extension.id)}
-                onRestart={() => restartExtension(extension.id)}
-                onToggle={(running) => toggleExtension(extension.id, running)}
-                restarting={restartingExtensionId === extension.id}
                 status={extensionStatuses[extension.id] ?? null}
-                toggling={togglingExtensionId === extension.id}
               />
             ))}
             {extensions.length === 0 ? (
@@ -574,86 +529,65 @@ function ExtensionRow({
   name,
   nowMs,
   onOpenDetails,
-  onRestart,
-  onToggle,
-  restarting,
   status,
-  toggling,
 }: {
   iconDarkUrl: string | null;
   iconUrl: string | null;
   name: string;
   nowMs: number;
   onOpenDetails: () => void;
-  onRestart: () => void;
-  onToggle: (running: boolean) => void;
-  restarting: boolean;
   status: ExtensionServerStatus | null;
-  toggling: boolean;
 }) {
   const { styles, theme } = useSettingsTheme();
   const [imageFailed, setImageFailed] = useState(false);
-  const controllable = Boolean(status?.restartable);
-  const busy = restarting || toggling;
   const hasServer = Boolean(status);
   const themedUrl = themedIconUrl({ iconDarkUrl, iconUrl }, theme.isDark);
 
   return (
-    <View style={styles.extensionRow}>
-      <Pressable
-        accessibilityLabel={`${name} server details`}
-        accessibilityRole="button"
-        disabled={!hasServer}
-        onPress={onOpenDetails}
-        style={({ pressed }) => [styles.extensionRowMain, pressed && hasServer ? styles.extensionRowPressed : null]}
-      >
-        <View style={styles.extensionIconFrame}>
-          {themedUrl && !imageFailed ? (
-            <Image
-              accessibilityIgnoresInvertColors
-              onError={() => setImageFailed(true)}
-              resizeMode="contain"
-              source={{ uri: themedUrl }}
-              style={styles.extensionIcon}
-            />
-          ) : (
-            <Text style={styles.extensionFallback}>{name.slice(0, 1)}</Text>
-          )}
-        </View>
-        <View style={styles.extensionText}>
-          <View style={styles.extensionNameRow}>
-            <Text numberOfLines={1} style={styles.extensionName}>{name}</Text>
-            {status ? <StateBadge state={status.state} /> : null}
-          </View>
+    <Pressable
+      accessibilityLabel={`${name} server details`}
+      accessibilityRole="button"
+      disabled={!hasServer}
+      onPress={onOpenDetails}
+      style={({ pressed }) => [styles.extensionRow, pressed && hasServer ? styles.extensionRowPressed : null]}
+    >
+      <View style={styles.extensionIconFrame}>
+        {themedUrl && !imageFailed ? (
+          <Image
+            accessibilityIgnoresInvertColors
+            onError={() => setImageFailed(true)}
+            resizeMode="contain"
+            source={{ uri: themedUrl }}
+            style={styles.extensionIcon}
+          />
+        ) : (
+          <Text style={styles.extensionFallback}>{name.slice(0, 1)}</Text>
+        )}
+      </View>
+      <View style={styles.extensionText}>
+        <Text numberOfLines={1} style={styles.extensionName}>{name}</Text>
+        <View style={styles.extensionMetaRow}>
+          {status ? <StateDot state={status.state} /> : null}
           <Text numberOfLines={1} style={styles.extensionMeta}>{serverStatusText(status, nowMs)}</Text>
         </View>
-      </Pressable>
-      {hasServer ? (
-        <View style={styles.extensionActions}>
-          {toggling ? (
-            <View style={styles.extensionToggleBusy}>
-              <ActivityIndicator color={theme.textMuted} size="small" />
-            </View>
-          ) : (
-            <Switch
-              disabled={!controllable || busy}
-              ios_backgroundColor={theme.surfaceHover}
-              onValueChange={onToggle}
-              thumbColor={theme.surfaceRaised}
-              trackColor={{ false: theme.surfaceHover, true: theme.focusRing }}
-              value={status?.running === true}
-            />
-          )}
-          <SettingsButton
-            disabled={!controllable || !status?.running || busy}
-            label={restarting ? 'Restarting' : 'Restart'}
-            loading={restarting}
-            onPress={onRestart}
-          />
-        </View>
-      ) : null}
-    </View>
+      </View>
+      {hasServer ? <Text style={styles.extensionChevron}>›</Text> : null}
+    </Pressable>
   );
+}
+
+function StateDot({ state }: { state: ExtensionServerStatus['state'] }) {
+  const { styles, theme } = useSettingsTheme();
+  const tone = serverStateTone(state);
+  const color = tone === 'ok'
+    ? theme.success
+    : tone === 'bad'
+      ? theme.danger
+      : tone === 'busy'
+        ? theme.warning
+        : theme.textMuted;
+
+  return <View style={[styles.stateDot, { backgroundColor: color }]} />;
 }
 
 function serverStatusText(status: ExtensionServerStatus | null, nowMs: number) {
@@ -852,10 +786,11 @@ function createStyles(theme: RemuxTheme) {
     fontWeight: '800',
     lineHeight: 22,
   },
-  extensionActions: {
-    alignItems: 'center',
-    flexDirection: 'row',
-    gap: 10,
+  extensionChevron: {
+    color: theme.textMuted,
+    fontSize: 22,
+    fontWeight: '600',
+    lineHeight: 26,
   },
   extensionIcon: {
     height: 24,
@@ -882,6 +817,7 @@ function createStyles(theme: RemuxTheme) {
   },
   extensionMeta: {
     color: theme.textMuted,
+    flexShrink: 1,
     fontSize: 12,
     lineHeight: 16,
   },
@@ -891,35 +827,28 @@ function createStyles(theme: RemuxTheme) {
     fontWeight: '700',
     lineHeight: 21,
   },
+  extensionMetaRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 6,
+  },
   extensionRow: {
     alignItems: 'center',
     flexDirection: 'row',
     gap: 12,
     minHeight: 56,
   },
-  extensionRowMain: {
-    alignItems: 'center',
-    flex: 1,
-    flexDirection: 'row',
-    gap: 12,
-  },
   extensionRowPressed: {
     opacity: 0.72,
-  },
-  extensionNameRow: {
-    alignItems: 'center',
-    flexDirection: 'row',
-    gap: 8,
   },
   extensionText: {
     flex: 1,
     gap: 2,
   },
-  extensionToggleBusy: {
-    alignItems: 'center',
-    height: 32,
-    justifyContent: 'center',
-    width: 48,
+  stateDot: {
+    borderRadius: 3.5,
+    height: 7,
+    width: 7,
   },
   fieldGroup: {
     gap: 10,
