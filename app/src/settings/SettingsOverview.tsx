@@ -8,14 +8,6 @@ import {
   type ReactNode,
 } from 'react';
 import Constants from 'expo-constants';
-import { Host, SecureField, TextField, useNativeState } from '@expo/ui/swift-ui';
-import {
-  autocorrectionDisabled,
-  font,
-  foregroundStyle,
-  textFieldStyle,
-  textInputAutocapitalization,
-} from '@expo/ui/swift-ui/modifiers';
 import * as Updates from 'expo-updates';
 import {
   ActivityIndicator,
@@ -267,7 +259,7 @@ export function SettingsOverview() {
  * focused controlled `secureTextEntry` field every time its value is re-set.
  */
 const ConnectionSection = memo(function ConnectionSection() {
-  const { styles, theme } = useSettingsTheme();
+  const { styles } = useSettingsTheme();
   const connection = useRemuxConnection();
   const loadExtensions = useBrowserStore((state) => state.loadExtensions);
   const host = useRemuxSettingsStore((state) => state.host);
@@ -279,22 +271,10 @@ const ConnectionSection = memo(function ConnectionSection() {
   const token = useRemuxSettingsStore((state) => state.token);
   const [draftHost, setDraftHost] = useState(host);
   const [draftPort, setDraftPort] = useState(String(port));
-  // The token draft lives in native ObservableState on the UI thread, not in
-  // React state: RN's controlled secureTextEntry input redraws its dots every
-  // time a render re-sets `value`, which reads as flicker. The SwiftUI field
-  // bound to this state never sees React renders at all.
-  const tokenState = useNativeState(token);
-  const [showToken, setShowToken] = useState(false);
+  const [draftToken, setDraftToken] = useState(token);
   const [actionError, setActionError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [restartingRemux, setRestartingRemux] = useState(false);
-  const tokenFieldModifiers = useMemo(() => [
-    textFieldStyle('plain'),
-    font({ size: 16, weight: 'semibold' }),
-    foregroundStyle(theme.text),
-    autocorrectionDisabled(),
-    textInputAutocapitalization('never'),
-  ], [theme.text]);
 
   useEffect(() => {
     void loadSettings();
@@ -303,11 +283,8 @@ const ConnectionSection = memo(function ConnectionSection() {
   useEffect(() => {
     setDraftHost(host);
     setDraftPort(String(port));
-  }, [host, port]);
-
-  useEffect(() => {
-    tokenState.set(token);
-  }, [token, tokenState]);
+    setDraftToken(token);
+  }, [host, port, token]);
 
   const saveAndReconnect = async () => {
     setActionError(null);
@@ -316,7 +293,7 @@ const ConnectionSection = memo(function ConnectionSection() {
       await saveSettings({
         host: draftHost,
         port: draftPort,
-        token: tokenState.get(),
+        token: draftToken,
       });
       await loadExtensions({ force: true });
     } catch (error) {
@@ -359,28 +336,18 @@ const ConnectionSection = memo(function ConnectionSection() {
           placeholder="48123"
           value={draftPort}
         />
-        <View style={styles.inputShell}>
-          <Text style={styles.inputLabel}>Token</Text>
-          <Host style={styles.tokenFieldHost}>
-            {showToken ? (
-              <TextField
-                modifiers={tokenFieldModifiers}
-                placeholder="run: remux token"
-                text={tokenState}
-              />
-            ) : (
-              <SecureField
-                modifiers={tokenFieldModifiers}
-                placeholder="run: remux token"
-                text={tokenState}
-              />
-            )}
-          </Host>
-        </View>
+        {/* Plain text on purpose: RN's secureTextEntry path flickers on iOS
+            regardless of render granularity, and this screen is personal. */}
+        <LabeledInput
+          autoCapitalize="none"
+          autoComplete="off"
+          autoCorrect={false}
+          label="Token"
+          onChangeText={setDraftToken}
+          placeholder="run: remux token"
+          value={draftToken}
+        />
       </View>
-      <Pressable hitSlop={8} onPress={() => setShowToken((visible) => !visible)}>
-        <Text style={styles.tokenToggle}>{showToken ? 'Hide token' : 'Show token'}</Text>
-      </Pressable>
       <View style={styles.actionRow}>
         <SettingsButton
           disabled={saving || settingsStatus === 'saving'}
@@ -930,17 +897,6 @@ function createStyles(theme: RemuxTheme) {
     fontWeight: '600',
     lineHeight: 20,
     padding: 0,
-  },
-  tokenFieldHost: {
-    flex: 1,
-    height: 22,
-  },
-  tokenToggle: {
-    alignSelf: 'flex-end',
-    color: theme.textMuted,
-    fontSize: 12,
-    fontWeight: '600',
-    lineHeight: 16,
   },
   inputLabel: {
     color: theme.textMuted,
