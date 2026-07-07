@@ -8,6 +8,7 @@
 //! in which case the signal is forwarded and the worker gets 7s before
 //! SIGKILL.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,7 +43,7 @@ const POLL_MS: u64 = 50;
 /// `rebuild` is forwarded to every worker spawn: with fresh artifacts a
 /// re-run of the build phase is a fast no-op, and a crash-restarted worker
 /// still honors the operator's intent.
-pub fn supervise(rebuild: bool) -> i32 {
+pub fn supervise(root_dir: &Path, rebuild: bool) -> i32 {
     let pending_signal = Arc::new(AtomicUsize::new(0));
     for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
         let pending = pending_signal.clone();
@@ -71,7 +72,9 @@ pub fn supervise(rebuild: bool) -> i32 {
         let mut command = std::process::Command::new(&exe);
         command
             .arg("start")
-            .env(WORKER_ENV, std::process::id().to_string());
+            .env(WORKER_ENV, std::process::id().to_string())
+            .env(crate::cli::root::REMUX_ROOT_ENV, root_dir);
+        command.current_dir(root_dir);
         if rebuild {
             command.arg("--rebuild");
         }

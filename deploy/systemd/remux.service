@@ -25,11 +25,11 @@
 Description=Remux runtime
 
 [Service]
-ExecStart=%h/remux/target/release/remux start
+ExecStart=%h/.local/bin/remux start --foreground
 WorkingDirectory=%h/remux
 # systemd user units don't source the login profile; extension build phases
 # (and cargo-run manifests) need cargo on PATH.
-Environment=PATH=%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Restart=always
 RestartSec=1
 TimeoutStopSec=15

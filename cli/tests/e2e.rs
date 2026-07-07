@@ -62,7 +62,10 @@ fn write_build_fixture_extension(root: &Path) {
     std::fs::create_dir_all(&ext_dir).unwrap();
     std::fs::write(
         ext_dir.join("server-src.sh"),
-        format!("#!/bin/sh\nexec {} \"$@\"\n", env!("CARGO_BIN_EXE_remux-fixture-ext")),
+        format!(
+            "#!/bin/sh\nexec {} \"$@\"\n",
+            env!("CARGO_BIN_EXE_remux-fixture-ext")
+        ),
     )
     .unwrap();
     write_fixture_extension_with_server(
@@ -78,6 +81,35 @@ fn write_build_fixture_extension(root: &Path) {
             },
         }),
     );
+}
+
+fn write_watch_fixture_extension(root: &Path) {
+    let ext_dir = root.join("extensions/fixture");
+    let dist = ext_dir.join("viewer/dist");
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(dist.join("index.html"), "<h1>watch fixture</h1>").unwrap();
+
+    let manifest = json!({
+        "version": 1,
+        "id": "fixture",
+        "name": "Fixture",
+        "launchers": [ { "id": "open", "label": "Open" } ],
+        "views": {
+            "main": {
+                "entry": "viewer/dist/index.html",
+                "watch": {
+                    "command": env!("CARGO_BIN_EXE_remux-fixture-ext"),
+                    "args": [ "FIXTURE_IGNORE_EOF=1" ],
+                    "cwd": "."
+                }
+            }
+        }
+    });
+    std::fs::write(
+        ext_dir.join("remux-extension.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
 }
 
 struct Runtime {
@@ -97,7 +129,10 @@ impl Runtime {
         let port = free_port();
 
         let supervisor = Command::new(env!("CARGO_BIN_EXE_remux"))
+            .arg("--root")
+            .arg(root.path())
             .arg("start")
+            .arg("--foreground")
             .current_dir(root.path())
             // Hermetic: a stray REMUX_WORKER in the invoking environment
             // would turn the supervisor into a bare worker.
@@ -228,6 +263,43 @@ async fn ws_request(socket: &mut Ws, id: u64, method: &str, params: Option<Value
     }
 }
 
+fn runtime_log_contains(root: &Path, needle: &str) -> bool {
+    let dir = root.join(".remux/logs");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("runtime-") || !name.ends_with(".jsonl") {
+            continue;
+        }
+        if std::fs::read_to_string(&path)
+            .map(|body| body.contains(needle))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+async fn wait_for_runtime_log(root: &Path, needle: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if runtime_log_contains(root, needle) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "runtime log never contained {needle}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 #[tokio::test]
 async fn boots_serves_catalog_and_runs_the_fixture_extension() {
     let runtime = Runtime::start();
@@ -243,6 +315,10 @@ async fn boots_serves_catalog_and_runs_the_fixture_extension() {
         .await
         .unwrap();
     assert_eq!(unauthenticated.status(), 401);
+    let unauthenticated_status = reqwest::get(format!("{}/api/status", runtime.base_url()))
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated_status.status(), 401);
     let refused =
         tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/ws", runtime.port)).await;
     assert!(refused.is_err(), "unauthenticated ws connect must fail");
@@ -281,6 +357,17 @@ async fn boots_serves_catalog_and_runs_the_fixture_extension() {
     assert_eq!(extensions[0]["running"], json!(true));
     assert_eq!(extensions[0]["state"], "running");
     assert!(extensions[0]["pid"].is_number());
+
+    let http_status: Value = http_get(format!("{}/api/status", runtime.base_url()))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(http_status["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(http_status["requireAuth"], json!(true));
+    assert_eq!(http_status["host"], "127.0.0.1");
+    assert_eq!(http_status["port"], runtime.port);
+    assert_eq!(http_status["extensions"], status["result"]);
 
     // Stop/start block until truthful.
     let stopped = ws_request(
@@ -391,7 +478,11 @@ async fn boots_through_the_build_phase_and_serves_resources() {
         write_build_fixture_extension(root);
         // Fast sampler cadence for the didSample assertions below.
         std::fs::create_dir_all(root.join(".remux")).unwrap();
-        std::fs::write(root.join(".remux/config.toml"), "resource_poll_seconds = 1\n").unwrap();
+        std::fs::write(
+            root.join(".remux/config.toml"),
+            "resource_poll_seconds = 1\n",
+        )
+        .unwrap();
     });
     runtime.wait_for_health(Duration::from_secs(30)).await;
 
@@ -412,9 +503,7 @@ async fn boots_through_the_build_phase_and_serves_resources() {
     .await;
     let lines = logs["result"]["lines"].as_array().unwrap();
     assert!(
-        lines
-            .iter()
-            .any(|line| line["stream"] == "build"),
+        lines.iter().any(|line| line["stream"] == "build"),
         "{lines:?}"
     );
 
@@ -423,14 +512,20 @@ async fn boots_through_the_build_phase_and_serves_resources() {
     // poll until a sample reflects the running process group.
     let mut request_id = 3;
     let sample = loop {
-        let resources =
-            ws_request(&mut socket, request_id, "remux/system/resources", None).await;
+        let resources = ws_request(&mut socket, request_id, "remux/system/resources", None).await;
         request_id += 1;
         let sample = resources["result"].clone();
-        if sample["extensions"][0]["processCount"].as_u64().unwrap_or(0) >= 1 {
+        if sample["extensions"][0]["processCount"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+        {
             break sample;
         }
-        assert!(request_id < 13, "no sample caught the running extension: {sample}");
+        assert!(
+            request_id < 13,
+            "no sample caught the running extension: {sample}"
+        );
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
     assert!(sample["sampledAtMs"].as_i64().unwrap() > 0);
@@ -442,8 +537,7 @@ async fn boots_through_the_build_phase_and_serves_resources() {
     assert!(extension["rssBytes"].as_u64().unwrap() > 0, "{extension}");
 
     // didSample pushes flow while subscribed and stop after unsubscribe.
-    let subscribed =
-        ws_request(&mut socket, 100, "remux/system/resources/subscribe", None).await;
+    let subscribed = ws_request(&mut socket, 100, "remux/system/resources/subscribe", None).await;
     assert_eq!(subscribed["result"], json!({ "ok": true }));
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -480,6 +574,69 @@ async fn boots_through_the_build_phase_and_serves_resources() {
         }
     }
 
+    runtime.shutdown();
+}
+
+#[tokio::test]
+async fn watch_role_resources_and_memory_ceiling_alert_are_visible() {
+    let runtime = Runtime::start_with(|root| {
+        write_watch_fixture_extension(root);
+        std::fs::create_dir_all(root.join(".remux")).unwrap();
+        std::fs::write(
+            root.join(".remux/config.toml"),
+            "resource_poll_seconds = 1\nextension_memory_ceiling_mb = 1\n",
+        )
+        .unwrap();
+    });
+    runtime.wait_for_health(Duration::from_secs(30)).await;
+
+    let mut socket = ws_connect(runtime.port).await;
+    let started = ws_request(
+        &mut socket,
+        1,
+        "remux/extensions/watch/start",
+        Some(json!({ "extensionId": "fixture" })),
+    )
+    .await;
+    assert_eq!(started["result"]["started"], json!(true));
+    assert_eq!(started["result"]["watch"]["state"], "running");
+
+    let mut request_id = 2;
+    let sample = loop {
+        let resources = ws_request(&mut socket, request_id, "remux/system/resources", None).await;
+        request_id += 1;
+        let sample = resources["result"].clone();
+        let watch = &sample["extensions"][0]["roles"]["watch"];
+        if watch["processCount"].as_u64().unwrap_or(0) >= 1
+            && watch["rssBytes"].as_u64().unwrap_or(0) > 0
+        {
+            break sample;
+        }
+        assert!(
+            request_id < 20,
+            "watch role never appeared in resources: {sample}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+    let extension = &sample["extensions"][0];
+    let watch = &extension["roles"]["watch"];
+    assert!(extension["processCount"].as_u64().unwrap() >= watch["processCount"].as_u64().unwrap());
+    assert!(extension["rssBytes"].as_u64().unwrap() >= watch["rssBytes"].as_u64().unwrap());
+
+    wait_for_runtime_log(
+        runtime.root.path(),
+        "resources:memory-ceiling",
+        Duration::from_secs(10),
+    )
+    .await;
+
+    let _ = ws_request(
+        &mut socket,
+        request_id,
+        "remux/extensions/watch/stop",
+        Some(json!({ "extensionId": "fixture" })),
+    )
+    .await;
     runtime.shutdown();
 }
 

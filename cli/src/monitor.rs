@@ -109,10 +109,44 @@ pub struct MemoryAlert {
     pub ceiling_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct GroupUsage {
     process_count: u32,
     cpu_ticks: u64,
     rss_bytes: u64,
+}
+
+impl GroupUsage {
+    fn add(&mut self, other: GroupUsage) {
+        self.process_count += other.process_count;
+        self.cpu_ticks += other.cpu_ticks;
+        self.rss_bytes += other.rss_bytes;
+    }
+}
+
+struct RoleUsageRow {
+    role: &'static str,
+    pid: u32,
+    usage: GroupUsage,
+    cpu_percent: f64,
+}
+
+fn aggregate_role_usages(rows: &[RoleUsageRow]) -> (GroupUsage, Map<String, Value>) {
+    let mut total = GroupUsage::default();
+    let mut roles = Map::new();
+    for row in rows {
+        total.add(row.usage);
+        roles.insert(
+            row.role.to_string(),
+            serde_json::json!({
+                "pid": row.pid,
+                "processCount": row.usage.process_count,
+                "rssBytes": row.usage.rss_bytes,
+                "cpuPercent": row.cpu_percent,
+            }),
+        );
+    }
+    (total, roles)
 }
 
 pub struct ResourceMonitor {
@@ -286,7 +320,10 @@ impl ResourceMonitor {
                 "pid".to_string(),
                 status.pid.map(Value::from).unwrap_or(Value::Null),
             );
-            entry.insert("restartCount".to_string(), Value::from(status.restart_count));
+            entry.insert(
+                "restartCount".to_string(),
+                Value::from(status.restart_count),
+            );
             entry.insert(
                 "uptimeMs".to_string(),
                 status
@@ -295,20 +332,43 @@ impl ResourceMonitor {
                     .unwrap_or(Value::Null),
             );
 
-            let usage = status
-                .pid
-                .map(|pid| self.usage_for(&all, |stat| stat.pgrp == pid as i32))
-                .unwrap_or(GroupUsage {
-                    process_count: 0,
-                    cpu_ticks: 0,
-                    rss_bytes: 0,
+            let mut role_rows = Vec::new();
+            if let Some(pid) = status.pid {
+                let usage = self.usage_for(&all, |stat| stat.pgrp == pid as i32);
+                role_rows.push(RoleUsageRow {
+                    role: "server",
+                    pid,
+                    usage,
+                    cpu_percent: self.cpu_percent(
+                        &format!("{extension_id}:server"),
+                        usage.cpu_ticks,
+                        now,
+                    ),
                 });
-            entry.insert("processCount".to_string(), Value::from(usage.process_count));
-            entry.insert("rssBytes".to_string(), Value::from(usage.rss_bytes));
+            }
+            if status.watch.declared {
+                if let Some(pid) = status.watch.pid {
+                    let usage = self.usage_for(&all, |stat| stat.pgrp == pid as i32);
+                    role_rows.push(RoleUsageRow {
+                        role: "watch",
+                        pid,
+                        usage,
+                        cpu_percent: self.cpu_percent(
+                            &format!("{extension_id}:watch"),
+                            usage.cpu_ticks,
+                            now,
+                        ),
+                    });
+                }
+            }
+            let (total, roles) = aggregate_role_usages(&role_rows);
+            entry.insert("processCount".to_string(), Value::from(total.process_count));
+            entry.insert("rssBytes".to_string(), Value::from(total.rss_bytes));
             entry.insert(
                 "cpuPercent".to_string(),
-                Value::from(self.cpu_percent(extension_id, usage.cpu_ticks, now)),
+                Value::from(self.cpu_percent(extension_id, total.cpu_ticks, now)),
             );
+            entry.insert("roles".to_string(), Value::Object(roles));
             extensions.push(Value::Object(entry));
         }
 
@@ -326,6 +386,19 @@ impl ResourceMonitor {
     }
 
     fn usage_for(&self, all: &[ProcStat], matches: impl Fn(&ProcStat) -> bool) -> GroupUsage {
+        Self::usage_for_with(all, self.page_size, matches, |pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/statm"))
+                .ok()
+                .and_then(|statm| parse_statm_resident_pages(&statm))
+        })
+    }
+
+    fn usage_for_with(
+        all: &[ProcStat],
+        page_size: u64,
+        matches: impl Fn(&ProcStat) -> bool,
+        resident_pages: impl Fn(u32) -> Option<u64>,
+    ) -> GroupUsage {
         let mut usage = GroupUsage {
             process_count: 0,
             cpu_ticks: 0,
@@ -334,10 +407,8 @@ impl ResourceMonitor {
         for stat in all.iter().filter(|stat| matches(stat)) {
             usage.process_count += 1;
             usage.cpu_ticks += stat.cpu_ticks;
-            if let Ok(statm) = std::fs::read_to_string(format!("/proc/{}/statm", stat.pid)) {
-                if let Some(pages) = parse_statm_resident_pages(&statm) {
-                    usage.rss_bytes += pages * self.page_size;
-                }
+            if let Some(pages) = resident_pages(stat.pid) {
+                usage.rss_bytes += pages * page_size;
             }
         }
         usage
@@ -375,7 +446,10 @@ impl ResourceMonitor {
         let disk = nix::sys::statvfs::statvfs(&self.workspace_dir)
             .map(|stat| {
                 let frsize = stat.fragment_size() as u64;
-                (stat.blocks() as u64 * frsize, stat.blocks_available() as u64 * frsize)
+                (
+                    stat.blocks() as u64 * frsize,
+                    stat.blocks_available() as u64 * frsize,
+                )
             })
             .unwrap_or((0, 0));
 
@@ -430,6 +504,8 @@ impl ClientScopedRpc for ResourceMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rpc::jsonrpc::JsonRpcError;
+    use crate::rpc::router::{BoxFuture, LastExit, ServerStatus, ViewsFacet, WatchFacet};
 
     const STAT_FIXTURE: &str = "1234 (some (weird) comm) S 1 1200 1200 0 -1 4194304 500 0 0 0 731 209 0 0 20 0 4 0 555444 1000000 2500 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0";
 
@@ -447,11 +523,13 @@ mod tests {
 
     #[test]
     fn parses_statm_loadavg_meminfo() {
-        assert_eq!(parse_statm_resident_pages("52000 2500 1200 10 0 4000 0"), Some(2500));
+        assert_eq!(
+            parse_statm_resident_pages("52000 2500 1200 10 0 4000 0"),
+            Some(2500)
+        );
         assert_eq!(parse_statm_resident_pages(""), None);
 
-        let (load1, load5, load15) =
-            parse_loadavg("0.52 1.10 2.35 2/1567 2235165").unwrap();
+        let (load1, load5, load15) = parse_loadavg("0.52 1.10 2.35 2/1567 2235165").unwrap();
         assert_eq!((load1, load5, load15), (0.52, 1.10, 2.35));
 
         let meminfo = parse_meminfo(
@@ -460,12 +538,17 @@ mod tests {
         .unwrap();
         assert_eq!(meminfo.total_bytes, 65_536_000 * 1024);
         assert_eq!(meminfo.available_bytes, 40_000_000 * 1024);
-        assert_eq!(parse_meminfo("MemTotal: 1 kB\n"), None, "missing MemAvailable");
+        assert_eq!(
+            parse_meminfo("MemTotal: 1 kB\n"),
+            None,
+            "missing MemAvailable"
+        );
     }
 
     #[test]
     fn reads_own_proc_stat() {
-        let content = std::fs::read_to_string(format!("/proc/{}/stat", std::process::id())).unwrap();
+        let content =
+            std::fs::read_to_string(format!("/proc/{}/stat", std::process::id())).unwrap();
         let stat = parse_proc_stat(&content).unwrap();
         assert_eq!(stat.pid, std::process::id());
         assert!(stat.start_ticks > 0);
@@ -527,5 +610,142 @@ mod tests {
             "extensions": [ { "extensionId": "codex", "rssBytes": u64::MAX } ],
         }));
         assert!(alerts.lock().unwrap().is_empty());
+    }
+
+    struct FixtureServer {
+        status: ServerStatus,
+    }
+
+    impl ExtensionServer for FixtureServer {
+        fn start(&self, _rebuild: bool) -> BoxFuture<'_, ServerStatus> {
+            Box::pin(async { self.status.clone() })
+        }
+
+        fn stop(&self) -> BoxFuture<'_, ServerStatus> {
+            Box::pin(async { self.status.clone() })
+        }
+
+        fn restart(&self, _rebuild: bool) -> BoxFuture<'_, ServerStatus> {
+            Box::pin(async { self.status.clone() })
+        }
+
+        fn handle_rpc(
+            &self,
+            _method: String,
+            _params: Option<Value>,
+        ) -> BoxFuture<'_, Result<Value, JsonRpcError>> {
+            Box::pin(async { Ok(Value::Null) })
+        }
+
+        fn handle_notification(&self, _method: String, _params: Option<Value>) {}
+
+        fn status(&self) -> ServerStatus {
+            self.status.clone()
+        }
+
+        fn logs(&self, _lines: usize) -> Value {
+            Value::Array(Vec::new())
+        }
+    }
+
+    #[test]
+    fn role_sampling_adds_server_and_watch_breakdown() {
+        let status = ServerStatus {
+            restartable: true,
+            running: true,
+            state: "running".to_string(),
+            // Deliberately impossible pgrps: this keeps the usage values zero
+            // while still proving the role-keyed rows are additive.
+            pid: Some(u32::MAX - 1),
+            started_at_ms: Some(now_ms() - 1_000),
+            restart_count: 2,
+            last_exit: None::<LastExit>,
+            has_build: false,
+            has_server: true,
+            has_server_build: false,
+            views: ViewsFacet::default(),
+            watch: WatchFacet {
+                declared: true,
+                state: "running".to_string(),
+                pid: Some(u32::MAX),
+                started_at_ms: Some(now_ms() - 500),
+                restart_count: 1,
+            },
+        };
+        let server = Arc::new(FixtureServer { status });
+        let monitor = ResourceMonitor::new(
+            std::env::temp_dir(),
+            vec![("fixture".to_string(), server)],
+            0,
+            Box::new(|_| {}),
+        );
+        let sample = monitor.sample();
+        let extension = &sample["extensions"][0];
+        assert_eq!(
+            extension["roles"]["server"]["pid"],
+            serde_json::json!(u32::MAX - 1)
+        );
+        assert_eq!(
+            extension["roles"]["watch"]["pid"],
+            serde_json::json!(u32::MAX)
+        );
+        assert_eq!(extension["processCount"], serde_json::json!(0));
+        assert_eq!(extension["rssBytes"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn role_aggregation_sums_fake_proc_tables() {
+        let procs = vec![
+            ProcStat {
+                pid: 11,
+                pgrp: 100,
+                cpu_ticks: 7,
+                start_ticks: 1,
+            },
+            ProcStat {
+                pid: 12,
+                pgrp: 100,
+                cpu_ticks: 3,
+                start_ticks: 1,
+            },
+            ProcStat {
+                pid: 21,
+                pgrp: 200,
+                cpu_ticks: 5,
+                start_ticks: 1,
+            },
+        ];
+        let pages = |pid| match pid {
+            11 => Some(2),
+            12 => Some(3),
+            21 => Some(5),
+            _ => None,
+        };
+        let server = ResourceMonitor::usage_for_with(&procs, 4096, |stat| stat.pgrp == 100, pages);
+        let watch = ResourceMonitor::usage_for_with(&procs, 4096, |stat| stat.pgrp == 200, pages);
+        let rows = [
+            RoleUsageRow {
+                role: "server",
+                pid: 100,
+                usage: server,
+                cpu_percent: 10.0,
+            },
+            RoleUsageRow {
+                role: "watch",
+                pid: 200,
+                usage: watch,
+                cpu_percent: 20.0,
+            },
+        ];
+
+        let (total, roles) = aggregate_role_usages(&rows);
+
+        assert_eq!(total.process_count, 3);
+        assert_eq!(total.cpu_ticks, 15);
+        assert_eq!(total.rss_bytes, 10 * 4096);
+        assert_eq!(roles["server"]["processCount"], serde_json::json!(2));
+        assert_eq!(roles["watch"]["processCount"], serde_json::json!(1));
+        assert_eq!(roles["server"]["rssBytes"], serde_json::json!(5 * 4096));
+        assert_eq!(roles["watch"]["rssBytes"], serde_json::json!(5 * 4096));
     }
 }

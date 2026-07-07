@@ -22,7 +22,7 @@ use crate::extensions::supervisor::{ExtensionCtx, ExtensionSupervisor, Superviso
 use crate::fs::core::FsCore;
 use crate::fs::relay::{FsRelay, FsRelayOptions};
 use crate::http::viewers::ViewerProvider;
-use crate::http::{build_router, HttpState};
+use crate::http::{build_router_with_status, HttpState};
 use crate::logs::{ExtensionLogs, Journal, JournalEvent, StdTerminal, TerminalMode};
 use crate::monitor::{MemoryAlert, ResourceMonitor};
 use crate::notifications::{production_fetch, NotificationManager};
@@ -166,9 +166,10 @@ fn install_panic_hook(journal: Arc<Journal>) {
 }
 
 pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
-    let root_dir = crate::paths::resolve(
-        &std::env::current_dir().map_err(|error| format!("cannot resolve cwd: {error}"))?,
-    );
+    let root_dir = crate::cli::root::discover_from_worker_env()?;
+    std::env::set_current_dir(&root_dir)
+        .map_err(|error| format!("{}: {error}", root_dir.display()))?;
+    let started_at_ms = crate::time::now_ms();
 
     // Config + journal (journal applies log retention on boot).
     let config = load_remux_config(&root_dir)?;
@@ -377,7 +378,16 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
     });
     let app = ws
         .route()
-        .merge(build_router(http_state))
+        .merge(build_router_with_status(
+            http_state,
+            Arc::new(crate::http::ApiStatusState {
+                router: router.clone(),
+                started_at_ms,
+                require_auth,
+                host: runtime.host.clone(),
+                port: runtime.port,
+            }),
+        ))
         .layer(axum::middleware::from_fn_with_state(
             auth_state,
             crate::auth::require_auth,

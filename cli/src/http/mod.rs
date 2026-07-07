@@ -12,8 +12,11 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, StatusCode, Uri};
 use axum::response::Response;
+use axum::routing::get;
+use serde_json::Value;
 
 use crate::extensions::manifest::ExtensionManifest;
+use crate::rpc::router::{RpcRouter, EXTENSION_STATUS_METHOD, SYSTEM_RESOURCES_METHOD};
 use viewers::ViewerProvider;
 
 pub struct HttpState {
@@ -22,8 +25,37 @@ pub struct HttpState {
     pub viewer_providers: Vec<ViewerProvider>,
 }
 
+pub struct ApiStatusState {
+    pub router: Arc<RpcRouter>,
+    pub started_at_ms: i64,
+    pub require_auth: bool,
+    pub host: String,
+    pub port: u16,
+}
+
 pub fn build_router(state: Arc<HttpState>) -> axum::Router {
-    axum::Router::new().fallback(handle_request).with_state(state)
+    axum::Router::new()
+        .fallback(handle_request)
+        .with_state(state)
+}
+
+pub fn build_router_with_status(
+    state: Arc<HttpState>,
+    status_state: Arc<ApiStatusState>,
+) -> axum::Router {
+    axum::Router::new()
+        .route(
+            "/api/status",
+            get({
+                let status_state = status_state.clone();
+                move || {
+                    let status_state = status_state.clone();
+                    async move { handle_api_status(status_state).await }
+                }
+            }),
+        )
+        .fallback(handle_request)
+        .with_state(state)
 }
 
 async fn handle_request(State(state): State<Arc<HttpState>>, uri: Uri) -> Response {
@@ -72,6 +104,31 @@ async fn handle_request(State(state): State<Arc<HttpState>>, uri: Uri) -> Respon
     }
 
     text_response(StatusCode::NOT_FOUND, "Not found.")
+}
+
+async fn handle_api_status(state: Arc<ApiStatusState>) -> Response {
+    let resources = state
+        .router
+        .handle_request(SYSTEM_RESOURCES_METHOD, None)
+        .await
+        .unwrap_or(Value::Null);
+    let extensions = state
+        .router
+        .handle_request(EXTENSION_STATUS_METHOD, None)
+        .await
+        .unwrap_or_else(|_| serde_json::json!({ "extensions": [] }));
+    let now = crate::time::now_ms();
+    json_response(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "pid": std::process::id(),
+        "startedAtMs": state.started_at_ms,
+        "uptimeMs": (now - state.started_at_ms).max(0),
+        "requireAuth": state.require_auth,
+        "host": state.host.clone(),
+        "port": state.port,
+        "resources": resources,
+        "extensions": extensions,
+    }))
 }
 
 pub(crate) fn json_response(value: serde_json::Value) -> Response {

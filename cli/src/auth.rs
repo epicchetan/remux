@@ -134,13 +134,10 @@ fn tighten_permissions(path: &Path) -> Result<bool, String> {
 /// `remux token`: print the resolved token, generating it if absent — the
 /// device-pairing story, and the rollout's answer to "the file doesn't exist
 /// until auth-aware code first runs".
-pub fn token_command() -> Result<String, String> {
-    let root_dir = crate::paths::resolve(
-        &std::env::current_dir().map_err(|error| format!("cannot resolve cwd: {error}"))?,
-    );
+pub fn token_command(root_dir: &Path) -> Result<String, String> {
     let load = resolve_token(
         std::env::var("REMUX_AUTH_TOKEN").ok().as_deref(),
-        &root_dir,
+        root_dir,
     )?;
     Ok(load.token)
 }

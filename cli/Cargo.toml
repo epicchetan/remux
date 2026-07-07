@@ -18,6 +18,7 @@ name = "remux"
 path = "src/lib.rs"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "sync", "time", "io-util", "fs", "net"] }
 axum = { version = "0.8", features = ["ws"] }
 serde = { version = "1", features = ["derive"] }
