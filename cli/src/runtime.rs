@@ -233,7 +233,10 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
     });
     let run_state = RunState::new(&root_dir);
     let mut servers: Vec<(String, Arc<dyn ExtensionServer>)> = Vec::new();
-    for extension in extensions.iter().filter(|ext| ext.server.is_some()) {
+    for extension in extensions
+        .iter()
+        .filter(|ext| ext.server.is_some() || ext.has_managed_views())
+    {
         let (supervisor, actor) = ExtensionSupervisor::spawn(
             extension.clone(),
             SupervisorConfig::default(),
@@ -337,6 +340,7 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
             move || monitor.latest()
         })),
     };
+    let watch_autostart_servers = servers.clone();
     let router = Arc::new(RpcRouter::new(
         servers,
         Some(default_extension.id.clone()),
@@ -406,6 +410,33 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
         );
     }
     router.start(rebuild).await;
+
+    // View-watch autostart (config `watch = [...]`), after the initial
+    // start/builds. Spawned so a slow gating build never delays serving;
+    // unknown ids journal a warning and are ignored.
+    for extension_id in config.watch_autostart() {
+        match watch_autostart_servers
+            .iter()
+            .find(|(id, _)| id == extension_id)
+        {
+            Some((id, server)) => {
+                let server = server.clone();
+                let journal = journal.clone();
+                let id = id.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = server.watch_start().await {
+                        journal.warn(&format!(
+                            "[remux] watch autostart failed for {id}: {}",
+                            error.message
+                        ));
+                    }
+                });
+            }
+            None => journal.warn(&format!(
+                "[remux] watch autostart: unknown extension {extension_id}"
+            )),
+        }
+    }
 
     // Serve; the accept loop is critical.
     let serve_journal = journal.clone();

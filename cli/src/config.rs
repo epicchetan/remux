@@ -35,6 +35,11 @@ pub struct RemuxConfig {
     /// Pass-3a additive: `false` disables bearer-token enforcement — the
     /// ssh-recoverable lockout escape hatch. Defaults on.
     pub require_auth: Option<bool>,
+    /// View-build-watch additive: extension ids whose view watch starts at
+    /// boot (after their initial build-if-needed). Absent = no autostart.
+    /// NOTE: an old runtime rejects this key outright (`deny_unknown_fields`)
+    /// and fails to boot — deploy the runtime before adding it.
+    pub watch: Option<Vec<String>>,
 }
 
 impl RemuxConfig {
@@ -59,6 +64,10 @@ impl RemuxConfig {
 
     pub fn require_auth(&self) -> bool {
         self.require_auth.unwrap_or(true)
+    }
+
+    pub fn watch_autostart(&self) -> &[String] {
+        self.watch.as_deref().unwrap_or(&[])
     }
 }
 
@@ -250,6 +259,17 @@ mod tests {
         let config =
             parse_remux_config_toml("require_auth = false", CONFIG_RELATIVE_PATH).unwrap();
         assert!(!config.require_auth());
+    }
+
+    #[test]
+    fn watch_autostart_parses_and_defaults_empty() {
+        assert!(RemuxConfig::default().watch_autostart().is_empty());
+        let config = parse_remux_config_toml(
+            "watch = [\"ledger\", \"codex\"]",
+            CONFIG_RELATIVE_PATH,
+        )
+        .unwrap();
+        assert_eq!(config.watch_autostart(), ["ledger", "codex"]);
     }
 
     #[test]

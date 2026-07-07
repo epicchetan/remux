@@ -26,13 +26,10 @@ npm run viewers:build
 
 This builds static assets for extensions that define build scripts. The runtime serves those built assets from each extension manifest's `views.main.entry`.
 
-During viewer development, run:
-
-```bash
-npm run viewers:watch
-```
-
-Keep this in a separate terminal from the runtime.
+During viewer development, toggle Watch from the extension's detail sheet
+in the app's Settings (or list extension ids under `watch = [...]` in
+`.remux/config.toml` for autostart) — the runtime supervises `npm run watch`
+per extension and streams its output into the extension logs.
 
 ## Start The Runtime
 

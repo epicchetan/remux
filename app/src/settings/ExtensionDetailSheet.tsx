@@ -36,7 +36,7 @@ import type { ExtensionResourceSample } from './systemResourcesApi';
 
 const logRingLines = 500;
 
-export type ExtensionDetailAction = 'start' | 'stop' | 'restart' | 'rebuild';
+export type ExtensionDetailAction = 'start' | 'stop' | 'restart' | 'rebuild' | 'watch-start' | 'watch-stop';
 
 export function ExtensionDetailSheet({
   busyAction,
@@ -138,6 +138,20 @@ export function ExtensionDetailSheet({
   const resourceText = resources && status?.running
     ? `${resources.cpuPercent.toFixed(1)}% CPU · ${formatBytes(resources.rssBytes)} · ${resources.processCount} ${resources.processCount === 1 ? 'process' : 'processes'}`
     : null;
+  // Serverless extensions (view builds/watch only): Start/Stop/Restart are
+  // meaningless — Rebuild and Watch are the only verbs.
+  const hasServer = status?.hasServer !== false;
+  const watch = status?.watch ?? null;
+  const watchRunning = watch?.state === 'running';
+  const watchText = watch?.declared
+    ? watch.state === 'running'
+      ? ['running', watch.pid !== null ? `pid ${watch.pid}` : null, formatUptime(watch.startedAtMs, nowMs)]
+          .filter(Boolean)
+          .join(' · ')
+      : watch.state === 'failed'
+        ? `failed (${watch.restartCount} ${watch.restartCount === 1 ? 'restart' : 'restarts'})`
+        : 'stopped'
+    : null;
 
   // Native SwiftUI sheet: system detents, drag indicator, dimming, and the
   // liquid-glass chrome all come from UIKit. Sizing flows native → RN: the
@@ -170,31 +184,52 @@ export function ExtensionDetailSheet({
                 <StatusRow label="Uptime" value={uptime ?? '—'} />
                 <StatusRow label="Restarts" value={String(status?.restartCount ?? 0)} />
                 <StatusRow label="Last exit" value={lastExit ?? '—'} />
+                {watchText ? <StatusRow label="Watch" value={watchText} /> : null}
                 {resourceText ? <StatusRow label="Resources" value={resourceText} /> : null}
               </View>
 
               <View style={styles.actionsRow}>
-                {status?.running ? (
+                {hasServer ? (
+                  status?.running ? (
+                    <SheetButton
+                      busy={busyAction === 'stop'}
+                      disabled={busy}
+                      label="Stop"
+                      onPress={() => onAction('stop')}
+                    />
+                  ) : (
+                    <SheetButton
+                      busy={busyAction === 'start'}
+                      disabled={busy}
+                      label="Start"
+                      onPress={() => onAction('start')}
+                    />
+                  )
+                ) : null}
+                {hasServer ? (
                   <SheetButton
-                    busy={busyAction === 'stop'}
-                    disabled={busy}
-                    label="Stop"
-                    onPress={() => onAction('stop')}
+                    busy={busyAction === 'restart'}
+                    disabled={busy || !status?.running}
+                    label="Restart"
+                    onPress={() => onAction('restart')}
                   />
-                ) : (
+                ) : null}
+                {watch?.declared ? (
                   <SheetButton
-                    busy={busyAction === 'start'}
+                    busy={busyAction === 'watch-start' || busyAction === 'watch-stop'}
                     disabled={busy}
-                    label="Start"
-                    onPress={() => onAction('start')}
+                    label={
+                      busyAction === 'watch-start'
+                        ? 'Starting Watch'
+                        : busyAction === 'watch-stop'
+                          ? 'Stopping Watch'
+                          : watchRunning
+                            ? 'Stop Watch'
+                            : 'Start Watch'
+                    }
+                    onPress={() => onAction(watchRunning ? 'watch-stop' : 'watch-start')}
                   />
-                )}
-                <SheetButton
-                  busy={busyAction === 'restart'}
-                  disabled={busy || !status?.running}
-                  label="Restart"
-                  onPress={() => onAction('restart')}
-                />
+                ) : null}
                 {status?.hasBuild ? (
                   <SheetButton
                     busy={busyAction === 'rebuild'}
@@ -257,7 +292,7 @@ function LogEntryLine({ entry }: { entry: ExtensionLogLine }) {
   );
 }
 
-type LogTagTone = 'bad' | 'build' | 'muted';
+type LogTagTone = 'bad' | 'build' | 'watch' | 'muted';
 
 function logStreamTag(stream: string): { label: string; tone: LogTagTone } | null {
   switch (stream) {
@@ -267,6 +302,8 @@ function logStreamTag(stream: string): { label: string; tone: LogTagTone } | nul
       return { label: 'err', tone: 'bad' };
     case 'build':
       return { label: 'build', tone: 'build' };
+    case 'watch':
+      return { label: 'watch', tone: 'watch' };
     default:
       return { label: stream, tone: 'muted' };
   }
@@ -278,16 +315,19 @@ function logTagStyle(styles: SheetStyles, tone: LogTagTone) {
       return styles.logTagBad;
     case 'build':
       return styles.logTagBuild;
+    case 'watch':
+      return styles.logTagWatch;
     default:
       return styles.logTagMuted;
   }
 }
 
-// Ring build lines carry the runtime's own "[build] " prefix; the tag
-// already says it.
+// Ring build/watch lines carry the runtime's own "[build] "/"[watch] "
+// prefix; the tag already says it.
 function logMessage(entry: ExtensionLogLine): string {
-  return entry.stream === 'build' && entry.line.startsWith('[build] ')
-    ? entry.line.slice('[build] '.length)
+  const prefix = `[${entry.stream}] `;
+  return (entry.stream === 'build' || entry.stream === 'watch') && entry.line.startsWith(prefix)
+    ? entry.line.slice(prefix.length)
     : entry.line;
 }
 
@@ -532,6 +572,9 @@ function createStyles(theme: RemuxTheme) {
     },
     logTagMuted: {
       color: theme.textMuted,
+    },
+    logTagWatch: {
+      color: theme.warning,
     },
     logText: {
       color: theme.text,

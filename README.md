@@ -71,7 +71,6 @@ See [docs/architecture/remux-runtime.md](docs/architecture/remux-runtime.md) and
 | `npm run dev` | Start the Remux runtime (cargo run) with extension discovery and `/ws`. |
 | `npm run build:cli` | Build the release runtime binary at `target/release/remux`. |
 | `npm run viewers:build` | Build bundled extension viewer assets. |
-| `npm run viewers:watch` | Watch extension viewers during frontend development. |
 | `npm run typecheck` | Typecheck the root TypeScript project. |
 | `npm run app:typecheck` | Typecheck the Expo app workspace. |
 | `npm run test:cli` | Run the Rust runtime tests (unit, chaos, and e2e). |

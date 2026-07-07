@@ -18,8 +18,17 @@
 //! Pass-2 L3: children lead their own process groups; kill escalation and
 //! the crash-path sweep use group signals so grandchildren die too, and every
 //! live group is recorded in the run-state file for the boot orphan sweep.
+//!
+//! View-build-watch pass: extensions get a supervisor even without a server
+//! (view builds run in `start_flow`, which then settles back to `stopped`),
+//! and a `watch` sidecar — a supervised long-lived child per watched view —
+//! rides a *facet* of the status (`stopped | running | failed`), never the
+//! lifecycle state machine above. The facet keeps its own crash counter and
+//! backoff; during backoff it stays `running` ("watch is enabled and being
+//! kept alive") so the Settings toggle doesn't flap.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -31,10 +40,12 @@ use crate::extensions::process::{
     exit_parts, group_alive, harden_command, read_lines, send_sigterm, signal_group,
     spawn_extension, SpawnedChild, StdinCommand,
 };
-use crate::extensions::runstate::{read_start_ticks, RunEntry, RunState};
+use crate::extensions::runstate::{read_start_ticks, RunEntry, RunRole, RunState};
 use crate::logs::{ExtensionLogs, Journal, JournalEvent};
 use crate::rpc::jsonrpc::{JsonRpcError, EXTENSION_ERROR};
-use crate::rpc::router::{BoxFuture, ExtensionServer, LastExit, RpcResult, ServerStatus};
+use crate::rpc::router::{
+    BoxFuture, ExtensionServer, LastExit, RpcResult, ServerStatus, ViewsFacet, WatchFacet,
+};
 use crate::time::now_ms;
 
 pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 300_000;
@@ -132,6 +143,15 @@ enum Cmd {
         rebuild: bool,
         ack: oneshot::Sender<ServerStatus>,
     },
+    WatchStart(oneshot::Sender<Result<(ServerStatus, bool), JsonRpcError>>),
+    WatchStop(oneshot::Sender<(ServerStatus, bool)>),
+    /// Internal: a watch child's monitor task reporting its exit. Stale
+    /// generations (bumped by every watch stop) are ignored.
+    WatchChildExited {
+        generation: u64,
+        view_id: String,
+        status: Option<std::process::ExitStatus>,
+    },
     Rpc {
         method: String,
         params: Option<Value>,
@@ -148,6 +168,10 @@ pub struct ExtensionSupervisor {
     commands: mpsc::UnboundedSender<Cmd>,
     status: Arc<Mutex<ServerStatus>>,
     logs: Arc<ExtensionLogs>,
+    /// Entries of views with a declared build — `views.built` is recomputed
+    /// by statting these at snapshot time so it is always fresh (a running
+    /// watcher rewrites bundles behind the actor's back).
+    built_entries: Vec<PathBuf>,
 }
 
 impl ExtensionSupervisor {
@@ -162,11 +186,12 @@ impl ExtensionSupervisor {
         logs: Arc<ExtensionLogs>,
         run_state: Arc<RunState>,
     ) -> (Arc<Self>, tokio::task::JoinHandle<()>) {
-        let has_build = extension
-            .server
-            .as_ref()
-            .map(|server| server.build.is_some())
-            .unwrap_or(false);
+        let built_entries: Vec<PathBuf> = extension
+            .views
+            .iter()
+            .filter(|(_, view)| view.build.is_some())
+            .map(|(_, view)| view.entry.clone())
+            .collect();
         let status = Arc::new(Mutex::new(ServerStatus {
             restartable: true,
             running: false,
@@ -175,15 +200,29 @@ impl ExtensionSupervisor {
             started_at_ms: None,
             restart_count: 0,
             last_exit: None,
-            has_build,
+            has_build: extension.has_build(),
+            has_server: extension.server.is_some(),
+            views: ViewsFacet {
+                declared: built_entries.len() as u32,
+                built: views_built(&built_entries),
+                last_build_at_ms: None,
+            },
+            watch: WatchFacet {
+                declared: extension
+                    .views
+                    .iter()
+                    .any(|(_, view)| view.watch.is_some()),
+                ..WatchFacet::default()
+            },
         }));
         let (commands, mailbox) = mpsc::unbounded_channel();
 
         let supervisor = Arc::new(Self {
             extension_id: extension.id.clone(),
-            commands,
+            commands: commands.clone(),
             status: status.clone(),
             logs: logs.clone(),
+            built_entries,
         });
 
         let actor = Actor {
@@ -194,6 +233,7 @@ impl ExtensionSupervisor {
             logs,
             status,
             run_state,
+            self_commands: commands,
             pending: Arc::new(Mutex::new(HashMap::new())),
             generation: Arc::new(AtomicU64::new(0)),
             state: Lifecycle::Stopped,
@@ -205,8 +245,18 @@ impl ExtensionSupervisor {
             restart_count: 0,
             last_exit: None,
             last_build_failed: false,
+            failed_view_builds: HashSet::new(),
+            last_view_build_at_ms: None,
             crash_times: VecDeque::new(),
             backoff_deadline: None,
+            watch_enabled: false,
+            watch_failed: false,
+            watch_children: Vec::new(),
+            watch_generation: Arc::new(AtomicU64::new(0)),
+            watch_started_at_ms: None,
+            watch_restart_count: 0,
+            watch_crash_times: VecDeque::new(),
+            watch_backoff_deadline: None,
             next_rpc_id: 1,
         };
         let handle = tokio::spawn(actor.run(mailbox));
@@ -215,7 +265,9 @@ impl ExtensionSupervisor {
     }
 
     fn snapshot(&self) -> ServerStatus {
-        self.status.lock().unwrap().clone()
+        let mut status = self.status.lock().unwrap().clone();
+        status.views.built = views_built(&self.built_entries);
+        status
     }
 
     async fn command_status(
@@ -241,6 +293,32 @@ impl ExtensionServer for ExtensionSupervisor {
 
     fn restart(&self, rebuild: bool) -> BoxFuture<'_, ServerStatus> {
         Box::pin(self.command_status(move |ack| Cmd::Restart { rebuild, ack }))
+    }
+
+    fn watch_start(&self) -> BoxFuture<'_, Result<(ServerStatus, bool), JsonRpcError>> {
+        Box::pin(async move {
+            let unavailable = || {
+                JsonRpcError::new(
+                    EXTENSION_ERROR,
+                    format!("extension {} is not running", self.extension_id),
+                )
+            };
+            let (ack, response) = oneshot::channel();
+            if self.commands.send(Cmd::WatchStart(ack)).is_err() {
+                return Err(unavailable());
+            }
+            response.await.unwrap_or_else(|_| Err(unavailable()))
+        })
+    }
+
+    fn watch_stop(&self) -> BoxFuture<'_, (ServerStatus, bool)> {
+        Box::pin(async move {
+            let (ack, response) = oneshot::channel();
+            if self.commands.send(Cmd::WatchStop(ack)).is_err() {
+                return (self.snapshot(), false);
+            }
+            response.await.unwrap_or_else(|_| (self.snapshot(), false))
+        })
     }
 
     fn handle_rpc(&self, method: String, params: Option<Value>) -> BoxFuture<'_, RpcResult> {
@@ -278,6 +356,14 @@ impl ExtensionServer for ExtensionSupervisor {
     }
 }
 
+/// A live watch child: the `Child` itself is owned by its monitor task
+/// (which reaps it and reports the exit through the mailbox); the actor
+/// keeps only the group handle for signalling.
+struct WatchChild {
+    pid: u32,
+    pgid: u32,
+}
+
 struct Actor {
     extension: ExtensionManifest,
     cfg: SupervisorConfig,
@@ -286,6 +372,8 @@ struct Actor {
     logs: Arc<ExtensionLogs>,
     status: Arc<Mutex<ServerStatus>>,
     run_state: Arc<RunState>,
+    /// Loops back into our own mailbox (watch child exit reports).
+    self_commands: mpsc::UnboundedSender<Cmd>,
     pending: PendingMap,
     generation: Arc<AtomicU64>,
     state: Lifecycle,
@@ -296,11 +384,25 @@ struct Actor {
     started_at_ms: Option<i64>,
     restart_count: u32,
     last_exit: Option<LastExit>,
-    /// Forces the next start to re-run the build even when a stale artifact
-    /// from an earlier successful build still exists.
+    /// Forces the next start to re-run the server build even when a stale
+    /// artifact from an earlier successful build still exists.
     last_build_failed: bool,
+    /// Per-view analog of `last_build_failed` (view ids).
+    failed_view_builds: HashSet<String>,
+    last_view_build_at_ms: Option<i64>,
     crash_times: VecDeque<std::time::Instant>,
     backoff_deadline: Option<tokio::time::Instant>,
+    // Watch facet — deliberately parallel to (not shared with) the server's
+    // crash/backoff bookkeeping: a flapping watcher must not eat the
+    // server's crash budget or vice versa.
+    watch_enabled: bool,
+    watch_failed: bool,
+    watch_children: Vec<(String, WatchChild)>,
+    watch_generation: Arc<AtomicU64>,
+    watch_started_at_ms: Option<i64>,
+    watch_restart_count: u32,
+    watch_crash_times: VecDeque<std::time::Instant>,
+    watch_backoff_deadline: Option<tokio::time::Instant>,
     next_rpc_id: u64,
 }
 
@@ -308,6 +410,7 @@ impl Actor {
     async fn run(mut self, mut mailbox: mpsc::UnboundedReceiver<Cmd>) {
         loop {
             let backoff_deadline = self.backoff_deadline;
+            let watch_backoff_deadline = self.watch_backoff_deadline;
             tokio::select! {
                 command = mailbox.recv() => {
                     match command {
@@ -326,6 +429,13 @@ impl Actor {
                     self.backoff_deadline = None;
                     self.restart_count += 1;
                     self.start_flow(false).await;
+                }
+                _ = tokio::time::sleep_until(watch_backoff_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                    if watch_backoff_deadline.is_some() =>
+                {
+                    self.watch_backoff_deadline = None;
+                    self.watch_restart_count += 1;
+                    self.spawn_watch_children();
                 }
             }
         }
@@ -359,37 +469,121 @@ impl Actor {
                 self.start_flow(rebuild).await;
                 let _ = ack.send(self.current_status());
             }
+            Cmd::WatchStart(ack) => {
+                let result = self.handle_watch_start().await;
+                let _ = ack.send(result);
+            }
+            Cmd::WatchStop(ack) => {
+                let stopped = self.stop_watchers().await;
+                let _ = ack.send((self.current_status(), stopped));
+            }
+            Cmd::WatchChildExited {
+                generation,
+                view_id,
+                status,
+            } => self.handle_watch_child_exited(generation, &view_id, status),
             Cmd::Rpc { method, params, ack } => self.handle_rpc(method, params, ack),
             Cmd::Notify { method, params } => self.handle_notify(method, params),
         }
     }
 
-    /// Build (when needed) then spawn. The build runs inline in the actor, so
-    /// start/restart RPCs block through `building` like every other state.
+    /// Build (when needed) then spawn — or, with no server, settle back to
+    /// `stopped` after the view builds (the app renders serverless rows from
+    /// the build/watch facets, not a fake `running`). Builds run inline in
+    /// the actor, so start/restart RPCs block through `building` like every
+    /// other state.
+    ///
+    /// Sequence: server build first (it gates the spawn, so it fails fastest
+    /// where it matters), then view builds in manifest order, then spawn.
     async fn start_flow(&mut self, rebuild: bool) {
-        let Some(server) = self.extension.server.clone() else {
-            return;
-        };
-        if let Some(build) = server.build.clone() {
-            let artifact = if std::path::Path::new(&server.command).is_absolute() {
-                std::path::PathBuf::from(&server.command)
-            } else {
-                server.cwd.join(&server.command)
-            };
-            let needed = rebuild || self.last_build_failed || !artifact.exists();
-            if needed && !self.run_build(&build).await {
-                return;
+        let server = self.extension.server.clone();
+        if let Some(server) = &server {
+            if let Some(build) = server.build.clone() {
+                let artifact = if std::path::Path::new(&server.command).is_absolute() {
+                    std::path::PathBuf::from(&server.command)
+                } else {
+                    server.cwd.join(&server.command)
+                };
+                let needed = rebuild || self.last_build_failed || !artifact.exists();
+                if needed && !self.run_server_build(&build).await {
+                    return;
+                }
             }
         }
-        self.spawn_child(&server);
+        if !self.run_view_builds(rebuild).await {
+            return;
+        }
+        match &server {
+            Some(server) => self.spawn_child(server),
+            None => self.set_state(Lifecycle::Stopped),
+        }
     }
 
-    /// Runs the manifest build phase under the same pgroup/log plumbing as
-    /// the server. Build failure lands `failed` with `lastExit` reason
-    /// `build-failed` and does NOT consume crash budget — builds are
+    /// Runs the `server.build` phase. Failure lands `failed` with `lastExit`
+    /// reason `build-failed` and does NOT consume crash budget — builds are
     /// deterministic; retry is manual.
-    async fn run_build(&mut self, build: &BuildSpec) -> bool {
+    async fn run_server_build(&mut self, build: &BuildSpec) -> bool {
         self.set_state(Lifecycle::Building);
+        match self.exec_build(build).await {
+            Ok(()) => {
+                self.last_build_failed = false;
+                true
+            }
+            Err((code, signal, message)) => {
+                self.last_build_failed = true;
+                self.fail_build(code, signal, &message);
+                false
+            }
+        }
+    }
+
+    /// Runs each declared view build (manifest order) that is needed: entry
+    /// missing, `rebuild: true`, or that view's last build failed. Views
+    /// whose watcher is enabled are skipped — the watcher owns that dist;
+    /// racing it produces torn bundles. Any failure aborts the sequence with
+    /// the same `failed`/`build-failed` landing as a server build.
+    async fn run_view_builds(&mut self, rebuild: bool) -> bool {
+        for (view_id, view) in self.extension.views.clone() {
+            let Some(build) = &view.build else {
+                continue;
+            };
+            if self.watch_enabled && view.watch.is_some() {
+                self.append_build_log(&format!(
+                    "skipping view {view_id}: watch owns the bundle"
+                ));
+                continue;
+            }
+            let needed = rebuild
+                || self.failed_view_builds.contains(&view_id)
+                || !view.entry.exists();
+            if !needed {
+                continue;
+            }
+            self.set_state(Lifecycle::Building);
+            match self.exec_build(build).await {
+                Ok(()) => {
+                    self.failed_view_builds.remove(&view_id);
+                    self.last_view_build_at_ms = Some(now_ms());
+                }
+                Err((code, signal, message)) => {
+                    self.failed_view_builds.insert(view_id);
+                    self.fail_build(code, signal, &message);
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Runs one build job under the shared pgroup/log/run-state plumbing.
+    /// Deliberately does NOT touch the lifecycle state — callers decide
+    /// whether this build runs under `building` (start flow) or under the
+    /// watch facet (gating build), where the server may be `running` the
+    /// whole time.
+    async fn exec_build(
+        &mut self,
+        build: &BuildSpec,
+    ) -> Result<(), (Option<i32>, Option<String>, String)> {
         self.journal_lifecycle(
             "extension:build",
             Some(serde_json::json!({
@@ -417,14 +611,14 @@ impl Actor {
             Ok(child) => child,
             Err(error) => {
                 self.append_build_log(&format!("spawn failed: {error}"));
-                self.fail_build(None, None, &format!("build spawn failed: {error}"));
-                return false;
+                return Err((None, None, format!("build spawn failed: {error}")));
             }
         };
 
         let pid = child.id().unwrap_or_default();
         self.run_state.record(
             &self.extension.id,
+            RunRole::Build,
             RunEntry {
                 pid,
                 pgid: pid,
@@ -463,28 +657,25 @@ impl Actor {
             Err(_) => {
                 signal_group(pid, nix::sys::signal::Signal::SIGKILL);
                 let _ = child.wait().await;
-                self.run_state.remove(&self.extension.id);
+                self.run_state.remove(&self.extension.id, RunRole::Build);
                 self.append_build_log(&format!(
                     "timed out after {}ms",
                     self.cfg.build_timeout_ms
                 ));
-                self.fail_build(None, None, "build timed out");
-                return false;
+                return Err((None, None, "build timed out".to_string()));
             }
         };
-        self.run_state.remove(&self.extension.id);
+        self.run_state.remove(&self.extension.id, RunRole::Build);
 
         let (code, signal) = status.map(exit_parts).unwrap_or((None, None));
         if signal.is_none() && code == Some(0) {
             self.append_build_log("completed");
             self.journal_lifecycle("extension:build-done", None, "info");
-            self.last_build_failed = false;
-            return true;
+            return Ok(());
         }
 
         self.append_build_log(&format!("failed {}", exit_summary(code, &signal)));
-        self.fail_build(code, signal, "build failed");
-        false
+        Err((code, signal, "build failed".to_string()))
     }
 
     fn fail_build(&mut self, code: Option<i32>, signal: Option<String>, message: &str) {
@@ -493,7 +684,6 @@ impl Actor {
             Some(serde_json::json!({ "code": code, "signal": signal, "message": message })),
             "error",
         );
-        self.last_build_failed = true;
         self.last_exit = Some(LastExit {
             code,
             signal,
@@ -511,6 +701,345 @@ impl Actor {
     fn append_build_log(&self, message: &str) {
         self.logs
             .append(&self.extension.id, "build", &format!("[build] {message}"));
+    }
+
+    fn append_watch_log(&self, message: &str) {
+        self.logs
+            .append(&self.extension.id, "watch", &format!("[watch] {message}"));
+    }
+
+    /// `watch/start`: gate on a one-shot view build when the entry is
+    /// missing (so the first page load never races vite's initial compile),
+    /// then spawn one supervised child per watched view. The gating build
+    /// runs under the watch *facet*, not the lifecycle `Building` state —
+    /// the server may be `running` while it happens and `running: state ==
+    /// Running` must stay truthful. It still runs inline in the actor, so
+    /// other commands queue behind it (same mailbox semantics as a rebuild).
+    async fn handle_watch_start(&mut self) -> Result<(ServerStatus, bool), JsonRpcError> {
+        let watched: Vec<(String, crate::extensions::manifest::View)> = self
+            .extension
+            .views
+            .iter()
+            .filter(|(_, view)| view.watch.is_some())
+            .cloned()
+            .collect();
+        if watched.is_empty() {
+            return Err(JsonRpcError::new(EXTENSION_ERROR, "watch not declared"));
+        }
+        if self.watch_enabled {
+            // Idempotent: already enabled (live or in backoff).
+            return Ok((self.current_status(), false));
+        }
+
+        for (view_id, view) in &watched {
+            let Some(build) = &view.build else {
+                continue;
+            };
+            if view.entry.exists() && !self.failed_view_builds.contains(view_id) {
+                continue;
+            }
+            match self.exec_build(build).await {
+                Ok(()) => {
+                    self.failed_view_builds.remove(view_id);
+                    self.last_view_build_at_ms = Some(now_ms());
+                }
+                Err((code, signal, message)) => {
+                    // Watch-facet failure only: the extension lifecycle (and
+                    // a running server) stays untouched.
+                    self.failed_view_builds.insert(view_id.clone());
+                    self.watch_failed = true;
+                    self.journal_lifecycle(
+                        "extension:watch-build-failed",
+                        Some(serde_json::json!({
+                            "code": code,
+                            "signal": signal,
+                            "message": message,
+                            "view": view_id,
+                        })),
+                        "error",
+                    );
+                    self.append_watch_log(&format!(
+                        "start aborted: initial build of view {view_id} failed"
+                    ));
+                    self.broadcast_status();
+                    return Ok((self.current_status(), false));
+                }
+            }
+        }
+
+        self.watch_enabled = true;
+        self.watch_failed = false;
+        self.watch_restart_count = 0;
+        self.watch_crash_times.clear();
+        self.watch_started_at_ms = Some(now_ms());
+        self.spawn_watch_children();
+        Ok((self.current_status(), true))
+    }
+
+    /// Spawns a supervised child for every watched view that doesn't already
+    /// have one (backoff restarts respawn only the dead ones). Broadcasts
+    /// the status afterwards — every watch transition is a `didChangeStatus`.
+    fn spawn_watch_children(&mut self) {
+        if !self.watch_enabled {
+            return;
+        }
+        let generation = self.watch_generation.load(Ordering::SeqCst);
+        let specs: Vec<(String, BuildSpec)> = self
+            .extension
+            .views
+            .iter()
+            .filter(|(view_id, view)| {
+                view.watch.is_some()
+                    && !self.watch_children.iter().any(|(id, _)| id == view_id)
+            })
+            .map(|(view_id, view)| (view_id.clone(), view.watch.clone().expect("filtered")))
+            .collect();
+
+        for (view_id, spec) in specs {
+            self.journal_lifecycle(
+                "extension:watch-start",
+                Some(serde_json::json!({
+                    "view": view_id,
+                    "command": spec.command,
+                    "args": spec.args,
+                    "cwd": spec.cwd.to_string_lossy(),
+                })),
+                "info",
+            );
+            self.append_watch_log(&format!(
+                "starting: {} {}",
+                spec.command,
+                spec.args.join(" ")
+            ));
+
+            let mut command = tokio::process::Command::new(&spec.command);
+            command
+                .args(&spec.args)
+                .current_dir(&spec.cwd)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true);
+            let mut child = match harden_command(&mut command).spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    self.append_watch_log(&format!("spawn failed: {error}"));
+                    self.journal_lifecycle(
+                        "extension:watch-error",
+                        Some(serde_json::json!({ "message": error.to_string() })),
+                        "error",
+                    );
+                    self.record_watch_crash();
+                    continue;
+                }
+            };
+
+            let pid = child.id().unwrap_or_default();
+            self.run_state.record(
+                &self.extension.id,
+                RunRole::Watch,
+                RunEntry {
+                    pid,
+                    pgid: pid,
+                    start_ticks: read_start_ticks(pid).unwrap_or(0),
+                    started_at_ms: now_ms(),
+                },
+            );
+
+            // Both pipes stream into the ring as the `watch` stream; the
+            // generation guard mutes readers that outlive a watch stop.
+            for stream in [
+                child.stdout.take().map(BuildPipe::Stdout),
+                child.stderr.take().map(BuildPipe::Stderr),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let logs = self.logs.clone();
+                let extension_id = self.extension.id.clone();
+                let generations = self.watch_generation.clone();
+                tokio::spawn(async move {
+                    let append = move |line: String| {
+                        if line.trim().is_empty() {
+                            return;
+                        }
+                        if generations.load(Ordering::SeqCst) != generation {
+                            return;
+                        }
+                        logs.append(&extension_id, "watch", &format!("[watch] {line}"));
+                    };
+                    match stream {
+                        BuildPipe::Stdout(pipe) => read_lines(pipe, append).await,
+                        BuildPipe::Stderr(pipe) => read_lines(pipe, append).await,
+                    }
+                });
+            }
+
+            // The monitor task owns the Child: it reaps the exit and reports
+            // it through the mailbox so the actor never blocks on a watcher.
+            let sender = self.self_commands.clone();
+            let exited_view = view_id.clone();
+            tokio::spawn(async move {
+                let status = child.wait().await.ok();
+                let _ = sender.send(Cmd::WatchChildExited {
+                    generation,
+                    view_id: exited_view,
+                    status,
+                });
+            });
+
+            self.watch_children.push((view_id, WatchChild { pid, pgid: pid }));
+        }
+        self.broadcast_status();
+    }
+
+    fn handle_watch_child_exited(
+        &mut self,
+        generation: u64,
+        view_id: &str,
+        status: Option<std::process::ExitStatus>,
+    ) {
+        if generation != self.watch_generation.load(Ordering::SeqCst) {
+            return; // Stale: this child belonged to a stopped watch session.
+        }
+        let Some(index) = self.watch_children.iter().position(|(id, _)| id == view_id)
+        else {
+            return;
+        };
+        let (_, child) = self.watch_children.remove(index);
+        // Crash-path sweep: grandchildren (vite under npm) survive the direct
+        // child's death — kill the group before any respawn.
+        signal_group(child.pgid, nix::sys::signal::Signal::SIGKILL);
+        if self.watch_children.is_empty() {
+            self.run_state.remove(&self.extension.id, RunRole::Watch);
+        }
+
+        let (code, signal) = status.map(exit_parts).unwrap_or((None, None));
+        self.journal_lifecycle(
+            "extension:watch-exit",
+            Some(serde_json::json!({ "code": code, "signal": signal, "view": view_id })),
+            "warn",
+        );
+        self.append_watch_log(&format!("exited {}", exit_summary(code, &signal)));
+
+        if !self.watch_enabled {
+            self.broadcast_status();
+            return;
+        }
+        // A watcher is a keep-alive service: any unprompted exit (clean or
+        // not) goes through the crash/backoff path.
+        self.record_watch_crash();
+    }
+
+    /// Watch analog of `record_crash`, on its own counter. Budget exhaustion
+    /// lands the *facet* on `failed` — journal event and broadcast, but no
+    /// system push (a dev watcher dying is not an ops page). During backoff
+    /// the facet stays `running`: watch is enabled and being kept alive.
+    fn record_watch_crash(&mut self) {
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_millis(self.cfg.crash_window_ms);
+        self.watch_crash_times.push_back(now);
+        while let Some(first) = self.watch_crash_times.front() {
+            if now.duration_since(*first) > window {
+                self.watch_crash_times.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        let crashes = self.watch_crash_times.len();
+        if crashes >= self.cfg.crash_budget {
+            self.journal_lifecycle(
+                "extension:watch-failed",
+                Some(serde_json::json!({
+                    "crashes": crashes,
+                    "windowMs": self.cfg.crash_window_ms,
+                })),
+                "error",
+            );
+            self.append_watch_log(&format!(
+                "failed: crash budget exceeded ({crashes} crashes)"
+            ));
+            self.watch_backoff_deadline = None;
+            self.watch_crash_times.clear();
+            self.watch_enabled = false;
+            self.watch_failed = true;
+            self.watch_started_at_ms = None;
+            self.broadcast_status();
+            return;
+        }
+
+        let exponent = crashes.saturating_sub(1).min(10) as u32;
+        let delay_ms = self
+            .cfg
+            .backoff_cap_ms
+            .min(self.cfg.backoff_base_ms.saturating_mul(1 << exponent));
+        self.journal_lifecycle(
+            "extension:watch-backoff",
+            Some(serde_json::json!({ "crashes": crashes, "delayMs": delay_ms })),
+            "warn",
+        );
+        self.watch_backoff_deadline =
+            Some(tokio::time::Instant::now() + std::time::Duration::from_millis(delay_ms));
+        self.broadcast_status();
+    }
+
+    /// `watch/stop`: EOF is meaningless to vite, so the escalation is
+    /// SIGTERM (group) → SIGKILL (group) with a confirmed reap — the server
+    /// escalation minus the EOF step. Returns whether anything was stopped.
+    async fn stop_watchers(&mut self) -> bool {
+        let was_enabled = self.watch_enabled;
+        self.watch_backoff_deadline = None;
+        self.watch_enabled = false;
+        self.watch_failed = false;
+        // Invalidate monitor tasks and pipe readers of this session.
+        self.watch_generation.fetch_add(1, Ordering::SeqCst);
+
+        let children = std::mem::take(&mut self.watch_children);
+        if children.is_empty() {
+            self.watch_started_at_ms = None;
+            if was_enabled {
+                self.journal_lifecycle("extension:watch-stop", None, "info");
+                self.append_watch_log("stopped");
+            }
+            self.broadcast_status();
+            return was_enabled;
+        }
+
+        self.journal_lifecycle("extension:watch-stop", None, "info");
+        for (_, child) in &children {
+            signal_group(child.pgid, nix::sys::signal::Signal::SIGTERM);
+        }
+        let any_alive = |children: &[(String, WatchChild)]| {
+            children.iter().any(|(_, child)| group_alive(child.pgid))
+        };
+        let term_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(self.cfg.stop_term_wait_ms);
+        while any_alive(&children) && tokio::time::Instant::now() < term_deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        for (_, child) in &children {
+            signal_group(child.pgid, nix::sys::signal::Signal::SIGKILL);
+        }
+        let kill_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(self.cfg.stop_group_wait_ms);
+        while any_alive(&children) && tokio::time::Instant::now() < kill_deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        if any_alive(&children) {
+            self.journal_lifecycle(
+                "extension:watch-group-lingering",
+                Some(serde_json::json!({
+                    "pgids": children.iter().map(|(_, child)| child.pgid).collect::<Vec<_>>(),
+                })),
+                "warn",
+            );
+        }
+        self.run_state.remove(&self.extension.id, RunRole::Watch);
+        self.watch_started_at_ms = None;
+        self.append_watch_log("stopped");
+        self.broadcast_status();
+        true
     }
 
     fn handle_rpc(&mut self, method: String, params: Option<Value>, ack: oneshot::Sender<RpcResult>) {
@@ -612,6 +1141,7 @@ impl Actor {
                 self.started_at_ms = Some(now_ms());
                 self.run_state.record(
                     &self.extension.id,
+                    RunRole::Server,
                     RunEntry {
                         pid,
                         pgid,
@@ -665,7 +1195,7 @@ impl Actor {
         if let Some(pgid) = self.pgid.take() {
             signal_group(pgid, nix::sys::signal::Signal::SIGKILL);
         }
-        self.run_state.remove(&self.extension.id);
+        self.run_state.remove(&self.extension.id, RunRole::Server);
         self.started_at_ms = None;
         self.last_exit = Some(LastExit {
             code,
@@ -809,7 +1339,7 @@ impl Actor {
                 );
             }
         }
-        self.run_state.remove(&self.extension.id);
+        self.run_state.remove(&self.extension.id, RunRole::Server);
 
         let (code, signal) = status.map(exit_parts).unwrap_or((None, None));
         self.journal_lifecycle(
@@ -893,6 +1423,13 @@ impl Actor {
     }
 
     fn current_status(&self) -> ServerStatus {
+        let built_entries: Vec<PathBuf> = self
+            .extension
+            .views
+            .iter()
+            .filter(|(_, view)| view.build.is_some())
+            .map(|(_, view)| view.entry.clone())
+            .collect();
         ServerStatus {
             restartable: true,
             running: self.state == Lifecycle::Running,
@@ -901,17 +1438,43 @@ impl Actor {
             started_at_ms: self.started_at_ms,
             restart_count: self.restart_count,
             last_exit: self.last_exit.clone(),
-            has_build: self
-                .extension
-                .server
-                .as_ref()
-                .map(|server| server.build.is_some())
-                .unwrap_or(false),
+            has_build: self.extension.has_build(),
+            has_server: self.extension.server.is_some(),
+            views: ViewsFacet {
+                declared: built_entries.len() as u32,
+                built: views_built(&built_entries),
+                last_build_at_ms: self.last_view_build_at_ms,
+            },
+            watch: WatchFacet {
+                declared: self
+                    .extension
+                    .views
+                    .iter()
+                    .any(|(_, view)| view.watch.is_some()),
+                state: if self.watch_failed {
+                    "failed"
+                } else if self.watch_enabled {
+                    "running"
+                } else {
+                    "stopped"
+                }
+                .to_string(),
+                pid: self.watch_children.first().map(|(_, child)| child.pid),
+                started_at_ms: self.watch_started_at_ms,
+                restart_count: self.watch_restart_count,
+            },
         }
     }
 
     fn set_state(&mut self, state: Lifecycle) {
         self.state = state;
+        self.broadcast_status();
+    }
+
+    /// Publishes the current status to the shared snapshot and as a
+    /// `didChangeStatus` broadcast. Watch-facet transitions call this
+    /// directly — they change the status without a lifecycle transition.
+    fn broadcast_status(&self) {
         let status = self.current_status();
         *self.status.lock().unwrap() = status.clone();
 
@@ -941,6 +1504,12 @@ impl Actor {
 enum BuildPipe {
     Stdout(tokio::process::ChildStdout),
     Stderr(tokio::process::ChildStderr),
+}
+
+/// True when every declared view entry exists (fresh stat). False with no
+/// declared entries — the facet is `null`-equivalent at `declared: 0`.
+fn views_built(entries: &[PathBuf]) -> bool {
+    !entries.is_empty() && entries.iter().all(|entry| entry.exists())
 }
 
 /// Exit status for user-facing log lines: `code=0`, `signal=SIGKILL`, or

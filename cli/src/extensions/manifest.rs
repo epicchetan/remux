@@ -52,6 +52,12 @@ pub struct BuildSpec {
 pub struct View {
     pub entry: PathBuf,
     pub route: String,
+    /// Optional build phase: when present, `entry` legitimately may not
+    /// exist until the build has run (fresh checkout, wiped dist).
+    pub build: Option<BuildSpec>,
+    /// Optional watch sidecar: a long-lived supervised child (e.g. `vite
+    /// build --watch`) that rewrites the view bundle as sources change.
+    pub watch: Option<BuildSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -92,6 +98,24 @@ impl ExtensionManifest {
 
     pub fn main_view(&self) -> &View {
         self.view("main").expect("validated manifest has views.main")
+    }
+
+    /// Any view with a `build` or `watch` phase — such extensions get a
+    /// supervisor even without a server.
+    pub fn has_managed_views(&self) -> bool {
+        self.views
+            .iter()
+            .any(|(_, view)| view.build.is_some() || view.watch.is_some())
+    }
+
+    /// Aggregate build flag: `server.build` or any view build. Gates the
+    /// app's Rebuild & Restart action.
+    pub fn has_build(&self) -> bool {
+        self.server
+            .as_ref()
+            .map(|server| server.build.is_some())
+            .unwrap_or(false)
+            || self.views.iter().any(|(_, view)| view.build.is_some())
     }
 }
 
@@ -163,6 +187,8 @@ fn parse_views(extension_id: &str, raw_views: &Value, root_dir: &Path) -> Vec<(S
                     raw_view["entry"].as_str().expect("validated"),
                 ),
                 route: normalize_route(&route),
+                build: parse_view_job(raw_view.get("build"), root_dir),
+                watch: parse_view_job(raw_view.get("watch"), root_dir),
             },
         ));
     }
@@ -204,7 +230,15 @@ fn parse_server(raw_server: Option<&Value>, root_dir: &Path) -> Option<ServerSpe
     })
 }
 
-/// Shared command/args/cwd parsing for `server` and `server.build`.
+fn parse_view_job(raw: Option<&Value>, root_dir: &Path) -> Option<BuildSpec> {
+    raw.and_then(Value::as_object).map(|job| {
+        let (command, args, cwd) = parse_command_triple(job, root_dir);
+        BuildSpec { command, args, cwd }
+    })
+}
+
+/// Shared command/args/cwd parsing for `server`, `server.build`, and view
+/// `build`/`watch` jobs.
 fn parse_command_triple(
     record: &serde_json::Map<String, Value>,
     root_dir: &Path,
@@ -476,6 +510,50 @@ fn validate_main_view(manifest: &Value, id: &str) -> Result<(), String> {
         }
         if view.get("dev").is_some() {
             return invalid(format!("views.{view_id}.dev is not supported"));
+        }
+        // Validation must NOT stat `entry` — with a build phase the bundle
+        // legitimately doesn't exist on a fresh checkout.
+        for job in ["build", "watch"] {
+            validate_view_job(id, view_id, job, view.get(job))?;
+        }
+    }
+    Ok(())
+}
+
+/// Mirrors the `server.build` command/args/cwd rules for `views.<id>.build`
+/// and `views.<id>.watch`.
+fn validate_view_job(
+    id: &str,
+    view_id: &str,
+    job: &str,
+    value: Option<&Value>,
+) -> Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let invalid = |detail: String| Err(format!("Invalid Remux extension {id}: {detail}"));
+
+    if !is_record(value) {
+        return invalid(format!("views.{view_id}.{job} must be an object"));
+    }
+    match value.get("command").and_then(Value::as_str) {
+        Some(command) if !command.is_empty() => {}
+        _ => {
+            return invalid(format!(
+                "views.{view_id}.{job}.command must be a non-empty string"
+            ))
+        }
+    }
+    if let Some(args) = value.get("args") {
+        if !is_string_array(args) {
+            return invalid(format!(
+                "views.{view_id}.{job}.args must be an array of strings"
+            ));
+        }
+    }
+    if let Some(cwd) = value.get("cwd") {
+        if !cwd.is_string() {
+            return invalid(format!("views.{view_id}.{job}.cwd must be a string"));
         }
     }
     Ok(())
@@ -751,6 +829,34 @@ mod tests {
         assert_invalid(
             json!({
                 "version": 1, "id": "bad",
+                "views": { "main": { "entry": "index.html", "build": "npm run build" } }
+            }),
+            "views.main.build must be an object",
+        );
+        assert_invalid(
+            json!({
+                "version": 1, "id": "bad",
+                "views": { "main": { "entry": "index.html", "build": { "command": "" } } }
+            }),
+            "views.main.build.command must be a non-empty string",
+        );
+        assert_invalid(
+            json!({
+                "version": 1, "id": "bad",
+                "views": { "main": { "entry": "index.html", "watch": { "command": "npm", "args": [1] } } }
+            }),
+            "views.main.watch.args must be an array of strings",
+        );
+        assert_invalid(
+            json!({
+                "version": 1, "id": "bad",
+                "views": { "main": { "entry": "index.html", "watch": { "command": "npm", "cwd": 5 } } }
+            }),
+            "views.main.watch.cwd must be a string",
+        );
+        assert_invalid(
+            json!({
+                "version": 1, "id": "bad",
                 "server": { "transport": "stdio", "command": "node" },
                 "views": { "main": { "entry": "index.html", "dev": { "command": "npm", "url": "" } } }
             }),
@@ -959,6 +1065,99 @@ mod tests {
                 cwd: ext_dir.join("server"),
             })
         );
+    }
+
+    #[test]
+    fn parses_view_build_and_watch_without_statting_the_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let ext_dir = root.path().join("viewy");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        let manifest = json!({
+            "version": 1,
+            "id": "viewy",
+            "views": {
+                "main": {
+                    "route": "/viewers/viewy",
+                    // Deliberately nonexistent: with a build phase the bundle
+                    // legitimately doesn't exist at validation time.
+                    "entry": "lens/dist/index.html",
+                    "build": { "command": "npm", "args": ["run", "build"], "cwd": "lens" },
+                    "watch": { "command": "npm", "args": ["run", "watch"], "cwd": "lens" }
+                }
+            }
+        });
+        let manifest_path = ext_dir.join(MANIFEST_FILENAME);
+        std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+
+        let extension = load_extension_manifest(&manifest_path).unwrap();
+        let view = extension.main_view();
+        assert_eq!(view.entry, ext_dir.join("lens/dist/index.html"));
+        assert_eq!(
+            view.build,
+            Some(BuildSpec {
+                command: "npm".to_string(),
+                args: vec!["run".to_string(), "build".to_string()],
+                cwd: ext_dir.join("lens"),
+            })
+        );
+        assert_eq!(
+            view.watch,
+            Some(BuildSpec {
+                command: "npm".to_string(),
+                args: vec!["run".to_string(), "watch".to_string()],
+                cwd: ext_dir.join("lens"),
+            })
+        );
+        assert!(extension.has_managed_views());
+        assert!(extension.has_build());
+    }
+
+    #[test]
+    fn has_managed_views_and_has_build_truth_tables() {
+        let root = tempfile::tempdir().unwrap();
+        let load = |id: &str, manifest: Value| {
+            let ext_dir = root.path().join(id);
+            std::fs::create_dir_all(&ext_dir).unwrap();
+            let manifest_path = ext_dir.join(MANIFEST_FILENAME);
+            std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+            load_extension_manifest(&manifest_path).unwrap()
+        };
+
+        // Neither build nor watch: unmanaged, no build.
+        let bare = load("bare", json!({
+            "version": 1, "id": "bare",
+            "views": { "main": { "entry": "index.html" } }
+        }));
+        assert!(!bare.has_managed_views());
+        assert!(!bare.has_build());
+
+        // Watch without build: managed, but no build phase.
+        let watch_only = load("watch-only", json!({
+            "version": 1, "id": "watch-only",
+            "views": { "main": { "entry": "index.html", "watch": { "command": "npm" } } }
+        }));
+        assert!(watch_only.has_managed_views());
+        assert!(!watch_only.has_build());
+
+        // View build only: managed and buildable, no server needed.
+        let view_build = load("view-build", json!({
+            "version": 1, "id": "view-build",
+            "views": { "main": { "entry": "index.html", "build": { "command": "npm" } } }
+        }));
+        assert!(view_build.has_managed_views());
+        assert!(view_build.has_build());
+
+        // Server build only: buildable but views are unmanaged.
+        let server_build = load("server-build", json!({
+            "version": 1, "id": "server-build",
+            "server": {
+                "transport": "stdio", "command": "/tmp/bin",
+                "build": { "command": "cargo" }
+            },
+            "views": { "main": { "entry": "index.html" } }
+        }));
+        assert!(!server_build.has_managed_views());
+        assert!(server_build.has_build());
     }
 
     #[test]

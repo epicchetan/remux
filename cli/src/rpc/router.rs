@@ -8,12 +8,14 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
-use crate::rpc::jsonrpc::{JsonRpcError, INVALID_PARAMS};
+use crate::rpc::jsonrpc::{JsonRpcError, EXTENSION_ERROR, INVALID_PARAMS};
 
 pub const EXTENSION_STATUS_METHOD: &str = "remux/extensions/status";
 pub const EXTENSION_START_METHOD: &str = "remux/extensions/start";
 pub const EXTENSION_STOP_METHOD: &str = "remux/extensions/stop";
 pub const EXTENSION_RESTART_METHOD: &str = "remux/extensions/restart";
+pub const EXTENSION_WATCH_START_METHOD: &str = "remux/extensions/watch/start";
+pub const EXTENSION_WATCH_STOP_METHOD: &str = "remux/extensions/watch/stop";
 pub const EXTENSION_LOGS_METHOD: &str = "remux/extensions/logs";
 pub const SYSTEM_INFO_METHOD: &str = "remux/system/info";
 pub const SYSTEM_PING_METHOD: &str = "remux/system/ping";
@@ -35,9 +37,61 @@ pub struct ServerStatus {
     pub started_at_ms: Option<i64>,
     pub restart_count: u32,
     pub last_exit: Option<LastExit>,
-    /// Pass-2 additive: whether the manifest declares a `server.build` phase
+    /// Pass-2 additive: whether the manifest declares any build phase —
+    /// `server.build` or a view build since the view-build-watch pass
     /// (gates the app's Rebuild & Restart action).
     pub has_build: bool,
+    /// View-build-watch additive: distinguishes "stopped server" from
+    /// "nothing to run" (editor/markdown).
+    pub has_server: bool,
+    /// View-build-watch additive: view build facet.
+    pub views: ViewsFacet,
+    /// View-build-watch additive: watch sidecar facet — NOT the extension
+    /// lifecycle; states are `stopped | running | failed`.
+    pub watch: WatchFacet,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ViewsFacet {
+    /// Views with a declared build.
+    pub declared: u32,
+    /// True when every declared view's entry exists (statted at snapshot
+    /// time).
+    pub built: bool,
+    pub last_build_at_ms: Option<i64>,
+}
+
+impl Default for ViewsFacet {
+    fn default() -> Self {
+        Self {
+            declared: 0,
+            built: false,
+            last_build_at_ms: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WatchFacet {
+    /// Whether any view declares a watch spec; when false the wire shape is
+    /// `{ "declared": false }` and nothing else.
+    pub declared: bool,
+    pub state: String,
+    pub pid: Option<u32>,
+    pub started_at_ms: Option<i64>,
+    pub restart_count: u32,
+}
+
+impl Default for WatchFacet {
+    fn default() -> Self {
+        Self {
+            declared: false,
+            state: "stopped".to_string(),
+            pid: None,
+            started_at_ms: None,
+            restart_count: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -92,6 +146,39 @@ impl ServerStatus {
             },
         );
         target.insert("hasBuild".to_string(), Value::from(self.has_build));
+        target.insert("hasServer".to_string(), Value::from(self.has_server));
+        let mut views = Map::new();
+        views.insert("declared".to_string(), Value::from(self.views.declared));
+        views.insert("built".to_string(), Value::from(self.views.built));
+        views.insert(
+            "lastBuildAtMs".to_string(),
+            self.views
+                .last_build_at_ms
+                .map(Value::from)
+                .unwrap_or(Value::Null),
+        );
+        target.insert("views".to_string(), Value::Object(views));
+        let mut watch = Map::new();
+        watch.insert("declared".to_string(), Value::from(self.watch.declared));
+        if self.watch.declared {
+            watch.insert("state".to_string(), Value::from(self.watch.state.clone()));
+            watch.insert(
+                "pid".to_string(),
+                self.watch.pid.map(Value::from).unwrap_or(Value::Null),
+            );
+            watch.insert(
+                "startedAtMs".to_string(),
+                self.watch
+                    .started_at_ms
+                    .map(Value::from)
+                    .unwrap_or(Value::Null),
+            );
+            watch.insert(
+                "restartCount".to_string(),
+                Value::from(self.watch.restart_count),
+            );
+        }
+        target.insert("watch".to_string(), Value::Object(watch));
     }
 }
 
@@ -103,6 +190,19 @@ pub trait ExtensionServer: Send + Sync {
     fn start(&self, rebuild: bool) -> BoxFuture<'_, ServerStatus>;
     fn stop(&self) -> BoxFuture<'_, ServerStatus>;
     fn restart(&self, rebuild: bool) -> BoxFuture<'_, ServerStatus>;
+    /// Starts the view-watch sidecar. The bool is the idempotency flag
+    /// (`started`): false when the watcher was already running (or the
+    /// gating build failed — the facet in the status says so). Errors when
+    /// no view declares a watch spec.
+    fn watch_start(&self) -> BoxFuture<'_, Result<(ServerStatus, bool), JsonRpcError>> {
+        Box::pin(async {
+            Err(JsonRpcError::new(EXTENSION_ERROR, "watch not declared"))
+        })
+    }
+    /// Stops the view-watch sidecar. Idempotent: the bool is `stopped`.
+    fn watch_stop(&self) -> BoxFuture<'_, (ServerStatus, bool)> {
+        Box::pin(async { (self.status(), false) })
+    }
     fn handle_rpc(&self, method: String, params: Option<Value>) -> BoxFuture<'_, RpcResult>;
     fn handle_notification(&self, method: String, params: Option<Value>);
     fn status(&self) -> ServerStatus;
@@ -336,6 +436,28 @@ impl RpcRouter {
             return Ok(Value::Object(result));
         }
 
+        if method == EXTENSION_WATCH_START_METHOD || method == EXTENSION_WATCH_STOP_METHOD {
+            let extension_id = extension_id_from_params(params, method)?;
+            let Some(server) = self.server(&extension_id) else {
+                return Err(JsonRpcError::new(
+                    EXTENSION_ERROR,
+                    format!("unknown extension: {extension_id}"),
+                ));
+            };
+            let (status, changed, flag) = if method == EXTENSION_WATCH_START_METHOD {
+                let (status, started) = server.watch_start().await?;
+                (status, started, "started")
+            } else {
+                let (status, stopped) = server.watch_stop().await;
+                (status, stopped, "stopped")
+            };
+            let mut result = Map::new();
+            result.insert("extensionId".to_string(), Value::from(extension_id));
+            status.append_to(&mut result);
+            result.insert(flag.to_string(), Value::from(changed));
+            return Ok(Value::Object(result));
+        }
+
         Err(JsonRpcError::method_not_found(method))
     }
 }
@@ -352,6 +474,8 @@ pub fn is_extension_management_method(method: &str) -> bool {
         || method == EXTENSION_START_METHOD
         || method == EXTENSION_STOP_METHOD
         || method == EXTENSION_RESTART_METHOD
+        || method == EXTENSION_WATCH_START_METHOD
+        || method == EXTENSION_WATCH_STOP_METHOD
         || method == EXTENSION_LOGS_METHOD
 }
 
@@ -394,18 +518,31 @@ mod tests {
         extension_id: String,
         calls: Arc<Mutex<Vec<String>>>,
         running: Mutex<bool>,
+        watch_declared: bool,
+        watching: Mutex<bool>,
     }
 
     impl FixtureServer {
         fn new(extension_id: &str, calls: Arc<Mutex<Vec<String>>>) -> Arc<Self> {
+            Self::with_watch(extension_id, calls, false)
+        }
+
+        fn with_watch(
+            extension_id: &str,
+            calls: Arc<Mutex<Vec<String>>>,
+            watch_declared: bool,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 extension_id: extension_id.to_string(),
                 calls,
                 running: Mutex::new(false),
+                watch_declared,
+                watching: Mutex::new(false),
             })
         }
 
         fn snapshot(&self) -> ServerStatus {
+            let watching = *self.watching.lock().unwrap();
             ServerStatus {
                 restartable: true,
                 running: *self.running.lock().unwrap(),
@@ -415,6 +552,13 @@ mod tests {
                 restart_count: 0,
                 last_exit: None,
                 has_build: false,
+                has_server: true,
+                views: ViewsFacet::default(),
+                watch: WatchFacet {
+                    declared: self.watch_declared,
+                    state: if watching { "running" } else { "stopped" }.to_string(),
+                    ..WatchFacet::default()
+                },
             }
         }
     }
@@ -447,6 +591,37 @@ mod tests {
             Box::pin(async move {
                 self.stop().await;
                 self.start(rebuild).await
+            })
+        }
+
+        fn watch_start(&self) -> BoxFuture<'_, Result<(ServerStatus, bool), JsonRpcError>> {
+            Box::pin(async {
+                if !self.watch_declared {
+                    return Err(JsonRpcError::new(EXTENSION_ERROR, "watch not declared"));
+                }
+                let started = {
+                    let mut watching = self.watching.lock().unwrap();
+                    let started = !*watching;
+                    *watching = true;
+                    started
+                };
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}:watch-start", self.extension_id));
+                Ok((self.snapshot(), started))
+            })
+        }
+
+        fn watch_stop(&self) -> BoxFuture<'_, (ServerStatus, bool)> {
+            Box::pin(async {
+                let stopped = {
+                    let mut watching = self.watching.lock().unwrap();
+                    let stopped = *watching;
+                    *watching = false;
+                    stopped
+                };
+                (self.snapshot(), stopped)
             })
         }
 
@@ -499,7 +674,7 @@ mod tests {
             ),
             (
                 "files".to_string(),
-                FixtureServer::new("files", calls.clone()),
+                FixtureServer::with_watch("files", calls.clone(), true),
             ),
         ];
         let system_calls = calls.clone();
@@ -654,6 +829,147 @@ mod tests {
         let mut last = calls[calls.len() - 3..].to_vec();
         last.sort();
         assert_eq!(last, ["codex:stop", "files:stop", "fs-extension:stop"]);
+    }
+
+    #[tokio::test]
+    async fn watch_rpcs_route_with_idempotency_flags_and_errors() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let router = fixture_router(&calls);
+
+        // Happy path: first start flips the flag, second is idempotent.
+        let started = router
+            .handle_request(
+                EXTENSION_WATCH_START_METHOD,
+                Some(&json!({ "extensionId": "files" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started["started"], json!(true));
+        assert_eq!(started["watch"]["declared"], json!(true));
+        assert_eq!(started["watch"]["state"], json!("running"));
+        let again = router
+            .handle_request(
+                EXTENSION_WATCH_START_METHOD,
+                Some(&json!({ "extensionId": "files" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again["started"], json!(false));
+
+        let stopped = router
+            .handle_request(
+                EXTENSION_WATCH_STOP_METHOD,
+                Some(&json!({ "extensionId": "files" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stopped["stopped"], json!(true));
+        assert_eq!(stopped["watch"]["state"], json!("stopped"));
+        let stopped_again = router
+            .handle_request(
+                EXTENSION_WATCH_STOP_METHOD,
+                Some(&json!({ "extensionId": "files" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stopped_again["stopped"], json!(false));
+
+        // No watch declared (codex fixture) → error.
+        let err = router
+            .handle_request(
+                EXTENSION_WATCH_START_METHOD,
+                Some(&json!({ "extensionId": "codex" })),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, EXTENSION_ERROR);
+        assert_eq!(err.message, "watch not declared");
+
+        // Unknown extension → error (not a degenerate shape: watch is new
+        // enough that no old app calls it blind).
+        let err = router
+            .handle_request(
+                EXTENSION_WATCH_START_METHOD,
+                Some(&json!({ "extensionId": "nope" })),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, "unknown extension: nope");
+
+        let err = router
+            .handle_request(EXTENSION_WATCH_START_METHOD, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[test]
+    fn status_appends_facets_in_stable_order_after_has_build() {
+        let status = ServerStatus {
+            restartable: true,
+            running: false,
+            state: "stopped".to_string(),
+            pid: None,
+            started_at_ms: None,
+            restart_count: 0,
+            last_exit: None,
+            has_build: true,
+            has_server: false,
+            views: ViewsFacet {
+                declared: 1,
+                built: true,
+                last_build_at_ms: Some(42),
+            },
+            watch: WatchFacet {
+                declared: true,
+                state: "running".to_string(),
+                pid: Some(9),
+                started_at_ms: Some(7),
+                restart_count: 2,
+            },
+        };
+        let mut target = Map::new();
+        status.append_to(&mut target);
+        let keys: Vec<&String> = target.keys().collect();
+        assert_eq!(
+            keys,
+            [
+                "restartable",
+                "running",
+                "state",
+                "pid",
+                "startedAtMs",
+                "restartCount",
+                "lastExit",
+                "hasBuild",
+                "hasServer",
+                "views",
+                "watch",
+            ]
+        );
+        assert_eq!(
+            target["views"],
+            json!({ "declared": 1, "built": true, "lastBuildAtMs": 42 })
+        );
+        assert_eq!(
+            target["watch"],
+            json!({
+                "declared": true,
+                "state": "running",
+                "pid": 9,
+                "startedAtMs": 7,
+                "restartCount": 2,
+            })
+        );
+
+        // Undeclared watch is `{ declared: false }` and nothing else.
+        let undeclared = ServerStatus {
+            watch: WatchFacet::default(),
+            ..status
+        };
+        let mut target = Map::new();
+        undeclared.append_to(&mut target);
+        assert_eq!(target["watch"], json!({ "declared": false }));
     }
 
     #[tokio::test]

@@ -4,6 +4,8 @@ const extensionStatusMethod = 'remux/extensions/status';
 const extensionStartMethod = 'remux/extensions/start';
 const extensionStopMethod = 'remux/extensions/stop';
 const extensionRestartMethod = 'remux/extensions/restart';
+const extensionWatchStartMethod = 'remux/extensions/watch/start';
+const extensionWatchStopMethod = 'remux/extensions/watch/stop';
 const extensionLogsMethod = 'remux/extensions/logs';
 const extensionLogsSubscribeMethod = 'remux/extensions/logs/subscribe';
 const extensionLogsUnsubscribeMethod = 'remux/extensions/logs/unsubscribe';
@@ -30,6 +32,24 @@ export type ExtensionServerLastExit = {
   reason: string | null;
 };
 
+/** Watch is a facet of extension status, not a lifecycle state. */
+export type ExtensionWatchState = 'stopped' | 'running' | 'failed';
+
+export type ExtensionViewsFacet = {
+  /** Views with a declared build; 0 means the facet is inert. */
+  declared: number;
+  built: boolean;
+  lastBuildAtMs: number | null;
+};
+
+export type ExtensionWatchFacet = {
+  declared: boolean;
+  state: ExtensionWatchState;
+  pid: number | null;
+  startedAtMs: number | null;
+  restartCount: number;
+};
+
 export type ExtensionServerStatus = {
   extensionId: string;
   restartable: boolean;
@@ -41,6 +61,14 @@ export type ExtensionServerStatus = {
   restartCount: number;
   lastExit: ExtensionServerLastExit | null;
   hasBuild: boolean;
+  /**
+   * View-build-watch additive facets; defaulted against a pass-2 runtime so
+   * every new control hides itself (`hasServer: true`, `views.declared: 0`,
+   * `watch.declared: false`).
+   */
+  hasServer: boolean;
+  views: ExtensionViewsFacet;
+  watch: ExtensionWatchFacet;
 };
 
 export type ExtensionLogLine = {
@@ -100,6 +128,31 @@ export async function setExtensionServerRunning(
   const status = parseExtensionServerStatus(response);
   if (!status || !isRecord(response)) {
     throw new Error(`Invalid extension ${running ? 'start' : 'stop'} response`);
+  }
+
+  return {
+    ...status,
+    changed: response.started === true || response.stopped === true,
+  };
+}
+
+/**
+ * Starts/stops the view-watch sidecar. Start may gate on an initial view
+ * build, so it gets the rebuild timeout; stop uses the standard 30s.
+ */
+export async function setExtensionWatchRunning(
+  request: RemuxConnection['request'],
+  extensionId: string,
+  running: boolean,
+): Promise<ExtensionServerStatus & { changed: boolean }> {
+  const response = await request<unknown>(
+    running ? extensionWatchStartMethod : extensionWatchStopMethod,
+    { extensionId },
+    running ? rebuildTimeoutMs : 30_000,
+  );
+  const status = parseExtensionServerStatus(response);
+  if (!status || !isRecord(response)) {
+    throw new Error(`Invalid extension watch ${running ? 'start' : 'stop'} response`);
   }
 
   return {
@@ -170,7 +223,53 @@ export function parseExtensionServerStatus(raw: unknown): ExtensionServerStatus 
     restartCount: typeof raw.restartCount === 'number' ? raw.restartCount : 0,
     lastExit: parseLastExit(raw.lastExit),
     hasBuild: raw.hasBuild === true,
+    hasServer: raw.hasServer !== false,
+    views: parseViewsFacet(raw.views),
+    watch: parseWatchFacet(raw.watch),
   };
+}
+
+function parseViewsFacet(value: unknown): ExtensionViewsFacet {
+  if (!isRecord(value)) {
+    return { declared: 0, built: false, lastBuildAtMs: null };
+  }
+
+  return {
+    declared: typeof value.declared === 'number' ? value.declared : 0,
+    built: value.built === true,
+    lastBuildAtMs: typeof value.lastBuildAtMs === 'number' ? value.lastBuildAtMs : null,
+  };
+}
+
+function parseWatchFacet(value: unknown): ExtensionWatchFacet {
+  const stopped: ExtensionWatchFacet = {
+    declared: false,
+    state: 'stopped',
+    pid: null,
+    startedAtMs: null,
+    restartCount: 0,
+  };
+  if (!isRecord(value) || value.declared !== true) {
+    return stopped;
+  }
+
+  return {
+    declared: true,
+    state: parseWatchState(value.state),
+    pid: typeof value.pid === 'number' ? value.pid : null,
+    startedAtMs: typeof value.startedAtMs === 'number' ? value.startedAtMs : null,
+    restartCount: typeof value.restartCount === 'number' ? value.restartCount : 0,
+  };
+}
+
+function parseWatchState(value: unknown): ExtensionWatchState {
+  switch (value) {
+    case 'running':
+    case 'failed':
+      return value;
+    default:
+      return 'stopped';
+  }
 }
 
 function parseServerState(value: unknown): ExtensionServerState | null {

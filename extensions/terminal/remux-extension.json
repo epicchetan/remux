@@ -29,7 +29,23 @@
   "views": {
     "main": {
       "route": "/viewers/terminal",
-      "entry": "viewer/dist/index.html"
+      "entry": "viewer/dist/index.html",
+      "build": {
+        "command": "npm",
+        "args": [
+          "run",
+          "build"
+        ],
+        "cwd": "."
+      },
+      "watch": {
+        "command": "npm",
+        "args": [
+          "run",
+          "watch"
+        ],
+        "cwd": "."
+      }
     }
   },
   "launchers": [

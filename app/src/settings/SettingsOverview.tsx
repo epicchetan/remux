@@ -35,9 +35,18 @@ import {
   readExtensionServerStatuses,
   restartExtensionServer,
   setExtensionServerRunning,
+  setExtensionWatchRunning,
   type ExtensionServerStatus,
 } from './extensionServerApi';
-import { formatBytes, formatDurationMs, formatLastExit, formatUptime, serverStateLabel, serverStateTone } from './formatters';
+import {
+  formatBytes,
+  formatDurationMs,
+  formatLastExit,
+  formatUptime,
+  serverStateLabel,
+  serverStateTone,
+  type ServerStateTone,
+} from './formatters';
 import { restartRemuxCli } from './remuxSystemApi';
 import {
   parseSystemResourcesSample,
@@ -111,14 +120,18 @@ export function SettingsOverview() {
     setExtensionStatusError(null);
     setDetailBusyAction(action);
     try {
-      const status = action === 'restart' || action === 'rebuild'
-        ? await restartExtensionServer(connection.request, extensionId, { rebuild: action === 'rebuild' })
-        : await setExtensionServerRunning(connection.request, extensionId, action === 'start');
+      const status = action === 'watch-start' || action === 'watch-stop'
+        ? await setExtensionWatchRunning(connection.request, extensionId, action === 'watch-start')
+        : action === 'restart' || action === 'rebuild'
+          ? await restartExtensionServer(connection.request, extensionId, { rebuild: action === 'rebuild' })
+          : await setExtensionServerRunning(connection.request, extensionId, action === 'start');
       setExtensionStatuses((current) => ({
         ...current,
         [extensionId]: status,
       }));
-      if (status.running) {
+      // Stopping the watcher changes nothing on disk; everything else may
+      // have rewritten the served bundle or restarted the server.
+      if (status.running && action !== 'watch-stop') {
         reloadExtensionTabs(extensionId);
       }
     } catch (error) {
@@ -572,16 +585,20 @@ const ExtensionRow = memo(function ExtensionRow({
 }) {
   const { styles, theme } = useSettingsTheme();
   const [imageFailed, setImageFailed] = useState(false);
-  const hasServer = Boolean(status);
+  // Tappable whenever a status exists (serverless extensions have real
+  // statuses since the view-build-watch pass); the sheet decides which
+  // verbs to show.
+  const hasStatus = Boolean(status);
+  const badge = rowBadge(status, nowMs);
   const themedUrl = themedIconUrl({ iconDarkUrl, iconUrl }, theme.isDark);
 
   return (
     <Pressable
       accessibilityLabel={`${name} server details`}
       accessibilityRole="button"
-      disabled={!hasServer}
+      disabled={!hasStatus}
       onPress={() => onOpenDetails(extensionId)}
-      style={({ pressed }) => [styles.extensionRow, pressed && hasServer ? styles.extensionRowPressed : null]}
+      style={({ pressed }) => [styles.extensionRow, pressed && hasStatus ? styles.extensionRowPressed : null]}
     >
       <View style={styles.extensionIconFrame}>
         {themedUrl && !imageFailed ? (
@@ -599,18 +616,17 @@ const ExtensionRow = memo(function ExtensionRow({
       <View style={styles.extensionText}>
         <Text numberOfLines={1} style={styles.extensionName}>{name}</Text>
         <View style={styles.extensionMetaRow}>
-          {status ? <StateDot state={status.state} /> : null}
-          <Text numberOfLines={1} style={styles.extensionMeta}>{serverStatusText(status, nowMs)}</Text>
+          {badge.tone ? <StateDot tone={badge.tone} /> : null}
+          <Text numberOfLines={1} style={styles.extensionMeta}>{badge.text}</Text>
         </View>
       </View>
-      {hasServer ? <Text style={styles.extensionChevron}>›</Text> : null}
+      {hasStatus ? <Text style={styles.extensionChevron}>›</Text> : null}
     </Pressable>
   );
 });
 
-function StateDot({ state }: { state: ExtensionServerStatus['state'] }) {
+function StateDot({ tone }: { tone: ServerStateTone }) {
   const { styles, theme } = useSettingsTheme();
-  const tone = serverStateTone(state);
   const color = tone === 'ok'
     ? theme.success
     : tone === 'bad'
@@ -622,11 +638,42 @@ function StateDot({ state }: { state: ExtensionServerStatus['state'] }) {
   return <View style={[styles.stateDot, { backgroundColor: color }]} />;
 }
 
-function serverStatusText(status: ExtensionServerStatus | null, nowMs: number) {
+/**
+ * Row meta line + dot tone. Server rows keep the lifecycle-derived badge
+ * (plus a `· watching` suffix while the watch facet runs); serverless rows
+ * would otherwise read as permanently `Stopped`, so they badge from the
+ * build/watch facets instead.
+ */
+function rowBadge(
+  status: ExtensionServerStatus | null,
+  nowMs: number,
+): { text: string; tone: ServerStateTone | null } {
   if (!status) {
-    return 'No server extension';
+    return { text: 'No server extension', tone: null };
   }
 
+  if (!status.hasServer) {
+    if (status.watch.state === 'running') {
+      return { text: 'Watching', tone: 'busy' };
+    }
+    const watchFailed = status.watch.state === 'failed' ? ' · watch failed' : '';
+    if (status.state === 'failed' && status.lastExit?.reason === 'build-failed') {
+      return { text: `Build failed${watchFailed}`, tone: 'bad' };
+    }
+    if (status.views.built) {
+      return { text: `Built${watchFailed}`, tone: watchFailed ? 'bad' : 'ok' };
+    }
+    return { text: `Not built${watchFailed}`, tone: watchFailed ? 'bad' : 'idle' };
+  }
+
+  const watching = status.watch.state === 'running' ? ' · watching' : '';
+  return {
+    text: serverStatusText(status, nowMs) + watching,
+    tone: serverStateTone(status.state),
+  };
+}
+
+function serverStatusText(status: ExtensionServerStatus, nowMs: number) {
   const parts: string[] = [serverStateLabel(status.state)];
   const uptime = status.running ? formatUptime(status.startedAtMs, nowMs) : null;
   if (uptime) {

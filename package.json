@@ -12,7 +12,6 @@
     "app:typecheck": "npm --workspace @remux/app run typecheck",
     "mobile:typecheck": "npm --workspace @remux/app run typecheck",
     "viewers:build": "npm --workspaces --if-present run build",
-    "viewers:watch": "node scripts/watch-viewers.cjs",
     "typecheck": "tsc --noEmit",
     "lint": "npm run typecheck",
     "test:cli": "cargo test --manifest-path cli/Cargo.toml",

@@ -55,6 +55,8 @@ fn fixture_extension(root: &std::path::Path) -> ExtensionManifest {
             View {
                 entry: dist.join("index.html"),
                 route: "/viewers/fixture".to_string(),
+                build: None,
+                watch: None,
             },
         )],
         launchers: Vec::new(),

@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use remux::extensions::manifest::{BuildSpec, Display, ExtensionManifest, ServerSpec, View};
-use remux::extensions::runstate::{read_start_ticks, sweep_orphans, RunEntry, RunState};
+use remux::extensions::runstate::{read_start_ticks, sweep_orphans, RunEntry, RunRole, RunState};
 use remux::extensions::supervisor::{ExtensionCtx, ExtensionSupervisor, SupervisorConfig};
 use remux::logs::{ExtensionLogs, Journal, StdTerminal};
 use remux::rpc::router::{BoxFuture, ExtensionServer, ServerStatus};
@@ -81,6 +81,8 @@ fn fixture_manifest_with_server(root: &Path, server: ServerSpec) -> ExtensionMan
             View {
                 entry: root.join("index.html"),
                 route: "/viewers/fixture".to_string(),
+                build: None,
+                watch: None,
             },
         )],
         launchers: Vec::new(),
@@ -522,6 +524,7 @@ async fn boot_sweep_kills_recorded_groups_and_skips_stale_records() {
     let run_state = RunState::new(root.path());
     run_state.record(
         "orphaned",
+        RunRole::Server,
         RunEntry {
             pid: decoy_pid,
             pgid: decoy_pid,
@@ -531,6 +534,7 @@ async fn boot_sweep_kills_recorded_groups_and_skips_stale_records() {
     );
     run_state.record(
         "reused-pid",
+        RunRole::Watch,
         RunEntry {
             pid: survivor_pid,
             pgid: survivor_pid,
@@ -568,10 +572,11 @@ async fn run_state_file_tracks_spawn_and_reap() {
     let status = harness.supervisor.start(false).await;
     let document: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(document["version"], 1);
-    assert_eq!(document["extensions"]["fixture"]["pid"], status.pid.unwrap());
-    assert_eq!(document["extensions"]["fixture"]["pgid"], status.pid.unwrap());
-    assert!(document["extensions"]["fixture"]["startTicks"].as_u64().unwrap() > 0);
+    assert_eq!(document["version"], 2);
+    let server = &document["extensions"]["fixture"]["server"];
+    assert_eq!(server["pid"], status.pid.unwrap());
+    assert_eq!(server["pgid"], status.pid.unwrap());
+    assert!(server["startTicks"].as_u64().unwrap() > 0);
 
     harness.supervisor.stop().await;
     let document: serde_json::Value =
@@ -689,4 +694,456 @@ async fn failing_build_lands_failed_without_consuming_crash_budget() {
 
     // Failure is announced once per failed entry.
     assert_eq!(harness.ctx.failures.lock().unwrap().len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// View build + watch pass.
+// ---------------------------------------------------------------------------
+
+/// Manifest with a single `main` view carrying optional build/watch jobs.
+/// The entry is `dist/index.html` under the extension root.
+fn view_manifest(
+    root: &Path,
+    server: Option<ServerSpec>,
+    build: Option<&str>,
+    watch: Option<&str>,
+) -> ExtensionManifest {
+    let job = |script: &str| BuildSpec {
+        command: "sh".to_string(),
+        args: vec!["-c".to_string(), script.to_string()],
+        cwd: root.to_path_buf(),
+    };
+    ExtensionManifest {
+        id: "fixture".to_string(),
+        name: "Fixture".to_string(),
+        root_dir: root.to_path_buf(),
+        display: Display {
+            icon: None,
+            icon_dark: None,
+            title: "Fixture".to_string(),
+        },
+        server,
+        views: vec![(
+            "main".to_string(),
+            View {
+                entry: root.join("dist/index.html"),
+                route: "/viewers/fixture".to_string(),
+                build: build.map(job),
+                watch: watch.map(job),
+            },
+        )],
+        launchers: Vec::new(),
+        file_handlers: Vec::new(),
+    }
+}
+
+const VIEW_BUILD_OK: &str =
+    "echo x >> view-build-count.txt && mkdir -p dist && echo bundle > dist/index.html && echo view-built";
+
+fn view_build_count(root: &Path) -> usize {
+    std::fs::read_to_string(root.join("view-build-count.txt"))
+        .map(|content| content.lines().count())
+        .unwrap_or(0)
+}
+
+fn log_lines(harness: &Harness) -> Vec<String> {
+    harness
+        .supervisor
+        .logs(200)
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line["line"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Watch facet states carried by didChangeStatus broadcasts, in order.
+fn watch_states(ctx: &TestCtx) -> Vec<String> {
+    ctx.broadcasts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|message| message["method"] == "remux/extensions/didChangeStatus")
+        .filter_map(|message| {
+            message["params"]["watch"]["state"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+async fn wait_for<F: Fn() -> bool>(condition: F, what: &str, timeout_ms: u64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    while !condition() {
+        if tokio::time::Instant::now() > deadline {
+            panic!("timed out waiting for {what}");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn serverless_start_runs_view_build_then_lands_stopped_and_built() {
+    let harness = harness_with_manifest(tempfile::tempdir().unwrap(), fast_config(), |root| {
+        view_manifest(root, None, Some(VIEW_BUILD_OK), None)
+    });
+
+    let status = harness.supervisor.start(false).await;
+    assert_eq!(status.state, "stopped");
+    assert!(!status.running);
+    assert!(!status.has_server);
+    assert!(status.has_build, "view build must aggregate into hasBuild");
+    assert_eq!(status.views.declared, 1);
+    assert!(status.views.built);
+    assert!(status.views.last_build_at_ms.is_some());
+    assert_eq!(view_build_count(harness.root.path()), 1);
+
+    // The build ran under the lifecycle Building state and settled back.
+    let states = harness.ctx.states();
+    assert!(states.contains(&"building".to_string()), "{states:?}");
+    assert_eq!(states.last().map(String::as_str), Some("stopped"));
+
+    // A second start with the bundle present is a no-op build-wise.
+    let again = harness.supervisor.start(false).await;
+    assert_eq!(again.state, "stopped");
+    assert_eq!(view_build_count(harness.root.path()), 1);
+
+    // rebuild: true re-runs the view build.
+    let rebuilt = harness.supervisor.restart(true).await;
+    assert_eq!(rebuilt.state, "stopped");
+    assert_eq!(view_build_count(harness.root.path()), 2);
+
+    let lines = log_lines(&harness);
+    assert!(lines.iter().any(|line| line == "[build] view-built"), "{lines:?}");
+}
+
+#[tokio::test]
+async fn view_build_failure_lands_failed_without_consuming_crash_budget() {
+    let harness = harness_with_manifest(tempfile::tempdir().unwrap(), fast_config(), |root| {
+        view_manifest(root, None, Some("echo view-boom >&2; exit 1"), None)
+    });
+
+    let status = harness.supervisor.start(false).await;
+    assert_eq!(status.state, "failed");
+    let last_exit = status.last_exit.expect("failed build records lastExit");
+    assert_eq!(last_exit.reason.as_deref(), Some("build-failed"));
+    assert!(!status.views.built);
+
+    let states = harness.ctx.states();
+    assert!(!states.contains(&"backingOff".to_string()), "{states:?}");
+
+    // Manual start retries the view build even though nothing else changed.
+    let retried = harness.supervisor.start(false).await;
+    assert_eq!(retried.state, "failed");
+    let buildings = harness
+        .ctx
+        .states()
+        .iter()
+        .filter(|state| *state == "building")
+        .count();
+    assert_eq!(buildings, 2);
+}
+
+#[tokio::test]
+async fn build_sequence_skips_watch_owned_views_and_logs_the_skip() {
+    let harness = harness_with_manifest(tempfile::tempdir().unwrap(), fast_config(), |root| {
+        view_manifest(root, None, Some(VIEW_BUILD_OK), Some("sleep 300"))
+    });
+
+    // Watch start gates on the initial build (entry missing).
+    let (status, started) = harness.supervisor.watch_start().await.unwrap();
+    assert!(started);
+    assert_eq!(status.watch.state, "running");
+    assert!(status.watch.pid.is_some());
+    assert!(status.views.built, "gating build must produce the bundle");
+    assert_eq!(view_build_count(harness.root.path()), 1);
+    // The gating build ran under the watch facet, not the lifecycle.
+    assert_eq!(status.state, "stopped");
+    assert!(!harness.ctx.states().contains(&"building".to_string()));
+
+    // A forced rebuild skips the watch-owned view instead of racing vite.
+    let rebuilt = harness.supervisor.restart(true).await;
+    assert_eq!(rebuilt.state, "stopped");
+    assert_eq!(view_build_count(harness.root.path()), 1, "build must be skipped");
+    let lines = log_lines(&harness);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "[build] skipping view main: watch owns the bundle"),
+        "{lines:?}"
+    );
+
+    // watch/start is idempotent while enabled.
+    let (_, started_again) = harness.supervisor.watch_start().await.unwrap();
+    assert!(!started_again);
+
+    // Stop kills the sleeping watcher group and lands the facet on stopped.
+    let watch_pid = status.watch.pid.unwrap();
+    let (stopped, changed) = harness.supervisor.watch_stop().await;
+    assert!(changed);
+    assert_eq!(stopped.watch.state, "stopped");
+    assert!(!process_alive(watch_pid), "watcher must be reaped");
+    let (_, changed_again) = harness.supervisor.watch_stop().await;
+    assert!(!changed_again, "watch/stop is idempotent");
+
+    // didChangeStatus carried the watch transitions.
+    let states = watch_states(&harness.ctx);
+    assert!(states.contains(&"running".to_string()), "{states:?}");
+    assert_eq!(states.last().map(String::as_str), Some("stopped"));
+}
+
+#[tokio::test]
+async fn watch_not_declared_errors_and_undeclared_facet_stays_minimal() {
+    let harness = harness_with_manifest(tempfile::tempdir().unwrap(), fast_config(), |root| {
+        view_manifest(root, None, Some(VIEW_BUILD_OK), None)
+    });
+
+    let err = harness.supervisor.watch_start().await.unwrap_err();
+    assert_eq!(err.message, "watch not declared");
+    assert!(!harness.supervisor.status().watch.declared);
+}
+
+#[tokio::test]
+async fn gating_build_failure_fails_the_watch_facet_and_spares_a_running_server() {
+    let root = tempfile::tempdir().unwrap();
+    // Entry pre-exists so the server start needs no view build; the watcher's
+    // gating build only triggers after we delete the bundle.
+    std::fs::create_dir_all(root.path().join("dist")).unwrap();
+    std::fs::write(root.path().join("dist/index.html"), "bundle").unwrap();
+    let harness = harness_with_manifest(root, fast_config(), |root| {
+        view_manifest(
+            root,
+            Some(ServerSpec {
+                transport: "stdio".to_string(),
+                command: env!("CARGO_BIN_EXE_remux-fixture-ext").to_string(),
+                args: Vec::new(),
+                cwd: root.to_path_buf(),
+                build: None,
+            }),
+            Some("echo gate-boom >&2; exit 1"),
+            Some("sleep 300"),
+        )
+    });
+
+    let status = harness.supervisor.start(false).await;
+    assert_eq!(status.state, "running");
+    let server_pid = status.pid.unwrap();
+
+    std::fs::remove_file(harness.root.path().join("dist/index.html")).unwrap();
+    let (status, started) = harness.supervisor.watch_start().await.unwrap();
+    assert!(!started);
+    assert_eq!(status.watch.state, "failed");
+    // The lifecycle — and the live server — are untouched.
+    assert_eq!(status.state, "running");
+    assert!(status.running);
+    assert_eq!(status.pid, Some(server_pid));
+    assert!(process_alive(server_pid));
+    assert!(status.last_exit.is_none(), "no build-failed lastExit on the lifecycle");
+    assert!(harness.ctx.failures.lock().unwrap().is_empty(), "no push for watch failures");
+
+    harness.supervisor.stop().await;
+}
+
+#[tokio::test]
+async fn watch_crashes_restart_with_backoff_while_the_facet_stays_running() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("dist")).unwrap();
+    std::fs::write(root.path().join("dist/index.html"), "bundle").unwrap();
+    // Crashes twice, then stays up.
+    let flaky =
+        "echo x >> watch-count.txt; n=$(wc -l < watch-count.txt); if [ \"$n\" -le 2 ]; then exit 1; fi; sleep 300";
+    let harness = harness_with_manifest(root, fast_config(), |root| {
+        view_manifest(root, None, None, Some(flaky))
+    });
+
+    let (status, started) = harness.supervisor.watch_start().await.unwrap();
+    assert!(started);
+    assert_eq!(status.watch.state, "running");
+
+    wait_for(
+        || {
+            let watch = harness.supervisor.status().watch;
+            watch.restart_count >= 2 && watch.pid.is_some()
+        },
+        "watcher to settle after two crash restarts",
+        10_000,
+    )
+    .await;
+
+    let status = harness.supervisor.status();
+    assert_eq!(status.watch.state, "running");
+    assert_eq!(status.watch.restart_count, 2);
+    // The extension lifecycle never budged and its crash counter is separate.
+    assert_eq!(status.state, "stopped");
+    assert_eq!(status.restart_count, 0);
+    // The facet stayed `running` through every backoff broadcast.
+    let states = watch_states(&harness.ctx);
+    assert!(states.iter().all(|state| state == "running"), "{states:?}");
+
+    harness.supervisor.watch_stop().await;
+}
+
+#[tokio::test]
+async fn watch_budget_exhaustion_fails_the_facet_without_a_push() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("dist")).unwrap();
+    std::fs::write(root.path().join("dist/index.html"), "bundle").unwrap();
+    let harness = harness_with_manifest(root, fast_config(), |root| {
+        view_manifest(root, None, None, Some("exit 1"))
+    });
+
+    let (status, started) = harness.supervisor.watch_start().await.unwrap();
+    assert!(started);
+    assert_eq!(status.watch.state, "running");
+
+    wait_for(
+        || harness.supervisor.status().watch.state == "failed",
+        "watch crash budget to exhaust",
+        10_000,
+    )
+    .await;
+
+    let status = harness.supervisor.status();
+    assert_eq!(status.watch.state, "failed");
+    assert_eq!(status.watch.pid, None);
+    // No system push — a dev watcher dying is not an ops page.
+    assert!(harness.ctx.failures.lock().unwrap().is_empty());
+    // Lifecycle untouched.
+    assert_eq!(status.state, "stopped");
+
+    // Manual watch/start retries from failed.
+    let (status, started) = harness.supervisor.watch_start().await.unwrap();
+    assert!(started);
+    assert_eq!(status.watch.state, "running");
+    harness.supervisor.watch_stop().await;
+}
+
+#[tokio::test]
+async fn extension_stop_and_restart_leave_the_watcher_untouched() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("dist")).unwrap();
+    std::fs::write(root.path().join("dist/index.html"), "bundle").unwrap();
+    let harness = harness_with_manifest(root, fast_config(), |root| {
+        view_manifest(
+            root,
+            Some(ServerSpec {
+                transport: "stdio".to_string(),
+                command: env!("CARGO_BIN_EXE_remux-fixture-ext").to_string(),
+                args: Vec::new(),
+                cwd: root.to_path_buf(),
+                build: None,
+            }),
+            None,
+            Some("sleep 300"),
+        )
+    });
+
+    harness.supervisor.start(false).await;
+    let (status, _) = harness.supervisor.watch_start().await.unwrap();
+    let watch_pid = status.watch.pid.unwrap();
+    assert!(process_alive(watch_pid));
+
+    let restarted = harness.supervisor.restart(false).await;
+    assert_eq!(restarted.state, "running");
+    assert!(process_alive(watch_pid), "server restart must not kill the watcher");
+    assert_eq!(restarted.watch.state, "running");
+
+    let stopped = harness.supervisor.stop().await;
+    assert_eq!(stopped.state, "stopped");
+    assert!(process_alive(watch_pid), "server stop must not kill the watcher");
+    assert_eq!(stopped.watch.state, "running");
+
+    let (final_status, changed) = harness.supervisor.watch_stop().await;
+    assert!(changed);
+    assert_eq!(final_status.watch.state, "stopped");
+    assert!(!process_alive(watch_pid));
+}
+
+#[tokio::test]
+async fn boot_sweep_reads_v1_files_and_kills_their_groups() {
+    use std::os::unix::process::CommandExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let journal = Journal::new(root.path(), 14, Arc::new(StdTerminal)).unwrap();
+
+    let mut decoy = {
+        let mut command = std::process::Command::new("sleep");
+        command.arg("300").process_group(0);
+        command.spawn().unwrap()
+    };
+    let decoy_pid = decoy.id();
+    let decoy_ticks = read_start_ticks(decoy_pid).expect("decoy is alive");
+
+    // Hand-written v1 file: flat one-entry-per-id map, no roles.
+    let run_dir = root.path().join(".remux/run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(
+        run_dir.join("extensions.json"),
+        serde_json::json!({
+            "version": 1,
+            "extensions": {
+                "legacy": {
+                    "pid": decoy_pid,
+                    "pgid": decoy_pid,
+                    "startTicks": decoy_ticks,
+                    "startedAtMs": 0,
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    sweep_orphans(root.path(), &journal);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if decoy.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "v1 decoy survived the sweep");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!root.path().join(".remux/run/extensions.json").exists());
+}
+
+#[tokio::test]
+async fn boot_sweep_kills_orphaned_watch_role_groups() {
+    use std::os::unix::process::CommandExt;
+
+    // The `kill -9`'d-worker scenario for a live watcher: its group is
+    // recorded under the watch role and must be swept on the next boot.
+    let root = tempfile::tempdir().unwrap();
+    let journal = Journal::new(root.path(), 14, Arc::new(StdTerminal)).unwrap();
+
+    let mut watcher = {
+        let mut command = std::process::Command::new("sleep");
+        command.arg("300").process_group(0);
+        command.spawn().unwrap()
+    };
+    let watcher_pid = watcher.id();
+    let watcher_ticks = read_start_ticks(watcher_pid).expect("watcher is alive");
+
+    let run_state = RunState::new(root.path());
+    run_state.record(
+        "fixture",
+        RunRole::Watch,
+        RunEntry {
+            pid: watcher_pid,
+            pgid: watcher_pid,
+            start_ticks: watcher_ticks,
+            started_at_ms: 0,
+        },
+    );
+
+    sweep_orphans(root.path(), &journal);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if watcher.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "orphaned watcher survived the sweep");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
