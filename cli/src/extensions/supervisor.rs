@@ -482,7 +482,7 @@ impl Actor {
             return true;
         }
 
-        self.append_build_log(&format!("failed code={code:?} signal={signal:?}"));
+        self.append_build_log(&format!("failed {}", exit_summary(code, &signal)));
         self.fail_build(code, signal, "build failed");
         false
     }
@@ -652,7 +652,7 @@ impl Actor {
         self.logs.append(
             &self.extension.id,
             "lifecycle",
-            &format!("exited code={code:?} signal={signal:?}"),
+            &format!("exited {}", exit_summary(code, &signal)),
         );
 
         self.reject_pending(&format!("extension {} exited", self.extension.id));
@@ -820,7 +820,7 @@ impl Actor {
         self.logs.append(
             &self.extension.id,
             "lifecycle",
-            &format!("stopped code={code:?} signal={signal:?}"),
+            &format!("stopped {}", exit_summary(code, &signal)),
         );
         self.last_exit = Some(LastExit {
             code,
@@ -941,6 +941,16 @@ impl Actor {
 enum BuildPipe {
     Stdout(tokio::process::ChildStdout),
     Stderr(tokio::process::ChildStderr),
+}
+
+/// Exit status for user-facing log lines: `code=0`, `signal=SIGKILL`, or
+/// `status unknown` (never the raw `Option` debug form).
+fn exit_summary(code: Option<i32>, signal: &Option<String>) -> String {
+    match (signal, code) {
+        (Some(signal), _) => format!("signal={signal}"),
+        (None, Some(code)) => format!("code={code}"),
+        (None, None) => "status unknown".to_string(),
+    }
 }
 
 /// Last stderr line from an `ExtensionLogs::snapshot` array — the push

@@ -105,7 +105,6 @@ fn fast_config() -> SupervisorConfig {
 struct Harness {
     supervisor: Arc<ExtensionSupervisor>,
     ctx: Arc<TestCtx>,
-    run_state: Arc<RunState>,
     root: tempfile::TempDir,
 }
 
@@ -130,12 +129,11 @@ fn harness_with_manifest(
         ctx.clone(),
         journal,
         logs,
-        run_state.clone(),
+        run_state,
     );
     Harness {
         supervisor,
         ctx,
-        run_state,
         root,
     }
 }

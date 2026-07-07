@@ -201,13 +201,12 @@ export function ExtensionDetailSheet({
               style={styles.logScroll}
             >
               {logLines.length === 0 ? (
-                <Text style={styles.logEmpty}>No log output yet.</Text>
+                <Text style={styles.logEmpty}>
+                  No output yet — servers only log errors, builds, and lifecycle events, so quiet is healthy.
+                </Text>
               ) : (
-                logLines.map((line, index) => (
-                  <Text key={`${line.ts}:${index}`} style={styles.logLine}>
-                    <Text style={styles.logStream}>{`[${line.stream}] `}</Text>
-                    {line.line}
-                  </Text>
+                logLines.map((entry, index) => (
+                  <LogEntryLine entry={entry} key={`${entry.ts}:${index}`} />
                 ))
               )}
             </ScrollView>
@@ -220,6 +219,74 @@ export function ExtensionDetailSheet({
 
 function trimLog(lines: ExtensionLogLine[]): ExtensionLogLine[] {
   return lines.length > logRingLines ? lines.slice(lines.length - logRingLines) : lines;
+}
+
+/**
+ * One log entry: muted timestamp, colored stream tag, wrapped message.
+ * Lifecycle lines are runtime narration and render fully muted with no tag.
+ */
+function LogEntryLine({ entry }: { entry: ExtensionLogLine }) {
+  const { styles } = useSheetTheme();
+  const tag = logStreamTag(entry.stream);
+
+  return (
+    <Text selectable style={styles.logLine}>
+      <Text style={styles.logTime}>{`${formatLogTime(entry.ts)} `}</Text>
+      {tag ? <Text style={[styles.logTag, logTagStyle(styles, tag.tone)]}>{`${tag.label} `}</Text> : null}
+      <Text style={entry.stream === 'lifecycle' ? styles.logTextMuted : styles.logText}>
+        {logMessage(entry)}
+      </Text>
+    </Text>
+  );
+}
+
+type LogTagTone = 'bad' | 'build' | 'muted';
+
+function logStreamTag(stream: string): { label: string; tone: LogTagTone } | null {
+  switch (stream) {
+    case 'lifecycle':
+      return null;
+    case 'stderr':
+      return { label: 'err', tone: 'bad' };
+    case 'build':
+      return { label: 'build', tone: 'build' };
+    default:
+      return { label: stream, tone: 'muted' };
+  }
+}
+
+function logTagStyle(styles: SheetStyles, tone: LogTagTone) {
+  switch (tone) {
+    case 'bad':
+      return styles.logTagBad;
+    case 'build':
+      return styles.logTagBuild;
+    default:
+      return styles.logTagMuted;
+  }
+}
+
+// Ring build lines carry the runtime's own "[build] " prefix; the tag
+// already says it.
+function logMessage(entry: ExtensionLogLine): string {
+  return entry.stream === 'build' && entry.line.startsWith('[build] ')
+    ? entry.line.slice('[build] '.length)
+    : entry.line;
+}
+
+/** Local HH:MM:SS, with a MM-DD prefix once the entry is from another day. */
+function formatLogTime(ts: string): string {
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) {
+    return '--:--:--';
+  }
+  const pad = (value: number) => String(value).padStart(2, '0');
+  const time = `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  const now = new Date();
+  const sameDay = date.getFullYear() === now.getFullYear()
+    && date.getMonth() === now.getMonth()
+    && date.getDate() === now.getDate();
+  return sameDay ? time : `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${time}`;
 }
 
 function StatusRow({ label, value }: { label: string; value: string }) {
@@ -431,10 +498,10 @@ function createStyles(theme: RemuxTheme) {
       padding: 12,
     },
     logLine: {
-      color: theme.text,
       fontFamily: 'Menlo',
       fontSize: 11,
-      lineHeight: 16,
+      lineHeight: 17,
+      marginBottom: 2,
     },
     logPanel: {
       backgroundColor: theme.surface,
@@ -450,8 +517,26 @@ function createStyles(theme: RemuxTheme) {
       paddingHorizontal: 12,
       paddingVertical: 8,
     },
-    logStream: {
+    logTag: {
+      fontWeight: '700',
+    },
+    logTagBad: {
+      color: theme.danger,
+    },
+    logTagBuild: {
+      color: theme.focusRing,
+    },
+    logTagMuted: {
       color: theme.textMuted,
+    },
+    logText: {
+      color: theme.text,
+    },
+    logTextMuted: {
+      color: theme.textMuted,
+    },
+    logTime: {
+      color: alpha(theme.textMuted, 0.8),
     },
     logsTitle: {
       color: theme.text,
