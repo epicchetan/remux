@@ -1,7 +1,7 @@
 # CLI Rust Port — Pass 2 Implementation Spec
 
-Status: Active Spec
-Last verified: 2026-07-06
+Status: Implemented
+Last verified: 2026-07-07
 Canonical code: `cli/` (Rust runtime crate), `extensions/{codex,terminal}/remux-extension.json`, `app/src/settings/`, `app/src/notifications/`
 
 Parent: [cli-rust-port.md](cli-rust-port.md) (audit + roadmap). Predecessor: [cli-rust-port-pass-1.md](cli-rust-port-pass-1.md) (Implemented — L1 supervisor, L2 crash containment, EOF-first stop, per-extension logs, journal, chaos suite, Node CLI deleted).
