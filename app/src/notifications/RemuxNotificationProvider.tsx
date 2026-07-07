@@ -193,7 +193,20 @@ export function RemuxNotificationProvider({ children }: { children: ReactNode })
     }
     handledNotificationResponsesRef.current.add(responseId);
 
-    const intent = parseNotificationIntentFromData(response.notification.request.content.data);
+    // System pushes (runtime operational alerts) have no tab target — they
+    // open the Settings surface.
+    const data = response.notification.request.content.data;
+    if (isRecord(data) && data.kind === 'system') {
+      useBrowserStore.getState().openOverview('settings');
+      Notifications.clearLastNotificationResponse();
+      logRemuxDebug('notifications:response:system', {
+        extensionId: optionalString(data.extensionId),
+        reason: optionalString(data.reason),
+      });
+      return;
+    }
+
+    const intent = parseNotificationIntentFromData(data);
     if (!intent) {
       logRemuxDebug('notifications:response:invalid', { responseId });
       return;

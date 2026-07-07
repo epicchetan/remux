@@ -24,17 +24,29 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { getBottomBarHeight, tabGridGap, tabGridHorizontalPadding } from '../browser/browserLayout';
 import { useBrowserStore } from '../browser/browserStore';
-import { useRemuxConnection } from '../remote/RemuxConnectionProvider';
+import { useRemuxConnection, type RemuxConnection } from '../remote/RemuxConnectionProvider';
 import { themedIconUrl } from '../remote/remuxExtensions';
 import { useRemuxSettingsStore } from '../remote/remuxSettingsStore';
 import { alpha, useTheme, type RemuxTheme } from '../theme/ThemeProvider';
+import { ExtensionDetailSheet, StateBadge, type ExtensionDetailAction } from './ExtensionDetailSheet';
 import {
+  extensionDidChangeStatusMethod,
+  parseExtensionServerStatus,
   readExtensionServerStatuses,
   restartExtensionServer,
   setExtensionServerRunning,
   type ExtensionServerStatus,
 } from './extensionServerApi';
+import { formatBytes, formatDurationMs, formatLastExit, formatUptime, serverStateLabel } from './formatters';
 import { restartRemuxCli } from './remuxSystemApi';
+import {
+  parseSystemResourcesSample,
+  readSystemResources,
+  subscribeSystemResources,
+  systemResourcesDidSampleMethod,
+  unsubscribeSystemResources,
+  type SystemResourcesSample,
+} from './systemResourcesApi';
 
 export function SettingsOverview() {
   const catalogError = useBrowserStore((state) => state.catalogError);
@@ -55,6 +67,10 @@ export function SettingsOverview() {
   const [restartingExtensionId, setRestartingExtensionId] = useState<string | null>(null);
   const [restartingRemux, setRestartingRemux] = useState(false);
   const [togglingExtensionId, setTogglingExtensionId] = useState<string | null>(null);
+  const [detailExtensionId, setDetailExtensionId] = useState<string | null>(null);
+  const [detailBusyAction, setDetailBusyAction] = useState<ExtensionDetailAction | null>(null);
+  const resources = useSystemResources(connection);
+  const nowMinuteMs = useMinuteTick();
   const [draftHost, setDraftHost] = useState(host);
   const [draftPort, setDraftPort] = useState(String(port));
   const [actionError, setActionError] = useState<string | null>(null);
@@ -129,6 +145,22 @@ export function SettingsOverview() {
     void refreshServerStatuses();
   }, [extensions.length, refreshServerStatuses]);
 
+  // Live states: merge `didChangeStatus` broadcasts so crash → backingOff →
+  // running is visible without a manual refresh.
+  useEffect(() => connection.subscribe((message) => {
+    if (message.method !== extensionDidChangeStatusMethod) {
+      return;
+    }
+    const status = parseExtensionServerStatus(message.params);
+    if (!status) {
+      return;
+    }
+    setExtensionStatuses((current) => ({
+      ...current,
+      [status.extensionId]: status,
+    }));
+  }), [connection]);
+
   const restartExtension = async (extensionId: string) => {
     setActionError(null);
     setExtensionStatusError(null);
@@ -164,6 +196,28 @@ export function SettingsOverview() {
       setExtensionStatusError(error instanceof Error ? error.message : String(error));
     } finally {
       setTogglingExtensionId(null);
+    }
+  };
+
+  const runDetailAction = async (extensionId: string, action: ExtensionDetailAction) => {
+    setActionError(null);
+    setExtensionStatusError(null);
+    setDetailBusyAction(action);
+    try {
+      const status = action === 'restart' || action === 'rebuild'
+        ? await restartExtensionServer(connection.request, extensionId, { rebuild: action === 'rebuild' })
+        : await setExtensionServerRunning(connection.request, extensionId, action === 'start');
+      setExtensionStatuses((current) => ({
+        ...current,
+        [extensionId]: status,
+      }));
+      if (status.running) {
+        reloadExtensionTabs(extensionId);
+      }
+    } catch (error) {
+      setExtensionStatusError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDetailBusyAction(null);
     }
   };
 
@@ -269,6 +323,8 @@ export function SettingsOverview() {
                 iconUrl={extension.display.iconUrl}
                 key={extension.id}
                 name={extension.display.title}
+                nowMs={nowMinuteMs}
+                onOpenDetails={() => setDetailExtensionId(extension.id)}
                 onRestart={() => restartExtension(extension.id)}
                 onToggle={(running) => toggleExtension(extension.id, running)}
                 restarting={restartingExtensionId === extension.id}
@@ -281,6 +337,8 @@ export function SettingsOverview() {
             ) : null}
           </View>
         </Section>
+
+        {resources ? <SystemSection sample={resources} /> : null}
 
         <Section title="Updates">
           <View style={styles.infoList}>
@@ -309,7 +367,114 @@ export function SettingsOverview() {
           {updateError ? <Text style={styles.errorText}>{updateError}</Text> : null}
         </Section>
       </ScrollView>
+
+      <ExtensionDetailSheet
+        busyAction={detailBusyAction}
+        name={extensions.find((extension) => extension.id === detailExtensionId)?.display.title ?? detailExtensionId ?? ''}
+        onAction={(action) => {
+          if (detailExtensionId) {
+            void runDetailAction(detailExtensionId, action);
+          }
+        }}
+        onClose={() => setDetailExtensionId(null)}
+        resources={resources?.extensions.find((entry) => entry.extensionId === detailExtensionId) ?? null}
+        status={detailExtensionId ? extensionStatuses[detailExtensionId] ?? null : null}
+        visible={detailExtensionId !== null}
+      />
     </View>
+  );
+}
+
+/**
+ * Sampler feed, alive exactly while Settings is mounted (the overview
+ * unmounts this surface when it is not visible). `null` against a pass-1
+ * runtime — the System section hides.
+ */
+function useSystemResources(connection: RemuxConnection) {
+  const [sample, setSample] = useState<SystemResourcesSample | null>(null);
+  const connected = connection.status.type === 'connected';
+
+  useEffect(() => {
+    if (!connected) {
+      setSample(null);
+      return undefined;
+    }
+
+    let cancelled = false;
+    let subscribed = false;
+    void (async () => {
+      try {
+        const snapshot = await readSystemResources(connection.request);
+        if (cancelled || !snapshot) {
+          return; // Unsupported runtime — leave the section hidden.
+        }
+        setSample(snapshot);
+        await subscribeSystemResources(connection.request);
+        subscribed = true;
+      } catch {
+        // Snapshot/subscribe failure just leaves the section static/hidden.
+      }
+    })();
+
+    const unsubscribeMessages = connection.subscribe((message) => {
+      if (message.method !== systemResourcesDidSampleMethod) {
+        return;
+      }
+      const next = parseSystemResourcesSample(message.params);
+      if (next) {
+        setSample(next);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      unsubscribeMessages();
+      if (subscribed) {
+        void unsubscribeSystemResources(connection.request).catch(() => undefined);
+      }
+    };
+  }, [connected, connection]);
+
+  return sample;
+}
+
+/** Minute-granularity clock for the row uptime labels. */
+function useMinuteTick() {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  useEffect(() => {
+    const timer = setInterval(() => setNowMs(Date.now()), 30_000);
+    return () => clearInterval(timer);
+  }, []);
+
+  return nowMs;
+}
+
+function SystemSection({ sample }: { sample: SystemResourcesSample }) {
+  const { styles } = useSettingsTheme();
+  const memUsed = Math.max(0, sample.system.memTotalBytes - sample.system.memAvailableBytes);
+
+  return (
+    <Section title="System">
+      <View style={styles.infoList}>
+        <InfoRow
+          label="Load"
+          value={`${sample.system.load1.toFixed(2)} · ${sample.system.load5.toFixed(2)} · ${sample.system.load15.toFixed(2)}`}
+        />
+        <InfoRow
+          label="Memory"
+          value={`${formatBytes(memUsed)} of ${formatBytes(sample.system.memTotalBytes)}`}
+        />
+        <InfoRow
+          label="Disk free"
+          value={`${formatBytes(sample.system.diskFreeBytes)} of ${formatBytes(sample.system.diskTotalBytes)}`}
+        />
+        <InfoRow
+          label="Runtime"
+          value={`${sample.runtime.cpuPercent.toFixed(1)}% CPU · ${formatBytes(sample.runtime.rssBytes)} · up ${formatDurationMs(sample.runtime.uptimeMs)}`}
+        />
+      </View>
+    </Section>
   );
 }
 
@@ -407,6 +572,8 @@ function ExtensionRow({
   iconDarkUrl,
   iconUrl,
   name,
+  nowMs,
+  onOpenDetails,
   onRestart,
   onToggle,
   restarting,
@@ -416,6 +583,8 @@ function ExtensionRow({
   iconDarkUrl: string | null;
   iconUrl: string | null;
   name: string;
+  nowMs: number;
+  onOpenDetails: () => void;
   onRestart: () => void;
   onToggle: (running: boolean) => void;
   restarting: boolean;
@@ -431,23 +600,34 @@ function ExtensionRow({
 
   return (
     <View style={styles.extensionRow}>
-      <View style={styles.extensionIconFrame}>
-        {themedUrl && !imageFailed ? (
-          <Image
-            accessibilityIgnoresInvertColors
-            onError={() => setImageFailed(true)}
-            resizeMode="contain"
-            source={{ uri: themedUrl }}
-            style={styles.extensionIcon}
-          />
-        ) : (
-          <Text style={styles.extensionFallback}>{name.slice(0, 1)}</Text>
-        )}
-      </View>
-      <View style={styles.extensionText}>
-        <Text numberOfLines={1} style={styles.extensionName}>{name}</Text>
-        <Text style={styles.extensionMeta}>{serverStatusText(status)}</Text>
-      </View>
+      <Pressable
+        accessibilityLabel={`${name} server details`}
+        accessibilityRole="button"
+        disabled={!hasServer}
+        onPress={onOpenDetails}
+        style={({ pressed }) => [styles.extensionRowMain, pressed && hasServer ? styles.extensionRowPressed : null]}
+      >
+        <View style={styles.extensionIconFrame}>
+          {themedUrl && !imageFailed ? (
+            <Image
+              accessibilityIgnoresInvertColors
+              onError={() => setImageFailed(true)}
+              resizeMode="contain"
+              source={{ uri: themedUrl }}
+              style={styles.extensionIcon}
+            />
+          ) : (
+            <Text style={styles.extensionFallback}>{name.slice(0, 1)}</Text>
+          )}
+        </View>
+        <View style={styles.extensionText}>
+          <View style={styles.extensionNameRow}>
+            <Text numberOfLines={1} style={styles.extensionName}>{name}</Text>
+            {status ? <StateBadge state={status.state} /> : null}
+          </View>
+          <Text numberOfLines={1} style={styles.extensionMeta}>{serverStatusText(status, nowMs)}</Text>
+        </View>
+      </Pressable>
       {hasServer ? (
         <View style={styles.extensionActions}>
           {toggling ? (
@@ -476,12 +656,26 @@ function ExtensionRow({
   );
 }
 
-function serverStatusText(status: ExtensionServerStatus | null) {
+function serverStatusText(status: ExtensionServerStatus | null, nowMs: number) {
   if (!status) {
     return 'No server extension';
   }
 
-  return status.running ? 'Running' : 'Stopped';
+  const parts: string[] = [serverStateLabel(status.state)];
+  const uptime = status.running ? formatUptime(status.startedAtMs, nowMs) : null;
+  if (uptime) {
+    parts.push(uptime);
+  }
+  if (status.state === 'failed') {
+    const lastExit = formatLastExit(status.lastExit);
+    if (lastExit) {
+      parts.push(lastExit);
+    }
+  }
+  if (status.restartCount > 0) {
+    parts.push(`${status.restartCount} ${status.restartCount === 1 ? 'restart' : 'restarts'}`);
+  }
+  return parts.join(' · ');
 }
 
 function statusLabel(status: string) {
@@ -702,6 +896,20 @@ function createStyles(theme: RemuxTheme) {
     flexDirection: 'row',
     gap: 12,
     minHeight: 56,
+  },
+  extensionRowMain: {
+    alignItems: 'center',
+    flex: 1,
+    flexDirection: 'row',
+    gap: 12,
+  },
+  extensionRowPressed: {
+    opacity: 0.72,
+  },
+  extensionNameRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 8,
   },
   extensionText: {
     flex: 1,
