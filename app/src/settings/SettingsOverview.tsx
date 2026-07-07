@@ -1,4 +1,5 @@
 import {
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -50,31 +51,16 @@ import {
 export function SettingsOverview() {
   const catalogError = useBrowserStore((state) => state.catalogError);
   const extensions = useBrowserStore((state) => state.extensions);
-  const loadExtensions = useBrowserStore((state) => state.loadExtensions);
   const reloadExtensionTabs = useBrowserStore((state) => state.reloadExtensionTabs);
   const connection = useRemuxConnection();
   const insets = useSafeAreaInsets();
-  const host = useRemuxSettingsStore((state) => state.host);
-  const loadSettings = useRemuxSettingsStore((state) => state.loadSettings);
-  const port = useRemuxSettingsStore((state) => state.port);
-  const saveSettings = useRemuxSettingsStore((state) => state.saveSettings);
-  const settingsError = useRemuxSettingsStore((state) => state.error);
-  const settingsStatus = useRemuxSettingsStore((state) => state.status);
-  const token = useRemuxSettingsStore((state) => state.token);
   const [extensionStatuses, setExtensionStatuses] = useState<Record<string, ExtensionServerStatus>>({});
   const [extensionStatusError, setExtensionStatusError] = useState<string | null>(null);
   const [extensionStatusLoading, setExtensionStatusLoading] = useState(false);
-  const [restartingRemux, setRestartingRemux] = useState(false);
   const [detailExtensionId, setDetailExtensionId] = useState<string | null>(null);
   const [detailBusyAction, setDetailBusyAction] = useState<ExtensionDetailAction | null>(null);
   const resources = useSystemResources(connection);
   const nowMinuteMs = useMinuteTick();
-  const [draftHost, setDraftHost] = useState(host);
-  const [draftPort, setDraftPort] = useState(String(port));
-  const [draftToken, setDraftToken] = useState(token);
-  const [showToken, setShowToken] = useState(false);
-  const [actionError, setActionError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
   const bottomPadding = getBottomBarHeight(insets.bottom) + tabGridGap;
   const { styles, theme } = useSettingsTheme();
   const { availableUpdate, currentlyRunning, isUpdatePending } = Updates.useUpdates();
@@ -82,48 +68,6 @@ export function SettingsOverview() {
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
   const [updateError, setUpdateError] = useState<string | null>(null);
   const updateInfo = useMemo(() => deployedUpdateInfo(currentlyRunning), [currentlyRunning]);
-
-  useEffect(() => {
-    void loadSettings();
-  }, [loadSettings]);
-
-  useEffect(() => {
-    setDraftHost(host);
-    setDraftPort(String(port));
-    setDraftToken(token);
-  }, [host, port, token]);
-
-  const saveAndReconnect = async () => {
-    setActionError(null);
-    setSaving(true);
-    try {
-      await saveSettings({
-        host: draftHost,
-        port: draftPort,
-        token: draftToken,
-      });
-      await loadExtensions({ force: true });
-    } catch (error) {
-      setActionError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const restartRemux = async () => {
-    setActionError(null);
-    setRestartingRemux(true);
-    try {
-      const result = await restartRemuxCli(connection.request);
-      if (!result.restartable) {
-        throw new Error('Remux CLI restart is unavailable');
-      }
-    } catch (error) {
-      setActionError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setRestartingRemux(false);
-    }
-  };
 
   const refreshServerStatuses = useCallback(async () => {
     if (connection.status.type !== 'connected') {
@@ -164,7 +108,6 @@ export function SettingsOverview() {
   }), [connection]);
 
   const runDetailAction = async (extensionId: string, action: ExtensionDetailAction) => {
-    setActionError(null);
     setExtensionStatusError(null);
     setDetailBusyAction(action);
     try {
@@ -233,55 +176,7 @@ export function SettingsOverview() {
           <ConnectionPill status={connection.status.type} />
         </View>
 
-        <Section title="Connection">
-          <View style={styles.fieldGroup}>
-            <LabeledInput
-              autoCapitalize="none"
-              autoCorrect={false}
-              label="Host"
-              onChangeText={setDraftHost}
-              placeholder="100.65.220.71"
-              value={draftHost}
-            />
-            <LabeledInput
-              keyboardType="number-pad"
-              label="Port"
-              onChangeText={setDraftPort}
-              placeholder="48123"
-              value={draftPort}
-            />
-            <LabeledInput
-              autoCapitalize="none"
-              autoCorrect={false}
-              label="Token"
-              onChangeText={setDraftToken}
-              placeholder="run: remux token"
-              secureTextEntry={!showToken}
-              value={draftToken}
-            />
-          </View>
-          <Pressable hitSlop={8} onPress={() => setShowToken((visible) => !visible)}>
-            <Text style={styles.tokenToggle}>{showToken ? 'Hide token' : 'Show token'}</Text>
-          </Pressable>
-          <View style={styles.actionRow}>
-            <SettingsButton
-              disabled={saving || settingsStatus === 'saving'}
-              label={saving || settingsStatus === 'saving' ? 'Saving' : 'Save & Reconnect'}
-              loading={saving || settingsStatus === 'saving'}
-              onPress={saveAndReconnect}
-              variant="primary"
-            />
-            <SettingsButton
-              disabled={connection.status.type !== 'connected' || restartingRemux}
-              label={restartingRemux ? 'Restarting' : 'Restart Remux'}
-              loading={restartingRemux}
-              onPress={restartRemux}
-            />
-          </View>
-          {connection.error ? <Text style={styles.errorText}>{connection.error}</Text> : null}
-          {settingsError ? <Text style={styles.errorText}>{settingsError}</Text> : null}
-          {actionError ? <Text style={styles.errorText}>{actionError}</Text> : null}
-        </Section>
+        <ConnectionSection />
 
         <Section title="Extensions">
           {catalogError ? <Text style={styles.errorText}>{catalogError}</Text> : null}
@@ -295,12 +190,13 @@ export function SettingsOverview() {
           <View style={styles.extensionList}>
             {extensions.map((extension) => (
               <ExtensionRow
+                extensionId={extension.id}
                 iconDarkUrl={extension.display.iconDarkUrl}
                 iconUrl={extension.display.iconUrl}
                 key={extension.id}
                 name={extension.display.title}
                 nowMs={nowMinuteMs}
-                onOpenDetails={() => setDetailExtensionId(extension.id)}
+                onOpenDetails={setDetailExtensionId}
                 status={extensionStatuses[extension.id] ?? null}
               />
             ))}
@@ -356,6 +252,128 @@ export function SettingsOverview() {
     </View>
   );
 }
+
+/**
+ * Memoized with no props so the overview's periodic re-renders (5s resource
+ * samples, 30s uptime ticks) never reach these inputs: iOS visibly flashes a
+ * focused controlled `secureTextEntry` field every time its value is re-set.
+ */
+const ConnectionSection = memo(function ConnectionSection() {
+  const { styles } = useSettingsTheme();
+  const connection = useRemuxConnection();
+  const loadExtensions = useBrowserStore((state) => state.loadExtensions);
+  const host = useRemuxSettingsStore((state) => state.host);
+  const loadSettings = useRemuxSettingsStore((state) => state.loadSettings);
+  const port = useRemuxSettingsStore((state) => state.port);
+  const saveSettings = useRemuxSettingsStore((state) => state.saveSettings);
+  const settingsError = useRemuxSettingsStore((state) => state.error);
+  const settingsStatus = useRemuxSettingsStore((state) => state.status);
+  const token = useRemuxSettingsStore((state) => state.token);
+  const [draftHost, setDraftHost] = useState(host);
+  const [draftPort, setDraftPort] = useState(String(port));
+  const [draftToken, setDraftToken] = useState(token);
+  const [showToken, setShowToken] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [restartingRemux, setRestartingRemux] = useState(false);
+
+  useEffect(() => {
+    void loadSettings();
+  }, [loadSettings]);
+
+  useEffect(() => {
+    setDraftHost(host);
+    setDraftPort(String(port));
+    setDraftToken(token);
+  }, [host, port, token]);
+
+  const saveAndReconnect = async () => {
+    setActionError(null);
+    setSaving(true);
+    try {
+      await saveSettings({
+        host: draftHost,
+        port: draftPort,
+        token: draftToken,
+      });
+      await loadExtensions({ force: true });
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const restartRemux = async () => {
+    setActionError(null);
+    setRestartingRemux(true);
+    try {
+      const result = await restartRemuxCli(connection.request);
+      if (!result.restartable) {
+        throw new Error('Remux CLI restart is unavailable');
+      }
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRestartingRemux(false);
+    }
+  };
+
+  return (
+    <Section title="Connection">
+      <View style={styles.fieldGroup}>
+        <LabeledInput
+          autoCapitalize="none"
+          autoCorrect={false}
+          label="Host"
+          onChangeText={setDraftHost}
+          placeholder="100.65.220.71"
+          value={draftHost}
+        />
+        <LabeledInput
+          keyboardType="number-pad"
+          label="Port"
+          onChangeText={setDraftPort}
+          placeholder="48123"
+          value={draftPort}
+        />
+        {/* textContentType="none" keeps iOS password AutoFill (and its focus flash) off this field. */}
+        <LabeledInput
+          autoCapitalize="none"
+          autoComplete="off"
+          autoCorrect={false}
+          label="Token"
+          onChangeText={setDraftToken}
+          placeholder="run: remux token"
+          secureTextEntry={!showToken}
+          textContentType="none"
+          value={draftToken}
+        />
+      </View>
+      <Pressable hitSlop={8} onPress={() => setShowToken((visible) => !visible)}>
+        <Text style={styles.tokenToggle}>{showToken ? 'Hide token' : 'Show token'}</Text>
+      </Pressable>
+      <View style={styles.actionRow}>
+        <SettingsButton
+          disabled={saving || settingsStatus === 'saving'}
+          label={saving || settingsStatus === 'saving' ? 'Saving' : 'Save & Reconnect'}
+          loading={saving || settingsStatus === 'saving'}
+          onPress={saveAndReconnect}
+          variant="primary"
+        />
+        <SettingsButton
+          disabled={connection.status.type !== 'connected' || restartingRemux}
+          label={restartingRemux ? 'Restarting' : 'Restart Remux'}
+          loading={restartingRemux}
+          onPress={restartRemux}
+        />
+      </View>
+      {connection.error ? <Text style={styles.errorText}>{connection.error}</Text> : null}
+      {settingsError ? <Text style={styles.errorText}>{settingsError}</Text> : null}
+      {actionError ? <Text style={styles.errorText}>{actionError}</Text> : null}
+    </Section>
+  );
+});
 
 /**
  * Sampler feed, alive exactly while Settings is mounted (the overview
@@ -540,7 +558,8 @@ function SettingsButton({
   );
 }
 
-function ExtensionRow({
+const ExtensionRow = memo(function ExtensionRow({
+  extensionId,
   iconDarkUrl,
   iconUrl,
   name,
@@ -548,11 +567,12 @@ function ExtensionRow({
   onOpenDetails,
   status,
 }: {
+  extensionId: string;
   iconDarkUrl: string | null;
   iconUrl: string | null;
   name: string;
   nowMs: number;
-  onOpenDetails: () => void;
+  onOpenDetails: (extensionId: string) => void;
   status: ExtensionServerStatus | null;
 }) {
   const { styles, theme } = useSettingsTheme();
@@ -565,7 +585,7 @@ function ExtensionRow({
       accessibilityLabel={`${name} server details`}
       accessibilityRole="button"
       disabled={!hasServer}
-      onPress={onOpenDetails}
+      onPress={() => onOpenDetails(extensionId)}
       style={({ pressed }) => [styles.extensionRow, pressed && hasServer ? styles.extensionRowPressed : null]}
     >
       <View style={styles.extensionIconFrame}>
@@ -591,7 +611,7 @@ function ExtensionRow({
       {hasServer ? <Text style={styles.extensionChevron}>›</Text> : null}
     </Pressable>
   );
-}
+});
 
 function StateDot({ state }: { state: ExtensionServerStatus['state'] }) {
   const { styles, theme } = useSettingsTheme();

@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { BottomSheet, Group, Host, RNHostView } from '@expo/ui/swift-ui';
+import { presentationDragIndicator } from '@expo/ui/swift-ui/modifiers';
 import {
   ActivityIndicator,
-  Modal,
   Pressable,
   ScrollView,
   StyleSheet,
   Text,
   View,
+  useWindowDimensions,
   type NativeScrollEvent,
   type NativeSyntheticEvent,
 } from 'react-native';
@@ -56,6 +58,7 @@ export function ExtensionDetailSheet({
 }) {
   const { styles, theme } = useSheetTheme();
   const insets = useSafeAreaInsets();
+  const { width: windowWidth } = useWindowDimensions();
   const connection = useRemuxConnection();
   const extensionId = status?.extensionId ?? null;
   const [logLines, setLogLines] = useState<ExtensionLogLine[]>([]);
@@ -138,82 +141,97 @@ export function ExtensionDetailSheet({
     ? `${resources.cpuPercent.toFixed(1)}% CPU · ${formatBytes(resources.rssBytes)} · ${resources.processCount} ${resources.processCount === 1 ? 'process' : 'processes'}`
     : null;
 
+  // Native SwiftUI sheet: system detents, drag indicator, dimming, and the
+  // liquid-glass chrome all come from UIKit. The RN content is hosted inside
+  // via RNHostView; Yoga lays that subtree out against the zero-size sheet
+  // anchor, so the width must be explicit — RNHostView (matchContents) then
+  // reports the resulting size to SwiftUI and fitToContents sizes the detent.
   return (
-    <Modal animationType="slide" onRequestClose={onClose} transparent visible={visible}>
-      <View style={styles.backdropContainer}>
-        <Pressable accessibilityLabel="Close extension details" onPress={onClose} style={styles.backdrop} />
-        <View style={[styles.sheet, { paddingBottom: Math.max(insets.bottom, 16) }]}>
-          <View style={styles.grabber} />
-          <View style={styles.headerRow}>
-            <Text numberOfLines={1} style={styles.title}>{name}</Text>
-            <StateBadge state={state} />
-          </View>
+    <Host style={styles.anchor}>
+      <BottomSheet
+        fitToContents
+        isPresented={visible}
+        onIsPresentedChange={(isPresented) => {
+          if (!isPresented) {
+            onClose();
+          }
+        }}
+      >
+        <Group modifiers={[presentationDragIndicator('visible')]}>
+          <RNHostView matchContents>
+            <View style={[styles.sheet, { paddingBottom: Math.max(insets.bottom, 16), width: windowWidth }]}>
+              <View style={styles.headerRow}>
+                <Text numberOfLines={1} style={styles.title}>{name}</Text>
+                <StateBadge state={state} />
+              </View>
 
-          <View style={styles.statusBlock}>
-            <StatusRow label="State" value={serverStateLabel(state)} />
-            <StatusRow label="PID" value={status?.pid !== null && status?.pid !== undefined ? String(status.pid) : '—'} />
-            <StatusRow label="Uptime" value={uptime ?? '—'} />
-            <StatusRow label="Restarts" value={String(status?.restartCount ?? 0)} />
-            <StatusRow label="Last exit" value={lastExit ?? '—'} />
-            {resourceText ? <StatusRow label="Resources" value={resourceText} /> : null}
-          </View>
+              <View style={styles.statusBlock}>
+                <StatusRow label="State" value={serverStateLabel(state)} />
+                <StatusRow label="PID" value={status?.pid !== null && status?.pid !== undefined ? String(status.pid) : '—'} />
+                <StatusRow label="Uptime" value={uptime ?? '—'} />
+                <StatusRow label="Restarts" value={String(status?.restartCount ?? 0)} />
+                <StatusRow label="Last exit" value={lastExit ?? '—'} />
+                {resourceText ? <StatusRow label="Resources" value={resourceText} /> : null}
+              </View>
 
-          <View style={styles.actionsRow}>
-            {status?.running ? (
-              <SheetButton
-                busy={busyAction === 'stop'}
-                disabled={busy}
-                label="Stop"
-                onPress={() => onAction('stop')}
-              />
-            ) : (
-              <SheetButton
-                busy={busyAction === 'start'}
-                disabled={busy}
-                label="Start"
-                onPress={() => onAction('start')}
-              />
-            )}
-            <SheetButton
-              busy={busyAction === 'restart'}
-              disabled={busy || !status?.running}
-              label="Restart"
-              onPress={() => onAction('restart')}
-            />
-            {status?.hasBuild ? (
-              <SheetButton
-                busy={busyAction === 'rebuild'}
-                disabled={busy}
-                label={busyAction === 'rebuild' ? 'Rebuilding' : 'Rebuild & Restart'}
-                onPress={() => onAction('rebuild')}
-                variant="primary"
-              />
-            ) : null}
-          </View>
+              <View style={styles.actionsRow}>
+                {status?.running ? (
+                  <SheetButton
+                    busy={busyAction === 'stop'}
+                    disabled={busy}
+                    label="Stop"
+                    onPress={() => onAction('stop')}
+                  />
+                ) : (
+                  <SheetButton
+                    busy={busyAction === 'start'}
+                    disabled={busy}
+                    label="Start"
+                    onPress={() => onAction('start')}
+                  />
+                )}
+                <SheetButton
+                  busy={busyAction === 'restart'}
+                  disabled={busy || !status?.running}
+                  label="Restart"
+                  onPress={() => onAction('restart')}
+                />
+                {status?.hasBuild ? (
+                  <SheetButton
+                    busy={busyAction === 'rebuild'}
+                    disabled={busy}
+                    label={busyAction === 'rebuild' ? 'Rebuilding' : 'Rebuild & Restart'}
+                    onPress={() => onAction('rebuild')}
+                    variant="primary"
+                  />
+                ) : null}
+              </View>
 
-          <Text style={styles.logsTitle}>Logs</Text>
-          {logsError ? <Text style={styles.errorText}>{logsError}</Text> : null}
-          <View style={styles.logPanel}>
-            <ScrollView
-              onScroll={onLogScroll}
-              ref={logScrollRef}
-              scrollEventThrottle={64}
-              style={styles.logScroll}
-            >
-              {logLines.length === 0 ? (
-                <Text style={styles.logEmpty}>
-                  No output yet — servers only log errors, builds, and lifecycle events, so quiet is healthy.
-                </Text>
-              ) : (
-                logLines.map((entry, index) => (
-                  <LogEntryLine entry={entry} key={`${entry.ts}:${index}`} />
-                ))
-              )}
-            </ScrollView>
-          </View>
-        </View>
-      </View>
-    </Modal>
+              <Text style={styles.logsTitle}>Logs</Text>
+              {logsError ? <Text style={styles.errorText}>{logsError}</Text> : null}
+              <View style={styles.logPanel}>
+                <ScrollView
+                  onScroll={onLogScroll}
+                  ref={logScrollRef}
+                  scrollEventThrottle={64}
+                  style={styles.logScroll}
+                >
+                  {logLines.length === 0 ? (
+                    <Text style={styles.logEmpty}>
+                      No output yet — servers only log errors, builds, and lifecycle events, so quiet is healthy.
+                    </Text>
+                  ) : (
+                    logLines.map((entry, index) => (
+                      <LogEntryLine entry={entry} key={`${entry.ts}:${index}`} />
+                    ))
+                  )}
+                </ScrollView>
+              </View>
+            </View>
+          </RNHostView>
+        </Group>
+      </BottomSheet>
+    </Host>
   );
 }
 
@@ -388,17 +406,10 @@ function createStyles(theme: RemuxTheme) {
       gap: 10,
       marginTop: 14,
     },
-    backdrop: {
-      backgroundColor: alpha('#000000', theme.isDark ? 0.55 : 0.35),
-      bottom: 0,
-      left: 0,
+    anchor: {
+      height: 0,
       position: 'absolute',
-      right: 0,
-      top: 0,
-    },
-    backdropContainer: {
-      flex: 1,
-      justifyContent: 'flex-end',
+      width: 0,
     },
     badge: {
       alignItems: 'center',
@@ -477,14 +488,6 @@ function createStyles(theme: RemuxTheme) {
       lineHeight: 17,
       marginTop: 6,
     },
-    grabber: {
-      alignSelf: 'center',
-      backgroundColor: theme.border,
-      borderRadius: 3,
-      height: 5,
-      marginBottom: 12,
-      width: 40,
-    },
     headerRow: {
       alignItems: 'center',
       flexDirection: 'row',
@@ -551,15 +554,11 @@ function createStyles(theme: RemuxTheme) {
       backgroundColor: alpha(theme.focusRing, 0.16),
       borderColor: theme.focusRing,
     },
+    // Background, corner radius, and grabber belong to the native sheet;
+    // painting over them would cover the system glass.
     sheet: {
-      backgroundColor: theme.surfaceRaised,
-      borderColor: theme.border,
-      borderTopLeftRadius: 24,
-      borderTopRightRadius: 24,
-      borderWidth: 1,
-      maxHeight: '88%',
       paddingHorizontal: 18,
-      paddingTop: 10,
+      paddingTop: 20,
     },
     statusBlock: {
       gap: 8,
