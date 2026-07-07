@@ -8,7 +8,12 @@ use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
+
+/// Fixed token injected via `REMUX_AUTH_TOKEN` so the harness never depends
+/// on the generated `.remux/auth-token` file.
+const E2E_TOKEN: &str = "e2e-test-token-e2e-test-token-e2e-test-token-e2e-test-token-0123";
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -100,6 +105,7 @@ impl Runtime {
             .env_remove("REMUX_EXTENSION_ROOTS")
             .env("REMUX_HOST", "127.0.0.1")
             .env("REMUX_PORT", port.to_string())
+            .env("REMUX_AUTH_TOKEN", E2E_TOKEN)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -174,10 +180,25 @@ type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn ws_connect(port: u16) -> Ws {
-    let (socket, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
-        .await
+    let mut request = format!("ws://127.0.0.1:{port}/ws")
+        .into_client_request()
         .unwrap();
+    request.headers_mut().insert(
+        "authorization",
+        format!("Bearer {E2E_TOKEN}").parse().unwrap(),
+    );
+    let (socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
     socket
+}
+
+/// Authenticated GET against the runtime.
+async fn http_get(url: String) -> reqwest::Response {
+    reqwest::Client::new()
+        .get(url)
+        .header("authorization", format!("Bearer {E2E_TOKEN}"))
+        .send()
+        .await
+        .unwrap()
 }
 
 async fn ws_request(socket: &mut Ws, id: u64, method: &str, params: Option<Value>) -> Value {
@@ -216,18 +237,25 @@ async fn boots_serves_catalog_and_runs_the_fixture_extension() {
         json!({ "ok": true, "defaultExtension": "fixture", "service": "remux" })
     );
 
-    let catalog: Value = reqwest::get(format!("{}/remux/extensions", runtime.base_url()))
+    // Auth is enforced end-to-end: unauthenticated HTTP 401s and the
+    // unauthenticated WS handshake is refused before upgrade.
+    let unauthenticated = reqwest::get(format!("{}/remux/extensions", runtime.base_url()))
         .await
-        .unwrap()
+        .unwrap();
+    assert_eq!(unauthenticated.status(), 401);
+    let refused =
+        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/ws", runtime.port)).await;
+    assert!(refused.is_err(), "unauthenticated ws connect must fail");
+
+    let catalog: Value = http_get(format!("{}/remux/extensions", runtime.base_url()))
+        .await
         .json()
         .await
         .unwrap();
     assert_eq!(catalog["defaultExtensionId"], "fixture");
     assert_eq!(catalog["extensions"][0]["id"], "fixture");
 
-    let viewer = reqwest::get(format!("{}/viewers/fixture/", runtime.base_url()))
-        .await
-        .unwrap();
+    let viewer = http_get(format!("{}/viewers/fixture/", runtime.base_url())).await;
     assert_eq!(viewer.status(), 200);
     assert_eq!(viewer.text().await.unwrap(), "<h1>fixture viewer</h1>");
 

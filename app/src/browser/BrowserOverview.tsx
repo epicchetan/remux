@@ -16,7 +16,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { FilesOverview } from '../files/FilesOverview';
 import { useRemuxConnection } from '../remote/RemuxConnectionProvider';
-import { themedIconUrl } from '../remote/remuxExtensions';
+import { remuxImageSource, themedIconUrl } from '../remote/remuxExtensions';
 import { SettingsOverview } from '../settings/SettingsOverview';
 import { useTheme, type RemuxTheme } from '../theme/ThemeProvider';
 import { BrowserBottomBar } from './BrowserBottomBar';
@@ -449,7 +449,7 @@ function TabIcon({ styles, tab }: { styles: BrowserOverviewStyles; tab: BrowserT
           accessibilityIgnoresInvertColors
           onError={() => setImageFailed(true)}
           resizeMode="contain"
-          source={{ uri: iconUrl }}
+          source={remuxImageSource(iconUrl)}
           style={styles.tabIconImage}
         />
       ) : (

@@ -102,4 +102,4 @@ The notification system is extension-shaped, but the current concrete long-runni
 
 ## Security Model
 
-Remux currently assumes a trusted runtime and trusted clients. The runtime is unauthenticated and exposes filesystem and extension RPC capabilities to connected clients. Keep it bound to a trusted interface and avoid exposing it to untrusted networks.
+Remux assumes a trusted runtime host. The `/ws` upgrade and all HTTP (except the health endpoints) require a shared bearer token generated at `.remux/auth-token` (0600) — accepted as an `Authorization: Bearer` header, a `remux_auth` cookie (set automatically on header-authenticated responses so viewer WebView subresources authenticate), or a `?token=` query parameter. `remux token` prints it for pairing; `require_auth = false` in `.remux/config.toml` disables enforcement. The token is a second layer, not transport security: it exposes shell-grade RPC to any holder, so keep the runtime on a trusted network (the tailnet) — transport encryption is WireGuard's job, and there is no TLS. Design intent and threat model: `docs/specs/cli-rust-port-pass-3-auth.md`.

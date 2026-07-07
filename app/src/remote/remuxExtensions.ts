@@ -1,4 +1,4 @@
-import { currentRemuxOrigin } from './remuxSettingsStore';
+import { authHeaders, currentRemuxOrigin } from './remuxSettingsStore';
 
 export type RemuxExtensionView = {
   route: string;
@@ -96,13 +96,25 @@ type RawFileHandler = {
 };
 
 export async function fetchRemuxExtensionCatalog(origin = currentRemuxOrigin()): Promise<RemuxExtensionCatalog> {
-  const response = await fetch(`${origin}/remux/extensions`);
+  const response = await fetch(`${origin}/remux/extensions`, { headers: authHeaders() });
 
   if (!response.ok) {
-    throw new Error(`Remux extension catalog failed (${response.status})`);
+    throw new Error(response.status === 401
+      ? 'Remux rejected the auth token — check the token in Settings.'
+      : `Remux extension catalog failed (${response.status})`);
   }
 
   return parseRemuxExtensionCatalog(await response.json(), origin);
+}
+
+/**
+ * `Image` source for runtime-hosted assets (extension icons): the bearer
+ * header rides along since RN's image pipeline shares no cookies with the
+ * WebView or fetch. Same-origin only — the token never goes to another host.
+ */
+export function remuxImageSource(uri: string): { headers?: { Authorization: string }; uri: string } {
+  const headers = authHeaders();
+  return headers && uri.startsWith(`${currentRemuxOrigin()}/`) ? { headers, uri } : { uri };
 }
 
 function parseRemuxExtensionCatalog(raw: unknown, origin: string): RemuxExtensionCatalog {

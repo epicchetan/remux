@@ -24,6 +24,8 @@ export type RemuxRpcRequestContext = {
 
 type RemuxRpcClientOptions = {
   connectTimeoutMs?: number;
+  /** Sent on the upgrade request (RN WebSocket third-arg headers). */
+  headers?: Record<string, string>;
   onMessage?: (message: RemuxRpcMessage) => void;
   onStatus?: (status: RemuxRpcStatus) => void;
   url: string;
@@ -78,7 +80,16 @@ export class RemuxRpcClient {
     const promise = new Promise<void>((resolve, reject) => {
       let settled = false;
       let timeout: ReturnType<typeof setTimeout> | null = null;
-      const socket = new WebSocket(this.options.url);
+      // React Native's WebSocket takes headers as a third argument; the DOM
+      // typings don't know about it.
+      const RNWebSocket = WebSocket as unknown as new (
+        url: string,
+        protocols?: string | string[] | null,
+        options?: { headers?: Record<string, string> },
+      ) => WebSocket;
+      const socket = this.options.headers
+        ? new RNWebSocket(this.options.url, null, { headers: this.options.headers })
+        : new WebSocket(this.options.url);
       this.socket = socket;
 
       const clearConnectTimeout = () => {

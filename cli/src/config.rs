@@ -32,6 +32,9 @@ pub struct RemuxConfig {
     pub watchdog_stale_seconds: Option<u32>,
     /// Pass-2 additive: per-extension RSS alert ceiling; absent/0 disables.
     pub extension_memory_ceiling_mb: Option<u32>,
+    /// Pass-3a additive: `false` disables bearer-token enforcement — the
+    /// ssh-recoverable lockout escape hatch. Defaults on.
+    pub require_auth: Option<bool>,
 }
 
 impl RemuxConfig {
@@ -52,6 +55,10 @@ impl RemuxConfig {
 
     pub fn extension_memory_ceiling_mb(&self) -> u32 {
         self.extension_memory_ceiling_mb.unwrap_or(0)
+    }
+
+    pub fn require_auth(&self) -> bool {
+        self.require_auth.unwrap_or(true)
     }
 }
 
@@ -235,6 +242,14 @@ mod tests {
         let zero_poll =
             parse_remux_config_toml("resource_poll_seconds = 0", CONFIG_RELATIVE_PATH).unwrap();
         assert_eq!(zero_poll.resource_poll_seconds(), 5);
+    }
+
+    #[test]
+    fn require_auth_defaults_on_and_parses_off() {
+        assert!(RemuxConfig::default().require_auth());
+        let config =
+            parse_remux_config_toml("require_auth = false", CONFIG_RELATIVE_PATH).unwrap();
+        assert!(!config.require_auth());
     }
 
     #[test]

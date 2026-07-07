@@ -32,6 +32,7 @@ import {
   type RemuxConnectionStatus,
 } from '../../remote/RemuxConnectionProvider';
 import type { RemuxRpcMessage } from '../../remote/remuxRpcClient';
+import { useRemuxSettingsStore } from '../../remote/remuxSettingsStore';
 import { useTheme, type RemuxTheme, type RemuxThemeName } from '../../theme/ThemeProvider';
 import type { BrowserPendingNavigation, BrowserSection, ViewerTab } from '../../browser/browserTypes';
 import { serializedResourceKey } from '../../browser/resourceKeys';
@@ -253,6 +254,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
   ref,
 ) {
   const remux = useRemuxConnection();
+  const authToken = useRemuxSettingsStore((state) => state.token);
   const theme = useTheme();
   const [pageState, setPageState] = useState<WebViewPageState>({ type: 'loading' });
   const [reloadNonce, setReloadNonce] = useState(0);
@@ -1207,7 +1209,12 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
         ref={webViewRef}
         setSupportMultipleWindows={false}
         key={`${activeSourceUrl}:${reloadNonce}`}
-        source={{ uri: webViewSourceUrl }}
+        // The bearer header covers only this top document; the runtime's
+        // Set-Cookie hand-off authenticates every subresource after it.
+        source={{
+          headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
+          uri: webViewSourceUrl,
+        }}
         style={styles.webView}
       />
       {pageState.type === 'loading' ? (

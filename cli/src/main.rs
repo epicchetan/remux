@@ -1,15 +1,32 @@
 //! `remux start` entrypoint. Without `REMUX_WORKER=1` this process is the L1
-//! supervisor; with it, the runtime worker.
+//! supervisor; with it, the runtime worker. `remux token` prints the auth
+//! token (generating it if absent) for pairing a device.
 
 fn main() {
     let usage = || -> ! {
-        eprintln!("Usage: remux start [--rebuild]");
+        eprintln!("Usage: remux start [--rebuild] | remux token");
         std::process::exit(1);
     };
 
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() != Some("start") {
-        usage();
+    match args.next().as_deref() {
+        Some("start") => {}
+        Some("token") => {
+            if args.next().is_some() {
+                usage();
+            }
+            match remux::auth::token_command() {
+                Ok(token) => {
+                    println!("{token}");
+                    std::process::exit(0);
+                }
+                Err(message) => {
+                    eprintln!("remux: {message}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ => usage(),
     }
     let rebuild = match args.next().as_deref() {
         None => false,

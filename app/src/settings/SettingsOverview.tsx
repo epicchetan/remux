@@ -24,7 +24,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { getBottomBarHeight, tabGridGap, tabGridHorizontalPadding } from '../browser/browserLayout';
 import { useBrowserStore } from '../browser/browserStore';
 import { useRemuxConnection, type RemuxConnection } from '../remote/RemuxConnectionProvider';
-import { themedIconUrl } from '../remote/remuxExtensions';
+import { remuxImageSource, themedIconUrl } from '../remote/remuxExtensions';
 import { useRemuxSettingsStore } from '../remote/remuxSettingsStore';
 import { alpha, useTheme, type RemuxTheme } from '../theme/ThemeProvider';
 import { ExtensionDetailSheet, type ExtensionDetailAction } from './ExtensionDetailSheet';
@@ -60,6 +60,7 @@ export function SettingsOverview() {
   const saveSettings = useRemuxSettingsStore((state) => state.saveSettings);
   const settingsError = useRemuxSettingsStore((state) => state.error);
   const settingsStatus = useRemuxSettingsStore((state) => state.status);
+  const token = useRemuxSettingsStore((state) => state.token);
   const [extensionStatuses, setExtensionStatuses] = useState<Record<string, ExtensionServerStatus>>({});
   const [extensionStatusError, setExtensionStatusError] = useState<string | null>(null);
   const [extensionStatusLoading, setExtensionStatusLoading] = useState(false);
@@ -70,6 +71,8 @@ export function SettingsOverview() {
   const nowMinuteMs = useMinuteTick();
   const [draftHost, setDraftHost] = useState(host);
   const [draftPort, setDraftPort] = useState(String(port));
+  const [draftToken, setDraftToken] = useState(token);
+  const [showToken, setShowToken] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const bottomPadding = getBottomBarHeight(insets.bottom) + tabGridGap;
@@ -87,7 +90,8 @@ export function SettingsOverview() {
   useEffect(() => {
     setDraftHost(host);
     setDraftPort(String(port));
-  }, [host, port]);
+    setDraftToken(token);
+  }, [host, port, token]);
 
   const saveAndReconnect = async () => {
     setActionError(null);
@@ -96,6 +100,7 @@ export function SettingsOverview() {
       await saveSettings({
         host: draftHost,
         port: draftPort,
+        token: draftToken,
       });
       await loadExtensions({ force: true });
     } catch (error) {
@@ -245,7 +250,19 @@ export function SettingsOverview() {
               placeholder="48123"
               value={draftPort}
             />
+            <LabeledInput
+              autoCapitalize="none"
+              autoCorrect={false}
+              label="Token"
+              onChangeText={setDraftToken}
+              placeholder="run: remux token"
+              secureTextEntry={!showToken}
+              value={draftToken}
+            />
           </View>
+          <Pressable hitSlop={8} onPress={() => setShowToken((visible) => !visible)}>
+            <Text style={styles.tokenToggle}>{showToken ? 'Hide token' : 'Show token'}</Text>
+          </Pressable>
           <View style={styles.actionRow}>
             <SettingsButton
               disabled={saving || settingsStatus === 'saving'}
@@ -557,7 +574,7 @@ function ExtensionRow({
             accessibilityIgnoresInvertColors
             onError={() => setImageFailed(true)}
             resizeMode="contain"
-            source={{ uri: themedUrl }}
+            source={remuxImageSource(themedUrl)}
             style={styles.extensionIcon}
           />
         ) : (
@@ -865,6 +882,13 @@ function createStyles(theme: RemuxTheme) {
     fontWeight: '600',
     lineHeight: 20,
     padding: 0,
+  },
+  tokenToggle: {
+    alignSelf: 'flex-end',
+    color: theme.textMuted,
+    fontSize: 12,
+    fontWeight: '600',
+    lineHeight: 16,
   },
   inputLabel: {
     color: theme.textMuted,

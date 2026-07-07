@@ -186,6 +186,28 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
         &config,
     )?;
 
+    // Pass-3a auth token: resolve (or mint) before anything listens.
+    let token_load = crate::auth::resolve_token(
+        std::env::var("REMUX_AUTH_TOKEN").ok().as_deref(),
+        &root_dir,
+    )?;
+    if token_load.generated {
+        journal.log(&format!(
+            "generated auth token at {}",
+            crate::auth::TOKEN_RELATIVE_PATH
+        ));
+    }
+    if token_load.perms_tightened {
+        journal.warn(&format!(
+            "{} had loose permissions; tightened to 0600",
+            crate::auth::TOKEN_RELATIVE_PATH
+        ));
+    }
+    let require_auth = config.require_auth();
+    if !require_auth {
+        journal.warn("auth is DISABLED (require_auth = false); every client is trusted");
+    }
+
     // Discovery.
     let roots = extension_roots(
         std::env::var("REMUX_EXTENSION_ROOTS").ok().as_deref(),
@@ -342,9 +364,20 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
     );
     let _ = shared.ws.set(ws.clone());
 
+    // One auth layer over the merged router: the `/ws` upgrade 401s before
+    // the handshake and the whole HTTP fallback tree sits behind it.
+    let auth_state = Arc::new(crate::auth::AuthState {
+        token: token_load.token,
+        require_auth,
+        log: journal.clone() as Arc<dyn crate::rpc::ws::WsLog>,
+    });
     let app = ws
         .route()
         .merge(build_router(http_state))
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            crate::auth::require_auth,
+        ))
         .into_make_service_with_connect_info::<std::net::SocketAddr>();
 
     log_start_config(&journal, &runtime.host, runtime.port, &default_extension, &extensions);

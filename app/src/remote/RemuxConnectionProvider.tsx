@@ -72,6 +72,7 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
   const loadSettings = useRemuxSettingsStore((state) => state.loadSettings);
   const port = useRemuxSettingsStore((state) => state.port);
   const settingsLoaded = useRemuxSettingsStore((state) => state.loaded);
+  const token = useRemuxSettingsStore((state) => state.token);
   const [status, setStatus] = useState<RemuxConnectionStatus>({ type: 'connecting' });
   const [error, setError] = useState<string | null>(null);
   const clientRef = useRef<RemuxRpcClient | null>(null);
@@ -264,6 +265,7 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
         }
       },
       connectTimeoutMs: remuxWebSocketConnectTimeoutMs,
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
       url: wsUrl,
     });
 
@@ -283,6 +285,7 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
     scheduleReconnect,
     setConnectionStatus,
     settingsLoaded,
+    token,
     wsUrl,
   ]);
 

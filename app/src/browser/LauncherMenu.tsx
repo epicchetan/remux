@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Animated, Image, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { themedIconUrl, type RemuxExtensionLauncher } from '../remote/remuxExtensions';
+import { remuxImageSource, themedIconUrl, type RemuxExtensionLauncher } from '../remote/remuxExtensions';
 import { useTheme, type RemuxTheme } from '../theme/ThemeProvider';
 import { NativeGlassRoundedRect } from '../ui/NativeGlassIconButton';
 import { getBottomBarHeight, tabGridHorizontalPadding } from './browserLayout';
@@ -172,7 +172,7 @@ function LauncherRow({
             accessibilityIgnoresInvertColors
             onError={() => setImageFailed(true)}
             resizeMode="cover"
-            source={{ uri: iconUrl }}
+            source={remuxImageSource(iconUrl)}
             style={styles.rowIconImage}
           />
         ) : (

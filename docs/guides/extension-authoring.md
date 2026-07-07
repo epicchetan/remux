@@ -115,6 +115,6 @@ Route metadata becomes part of the browser tab target and notification target ma
 ## Current Limits
 
 - Dev viewer proxies are rejected by manifest validation.
-- Runtime authentication is not implemented.
+- Runtime HTTP/WS requires the shared bearer token (`docs/guides/development.md` §Auth token); extension server processes are unaffected — they speak stdio only.
 - Extension server crashes are treated as runtime-fatal.
 - Viewer assets must be built before the runtime can serve them.

@@ -96,6 +96,7 @@ log_retention_days = 14
 resource_poll_seconds = 5          # resource sampler cadence
 watchdog_stale_seconds = 30        # worker hang watchdog; 0 disables
 extension_memory_ceiling_mb = 0    # per-extension RSS alert; 0 disables
+require_auth = true                # false disables bearer-token auth (lockout escape hatch)
 ```
 
 `extension_roots` entries are parent directories scanned for child folders that
@@ -109,6 +110,7 @@ Environment variables override `.remux/config.toml` when present:
 | --- | --- |
 | `REMUX_HOST` | Runtime bind host. Defaults to `0.0.0.0`. |
 | `REMUX_PORT` | Runtime port. Defaults to `48123`. |
+| `REMUX_AUTH_TOKEN` | Auth token override (tests / emergencies). Defaults to `.remux/auth-token`. |
 | `REMUX_EXTENSION_ROOTS` | Path-list override for configured extension discovery roots. |
 | `EXPO_PUBLIC_REMUX_ORIGIN` | Build-time fallback origin used by the Expo app before local settings are saved. |
 | `CODEX_HOME` | Codex home used by the Codex extension server. |
@@ -116,6 +118,20 @@ Environment variables override `.remux/config.toml` when present:
 | `REMUX_CODEX_DEBUG` | Enables additional Codex extension diagnostics. |
 
 Runtime logs are written under `.remux/logs/`: a journal per boot (`runtime-<runId>.jsonl`, pruned by `log_retention_days`, default 14) and rotated per-extension stderr files under `.remux/logs/extensions/`.
+
+### Auth token
+
+Every runtime request — the `/ws` upgrade and all HTTP except `/healthz`/`/readyz`/`/health` — requires a shared bearer token (spec: `docs/specs/cli-rust-port-pass-3-auth.md`). The worker generates it on first boot at `.remux/auth-token` (mode 0600).
+
+Pairing a device:
+
+```bash
+./target/release/remux token   # prints the token, generating it if absent
+```
+
+Paste it into the app's Settings → Connection → Token field and Save & Reconnect. `curl` against the runtime with `-H "Authorization: Bearer $(./target/release/remux token)"` (a `?token=` query parameter also works).
+
+Locked out (wrong token on the phone): from SSH, `cat ~/remux/.remux/auth-token` and re-paste — or set `require_auth = false` in `.remux/config.toml`, `systemctl --user restart remux`, fix the token, and re-enable. Rotation is `rm .remux/auth-token`, restart, re-pair.
 
 ## Start The Mobile App
 

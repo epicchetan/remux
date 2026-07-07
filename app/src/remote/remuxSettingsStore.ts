@@ -14,8 +14,9 @@ type RemuxSettingsState = {
   loaded: boolean;
   loadSettings: () => Promise<void>;
   port: number;
-  saveSettings: (settings: { host: string; port: number | string }) => Promise<void>;
+  saveSettings: (settings: { host: string; port: number | string; token?: string }) => Promise<void>;
   status: RemuxSettingsStatus;
+  token: string;
 };
 
 export const useRemuxSettingsStore = create<RemuxSettingsState>((set, get) => ({
@@ -37,6 +38,7 @@ export const useRemuxSettingsStore = create<RemuxSettingsState>((set, get) => ({
         loaded: true,
         port: parsed?.port ?? fallbackSettings.port,
         status: 'ready',
+        token: parsed?.token ?? '',
       });
     } catch (error) {
       set({
@@ -45,6 +47,7 @@ export const useRemuxSettingsStore = create<RemuxSettingsState>((set, get) => ({
         loaded: true,
         port: fallbackSettings.port,
         status: 'error',
+        token: '',
       });
     }
   },
@@ -56,6 +59,7 @@ export const useRemuxSettingsStore = create<RemuxSettingsState>((set, get) => ({
       await AsyncStorage.setItem(settingsStorageKey, JSON.stringify({
         host: normalized.host,
         port: normalized.port,
+        token: normalized.token,
         version: settingsVersion,
       }));
       set({
@@ -64,6 +68,7 @@ export const useRemuxSettingsStore = create<RemuxSettingsState>((set, get) => ({
         loaded: true,
         port: normalized.port,
         status: 'ready',
+        token: normalized.token,
       });
     } catch (error) {
       set({
@@ -74,6 +79,7 @@ export const useRemuxSettingsStore = create<RemuxSettingsState>((set, get) => ({
     }
   },
   status: 'idle',
+  token: '',
 }));
 
 export function currentRemuxOrigin() {
@@ -82,6 +88,16 @@ export function currentRemuxOrigin() {
     host: state.host,
     port: state.port,
   });
+}
+
+/**
+ * Bearer header for every runtime request (WS connect, catalog fetch, icon
+ * Images, WebView top document). Undefined when no token is set, which
+ * matches a `require_auth = false` runtime.
+ */
+export function authHeaders(): { Authorization: string } | undefined {
+  const token = useRemuxSettingsStore.getState().token;
+  return token ? { Authorization: `Bearer ${token}` } : undefined;
 }
 
 export function remuxOriginFromSettings({ host, port }: { host: string; port: number }) {
@@ -96,13 +112,14 @@ export function websocketUrl(origin: string, path: string) {
   return `${protocol}${origin.replace(/^https?:/u, '')}${path}`;
 }
 
-function normalizeSettings({ host, port }: { host: string; port: number | string }) {
+function normalizeSettings({ host, port, token }: { host: string; port: number | string; token?: string }) {
   const normalizedHost = normalizeHost(host);
   const normalizedPort = normalizePort(port);
 
   return {
     host: normalizedHost,
     port: normalizedPort,
+    token: token?.trim() ?? '',
   };
 }
 
@@ -172,6 +189,7 @@ function parseStoredSettings(text: string) {
   return normalizeSettings({
     host: parsed.host,
     port: parsed.port,
+    token: typeof parsed.token === 'string' ? parsed.token : undefined,
   });
 }
 
