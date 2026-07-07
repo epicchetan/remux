@@ -62,8 +62,6 @@ export function ExtensionDetailSheet({
   const [logLines, setLogLines] = useState<ExtensionLogLine[]>([]);
   const [logsError, setLogsError] = useState<string | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
-  const logScrollRef = useRef<ScrollView | null>(null);
-  const stickToBottomRef = useRef(true);
 
   // Live log tail: snapshot, then subscribe; the subscription dies with the
   // sheet (and, server-side, with the socket).
@@ -75,7 +73,6 @@ export function ExtensionDetailSheet({
     let cancelled = false;
     setLogLines([]);
     setLogsError(null);
-    stickToBottomRef.current = true;
 
     void (async () => {
       try {
@@ -119,18 +116,6 @@ export function ExtensionDetailSheet({
     return () => clearInterval(timer);
   }, [visible]);
 
-  useEffect(() => {
-    if (stickToBottomRef.current) {
-      logScrollRef.current?.scrollToEnd({ animated: false });
-    }
-  }, [logLines]);
-
-  const onLogScroll = useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
-    const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
-    const distanceFromBottom = contentSize.height - layoutMeasurement.height - contentOffset.y;
-    stickToBottomRef.current = distanceFromBottom < 48;
-  }, []);
-
   const busy = busyAction !== null;
   const state = status?.state ?? 'stopped';
   const uptime = formatUptime(status?.startedAtMs ?? null, nowMs);
@@ -152,6 +137,17 @@ export function ExtensionDetailSheet({
         ? `failed (${watch.restartCount} ${watch.restartCount === 1 ? 'restart' : 'restarts'})`
         : 'stopped'
     : null;
+  // Watch output gets its own section — vite recompile chatter mingled with
+  // server stderr made both harder to read.
+  const serverLines = useMemo(
+    () => logLines.filter((entry) => entry.stream !== 'watch'),
+    [logLines],
+  );
+  const watchLines = useMemo(
+    () => logLines.filter((entry) => entry.stream === 'watch'),
+    [logLines],
+  );
+  const showWatchLogs = Boolean(watch?.declared) || watchLines.length > 0;
 
   // Native SwiftUI sheet: system detents, drag indicator, dimming, and the
   // liquid-glass chrome all come from UIKit. Sizing flows native → RN: the
@@ -243,24 +239,20 @@ export function ExtensionDetailSheet({
 
               <Text style={styles.logsTitle}>Logs</Text>
               {logsError ? <Text style={styles.errorText}>{logsError}</Text> : null}
-              <View style={styles.logPanel}>
-                <ScrollView
-                  onScroll={onLogScroll}
-                  ref={logScrollRef}
-                  scrollEventThrottle={64}
-                  style={styles.logScroll}
-                >
-                  {logLines.length === 0 ? (
-                    <Text style={styles.logEmpty}>
-                      No output yet — servers only log errors, builds, and lifecycle events, so quiet is healthy.
-                    </Text>
-                  ) : (
-                    logLines.map((entry, index) => (
-                      <LogEntryLine entry={entry} key={`${entry.ts}:${index}`} />
-                    ))
-                  )}
-                </ScrollView>
-              </View>
+              <LogPanel
+                emptyText="No output yet — servers only log errors, builds, and lifecycle events, so quiet is healthy."
+                lines={serverLines}
+              />
+              {showWatchLogs ? (
+                <>
+                  <Text style={styles.logsTitle}>Watch</Text>
+                  <LogPanel
+                    emptyText="No watch output yet — start Watch to stream rebuild notices here."
+                    hideTags
+                    lines={watchLines}
+                  />
+                </>
+              ) : null}
             </View>
           </RNHostView>
         </Group>
@@ -274,12 +266,63 @@ function trimLog(lines: ExtensionLogLine[]): ExtensionLogLine[] {
 }
 
 /**
- * One log entry: muted timestamp, colored stream tag, wrapped message.
- * Lifecycle lines are runtime narration and render fully muted with no tag.
+ * One scrolling log section with its own stick-to-bottom tracking. The
+ * native sheet unmounts its children on dismiss, so the refs reset on every
+ * open for free.
  */
-function LogEntryLine({ entry }: { entry: ExtensionLogLine }) {
+function LogPanel({
+  emptyText,
+  hideTags = false,
+  lines,
+}: {
+  emptyText: string;
+  hideTags?: boolean;
+  lines: ExtensionLogLine[];
+}) {
   const { styles } = useSheetTheme();
-  const tag = logStreamTag(entry.stream);
+  const scrollRef = useRef<ScrollView | null>(null);
+  const stickToBottomRef = useRef(true);
+
+  useEffect(() => {
+    if (stickToBottomRef.current) {
+      scrollRef.current?.scrollToEnd({ animated: false });
+    }
+  }, [lines]);
+
+  const onScroll = useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
+    const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
+    const distanceFromBottom = contentSize.height - layoutMeasurement.height - contentOffset.y;
+    stickToBottomRef.current = distanceFromBottom < 48;
+  }, []);
+
+  return (
+    <View style={styles.logPanel}>
+      <ScrollView
+        onScroll={onScroll}
+        ref={scrollRef}
+        scrollEventThrottle={64}
+        style={styles.logScroll}
+      >
+        {lines.length === 0 ? (
+          <Text style={styles.logEmpty}>{emptyText}</Text>
+        ) : (
+          lines.map((entry, index) => (
+            <LogEntryLine entry={entry} hideTag={hideTags} key={`${entry.ts}:${index}`} />
+          ))
+        )}
+      </ScrollView>
+    </View>
+  );
+}
+
+/**
+ * One log entry: muted timestamp, colored stream tag, wrapped message.
+ * Lifecycle lines are runtime narration and render fully muted with no tag;
+ * single-stream panels (Watch) hide the tag — it would repeat on every line.
+ */
+function LogEntryLine({ entry, hideTag = false }: { entry: ExtensionLogLine; hideTag?: boolean }) {
+  const { styles } = useSheetTheme();
+  const tag = hideTag ? null : logStreamTag(entry.stream);
 
   return (
     <Text selectable style={styles.logLine}>
@@ -292,7 +335,7 @@ function LogEntryLine({ entry }: { entry: ExtensionLogLine }) {
   );
 }
 
-type LogTagTone = 'bad' | 'build' | 'watch' | 'muted';
+type LogTagTone = 'bad' | 'build' | 'muted';
 
 function logStreamTag(stream: string): { label: string; tone: LogTagTone } | null {
   switch (stream) {
@@ -302,8 +345,6 @@ function logStreamTag(stream: string): { label: string; tone: LogTagTone } | nul
       return { label: 'err', tone: 'bad' };
     case 'build':
       return { label: 'build', tone: 'build' };
-    case 'watch':
-      return { label: 'watch', tone: 'watch' };
     default:
       return { label: stream, tone: 'muted' };
   }
@@ -315,8 +356,6 @@ function logTagStyle(styles: SheetStyles, tone: LogTagTone) {
       return styles.logTagBad;
     case 'build':
       return styles.logTagBuild;
-    case 'watch':
-      return styles.logTagWatch;
     default:
       return styles.logTagMuted;
   }
@@ -572,9 +611,6 @@ function createStyles(theme: RemuxTheme) {
     },
     logTagMuted: {
       color: theme.textMuted,
-    },
-    logTagWatch: {
-      color: theme.warning,
     },
     logText: {
       color: theme.text,

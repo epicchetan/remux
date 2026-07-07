@@ -1,6 +1,6 @@
 # CLI Rust Port — Pass 3a: Bearer-Token Auth
 
-Status: Active Spec
+Status: Implemented
 Last verified: 2026-07-07
 Canonical code: `cli/src/auth.rs` (new), `cli/src/runtime.rs`, `cli/src/config.rs`, `app/src/remote/`, `app/src/surfaces/viewer/ExtensionWebView.tsx`, `app/src/settings/SettingsOverview.tsx`
 
