@@ -1,0 +1,35 @@
+# Remux runtime — systemd user service (L0).
+#
+# Install (one-time, from tmux/SSH — never from a remux terminal session):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/systemd/remux.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   loginctl enable-linger "$USER"     # run without an SSH session; start on boot
+#   systemctl --user enable --now remux
+#
+# Notes (see docs/specs/cli-rust-port-pass-2.md §L0):
+# - No Type=notify/WatchdogSec: the unit's main process is the L1 supervisor,
+#   which is trivially alive; hang protection lives in the worker's own
+#   watchdog thread, where it also covers ad-hoc dev runs.
+# - StartLimitIntervalSec stays default: L1 never gives up, so systemd's rate
+#   limit only trips if the supervisor itself crash-loops (e.g. missing
+#   binary), where stopping with a journal error is right.
+#   Recover with: systemctl --user reset-failed remux
+# - TimeoutStopSec=15 brackets the worker's 5s shutdown deadline + the
+#   supervisor's 7s signal-forward grace.
+# - Default KillMode=control-group sweeps the whole cgroup on stop — same
+#   semantics as the runtime's own stop path; the user's tmux server lives
+#   outside this cgroup and survives.
+
+[Unit]
+Description=Remux runtime
+
+[Service]
+ExecStart=%h/remux/target/release/remux start
+WorkingDirectory=%h/remux
+Restart=always
+RestartSec=1
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

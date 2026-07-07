@@ -1,7 +1,7 @@
 # Development Guide
 
 Status: Current
-Last verified: 2026-07-06
+Last verified: 2026-07-07
 
 ## Prerequisites
 
@@ -57,7 +57,34 @@ npm run build:cli
 ./target/release/remux start
 ```
 
-`remux start` runs a supervisor that restarts the worker on any abnormal exit, so a crash or an in-app "Restart runtime" never requires SSH. After editing runtime source, rebuild (`npm run build:cli`) and restart from the app — the supervisor respawns the worker from the freshly built binary on disk. Changes to the supervisor itself (`cli/src/supervise.rs`, `cli/src/main.rs`) need a full stop/start of `remux start`.
+`remux start` runs a supervisor that restarts the worker on any abnormal exit, so a crash or an in-app "Restart runtime" never requires SSH. After editing runtime source, rebuild (`npm run build:cli`) and restart from the app — the supervisor respawns the worker from the freshly built binary on disk. Changes to the supervisor itself (`cli/src/supervise.rs`, `cli/src/main.rs`) need a full stop/start of `remux start` (under systemd: `systemctl --user restart remux`).
+
+`remux start --rebuild` forces each extension's manifest `build` phase to run on first spawn even when the built artifact exists. Extension servers with a `server.build` manifest phase (codex, terminal) are otherwise built automatically whenever their binary is missing — e.g. after a reboot clears `/tmp` — and can be rebuilt from the app via **Rebuild & Restart** in the extension's detail sheet.
+
+### Run under systemd (production)
+
+The production host runs remux as a systemd user service so it starts on boot and survives supervisor death. One-time install, performed **from tmux/SSH, never from a remux terminal session** (stopping the runtime from inside kills your own shell):
+
+```bash
+npm run build:cli
+mkdir -p ~/.config/systemd/user
+cp deploy/systemd/remux.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+loginctl enable-linger "$USER"        # run without an SSH session; start on boot
+# stop any tmux-hosted `remux start`, then:
+systemctl --user enable --now remux
+```
+
+Operations:
+
+```bash
+systemctl --user status remux         # unit + supervisor/worker state
+journalctl --user -u remux -f         # supervisor/worker stderr
+systemctl --user restart remux        # full restart incl. the supervisor
+systemctl --user reset-failed remux   # recover from a supervisor crash-loop stop
+```
+
+The structured runtime journal stays in `.remux/logs/`. The app's **Restart runtime** flow is unchanged under systemd: the worker exits 75 and the persistent supervisor respawns it from the on-disk binary — so `npm run build:cli` + app restart remains the hot-swap path for worker-side changes.
 
 Local runtime configuration can live in `.remux/config.toml`:
 
@@ -65,6 +92,10 @@ Local runtime configuration can live in `.remux/config.toml`:
 host = "0.0.0.0"
 port = 48123
 extension_roots = ["extensions"]
+log_retention_days = 14
+resource_poll_seconds = 5          # resource sampler cadence
+watchdog_stale_seconds = 30        # worker hang watchdog; 0 disables
+extension_memory_ceiling_mb = 0    # per-extension RSS alert; 0 disables
 ```
 
 `extension_roots` entries are parent directories scanned for child folders that
