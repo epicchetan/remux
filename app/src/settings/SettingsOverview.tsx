@@ -30,6 +30,7 @@ import { useRemuxSettingsStore } from '../remote/remuxSettingsStore';
 import { alpha, useTheme, type RemuxTheme } from '../theme/ThemeProvider';
 import { ExtensionDetailSheet, type ExtensionDetailAction } from './ExtensionDetailSheet';
 import {
+  buildExtension,
   extensionDidChangeStatusMethod,
   parseExtensionServerStatus,
   readExtensionServerStatuses,
@@ -122,16 +123,19 @@ export function SettingsOverview() {
     try {
       const status = action === 'watch-start' || action === 'watch-stop'
         ? await setExtensionWatchRunning(connection.request, extensionId, action === 'watch-start')
-        : action === 'restart' || action === 'rebuild'
-          ? await restartExtensionServer(connection.request, extensionId, { rebuild: action === 'rebuild' })
-          : await setExtensionServerRunning(connection.request, extensionId, action === 'start');
+        : action === 'server-build' || action === 'views-build'
+          ? await buildExtension(connection.request, extensionId, action === 'server-build' ? 'server' : 'views')
+          : action === 'restart'
+            ? await restartExtensionServer(connection.request, extensionId)
+            : await setExtensionServerRunning(connection.request, extensionId, action === 'start');
       setExtensionStatuses((current) => ({
         ...current,
         [extensionId]: status,
       }));
       // Stopping the watcher changes nothing on disk; everything else may
-      // have rewritten the served bundle or restarted the server.
-      if (status.running && action !== 'watch-stop') {
+      // have rewritten the served bundle or restarted the server. A viewer
+      // build rewrites the bundle even when no server runs.
+      if (action === 'views-build' || (status.running && action !== 'watch-stop')) {
         reloadExtensionTabs(extensionId);
       }
     } catch (error) {

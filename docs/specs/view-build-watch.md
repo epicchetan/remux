@@ -404,6 +404,43 @@ controls only when declared; serverless rows badge from facets.
   (`cwd: "lens"`); ledger's `.env`/cwd semantics are untouched (the manifest
   `cwd` only scopes build/watch commands).
 
+## Revision: split build verbs (2026-07-07)
+
+After using the shipped pass, one aggregate Rebuild & Restart proved the
+wrong shape — server builds and viewer builds are different acts with
+different consequences. Replaced by two scoped manual-build RPCs and a
+regrouped sheet:
+
+- **`remux/extensions/server/build`** — runs `server.build` while any live
+  server keeps serving (cargo swaps the artifact under it), then restarts a
+  running server into the new binary; a stopped server stays stopped (a
+  prior `failed`-from-build resolves to `stopped`). **Failure is a plain
+  RPC error** — the lifecycle and a live server stay untouched, no push;
+  `last_build_failed` still flips so the next start rebuilds.
+- **`remux/extensions/views/build`** — force-runs every declared view build
+  (manifest order, watch-owned views skipped with the logged skip). Same
+  error-not-lifecycle failure contract; the previously built bundle keeps
+  serving. Success refreshes `views.built`/`lastBuildAtMs` and resolves a
+  serverless `failed` landing to `stopped`.
+- Both return the full status plus `built: true`; unknown extension and
+  "server build not declared" / "view build not declared" are errors. The
+  app allows both the rebuild timeout (600s).
+- **`rebuild: true` on start/restart is now scoped to the server build.**
+  The start-flow *needed* rule for views (entry missing or last build
+  failed) is unchanged — fresh checkouts still self-build; forcing a view
+  rebuild is `views/build`'s job.
+- Status gains **`hasServerBuild`** (after `hasServer`): the sheet's server
+  Build button keys off it instead of the aggregate `hasBuild`, which stays
+  for old-app compat. The app parser falls back to `hasBuild` when the
+  `views` facet is absent (a pass-2 payload could only mean a server
+  build).
+- **Sheet regrouped** into a `Server` actions row (Start/Stop, Restart —
+  disabled unless running, Build — labeled `Build & Restart` while
+  running) and a `Viewer` actions row (Build — disabled while the watcher
+  owns the bundle, Start/Stop Watch). Serverless extensions render only
+  the Viewer group. A viewer build reloads the extension's tabs on
+  success.
+
 ## Non-goals / punts
 
 - **HMR / vite dev-server proxying** — rejected above; static-from-disk is

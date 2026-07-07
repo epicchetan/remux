@@ -16,6 +16,8 @@ pub const EXTENSION_STOP_METHOD: &str = "remux/extensions/stop";
 pub const EXTENSION_RESTART_METHOD: &str = "remux/extensions/restart";
 pub const EXTENSION_WATCH_START_METHOD: &str = "remux/extensions/watch/start";
 pub const EXTENSION_WATCH_STOP_METHOD: &str = "remux/extensions/watch/stop";
+pub const EXTENSION_SERVER_BUILD_METHOD: &str = "remux/extensions/server/build";
+pub const EXTENSION_VIEWS_BUILD_METHOD: &str = "remux/extensions/views/build";
 pub const EXTENSION_LOGS_METHOD: &str = "remux/extensions/logs";
 pub const SYSTEM_INFO_METHOD: &str = "remux/system/info";
 pub const SYSTEM_PING_METHOD: &str = "remux/system/ping";
@@ -44,6 +46,9 @@ pub struct ServerStatus {
     /// View-build-watch additive: distinguishes "stopped server" from
     /// "nothing to run" (editor/markdown).
     pub has_server: bool,
+    /// Whether the manifest declares `server.build` specifically — the app's
+    /// server Build button keys off this, not the aggregate `hasBuild`.
+    pub has_server_build: bool,
     /// View-build-watch additive: view build facet.
     pub views: ViewsFacet,
     /// View-build-watch additive: watch sidecar facet — NOT the extension
@@ -147,6 +152,10 @@ impl ServerStatus {
         );
         target.insert("hasBuild".to_string(), Value::from(self.has_build));
         target.insert("hasServer".to_string(), Value::from(self.has_server));
+        target.insert(
+            "hasServerBuild".to_string(),
+            Value::from(self.has_server_build),
+        );
         let mut views = Map::new();
         views.insert("declared".to_string(), Value::from(self.views.declared));
         views.insert("built".to_string(), Value::from(self.views.built));
@@ -202,6 +211,26 @@ pub trait ExtensionServer: Send + Sync {
     /// Stops the view-watch sidecar. Idempotent: the bool is `stopped`.
     fn watch_stop(&self) -> BoxFuture<'_, (ServerStatus, bool)> {
         Box::pin(async { (self.status(), false) })
+    }
+    /// Manual server build: rebuilds the binary while any running server
+    /// keeps serving, then restarts it into the new build. A stopped server
+    /// stays stopped. Build failure is a plain error — the lifecycle (and a
+    /// live server) stays untouched.
+    fn build_server(&self) -> BoxFuture<'_, Result<ServerStatus, JsonRpcError>> {
+        Box::pin(async {
+            Err(JsonRpcError::new(
+                EXTENSION_ERROR,
+                "server build not declared",
+            ))
+        })
+    }
+    /// Manual view build: force-runs every declared view build (watch-owned
+    /// views are skipped). Same error-not-lifecycle failure contract as
+    /// `build_server`.
+    fn build_views(&self) -> BoxFuture<'_, Result<ServerStatus, JsonRpcError>> {
+        Box::pin(async {
+            Err(JsonRpcError::new(EXTENSION_ERROR, "view build not declared"))
+        })
     }
     fn handle_rpc(&self, method: String, params: Option<Value>) -> BoxFuture<'_, RpcResult>;
     fn handle_notification(&self, method: String, params: Option<Value>);
@@ -436,6 +465,26 @@ impl RpcRouter {
             return Ok(Value::Object(result));
         }
 
+        if method == EXTENSION_SERVER_BUILD_METHOD || method == EXTENSION_VIEWS_BUILD_METHOD {
+            let extension_id = extension_id_from_params(params, method)?;
+            let Some(server) = self.server(&extension_id) else {
+                return Err(JsonRpcError::new(
+                    EXTENSION_ERROR,
+                    format!("unknown extension: {extension_id}"),
+                ));
+            };
+            let status = if method == EXTENSION_SERVER_BUILD_METHOD {
+                server.build_server().await?
+            } else {
+                server.build_views().await?
+            };
+            let mut result = Map::new();
+            result.insert("extensionId".to_string(), Value::from(extension_id));
+            status.append_to(&mut result);
+            result.insert("built".to_string(), Value::from(true));
+            return Ok(Value::Object(result));
+        }
+
         if method == EXTENSION_WATCH_START_METHOD || method == EXTENSION_WATCH_STOP_METHOD {
             let extension_id = extension_id_from_params(params, method)?;
             let Some(server) = self.server(&extension_id) else {
@@ -476,6 +525,8 @@ pub fn is_extension_management_method(method: &str) -> bool {
         || method == EXTENSION_RESTART_METHOD
         || method == EXTENSION_WATCH_START_METHOD
         || method == EXTENSION_WATCH_STOP_METHOD
+        || method == EXTENSION_SERVER_BUILD_METHOD
+        || method == EXTENSION_VIEWS_BUILD_METHOD
         || method == EXTENSION_LOGS_METHOD
 }
 
@@ -553,6 +604,7 @@ mod tests {
                 last_exit: None,
                 has_build: false,
                 has_server: true,
+                has_server_build: false,
                 views: ViewsFacet::default(),
                 watch: WatchFacet {
                     declared: self.watch_declared,
@@ -903,6 +955,31 @@ mod tests {
         assert_eq!(err.code, INVALID_PARAMS);
     }
 
+    #[tokio::test]
+    async fn build_rpcs_route_with_not_declared_and_unknown_errors() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let router = fixture_router(&calls);
+
+        // Fixtures use the trait defaults: no build phases declared.
+        for method in [EXTENSION_SERVER_BUILD_METHOD, EXTENSION_VIEWS_BUILD_METHOD] {
+            let err = router
+                .handle_request(method, Some(&json!({ "extensionId": "codex" })))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, EXTENSION_ERROR);
+            assert!(err.message.ends_with("build not declared"), "{}", err.message);
+
+            let err = router
+                .handle_request(method, Some(&json!({ "extensionId": "nope" })))
+                .await
+                .unwrap_err();
+            assert_eq!(err.message, "unknown extension: nope");
+
+            let err = router.handle_request(method, None).await.unwrap_err();
+            assert_eq!(err.code, INVALID_PARAMS);
+        }
+    }
+
     #[test]
     fn status_appends_facets_in_stable_order_after_has_build() {
         let status = ServerStatus {
@@ -915,6 +992,7 @@ mod tests {
             last_exit: None,
             has_build: true,
             has_server: false,
+            has_server_build: false,
             views: ViewsFacet {
                 declared: 1,
                 built: true,
@@ -943,6 +1021,7 @@ mod tests {
                 "lastExit",
                 "hasBuild",
                 "hasServer",
+                "hasServerBuild",
                 "views",
                 "watch",
             ]

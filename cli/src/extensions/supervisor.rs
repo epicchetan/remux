@@ -145,6 +145,8 @@ enum Cmd {
     },
     WatchStart(oneshot::Sender<Result<(ServerStatus, bool), JsonRpcError>>),
     WatchStop(oneshot::Sender<(ServerStatus, bool)>),
+    ServerBuild(oneshot::Sender<Result<ServerStatus, JsonRpcError>>),
+    ViewsBuild(oneshot::Sender<Result<ServerStatus, JsonRpcError>>),
     /// Internal: a watch child's monitor task reporting its exit. Stale
     /// generations (bumped by every watch stop) are ignored.
     WatchChildExited {
@@ -202,6 +204,11 @@ impl ExtensionSupervisor {
             last_exit: None,
             has_build: extension.has_build(),
             has_server: extension.server.is_some(),
+            has_server_build: extension
+                .server
+                .as_ref()
+                .map(|server| server.build.is_some())
+                .unwrap_or(false),
             views: ViewsFacet {
                 declared: built_entries.len() as u32,
                 built: views_built(&built_entries),
@@ -280,6 +287,23 @@ impl ExtensionSupervisor {
         }
         response.await.unwrap_or_else(|_| self.snapshot())
     }
+
+    async fn command_build(
+        &self,
+        make: impl FnOnce(oneshot::Sender<Result<ServerStatus, JsonRpcError>>) -> Cmd,
+    ) -> Result<ServerStatus, JsonRpcError> {
+        let unavailable = || {
+            JsonRpcError::new(
+                EXTENSION_ERROR,
+                format!("extension {} is not running", self.extension_id),
+            )
+        };
+        let (ack, response) = oneshot::channel();
+        if self.commands.send(make(ack)).is_err() {
+            return Err(unavailable());
+        }
+        response.await.unwrap_or_else(|_| Err(unavailable()))
+    }
 }
 
 impl ExtensionServer for ExtensionSupervisor {
@@ -319,6 +343,14 @@ impl ExtensionServer for ExtensionSupervisor {
             }
             response.await.unwrap_or_else(|_| (self.snapshot(), false))
         })
+    }
+
+    fn build_server(&self) -> BoxFuture<'_, Result<ServerStatus, JsonRpcError>> {
+        Box::pin(self.command_build(Cmd::ServerBuild))
+    }
+
+    fn build_views(&self) -> BoxFuture<'_, Result<ServerStatus, JsonRpcError>> {
+        Box::pin(self.command_build(Cmd::ViewsBuild))
     }
 
     fn handle_rpc(&self, method: String, params: Option<Value>) -> BoxFuture<'_, RpcResult> {
@@ -482,6 +514,14 @@ impl Actor {
                 view_id,
                 status,
             } => self.handle_watch_child_exited(generation, &view_id, status),
+            Cmd::ServerBuild(ack) => {
+                let result = self.handle_server_build().await;
+                let _ = ack.send(result);
+            }
+            Cmd::ViewsBuild(ack) => {
+                let result = self.handle_views_build().await;
+                let _ = ack.send(result);
+            }
             Cmd::Rpc { method, params, ack } => self.handle_rpc(method, params, ack),
             Cmd::Notify { method, params } => self.handle_notify(method, params),
         }
@@ -510,7 +550,7 @@ impl Actor {
                 }
             }
         }
-        if !self.run_view_builds(rebuild).await {
+        if !self.run_view_builds().await {
             return;
         }
         match &server {
@@ -538,11 +578,13 @@ impl Actor {
     }
 
     /// Runs each declared view build (manifest order) that is needed: entry
-    /// missing, `rebuild: true`, or that view's last build failed. Views
-    /// whose watcher is enabled are skipped — the watcher owns that dist;
-    /// racing it produces torn bundles. Any failure aborts the sequence with
-    /// the same `failed`/`build-failed` landing as a server build.
-    async fn run_view_builds(&mut self, rebuild: bool) -> bool {
+    /// missing or that view's last build failed. The `rebuild` flag does NOT
+    /// reach here — forcing a view build is the manual `views/build` RPC's
+    /// job; `rebuild` is scoped to the server binary. Views whose watcher is
+    /// enabled are skipped — the watcher owns that dist; racing it produces
+    /// torn bundles. Any failure aborts the sequence with the same
+    /// `failed`/`build-failed` landing as a server build.
+    async fn run_view_builds(&mut self) -> bool {
         for (view_id, view) in self.extension.views.clone() {
             let Some(build) = &view.build else {
                 continue;
@@ -553,9 +595,7 @@ impl Actor {
                 ));
                 continue;
             }
-            let needed = rebuild
-                || self.failed_view_builds.contains(&view_id)
-                || !view.entry.exists();
+            let needed = self.failed_view_builds.contains(&view_id) || !view.entry.exists();
             if !needed {
                 continue;
             }
@@ -774,6 +814,126 @@ impl Actor {
         self.watch_started_at_ms = Some(now_ms());
         self.spawn_watch_children();
         Ok((self.current_status(), true))
+    }
+
+    /// Manual server build (`server/build` RPC): the build runs while any
+    /// live server keeps serving (cargo swaps the artifact under it — the
+    /// running binary's inode persists), then the server restarts into the
+    /// new build. Build failure is a plain error: the lifecycle — and a
+    /// running server — stays untouched, and there is no push (the user is
+    /// looking at the screen). `last_build_failed` still flips so the next
+    /// start re-runs the build.
+    async fn handle_server_build(&mut self) -> Result<ServerStatus, JsonRpcError> {
+        let Some(server) = self.extension.server.clone() else {
+            return Err(JsonRpcError::new(
+                EXTENSION_ERROR,
+                "server build not declared",
+            ));
+        };
+        let Some(build) = server.build.clone() else {
+            return Err(JsonRpcError::new(
+                EXTENSION_ERROR,
+                "server build not declared",
+            ));
+        };
+
+        match self.exec_build(&build).await {
+            Ok(()) => {
+                self.last_build_failed = false;
+                match self.state {
+                    Lifecycle::Running | Lifecycle::Starting => {
+                        self.journal_lifecycle("extension:restart", None, "info");
+                        self.journal_lifecycle("extension:stop", None, "info");
+                        self.stop_child().await;
+                        self.spawn_child(&server);
+                    }
+                    // A successful build resolves an earlier build failure.
+                    Lifecycle::Failed => self.set_state(Lifecycle::Stopped),
+                    _ => {}
+                }
+                Ok(self.current_status())
+            }
+            Err((code, signal, message)) => {
+                self.last_build_failed = true;
+                self.journal_lifecycle(
+                    "extension:build-failed",
+                    Some(serde_json::json!({
+                        "code": code,
+                        "signal": signal,
+                        "message": message,
+                    })),
+                    "error",
+                );
+                Err(JsonRpcError::new(
+                    EXTENSION_ERROR,
+                    format!(
+                        "server build failed ({}) — see extension logs",
+                        exit_summary(code, &signal)
+                    ),
+                ))
+            }
+        }
+    }
+
+    /// Manual view build (`views/build` RPC): force-runs every declared view
+    /// build in manifest order, skipping watch-owned views. Same contract as
+    /// `handle_server_build`: failure is an error, never a lifecycle change —
+    /// the previously built bundle keeps serving.
+    async fn handle_views_build(&mut self) -> Result<ServerStatus, JsonRpcError> {
+        let declared: Vec<(String, crate::extensions::manifest::View)> = self
+            .extension
+            .views
+            .iter()
+            .filter(|(_, view)| view.build.is_some())
+            .cloned()
+            .collect();
+        if declared.is_empty() {
+            return Err(JsonRpcError::new(EXTENSION_ERROR, "view build not declared"));
+        }
+
+        for (view_id, view) in declared {
+            let build = view.build.as_ref().expect("filtered");
+            if self.watch_enabled && view.watch.is_some() {
+                self.append_build_log(&format!(
+                    "skipping view {view_id}: watch owns the bundle"
+                ));
+                continue;
+            }
+            match self.exec_build(build).await {
+                Ok(()) => {
+                    self.failed_view_builds.remove(&view_id);
+                    self.last_view_build_at_ms = Some(now_ms());
+                }
+                Err((code, signal, message)) => {
+                    self.failed_view_builds.insert(view_id.clone());
+                    self.journal_lifecycle(
+                        "extension:build-failed",
+                        Some(serde_json::json!({
+                            "code": code,
+                            "signal": signal,
+                            "message": message,
+                            "view": view_id,
+                        })),
+                        "error",
+                    );
+                    return Err(JsonRpcError::new(
+                        EXTENSION_ERROR,
+                        format!(
+                            "view build failed ({}) — see extension logs",
+                            exit_summary(code, &signal)
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // A successful build resolves a serverless build-failed landing.
+        if self.state == Lifecycle::Failed && self.extension.server.is_none() {
+            self.set_state(Lifecycle::Stopped);
+        } else {
+            self.broadcast_status(); // views.built / lastBuildAtMs changed
+        }
+        Ok(self.current_status())
     }
 
     /// Spawns a supervised child for every watched view that doesn't already
@@ -1440,6 +1600,12 @@ impl Actor {
             last_exit: self.last_exit.clone(),
             has_build: self.extension.has_build(),
             has_server: self.extension.server.is_some(),
+            has_server_build: self
+                .extension
+                .server
+                .as_ref()
+                .map(|server| server.build.is_some())
+                .unwrap_or(false),
             views: ViewsFacet {
                 declared: built_entries.len() as u32,
                 built: views_built(&built_entries),

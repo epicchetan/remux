@@ -6,6 +6,8 @@ const extensionStopMethod = 'remux/extensions/stop';
 const extensionRestartMethod = 'remux/extensions/restart';
 const extensionWatchStartMethod = 'remux/extensions/watch/start';
 const extensionWatchStopMethod = 'remux/extensions/watch/stop';
+const extensionServerBuildMethod = 'remux/extensions/server/build';
+const extensionViewsBuildMethod = 'remux/extensions/views/build';
 const extensionLogsMethod = 'remux/extensions/logs';
 const extensionLogsSubscribeMethod = 'remux/extensions/logs/subscribe';
 const extensionLogsUnsubscribeMethod = 'remux/extensions/logs/unsubscribe';
@@ -67,6 +69,8 @@ export type ExtensionServerStatus = {
    * `watch.declared: false`).
    */
   hasServer: boolean;
+  /** `server.build` specifically — gates the server Build button. */
+  hasServerBuild: boolean;
   views: ExtensionViewsFacet;
   watch: ExtensionWatchFacet;
 };
@@ -161,6 +165,32 @@ export async function setExtensionWatchRunning(
   };
 }
 
+/**
+ * Manual builds. `server` rebuilds the binary (restarting a running server
+ * into it); `views` force-runs every declared view build. Build failure
+ * arrives as a thrown error — the runtime leaves the lifecycle untouched.
+ */
+export async function buildExtension(
+  request: RemuxConnection['request'],
+  extensionId: string,
+  target: 'server' | 'views',
+): Promise<ExtensionServerStatus & { changed: boolean }> {
+  const response = await request<unknown>(
+    target === 'server' ? extensionServerBuildMethod : extensionViewsBuildMethod,
+    { extensionId },
+    rebuildTimeoutMs,
+  );
+  const status = parseExtensionServerStatus(response);
+  if (!status || !isRecord(response)) {
+    throw new Error(`Invalid extension ${target} build response`);
+  }
+
+  return {
+    ...status,
+    changed: response.built === true,
+  };
+}
+
 export async function readExtensionLogs(
   request: RemuxConnection['request'],
   extensionId: string,
@@ -224,6 +254,9 @@ export function parseExtensionServerStatus(raw: unknown): ExtensionServerStatus 
     lastExit: parseLastExit(raw.lastExit),
     hasBuild: raw.hasBuild === true,
     hasServer: raw.hasServer !== false,
+    // Pass-2 runtimes (no views facet) only ever set hasBuild for a server
+    // build, so it doubles as the fallback.
+    hasServerBuild: raw.hasServerBuild === true || (!isRecord(raw.views) && raw.hasBuild === true),
     views: parseViewsFacet(raw.views),
     watch: parseWatchFacet(raw.watch),
   };

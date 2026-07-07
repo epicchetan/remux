@@ -75,6 +75,7 @@ impl ExtensionServer for EchoServer {
             last_exit: None,
             has_build: false,
             has_server: true,
+            has_server_build: false,
             views: remux::rpc::router::ViewsFacet::default(),
             watch: remux::rpc::router::WatchFacet::default(),
         }

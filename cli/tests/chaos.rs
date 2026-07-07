@@ -808,10 +808,11 @@ async fn serverless_start_runs_view_build_then_lands_stopped_and_built() {
     assert_eq!(again.state, "stopped");
     assert_eq!(view_build_count(harness.root.path()), 1);
 
-    // rebuild: true re-runs the view build.
+    // rebuild: true is scoped to the server build — views stay untouched
+    // (the manual views/build RPC is the force path).
     let rebuilt = harness.supervisor.restart(true).await;
     assert_eq!(rebuilt.state, "stopped");
-    assert_eq!(view_build_count(harness.root.path()), 2);
+    assert_eq!(view_build_count(harness.root.path()), 1);
 
     let lines = log_lines(&harness);
     assert!(lines.iter().any(|line| line == "[build] view-built"), "{lines:?}");
@@ -1146,4 +1147,187 @@ async fn boot_sweep_kills_orphaned_watch_role_groups() {
         assert!(tokio::time::Instant::now() < deadline, "orphaned watcher survived the sweep");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Manual build verbs (server/build + views/build RPCs).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn manual_server_build_rebuilds_and_restarts_a_running_server() {
+    let harness = harness_with_manifest(tempfile::tempdir().unwrap(), fast_config(), |root| {
+        build_manifest(root, BUILD_OK)
+    });
+
+    let started = harness.supervisor.start(false).await;
+    assert_eq!(started.state, "running");
+    assert!(started.has_server_build);
+    let first_pid = started.pid.unwrap();
+    assert_eq!(build_count(harness.root.path()), 1);
+
+    let status = harness.supervisor.build_server().await.unwrap();
+    assert_eq!(status.state, "running");
+    assert_eq!(build_count(harness.root.path()), 2, "manual build always runs");
+    let second_pid = status.pid.unwrap();
+    assert_ne!(first_pid, second_pid, "running server restarts into the new build");
+    assert!(!process_alive(first_pid));
+    assert!(process_alive(second_pid));
+
+    harness.supervisor.stop().await;
+
+    // Stopped server: build runs, server stays stopped.
+    let status = harness.supervisor.build_server().await.unwrap();
+    assert_eq!(status.state, "stopped");
+    assert!(!status.running);
+    assert_eq!(build_count(harness.root.path()), 3);
+}
+
+#[tokio::test]
+async fn manual_server_build_failure_spares_the_running_server() {
+    let root = tempfile::tempdir().unwrap();
+    // First build succeeds (creates the wrapper), later ones fail.
+    let flaky_build =
+        "if [ -f built-once ]; then echo boom >&2; exit 1; fi; touch built-once; cp server-src.sh server-bin && chmod +x server-bin";
+    let harness = harness_with_manifest(root, fast_config(), |root| {
+        build_manifest(root, flaky_build)
+    });
+
+    let started = harness.supervisor.start(false).await;
+    assert_eq!(started.state, "running");
+    let pid = started.pid.unwrap();
+
+    let err = harness.supervisor.build_server().await.unwrap_err();
+    assert!(err.message.starts_with("server build failed"), "{}", err.message);
+    // Lifecycle — and the live server — untouched; no push.
+    let status = harness.supervisor.status();
+    assert_eq!(status.state, "running");
+    assert_eq!(status.pid, Some(pid));
+    assert!(process_alive(pid));
+    assert!(harness.ctx.failures.lock().unwrap().is_empty());
+
+    harness.supervisor.stop().await;
+}
+
+#[tokio::test]
+async fn manual_views_build_forces_a_rebuild_without_lifecycle_changes() {
+    let harness = harness_with_manifest(tempfile::tempdir().unwrap(), fast_config(), |root| {
+        view_manifest(root, None, Some(VIEW_BUILD_OK), None)
+    });
+
+    // First manual build creates the bundle from scratch.
+    let status = harness.supervisor.build_views().await.unwrap();
+    assert!(status.views.built);
+    assert!(status.views.last_build_at_ms.is_some());
+    assert_eq!(status.state, "stopped");
+    assert_eq!(view_build_count(harness.root.path()), 1);
+
+    // Bundle exists — a manual build still force-runs (unlike start).
+    harness.supervisor.build_views().await.unwrap();
+    assert_eq!(view_build_count(harness.root.path()), 2);
+    let started = harness.supervisor.start(false).await;
+    assert_eq!(started.state, "stopped");
+    assert_eq!(view_build_count(harness.root.path()), 2, "start must not rebuild");
+
+    // The lifecycle never left stopped/building territory — no failed.
+    assert!(!harness.ctx.states().contains(&"failed".to_string()));
+}
+
+#[tokio::test]
+async fn manual_views_build_failure_errors_and_marks_the_view_for_rebuild() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("dist")).unwrap();
+    std::fs::write(root.path().join("dist/index.html"), "stale bundle").unwrap();
+    let harness = harness_with_manifest(root, fast_config(), |root| {
+        view_manifest(root, None, Some("echo view-boom >&2; exit 1"), None)
+    });
+
+    let err = harness.supervisor.build_views().await.unwrap_err();
+    assert!(err.message.starts_with("view build failed"), "{}", err.message);
+    // No lifecycle change; the stale bundle keeps serving (views.built true).
+    let status = harness.supervisor.status();
+    assert_eq!(status.state, "stopped");
+    assert!(status.views.built, "old bundle still exists and serves");
+    assert!(harness.ctx.failures.lock().unwrap().is_empty());
+
+    // The failure marks the view: the next start re-runs its build.
+    let started = harness.supervisor.start(false).await;
+    assert_eq!(started.state, "failed");
+    assert_eq!(
+        started.last_exit.unwrap().reason.as_deref(),
+        Some("build-failed")
+    );
+}
+
+#[tokio::test]
+async fn manual_views_build_skips_watch_owned_views() {
+    let harness = harness_with_manifest(tempfile::tempdir().unwrap(), fast_config(), |root| {
+        view_manifest(root, None, Some(VIEW_BUILD_OK), Some("sleep 300"))
+    });
+
+    let (_, started) = harness.supervisor.watch_start().await.unwrap();
+    assert!(started);
+    assert_eq!(view_build_count(harness.root.path()), 1, "gating build");
+
+    let status = harness.supervisor.build_views().await.unwrap();
+    assert_eq!(view_build_count(harness.root.path()), 1, "watch owns the bundle");
+    assert_eq!(status.watch.state, "running");
+
+    harness.supervisor.watch_stop().await;
+}
+
+#[tokio::test]
+async fn build_rpcs_error_when_not_declared() {
+    let harness = harness(&[], fast_config());
+    let err = harness.supervisor.build_server().await.unwrap_err();
+    assert_eq!(err.message, "server build not declared");
+    let err = harness.supervisor.build_views().await.unwrap_err();
+    assert_eq!(err.message, "view build not declared");
+}
+
+#[tokio::test]
+async fn rebuild_flag_is_scoped_to_the_server_build() {
+    // Server build + view build on one extension: restart(rebuild: true)
+    // re-runs the server build but leaves an existing view bundle alone.
+    let root = tempfile::tempdir().unwrap();
+    let wrapper = format!(
+        "#!/bin/sh\nexec {} \"$@\"\n",
+        env!("CARGO_BIN_EXE_remux-fixture-ext")
+    );
+    std::fs::write(root.path().join("server-src.sh"), wrapper).unwrap();
+    let harness = harness_with_manifest(root, fast_config(), |root| {
+        let mut manifest = view_manifest(
+            root,
+            Some(ServerSpec {
+                transport: "stdio".to_string(),
+                command: root.join("server-bin").to_string_lossy().into_owned(),
+                args: Vec::new(),
+                cwd: root.to_path_buf(),
+                build: Some(BuildSpec {
+                    command: "sh".to_string(),
+                    args: vec!["-c".to_string(), BUILD_OK.to_string()],
+                    cwd: root.to_path_buf(),
+                }),
+            }),
+            Some(VIEW_BUILD_OK),
+            None,
+        );
+        manifest.id = "fixture".to_string();
+        manifest
+    });
+
+    let started = harness.supervisor.start(false).await;
+    assert_eq!(started.state, "running");
+    assert_eq!(build_count(harness.root.path()), 1);
+    assert_eq!(view_build_count(harness.root.path()), 1);
+
+    let rebuilt = harness.supervisor.restart(true).await;
+    assert_eq!(rebuilt.state, "running");
+    assert_eq!(build_count(harness.root.path()), 2, "rebuild forces the server build");
+    assert_eq!(
+        view_build_count(harness.root.path()),
+        1,
+        "rebuild must not force view builds"
+    );
+
+    harness.supervisor.stop().await;
 }

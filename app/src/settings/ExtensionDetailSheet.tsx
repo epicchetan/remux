@@ -36,7 +36,14 @@ import type { ExtensionResourceSample } from './systemResourcesApi';
 
 const logRingLines = 500;
 
-export type ExtensionDetailAction = 'start' | 'stop' | 'restart' | 'rebuild' | 'watch-start' | 'watch-stop';
+export type ExtensionDetailAction =
+  | 'start'
+  | 'stop'
+  | 'restart'
+  | 'server-build'
+  | 'views-build'
+  | 'watch-start'
+  | 'watch-stop';
 
 export function ExtensionDetailSheet({
   busyAction,
@@ -123,8 +130,8 @@ export function ExtensionDetailSheet({
   const resourceText = resources && status?.running
     ? `${resources.cpuPercent.toFixed(1)}% CPU · ${formatBytes(resources.rssBytes)} · ${resources.processCount} ${resources.processCount === 1 ? 'process' : 'processes'}`
     : null;
-  // Serverless extensions (view builds/watch only): Start/Stop/Restart are
-  // meaningless — Rebuild and Watch are the only verbs.
+  // Serverless extensions (view builds/watch only): the Server group is
+  // meaningless — the Viewer group (Build/Watch) is all they get.
   const hasServer = status?.hasServer !== false;
   const watch = status?.watch ?? null;
   const watchRunning = watch?.state === 'running';
@@ -184,60 +191,85 @@ export function ExtensionDetailSheet({
                 {resourceText ? <StatusRow label="Resources" value={resourceText} /> : null}
               </View>
 
-              <View style={styles.actionsRow}>
-                {hasServer ? (
-                  status?.running ? (
+              {hasServer ? (
+                <>
+                  <Text style={styles.groupTitle}>Server</Text>
+                  <View style={styles.actionsRow}>
+                    {status?.running ? (
+                      <SheetButton
+                        busy={busyAction === 'stop'}
+                        disabled={busy}
+                        label="Stop"
+                        onPress={() => onAction('stop')}
+                      />
+                    ) : (
+                      <SheetButton
+                        busy={busyAction === 'start'}
+                        disabled={busy}
+                        label="Start"
+                        onPress={() => onAction('start')}
+                      />
+                    )}
                     <SheetButton
-                      busy={busyAction === 'stop'}
-                      disabled={busy}
-                      label="Stop"
-                      onPress={() => onAction('stop')}
+                      busy={busyAction === 'restart'}
+                      disabled={busy || !status?.running}
+                      label="Restart"
+                      onPress={() => onAction('restart')}
                     />
-                  ) : (
-                    <SheetButton
-                      busy={busyAction === 'start'}
-                      disabled={busy}
-                      label="Start"
-                      onPress={() => onAction('start')}
-                    />
-                  )
-                ) : null}
-                {hasServer ? (
-                  <SheetButton
-                    busy={busyAction === 'restart'}
-                    disabled={busy || !status?.running}
-                    label="Restart"
-                    onPress={() => onAction('restart')}
-                  />
-                ) : null}
-                {watch?.declared ? (
-                  <SheetButton
-                    busy={busyAction === 'watch-start' || busyAction === 'watch-stop'}
-                    disabled={busy}
-                    label={
-                      busyAction === 'watch-start'
-                        ? 'Starting Watch'
-                        : busyAction === 'watch-stop'
-                          ? 'Stopping Watch'
-                          : watchRunning
-                            ? 'Stop Watch'
-                            : 'Start Watch'
-                    }
-                    onPress={() => onAction(watchRunning ? 'watch-stop' : 'watch-start')}
-                  />
-                ) : null}
-                {status?.hasBuild ? (
-                  <SheetButton
-                    busy={busyAction === 'rebuild'}
-                    disabled={busy}
-                    label={busyAction === 'rebuild' ? 'Rebuilding' : 'Rebuild & Restart'}
-                    onPress={() => onAction('rebuild')}
-                    variant="primary"
-                  />
-                ) : null}
-              </View>
+                    {status?.hasServerBuild ? (
+                      <SheetButton
+                        busy={busyAction === 'server-build'}
+                        disabled={busy}
+                        label={
+                          busyAction === 'server-build'
+                            ? 'Building'
+                            : status?.running
+                              ? 'Build & Restart'
+                              : 'Build'
+                        }
+                        onPress={() => onAction('server-build')}
+                        variant="primary"
+                      />
+                    ) : null}
+                  </View>
+                </>
+              ) : null}
+              {(status?.views.declared ?? 0) > 0 || watch?.declared ? (
+                <>
+                  <Text style={styles.groupTitle}>Viewer</Text>
+                  <View style={styles.actionsRow}>
+                    {(status?.views.declared ?? 0) > 0 ? (
+                      <SheetButton
+                        busy={busyAction === 'views-build'}
+                        // The watcher owns the bundle while it runs — a
+                        // manual build would be skipped anyway.
+                        disabled={busy || watchRunning}
+                        label={busyAction === 'views-build' ? 'Building' : 'Build'}
+                        onPress={() => onAction('views-build')}
+                        variant={hasServer ? 'secondary' : 'primary'}
+                      />
+                    ) : null}
+                    {watch?.declared ? (
+                      <SheetButton
+                        busy={busyAction === 'watch-start' || busyAction === 'watch-stop'}
+                        disabled={busy}
+                        label={
+                          busyAction === 'watch-start'
+                            ? 'Starting Watch'
+                            : busyAction === 'watch-stop'
+                              ? 'Stopping Watch'
+                              : watchRunning
+                                ? 'Stop Watch'
+                                : 'Start Watch'
+                        }
+                        onPress={() => onAction(watchRunning ? 'watch-stop' : 'watch-start')}
+                      />
+                    ) : null}
+                  </View>
+                </>
+              ) : null}
 
-              <Text style={styles.logsTitle}>Logs</Text>
+              <Text style={styles.groupTitle}>Logs</Text>
               {logsError ? <Text style={styles.errorText}>{logsError}</Text> : null}
               <LogPanel
                 emptyText="No output yet — servers only log errors, builds, and lifecycle events, so quiet is healthy."
@@ -245,7 +277,7 @@ export function ExtensionDetailSheet({
               />
               {showWatchLogs ? (
                 <>
-                  <Text style={styles.logsTitle}>Watch</Text>
+                  <Text style={styles.groupTitle}>Watch</Text>
                   <LogPanel
                     emptyText="No watch output yet — start Watch to stream rebuild notices here."
                     hideTags
@@ -621,7 +653,7 @@ function createStyles(theme: RemuxTheme) {
     logTime: {
       color: alpha(theme.textMuted, 0.8),
     },
-    logsTitle: {
+    groupTitle: {
       color: theme.text,
       fontSize: 13,
       fontWeight: '800',
