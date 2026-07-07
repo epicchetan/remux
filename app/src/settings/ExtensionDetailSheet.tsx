@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { BottomSheet, Group, Host, RNHostView } from '@expo/ui/swift-ui';
-import { presentationDragIndicator } from '@expo/ui/swift-ui/modifiers';
+import { presentationDetents, presentationDragIndicator } from '@expo/ui/swift-ui/modifiers';
 import {
   ActivityIndicator,
   Pressable,
@@ -8,7 +8,6 @@ import {
   StyleSheet,
   Text,
   View,
-  useWindowDimensions,
   type NativeScrollEvent,
   type NativeSyntheticEvent,
 } from 'react-native';
@@ -58,7 +57,6 @@ export function ExtensionDetailSheet({
 }) {
   const { styles, theme } = useSheetTheme();
   const insets = useSafeAreaInsets();
-  const { width: windowWidth } = useWindowDimensions();
   const connection = useRemuxConnection();
   const extensionId = status?.extensionId ?? null;
   const [logLines, setLogLines] = useState<ExtensionLogLine[]>([]);
@@ -142,14 +140,15 @@ export function ExtensionDetailSheet({
     : null;
 
   // Native SwiftUI sheet: system detents, drag indicator, dimming, and the
-  // liquid-glass chrome all come from UIKit. The RN content is hosted inside
-  // via RNHostView; Yoga lays that subtree out against the zero-size sheet
-  // anchor, so the width must be explicit — RNHostView (matchContents) then
-  // reports the resulting size to SwiftUI and fitToContents sizes the detent.
+  // liquid-glass chrome all come from UIKit. Sizing flows native → RN: the
+  // detents fix the sheet height, RNHostView (no matchContents) takes the
+  // sheet's proposed size and reports it into Yoga, and the RN content fills
+  // it. The reverse direction (Yoga-measured content sizing the sheet via
+  // fitToContents) measured near-zero — the content hangs off a zero-size
+  // native anchor in the RN shadow tree.
   return (
     <Host style={styles.anchor}>
       <BottomSheet
-        fitToContents
         isPresented={visible}
         onIsPresentedChange={(isPresented) => {
           if (!isPresented) {
@@ -157,9 +156,9 @@ export function ExtensionDetailSheet({
           }
         }}
       >
-        <Group modifiers={[presentationDragIndicator('visible')]}>
-          <RNHostView matchContents>
-            <View style={[styles.sheet, { paddingBottom: Math.max(insets.bottom, 16), width: windowWidth }]}>
+        <Group modifiers={[presentationDetents(['medium', 'large']), presentationDragIndicator('visible')]}>
+          <RNHostView>
+            <View style={[styles.sheet, { paddingBottom: Math.max(insets.bottom, 16) }]}>
               <View style={styles.headerRow}>
                 <Text numberOfLines={1} style={styles.title}>{name}</Text>
                 <StateBadge state={state} />
@@ -506,14 +505,16 @@ function createStyles(theme: RemuxTheme) {
       lineHeight: 17,
       marginBottom: 2,
     },
+    // Flexes into whatever the active detent leaves over: a sliver at
+    // medium, the full remainder at large.
     logPanel: {
       backgroundColor: theme.surface,
       borderColor: theme.border,
       borderRadius: 14,
       borderWidth: 1,
-      flexGrow: 0,
-      height: 260,
+      flex: 1,
       marginTop: 8,
+      minHeight: 96,
       overflow: 'hidden',
     },
     logScroll: {
@@ -555,8 +556,10 @@ function createStyles(theme: RemuxTheme) {
       borderColor: theme.focusRing,
     },
     // Background, corner radius, and grabber belong to the native sheet;
-    // painting over them would cover the system glass.
+    // painting over them would cover the system glass. flex: 1 fills the
+    // detent-sized RNHostView.
     sheet: {
+      flex: 1,
       paddingHorizontal: 18,
       paddingTop: 20,
     },
