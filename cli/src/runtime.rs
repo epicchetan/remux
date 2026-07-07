@@ -17,12 +17,14 @@ use serde_json::Value;
 use crate::config::{load_remux_config, load_runtime_values};
 use crate::extensions::discovery::{discover_extensions, extension_roots};
 use crate::extensions::manifest::ExtensionManifest;
+use crate::extensions::runstate::{sweep_orphans, RunState};
 use crate::extensions::supervisor::{ExtensionCtx, ExtensionSupervisor, SupervisorConfig};
 use crate::fs::core::FsCore;
 use crate::fs::relay::{FsRelay, FsRelayOptions};
 use crate::http::viewers::ViewerProvider;
 use crate::http::{build_router, HttpState};
 use crate::logs::{ExtensionLogs, Journal, JournalEvent, StdTerminal, TerminalMode};
+use crate::monitor::{MemoryAlert, ResourceMonitor};
 use crate::notifications::{production_fetch, NotificationManager};
 use crate::rpc::router::{BoxFuture, ExtensionServer, RpcRouter, SystemHooks};
 use crate::rpc::ws::{ClientCountListener, WsHooks, WsServer, REMUX_WEB_SOCKET_PATH};
@@ -90,6 +92,19 @@ impl ExtensionCtx for RuntimeCtx {
             }
         })
     }
+
+    fn on_extension_failed(&self, extension_id: &str, name: &str, body: String) {
+        let Some(notifications) = self.shared.notifications.get().cloned() else {
+            return;
+        };
+        let extension_id = extension_id.to_string();
+        let title = format!("{name} server failed");
+        tokio::spawn(async move {
+            notifications
+                .notify_system(&title, &body, "extension-failed", &extension_id)
+                .await;
+        });
+    }
 }
 
 struct RelayClientCount(Arc<FsRelay>);
@@ -150,7 +165,7 @@ fn install_panic_hook(journal: Arc<Journal>) {
     }));
 }
 
-pub async fn run_worker() -> Result<i32, String> {
+pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
     let root_dir = crate::paths::resolve(
         &std::env::current_dir().map_err(|error| format!("cannot resolve cwd: {error}"))?,
     );
@@ -160,6 +175,10 @@ pub async fn run_worker() -> Result<i32, String> {
     let journal = Journal::new(&root_dir, config.log_retention_days(), Arc::new(StdTerminal))
         .map_err(|error| format!("failed to open journal: {error}"))?;
     install_panic_hook(journal.clone());
+
+    // L3 boot orphan sweep: kill any process group a previous worker left
+    // behind, before anything new spawns.
+    sweep_orphans(&root_dir, &journal);
 
     let runtime = load_runtime_values(
         std::env::var("REMUX_HOST").ok().as_deref(),
@@ -190,6 +209,7 @@ pub async fn run_worker() -> Result<i32, String> {
     let ctx: Arc<dyn ExtensionCtx> = Arc::new(RuntimeCtx {
         shared: shared.clone(),
     });
+    let run_state = RunState::new(&root_dir);
     let mut servers: Vec<(String, Arc<dyn ExtensionServer>)> = Vec::new();
     for extension in extensions.iter().filter(|ext| ext.server.is_some()) {
         let (supervisor, actor) = ExtensionSupervisor::spawn(
@@ -198,6 +218,7 @@ pub async fn run_worker() -> Result<i32, String> {
             ctx.clone(),
             journal.clone(),
             extension_logs.clone(),
+            run_state.clone(),
         );
         servers.push((extension.id.clone(), supervisor));
 
@@ -230,6 +251,46 @@ pub async fn run_worker() -> Result<i32, String> {
         }));
     }
 
+    // Resource monitor (always on — it also feeds the memory guardrail).
+    let monitor = ResourceMonitor::new(
+        root_dir.clone(),
+        servers.clone(),
+        config.extension_memory_ceiling_mb(),
+        Box::new({
+            let notifications = notifications.clone();
+            let journal = journal.clone();
+            move |alert: MemoryAlert| {
+                let rss_mb = alert.rss_bytes / (1024 * 1024);
+                let ceiling_mb = alert.ceiling_bytes / (1024 * 1024);
+                journal.event(JournalEvent {
+                    detail: Some(serde_json::json!({
+                        "extensionId": alert.extension_id,
+                        "rssBytes": alert.rss_bytes,
+                        "ceilingBytes": alert.ceiling_bytes,
+                    })),
+                    label: Some("resources:memory-ceiling".to_string()),
+                    level: "warn",
+                    message: Some(format!(
+                        "{} is using {rss_mb}MB (ceiling {ceiling_mb}MB)",
+                        alert.extension_id
+                    )),
+                    ..Default::default()
+                });
+                let notifications = notifications.clone();
+                tokio::spawn(async move {
+                    notifications
+                        .notify_system(
+                            &format!("{} exceeded its memory ceiling", alert.extension_id),
+                            &format!("{rss_mb}MB resident (ceiling {ceiling_mb}MB)"),
+                            "memory-ceiling",
+                            &alert.extension_id,
+                        )
+                        .await;
+                });
+            }
+        }),
+    );
+
     // RPC router with system hooks.
     let system = SystemHooks {
         info: Some(Box::new({
@@ -248,6 +309,10 @@ pub async fn run_worker() -> Result<i32, String> {
                     std::process::exit(REMUX_RESTART_EXIT_CODE);
                 });
             }
+        })),
+        resources: Some(Box::new({
+            let monitor = monitor.clone();
+            move || monitor.latest()
         })),
     };
     let router = Arc::new(RpcRouter::new(
@@ -271,7 +336,7 @@ pub async fn run_worker() -> Result<i32, String> {
         WsHooks {
             notifications: Some(notifications.clone()),
             client_count: Some(Arc::new(RelayClientCount(relay.clone()))),
-            client_scoped: Some(extension_logs.clone()),
+            client_scoped: vec![extension_logs.clone(), monitor.clone()],
         },
         journal.clone(),
     );
@@ -291,6 +356,13 @@ pub async fn run_worker() -> Result<i32, String> {
         bind_display_url(&runtime.host, runtime.port)
     ));
 
+    // Hang watchdog + resource sampler.
+    crate::watchdog::start(config.watchdog_stale_seconds(), journal.clone(), {
+        let shared = shared.clone();
+        move || shared.shutting_down.load(Ordering::SeqCst)
+    });
+    monitor.start(config.resource_poll_seconds());
+
     // Relay + extension servers.
     {
         let ws = ws.clone();
@@ -300,7 +372,7 @@ pub async fn run_worker() -> Result<i32, String> {
             Arc::new(move |paths, roots| fs_core.invalidate(paths, roots)),
         );
     }
-    router.start().await;
+    router.start(rebuild).await;
 
     // Serve; the accept loop is critical.
     let serve_journal = journal.clone();

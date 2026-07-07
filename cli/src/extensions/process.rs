@@ -24,26 +24,44 @@ pub enum StdinCommand {
 pub struct SpawnedChild {
     pub child: Child,
     pub pid: u32,
+    /// Process-group id — equals `pid` because the child is spawned as a
+    /// group leader (`process_group(0)`). Group signals reach grandchildren.
+    pub pgid: u32,
     pub stdin: mpsc::UnboundedSender<StdinCommand>,
     pub stdout: ChildStdout,
     pub stderr: ChildStderr,
 }
 
-/// Spawns the extension server process with piped stdio and `kill_on_drop`
-/// (worker death takes the direct child with it — cheap insurance until full
-/// L3), and starts the dedicated stdin writer task.
+/// L3 spawn hardening shared by server and build processes: the child leads
+/// a fresh process group (so kill escalation can reach grandchildren) and
+/// takes `PDEATHSIG(SIGKILL)` (so an abrupt worker death kills the direct
+/// child even without `kill_on_drop` running).
+pub fn harden_command(command: &mut Command) -> &mut Command {
+    command.process_group(0);
+    unsafe {
+        command.pre_exec(|| {
+            nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL)
+                .map_err(std::io::Error::from)
+        });
+    }
+    command
+}
+
+/// Spawns the extension server process with piped stdio, `kill_on_drop`, and
+/// the L3 hardening above, and starts the dedicated stdin writer task.
 pub fn spawn_extension(
     spec: &ServerSpec,
     on_write_error: impl Fn(String) + Send + 'static,
 ) -> std::io::Result<SpawnedChild> {
-    let mut child = Command::new(&spec.command)
+    let mut command = Command::new(&spec.command);
+    command
         .args(&spec.args)
         .current_dir(&spec.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
+        .kill_on_drop(true);
+    let mut child = harden_command(&mut command).spawn()?;
 
     let pid = child.id().unwrap_or_default();
     let mut stdin = child.stdin.take().expect("stdin piped");
@@ -73,6 +91,7 @@ pub fn spawn_extension(
     Ok(SpawnedChild {
         child,
         pid,
+        pgid: pid,
         stdin: stdin_tx,
         stdout,
         stderr,
@@ -97,6 +116,29 @@ pub fn send_sigterm(pid: u32) {
         nix::unistd::Pid::from_raw(pid as i32),
         nix::sys::signal::Signal::SIGTERM,
     );
+}
+
+/// Best-effort group signal. Refuses pgid ≤ 1 and our own group — a stale or
+/// corrupt pgid must never fan out to the session or the runtime itself.
+pub fn signal_group(pgid: u32, signal: nix::sys::signal::Signal) {
+    if !group_signal_allowed(pgid) {
+        return;
+    }
+    let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid as i32), signal);
+}
+
+/// True while any member of the group is alive (signal-0 probe).
+pub fn group_alive(pgid: u32) -> bool {
+    if !group_signal_allowed(pgid) {
+        return false;
+    }
+    nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid as i32), None).is_ok()
+}
+
+fn group_signal_allowed(pgid: u32) -> bool {
+    pgid > 1
+        && pgid != std::process::id()
+        && nix::unistd::getpgrp() != nix::unistd::Pid::from_raw(pgid as i32)
 }
 
 /// Maps a wait status to `(code, signal_name)` like Node's `exit` event.

@@ -39,7 +39,10 @@ const BACKOFF_RESET_UPTIME_MS: u64 = 60_000;
 const SIGNAL_FORWARD_GRACE_MS: u64 = 7_000;
 const POLL_MS: u64 = 50;
 
-pub fn supervise() -> i32 {
+/// `rebuild` is forwarded to every worker spawn: with fresh artifacts a
+/// re-run of the build phase is a fast no-op, and a crash-restarted worker
+/// still honors the operator's intent.
+pub fn supervise(rebuild: bool) -> i32 {
     let pending_signal = Arc::new(AtomicUsize::new(0));
     for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
         let pending = pending_signal.clone();
@@ -65,11 +68,14 @@ pub fn supervise() -> i32 {
 
     loop {
         let started_at = Instant::now();
-        let mut child = match std::process::Command::new(&exe)
+        let mut command = std::process::Command::new(&exe);
+        command
             .arg("start")
-            .env(WORKER_ENV, std::process::id().to_string())
-            .spawn()
-        {
+            .env(WORKER_ENV, std::process::id().to_string());
+        if rebuild {
+            command.arg("--rebuild");
+        }
+        let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
                 eprintln!("remux worker failed to start: {error}");

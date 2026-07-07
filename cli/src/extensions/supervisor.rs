@@ -3,16 +3,21 @@
 //! removes the `ctx.fatal` escalation entirely — nothing an extension does
 //! can terminate the runtime.
 //!
-//! State machine (spec §L2):
+//! State machine (pass-1 spec §L2, `building` added in pass 2):
 //!
 //! ```text
-//! Stopped ──start──▶ Starting ──spawned──▶ Running
+//! Stopped ──start──▶ [Building ──built──▶] Starting ──spawned──▶ Running
+//! Building ──build fails──▶ Failed (lastExit reason build-failed, no crash budget)
 //! Running ──stop──▶ Stopping ──reaped──▶ Stopped
 //! Running ──exit code 0 (unprompted)──▶ Stopped
 //! Running ──crash──▶ BackingOff{n} ──delay──▶ Starting
 //! BackingOff: 5 crashes in 60s ──▶ Failed
 //! Failed ──manual start──▶ Starting
 //! ```
+//!
+//! Pass-2 L3: children lead their own process groups; kill escalation and
+//! the crash-path sweep use group signals so grandchildren die too, and every
+//! live group is recorded in the run-state file for the boot orphan sweep.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,10 +26,12 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::extensions::manifest::ExtensionManifest;
+use crate::extensions::manifest::{BuildSpec, ExtensionManifest, ServerSpec};
 use crate::extensions::process::{
-    exit_parts, read_lines, send_sigterm, spawn_extension, SpawnedChild, StdinCommand,
+    exit_parts, group_alive, harden_command, read_lines, send_sigterm, signal_group,
+    spawn_extension, SpawnedChild, StdinCommand,
 };
+use crate::extensions::runstate::{read_start_ticks, RunEntry, RunState};
 use crate::logs::{ExtensionLogs, Journal, JournalEvent};
 use crate::rpc::jsonrpc::{JsonRpcError, EXTENSION_ERROR};
 use crate::rpc::router::{BoxFuture, ExtensionServer, LastExit, RpcResult, ServerStatus};
@@ -37,15 +44,21 @@ pub const CRASH_BUDGET: usize = 5;
 pub const CRASH_WINDOW_MS: u64 = 60_000;
 pub const STOP_EOF_WAIT_MS: u64 = 2_000;
 pub const STOP_TERM_WAIT_MS: u64 = 2_000;
+pub const STOP_GROUP_WAIT_MS: u64 = 2_000;
+pub const BUILD_TIMEOUT_MS: u64 = 600_000;
+pub const BUILD_FAILED_REASON: &str = "build-failed";
 
 pub const DID_CHANGE_STATUS_METHOD: &str = "remux/extensions/didChangeStatus";
 const REMUX_NOTIFICATION_METHOD_PREFIX: &str = "remux/notifications/";
 
-/// What the supervisor needs from the runtime: client broadcast and the
-/// notification manager's first-refusal hook.
+/// What the supervisor needs from the runtime: client broadcast, the
+/// notification manager's first-refusal hook, and the failed-state alert
+/// (system push notification; no-op default keeps test contexts small).
 pub trait ExtensionCtx: Send + Sync {
     fn broadcast(&self, message: Value);
     fn handle_extension_notification(&self, message: Value) -> BoxFuture<'_, bool>;
+    /// Fires once per `failed` entry (crash budget exhausted or build failed).
+    fn on_extension_failed(&self, _extension_id: &str, _name: &str, _body: String) {}
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -57,6 +70,8 @@ pub struct SupervisorConfig {
     pub crash_window_ms: u64,
     pub stop_eof_wait_ms: u64,
     pub stop_term_wait_ms: u64,
+    pub stop_group_wait_ms: u64,
+    pub build_timeout_ms: u64,
 }
 
 impl Default for SupervisorConfig {
@@ -69,6 +84,8 @@ impl Default for SupervisorConfig {
             crash_window_ms: CRASH_WINDOW_MS,
             stop_eof_wait_ms: STOP_EOF_WAIT_MS,
             stop_term_wait_ms: STOP_TERM_WAIT_MS,
+            stop_group_wait_ms: STOP_GROUP_WAIT_MS,
+            build_timeout_ms: BUILD_TIMEOUT_MS,
         }
     }
 }
@@ -76,6 +93,7 @@ impl Default for SupervisorConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lifecycle {
     Stopped,
+    Building,
     Starting,
     Running,
     Stopping,
@@ -87,6 +105,7 @@ impl Lifecycle {
     fn name(self) -> &'static str {
         match self {
             Lifecycle::Stopped => "stopped",
+            Lifecycle::Building => "building",
             Lifecycle::Starting => "starting",
             Lifecycle::Running => "running",
             Lifecycle::Stopping => "stopping",
@@ -104,9 +123,15 @@ struct PendingRpc {
 type PendingMap = Arc<Mutex<HashMap<u64, PendingRpc>>>;
 
 enum Cmd {
-    Start(oneshot::Sender<ServerStatus>),
+    Start {
+        rebuild: bool,
+        ack: oneshot::Sender<ServerStatus>,
+    },
     Stop(oneshot::Sender<ServerStatus>),
-    Restart(oneshot::Sender<ServerStatus>),
+    Restart {
+        rebuild: bool,
+        ack: oneshot::Sender<ServerStatus>,
+    },
     Rpc {
         method: String,
         params: Option<Value>,
@@ -135,7 +160,13 @@ impl ExtensionSupervisor {
         ctx: Arc<dyn ExtensionCtx>,
         journal: Arc<Journal>,
         logs: Arc<ExtensionLogs>,
+        run_state: Arc<RunState>,
     ) -> (Arc<Self>, tokio::task::JoinHandle<()>) {
+        let has_build = extension
+            .server
+            .as_ref()
+            .map(|server| server.build.is_some())
+            .unwrap_or(false);
         let status = Arc::new(Mutex::new(ServerStatus {
             restartable: true,
             running: false,
@@ -144,6 +175,7 @@ impl ExtensionSupervisor {
             started_at_ms: None,
             restart_count: 0,
             last_exit: None,
+            has_build,
         }));
         let (commands, mailbox) = mpsc::unbounded_channel();
 
@@ -161,15 +193,18 @@ impl ExtensionSupervisor {
             journal,
             logs,
             status,
+            run_state,
             pending: Arc::new(Mutex::new(HashMap::new())),
             generation: Arc::new(AtomicU64::new(0)),
             state: Lifecycle::Stopped,
             child: None,
             stdin: None,
             pid: None,
+            pgid: None,
             started_at_ms: None,
             restart_count: 0,
             last_exit: None,
+            last_build_failed: false,
             crash_times: VecDeque::new(),
             backoff_deadline: None,
             next_rpc_id: 1,
@@ -196,16 +231,16 @@ impl ExtensionSupervisor {
 }
 
 impl ExtensionServer for ExtensionSupervisor {
-    fn start(&self) -> BoxFuture<'_, ServerStatus> {
-        Box::pin(self.command_status(Cmd::Start))
+    fn start(&self, rebuild: bool) -> BoxFuture<'_, ServerStatus> {
+        Box::pin(self.command_status(move |ack| Cmd::Start { rebuild, ack }))
     }
 
     fn stop(&self) -> BoxFuture<'_, ServerStatus> {
         Box::pin(self.command_status(Cmd::Stop))
     }
 
-    fn restart(&self) -> BoxFuture<'_, ServerStatus> {
-        Box::pin(self.command_status(Cmd::Restart))
+    fn restart(&self, rebuild: bool) -> BoxFuture<'_, ServerStatus> {
+        Box::pin(self.command_status(move |ack| Cmd::Restart { rebuild, ack }))
     }
 
     fn handle_rpc(&self, method: String, params: Option<Value>) -> BoxFuture<'_, RpcResult> {
@@ -250,15 +285,20 @@ struct Actor {
     journal: Arc<Journal>,
     logs: Arc<ExtensionLogs>,
     status: Arc<Mutex<ServerStatus>>,
+    run_state: Arc<RunState>,
     pending: PendingMap,
     generation: Arc<AtomicU64>,
     state: Lifecycle,
     child: Option<tokio::process::Child>,
     stdin: Option<mpsc::UnboundedSender<StdinCommand>>,
     pid: Option<u32>,
+    pgid: Option<u32>,
     started_at_ms: Option<i64>,
     restart_count: u32,
     last_exit: Option<LastExit>,
+    /// Forces the next start to re-run the build even when a stale artifact
+    /// from an earlier successful build still exists.
+    last_build_failed: bool,
     crash_times: VecDeque<std::time::Instant>,
     backoff_deadline: Option<tokio::time::Instant>,
     next_rpc_id: u64,
@@ -285,7 +325,7 @@ impl Actor {
                 {
                     self.backoff_deadline = None;
                     self.restart_count += 1;
-                    self.spawn_child();
+                    self.start_flow(false).await;
                 }
             }
         }
@@ -296,13 +336,13 @@ impl Actor {
 
     async fn handle_command(&mut self, command: Cmd) {
         match command {
-            Cmd::Start(ack) => {
+            Cmd::Start { rebuild, ack } => {
                 match self.state {
                     // Idempotent when already up (extensionProcess.cjs:19-23).
                     Lifecycle::Running | Lifecycle::Starting => {}
                     _ => {
                         self.backoff_deadline = None;
-                        self.spawn_child();
+                        self.start_flow(rebuild).await;
                     }
                 }
                 let _ = ack.send(self.current_status());
@@ -312,16 +352,165 @@ impl Actor {
                 self.stop_child().await;
                 let _ = ack.send(self.current_status());
             }
-            Cmd::Restart(ack) => {
+            Cmd::Restart { rebuild, ack } => {
                 self.journal_lifecycle("extension:restart", None, "info");
                 self.journal_lifecycle("extension:stop", None, "info");
                 self.stop_child().await;
-                self.spawn_child();
+                self.start_flow(rebuild).await;
                 let _ = ack.send(self.current_status());
             }
             Cmd::Rpc { method, params, ack } => self.handle_rpc(method, params, ack),
             Cmd::Notify { method, params } => self.handle_notify(method, params),
         }
+    }
+
+    /// Build (when needed) then spawn. The build runs inline in the actor, so
+    /// start/restart RPCs block through `building` like every other state.
+    async fn start_flow(&mut self, rebuild: bool) {
+        let Some(server) = self.extension.server.clone() else {
+            return;
+        };
+        if let Some(build) = server.build.clone() {
+            let artifact = if std::path::Path::new(&server.command).is_absolute() {
+                std::path::PathBuf::from(&server.command)
+            } else {
+                server.cwd.join(&server.command)
+            };
+            let needed = rebuild || self.last_build_failed || !artifact.exists();
+            if needed && !self.run_build(&build).await {
+                return;
+            }
+        }
+        self.spawn_child(&server);
+    }
+
+    /// Runs the manifest build phase under the same pgroup/log plumbing as
+    /// the server. Build failure lands `failed` with `lastExit` reason
+    /// `build-failed` and does NOT consume crash budget — builds are
+    /// deterministic; retry is manual.
+    async fn run_build(&mut self, build: &BuildSpec) -> bool {
+        self.set_state(Lifecycle::Building);
+        self.journal_lifecycle(
+            "extension:build",
+            Some(serde_json::json!({
+                "command": build.command,
+                "args": build.args,
+                "cwd": build.cwd.to_string_lossy(),
+            })),
+            "info",
+        );
+        self.append_build_log(&format!(
+            "starting: {} {}",
+            build.command,
+            build.args.join(" ")
+        ));
+
+        let mut command = tokio::process::Command::new(&build.command);
+        command
+            .args(&build.args)
+            .current_dir(&build.cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = match harden_command(&mut command).spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                self.append_build_log(&format!("spawn failed: {error}"));
+                self.fail_build(None, None, &format!("build spawn failed: {error}"));
+                return false;
+            }
+        };
+
+        let pid = child.id().unwrap_or_default();
+        self.run_state.record(
+            &self.extension.id,
+            RunEntry {
+                pid,
+                pgid: pid,
+                start_ticks: read_start_ticks(pid).unwrap_or(0),
+                started_at_ms: now_ms(),
+            },
+        );
+
+        // Stream both pipes into the extension log ring with the [build]
+        // prefix — build errors are readable from the phone.
+        for stream in [
+            child.stdout.take().map(BuildPipe::Stdout),
+            child.stderr.take().map(BuildPipe::Stderr),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let logs = self.logs.clone();
+            let extension_id = self.extension.id.clone();
+            tokio::spawn(async move {
+                let append = move |line: String| {
+                    if !line.trim().is_empty() {
+                        logs.append(&extension_id, "build", &format!("[build] {line}"));
+                    }
+                };
+                match stream {
+                    BuildPipe::Stdout(pipe) => read_lines(pipe, append).await,
+                    BuildPipe::Stderr(pipe) => read_lines(pipe, append).await,
+                }
+            });
+        }
+
+        let timeout = std::time::Duration::from_millis(self.cfg.build_timeout_ms);
+        let status = match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(status) => status.ok(),
+            Err(_) => {
+                signal_group(pid, nix::sys::signal::Signal::SIGKILL);
+                let _ = child.wait().await;
+                self.run_state.remove(&self.extension.id);
+                self.append_build_log(&format!(
+                    "timed out after {}ms",
+                    self.cfg.build_timeout_ms
+                ));
+                self.fail_build(None, None, "build timed out");
+                return false;
+            }
+        };
+        self.run_state.remove(&self.extension.id);
+
+        let (code, signal) = status.map(exit_parts).unwrap_or((None, None));
+        if signal.is_none() && code == Some(0) {
+            self.append_build_log("completed");
+            self.journal_lifecycle("extension:build-done", None, "info");
+            self.last_build_failed = false;
+            return true;
+        }
+
+        self.append_build_log(&format!("failed code={code:?} signal={signal:?}"));
+        self.fail_build(code, signal, "build failed");
+        false
+    }
+
+    fn fail_build(&mut self, code: Option<i32>, signal: Option<String>, message: &str) {
+        self.journal_lifecycle(
+            "extension:build-failed",
+            Some(serde_json::json!({ "code": code, "signal": signal, "message": message })),
+            "error",
+        );
+        self.last_build_failed = true;
+        self.last_exit = Some(LastExit {
+            code,
+            signal,
+            at: now_ms(),
+            reason: Some(BUILD_FAILED_REASON.to_string()),
+        });
+        self.set_state(Lifecycle::Failed);
+        self.ctx.on_extension_failed(
+            &self.extension.id,
+            &self.extension.display.title,
+            format!("{message} — see extension logs"),
+        );
+    }
+
+    fn append_build_log(&self, message: &str) {
+        self.logs
+            .append(&self.extension.id, "build", &format!("[build] {message}"));
     }
 
     fn handle_rpc(&mut self, method: String, params: Option<Value>, ack: oneshot::Sender<RpcResult>) {
@@ -383,11 +572,7 @@ impl Actor {
         let _ = stdin.send(StdinCommand::Line(format!("{}\n", Value::Object(message))));
     }
 
-    fn spawn_child(&mut self) {
-        let Some(server) = self.extension.server.clone() else {
-            return;
-        };
-
+    fn spawn_child(&mut self, server: &ServerSpec) {
         self.set_state(Lifecycle::Starting);
         self.journal_lifecycle(
             "extension:start",
@@ -405,7 +590,7 @@ impl Actor {
 
         let journal = self.journal.clone();
         let extension_id = self.extension.id.clone();
-        let spawned = spawn_extension(&server, move |error| {
+        let spawned = spawn_extension(server, move |error| {
             journal.warn(&format!(
                 "[remux] failed to write to extension {extension_id}: {error}"
             ));
@@ -415,6 +600,7 @@ impl Actor {
             Ok(SpawnedChild {
                 child,
                 pid,
+                pgid,
                 stdin,
                 stdout,
                 stderr,
@@ -422,7 +608,17 @@ impl Actor {
                 self.child = Some(child);
                 self.stdin = Some(stdin);
                 self.pid = Some(pid);
+                self.pgid = Some(pgid);
                 self.started_at_ms = Some(now_ms());
+                self.run_state.record(
+                    &self.extension.id,
+                    RunEntry {
+                        pid,
+                        pgid,
+                        start_ticks: read_start_ticks(pid).unwrap_or(0),
+                        started_at_ms: now_ms(),
+                    },
+                );
                 self.spawn_stdout_reader(stdout, generation);
                 self.spawn_stderr_reader(stderr, generation);
                 self.set_state(Lifecycle::Running);
@@ -463,11 +659,19 @@ impl Actor {
         self.child = None;
         self.stdin = None;
         self.pid = None;
+        // Crash-path sweep: the direct child is reaped, but grandchildren
+        // (helpers, PTY shells) survive its death — kill the group before any
+        // respawn so instances can never overlap.
+        if let Some(pgid) = self.pgid.take() {
+            signal_group(pgid, nix::sys::signal::Signal::SIGKILL);
+        }
+        self.run_state.remove(&self.extension.id);
         self.started_at_ms = None;
         self.last_exit = Some(LastExit {
             code,
             signal,
             at: now_ms(),
+            reason: None,
         });
         self.generation.fetch_add(1, Ordering::SeqCst);
 
@@ -512,6 +716,13 @@ impl Actor {
             self.backoff_deadline = None;
             self.crash_times.clear();
             self.set_state(Lifecycle::Failed);
+            let last_stderr = last_stderr_line(&self.logs.snapshot(&self.extension.id, 50))
+                .unwrap_or_else(|| format!("{crashes} crashes in 60s"));
+            self.ctx.on_extension_failed(
+                &self.extension.id,
+                &self.extension.display.title,
+                format!("{last_stderr} · {} restarts", self.restart_count),
+            );
             return;
         }
 
@@ -530,22 +741,25 @@ impl Actor {
         self.set_state(Lifecycle::BackingOff);
     }
 
-    /// EOF → SIGTERM → SIGKILL with confirmed reap. Returns only after the
-    /// direct child is gone, so restart can never overlap two instances and
-    /// the reported status is truthful.
+    /// EOF → SIGTERM (group) → SIGKILL (group) with confirmed reap, then a
+    /// group-empty check. Returns only after the direct child is gone, so
+    /// restart can never overlap two instances and the reported status is
+    /// truthful. Group signals make the escalation reach grandchildren — the
+    /// EOF-first step stays because it is the polite path both real servers
+    /// honor (and lets them run their own child cleanup).
     async fn stop_child(&mut self) {
         self.backoff_deadline = None;
         self.reject_pending(&format!("extension {} stopped", self.extension.id));
 
         // Close the stdin channel and drop ChildStdin -> the extension sees
-        // EOF. With `cargo run`, stdin passes through to the binary, so EOF
-        // reaches the grandchild — which SIGTERM to cargo does not.
+        // EOF.
         if let Some(stdin) = self.stdin.take() {
             let _ = stdin.send(StdinCommand::Close);
         }
 
         let Some(mut child) = self.child.take() else {
             self.pid = None;
+            self.pgid = None;
             self.started_at_ms = None;
             self.set_state(Lifecycle::Stopped);
             return;
@@ -559,18 +773,43 @@ impl Actor {
         let status = match tokio::time::timeout(eof_wait, child.wait()).await {
             Ok(status) => status.ok(),
             Err(_) => {
-                if let Some(pid) = self.pid {
-                    send_sigterm(pid);
+                match (self.pgid, self.pid) {
+                    (Some(pgid), _) => signal_group(pgid, nix::sys::signal::Signal::SIGTERM),
+                    (None, Some(pid)) => send_sigterm(pid),
+                    (None, None) => {}
                 }
                 match tokio::time::timeout(term_wait, child.wait()).await {
                     Ok(status) => status.ok(),
                     Err(_) => {
+                        if let Some(pgid) = self.pgid {
+                            signal_group(pgid, nix::sys::signal::Signal::SIGKILL);
+                        }
                         let _ = child.start_kill();
                         child.wait().await.ok()
                     }
                 }
             }
         };
+
+        // The direct child is reaped; make sure the rest of its group is too.
+        // SIGKILL to a drained group is a no-op, so this is safe on the
+        // polite path — and it is what makes restart storms leave zero strays.
+        if let Some(pgid) = self.pgid {
+            signal_group(pgid, nix::sys::signal::Signal::SIGKILL);
+            let deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_millis(self.cfg.stop_group_wait_ms);
+            while group_alive(pgid) && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            if group_alive(pgid) {
+                self.journal_lifecycle(
+                    "extension:group-lingering",
+                    Some(serde_json::json!({ "pgid": pgid })),
+                    "warn",
+                );
+            }
+        }
+        self.run_state.remove(&self.extension.id);
 
         let (code, signal) = status.map(exit_parts).unwrap_or((None, None));
         self.journal_lifecycle(
@@ -587,8 +826,10 @@ impl Actor {
             code,
             signal,
             at: now_ms(),
+            reason: None,
         });
         self.pid = None;
+        self.pgid = None;
         self.started_at_ms = None;
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.set_state(Lifecycle::Stopped);
@@ -660,6 +901,12 @@ impl Actor {
             started_at_ms: self.started_at_ms,
             restart_count: self.restart_count,
             last_exit: self.last_exit.clone(),
+            has_build: self
+                .extension
+                .server
+                .as_ref()
+                .map(|server| server.build.is_some())
+                .unwrap_or(false),
         }
     }
 
@@ -689,6 +936,23 @@ impl Actor {
             ..Default::default()
         });
     }
+}
+
+enum BuildPipe {
+    Stdout(tokio::process::ChildStdout),
+    Stderr(tokio::process::ChildStderr),
+}
+
+/// Last stderr line from an `ExtensionLogs::snapshot` array — the push
+/// notification body for failed extensions.
+fn last_stderr_line(snapshot: &Value) -> Option<String> {
+    snapshot
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|entry| entry.get("stream").and_then(Value::as_str) == Some("stderr"))
+        .and_then(|entry| entry.get("line").and_then(Value::as_str))
+        .map(str::to_string)
 }
 
 async fn handle_protocol_line(

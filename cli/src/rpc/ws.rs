@@ -183,7 +183,8 @@ pub trait WsLog: Send + Sync {
 pub struct WsHooks {
     pub notifications: Option<Arc<dyn NotificationsHook>>,
     pub client_count: Option<Arc<dyn ClientCountListener>>,
-    pub client_scoped: Option<Arc<dyn ClientScopedRpc>>,
+    /// Tried in order; the first hook that recognizes the method wins.
+    pub client_scoped: Vec<Arc<dyn ClientScopedRpc>>,
 }
 
 pub struct WsServer {
@@ -361,7 +362,7 @@ impl WsServer {
         let params = message.get("params");
         let id = message.get("id").cloned().unwrap_or(Value::Null);
 
-        if let Some(client_scoped) = &self.hooks.client_scoped {
+        for client_scoped in &self.hooks.client_scoped {
             if let Some(result) = client_scoped.handle(client, &method, params) {
                 match result {
                     Ok(result) => client.send_message(&response_message(&id, result)),

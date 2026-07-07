@@ -10,6 +10,8 @@
 //! - `FIXTURE_STDERR=<text>`: write a stderr line at startup.
 //! - `FIXTURE_SPAM_NOTIFICATIONS=1`: emit notifications continuously.
 //! - `FIXTURE_STARTUP_NOTIFICATION=<method>`: emit one notification at boot.
+//! - `FIXTURE_SPAWN_CHILD=1`: spawn a long-lived grandchild (`sleep 300`) and
+//!   print `child:<pid>` to stderr — the L3 group-kill test subject.
 //!
 //! Methods: `fixture/echo` (echoes params), `fixture/block` (never responds),
 //! `fixture/crash` (exits with `params.code`), `fixture/stderr` (writes
@@ -53,6 +55,13 @@ fn main() {
 
     if let Ok(line) = std::env::var("FIXTURE_STDERR") {
         eprintln!("{line}");
+    }
+
+    if env_flag("FIXTURE_SPAWN_CHILD") {
+        match std::process::Command::new("sleep").arg("300").spawn() {
+            Ok(child) => eprintln!("child:{}", child.id()),
+            Err(error) => eprintln!("child-spawn-failed:{error}"),
+        }
     }
 
     if let Ok(ms) = std::env::var("FIXTURE_EXIT_AFTER_MS") {

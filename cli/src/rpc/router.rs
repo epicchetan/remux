@@ -18,6 +18,7 @@ pub const EXTENSION_LOGS_METHOD: &str = "remux/extensions/logs";
 pub const SYSTEM_INFO_METHOD: &str = "remux/system/info";
 pub const SYSTEM_PING_METHOD: &str = "remux/system/ping";
 pub const SYSTEM_RESTART_METHOD: &str = "remux/system/restart";
+pub const SYSTEM_RESOURCES_METHOD: &str = "remux/system/resources";
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type RpcResult = Result<Value, JsonRpcError>;
@@ -34,6 +35,9 @@ pub struct ServerStatus {
     pub started_at_ms: Option<i64>,
     pub restart_count: u32,
     pub last_exit: Option<LastExit>,
+    /// Pass-2 additive: whether the manifest declares a `server.build` phase
+    /// (gates the app's Rebuild & Restart action).
+    pub has_build: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +45,9 @@ pub struct LastExit {
     pub code: Option<i32>,
     pub signal: Option<String>,
     pub at: i64,
+    /// Pass-2 additive: non-exit failure reason (`build-failed`), omitted
+    /// from the wire when absent.
+    pub reason: Option<String>,
 }
 
 impl ServerStatus {
@@ -76,20 +83,26 @@ impl ServerStatus {
                             .unwrap_or(Value::Null),
                     );
                     value.insert("at".to_string(), Value::from(exit.at));
+                    if let Some(reason) = &exit.reason {
+                        value.insert("reason".to_string(), Value::from(reason.clone()));
+                    }
                     Value::Object(value)
                 }
                 None => Value::Null,
             },
         );
+        target.insert("hasBuild".to_string(), Value::from(self.has_build));
     }
 }
 
 /// The contract the router expects from an extension server, mirroring the
 /// duck-typed server objects `createRpcRouter` consumed in Node.
 pub trait ExtensionServer: Send + Sync {
-    fn start(&self) -> BoxFuture<'_, ServerStatus>;
+    /// `rebuild` forces the manifest `build` phase to run even when the
+    /// artifact exists; ignored for extensions without a build phase.
+    fn start(&self, rebuild: bool) -> BoxFuture<'_, ServerStatus>;
     fn stop(&self) -> BoxFuture<'_, ServerStatus>;
-    fn restart(&self) -> BoxFuture<'_, ServerStatus>;
+    fn restart(&self, rebuild: bool) -> BoxFuture<'_, ServerStatus>;
     fn handle_rpc(&self, method: String, params: Option<Value>) -> BoxFuture<'_, RpcResult>;
     fn handle_notification(&self, method: String, params: Option<Value>);
     fn status(&self) -> ServerStatus;
@@ -102,11 +115,13 @@ pub trait CoreRpc: Send + Sync {
 }
 
 /// System hooks wired by the runtime: `info` supplies `remux/system/info`,
-/// `restart` schedules the exit-75 restart before the response is sent.
+/// `restart` schedules the exit-75 restart before the response is sent,
+/// `resources` supplies the latest `remux/system/resources` sample.
 #[derive(Default)]
 pub struct SystemHooks {
     pub info: Option<Box<dyn Fn() -> Value + Send + Sync>>,
     pub restart: Option<Box<dyn Fn() + Send + Sync>>,
+    pub resources: Option<Box<dyn Fn() -> Value + Send + Sync>>,
 }
 
 pub struct RpcRouter {
@@ -138,12 +153,14 @@ impl RpcRouter {
             .map(|(_, server)| server)
     }
 
-    pub async fn start(&self) {
+    /// Boot start; `rebuild` comes from `remux start --rebuild` and applies
+    /// to each extension's first spawn only.
+    pub async fn start(&self, rebuild: bool) {
         let mut tasks = tokio::task::JoinSet::new();
         for (_, server) in &self.servers {
             let server = server.clone();
             tasks.spawn(async move {
-                server.start().await;
+                server.start(rebuild).await;
             });
         }
         while tasks.join_next().await.is_some() {}
@@ -220,6 +237,14 @@ impl RpcRouter {
             });
         }
 
+        if method == SYSTEM_RESOURCES_METHOD {
+            // Without a monitor wired, degrade like an un-updated runtime.
+            return match &self.system.resources {
+                Some(resources) => Ok(resources()),
+                None => Err(JsonRpcError::method_not_found(method)),
+            };
+        }
+
         Err(JsonRpcError::method_not_found(method))
     }
 
@@ -267,7 +292,7 @@ impl RpcRouter {
                     "started": false,
                 }));
             };
-            let status = server.start().await;
+            let status = server.start(rebuild_from_params(params)).await;
             let mut result = Map::new();
             result.insert("extensionId".to_string(), Value::from(extension_id));
             status.append_to(&mut result);
@@ -303,7 +328,7 @@ impl RpcRouter {
                     "running": false,
                 }));
             };
-            let status = server.restart().await;
+            let status = server.restart(rebuild_from_params(params)).await;
             let mut result = Map::new();
             result.insert("extensionId".to_string(), Value::from(extension_id));
             status.append_to(&mut result);
@@ -316,7 +341,10 @@ impl RpcRouter {
 }
 
 pub fn is_system_method(method: &str) -> bool {
-    method == SYSTEM_INFO_METHOD || method == SYSTEM_PING_METHOD || method == SYSTEM_RESTART_METHOD
+    method == SYSTEM_INFO_METHOD
+        || method == SYSTEM_PING_METHOD
+        || method == SYSTEM_RESTART_METHOD
+        || method == SYSTEM_RESOURCES_METHOD
 }
 
 pub fn is_extension_management_method(method: &str) -> bool {
@@ -349,6 +377,13 @@ fn extension_id_from_params(params: Option<&Value>, method: &str) -> Result<Stri
         .ok_or_else(|| JsonRpcError::new(INVALID_PARAMS, format!("Invalid {method} params")))
 }
 
+fn rebuild_from_params(params: Option<&Value>) -> bool {
+    params
+        .and_then(|params| params.get("rebuild"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,18 +414,20 @@ mod tests {
                 started_at_ms: None,
                 restart_count: 0,
                 last_exit: None,
+                has_build: false,
             }
         }
     }
 
     impl ExtensionServer for FixtureServer {
-        fn start(&self) -> BoxFuture<'_, ServerStatus> {
-            Box::pin(async {
+        fn start(&self, rebuild: bool) -> BoxFuture<'_, ServerStatus> {
+            Box::pin(async move {
                 *self.running.lock().unwrap() = true;
+                let suffix = if rebuild { ":rebuild" } else { "" };
                 self.calls
                     .lock()
                     .unwrap()
-                    .push(format!("{}:start", self.extension_id));
+                    .push(format!("{}:start{suffix}", self.extension_id));
                 self.snapshot()
             })
         }
@@ -406,10 +443,10 @@ mod tests {
             })
         }
 
-        fn restart(&self) -> BoxFuture<'_, ServerStatus> {
-            Box::pin(async {
+        fn restart(&self, rebuild: bool) -> BoxFuture<'_, ServerStatus> {
+            Box::pin(async move {
                 self.stop().await;
-                self.start().await
+                self.start(rebuild).await
             })
         }
 
@@ -475,6 +512,7 @@ mod tests {
                 restart: Some(Box::new(move || {
                     system_calls.lock().unwrap().push("system:restart".to_string());
                 })),
+                resources: None,
             },
         )
     }
@@ -495,7 +533,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let router = fixture_router(&calls);
 
-        router.start().await;
+        router.start(false).await;
         {
             let mut started = calls.lock().unwrap().clone();
             started.sort();
@@ -570,6 +608,32 @@ mod tests {
             .unwrap();
         assert_eq!(started["started"], json!(true));
         assert_eq!(started["running"], json!(true));
+        assert_eq!(started["hasBuild"], json!(false));
+
+        // Optional rebuild param reaches the server on start and restart.
+        router
+            .handle_request(
+                EXTENSION_START_METHOD,
+                Some(&json!({ "extensionId": "files", "rebuild": true })),
+            )
+            .await
+            .unwrap();
+        router
+            .handle_request(
+                EXTENSION_RESTART_METHOD,
+                Some(&json!({ "extensionId": "files", "rebuild": true })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| *call == "files:start:rebuild")
+                .count(),
+            2
+        );
 
         assert_eq!(
             router.handle_request(SYSTEM_PING_METHOD, None).await.unwrap(),

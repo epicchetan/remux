@@ -9,17 +9,22 @@
   },
   "server": {
     "transport": "stdio",
-    "command": "cargo",
-    "args": [
-      "run",
-      "--manifest-path",
-      "server/Cargo.toml",
-      "--target-dir",
-      "/tmp/remux-codex-server-target",
-      "--offline",
-      "--quiet",
-      "--"
-    ],
+    "build": {
+      "command": "cargo",
+      "args": [
+        "build",
+        "--release",
+        "--manifest-path",
+        "server/Cargo.toml",
+        "--target-dir",
+        "/tmp/remux-codex-server-target",
+        "--offline",
+        "--quiet"
+      ],
+      "cwd": "."
+    },
+    "command": "/tmp/remux-codex-server-target/release/remux-codex-server",
+    "args": [],
     "cwd": "."
   },
   "views": {

@@ -533,6 +533,60 @@ impl NotificationManager {
         results.into_iter().any(|visible| visible)
     }
 
+    /// Operational alert to **all** registered clients with push tokens, with
+    /// no is-viewing suppression — there is no tab target to be "viewing".
+    /// The app opens Settings when `data.kind == "system"`.
+    pub async fn notify_system(&self, title: &str, body: &str, reason: &str, extension_id: &str) {
+        let recipients: Vec<(String, String)> = {
+            let clients = self.clients.lock().unwrap();
+            clients
+                .iter()
+                .filter_map(|(client_id, state)| {
+                    state
+                        .expo_push_token
+                        .clone()
+                        .map(|token| (client_id.clone(), token))
+                })
+                .collect()
+        };
+
+        let data = serde_json::json!({
+            "kind": "system",
+            "reason": reason,
+            "extensionId": extension_id,
+        });
+        let log_detail = serde_json::json!({
+            "kind": "system",
+            "reason": reason,
+            "extensionId": extension_id,
+            "title": title,
+        });
+
+        if recipients.is_empty() {
+            self.log.event(
+                "notifications:system:no-recipients",
+                "info",
+                Some(log_detail),
+                false,
+            );
+            return;
+        }
+
+        for (client_id, token) in recipients {
+            let mut payload = Map::new();
+            payload.insert("body".to_string(), Value::from(body));
+            payload.insert("channelId".to_string(), Value::from(NOTIFICATION_CHANNEL_ID));
+            payload.insert("data".to_string(), data.clone());
+            payload.insert("interruptionLevel".to_string(), Value::from("active"));
+            payload.insert("priority".to_string(), Value::from("high"));
+            payload.insert("sound".to_string(), Value::from("default"));
+            payload.insert("title".to_string(), Value::from(title));
+            payload.insert("to".to_string(), Value::from(token.as_str()));
+            self.dispatch_expo_push(&client_id, Value::Object(payload), log_detail.clone())
+                .await;
+        }
+    }
+
     async fn send_expo_push(&self, client_id: &str, token: &str, intent: &Value) {
         let mut payload = Map::new();
         if let Some(body) = intent.get("body").and_then(Value::as_str) {
@@ -549,8 +603,14 @@ impl NotificationManager {
         payload.insert("title".to_string(), intent.get("title").cloned().unwrap_or(Value::Null));
         payload.insert("to".to_string(), Value::from(token));
 
-        let response =
-            (self.fetch)(EXPO_PUSH_SEND_URL.to_string(), Value::Object(payload)).await;
+        self.dispatch_expo_push(client_id, Value::Object(payload), notification_log_detail(intent))
+            .await;
+    }
+
+    /// Shared Expo send + ticket handling (DeviceNotRegistered clears the
+    /// stored token) for intent and system pushes.
+    async fn dispatch_expo_push(&self, client_id: &str, payload: Value, log_detail: Value) {
+        let response = (self.fetch)(EXPO_PUSH_SEND_URL.to_string(), payload).await;
 
         let response = match response {
             Ok(response) => response,
@@ -560,7 +620,7 @@ impl NotificationManager {
                     "warn",
                     Some(serde_json::json!({
                         "body": error,
-                        "intent": notification_log_detail(intent),
+                        "intent": log_detail,
                         "status": null,
                     })),
                     false,
@@ -575,7 +635,7 @@ impl NotificationManager {
                 "warn",
                 Some(serde_json::json!({
                     "body": response.body,
-                    "intent": notification_log_detail(intent),
+                    "intent": log_detail,
                     "status": response.status,
                 })),
                 false,
@@ -610,7 +670,7 @@ impl NotificationManager {
                     "notifications:push:ticket-error",
                     "warn",
                     Some(serde_json::json!({
-                        "intent": notification_log_detail(intent),
+                        "intent": log_detail,
                         "ticket": ticket,
                     })),
                     false,
@@ -623,7 +683,7 @@ impl NotificationManager {
             "notifications:push:sent",
             "info",
             Some(serde_json::json!({
-                "intent": notification_log_detail(intent),
+                "intent": log_detail,
                 "ticket": ticket,
             })),
             true,

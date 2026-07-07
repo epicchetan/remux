@@ -19,6 +19,17 @@ fn free_port() -> u16 {
 }
 
 fn write_fixture_extension(root: &Path) {
+    write_fixture_extension_with_server(
+        root,
+        json!({
+            "transport": "stdio",
+            "command": env!("CARGO_BIN_EXE_remux-fixture-ext"),
+            "args": [],
+        }),
+    );
+}
+
+fn write_fixture_extension_with_server(root: &Path, server: Value) {
     let ext_dir = root.join("extensions/fixture");
     let dist = ext_dir.join("viewer/dist");
     std::fs::create_dir_all(&dist).unwrap();
@@ -29,11 +40,7 @@ fn write_fixture_extension(root: &Path) {
         "id": "fixture",
         "name": "Fixture",
         "launchers": [ { "id": "open", "label": "Open" } ],
-        "server": {
-            "transport": "stdio",
-            "command": env!("CARGO_BIN_EXE_remux-fixture-ext"),
-            "args": [],
-        },
+        "server": server,
         "views": { "main": { "entry": "viewer/dist/index.html" } },
     });
     std::fs::write(
@@ -41,6 +48,31 @@ fn write_fixture_extension(root: &Path) {
         serde_json::to_string_pretty(&manifest).unwrap(),
     )
     .unwrap();
+}
+
+/// Build-phase manifest: the binary is missing at boot and produced by a
+/// scripted build step (a wrapper that execs the fixture binary).
+fn write_build_fixture_extension(root: &Path) {
+    let ext_dir = root.join("extensions/fixture");
+    std::fs::create_dir_all(&ext_dir).unwrap();
+    std::fs::write(
+        ext_dir.join("server-src.sh"),
+        format!("#!/bin/sh\nexec {} \"$@\"\n", env!("CARGO_BIN_EXE_remux-fixture-ext")),
+    )
+    .unwrap();
+    write_fixture_extension_with_server(
+        root,
+        json!({
+            "transport": "stdio",
+            "command": ext_dir.join("server-bin").to_string_lossy(),
+            "args": [],
+            "build": {
+                "command": "sh",
+                "args": ["-c", "cp server-src.sh server-bin && chmod +x server-bin"],
+                "cwd": ".",
+            },
+        }),
+    );
 }
 
 struct Runtime {
@@ -51,8 +83,12 @@ struct Runtime {
 
 impl Runtime {
     fn start() -> Self {
+        Self::start_with(write_fixture_extension)
+    }
+
+    fn start_with(write_extension: fn(&Path)) -> Self {
         let root = tempfile::tempdir().unwrap();
-        write_fixture_extension(root.path());
+        write_extension(root.path());
         let port = free_port();
 
         let supervisor = Command::new(env!("CARGO_BIN_EXE_remux"))
@@ -317,6 +353,104 @@ async fn kill_dash_nine_of_the_worker_self_heals() {
     let status = ws_request(&mut socket, 1, "remux/extensions/status", None).await;
     assert_eq!(status["result"]["extensions"][0]["running"], json!(true));
     assert_eq!(status["result"]["extensions"][0]["extensionId"], "fixture");
+
+    runtime.shutdown();
+}
+
+#[tokio::test]
+async fn boots_through_the_build_phase_and_serves_resources() {
+    let runtime = Runtime::start_with(|root| {
+        write_build_fixture_extension(root);
+        // Fast sampler cadence for the didSample assertions below.
+        std::fs::create_dir_all(root.join(".remux")).unwrap();
+        std::fs::write(root.join(".remux/config.toml"), "resource_poll_seconds = 1\n").unwrap();
+    });
+    runtime.wait_for_health(Duration::from_secs(30)).await;
+
+    // The extension came up through `building` on the real assembly path.
+    let mut socket = ws_connect(runtime.port).await;
+    let status = ws_request(&mut socket, 1, "remux/extensions/status", None).await;
+    let extension = &status["result"]["extensions"][0];
+    assert_eq!(extension["state"], "running");
+    assert_eq!(extension["hasBuild"], json!(true));
+
+    // Build lines are visible over the logs RPC.
+    let logs = ws_request(
+        &mut socket,
+        2,
+        "remux/extensions/logs",
+        Some(json!({ "extensionId": "fixture" })),
+    )
+    .await;
+    let lines = logs["result"]["lines"].as_array().unwrap();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["stream"] == "build"),
+        "{lines:?}"
+    );
+
+    // Resource snapshot has the documented shape with a live extension.
+    // Samples are periodic; the first tick can race the extension spawn, so
+    // poll until a sample reflects the running process group.
+    let mut request_id = 3;
+    let sample = loop {
+        let resources =
+            ws_request(&mut socket, request_id, "remux/system/resources", None).await;
+        request_id += 1;
+        let sample = resources["result"].clone();
+        if sample["extensions"][0]["processCount"].as_u64().unwrap_or(0) >= 1 {
+            break sample;
+        }
+        assert!(request_id < 13, "no sample caught the running extension: {sample}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert!(sample["sampledAtMs"].as_i64().unwrap() > 0);
+    assert!(sample["system"]["memTotalBytes"].as_u64().unwrap() > 0);
+    assert!(sample["system"]["diskTotalBytes"].as_u64().unwrap() > 0);
+    assert!(sample["runtime"]["rssBytes"].as_u64().unwrap() > 0);
+    let extension = &sample["extensions"][0];
+    assert_eq!(extension["extensionId"], "fixture");
+    assert!(extension["rssBytes"].as_u64().unwrap() > 0, "{extension}");
+
+    // didSample pushes flow while subscribed and stop after unsubscribe.
+    let subscribed =
+        ws_request(&mut socket, 100, "remux/system/resources/subscribe", None).await;
+    assert_eq!(subscribed["result"], json!({ "ok": true }));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let frame = tokio::time::timeout(remaining, socket.next())
+            .await
+            .expect("no didSample before the deadline")
+            .unwrap()
+            .unwrap();
+        if let Message::Text(text) = frame {
+            let message: Value = serde_json::from_str(&text).unwrap();
+            if message["method"] == "remux/system/resources/didSample" {
+                assert!(message["params"]["sampledAtMs"].as_i64().unwrap() > 0);
+                break;
+            }
+        }
+    }
+    let unsubscribed =
+        ws_request(&mut socket, 101, "remux/system/resources/unsubscribe", None).await;
+    assert_eq!(unsubscribed["result"], json!({ "ok": true }));
+    // Drain anything already in flight, then expect silence for > one tick.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    loop {
+        match tokio::time::timeout(Duration::from_millis(1_500), socket.next()).await {
+            Err(_) => break, // silence — unsubscribed
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let message: Value = serde_json::from_str(&text).unwrap();
+                assert_ne!(
+                    message["method"], "remux/system/resources/didSample",
+                    "push after unsubscribe"
+                );
+            }
+            Ok(_) => {}
+        }
+    }
 
     runtime.shutdown();
 }

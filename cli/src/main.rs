@@ -2,10 +2,22 @@
 //! supervisor; with it, the runtime worker.
 
 fn main() {
+    let usage = || -> ! {
+        eprintln!("Usage: remux start [--rebuild]");
+        std::process::exit(1);
+    };
+
     let mut args = std::env::args().skip(1);
     if args.next().as_deref() != Some("start") {
-        eprintln!("Usage: remux start");
-        std::process::exit(1);
+        usage();
+    }
+    let rebuild = match args.next().as_deref() {
+        None => false,
+        Some("--rebuild") => true,
+        Some(_) => usage(),
+    };
+    if args.next().is_some() {
+        usage();
     }
 
     if remux::supervise::is_worker_process() {
@@ -16,7 +28,7 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        match runtime.block_on(remux::runtime::run_worker()) {
+        match runtime.block_on(remux::runtime::run_worker(rebuild)) {
             Ok(code) => std::process::exit(code),
             Err(message) => {
                 eprintln!("{message}");
@@ -25,5 +37,5 @@ fn main() {
         }
     }
 
-    std::process::exit(remux::supervise::supervise());
+    std::process::exit(remux::supervise::supervise(rebuild));
 }

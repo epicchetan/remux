@@ -36,6 +36,16 @@ pub struct ServerSpec {
     pub command: String,
     pub args: Vec<String>,
     pub cwd: PathBuf,
+    /// Optional build phase: when present, `command` points at the build
+    /// artifact and legitimately may not exist until the build has run.
+    pub build: Option<BuildSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BuildSpec {
+    pub command: String,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -177,7 +187,29 @@ fn normalize_route(route: &str) -> String {
 
 fn parse_server(raw_server: Option<&Value>, root_dir: &Path) -> Option<ServerSpec> {
     let server = raw_server?.as_object().expect("validated");
-    let args = server
+    let (command, args, cwd) = parse_command_triple(server, root_dir);
+
+    Some(ServerSpec {
+        args,
+        command,
+        cwd,
+        build: server
+            .get("build")
+            .and_then(Value::as_object)
+            .map(|build| {
+                let (command, args, cwd) = parse_command_triple(build, root_dir);
+                BuildSpec { command, args, cwd }
+            }),
+        transport: server["transport"].as_str().expect("validated").to_string(),
+    })
+}
+
+/// Shared command/args/cwd parsing for `server` and `server.build`.
+fn parse_command_triple(
+    record: &serde_json::Map<String, Value>,
+    root_dir: &Path,
+) -> (String, Vec<String>, PathBuf) {
+    let args = record
         .get("args")
         .and_then(Value::as_array)
         .map(|values| {
@@ -187,18 +219,16 @@ fn parse_server(raw_server: Option<&Value>, root_dir: &Path) -> Option<ServerSpe
                 .collect()
         })
         .unwrap_or_default();
-    let cwd = server
+    let cwd = record
         .get("cwd")
         .and_then(Value::as_str)
         .filter(|cwd| !cwd.is_empty())
         .unwrap_or(".");
-
-    Some(ServerSpec {
+    (
+        record["command"].as_str().expect("validated").to_string(),
         args,
-        command: server["command"].as_str().expect("validated").to_string(),
-        cwd: resolve_manifest_path(root_dir, cwd),
-        transport: server["transport"].as_str().expect("validated").to_string(),
-    })
+        resolve_manifest_path(root_dir, cwd),
+    )
 }
 
 fn parse_launchers(
@@ -391,6 +421,28 @@ fn validate_server(manifest: &Value, id: &str) -> Result<(), String> {
     if let Some(cwd) = server.get("cwd") {
         if !cwd.is_string() {
             return invalid("server.cwd must be a string");
+        }
+    }
+    if let Some(build) = server.get("build") {
+        // Mirrors the server command/args/cwd rules. Validation must NOT stat
+        // `command` — with a build phase the binary legitimately doesn't
+        // exist yet.
+        if !is_record(build) {
+            return invalid("server.build must be an object");
+        }
+        match build.get("command").and_then(Value::as_str) {
+            Some(command) if !command.is_empty() => {}
+            _ => return invalid("server.build.command must be a non-empty string"),
+        }
+        if let Some(args) = build.get("args") {
+            if !is_string_array(args) {
+                return invalid("server.build.args must be an array of strings");
+            }
+        }
+        if let Some(cwd) = build.get("cwd") {
+            if !cwd.is_string() {
+                return invalid("server.build.cwd must be a string");
+            }
         }
     }
     Ok(())
@@ -653,6 +705,44 @@ mod tests {
         assert_invalid(
             json!({
                 "version": 1, "id": "bad",
+                "server": { "transport": "stdio", "command": "bin", "build": "make" },
+                "views": { "main": { "entry": "index.html" } }
+            }),
+            "server.build must be an object",
+        );
+        assert_invalid(
+            json!({
+                "version": 1, "id": "bad",
+                "server": { "transport": "stdio", "command": "bin", "build": { "command": "" } },
+                "views": { "main": { "entry": "index.html" } }
+            }),
+            "server.build.command must be a non-empty string",
+        );
+        assert_invalid(
+            json!({
+                "version": 1, "id": "bad",
+                "server": {
+                    "transport": "stdio", "command": "bin",
+                    "build": { "command": "make", "args": [1] }
+                },
+                "views": { "main": { "entry": "index.html" } }
+            }),
+            "server.build.args must be an array of strings",
+        );
+        assert_invalid(
+            json!({
+                "version": 1, "id": "bad",
+                "server": {
+                    "transport": "stdio", "command": "bin",
+                    "build": { "command": "make", "cwd": 5 }
+                },
+                "views": { "main": { "entry": "index.html" } }
+            }),
+            "server.build.cwd must be a string",
+        );
+        assert_invalid(
+            json!({
+                "version": 1, "id": "bad",
                 "server": { "transport": "stdio", "command": "node" },
                 "views": { "main": { "route": "viewers/bad", "entry": "index.html" } }
             }),
@@ -795,6 +885,7 @@ mod tests {
         let server = extension.server.as_ref().unwrap();
         assert_eq!(server.cwd, ext_dir);
         assert_eq!(server.args, vec!["server.cjs".to_string()]);
+        assert_eq!(server.build, None);
         assert_eq!(extension.main_view().route, "/viewers/codex");
         assert_eq!(
             extension.main_view().entry,
@@ -828,6 +919,45 @@ mod tests {
                 view: "main".to_string(),
                 view_route: "/viewers/codex".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn parses_build_phase_without_statting_the_artifact() {
+        let root = tempfile::tempdir().unwrap();
+        let ext_dir = root.path().join("built");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        let manifest = json!({
+            "version": 1,
+            "id": "built",
+            "server": {
+                "transport": "stdio",
+                "build": {
+                    "command": "cargo",
+                    "args": ["build", "--release"],
+                    "cwd": "server"
+                },
+                // Deliberately nonexistent: with a build phase the artifact
+                // legitimately doesn't exist at validation time.
+                "command": "/tmp/definitely-missing/release/built-server",
+                "args": [],
+                "cwd": "."
+            },
+            "views": { "main": { "entry": "index.html" } }
+        });
+        let manifest_path = ext_dir.join(MANIFEST_FILENAME);
+        std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+
+        let extension = load_extension_manifest(&manifest_path).unwrap();
+        let server = extension.server.as_ref().unwrap();
+        assert_eq!(server.command, "/tmp/definitely-missing/release/built-server");
+        assert_eq!(
+            server.build,
+            Some(BuildSpec {
+                command: "cargo".to_string(),
+                args: vec!["build".to_string(), "--release".to_string()],
+                cwd: ext_dir.join("server"),
+            })
         );
     }
 

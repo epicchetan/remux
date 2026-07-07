@@ -44,13 +44,13 @@ struct EchoServer {
 }
 
 impl ExtensionServer for EchoServer {
-    fn start(&self) -> BoxFuture<'_, ServerStatus> {
+    fn start(&self, _rebuild: bool) -> BoxFuture<'_, ServerStatus> {
         Box::pin(async { self.status() })
     }
     fn stop(&self) -> BoxFuture<'_, ServerStatus> {
         Box::pin(async { self.status() })
     }
-    fn restart(&self) -> BoxFuture<'_, ServerStatus> {
+    fn restart(&self, _rebuild: bool) -> BoxFuture<'_, ServerStatus> {
         Box::pin(async { self.status() })
     }
     fn handle_rpc(&self, method: String, params: Option<Value>) -> BoxFuture<'_, RpcResult> {
@@ -73,6 +73,7 @@ impl ExtensionServer for EchoServer {
             started_at_ms: None,
             restart_count: 0,
             last_exit: None,
+            has_build: false,
         }
     }
     fn logs(&self, _lines: usize) -> Value {

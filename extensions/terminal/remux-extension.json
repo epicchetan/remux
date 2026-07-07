@@ -9,16 +9,21 @@
   },
   "server": {
     "transport": "stdio",
-    "command": "cargo",
-    "args": [
-      "run",
-      "--manifest-path",
-      "server/Cargo.toml",
-      "--target-dir",
-      "/tmp/remux-terminal-server-target",
-      "--quiet",
-      "--"
-    ],
+    "build": {
+      "command": "cargo",
+      "args": [
+        "build",
+        "--release",
+        "--manifest-path",
+        "server/Cargo.toml",
+        "--target-dir",
+        "/tmp/remux-terminal-server-target",
+        "--quiet"
+      ],
+      "cwd": "."
+    },
+    "command": "/tmp/remux-terminal-server-target/release/remux-terminal-server",
+    "args": [],
     "cwd": "."
   },
   "views": {

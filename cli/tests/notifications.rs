@@ -531,3 +531,109 @@ async fn intents_without_audience_are_owned_but_not_pushed() {
             .await
     );
 }
+
+// ---------------------------------------------------------------------------
+// Pass 2 — system pushes (notify_system).
+// ---------------------------------------------------------------------------
+
+async fn register_as(fixture: &Fixture, client: &Arc<MockClient>, client_id: &str, token: Option<&str>) {
+    let mut params = json!({ "clientId": client_id, "sessionId": format!("{client_id}-session") });
+    if let Some(token) = token {
+        params["expoPushToken"] = json!(token);
+    }
+    fixture
+        .manager
+        .handle_client_request(client.clone(), "remux/clients/register", Some(&params))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn notify_system_fans_out_to_all_tokened_clients_with_exact_payload() {
+    let fixture = fixture();
+    let phone = MockClient::new(true); // visible — must NOT suppress system pushes
+    let tablet = MockClient::new(false);
+    let tokenless = MockClient::new(false);
+    register_as(&fixture, &phone, "client-1", Some("ExponentPushToken[one]")).await;
+    register_as(&fixture, &tablet, "client-2", Some("ExponentPushToken[two]")).await;
+    register_as(&fixture, &tokenless, "client-3", None).await;
+
+    fixture
+        .manager
+        .notify_system(
+            "Codex server failed",
+            "boom · 3 restarts",
+            "extension-failed",
+            "codex",
+        )
+        .await;
+
+    let pushes = fixture.pushes.lock().unwrap();
+    assert_eq!(pushes.len(), 2, "all clients with tokens, none without");
+    let mut recipients: Vec<String> = pushes
+        .iter()
+        .map(|(_, payload)| payload["to"].as_str().unwrap().to_string())
+        .collect();
+    recipients.sort();
+    assert_eq!(
+        recipients,
+        vec!["ExponentPushToken[one]", "ExponentPushToken[two]"]
+    );
+
+    let payload = &pushes[0].1;
+    assert_eq!(payload["title"], "Codex server failed");
+    assert_eq!(payload["body"], "boom · 3 restarts");
+    assert_eq!(payload["channelId"], "remux-extension-events");
+    assert_eq!(
+        payload["data"],
+        json!({ "kind": "system", "reason": "extension-failed", "extensionId": "codex" })
+    );
+    assert_eq!(payload["priority"], "high");
+    assert_eq!(payload["sound"], "default");
+
+    // No visibility checks: system pushes have no target to be "viewing".
+    assert!(phone.visibility_checks.lock().unwrap().is_empty());
+    assert!(tablet.visibility_checks.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn notify_system_without_recipients_logs_and_sends_nothing() {
+    let fixture = fixture();
+    fixture
+        .manager
+        .notify_system("title", "body", "memory-ceiling", "terminal")
+        .await;
+    assert!(fixture.pushes.lock().unwrap().is_empty());
+    let events = fixture.log.events.lock().unwrap();
+    assert!(events
+        .iter()
+        .any(|(label, _)| label == "notifications:system:no-recipients"));
+}
+
+#[tokio::test]
+async fn notify_system_clears_tokens_on_device_not_registered() {
+    let fixture = fixture_with_response(json!({
+        "data": [{ "status": "error", "details": { "error": "DeviceNotRegistered" } }],
+    }));
+    let client = MockClient::new(false);
+    register_as(&fixture, &client, "client-1", Some("ExponentPushToken[dead]")).await;
+
+    fixture
+        .manager
+        .notify_system("title", "body", "extension-failed", "codex")
+        .await;
+    assert_eq!(fixture.pushes.lock().unwrap().len(), 1);
+
+    // The token was cleared and persisted: a second system push sends nothing.
+    fixture
+        .manager
+        .notify_system("title", "body", "extension-failed", "codex")
+        .await;
+    assert_eq!(fixture.pushes.lock().unwrap().len(), 1);
+    let store = std::fs::read_to_string(
+        fixture.root.path().join(".remux/notifications/clients.json"),
+    )
+    .unwrap();
+    let store: Value = serde_json::from_str(&store).unwrap();
+    assert_eq!(store["clients"]["client-1"]["expoPushToken"], Value::Null);
+}

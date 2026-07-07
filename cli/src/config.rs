@@ -15,6 +15,8 @@ pub const CONFIG_RELATIVE_PATH: &str = ".remux/config.toml";
 pub const DEFAULT_HOST: &str = "0.0.0.0";
 pub const DEFAULT_PORT: u16 = 48123;
 pub const DEFAULT_LOG_RETENTION_DAYS: u32 = 14;
+pub const DEFAULT_RESOURCE_POLL_SECONDS: u32 = 5;
+pub const DEFAULT_WATCHDOG_STALE_SECONDS: u32 = 30;
 
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -24,11 +26,32 @@ pub struct RemuxConfig {
     #[serde(alias = "extensionRoots")]
     pub extension_roots: Option<Vec<String>>,
     pub log_retention_days: Option<u32>,
+    /// Pass-2 additive: resource sampler cadence.
+    pub resource_poll_seconds: Option<u32>,
+    /// Pass-2 additive: worker hang watchdog staleness; 0 disables.
+    pub watchdog_stale_seconds: Option<u32>,
+    /// Pass-2 additive: per-extension RSS alert ceiling; absent/0 disables.
+    pub extension_memory_ceiling_mb: Option<u32>,
 }
 
 impl RemuxConfig {
     pub fn log_retention_days(&self) -> u32 {
         self.log_retention_days.unwrap_or(DEFAULT_LOG_RETENTION_DAYS)
+    }
+
+    pub fn resource_poll_seconds(&self) -> u32 {
+        self.resource_poll_seconds
+            .filter(|seconds| *seconds > 0)
+            .unwrap_or(DEFAULT_RESOURCE_POLL_SECONDS)
+    }
+
+    pub fn watchdog_stale_seconds(&self) -> u32 {
+        self.watchdog_stale_seconds
+            .unwrap_or(DEFAULT_WATCHDOG_STALE_SECONDS)
+    }
+
+    pub fn extension_memory_ceiling_mb(&self) -> u32 {
+        self.extension_memory_ceiling_mb.unwrap_or(0)
     }
 }
 
@@ -144,7 +167,7 @@ mod tests {
                     "extensions".to_string(),
                     "/home/ubuntu".to_string()
                 ]),
-                log_retention_days: None,
+                ..Default::default()
             }
         );
     }
@@ -190,6 +213,28 @@ mod tests {
         assert_eq!(config.host.as_deref(), Some("a"));
         assert_eq!(config.log_retention_days(), 3);
         assert_eq!(RemuxConfig::default().log_retention_days(), 14);
+    }
+
+    #[test]
+    fn pass2_keys_parse_with_defaults() {
+        let config = parse_remux_config_toml(
+            "resource_poll_seconds = 2\nwatchdog_stale_seconds = 0\nextension_memory_ceiling_mb = 512",
+            CONFIG_RELATIVE_PATH,
+        )
+        .unwrap();
+        assert_eq!(config.resource_poll_seconds(), 2);
+        assert_eq!(config.watchdog_stale_seconds(), 0, "0 disables the watchdog");
+        assert_eq!(config.extension_memory_ceiling_mb(), 512);
+
+        let defaults = RemuxConfig::default();
+        assert_eq!(defaults.resource_poll_seconds(), 5);
+        assert_eq!(defaults.watchdog_stale_seconds(), 30);
+        assert_eq!(defaults.extension_memory_ceiling_mb(), 0);
+
+        // 0 poll cadence falls back to the default rather than spinning.
+        let zero_poll =
+            parse_remux_config_toml("resource_poll_seconds = 0", CONFIG_RELATIVE_PATH).unwrap();
+        assert_eq!(zero_poll.resource_poll_seconds(), 5);
     }
 
     #[test]
