@@ -103,6 +103,7 @@ export type CodexThreadComposerStateResource = {
 
 export type CodexThreadObservedComposerConfig = {
   intelligence: CodexComposerIntelligence | null;
+  model: string | null;
   reviewMode: CodexComposerReviewMode | null;
   speed: CodexComposerSpeed | null;
 };

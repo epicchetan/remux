@@ -237,10 +237,15 @@ function isObservedConfig(value: unknown): value is CodexThreadComposerStateReso
   const config = value as Partial<CodexThreadComposerStateResource['observedConfig']>;
   return (
     (config.intelligence === null ||
+      config.intelligence === 'none' ||
+      config.intelligence === 'minimal' ||
       config.intelligence === 'low' ||
       config.intelligence === 'medium' ||
       config.intelligence === 'high' ||
-      config.intelligence === 'xhigh') &&
+      config.intelligence === 'xhigh' ||
+      config.intelligence === 'max' ||
+      config.intelligence === 'ultra') &&
+    (config.model === null || typeof config.model === 'string') &&
     (config.reviewMode === null ||
       config.reviewMode === 'auto-review' ||
       config.reviewMode === 'default' ||
@@ -256,10 +261,15 @@ function isComposerConfig(value: unknown): value is CodexComposerConfig {
 
   const config = value as Partial<CodexComposerConfig>;
   return (
-    (config.intelligence === 'low' ||
+    (config.intelligence === 'none' ||
+      config.intelligence === 'minimal' ||
+      config.intelligence === 'low' ||
       config.intelligence === 'medium' ||
       config.intelligence === 'high' ||
-      config.intelligence === 'xhigh') &&
+      config.intelligence === 'xhigh' ||
+      config.intelligence === 'max' ||
+      config.intelligence === 'ultra') &&
+    (config.model === null || typeof config.model === 'string') &&
     (config.reviewMode === 'auto-review' ||
       config.reviewMode === 'default' ||
       config.reviewMode === 'full-access') &&

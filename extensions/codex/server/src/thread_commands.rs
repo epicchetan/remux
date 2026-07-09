@@ -427,7 +427,7 @@ impl CodexThreadCommandServer {
 
         let input = composer_parts_to_user_input(params.parts)?;
         let composer_config = params.composer_config;
-        let mut start_params = match composer_config {
+        let mut start_params = match composer_config.as_ref() {
             Some(config) => self.composer_config.thread_start_params_for_config(config),
             None => self.composer_config.thread_start_params()?,
         };

@@ -303,7 +303,7 @@ impl CodexThreadResourcesServer {
         let observed_config = rollout.observed_config;
         let _ = self
             .composer_config
-            .seed_thread_config_from_observed(&thread_id, observed_config);
+            .seed_thread_config_from_observed(&thread_id, observed_config.clone());
 
         let preference = match self.composer_config.read_thread_config(&thread_id) {
             Ok(value) => value.get("config").cloned().unwrap_or(Value::Null),

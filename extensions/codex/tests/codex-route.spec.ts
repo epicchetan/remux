@@ -165,11 +165,13 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
                       lastAppliedTurnId: tokenUsage ? 'mock-token-turn-1' : null,
                       observedConfig: {
                         intelligence: 'medium',
+                        model: null,
                         reviewMode: 'auto-review',
                         speed: null,
                       },
                       preference: {
                         intelligence: 'medium',
+                        model: null,
                         reviewMode: 'auto-review',
                         revision: `mock-composer-state-revision:${threadId}`,
                         speed: 'fast',

@@ -76,7 +76,8 @@ fn apply_rollout_row(state: &mut RolloutComposerState, turn_id: &str, row: &Valu
 
 fn apply_turn_context(state: &mut RolloutComposerState, turn_id: &str, payload: &Value) {
     if let Some(value) = string_field(payload, "model") {
-        state.model = Some(value);
+        state.model = Some(value.clone());
+        state.observed_config.model = Some(value);
     }
     if let Some(value) =
         string_field(payload, "modelProvider").or_else(|| string_field(payload, "model_provider"))
@@ -163,10 +164,14 @@ fn token_usage_breakdown_from_rollout(value: &Value) -> Option<Value> {
 
 fn parse_intelligence(value: Option<&Value>) -> Option<ComposerIntelligence> {
     match value.and_then(Value::as_str) {
+        Some("none") => Some(ComposerIntelligence::NoReasoning),
+        Some("minimal") => Some(ComposerIntelligence::Minimal),
         Some("low") => Some(ComposerIntelligence::Low),
         Some("medium") => Some(ComposerIntelligence::Medium),
         Some("high") => Some(ComposerIntelligence::High),
         Some("xhigh") => Some(ComposerIntelligence::Xhigh),
+        Some("max") => Some(ComposerIntelligence::Max),
+        Some("ultra") => Some(ComposerIntelligence::Ultra),
         _ => None,
     }
 }
@@ -253,6 +258,10 @@ mod tests {
         assert_eq!(
             state.observed_config.review_mode,
             Some(ComposerReviewMode::AutoReview)
+        );
+        assert_eq!(
+            state.observed_config.model.as_deref(),
+            Some("gpt-5.1-codex")
         );
         assert_eq!(state.observed_config.speed, Some(ComposerSpeed::Fast));
         assert_eq!(

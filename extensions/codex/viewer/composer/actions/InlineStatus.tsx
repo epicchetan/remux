@@ -59,6 +59,10 @@ function modelLabel(model: string | null) {
 
 function thinkingLabel(effort: ComposerIntelligence) {
   switch (effort) {
+    case 'none':
+      return 'No thinking';
+    case 'minimal':
+      return 'Minimal thinking';
     case 'low':
       return 'Low thinking';
     case 'medium':
@@ -67,6 +71,10 @@ function thinkingLabel(effort: ComposerIntelligence) {
       return 'High thinking';
     case 'xhigh':
       return 'Extra high thinking';
+    case 'max':
+      return 'Max thinking';
+    case 'ultra':
+      return 'Ultra thinking';
   }
 }
 

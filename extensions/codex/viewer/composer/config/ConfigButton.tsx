@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { Archive, Check, ChevronDown, Gauge, Loader2, Play, RefreshCw, Shield, Sparkles, Wrench } from 'lucide-react';
+import { Archive, Boxes, Check, ChevronDown, Gauge, Loader2, Play, RefreshCw, Shield, Sparkles, Wrench } from 'lucide-react';
 
 import { applyCodexResourceInvalidations } from '../../ipc/resourceInvalidations';
 import { compactThread } from '../../ipc/threadCommands';
@@ -8,16 +8,27 @@ import { reloadHostView } from '@remux/viewer-kit/host';
 import { useThreadRuntimeStore } from '../../threads/runtimeStore';
 import { useThreadsStore } from '../../threads/store';
 import { useComposerStore } from '../store';
-import type { ComposerIntelligence, ComposerReviewMode, ComposerSpeed } from './types';
+import type { CodexModelOption, ComposerIntelligence, ComposerReviewMode, ComposerSpeed } from './types';
 
-type ConfigSection = 'intelligence' | 'speed' | 'review';
+type ConfigSection = 'model' | 'intelligence' | 'speed' | 'review';
 
-const intelligenceOptions: Array<{ label: string; value: ComposerIntelligence }> = [
+const defaultIntelligenceOptions: Array<{ label: string; value: ComposerIntelligence }> = [
   { label: 'Low', value: 'low' },
   { label: 'Medium', value: 'medium' },
   { label: 'High', value: 'high' },
   { label: 'Extra High', value: 'xhigh' },
 ];
+
+const intelligenceLabels: Record<string, string> = {
+  none: 'None',
+  minimal: 'Minimal',
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'Extra High',
+  max: 'Max',
+  ultra: 'Ultra',
+};
 
 const speedOptions: Array<{ detail: string; label: string; value: ComposerSpeed }> = [
   { detail: 'Normal usage', label: 'Default', value: 'default' },
@@ -33,9 +44,13 @@ const reviewOptions: Array<{ label: string; value: ComposerReviewMode }> = [
 export function ComposerConfigButton({ disabled = false }: { disabled?: boolean }) {
   const activeThreadId = useThreadsStore((state) => state.activeThreadId);
   const intelligence = useComposerStore((state) => state.intelligence);
+  const model = useComposerStore((state) => state.model);
+  const models = useComposerStore((state) => state.models);
   const reviewMode = useComposerStore((state) => state.reviewMode);
   const speed = useComposerStore((state) => state.speed);
+  const loadModels = useComposerStore((state) => state.loadModels);
   const setIntelligence = useComposerStore((state) => state.setIntelligence);
+  const setModel = useComposerStore((state) => state.setModel);
   const setReviewMode = useComposerStore((state) => state.setReviewMode);
   const setSpeed = useComposerStore((state) => state.setSpeed);
   const runtimeStatus = useThreadRuntimeStore((state) => state.status);
@@ -129,6 +144,9 @@ export function ComposerConfigButton({ disabled = false }: { disabled?: boolean 
   }, [compactPending, open]);
 
   const panelBlocked = compactPending;
+  const selectedModel = selectedModelOption(models, model);
+  const selectedModelId = selectedModelIdValue(models, model);
+  const intelligenceOptions = intelligenceOptionsForModel(selectedModel);
 
   return (
     <div className="remux-composer-config remux-composer-preferences-menu" ref={rootRef}>
@@ -143,7 +161,13 @@ export function ComposerConfigButton({ disabled = false }: { disabled?: boolean 
             return;
           }
 
-          setOpen((current) => !current);
+          setOpen((current) => {
+            const next = !current;
+            if (next) {
+              void loadModels();
+            }
+            return next;
+          });
           setExpanded(null);
           setCompactError(null);
         }}
@@ -174,6 +198,31 @@ export function ComposerConfigButton({ disabled = false }: { disabled?: boolean 
             <div className="remux-composer-config-error" role="alert">
               {compactError}
             </div>
+          ) : null}
+
+          {models && models.length > 0 ? (
+            <ConfigRow
+              disabled={panelBlocked}
+              expanded={expanded === 'model'}
+              icon={<Boxes className="size-4" />}
+              label={selectedModel?.displayName ?? model ?? selectedModelId}
+              onToggle={() => setExpanded((current) => (current === 'model' ? null : 'model'))}
+            >
+              <ConfigOptionList
+                disabled={panelBlocked}
+                onSelect={(value) => {
+                  setModel(value, activeThreadId);
+                  setExpanded(null);
+                  setCompactError(null);
+                }}
+                options={models.map((model) => ({
+                  detail: model.description,
+                  label: model.displayName,
+                  value: model.id,
+                }))}
+                value={selectedModelId}
+              />
+            </ConfigRow>
           ) : null}
 
           <ConfigRow
@@ -341,6 +390,38 @@ function ConfigOptionList<Value extends string>({
       ))}
     </div>
   );
+}
+
+function selectedModelOption(models: CodexModelOption[] | null, model: string | null) {
+  if (!models || models.length === 0) {
+    return null;
+  }
+
+  if (model) {
+    return models.find((option) => option.id === model) ?? null;
+  }
+
+  return models.find((option) => option.isDefault) ?? models[0] ?? null;
+}
+
+function selectedModelIdValue(models: CodexModelOption[] | null, model: string | null) {
+  if (model) {
+    return model;
+  }
+
+  return selectedModelOption(models, null)?.id ?? '';
+}
+
+function intelligenceOptionsForModel(model: CodexModelOption | null) {
+  if (!model) {
+    return defaultIntelligenceOptions;
+  }
+
+  return model.supportedReasoningEfforts.map((option) => ({
+    detail: option.description.trim() ? option.description : undefined,
+    label: intelligenceLabels[option.reasoningEffort] ?? option.reasoningEffort,
+    value: option.reasoningEffort,
+  }));
 }
 
 function optionLabel<Value extends string>(options: Array<{ label: string; value: Value }>, value: Value) {

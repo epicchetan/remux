@@ -5,6 +5,7 @@ mod file_resources;
 mod history;
 mod item_identity;
 mod live_transcript;
+mod models;
 mod projection;
 mod resource_invalidations;
 mod resources;
@@ -30,6 +31,7 @@ use crate::app_server::{AppServerEvent, AppServerEventSink, AppServerRuntime};
 use crate::composer_config::ComposerConfigStore;
 use crate::file_resources::CodexFileResourcesServer;
 use crate::live_transcript::LiveTranscriptStore;
+use crate::models::CodexModelsServer;
 use crate::resource_invalidations::{
     invalidations_for_app_server_notification, resources_invalidated_notification,
 };
@@ -43,6 +45,7 @@ use crate::thread_usage::ThreadUsageStore;
 const FILES_METHOD: &str = "remux/codex/files";
 const COMPOSER_CONFIG_READ_METHOD: &str = "remux/codex/composer/config/read";
 const COMPOSER_CONFIG_WRITE_METHOD: &str = "remux/codex/composer/config/write";
+const MODELS_READ_METHOD: &str = "remux/codex/models/read";
 const TRANSCRIPT_RESOURCES_READ_METHOD: &str = "remux/codex/transcript/resources/read";
 const THREAD_RESOURCES_READ_METHOD: &str = "remux/codex/thread/resources/read";
 const THREAD_COMPACT_METHOD: &str = "remux/codex/thread/compact";
@@ -106,6 +109,7 @@ fn handle_request(server: &mut CodexExtensionServer, request: JsonRpcRequest) ->
         COMPOSER_CONFIG_WRITE_METHOD => server
             .composer_config
             .write_config(request.params.unwrap_or(Value::Null)),
+        MODELS_READ_METHOD => server.models.read_models(),
         TRANSCRIPT_RESOURCES_READ_METHOD => server
             .transcript
             .read_resources(request.params.unwrap_or(Value::Null)),
@@ -147,6 +151,7 @@ fn handle_request(server: &mut CodexExtensionServer, request: JsonRpcRequest) ->
 struct CodexExtensionServer {
     composer_config: ComposerConfigStore,
     files: CodexFileResourcesServer,
+    models: CodexModelsServer,
     thread_commands: CodexThreadCommandServer,
     threads: CodexThreadResourcesServer,
     transcript: CodexTranscriptServer,
@@ -171,6 +176,7 @@ impl CodexExtensionServer {
         Self {
             composer_config: composer_config.clone(),
             files: CodexFileResourcesServer::new(),
+            models: CodexModelsServer::new(app_server.clone()),
             thread_commands: CodexThreadCommandServer::new(
                 app_server.clone(),
                 composer_config.clone(),

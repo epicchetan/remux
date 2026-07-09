@@ -32,6 +32,7 @@ export function useComposerTurnAction() {
   const beginSubmission = useComposerStore((state) => state.beginSubmission);
   const failSubmission = useComposerStore((state) => state.failSubmission);
   const isSubmitting = useComposerStore((state) => state.isSubmitting);
+  const model = useComposerStore((state) => state.model);
   const reviewMode = useComposerStore((state) => state.reviewMode);
   const setSubmissionTurn = useComposerStore((state) => state.setSubmissionTurn);
   const speed = useComposerStore((state) => state.speed);
@@ -168,6 +169,7 @@ export function useComposerTurnAction() {
         clientMessageId: createComposerNodeId(),
         composerConfig: {
           intelligence,
+          model,
           reviewMode,
           speed,
         },
@@ -240,6 +242,7 @@ export function useComposerTurnAction() {
     intelligence,
     isSubmitting,
     isWorking,
+    model,
     reviewMode,
     runtimeActiveTurnId,
     runtimeStatus,

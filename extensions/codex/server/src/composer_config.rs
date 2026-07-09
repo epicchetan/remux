@@ -43,11 +43,16 @@ impl Default for ComposerConfigState {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum ComposerIntelligence {
+    #[serde(rename = "none")]
+    NoReasoning,
+    Minimal,
     Low,
     Medium,
     High,
     #[serde(rename = "xhigh")]
     Xhigh,
+    Max,
+    Ultra,
 }
 
 impl Default for ComposerIntelligence {
@@ -83,10 +88,12 @@ impl Default for ComposerSpeed {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ComposerConfig {
     pub(crate) intelligence: ComposerIntelligence,
+    #[serde(default)]
+    pub(crate) model: Option<String>,
     pub(crate) review_mode: ComposerReviewMode,
     pub(crate) speed: ComposerSpeed,
 }
@@ -95,28 +102,36 @@ impl Default for ComposerConfig {
     fn default() -> Self {
         Self {
             intelligence: ComposerIntelligence::High,
+            model: None,
             review_mode: ComposerReviewMode::AutoReview,
             speed: ComposerSpeed::Default,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ObservedComposerConfig {
     pub(crate) intelligence: Option<ComposerIntelligence>,
+    pub(crate) model: Option<String>,
     pub(crate) review_mode: Option<ComposerReviewMode>,
     pub(crate) speed: Option<ComposerSpeed>,
 }
 
 impl ObservedComposerConfig {
     pub(crate) fn is_empty(&self) -> bool {
-        self.intelligence.is_none() && self.review_mode.is_none() && self.speed.is_none()
+        self.intelligence.is_none()
+            && self.model.is_none()
+            && self.review_mode.is_none()
+            && self.speed.is_none()
     }
 
     fn apply_to(&self, mut config: ComposerConfig) -> ComposerConfig {
         if let Some(intelligence) = self.intelligence {
             config.intelligence = intelligence;
+        }
+        if let Some(model) = &self.model {
+            config.model = Some(model.clone());
         }
         if let Some(review_mode) = self.review_mode {
             config.review_mode = review_mode;
@@ -127,9 +142,10 @@ impl ObservedComposerConfig {
         config
     }
 
-    fn from_config(config: ComposerConfig) -> Self {
+    fn from_config(config: &ComposerConfig) -> Self {
         Self {
             intelligence: Some(config.intelligence),
+            model: config.model.clone(),
             review_mode: Some(config.review_mode),
             speed: Some(config.speed),
         }
@@ -140,6 +156,7 @@ impl ObservedComposerConfig {
 #[serde(rename_all = "camelCase")]
 struct ComposerConfigWriteParams {
     intelligence: Option<ComposerIntelligence>,
+    model: Option<String>,
     review_mode: Option<ComposerReviewMode>,
     speed: Option<ComposerSpeed>,
     thread_id: Option<String>,
@@ -183,10 +200,13 @@ impl ComposerConfigStore {
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
         let previous = config_for_thread_locked(&state, thread_id.as_deref().unwrap_or(""));
-        let mut next = previous;
+        let mut next = previous.clone();
 
         if let Some(intelligence) = params.intelligence {
             next.intelligence = intelligence;
+        }
+        if let Some(model) = &params.model {
+            next.model = Some(model.clone());
         }
         if let Some(review_mode) = params.review_mode {
             next.review_mode = review_mode;
@@ -200,6 +220,9 @@ impl ComposerConfigStore {
             if let Some(intelligence) = params.intelligence {
                 preference.intelligence = Some(intelligence);
             }
+            if let Some(model) = &params.model {
+                preference.model = Some(model.clone());
+            }
             if let Some(review_mode) = params.review_mode {
                 preference.review_mode = Some(review_mode);
             }
@@ -207,7 +230,7 @@ impl ComposerConfigStore {
                 preference.speed = Some(speed);
             }
         } else {
-            state.config = next;
+            state.config = next.clone();
         }
 
         if next != previous {
@@ -232,11 +255,11 @@ impl ComposerConfigStore {
             .state
             .lock()
             .map_err(|_| "composer config store poisoned".to_string())?;
-        let previous = state.thread_preferences.insert(
-            thread_id.to_string(),
-            ObservedComposerConfig::from_config(config),
-        );
-        if previous != Some(ObservedComposerConfig::from_config(config)) {
+        let observed = ObservedComposerConfig::from_config(&config);
+        let previous = state
+            .thread_preferences
+            .insert(thread_id.to_string(), observed.clone());
+        if previous != Some(observed) {
             state.revision += 1;
             self.persist_state(&state)?;
         }
@@ -281,12 +304,12 @@ impl ComposerConfigStore {
     }
 
     pub(crate) fn thread_start_params(&self) -> Result<Map<String, Value>, String> {
-        Ok(thread_params(self.snapshot()?))
+        Ok(thread_params(&self.snapshot()?))
     }
 
     pub(crate) fn thread_start_params_for_config(
         &self,
-        config: ComposerConfig,
+        config: &ComposerConfig,
     ) -> Map<String, Value> {
         thread_params(config)
     }
@@ -295,7 +318,7 @@ impl ComposerConfigStore {
         &self,
         thread_id: &str,
     ) -> Result<Map<String, Value>, String> {
-        Ok(turn_params(self.config_for_thread(thread_id)?))
+        Ok(turn_params(&self.config_for_thread(thread_id)?))
     }
 
     fn snapshot(&self) -> Result<ComposerConfig, String> {
@@ -303,7 +326,7 @@ impl ComposerConfigStore {
             .state
             .lock()
             .map_err(|_| "composer config store poisoned".to_string())?;
-        Ok(state.config)
+        Ok(state.config.clone())
     }
 
     fn persist_state(&self, state: &ComposerConfigState) -> Result<(), String> {
@@ -311,7 +334,7 @@ impl ComposerConfigStore {
             return Ok(());
         };
         let persisted = PersistedComposerConfigState {
-            config: state.config,
+            config: state.config.clone(),
             thread_configs: state.thread_preferences.clone(),
             version: 1,
         };
@@ -330,6 +353,7 @@ fn config_response(config: &ComposerConfig, revision: u64) -> Value {
     json!({
         "config": {
             "intelligence": config.intelligence,
+            "model": config.model.as_deref(),
             "reviewMode": config.review_mode,
             "revision": revision.to_string(),
             "speed": config.speed,
@@ -342,13 +366,13 @@ fn config_for_thread_locked(state: &ComposerConfigState, thread_id: &str) -> Com
     let config = state
         .thread_observed
         .get(thread_id)
-        .map(|observed| observed.apply_to(state.config))
-        .unwrap_or(state.config);
-    state
-        .thread_preferences
-        .get(thread_id)
-        .map(|preference| preference.apply_to(config))
-        .unwrap_or(config)
+        .map(|observed| observed.apply_to(state.config.clone()))
+        .unwrap_or_else(|| state.config.clone());
+    if let Some(preference) = state.thread_preferences.get(thread_id) {
+        preference.apply_to(config)
+    } else {
+        config
+    }
 }
 
 pub(crate) fn observed_config_value(observed: ObservedComposerConfig) -> Value {
@@ -374,7 +398,7 @@ fn load_persisted_state(path: &PathBuf) -> ComposerConfigState {
     }
 }
 
-fn thread_params(config: ComposerConfig) -> Map<String, Value> {
+fn thread_params(config: &ComposerConfig) -> Map<String, Value> {
     let mut params = Map::new();
     insert_shared_params(&mut params, config);
 
@@ -392,7 +416,7 @@ fn thread_params(config: ComposerConfig) -> Map<String, Value> {
     params
 }
 
-fn turn_params(config: ComposerConfig) -> Map<String, Value> {
+fn turn_params(config: &ComposerConfig) -> Map<String, Value> {
     let mut params = Map::new();
     insert_shared_params(&mut params, config);
 
@@ -413,8 +437,12 @@ fn turn_params(config: ComposerConfig) -> Map<String, Value> {
     params
 }
 
-fn insert_shared_params(params: &mut Map<String, Value>, config: ComposerConfig) {
+fn insert_shared_params(params: &mut Map<String, Value>, config: &ComposerConfig) {
     params.insert("effort".to_string(), json!(config.intelligence));
+
+    if let Some(model) = &config.model {
+        params.insert("model".to_string(), json!(model));
+    }
 
     if config.speed == ComposerSpeed::Fast {
         params.insert("serviceTier".to_string(), json!("priority"));
@@ -441,6 +469,7 @@ mod tests {
             json!({
                 "config": {
                     "intelligence": "high",
+                    "model": null,
                     "reviewMode": "auto-review",
                     "revision": "1",
                     "speed": "default",
@@ -465,6 +494,7 @@ mod tests {
             response["config"],
             json!({
                 "intelligence": "xhigh",
+                "model": null,
                 "reviewMode": "full-access",
                 "revision": "2",
                 "speed": "fast",
@@ -519,6 +549,39 @@ mod tests {
     }
 
     #[test]
+    fn maps_global_and_thread_model_to_codex_app_server_params() {
+        let store = ComposerConfigStore::default();
+        store
+            .write_config(json!({
+                "model": "gpt-5.5",
+            }))
+            .unwrap();
+        store
+            .write_config(json!({
+                "threadId": "thread-1",
+                "model": "gpt-5.6-terra",
+            }))
+            .unwrap();
+
+        assert_eq!(
+            Value::Object(store.thread_start_params().unwrap()),
+            json!({
+                "approvalsReviewer": "auto_review",
+                "effort": "high",
+                "model": "gpt-5.5",
+            })
+        );
+        assert_eq!(
+            Value::Object(store.turn_start_params_for_thread("thread-1").unwrap()),
+            json!({
+                "approvalsReviewer": "auto_review",
+                "effort": "high",
+                "model": "gpt-5.6-terra",
+            })
+        );
+    }
+
+    #[test]
     fn persists_explicit_thread_preferences() {
         let (dir, path) = temp_config_path("persist-thread");
         let store = ComposerConfigStore::new(path.clone());
@@ -536,6 +599,7 @@ mod tests {
             reloaded.read_thread_config("thread-1").unwrap()["config"],
             json!({
                 "intelligence": "low",
+                "model": null,
                 "reviewMode": "auto-review",
                 "revision": "1",
                 "speed": "fast",
@@ -559,6 +623,7 @@ mod tests {
                 "thread-1",
                 ObservedComposerConfig {
                     intelligence: Some(ComposerIntelligence::Low),
+                    model: None,
                     review_mode: None,
                     speed: None,
                 },
@@ -569,6 +634,7 @@ mod tests {
             store.read_thread_config("thread-1").unwrap()["config"],
             json!({
                 "intelligence": "low",
+                "model": null,
                 "reviewMode": "auto-review",
                 "revision": "2",
                 "speed": "fast",
@@ -580,10 +646,76 @@ mod tests {
             reloaded.read_thread_config("thread-1").unwrap()["config"],
             json!({
                 "intelligence": "high",
+                "model": null,
                 "reviewMode": "auto-review",
                 "revision": "1",
                 "speed": "fast",
             })
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn loads_persisted_config_without_model() {
+        let (dir, path) = temp_config_path("backward-compatible");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "config": {
+                    "intelligence": "medium",
+                    "reviewMode": "default",
+                    "speed": "fast",
+                },
+                "threadConfigs": {},
+                "version": 1,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = ComposerConfigStore::new(path);
+
+        assert_eq!(
+            store.read_config().unwrap()["config"],
+            json!({
+                "intelligence": "medium",
+                "model": null,
+                "reviewMode": "default",
+                "revision": "1",
+                "speed": "fast",
+            })
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn model_round_trips_through_persistence() {
+        let (dir, path) = temp_config_path("model-round-trip");
+        let store = ComposerConfigStore::new(path.clone());
+        store
+            .write_config(json!({
+                "model": "gpt-5.5",
+            }))
+            .unwrap();
+        store
+            .write_config(json!({
+                "threadId": "thread-1",
+                "model": "gpt-5.6-terra",
+            }))
+            .unwrap();
+
+        let reloaded = ComposerConfigStore::new(path);
+
+        assert_eq!(
+            reloaded.read_config().unwrap()["config"]["model"],
+            "gpt-5.5"
+        );
+        assert_eq!(
+            reloaded.read_thread_config("thread-1").unwrap()["config"]["model"],
+            "gpt-5.6-terra"
         );
 
         let _ = fs::remove_dir_all(dir);
@@ -598,6 +730,7 @@ mod tests {
                 "thread-1",
                 ObservedComposerConfig {
                     intelligence: Some(ComposerIntelligence::Low),
+                    model: None,
                     review_mode: None,
                     speed: None,
                 },
@@ -614,6 +747,7 @@ mod tests {
             store.read_thread_config("thread-1").unwrap()["config"],
             json!({
                 "intelligence": "low",
+                "model": null,
                 "reviewMode": "auto-review",
                 "revision": "2",
                 "speed": "fast",
@@ -625,6 +759,7 @@ mod tests {
             reloaded.read_thread_config("thread-1").unwrap()["config"],
             json!({
                 "intelligence": "high",
+                "model": null,
                 "reviewMode": "auto-review",
                 "revision": "1",
                 "speed": "fast",
@@ -635,6 +770,7 @@ mod tests {
                 "thread-1",
                 ObservedComposerConfig {
                     intelligence: Some(ComposerIntelligence::Low),
+                    model: None,
                     review_mode: None,
                     speed: None,
                 },
@@ -644,6 +780,7 @@ mod tests {
             reloaded.read_thread_config("thread-1").unwrap()["config"],
             json!({
                 "intelligence": "low",
+                "model": null,
                 "reviewMode": "auto-review",
                 "revision": "1",
                 "speed": "fast",

@@ -1,7 +1,8 @@
 import { create } from 'zustand';
 
-import type { CodexComposerConfig, CodexComposerConfigWriteParams } from '../../shared/composerConfig';
+import type { CodexComposerConfig, CodexComposerConfigWriteParams, CodexModelOption } from '../../shared/composerConfig';
 import { readComposerConfig, writeComposerConfig } from '../ipc/composerConfig';
+import { readModels } from '../ipc/models';
 import {
   createEmptyComposerSnapshot,
   type ComposerAttachmentResource,
@@ -48,6 +49,7 @@ export type ComposerSubmission = {
 };
 
 export type ComposerConfigStatus = 'failed' | 'idle' | 'loading' | 'ready';
+export type ComposerModelsStatus = 'failed' | 'idle' | 'loading' | 'ready';
 
 type ComposerStoreState = {
   applyServerConfig: (config: CodexComposerConfig) => void;
@@ -75,8 +77,12 @@ type ComposerStoreState = {
   intelligence: ComposerIntelligence;
   isSubmitting: boolean;
   failSubmission: (id: number, message: string) => void;
+  loadModels: () => Promise<void>;
   loadServerConfig: () => Promise<void>;
   mentionSession: ComposerMentionSession | null;
+  model: string | null;
+  models: CodexModelOption[] | null;
+  modelsStatus: ComposerModelsStatus;
   openAttachmentPicker: (kind?: ComposerAttachmentPickerKind) => void;
   preEditSnapshot: ComposerSnapshot | null;
   reviewMode: ComposerReviewMode;
@@ -88,6 +94,7 @@ type ComposerStoreState = {
   setComposerDocument: (document: ComposerDocument, resources?: ComposerAttachmentResource[]) => void;
   setIntelligence: (intelligence: ComposerIntelligence, threadId?: string | null) => void;
   setMentionSession: (session: ComposerMentionSession | null) => void;
+  setModel: (model: string, threadId?: string | null) => void;
   setReviewMode: (reviewMode: ComposerReviewMode, threadId?: string | null) => void;
   setSubmitting: (isSubmitting: boolean) => void;
   setSubmissionPhase: (id: number, phase: ComposerSubmissionPhase) => void;
@@ -117,6 +124,7 @@ const nullConfigRevision = '0';
 
 const defaultComposerConfig: CodexComposerConfig = {
   intelligence: 'high',
+  model: null,
   reviewMode: 'auto-review',
   revision: nullConfigRevision,
   speed: 'default',
@@ -213,6 +221,24 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
   forkTarget: null,
   intelligence: defaultComposerConfig.intelligence,
   isSubmitting: false,
+  loadModels: async () => {
+    const status = get().modelsStatus;
+    if (status === 'ready' || status === 'loading') {
+      return;
+    }
+
+    set({ modelsStatus: 'loading' });
+
+    try {
+      const response = await readModels();
+      set({
+        models: response.models,
+        modelsStatus: 'ready',
+      });
+    } catch {
+      set({ modelsStatus: 'failed' });
+    }
+  },
   loadServerConfig: async () => {
     const requestId = ++latestConfigRequestId;
     set({ configStatus: 'loading' });
@@ -229,6 +255,9 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
     }
   },
   mentionSession: null,
+  model: defaultComposerConfig.model,
+  models: null,
+  modelsStatus: 'idle',
   openAttachmentPicker: noopOpenAttachmentPicker,
   preEditSnapshot: null,
   reviewMode: defaultComposerConfig.reviewMode,
@@ -271,6 +300,7 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
   setComposerDocument: noopSetComposerDocument,
   setIntelligence: (intelligence, threadId = null) => updateServerConfig(set, { intelligence, threadId }),
   setMentionSession: (mentionSession) => set({ mentionSession }),
+  setModel: (model, threadId = null) => updateServerConfig(set, { model, threadId }),
   setReviewMode: (reviewMode, threadId = null) => updateServerConfig(set, { reviewMode, threadId }),
   setSubmitting: (isSubmitting) => set((state) => ({
     isSubmitting,
@@ -316,6 +346,7 @@ function composerConfigState(config: CodexComposerConfig, status: ComposerConfig
     configRevision: config.revision,
     configStatus: status,
     intelligence: config.intelligence,
+    model: config.model,
     reviewMode: config.reviewMode,
     speed: config.speed,
   };

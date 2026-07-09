@@ -35,6 +35,7 @@ The Rust server exposes:
 - `remux/codex/files`
 - `remux/codex/composer/config/read`
 - `remux/codex/composer/config/write`
+- `remux/codex/models/read`
 - `remux/codex/thread/message/start`
 - `remux/codex/thread/message/send`
 - `remux/codex/thread/message/edit`

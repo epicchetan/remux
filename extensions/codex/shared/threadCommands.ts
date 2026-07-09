@@ -12,6 +12,7 @@ export type CodexThreadMessageSendParams = {
 
 export type CodexThreadMessageStartConfig = {
   intelligence: CodexComposerIntelligence;
+  model: string | null;
   reviewMode: CodexComposerReviewMode;
   speed: CodexComposerSpeed;
 };
