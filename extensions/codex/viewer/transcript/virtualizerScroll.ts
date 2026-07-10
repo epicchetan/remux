@@ -14,6 +14,10 @@ export type TranscriptInitialScrollTarget = {
   scrollTop: number;
 };
 
+export type TranscriptNativeScrollPhase = 'idle' | 'momentum' | 'touch';
+
+export type TranscriptNativeScrollEvent = 'settle' | 'touch-end' | 'touch-start';
+
 type ExpandedRowGeometry = {
   heightAfterRow: (turnId: string, rowId: string) => number;
   heightBeforeTurnIndex: (turnIndex: number) => number;
@@ -21,6 +25,38 @@ type ExpandedRowGeometry = {
 
 export function transcriptMessageAnchorTopOffset(topPadding: number) {
   return Math.max(sentMessageAnchorTopOffsetPx, topPadding);
+}
+
+export function transcriptNativeScrollPhaseAfterEvent(
+  phase: TranscriptNativeScrollPhase,
+  event: TranscriptNativeScrollEvent,
+): TranscriptNativeScrollPhase {
+  if (event === 'touch-start') {
+    return 'touch';
+  }
+  if (event === 'touch-end') {
+    return 'momentum';
+  }
+  return phase === 'touch' ? phase : 'idle';
+}
+
+export function nativeScrollOwnsTranscriptViewport(phase: TranscriptNativeScrollPhase) {
+  return phase !== 'idle';
+}
+
+export function autoScrollModeAfterNativeScrollSettles({
+  nearBottom,
+  streamingTurnId,
+}: {
+  nearBottom: boolean;
+  streamingTurnId: string | null;
+}): TranscriptAutoScrollMode {
+  if (!nearBottom) {
+    return { type: 'off' };
+  }
+  return streamingTurnId
+    ? { type: 'sent-message-anchor', turnId: streamingTurnId }
+    : { type: 'bottom' };
 }
 
 export function userMessageAnchorScrollTop(rowTop: number, topPadding: number) {

@@ -76,6 +76,7 @@ export type CodexThreadRuntimeError = {
 };
 
 export type CodexThreadRuntimeResource = {
+  activeTurnElapsedMs: number | null;
   activeTurnId: string | null;
   lastError: CodexThreadRuntimeError | null;
   revision: string;

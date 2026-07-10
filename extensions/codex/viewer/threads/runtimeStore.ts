@@ -16,6 +16,7 @@ type ThreadRuntimeRefreshOptions = {
 
 type ThreadRuntimeStoreState = {
   activeThreadId: string | null;
+  activeTurnElapsedMs: number | null;
   activeTurnId: string | null;
   lastError: CodexThreadRuntimeError | null;
   resourceStatus: ThreadRuntimeResourceStatus;
@@ -46,6 +47,7 @@ const actions: Pick<
 
     runtimeStore.setState({
       activeThreadId: threadId,
+      activeTurnElapsedMs: null,
       activeTurnId: null,
       lastError: null,
       resourceStatus: 'loading',
@@ -101,6 +103,7 @@ function resetThreadRuntimeState(): Omit<
 > {
   return {
     activeThreadId: null,
+    activeTurnElapsedMs: null,
     activeTurnId: null,
     lastError: null,
     resourceStatus: 'idle',
@@ -143,6 +146,7 @@ async function loadThreadRuntime(
 
     runtimeStore.setState({
       activeThreadId: threadId,
+      activeTurnElapsedMs: resource.activeTurnElapsedMs,
       activeTurnId: resource.activeTurnId,
       lastError: resource.lastError,
       resourceStatus: 'ready',
@@ -184,6 +188,10 @@ function parseThreadRuntimeResource(result: CodexThreadResourceResult | undefine
   }
 
   return {
+    activeTurnElapsedMs:
+      typeof value.activeTurnElapsedMs === 'number' && Number.isFinite(value.activeTurnElapsedMs)
+        ? Math.max(0, value.activeTurnElapsedMs)
+        : null,
     activeTurnId: typeof value.activeTurnId === 'string' ? value.activeTurnId : null,
     lastError: parseRuntimeError(value.lastError),
     revision: value.revision,

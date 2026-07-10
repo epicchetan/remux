@@ -241,7 +241,10 @@ impl CodexThreadResourcesServer {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        if known_revision.as_deref() == Some(revision.as_str()) {
+        let has_active_turn_timing = value
+            .get("activeTurnElapsedMs")
+            .is_some_and(Value::is_number);
+        if known_revision.as_deref() == Some(revision.as_str()) && !has_active_turn_timing {
             return not_modified_result(request_index, key, revision);
         }
 

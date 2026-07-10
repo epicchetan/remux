@@ -25,8 +25,12 @@ import {
 } from './virtualizerRange';
 import {
   anchorTurnUserMessageScrollTop,
+  autoScrollModeAfterNativeScrollSettles,
   initialTranscriptScrollTarget,
+  nativeScrollOwnsTranscriptViewport,
+  transcriptNativeScrollPhaseAfterEvent,
   userMessageAnchorScrollTop,
+  type TranscriptNativeScrollPhase,
   type TranscriptScrollAnchor,
 } from './virtualizerScroll';
 
@@ -34,6 +38,9 @@ const bottomStickThresholdPx = 12;
 const scrollNavigationDurationMs = 170;
 const scrollNavigationThresholdPx = 12;
 const scrollDirectionThresholdPx = 4;
+// A scrollTop write after touchend cancels native iOS deceleration. Older WebViews
+// lack scrollend, so release ownership only after scroll events have gone quiet.
+const touchScrollSettleDelayMs = 180;
 
 type TranscriptViewportAnchor = {
   offset: number;
@@ -53,9 +60,9 @@ type TranscriptViewportModeChangeReason =
   | 'manual-scroll'
   | 'scroll-navigation'
   | 'scroll-navigation-bottom'
+  | 'scroll-settled'
   | 'host-navigate'
   | 'streaming-turn'
-  | 'touch-end-bottom'
   | 'touch-start';
 
 export function VirtualizedTranscript({ threadId = null }: { threadId?: string | null }) {
@@ -110,7 +117,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
   const programmaticScrollRef = useRef(false);
   const scrollAnchorRef = useRef<TranscriptViewportAnchor | null>(null);
   const autoScrollModeRef = useRef<TranscriptAutoScrollMode>(autoScrollMode);
-  const touchActiveRef = useRef(false);
+  const nativeScrollPhaseRef = useRef<TranscriptNativeScrollPhase>('idle');
   const turnsRef = useRef(turns);
   const streamingTurnIdRef = useRef(streamingTurnId);
   const [width, setWidth] = useState<number | null>(null);
@@ -243,7 +250,10 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
   ]);
 
   const scheduleAutoScroll = useCallback(() => {
-    if (bottomScrollRafRef.current !== null || touchActiveRef.current) {
+    if (
+      bottomScrollRafRef.current !== null ||
+      nativeScrollOwnsTranscriptViewport(nativeScrollPhaseRef.current)
+    ) {
       return;
     }
 
@@ -251,7 +261,11 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       bottomScrollRafRef.current = null;
 
       const viewport = viewportRef.current;
-      if (!viewport || autoScrollModeRef.current.type === 'off' || touchActiveRef.current) {
+      if (
+        !viewport ||
+        autoScrollModeRef.current.type === 'off' ||
+        nativeScrollOwnsTranscriptViewport(nativeScrollPhaseRef.current)
+      ) {
         return;
       }
 
@@ -440,7 +454,10 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     const updateStickiness = () => {
       const currentScrollTop = viewport.scrollTop;
 
-      if (programmaticScrollRef.current) {
+      if (
+        programmaticScrollRef.current ||
+        nativeScrollOwnsTranscriptViewport(nativeScrollPhaseRef.current)
+      ) {
         lastScrollTopRef.current = currentScrollTop;
         return;
       }
@@ -457,21 +474,68 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       lastScrollTopRef.current = currentScrollTop;
     };
 
+    let scrollSettleTimer: number | null = null;
+    const clearScrollSettleTimer = () => {
+      if (scrollSettleTimer === null) {
+        return;
+      }
+      window.clearTimeout(scrollSettleTimer);
+      scrollSettleTimer = null;
+    };
+    const finishUserScroll = () => {
+      clearScrollSettleTimer();
+      if (nativeScrollPhaseRef.current !== 'momentum') {
+        return;
+      }
+
+      nativeScrollPhaseRef.current = transcriptNativeScrollPhaseAfterEvent(
+        nativeScrollPhaseRef.current,
+        'settle',
+      );
+      lastScrollTopRef.current = viewport.scrollTop;
+      captureViewportAnchor();
+      scheduleRangeUpdate();
+
+      const mode = autoScrollModeAfterNativeScrollSettles({
+        nearBottom: isNearBottom(viewport),
+        streamingTurnId: streamingTurnIdRef.current,
+      });
+      setViewportAutoScrollMode(mode, 'scroll-settled');
+      if (mode.type === 'off') {
+        return;
+      }
+      scheduleAutoScroll();
+    };
+    const scheduleUserScrollSettleFallback = () => {
+      clearScrollSettleTimer();
+      scrollSettleTimer = window.setTimeout(finishUserScroll, touchScrollSettleDelayMs);
+    };
     const onScroll = () => {
       updateStickiness();
       scheduleRangeUpdate();
+      if (nativeScrollPhaseRef.current === 'momentum') {
+        scheduleUserScrollSettleFallback();
+      }
     };
     const onTouchStart = () => {
+      clearScrollSettleTimer();
       cancelScrollAnimation();
+      if (bottomScrollRafRef.current !== null) {
+        window.cancelAnimationFrame(bottomScrollRafRef.current);
+        bottomScrollRafRef.current = null;
+      }
+      nativeScrollPhaseRef.current = transcriptNativeScrollPhaseAfterEvent(
+        nativeScrollPhaseRef.current,
+        'touch-start',
+      );
       setViewportAutoScrollMode({ type: 'off' }, 'touch-start');
-      touchActiveRef.current = true;
     };
     const onTouchEnd = () => {
-      touchActiveRef.current = false;
-      if (isNearBottom(viewport)) {
-        setViewportAutoScrollMode({ type: 'bottom' }, 'touch-end-bottom');
-        scheduleAutoScroll();
-      }
+      nativeScrollPhaseRef.current = transcriptNativeScrollPhaseAfterEvent(
+        nativeScrollPhaseRef.current,
+        'touch-end',
+      );
+      scheduleUserScrollSettleFallback();
     };
     const observer = new ResizeObserver(scheduleRangeUpdate);
 
@@ -479,6 +543,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     viewport.addEventListener('touchstart', onTouchStart, { passive: true });
     viewport.addEventListener('touchcancel', onTouchEnd, { passive: true });
     viewport.addEventListener('touchend', onTouchEnd, { passive: true });
+    viewport.addEventListener('scrollend', finishUserScroll, { passive: true });
     observer.observe(viewport);
     lastScrollTopRef.current = viewport.scrollTop;
     setViewportAutoScrollMode(isNearBottom(viewport) ? { type: 'bottom' } : { type: 'off' }, 'mount-stickiness');
@@ -489,6 +554,9 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       viewport.removeEventListener('touchstart', onTouchStart);
       viewport.removeEventListener('touchcancel', onTouchEnd);
       viewport.removeEventListener('touchend', onTouchEnd);
+      viewport.removeEventListener('scrollend', finishUserScroll);
+      clearScrollSettleTimer();
+      nativeScrollPhaseRef.current = 'idle';
       observer.disconnect();
       if (rafRef.current !== null) {
         window.cancelAnimationFrame(rafRef.current);
@@ -502,6 +570,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     };
   }, [
     cancelScrollAnimation,
+    captureViewportAnchor,
     scheduleAutoScroll,
     scheduleRangeUpdate,
     setViewportAutoScrollMode,
@@ -517,7 +586,11 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       return;
     }
 
-    if (autoScrollModeRef.current.type !== 'off' || touchActiveRef.current || programmaticScrollRef.current) {
+    if (
+      autoScrollModeRef.current.type !== 'off' ||
+      nativeScrollOwnsTranscriptViewport(nativeScrollPhaseRef.current) ||
+      programmaticScrollRef.current
+    ) {
       captureViewportAnchor();
       return;
     }
@@ -558,7 +631,10 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
 
   useEffect(() => {
     const viewport = viewportRef.current;
-    if (!streamingTurnId) {
+    if (
+      !streamingTurnId ||
+      nativeScrollOwnsTranscriptViewport(nativeScrollPhaseRef.current)
+    ) {
       return;
     }
 
@@ -578,7 +654,12 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
   }, [scheduleAutoScroll, setViewportAutoScrollMode, streamingTurnId]);
 
   useLayoutEffect(() => {
-    if (status !== 'ready' || width === null || autoScrollModeRef.current.type === 'off' || touchActiveRef.current) {
+    if (
+      status !== 'ready' ||
+      width === null ||
+      autoScrollModeRef.current.type === 'off' ||
+      nativeScrollOwnsTranscriptViewport(nativeScrollPhaseRef.current)
+    ) {
       return;
     }
 

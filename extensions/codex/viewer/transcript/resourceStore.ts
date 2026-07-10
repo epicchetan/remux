@@ -28,6 +28,8 @@ import {
   summarizeWorkItem,
   transcriptDebugEnabled,
 } from './debug';
+import { StreamingRefreshScheduler } from './streamingRefreshScheduler';
+import { partitionStreamingTranscriptInvalidations } from './streamingRefreshPolicy';
 
 export type TranscriptStatus = 'idle' | 'loading' | 'ready' | 'failed';
 
@@ -116,6 +118,7 @@ let transcriptReadGeneration = 0;
 let pendingTranscriptRefresh: PendingTranscriptRefresh | null = null;
 let invalidatedTranscriptRefreshInFlight = false;
 const transcriptInvalidationCoalesceMs = 32;
+const streamingTurnRefreshCadenceMs = 125;
 const workItemMissingRetryDelayMs = 1000;
 
 const actions: Pick<
@@ -132,6 +135,7 @@ const actions: Pick<
     }
 
     cancelPendingTranscriptRefresh();
+    streamingRefreshScheduler.cancelPending();
     transcriptReadGeneration += 1;
     workDetailsRequests.clear();
     workItemRequests.clear();
@@ -168,6 +172,12 @@ const actions: Pick<
 const resourceStore = createExternalStore<TranscriptResourceStoreState>({
   ...resetTranscriptResourceState(),
   ...actions,
+});
+
+const streamingRefreshScheduler = new StreamingRefreshScheduler<CodexResourceInvalidation>({
+  cadenceMs: streamingTurnRefreshCadenceMs,
+  key: (invalidation) => invalidation.key,
+  run: refreshStreamingTranscriptInvalidations,
 });
 
 configureTranscriptLayoutResourceAdapter({
@@ -221,16 +231,28 @@ export async function invalidateTranscriptResources(invalidations: CodexResource
     (invalidation): invalidation is Extract<CodexResourceInvalidation, { type: 'workItem' }> =>
       invalidation.type === 'workItem' && invalidation.threadId === activeThreadId,
   );
-  const turnRefresh = shouldRefreshTranscript
-    ? Promise.resolve()
-    : refreshInvalidatedTurns(activeThreadId, turnInvalidations);
-  const workItemRefresh = Promise.all(workItemInvalidations.map((invalidation) =>
+  const {
+    immediateWorkItemInvalidations,
+    streamingInvalidations,
+  } = partitionStreamingTranscriptInvalidations({
+    shouldRefreshTranscript,
+    turnInvalidations,
+    workItemInvalidations,
+  });
+
+  if (shouldRefreshTranscript) {
+    streamingRefreshScheduler.cancelPending();
+  } else {
+    streamingRefreshScheduler.enqueue(streamingInvalidations);
+  }
+
+  const workItemRefresh = Promise.all(immediateWorkItemInvalidations.map((invalidation) =>
     requestWorkItem(activeThreadId, invalidation.turnId, invalidation.itemId, {
       keepExistingVisible: true,
     }))).then(() => undefined);
 
   if (!shouldRefreshTranscript) {
-    await Promise.all([turnRefresh, workItemRefresh]);
+    await workItemRefresh;
     return;
   }
 
@@ -248,6 +270,7 @@ export async function refreshActiveTranscriptResources(options: TranscriptRefres
   }
 
   cancelPendingTranscriptRefresh();
+  streamingRefreshScheduler.cancelPending();
   transcriptReadGeneration += 1;
   await loadTranscript(activeThreadId, transcriptReadGeneration, {
     forceFullMeasure: options.forceFullMeasure ?? false,
@@ -572,6 +595,30 @@ function reconcileThreadResource(result: CodexTranscriptResourceResult | undefin
   }
 
   return result.value;
+}
+
+async function refreshStreamingTranscriptInvalidations(invalidations: CodexResourceInvalidation[]) {
+  const activeThreadId = resourceStore.getState().activeThreadId;
+  if (!activeThreadId) {
+    return;
+  }
+
+  const turnInvalidations = invalidations.filter(
+    (invalidation): invalidation is Extract<CodexResourceInvalidation, { type: 'turn' }> =>
+      invalidation.type === 'turn' && invalidation.threadId === activeThreadId,
+  );
+  const workItemInvalidations = invalidations.filter(
+    (invalidation): invalidation is Extract<CodexResourceInvalidation, { type: 'workItem' }> =>
+      invalidation.type === 'workItem' && invalidation.threadId === activeThreadId,
+  );
+
+  await Promise.all([
+    refreshInvalidatedTurns(activeThreadId, turnInvalidations),
+    Promise.all(workItemInvalidations.map((invalidation) =>
+      requestWorkItem(activeThreadId, invalidation.turnId, invalidation.itemId, {
+        keepExistingVisible: true,
+      }))).then(() => undefined),
+  ]);
 }
 
 async function refreshInvalidatedTurns(

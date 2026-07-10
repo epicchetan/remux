@@ -630,7 +630,7 @@ impl CodexThreadCommandServer {
             self.live_transcript.record_turn(thread_id, turn);
         }
         self.thread_runtime
-            .record_turn_started(thread_id, Some(&turn_id));
+            .record_turn_accepted(thread_id, Some(&turn_id));
         Ok(turn_id)
     }
 }

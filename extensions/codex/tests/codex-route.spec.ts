@@ -20,6 +20,11 @@ type MockHostOptions = {
   commandErrors?: Record<string, string>;
   cwd?: string;
   fuzzyFiles?: Array<{ path: string; isDirectory?: boolean }>;
+  runtime?: {
+    activeTurnElapsedMs: number | null;
+    activeTurnId: string | null;
+    status: 'failed' | 'ready' | 'running' | 'stopping';
+  };
   threadCwd?: string;
   tokenUsage?: ThreadTokenUsage | null;
   turns?: CodexTranscriptTurn[];
@@ -40,6 +45,11 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
   const commandErrors = options.commandErrors ?? {};
   const cwd = options.cwd ?? '/tmp/remux';
   const fuzzyFiles = options.fuzzyFiles ?? defaultFuzzyFiles;
+  const runtime = options.runtime ?? {
+    activeTurnElapsedMs: null,
+    activeTurnId: null,
+    status: 'ready' as const,
+  };
   const threadCwd = options.threadCwd ?? cwd;
   const tokenUsage = options.tokenUsage ?? null;
   const turns = options.turns ?? [];
@@ -47,7 +57,7 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
   const workItems = options.workItems ?? {};
 
   await page.addInitScript(
-    ({ attachments, commandErrors, cwd, files, threadCwd, tokenUsage, turns, workDetails, workItems }) => {
+    ({ attachments, commandErrors, cwd, files, runtime, threadCwd, tokenUsage, turns, workDetails, workItems }) => {
       const capturedMessages: HostRequest[] = [];
 
       function dispatchHostMessage(message: unknown) {
@@ -144,10 +154,11 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
                     revision: `mock-runtime-revision:${threadId}`,
                     status: 'ok',
                     value: {
-                      activeTurnId: null,
+                      activeTurnElapsedMs: runtime.activeTurnElapsedMs,
+                      activeTurnId: runtime.activeTurnId,
                       lastError: null,
                       revision: `mock-runtime-revision:${threadId}`,
-                      status: 'ready',
+                      status: runtime.status,
                       threadId,
                     },
                   };
@@ -560,6 +571,7 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
       commandErrors,
       cwd,
       files: fuzzyFiles,
+      runtime,
       threadCwd,
       tokenUsage,
       turns,
@@ -785,6 +797,48 @@ test.describe('codex viewer route', () => {
     await page.getByTestId('work-section-work-steering').click();
     await expect(page.getByText('Change the output format')).toBeVisible();
     await expect(page.getByText('Steered conversation')).toHaveCount(1);
+  });
+
+  test('advances an isolated running work duration from the server timing anchor', async ({ page }) => {
+    const turn: CodexTranscriptTurn = {
+      completedAt: null,
+      durationMs: null,
+      error: null,
+      id: 'turn-running-duration',
+      revision: 'turn-running-duration-revision',
+      segments: [
+        {
+          content: [{ text: 'Run the task', text_elements: [], type: 'text' }],
+          id: 'user-running-duration',
+          revision: 'user-running-duration-revision',
+          type: 'userMessage',
+        },
+        {
+          durationMs: null,
+          hasDetails: false,
+          id: 'work-running-duration',
+          revision: 'work-running-duration-revision',
+          state: 'running',
+          type: 'work',
+        },
+      ],
+      startedAt: 1782000000,
+      status: 'inProgress',
+    };
+    await installMockRemuxHost(page, {
+      runtime: {
+        activeTurnElapsedMs: 1000,
+        activeTurnId: turn.id,
+        status: 'running',
+      },
+      turns: [turn],
+    });
+
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+
+    const workHeader = page.getByTestId('work-section-work-running-duration');
+    await expect(workHeader).toContainText('Working for 1s');
+    await expect(workHeader).toContainText('Working for 2s', { timeout: 2500 });
   });
 
   test('renders text-backed mention spans as chips and rebuilds them on edit', async ({ page }) => {

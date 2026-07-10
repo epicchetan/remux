@@ -11,8 +11,11 @@ import {
 } from '../viewer/transcript/layoutStore';
 import {
   anchorTurnUserMessageScrollTop,
+  autoScrollModeAfterNativeScrollSettles,
   initialTranscriptScrollTarget,
+  nativeScrollOwnsTranscriptViewport,
   transcriptMessageAnchorTopOffset,
+  transcriptNativeScrollPhaseAfterEvent,
 } from '../viewer/transcript/virtualizerScroll';
 import {
   computeTranscriptSpacerRange,
@@ -892,6 +895,35 @@ test.describe('transcript virtualizer range', () => {
 });
 
 test.describe('transcript virtualizer scroll targets', () => {
+  test('keeps native scroll ownership from touch through momentum', () => {
+    let phase = transcriptNativeScrollPhaseAfterEvent('idle', 'touch-start');
+    expect(phase).toBe('touch');
+    expect(nativeScrollOwnsTranscriptViewport(phase)).toBe(true);
+
+    phase = transcriptNativeScrollPhaseAfterEvent(phase, 'touch-end');
+    expect(phase).toBe('momentum');
+    expect(nativeScrollOwnsTranscriptViewport(phase)).toBe(true);
+
+    phase = transcriptNativeScrollPhaseAfterEvent(phase, 'settle');
+    expect(phase).toBe('idle');
+    expect(nativeScrollOwnsTranscriptViewport(phase)).toBe(false);
+  });
+
+  test('restores stickiness only after native scrolling settles near its target', () => {
+    expect(autoScrollModeAfterNativeScrollSettles({
+      nearBottom: false,
+      streamingTurnId: 'turn-1',
+    })).toEqual({ type: 'off' });
+    expect(autoScrollModeAfterNativeScrollSettles({
+      nearBottom: true,
+      streamingTurnId: 'turn-1',
+    })).toEqual({ type: 'sent-message-anchor', turnId: 'turn-1' });
+    expect(autoScrollModeAfterNativeScrollSettles({
+      nearBottom: true,
+      streamingTurnId: null,
+    })).toEqual({ type: 'bottom' });
+  });
+
   test('uses safe-area-aware offset for sent message targets', () => {
     const layout = measureCollapsedTranscript({
       turns: [

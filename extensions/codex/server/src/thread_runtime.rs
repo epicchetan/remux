@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use serde_json::{Value, json};
 
@@ -13,6 +14,7 @@ pub(crate) struct ThreadRuntimeStore {
 #[derive(Clone, Debug)]
 struct ThreadRuntimeState {
     active_turn_id: Option<String>,
+    active_turn_started_at: Option<Instant>,
     last_error: Option<ThreadRuntimeError>,
     status: ThreadRuntimeStatus,
 }
@@ -36,6 +38,7 @@ impl Default for ThreadRuntimeState {
     fn default() -> Self {
         Self {
             active_turn_id: None,
+            active_turn_started_at: None,
             last_error: None,
             status: ThreadRuntimeStatus::Ready,
         }
@@ -43,10 +46,30 @@ impl Default for ThreadRuntimeState {
 }
 
 impl ThreadRuntimeStore {
-    pub(crate) fn record_turn_started(&self, thread_id: &str, turn_id: Option<&str>) {
+    pub(crate) fn record_turn_accepted(&self, thread_id: &str, turn_id: Option<&str>) {
         self.update_thread(thread_id, |state| {
             if let Some(turn_id) = turn_id {
+                if state.active_turn_id.as_deref() != Some(turn_id) {
+                    state.active_turn_started_at = None;
+                }
                 state.active_turn_id = Some(turn_id.to_string());
+            }
+            state.last_error = None;
+            state.status = ThreadRuntimeStatus::Running;
+        });
+    }
+
+    pub(crate) fn record_turn_started(&self, thread_id: &str, turn_id: Option<&str>) {
+        let started_at = Instant::now();
+        self.update_thread(thread_id, |state| {
+            if let Some(turn_id) = turn_id {
+                if state.active_turn_id.as_deref() != Some(turn_id) {
+                    state.active_turn_started_at = None;
+                }
+                state.active_turn_id = Some(turn_id.to_string());
+            }
+            if state.active_turn_started_at.is_none() {
+                state.active_turn_started_at = Some(started_at);
             }
             state.last_error = None;
             state.status = ThreadRuntimeStatus::Running;
@@ -65,6 +88,7 @@ impl ThreadRuntimeStore {
     pub(crate) fn record_turn_failed(&self, thread_id: &str, turn_id: Option<&str>, error: &str) {
         self.update_thread(thread_id, |state| {
             state.active_turn_id = None;
+            state.active_turn_started_at = None;
             state.last_error = Some(ThreadRuntimeError {
                 codex_error_info: None,
                 message: error.to_string(),
@@ -104,12 +128,14 @@ impl ThreadRuntimeStore {
                     let error = runtime_error_from_params(params, turn_id);
                     self.update_thread(&thread_id, |state| {
                         state.active_turn_id = None;
+                        state.active_turn_started_at = None;
                         state.last_error = Some(error);
                         state.status = ThreadRuntimeStatus::Failed;
                     });
                 } else {
                     self.update_thread(&thread_id, |state| {
                         state.active_turn_id = None;
+                        state.active_turn_started_at = None;
                         state.last_error = None;
                         state.status = ThreadRuntimeStatus::Ready;
                     });
@@ -119,6 +145,7 @@ impl ThreadRuntimeStore {
                 let error = runtime_error_from_params(params, turn_id);
                 self.update_thread(&thread_id, |state| {
                     state.active_turn_id = None;
+                    state.active_turn_started_at = None;
                     state.last_error = Some(error);
                     state.status = ThreadRuntimeStatus::Failed;
                 });
@@ -133,6 +160,7 @@ impl ThreadRuntimeStore {
                         state.status = status;
                         if state.status != ThreadRuntimeStatus::Running {
                             state.active_turn_id = None;
+                            state.active_turn_started_at = None;
                         }
                     });
                 }
@@ -156,8 +184,12 @@ impl ThreadRuntimeStore {
             .ok()
             .and_then(|inner| inner.get(thread_id).cloned())
             .unwrap_or_default();
+        let active_turn_elapsed_ms = state
+            .active_turn_started_at
+            .map(|started_at| i64::try_from(started_at.elapsed().as_millis()).unwrap_or(i64::MAX));
         let mut value = json!({
             "activeTurnId": state.active_turn_id,
+            "activeTurnElapsedMs": active_turn_elapsed_ms,
             "lastError": state.last_error.map(|error| json!({
                 "codexErrorInfo": error.codex_error_info,
                 "message": error.message,
@@ -166,7 +198,13 @@ impl ThreadRuntimeStore {
             "status": state.status.as_str(),
             "threadId": thread_id,
         });
-        let revision = stable_revision_value(&value);
+        let revision = stable_revision_value(&json!({
+            "activeTurnId": value["activeTurnId"],
+            "activeTurnTimingReady": active_turn_elapsed_ms.is_some(),
+            "lastError": value["lastError"],
+            "status": value["status"],
+            "threadId": thread_id,
+        }));
         value["revision"] = Value::String(revision);
         value
     }
@@ -183,12 +221,19 @@ impl ThreadRuntimeStore {
     }
 
     fn record_item_started(&self, thread_id: &str, turn_id: Option<&str>) {
+        let started_at = Instant::now();
         self.update_thread(thread_id, |state| {
             if state.status == ThreadRuntimeStatus::Stopping {
                 return;
             }
             if let Some(turn_id) = turn_id {
+                if state.active_turn_id.as_deref() != Some(turn_id) {
+                    state.active_turn_started_at = None;
+                }
                 state.active_turn_id = Some(turn_id.to_string());
+            }
+            if state.active_turn_started_at.is_none() {
+                state.active_turn_started_at = Some(started_at);
             }
             state.last_error = None;
             state.status = ThreadRuntimeStatus::Running;
@@ -328,6 +373,45 @@ mod tests {
         assert_eq!(value["status"], json!("running"));
         assert_eq!(value["activeTurnId"], json!("turn-2"));
         assert_eq!(value["lastError"], Value::Null);
+    }
+
+    #[test]
+    fn exposes_elapsed_time_only_after_the_turn_started_notification() {
+        let store = ThreadRuntimeStore::default();
+        store.record_turn_accepted("thread-1", Some("turn-1"));
+
+        let accepted = store.resource_value("thread-1");
+        assert_eq!(accepted["activeTurnElapsedMs"], Value::Null);
+
+        store.record_notification(&json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {
+                    "id": "turn-1",
+                    "startedAt": 1_700_000_000
+                }
+            }
+        }));
+
+        let running = store.resource_value("thread-1");
+        assert!(running["activeTurnElapsedMs"].as_i64().is_some());
+        assert_ne!(running["revision"], accepted["revision"]);
+
+        store.record_notification(&json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {
+                    "id": "turn-1",
+                    "status": "completed"
+                }
+            }
+        }));
+
+        let completed = store.resource_value("thread-1");
+        assert_eq!(completed["activeTurnElapsedMs"], Value::Null);
+        assert_eq!(completed["activeTurnId"], Value::Null);
     }
 
     #[test]

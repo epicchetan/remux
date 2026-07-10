@@ -39,6 +39,8 @@ import { transcriptWorkDisclosureKey, useTranscriptLayoutStore } from '../../lay
 import { useTranscriptResourceStore, workItemResourceKey } from '../../resourceStore';
 import { Compaction } from '../compaction';
 import { UserMessage } from '../userMessage';
+import { WorkingDuration } from './WorkingDuration';
+import { formatWorkDuration } from './workDuration';
 
 type LocalDisclosure = {
   isOpen: (id: string, defaultOpen?: boolean) => boolean;
@@ -168,7 +170,9 @@ export function WorkSection({
           type="button"
         >
           <span className="flex min-w-0 flex-1 items-center gap-2">
-            <span className="min-w-0 truncate">{workTitle(segment)}</span>
+            <span className="min-w-0 truncate">
+              <WorkTitle segment={segment} turnId={turnId} />
+            </span>
           </span>
           <span className="flex shrink-0 items-center gap-1.5">
             {segment.state === 'running' || waitingForDetails ? (
@@ -606,12 +610,16 @@ function ToolMediaPreview({ media }: { media: CodexMediaPreview }) {
   );
 }
 
-function workTitle(segment: CodexWorkSegment) {
+function WorkTitle({ segment, turnId }: { segment: CodexWorkSegment; turnId: string }) {
   if (segment.state === 'running') {
-    return 'Working';
+    return <WorkingDuration turnId={turnId} />;
   }
 
-  return `Worked${segment.durationMs ? ` for ${formatWorkDuration(segment.durationMs)}` : ''}`;
+  return (
+    <>
+      Worked{segment.durationMs !== null ? ` for ${formatWorkDuration(segment.durationMs)}` : ''}
+    </>
+  );
 }
 
 function useLocalDisclosure() {
@@ -875,23 +883,6 @@ function StatusIcon({ status }: { status: string }) {
   }
 
   return <CheckCircle2 className="size-4 shrink-0 text-success" />;
-}
-
-function formatWorkDuration(durationMs: number) {
-  const totalSeconds = Math.max(1, Math.round(durationMs / 1000));
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-
-  if (hours > 0) {
-    return `${hours}h ${Math.floor((totalSeconds % 3600) / 60)}m`;
-  }
-
-  if (minutes === 0) {
-    return `${seconds}s`;
-  }
-
-  return `${minutes}m ${seconds}s`;
 }
 
 function formatCount(count: number, singular: string, plural = `${singular}s`) {
