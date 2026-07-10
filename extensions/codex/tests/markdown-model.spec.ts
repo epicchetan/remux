@@ -1,10 +1,23 @@
 import { expect, test } from '@playwright/test';
 
 import {
+  cappedMarkdownLayoutDocumentHeight,
   getMarkdownLayoutDocument,
   markdownMetrics,
   parseMarkdownDocument,
 } from '../viewer/transcript/components/markdown/markdownModel';
+
+if (typeof globalThis.OffscreenCanvas === 'undefined') {
+  globalThis.OffscreenCanvas = class {
+    constructor(_width: number, _height: number) {}
+
+    getContext() {
+      return {
+        measureText: (text: string) => ({ width: text.length * 8 }),
+      };
+    }
+  } as unknown as typeof OffscreenCanvas;
+}
 
 test.describe('markdownModel', () => {
   test('ends an ordered list before following unindented paragraphs', () => {
@@ -290,6 +303,98 @@ test.describe('markdownModel', () => {
     });
   });
 
+  test('parses GFM tables into rows and cells with inline formatting', () => {
+    const blocks = parseMarkdownDocument(gfmTableMarkdown());
+
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]).toMatchObject({
+      align: ['left', 'center', 'right'],
+      rows: [
+        {
+          cells: [
+            { lines: [[{ text: 'Projection shape', type: 'text' }]] },
+            { lines: [[{ text: 'Cache representation', type: 'text' }]] },
+            { lines: [[{ text: 'Delivery read', type: 'text' }]] },
+          ],
+          header: true,
+        },
+        {
+          cells: [
+            { lines: [[{ text: 'Bars', type: 'text' }]] },
+            { lines: [[{ text: 'Append-only array + live value + status', type: 'text' }]] },
+            { lines: [[{ text: 'Read only unseen bar suffix and latest live bar', type: 'text' }]] },
+          ],
+          header: false,
+        },
+        {
+          cells: [
+            { lines: [[{ text: 'Depth/DOM', type: 'text' }]] },
+            { lines: [[{ text: 'Replaceable snapshot', type: 'text' }]] },
+            {
+              lines: [[
+                { text: 'Clone an ', type: 'text' },
+                { text: 'Arc<DepthSnapshot>', type: 'code' },
+              ]],
+            },
+          ],
+          header: false,
+        },
+      ],
+      type: 'table',
+    });
+  });
+
+  test('lays out table cells with deterministic PreText row heights', () => {
+    const document = getMarkdownLayoutDocument(gfmTableMarkdown(), 'default', 360);
+    const table = document.blocks[0];
+
+    expect(table).toMatchObject({ type: 'table' });
+    if (table?.type !== 'table') {
+      throw new Error('Expected table block');
+    }
+
+    expect(table.tableWidth).toBeCloseTo(360, 5);
+    expect(table.columnWidths).toHaveLength(3);
+    expect(table.rows).toHaveLength(3);
+    expect(table.rows.some((row) => row.lineCount > 1)).toBe(true);
+    for (const row of table.rows) {
+      expect(row.lineCount).toBe(Math.max(1, ...row.cells.map((cell) => cell.lines.length)));
+      expect(row.height).toBe(
+        row.lineCount * table.lineHeight +
+          markdownMetrics.table.cellPaddingY * 2 +
+          (row === table.rows.at(-1) ? 0 : markdownMetrics.table.borderWidth),
+      );
+    }
+    expect(table.contentHeight).toBe(
+      markdownMetrics.table.borderWidth * 2 +
+        table.rows.reduce((total, row) => total + row.height, 0),
+    );
+    expect(document.height).toBe(table.contentHeight);
+    expect(cappedMarkdownLayoutDocumentHeight(document, 1)).toBe(
+      markdownMetrics.table.borderWidth +
+        markdownMetrics.table.cellPaddingY +
+        table.lineHeight,
+    );
+    expect(cappedMarkdownLayoutDocumentHeight(document, 2)).toBeLessThan(document.height);
+  });
+
+  test('uses horizontal overflow when minimum table columns exceed the content width', () => {
+    const document = getMarkdownLayoutDocument(gfmTableMarkdown(), 'default', 220);
+    const table = document.blocks[0];
+
+    expect(table).toMatchObject({ type: 'table' });
+    if (table?.type !== 'table') {
+      throw new Error('Expected table block');
+    }
+
+    expect(table.columnWidths).toEqual([
+      markdownMetrics.table.minColumnWidth,
+      markdownMetrics.table.minColumnWidth,
+      markdownMetrics.table.minColumnWidth,
+    ]);
+    expect(table.tableWidth).toBeGreaterThan(document.width);
+  });
+
   test('lays out a long fenced code line as one logical line at narrow width', () => {
     const document = getMarkdownLayoutDocument(
       ['```ts', `const value = '${'x'.repeat(180)}';`, '```'].join('\n'),
@@ -353,3 +458,12 @@ test.describe('markdownModel', () => {
   });
 
 });
+
+function gfmTableMarkdown() {
+  return [
+    '| Projection shape | Cache representation | Delivery read |',
+    '| :--- | :---: | ---: |',
+    '| Bars | Append-only array + live value + status | Read only unseen bar suffix and latest live bar |',
+    '| Depth/DOM | Replaceable snapshot | Clone an `Arc<DepthSnapshot>` |',
+  ].join('\n');
+}

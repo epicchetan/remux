@@ -36,7 +36,6 @@ export type UserMessageLayoutModel = {
   bodyMarkdown: string | null;
   placement: UserMessagePlacement;
   railItems: UserMessageRailItem[];
-  showSteeringLabel: boolean;
 };
 
 type UserMessageItem = Extract<ThreadItem, { type: 'userMessage' }>;
@@ -90,7 +89,6 @@ export function buildUserMessageLayout(
     bodyMarkdown: markdownParts.length > 0 ? markdownParts.join('\n\n') : null,
     placement,
     railItems,
-    showSteeringLabel: placement === 'work',
   };
 }
 

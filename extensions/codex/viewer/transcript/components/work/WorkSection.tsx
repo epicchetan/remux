@@ -305,6 +305,7 @@ function WorkUserMessage({ item, width }: { item: Extract<CodexWorkItem, { type:
         segment={{
           content: item.content,
           id: item.id,
+          isSteering: item.isSteering,
           revision: `${item.id}:${item.content.length}`,
           type: 'userMessage',
         }}

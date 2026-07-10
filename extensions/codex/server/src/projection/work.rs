@@ -94,6 +94,7 @@ pub(super) fn build_work_item(
             Some(json!({
                 "content": normalize_user_content(item.get("content")),
                 "id": id,
+                "isSteering": item.get("isSteering").and_then(Value::as_bool).unwrap_or(false),
                 "type": "userMessage",
             }))
         }

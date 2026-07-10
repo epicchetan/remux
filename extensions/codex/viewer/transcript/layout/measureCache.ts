@@ -1,4 +1,4 @@
-export const transcriptMeasureCacheVersion = 3;
+export const transcriptMeasureCacheVersion = 4;
 
 export type TranscriptMeasureCacheLookup = {
   contentWidth: number;

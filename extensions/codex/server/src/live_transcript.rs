@@ -10,7 +10,7 @@ use crate::item_identity::{
 use crate::projection::{
     ProjectedTurn, RawTurn, is_contextual_user_message_content,
     parse_visible_hook_prompt_fragments, project_app_server_turn, project_raw_turn,
-    reconcile_raw_turn_items,
+    reconcile_raw_turn_items, user_message_key, user_message_replay_key,
 };
 use crate::util::{number_as_i64, stable_revision_value};
 
@@ -904,6 +904,7 @@ fn merge_live_turn_into_raw(raw_turn: &mut RawTurn, live_turn: &LiveTurn) {
     merge_live_metadata_into_raw(raw_turn, &live_turn.turn);
 
     let mut live_compaction_ordinal = 0;
+    let mut live_user_ordinal = 0;
     for item in live_turn
         .turn
         .get("items")
@@ -918,11 +919,19 @@ fn merge_live_turn_into_raw(raw_turn: &mut RawTurn, live_turn: &LiveTurn) {
         } else {
             None
         };
+        let user_ordinal = if item_type(item) == Some("userMessage") {
+            let ordinal = live_user_ordinal;
+            live_user_ordinal += 1;
+            Some(ordinal)
+        } else {
+            None
+        };
         merge_live_item_snapshot(
             raw_turn,
             item,
             live_turn.deltas.get(item_id(item).unwrap_or("")),
             compaction_ordinal,
+            user_ordinal,
         );
     }
 
@@ -954,6 +963,7 @@ fn merge_live_item_snapshot(
     live_item: &Value,
     delta: Option<&LiveItemDelta>,
     compaction_ordinal: Option<usize>,
+    user_ordinal: Option<usize>,
 ) {
     let Some(live_item_id) = item_id(live_item) else {
         return;
@@ -973,8 +983,28 @@ fn merge_live_item_snapshot(
         return;
     }
 
-    if live_item_type == "userMessage" && raw_has_item_type(raw_turn, "userMessage") {
-        return;
+    if live_item_type == "userMessage" {
+        let live_message_key = user_message_key(live_item);
+        if let Some(index) = raw_turn.items.iter().position(|item| {
+            item_type(item) == Some("userMessage") && user_message_key(item) == live_message_key
+        }) {
+            merge_item_snapshot_fields(&mut raw_turn.items[index], live_item, delta);
+            return;
+        }
+        if let Some(index) = user_ordinal.and_then(|ordinal| {
+            raw_turn
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| item_type(item) == Some("userMessage"))
+                .nth(ordinal)
+                .map(|(index, _)| index)
+        }) && user_message_replay_key(&raw_turn.items[index])
+            == user_message_replay_key(live_item)
+        {
+            merge_item_snapshot_fields(&mut raw_turn.items[index], live_item, delta);
+            return;
+        }
     }
 
     raw_turn.items.push(live_item.clone());
@@ -1202,13 +1232,6 @@ fn item_id(item: &Value) -> Option<&str> {
 
 fn item_type(item: &Value) -> Option<&str> {
     item.get("type").and_then(Value::as_str)
-}
-
-fn raw_has_item_type(raw_turn: &RawTurn, target: &str) -> bool {
-    raw_turn
-        .items
-        .iter()
-        .any(|item| item_type(item) == Some(target))
 }
 
 fn live_revision_value(turn_id: &str, turn: &LiveTurn) -> Value {

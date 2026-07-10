@@ -6,13 +6,14 @@ use crate::util::stable_revision_value;
 
 use super::{RawTurn, compaction_status, item_id, merge_compaction_status, normalize_user_content};
 
-pub(super) fn user_segment(item: &Value) -> Value {
+pub(super) fn user_segment(item: &Value, is_steering: bool) -> Value {
     let content = normalize_user_content(item.get("content"));
     let id = item_id(item).unwrap_or("user");
     json!({
         "content": content,
         "id": id,
-        "revision": stable_revision_value(&json!(["user", id, content])),
+        "isSteering": is_steering,
+        "revision": stable_revision_value(&json!(["user", id, is_steering, content])),
         "type": "userMessage",
     })
 }

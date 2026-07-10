@@ -5,13 +5,16 @@ import {
 } from '@chenglou/pretext';
 import {
   materializeRichInlineLineRange,
+  measureRichInlineStats,
   prepareRichInline,
   walkRichInlineLineRanges,
   type PreparedRichInline,
   type RichInlineItem,
 } from '@chenglou/pretext/rich-inline';
 import { fromMarkdown } from 'mdast-util-from-markdown';
-import type { BlockContent, DefinitionContent, PhrasingContent, RootContent } from 'mdast';
+import { gfmTableFromMarkdown } from 'mdast-util-gfm-table';
+import { gfmTable } from 'micromark-extension-gfm-table';
+import type { AlignType, BlockContent, DefinitionContent, PhrasingContent, RootContent } from 'mdast';
 
 import { hostFileHrefInfoFromHref, webUrlFromHref } from '@remux/viewer-kit/links';
 
@@ -91,12 +94,28 @@ export type PreparedMarkdownBlock =
       type: 'list';
     }
   | {
+      align: MarkdownTableAlignment[];
+      rows: PreparedMarkdownTableRow[];
+      type: 'table';
+    }
+  | {
       type: 'rule';
     };
 
 export type PreparedMarkdownListItem = {
   blocks: PreparedMarkdownBlock[];
   marker: string;
+};
+
+export type MarkdownTableAlignment = Exclude<AlignType, undefined>;
+
+export type PreparedMarkdownTableCell = {
+  lines: PreparedMarkdownInlineLine[];
+};
+
+export type PreparedMarkdownTableRow = {
+  cells: PreparedMarkdownTableCell[];
+  header: boolean;
 };
 
 export type PreparedMarkdownDocument = {
@@ -161,6 +180,13 @@ export type MarkdownLayoutBlock =
       type: 'list';
     })
   | (MarkdownLayoutBlockBase & {
+      columnWidths: number[];
+      lineHeight: number;
+      rows: MarkdownLayoutTableRow[];
+      tableWidth: number;
+      type: 'table';
+    })
+  | (MarkdownLayoutBlockBase & {
       type: 'rule';
     });
 
@@ -174,6 +200,18 @@ export type MarkdownLayoutListItem = {
   height: number;
   marker: string;
   topGap: number;
+};
+
+export type MarkdownLayoutTableCell = {
+  align: MarkdownTableAlignment;
+  lines: MarkdownLayoutTextLine[];
+};
+
+export type MarkdownLayoutTableRow = {
+  cells: MarkdownLayoutTableCell[];
+  header: boolean;
+  height: number;
+  lineCount: number;
 };
 
 export type MarkdownLayoutDocument = {
@@ -209,12 +247,26 @@ export type RawMarkdownBlock =
       type: 'list';
     }
   | {
+      align: MarkdownTableAlignment[];
+      rows: RawMarkdownTableRow[];
+      type: 'table';
+    }
+  | {
       type: 'rule';
     };
 
 export type RawMarkdownListItem = {
   blocks: RawMarkdownBlock[];
   marker: string;
+};
+
+export type RawMarkdownTableRow = {
+  cells: RawMarkdownTableCell[];
+  header: boolean;
+};
+
+export type RawMarkdownTableCell = {
+  lines: MarkdownInline[][];
 };
 
 type InlineMarks = {
@@ -320,6 +372,13 @@ export const markdownMetrics = {
     },
   },
   ruleHeight: 17,
+  table: {
+    borderWidth: 1,
+    cellPaddingX: 10,
+    cellPaddingY: 7,
+    maxColumnWidth: 320,
+    minColumnWidth: 96,
+  },
 } as const;
 
 const documentCache = new Map<string, PreparedMarkdownDocument>();
@@ -547,6 +606,8 @@ function layoutPreparedMarkdownBlock(
         type: 'list',
       };
     }
+    case 'table':
+      return layoutPreparedMarkdownTable(block, density, safeWidth, topGap);
     case 'rule':
       return {
         contentHeight: markdownMetrics.ruleHeight,
@@ -555,6 +616,122 @@ function layoutPreparedMarkdownBlock(
         type: 'rule',
       };
   }
+}
+
+function layoutPreparedMarkdownTable(
+  block: Extract<PreparedMarkdownBlock, { type: 'table' }>,
+  density: MarkdownDensity,
+  width: number,
+  topGap: number,
+): Extract<MarkdownLayoutBlock, { type: 'table' }> {
+  const borderWidth = markdownMetrics.table.borderWidth;
+  const columnCount = Math.max(block.align.length, ...block.rows.map((row) => row.cells.length), 0);
+  if (columnCount === 0) {
+    return {
+      columnWidths: [],
+      contentHeight: 0,
+      height: topGap,
+      lineHeight: markdownMetrics.paragraph.lineHeight[density],
+      rows: [],
+      tableWidth: 0,
+      topGap,
+      type: 'table',
+    };
+  }
+
+  const availableInnerWidth = Math.max(1, width - borderWidth * 2);
+  const preferredColumnWidths: number[] = Array.from(
+    { length: columnCount },
+    () => markdownMetrics.table.minColumnWidth,
+  );
+  for (const row of block.rows) {
+    for (let columnIndex = 0; columnIndex < columnCount; columnIndex += 1) {
+      const cell = row.cells[columnIndex];
+      const naturalWidth = cell ? preparedInlineLinesNaturalWidth(cell.lines) : 0;
+      preferredColumnWidths[columnIndex] = Math.max(
+        preferredColumnWidths[columnIndex],
+        Math.min(
+          markdownMetrics.table.maxColumnWidth,
+          naturalWidth + markdownMetrics.table.cellPaddingX * 2 +
+            (columnIndex < columnCount - 1 ? borderWidth : 0),
+        ),
+      );
+    }
+  }
+
+  const columnWidths = fitTableColumnWidths(preferredColumnWidths, availableInnerWidth);
+  const lineHeight = markdownMetrics.paragraph.lineHeight[density];
+  const rows = block.rows.map((row, rowIndex): MarkdownLayoutTableRow => {
+    let lineCount = 1;
+    const cells = Array.from({ length: columnCount }, (_, columnIndex): MarkdownLayoutTableCell => {
+      const innerWidth = Math.max(
+        1,
+        columnWidths[columnIndex] - markdownMetrics.table.cellPaddingX * 2 -
+          (columnIndex < columnCount - 1 ? borderWidth : 0),
+      );
+      const lines = layoutInlineLines(row.cells[columnIndex]?.lines ?? [], innerWidth);
+      lineCount = Math.max(lineCount, lines.length);
+      return {
+        align: block.align[columnIndex] ?? null,
+        lines,
+      };
+    });
+    const rowBorderHeight = rowIndex < block.rows.length - 1 ? borderWidth : 0;
+
+    return {
+      cells,
+      header: row.header,
+      height: lineCount * lineHeight + markdownMetrics.table.cellPaddingY * 2 + rowBorderHeight,
+      lineCount,
+    };
+  });
+  const contentHeight = rows.length > 0
+    ? borderWidth * 2 + rows.reduce((total, row) => total + row.height, 0)
+    : 0;
+  const tableWidth = columnWidths.reduce((total, columnWidth) => total + columnWidth, 0) + borderWidth * 2;
+
+  return {
+    columnWidths,
+    contentHeight,
+    height: topGap + contentHeight,
+    lineHeight,
+    rows,
+    tableWidth,
+    topGap,
+    type: 'table',
+  };
+}
+
+function preparedInlineLinesNaturalWidth(lines: PreparedMarkdownInlineLine[]) {
+  let width = 0;
+  for (const line of lines) {
+    if (line.prepared) {
+      width = Math.max(width, measureRichInlineStats(line.prepared, Number.POSITIVE_INFINITY).maxLineWidth);
+    }
+  }
+  return width;
+}
+
+function fitTableColumnWidths(preferredWidths: number[], availableWidth: number) {
+  const minimumWidth = markdownMetrics.table.minColumnWidth;
+  const minimumTotal = minimumWidth * preferredWidths.length;
+  if (minimumTotal >= availableWidth) {
+    return preferredWidths.map(() => minimumWidth);
+  }
+
+  const preferredTotal = preferredWidths.reduce((total, columnWidth) => total + columnWidth, 0);
+  if (preferredTotal > availableWidth) {
+    const flexibleTotal = preferredTotal - minimumTotal;
+    const availableFlexibleWidth = availableWidth - minimumTotal;
+    return preferredWidths.map((preferredWidth) =>
+      minimumWidth + (preferredWidth - minimumWidth) / flexibleTotal * availableFlexibleWidth
+    );
+  }
+
+  const extraWidth = availableWidth - preferredTotal;
+  return preferredWidths.map((preferredWidth) =>
+    preferredWidth + extraWidth * preferredWidth / preferredTotal
+  );
 }
 
 function cappedMarkdownBlocksHeight(blocks: MarkdownLayoutBlock[], maxLines: number) {
@@ -615,6 +792,31 @@ function cappedMarkdownBlockHeight(block: MarkdownLayoutBlock, remainingLines: n
         const capped = cappedMarkdownBlocksHeight(item.blocks, nextRemainingLines);
         height += item.topGap + capped.height;
         nextRemainingLines = capped.remainingLines;
+      }
+      return {
+        height,
+        remainingLines: nextRemainingLines,
+      };
+    }
+    case 'table': {
+      let height = block.topGap + markdownMetrics.table.borderWidth;
+      let nextRemainingLines = remainingLines;
+      let completedRows = 0;
+      for (const row of block.rows) {
+        if (nextRemainingLines <= 0) {
+          break;
+        }
+        const visibleLines = Math.min(row.lineCount, nextRemainingLines);
+        nextRemainingLines -= visibleLines;
+        if (visibleLines < row.lineCount) {
+          height += markdownMetrics.table.cellPaddingY + visibleLines * block.lineHeight;
+          return { height, remainingLines: nextRemainingLines };
+        }
+        height += row.height;
+        completedRows += 1;
+      }
+      if (completedRows === block.rows.length) {
+        height += markdownMetrics.table.borderWidth;
       }
       return {
         height,
@@ -767,13 +969,34 @@ function prepareMarkdownBlock(block: RawMarkdownBlock, density: MarkdownDensity)
         start: block.start,
         type: 'list',
       };
+    case 'table':
+      return {
+        align: block.align,
+        rows: block.rows.map((row) => ({
+          cells: row.cells.map((cell) => ({
+            lines: cell.lines.map((line) => prepareInlineLine(
+              line,
+              density,
+              'body',
+              row.header ? { ...emptyMarks, strong: true } : emptyMarks,
+            )),
+          })),
+          header: row.header,
+        })),
+        type: 'table',
+      };
     case 'rule':
       return block;
   }
 }
 
-function prepareInlineLine(inlines: MarkdownInline[], density: MarkdownDensity, variant: InlineVariant): PreparedMarkdownInlineLine {
-  const { items, sources } = inlineRichItems(inlines, density, variant);
+function prepareInlineLine(
+  inlines: MarkdownInline[],
+  density: MarkdownDensity,
+  variant: InlineVariant,
+  initialMarks: InlineMarks = emptyMarks,
+): PreparedMarkdownInlineLine {
+  const { items, sources } = inlineRichItems(inlines, density, variant, initialMarks);
 
   return {
     inlines,
@@ -782,7 +1005,12 @@ function prepareInlineLine(inlines: MarkdownInline[], density: MarkdownDensity, 
   };
 }
 
-function inlineRichItems(inlines: MarkdownInline[], density: MarkdownDensity, variant: InlineVariant) {
+function inlineRichItems(
+  inlines: MarkdownInline[],
+  density: MarkdownDensity,
+  variant: InlineVariant,
+  initialMarks: InlineMarks = emptyMarks,
+) {
   const items: RichInlineItem[] = [];
   const sources: MarkdownInlineSource[] = [];
 
@@ -850,7 +1078,7 @@ function inlineRichItems(inlines: MarkdownInline[], density: MarkdownDensity, va
     return extraWidth;
   };
 
-  walk(inlines, emptyMarks);
+  walk(inlines, initialMarks);
   return { items, sources };
 }
 
@@ -930,7 +1158,10 @@ function markdownParseOptions(options: MarkdownRenderOptions = {}): MarkdownPars
 }
 
 function parseMarkdownBlocks(markdown: string, options: MarkdownParseOptions): RawMarkdownBlock[] {
-  return rootContentToRawBlocks(fromMarkdown(markdown).children, options);
+  return rootContentToRawBlocks(fromMarkdown(markdown, {
+    extensions: [gfmTable()],
+    mdastExtensions: [gfmTableFromMarkdown()],
+  }).children, options);
 }
 
 function sanitizeHref(href: string) {
@@ -1024,7 +1255,18 @@ function blockContentToRawBlock(node: BlockContent, options: MarkdownParseOption
     case 'html':
       return textToParagraphBlocks(node.value);
     case 'table':
-      return textToParagraphBlocks(markdownTextFromNode(node));
+      return [
+        {
+          align: (node.align ?? []).map((alignment) => alignment ?? null),
+          rows: node.children.map((row, rowIndex) => ({
+            cells: row.children.map((cell) => ({
+              lines: phrasingToInlineLines(cell.children, options),
+            })),
+            header: rowIndex === 0,
+          })),
+          type: 'table',
+        },
+      ];
     default:
       return [];
   }

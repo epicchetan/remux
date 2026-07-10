@@ -269,6 +269,214 @@ fn mention_text_elements_survive_replay_and_dedupe_with_response_item() {
 }
 
 #[test]
+fn screenshot_message_replay_collapses_structured_and_flattened_rows() {
+    // A complex submission is persisted in two shapes: the response item keeps
+    // text around the image as separate parts, while the user_message event
+    // flattens the text and stores image data URLs in a side array. They are
+    // one user action and must not create a nested steering message.
+    let response_image_url = "data:image/png;base64,b3JpZ2luYWw=";
+    let legacy_image_url = "data:image/png;base64,cmVlbmNvZGVk";
+    let (home, _path) = write_temp_session(&format!(
+        r#"{{"type":"session_meta","payload":{{"id":"019test"}}}}
+{{"type":"event_msg","payload":{{"type":"task_started","turn_id":"turn-1","started_at":1}}}}
+{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"Look at "}},{{"type":"input_image","image_url":"{response_image_url}"}},{{"type":"input_text","text":" please"}}]}}}}
+{{"type":"event_msg","payload":{{"type":"user_message","message":"Look at  please","images":["{legacy_image_url}"]}}}}
+{{"type":"event_msg","payload":{{"type":"agent_message","message":"Inspecting the screenshot","phase":"commentary"}}}}
+{{"type":"event_msg","payload":{{"type":"task_complete","turn_id":"turn-1","completed_at":2,"duration_ms":1}}}}
+"#,
+    ));
+    let mut server = CodexTranscriptServer::new(home.clone());
+
+    let turn_response = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [
+                { "type": "turn", "turnId": "turn-1" }
+            ]
+        }))
+        .expect("turn read should succeed");
+    let segments = turn_response["resources"][0]["value"]["turn"]["segments"]
+        .as_array()
+        .expect("segments");
+
+    assert_eq!(segments.len(), 2);
+    assert_eq!(segments[0]["type"], json!("userMessage"));
+    assert_eq!(segments[0]["isSteering"], json!(false));
+    assert_eq!(
+        segments[0]["content"],
+        json!([
+            {
+                "text": "Look at  please",
+                "text_elements": [],
+                "type": "text",
+            },
+            {
+                "type": "image",
+                "url": legacy_image_url,
+            }
+        ])
+    );
+    assert_eq!(segments[1]["type"], json!("work"));
+
+    let work_id = segments[1]["id"].as_str().expect("work id");
+    let details = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [
+                { "type": "workDetails", "turnId": "turn-1", "segmentId": work_id }
+            ]
+        }))
+        .expect("details read should succeed");
+    let entries = details["resources"][0]["value"]["details"]["entries"]
+        .as_array()
+        .expect("entries");
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry["type"] != json!("userMessage"))
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn non_adjacent_same_caption_images_remain_distinct_user_submissions() {
+    let (home, _path) = write_temp_session(
+        r#"{"type":"session_meta","payload":{"id":"019test"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","started_at":1}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Use this screenshot"},{"type":"input_image","image_url":"data:image/png;base64,Zmlyc3Q="}]}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"Working on the first screenshot","phase":"commentary"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"Use this screenshot","images":["data:image/png;base64,c2Vjb25k"]}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"Switching to the second screenshot","phase":"commentary"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":2,"duration_ms":1}}
+"#,
+    );
+    let mut server = CodexTranscriptServer::new(home.clone());
+
+    let turn_response = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [
+                { "type": "turn", "turnId": "turn-1" }
+            ]
+        }))
+        .expect("turn read should succeed");
+    let segments = turn_response["resources"][0]["value"]["turn"]["segments"]
+        .as_array()
+        .expect("segments");
+    assert_eq!(segments[0]["type"], json!("userMessage"));
+    assert_eq!(
+        segments[0]["content"][1]["url"],
+        json!("data:image/png;base64,Zmlyc3Q=")
+    );
+    let work = segments
+        .iter()
+        .find(|segment| segment["type"] == json!("work"))
+        .expect("work segment");
+    let work_id = work["id"].as_str().expect("work id");
+
+    let details_response = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [
+                { "type": "workDetails", "turnId": "turn-1", "segmentId": work_id }
+            ]
+        }))
+        .expect("details read should succeed");
+    let steering_item_id = details_response["resources"][0]["value"]["details"]["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["type"] == json!("userMessage"))
+        .and_then(|entry| entry["itemId"].as_str())
+        .expect("steering item id");
+    let item_response = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [
+                { "type": "workItem", "turnId": "turn-1", "itemId": steering_item_id }
+            ]
+        }))
+        .expect("work item read should succeed");
+    let steering_item = &item_response["resources"][0]["value"]["item"];
+    assert_eq!(steering_item["isSteering"], json!(true));
+    assert_eq!(
+        steering_item["content"][1]["url"],
+        json!("data:image/png;base64,c2Vjb25k")
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn distinct_mid_turn_user_message_is_explicitly_projected_as_steering() {
+    let (home, _path) = write_temp_session(
+        r#"{"type":"session_meta","payload":{"id":"019test"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","started_at":1}}
+{"type":"event_msg","payload":{"type":"user_message","message":"Start with the first approach"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"Working on it","phase":"commentary"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"Actually use the second approach"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"Switching approaches","phase":"commentary"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":2,"duration_ms":1}}
+"#,
+    );
+    let mut server = CodexTranscriptServer::new(home.clone());
+
+    let turn_response = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [
+                { "type": "turn", "turnId": "turn-1" }
+            ]
+        }))
+        .expect("turn read should succeed");
+    let segments = turn_response["resources"][0]["value"]["turn"]["segments"]
+        .as_array()
+        .expect("segments");
+    assert_eq!(segments[0]["type"], json!("userMessage"));
+    assert_eq!(segments[0]["isSteering"], json!(false));
+    let work = segments
+        .iter()
+        .find(|segment| segment["type"] == json!("work"))
+        .expect("work segment");
+    let work_id = work["id"].as_str().expect("work id");
+
+    let details_response = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [
+                { "type": "workDetails", "turnId": "turn-1", "segmentId": work_id }
+            ]
+        }))
+        .expect("details read should succeed");
+    let steering_entry = details_response["resources"][0]["value"]["details"]["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["type"] == json!("userMessage"))
+        .expect("steering entry");
+    let steering_item_id = steering_entry["itemId"].as_str().expect("steering item id");
+
+    let item_response = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [
+                { "type": "workItem", "turnId": "turn-1", "itemId": steering_item_id }
+            ]
+        }))
+        .expect("work item read should succeed");
+    let steering_item = &item_response["resources"][0]["value"]["item"];
+    assert_eq!(steering_item["type"], json!("userMessage"));
+    assert_eq!(steering_item["isSteering"], json!(true));
+    assert_eq!(
+        steering_item["content"][0]["text"],
+        json!("Actually use the second approach")
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
 fn turn_aborted_marker_is_not_projected_as_user_message() {
     let (home, _path) = write_temp_session(
         r#"{"type":"session_meta","payload":{"id":"019test"}}
@@ -935,6 +1143,119 @@ fn live_turns_overlay_disk_backed_transcript_reads() {
     assert_eq!(
         response["resources"][1]["value"]["turn"]["status"],
         json!("inProgress")
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn live_overlay_keeps_distinct_user_steering_after_matching_disk_message() {
+    let (home, _path) = write_temp_session(
+        r#"{"type":"session_meta","payload":{"id":"019test"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","started_at":1}}
+{"type":"event_msg","payload":{"type":"user_message","message":"Start the task","images":["data:image/png;base64,ZGlzaw=="]}}
+"#,
+    );
+    let live = LiveTranscriptStore::default();
+    live.record_turn(
+        "019test",
+        &json!({
+            "completedAt": null,
+            "durationMs": null,
+            "error": null,
+            "id": "turn-1",
+            "items": [
+                {
+                    "content": [
+                        { "type": "text", "text": "Start the task", "text_elements": [] },
+                        { "type": "image", "url": "data:image/png;base64,bGl2ZS1yZWVuY29kZWQ=" }
+                    ],
+                    "id": "user-initial",
+                    "type": "userMessage"
+                },
+                {
+                    "content": [
+                        { "type": "text", "text": "Change the output format", "text_elements": [] }
+                    ],
+                    "id": "user-steering",
+                    "type": "userMessage"
+                },
+                {
+                    "aggregatedOutput": "",
+                    "command": "echo changed",
+                    "commandActions": [],
+                    "cwd": "/tmp",
+                    "durationMs": null,
+                    "exitCode": null,
+                    "id": "cmd-1",
+                    "processId": null,
+                    "source": "agent",
+                    "status": "inProgress",
+                    "type": "commandExecution"
+                }
+            ],
+            "itemsView": "full",
+            "startedAt": 1,
+            "status": "inProgress"
+        }),
+    );
+    let mut server = CodexTranscriptServer::new_with_live_transcript(home.clone(), live);
+
+    let turn_response = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [
+                { "type": "turn", "turnId": "turn-1" }
+            ]
+        }))
+        .expect("turn read should succeed");
+    let segments = turn_response["resources"][0]["value"]["turn"]["segments"]
+        .as_array()
+        .expect("segments");
+    assert_eq!(
+        segments
+            .iter()
+            .filter(|segment| segment["type"] == json!("userMessage"))
+            .count(),
+        1
+    );
+    let work = segments
+        .iter()
+        .find(|segment| segment["type"] == json!("work"))
+        .expect("work segment");
+    let work_id = work["id"].as_str().expect("work id");
+
+    let details_response = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [
+                { "type": "workDetails", "turnId": "turn-1", "segmentId": work_id }
+            ]
+        }))
+        .expect("details read should succeed");
+    let steering_item_id = details_response["resources"][0]["value"]["details"]["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["type"] == json!("userMessage"))
+        .and_then(|entry| entry["itemId"].as_str())
+        .expect("steering item id");
+
+    let item_response = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [
+                { "type": "workItem", "turnId": "turn-1", "itemId": steering_item_id }
+            ]
+        }))
+        .expect("work item read should succeed");
+    assert_eq!(
+        item_response["resources"][0]["value"]["item"]["isSteering"],
+        json!(true)
+    );
+    assert_eq!(
+        item_response["resources"][0]["value"]["item"]["content"][0]["text"],
+        json!("Change the output format")
     );
 
     let _ = fs::remove_dir_all(home);

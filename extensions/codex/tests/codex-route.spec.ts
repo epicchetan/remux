@@ -1,7 +1,7 @@
 import { expect, type Page, test } from '@playwright/test';
 
 import type { ThreadTokenUsage } from '../shared/protocol/v2/ThreadTokenUsage';
-import type { CodexTranscriptTurn } from '../shared/transcript';
+import type { CodexTranscriptTurn, CodexWorkDetails, CodexWorkItem } from '../shared/transcript';
 
 type HostRequest = {
   id?: number | string;
@@ -23,6 +23,8 @@ type MockHostOptions = {
   threadCwd?: string;
   tokenUsage?: ThreadTokenUsage | null;
   turns?: CodexTranscriptTurn[];
+  workDetails?: Record<string, CodexWorkDetails>;
+  workItems?: Record<string, CodexWorkItem>;
 };
 
 const defaultFuzzyFiles = [
@@ -41,9 +43,11 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
   const threadCwd = options.threadCwd ?? cwd;
   const tokenUsage = options.tokenUsage ?? null;
   const turns = options.turns ?? [];
+  const workDetails = options.workDetails ?? {};
+  const workItems = options.workItems ?? {};
 
   await page.addInitScript(
-    ({ attachments, commandErrors, cwd, files, threadCwd, tokenUsage, turns }) => {
+    ({ attachments, commandErrors, cwd, files, threadCwd, tokenUsage, turns, workDetails, workItems }) => {
       const capturedMessages: HostRequest[] = [];
 
       function dispatchHostMessage(message: unknown) {
@@ -222,7 +226,12 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
               resources: requests.map((resourceRequest, requestIndex) => {
                 const typedRequest =
                   resourceRequest && typeof resourceRequest === 'object'
-                    ? (resourceRequest as { turnId?: unknown; type?: unknown })
+                    ? (resourceRequest as {
+                        itemId?: unknown;
+                        segmentId?: unknown;
+                        turnId?: unknown;
+                        type?: unknown;
+                      })
                     : {};
 
                 if (typedRequest.type === 'threadTranscript') {
@@ -253,6 +262,53 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
                         threadId,
                         turn,
                         turnId: turn.id,
+                      },
+                    };
+                  }
+                }
+
+                if (
+                  typedRequest.type === 'workDetails' &&
+                  typeof typedRequest.segmentId === 'string' &&
+                  typeof typedRequest.turnId === 'string'
+                ) {
+                  const details = workDetails[typedRequest.segmentId];
+                  if (details) {
+                    return {
+                      key: `workDetails:${threadId}:${typedRequest.turnId}:${typedRequest.segmentId}`,
+                      requestIndex,
+                      revision: details.revision,
+                      status: 'ok',
+                      value: {
+                        details,
+                        revision: details.revision,
+                        segmentId: typedRequest.segmentId,
+                        threadId,
+                        turnId: typedRequest.turnId,
+                      },
+                    };
+                  }
+                }
+
+                if (
+                  typedRequest.type === 'workItem' &&
+                  typeof typedRequest.itemId === 'string' &&
+                  typeof typedRequest.turnId === 'string'
+                ) {
+                  const item = workItems[typedRequest.itemId];
+                  if (item) {
+                    const revision = `mock-work-item-revision:${typedRequest.itemId}`;
+                    return {
+                      key: `workItem:${threadId}:${typedRequest.turnId}:${typedRequest.itemId}`,
+                      requestIndex,
+                      revision,
+                      status: 'ok',
+                      value: {
+                        item,
+                        itemId: typedRequest.itemId,
+                        revision,
+                        threadId,
+                        turnId: typedRequest.turnId,
                       },
                     };
                   }
@@ -499,7 +555,17 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
         },
       });
     },
-    { attachments, commandErrors, cwd, files: fuzzyFiles, threadCwd, tokenUsage, turns },
+    {
+      attachments,
+      commandErrors,
+      cwd,
+      files: fuzzyFiles,
+      threadCwd,
+      tokenUsage,
+      turns,
+      workDetails,
+      workItems,
+    },
   );
 }
 
@@ -600,6 +666,125 @@ test.describe('codex viewer route', () => {
       ],
       threadId: 'mock-thread-1',
     });
+  });
+
+  test('renders GFM tables with DOM height matching the measured layout', async ({ page }) => {
+    const tableMarkdown = [
+      'Different projection shapes need different reading strategies:',
+      '',
+      '| Projection shape | Cache representation | Delivery read |',
+      '| :--- | :---: | ---: |',
+      '| Bars | Append-only array + live value + status | Read only unseen bar suffix and latest live bar |',
+      '| Depth/DOM | Replaceable snapshot | Clone an `Arc<DepthSnapshot>` |',
+      '',
+      'Delivery continues after the table.',
+    ].join('\n');
+    await installMockRemuxHost(page, {
+      turns: [completedTurn({ assistantText: tableMarkdown })],
+    });
+
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+
+    const assistantMarkdown = page.locator('[data-row-kind="assistantMessage"] .codex-markdown');
+    const table = assistantMarkdown.getByRole('table');
+    await expect(table).toBeVisible();
+    await expect(table.getByRole('columnheader')).toHaveCount(3);
+    await expect(table.getByRole('columnheader').nth(0)).toHaveText('Projection shape');
+    await expect(table.getByRole('cell').nth(5)).toContainText('Arc<DepthSnapshot>');
+    await expect.poll(async () =>
+      (await table.locator('.codex-md-inline-code').allTextContents()).join('')
+    ).toBe('Arc<DepthSnapshot>');
+    await expect(table).not.toContainText('---');
+
+    const geometry = await assistantMarkdown.evaluate((element) => {
+      const root = element as HTMLElement;
+      const scroll = root.querySelector<HTMLElement>('.codex-md-table-scroll');
+      const tableNode = root.querySelector<HTMLElement>('.codex-md-table');
+      if (!scroll || !tableNode) {
+        throw new Error('Expected rendered table geometry');
+      }
+      const blockHeight = Array.from(root.children).reduce(
+        (total, child) => total + (child as HTMLElement).getBoundingClientRect().height,
+        0,
+      );
+      const rowHeight = Array.from(tableNode.querySelectorAll<HTMLElement>('.codex-md-table-row')).reduce(
+        (total, row) => total + row.getBoundingClientRect().height,
+        0,
+      );
+
+      return {
+        blockHeight,
+        modeledHeight: Number.parseFloat(root.style.height),
+        rootHeight: root.getBoundingClientRect().height,
+        rowHeight,
+        scrollHeight: scroll.getBoundingClientRect().height,
+        tableBorderWidth: Number.parseFloat(getComputedStyle(tableNode).borderTopWidth),
+        tableHeight: tableNode.getBoundingClientRect().height,
+      };
+    });
+
+    expect(Math.abs(geometry.rootHeight - geometry.modeledHeight)).toBeLessThan(0.5);
+    expect(Math.abs(geometry.rootHeight - geometry.blockHeight)).toBeLessThan(0.5);
+    expect(Math.abs(geometry.scrollHeight - geometry.tableHeight)).toBeLessThan(0.5);
+    expect(Math.abs(
+      geometry.tableHeight - geometry.rowHeight - geometry.tableBorderWidth * 2,
+    )).toBeLessThan(0.5);
+  });
+
+  test('labels only explicitly projected steering messages inside work', async ({ page }) => {
+    const turn: CodexTranscriptTurn = {
+      completedAt: 1782000001000,
+      durationMs: 1000,
+      error: null,
+      id: 'turn-steering',
+      revision: 'turn-steering-revision',
+      segments: [
+        {
+          content: [{ text: 'Start the task', text_elements: [], type: 'text' }],
+          id: 'user-initial',
+          isSteering: false,
+          revision: 'user-initial-revision',
+          type: 'userMessage',
+        },
+        {
+          durationMs: 1000,
+          hasDetails: true,
+          id: 'work-steering',
+          revision: 'work-steering-revision',
+          state: 'completed',
+          type: 'work',
+        },
+      ],
+      startedAt: 1782000000000,
+      status: 'completed',
+    };
+    await installMockRemuxHost(page, {
+      turns: [turn],
+      workDetails: {
+        'work-steering': {
+          entries: [{ id: 'user-steering', itemId: 'user-steering', type: 'userMessage' }],
+          itemIds: ['user-steering'],
+          revision: 'work-details-steering-revision',
+          segmentId: 'work-steering',
+        },
+      },
+      workItems: {
+        'user-steering': {
+          content: [{ text: 'Change the output format', text_elements: [], type: 'text' }],
+          id: 'user-steering',
+          isSteering: true,
+          type: 'userMessage',
+        },
+      },
+    });
+
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+
+    await expect(page.getByText('Start the task')).toBeVisible();
+    await expect(page.getByText('Steered conversation')).toHaveCount(0);
+    await page.getByTestId('work-section-work-steering').click();
+    await expect(page.getByText('Change the output format')).toBeVisible();
+    await expect(page.getByText('Steered conversation')).toHaveCount(1);
   });
 
   test('renders text-backed mention spans as chips and rebuilds them on edit', async ({ page }) => {

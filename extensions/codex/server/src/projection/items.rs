@@ -28,7 +28,10 @@ pub(super) fn user_message_item(payload: &Value, id: &str) -> Value {
         .into_iter()
         .flatten()
     {
-        content.push(image.clone());
+        content.push(match image.as_str() {
+            Some(url) => json!({ "type": "image", "url": url }),
+            None => image.clone(),
+        });
     }
     for image in payload
         .get("local_images")
@@ -36,7 +39,10 @@ pub(super) fn user_message_item(payload: &Value, id: &str) -> Value {
         .into_iter()
         .flatten()
     {
-        content.push(image.clone());
+        content.push(match image.as_str() {
+            Some(path) => json!({ "type": "localImage", "path": path }),
+            None => image.clone(),
+        });
     }
 
     json!({

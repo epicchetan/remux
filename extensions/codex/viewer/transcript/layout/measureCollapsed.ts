@@ -323,7 +323,7 @@ function measureUserMessage({
     },
     'topLevel',
   );
-  const steeringHeight = layout.showSteeringLabel
+  const steeringHeight = segment.isSteering
     ? transcriptLayout.user.steeringLabelHeight + transcriptLayout.user.steeringLabelBottomGap
     : 0;
   const bubbleHeight = measureUserMessageBubble(layout, contentWidth, 'topLevel', userMessageDisclosure);

@@ -654,6 +654,60 @@
     min-width: 0;
   }
 
+  .codex-md-table-scroll {
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .codex-md-table-scroll::-webkit-scrollbar {
+    display: none;
+  }
+
+  .codex-md-table {
+    box-sizing: border-box;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+
+  .codex-md-table-row {
+    display: grid;
+    min-width: 0;
+  }
+
+  .codex-md-table-cell {
+    box-sizing: border-box;
+    min-width: 0;
+    height: 100%;
+    overflow: hidden;
+    padding: 7px 10px;
+  }
+
+  .codex-md-table-cell:not(:last-child) {
+    border-right: 1px solid var(--border);
+  }
+
+  .codex-md-table-row:not(:last-child) .codex-md-table-cell {
+    border-bottom: 1px solid var(--border);
+  }
+
+  .codex-md-table-row[data-header="true"] .codex-md-table-cell {
+    background: color-mix(in srgb, var(--muted) 72%, transparent);
+    color: var(--foreground);
+  }
+
+  .codex-md-table-cell[data-align="center"] .codex-md-text-line {
+    text-align: center;
+  }
+
+  .codex-md-table-cell[data-align="right"] .codex-md-text-line {
+    text-align: right;
+  }
+
   .codex-md-rule {
     height: 17px;
     border: 0;

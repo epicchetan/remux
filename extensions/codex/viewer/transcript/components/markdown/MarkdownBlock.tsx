@@ -116,9 +116,58 @@ function MarkdownBlockContent({ block }: { block: MarkdownLayoutBlock }) {
           ))}
         </div>
       );
+    case 'table':
+      return <MarkdownTable block={block} style={style} />;
     case 'rule':
       return <hr className="codex-md-block codex-md-rule" style={style} />;
   }
+}
+
+function MarkdownTable({
+  block,
+  style,
+}: {
+  block: Extract<MarkdownLayoutBlock, { type: 'table' }>;
+  style: CSSProperties;
+}) {
+  const gridTemplateColumns = block.columnWidths.map((columnWidth) => `${columnWidth}px`).join(' ');
+
+  return (
+    <div className="codex-md-block codex-md-table-scroll" style={style}>
+      <div
+        className="codex-md-table"
+        role="table"
+        style={{
+          height: `${block.contentHeight}px`,
+          width: `${block.tableWidth}px`,
+        }}
+      >
+        {block.rows.map((row, rowIndex) => (
+          <div
+            className="codex-md-table-row"
+            data-header={row.header ? 'true' : undefined}
+            key={rowIndex}
+            role="row"
+            style={{
+              gridTemplateColumns,
+              height: `${row.height}px`,
+            }}
+          >
+            {row.cells.map((cell, cellIndex) => (
+              <div
+                className="codex-md-table-cell"
+                data-align={cell.align ?? 'left'}
+                key={cellIndex}
+                role={row.header ? 'columnheader' : 'cell'}
+              >
+                <MarkdownTextLines lineHeight={block.lineHeight} lines={cell.lines} />
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function contentStyle(block: MarkdownLayoutBlock): CSSProperties {
@@ -133,7 +182,7 @@ function MarkdownTextLines({
   lines,
 }: {
   lineHeight: number;
-  lines: Extract<MarkdownLayoutBlock, { type: 'paragraph' | 'heading' }>['lines'];
+  lines: Extract<MarkdownLayoutBlock, { type: 'paragraph' }>['lines'];
 }) {
   return (
     <>

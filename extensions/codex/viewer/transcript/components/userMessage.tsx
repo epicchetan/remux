@@ -53,7 +53,7 @@ export function UserMessage({
 
   return (
     <div className={cn('codex-user-message', placement === 'work' && 'codex-user-message-work')}>
-      {layout.showSteeringLabel ? <div className="codex-user-steering-label">Steered conversation</div> : null}
+      {segment.isSteering ? <div className="codex-user-steering-label">Steered conversation</div> : null}
       {hasMessageContent ? (
         <div className={cn('codex-user-bubble', layout.railItems.length > 0 && 'codex-user-bubble-with-rail')}>
           {layout.railItems.length > 0 ? <UserMessageRail items={layout.railItems} /> : null}

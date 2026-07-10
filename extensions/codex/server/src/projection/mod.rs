@@ -107,38 +107,82 @@ fn normalize_text_element(element: &Value) -> Option<Value> {
     }))
 }
 
-fn user_message_key(item: &Value) -> String {
+pub(crate) fn user_message_key(item: &Value) -> String {
     format!(
         "user:{}",
-        stable_revision_value(&content_without_text_elements(
+        stable_revision_value(&canonical_user_message_identity(
             item.get("content").unwrap_or(&Value::Null)
         ))
     )
 }
 
-/// The same user message reaches the projection twice on disk replay: once as
-/// the raw response item (never has `text_elements`) and once as the
-/// `user_message` event (may carry them). Key on element-free content so both
-/// rows collapse into one item; `merge_disk_item` keeps the richer content.
-fn content_without_text_elements(content: &Value) -> Value {
+pub(crate) fn user_message_replay_key(item: &Value) -> String {
+    format!(
+        "user-replay:{}",
+        stable_revision_value(&canonical_user_message_replay_identity(
+            item.get("content").unwrap_or(&Value::Null)
+        ))
+    )
+}
+
+/// Strict identity used outside the guarded response-item/user-event replay
+/// pair. Text fragmentation and `text_elements` are representation details,
+/// but media bytes remain part of this key so two genuinely different image
+/// submissions do not collapse merely because their captions match.
+fn canonical_user_message_identity(content: &Value) -> Value {
     let Some(parts) = content.as_array() else {
         return content.clone();
     };
 
-    Value::Array(
-        parts
-            .iter()
-            .map(|part| {
-                let mut part = part.clone();
-                if part.get("type").and_then(Value::as_str) == Some("text") {
-                    if let Some(object) = part.as_object_mut() {
-                        object.remove("text_elements");
-                    }
-                }
-                part
-            })
-            .collect(),
-    )
+    let mut text = String::new();
+    let mut non_text = Vec::new();
+    for part in parts {
+        if part.get("type").and_then(Value::as_str) == Some("text") {
+            text.push_str(part.get("text").and_then(Value::as_str).unwrap_or(""));
+        } else {
+            non_text.push(part.clone());
+        }
+    }
+
+    json!({ "text": text, "nonText": non_text })
+}
+
+/// Compatibility identity for the two adjacent rows Codex persists for one
+/// submission. The legacy event may contain a resized/re-encoded data URL, so
+/// media are compared by kind and MIME type rather than bytes. This key is only
+/// used with source/order guards; it is intentionally not a general identity.
+fn canonical_user_message_replay_identity(content: &Value) -> Value {
+    let Some(parts) = content.as_array() else {
+        return content.clone();
+    };
+
+    let mut text = String::new();
+    let mut non_text = Vec::new();
+    for part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                text.push_str(part.get("text").and_then(Value::as_str).unwrap_or(""));
+            }
+            Some("image") => non_text.push(json!({
+                "mediaType": data_url_media_type(
+                    part.get("url").and_then(Value::as_str).unwrap_or("")
+                ),
+                "type": "image",
+            })),
+            _ => non_text.push(part.clone()),
+        }
+    }
+
+    json!({ "text": text, "nonText": non_text })
+}
+
+fn data_url_media_type(url: &str) -> &str {
+    url.strip_prefix("data:")
+        .and_then(|rest| {
+            rest.split_once([',', ';'])
+                .map(|(media_type, _)| media_type)
+        })
+        .unwrap_or("")
 }
 
 fn hook_prompt_item(id: &str, fragments: Vec<HookPromptFragment>) -> Value {
@@ -348,6 +392,7 @@ struct DiskItemTable {
     id_to_index: HashMap<String, usize>,
     items: Vec<Value>,
     last_compaction_item_id: Option<String>,
+    last_response_user_item_id: Option<String>,
     message_key_to_item_id: HashMap<String, String>,
     pending_call_outputs: HashMap<String, Vec<Value>>,
 }
@@ -410,6 +455,39 @@ impl DiskItemTable {
         self.message_key_to_item_id
             .insert(message_key, new_item_id.clone());
         self.upsert_item(item);
+    }
+
+    fn upsert_response_user_message(&mut self, item: Value) {
+        let message_key = user_message_key(&item);
+        self.upsert_message(message_key.clone(), item);
+        self.last_response_user_item_id = self.message_key_to_item_id.get(&message_key).cloned();
+    }
+
+    fn upsert_legacy_user_message(&mut self, item: Value) {
+        let item_message_key = user_message_key(&item);
+        let item_replay_key = user_message_replay_key(&item);
+        let replay_candidate = self.last_response_user_item_id.take().and_then(|item_id| {
+            let index = self.id_to_index.get(&item_id).copied()?;
+            (user_message_replay_key(&self.items[index]) == item_replay_key)
+                .then_some((item_id, index))
+        });
+
+        let Some((candidate_id, candidate_index)) = replay_candidate else {
+            self.upsert_message(item_message_key, item);
+            return;
+        };
+        let candidate_message_key = user_message_key(&self.items[candidate_index]);
+        self.message_key_to_item_id
+            .insert(candidate_message_key.clone(), candidate_id);
+        self.upsert_message(candidate_message_key.clone(), item);
+        if let Some(resolved_id) = self
+            .message_key_to_item_id
+            .get(&candidate_message_key)
+            .cloned()
+        {
+            self.message_key_to_item_id
+                .insert(item_message_key, resolved_id);
+        }
     }
 
     fn upsert_call_item(&mut self, call_id: Option<&str>, item: Value) {
@@ -502,6 +580,10 @@ impl DiskItemTable {
 
     fn clear_compaction_candidate(&mut self) {
         self.last_compaction_item_id = None;
+    }
+
+    fn clear_user_replay_candidate(&mut self) {
+        self.last_response_user_item_id = None;
     }
 }
 
@@ -678,6 +760,9 @@ pub(crate) fn project_rows_to_raw_turn(
     for row in rows {
         let payload = payload_value(row).unwrap_or(row);
         let payload_type = payload.get("type").and_then(Value::as_str);
+        if payload_type != Some("user_message") {
+            table.clear_user_replay_candidate();
+        }
         if is_compaction_candidate_boundary(payload_type, row) {
             table.clear_compaction_candidate();
         }
@@ -711,7 +796,7 @@ pub(crate) fn project_rows_to_raw_turn(
                     &mut identity_counters,
                 );
                 let item = apply_item_identity(user_message_item(payload, &identity.id), identity);
-                table.upsert_message(user_message_key(&item), item);
+                table.upsert_legacy_user_message(item);
             }
             Some("agent_message") => {
                 let identity = disk_item_identity(
@@ -757,7 +842,7 @@ pub(crate) fn project_rows_to_raw_turn(
                     }),
                     identity,
                 );
-                table.upsert_message(user_message_key(&item), item);
+                table.upsert_response_user_message(item);
             }
             Some("message") if payload.get("role").and_then(Value::as_str) == Some("assistant") => {
                 let text = message_content_text(payload.get("content"));
@@ -1053,14 +1138,16 @@ pub(crate) fn project_raw_turn(turn: RawTurn) -> ProjectedTurn {
                         &compaction_statuses,
                         WorkFlushReason::Boundary,
                     );
-                    segments.push(user_segment(item));
+                    segments.push(user_segment(item, false));
                 } else if !pending_work.is_empty()
                     || has_upcoming_work_item(&turn.items, item, &assistant_answer_ids)
                 {
                     if pending_work.is_empty() {
                         pending_work_start_index = Some(item_index);
                     }
-                    pending_work.push(item.clone());
+                    let mut steering_item = item.clone();
+                    steering_item["isSteering"] = Value::Bool(true);
+                    pending_work.push(steering_item);
                 } else {
                     flush_work(
                         &turn,
@@ -1072,7 +1159,7 @@ pub(crate) fn project_raw_turn(turn: RawTurn) -> ProjectedTurn {
                         &compaction_statuses,
                         WorkFlushReason::Boundary,
                     );
-                    segments.push(user_segment(item));
+                    segments.push(user_segment(item, true));
                 }
             }
             Some("contextCompaction") => {

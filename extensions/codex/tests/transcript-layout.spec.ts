@@ -144,6 +144,32 @@ test.describe('transcript collapsed layout', () => {
     );
   });
 
+  test('reserves steering label height only for explicitly steered messages', () => {
+    const ordinary = userTextSegment('user-1', 'hello') as Extract<
+      CodexTranscriptSegment,
+      { type: 'userMessage' }
+    >;
+    const steering = {
+      ...ordinary,
+      isSteering: true,
+    } satisfies CodexTranscriptSegment;
+    const ordinaryLayout = measureCollapsedTranscript({
+      turns: [turn('turn-1', ordinary)],
+      width: 600,
+    });
+    const steeringLayout = measureCollapsedTranscript({
+      turns: [turn('turn-1', steering)],
+      width: 600,
+    });
+
+    expect(
+      steeringLayout.turns[0]!.rows[0]!.height - ordinaryLayout.turns[0]!.rows[0]!.height,
+    ).toBe(
+      transcriptLayout.user.steeringLabelHeight +
+        transcriptLayout.user.steeringLabelBottomGap,
+    );
+  });
+
   test('collapses long user messages to the configured rendered line cap', () => {
     const userTurn = turn('turn-1', userTextSegment('user-1', longParagraph(160)));
     const collapsedLayout = measureCollapsedTranscript({

@@ -98,6 +98,7 @@ export type CodexTranscriptSegment =
 export type CodexUserMessageSegment = {
   content: UserInput[];
   id: string;
+  isSteering?: boolean;
   revision: string;
   type: 'userMessage';
 };
@@ -172,6 +173,7 @@ export type CodexWorkItem =
   | {
       content: UserInput[];
       id: string;
+      isSteering?: boolean;
       type: 'userMessage';
     }
   | {

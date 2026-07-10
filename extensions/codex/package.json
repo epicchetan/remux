@@ -22,6 +22,8 @@
     "lexical": "^0.44.0",
     "lucide-react": "^1.14.0",
     "mdast-util-from-markdown": "^2.0.3",
+    "mdast-util-gfm-table": "^2.0.0",
+    "micromark-extension-gfm-table": "^2.1.1",
     "react": "^19.2.3",
     "react-dom": "^19.2.3",
     "shiki": "^4.1.0",
