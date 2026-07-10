@@ -43,19 +43,16 @@ export function useComposerTurnAction() {
   const isStopping = runtimeStatus === 'stopping';
   const isWorking = runtimeStatus === 'running' || isStopping;
   const setAutoScrollMode = useTranscriptViewportStore((state) => state.setAutoScrollMode);
-  const canInterrupt = Boolean(activeThreadId && runtimeStatus === 'running');
   const canEditThread = Boolean(editTarget?.threadId);
   const canForkThread = Boolean(forkTarget?.threadId);
   const canSendExistingThread = Boolean(activeThreadId);
   const canStartDraftThread = Boolean(activeDraft?.cwd);
   const sendDisabled = Boolean(
     isSubmitting ||
-      (isWorking
-        ? !canInterrupt
-          : (
-            !snapshot.canSend ||
-            (!canEditThread && !canForkThread && !canSendExistingThread && !canStartDraftThread)
-          )),
+      !snapshot.canSend ||
+      (!canEditThread && !canForkThread && !canSendExistingThread && !canStartDraftThread) ||
+      isStopping ||
+      (isWorking && (canEditThread || canForkThread)),
   );
 
   useEffect(() => {
@@ -67,17 +64,7 @@ export function useComposerTurnAction() {
     }
   }, [clearSubmission, runtimeStatus, submission]);
 
-  const handleTurnAction = useCallback(() => {
-    if (runtimeStatus === 'running' && activeThreadId) {
-      void interruptThreadTurn({
-        threadId: activeThreadId,
-        turnId: runtimeActiveTurnId,
-      })
-        .then((response) => applyCodexResourceInvalidations(response.invalidations))
-        .catch(() => undefined);
-      return;
-    }
-
+  const handleSendAction = useCallback(() => {
     if (sendDisabled) {
       return;
     }
@@ -206,23 +193,29 @@ export function useComposerTurnAction() {
       snapshot,
       threadId: activeThreadId,
     });
-
     void sendThreadMessage({
       clientMessageId: createComposerNodeId(),
       parts: projection.parts,
       threadId: activeThreadId,
     })
       .then(async (response) => {
-        setSubmissionTurn(submission.id, {
-          phase: 'awaiting-transcript',
-          threadId: response.threadId,
-          turnId: response.turnId,
-        });
-        setAutoScrollMode({ type: 'sent-message-anchor', turnId: response.turnId });
+        if (response.delivery === 'sent' && response.turnId) {
+          setSubmissionTurn(submission.id, {
+            phase: 'awaiting-transcript',
+            threadId: response.threadId,
+            turnId: response.turnId,
+          });
+          setAutoScrollMode({ type: 'sent-message-anchor', turnId: response.turnId });
+          clearComposer();
+          clearMode();
+          await refreshAcceptedSend(response.invalidations, () =>
+            useComposerStore.getState().submission?.id === submission.id);
+          clearSubmission(submission.id);
+          return;
+        }
         clearComposer();
         clearMode();
-        await refreshAcceptedSend(response.invalidations, () =>
-          useComposerStore.getState().submission?.id === submission.id);
+        await applyCodexResourceInvalidations(response.invalidations);
         clearSubmission(submission.id);
       })
       .catch((error) => {
@@ -244,8 +237,6 @@ export function useComposerTurnAction() {
     isWorking,
     model,
     reviewMode,
-    runtimeActiveTurnId,
-    runtimeStatus,
     selectThread,
     sendDisabled,
     setSubmissionTurn,
@@ -254,13 +245,25 @@ export function useComposerTurnAction() {
     snapshot,
   ]);
 
+  const handleInterrupt = useCallback(() => {
+    if (runtimeStatus !== 'running' || !activeThreadId) return;
+    void interruptThreadTurn({
+      threadId: activeThreadId,
+      turnId: runtimeActiveTurnId,
+    })
+      .then((response) => applyCodexResourceInvalidations(response.invalidations))
+      .catch(() => undefined);
+  }, [activeThreadId, runtimeActiveTurnId, runtimeStatus]);
+
   return {
     editTarget,
     forkTarget,
-    handleTurnAction,
+    handleInterrupt,
+    handleSendAction,
     isSubmitting,
     isStopping,
     isWorking,
+    hasSendableContent: snapshot.canSend,
     sendDisabled,
   };
 }

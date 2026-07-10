@@ -13,6 +13,7 @@ import type { RemuxHostViewportMetrics } from './ipc/types';
 import { useThreadHistoryStore } from './threads/historyStore';
 import { readThreadComposerPreference, useThreadComposerStateStore } from './threads/composerStateStore';
 import { useThreadRuntimeStore } from './threads/runtimeStore';
+import { useOperationQueueStore } from './threads/operationQueueStore';
 import { useThreadsStore } from './threads/store';
 import { useCodexResumeSync } from './resumeSync';
 import { NewChatDirectoryPicker } from './threads/newChat/DirectoryPicker';
@@ -45,6 +46,7 @@ export function App() {
   const activeThreadComposerPreference = useThreadComposerStateStore((state) => state.preference);
   const activeThreadRuntimeStatus = useThreadRuntimeStore((state) => state.status);
   const setRuntimeThreadId = useThreadRuntimeStore((state) => state.setActiveThreadId);
+  const setOperationQueueThreadId = useOperationQueueStore((state) => state.setActiveThreadId);
   const setComposerStateThreadId = useThreadComposerStateStore((state) => state.setActiveThreadId);
   const directoryPickerOpen = useThreadsStore((state) => state.directoryPickerOpen);
   const activeDraftCwd = useThreadsStore((state) =>
@@ -338,8 +340,9 @@ export function App() {
 
   useEffect(() => {
     void setRuntimeThreadId(activeThreadId);
+    void setOperationQueueThreadId(activeThreadId);
     void setComposerStateThreadId(activeThreadId);
-  }, [activeThreadId, setComposerStateThreadId, setRuntimeThreadId]);
+  }, [activeThreadId, setComposerStateThreadId, setOperationQueueThreadId, setRuntimeThreadId]);
 
   useEffect(() => {
     if (activeThreadComposerPreference) {

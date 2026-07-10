@@ -19,6 +19,7 @@ import { cn } from '@remux/viewer-kit/shadcn';
 import { userBubbleContentWidth } from '../layout/constants';
 import { useTranscriptLayoutStore } from '../layoutStore';
 import type { TranscriptUserMessageDisclosure } from '../layout/types';
+import { useOperationQueueStore } from '../../threads/operationQueueStore';
 
 export function UserMessage({
   disclosure,
@@ -99,8 +100,10 @@ function UserMessageActions({
 }) {
   const copiedTimeoutRef = useRef<number | null>(null);
   const startEdit = useComposerStore((state) => state.startEdit);
+  const queueBlocksEdit = useOperationQueueStore((state) =>
+    state.queue?.threadId === threadId && state.queue.entries.length > 0);
   const [copied, setCopied] = useState(false);
-  const editDisabled = !editEnabled || !composerUserInputCanStartEdit(segment.content);
+  const editDisabled = queueBlocksEdit || !editEnabled || !composerUserInputCanStartEdit(segment.content);
 
   useEffect(() => () => {
     if (copiedTimeoutRef.current !== null) {

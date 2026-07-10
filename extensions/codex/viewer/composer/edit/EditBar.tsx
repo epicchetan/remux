@@ -27,7 +27,7 @@ export function ComposerEditBar() {
       };
 
   return (
-    <div className="remux-composer-edit-bar" data-remux-no-composer-focus>
+    <div className="remux-composer-context-row remux-composer-edit-bar" data-remux-no-composer-focus>
       <span className="remux-composer-edit-label">
         {mode.icon}
         {mode.label}

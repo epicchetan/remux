@@ -5,6 +5,7 @@ import type {
 import { invalidateThreadResources } from '../threads/historyStore';
 import { invalidateThreadComposerStateResources } from '../threads/composerStateStore';
 import { invalidateThreadRuntimeResources } from '../threads/runtimeStore';
+import { invalidateOperationQueueResources } from '../threads/operationQueueStore';
 import { invalidateTranscriptResources } from '../transcript/store';
 import { subscribeIpcEvents } from '@remux/viewer-kit/ipc';
 
@@ -20,6 +21,7 @@ export async function applyCodexResourceInvalidations(invalidations: CodexResour
     invalidateThreadResources(uniqueInvalidations),
     invalidateThreadComposerStateResources(uniqueInvalidations),
     invalidateThreadRuntimeResources(uniqueInvalidations),
+    invalidateOperationQueueResources(uniqueInvalidations),
   ]);
   await invalidateTranscriptResources(uniqueInvalidations);
 }
@@ -88,6 +90,7 @@ function isCodexResourceInvalidation(value: unknown): value is CodexResourceInva
   return (
     (
       invalidation.type === 'threadRuntime' ||
+      invalidation.type === 'threadOperationQueue' ||
       invalidation.type === 'threadComposerState' ||
       invalidation.type === 'threadSummary' ||
       invalidation.type === 'threadTokenUsage' ||

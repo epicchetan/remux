@@ -8,6 +8,7 @@ import {
 
 import { refreshActiveThreadComposerState } from './threads/composerStateStore';
 import { refreshActiveThreadRuntime } from './threads/runtimeStore';
+import { refreshActiveOperationQueue } from './threads/operationQueueStore';
 import { refreshActiveTranscriptResources } from './transcript/store';
 
 export type CodexResumeSyncReason = RemuxHostResumeReason;
@@ -37,6 +38,7 @@ export async function syncCodexViewerAfterResume(params: CodexResumeSyncParams) 
     threadTasks.push(
       ['threadSummary', params.ensureThreadSummary(params.activeThreadId)],
       ['threadRuntime', refreshActiveThreadRuntime({ preserveReady: true })],
+      ['threadOperationQueue', refreshActiveOperationQueue()],
       ['threadComposerState', refreshActiveThreadComposerState({ preserveReady: true })],
     );
   } else {

@@ -59,6 +59,8 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
   await page.addInitScript(
     ({ attachments, commandErrors, cwd, files, runtime, threadCwd, tokenUsage, turns, workDetails, workItems }) => {
       const capturedMessages: HostRequest[] = [];
+      let queueRevision = 0;
+      const queuedEntries: Array<Record<string, unknown>> = [];
 
       function dispatchHostMessage(message: unknown) {
         const event = new MessageEvent('message', {
@@ -159,6 +161,20 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
                       lastError: null,
                       revision: `mock-runtime-revision:${threadId}`,
                       status: runtime.status,
+                      threadId,
+                    },
+                  };
+                }
+
+                if (typedRequest.type === 'threadOperationQueue') {
+                  return {
+                    key: `threadOperationQueue:${threadId}`,
+                    requestIndex,
+                    revision: String(queueRevision),
+                    status: 'ok',
+                    value: {
+                      entries: queuedEntries,
+                      revision: String(queueRevision),
                       threadId,
                     },
                   };
@@ -335,31 +351,97 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
               threadId,
             };
           }
-          case 'remux/codex/thread/message/send':
+          case 'remux/codex/thread/message/send': {
+            const params = request.params as {
+              clientMessageId?: string;
+              parts?: Array<Record<string, unknown>>;
+              threadId?: string;
+            };
+            if (runtime.status === 'running') {
+              queuedEntries.push({
+                createdAt: Date.now(),
+                id: `queued-message-${queuedEntries.length + 1}`,
+                kind: 'message',
+                preview: {
+                  attachmentCount: (params.parts ?? []).filter((part) => part.type === 'image').length,
+                  mentionCount: (params.parts ?? []).filter((part) => part.type === 'mention').length,
+                  text: (params.parts ?? [])
+                    .filter((part) => part.type === 'text')
+                    .map((part) => part.text)
+                    .join(''),
+                },
+              });
+              queueRevision += 1;
+            }
             return {
               invalidations: [
                 {
-                  key: 'threadHistory:updated_at:desc:50::false:',
-                  reason: 'sendAccepted',
-                  type: 'threadHistory',
-                },
-                {
-                  key: 'threadSummary:mock-thread-1',
-                  reason: 'sendAccepted',
+                  key: 'threadOperationQueue:mock-thread-1',
+                  reason: 'commandAccepted',
                   threadId: 'mock-thread-1',
-                  type: 'threadSummary',
-                },
-                {
-                  key: 'threadTranscript:mock-thread-1',
-                  reason: 'sendAccepted',
-                  threadId: 'mock-thread-1',
-                  type: 'threadTranscript',
+                  type: 'threadOperationQueue',
                 },
               ],
+              delivery: runtime.status === 'running' ? 'queued' : 'sent',
               status: 'accepted',
               threadId: 'mock-thread-1',
-              turnId: 'mock-turn-1',
+              turnId: runtime.status === 'running' ? undefined : 'mock-turn-1',
             };
+          }
+          case 'remux/codex/thread/compact': {
+            if (runtime.status === 'running') {
+              queuedEntries.push({
+                createdAt: Date.now(),
+                id: `queued-compact-${queuedEntries.length + 1}`,
+                kind: 'compact',
+              });
+              queueRevision += 1;
+            }
+            return {
+              delivery: runtime.status === 'running' ? 'queued' : 'sent',
+              invalidations: [{
+                key: 'threadOperationQueue:mock-thread-1',
+                reason: 'commandAccepted',
+                threadId: 'mock-thread-1',
+                type: 'threadOperationQueue',
+              }],
+              status: 'accepted',
+              threadId: 'mock-thread-1',
+            };
+          }
+          case 'remux/codex/thread/queue/remove':
+          case 'remux/codex/thread/queue/run-now': {
+            const params = request.params as { operationId?: string };
+            const index = queuedEntries.findIndex((entry) => entry.id === params.operationId);
+            if (index >= 0) queuedEntries.splice(index, 1);
+            queueRevision += 1;
+            return {
+              invalidations: [{
+                key: 'threadOperationQueue:mock-thread-1',
+                reason: 'commandAccepted',
+                threadId: 'mock-thread-1',
+                type: 'threadOperationQueue',
+              }],
+              queueRevision: String(queueRevision),
+              status: 'accepted',
+              threadId: 'mock-thread-1',
+            };
+          }
+          case 'remux/codex/thread/turn/interrupt': {
+            queuedEntries.splice(0, queuedEntries.length);
+            queueRevision += 1;
+            return {
+              invalidations: [{
+                key: 'threadOperationQueue:mock-thread-1',
+                reason: 'commandAccepted',
+                threadId: 'mock-thread-1',
+                type: 'threadOperationQueue',
+              }],
+              status: 'accepted',
+              threadId: 'mock-thread-1',
+              turnId: 'active-turn-1',
+            };
+          }
           case 'remux/codex/thread/message/start':
             return {
               invalidations: [
@@ -941,7 +1023,7 @@ test.describe('codex viewer route', () => {
     });
   });
 
-  test('sends existing thread composer content through the Remux thread command', async ({ page }) => {
+  test('sends idle existing-thread content directly without rendering the queue', async ({ page }) => {
     await installMockRemuxHost(page);
 
     await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
@@ -967,6 +1049,60 @@ test.describe('codex viewer route', () => {
     expect(sendRequest?.params).not.toHaveProperty('cwd');
     expect(sendRequest?.params).not.toHaveProperty('model');
     expect(sendRequest?.params).not.toHaveProperty('approvalPolicy');
+    await expect(page.getByText('Queued 1')).toHaveCount(0);
+  });
+
+  test('keeps stop available while composing and queues the next message during a turn', async ({ page }) => {
+    await installMockRemuxHost(page, {
+      runtime: {
+        activeTurnElapsedMs: 2400,
+        activeTurnId: 'active-turn-1',
+        status: 'running',
+      },
+      turns: [completedTurn()],
+    });
+
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    await expect(page.getByRole('button', { name: 'Stop turn' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Queue message' })).toHaveCount(0);
+
+    const editor = page.locator('.remux-composer-contenteditable');
+    await editor.click();
+    await editor.pressSequentially('follow up after this');
+    const queueButton = page.getByRole('button', { name: 'Queue message' });
+    await expect(queueButton).toBeEnabled();
+    await queueButton.click();
+
+    await expect(page.getByText('Queued 1')).toBeVisible();
+    await expect(page.getByText('follow up after this')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Stop turn' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Edit message' })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Fork from response' })).toBeDisabled();
+    await page.getByRole('button', { name: /Queued 1/ }).click();
+    await expect(page.getByRole('button', { name: 'Send now' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Delete queued entry' })).toBeVisible();
+    await page.getByRole('button', { name: 'Stop turn' }).click();
+    await expect(page.getByText('Queued 1')).toHaveCount(0);
+  });
+
+  test('allows compaction to be queued while a turn is running', async ({ page }) => {
+    await installMockRemuxHost(page, {
+      runtime: {
+        activeTurnElapsedMs: 2400,
+        activeTurnId: 'active-turn-1',
+        status: 'running',
+      },
+    });
+
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    await page.getByRole('button', { name: 'Preferences' }).click();
+    await page.getByRole('button', { name: 'Compact' }).click();
+
+    await expect(page.getByText('Queued 1')).toBeVisible();
+    await expect(page.getByText('Compact context')).toBeVisible();
+    await page.getByRole('button', { name: /Queued 1/ }).click();
+    await expect(page.getByRole('button', { name: 'Send now' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Delete queued entry' })).toBeVisible();
   });
 
   test('shows thread token usage in the composer inline status', async ({ page }) => {

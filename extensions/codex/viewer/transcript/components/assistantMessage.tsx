@@ -4,6 +4,7 @@ import { Check, Copy, GitFork } from 'lucide-react';
 import type { CodexAssistantMessageSegment, CodexTranscriptTurn } from '../../../shared/transcript';
 import { useComposerStore } from '../../composer/store';
 import { MarkdownBlock } from './markdown/MarkdownBlock';
+import { useOperationQueueStore } from '../../threads/operationQueueStore';
 
 export function AssistantMessage({
   segment,
@@ -47,6 +48,8 @@ function AssistantMessageActions({
 }) {
   const copiedTimeoutRef = useRef<number | null>(null);
   const startFork = useComposerStore((state) => state.startFork);
+  const forkDisabled = useOperationQueueStore((state) =>
+    state.queue?.threadId === threadId && state.queue.entries.length > 0);
   const [copied, setCopied] = useState(false);
 
   useEffect(() => () => {
@@ -68,6 +71,7 @@ function AssistantMessageActions({
   };
 
   const fork = () => {
+    if (forkDisabled) return;
     startFork({
       assistantMessageId: segment.id,
       threadId,
@@ -88,6 +92,7 @@ function AssistantMessageActions({
       <button
         aria-label="Fork from response"
         className="codex-user-action-button"
+        disabled={forkDisabled}
         onClick={fork}
         type="button"
       >

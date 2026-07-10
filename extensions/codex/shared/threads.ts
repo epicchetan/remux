@@ -5,6 +5,9 @@ import type {
   CodexComposerSpeed,
 } from './composerConfig';
 import type { ThreadTokenUsage } from './protocol/v2/ThreadTokenUsage';
+import type { CodexPendingQueueResource } from './operationQueue';
+
+export type { CodexPendingQueueResource } from './operationQueue';
 
 export type CodexThreadResourcesReadParams = {
   requests: CodexThreadResourceRequest[];
@@ -29,6 +32,11 @@ export type CodexThreadResourceRequest =
   | {
       knownRevision?: string;
       threadId: string;
+      type: 'threadOperationQueue';
+    }
+  | {
+      knownRevision?: string;
+      threadId: string;
       type: 'threadSummary';
     }
   | {
@@ -45,6 +53,8 @@ export type CodexThreadResourceRequest =
 export type CodexThreadResourcesReadResponse = {
   resources: CodexThreadResourceResult[];
 };
+
+export type CodexThreadOperationQueueReadResult = CodexPendingQueueResource;
 
 export type CodexThreadResourceResult = {
   key: string;

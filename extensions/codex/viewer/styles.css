@@ -859,6 +859,126 @@
     margin-inline: auto;
   }
 
+  .remux-composer-context-strip {
+    display: grid;
+    width: 100%;
+    max-width: var(--remux-feed-max-width);
+    min-width: 0;
+    margin: 0 auto 6px;
+  }
+
+  .remux-composer-context-strip:empty {
+    display: none;
+  }
+
+  .remux-composer-context-row {
+    display: flex;
+    min-width: 0;
+    min-height: 32px;
+    align-items: center;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 58%, transparent);
+    color: var(--muted-foreground);
+    font-size: 13px;
+    line-height: 18px;
+  }
+
+  .remux-operation-queue {
+    overflow: hidden;
+    font-size: 12px;
+  }
+
+  .remux-operation-queue-summary {
+    gap: 4px;
+  }
+
+  .remux-operation-queue-disclosure {
+    display: flex;
+    min-width: 0;
+    flex: 1;
+    align-items: center;
+    gap: 8px;
+    color: var(--foreground);
+    text-align: left;
+  }
+
+  .remux-operation-queue-count {
+    flex-shrink: 0;
+    font-weight: 500;
+  }
+
+  .remux-operation-queue-preview {
+    overflow: hidden;
+    color: var(--muted-foreground);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .remux-operation-queue-list {
+    max-height: 208px;
+    overflow-y: auto;
+    background: color-mix(in srgb, var(--muted) 22%, transparent);
+  }
+
+  .remux-operation-queue-row {
+    display: flex;
+    min-height: 44px;
+    align-items: center;
+    gap: 8px;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+    padding-inline: 8px;
+  }
+
+  .remux-operation-queue-row:last-child {
+    border-bottom: 0;
+  }
+
+  .remux-operation-queue-index {
+    width: 16px;
+    flex-shrink: 0;
+    color: var(--muted-foreground);
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+  }
+
+  .remux-operation-queue-row-copy {
+    display: flex;
+    min-width: 0;
+    flex: 1;
+    flex-direction: column;
+  }
+
+  .remux-operation-queue-row-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .remux-operation-queue-row-actions {
+    display: flex;
+    flex-shrink: 0;
+    align-items: center;
+    gap: 2px;
+  }
+
+  .remux-operation-queue-button {
+    display: inline-flex;
+    width: 28px;
+    height: 28px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    color: var(--muted-foreground);
+  }
+
+  .remux-operation-queue-button:hover {
+    background: var(--accent);
+    color: var(--foreground);
+  }
+
+  .remux-operation-queue-button:disabled {
+    opacity: 0.4;
+  }
+
   .remux-composer-editor {
     position: relative;
     display: grid;
@@ -871,19 +991,9 @@
   }
 
   .remux-composer-edit-bar {
-    display: flex;
-    min-width: 0;
-    align-items: center;
     justify-content: space-between;
     gap: 12px;
-    border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
-    border-radius: 12px;
-    background: color-mix(in srgb, var(--card) 76%, transparent);
-    color: var(--muted-foreground);
-    font-size: 13px;
     font-weight: 500;
-    line-height: 18px;
-    padding: 7px 10px;
   }
 
   .remux-composer-edit-label {

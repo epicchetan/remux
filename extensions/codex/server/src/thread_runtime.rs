@@ -177,6 +177,25 @@ impl ThreadRuntimeStore {
         })
     }
 
+    pub(crate) fn is_busy(&self, thread_id: &str) -> bool {
+        self.inner.lock().ok().is_some_and(|inner| {
+            inner.get(thread_id).is_some_and(|state| {
+                matches!(
+                    state.status,
+                    ThreadRuntimeStatus::Running | ThreadRuntimeStatus::Stopping
+                )
+            })
+        })
+    }
+
+    pub(crate) fn is_stopping(&self, thread_id: &str) -> bool {
+        self.inner.lock().ok().is_some_and(|inner| {
+            inner
+                .get(thread_id)
+                .is_some_and(|state| state.status == ThreadRuntimeStatus::Stopping)
+        })
+    }
+
     pub(crate) fn resource_value(&self, thread_id: &str) -> Value {
         let state = self
             .inner

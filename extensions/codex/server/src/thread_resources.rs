@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 
 use crate::app_server::AppServerRuntime;
 use crate::composer_config::{ComposerConfigStore, observed_config_value};
+use crate::operation_queue::CodexOperationQueueServer;
 use crate::thread_composer_state::read_rollout_composer_state;
 use crate::thread_runtime::ThreadRuntimeStore;
 use crate::thread_usage::ThreadUsageStore;
@@ -14,6 +15,7 @@ use crate::util::stable_revision_value;
 pub(crate) struct CodexThreadResourcesServer {
     app_server: AppServerRuntime,
     composer_config: ComposerConfigStore,
+    operation_queue: CodexOperationQueueServer,
     thread_runtime: ThreadRuntimeStore,
     thread_usage: ThreadUsageStore,
 }
@@ -42,6 +44,11 @@ enum ThreadResourceRequest {
         sort_direction: Option<String>,
         sort_key: Option<String>,
     },
+    #[serde(rename = "threadOperationQueue", rename_all = "camelCase")]
+    ThreadOperationQueue {
+        known_revision: Option<String>,
+        thread_id: String,
+    },
     #[serde(rename = "threadSummary", rename_all = "camelCase")]
     ThreadSummary {
         known_revision: Option<String>,
@@ -63,12 +70,14 @@ impl CodexThreadResourcesServer {
     pub(crate) fn new(
         app_server: AppServerRuntime,
         composer_config: ComposerConfigStore,
+        operation_queue: CodexOperationQueueServer,
         thread_runtime: ThreadRuntimeStore,
         thread_usage: ThreadUsageStore,
     ) -> Self {
         Self {
             app_server,
             composer_config,
+            operation_queue,
             thread_runtime,
             thread_usage,
         }
@@ -108,6 +117,14 @@ impl CodexThreadResourcesServer {
                         sort_direction,
                         sort_key,
                     },
+                ),
+                ThreadResourceRequest::ThreadOperationQueue {
+                    known_revision,
+                    thread_id,
+                } => self.read_thread_operation_queue_resource(
+                    request_index,
+                    thread_id,
+                    known_revision,
                 ),
                 ThreadResourceRequest::ThreadSummary {
                     known_revision,
@@ -248,6 +265,28 @@ impl CodexThreadResourcesServer {
             return not_modified_result(request_index, key, revision);
         }
 
+        ok_result(request_index, key, revision, value)
+    }
+
+    fn read_thread_operation_queue_resource(
+        &self,
+        request_index: usize,
+        thread_id: String,
+        known_revision: Option<String>,
+    ) -> Value {
+        let key = format!("threadOperationQueue:{thread_id}");
+        if thread_id.trim().is_empty() {
+            return missing_result(request_index, key, "thread_id_required".to_string());
+        }
+        let value = self.operation_queue.resource_value(&thread_id);
+        let revision = value
+            .get("revision")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if known_revision.as_deref() == Some(revision.as_str()) {
+            return not_modified_result(request_index, key, revision);
+        }
         ok_result(request_index, key, revision, value)
     }
 

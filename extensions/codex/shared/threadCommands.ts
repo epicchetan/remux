@@ -62,19 +62,23 @@ export type CodexComposerMessagePart =
     };
 
 export type CodexThreadMessageSendResponse = {
+  delivery: 'queued' | 'sent';
   invalidations: CodexResourceInvalidation[];
   status: 'accepted';
   threadId: string;
+  turnId?: string;
+};
+
+export type CodexThreadMessageStartResponse = Omit<CodexThreadMessageSendResponse, 'delivery' | 'turnId'> & {
   turnId: string;
 };
 
-export type CodexThreadMessageStartResponse = CodexThreadMessageSendResponse;
+export type CodexThreadMessageEditResponse = CodexThreadMessageStartResponse;
 
-export type CodexThreadMessageEditResponse = CodexThreadMessageSendResponse;
-
-export type CodexThreadMessageForkResponse = CodexThreadMessageSendResponse;
+export type CodexThreadMessageForkResponse = CodexThreadMessageStartResponse;
 
 export type CodexThreadCompactResponse = {
+  delivery: 'queued' | 'sent';
   invalidations: CodexResourceInvalidation[];
   status: 'accepted';
   threadId: string;
@@ -102,7 +106,13 @@ export type CodexResourceInvalidation =
       key: string;
       reason: CodexResourceInvalidationReason;
       threadId: string;
-      type: 'threadComposerState' | 'threadRuntime' | 'threadSummary' | 'threadTokenUsage' | 'threadTranscript';
+      type:
+        | 'threadComposerState'
+        | 'threadOperationQueue'
+        | 'threadRuntime'
+        | 'threadSummary'
+        | 'threadTokenUsage'
+        | 'threadTranscript';
     }
   | {
       key: string;

@@ -5,7 +5,6 @@ import { Archive, Boxes, Check, ChevronDown, Gauge, Loader2, Play, RefreshCw, Sh
 import { applyCodexResourceInvalidations } from '../../ipc/resourceInvalidations';
 import { compactThread } from '../../ipc/threadCommands';
 import { reloadHostView } from '@remux/viewer-kit/host';
-import { useThreadRuntimeStore } from '../../threads/runtimeStore';
 import { useThreadsStore } from '../../threads/store';
 import { useComposerStore } from '../store';
 import type { CodexModelOption, ComposerIntelligence, ComposerReviewMode, ComposerSpeed } from './types';
@@ -53,7 +52,6 @@ export function ComposerConfigButton({ disabled = false }: { disabled?: boolean 
   const setModel = useComposerStore((state) => state.setModel);
   const setReviewMode = useComposerStore((state) => state.setReviewMode);
   const setSpeed = useComposerStore((state) => state.setSpeed);
-  const runtimeStatus = useThreadRuntimeStore((state) => state.status);
   const [open, setOpen] = useState(false);
   const [expanded, setExpanded] = useState<ConfigSection | null>(null);
   const [compactPending, setCompactPending] = useState(false);
@@ -62,9 +60,7 @@ export function ComposerConfigButton({ disabled = false }: { disabled?: boolean 
   const compactDisabled = Boolean(
     disabled ||
       compactPending ||
-      !activeThreadId ||
-      runtimeStatus === 'running' ||
-      runtimeStatus === 'stopping',
+      !activeThreadId,
   );
 
   const handleReload = () => {

@@ -6,6 +6,7 @@ mod history;
 mod item_identity;
 mod live_transcript;
 mod models;
+mod operation_queue;
 mod projection;
 mod resource_invalidations;
 mod resources;
@@ -32,6 +33,7 @@ use crate::composer_config::ComposerConfigStore;
 use crate::file_resources::CodexFileResourcesServer;
 use crate::live_transcript::LiveTranscriptStore;
 use crate::models::CodexModelsServer;
+use crate::operation_queue::{CodexOperationQueueServer, PendingQueueStore};
 use crate::resource_invalidations::{
     invalidations_for_app_server_notification, resources_invalidated_notification,
 };
@@ -49,6 +51,8 @@ const MODELS_READ_METHOD: &str = "remux/codex/models/read";
 const TRANSCRIPT_RESOURCES_READ_METHOD: &str = "remux/codex/transcript/resources/read";
 const THREAD_RESOURCES_READ_METHOD: &str = "remux/codex/thread/resources/read";
 const THREAD_COMPACT_METHOD: &str = "remux/codex/thread/compact";
+const THREAD_QUEUE_REMOVE_METHOD: &str = "remux/codex/thread/queue/remove";
+const THREAD_QUEUE_RUN_NOW_METHOD: &str = "remux/codex/thread/queue/run-now";
 const THREAD_MESSAGE_EDIT_METHOD: &str = "remux/codex/thread/message/edit";
 const THREAD_MESSAGE_FORK_METHOD: &str = "remux/codex/thread/message/fork";
 const THREAD_MESSAGE_SEND_METHOD: &str = "remux/codex/thread/message/send";
@@ -117,23 +121,37 @@ fn handle_request(server: &mut CodexExtensionServer, request: JsonRpcRequest) ->
             .threads
             .read_resources(request.params.unwrap_or(Value::Null)),
         THREAD_COMPACT_METHOD => server
-            .thread_commands
-            .compact_thread(request.params.unwrap_or(Value::Null)),
-        THREAD_MESSAGE_EDIT_METHOD => server
-            .thread_commands
-            .edit_message(request.params.unwrap_or(Value::Null)),
-        THREAD_MESSAGE_FORK_METHOD => server
-            .thread_commands
-            .fork_message(request.params.unwrap_or(Value::Null)),
+            .operation_queue
+            .submit_compact(request.params.unwrap_or(Value::Null)),
+        THREAD_QUEUE_REMOVE_METHOD => server
+            .operation_queue
+            .remove(request.params.unwrap_or(Value::Null)),
+        THREAD_QUEUE_RUN_NOW_METHOD => server
+            .operation_queue
+            .run_now(request.params.unwrap_or(Value::Null)),
+        THREAD_MESSAGE_EDIT_METHOD => {
+            let params = request.params.unwrap_or(Value::Null);
+            server
+                .operation_queue
+                .ensure_direct_mutation_allowed(&params)
+                .and_then(|_| server.thread_commands.edit_message(params))
+        }
+        THREAD_MESSAGE_FORK_METHOD => {
+            let params = request.params.unwrap_or(Value::Null);
+            server
+                .operation_queue
+                .ensure_direct_mutation_allowed(&params)
+                .and_then(|_| server.thread_commands.fork_message(params))
+        }
         THREAD_MESSAGE_SEND_METHOD => server
-            .thread_commands
-            .send_message(request.params.unwrap_or(Value::Null)),
+            .operation_queue
+            .submit_message(request.params.unwrap_or(Value::Null)),
         THREAD_MESSAGE_START_METHOD => server
             .thread_commands
             .start_message(request.params.unwrap_or(Value::Null)),
         THREAD_TURN_INTERRUPT_METHOD => server
-            .thread_commands
-            .interrupt_turn(request.params.unwrap_or(Value::Null)),
+            .operation_queue
+            .interrupt(request.params.unwrap_or(Value::Null)),
         _ => {
             return JsonRpcResponse::error(
                 request.id,
@@ -152,6 +170,7 @@ struct CodexExtensionServer {
     composer_config: ComposerConfigStore,
     files: CodexFileResourcesServer,
     models: CodexModelsServer,
+    operation_queue: CodexOperationQueueServer,
     thread_commands: CodexThreadCommandServer,
     threads: CodexThreadResourcesServer,
     transcript: CodexTranscriptServer,
@@ -165,28 +184,37 @@ impl CodexExtensionServer {
         let live_transcript = LiveTranscriptStore::default();
         let thread_runtime = ThreadRuntimeStore::default();
         let thread_usage = ThreadUsageStore::default();
+        let app_server = AppServerRuntime::new_with_event_sink(codex_home.clone(), event_sink);
+        let thread_commands = CodexThreadCommandServer::new(
+            app_server.clone(),
+            composer_config.clone(),
+            live_transcript.clone(),
+            thread_runtime.clone(),
+            codex_home.clone(),
+        );
+        let operation_queue = CodexOperationQueueServer::new(
+            PendingQueueStore::new(codex_home.join("remux").join("operation-queue")),
+            thread_commands.clone(),
+            thread_runtime.clone(),
+        );
         spawn_app_server_event_forwarder(
             event_rx,
             output_tx,
             live_transcript.clone(),
             thread_runtime.clone(),
             thread_usage.clone(),
+            operation_queue.clone(),
         );
-        let app_server = AppServerRuntime::new_with_event_sink(codex_home.clone(), event_sink);
         Self {
             composer_config: composer_config.clone(),
             files: CodexFileResourcesServer::new(),
             models: CodexModelsServer::new(app_server.clone()),
-            thread_commands: CodexThreadCommandServer::new(
-                app_server.clone(),
-                composer_config.clone(),
-                live_transcript.clone(),
-                thread_runtime.clone(),
-                codex_home.clone(),
-            ),
+            operation_queue: operation_queue.clone(),
+            thread_commands,
             threads: CodexThreadResourcesServer::new(
                 app_server,
                 composer_config,
+                operation_queue,
                 thread_runtime,
                 thread_usage,
             ),
@@ -221,25 +249,58 @@ fn spawn_app_server_event_forwarder(
     live_transcript: LiveTranscriptStore,
     thread_runtime: ThreadRuntimeStore,
     thread_usage: ThreadUsageStore,
+    operation_queue: CodexOperationQueueServer,
 ) {
     thread::spawn(move || {
         for event in event_rx {
-            let AppServerEvent::Notification(notification) = event else {
-                continue;
+            let notification = match event {
+                AppServerEvent::Notification(notification) => notification,
+                AppServerEvent::Disconnected(_) => {
+                    let invalidations = operation_queue
+                        .clear_all()
+                        .into_iter()
+                        .map(|thread_id| {
+                            crate::resource_invalidations::thread_operation_queue_invalidation(
+                                &thread_id,
+                                "appServerEvent",
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    if !invalidations.is_empty() {
+                        let _ = output_tx.send(resources_invalidated_notification(invalidations));
+                    }
+                    continue;
+                }
+                AppServerEvent::ServerRequest(_) => continue,
             };
             let live_effect = live_transcript.record_notification(&notification);
             thread_runtime.record_notification(&notification);
             thread_usage.record_notification(&notification);
-            let invalidations = invalidations_for_app_server_notification(
+            let queue_effect = operation_queue.record_notification(&notification);
+            let mut invalidations = invalidations_for_app_server_notification(
                 &notification,
                 live_effect.canonical_item_id.as_deref(),
                 &live_effect.rekeyed_item_ids,
             );
+            if queue_effect.invalidated
+                && let Some(thread_id) = notification
+                    .get("params")
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(Value::as_str)
+            {
+                invalidations.push(
+                    crate::resource_invalidations::thread_operation_queue_invalidation(
+                        thread_id,
+                        "appServerEvent",
+                    ),
+                );
+            }
             let projected_turn = completed_turn_target(&notification)
                 .and_then(|(thread_id, turn_id)| live_transcript.projected_turn(thread_id, turn_id))
                 .map(|projected| projected.turn);
-            if let Some(notification_intent) =
-                notification_for_app_server_notification(&notification, projected_turn.as_ref())
+            if !queue_effect.suppress_completion_notification
+                && let Some(notification_intent) =
+                    notification_for_app_server_notification(&notification, projected_turn.as_ref())
             {
                 let _ = output_tx.send(notification_intent);
             }

@@ -58,27 +58,32 @@ export function ComposerActionButtons() {
       onClick: scrollDown,
     },
   ];
-  const turnAction: ComposerAction = {
-    busy: turn.isSubmitting || turn.isStopping,
+  const sendAction: ComposerAction = {
+    busy: turn.isSubmitting,
     disabled: turn.sendDisabled,
-    icon: turn.isSubmitting || turn.isStopping
+    icon: turn.isSubmitting
       ? <Loader2 className="size-4 animate-spin" />
-      : turn.isWorking
-        ? <Square className="size-4 fill-current" />
-        : <Send className="size-4" />,
-    label: turn.isStopping
-      ? 'Stopping turn'
-      : turn.isSubmitting
+      : <Send className="size-4" />,
+    label: turn.isSubmitting
       ? 'Sending message'
-      : turn.isWorking
-        ? 'Stop turn'
-        : turn.editTarget
+      : turn.editTarget
           ? 'Save edited message'
           : turn.forkTarget
             ? 'Send forked message'
-            : 'Send message',
-    onClick: turn.handleTurnAction,
+            : turn.isWorking
+              ? 'Queue message'
+              : 'Send message',
+    onClick: turn.handleSendAction,
     tone: 'send',
+  };
+  const stopAction: ComposerAction = {
+    busy: turn.isStopping,
+    disabled: turn.isStopping,
+    icon: turn.isStopping
+      ? <Loader2 className="size-4 animate-spin" />
+      : <Square className="size-4 fill-current" />,
+    label: turn.isStopping ? 'Stopping turn' : 'Stop turn',
+    onClick: turn.handleInterrupt,
   };
   const directoryActions: ComposerAction[] = [
     {
@@ -113,7 +118,10 @@ export function ComposerActionButtons() {
         {pickingDirectory ? null : (
           <>
             <ComposerAttachmentButton />
-            <ComposerActionKey action={turnAction} />
+            {turn.isWorking ? <ComposerActionKey action={stopAction} /> : null}
+            {!turn.isWorking || (turn.hasSendableContent && !turn.isStopping) ? (
+              <ComposerActionKey action={sendAction} />
+            ) : null}
           </>
         )}
       </div>

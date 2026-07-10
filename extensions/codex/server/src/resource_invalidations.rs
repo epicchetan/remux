@@ -26,6 +26,15 @@ pub(crate) fn command_accepted_invalidations(thread_id: &str) -> Vec<Value> {
     ]
 }
 
+pub(crate) fn thread_operation_queue_invalidation(thread_id: &str, reason: &str) -> Value {
+    json!({
+        "key": format!("threadOperationQueue:{thread_id}"),
+        "reason": reason,
+        "threadId": thread_id,
+        "type": "threadOperationQueue",
+    })
+}
+
 pub(crate) fn invalidations_for_app_server_notification(
     notification: &Value,
     canonical_item_id: Option<&str>,

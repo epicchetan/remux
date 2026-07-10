@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::app_server::AppServerRuntime;
@@ -11,7 +11,7 @@ use crate::resource_invalidations::{command_accepted_invalidations, send_accepte
 use crate::resources::CodexTranscriptServer;
 use crate::thread_runtime::ThreadRuntimeStore;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct CodexThreadCommandServer {
     app_server: Arc<dyn AppServerRequester>,
     composer_config: ComposerConfigStore,
@@ -20,7 +20,7 @@ pub(crate) struct CodexThreadCommandServer {
     thread_runtime: ThreadRuntimeStore,
 }
 
-trait AppServerRequester: Send + Sync + std::fmt::Debug {
+pub(crate) trait AppServerRequester: Send + Sync + std::fmt::Debug {
     fn request(&self, method: &str, params: Value) -> Result<Value, String>;
 }
 
@@ -171,6 +171,7 @@ struct ThreadMessageForkParams {
     turn_id: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ThreadMessageSendParams {
@@ -188,6 +189,7 @@ struct ThreadMessageStartParams {
     parts: Vec<ComposerMessagePart>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ThreadCompactParams {
@@ -201,9 +203,9 @@ struct ThreadTurnInterruptParams {
     turn_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
-enum ComposerMessagePart {
+pub(crate) enum ComposerMessagePart {
     Text {
         text: String,
     },
@@ -244,7 +246,7 @@ impl CodexThreadCommandServer {
     }
 
     #[cfg(test)]
-    fn with_requester(app_server: Arc<dyn AppServerRequester>) -> Self {
+    pub(crate) fn with_requester(app_server: Arc<dyn AppServerRequester>) -> Self {
         Self::with_requester_live_transcript_and_fork_target_validator(
             app_server,
             ComposerConfigStore::default(),
@@ -255,7 +257,7 @@ impl CodexThreadCommandServer {
     }
 
     #[cfg(test)]
-    fn with_requester_and_live_transcript(
+    pub(crate) fn with_requester_and_live_transcript(
         app_server: Arc<dyn AppServerRequester>,
         composer_config: ComposerConfigStore,
         live_transcript: LiveTranscriptStore,
@@ -396,6 +398,7 @@ impl CodexThreadCommandServer {
         }))
     }
 
+    #[cfg(test)]
     pub(crate) fn send_message(&self, params: Value) -> Result<Value, String> {
         let params: ThreadMessageSendParams = serde_json::from_value(params)
             .map_err(|error| format!("invalid thread message/send params: {error}"))?;
@@ -457,6 +460,7 @@ impl CodexThreadCommandServer {
         }))
     }
 
+    #[cfg(test)]
     pub(crate) fn compact_thread(&self, params: Value) -> Result<Value, String> {
         let params: ThreadCompactParams = serde_json::from_value(params)
             .map_err(|error| format!("invalid thread compact params: {error}"))?;
@@ -464,15 +468,11 @@ impl CodexThreadCommandServer {
         if thread_id.is_empty() {
             return Err("threadId is required".to_string());
         }
-
         self.ensure_thread_resumed(&thread_id)?;
         self.app_server.request(
             "thread/compact/start",
-            json!({
-                "threadId": thread_id.clone(),
-            }),
+            json!({ "threadId": thread_id.clone() }),
         )?;
-
         Ok(json!({
             "invalidations": command_accepted_invalidations(&thread_id),
             "status": "accepted",
@@ -633,6 +633,57 @@ impl CodexThreadCommandServer {
             .record_turn_accepted(thread_id, Some(&turn_id));
         Ok(turn_id)
     }
+
+    pub(crate) fn dispatch_queued_message(
+        &self,
+        thread_id: &str,
+        client_message_id: Option<String>,
+        parts: Vec<ComposerMessagePart>,
+    ) -> Result<String, String> {
+        let input = composer_parts_to_user_input(parts)?;
+        self.ensure_thread_resumed(thread_id)?;
+        self.start_turn(thread_id, client_message_id, input)
+    }
+
+    pub(crate) fn dispatch_queued_compaction(&self, thread_id: &str) -> Result<(), String> {
+        self.ensure_thread_resumed(thread_id)?;
+        self.app_server
+            .request(
+                "thread/compact/start",
+                json!({
+                    "threadId": thread_id,
+                }),
+            )
+            .map(|_| {
+                self.thread_runtime.record_turn_accepted(thread_id, None);
+            })
+    }
+
+    pub(crate) fn steer_queued_message(
+        &self,
+        thread_id: &str,
+        expected_turn_id: &str,
+        client_message_id: Option<String>,
+        parts: Vec<ComposerMessagePart>,
+    ) -> Result<String, String> {
+        let input = composer_parts_to_user_input(parts)?;
+        self.ensure_thread_resumed(thread_id)?;
+        let response = self.app_server.request(
+            "turn/steer",
+            json!({
+                "expectedTurnId": expected_turn_id,
+                "clientUserMessageId": client_message_id,
+                "input": input,
+                "threadId": thread_id,
+            }),
+        )?;
+        response
+            .get("turnId")
+            .or_else(|| response.get("turn").and_then(|turn| turn.get("id")))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "turn/steer response missing turnId".to_string())
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -686,7 +737,9 @@ fn is_forkable_assistant_message(item: &Value, assistant_message_id: &str) -> bo
 /// becomes a `text_elements` span over the literal path so viewers can keep
 /// rendering it as a chip; the span survives resume because Codex rebases
 /// `text_elements` onto the flattened `user_message` event text.
-fn composer_parts_to_user_input(parts: Vec<ComposerMessagePart>) -> Result<Vec<Value>, String> {
+pub(crate) fn composer_parts_to_user_input(
+    parts: Vec<ComposerMessagePart>,
+) -> Result<Vec<Value>, String> {
     let mut input = Vec::new();
     let mut run = MentionTextRun::default();
 
