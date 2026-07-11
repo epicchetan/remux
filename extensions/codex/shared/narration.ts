@@ -159,7 +159,11 @@ export type CodexNarrationUpdatedNotification = {
 };
 
 export type CodexNarrationProviderDescriptor = {
-  aligner: {
+  acousticTiming?: {
+    algorithmVersion: string;
+    provider: string;
+  };
+  aligner?: {
     algorithmVersion: string;
     model?: string;
     modelRevision?: string;
@@ -167,9 +171,18 @@ export type CodexNarrationProviderDescriptor = {
   };
   id: string;
   scriptGenerator: {
+    baseInstructionsVersion?: string;
+    contextProfileVersion?: string;
+    contractVersion?: number;
     effort?: string;
     model: string;
     promptVersion: string;
+    provider: string;
+    reasoningSummary?: string;
+    serviceTier?: 'priority' | 'standard';
+  };
+  sourceMapper?: {
+    algorithmVersion: string;
     provider: string;
   };
   synthesizer: {
@@ -237,7 +250,15 @@ export type CodexNarrationCue = {
     | 'tableRegion'
     | 'word';
   id: string;
-  origin: 'deterministic' | 'fallback' | 'forcedAlignment' | 'scriptHint' | 'ttsTiming';
+  origin:
+    | 'deterministic'
+    | 'fallback'
+    | 'forcedAlignment'
+    | 'scriptHint'
+    | 'sourceSemantic'
+    | 'sourceWord'
+    | 'summarySemantic'
+    | 'ttsTiming';
   spokenEnd: number;
   spokenStart: number;
   start: number;

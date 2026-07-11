@@ -22,6 +22,7 @@ import { shortenPath, threadTitle } from './threads/threadFormat';
 import { CodexTranscript } from './transcript';
 import { requestTranscriptTurnScroll } from './transcript/viewportStore';
 import { subscribeNarrationUpdates, useNarrationStore } from './narration/store';
+import { installNarrationPaintController } from './narration/paintController';
 
 export function App() {
   const connectionStatus = useHostStore((state) => state.connectionStatus);
@@ -325,6 +326,7 @@ export function App() {
 
   useEffect(() => subscribeCodexResourceInvalidations(), []);
   useEffect(() => subscribeNarrationUpdates(), []);
+  useEffect(() => installNarrationPaintController(), []);
 
   useEffect(() => {
     if (narrationTargetThreadId && narrationTargetThreadId !== activeThreadId) {

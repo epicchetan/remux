@@ -10,6 +10,8 @@ type TranscriptScrollNavigationController = {
 
 export type TranscriptNarrationFocusRequest = {
   assistantMessageId: string;
+  bounds?: { bottom: number; top: number };
+  materializeOnly?: boolean;
   reason: 'explicitSeek' | 'follow' | 'followReenabled';
   targetIds: string[];
   threadId: string;

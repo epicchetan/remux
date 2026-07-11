@@ -21,6 +21,7 @@ Canonical code: ...
 | Spec | Status | Notes |
 | --- | --- | --- |
 | [codex/assistant-narration.md](codex/assistant-narration.md) | Active Spec | On-demand cached narration for completed assistant responses, entered next to Fork and controlled through block seek, play/pause, speed, and close actions in the composer. |
+| [codex/assistant-narration-planning-optimization.md](codex/assistant-narration-planning-optimization.md) | Active Spec | Production path and automated phases 1–6 coverage implemented: exact Codex prompt/schema, Sol Priority batching, deterministic source mapping, Kokoro-native timing, DOM-range word paint, structural glow CSS, and version migration. iOS device and opt-in rollout benchmarks remain. |
 | [codex/thread-operation-queue.md](codex/thread-operation-queue.md) | Implemented | Hidden-when-empty process-memory queue for pending messages and compactions, with direct idle dispatch, steering, delete, and cancel-on-interrupt semantics. |
 | [codex/transcript-identity-reconciliation.md](codex/transcript-identity-reconciliation.md) | Active Spec | Canonical item identity model for persisted and live transcript items. |
 | [codex/transcript-store-scroll.md](codex/transcript-store-scroll.md) | Implemented | Transcript resource/layout/viewport ownership and scroll model. |

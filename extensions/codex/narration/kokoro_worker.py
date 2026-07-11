@@ -80,10 +80,6 @@ def main() -> None:
         for target in targets
         if isinstance(target, dict) and isinstance(target.get("id"), str)
     }
-    targets_by_block: dict[str, list[dict]] = {}
-    for target in target_by_id.values():
-        targets_by_block.setdefault(str(target.get("blockId", "")), []).append(target)
-
     audio_dir = output_dir / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
 
@@ -130,7 +126,7 @@ def main() -> None:
         block_id = required_string(script_unit, "blockId")
         mode = required_string(script_unit, "mode")
         spoken_text = required_string(script_unit, "spokenText").strip()
-        display_text = required_string(script_unit, "displayText")
+        required_string(script_unit, "displayText")
         fallback_target_ids = valid_target_ids(
             script_unit.get("fallbackTargetIds"), target_by_id, unit_id
         )
@@ -183,18 +179,30 @@ def main() -> None:
         chunk_samples += len(unit_audio)
         total_samples += len(unit_audio)
         unit_end = total_samples / SAMPLE_RATE
+        previous_start = unit_start
+        previous_end = unit_start
+        for token in timed_tokens:
+            token["start"] = max(
+                previous_start,
+                unit_start,
+                min(unit_end, float(token["start"])),
+            )
+            token["end"] = max(
+                token["start"],
+                previous_end,
+                min(unit_end, float(token["end"])),
+            )
+            previous_start = token["start"]
+            previous_end = token["end"]
         chunk_parts.append(pause)
         chunk_samples += len(pause)
         total_samples += len(pause)
 
         unit_cues = build_cues(
             unit_id=unit_id,
-            block_id=block_id,
             mode=mode,
-            display_text=display_text,
             spoken_text=spoken_text,
             timed_tokens=timed_tokens,
-            block_targets=targets_by_block.get(block_id, []),
             fallback_target_ids=fallback_target_ids,
             alignment_hints=script_unit.get("alignmentHints", []),
             target_by_id=target_by_id,
@@ -243,12 +251,9 @@ def main() -> None:
 def build_cues(
     *,
     unit_id: str,
-    block_id: str,
     mode: str,
-    display_text: str,
     spoken_text: str,
     timed_tokens: list[dict],
-    block_targets: list[dict],
     fallback_target_ids: list[str],
     alignment_hints: object,
     target_by_id: dict[str, dict],
@@ -256,80 +261,48 @@ def build_cues(
     unit_end: float,
 ) -> list[dict]:
     cues: list[dict] = []
-    word_targets = sorted(
-        (
-            target
-            for target in block_targets
-            if target.get("kind") == "textRange" and target.get("role") == "word"
-        ),
-        key=lambda target: (int(target["displayStart"]), int(target["displayEnd"])),
-    )
     prepared_hints = prepare_alignment_hints(
-        alignment_hints, spoken_text, target_by_id, unit_id
+        alignment_hints, spoken_text, target_by_id, unit_id, mode
     )
-    display_normalized, display_map = normalized_char_map(display_text)
-    display_cursor = 0
-    last_word_target_ids: list[str] = []
+    last_non_fallback: tuple[list[str], str, str, float] | None = None
     for token_index, token in enumerate(timed_tokens):
-        hint = next(
-            (
-                candidate
-                for candidate in prepared_hints
-                if candidate["spokenEnd"] > token["spokenStart"]
-                and candidate["spokenStart"] < token["spokenEnd"]
+        overlapping = [
+            candidate
+            for candidate in prepared_hints
+            if candidate["spokenEnd"] > token["spokenStart"]
+            and candidate["spokenStart"] < token["spokenEnd"]
+        ]
+        hint = min(
+            overlapping,
+            key=lambda candidate: (
+                hint_target_precedence(candidate["targetIds"], target_by_id),
+                candidate["spokenEnd"] - candidate["spokenStart"],
+                candidate["order"],
             ),
-            None,
+            default=None,
         )
         if hint is not None:
-            hinted_target_ids = hint["targetIds"]
-            last_word_target_ids = hinted_target_ids
-            hinted_ends = [
-                int(target_by_id[target_id].get("displayEnd", -1))
-                for target_id in hinted_target_ids
-                if target_by_id[target_id].get("kind") == "textRange"
-            ]
-            if hinted_ends:
-                display_cursor = next(
-                    (
-                        index
-                        for index, source_offset in enumerate(display_map)
-                        if utf16_offset(display_text, source_offset) >= max(hinted_ends)
-                    ),
-                    len(display_map),
-                )
+            target_ids = hint["targetIds"]
+            granularity = target_granularity(target_ids, target_by_id)
+            origin = hint["origin"]
+            confidence = 0.98 if origin == "sourceWord" else 0.9
+            last_non_fallback = (target_ids, granularity, origin, confidence)
             cues.append(
                 cue(
                     unit_id,
                     token_index,
                     token,
-                    hinted_target_ids,
-                    target_granularity(hinted_target_ids, target_by_id),
-                    "scriptHint",
-                    0.88,
+                    target_ids,
+                    granularity,
+                    origin,
+                    confidence,
                 )
             )
             continue
 
-        normalized_token, _ = normalized_char_map(token["text"])
-        target_ids: list[str] = []
-        if mode in {"verbatim", "normalized"} and normalized_token:
-            normalized_start = display_normalized.find(normalized_token, display_cursor)
-            if normalized_start >= 0:
-                normalized_end = normalized_start + len(normalized_token)
-                display_cursor = normalized_end
-                original_start = utf16_offset(display_text, display_map[normalized_start])
-                original_end = utf16_offset(display_text, display_map[normalized_end - 1] + 1)
-                target_ids = [
-                    target["id"]
-                    for target in word_targets
-                    if int(target["displayEnd"]) > original_start
-                    and int(target["displayStart"]) < original_end
-                ]
-        if target_ids:
-            last_word_target_ids = target_ids
-            cues.append(cue(unit_id, token_index, token, target_ids, "word", "deterministic", 0.98))
-        elif not normalized_token and last_word_target_ids:
-            cues.append(cue(unit_id, token_index, token, last_word_target_ids, "word", "deterministic", 0.94))
+        if not token_contains_word(token["text"]) and last_non_fallback is not None:
+            target_ids, granularity, origin, confidence = last_non_fallback
+            cues.append(cue(unit_id, token_index, token, target_ids, granularity, origin, confidence))
         else:
             cues.append(
                 cue(
@@ -366,12 +339,13 @@ def prepare_alignment_hints(
     spoken_text: str,
     target_by_id: dict[str, dict],
     unit_id: str,
+    mode: str,
 ) -> list[dict]:
     if not isinstance(value, list):
         fail(f"Narration script unit {unit_id} has invalid alignment hints")
     prepared: list[dict] = []
     cursor = 0
-    for hint in value:
+    for order, hint in enumerate(value):
         if not isinstance(hint, dict):
             fail(f"Narration script unit {unit_id} has an invalid alignment hint")
         hint_text = required_string(hint, "spokenText")
@@ -379,15 +353,43 @@ def prepare_alignment_hints(
         if start < 0:
             fail(f"Narration script unit {unit_id} has an unmatched alignment hint")
         end = start + len(hint_text)
+        target_ids = valid_target_ids(hint.get("targetIds"), target_by_id, unit_id)
+        origin = hint.get("origin")
+        if origin not in {"sourceWord", "sourceSemantic", "summarySemantic"}:
+            granularity = target_granularity(target_ids, target_by_id)
+            origin = (
+                "sourceWord"
+                if granularity == "word"
+                else "summarySemantic"
+                if mode == "summary"
+                else "sourceSemantic"
+            )
         prepared.append(
             {
                 "spokenStart": utf16_offset(spoken_text, start),
                 "spokenEnd": utf16_offset(spoken_text, end),
-                "targetIds": valid_target_ids(hint.get("targetIds"), target_by_id, unit_id),
+                "targetIds": target_ids,
+                "origin": origin,
+                "order": order,
             }
         )
         cursor = end
     return prepared
+
+
+def hint_target_precedence(target_ids: list[str], target_by_id: dict[str, dict]) -> int:
+    granularity = target_granularity(target_ids, target_by_id)
+    if granularity == "word":
+        return 0
+    if granularity == "expression":
+        return 1
+    if granularity in {"tableCell", "tableRegion", "codeLines", "diagramNode"}:
+        return 2
+    return 3
+
+
+def token_contains_word(value: str) -> bool:
+    return any(character.isalnum() for character in value)
 
 
 def cue(

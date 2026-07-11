@@ -1,4 +1,30 @@
 @layer components {
+  :root {
+    --codex-narration-word-fill: color-mix(in srgb, var(--composer-accent) 20%, transparent);
+    --codex-narration-context-fill: color-mix(in srgb, var(--composer-accent) 5%, transparent);
+    --codex-narration-frame-ring: color-mix(in srgb, var(--composer-accent) 52%, transparent);
+    --codex-narration-frame-inner: color-mix(in srgb, var(--composer-accent) 8%, transparent);
+    --codex-narration-frame-outer: color-mix(in srgb, var(--composer-accent) 22%, transparent);
+    --codex-narration-line-fill: color-mix(in srgb, var(--composer-accent) 8%, transparent);
+    --codex-narration-line-rail: color-mix(in srgb, var(--composer-accent) 72%, transparent);
+    --codex-narration-line-inner: color-mix(in srgb, var(--composer-accent) 36%, transparent);
+    --codex-narration-cell-fill: color-mix(in srgb, var(--composer-accent) 9%, transparent);
+    --codex-narration-cell-ring: color-mix(in srgb, var(--composer-accent) 64%, transparent);
+    --codex-narration-cell-inner: color-mix(in srgb, var(--composer-accent) 16%, transparent);
+  }
+
+  :root[data-remux-theme="light"] {
+    --codex-narration-word-fill: color-mix(in srgb, var(--composer-accent) 15%, transparent);
+    --codex-narration-context-fill: color-mix(in srgb, var(--composer-accent) 4%, transparent);
+    --codex-narration-frame-ring: color-mix(in srgb, var(--composer-accent) 48%, transparent);
+    --codex-narration-frame-inner: color-mix(in srgb, var(--composer-accent) 7%, transparent);
+    --codex-narration-frame-outer: color-mix(in srgb, var(--composer-accent) 16%, transparent);
+    --codex-narration-line-fill: color-mix(in srgb, var(--composer-accent) 7%, transparent);
+    --codex-narration-line-inner: color-mix(in srgb, var(--composer-accent) 28%, transparent);
+    --codex-narration-cell-fill: color-mix(in srgb, var(--composer-accent) 7%, transparent);
+    --codex-narration-cell-inner: color-mix(in srgb, var(--composer-accent) 12%, transparent);
+  }
+
   .remux-feed-lane {
     display: flex;
     width: 100%;
@@ -445,23 +471,38 @@
   .codex-md-block-frame {
     min-width: 0;
     overflow: visible;
+    isolation: isolate;
+    position: relative;
   }
 
-  .codex-md-block-frame.codex-md-block-narrating {
-    border-radius: 5px;
-    background: color-mix(in srgb, var(--composer-accent) 9%, transparent);
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--composer-accent) 12%, transparent);
+  .codex-narration-paint-layer {
+    position: absolute;
+    z-index: 2;
+    inset: 0;
+    overflow: visible;
+    pointer-events: none;
   }
 
-  .codex-md-narrated-word {
+  .codex-narration-paint-layer[hidden] {
+    display: none;
+  }
+
+  .codex-narration-context-rect,
+  .codex-narration-word-rect {
+    position: absolute;
+    top: 0;
+    left: 0;
+    box-sizing: border-box;
+    pointer-events: none;
+  }
+
+  .codex-narration-context-rect {
+    background: var(--codex-narration-context-fill);
+  }
+
+  .codex-narration-word-rect {
     border-radius: 2px;
-    background: color-mix(in srgb, var(--composer-accent) 30%, transparent);
-    color: var(--foreground);
-  }
-
-  .codex-md-target-narrating {
-    background: color-mix(in srgb, var(--composer-accent) 22%, transparent);
-    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--composer-accent) 28%, transparent);
+    background: var(--codex-narration-word-fill);
   }
 
   .codex-md-paragraph {
@@ -729,16 +770,105 @@
     color: var(--foreground);
   }
 
-  .codex-md-table-cell.codex-md-target-narrating {
-    background: color-mix(in srgb, var(--composer-accent) 22%, transparent);
-  }
-
   .codex-md-table-cell[data-align="center"] .codex-md-text-line {
     text-align: center;
   }
 
   .codex-md-table-cell[data-align="right"] .codex-md-text-line {
     text-align: right;
+  }
+
+  .codex-md-code-block.codex-md-structural-target-narrating,
+  .codex-md-table.codex-md-structural-target-narrating {
+    border-color: var(--codex-narration-frame-ring);
+    box-shadow:
+      inset 0 0 14px var(--codex-narration-frame-inner),
+      0 0 9px var(--codex-narration-frame-outer);
+  }
+
+  .codex-md-code-line.codex-md-code-line-narrating {
+    background-color: var(--codex-narration-line-fill);
+    box-shadow:
+      inset 3px 0 0 var(--codex-narration-line-rail),
+      inset 10px 0 16px -12px var(--codex-narration-line-inner);
+  }
+
+  .codex-md-table-cell.codex-md-table-cell-narrating {
+    --codex-narration-cell-edge-top: transparent;
+    --codex-narration-cell-edge-right: transparent;
+    --codex-narration-cell-edge-bottom: transparent;
+    --codex-narration-cell-edge-left: transparent;
+    background: var(--codex-narration-cell-fill);
+    box-shadow:
+      inset 0 2px 0 var(--codex-narration-cell-edge-top),
+      inset -2px 0 0 var(--codex-narration-cell-edge-right),
+      inset 0 -2px 0 var(--codex-narration-cell-edge-bottom),
+      inset 2px 0 0 var(--codex-narration-cell-edge-left),
+      inset 0 0 12px var(--codex-narration-cell-inner);
+  }
+
+  .codex-md-table-cell-narrating.codex-md-table-cell-edge-top {
+    --codex-narration-cell-edge-top: var(--codex-narration-cell-ring);
+  }
+
+  .codex-md-table-cell-narrating.codex-md-table-cell-edge-right {
+    --codex-narration-cell-edge-right: var(--codex-narration-cell-ring);
+  }
+
+  .codex-md-table-cell-narrating.codex-md-table-cell-edge-bottom {
+    --codex-narration-cell-edge-bottom: var(--codex-narration-cell-ring);
+  }
+
+  .codex-md-table-cell-narrating.codex-md-table-cell-edge-left {
+    --codex-narration-cell-edge-left: var(--codex-narration-cell-ring);
+  }
+
+  .codex-md-diagram-node-narrating {
+    outline: 1px solid var(--codex-narration-frame-ring);
+    outline-offset: 2px;
+    filter: drop-shadow(0 0 5px var(--codex-narration-frame-outer));
+  }
+
+  .codex-md-code-block,
+  .codex-md-table,
+  .codex-md-code-line,
+  .codex-md-table-cell {
+    transition:
+      background-color 110ms ease-out,
+      box-shadow 110ms ease-out;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .codex-md-code-block,
+    .codex-md-table,
+    .codex-md-code-line,
+    .codex-md-table-cell {
+      transition: none;
+    }
+  }
+
+  @media (forced-colors: active) {
+    .codex-narration-context-rect {
+      background: Highlight;
+      opacity: 0.18;
+    }
+
+    .codex-narration-word-rect {
+      background: Highlight;
+      opacity: 0.62;
+    }
+
+    .codex-md-code-block.codex-md-structural-target-narrating,
+    .codex-md-table.codex-md-structural-target-narrating,
+    .codex-md-code-line.codex-md-code-line-narrating,
+    .codex-md-table-cell.codex-md-table-cell-narrating,
+    .codex-md-diagram-node-narrating {
+      outline: 2px solid Highlight;
+      outline-offset: -2px;
+      background: transparent;
+      box-shadow: none;
+      filter: none;
+    }
   }
 
   .codex-md-rule {

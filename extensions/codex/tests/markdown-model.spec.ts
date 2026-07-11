@@ -479,6 +479,37 @@ test.describe('markdownModel', () => {
     });
   });
 
+  test('keeps rendered fragment ranges aligned with display text across collapsed whitespace', () => {
+    const fixtures = [
+      '**Bold** next word after emphasis',
+      '[Linked](https://example.com) next word after link',
+      '`inlineCode` next word after code',
+      '[app.ts](src/app.ts) next word after file chip',
+      'alpha    beta\tgamma delta',
+      'café 😀alpha beta repeated beta',
+    ];
+
+    for (const markdown of fixtures) {
+      for (const width of [110, 170, 280]) {
+        const document = getMarkdownLayoutDocument(markdown, 'default', width);
+        const sourceById = new Map(narrationSourceBlocks(markdown).map((block) => [block.id, block]));
+        for (const block of document.blocks) {
+          if (block.type !== 'paragraph' && block.type !== 'heading') continue;
+          const displayText = sourceById.get(block.narrationId)?.displayText;
+          expect(displayText).toBeDefined();
+          for (const line of block.lines) {
+            for (const fragment of line.fragments) {
+              expect(
+                displayText!.slice(fragment.displayStart, fragment.displayEnd),
+                `${JSON.stringify(markdown)} at ${width}px range ${fragment.displayStart}-${fragment.displayEnd}`,
+              ).toBe(fragment.text);
+            }
+          }
+        }
+      }
+    }
+  });
+
   test('lays out a long fenced code line as one logical line at narrow width', () => {
     const document = getMarkdownLayoutDocument(
       ['```ts', `const value = '${'x'.repeat(180)}';`, '```'].join('\n'),

@@ -1,6 +1,7 @@
 import { useCallback, useRef } from 'react';
 
 const targets = new Map<string, Set<HTMLElement>>();
+const listeners = new Set<() => void>();
 
 function registryKey(assistantMessageId: string, targetId: string) {
   return `${assistantMessageId}\0${targetId}`;
@@ -19,6 +20,7 @@ export function registerNarrationTargets(
       targets.set(key, elements);
     }
   }
+  notifyListeners();
 }
 
 export function unregisterNarrationTargets(
@@ -32,6 +34,7 @@ export function unregisterNarrationTargets(
     elements?.delete(element);
     if (elements?.size === 0) targets.delete(key);
   }
+  notifyListeners();
 }
 
 export function useNarrationTargetRef(assistantMessageId: string | null, targetIds: string[]) {
@@ -68,4 +71,13 @@ export function resolveNarrationTargetElements(assistantMessageId: string, targe
     }
   }
   return elements;
+}
+
+export function subscribeNarrationTargets(listener: () => void) {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
+function notifyListeners() {
+  for (const listener of listeners) listener();
 }

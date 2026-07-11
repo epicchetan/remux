@@ -11,7 +11,7 @@ import type {
   CodexNarrationTarget,
 } from '../../shared/narration';
 import { cancelNarration, readNarration, startNarration } from '../ipc/narration';
-import { focusTranscriptNarration, setTranscriptNarrationManualScrollHandler } from '../transcript/viewportStore';
+import { setTranscriptNarrationManualScrollHandler } from '../transcript/viewportStore';
 import { NarrationAudioEngine } from './audioEngine';
 import { resolveNarrationPosition } from './cueResolver';
 
@@ -36,6 +36,7 @@ type NarrationStoreState = {
   currentUnitIndex: number;
   error: string | null;
   followEnabled: boolean;
+  focusIntent: { id: number; reason: 'explicitSeek' | 'follow' | 'followReenabled' } | null;
   followSuspendedByUser: boolean;
   manifest: CodexNarrationManifest | null;
   nextBlock: () => Promise<void>;
@@ -59,6 +60,7 @@ const defaultRate = [0.75, 1, 1.25, 1.5, 2].includes(storedRate) ? storedRate : 
 let lastRequest: NarrationRequest | null = null;
 let refreshTimer: number | null = null;
 let pendingFocusReason: 'explicitSeek' | 'followReenabled' | null = null;
+let focusIntentId = 0;
 
 const audioEngine = new NarrationAudioEngine({
   onEnded: () => undefined,
@@ -91,6 +93,7 @@ export const useNarrationStore = create<NarrationStoreState>((set, get) => ({
   currentUnitIndex: 0,
   error: null,
   followEnabled: true,
+  focusIntent: null,
   followSuspendedByUser: false,
   manifest: null,
   async nextBlock() {
@@ -149,14 +152,23 @@ export const useNarrationStore = create<NarrationStoreState>((set, get) => ({
   target: null,
   toggleFollow() {
     const enabled = !get().followEnabled;
-    set({ followEnabled: enabled, followSuspendedByUser: false });
-    if (enabled) focusCurrentTargets('followReenabled');
+    set({
+      focusIntent: enabled ? nextFocusIntent('followReenabled') : null,
+      followEnabled: enabled,
+      followSuspendedByUser: false,
+    });
   },
   totalUnits: null,
 }));
 
 audioEngine.setCallbacks({
-  onEnded: () => useNarrationStore.setState({ phase: 'paused' }),
+  onEnded: () => useNarrationStore.setState({
+    activeTargets: [],
+    currentCue: null,
+    currentCueIndex: -1,
+    currentTargetIds: [],
+    phase: 'paused',
+  }),
   onError: (error) => useNarrationStore.setState({ error, phase: 'ready' }),
   onTime: (globalTime) => applyAudioTime(globalTime),
 });
@@ -209,12 +221,12 @@ function applyResource(
       currentTargetIds: position.targetIds,
       currentUnitIndex: position.unitIndex,
       error: null,
+      focusIntent: nextFocusIntent('follow'),
       manifest: resource.manifest,
       phase: 'ready',
       stage: null,
       totalUnits: resource.totalUnits,
     });
-    window.requestAnimationFrame(() => focusCurrentTargets('follow'));
     return;
   }
   if (resource.status === 'failed') {
@@ -243,7 +255,8 @@ function applyAudioTime(globalTime: number) {
   if (!state.manifest) return;
   const position = resolveNarrationPosition(state.manifest, globalTime);
   if (position.cueIndex === state.currentCueIndex && position.unitIndex === state.currentUnitIndex) return;
-  const previousFocusKey = visualFocusTargetIds(state).join('\0');
+  const reason = pendingFocusReason ?? (state.followEnabled ? 'follow' : null);
+  pendingFocusReason = null;
   useNarrationStore.setState({
     activeTargets: position.targets,
     currentBlockId: position.unit?.blockId ?? null,
@@ -251,12 +264,8 @@ function applyAudioTime(globalTime: number) {
     currentCueIndex: position.cueIndex,
     currentTargetIds: position.targetIds,
     currentUnitIndex: position.unitIndex,
+    focusIntent: reason ? nextFocusIntent(reason) : null,
   });
-  const targetsChanged = visualFocusTargetIds(useNarrationStore.getState()).join('\0') !== previousFocusKey;
-  const reason = pendingFocusReason;
-  pendingFocusReason = null;
-  if (reason) focusCurrentTargets(reason);
-  else if (targetsChanged && useNarrationStore.getState().followEnabled) focusCurrentTargets('follow');
 }
 
 async function seekBlock(direction: -1 | 1, get: () => NarrationStoreState) {
@@ -273,36 +282,23 @@ async function seekBlock(direction: -1 | 1, get: () => NarrationStoreState) {
     }
   }
   pendingFocusReason = 'explicitSeek';
-  await audioEngine.seek(manifest.units[destination].start, phase === 'playing');
+  await audioEngine.seek(blockNavigationTime(manifest, destination), phase === 'playing');
   if (destination === current) {
     pendingFocusReason = null;
-    focusCurrentTargets('explicitSeek');
+    useNarrationStore.setState({ focusIntent: nextFocusIntent('explicitSeek') });
   }
 }
 
-function focusCurrentTargets(reason: 'explicitSeek' | 'follow' | 'followReenabled') {
-  const state = useNarrationStore.getState();
-  const targetIds = visualFocusTargetIds(state);
-  if (!state.target || targetIds.length === 0) return;
-  focusTranscriptNarration({
-    assistantMessageId: state.target.assistantMessageId,
-    reason,
-    targetIds,
-    threadId: state.target.threadId,
-    turnId: state.target.turnId,
-  });
-}
-
-function visualFocusTargetIds(state: NarrationStoreState) {
-  const semanticTargets = state.activeTargets.filter((target) =>
-    target.kind === 'codeLines' ||
-    target.kind === 'diagramNode' ||
-    target.kind === 'tableCell' ||
-    target.kind === 'tableRegion');
-  if (semanticTargets.length > 0) return semanticTargets.map((target) => target.id);
-  const blockTarget = state.manifest?.targets.find((target) =>
-    target.kind === 'block' && target.blockId === state.currentBlockId);
-  return blockTarget ? [blockTarget.id] : state.currentTargetIds;
+function blockNavigationTime(manifest: CodexNarrationManifest, unitIndex: number) {
+  const unit = manifest.units[unitIndex];
+  if (!unit) return 0;
+  const firstCue = manifest.cues.find((cue) => cue.unitId === unit.id);
+  if (!firstCue) return unit.start;
+  const cueStart = Math.max(unit.start, Math.min(unit.end, firstCue.start));
+  const cueEnd = Math.max(cueStart, Math.min(unit.end, firstCue.end));
+  // Unit and cue endpoints are inclusive in the resolver. Move just inside the
+  // first precise cue so a shared boundary cannot resolve to the prior cue.
+  return cueStart + Math.min(0.001, Math.max(0, (cueEnd - cueStart) / 2));
 }
 
 function idleState(): Pick<
@@ -317,6 +313,7 @@ function idleState(): Pick<
   | 'currentUnitIndex'
   | 'error'
   | 'followEnabled'
+  | 'focusIntent'
   | 'followSuspendedByUser'
   | 'manifest'
   | 'phase'
@@ -335,6 +332,7 @@ function idleState(): Pick<
     currentUnitIndex: 0,
     error: null,
     followEnabled: true,
+    focusIntent: null,
     followSuspendedByUser: false,
     manifest: null,
     phase: 'idle',
@@ -342,6 +340,11 @@ function idleState(): Pick<
     target: null,
     totalUnits: null,
   };
+}
+
+function nextFocusIntent(reason: 'explicitSeek' | 'follow' | 'followReenabled') {
+  focusIntentId += 1;
+  return { id: focusIntentId, reason } as const;
 }
 
 function errorMessage(error: unknown) {

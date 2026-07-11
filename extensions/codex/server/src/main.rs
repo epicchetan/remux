@@ -7,6 +7,8 @@ mod item_identity;
 mod live_transcript;
 mod models;
 mod narration;
+mod narration_planning;
+mod narration_source_mapping;
 mod operation_queue;
 mod projection;
 mod resource_invalidations;
@@ -53,6 +55,7 @@ const COMPOSER_CONFIG_WRITE_METHOD: &str = "remux/codex/composer/config/write";
 const MODELS_READ_METHOD: &str = "remux/codex/models/read";
 const NARRATION_AUDIO_READ_METHOD: &str = "remux/codex/narration/audio/read";
 const NARRATION_CANCEL_METHOD: &str = "remux/codex/narration/cancel";
+const NARRATION_DIAGNOSTICS_READ_METHOD: &str = "remux/codex/narration/diagnostics/read";
 const NARRATION_READ_METHOD: &str = "remux/codex/narration/resources/read";
 const NARRATION_START_METHOD: &str = "remux/codex/narration/start";
 const TRANSCRIPT_RESOURCES_READ_METHOD: &str = "remux/codex/transcript/resources/read";
@@ -136,6 +139,7 @@ fn handle_request(server: &CodexExtensionServer, request: JsonRpcRequest) -> Jso
         NARRATION_CANCEL_METHOD => server
             .narration
             .cancel(request.params.unwrap_or(Value::Null)),
+        NARRATION_DIAGNOSTICS_READ_METHOD => server.narration.read_diagnostics(),
         NARRATION_READ_METHOD => server.narration.read(request.params.unwrap_or(Value::Null)),
         NARRATION_START_METHOD => server
             .narration
@@ -250,6 +254,7 @@ impl CodexRequestDispatcher {
             | COMPOSER_CONFIG_READ_METHOD
             | MODELS_READ_METHOD
             | NARRATION_AUDIO_READ_METHOD
+            | NARRATION_DIAGNOSTICS_READ_METHOD
             | NARRATION_READ_METHOD
             | TRANSCRIPT_RESOURCES_READ_METHOD
             | THREAD_RESOURCES_READ_METHOD => {

@@ -27,22 +27,16 @@ export function AssistantMessage({
   width: number;
 }) {
   const narrationTargetMessageId = useNarrationStore((state) => state.target?.assistantMessageId ?? null);
-  const narrationActiveTargets = useNarrationStore((state) => state.activeTargets);
   const narrationSourceTargets = useNarrationStore((state) => state.manifest?.targets ?? noNarrationTargets);
   if (!segment.text.trim()) {
     return null;
   }
 
   const streaming = turnStatus === 'inProgress';
-  const narrationHighlight = narrationTargetMessageId === segment.id && narrationActiveTargets.length > 0
-    ? { targets: narrationActiveTargets }
-    : null;
-
   return (
     <div className="codex-assistant-message">
       <MarkdownBlock
         narrationAssistantMessageId={narrationTargetMessageId === segment.id ? segment.id : null}
-        narrationHighlight={narrationHighlight}
         narrationTargets={narrationTargetMessageId === segment.id ? narrationSourceTargets : []}
         streaming={streaming}
         width={width}

@@ -9,7 +9,6 @@ import {
 } from './codeHighlight';
 import type { CodexNarrationSourceTarget } from '../../../../shared/narration';
 import { useNarrationTargetRef } from '../../../narration/targetRegistry';
-import { cn } from '@remux/viewer-kit/shadcn';
 
 type CodeLayoutBlock = Extract<MarkdownLayoutBlock, { type: 'code' }>;
 
@@ -19,13 +18,11 @@ type HighlightState =
   | { status: 'plain' };
 
 export function CodeBlock({
-  activeTargets,
   assistantMessageId,
   block,
   style,
   targets,
 }: {
-  activeTargets: CodexNarrationSourceTarget[];
   assistantMessageId: string | null;
   block: CodeLayoutBlock;
   style: CSSProperties;
@@ -75,6 +72,7 @@ export function CodeBlock({
   return (
     <pre
       className="codex-md-block codex-md-code-block"
+      data-narration-surface="code"
       data-highlight-state={highlightState.status}
       data-language={block.language ?? undefined}
       style={{
@@ -85,7 +83,6 @@ export function CodeBlock({
       <code style={{ minHeight: `${block.textHeight}px` }}>
         {block.lines.map((line, index) => (
           <NarratedCodeLine
-            activeTargets={activeTargets}
             assistantMessageId={assistantMessageId}
             blockId={block.narrationId}
             fallbackText={line.text}
@@ -101,7 +98,6 @@ export function CodeBlock({
 }
 
 function NarratedCodeLine({
-  activeTargets,
   assistantMessageId,
   blockId,
   fallbackText,
@@ -109,7 +105,6 @@ function NarratedCodeLine({
   targets,
   tokens,
 }: {
-  activeTargets: CodexNarrationSourceTarget[];
   assistantMessageId: string | null;
   blockId: string;
   fallbackText: string;
@@ -119,10 +114,9 @@ function NarratedCodeLine({
 }) {
   const lineTargets = targets.filter((target) =>
     target.blockId === blockId && target.kind === 'codeLines' && line >= target.lineStart && line <= target.lineEnd);
-  const active = activeTargets.some((target) => lineTargets.some((candidate) => candidate.id === target.id));
   const targetRef = useNarrationTargetRef(assistantMessageId, lineTargets.map((target) => target.id));
   return (
-    <div className={cn('codex-md-code-line', active && 'codex-md-target-narrating')} ref={targetRef}>
+    <div className="codex-md-code-line" ref={targetRef}>
       <CodeLineText fallbackText={fallbackText} tokens={tokens} />
     </div>
   );

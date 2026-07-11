@@ -1,4 +1,4 @@
-import { memo, useMemo, type CSSProperties, type MouseEvent, type ReactNode } from 'react';
+import { memo, useMemo, type CSSProperties, type MouseEvent, type RefCallback } from 'react';
 
 import {
   cappedMarkdownLayoutDocumentHeight,
@@ -17,18 +17,14 @@ import { cn } from '@remux/viewer-kit/shadcn';
 import { openHostHref, openHostTarget } from '@remux/viewer-kit/links';
 import type { CodexNarrationSourceTarget } from '../../../../shared/narration';
 import { useNarrationTargetRef } from '../../../narration/targetRegistry';
+import { useNarrationTextLeafRegistration } from '../../../narration/textLeafRegistry';
 
 const fallbackMarkdownWidth = 868;
-
-export type MarkdownNarrationHighlight = {
-  targets: CodexNarrationSourceTarget[];
-};
 
 export function MarkdownBlock({
   children,
   density = 'default',
   narrationAssistantMessageId = null,
-  narrationHighlight,
   narrationTargets = [],
   maxLines,
   streaming = false,
@@ -38,7 +34,6 @@ export function MarkdownBlock({
   density?: MarkdownDensity;
   maxLines?: number;
   narrationAssistantMessageId?: string | null;
-  narrationHighlight?: MarkdownNarrationHighlight | null;
   narrationTargets?: CodexNarrationSourceTarget[];
   streaming?: boolean;
   width?: number;
@@ -66,7 +61,6 @@ export function MarkdownBlock({
         <MarkdownBlockNode
           assistantMessageId={narrationAssistantMessageId}
           block={block}
-          highlight={narrationHighlight}
           key={`${block.type}:${index}`}
           targets={narrationTargets}
         />
@@ -78,29 +72,25 @@ export function MarkdownBlock({
 const MarkdownBlockNode = memo(function MarkdownBlockNode({
   assistantMessageId,
   block,
-  highlight,
   targets,
 }: {
   assistantMessageId: string | null;
   block: MarkdownLayoutBlock;
-  highlight?: MarkdownNarrationHighlight | null;
   targets: CodexNarrationSourceTarget[];
 }) {
-  const blockTargets = targets.filter((target) => target.blockId === block.narrationId);
-  const activeTargets = highlight?.targets.filter((target) => target.blockId === block.narrationId) ?? [];
-  const active = activeTargets.length > 0;
+  const blockTargets = targets.filter((target) => target.blockId === block.narrationId && target.kind === 'block');
   const targetRef = useNarrationTargetRef(assistantMessageId, blockTargets.map((target) => target.id));
   return (
     <div
-      className={cn('codex-md-block-frame', active && 'codex-md-block-narrating')}
+      className="codex-md-block-frame"
       data-narration-block-id={block.narrationId}
       ref={targetRef}
       style={{ height: `${block.height}px` }}
     >
+      <div aria-hidden="true" className="codex-narration-paint-layer" hidden />
       <MarkdownBlockContent
         assistantMessageId={assistantMessageId}
         block={block}
-        highlight={highlight}
         targets={targets}
       />
     </div>
@@ -108,50 +98,36 @@ const MarkdownBlockNode = memo(function MarkdownBlockNode({
 }, (previous, next) => (
   previous.assistantMessageId === next.assistantMessageId &&
   previous.block === next.block &&
-  previous.targets === next.targets &&
-  activeTargetKey(previous.highlight, previous.block.narrationId) === activeTargetKey(next.highlight, next.block.narrationId)
+  previous.targets === next.targets
 ));
-
-function activeTargetKey(highlight: MarkdownNarrationHighlight | null | undefined, blockId: string) {
-  return highlight?.targets
-    .filter((target) => target.blockId === blockId)
-    .map((target) => target.id)
-    .join('\0') ?? '';
-}
 
 function MarkdownBlockContent({
   assistantMessageId,
   block,
-  highlight,
   targets,
 }: {
   assistantMessageId: string | null;
   block: MarkdownLayoutBlock;
-  highlight?: MarkdownNarrationHighlight | null;
   targets: CodexNarrationSourceTarget[];
 }) {
   const style = contentStyle(block);
-  const activeHighlight = highlight?.targets.filter((target): target is Extract<CodexNarrationSourceTarget, { kind: 'textRange' }> =>
-    target.blockId === block.narrationId && target.kind === 'textRange') ?? [];
-
   switch (block.type) {
     case 'paragraph':
       return (
-        <div className="codex-md-block codex-md-paragraph" style={style}>
-          <MarkdownTextLines highlights={activeHighlight} lineHeight={block.lineHeight} lines={block.lines} />
+        <div className="codex-md-block codex-md-paragraph" data-narration-surface="prose" style={style}>
+          <MarkdownTextLines assistantMessageId={assistantMessageId} blockId={block.narrationId} lineHeight={block.lineHeight} lines={block.lines} />
         </div>
       );
     case 'heading': {
       const HeadingTag = `h${block.depth}` as 'h1' | 'h2' | 'h3';
       return (
-        <HeadingTag className="codex-md-block codex-md-heading" data-depth={block.depth} style={style}>
-          <MarkdownTextLines highlights={activeHighlight} lineHeight={block.lineHeight} lines={block.lines} />
+        <HeadingTag className="codex-md-block codex-md-heading" data-depth={block.depth} data-narration-surface="prose" style={style}>
+          <MarkdownTextLines assistantMessageId={assistantMessageId} blockId={block.narrationId} lineHeight={block.lineHeight} lines={block.lines} />
         </HeadingTag>
       );
     }
     case 'code':
       return <CodeBlock
-        activeTargets={highlight?.targets ?? []}
         assistantMessageId={assistantMessageId}
         block={block}
         style={style}
@@ -161,7 +137,7 @@ function MarkdownBlockContent({
       return (
         <blockquote className="codex-md-block codex-md-blockquote" style={style}>
           {block.children.map((child, index) => (
-            <MarkdownBlockNode assistantMessageId={assistantMessageId} block={child} highlight={highlight} key={`${child.type}:${index}`} targets={targets} />
+            <MarkdownBlockNode assistantMessageId={assistantMessageId} block={child} key={`${child.type}:${index}`} targets={targets} />
           ))}
         </blockquote>
       );
@@ -181,7 +157,7 @@ function MarkdownBlockContent({
                 <span className="codex-md-list-marker">{item.marker}</span>
                 <div className="codex-md-list-content">
                   {item.blocks.map((child, childIndex) => (
-                    <MarkdownBlockNode assistantMessageId={assistantMessageId} block={child} highlight={highlight} key={`${child.type}:${childIndex}`} targets={targets} />
+                    <MarkdownBlockNode assistantMessageId={assistantMessageId} block={child} key={`${child.type}:${childIndex}`} targets={targets} />
                   ))}
                 </div>
               </div>
@@ -191,7 +167,6 @@ function MarkdownBlockContent({
       );
     case 'table':
       return <MarkdownTable
-        activeTargets={highlight?.targets ?? []}
         assistantMessageId={assistantMessageId}
         block={block}
         style={style}
@@ -203,13 +178,11 @@ function MarkdownBlockContent({
 }
 
 function MarkdownTable({
-  activeTargets,
   assistantMessageId,
   block,
   style,
   targets,
 }: {
-  activeTargets: CodexNarrationSourceTarget[];
   assistantMessageId: string | null;
   block: Extract<MarkdownLayoutBlock, { type: 'table' }>;
   style: CSSProperties;
@@ -221,6 +194,7 @@ function MarkdownTable({
     <div className="codex-md-block codex-md-table-scroll" style={style}>
       <div
         className="codex-md-table"
+        data-narration-surface="table"
         role="table"
         style={{
           height: `${block.contentHeight}px`,
@@ -240,7 +214,6 @@ function MarkdownTable({
           >
             {row.cells.map((cell, cellIndex) => (
               <MarkdownTableCell
-                activeTargets={activeTargets}
                 align={cell.align}
                 assistantMessageId={assistantMessageId}
                 blockId={block.narrationId}
@@ -261,7 +234,6 @@ function MarkdownTable({
 }
 
 function MarkdownTableCell({
-  activeTargets,
   align,
   assistantMessageId,
   blockId,
@@ -272,7 +244,6 @@ function MarkdownTableCell({
   row,
   targets,
 }: {
-  activeTargets: CodexNarrationSourceTarget[];
   align: string | null;
   assistantMessageId: string | null;
   blockId: string;
@@ -288,16 +259,17 @@ function MarkdownTableCell({
       (target.kind === 'tableCell' && target.row === row && target.column === column) ||
       (target.kind === 'tableRegion' && row >= target.rowStart && row <= target.rowEnd && column >= target.columnStart && column <= target.columnEnd)
     ));
-  const active = activeTargets.some((target) => cellTargets.some((candidate) => candidate.id === target.id));
   const targetRef = useNarrationTargetRef(assistantMessageId, cellTargets.map((target) => target.id));
   return (
     <div
-      className={cn('codex-md-table-cell', active && 'codex-md-target-narrating')}
+      className="codex-md-table-cell"
       data-align={align ?? 'left'}
+      data-narration-column={column}
+      data-narration-row={row}
       ref={targetRef}
       role={header ? 'columnheader' : 'cell'}
     >
-      <MarkdownTextLines highlights={[]} lineHeight={lineHeight} lines={lines} />
+      <MarkdownTextLines assistantMessageId={assistantMessageId} blockId={blockId} lineHeight={lineHeight} lines={lines} />
     </div>
   );
 }
@@ -310,11 +282,13 @@ function contentStyle(block: MarkdownLayoutBlock): CSSProperties {
 }
 
 function MarkdownTextLines({
-  highlights,
+  assistantMessageId,
+  blockId,
   lineHeight,
   lines,
 }: {
-  highlights: Extract<CodexNarrationSourceTarget, { kind: 'textRange' }>[];
+  assistantMessageId: string | null;
+  blockId: string;
   lineHeight: number;
   lines: Extract<MarkdownLayoutBlock, { type: 'paragraph' }>['lines'];
 }) {
@@ -328,8 +302,9 @@ function MarkdownTextLines({
         >
           {line.fragments.map((fragment, fragmentIndex) => (
             <MarkdownLineFragment
+              assistantMessageId={assistantMessageId}
+              blockId={blockId}
               fragment={fragment}
-              highlights={highlights}
               key={`${lineIndex}:${fragmentIndex}:${fragment.text}`}
             />
           ))}
@@ -340,28 +315,39 @@ function MarkdownTextLines({
 }
 
 function MarkdownLineFragment({
+  assistantMessageId,
+  blockId,
   fragment,
-  highlights,
 }: {
+  assistantMessageId: string | null;
+  blockId: string;
   fragment: MarkdownLayoutLineFragment;
-  highlights: Extract<CodexNarrationSourceTarget, { kind: 'textRange' }>[];
 }) {
-  if (!fragment.text) {
-    return null;
-  }
-
+  const registration = useNarrationTextLeafRegistration({
+    assistantMessageId,
+    blockId,
+    displayEnd: fragment.displayEnd,
+    displayStart: fragment.displayStart,
+    expectedText: fragment.text,
+  });
+  if (!fragment.text) return null;
   const style = fragment.gapBefore > 0 ? { marginLeft: `${fragment.gapBefore}px` } : undefined;
   const source = fragment.source;
-  const content = highlightedFragment(fragment, highlights);
 
   if (source.kind === 'fileLink' && source.file && source.href) {
-    return <FileLink file={source.file} href={source.href} style={style} text={content} />;
+    return <FileLink
+      file={source.file}
+      href={source.href}
+      style={style}
+      text={fragment.text}
+      textRef={registration.setTextElement}
+    />;
   }
 
   if (source.kind === 'code') {
     const code = (
-      <code className={inlineClassName(source)} style={style}>
-        {content}
+      <code className={inlineClassName(source)} ref={registration.setTextElement} style={style}>
+        {fragment.text}
       </code>
     );
 
@@ -378,8 +364,8 @@ function MarkdownLineFragment({
   if (source.href) {
     const href = source.href;
     return (
-      <a className={inlineClassName(source)} href={href} onClick={(event) => handleCodexLinkClick(event, href)} style={style}>
-        {content}
+      <a className={inlineClassName(source)} href={href} onClick={(event) => handleCodexLinkClick(event, href)} ref={registration.setTextElement} style={style}>
+        {fragment.text}
       </a>
     );
   }
@@ -387,40 +373,9 @@ function MarkdownLineFragment({
   const Tag = source.strong ? 'strong' : source.emphasis ? 'em' : 'span';
 
   return (
-    <Tag className={inlineClassName(source)} style={style}>
-      {content}
+    <Tag className={inlineClassName(source)} ref={registration.setTextElement} style={style}>
+      {fragment.text}
     </Tag>
-  );
-}
-
-function highlightedFragment(
-  fragment: MarkdownLayoutLineFragment,
-  highlights: Extract<CodexNarrationSourceTarget, { kind: 'textRange' }>[],
-) {
-  const ranges = highlights
-    .map((highlight) => ({
-      end: Math.min(fragment.text.length, highlight.displayEnd - fragment.displayStart),
-      start: Math.max(0, highlight.displayStart - fragment.displayStart),
-    }))
-    .filter((range) => range.end > range.start)
-    .sort((left, right) => left.start - right.start);
-  if (ranges.length === 0) return fragment.text;
-  const merged = ranges.reduce<Array<{ end: number; start: number }>>((output, range) => {
-    const previous = output.at(-1);
-    if (previous && range.start <= previous.end) previous.end = Math.max(previous.end, range.end);
-    else output.push({ ...range });
-    return output;
-  }, []);
-  const content: ReactNode[] = [];
-  let cursor = 0;
-  merged.forEach((range, index) => {
-    if (range.start > cursor) content.push(fragment.text.slice(cursor, range.start));
-    content.push(<span className="codex-md-narrated-word" key={`${index}:${range.start}`}>{fragment.text.slice(range.start, range.end)}</span>);
-    cursor = range.end;
-  });
-  if (cursor < fragment.text.length) content.push(fragment.text.slice(cursor));
-  return (
-    <>{content}</>
   );
 }
 
@@ -439,11 +394,13 @@ function FileLink({
   href,
   style,
   text,
+  textRef,
 }: {
   file: MarkdownFileLink;
   href: string;
   style?: CSSProperties;
-  text?: ReactNode;
+  text: string;
+  textRef: RefCallback<HTMLElement>;
 }) {
   const title = file.line ? `${file.path}:${file.line}` : file.path;
   const linkStyle = {
@@ -466,7 +423,7 @@ function FileLink({
       <span className="codex-md-file-icon-frame">
         <FileLinkIcon file={file} />
       </span>
-      <span className="codex-md-file-link-name">{text ?? file.displayName}</span>
+      <span className="codex-md-file-link-name" ref={textRef}>{text}</span>
     </a>
   );
 }

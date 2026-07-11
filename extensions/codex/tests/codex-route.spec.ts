@@ -557,7 +557,7 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
                 origin: 'deterministic',
                 spokenEnd: Math.min(4, block.displayText?.length ?? 0),
                 spokenStart: 0,
-                start: semanticTarget ? index : index + 0.1,
+                start: index + 0.1,
                 targetIds: [activeTarget?.id ?? block.targetIds?.[0]],
                 unitId: `unit:${block.id ?? `md:${index}`}`,
               };
@@ -1418,7 +1418,8 @@ test.describe('codex viewer route', () => {
     await expect(composer.getByRole('button', { name: 'Close narration' })).toBeVisible();
     await expect(composer.getByRole('button', { name: 'Attach' })).toHaveCount(0);
     await expect(composer.getByRole('button', { name: 'Send message' })).toHaveCount(0);
-    await expect(markdown.locator('[data-narration-block-id="md:0"]')).toHaveClass(/codex-md-block-narrating/);
+    await expect(markdown.locator('[data-narration-block-id="md:0"]')).not.toHaveClass(/codex-md-structural-target-narrating/);
+    await expect(markdown.locator('[data-narration-block-id="md:0"] .codex-narration-context-rect')).toBeVisible();
     expect(await markdown.evaluate((element) => element.getBoundingClientRect().height)).toBe(heightBeforeNarration);
 
     await page.locator('.remux-transcript-viewport').dispatchEvent('wheel');
@@ -1427,16 +1428,16 @@ test.describe('codex viewer route', () => {
     await expect(composer.getByRole('button', { name: 'Disable narration auto-scroll' })).toBeVisible();
 
     await composer.getByRole('button', { name: 'Next narrated block' }).click();
-    await expect(markdown.locator('[data-narration-block-id="md:1"]')).toHaveClass(/codex-md-block-narrating/);
     await expect(composer.getByRole('button', { name: 'Previous narrated block' })).toBeEnabled();
     await composer.getByRole('button', { name: 'Previous narrated block' }).click();
-    await expect(markdown.locator('[data-narration-block-id="md:0"]')).toHaveClass(/codex-md-block-narrating/);
 
     await composer.getByRole('button', { name: 'Play narration' }).click();
     await expect(composer.getByRole('button', { name: 'Pause narration' })).toBeVisible();
-    await expect(markdown.locator('.codex-md-narrated-word')).toBeVisible();
+    await expect(markdown.locator('.codex-narration-word-rect')).toBeVisible();
+    await expect(markdown.locator('.codex-md-narrated-word')).toHaveCount(0);
     expect(await markdown.evaluate((element) => element.getBoundingClientRect().height)).toBe(heightBeforeNarration);
     await composer.getByRole('button', { name: 'Pause narration' }).click();
+    await expect(markdown.locator('.codex-narration-word-rect')).toBeVisible();
 
     await composer.getByRole('button', { name: 'Narration speed 1×' }).click();
     await expect(page.getByRole('menuitemradio')).toHaveCount(5);
@@ -1444,6 +1445,9 @@ test.describe('codex viewer route', () => {
     await expect(composer.getByRole('button', { name: 'Narration speed 1.5×' })).toBeVisible();
 
     await composer.getByRole('button', { name: 'Close narration' }).click();
+    await expect(markdown.locator('.codex-narration-paint-layer:not([hidden])')).toHaveCount(0);
+    await expect(markdown.locator('.codex-narration-paint-layer').locator('div')).toHaveCount(0);
+    await expect(markdown.locator('.codex-md-structural-target-narrating')).toHaveCount(0);
     await expect(composer.getByRole('button', { name: 'Preferences' })).toBeVisible();
     await expect(composer.getByRole('button', { name: 'Attach' })).toBeVisible();
     await expect(composer.getByRole('button', { name: 'Send message' })).toBeVisible();
@@ -1469,6 +1473,93 @@ test.describe('codex viewer route', () => {
     await expect.poll(() => capturedHostMethods(page)).toContain('remux/codex/narration/cancel');
   });
 
+  test('paints word ranges through nested Markdown leaves without changing layout', async ({ page }) => {
+    await installMockRemuxHost(page, {
+      turns: [completedTurn({
+        assistantText: [
+          '***Nested*** emphasis.',
+          '[Linked](https://example.com) text.',
+          '`inlineCode` value.',
+        ].join('\n\n'),
+      })],
+    });
+
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    const markdown = page.locator('[data-row-kind="assistantMessage"] .codex-markdown');
+    const height = await markdown.evaluate((element) => element.getBoundingClientRect().height);
+    await page.getByRole('button', { name: 'Narrate response' }).click();
+    const composer = page.locator('[data-remux-composer-root]');
+
+    const expectedWords = ['Nested', 'Linked', 'inlineCode'];
+    for (const [index, expected] of expectedWords.entries()) {
+      await composer.getByRole('button', { name: 'Play narration' }).click();
+      const activeFrame = markdown.locator(`[data-narration-block-id="md:${index}"]`);
+      await expect(activeFrame.locator('.codex-narration-word-rect')).toBeVisible();
+      await expect(activeFrame.locator('.codex-narration-context-rect')).toBeVisible();
+      const wordGeometry = await activeFrame.evaluate((frame, expectedWord) => {
+        const walker = document.createTreeWalker(frame, NodeFilter.SHOW_TEXT);
+        let textNode = walker.nextNode();
+        while (textNode && !textNode.textContent?.includes(expectedWord)) {
+          textNode = walker.nextNode();
+        }
+        const wordStart = textNode?.textContent?.indexOf(expectedWord) ?? -1;
+        const overlay = frame.querySelector<HTMLElement>('.codex-narration-word-rect');
+        if (!textNode || wordStart < 0 || !overlay) return null;
+        const expectedRange = document.createRange();
+        expectedRange.setStart(textNode, wordStart);
+        expectedRange.setEnd(textNode, wordStart + expectedWord.length);
+        const expectedRect = expectedRange.getBoundingClientRect();
+        const overlayRect = overlay.getBoundingClientRect();
+        return {
+          leftDelta: Math.abs(overlayRect.left - expectedRect.left),
+          widthDelta: Math.abs(overlayRect.width - expectedRect.width),
+        };
+      }, expected);
+      expect(wordGeometry).not.toBeNull();
+      expect(wordGeometry!.leftDelta).toBeLessThan(0.5);
+      expect(wordGeometry!.widthDelta).toBeLessThan(0.5);
+      await expect(markdown.locator('.codex-narration-paint-layer:not([hidden])')).toHaveCount(1);
+      for (let previous = 0; previous < index; previous += 1) {
+        const previousLayer = markdown.locator(`[data-narration-block-id="md:${previous}"] .codex-narration-paint-layer`);
+        await expect(previousLayer).toHaveAttribute('hidden', '');
+        await expect(previousLayer.locator('div')).toHaveCount(0);
+      }
+      await composer.getByRole('button', { name: 'Pause narration' }).click();
+      if (expected !== expectedWords.at(-1)) {
+        await composer.getByRole('button', { name: 'Next narrated block' }).click();
+      }
+    }
+
+    expect(await markdown.evaluate((element) => element.getBoundingClientRect().height)).toBe(height);
+    await expect(markdown.locator('.codex-md-narrated-word')).toHaveCount(0);
+    await expect(markdown.locator('.codex-md-file-link-narrating')).toHaveCount(0);
+  });
+
+  test('paints file-link text through the block overlay without activating the chip', async ({ page }) => {
+    await installMockRemuxHost(page, {
+      turns: [completedTurn({ assistantText: '[app.ts](src/app.ts) file.' })],
+    });
+
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    const markdown = page.locator('[data-row-kind="assistantMessage"] .codex-markdown');
+    const initialHeight = await markdown.evaluate((element) => element.getBoundingClientRect().height);
+    await page.getByRole('button', { name: 'Narrate response' }).click();
+    await page.locator('[data-remux-composer-root]').getByRole('button', { name: 'Play narration' }).click();
+
+    const word = markdown.locator('.codex-narration-word-rect');
+    const chipText = markdown.locator('.codex-md-file-link-name');
+    await expect(word).toBeVisible();
+    await expect(markdown.locator('.codex-md-file-link-narrating')).toHaveCount(0);
+    expect(await word.evaluate((element, textSelector) => {
+      const text = document.querySelector<HTMLElement>(textSelector)!;
+      const wordRect = element.getBoundingClientRect();
+      const textRect = text.getBoundingClientRect();
+      return Math.min(wordRect.right, textRect.right) > Math.max(wordRect.left, textRect.left)
+        && Math.min(wordRect.bottom, textRect.bottom) > Math.max(wordRect.top, textRect.top);
+    }, '.codex-md-file-link-name')).toBe(true);
+    expect(await markdown.evaluate((element) => element.getBoundingClientRect().height)).toBe(initialHeight);
+  });
+
   test('positions explicitly selected narration blocks in the reading band', async ({ page }) => {
     const paragraph = (label: string) => `${label} ${'reading position content '.repeat(56)}`;
     await installMockRemuxHost(page, {
@@ -1490,7 +1581,7 @@ test.describe('codex viewer route', () => {
     await composer.getByRole('button', { name: 'Next narrated block' }).click();
     await composer.getByRole('button', { name: 'Next narrated block' }).click();
     const target = page.locator('[data-narration-block-id="md:2"]');
-    await expect(target).toHaveClass(/codex-md-block-narrating/);
+    await expect(target).toBeVisible();
 
     const readingPosition = () => page.evaluate(() => {
       const viewport = document.querySelector<HTMLElement>('.remux-transcript-viewport');
@@ -1503,6 +1594,62 @@ test.describe('codex viewer route', () => {
     });
     await expect.poll(readingPosition).toBeLessThan(0.38);
     expect(await readingPosition()).toBeGreaterThan(0.22);
+  });
+
+  test('keeps playing Previous block navigation monotonic until explicit focus settles', async ({ page }) => {
+    const paragraph = (label: string) => `${label} ${'navigation trajectory content '.repeat(72)}`;
+    await installMockRemuxHost(page, {
+      turns: [completedTurn({
+        assistantText: [
+          paragraph('First.'),
+          paragraph('Second.'),
+          paragraph('Third.'),
+          paragraph('Fourth.'),
+        ].join('\n\n'),
+      })],
+    });
+
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    await page.getByRole('button', { name: 'Narrate response' }).click();
+    const composer = page.locator('[data-remux-composer-root]');
+    const markdown = page.locator('[data-row-kind="assistantMessage"] .codex-markdown');
+    await composer.getByRole('button', { name: 'Next narrated block' }).click();
+    await expect(markdown.locator('[data-narration-block-id="md:1"] .codex-narration-word-rect')).toBeVisible();
+    await composer.getByRole('button', { name: 'Next narrated block' }).click();
+    await expect(markdown.locator('[data-narration-block-id="md:2"] .codex-narration-word-rect')).toBeVisible();
+    await composer.getByRole('button', { name: 'Play narration' }).click();
+    await expect(composer.getByRole('button', { name: 'Pause narration' })).toBeVisible();
+
+    await page.evaluate(() => {
+      const viewport = document.querySelector<HTMLElement>('.remux-transcript-viewport')!;
+      const state = globalThis as typeof globalThis & { __narrationScrollSamples?: number[] };
+      state.__narrationScrollSamples = [viewport.scrollTop];
+      const startedAt = performance.now();
+      const sample = () => {
+        state.__narrationScrollSamples?.push(viewport.scrollTop);
+        if (performance.now() - startedAt < 360) requestAnimationFrame(sample);
+      };
+      requestAnimationFrame(sample);
+    });
+    await composer.getByRole('button', { name: 'Previous narrated block' }).click();
+    const destination = markdown.locator('[data-narration-block-id="md:1"]');
+    await expect(destination.locator('.codex-narration-word-rect')).toBeVisible();
+    await page.waitForTimeout(400);
+
+    const samples = await page.evaluate(() => {
+      const state = globalThis as typeof globalThis & { __narrationScrollSamples?: number[] };
+      const captured = state.__narrationScrollSamples ?? [];
+      delete state.__narrationScrollSamples;
+      return captured;
+    });
+    expect(samples.length).toBeGreaterThan(3);
+    expect(samples.at(-1)!).toBeLessThan(samples[0] - 10);
+    const largestDownwardCorrection = samples.slice(1).reduce(
+      (largest, value, index) => Math.max(largest, value - samples[index]),
+      0,
+    );
+    expect(largestDownwardCorrection).toBeLessThanOrEqual(1.5);
+    await expect(composer.getByRole('button', { name: 'Pause narration' })).toBeVisible();
   });
 
   test('resolves semantic narration cues to table cells without changing layout', async ({ page }) => {
@@ -1519,8 +1666,31 @@ test.describe('codex viewer route', () => {
     const startRequest = (await capturedHostRequests(page)).find((request) => request.method === 'remux/codex/narration/start');
     const sourceTargets = (startRequest?.params as { document?: { targets?: Array<{ kind?: string }> } })?.document?.targets ?? [];
     expect(sourceTargets.some((target) => target.kind === 'tableCell')).toBe(true);
+    await expect(markdown.locator('.codex-md-table')).toHaveClass(/codex-md-structural-target-narrating/);
+    await expect(markdown.locator('.codex-md-table-scroll')).not.toHaveClass(/codex-md-structural-target-narrating/);
     await page.locator('[data-remux-composer-root]').getByRole('button', { name: 'Play narration' }).click();
-    await expect(markdown.locator('.codex-md-table-cell.codex-md-target-narrating')).toBeVisible();
+    await expect(markdown.locator('.codex-md-table-cell.codex-md-table-cell-narrating')).toBeVisible();
+    await expect(markdown.locator('.codex-md-table')).not.toHaveClass(/codex-md-structural-target-narrating/);
+    expect(await markdown.evaluate((element) => element.getBoundingClientRect().height)).toBe(initialHeight);
+  });
+
+  test('anchors whole-code narration paint to the code border', async ({ page }) => {
+    await installMockRemuxHost(page, {
+      turns: [completedTurn({
+        assistantText: ['```ts', 'const answer = 42;', '```'].join('\n'),
+      })],
+    });
+
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    const markdown = page.locator('[data-row-kind="assistantMessage"] .codex-markdown');
+    const initialHeight = await markdown.evaluate((element) => element.getBoundingClientRect().height);
+    await page.getByRole('button', { name: 'Narrate response' }).click();
+
+    await expect(markdown.locator('.codex-md-code-block')).toHaveClass(/codex-md-structural-target-narrating/);
+    await expect(markdown.locator('[data-narration-block-id="md:0"]')).not.toHaveClass(/codex-md-structural-target-narrating/);
+    await page.locator('[data-remux-composer-root]').getByRole('button', { name: 'Play narration' }).click();
+    await expect(markdown.locator('.codex-md-code-line.codex-md-code-line-narrating')).toBeVisible();
+    await expect(markdown.locator('.codex-md-code-block')).not.toHaveClass(/codex-md-structural-target-narrating/);
     expect(await markdown.evaluate((element) => element.getBoundingClientRect().height)).toBe(initialHeight);
   });
 
@@ -1541,8 +1711,12 @@ test.describe('codex viewer route', () => {
     await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
     await page.getByRole('button', { name: 'Narrate response' }).click();
     await page.locator('[data-remux-composer-root]').getByRole('button', { name: 'Play narration' }).click();
-    const second = page.locator('[data-narration-block-id="md:1"]');
-    await expect(second).toHaveClass(/codex-md-block-narrating/, { timeout: 3_000 });
+    const markdown = page.locator('[data-row-kind="assistantMessage"] .codex-markdown');
+    const second = markdown.locator('[data-narration-block-id="md:1"]');
+    await expect(second.locator('.codex-narration-word-rect')).toBeVisible({ timeout: 3_000 });
+    const firstLayer = markdown.locator('[data-narration-block-id="md:0"] .codex-narration-paint-layer');
+    await expect(firstLayer).toHaveAttribute('hidden', '');
+    await expect(firstLayer.locator('div')).toHaveCount(0);
     const readingPosition = () => page.evaluate(() => {
       const viewport = document.querySelector<HTMLElement>('.remux-transcript-viewport')!;
       const composerRoot = document.querySelector<HTMLElement>('[data-remux-composer-root]')!;

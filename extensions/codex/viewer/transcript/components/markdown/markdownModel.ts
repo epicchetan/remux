@@ -75,6 +75,7 @@ export type PreparedMarkdownInlineLine = {
   displayLength: number;
   inlines: MarkdownInline[];
   itemStarts: number[];
+  itemTexts: string[];
   prepared: PreparedRichInline | null;
   sources: MarkdownInlineSource[];
 };
@@ -909,15 +910,19 @@ function layoutInlineLines(lines: PreparedMarkdownInlineLine[], width: number) {
     }
 
     let emitted = false;
-    const itemConsumed = line.itemStarts.map(() => 0);
+    const itemSourceCursors = line.itemStarts.map(() => 0);
     walkRichInlineLineRanges(line.prepared, Math.max(1, width), (range) => {
       const materialized = materializeRichInlineLineRange(line.prepared!, range);
       emitted = true;
       laidOutLines.push({
         fragments: materialized.fragments.map((fragment) => {
           const itemIndex = fragment.itemIndex;
-          const displayStart = logicalLineStart + (line.itemStarts[itemIndex] ?? 0) + (itemConsumed[itemIndex] ?? 0);
-          itemConsumed[itemIndex] = (itemConsumed[itemIndex] ?? 0) + fragment.text.length;
+          const itemText = line.itemTexts[itemIndex] ?? '';
+          const sourceCursor = itemSourceCursors[itemIndex] ?? 0;
+          const locatedStart = itemText.indexOf(fragment.text, sourceCursor);
+          const fragmentStart = locatedStart >= sourceCursor ? locatedStart : sourceCursor;
+          const displayStart = logicalLineStart + (line.itemStarts[itemIndex] ?? 0) + fragmentStart;
+          itemSourceCursors[itemIndex] = fragmentStart + fragment.text.length;
           return {
             displayEnd: displayStart + fragment.text.length,
             displayStart,
@@ -1088,6 +1093,7 @@ function prepareInlineLine(
     displayLength,
     inlines,
     itemStarts,
+    itemTexts: items.map((item) => item.text),
     prepared: items.length > 0 ? prepareRichInline(items) : null,
     sources,
   };
