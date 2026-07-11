@@ -8,6 +8,8 @@
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
+use sha1::{Digest, Sha1};
+
 use crate::cli::systemd;
 
 pub fn run(root: &Path) -> Result<i32, String> {
@@ -30,6 +32,7 @@ pub fn run(root: &Path) -> Result<i32, String> {
             None => println!("skipped {binary}: not found on PATH"),
         }
     }
+    install_codex_skill(root)?;
 
     let unit_changed = write_unit()?;
     if unit_changed {
@@ -52,6 +55,67 @@ pub fn run(root: &Path) -> Result<i32, String> {
     }
 
     Ok(0)
+}
+
+fn install_codex_skill(root: &Path) -> Result<(), String> {
+    let source = root.join("deploy/codex/skills/remux-workloads");
+    if !source.join("SKILL.md").is_file() {
+        println!("skipped remux-workloads skill: source is missing");
+        return Ok(());
+    }
+    let home = systemd::home_dir()?;
+    let skills = home.join(".agents/skills");
+    let destination = skills.join("remux-workloads");
+    let marker = skills.join(".remux-workloads.sha1");
+    ensure_dir(&skills)?;
+    let source_hash = skill_hash(&source)?;
+
+    if destination.exists() {
+        let installed_hash = skill_hash(&destination)?;
+        let managed_hash = std::fs::read_to_string(&marker).ok();
+        if managed_hash.as_deref().map(str::trim) != Some(installed_hash.as_str()) {
+            println!(
+                "warn preserved user-modified skill at {}; managed source differs",
+                destination.display()
+            );
+            return Ok(());
+        }
+        if installed_hash == source_hash {
+            println!("unchanged skill: {}", destination.display());
+            return Ok(());
+        }
+        std::fs::remove_dir_all(&destination)
+            .map_err(|error| format!("{}: {error}", destination.display()))?;
+    }
+
+    copy_skill(&source, &destination)?;
+    std::fs::write(&marker, format!("{source_hash}\n"))
+        .map_err(|error| format!("{}: {error}", marker.display()))?;
+    println!("installed skill: {}", destination.display());
+    Ok(())
+}
+
+fn copy_skill(source: &Path, destination: &Path) -> Result<(), String> {
+    ensure_dir(&destination.join("agents"))?;
+    for relative in ["SKILL.md", "agents/openai.yaml"] {
+        let from = source.join(relative);
+        let to = destination.join(relative);
+        std::fs::copy(&from, &to)
+            .map_err(|error| format!("{} -> {}: {error}", from.display(), to.display()))?;
+    }
+    Ok(())
+}
+
+fn skill_hash(path: &Path) -> Result<String, String> {
+    let mut digest = Sha1::new();
+    for relative in ["SKILL.md", "agents/openai.yaml"] {
+        let file = path.join(relative);
+        let bytes = std::fs::read(&file).map_err(|error| format!("{}: {error}", file.display()))?;
+        digest.update(relative.as_bytes());
+        digest.update([0]);
+        digest.update(bytes);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn release_binary(root: &Path) -> PathBuf {
@@ -112,30 +176,32 @@ fn is_dangling(link: &Path) -> bool {
 }
 
 fn write_unit() -> Result<bool, String> {
-    let path = systemd::unit_path()?;
-    if let Some(parent) = path.parent() {
-        ensure_dir(parent)?;
+    let mut changed = false;
+    for (name, embedded) in systemd::embedded_static_units() {
+        let path = systemd::unit_path_for(name)?;
+        if let Some(parent) = path.parent() {
+            ensure_dir(parent)?;
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(existing) if existing == embedded => {
+                println!("unchanged unit: {}", path.display());
+            }
+            Ok(_) => {
+                std::fs::write(&path, embedded)
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+                println!("updated unit: {}", path.display());
+                changed = true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::write(&path, embedded)
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+                println!("created unit: {}", path.display());
+                changed = true;
+            }
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        }
     }
-    let embedded = systemd::embedded_unit();
-    match std::fs::read_to_string(&path) {
-        Ok(existing) if existing == embedded => {
-            println!("unchanged unit: {}", path.display());
-            Ok(false)
-        }
-        Ok(_) => {
-            std::fs::write(&path, embedded)
-                .map_err(|error| format!("{}: {error}", path.display()))?;
-            println!("updated unit: {}", path.display());
-            Ok(true)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::write(&path, embedded)
-                .map_err(|error| format!("{}: {error}", path.display()))?;
-            println!("created unit: {}", path.display());
-            Ok(true)
-        }
-        Err(error) => Err(format!("{}: {error}", path.display())),
-    }
+    Ok(changed)
 }
 
 fn run_or_print(program: &str, args: &[&str]) {

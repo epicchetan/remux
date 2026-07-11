@@ -836,8 +836,27 @@ fn run_kokoro_worker(
     if !worker.is_file() {
         return Err(format!("Kokoro worker is missing at {}", worker.display()));
     }
-    let mut child = Command::new(&python)
-        .arg(&worker)
+    let mut command = if let Ok(wrapper) = std::env::var("REMUX_WORKLOAD_EXEC") {
+        let mut command = Command::new(wrapper);
+        command.args([
+            "workload",
+            "exec",
+            "--workload",
+            "narration",
+            "--operation",
+            &format!("narration:{artifact_key}"),
+            "--threads",
+            "7",
+            "--",
+        ]);
+        command.arg(&python).arg(&worker);
+        command
+    } else {
+        let mut command = Command::new(&python);
+        command.arg(&worker);
+        command
+    };
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

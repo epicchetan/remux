@@ -1,9 +1,8 @@
 import type { CodexModelsReadResponse } from '../../shared/composerConfig';
-import { requestIpc } from '@remux/viewer-kit/ipc';
-import { rpcPolicies } from '@remux/viewer-kit/rpc-policy';
+import { rpc } from '@remux/viewer-kit/ipc';
 
 export const modelsReadMethod = 'remux/codex/models/read';
 
 export function readModels() {
-  return requestIpc<CodexModelsReadResponse>(rpcPolicies['codex-models-read']);
+  return rpc.query<CodexModelsReadResponse>(modelsReadMethod);
 }

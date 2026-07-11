@@ -10,6 +10,7 @@ pub mod logs;
 pub mod root;
 pub mod status;
 pub mod systemd;
+pub mod workload;
 
 use std::path::PathBuf;
 
@@ -67,6 +68,39 @@ pub enum Command {
     Install,
     /// Print the bearer token used for pairing.
     Token,
+    /// Run a declared extension workload in its managed resource scope.
+    Workload {
+        #[command(subcommand)]
+        command: WorkloadCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkloadCommand {
+    /// Print resource capacity available to extension workloads.
+    Capacity,
+    /// List active and recently completed workload scopes.
+    Status {
+        #[arg(long)]
+        extension: Option<String>,
+    },
+    /// Freeze a running workload operation.
+    Pause { operation: String },
+    /// Thaw a frozen workload operation.
+    Resume { operation: String },
+    /// Stop a workload operation and its descendants.
+    Stop { operation: String },
+    /// Replace this process with a command in a declared workload scope.
+    Exec {
+        #[arg(long)]
+        workload: String,
+        #[arg(long)]
+        operation: String,
+        #[arg(long)]
+        threads: Option<usize>,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
 }
 
 pub fn run(cli: Cli) -> i32 {
@@ -120,6 +154,19 @@ fn run_inner(cli: Cli) -> Result<i32, String> {
             println!("{token}");
             Ok(0)
         }
+        Command::Workload { command } => match command {
+            WorkloadCommand::Capacity => workload::capacity(),
+            WorkloadCommand::Status { extension } => workload::status(extension.as_deref()),
+            WorkloadCommand::Pause { operation } => workload::control(&operation, "freeze"),
+            WorkloadCommand::Resume { operation } => workload::control(&operation, "thaw"),
+            WorkloadCommand::Stop { operation } => workload::control(&operation, "stop"),
+            WorkloadCommand::Exec {
+                workload,
+                operation,
+                threads,
+                command,
+            } => workload::exec(&workload, &operation, threads, &command),
+        },
     }
 }
 

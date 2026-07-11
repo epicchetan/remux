@@ -32,21 +32,21 @@ type FilesStore = {
   expandedPaths: Record<string, boolean>;
   isRefreshingAll: boolean;
   refreshError: string | null;
-  applyFsDidChange: (request: RemuxConnection['request'], params: RemuxFsDidChangeParams) => void;
-  loadDirectory: (request: RemuxConnection['request'], path?: string | null) => Promise<void>;
-  loadRootDirectory: (request: RemuxConnection['request']) => Promise<void>;
+  applyFsDidChange: (request: RemuxConnection['query'], params: RemuxFsDidChangeParams) => void;
+  loadDirectory: (request: RemuxConnection['query'], path?: string | null) => Promise<void>;
+  loadRootDirectory: (request: RemuxConnection['query']) => Promise<void>;
   navigateToDirectory: (
-    request: RemuxConnection['request'],
+    request: RemuxConnection['query'],
     path: string,
     parentPath: string | null,
   ) => Promise<void>;
-  navigateToParentDirectory: (request: RemuxConnection['request']) => Promise<void>;
-  preloadDirectories: (request: RemuxConnection['request'], paths: string[]) => Promise<void>;
+  navigateToParentDirectory: (request: RemuxConnection['query']) => Promise<void>;
+  preloadDirectories: (request: RemuxConnection['query'], paths: string[]) => Promise<void>;
   refreshVisibleDirectories: (
-    request: RemuxConnection['request'],
+    request: RemuxConnection['query'],
     options?: { spinner?: boolean },
   ) => Promise<void>;
-  toggleFolder: (request: RemuxConnection['request'], path: string) => Promise<void>;
+  toggleFolder: (request: RemuxConnection['query'], path: string) => Promise<void>;
 };
 
 export const filesRootKey = '__root__';
@@ -429,7 +429,7 @@ function scheduleDirtyPathsRefresh({
 }: {
   get: () => FilesStore;
   paths: string[];
-  request: RemuxConnection['request'];
+  request: RemuxConnection['query'];
   set: SetFilesStore;
 }) {
   for (const path of paths) {
@@ -484,7 +484,7 @@ async function refreshDirectoryPaths({
 }: {
   get: () => FilesStore;
   paths: string[];
-  request: RemuxConnection['request'];
+  request: RemuxConnection['query'];
   set: SetFilesStore;
 }): Promise<{ failedCount: number; requestedCount: number }> {
   const refreshablePaths = Array.from(new Set(paths)).filter((path) => {

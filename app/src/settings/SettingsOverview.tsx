@@ -92,14 +92,14 @@ export function SettingsOverview() {
     setExtensionStatusLoading(true);
     setExtensionStatusError(null);
     try {
-      const statuses = await readExtensionServerStatuses(connection.request);
+      const statuses = await readExtensionServerStatuses(connection.query);
       setExtensionStatuses(Object.fromEntries(statuses.map((status) => [status.extensionId, status])));
     } catch (error) {
       setExtensionStatusError(error instanceof Error ? error.message : String(error));
     } finally {
       setExtensionStatusLoading(false);
     }
-  }, [connection.request, connection.status.type]);
+  }, [connection.query, connection.status.type]);
 
   useEffect(() => {
     void refreshServerStatuses();
@@ -114,7 +114,7 @@ export function SettingsOverview() {
       return;
     }
     try {
-      const next = await readCodexAppServerStatus(connection.request);
+      const next = await readCodexAppServerStatus(connection.query);
       setCodexAppServerStatus((current) => (
         codexAppServerStatusesEqual(current, next) ? current : next
       ));
@@ -124,7 +124,7 @@ export function SettingsOverview() {
       }
       setCodexAppServerStatus(null);
     }
-  }, [connection.request, connection.status.type, detailExtensionId, extensionStatuses.codex?.running]);
+  }, [connection.query, connection.status.type, detailExtensionId, extensionStatuses.codex?.running]);
 
   useEffect(() => {
     // Warm the facet once when Codex becomes available so opening the sheet
@@ -142,6 +142,23 @@ export function SettingsOverview() {
   // Live states: merge `didChangeStatus` broadcasts so crash → backingOff →
   // running is visible without a manual refresh.
   useEffect(() => connection.subscribe((message) => {
+    if (message.method === 'remux/jobs/didChange' && isRecord(message.params)) {
+      const state = message.params.state;
+      if (state === 'completed' || state === 'failed') {
+        void refreshServerStatuses();
+        const operationId = typeof message.params.operationId === 'string'
+          ? message.params.operationId
+          : '';
+        if (operationId.startsWith('codex-app-server:')) {
+          void refreshCodexAppServerStatus();
+        }
+        const extensionMatch = /^extension:([^:]+):/.exec(operationId);
+        if (state === 'completed' && extensionMatch) {
+          reloadExtensionTabs(extensionMatch[1]!);
+        }
+      }
+      return;
+    }
     if (message.method !== extensionDidChangeStatusMethod) {
       return;
     }
@@ -153,7 +170,7 @@ export function SettingsOverview() {
       ...current,
       [status.extensionId]: status,
     }));
-  }), [connection]);
+  }), [connection, refreshCodexAppServerStatus, refreshServerStatuses, reloadExtensionTabs]);
 
   const runDetailAction = async (extensionId: string, action: ExtensionDetailAction) => {
     setExtensionStatusError(null);
@@ -161,35 +178,16 @@ export function SettingsOverview() {
     try {
       if (action.startsWith('app-server-')) {
         const appAction = action.slice('app-server-'.length) as 'start' | 'stop' | 'restart' | 'update';
-        setCodexAppServerStatus(await runCodexAppServerAction(connection.request, appAction));
-        if (appAction === 'start' || appAction === 'restart') {
-          reloadExtensionTabs(extensionId);
-        }
+        await runCodexAppServerAction(connection.startJob, appAction);
         return;
       }
-      const status = action === 'watch-start' || action === 'watch-stop'
-        ? await setExtensionWatchRunning(connection.request, extensionId, action === 'watch-start')
+      await (action === 'watch-start' || action === 'watch-stop'
+        ? await setExtensionWatchRunning(connection.startJob, extensionId, action === 'watch-start')
         : action === 'server-build' || action === 'views-build'
-          ? await buildExtension(connection.request, extensionId, action === 'server-build' ? 'server' : 'views')
+          ? await buildExtension(connection.startJob, extensionId, action === 'server-build' ? 'server' : 'views')
           : action === 'restart'
-            ? await restartExtensionServer(connection.request, extensionId)
-            : await setExtensionServerRunning(connection.request, extensionId, action === 'start');
-      setExtensionStatuses((current) => ({
-        ...current,
-        [extensionId]: status,
-      }));
-      // Stopping the watcher changes nothing on disk; everything else may
-      // have rewritten the served bundle or restarted the server. A viewer
-      // build rewrites the bundle even when no server runs.
-      if (
-        action === 'views-build'
-        || ((action === 'start' || action === 'restart' || action === 'watch-start') && status.running)
-      ) {
-        reloadExtensionTabs(extensionId);
-      }
-      if (extensionId === 'codex' && (action === 'start' || action === 'restart')) {
-        await refreshCodexAppServerStatus();
-      }
+            ? await restartExtensionServer(connection.startJob, extensionId)
+            : await setExtensionServerRunning(connection.startJob, extensionId, action === 'start'));
     } catch (error) {
       setExtensionStatusError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -377,7 +375,7 @@ const ConnectionSection = memo(function ConnectionSection() {
     setActionError(null);
     setRestartingRemux(true);
     try {
-      const result = await restartRemuxCli(connection.request);
+      const result = await restartRemuxCli(connection.command);
       if (!result.restartable) {
         throw new Error('Remux CLI restart is unavailable');
       }
@@ -459,12 +457,12 @@ function useSystemResources(connection: RemuxConnection) {
     let subscribed = false;
     void (async () => {
       try {
-        const snapshot = await readSystemResources(connection.request);
+        const snapshot = await readSystemResources(connection.query);
         if (cancelled || !snapshot) {
           return; // Unsupported runtime — leave the section hidden.
         }
         setSample(snapshot);
-        await subscribeSystemResources(connection.request);
+        await subscribeSystemResources(connection.subscribeRequest);
         subscribed = true;
       } catch {
         // Snapshot/subscribe failure just leaves the section static/hidden.
@@ -485,7 +483,7 @@ function useSystemResources(connection: RemuxConnection) {
       cancelled = true;
       unsubscribeMessages();
       if (subscribed) {
-        void unsubscribeSystemResources(connection.request).catch(() => undefined);
+        void unsubscribeSystemResources(connection.command).catch(() => undefined);
       }
     };
   }, [connected, connection]);
@@ -526,6 +524,10 @@ function codexAppServerStatusesEqual(
     && left.activeTurnIds.every((turnId, index) => turnId === right.activeTurnIds[index]);
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
 function SystemSection({ sample }: { sample: SystemResourcesSample }) {
   const { styles } = useSettingsTheme();
   const memUsed = Math.max(0, sample.system.memTotalBytes - sample.system.memAvailableBytes);
@@ -533,6 +535,14 @@ function SystemSection({ sample }: { sample: SystemResourcesSample }) {
   return (
     <Section title="System">
       <View style={styles.infoList}>
+        {sample.resourceProtection ? (
+          <InfoRow
+            label="Protection"
+            value={sample.resourceProtection.protectedMode
+              ? `Protected · core ${sample.resourceProtection.reservedCpus.join(',')}`
+              : `Unprotected · ${sample.resourceProtection.reasons.join(', ') || 'capability unavailable'}`}
+          />
+        ) : null}
         <InfoRow
           label="Load"
           value={`${sample.system.load1.toFixed(2)} · ${sample.system.load5.toFixed(2)} · ${sample.system.load15.toFixed(2)}`}

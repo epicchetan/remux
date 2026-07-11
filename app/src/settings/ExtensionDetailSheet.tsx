@@ -76,9 +76,11 @@ export function ExtensionDetailSheet({
   const { styles } = useSheetTheme();
   const insets = useSafeAreaInsets();
   const {
-    request,
+    command,
+    query,
     status: connectionStatus,
     subscribe,
+    subscribeRequest,
   } = useRemuxConnection();
   const extensionId = status?.extensionId ?? null;
   const [logLines, setLogLines] = useState<ExtensionLogLine[]>([]);
@@ -105,8 +107,8 @@ export function ExtensionDetailSheet({
 
     void (async () => {
       try {
-        await subscribeExtensionLogs(request, extensionId);
-        const snapshot = await readExtensionLogs(request, extensionId, logRingLines);
+        await subscribeExtensionLogs(subscribeRequest, extensionId);
+        const snapshot = await readExtensionLogs(query, extensionId, logRingLines);
         if (!cancelled) {
           setLogLines((current) => mergeLogLines(snapshot, current));
         }
@@ -131,9 +133,9 @@ export function ExtensionDetailSheet({
     return () => {
       cancelled = true;
       unsubscribeMessages();
-      void unsubscribeExtensionLogs(request, extensionId).catch(() => undefined);
+      void unsubscribeExtensionLogs(command, extensionId).catch(() => undefined);
     };
-  }, [connectionStatus.type, extensionId, request, subscribe, visible]);
+  }, [command, connectionStatus.type, extensionId, query, subscribe, subscribeRequest, visible]);
 
   // Uptime is diagnostic context, not a stopwatch. Avoid rebuilding the
   // native SwiftUI host and its RN subtree every second.

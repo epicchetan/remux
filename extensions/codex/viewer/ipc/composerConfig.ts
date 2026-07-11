@@ -3,16 +3,15 @@ import type {
   CodexComposerConfigWriteParams,
   CodexComposerConfigWriteResponse,
 } from '../../shared/composerConfig';
-import { requestIpc } from '@remux/viewer-kit/ipc';
-import { rpcPolicies } from '@remux/viewer-kit/rpc-policy';
+import { rpc } from '@remux/viewer-kit/ipc';
 
 export const composerConfigReadMethod = 'remux/codex/composer/config/read';
 export const composerConfigWriteMethod = 'remux/codex/composer/config/write';
 
 export function readComposerConfig() {
-  return requestIpc<CodexComposerConfigReadResponse>(rpcPolicies['codex-config-read']);
+  return rpc.query<CodexComposerConfigReadResponse>(composerConfigReadMethod);
 }
 
 export function writeComposerConfig(params: CodexComposerConfigWriteParams) {
-  return requestIpc<CodexComposerConfigWriteResponse>(rpcPolicies['codex-config-write'], params);
+  return rpc.command<CodexComposerConfigWriteResponse>(composerConfigWriteMethod, params);
 }

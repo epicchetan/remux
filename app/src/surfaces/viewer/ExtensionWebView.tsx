@@ -25,7 +25,7 @@ import type {
   WebViewRenderProcessGoneEvent,
   WebViewTerminatedEvent,
 } from 'react-native-webview/lib/WebViewTypes';
-import { resolveRpcPolicy } from '@remux/viewer-kit/rpc-policy';
+import type { RpcContract } from '@remux/viewer-kit/rpc';
 
 import { logRemuxDebug } from '../../remote/remuxDebug';
 import {
@@ -56,9 +56,13 @@ type WebViewToNativeMessage =
       id: JsonRpcId;
       method: string;
       params?: unknown;
-      policy: string;
-      timeoutMs: number;
+      contract: RpcContract;
       type: 'remux/request';
+    }
+  | {
+      id: JsonRpcId;
+      reason: string;
+      type: 'remux/cancel';
     }
   | {
       id: string;
@@ -266,6 +270,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
   const healthPingIdRef = useRef(0);
   const healthPingWaitersRef = useRef(new Map<string, HealthPingWaiter>());
   const pageEpochRef = useRef(0);
+  const requestControllersRef = useRef(new Map<JsonRpcId, AbortController>());
   const pageStateRef = useRef<WebViewPageState>({ type: 'loading' });
   const readyRef = useRef(false);
   const readyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -301,6 +306,13 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
     pageStateRef.current = pageState;
   }, [pageState]);
 
+  useEffect(() => () => {
+    for (const controller of requestControllersRef.current.values()) {
+      controller.abort('webview-unmounted');
+    }
+    requestControllersRef.current.clear();
+  }, []);
+
   const resolveHealthPingWaiters = useCallback((healthy: boolean, reason: string) => {
     for (const [id, waiter] of healthPingWaitersRef.current) {
       clearTimeout(waiter.timer);
@@ -318,6 +330,10 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
 
   const advancePageEpoch = useCallback((reason: string) => {
     pageEpochRef.current += 1;
+    for (const controller of requestControllersRef.current.values()) {
+      controller.abort(`webview-epoch:${reason}`);
+    }
+    requestControllersRef.current.clear();
     resolveHealthPingWaiters(false, `epoch:${reason}`);
     logRemuxDebug('webview:epoch', {
       epoch: pageEpochRef.current,
@@ -727,20 +743,14 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
             });
           }
           break;
+        case 'remux/cancel': {
+          const controller = requestControllersRef.current.get(message.id);
+          requestControllersRef.current.delete(message.id);
+          controller?.abort(message.reason);
+          break;
+        }
         case 'remux/request': {
           const requestEpoch = pageEpochRef.current;
-          const requestPolicy = resolveRpcPolicy(message.policy, message.method);
-          if (!requestPolicy || message.timeoutMs <= 0 || message.timeoutMs > requestPolicy.budget.totalMs) {
-            postToWebView({
-              error: {
-                code: -32600,
-                message: `Unregistered or invalid RPC policy for ${message.method}`,
-              },
-              id: message.id,
-              type: 'remux/error',
-            }, { epoch: requestEpoch });
-            break;
-          }
           if (message.method === 'host/viewport/get') {
             postToWebView({
               id: message.id,
@@ -936,8 +946,16 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
             break;
           }
 
+          const controller = new AbortController();
+          requestControllersRef.current.set(message.id, controller);
           void remux
-            .request(requestPolicy, message.params, remuxRequestContext)
+            .routeRequest(
+              message.method,
+              message.params,
+              message.contract,
+              remuxRequestContext,
+              { signal: controller.signal },
+            )
             .then((result) => {
               postToWebView({
                 id: message.id,
@@ -946,6 +964,9 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
               }, { epoch: requestEpoch });
             })
             .catch((requestError) => {
+              if (controller.signal.aborted) {
+                return;
+              }
               postToWebView({
                 error: {
                   code: -32000,
@@ -954,6 +975,11 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
                 id: message.id,
                 type: 'remux/error',
               }, { epoch: requestEpoch });
+            })
+            .finally(() => {
+              if (requestControllersRef.current.get(message.id) === controller) {
+                requestControllersRef.current.delete(message.id);
+              }
             });
           break;
         }
@@ -1322,6 +1348,18 @@ function parseWebViewMessage(data: string): WebViewToNativeMessage | InvalidWebV
       };
     }
 
+    if (
+      parsed.type === 'remux/cancel' &&
+      isJsonRpcId(parsed.id) &&
+      typeof parsed.reason === 'string'
+    ) {
+      return {
+        id: parsed.id,
+        reason: parsed.reason,
+        type: 'remux/cancel',
+      };
+    }
+
     if (parsed.type !== 'remux/request') {
       return null;
     }
@@ -1342,24 +1380,52 @@ function parseWebViewMessage(data: string): WebViewToNativeMessage | InvalidWebV
       };
     }
 
-    if (typeof parsed.policy !== 'string' || typeof parsed.timeoutMs !== 'number') {
+    const contract = parseRpcContract(parsed.contract);
+    if (!contract) {
       return {
         id,
-        message: 'Invalid Remux request policy or timeout',
+        message: 'Invalid Remux request contract',
         type: 'remux/invalid-request',
       };
     }
 
     return {
+      contract,
       id,
       method: parsed.method,
       params: parsed.params,
-      policy: parsed.policy,
-      timeoutMs: parsed.timeoutMs,
       type: 'remux/request',
     };
   } catch {
     return null;
+  }
+}
+
+function parseRpcContract(value: unknown): RpcContract | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  switch (value.kind) {
+    case 'query':
+    case 'subscription':
+      return {
+        kind: value.kind,
+        ...(typeof value.resourceKey === 'string' ? { resourceKey: value.resourceKey } : {}),
+      };
+    case 'command':
+      return {
+        kind: 'command',
+        ...(typeof value.operationId === 'string' ? { operationId: value.operationId } : {}),
+        ...(typeof value.preconditionRevision === 'number'
+          ? { preconditionRevision: value.preconditionRevision }
+          : {}),
+      };
+    case 'job-start':
+      return typeof value.operationId === 'string' && value.operationId.length > 0
+        ? { kind: 'job-start', operationId: value.operationId }
+        : null;
+    default:
+      return null;
   }
 }
 

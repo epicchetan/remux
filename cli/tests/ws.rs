@@ -314,7 +314,8 @@ async fn routes_downstream_notifications_without_sending_a_response() {
             json!({
                 "jsonrpc": "2.0",
                 "id": 7,
-                "method": "remux/terminal/session/list"
+                "method": "remux/terminal/session/list",
+                "remuxContract": { "kind": "query" }
             })
             .to_string()
             .into(),
@@ -358,6 +359,57 @@ async fn rejects_notifications_for_must_ack_methods() {
 }
 
 #[tokio::test]
+async fn job_start_acks_immediately_and_exposes_terminal_state() {
+    let fixture = start_fixture().await;
+    let mut socket = connect(fixture.addr).await;
+    socket
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 71,
+                "method": "remux/terminal/session/list",
+                "remuxContract": { "kind": "job-start", "operationId": "test-job-71" }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let admission = next_text(&mut socket).await;
+    assert_eq!(admission["id"], 71);
+    assert_eq!(admission["result"]["accepted"], true);
+    assert_eq!(admission["result"]["operationId"], "test-job-71");
+
+    let mut completed = false;
+    for _ in 0..6 {
+        let event = next_text(&mut socket).await;
+        if event["method"] == "remux/jobs/didChange" && event["params"]["state"] == "completed" {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed);
+
+    socket
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 72,
+                "method": "remux/jobs/read",
+                "params": { "operationId": "test-job-71" },
+                "remuxContract": { "kind": "query", "resourceKey": "job:test-job-71" }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let snapshot = next_text(&mut socket).await;
+    assert_eq!(snapshot["result"]["state"], "completed");
+}
+
+#[tokio::test]
 async fn registration_is_a_barrier_for_later_extension_work() {
     let fixture = start_fixture_with_hooks(WsHooks {
         notifications: Some(Arc::new(DelayedRegistrationHook)),
@@ -367,17 +419,23 @@ async fn registration_is_a_barrier_for_later_extension_work() {
     let mut socket = connect(fixture.addr).await;
     socket
         .send(Message::Text(
-            json!({ "jsonrpc": "2.0", "id": 1, "method": "remux/clients/register" })
-                .to_string()
-                .into(),
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "remux/clients/register",
+                "remuxContract": { "kind": "subscription" }
+            })
+            .to_string()
+            .into(),
         ))
         .await
         .unwrap();
     socket
         .send(Message::Text(
-            json!({ "jsonrpc": "2.0", "id": 2, "method": "remux/terminal/session/list" })
-                .to_string()
-                .into(),
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "remux/terminal/session/list",
+                "remuxContract": { "kind": "query" }
+            })
+            .to_string()
+            .into(),
         ))
         .await
         .unwrap();
@@ -397,6 +455,7 @@ async fn slow_business_request_does_not_block_same_socket_control_request() {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "remux/terminal/tmux/action",
+                "remuxContract": { "kind": "command" },
                 "params": { "testSlow": true }
             })
             .to_string()
@@ -406,9 +465,12 @@ async fn slow_business_request_does_not_block_same_socket_control_request() {
         .unwrap();
     socket
         .send(Message::Text(
-            json!({ "jsonrpc": "2.0", "id": 2, "method": "remux/system/ping" })
-                .to_string()
-                .into(),
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "remux/system/ping",
+                "remuxContract": { "kind": "query" }
+            })
+            .to_string()
+            .into(),
         ))
         .await
         .unwrap();
@@ -438,6 +500,7 @@ async fn slow_extension_does_not_block_another_extension_lane() {
                 "jsonrpc": "2.0",
                 "id": 11,
                 "method": "remux/terminal/tmux/action",
+                "remuxContract": { "kind": "command" },
                 "params": { "testSlow": true }
             })
             .to_string()
@@ -447,9 +510,12 @@ async fn slow_extension_does_not_block_another_extension_lane() {
         .unwrap();
     socket
         .send(Message::Text(
-            json!({ "jsonrpc": "2.0", "id": 12, "method": "remux/ledger/read" })
-                .to_string()
-                .into(),
+            json!({
+                "jsonrpc": "2.0", "id": 12, "method": "remux/ledger/read",
+                "remuxContract": { "kind": "query" }
+            })
+            .to_string()
+            .into(),
         ))
         .await
         .unwrap();
@@ -478,9 +544,12 @@ async fn host_request_response_is_consumed_while_app_request_is_pending() {
 
     socket
         .send(Message::Text(
-            json!({ "jsonrpc": "2.0", "id": 8, "method": "remux/test/host-roundtrip" })
-                .to_string()
-                .into(),
+            json!({
+                "jsonrpc": "2.0", "id": 8, "method": "remux/test/host-roundtrip",
+                "remuxContract": { "kind": "query" }
+            })
+            .to_string()
+            .into(),
         ))
         .await
         .unwrap();
@@ -528,6 +597,7 @@ async fn responds_with_errors_for_parse_failures_and_rpc_errors() {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "remux/terminal/session/list",
+                "remuxContract": { "kind": "query" },
                 "params": { "testFail": true }
             })
             .to_string()
@@ -594,6 +664,7 @@ async fn extension_origins_are_opaque_stable_and_target_one_downstream_context()
                 "jsonrpc": "2.0",
                 "id": 41,
                 "method": "remux/terminal/session/attach",
+                "remuxContract": { "kind": "subscription" },
                 "params": { "projection": "bars:1m" },
                 "remuxContext": { "tabId": "tab-a", "resourceKey": "replay-a" }
             })
@@ -615,6 +686,7 @@ async fn extension_origins_are_opaque_stable_and_target_one_downstream_context()
                 "jsonrpc": "2.0",
                 "id": 42,
                 "method": "remux/terminal/session/attach",
+                "remuxContract": { "kind": "subscription" },
                 "params": {},
                 "remuxContext": { "tabId": "tab-a", "resourceKey": "replay-a" }
             })

@@ -1,6 +1,6 @@
 import {
   getIpcStatusSnapshot,
-  requestIpc,
+  rpc,
   signalIpcPreviewChanged,
   subscribeIpcEvents,
   subscribeIpcResume,
@@ -10,7 +10,6 @@ import {
   type JsonRpcMessage,
   type RemuxViewHostStatus,
 } from './ipc';
-import { rpcPolicies } from './rpcPolicy';
 
 export type HostOverviewOpenParams = {
   section?: 'files' | 'tabs';
@@ -74,7 +73,7 @@ export type {
 };
 
 export function dismissHostKeyboard() {
-  return requestIpc(rpcPolicies['host-keyboard-dismiss']);
+  return rpc.command('host/keyboard/dismiss');
 }
 
 // DOM mutations signal automatically (see viewer-kit ipc); views that render
@@ -84,11 +83,11 @@ export function signalHostPreviewChanged() {
 }
 
 export function readHostClipboardText() {
-  return requestIpc<{ text: string }>(rpcPolicies['host-clipboard-read']);
+  return rpc.query<{ text: string }>('host/clipboard/read');
 }
 
 export function getHostViewportMetrics() {
-  return requestIpc<RemuxHostViewportMetrics>(rpcPolicies['host-viewport-get']);
+  return rpc.query<RemuxHostViewportMetrics>('host/viewport/get');
 }
 
 export function getHostStatusSnapshot() {
@@ -104,34 +103,34 @@ export function getHostTheme(): RemuxHostTheme {
 }
 
 export function openHostOverview(params: HostOverviewOpenParams = {}) {
-  return requestIpc<{ ok: boolean }>(rpcPolicies['host-overview-open'], params);
+  return rpc.command<{ ok: boolean }>('host/overview/open', params);
 }
 
 export function openHostFile(params: HostFileOpenParams) {
-  return requestIpc<{ ok: boolean; reason?: string }>(rpcPolicies['host-file-open'], params);
+  return rpc.command<{ ok: boolean; reason?: string }>('host/file/open', params);
 }
 
 // Opens a url in the device's default browser. In-page escapes like
 // window.open are swallowed by the app's WebView, so this is the host's job
 // (e.g. Linking.openURL on React Native).
 export function openHostLink(params: HostLinkOpenParams) {
-  return requestIpc<{ ok: boolean; reason?: string }>(rpcPolicies['host-link-open'], params);
+  return rpc.command<{ ok: boolean; reason?: string }>('host/link/open', params);
 }
 
 export function pickHostAttachments(params: HostAttachmentPickParams = {}) {
-  return requestIpc<HostAttachmentPickResult>(rpcPolicies['host-attachments-pick'], params);
+  return rpc.command<HostAttachmentPickResult>('host/attachments/pick', params);
 }
 
 export function reloadHostView() {
-  return requestIpc<{ ok: boolean }>(rpcPolicies['host-view-reload']);
+  return rpc.command<{ ok: boolean }>('host/view/reload');
 }
 
 export function closeHostTab() {
-  return requestIpc<{ ok: boolean }>(rpcPolicies['host-tab-close']);
+  return rpc.command<{ ok: boolean }>('host/tab/close');
 }
 
 export function updateHostTab(params: HostTabUpdate) {
-  return requestIpc<{ ok: boolean }>(rpcPolicies['host-tab-update'], params);
+  return rpc.command<{ ok: boolean }>('host/tab/update', params);
 }
 
 export function subscribeHostViewportMetrics(subscriber: (metrics: RemuxHostViewportMetrics) => void) {

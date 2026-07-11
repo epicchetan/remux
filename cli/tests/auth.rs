@@ -61,6 +61,7 @@ fn fixture_extension(root: &std::path::Path) -> ExtensionManifest {
         )],
         launchers: Vec::new(),
         file_handlers: Vec::<FileHandler>::new(),
+        workloads: Default::default(),
     }
 }
 
@@ -237,7 +238,12 @@ async fn ws_upgrade_401s_without_a_token_and_connects_with_one() {
     let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
     socket
         .send(Message::Text(
-            json!({ "jsonrpc": "2.0", "id": 1, "method": "remux/system/ping" })
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "remux/system/ping",
+                "remuxContract": { "kind": "query" },
+            })
                 .to_string()
                 .into(),
         ))

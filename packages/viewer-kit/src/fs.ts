@@ -1,5 +1,4 @@
-import { requestIpc } from './ipc';
-import { rpcPolicies } from './rpcPolicy';
+import { rpc } from './ipc';
 
 export type FileSystemEntry = {
   git?: FileSystemGitStatus | null;
@@ -74,17 +73,22 @@ export type ReadFileResult = {
 };
 
 export function readDirectory(path?: string | null, options: { force?: boolean } = {}) {
-  return requestIpc<ReadDirectoryResult>(
-    rpcPolicies['fs-directory-read'],
+  return rpc.query<ReadDirectoryResult>(
+    'remux/fs/readDirectory',
     path || options.force ? { force: options.force === true, ...(path ? { path } : {}) } : undefined,
+    { resourceKey: `directory:${path ?? ''}` },
   );
 }
 
 export function readDirectories(paths: string[], options: { force?: boolean } = {}) {
-  return requestIpc<ReadDirectoriesResult>(rpcPolicies['fs-directories-read'], {
-    force: options.force === true,
-    paths,
-  });
+  return rpc.query<ReadDirectoriesResult>(
+    'remux/fs/readDirectories',
+    {
+      force: options.force === true,
+      paths,
+    },
+    { resourceKey: `directories:${paths.join('\u0000')}` },
+  );
 }
 
 export function readFile(
@@ -94,11 +98,11 @@ export function readFile(
     git?: { includeBase?: boolean; includeStatus?: boolean };
   } = {},
 ) {
-  return requestIpc<ReadFileResult>(rpcPolicies['fs-file-read'], {
+  return rpc.query<ReadFileResult>('remux/fs/readFile', {
     ...(options.format ? { format: options.format } : {}),
     ...(options.git ? { git: options.git } : {}),
     path,
-  });
+  }, { resourceKey: `file:${path}` });
 }
 
 export async function readFileDataUrl(path: string) {

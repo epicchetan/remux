@@ -1,0 +1,7 @@
+[Unit]
+Description=Remux resource root
+
+[Slice]
+CPUAccounting=yes
+MemoryAccounting=yes
+TasksAccounting=yes

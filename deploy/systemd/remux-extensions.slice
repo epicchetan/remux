@@ -1,0 +1,8 @@
+[Unit]
+Description=Remux extension resource slice
+
+[Slice]
+CPUWeight=400
+CPUAccounting=yes
+MemoryAccounting=yes
+TasksAccounting=yes

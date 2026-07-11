@@ -1,5 +1,4 @@
 import type { RemuxConnection } from '../remote/RemuxConnectionProvider';
-import { rpcPolicies } from '@remux/viewer-kit/rpc-policy';
 import type { FileTreeEntry, FileTreeGitStatus } from './filesTypes';
 
 const readDirectoryMethod = 'remux/fs/readDirectory';
@@ -35,26 +34,28 @@ export type RemuxReadDirectoriesResponse = {
 };
 
 export async function readRemuxDirectory(
-  request: RemuxConnection['request'],
+  query: RemuxConnection['query'],
   path?: string | null,
   options: { force?: boolean } = {},
 ): Promise<RemuxReadDirectoryResponse> {
-  const response = await request<unknown>(
-    rpcPolicies['fs-directory-read'],
+  const response = await query<unknown>(
+    readDirectoryMethod,
     path || options.force ? { force: options.force === true, ...(path ? { path } : {}) } : undefined,
+    { resourceKey: `directory:${path ?? ''}` },
   );
 
   return parseReadDirectoryResponse(response);
 }
 
 export async function readRemuxDirectories(
-  request: RemuxConnection['request'],
+  query: RemuxConnection['query'],
   paths: string[],
   options: { force?: boolean } = {},
 ): Promise<RemuxReadDirectoriesResponse> {
-  const response = await request<unknown>(
-    rpcPolicies['fs-directories-read'],
+  const response = await query<unknown>(
+    readDirectoriesMethod,
     { force: options.force === true, paths },
+    { resourceKey: `directories:${paths.join('\u0000')}` },
   );
 
   return parseReadDirectoriesResponse(response);

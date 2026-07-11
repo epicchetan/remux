@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["cli"]
+members = ["cli", "crates/remux-extension-host"]
 # Extension server crates keep their standalone builds (codex builds --offline;
 # do not perturb its lockfile).
 exclude = ["extensions/codex/server", "extensions/terminal/server", "extensions/*"]

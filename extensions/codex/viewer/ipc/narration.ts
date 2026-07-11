@@ -1,5 +1,4 @@
-import { requestIpc } from '@remux/viewer-kit/ipc';
-import { rpcPolicies } from '@remux/viewer-kit/rpc-policy';
+import { rpc } from '@remux/viewer-kit/ipc';
 
 import type {
   CodexNarrationAudioReadParams,
@@ -18,13 +17,21 @@ export const narrationReadMethod = 'remux/codex/narration/resources/read';
 export const narrationStartMethod = 'remux/codex/narration/start';
 
 export const readNarration = (params: CodexNarrationReadParams) =>
-  requestIpc<CodexNarrationReadResponse>(rpcPolicies['codex-narration-read'], params);
+  rpc.query<CodexNarrationReadResponse>(narrationReadMethod, params, {
+    resourceKey: `narration:${params.artifactKey}`,
+  });
 
 export const startNarration = (params: CodexNarrationStartParams) =>
-  requestIpc<CodexNarrationStartResponse>(rpcPolicies['codex-narration-start'], params);
+  rpc.startJob<CodexNarrationStartResponse>(narrationStartMethod, params, {
+    operationId: `narration:${params.document.sourceHash}`,
+  });
 
 export const cancelNarration = (params: CodexNarrationCancelParams) =>
-  requestIpc<CodexNarrationCancelResponse>(rpcPolicies['codex-narration-cancel'], params);
+  rpc.command<CodexNarrationCancelResponse>(narrationCancelMethod, params, {
+    operationId: `narration:${params.artifactKey}`,
+  });
 
 export const readNarrationAudio = (params: CodexNarrationAudioReadParams) =>
-  requestIpc<CodexNarrationAudioReadResponse>(rpcPolicies['codex-narration-audio-read'], params);
+  rpc.query<CodexNarrationAudioReadResponse>(narrationAudioReadMethod, params, {
+    resourceKey: `narration-audio:${params.artifactKey}:${params.chunkId}`,
+  });

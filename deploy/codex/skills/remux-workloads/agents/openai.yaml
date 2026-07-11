@@ -1,0 +1,4 @@
+interface:
+  display_name: "Remux Workloads"
+  short_description: "Run heavy local compute without starving Remux"
+  default_prompt: "Use $remux-workloads to run this CPU-intensive task in a managed Remux workload."

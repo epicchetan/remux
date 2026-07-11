@@ -44,13 +44,13 @@ use crate::extensions::runstate::{read_start_ticks, RunEntry, RunRole, RunState}
 use crate::logs::{
     ExtensionLogMeta, ExtensionLogs, Journal, JournalEvent, LogChannel, LogLevel, LogSource,
 };
+use crate::resource::{ResourceClass, ResourcePlacement};
 use crate::rpc::jsonrpc::{JsonRpcError, EXTENSION_ERROR};
 use crate::rpc::router::{
     BoxFuture, ExtensionServer, LastExit, RpcResult, ServerStatus, ViewsFacet, WatchFacet,
 };
 use crate::time::now_ms;
 
-pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 120_000;
 pub const BACKOFF_BASE_MS: u64 = 500;
 pub const BACKOFF_CAP_MS: u64 = 10_000;
 pub const CRASH_BUDGET: usize = 5;
@@ -84,7 +84,6 @@ pub trait ExtensionCtx: Send + Sync {
 
 #[derive(Debug, Clone, Copy)]
 pub struct SupervisorConfig {
-    pub request_timeout_ms: u64,
     pub backoff_base_ms: u64,
     pub backoff_cap_ms: u64,
     pub crash_budget: usize,
@@ -98,7 +97,6 @@ pub struct SupervisorConfig {
 impl Default for SupervisorConfig {
     fn default() -> Self {
         Self {
-            request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
             backoff_base_ms: BACKOFF_BASE_MS,
             backoff_cap_ms: BACKOFF_CAP_MS,
             crash_budget: CRASH_BUDGET,
@@ -142,6 +140,7 @@ struct PendingRpc {
 }
 
 type PendingMap = Arc<Mutex<HashMap<u64, PendingRpc>>>;
+const MAX_PENDING_EXTENSION_RPCS: usize = 64;
 
 enum Cmd {
     Start {
@@ -165,9 +164,13 @@ enum Cmd {
         status: Option<std::process::ExitStatus>,
     },
     Rpc {
+        request_id: u64,
         method: String,
         params: Option<Value>,
         ack: oneshot::Sender<RpcResult>,
+    },
+    CancelRpc {
+        request_id: u64,
     },
     Notify {
         method: String,
@@ -180,10 +183,27 @@ pub struct ExtensionSupervisor {
     commands: mpsc::Sender<Cmd>,
     status: Arc<Mutex<ServerStatus>>,
     logs: Arc<ExtensionLogs>,
+    next_rpc_request_id: AtomicU64,
     /// Entries of views with a declared build — `views.built` is recomputed
     /// by statting these at snapshot time so it is always fresh (a running
     /// watcher rewrites bundles behind the actor's back).
     built_entries: Vec<PathBuf>,
+}
+
+struct CancelRpcOnDrop {
+    armed: bool,
+    commands: mpsc::Sender<Cmd>,
+    request_id: u64,
+}
+
+impl Drop for CancelRpcOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.commands.try_send(Cmd::CancelRpc {
+                request_id: self.request_id,
+            });
+        }
+    }
 }
 
 impl ExtensionSupervisor {
@@ -230,12 +250,15 @@ impl ExtensionSupervisor {
             },
         }));
         let (commands, mailbox) = mpsc::channel(128);
+        let resource_placement =
+            ResourcePlacement::for_extension(&extension.id, &extension.root_dir);
 
         let supervisor = Arc::new(Self {
             extension_id: extension.id.clone(),
             commands: commands.clone(),
             status: status.clone(),
             logs: logs.clone(),
+            next_rpc_request_id: AtomicU64::new(1),
             built_entries,
         });
 
@@ -247,6 +270,7 @@ impl ExtensionSupervisor {
             logs,
             status,
             run_state,
+            resource_placement,
             self_commands: commands,
             pending: Arc::new(Mutex::new(HashMap::new())),
             generation: Arc::new(AtomicU64::new(0)),
@@ -271,7 +295,6 @@ impl ExtensionSupervisor {
             watch_restart_count: 0,
             watch_crash_times: VecDeque::new(),
             watch_backoff_deadline: None,
-            next_rpc_id: 1,
         };
         let handle = tokio::spawn(actor.run(mailbox));
 
@@ -362,10 +385,12 @@ impl ExtensionServer for ExtensionSupervisor {
 
     fn handle_rpc(&self, method: String, params: Option<Value>) -> BoxFuture<'_, RpcResult> {
         Box::pin(async move {
+            let request_id = self.next_rpc_request_id.fetch_add(1, Ordering::Relaxed);
             let (ack, response) = oneshot::channel();
             if self
                 .commands
                 .send(Cmd::Rpc {
+                    request_id,
                     method,
                     params,
                     ack,
@@ -378,12 +403,19 @@ impl ExtensionServer for ExtensionSupervisor {
                     format!("extension {} is not running", self.extension_id),
                 ));
             }
-            response.await.unwrap_or_else(|_| {
+            let mut cancel = CancelRpcOnDrop {
+                armed: true,
+                commands: self.commands.clone(),
+                request_id,
+            };
+            let result = response.await.unwrap_or_else(|_| {
                 Err(JsonRpcError::new(
                     EXTENSION_ERROR,
                     format!("extension {} is not running", self.extension_id),
                 ))
-            })
+            });
+            cancel.armed = false;
+            result
         })
     }
 
@@ -435,6 +467,7 @@ struct Actor {
     logs: Arc<ExtensionLogs>,
     status: Arc<Mutex<ServerStatus>>,
     run_state: Arc<RunState>,
+    resource_placement: ResourcePlacement,
     /// Loops back into our own mailbox (watch child exit reports).
     self_commands: mpsc::Sender<Cmd>,
     pending: PendingMap,
@@ -466,7 +499,6 @@ struct Actor {
     watch_restart_count: u32,
     watch_crash_times: VecDeque<std::time::Instant>,
     watch_backoff_deadline: Option<tokio::time::Instant>,
-    next_rpc_id: u64,
 }
 
 impl Actor {
@@ -554,10 +586,12 @@ impl Actor {
                 let _ = ack.send(result);
             }
             Cmd::Rpc {
+                request_id,
                 method,
                 params,
                 ack,
-            } => self.handle_rpc(method, params, ack),
+            } => self.handle_rpc(request_id, method, params, ack),
+            Cmd::CancelRpc { request_id } => self.cancel_rpc(request_id),
             Cmd::Notify { method, params } => self.handle_notify(method, params),
         }
     }
@@ -687,10 +721,13 @@ impl Actor {
             Some(LogLevel::Info),
         );
 
-        let mut command = tokio::process::Command::new(&build.command);
+        let mut command = self.resource_placement.configure_command(
+            &build.command,
+            &build.args,
+            &build.cwd,
+            ResourceClass::Build,
+        );
         command
-            .args(&build.args)
-            .current_dir(&build.cwd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -1081,10 +1118,13 @@ impl Actor {
                 Some(LogLevel::Info),
             );
 
-            let mut command = tokio::process::Command::new(&spec.command);
+            let mut command = self.resource_placement.configure_command(
+                &spec.command,
+                &spec.args,
+                &spec.cwd,
+                ResourceClass::Watch,
+            );
             command
-                .args(&spec.args)
-                .current_dir(&spec.cwd)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -1342,17 +1382,11 @@ impl Actor {
 
     fn handle_rpc(
         &mut self,
+        id: u64,
         method: String,
-        mut params: Option<Value>,
+        params: Option<Value>,
         ack: oneshot::Sender<RpcResult>,
     ) {
-        let request_timeout_ms = params
-            .as_mut()
-            .and_then(Value::as_object_mut)
-            .and_then(|params| params.remove("_remuxExecutionTimeoutMs"))
-            .and_then(|value| value.as_u64())
-            .unwrap_or(self.cfg.request_timeout_ms)
-            .max(1);
         let stdin = match (&self.stdin, self.state) {
             (Some(stdin), Lifecycle::Running) => stdin.clone(),
             _ => {
@@ -1364,8 +1398,13 @@ impl Actor {
             }
         };
 
-        let id = self.next_rpc_id;
-        self.next_rpc_id += 1;
+        if self.pending.lock().unwrap().len() >= MAX_PENDING_EXTENSION_RPCS {
+            let _ = ack.send(Err(JsonRpcError::new(
+                EXTENSION_ERROR,
+                format!("extension {} RPC queue is full", self.extension.id),
+            )));
+            return;
+        }
 
         let mut message = Map::new();
         message.insert("jsonrpc".to_string(), Value::from("2.0"));
@@ -1393,19 +1432,25 @@ impl Actor {
             }
             return;
         }
+    }
 
-        // Timeout: reject with the same -32000 "<method> timed out".
-        let pending = self.pending.clone();
-        let timeout_ms = request_timeout_ms;
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
-            if let Some(entry) = pending.lock().unwrap().remove(&id) {
-                let _ = entry.ack.send(Err(JsonRpcError::new(
-                    EXTENSION_ERROR,
-                    format!("{method} timed out"),
-                )));
-            }
+    fn cancel_rpc(&mut self, id: u64) {
+        if self.pending.lock().unwrap().remove(&id).is_none() {
+            return;
+        }
+        let Some(stdin) = self
+            .stdin
+            .as_ref()
+            .filter(|_| self.state == Lifecycle::Running)
+        else {
+            return;
+        };
+        let cancellation = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "$/cancelRequest",
+            "params": { "id": id },
         });
+        let _ = stdin.try_send(StdinCommand::Line(format!("{cancellation}\n")));
     }
 
     fn handle_notify(&mut self, method: String, params: Option<Value>) {
@@ -1452,7 +1497,7 @@ impl Actor {
 
         let journal = self.journal.clone();
         let extension_id = self.extension.id.clone();
-        let spawned = spawn_extension(server, move |error| {
+        let spawned = spawn_extension(server, &self.resource_placement, move |error| {
             journal.warn(&format!(
                 "[remux] failed to write to extension {extension_id}: {error}"
             ));

@@ -38,6 +38,7 @@ const CONTROL_OUTBOUND_FRAMES: usize = 32;
 const BUSINESS_OUTBOUND_FRAMES: usize = MAX_OUTBOUND_FRAMES - CONTROL_OUTBOUND_FRAMES;
 const MAX_OUTBOUND_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ROUTE_LANES: usize = 512;
+const MAX_RETAINED_JOBS: usize = 256;
 
 struct OutboundFrame {
     bytes: usize,
@@ -81,6 +82,7 @@ pub struct WsClient {
     pub(crate) connection_id: u64,
     next_origin_id: AtomicU64,
     origins: Mutex<HashMap<String, String>>,
+    active_requests: Mutex<HashMap<String, Option<Arc<tokio::sync::Notify>>>>,
     connected: AtomicBool,
     outstanding_requests: AtomicUsize,
 }
@@ -105,6 +107,7 @@ impl WsClient {
             connection_id,
             next_origin_id: AtomicU64::new(1),
             origins: Mutex::new(HashMap::new()),
+            active_requests: Mutex::new(HashMap::new()),
             connected: AtomicBool::new(true),
             outstanding_requests: AtomicUsize::new(0),
         })
@@ -240,6 +243,16 @@ impl WsClient {
 
     fn mark_disconnected(&self) {
         self.connected.store(false, Ordering::SeqCst);
+        let cancellations: Vec<Arc<tokio::sync::Notify>> = self
+            .active_requests
+            .lock()
+            .unwrap()
+            .drain()
+            .filter_map(|(_, cancellation)| cancellation)
+            .collect();
+        for cancellation in cancellations {
+            cancellation.notify_waiters();
+        }
         self.registration_committed.notify_waiters();
     }
 
@@ -276,6 +289,50 @@ impl WsClient {
             .values()
             .any(|candidate| candidate == origin)
     }
+
+    fn register_request(&self, id: &Value) -> bool {
+        self.active_requests
+            .lock()
+            .unwrap()
+            .insert(request_key(id), None)
+            .is_none()
+    }
+
+    fn begin_request(&self, id: &Value) -> Option<Arc<tokio::sync::Notify>> {
+        let key = request_key(id);
+        let mut active = self.active_requests.lock().unwrap();
+        let slot = active.get_mut(&key)?;
+        let cancellation = Arc::new(tokio::sync::Notify::new());
+        *slot = Some(cancellation.clone());
+        Some(cancellation)
+    }
+
+    fn finish_request(&self, id: &Value) {
+        self.active_requests
+            .lock()
+            .unwrap()
+            .remove(&request_key(id));
+    }
+
+    fn cancel_request(&self, id: &Value) -> bool {
+        let removed = self
+            .active_requests
+            .lock()
+            .unwrap()
+            .remove(&request_key(id));
+        match removed {
+            Some(Some(cancellation)) => {
+                cancellation.notify_one();
+                true
+            }
+            Some(None) => true,
+            None => false,
+        }
+    }
+}
+
+fn request_key(id: &Value) -> String {
+    id.to_string()
 }
 
 /// Hooks the notification manager registers with the WS layer
@@ -344,6 +401,31 @@ pub struct WsServer {
     dispatch_lanes: Mutex<HashMap<String, mpsc::Sender<DispatchJob>>>,
     control_permits: Arc<Semaphore>,
     business_permits: Arc<Semaphore>,
+    jobs: Mutex<HashMap<String, JobState>>,
+}
+
+#[derive(Clone)]
+struct JobState {
+    method: String,
+    operation_id: String,
+    revision: u64,
+    state: &'static str,
+    error: Option<String>,
+    result: Option<Value>,
+    abort: Option<tokio::task::AbortHandle>,
+}
+
+impl JobState {
+    fn value(&self) -> Value {
+        serde_json::json!({
+            "error": self.error,
+            "method": self.method,
+            "operationId": self.operation_id,
+            "result": self.result,
+            "revision": self.revision,
+            "state": self.state,
+        })
+    }
 }
 
 impl WsServer {
@@ -357,6 +439,7 @@ impl WsServer {
             dispatch_lanes: Mutex::new(HashMap::new()),
             control_permits: Arc::new(Semaphore::new(CONTROL_CONCURRENCY)),
             business_permits: Arc::new(Semaphore::new(BUSINESS_CONCURRENCY)),
+            jobs: Mutex::new(HashMap::new()),
         })
     }
 
@@ -534,7 +617,18 @@ impl WsServer {
                     log_app_diagnostic(message.get("params"), self.log.as_ref());
                     return;
                 }
-                if extension_execution_budget_ms(method, &message).is_some() {
+                if method == "$/cancelRequest" {
+                    if let Some(id) = message.get("params").and_then(|params| params.get("id")) {
+                        if client.cancel_request(id) {
+                            self.log.log(&format!(
+                                "[remux] rpc canceled connection={} id={id}",
+                                client.connection_id
+                            ));
+                        }
+                    }
+                    return;
+                }
+                if !is_downstream_notification_method(method) {
                     self.log.warn(&format!(
                         "[remux] rejected notification for must-ack method={method}"
                     ));
@@ -563,18 +657,13 @@ impl WsServer {
             .expect("validated request")
             .to_string();
         let id = message.get("id").cloned().unwrap_or(Value::Null);
-        if matches!(
-            extension_id_from_method(&method),
-            Some("codex" | "terminal")
-        ) && extension_execution_budget_ms(&method, &message).is_none()
-        {
+        if !valid_remux_contract(message.get("remuxContract")) {
             client.send_control_message(&error_message(
                 &id,
-                &JsonRpcError::method_not_found(&method),
+                &JsonRpcError::new(INVALID_REQUEST, "Invalid or missing remuxContract"),
             ));
             return;
         }
-
         self.enqueue_dispatch(client, method, DispatchWork::Request { id, message });
     }
 
@@ -605,12 +694,26 @@ impl WsServer {
             }
             return;
         }
+        if let DispatchWork::Request { id, .. } = &work {
+            if !client.register_request(id) {
+                client.outstanding_requests.fetch_sub(1, Ordering::SeqCst);
+                client.send_control_message(&error_message(
+                    id,
+                    &JsonRpcError::new(INVALID_REQUEST, "Duplicate request id"),
+                ));
+                if is_registration {
+                    complete_registration_barrier(client);
+                }
+                return;
+            }
+        }
 
         let (lane_key, mode) = dispatch_lane(client, &method, &work);
         let Some(sender) = self.dispatch_sender(lane_key.clone(), mode) else {
             if is_request {
                 client.outstanding_requests.fetch_sub(1, Ordering::SeqCst);
                 if let DispatchWork::Request { id, .. } = &work {
+                    client.finish_request(id);
                     client.send_control_message(&error_message(id, &server_busy_error(&method)));
                 }
                 if is_registration {
@@ -637,6 +740,7 @@ impl WsServer {
                     .outstanding_requests
                     .fetch_sub(1, Ordering::SeqCst);
                 if let DispatchWork::Request { id, .. } = &job.work {
+                    job.client.finish_request(id);
                     job.client
                         .send_control_message(&error_message(id, &server_busy_error(&method)));
                 }
@@ -707,6 +811,7 @@ impl WsServer {
         let is_registration = is_request && job.method == "remux/clients/register";
         let method = job.method.clone();
         let lane_key = job.lane_key.clone();
+        let slow_threshold_ms = dispatch_slow_threshold_ms(&method, &job.work);
         let queue_ms = job.received_at.elapsed().as_millis();
         if queue_ms >= 250 {
             self.log.warn(&format!(
@@ -752,9 +857,9 @@ impl WsServer {
             complete_registration_barrier(&job.client);
         }
         let execution_ms = execution_started.elapsed().as_millis();
-        if execution_ms >= 5_000 {
+        if execution_ms >= u128::from(slow_threshold_ms) {
             self.log.warn(&format!(
-                "[remux] slow rpc method={method} lane={lane_key} execution_ms={execution_ms}"
+                "[remux] rpc:slow method={method} lane={lane_key} execution_ms={execution_ms} threshold_ms={slow_threshold_ms}"
             ));
         }
     }
@@ -767,7 +872,229 @@ impl WsServer {
         id: Value,
         received_at: std::time::Instant,
     ) {
+        let Some(cancellation) = client.begin_request(&id) else {
+            return;
+        };
+        if message
+            .get("remuxContract")
+            .and_then(|contract| contract.get("kind"))
+            .and_then(Value::as_str)
+            == Some("job-start")
+            && method != "remux/codex/narration/start"
+        {
+            self.clone()
+                .start_job(client.clone(), message, method, id.clone())
+                .await;
+            client.finish_request(&id);
+            return;
+        }
+        let server = self.clone();
+        let request_client = client.clone();
+        let request_id = id.clone();
+        tokio::select! {
+            _ = cancellation.notified() => {
+                self.log.log(&format!(
+                    "[remux] rpc cancellation completed connection={} method={method} id={id}",
+                    client.connection_id
+                ));
+            }
+            _ = server.handle_request_message_uncancelled(
+                request_client,
+                message,
+                method.clone(),
+                request_id,
+                received_at,
+            ) => {}
+        }
+        client.finish_request(&id);
+    }
+
+    async fn start_job(
+        self: Arc<Self>,
+        client: Arc<WsClient>,
+        message: Value,
+        method: String,
+        request_id: Value,
+    ) {
+        let Some(operation_id) = message
+            .get("remuxContract")
+            .and_then(|contract| contract.get("operationId"))
+            .and_then(Value::as_str)
+            .filter(|operation_id| !operation_id.is_empty())
+            .map(str::to_string)
+        else {
+            client.send_control_message(&error_message(
+                &request_id,
+                &JsonRpcError::new(INVALID_REQUEST, "job-start requires operationId"),
+            ));
+            return;
+        };
+
+        let admission = {
+            let mut jobs = self.jobs.lock().unwrap();
+            if let Some(existing) = jobs.get(&operation_id) {
+                Some((false, existing.revision))
+            } else {
+                if jobs.len() >= MAX_RETAINED_JOBS {
+                    let terminal = jobs
+                        .iter()
+                        .find(|(_, job)| matches!(job.state, "completed" | "failed" | "canceled"))
+                        .map(|(operation_id, _)| operation_id.clone());
+                    if let Some(terminal) = terminal {
+                        jobs.remove(&terminal);
+                    }
+                }
+                if jobs.len() >= MAX_RETAINED_JOBS {
+                    None
+                } else {
+                    jobs.insert(
+                        operation_id.clone(),
+                        JobState {
+                            method: method.clone(),
+                            operation_id: operation_id.clone(),
+                            revision: 1,
+                            state: "accepted",
+                            error: None,
+                            result: None,
+                            abort: None,
+                        },
+                    );
+                    Some((true, 1))
+                }
+            }
+        };
+        let Some((accepted, revision)) = admission else {
+            client.send_control_message(&error_message(
+                &request_id,
+                &server_busy_error("remux/jobs"),
+            ));
+            return;
+        };
+        client.send_control_message(&response_message(
+            &request_id,
+            serde_json::json!({
+                "accepted": accepted,
+                "operationId": operation_id.clone(),
+                "revision": revision,
+            }),
+        ));
+        if !accepted {
+            return;
+        }
+
+        self.broadcast_job(&operation_id);
+        let server = self.clone();
+        let operation_for_task = operation_id.clone();
+        let task = tokio::spawn(async move {
+            server.update_job(&operation_for_task, "running", None, None);
+            let params = message.get("params");
+            let routed_params = if server.router.routes_to_extension(&method) {
+                let origin = client.origin_for_context(message.get("remuxContext"));
+                let viewer_key = message
+                    .get("remuxContext")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| origin.clone());
+                params_with_origin(params, origin, viewer_key)
+            } else {
+                params.cloned()
+            };
+            match server
+                .router
+                .handle_request(&method, routed_params.as_ref())
+                .await
+            {
+                Ok(result) => {
+                    server.update_job(&operation_for_task, "completed", None, Some(result))
+                }
+                Err(error) => {
+                    server.update_job(&operation_for_task, "failed", Some(error.message), None)
+                }
+            }
+        });
+        if let Some(job) = self.jobs.lock().unwrap().get_mut(&operation_id) {
+            if !matches!(job.state, "completed" | "failed" | "canceled") {
+                job.abort = Some(task.abort_handle());
+            }
+        }
+    }
+
+    fn update_job(
+        &self,
+        operation_id: &str,
+        state: &'static str,
+        error: Option<String>,
+        result: Option<Value>,
+    ) {
+        if let Some(job) = self.jobs.lock().unwrap().get_mut(operation_id) {
+            job.revision = job.revision.saturating_add(1);
+            job.state = state;
+            job.error = error;
+            job.result = result;
+            if matches!(state, "completed" | "failed" | "canceled") {
+                job.abort = None;
+            }
+        }
+        self.broadcast_job(operation_id);
+    }
+
+    fn broadcast_job(&self, operation_id: &str) {
+        let job = self.jobs.lock().unwrap().get(operation_id).cloned();
+        if let Some(job) = job {
+            self.broadcast(serde_json::json!({
+                "method": "remux/jobs/didChange",
+                "params": job.value(),
+            }));
+        }
+    }
+
+    async fn handle_request_message_uncancelled(
+        self: Arc<Self>,
+        client: Arc<WsClient>,
+        message: Value,
+        method: String,
+        id: Value,
+        _received_at: std::time::Instant,
+    ) {
         let params = message.get("params");
+
+        if method == "remux/jobs/read" {
+            let operation_id = params
+                .and_then(|params| params.get("operationId"))
+                .and_then(Value::as_str);
+            let result = operation_id
+                .and_then(|operation_id| self.jobs.lock().unwrap().get(operation_id).cloned())
+                .map(|job| job.value())
+                .unwrap_or(Value::Null);
+            client.send_control_message(&response_message(&id, result));
+            return;
+        }
+        if method == "remux/jobs/cancel" {
+            let operation_id = params
+                .and_then(|params| params.get("operationId"))
+                .and_then(Value::as_str);
+            let abort = operation_id.and_then(|operation_id| {
+                self.jobs
+                    .lock()
+                    .unwrap()
+                    .get_mut(operation_id)
+                    .and_then(|job| job.abort.take())
+            });
+            let accepted = abort.is_some();
+            if let Some(abort) = abort {
+                abort.abort();
+                if let Some(operation_id) = operation_id {
+                    self.update_job(operation_id, "canceled", None, None);
+                }
+            }
+            client.send_control_message(&response_message(
+                &id,
+                serde_json::json!({
+                    "accepted": accepted,
+                    "operationId": operation_id,
+                }),
+            ));
+            return;
+        }
 
         for client_scoped in &self.hooks.client_scoped {
             if let Some(result) = client_scoped.handle(&client, &method, params) {
@@ -802,15 +1129,7 @@ impl WsServer {
                     .get("remuxContext")
                     .map(Value::to_string)
                     .unwrap_or_else(|| origin.clone());
-                let timeout_ms = extension_execution_budget_ms(&method, &message)
-                    .map(|budget_ms| {
-                        budget_ms.saturating_sub(
-                            received_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-                        )
-                    })
-                    .unwrap_or(30_000)
-                    .max(1);
-                params_with_origin_and_deadline(params, origin, viewer_key, timeout_ms)
+                params_with_origin(params, origin, viewer_key)
             } else {
                 params.cloned()
             };
@@ -981,6 +1300,52 @@ fn dispatch_params(work: &DispatchWork) -> Option<&Value> {
     }
 }
 
+fn is_downstream_notification_method(method: &str) -> bool {
+    matches!(method, "remux/terminal/session/input-preview")
+}
+
+fn valid_remux_contract(contract: Option<&Value>) -> bool {
+    let Some(contract) = contract.and_then(Value::as_object) else {
+        return false;
+    };
+    match contract.get("kind").and_then(Value::as_str) {
+        Some("query" | "subscription") => contract
+            .get("resourceKey")
+            .is_none_or(|value| value.is_string()),
+        Some("command") => {
+            contract
+                .get("operationId")
+                .is_none_or(|value| value.is_string())
+                && contract
+                    .get("preconditionRevision")
+                    .is_none_or(|value| value.is_number())
+        }
+        Some("job-start") => contract
+            .get("operationId")
+            .and_then(Value::as_str)
+            .is_some_and(|operation_id| !operation_id.is_empty()),
+        _ => false,
+    }
+}
+
+fn dispatch_slow_threshold_ms(method: &str, work: &DispatchWork) -> u64 {
+    if method.starts_with("remux/system/") || method.starts_with("remux/clients/") {
+        return 500;
+    }
+    let kind = match work {
+        DispatchWork::Request { message, .. } => message
+            .get("remuxContract")
+            .and_then(|contract| contract.get("kind"))
+            .and_then(Value::as_str),
+        DispatchWork::Notification { .. } => None,
+    };
+    match kind {
+        Some("query" | "subscription") => 2_000,
+        Some("job-start") => 10_000,
+        _ => 5_000,
+    }
+}
+
 fn server_busy_error(method: &str) -> JsonRpcError {
     JsonRpcError {
         code: EXTENSION_ERROR,
@@ -1000,21 +1365,12 @@ fn complete_registration_barrier(client: &WsClient) {
     }
 }
 
-fn params_with_origin_and_deadline(
-    params: Option<&Value>,
-    origin: String,
-    viewer_key: String,
-    execution_timeout_ms: u64,
-) -> Option<Value> {
+fn params_with_origin(params: Option<&Value>, origin: String, viewer_key: String) -> Option<Value> {
     match params {
         Some(Value::Object(params)) => {
             let mut params = params.clone();
             params.insert("_remuxOrigin".to_string(), Value::from(origin));
             params.insert("_remuxViewerKey".to_string(), Value::from(viewer_key));
-            params.insert(
-                "_remuxExecutionTimeoutMs".to_string(),
-                Value::from(execution_timeout_ms),
-            );
             Some(Value::Object(params))
         }
         Some(other) => Some(other.clone()),
@@ -1022,55 +1378,9 @@ fn params_with_origin_and_deadline(
             let mut params = serde_json::Map::new();
             params.insert("_remuxOrigin".to_string(), Value::from(origin));
             params.insert("_remuxViewerKey".to_string(), Value::from(viewer_key));
-            params.insert(
-                "_remuxExecutionTimeoutMs".to_string(),
-                Value::from(execution_timeout_ms),
-            );
             Some(Value::Object(params))
         }
     }
-}
-
-fn extension_execution_budget_ms(method: &str, message: &Value) -> Option<u64> {
-    let runtime_cap = match method {
-        "remux/codex/composer/config/read"
-        | "remux/codex/narration/resources/read"
-        | "remux/codex/narration/cancel"
-        | "remux/codex/thread/queue/remove" => 3_000,
-        "remux/codex/composer/config/write" => 5_000,
-        "remux/codex/files" | "remux/codex/narration/audio/read" => 60_000,
-        "remux/codex/models/read"
-        | "remux/codex/narration/start"
-        | "remux/codex/thread/turn/interrupt" => 15_000,
-        "remux/codex/app-server/status/read" => 15_000,
-        "remux/codex/app-server/start"
-        | "remux/codex/app-server/stop"
-        | "remux/codex/app-server/restart" => 40_000,
-        "remux/codex/app-server/update" => 600_000,
-        "remux/codex/thread/resources/read" => 20_000,
-        "remux/codex/transcript/resources/read"
-        | "remux/codex/thread/message/send"
-        | "remux/codex/thread/compact" => 30_000,
-        "remux/codex/thread/message/start" | "remux/codex/thread/message/edit" => 45_000,
-        "remux/codex/thread/message/fork" => 90_000,
-        "remux/codex/thread/queue/run-now" => 30_000,
-        "remux/terminal/session/list"
-        | "remux/terminal/session/detach"
-        | "remux/terminal/session/write"
-        | "remux/terminal/session/resize"
-        | "remux/terminal/session/kill"
-        | "remux/terminal/tmux/context/get" => 3_000,
-        "remux/terminal/session/start" | "remux/terminal/session/attach" => 10_000,
-        "remux/terminal/session/replay/read" => 5_000,
-        "remux/terminal/tmux/action" => 15_000,
-        _ => return None,
-    };
-    let caller_remaining = message
-        .get("remuxPolicy")
-        .and_then(|policy| policy.get("remainingMs"))
-        .and_then(Value::as_u64)
-        .unwrap_or(runtime_cap);
-    Some(runtime_cap.min(caller_remaining))
 }
 
 async fn upgrade_handler(
@@ -1155,29 +1465,30 @@ mod tests {
         assert!(client.is_connected());
     }
 
-    #[test]
-    fn runtime_policy_caps_caller_claimed_extension_deadline() {
-        let message = serde_json::json!({
-            "remuxPolicy": { "name": "forged", "remainingMs": 999_999 },
-        });
-        assert_eq!(
-            extension_execution_budget_ms("remux/terminal/session/write", &message),
-            Some(3_000),
-        );
-        let short = serde_json::json!({
-            "remuxPolicy": { "remainingMs": 750 },
-        });
-        assert_eq!(
-            extension_execution_budget_ms("remux/terminal/session/write", &short),
-            Some(750),
-        );
+    #[tokio::test]
+    async fn request_cancellation_removes_active_request() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let (control_sender, _control_receiver) = mpsc::channel(1);
+        let client = WsClient::new(sender, control_sender, 1);
+        let id = serde_json::json!(42);
+        assert!(client.register_request(&id));
+        let cancellation = client.begin_request(&id).expect("registered");
+        assert!(client.cancel_request(&id));
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            cancellation.notified(),
+        )
+        .await
+        .is_ok());
+        assert!(!client.cancel_request(&id));
     }
 
     #[test]
-    fn runtime_policy_rejects_unregistered_extension_methods() {
-        assert_eq!(
-            extension_execution_budget_ms("remux/codex/new-unknown-method", &Value::Null),
-            None,
-        );
+    fn extension_origin_params_do_not_inject_a_deadline() {
+        let params =
+            params_with_origin(None, "origin".to_string(), "viewer".to_string()).expect("params");
+        assert_eq!(params["_remuxOrigin"], "origin");
+        assert_eq!(params["_remuxViewerKey"], "viewer");
+        assert!(params.get("_remuxExecutionTimeoutMs").is_none());
     }
 }

@@ -1,7 +1,9 @@
 import {
-  isRegisteredRpcRequestMethod,
-  type RpcRequestPolicy,
-} from './rpcPolicy';
+  createAbortError,
+  createSemanticRpcClient,
+  type RpcContract,
+  type RpcRequestOptions,
+} from './rpc';
 
 export type JsonRpcId = number | string;
 
@@ -26,9 +28,13 @@ type WebViewRequest =
       id: JsonRpcId;
       method: string;
       params?: unknown;
-      policy: string;
-      timeoutMs: number;
+      contract: RpcContract;
       type: 'remux/request';
+    }
+  | {
+      id: JsonRpcId;
+      reason: string;
+      type: 'remux/cancel';
     };
 
 type WebViewResponse =
@@ -69,11 +75,10 @@ type WebViewStatus = {
 type NativeMessage = WebViewEvent | WebViewResponse | WebViewStatus;
 
 type PendingRequest = {
+  abort: (() => void) | null;
   method: string;
-  policyName: string;
   reject: (error: Error) => void;
   resolve: (value: unknown) => void;
-  timer: number;
 };
 
 type IpcEventSubscriber = (events: JsonRpcMessage[]) => void;
@@ -105,56 +110,70 @@ declare global {
   }
 }
 
-export class IpcRequestTimeoutError extends Error {
-  constructor(
-    readonly method: string,
-    readonly policyName: string,
-    readonly timeoutMs: number,
-  ) {
-    super(`${method} timed out after ${timeoutMs}ms (${policyName})`);
-    this.name = 'IpcRequestTimeoutError';
-  }
-}
-
-export function requestIpc<T>(policy: RpcRequestPolicy, params?: unknown) {
+function requestIpc<T>(
+  method: string,
+  params: unknown,
+  contract: RpcContract,
+  options: RpcRequestOptions = {},
+) {
   initializeIpc();
 
   const id = `${requestIdPrefix}:${nextId++}`;
-  const { method } = policy;
-  const timeoutMs = policy.budget.totalMs;
+
+  if (pendingRequests.size >= 64) {
+    return Promise.reject<T>(new Error('Remux request admission is full'));
+  }
+
+  if (options.signal?.aborted) {
+    return Promise.reject<T>(createAbortError(options.signal.reason));
+  }
 
   return new Promise<T>((resolve, reject) => {
-    const timer = window.setTimeout(() => {
-      pendingRequests.delete(id);
-      reject(new IpcRequestTimeoutError(method, policy.name, timeoutMs));
-    }, timeoutMs);
+    const abort = options.signal
+      ? () => {
+        const pending = pendingRequests.get(id);
+        if (!pending) {
+          return;
+        }
+        pendingRequests.delete(id);
+        pending.abort?.();
+        postMessage({
+          id,
+          reason: abortReason(options.signal?.reason),
+          type: 'remux/cancel',
+        });
+        reject(createAbortError(options.signal?.reason));
+      }
+      : null;
 
     pendingRequests.set(id, {
+      abort: abort && options.signal
+        ? () => options.signal?.removeEventListener('abort', abort)
+        : null,
       method,
-      policyName: policy.name,
       reject,
       resolve: resolve as (value: unknown) => void,
-      timer,
     });
+    options.signal?.addEventListener('abort', abort!, { once: true });
 
     try {
       postMessage(
         params === undefined
-          ? { id, method, policy: policy.name, timeoutMs, type: 'remux/request' }
-          : { id, method, params, policy: policy.name, timeoutMs, type: 'remux/request' },
+          ? { contract, id, method, type: 'remux/request' }
+          : { contract, id, method, params, type: 'remux/request' },
       );
     } catch (error) {
-      window.clearTimeout(timer);
+      const pending = pendingRequests.get(id);
       pendingRequests.delete(id);
+      pending?.abort?.();
       reject(errorFromUnknown(error));
     }
   });
 }
 
-export function notifyIpc(method: string, params?: unknown) {
-  if (isRegisteredRpcRequestMethod(method)) {
-    throw new Error(`${method} requires an acknowledged request policy`);
-  }
+export const rpc = createSemanticRpcClient(requestIpc);
+
+function notifyIpc(method: string, params?: unknown) {
   initializeIpc();
   postMessage(
     params === undefined
@@ -346,8 +365,8 @@ function handleNativeMessage(event: MessageEvent) {
     return;
   }
 
-  window.clearTimeout(pending.timer);
   pendingRequests.delete(message.id);
+  pending.abort?.();
 
   if (message.type === 'remux/error') {
     pending.reject(new Error(message.error.message));
@@ -373,7 +392,7 @@ function updateStatus(snapshot: IpcStatusSnapshot) {
 
 function rejectPendingRequests(reason: string) {
   for (const [id, pending] of pendingRequests) {
-    window.clearTimeout(pending.timer);
+    pending.abort?.();
     pending.reject(new Error(reason));
     pendingRequests.delete(id);
   }
@@ -428,6 +447,10 @@ function postMessage(message: WebViewRequest) {
   }
 
   window.parent?.postMessage(serialized, '*');
+}
+
+function abortReason(reason: unknown) {
+  return typeof reason === 'string' && reason.length > 0 ? reason : 'caller-aborted';
 }
 
 function isRequestId(id: JsonRpcId) {

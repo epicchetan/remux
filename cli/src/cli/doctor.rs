@@ -88,6 +88,8 @@ pub fn run(flag_root: Option<&Path>) -> Result<i32, String> {
     checks.push(check_node_symlinks());
     checks.push(check_unit_drift());
     checks.push(check_unit_state(&systemd_info));
+    checks.push(check_resource_protection());
+    checks.push(check_workload_skill());
     checks.push(check_unit_path_tools());
     checks.push(health);
     checks.push(check_binary_stale(&systemd_info));
@@ -98,13 +100,15 @@ pub fn run(flag_root: Option<&Path>) -> Result<i32, String> {
     Ok(print_checks(checks))
 }
 
-const CHECK_NAMES: [&str; 12] = [
+const CHECK_NAMES: [&str; 14] = [
     "root",
     "token",
     "path-remux",
     "node-symlinks",
     "unit-drift",
     "unit-state",
+    "resource-protection",
+    "workload-skill",
     "unit-path",
     "runtime",
     "binary-stale",
@@ -112,6 +116,39 @@ const CHECK_NAMES: [&str; 12] = [
     "port",
     "logs-size",
 ];
+
+fn check_resource_protection() -> Check {
+    let capabilities = crate::resource::systemd::effective_capabilities();
+    if capabilities.protected_mode {
+        let topology = crate::resource::CpuTopology::detect();
+        Check::ok(
+            "resource-protection",
+            format!("protected; reserved CPUs {:?}", topology.reserved_cpus),
+        )
+    } else {
+        let detail = if capabilities.reasons.is_empty() {
+            "resource slices are not active with an AllowedCPUs reservation".to_string()
+        } else {
+            capabilities.reasons.join(", ")
+        };
+        Check::warn("resource-protection", detail)
+    }
+}
+
+fn check_workload_skill() -> Check {
+    let path = match systemd::home_dir() {
+        Ok(home) => home.join(".agents/skills/remux-workloads/SKILL.md"),
+        Err(error) => return Check::warn("workload-skill", error),
+    };
+    if path.is_file() {
+        Check::ok("workload-skill", format!("{} installed", path.display()))
+    } else {
+        Check::warn(
+            "workload-skill",
+            format!("{} missing; run remux install", path.display()),
+        )
+    }
+}
 
 fn print_checks(checks: Vec<Check>) -> i32 {
     let failed = checks.iter().any(|check| check.severity == Severity::Fail);

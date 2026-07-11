@@ -1,9 +1,8 @@
 import {
-  requestIpc,
+  rpc,
   subscribeIpcEvents,
   type JsonRpcMessage,
 } from '@remux/viewer-kit/ipc';
-import { rpcPolicies } from '@remux/viewer-kit/rpc-policy';
 
 export type TerminalSessionOutputFrame = {
   dataBase64: string;
@@ -152,10 +151,9 @@ export function startTerminalSession(params: {
   sessionId?: string | null;
   shell?: string | null;
 }) {
-  return requestIpc<TerminalSessionStartResponse>(
-    rpcPolicies['terminal-session-start'],
-    params,
-  );
+  return rpc.command<TerminalSessionStartResponse>('remux/terminal/session/start', params, {
+    operationId: params.operationId,
+  });
 }
 
 export function attachTerminalSession(params: {
@@ -166,10 +164,9 @@ export function attachTerminalSession(params: {
   sessionId: string;
   sessionGeneration?: number | null;
 }) {
-  return requestIpc<TerminalSessionAttachResponse>(
-    rpcPolicies['terminal-session-attach'],
-    params,
-  );
+  return rpc.subscribe<TerminalSessionAttachResponse>('remux/terminal/session/attach', params, {
+    resourceKey: `terminal:${params.sessionId}`,
+  });
 }
 
 export function writeTerminalSession(params: {
@@ -180,18 +177,19 @@ export function writeTerminalSession(params: {
   sessionGeneration: number;
 }) {
   const { data, ...wireParams } = params;
-  return requestIpc<{
+  return rpc.command<{
     acceptedInputSeq: number;
     duplicate: boolean;
     nextInputSeq: number;
     ok: boolean;
     sessionGeneration: number;
   }>(
-    rpcPolicies['terminal-session-write'],
+    'remux/terminal/session/write',
     {
       ...wireParams,
       dataBase64: bytesToBase64(data),
     },
+    { operationId: `input:${params.sessionId}:${params.sessionGeneration}:${params.inputSeq}` },
   );
 }
 
@@ -200,8 +198,8 @@ export function detachTerminalSession(params: {
   sessionId: string;
   sessionGeneration: number;
 }) {
-  return requestIpc<{ ok: boolean; sessionGeneration: number }>(
-    rpcPolicies['terminal-session-detach'],
+  return rpc.command<{ ok: boolean; sessionGeneration: number }>(
+    'remux/terminal/session/detach',
     params,
   );
 }
@@ -212,7 +210,7 @@ export function readTerminalReplay(params: {
   sessionId: string;
   sessionGeneration: number;
 }) {
-  return requestIpc<{
+  return rpc.query<{
     complete: boolean;
     firstAvailableSeq: number;
     frames: TerminalSessionOutputFrame[];
@@ -220,7 +218,9 @@ export function readTerminalReplay(params: {
     sessionGeneration: number;
     sessionId: string;
     truncated: boolean;
-  }>(rpcPolicies['terminal-session-replay-read'], params);
+  }>('remux/terminal/session/replay/read', params, {
+    resourceKey: `terminal-replay:${params.sessionId}:${params.sessionGeneration}:${params.fromSeq}`,
+  });
 }
 
 export function resizeTerminalSession(params: {
@@ -231,23 +231,26 @@ export function resizeTerminalSession(params: {
   sessionId: string;
   sessionGeneration: number;
 }) {
-  return requestIpc<{ ok: boolean }>(
-    rpcPolicies['terminal-session-resize'],
+  return rpc.command<{ ok: boolean }>(
+    'remux/terminal/session/resize',
     params,
+    { preconditionRevision: params.sessionGeneration },
   );
 }
 
 export function killTerminalSession(sessionId: string, sessionGeneration: number) {
-  return requestIpc<{ ok: boolean }>(
-    rpcPolicies['terminal-session-kill'],
+  return rpc.command<{ ok: boolean }>(
+    'remux/terminal/session/kill',
     { sessionGeneration, sessionId },
+    { preconditionRevision: sessionGeneration },
   );
 }
 
 export function getTerminalTmuxContext(sessionId: string) {
-  return requestIpc<{ context: TerminalTmuxContext }>(
-    rpcPolicies['terminal-tmux-context-read'],
+  return rpc.query<{ context: TerminalTmuxContext }>(
+    'remux/terminal/tmux/context/get',
     { sessionId },
+    { resourceKey: `tmux-context:${sessionId}` },
   );
 }
 
@@ -258,17 +261,23 @@ export function runTerminalTmuxAction(params: {
   socketPath?: string | null;
   target?: TerminalTmuxActionTarget | null;
 }) {
-  return requestIpc<{ context?: TerminalTmuxContext; ok: boolean }>(
-    params.action === 'refresh'
-      ? rpcPolicies['terminal-tmux-refresh']
-      : rpcPolicies['terminal-tmux-mutation'],
-    params,
-  );
+  return params.action === 'refresh'
+    ? rpc.query<{ context?: TerminalTmuxContext; ok: boolean }>(
+      'remux/terminal/tmux/action',
+      params,
+      {
+        resourceKey: `tmux:${params.socketPath ?? 'default'}:${params.target?.tmuxSessionId ?? ''}:${params.target?.tmuxWindowId ?? ''}`,
+      },
+    )
+    : rpc.command<{ context?: TerminalTmuxContext; ok: boolean }>(
+      'remux/terminal/tmux/action',
+      params,
+    );
 }
 
 export async function readRemuxSystemInfo() {
   try {
-    const result = await requestIpc<unknown>(rpcPolicies['system-info']);
+    const result = await rpc.query<unknown>('remux/system/info');
     if (isRecord(result) && (typeof result.cwd === 'string' || result.cwd === null)) {
       return {
         cwd: typeof result.cwd === 'string' && result.cwd.trim().length > 0 ? result.cwd : null,

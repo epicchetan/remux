@@ -14,6 +14,7 @@ use crate::paths;
 pub const CONFIG_RELATIVE_PATH: &str = ".remux/config.toml";
 pub const DEFAULT_HOST: &str = "0.0.0.0";
 pub const DEFAULT_PORT: u16 = 48123;
+pub const DEFAULT_GUARDIAN_PORT: u16 = 48124;
 pub const DEFAULT_LOG_RETENTION_DAYS: u32 = 14;
 pub const DEFAULT_RESOURCE_POLL_SECONDS: u32 = 5;
 pub const DEFAULT_WATCHDOG_STALE_SECONDS: u32 = 30;
@@ -23,6 +24,7 @@ pub const DEFAULT_WATCHDOG_STALE_SECONDS: u32 = 30;
 pub struct RemuxConfig {
     pub host: Option<String>,
     pub port: Option<i64>,
+    pub guardian_port: Option<i64>,
     #[serde(alias = "extensionRoots")]
     pub extension_roots: Option<Vec<String>>,
     pub log_retention_days: Option<u32>,
@@ -43,6 +45,13 @@ pub struct RemuxConfig {
 }
 
 impl RemuxConfig {
+    pub fn guardian_port(&self) -> Result<u16, String> {
+        match self.guardian_port {
+            Some(port) => parse_port_number(port, "guardian_port"),
+            None => Ok(DEFAULT_GUARDIAN_PORT),
+        }
+    }
+
     pub fn log_retention_days(&self) -> u32 {
         self.log_retention_days.unwrap_or(DEFAULT_LOG_RETENTION_DAYS)
     }

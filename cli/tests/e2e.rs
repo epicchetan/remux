@@ -237,7 +237,12 @@ async fn http_get(url: String) -> reqwest::Response {
 }
 
 async fn ws_request(socket: &mut Ws, id: u64, method: &str, params: Option<Value>) -> Value {
-    let mut frame = json!({ "jsonrpc": "2.0", "id": id, "method": method });
+    let mut frame = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "remuxContract": { "kind": "query" },
+    });
     if let Some(params) = params {
         frame["params"] = params;
     }

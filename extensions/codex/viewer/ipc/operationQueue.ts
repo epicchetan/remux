@@ -2,14 +2,17 @@ import type {
   CodexQueueEntryMutationParams,
   CodexQueueMutationResponse,
 } from '../../shared/operationQueue';
-import { requestIpc } from '@remux/viewer-kit/ipc';
-import { rpcPolicies } from '@remux/viewer-kit/rpc-policy';
+import { rpc } from '@remux/viewer-kit/ipc';
 
 export const queueRemoveMethod = 'remux/codex/thread/queue/remove';
 export const queueRunNowMethod = 'remux/codex/thread/queue/run-now';
 
 export const removeThreadOperation = (params: CodexQueueEntryMutationParams) =>
-  requestIpc<CodexQueueMutationResponse>(rpcPolicies['codex-queue-remove'], params);
+  rpc.command<CodexQueueMutationResponse>(queueRemoveMethod, params, {
+    operationId: params.operationId,
+  });
 
 export const runThreadOperationNow = (params: CodexQueueEntryMutationParams) =>
-  requestIpc<CodexQueueMutationResponse>(rpcPolicies['codex-queue-run-now'], params);
+  rpc.command<CodexQueueMutationResponse>(queueRunNowMethod, params, {
+    operationId: params.operationId,
+  });

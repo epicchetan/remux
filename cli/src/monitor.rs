@@ -149,6 +149,42 @@ fn aggregate_role_usages(rows: &[RoleUsageRow]) -> (GroupUsage, Map<String, Valu
     (total, roles)
 }
 
+fn systemd_control_group(unit: &str) -> Option<PathBuf> {
+    let output = std::process::Command::new("systemctl")
+        .args(["--user", "show", unit, "-p", "ControlGroup", "--value"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let group = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!group.is_empty()).then(|| PathBuf::from("/sys/fs/cgroup").join(group.trim_start_matches('/')))
+}
+
+fn read_cgroup_usage(path: &std::path::Path, ticks_per_second: f64) -> Option<GroupUsage> {
+    let cpu = std::fs::read_to_string(path.join("cpu.stat")).ok()?;
+    let usage_usec = cpu
+        .lines()
+        .find_map(|line| line.strip_prefix("usage_usec "))?
+        .parse::<u64>()
+        .ok()?;
+    let rss_bytes = std::fs::read_to_string(path.join("memory.current"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let process_count = std::fs::read_to_string(path.join("pids.current"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(GroupUsage {
+        process_count,
+        cpu_ticks: ((usage_usec as f64 / 1_000_000.0) * ticks_per_second) as u64,
+        rss_bytes,
+    })
+}
+
 pub struct ResourceMonitor {
     workspace_dir: PathBuf,
     servers: Vec<(String, Arc<dyn ExtensionServer>)>,
@@ -163,12 +199,29 @@ pub struct ResourceMonitor {
     memory_ceiling_bytes: u64,
     last_memory_alert: Mutex<HashMap<String, Instant>>,
     on_memory_alert: Box<dyn Fn(MemoryAlert) + Send + Sync>,
+    cgroup_paths: HashMap<String, PathBuf>,
 }
 
 impl ResourceMonitor {
     pub fn new(
         workspace_dir: PathBuf,
         servers: Vec<(String, Arc<dyn ExtensionServer>)>,
+        memory_ceiling_mb: u32,
+        on_memory_alert: Box<dyn Fn(MemoryAlert) + Send + Sync>,
+    ) -> Arc<Self> {
+        Self::new_with_roots(
+            workspace_dir,
+            servers,
+            HashMap::new(),
+            memory_ceiling_mb,
+            on_memory_alert,
+        )
+    }
+
+    pub fn new_with_roots(
+        workspace_dir: PathBuf,
+        servers: Vec<(String, Arc<dyn ExtensionServer>)>,
+        extension_roots: HashMap<String, PathBuf>,
         memory_ceiling_mb: u32,
         on_memory_alert: Box<dyn Fn(MemoryAlert) + Send + Sync>,
     ) -> Arc<Self> {
@@ -194,6 +247,19 @@ impl ResourceMonitor {
             memory_ceiling_bytes: u64::from(memory_ceiling_mb) * 1024 * 1024,
             last_memory_alert: Mutex::new(HashMap::new()),
             on_memory_alert,
+            cgroup_paths: extension_roots
+                .into_iter()
+                .filter_map(|(extension_id, root)| {
+                    let canonical = root
+                        .canonicalize()
+                        .unwrap_or(root)
+                        .to_string_lossy()
+                        .into_owned();
+                    let slice =
+                        crate::resource::systemd::extension_slice_name(&extension_id, &canonical);
+                    systemd_control_group(&slice).map(|path| (extension_id, path))
+                })
+                .collect(),
         })
     }
 
@@ -332,6 +398,23 @@ impl ResourceMonitor {
                     .unwrap_or(Value::Null),
             );
 
+            if let Some(usage) = self
+                .cgroup_paths
+                .get(extension_id)
+                .and_then(|path| read_cgroup_usage(path, self.ticks_per_second))
+            {
+                entry.insert("processCount".to_string(), Value::from(usage.process_count));
+                entry.insert("rssBytes".to_string(), Value::from(usage.rss_bytes));
+                entry.insert(
+                    "cpuPercent".to_string(),
+                    Value::from(self.cpu_percent(extension_id, usage.cpu_ticks, now)),
+                );
+                entry.insert("roles".to_string(), Value::Object(Map::new()));
+                entry.insert("accounting".to_string(), Value::from("cgroup"));
+                extensions.push(Value::Object(entry));
+                continue;
+            }
+
             let mut role_rows = Vec::new();
             if let Some(pid) = status.pid {
                 let usage = self.usage_for(&all, |stat| stat.pgrp == pid as i32);
@@ -369,9 +452,12 @@ impl ResourceMonitor {
                 Value::from(self.cpu_percent(extension_id, total.cpu_ticks, now)),
             );
             entry.insert("roles".to_string(), Value::Object(roles));
+            entry.insert("accounting".to_string(), Value::from("process-group"));
             extensions.push(Value::Object(entry));
         }
 
+        let topology = crate::resource::CpuTopology::detect();
+        let capabilities = crate::resource::systemd::effective_capabilities();
         serde_json::json!({
             "sampledAtMs": sampled_at_ms,
             "system": self.system_block(),
@@ -382,6 +468,19 @@ impl ResourceMonitor {
                 "uptimeMs": self.started_at.elapsed().as_millis() as u64,
             },
             "extensions": extensions,
+            "resourceProtection": {
+                "cgroupVersion": capabilities.cgroup_version,
+                "cpuWeight": capabilities.cpu_weight,
+                "freeze": capabilities.freeze,
+                "memoryAccounting": capabilities.memory_accounting,
+                "pidAccounting": capabilities.pid_accounting,
+                "pressure": capabilities.pressure,
+                "processAffinity": capabilities.process_affinity,
+                "protectedMode": capabilities.protected_mode,
+                "reasons": capabilities.reasons,
+                "reservedCpus": topology.reserved_cpus,
+                "systemdUserManager": capabilities.systemd_user_manager,
+            },
         })
     }
 

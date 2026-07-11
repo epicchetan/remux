@@ -1,0 +1,9 @@
+[package]
+name = "remux-extension-host"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "remux_extension_host"
+path = "src/lib.rs"

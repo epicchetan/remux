@@ -95,12 +95,12 @@ fn fixture_manifest_with_server(root: &Path, server: ServerSpec) -> ExtensionMan
         )],
         launchers: Vec::new(),
         file_handlers: Vec::new(),
+        workloads: Default::default(),
     }
 }
 
 fn fast_config() -> SupervisorConfig {
     SupervisorConfig {
-        request_timeout_ms: 500,
         backoff_base_ms: 40,
         backoff_cap_ms: 160,
         crash_budget: 5,
@@ -295,7 +295,7 @@ async fn garbage_stdout_lines_are_skipped_and_later_rpc_still_correlates() {
 }
 
 #[tokio::test]
-async fn rpc_timeouts_and_error_responses_keep_node_shapes() {
+async fn rpc_cancellation_releases_pending_and_error_responses_keep_node_shapes() {
     let harness = harness(&[], fast_config());
 
     // Not running yet.
@@ -309,13 +309,26 @@ async fn rpc_timeouts_and_error_responses_keep_node_shapes() {
 
     harness.supervisor.start(false).await;
 
-    let err = harness
-        .supervisor
-        .handle_rpc("fixture/block".to_string(), None)
-        .await
-        .unwrap_err();
-    assert_eq!(err.code, -32000);
-    assert_eq!(err.message, "fixture/block timed out");
+    let supervisor = harness.supervisor.clone();
+    let blocked = tokio::spawn(async move {
+        supervisor
+            .handle_rpc("fixture/block".to_string(), None)
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    blocked.abort();
+    assert!(blocked.await.unwrap_err().is_cancelled());
+
+    let echo = tokio::time::timeout(
+        Duration::from_secs(1),
+        harness
+            .supervisor
+            .handle_rpc("fixture/echo".to_string(), None),
+    )
+    .await
+    .expect("canceled request must not occupy the pending map")
+    .unwrap();
+    assert_eq!(echo["echo"], "fixture/echo");
 
     let err = harness
         .supervisor
@@ -836,6 +849,7 @@ fn view_manifest(
         )],
         launchers: Vec::new(),
         file_handlers: Vec::new(),
+        workloads: Default::default(),
     }
 }
 

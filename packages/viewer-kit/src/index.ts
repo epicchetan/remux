@@ -9,3 +9,4 @@ export * from './host';
 export * from './ipc';
 export * from './links';
 export * from './route';
+export * from './rpc';

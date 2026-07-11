@@ -177,11 +177,16 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
     std::env::set_current_dir(&root_dir)
         .map_err(|error| format!("{}: {error}", root_dir.display()))?;
     let started_at_ms = crate::time::now_ms();
+    start_guardian_heartbeat(&root_dir);
 
     // Config + journal (journal applies log retention on boot).
     let config = load_remux_config(&root_dir)?;
-    let journal = Journal::new(&root_dir, config.log_retention_days(), Arc::new(StdTerminal))
-        .map_err(|error| format!("failed to open journal: {error}"))?;
+    let journal = Journal::new(
+        &root_dir,
+        config.log_retention_days(),
+        Arc::new(StdTerminal),
+    )
+    .map_err(|error| format!("failed to open journal: {error}"))?;
     install_panic_hook(journal.clone());
 
     // L3 boot orphan sweep: kill any process group a previous worker left
@@ -195,10 +200,8 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
     )?;
 
     // Pass-3a auth token: resolve (or mint) before anything listens.
-    let token_load = crate::auth::resolve_token(
-        std::env::var("REMUX_AUTH_TOKEN").ok().as_deref(),
-        &root_dir,
-    )?;
+    let token_load =
+        crate::auth::resolve_token(std::env::var("REMUX_AUTH_TOKEN").ok().as_deref(), &root_dir)?;
     if token_load.generated {
         journal.log(&format!(
             "generated auth token at {}",
@@ -285,9 +288,13 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
     }
 
     // Resource monitor (always on — it also feeds the memory guardrail).
-    let monitor = ResourceMonitor::new(
+    let monitor = ResourceMonitor::new_with_roots(
         root_dir.clone(),
         servers.clone(),
+        extensions
+            .iter()
+            .map(|extension| (extension.id.clone(), extension.root_dir.clone()))
+            .collect(),
         config.extension_memory_ceiling_mb(),
         Box::new({
             let notifications = notifications.clone();
@@ -401,7 +408,13 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
         ))
         .into_make_service_with_connect_info::<std::net::SocketAddr>();
 
-    log_start_config(&journal, &runtime.host, runtime.port, &default_extension, &extensions);
+    log_start_config(
+        &journal,
+        &runtime.host,
+        runtime.port,
+        &default_extension,
+        &extensions,
+    );
 
     // Bind, retrying through a lingering predecessor's EADDRINUSE.
     let listener = bind_with_retry(&runtime.host, runtime.port, &journal).await?;
@@ -460,7 +473,12 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
     let serve_shared = shared.clone();
     let server = tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
-            fatal_task_died(&serve_journal, &serve_shared, "http-server", Some(error.to_string()));
+            fatal_task_died(
+                &serve_journal,
+                &serve_shared,
+                "http-server",
+                Some(error.to_string()),
+            );
         }
     });
 
@@ -488,13 +506,25 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
     Ok(0)
 }
 
+fn start_guardian_heartbeat(root_dir: &std::path::Path) {
+    let path = root_dir.join(".remux/worker-heartbeat");
+    let _ = std::fs::create_dir_all(path.parent().unwrap_or(root_dir));
+    std::thread::Builder::new()
+        .name("remux-guardian-heartbeat".to_string())
+        .spawn(move || loop {
+            let _ = std::fs::write(&path, crate::time::now_ms().to_string());
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        })
+        .ok();
+}
+
 async fn bind_with_retry(
     host: &str,
     port: u16,
     journal: &Journal,
 ) -> Result<tokio::net::TcpListener, String> {
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_millis(BIND_RETRY_WINDOW_MS);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(BIND_RETRY_WINDOW_MS);
     loop {
         match tokio::net::TcpListener::bind((host, port)).await {
             Ok(listener) => return Ok(listener),

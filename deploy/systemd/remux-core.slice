@@ -1,0 +1,8 @@
+[Unit]
+Description=Remux core resource slice
+
+[Slice]
+CPUWeight=1000
+CPUAccounting=yes
+MemoryAccounting=yes
+TasksAccounting=yes

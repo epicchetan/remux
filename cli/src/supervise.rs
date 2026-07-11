@@ -44,6 +44,25 @@ const POLL_MS: u64 = 50;
 /// re-run of the build phase is a fast no-op, and a crash-restarted worker
 /// still honors the operator's intent.
 pub fn supervise(root_dir: &Path, rebuild: bool) -> i32 {
+    let guardian = match crate::config::load_remux_config(root_dir).and_then(|config| {
+        let runtime = crate::config::load_runtime_values(None, None, &config)?;
+        let port = config.guardian_port()?;
+        Ok(crate::guardian::Guardian::start(
+            root_dir,
+            &runtime.host,
+            port,
+        ))
+    }) {
+        Ok(guardian) => guardian,
+        Err(error) => {
+            eprintln!("remux guardian configuration failed: {error}");
+            crate::guardian::Guardian::start(
+                root_dir,
+                crate::config::DEFAULT_HOST,
+                crate::config::DEFAULT_GUARDIAN_PORT,
+            )
+        }
+    };
     let pending_signal = Arc::new(AtomicUsize::new(0));
     for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
         let pending = pending_signal.clone();
@@ -85,8 +104,10 @@ pub fn supervise(root_dir: &Path, rebuild: bool) -> i32 {
                 return 1;
             }
         };
+        guardian.set_worker_pid(child.id());
 
         let mut forwarded_at: Option<Instant> = None;
+        let mut guardian_restart_requested = false;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
@@ -108,6 +129,13 @@ pub fn supervise(root_dir: &Path, rebuild: bool) -> i32 {
                         .unwrap_or(nix::sys::signal::Signal::SIGTERM),
                 );
             }
+            if guardian.take_worker_restart() && !guardian_restart_requested {
+                guardian_restart_requested = true;
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(child.id() as i32),
+                    nix::sys::signal::Signal::SIGTERM,
+                );
+            }
             if let Some(at) = forwarded_at {
                 if at.elapsed() > Duration::from_millis(SIGNAL_FORWARD_GRACE_MS) {
                     let _ = child.kill();
@@ -118,11 +146,18 @@ pub fn supervise(root_dir: &Path, rebuild: bool) -> i32 {
         };
 
         let code = status.code();
+        guardian.set_worker_pid(0);
+        guardian.cleanup_ordinary_scopes();
         let uptime = started_at.elapsed();
 
         // Shutting down: exit with the worker's code.
         if forwarded_at.is_some() {
             return code.unwrap_or(0);
+        }
+        if guardian_restart_requested {
+            backoff_exponent = 0;
+            eprintln!("remux: guardian requested worker restart");
+            continue;
         }
 
         match code {
@@ -136,8 +171,8 @@ pub fn supervise(root_dir: &Path, rebuild: bool) -> i32 {
                 if uptime > Duration::from_millis(BACKOFF_RESET_UPTIME_MS) {
                     backoff_exponent = 0;
                 }
-                let delay =
-                    BACKOFF_CAP_MS.min(BACKOFF_BASE_MS.saturating_mul(1 << backoff_exponent.min(10)));
+                let delay = BACKOFF_CAP_MS
+                    .min(BACKOFF_BASE_MS.saturating_mul(1 << backoff_exponent.min(10)));
                 backoff_exponent = backoff_exponent.saturating_add(1);
 
                 let description = match code {

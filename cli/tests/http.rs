@@ -63,6 +63,7 @@ fn fixture_extension(root: &std::path::Path) -> ExtensionManifest {
             },
         ],
         file_handlers: Vec::<FileHandler>::new(),
+        workloads: Default::default(),
     }
 }
 

@@ -1,5 +1,4 @@
 import type { RemuxConnection } from '../remote/RemuxConnectionProvider';
-import { rpcPolicies } from '@remux/viewer-kit/rpc-policy';
 
 const extensionStatusMethod = 'remux/extensions/status';
 const extensionStartMethod = 'remux/extensions/start';
@@ -12,12 +11,10 @@ const extensionViewsBuildMethod = 'remux/extensions/views/build';
 const extensionLogsMethod = 'remux/extensions/logs';
 const extensionLogsSubscribeMethod = 'remux/extensions/logs/subscribe';
 const extensionLogsUnsubscribeMethod = 'remux/extensions/logs/unsubscribe';
+const codexAppServerStatusMethod = 'remux/codex/app-server/status/read';
 
 export const extensionDidChangeStatusMethod = 'remux/extensions/didChangeStatus';
 export const extensionLogsDidAppendMethod = 'remux/extensions/logs/didAppend';
-
-/** A rebuild runs the manifest build phase; allow it the runtime's 10min. */
-const rebuildTimeoutMs = 600_000;
 
 export type ExtensionServerState =
   | 'stopped'
@@ -102,11 +99,18 @@ export type CodexAppServerStatus = {
 };
 
 export type CodexAppServerAction = 'start' | 'stop' | 'restart' | 'update';
+export type JobAdmission = {
+  accepted: boolean;
+  operationId: string;
+  revision: number;
+};
 
 export async function readExtensionServerStatuses(
-  request: RemuxConnection['request'],
+  query: RemuxConnection['query'],
 ): Promise<ExtensionServerStatus[]> {
-  const response = await request<unknown>(rpcPolicies['extensions-status-read']);
+  const response = await query<unknown>(extensionStatusMethod, undefined, {
+    resourceKey: 'extension-statuses',
+  });
   if (!isRecord(response) || !Array.isArray(response.extensions)) {
     throw new Error('Invalid extension status response');
   }
@@ -118,46 +122,33 @@ export async function readExtensionServerStatuses(
 }
 
 export async function restartExtensionServer(
-  request: RemuxConnection['request'],
+  startJob: RemuxConnection['startJob'],
   extensionId: string,
   options?: { rebuild?: boolean },
-): Promise<ExtensionServerStatus & { restarted: boolean }> {
+): Promise<JobAdmission> {
   const rebuild = options?.rebuild === true;
-  const response = await request<unknown>(
-    rpcPolicies['extension-restart'],
+  const response = await startJob<unknown>(
+    extensionRestartMethod,
     { extensionId, ...(rebuild ? { rebuild: true } : {}) },
+    { operationId: newOperationId(`extension:${extensionId}:restart`) },
   );
-  const status = parseExtensionServerStatus(response);
-  if (!status || !isRecord(response)) {
-    throw new Error('Invalid extension restart response');
-  }
-
-  return {
-    ...status,
-    restarted: response.restarted === true,
-  };
+  return parseJobAdmission(response);
 }
 
 export async function setExtensionServerRunning(
-  request: RemuxConnection['request'],
+  startJob: RemuxConnection['startJob'],
   extensionId: string,
   running: boolean,
   options?: { rebuild?: boolean },
-): Promise<ExtensionServerStatus & { changed: boolean }> {
+): Promise<JobAdmission> {
   const rebuild = running && options?.rebuild === true;
-  const response = await request<unknown>(
-    running ? rpcPolicies['extension-start'] : rpcPolicies['extension-stop'],
+  const method = running ? extensionStartMethod : extensionStopMethod;
+  const response = await startJob<unknown>(
+    method,
     { extensionId, ...(rebuild ? { rebuild: true } : {}) },
+    { operationId: newOperationId(`extension:${extensionId}:${running ? 'start' : 'stop'}`) },
   );
-  const status = parseExtensionServerStatus(response);
-  if (!status || !isRecord(response)) {
-    throw new Error(`Invalid extension ${running ? 'start' : 'stop'} response`);
-  }
-
-  return {
-    ...status,
-    changed: response.started === true || response.stopped === true,
-  };
+  return parseJobAdmission(response);
 }
 
 /**
@@ -165,23 +156,16 @@ export async function setExtensionServerRunning(
  * build, so it gets the rebuild timeout; stop uses the standard 30s.
  */
 export async function setExtensionWatchRunning(
-  request: RemuxConnection['request'],
+  startJob: RemuxConnection['startJob'],
   extensionId: string,
   running: boolean,
-): Promise<ExtensionServerStatus & { changed: boolean }> {
-  const response = await request<unknown>(
-    running ? rpcPolicies['extension-watch-start'] : rpcPolicies['extension-watch-stop'],
+): Promise<JobAdmission> {
+  const response = await startJob<unknown>(
+    running ? extensionWatchStartMethod : extensionWatchStopMethod,
     { extensionId },
+    { operationId: newOperationId(`extension:${extensionId}:watch-${running ? 'start' : 'stop'}`) },
   );
-  const status = parseExtensionServerStatus(response);
-  if (!status || !isRecord(response)) {
-    throw new Error(`Invalid extension watch ${running ? 'start' : 'stop'} response`);
-  }
-
-  return {
-    ...status,
-    changed: response.started === true || response.stopped === true,
-  };
+  return parseJobAdmission(response);
 }
 
 /**
@@ -189,33 +173,27 @@ export async function setExtensionWatchRunning(
  * server; `views` force-runs every declared view build.
  */
 export async function buildExtension(
-  request: RemuxConnection['request'],
+  startJob: RemuxConnection['startJob'],
   extensionId: string,
   target: 'server' | 'views',
-): Promise<ExtensionServerStatus & { changed: boolean }> {
-  const response = await request<unknown>(
-    target === 'server'
-      ? rpcPolicies['extension-server-build']
-      : rpcPolicies['extension-views-build'],
+): Promise<JobAdmission> {
+  const method = target === 'server' ? extensionServerBuildMethod : extensionViewsBuildMethod;
+  const response = await startJob<unknown>(
+    method,
     { extensionId },
+    { operationId: newOperationId(`extension:${extensionId}:${target}-build`) },
   );
-  const status = parseExtensionServerStatus(response);
-  if (!status || !isRecord(response)) {
-    throw new Error(`Invalid extension ${target} build response`);
-  }
-
-  return {
-    ...status,
-    changed: response.built === true,
-  };
+  return parseJobAdmission(response);
 }
 
 export async function readExtensionLogs(
-  request: RemuxConnection['request'],
+  query: RemuxConnection['query'],
   extensionId: string,
   lines = 500,
 ): Promise<ExtensionLogLine[]> {
-  const response = await request<unknown>(rpcPolicies['extension-logs-read'], { extensionId, lines });
+  const response = await query<unknown>(extensionLogsMethod, { extensionId, lines }, {
+    resourceKey: `extension-logs:${extensionId}`,
+  });
   if (!isRecord(response) || !Array.isArray(response.lines)) {
     throw new Error('Invalid extension logs response');
   }
@@ -224,24 +202,28 @@ export async function readExtensionLogs(
 }
 
 export async function subscribeExtensionLogs(
-  request: RemuxConnection['request'],
+  subscribeRequest: RemuxConnection['subscribeRequest'],
   extensionId: string,
 ): Promise<void> {
-  await request<unknown>(rpcPolicies['extension-logs-subscribe'], { extensionId });
+  await subscribeRequest<unknown>(extensionLogsSubscribeMethod, { extensionId }, {
+    resourceKey: `extension-logs:${extensionId}`,
+  });
 }
 
 export async function unsubscribeExtensionLogs(
-  request: RemuxConnection['request'],
+  command: RemuxConnection['command'],
   extensionId: string,
 ): Promise<void> {
-  await request<unknown>(rpcPolicies['extension-logs-unsubscribe'], { extensionId });
+  await command<unknown>(extensionLogsUnsubscribeMethod, { extensionId });
 }
 
 export async function readCodexAppServerStatus(
-  request: RemuxConnection['request'],
+  query: RemuxConnection['query'],
 ): Promise<CodexAppServerStatus | null> {
   try {
-    const response = await request<unknown>(rpcPolicies['codex-app-server-status-read']);
+    const response = await query<unknown>(codexAppServerStatusMethod, undefined, {
+      resourceKey: 'codex-app-server-status',
+    });
     return parseCodexAppServerStatus(response);
   } catch (error) {
     if (isMethodNotFound(error)) {
@@ -252,22 +234,34 @@ export async function readCodexAppServerStatus(
 }
 
 export async function runCodexAppServerAction(
-  request: RemuxConnection['request'],
+  startJob: RemuxConnection['startJob'],
   action: CodexAppServerAction,
-): Promise<CodexAppServerStatus> {
-  const policy = action === 'start'
-    ? rpcPolicies['codex-app-server-start']
-    : action === 'stop'
-      ? rpcPolicies['codex-app-server-stop']
-      : action === 'restart'
-        ? rpcPolicies['codex-app-server-restart']
-        : rpcPolicies['codex-app-server-update'];
-  const response = await request<unknown>(policy);
-  const status = parseCodexAppServerStatus(response);
-  if (!status) {
-    throw new Error(`Invalid Codex App Server ${action} response`);
+): Promise<JobAdmission> {
+  const method = `remux/codex/app-server/${action}`;
+  const response = await startJob<unknown>(method, undefined, {
+    operationId: newOperationId(`codex-app-server:${action}`),
+  });
+  return parseJobAdmission(response);
+}
+
+function newOperationId(prefix: string) {
+  return `${prefix}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+}
+
+function parseJobAdmission(value: unknown): JobAdmission {
+  if (
+    !isRecord(value)
+    || typeof value.accepted !== 'boolean'
+    || typeof value.operationId !== 'string'
+    || typeof value.revision !== 'number'
+  ) {
+    throw new Error('Invalid job admission response');
   }
-  return status;
+  return {
+    accepted: value.accepted,
+    operationId: value.operationId,
+    revision: value.revision,
+  };
 }
 
 /** Params of a `remux/extensions/logs/didAppend` notification. */

@@ -12,8 +12,7 @@ import type {
   CodexThreadTurnInterruptParams,
   CodexThreadTurnInterruptResponse,
 } from '../../shared/threadCommands';
-import { requestIpc } from '@remux/viewer-kit/ipc';
-import { rpcPolicies } from '@remux/viewer-kit/rpc-policy';
+import { rpc } from '@remux/viewer-kit/ipc';
 
 export const threadCompactMethod = 'remux/codex/thread/compact';
 export const threadMessageEditMethod = 'remux/codex/thread/message/edit';
@@ -23,25 +22,35 @@ export const threadMessageStartMethod = 'remux/codex/thread/message/start';
 export const threadTurnInterruptMethod = 'remux/codex/thread/turn/interrupt';
 
 export function compactThread(params: CodexThreadCompactParams) {
-  return requestIpc<CodexThreadCompactResponse>(rpcPolicies['codex-compact'], params);
+  return rpc.command<CodexThreadCompactResponse>(threadCompactMethod, params);
 }
 
 export function editThreadMessage(params: CodexThreadMessageEditParams) {
-  return requestIpc<CodexThreadMessageEditResponse>(rpcPolicies['codex-message-edit'], params);
+  return rpc.command<CodexThreadMessageEditResponse>(threadMessageEditMethod, params, {
+    operationId: params.clientMessageId ?? undefined,
+  });
 }
 
 export function forkThreadMessage(params: CodexThreadMessageForkParams) {
-  return requestIpc<CodexThreadMessageForkResponse>(rpcPolicies['codex-message-fork'], params);
+  return rpc.command<CodexThreadMessageForkResponse>(threadMessageForkMethod, params, {
+    operationId: params.clientMessageId ?? undefined,
+  });
 }
 
 export function sendThreadMessage(params: CodexThreadMessageSendParams) {
-  return requestIpc<CodexThreadMessageSendResponse>(rpcPolicies['codex-message-send'], params);
+  return rpc.command<CodexThreadMessageSendResponse>(threadMessageSendMethod, params, {
+    operationId: params.clientMessageId ?? undefined,
+  });
 }
 
 export function startThreadMessage(params: CodexThreadMessageStartParams) {
-  return requestIpc<CodexThreadMessageStartResponse>(rpcPolicies['codex-message-start'], params);
+  return rpc.command<CodexThreadMessageStartResponse>(threadMessageStartMethod, params, {
+    operationId: params.clientMessageId ?? undefined,
+  });
 }
 
 export function interruptThreadTurn(params: CodexThreadTurnInterruptParams) {
-  return requestIpc<CodexThreadTurnInterruptResponse>(rpcPolicies['codex-turn-interrupt'], params);
+  return rpc.command<CodexThreadTurnInterruptResponse>(threadTurnInterruptMethod, params, {
+    operationId: `interrupt:${params.threadId}:${params.turnId ?? 'active'}`,
+  });
 }

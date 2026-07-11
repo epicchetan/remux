@@ -83,7 +83,7 @@ export function FilesOverview() {
   const refreshError = useFilesStore((state) => state.refreshError);
   const refreshVisibleDirectories = useFilesStore((state) => state.refreshVisibleDirectories);
   const toggleFolder = useFilesStore((state) => state.toggleFolder);
-  const { request, subscribe } = useRemuxConnection();
+  const { query: request, subscribe } = useRemuxConnection();
   const listRef = useRef<FlatList<VisibleFileTreeRow>>(null);
   const preloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [viewablePaths, setViewablePaths] = useState<string[]>([]);
@@ -395,7 +395,7 @@ function FileTreeRow({ row }: { row: VisibleFileTreeRow }) {
   const { styles, theme } = useFilesTheme();
   const extensions = useBrowserStore((state) => state.extensions);
   const openResource = useBrowserStore((state) => state.openResource);
-  const request = useRemuxConnection().request;
+  const request = useRemuxConnection().query;
   const record = useFilesStore((state) => state.directoriesByPath[row.path]);
   const error = record?.error ?? null;
   const loading = record?.refreshStatus === 'loading';

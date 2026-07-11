@@ -1013,8 +1013,26 @@ impl CodexCommandRunner for ProcessCodexCommandRunner {
         timeout: Duration,
         on_line: &mut dyn FnMut(CodexCommandLine),
     ) -> Result<CodexCommandOutput, String> {
-        let mut child = Command::new(command)
-            .args(args)
+        let mut process = if let Ok(wrapper) = env::var("REMUX_WORKLOAD_EXEC") {
+            let operation = format!("codex-app-server:{}", args.join("-"));
+            let mut process = Command::new(wrapper);
+            process.args([
+                "workload",
+                "exec",
+                "--workload",
+                "app-server",
+                "--operation",
+                &operation,
+                "--",
+            ]);
+            process.arg(command).args(args);
+            process
+        } else {
+            let mut process = Command::new(command);
+            process.args(args);
+            process
+        };
+        let mut child = process
             .env("CODEX_HOME", codex_home)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

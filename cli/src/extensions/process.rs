@@ -14,6 +14,7 @@ use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::sync::mpsc;
 
 use crate::extensions::manifest::ServerSpec;
+use crate::resource::{ResourceClass, ResourcePlacement};
 
 const MAX_EXTENSION_LINE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -53,12 +54,12 @@ pub fn harden_command(command: &mut Command) -> &mut Command {
 /// the L3 hardening above, and starts the dedicated stdin writer task.
 pub fn spawn_extension(
     spec: &ServerSpec,
+    placement: &ResourcePlacement,
     on_write_error: impl Fn(String) + Send + 'static,
 ) -> std::io::Result<SpawnedChild> {
-    let mut command = Command::new(&spec.command);
+    let mut command =
+        placement.configure_command(&spec.command, &spec.args, &spec.cwd, ResourceClass::Server);
     command
-        .args(&spec.args)
-        .current_dir(&spec.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

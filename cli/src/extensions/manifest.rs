@@ -2,6 +2,7 @@
 //! `cli/extensionManifest.cjs`. Validation error messages and ordering are
 //! preserved verbatim — they surface at startup and in tests.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -21,6 +22,28 @@ pub struct ExtensionManifest {
     pub views: Vec<(String, View)>,
     pub launchers: Vec<Launcher>,
     pub file_handlers: Vec<FileHandler>,
+    pub workloads: BTreeMap<String, WorkloadSpec>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkloadClass {
+    Interactive,
+    Background,
+    Research,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkloadLifetime {
+    Operation,
+    Extension,
+    Persistent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkloadSpec {
+    pub class: WorkloadClass,
+    pub lifetime: WorkloadLifetime,
+    pub threads: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -97,7 +120,8 @@ impl ExtensionManifest {
     }
 
     pub fn main_view(&self) -> &View {
-        self.view("main").expect("validated manifest has views.main")
+        self.view("main")
+            .expect("validated manifest has views.main")
     }
 
     /// Any view with a `build` or `watch` phase — such extensions get a
@@ -143,7 +167,10 @@ fn parse_manifest(raw: &Value, root_dir: &Path) -> ExtensionManifest {
 
     let views = parse_views(&id, &raw["views"], root_dir);
     let empty = serde_json::Map::new();
-    let display = raw.get("display").and_then(Value::as_object).unwrap_or(&empty);
+    let display = raw
+        .get("display")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
 
     let title = match display.get("title").and_then(Value::as_str) {
         Some(title) if !title.trim().is_empty() => title.to_string(),
@@ -163,7 +190,46 @@ fn parse_manifest(raw: &Value, root_dir: &Path) -> ExtensionManifest {
         name,
         root_dir: root_dir.to_path_buf(),
         views,
+        workloads: parse_workloads(raw.get("resources")),
     }
+}
+
+fn parse_workloads(resources: Option<&Value>) -> BTreeMap<String, WorkloadSpec> {
+    let Some(workloads) = resources
+        .and_then(|value| value.get("workloads"))
+        .and_then(Value::as_object)
+    else {
+        return BTreeMap::new();
+    };
+    workloads
+        .iter()
+        .map(|(name, raw)| {
+            let class = match raw.get("class").and_then(Value::as_str).expect("validated") {
+                "interactive" => WorkloadClass::Interactive,
+                "background" => WorkloadClass::Background,
+                "research" => WorkloadClass::Research,
+                _ => unreachable!("validated"),
+            };
+            let lifetime = match raw.get("lifetime").and_then(Value::as_str) {
+                None | Some("operation") => WorkloadLifetime::Operation,
+                Some("extension") => WorkloadLifetime::Extension,
+                Some("persistent") => WorkloadLifetime::Persistent,
+                _ => unreachable!("validated"),
+            };
+            let threads = raw
+                .get("threads")
+                .and_then(Value::as_u64)
+                .map(|threads| threads as usize);
+            (
+                name.clone(),
+                WorkloadSpec {
+                    class,
+                    lifetime,
+                    threads,
+                },
+            )
+        })
+        .collect()
 }
 
 fn resolve_optional_path(value: Option<&Value>, root_dir: &Path) -> Option<PathBuf> {
@@ -219,13 +285,10 @@ fn parse_server(raw_server: Option<&Value>, root_dir: &Path) -> Option<ServerSpe
         args,
         command,
         cwd,
-        build: server
-            .get("build")
-            .and_then(Value::as_object)
-            .map(|build| {
-                let (command, args, cwd) = parse_command_triple(build, root_dir);
-                BuildSpec { command, args, cwd }
-            }),
+        build: server.get("build").and_then(Value::as_object).map(|build| {
+            let (command, args, cwd) = parse_command_triple(build, root_dir);
+            BuildSpec { command, args, cwd }
+        }),
         transport: server["transport"].as_str().expect("validated").to_string(),
     })
 }
@@ -413,8 +476,9 @@ pub fn validate_manifest(manifest: &Value, manifest_path: &str) -> Result<(), St
     };
     let invalid = |detail: &str| Err(format!("Invalid Remux extension {id}: {detail}"));
 
-    if manifest.get("version").and_then(Value::as_f64) != Some(1.0) {
-        return invalid("version must be 1");
+    let version = manifest.get("version").and_then(Value::as_u64);
+    if !matches!(version, Some(1 | 2)) {
+        return invalid("version must be 1 or 2");
     }
 
     if let Some(name) = manifest.get("name") {
@@ -428,6 +492,64 @@ pub fn validate_manifest(manifest: &Value, manifest_path: &str) -> Result<(), St
     validate_display(manifest, id)?;
     validate_launchers(manifest, id)?;
     validate_file_handlers(manifest, id)?;
+    validate_resources(manifest, id, version.expect("validated"))?;
+    Ok(())
+}
+
+fn validate_resources(manifest: &Value, id: &str, version: u64) -> Result<(), String> {
+    let Some(resources) = manifest.get("resources") else {
+        return Ok(());
+    };
+    let invalid = |detail: &str| Err(format!("Invalid Remux extension {id}: {detail}"));
+    if version != 2 {
+        return invalid("resources requires version 2");
+    }
+    let Some(resources) = resources.as_object() else {
+        return invalid("resources must be an object");
+    };
+    let Some(workloads) = resources.get("workloads").and_then(Value::as_object) else {
+        return invalid("resources.workloads must be an object");
+    };
+    if workloads.len() > 32 {
+        return invalid("resources.workloads may declare at most 32 workloads");
+    }
+    let logical_cpus = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    for (name, workload) in workloads {
+        let valid_name = !name.is_empty()
+            && name.len() <= 48
+            && (name.as_bytes()[0].is_ascii_lowercase() || name.as_bytes()[0].is_ascii_digit())
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+        if !valid_name {
+            return invalid("workload names must match [a-z0-9][a-z0-9-]{0,47}");
+        }
+        let Some(workload) = workload.as_object() else {
+            return invalid("each workload must be an object");
+        };
+        if !matches!(
+            workload.get("class").and_then(Value::as_str),
+            Some("interactive" | "background" | "research")
+        ) {
+            return invalid("workload.class must be interactive, background, or research");
+        }
+        if let Some(lifetime) = workload.get("lifetime").and_then(Value::as_str) {
+            if !matches!(lifetime, "operation" | "extension" | "persistent") {
+                return invalid("workload.lifetime must be operation, extension, or persistent");
+            }
+        }
+        if let Some(threads) = workload.get("threads") {
+            let valid = threads.as_str() == Some("auto")
+                || threads
+                    .as_u64()
+                    .is_some_and(|threads| threads >= 1 && threads <= logical_cpus as u64);
+            if !valid {
+                return invalid("workload.threads must be auto or a logical CPU count");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -500,7 +622,11 @@ fn validate_main_view(manifest: &Value, id: &str) -> Result<(), String> {
             return invalid(format!("views.{view_id} must be an object"));
         }
         if let Some(route) = view.get("route") {
-            if !route.as_str().map(|route| route.starts_with('/')).unwrap_or(false) {
+            if !route
+                .as_str()
+                .map(|route| route.starts_with('/'))
+                .unwrap_or(false)
+            {
                 return invalid(format!("views.{view_id}.route must start with /"));
             }
         }
@@ -756,6 +882,31 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn parses_version_two_workloads_with_defaults() {
+        let raw = serde_json::json!({
+            "version": 2,
+            "id": "fixture",
+            "views": { "main": { "entry": "index.html" } },
+            "resources": {
+                "workloads": {
+                    "runtime": { "class": "interactive", "lifetime": "extension" },
+                    "research": { "class": "research", "threads": 2 }
+                }
+            }
+        });
+        validate_manifest(&raw, "fixture.json").unwrap();
+        let manifest = parse_manifest(&raw, Path::new("/tmp/fixture"));
+        assert_eq!(
+            manifest.workloads["runtime"].lifetime,
+            WorkloadLifetime::Extension
+        );
+        assert_eq!(
+            manifest.workloads["research"].lifetime,
+            WorkloadLifetime::Operation
+        );
+        assert_eq!(manifest.workloads["research"].threads, Some(2));
+    }
     fn assert_invalid(manifest: Value, expected: &str) {
         let err = validate_manifest(&manifest, "/tmp/bad").unwrap_err();
         assert!(err.contains(expected), "expected {expected:?} in {err:?}");
@@ -770,7 +921,7 @@ mod tests {
         );
         assert_invalid(
             json!({ "id": "bad", "views": { "main": { "entry": "index.html" } } }),
-            "version must be 1",
+            "version must be 1 or 2",
         );
         assert_invalid(
             json!({
@@ -1056,7 +1207,10 @@ mod tests {
 
         let extension = load_extension_manifest(&manifest_path).unwrap();
         let server = extension.server.as_ref().unwrap();
-        assert_eq!(server.command, "/tmp/definitely-missing/release/built-server");
+        assert_eq!(
+            server.command,
+            "/tmp/definitely-missing/release/built-server"
+        );
         assert_eq!(
             server.build,
             Some(BuildSpec {
@@ -1124,38 +1278,50 @@ mod tests {
         };
 
         // Neither build nor watch: unmanaged, no build.
-        let bare = load("bare", json!({
-            "version": 1, "id": "bare",
-            "views": { "main": { "entry": "index.html" } }
-        }));
+        let bare = load(
+            "bare",
+            json!({
+                "version": 1, "id": "bare",
+                "views": { "main": { "entry": "index.html" } }
+            }),
+        );
         assert!(!bare.has_managed_views());
         assert!(!bare.has_build());
 
         // Watch without build: managed, but no build phase.
-        let watch_only = load("watch-only", json!({
-            "version": 1, "id": "watch-only",
-            "views": { "main": { "entry": "index.html", "watch": { "command": "npm" } } }
-        }));
+        let watch_only = load(
+            "watch-only",
+            json!({
+                "version": 1, "id": "watch-only",
+                "views": { "main": { "entry": "index.html", "watch": { "command": "npm" } } }
+            }),
+        );
         assert!(watch_only.has_managed_views());
         assert!(!watch_only.has_build());
 
         // View build only: managed and buildable, no server needed.
-        let view_build = load("view-build", json!({
-            "version": 1, "id": "view-build",
-            "views": { "main": { "entry": "index.html", "build": { "command": "npm" } } }
-        }));
+        let view_build = load(
+            "view-build",
+            json!({
+                "version": 1, "id": "view-build",
+                "views": { "main": { "entry": "index.html", "build": { "command": "npm" } } }
+            }),
+        );
         assert!(view_build.has_managed_views());
         assert!(view_build.has_build());
 
         // Server build only: buildable but views are unmanaged.
-        let server_build = load("server-build", json!({
-            "version": 1, "id": "server-build",
-            "server": {
-                "transport": "stdio", "command": "/tmp/bin",
-                "build": { "command": "cargo" }
-            },
-            "views": { "main": { "entry": "index.html" } }
-        }));
+        let server_build = load(
+            "server-build",
+            json!({
+                "version": 1, "id": "server-build",
+                "server": {
+                    "transport": "stdio", "command": "/tmp/bin",
+                    "build": { "command": "cargo" }
+                },
+                "views": { "main": { "entry": "index.html" } }
+            }),
+        );
         assert!(!server_build.has_managed_views());
         assert!(server_build.has_build());
     }

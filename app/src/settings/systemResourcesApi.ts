@@ -1,5 +1,4 @@
 import type { RemuxConnection } from '../remote/RemuxConnectionProvider';
-import { rpcPolicies } from '@remux/viewer-kit/rpc-policy';
 
 const systemResourcesMethod = 'remux/system/resources';
 const systemResourcesSubscribeMethod = 'remux/system/resources/subscribe';
@@ -25,6 +24,11 @@ export type SystemResourcesSample = {
     uptimeMs: number;
   };
   extensions: ExtensionResourceSample[];
+  resourceProtection: {
+    protectedMode: boolean;
+    reasons: string[];
+    reservedCpus: number[];
+  } | null;
 };
 
 export type ExtensionResourceSample = {
@@ -54,11 +58,13 @@ export type ExtensionRoleResourceSample = {
  * caller hides the System section in that case.
  */
 export async function readSystemResources(
-  request: RemuxConnection['request'],
+  query: RemuxConnection['query'],
 ): Promise<SystemResourcesSample | null> {
   let response: unknown;
   try {
-    response = await request<unknown>(rpcPolicies['system-resources-read']);
+    response = await query<unknown>(systemResourcesMethod, undefined, {
+      resourceKey: 'system-resources',
+    });
   } catch (error) {
     if (isMethodNotFound(error)) {
       return null;
@@ -68,12 +74,18 @@ export async function readSystemResources(
   return parseSystemResourcesSample(response);
 }
 
-export async function subscribeSystemResources(request: RemuxConnection['request']): Promise<void> {
-  await request<unknown>(rpcPolicies['system-resources-subscribe']);
+export async function subscribeSystemResources(
+  subscribeRequest: RemuxConnection['subscribeRequest'],
+): Promise<void> {
+  await subscribeRequest<unknown>(systemResourcesSubscribeMethod, undefined, {
+    resourceKey: 'system-resources',
+  });
 }
 
-export async function unsubscribeSystemResources(request: RemuxConnection['request']): Promise<void> {
-  await request<unknown>(rpcPolicies['system-resources-unsubscribe']);
+export async function unsubscribeSystemResources(
+  command: RemuxConnection['command'],
+): Promise<void> {
+  await command<unknown>(systemResourcesUnsubscribeMethod);
 }
 
 export function parseSystemResourcesSample(raw: unknown): SystemResourcesSample | null {
@@ -83,6 +95,7 @@ export function parseSystemResourcesSample(raw: unknown): SystemResourcesSample 
   const system = isRecord(raw.system) ? raw.system : {};
   const runtime = isRecord(raw.runtime) ? raw.runtime : {};
   const extensions = Array.isArray(raw.extensions) ? raw.extensions : [];
+  const protection = isRecord(raw.resourceProtection) ? raw.resourceProtection : null;
 
   return {
     sampledAtMs: raw.sampledAtMs,
@@ -102,6 +115,17 @@ export function parseSystemResourcesSample(raw: unknown): SystemResourcesSample 
       uptimeMs: numberOrZero(runtime.uptimeMs),
     },
     extensions: extensions.flatMap(parseExtensionResourceSample),
+    resourceProtection: protection
+      ? {
+        protectedMode: protection.protectedMode === true,
+        reasons: Array.isArray(protection.reasons)
+          ? protection.reasons.filter((reason): reason is string => typeof reason === 'string')
+          : [],
+        reservedCpus: Array.isArray(protection.reservedCpus)
+          ? protection.reservedCpus.filter((cpu): cpu is number => typeof cpu === 'number')
+          : [],
+      }
+      : null,
   };
 }
 

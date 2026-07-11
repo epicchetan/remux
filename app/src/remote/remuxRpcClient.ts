@@ -1,4 +1,8 @@
-import type { RpcRequestPolicy } from '@remux/viewer-kit/rpc-policy';
+import {
+  createAbortError,
+  type RpcContract,
+  type RpcRequestOptions,
+} from '@remux/viewer-kit/rpc';
 
 import { logRemuxDebug } from './remuxDebug';
 
@@ -11,11 +15,12 @@ type JsonRpcError = {
 };
 
 type PendingRequest = {
+  abortCleanup: (() => void) | null;
+  contract: RpcContract;
   method: string;
-  policy: RpcRequestPolicy;
   reject: (error: Error) => void;
   resolve: (value: unknown) => void;
-  timer: ReturnType<typeof setTimeout>;
+  slowTimer: ReturnType<typeof setTimeout>;
 };
 
 type RemuxConnectionClosedPhase = 'closed' | 'send';
@@ -60,23 +65,6 @@ export class RemuxConnectionClosedError extends Error {
     this.name = 'RemuxConnectionClosedError';
     this.phase = options.phase;
     this.readyState = options.readyState;
-  }
-}
-
-export class RemuxRequestTimeoutError extends Error {
-  constructor(
-    readonly policy: RpcRequestPolicy,
-    readonly phase: 'before-send' | 'connection-wait' | 'response',
-    readonly timeoutMs: number,
-    readonly details: {
-      connectionGeneration?: number;
-      lastInboundAt?: number;
-      requestId?: JsonRpcId;
-      sentAt?: number;
-    } = {},
-  ) {
-    super(`${policy.method} timed out in ${phase} after ${timeoutMs}ms (${policy.name})`);
-    this.name = 'RemuxRequestTimeoutError';
   }
 }
 
@@ -230,45 +218,92 @@ export class RemuxRpcClient {
   }
 
   request<T>(
-    policy: RpcRequestPolicy,
+    method: string,
     params?: unknown,
+    contract: RpcContract = { kind: 'query' },
     context?: RemuxRpcRequestContext | null,
-    timeoutMs = policy.budget.totalMs,
-    operationRemainingMs = timeoutMs,
+    options: RpcRequestOptions = {},
   ): Promise<T> {
-    const { method } = policy;
+    if (options.signal?.aborted) {
+      return Promise.reject(createAbortError(options.signal.reason));
+    }
+    if (this.pending.size >= 64) {
+      return Promise.reject(new Error('Remux request admission is full'));
+    }
+
     const id = this.nextId++;
     const sentAt = Date.now();
     logRemuxDebug('rpc:request', `${method}#${id}`);
-    this.send(requestMessage({
-      context,
-      id,
-      method,
-      params,
-      policy,
-      timeoutMs: operationRemainingMs,
-    }));
 
     return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        logRemuxDebug('rpc:timeout', `${method}#${id}`);
-        reject(new RemuxRequestTimeoutError(policy, 'response', timeoutMs, {
+      const abort = options.signal
+        ? () => {
+          const pending = this.takePending(id);
+          if (!pending) {
+            return;
+          }
+          this.tryNotify('$/cancelRequest', {
+            id,
+            reason: abortReason(options.signal?.reason),
+          });
+          logRemuxDebug('rpc:canceled', {
+            connectionGeneration: this.options.connectionGeneration,
+            method,
+            requestId: id,
+          });
+          reject(createAbortError(options.signal?.reason));
+        }
+        : null;
+
+      const slowAfterMs = slowThresholdMs(method, contract);
+      const slowTimer = setTimeout(() => {
+        if (!this.pending.has(id)) {
+          return;
+        }
+        logRemuxDebug('rpc:slow', {
+          ageMs: Date.now() - sentAt,
           connectionGeneration: this.options.connectionGeneration,
-          lastInboundAt: this.lastInboundAt,
+          kind: contract.kind,
+          method,
           requestId: id,
-          sentAt,
-        }));
-      }, timeoutMs);
+        });
+      }, slowAfterMs);
 
       this.pending.set(id, {
+        abortCleanup: abort && options.signal
+          ? () => options.signal?.removeEventListener('abort', abort)
+          : null,
+        contract,
         method,
-        policy,
         reject,
         resolve: resolve as (value: unknown) => void,
-        timer,
+        slowTimer,
       });
+      options.signal?.addEventListener('abort', abort!, { once: true });
+
+      try {
+        this.send(requestMessage({ context, contract, id, method, params }));
+      } catch (error) {
+        this.takePending(id);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
     });
+  }
+
+  ping(timeoutMs = 3_000) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort('system-ping-timeout'), timeoutMs);
+    return this.request<unknown>(
+      'remux/system/ping',
+      undefined,
+      { kind: 'query', resourceKey: 'system-ping' },
+      null,
+      { signal: controller.signal },
+    ).finally(() => clearTimeout(timeout));
+  }
+
+  pendingCount() {
+    return this.pending.size;
   }
 
   notify(method: string, params?: unknown) {
@@ -311,9 +346,7 @@ export class RemuxRpcClient {
     this.lastInboundAt = Date.now();
 
     if (isJsonRpcResponseMessage(message) && this.pending.has(message.id)) {
-      const pending = this.pending.get(message.id)!;
-      clearTimeout(pending.timer);
-      this.pending.delete(message.id);
+      const pending = this.takePending(message.id)!;
 
       if (isRecord(message.error)) {
         logRemuxDebug('rpc:error', `${pending.method}#${message.id}`);
@@ -330,10 +363,22 @@ export class RemuxRpcClient {
 
   private rejectAll(reason: string) {
     for (const pending of this.pending.values()) {
-      clearTimeout(pending.timer);
+      clearTimeout(pending.slowTimer);
+      pending.abortCleanup?.();
       pending.reject(new RemuxConnectionClosedError(reason, { phase: 'closed' }));
     }
     this.pending.clear();
+  }
+
+  private takePending(id: JsonRpcId) {
+    const pending = this.pending.get(id);
+    if (!pending) {
+      return null;
+    }
+    this.pending.delete(id);
+    clearTimeout(pending.slowTimer);
+    pending.abortCleanup?.();
+    return pending;
   }
 
   private send(message: unknown) {
@@ -382,27 +427,42 @@ export class RemuxRpcClient {
 
 function requestMessage({
   context,
+  contract,
   id,
   method,
   params,
-  policy,
-  timeoutMs,
 }: {
   context?: RemuxRpcRequestContext | null;
+  contract: RpcContract;
   id: JsonRpcId;
   method: string;
   params?: unknown;
-  policy: RpcRequestPolicy;
-  timeoutMs: number;
 }) {
   return {
     jsonrpc: '2.0',
     id,
     method,
-    remuxPolicy: { name: policy.name, remainingMs: timeoutMs },
+    remuxContract: contract,
     ...(params === undefined ? {} : { params }),
     ...(context ? { remuxContext: context } : {}),
   };
+}
+
+function slowThresholdMs(method: string, contract: RpcContract) {
+  if (method.startsWith('remux/system/') || method.startsWith('remux/clients/')) {
+    return 500;
+  }
+  if (contract.kind === 'query' || contract.kind === 'subscription') {
+    return 2_000;
+  }
+  if (contract.kind === 'job-start') {
+    return 10_000;
+  }
+  return 5_000;
+}
+
+function abortReason(reason: unknown) {
+  return typeof reason === 'string' && reason.length > 0 ? reason : 'caller-aborted';
 }
 
 function jsonRpcError(error: Record<string, unknown>, method: string) {

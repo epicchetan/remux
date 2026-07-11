@@ -13,7 +13,6 @@ import {
   type ViewStyle,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { rpcPolicies } from '@remux/viewer-kit/rpc-policy';
 
 import { FilesOverview } from '../files/FilesOverview';
 import { useRemuxConnection, type RemuxConnection } from '../remote/RemuxConnectionProvider';
@@ -256,7 +255,7 @@ export function BrowserOverview({
                         event.stopPropagation();
                         closeViewerTab(tab, {
                           closeTab,
-                          request: remux.request,
+                          command: remux.command,
                         });
                       }}
                       style={styles.tabClose}
@@ -282,12 +281,12 @@ function closeViewerTab(
   tab: BrowserTab,
   options: {
     closeTab: (tabId: string) => void;
-    request: RemuxConnection['request'];
+    command: RemuxConnection['command'];
   },
 ) {
   if (tab.extensionId === 'terminal' && tab.resourceKind === 'terminalSession' && tab.resourceId) {
-    void options.request(
-      rpcPolicies['terminal-session-kill'],
+    void options.command(
+      'remux/terminal/session/kill',
       { sessionId: tab.resourceId },
     ).catch(() => undefined);
   }

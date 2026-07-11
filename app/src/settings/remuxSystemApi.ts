@@ -1,12 +1,11 @@
 import type { RemuxConnection } from '../remote/RemuxConnectionProvider';
-import { rpcPolicies } from '@remux/viewer-kit/rpc-policy';
 
 const remuxRestartMethod = 'remux/system/restart';
 
 export async function restartRemuxCli(
-  request: RemuxConnection['request'],
+  command: RemuxConnection['command'],
 ): Promise<{ restartable: boolean; restarting: boolean }> {
-  const response = await request<unknown>(rpcPolicies['system-restart']);
+  const response = await command<unknown>(remuxRestartMethod);
   if (!isRecord(response)) {
     throw new Error('Invalid Remux restart response');
   }

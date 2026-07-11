@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "id": "codex",
   "name": "Codex",
   "display": {
@@ -46,6 +46,25 @@
           "watch"
         ],
         "cwd": "."
+      }
+    }
+  },
+  "resources": {
+    "workloads": {
+      "app-server": {
+        "class": "interactive",
+        "lifetime": "persistent",
+        "threads": "auto"
+      },
+      "narration": {
+        "class": "background",
+        "lifetime": "operation",
+        "threads": 7
+      },
+      "research": {
+        "class": "research",
+        "lifetime": "operation",
+        "threads": "auto"
       }
     }
   },

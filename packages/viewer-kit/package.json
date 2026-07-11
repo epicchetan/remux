@@ -9,7 +9,7 @@
     "./ipc": "./src/ipc.ts",
     "./links": "./src/links.ts",
     "./route": "./src/route.ts",
-    "./rpc-policy": "./src/rpcPolicy.ts",
+    "./rpc": "./src/rpc.ts",
     "./react": "./src/react/index.ts",
     "./shadcn": "./src/shadcn/index.ts",
     "./ui": "./src/ui/index.ts",
