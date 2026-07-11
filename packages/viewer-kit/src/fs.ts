@@ -1,4 +1,5 @@
 import { requestIpc } from './ipc';
+import { rpcPolicies } from './rpcPolicy';
 
 export type FileSystemEntry = {
   git?: FileSystemGitStatus | null;
@@ -74,13 +75,13 @@ export type ReadFileResult = {
 
 export function readDirectory(path?: string | null, options: { force?: boolean } = {}) {
   return requestIpc<ReadDirectoryResult>(
-    'remux/fs/readDirectory',
+    rpcPolicies['fs-directory-read'],
     path || options.force ? { force: options.force === true, ...(path ? { path } : {}) } : undefined,
   );
 }
 
 export function readDirectories(paths: string[], options: { force?: boolean } = {}) {
-  return requestIpc<ReadDirectoriesResult>('remux/fs/readDirectories', {
+  return requestIpc<ReadDirectoriesResult>(rpcPolicies['fs-directories-read'], {
     force: options.force === true,
     paths,
   });
@@ -93,7 +94,7 @@ export function readFile(
     git?: { includeBase?: boolean; includeStatus?: boolean };
   } = {},
 ) {
-  return requestIpc<ReadFileResult>('remux/fs/readFile', {
+  return requestIpc<ReadFileResult>(rpcPolicies['fs-file-read'], {
     ...(options.format ? { format: options.format } : {}),
     ...(options.git ? { git: options.git } : {}),
     path,

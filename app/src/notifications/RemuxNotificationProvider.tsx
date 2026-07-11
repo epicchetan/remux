@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { AppState, Platform } from 'react-native';
 import Constants from 'expo-constants';
 import * as Notifications from 'expo-notifications';
+import { rpcPolicies } from '@remux/viewer-kit/rpc-policy';
 
 import { useBrowserStore } from '../browser/browserStore';
 import type { BrowserResourceTarget, ViewerTab } from '../browser/browserTypes';
@@ -275,7 +276,7 @@ function subscribeVisibilityChecks(remux: RemuxConnection) {
 
 async function registerClient(remux: RemuxConnection, registration: RemuxClientRegistration) {
   try {
-    await remux.request(remuxClientRegisterMethod, registration, registrationTimeoutMs);
+    await remux.request(rpcPolicies['client-register'], registration);
     logRemuxDebug('notifications:client:registered', {
       appState: registration.appState,
       clientId: registration.clientId,

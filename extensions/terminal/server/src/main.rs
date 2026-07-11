@@ -18,6 +18,8 @@ mod tmux;
 const SESSION_LIST_METHOD: &str = "remux/terminal/session/list";
 const SESSION_START_METHOD: &str = "remux/terminal/session/start";
 const SESSION_ATTACH_METHOD: &str = "remux/terminal/session/attach";
+const SESSION_DETACH_METHOD: &str = "remux/terminal/session/detach";
+const SESSION_REPLAY_READ_METHOD: &str = "remux/terminal/session/replay/read";
 const SESSION_WRITE_METHOD: &str = "remux/terminal/session/write";
 const SESSION_RESIZE_METHOD: &str = "remux/terminal/session/resize";
 const SESSION_KILL_METHOD: &str = "remux/terminal/session/kill";
@@ -31,13 +33,19 @@ const REMUX_NOTIFICATION_REQUEST_METHOD: &str = "remux/notifications/request";
 
 const MAX_REPLAY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_REPLAY_FRAMES: usize = 10_000;
+const MAX_INPUT_CHUNK_BYTES: usize = 64 * 1024;
+const SESSION_INPUT_QUEUE_CAPACITY: usize = 128;
+const MAX_INPUT_STREAMS: usize = 8;
+const MAX_SESSION_SUBSCRIPTIONS: usize = 8;
+const INPUT_STREAM_RECONNECT_LEASE: Duration = Duration::from_secs(2 * 60);
+const TERMINAL_OUTPUT_QUEUE_CAPACITY: usize = 256;
 // PTY read sizing and burst coalescing. A single read already returns everything
 // currently buffered (up to the buffer size), so reading large keeps the syscall
 // count down. The coalescer then merges a burst of reads triggered by one
 // keystroke (tab-completion, line rewrap, command output) into a single frame so
 // it crosses the wire as one packet instead of a flurry.
 const READ_BUFFER_BYTES: usize = 64 * 1024;
-const MAX_COALESCED_BYTES: usize = 256 * 1024;
+const MAX_COALESCED_BYTES: usize = 64 * 1024;
 const OUTPUT_COALESCE_WINDOW: Duration = Duration::from_millis(3);
 const MAX_NOTIFICATION_OSC_BYTES: usize = 16 * 1024;
 const MAX_PENDING_KITTY_NOTIFICATIONS: usize = 64;
@@ -57,7 +65,7 @@ fn main() {
 
 fn run_stdio_server() -> Result<(), String> {
     let stdin = io::stdin();
-    let (output_tx, output_rx) = mpsc::channel::<Value>();
+    let (output_tx, output_rx) = mpsc::sync_channel::<Value>(TERMINAL_OUTPUT_QUEUE_CAPACITY);
     spawn_stdout_writer(output_rx);
     let server = TerminalExtensionServer::new(output_tx.clone());
 
@@ -68,7 +76,16 @@ fn run_stdio_server() -> Result<(), String> {
         }
 
         match serde_json::from_str::<JsonRpcEnvelope>(&line) {
-            Ok(envelope) => handle_envelope(&server, envelope, &output_tx)?,
+            Ok(envelope) => {
+                let request_server = server.clone();
+                let request_output = output_tx.clone();
+                thread::spawn(move || {
+                    if let Err(error) = handle_envelope(&request_server, envelope, &request_output)
+                    {
+                        eprintln!("failed to handle terminal protocol frame: {error}");
+                    }
+                });
+            }
             Err(error) => {
                 eprintln!("ignored invalid terminal protocol frame: {error}");
             }
@@ -82,7 +99,7 @@ fn run_stdio_server() -> Result<(), String> {
 fn handle_envelope(
     server: &TerminalExtensionServer,
     envelope: JsonRpcEnvelope,
-    output_tx: &mpsc::Sender<Value>,
+    output_tx: &mpsc::SyncSender<Value>,
 ) -> Result<(), String> {
     let JsonRpcEnvelope { id, method, params } = envelope;
     if method == TMUX_ACTION_METHOD {
@@ -96,16 +113,31 @@ fn handle_envelope(
         }
     }
 
-    let result = handle_request(server, JsonRpcRequest {
-        method,
-        params,
-    });
+    let activation_origin = if matches!(
+        method.as_str(),
+        SESSION_START_METHOD | SESSION_ATTACH_METHOD
+    ) {
+        params
+            .as_ref()
+            .and_then(|params| params.get("_remuxOrigin"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    } else {
+        None
+    };
+    let result = handle_request(server, JsonRpcRequest { method, params });
     if let Some(id) = id {
-        let response = match result {
-            Ok(value) => JsonRpcResponse::result(id, value),
-            Err(error) => JsonRpcResponse::error(id, error),
-        };
-        send_jsonrpc_response(output_tx, response)?;
+        match result {
+            Ok(value) => {
+                send_jsonrpc_response(output_tx, JsonRpcResponse::result(id, value.clone()))?;
+                if let Some(origin) = activation_origin {
+                    server.activate_subscription(&origin, &value)?;
+                }
+            }
+            Err(error) => {
+                send_jsonrpc_response(output_tx, JsonRpcResponse::error(id, error))?;
+            }
+        }
     } else if let Err(error) = result {
         eprintln!("ignored terminal notification error: {}", error.message);
     }
@@ -124,6 +156,12 @@ fn handle_request(
             .map_err(internal_rpc_error),
         SESSION_ATTACH_METHOD => server
             .attach_session(request.params.unwrap_or(Value::Null))
+            .map_err(internal_rpc_error),
+        SESSION_DETACH_METHOD => server
+            .detach_session(request.params.unwrap_or(Value::Null))
+            .map_err(internal_rpc_error),
+        SESSION_REPLAY_READ_METHOD => server
+            .read_replay(request.params.unwrap_or(Value::Null))
             .map_err(internal_rpc_error),
         SESSION_WRITE_METHOD => server
             .write_session(request.params.unwrap_or(Value::Null))
@@ -154,7 +192,7 @@ fn handle_request(
 fn respond_or_log(
     id: Option<Value>,
     result: Result<Value, JsonRpcError>,
-    output_tx: &mpsc::Sender<Value>,
+    output_tx: &mpsc::SyncSender<Value>,
 ) -> Result<(), String> {
     match id {
         Some(id) => {
@@ -178,7 +216,7 @@ fn internal_rpc_error(message: String) -> JsonRpcError {
 }
 
 fn send_jsonrpc_response(
-    output_tx: &mpsc::Sender<Value>,
+    output_tx: &mpsc::SyncSender<Value>,
     response: JsonRpcResponse,
 ) -> Result<(), String> {
     let response = serde_json::to_value(response).map_err(|error| error.to_string())?;
@@ -189,13 +227,13 @@ fn send_jsonrpc_response(
 
 #[derive(Clone)]
 struct TerminalExtensionServer {
-    output_tx: mpsc::Sender<Value>,
+    output_tx: mpsc::SyncSender<Value>,
     state: Arc<Mutex<TerminalState>>,
     tmux_cache: Arc<Mutex<TmuxCacheState>>,
 }
 
 impl TerminalExtensionServer {
-    fn new(output_tx: mpsc::Sender<Value>) -> Self {
+    fn new(output_tx: mpsc::SyncSender<Value>) -> Self {
         Self {
             output_tx,
             state: Arc::new(Mutex::new(TerminalState::default())),
@@ -216,6 +254,11 @@ impl TerminalExtensionServer {
 
     fn start_session(&self, params: Value) -> Result<Value, String> {
         let params = parse_params::<TerminalSessionStartParams>(params, SESSION_START_METHOD)?;
+        let remux_origin = params.remux_origin.clone();
+        let operation_id = params.operation_id.trim();
+        if operation_id.is_empty() || operation_id.len() > 1024 {
+            return Err("terminal start operationId must be 1..1024 bytes".to_string());
+        }
         let size = params.size();
         let cwd = resolve_cwd(params.cwd.as_deref())?;
         let shell = params
@@ -233,7 +276,13 @@ impl TerminalExtensionServer {
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| self.generate_session_id());
 
-        if let Some(response) = self.running_session_response(&session_id, size)? {
+        if let Some(response) = self.running_session_response(
+            &session_id,
+            size,
+            params.remux_viewer_key.as_deref(),
+            remux_origin.as_deref(),
+            operation_id,
+        )? {
             return Ok(response);
         }
 
@@ -268,36 +317,50 @@ impl TerminalExtensionServer {
             .take_writer()
             .map_err(|error| format!("failed to open PTY writer: {error}"))?;
 
-        {
+        let (session_generation, input_stream_id, next_input_seq) = {
             let mut state = self.lock_state()?;
-            state.sessions.insert(
-                session_id.clone(),
-                SessionRecord::running(SessionRecordInit {
-                    cols: size.cols,
-                    cwd: cwd.clone(),
-                    killer,
-                    master,
-                    pid,
-                    rows: size.rows,
-                    session_id: session_id.clone(),
-                    shell: shell.clone(),
-                    shell_integration_dir,
-                    tty: tty.clone(),
-                    writer,
-                }),
-            );
-        }
+            state.next_session_generation += 1;
+            let session_generation = state.next_session_generation;
+            let mut session = SessionRecord::running(SessionRecordInit {
+                cols: size.cols,
+                cwd: cwd.clone(),
+                generation: session_generation,
+                killer,
+                master,
+                pid,
+                rows: size.rows,
+                session_id: session_id.clone(),
+                shell: shell.clone(),
+                shell_integration_dir,
+                tty: tty.clone(),
+                writer,
+            });
+            let subscription_boundary = session.next_seq;
+            session.subscribe_pending(
+                params.remux_viewer_key.as_deref(),
+                remux_origin.as_deref(),
+                subscription_boundary,
+            )?;
+            let (input_stream_id, next_input_seq) = session.allocate_input_stream(None)?;
+            session
+                .start_operations
+                .insert(operation_id.to_string(), input_stream_id.clone());
+            state.sessions.insert(session_id.clone(), session);
+            (session_generation, input_stream_id, next_input_seq)
+        };
 
         spawn_reader_thread(
             self.state.clone(),
             self.output_tx.clone(),
             session_id.clone(),
+            session_generation,
             reader,
         );
         spawn_wait_thread(
             self.state.clone(),
             self.output_tx.clone(),
             session_id.clone(),
+            session_generation,
             child,
         );
 
@@ -307,8 +370,13 @@ impl TerminalExtensionServer {
             "pid": pid,
             "rows": size.rows,
             "sessionId": session_id,
+            "sessionGeneration": session_generation,
             "shell": shell,
             "tty": tty,
+            "inputStreamId": input_stream_id,
+            "nextInputSeq": next_input_seq,
+            "firstAvailableSeq": 1,
+            "nextOutputSeq": 1,
         }))
     }
 
@@ -320,6 +388,15 @@ impl TerminalExtensionServer {
             .sessions
             .get_mut(&params.session_id)
             .ok_or_else(|| format!("terminal session not found: {}", params.session_id))?;
+
+        if let Some(expected_generation) = params.session_generation
+            && expected_generation != session.generation
+        {
+            return Err(format!(
+                "stale terminal session generation: expected {}, current {}",
+                expected_generation, session.generation
+            ));
+        }
 
         if session.status == SessionStatus::Running {
             session.resize(size)?;
@@ -338,15 +415,176 @@ impl TerminalExtensionServer {
             .filter(|frame| frame.frame.seq >= replay_seq)
             .map(|frame| frame.frame.clone())
             .collect::<Vec<_>>();
+        let subscription_boundary = session.next_seq;
+        session.subscribe_pending(
+            params.remux_viewer_key.as_deref(),
+            params.remux_origin.as_deref(),
+            subscription_boundary,
+        )?;
+        let (input_stream_id, next_input_seq) =
+            session.allocate_input_stream(params.input_stream_id.as_deref())?;
 
         Ok(json!({
             "exitCode": session.exit_code,
             "exitSignal": session.exit_signal,
             "nextSeq": session.next_seq,
+            "nextOutputSeq": session.next_seq,
+            "firstAvailableSeq": first_available_seq,
+            "nextInputSeq": next_input_seq,
+            "inputStreamId": input_stream_id,
             "replay": replay,
             "replayTruncated": replay_truncated,
             "sessionId": session.session_id,
+            "sessionGeneration": session.generation,
             "status": session.status.as_str(),
+        }))
+    }
+
+    fn detach_session(&self, params: Value) -> Result<Value, String> {
+        let params = parse_params::<TerminalSessionDetachParams>(params, SESSION_DETACH_METHOD)?;
+        let mut state = self.lock_state()?;
+        let session = state
+            .sessions
+            .get_mut(&params.session_id)
+            .ok_or_else(|| format!("terminal session not found: {}", params.session_id))?;
+        if session.generation != params.session_generation {
+            return Err(format!(
+                "stale terminal session generation: expected {}, current {}",
+                params.session_generation, session.generation
+            ));
+        }
+        if let Some(key) = params
+            .remux_viewer_key
+            .as_deref()
+            .or(params.remux_origin.as_deref())
+        {
+            session.subscriptions.remove(key);
+        }
+        session.input_streams.remove(&params.input_stream_id);
+        Ok(json!({
+            "ok": true,
+            "sessionGeneration": session.generation,
+        }))
+    }
+
+    fn activate_subscription(&self, origin: &str, response: &Value) -> Result<(), String> {
+        let session_id = response
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "terminal subscription response missing sessionId".to_string())?;
+        let generation = response
+            .get("sessionGeneration")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                "terminal subscription response missing sessionGeneration".to_string()
+            })?;
+        let mut state = self.lock_state()?;
+        let session = state
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("terminal session not found: {session_id}"))?;
+        if session.generation != generation {
+            return Ok(());
+        }
+        let Some((subscription_key, boundary)) = session
+            .subscriptions
+            .iter()
+            .find(|(_, subscription)| subscription.origin == origin)
+            .map(|(key, subscription)| (key.clone(), subscription.next_seq))
+        else {
+            return Ok(());
+        };
+        let frames = session
+            .replay
+            .iter()
+            .filter(|replay| replay.frame.seq >= boundary)
+            .map(|replay| replay.frame.clone())
+            .collect::<Vec<_>>();
+        let origin_set = HashSet::from([origin.to_string()]);
+        for frame in frames {
+            let notification = json!({
+                "jsonrpc": "2.0",
+                "method": SESSION_OUTPUT_NOTIFICATION,
+                "params": {
+                    "frame": frame,
+                    "sessionId": session_id,
+                    "sessionGeneration": generation,
+                },
+            });
+            for targeted in target_for_origins(notification, &origin_set) {
+                self.output_tx
+                    .send(targeted)
+                    .map_err(|error| format!("failed to activate terminal output: {error}"))?;
+            }
+        }
+        if session.status == SessionStatus::Exited {
+            let exited = json!({
+                "jsonrpc": "2.0",
+                "method": SESSION_EXITED_NOTIFICATION,
+                "params": {
+                    "exitCode": session.exit_code,
+                    "exitSignal": session.exit_signal,
+                    "sessionId": session_id,
+                    "sessionGeneration": generation,
+                },
+            });
+            for targeted in target_for_origins(exited, &origin_set) {
+                self.output_tx
+                    .send(targeted)
+                    .map_err(|error| format!("failed to activate terminal exit: {error}"))?;
+            }
+        }
+        if let Some(subscription) = session.subscriptions.get_mut(&subscription_key) {
+            subscription.next_seq = session.next_seq;
+            subscription.active = true;
+        }
+        Ok(())
+    }
+
+    fn read_replay(&self, params: Value) -> Result<Value, String> {
+        let params =
+            parse_params::<TerminalSessionReplayReadParams>(params, SESSION_REPLAY_READ_METHOD)?;
+        let state = self.lock_state()?;
+        let session = state
+            .sessions
+            .get(&params.session_id)
+            .ok_or_else(|| format!("terminal session not found: {}", params.session_id))?;
+        if session.generation != params.session_generation {
+            return Err(format!(
+                "stale terminal session generation: expected {}, current {}",
+                params.session_generation, session.generation
+            ));
+        }
+        let first_available_seq = session
+            .replay
+            .front()
+            .map(|frame| frame.frame.seq)
+            .unwrap_or(session.next_seq);
+        let truncated = params.from_seq > 0 && params.from_seq < first_available_seq;
+        let from_seq = params.from_seq.max(first_available_seq);
+        let max_bytes = params.max_bytes.unwrap_or(256 * 1024).clamp(1, 256 * 1024);
+        let mut bytes = 0usize;
+        let mut frames = Vec::new();
+        for replay in session
+            .replay
+            .iter()
+            .filter(|replay| replay.frame.seq >= from_seq)
+        {
+            if !frames.is_empty() && bytes.saturating_add(replay.byte_len) > max_bytes {
+                break;
+            }
+            bytes = bytes.saturating_add(replay.byte_len);
+            frames.push(replay.frame.clone());
+        }
+        let next_seq = frames.last().map(|frame| frame.seq + 1).unwrap_or(from_seq);
+        Ok(json!({
+            "complete": next_seq >= session.next_seq,
+            "firstAvailableSeq": first_available_seq,
+            "frames": frames,
+            "nextSeq": next_seq,
+            "sessionGeneration": session.generation,
+            "sessionId": session.session_id,
+            "truncated": truncated,
         }))
     }
 
@@ -356,8 +594,11 @@ impl TerminalExtensionServer {
             .decode(params.data_base64.as_bytes())
             .map_err(|error| format!("invalid terminal input: {error}"))?;
 
-        if bytes.is_empty() {
-            return Ok(json!({ "ok": true }));
+        if bytes.len() > MAX_INPUT_CHUNK_BYTES {
+            return Err(format!(
+                "terminal input chunk is too large: {}>{MAX_INPUT_CHUNK_BYTES}",
+                bytes.len()
+            ));
         }
 
         let mut state = self.lock_state()?;
@@ -365,18 +606,58 @@ impl TerminalExtensionServer {
             .sessions
             .get_mut(&params.session_id)
             .ok_or_else(|| format!("terminal session not found: {}", params.session_id))?;
+        if params.session_generation != session.generation {
+            return Err(format!(
+                "stale terminal session generation: expected {}, current {}",
+                params.session_generation, session.generation
+            ));
+        }
+        let input_stream = session
+            .input_streams
+            .get_mut(&params.input_stream_id)
+            .ok_or_else(|| {
+                format!(
+                    "terminal input stream is not active: {}",
+                    params.input_stream_id
+                )
+            })?;
+        input_stream.last_seen = Instant::now();
+        if params.input_seq < input_stream.next_seq {
+            return Ok(json!({
+                "acceptedInputSeq": params.input_seq,
+                "duplicate": true,
+                "nextInputSeq": input_stream.next_seq,
+                "ok": true,
+                "sessionGeneration": session.generation,
+            }));
+        }
+        if params.input_seq > input_stream.next_seq {
+            return Err(format!(
+                "terminal input sequence gap: expectedInputSeq={}, received={}",
+                input_stream.next_seq, params.input_seq
+            ));
+        }
         let writer = session
-            .writer
-            .as_mut()
+            .writer_tx
+            .as_ref()
             .ok_or_else(|| format!("terminal session is not running: {}", params.session_id))?;
-        writer
-            .write_all(&bytes)
-            .map_err(|error| format!("failed to write terminal input: {error}"))?;
-        writer
-            .flush()
-            .map_err(|error| format!("failed to flush terminal input: {error}"))?;
+        if !bytes.is_empty() {
+            writer.try_send(bytes).map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => "terminal input queue is full".to_string(),
+                mpsc::TrySendError::Disconnected(_) => {
+                    format!("terminal session is not running: {}", params.session_id)
+                }
+            })?;
+        }
+        input_stream.next_seq += 1;
 
-        Ok(json!({ "ok": true }))
+        Ok(json!({
+            "acceptedInputSeq": params.input_seq,
+            "duplicate": false,
+            "nextInputSeq": input_stream.next_seq,
+            "ok": true,
+            "sessionGeneration": session.generation,
+        }))
     }
 
     fn resize_session(&self, params: Value) -> Result<Value, String> {
@@ -387,20 +668,36 @@ impl TerminalExtensionServer {
             .sessions
             .get_mut(&params.session_id)
             .ok_or_else(|| format!("terminal session not found: {}", params.session_id))?;
+        if params.session_generation != session.generation {
+            return Err(format!(
+                "stale terminal session generation: expected {}, current {}",
+                params.session_generation, session.generation
+            ));
+        }
         session.resize(size)?;
 
-        Ok(json!({ "ok": true }))
+        Ok(json!({ "ok": true, "sessionGeneration": session.generation }))
     }
 
     fn kill_session(&self, params: Value) -> Result<Value, String> {
         let params = parse_params::<TerminalSessionKillParams>(params, SESSION_KILL_METHOD)?;
         let session_id = params.session_id.clone();
-        let killer = self
-            .remove_session_record(&session_id)
-            .and_then(|mut session| {
+        let killer = {
+            let mut state = self.lock_state()?;
+            let Some(session) = state.sessions.get(&session_id) else {
+                return Ok(json!({ "ok": true, "sessionGeneration": params.session_generation }));
+            };
+            if session.generation != params.session_generation {
+                return Err(format!(
+                    "stale terminal session generation: expected {}, current {}",
+                    params.session_generation, session.generation
+                ));
+            }
+            state.sessions.remove(&session_id).and_then(|mut session| {
                 session.cleanup_shell_integration();
                 session.killer.take()
-            });
+            })
+        };
 
         if let Some(mut killer) = killer {
             killer
@@ -411,7 +708,7 @@ impl TerminalExtensionServer {
         let _ = self
             .output_tx
             .send(terminal_audience_remove_notification(&session_id));
-        Ok(json!({ "ok": true }))
+        Ok(json!({ "ok": true, "sessionGeneration": params.session_generation }))
     }
 
     fn kill_all(&self) {
@@ -439,6 +736,9 @@ impl TerminalExtensionServer {
         &self,
         session_id: &str,
         size: PtySize,
+        viewer_key: Option<&str>,
+        remux_origin: Option<&str>,
+        operation_id: &str,
     ) -> Result<Option<Value>, String> {
         let mut state = self.lock_state()?;
         let Some(session) = state.sessions.get_mut(session_id) else {
@@ -450,14 +750,27 @@ impl TerminalExtensionServer {
         }
 
         session.resize(size)?;
+        let subscription_boundary = session.next_seq;
+        session.subscribe_pending(viewer_key, remux_origin, subscription_boundary)?;
+        let requested_stream = session.start_operations.get(operation_id).cloned();
+        let (input_stream_id, next_input_seq) =
+            session.allocate_input_stream(requested_stream.as_deref())?;
+        session
+            .start_operations
+            .insert(operation_id.to_string(), input_stream_id.clone());
         Ok(Some(json!({
             "cols": session.cols,
             "cwd": session.cwd.to_string_lossy(),
             "pid": session.pid,
             "rows": session.rows,
             "sessionId": session.session_id,
+            "sessionGeneration": session.generation,
             "shell": session.shell,
             "tty": session.tty,
+            "inputStreamId": input_stream_id,
+            "nextInputSeq": next_input_seq,
+            "firstAvailableSeq": session.replay.front().map(|frame| frame.frame.seq).unwrap_or(session.next_seq),
+            "nextOutputSeq": session.next_seq,
         })))
     }
 
@@ -474,7 +787,7 @@ impl TerminalExtensionServer {
         &self,
         params: Value,
         response_id: Option<Value>,
-        output_tx: mpsc::Sender<Value>,
+        output_tx: mpsc::SyncSender<Value>,
     ) -> Result<(), String> {
         let params = parse_params::<tmux::TerminalTmuxActionParams>(params, TMUX_ACTION_METHOD)?;
         let session_id = params.session_id.clone();
@@ -509,9 +822,9 @@ impl TerminalExtensionServer {
             .and_then(|state| state.contexts.get(&session_id).cloned())
             .filter(|context| context.terminal_tty == terminal_tty);
 
-        let fresh = cached
-            .as_ref()
-            .is_some_and(|context| now.saturating_sub(context.generated_at) <= TMUX_CONTEXT_CACHE_FRESH_MS);
+        let fresh = cached.as_ref().is_some_and(|context| {
+            now.saturating_sub(context.generated_at) <= TMUX_CONTEXT_CACHE_FRESH_MS
+        });
         if !fresh {
             self.schedule_tmux_context_refresh(session_id.clone(), terminal_tty.clone());
         }
@@ -589,6 +902,7 @@ impl TerminalExtensionServer {
 #[derive(Default)]
 struct TerminalState {
     next_generated_id: u64,
+    next_session_generation: u64,
     sessions: HashMap<String, SessionRecord>,
 }
 
@@ -616,11 +930,14 @@ struct SessionRecord {
     cwd: PathBuf,
     exit_code: Option<u32>,
     exit_signal: Option<String>,
+    generation: u64,
+    input_streams: HashMap<String, InputStreamState>,
     killer: Option<Box<dyn ChildKiller + Send + Sync>>,
     last_bell_notification_at: Option<u64>,
     last_explicit_notification: Option<(String, u64)>,
     master: Option<Box<dyn MasterPty + Send>>,
     next_notification_seq: u64,
+    next_input_stream_id: u64,
     next_seq: u64,
     notification_parser: TerminalNotificationParser,
     pid: Option<u32>,
@@ -631,13 +948,16 @@ struct SessionRecord {
     shell: String,
     shell_integration_dir: Option<PathBuf>,
     status: SessionStatus,
+    start_operations: HashMap<String, String>,
+    subscriptions: HashMap<String, TerminalSubscription>,
     tty: Option<String>,
-    writer: Option<Box<dyn Write + Send>>,
+    writer_tx: Option<mpsc::SyncSender<Vec<u8>>>,
 }
 
 struct SessionRecordInit {
     cols: u16,
     cwd: PathBuf,
+    generation: u64,
     killer: Box<dyn ChildKiller + Send + Sync>,
     master: Box<dyn MasterPty + Send>,
     pid: Option<u32>,
@@ -649,18 +969,34 @@ struct SessionRecordInit {
     writer: Box<dyn Write + Send>,
 }
 
+struct InputStreamState {
+    last_seen: Instant,
+    next_seq: u64,
+}
+
+struct TerminalSubscription {
+    active: bool,
+    next_seq: u64,
+    origin: String,
+}
+
 impl SessionRecord {
     fn running(init: SessionRecordInit) -> Self {
+        let (writer_tx, writer_rx) = mpsc::sync_channel(SESSION_INPUT_QUEUE_CAPACITY);
+        spawn_session_writer(init.writer, writer_rx);
         Self {
             cols: init.cols,
             cwd: init.cwd,
             exit_code: None,
             exit_signal: None,
+            generation: init.generation,
+            input_streams: HashMap::new(),
             killer: Some(init.killer),
             last_bell_notification_at: None,
             last_explicit_notification: None,
             master: Some(init.master),
             next_notification_seq: 1,
+            next_input_stream_id: 0,
             next_seq: 1,
             notification_parser: TerminalNotificationParser::default(),
             pid: init.pid,
@@ -671,9 +1007,82 @@ impl SessionRecord {
             shell: init.shell,
             shell_integration_dir: init.shell_integration_dir,
             status: SessionStatus::Running,
+            start_operations: HashMap::new(),
+            subscriptions: HashMap::new(),
             tty: init.tty,
-            writer: Some(init.writer),
+            writer_tx: Some(writer_tx),
         }
+    }
+
+    fn allocate_input_stream(&mut self, requested: Option<&str>) -> Result<(String, u64), String> {
+        self.input_streams
+            .retain(|_, stream| stream.last_seen.elapsed() < INPUT_STREAM_RECONNECT_LEASE);
+        if let Some(requested) = requested {
+            let next = self
+                .input_streams
+                .get_mut(requested)
+                .ok_or_else(|| format!("terminal input stream is not active: {requested}"))?;
+            next.last_seen = Instant::now();
+            return Ok((requested.to_string(), next.next_seq));
+        }
+        if self.input_streams.len() >= MAX_INPUT_STREAMS {
+            return Err(format!(
+                "TerminalInputStreamLimit: session {} already has {MAX_INPUT_STREAMS} input streams",
+                self.session_id
+            ));
+        }
+        self.next_input_stream_id += 1;
+        let stream_id = format!(
+            "terminal-input:{}:{}",
+            self.generation, self.next_input_stream_id
+        );
+        self.input_streams.insert(
+            stream_id.clone(),
+            InputStreamState {
+                last_seen: Instant::now(),
+                next_seq: 1,
+            },
+        );
+        Ok((stream_id, 1))
+    }
+
+    fn subscribe_pending(
+        &mut self,
+        viewer_key: Option<&str>,
+        origin: Option<&str>,
+        next_seq: u64,
+    ) -> Result<(), String> {
+        if let Some(origin) = origin.filter(|origin| !origin.is_empty()) {
+            let key = viewer_key
+                .filter(|key| !key.is_empty())
+                .unwrap_or(origin)
+                .to_string();
+            if !self.subscriptions.contains_key(&key)
+                && self.subscriptions.len() >= MAX_SESSION_SUBSCRIPTIONS
+            {
+                return Err(format!(
+                    "TerminalSubscriptionLimit: session {} already has {MAX_SESSION_SUBSCRIPTIONS} subscriptions",
+                    self.session_id
+                ));
+            }
+            self.subscriptions.insert(
+                key,
+                TerminalSubscription {
+                    active: false,
+                    next_seq,
+                    origin: origin.to_string(),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn active_origins(&self) -> HashSet<String> {
+        self.subscriptions
+            .iter()
+            .filter(|(_, subscription)| subscription.active)
+            .map(|(_, subscription)| subscription.origin.clone())
+            .collect()
     }
 
     fn resize(&mut self, size: PtySize) -> Result<(), String> {
@@ -691,6 +1100,7 @@ impl SessionRecord {
     fn append_output(&mut self, bytes: &[u8]) -> OutputFrame {
         let frame = OutputFrame {
             data_base64: BASE64.encode(bytes),
+            session_generation: self.generation,
             seq: self.next_seq,
         };
         self.next_seq += 1;
@@ -758,7 +1168,7 @@ impl SessionRecord {
         self.status = SessionStatus::Exited;
         self.killer = None;
         self.master = None;
-        self.writer = None;
+        self.writer_tx = None;
         self.cleanup_shell_integration();
     }
 
@@ -787,6 +1197,7 @@ impl SessionRecord {
             pid: self.pid,
             rows: self.rows,
             session_id: self.session_id.clone(),
+            session_generation: self.generation,
             shell: self.shell.clone(),
             status: self.status.as_str().to_string(),
             tty: self.tty.clone(),
@@ -803,6 +1214,7 @@ struct ReplayFrame {
 #[serde(rename_all = "camelCase")]
 struct OutputFrame {
     data_base64: String,
+    session_generation: u64,
     seq: u64,
 }
 
@@ -817,6 +1229,7 @@ struct SessionSummary {
     pid: Option<u32>,
     rows: u16,
     session_id: String,
+    session_generation: u64,
     shell: String,
     status: String,
     tty: Option<String>,
@@ -1189,14 +1602,41 @@ fn terminal_notification_target(session_id: &str) -> Value {
     })
 }
 
+fn target_for_origins(message: Value, origins: &HashSet<String>) -> Vec<Value> {
+    if origins.is_empty() {
+        return vec![message];
+    }
+    origins
+        .iter()
+        .map(|origin| {
+            let mut message = message.clone();
+            if let Some(record) = message.as_object_mut() {
+                record.insert("remuxTarget".to_string(), json!({ "origin": origin }));
+            }
+            message
+        })
+        .collect()
+}
+
+fn spawn_session_writer(mut writer: Box<dyn Write + Send>, input_rx: mpsc::Receiver<Vec<u8>>) {
+    thread::spawn(move || {
+        for bytes in input_rx {
+            if writer.write_all(&bytes).is_err() || writer.flush().is_err() {
+                break;
+            }
+        }
+    });
+}
+
 fn spawn_reader_thread(
     state: Arc<Mutex<TerminalState>>,
-    output_tx: mpsc::Sender<Value>,
+    output_tx: mpsc::SyncSender<Value>,
     session_id: String,
+    session_generation: u64,
     mut reader: Box<dyn Read + Send>,
 ) {
     // Stage 1: block on the PTY and forward raw chunks as they arrive.
-    let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>();
+    let (chunk_tx, chunk_rx) = mpsc::sync_channel::<Vec<u8>>(64);
     thread::spawn(move || {
         let mut buffer = vec![0_u8; READ_BUFFER_BYTES];
         loop {
@@ -1246,28 +1686,42 @@ fn spawn_reader_thread(
                 }
             }
 
-            let (output_notification, terminal_notifications) = {
+            let (output_notifications, terminal_notifications) = {
                 let Ok(mut state) = state.lock() else {
                     return;
                 };
                 let Some(session) = state.sessions.get_mut(&session_id) else {
                     return;
                 };
+                if session.generation != session_generation {
+                    return;
+                }
                 let terminal_notifications = session.notification_requests_for_output(&acc);
                 let frame = session.append_output(&acc);
+                let active_origins = session.active_origins();
                 let output_notification = json!({
                     "jsonrpc": "2.0",
                     "method": SESSION_OUTPUT_NOTIFICATION,
                     "params": {
                         "frame": frame,
                         "sessionId": session_id,
+                        "sessionGeneration": session_generation,
                     },
                 });
-                (output_notification, terminal_notifications)
+                let output_notifications = if session.subscriptions.is_empty() {
+                    vec![output_notification]
+                } else if active_origins.is_empty() {
+                    Vec::new()
+                } else {
+                    target_for_origins(output_notification, &active_origins)
+                };
+                (output_notifications, terminal_notifications)
             };
 
-            if output_tx.send(output_notification).is_err() {
-                return;
+            for output_notification in output_notifications {
+                if output_tx.send(output_notification).is_err() {
+                    return;
+                }
             }
             for notification in terminal_notifications {
                 if output_tx.send(notification).is_err() {
@@ -1280,8 +1734,9 @@ fn spawn_reader_thread(
 
 fn spawn_wait_thread(
     state: Arc<Mutex<TerminalState>>,
-    output_tx: mpsc::Sender<Value>,
+    output_tx: mpsc::SyncSender<Value>,
     session_id: String,
+    session_generation: u64,
     mut child: Box<dyn Child + Send + Sync>,
 ) {
     thread::spawn(move || {
@@ -1301,19 +1756,31 @@ fn spawn_wait_thread(
             let Some(session) = state.sessions.get_mut(&session_id) else {
                 return;
             };
+            if session.generation != session_generation {
+                return;
+            }
+            let origins = session.active_origins();
+            let has_subscriptions = !session.subscriptions.is_empty();
             session.mark_exited(exit_code, exit_signal.clone());
-            vec![
-                json!({
-                    "jsonrpc": "2.0",
-                    "method": SESSION_EXITED_NOTIFICATION,
-                    "params": {
-                        "exitCode": exit_code,
-                        "exitSignal": exit_signal,
-                        "sessionId": session_id.clone(),
-                    },
-                }),
-                terminal_audience_remove_notification(&session_id),
-            ]
+            let exited = json!({
+                "jsonrpc": "2.0",
+                "method": SESSION_EXITED_NOTIFICATION,
+                "params": {
+                    "exitCode": exit_code,
+                    "exitSignal": exit_signal,
+                    "sessionId": session_id.clone(),
+                    "sessionGeneration": session_generation,
+                },
+            });
+            let mut notifications = if !has_subscriptions {
+                vec![exited]
+            } else if origins.is_empty() {
+                Vec::new()
+            } else {
+                target_for_origins(exited, &origins)
+            };
+            notifications.push(terminal_audience_remove_notification(&session_id));
+            notifications
         };
 
         for notification in notifications {
@@ -1346,7 +1813,12 @@ struct TerminalSessionStartParams {
     cwd: Option<String>,
     pixel_height: Option<u32>,
     pixel_width: Option<u32>,
+    operation_id: String,
     rows: Option<u32>,
+    #[serde(rename = "_remuxOrigin")]
+    remux_origin: Option<String>,
+    #[serde(rename = "_remuxViewerKey")]
+    remux_viewer_key: Option<String>,
     session_id: Option<String>,
     shell: Option<String>,
 }
@@ -1361,9 +1833,36 @@ impl TerminalSessionStartParams {
 #[serde(rename_all = "camelCase")]
 struct TerminalSessionAttachParams {
     cols: Option<u32>,
+    input_stream_id: Option<String>,
     replay_seq: Option<u64>,
     rows: Option<u32>,
+    #[serde(rename = "_remuxOrigin")]
+    remux_origin: Option<String>,
+    #[serde(rename = "_remuxViewerKey")]
+    remux_viewer_key: Option<String>,
     session_id: String,
+    session_generation: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalSessionDetachParams {
+    input_stream_id: String,
+    #[serde(rename = "_remuxOrigin")]
+    remux_origin: Option<String>,
+    #[serde(rename = "_remuxViewerKey")]
+    remux_viewer_key: Option<String>,
+    session_id: String,
+    session_generation: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalSessionReplayReadParams {
+    from_seq: u64,
+    max_bytes: Option<usize>,
+    session_id: String,
+    session_generation: u64,
 }
 
 impl TerminalSessionAttachParams {
@@ -1376,7 +1875,10 @@ impl TerminalSessionAttachParams {
 #[serde(rename_all = "camelCase")]
 struct TerminalSessionWriteParams {
     data_base64: String,
+    input_seq: u64,
+    input_stream_id: String,
     session_id: String,
+    session_generation: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1387,6 +1889,7 @@ struct TerminalSessionResizeParams {
     pixel_width: Option<u32>,
     rows: Option<u32>,
     session_id: String,
+    session_generation: u64,
 }
 
 impl TerminalSessionResizeParams {
@@ -1399,6 +1902,7 @@ impl TerminalSessionResizeParams {
 #[serde(rename_all = "camelCase")]
 struct TerminalSessionKillParams {
     session_id: String,
+    session_generation: u64,
 }
 
 fn pty_size(
@@ -1814,12 +2318,11 @@ mod tests {
     use portable_pty::CommandBuilder;
 
     use super::{
-        handle_envelope, JsonRpcEnvelope,
-        BASE64, REMUX_NOTIFICATION_REQUEST_METHOD, SESSION_EXITED_NOTIFICATION,
-        SESSION_OUTPUT_NOTIFICATION, SESSION_WRITE_METHOD, SHELL_INTEGRATION_ENV,
-        TerminalExtensionServer,
+        BASE64, JsonRpcEnvelope, REMUX_NOTIFICATION_REQUEST_METHOD, SESSION_EXITED_NOTIFICATION,
+        SESSION_OUTPUT_NOTIFICATION, SESSION_START_METHOD, SESSION_WRITE_METHOD,
+        SHELL_INTEGRATION_ENV, TERMINAL_OUTPUT_QUEUE_CAPACITY, TerminalExtensionServer,
         TerminalNotificationEvent, TerminalNotificationParser, clamp_u16,
-        configure_shell_integration, configure_terminal_environment, pty_size,
+        configure_shell_integration, configure_terminal_environment, handle_envelope, pty_size,
     };
 
     #[test]
@@ -2041,6 +2544,8 @@ mod tests {
         let session_id = "terminal-test-idless-write";
 
         start_test_session(&server, session_id, shell, 80, 24);
+        let (session_generation, input_stream_id, input_seq) =
+            session_input_protocol(&server, session_id);
         let output_tx = server.output_tx.clone();
         handle_envelope(
             &server,
@@ -2049,7 +2554,10 @@ mod tests {
                 method: SESSION_WRITE_METHOD.to_string(),
                 params: Some(json!({
                     "dataBase64": BASE64.encode(b"printf 'idless-write-ok'\r"),
+                    "inputSeq": input_seq,
+                    "inputStreamId": input_stream_id,
                     "sessionId": session_id,
+                    "sessionGeneration": session_generation,
                 })),
             },
             &output_tx,
@@ -2057,6 +2565,39 @@ mod tests {
         .expect("expected id-less write notification to be handled");
 
         read_until_output_without_response(&output_rx, session_id, "idless-write-ok");
+        server.kill_all();
+    }
+
+    #[test]
+    fn start_response_is_admitted_before_early_targeted_output() {
+        let Some(shell) = test_shell() else {
+            return;
+        };
+        let (server, output_rx) = test_server();
+        let output_tx = server.output_tx.clone();
+        handle_envelope(
+            &server,
+            JsonRpcEnvelope {
+                id: Some(json!(91)),
+                method: SESSION_START_METHOD.to_string(),
+                params: Some(json!({
+                    "_remuxOrigin": "test-origin",
+                    "cols": 80,
+                    "cwd": env!("CARGO_MANIFEST_DIR"),
+                    "operationId": "response-barrier-start",
+                    "rows": 24,
+                    "sessionId": "terminal-test-response-barrier",
+                    "shell": shell,
+                })),
+            },
+            &output_tx,
+        )
+        .expect("start envelope succeeds");
+
+        let first = output_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("start response arrives");
+        assert_eq!(first["id"], 91, "early output overtook the start response");
         server.kill_all();
     }
 
@@ -2080,7 +2621,10 @@ mod tests {
         );
         assert_eq!(response["context"]["terminalSessionId"], session_id);
         assert_eq!(response["context"]["mode"], "none");
-        assert_eq!(response["context"]["sockets"].as_array().map(Vec::len), Some(0));
+        assert_eq!(
+            response["context"]["sockets"].as_array().map(Vec::len),
+            Some(0)
+        );
 
         server.kill_all();
     }
@@ -2120,11 +2664,13 @@ mod tests {
         let session_id = "terminal-test-resize";
 
         start_test_session(&server, session_id, shell, 80, 24);
+        let (session_generation, _, _) = session_input_protocol(&server, session_id);
         server
             .resize_session(json!({
                 "cols": 101,
                 "rows": 33,
                 "sessionId": session_id,
+                "sessionGeneration": session_generation,
             }))
             .expect("expected resize to succeed");
         write_text(
@@ -2151,20 +2697,87 @@ mod tests {
         let session_id = "terminal-test-kill";
 
         start_test_session(&server, session_id, shell, 80, 24);
+        let (session_generation, input_stream_id, input_seq) =
+            session_input_protocol(&server, session_id);
         server
-            .kill_session(json!({ "sessionId": session_id }))
+            .kill_session(json!({
+                "sessionId": session_id,
+                "sessionGeneration": session_generation,
+            }))
             .expect("expected kill to succeed");
 
         let error = server
             .write_session(json!({
                 "dataBase64": BASE64.encode(b"echo after-kill\r"),
+                "inputSeq": input_seq,
+                "inputStreamId": input_stream_id,
                 "sessionId": session_id,
+                "sessionGeneration": session_generation,
             }))
             .expect_err("expected write to killed session to fail");
         assert!(
             error.contains("terminal session not found"),
             "expected not-found error, got: {error}"
         );
+    }
+
+    #[test]
+    fn terminal_input_is_generation_checked_sequenced_and_deduplicated() {
+        let Some(shell) = test_shell() else {
+            return;
+        };
+        let (server, _output_rx) = test_server();
+        let session_id = "terminal-test-input-sequence";
+        let started = start_test_session(&server, session_id, shell, 80, 24);
+        let generation = started["sessionGeneration"].as_u64().unwrap();
+        let stream_id = started["inputStreamId"].as_str().unwrap();
+
+        let accepted = server
+            .write_session(json!({
+                "dataBase64": "",
+                "inputSeq": 1,
+                "inputStreamId": stream_id,
+                "sessionId": session_id,
+                "sessionGeneration": generation,
+            }))
+            .unwrap();
+        assert_eq!(accepted["nextInputSeq"], 2);
+        assert_eq!(accepted["duplicate"], false);
+
+        let duplicate = server
+            .write_session(json!({
+                "dataBase64": "",
+                "inputSeq": 1,
+                "inputStreamId": stream_id,
+                "sessionId": session_id,
+                "sessionGeneration": generation,
+            }))
+            .unwrap();
+        assert_eq!(duplicate["nextInputSeq"], 2);
+        assert_eq!(duplicate["duplicate"], true);
+
+        let gap = server
+            .write_session(json!({
+                "dataBase64": "",
+                "inputSeq": 3,
+                "inputStreamId": stream_id,
+                "sessionId": session_id,
+                "sessionGeneration": generation,
+            }))
+            .unwrap_err();
+        assert!(gap.contains("expectedInputSeq=2"));
+
+        let stale = server
+            .write_session(json!({
+                "dataBase64": "",
+                "inputSeq": 2,
+                "inputStreamId": stream_id,
+                "sessionId": session_id,
+                "sessionGeneration": generation + 1,
+            }))
+            .unwrap_err();
+        assert!(stale.contains("stale terminal session generation"));
+        server.kill_all();
     }
 
     #[test]
@@ -2208,14 +2821,17 @@ mod tests {
         let write_error = server
             .write_session(json!({
                 "dataBase64": BASE64.encode(b"x"),
+                "inputSeq": 1,
+                "inputStreamId": "missing-input-stream",
                 "sessionId": "missing-session",
+                "sessionGeneration": 1,
             }))
             .expect_err("expected missing write to fail");
         assert!(write_error.contains("terminal session not found"));
     }
 
     fn test_server() -> (TerminalExtensionServer, Receiver<Value>) {
-        let (output_tx, output_rx) = mpsc::channel();
+        let (output_tx, output_rx) = mpsc::sync_channel(TERMINAL_OUTPUT_QUEUE_CAPACITY);
         (TerminalExtensionServer::new(output_tx), output_rx)
     }
 
@@ -2242,6 +2858,7 @@ mod tests {
             .start_session(json!({
                 "cols": cols,
                 "cwd": env!("CARGO_MANIFEST_DIR"),
+                "operationId": format!("test-start-{session_id}"),
                 "rows": rows,
                 "sessionId": session_id,
                 "shell": shell,
@@ -2250,12 +2867,38 @@ mod tests {
     }
 
     fn write_text(server: &TerminalExtensionServer, session_id: &str, text: &str) {
+        let (session_generation, input_stream_id, input_seq) =
+            session_input_protocol(server, session_id);
         server
             .write_session(json!({
                 "dataBase64": BASE64.encode(text.as_bytes()),
+                "inputSeq": input_seq,
+                "inputStreamId": input_stream_id,
                 "sessionId": session_id,
+                "sessionGeneration": session_generation,
             }))
             .expect("expected write to test session to succeed");
+    }
+
+    fn session_input_protocol(
+        server: &TerminalExtensionServer,
+        session_id: &str,
+    ) -> (u64, String, u64) {
+        let state = server.state.lock().expect("terminal test state available");
+        let session = state
+            .sessions
+            .get(session_id)
+            .expect("terminal test session exists");
+        let (input_stream_id, input_seq) = session
+            .input_streams
+            .iter()
+            .next()
+            .expect("terminal test input stream exists");
+        (
+            session.generation,
+            input_stream_id.clone(),
+            input_seq.next_seq,
+        )
     }
 
     fn read_until_output(output_rx: &Receiver<Value>, session_id: &str, expected: &str) -> String {

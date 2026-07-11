@@ -12,7 +12,7 @@ use remux::rpc::jsonrpc::JsonRpcError;
 use remux::rpc::router::{
     BoxFuture, ExtensionServer, RpcResult, RpcRouter, ServerStatus, SystemHooks,
 };
-use remux::rpc::ws::{DiagnosticEvent, WsHooks, WsLog, WsServer};
+use remux::rpc::ws::{DiagnosticEvent, NotificationsHook, WsClient, WsHooks, WsLog, WsServer};
 
 type NotificationLog = Arc<Mutex<Vec<(String, Option<Value>)>>>;
 
@@ -55,8 +55,21 @@ impl ExtensionServer for EchoServer {
     }
     fn handle_rpc(&self, method: String, params: Option<Value>) -> BoxFuture<'_, RpcResult> {
         Box::pin(async move {
-            if method == "remux/terminal/fail" {
+            if params
+                .as_ref()
+                .and_then(|params| params.get("testFail"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
                 return Err(JsonRpcError::new(-32000, "boom"));
+            }
+            if params
+                .as_ref()
+                .and_then(|params| params.get("testSlow"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
             Ok(json!({ "echo": method, "params": params }))
         })
@@ -93,18 +106,28 @@ struct Fixture {
 }
 
 async fn start_fixture() -> Fixture {
+    start_fixture_with_hooks(WsHooks::default()).await
+}
+
+async fn start_fixture_with_hooks(hooks: WsHooks) -> Fixture {
     let notifications = Arc::new(Mutex::new(Vec::new()));
     let echo = Arc::new(EchoServer {
         notifications: notifications.clone(),
     });
     let router = Arc::new(RpcRouter::new(
-        vec![("terminal".to_string(), echo as Arc<dyn ExtensionServer>)],
+        vec![
+            (
+                "terminal".to_string(),
+                echo.clone() as Arc<dyn ExtensionServer>,
+            ),
+            ("ledger".to_string(), echo as Arc<dyn ExtensionServer>),
+        ],
         Some("terminal".to_string()),
         None,
         SystemHooks::default(),
     ));
     let log = Arc::new(CapturingLog::default());
-    let server = WsServer::new(router, WsHooks::default(), log.clone());
+    let server = WsServer::new(router, hooks, log.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -121,6 +144,60 @@ async fn start_fixture() -> Fixture {
         notifications,
         server,
     }
+}
+
+struct HostRoundTripHook;
+
+impl NotificationsHook for HostRoundTripHook {
+    fn can_handle_client_request(&self, method: &str) -> bool {
+        method == "remux/test/host-roundtrip"
+    }
+
+    fn handle_client_request(
+        &self,
+        client: Arc<WsClient>,
+        _method: String,
+        _params: Option<Value>,
+    ) -> BoxFuture<'_, RpcResult> {
+        Box::pin(async move {
+            let result = client
+                .request(
+                    "remux/test/client-check",
+                    Some(json!({ "visible": true })),
+                    500,
+                )
+                .await?;
+            Ok(json!({ "clientResult": result }))
+        })
+    }
+
+    fn record_client_request(&self, _client: &Arc<WsClient>, _request: &Value, _result: &Value) {}
+
+    fn on_client_disconnected(&self, _client: &Arc<WsClient>) {}
+}
+
+struct DelayedRegistrationHook;
+
+impl NotificationsHook for DelayedRegistrationHook {
+    fn can_handle_client_request(&self, method: &str) -> bool {
+        method == "remux/clients/register"
+    }
+
+    fn handle_client_request(
+        &self,
+        _client: Arc<WsClient>,
+        _method: String,
+        _params: Option<Value>,
+    ) -> BoxFuture<'_, RpcResult> {
+        Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Ok(json!({ "registered": true }))
+        })
+    }
+
+    fn record_client_request(&self, _client: &Arc<WsClient>, _request: &Value, _result: &Value) {}
+
+    fn on_client_disconnected(&self, _client: &Arc<WsClient>) {}
 }
 
 type WsStream =
@@ -206,7 +283,7 @@ async fn routes_downstream_notifications_without_sending_a_response() {
         .send(Message::Text(
             json!({
                 "jsonrpc": "2.0",
-                "method": "remux/terminal/session/write",
+                "method": "remux/terminal/session/input-preview",
                 "params": { "dataBase64": "YQ==", "sessionId": "session-1" }
             })
             .to_string()
@@ -225,7 +302,7 @@ async fn routes_downstream_notifications_without_sending_a_response() {
     assert_eq!(
         fixture.notifications.lock().unwrap().clone(),
         vec![(
-            "remux/terminal/session/write".to_string(),
+            "remux/terminal/session/input-preview".to_string(),
             Some(json!({ "dataBase64": "YQ==", "sessionId": "session-1" }))
         )]
     );
@@ -246,7 +323,183 @@ async fn routes_downstream_notifications_without_sending_a_response() {
         .unwrap();
     let response = next_text(&mut socket).await;
     assert_eq!(response["id"], json!(7));
-    assert_eq!(response["result"]["echo"], json!("remux/terminal/session/list"));
+    assert_eq!(
+        response["result"]["echo"],
+        json!("remux/terminal/session/list")
+    );
+    assert!(fixture.log.warnings.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn rejects_notifications_for_must_ack_methods() {
+    let fixture = start_fixture().await;
+    let mut socket = connect(fixture.addr).await;
+    socket
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "method": "remux/terminal/session/write",
+                "params": { "dataBase64": "YQ==", "sessionId": "session-1" }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert!(fixture.notifications.lock().unwrap().is_empty());
+    assert!(fixture
+        .log
+        .warnings
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|warning| warning.contains("must-ack method=remux/terminal/session/write")));
+}
+
+#[tokio::test]
+async fn registration_is_a_barrier_for_later_extension_work() {
+    let fixture = start_fixture_with_hooks(WsHooks {
+        notifications: Some(Arc::new(DelayedRegistrationHook)),
+        ..WsHooks::default()
+    })
+    .await;
+    let mut socket = connect(fixture.addr).await;
+    socket
+        .send(Message::Text(
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "remux/clients/register" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(Message::Text(
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "remux/terminal/session/list" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(next_text(&mut socket).await["id"], json!(1));
+    assert_eq!(next_text(&mut socket).await["id"], json!(2));
+}
+
+#[tokio::test]
+async fn slow_business_request_does_not_block_same_socket_control_request() {
+    let fixture = start_fixture().await;
+    let mut socket = connect(fixture.addr).await;
+
+    socket
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "remux/terminal/tmux/action",
+                "params": { "testSlow": true }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(Message::Text(
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "remux/system/ping" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+
+    let fast = tokio::time::timeout(
+        std::time::Duration::from_millis(150),
+        next_text(&mut socket),
+    )
+    .await
+    .expect("ping was blocked behind slow business RPC");
+    assert_eq!(fast["id"], json!(2));
+    assert_eq!(fast["result"], json!({ "ok": true }));
+
+    let slow = next_text(&mut socket).await;
+    assert_eq!(slow["id"], json!(1));
+    assert_eq!(slow["result"]["echo"], json!("remux/terminal/tmux/action"));
+}
+
+#[tokio::test]
+async fn slow_extension_does_not_block_another_extension_lane() {
+    let fixture = start_fixture().await;
+    let mut socket = connect(fixture.addr).await;
+
+    socket
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "remux/terminal/tmux/action",
+                "params": { "testSlow": true }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(Message::Text(
+            json!({ "jsonrpc": "2.0", "id": 12, "method": "remux/ledger/read" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+
+    let fast = tokio::time::timeout(
+        std::time::Duration::from_millis(150),
+        next_text(&mut socket),
+    )
+    .await
+    .expect("ledger was blocked behind terminal");
+    assert_eq!(fast["id"], json!(12));
+    assert_eq!(fast["result"]["echo"], json!("remux/ledger/read"));
+
+    let slow = next_text(&mut socket).await;
+    assert_eq!(slow["id"], json!(11));
+}
+
+#[tokio::test]
+async fn host_request_response_is_consumed_while_app_request_is_pending() {
+    let fixture = start_fixture_with_hooks(WsHooks {
+        notifications: Some(Arc::new(HostRoundTripHook)),
+        ..WsHooks::default()
+    })
+    .await;
+    let mut socket = connect(fixture.addr).await;
+
+    socket
+        .send(Message::Text(
+            json!({ "jsonrpc": "2.0", "id": 8, "method": "remux/test/host-roundtrip" })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+
+    let host_request = next_text(&mut socket).await;
+    assert_eq!(host_request["method"], json!("remux/test/client-check"));
+    let host_id = host_request["id"].clone();
+    socket
+        .send(Message::Text(
+            json!({ "jsonrpc": "2.0", "id": host_id, "result": { "visible": true } })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+
+    let response = next_text(&mut socket).await;
+    assert_eq!(response["id"], json!(8));
+    assert_eq!(response["result"]["clientResult"]["visible"], json!(true));
     assert!(fixture.log.warnings.lock().unwrap().is_empty());
 }
 
@@ -271,9 +524,14 @@ async fn responds_with_errors_for_parse_failures_and_rpc_errors() {
 
     socket
         .send(Message::Text(
-            json!({ "jsonrpc": "2.0", "id": 1, "method": "remux/terminal/fail" })
-                .to_string()
-                .into(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "remux/terminal/session/list",
+                "params": { "testFail": true }
+            })
+            .to_string()
+            .into(),
         ))
         .await
         .unwrap();
@@ -309,9 +567,9 @@ async fn broadcast_adds_jsonrpc_version_and_reaches_clients() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
-    fixture
-        .server
-        .broadcast(json!({ "method": "remux/extensions/didChangeStatus", "params": { "state": "Running" } }));
+    fixture.server.broadcast(
+        json!({ "method": "remux/extensions/didChangeStatus", "params": { "state": "Running" } }),
+    );
 
     let frame = next_text(&mut socket).await;
     assert_eq!(
@@ -335,7 +593,7 @@ async fn extension_origins_are_opaque_stable_and_target_one_downstream_context()
             json!({
                 "jsonrpc": "2.0",
                 "id": 41,
-                "method": "remux/terminal/projections/subscribe",
+                "method": "remux/terminal/session/attach",
                 "params": { "projection": "bars:1m" },
                 "remuxContext": { "tabId": "tab-a", "resourceKey": "replay-a" }
             })
@@ -356,7 +614,7 @@ async fn extension_origins_are_opaque_stable_and_target_one_downstream_context()
             json!({
                 "jsonrpc": "2.0",
                 "id": 42,
-                "method": "remux/terminal/projections/subscribe",
+                "method": "remux/terminal/session/attach",
                 "params": {},
                 "remuxContext": { "tabId": "tab-a", "resourceKey": "replay-a" }
             })

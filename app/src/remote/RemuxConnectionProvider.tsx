@@ -9,10 +9,15 @@ import {
   type ReactNode,
 } from 'react';
 import { AppState } from 'react-native';
+import {
+  rpcPolicies,
+  type RpcRequestPolicy,
+} from '@remux/viewer-kit/rpc-policy';
 
 import { logRemuxDebug, setRemuxDebugSink, type RemuxDebugEntry } from './remuxDebug';
 import {
   RemuxConnectionClosedError,
+  RemuxRequestTimeoutError,
   RemuxRpcClient,
   type JsonRpcId,
   type RemuxRpcMessage,
@@ -25,14 +30,13 @@ import {
 } from './remuxSettingsStore';
 
 const reconnectDelaysMs = [400, 900, 1800, 3500, 5000];
-const remuxSystemInfoMethod = 'remux/system/info';
-const remuxSystemInfoTimeoutMs = 2_000;
-const remuxSystemPingMethod = 'remux/system/ping';
-const resumePingTimeoutMs = 3_000;
 const remuxWebSocketConnectTimeoutMs = 6_000;
 const requestReconnectWaitMs = 8000;
 const maxRequestReconnectRetries = 1;
 const maxPendingLogEntries = 200;
+const foregroundIdlePingMs = 10_000;
+const heartbeatCheckMs = 1_000;
+const drainingClientCloseDelayMs = 250;
 
 type ReconnectOptions = {
   immediate?: boolean;
@@ -44,9 +48,14 @@ type ConnectedWaiter = {
   timer: ReturnType<typeof setTimeout>;
 };
 
+type DesiredRegistration = {
+  params: unknown;
+  revision: number;
+};
+
 export type RemuxConnectionStatus =
   | { type: 'connecting' }
-  | { cwd: string | null; type: 'connected' }
+  | { cwd: string | null; generation: number; type: 'connected' }
   | { attempt: number; type: 'reconnecting' }
   | { type: 'disconnected' };
 
@@ -54,9 +63,8 @@ export type RemuxConnection = {
   error: string | null;
   notify: (method: string, params?: unknown) => void;
   request: <T>(
-    method: string,
+    policy: RpcRequestPolicy,
     params?: unknown,
-    timeoutMs?: number,
     context?: RemuxRpcRequestContext | null,
   ) => Promise<T>;
   respond: (id: JsonRpcId, result: unknown) => void;
@@ -76,8 +84,12 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<RemuxConnectionStatus>({ type: 'connecting' });
   const [error, setError] = useState<string | null>(null);
   const clientRef = useRef<RemuxRpcClient | null>(null);
+  const candidateRef = useRef<RemuxRpcClient | null>(null);
   const connectedWaitersRef = useRef(new Set<ConnectedWaiter>());
+  const connectionGenerationRef = useRef(0);
   const generationRef = useRef(0);
+  const desiredRegistrationRef = useRef<DesiredRegistration | null>(null);
+  const lastInboundAtRef = useRef(Date.now());
   const openConnectionRef = useRef<(() => Promise<void>) | null>(null);
   const pendingLogEntriesRef = useRef<RemuxDebugEntry[]>([]);
   const reconnectAttemptRef = useRef(0);
@@ -148,16 +160,50 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const completeConnection = useCallback(async (client: RemuxRpcClient, generation: number) => {
+    await client.request(rpcPolicies['system-ping']);
     const info = await readRemuxSystemInfo(client);
-    if (clientRef.current !== client || generationRef.current !== generation) {
+    for (;;) {
+      const registration = desiredRegistrationRef.current;
+      if (!registration) {
+        break;
+      }
+      await client.request(
+        rpcPolicies['client-register'],
+        withRegistrationMetadata(
+          registration.params,
+          connectionGenerationRef.current + 1,
+          registration.revision,
+        ),
+      );
+      if (desiredRegistrationRef.current?.revision === registration.revision) {
+        break;
+      }
+    }
+    if (candidateRef.current !== client || generationRef.current !== generation) {
       return;
     }
 
+    const oldClient = clientRef.current;
+    clientRef.current = client;
+    candidateRef.current = null;
+    connectionGenerationRef.current += 1;
+    lastInboundAtRef.current = Date.now();
     reconnectAttemptRef.current = 0;
     setError(null);
-    setConnectionStatus({ cwd: info.cwd, type: 'connected' });
+    setConnectionStatus({
+      cwd: info.cwd,
+      generation: connectionGenerationRef.current,
+      type: 'connected',
+    });
     flushPendingLogEntries(client);
     resolveConnectedWaiters(client);
+    logRemuxDebug('connection:candidate:promoted', {
+      generation: connectionGenerationRef.current,
+      replacedActive: Boolean(oldClient && oldClient !== client),
+    });
+    if (oldClient && oldClient !== client) {
+      setTimeout(() => oldClient.close('Superseded by healthy connection'), drainingClientCloseDelayMs);
+    }
   }, [flushPendingLogEntries, resolveConnectedWaiters, setConnectionStatus]);
 
   const scheduleReconnect = useCallback((
@@ -183,7 +229,9 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
     setConnectionStatus({ attempt, type: 'reconnecting' });
 
     const baseDelay = reconnectDelaysMs[Math.min(attempt - 1, reconnectDelaysMs.length - 1)]!;
-    const delay = options.immediate ? 0 : baseDelay;
+    const delay = options.immediate
+      ? 0
+      : Math.floor(Math.random() * (baseDelay + 1));
     logRemuxDebug('connection:reconnect:scheduled', {
       attempt,
       delayMs: delay,
@@ -202,10 +250,13 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
     if (!settingsLoaded) {
       return;
     }
+    if (candidateRef.current) {
+      return;
+    }
 
     clearReconnectTimer();
     const generation = generationRef.current;
-    const reconnecting = reconnectAttemptRef.current > 0;
+    const reconnecting = reconnectAttemptRef.current > 0 || clientRef.current !== null;
     logRemuxDebug('connection:open', {
       reconnecting,
       url: wsUrl,
@@ -217,6 +268,7 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
     );
 
     const client = new RemuxRpcClient({
+      connectionGeneration: connectionGenerationRef.current + 1,
       onMessage: (message) => {
         if (clientRef.current !== client) {
           return;
@@ -226,15 +278,29 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
           handler(message);
         }
       },
+      onInbound: (receivedAt) => {
+        lastInboundAtRef.current = Math.max(lastInboundAtRef.current, receivedAt);
+      },
       onStatus: (nextStatus) => {
-        if (clientRef.current !== client) {
+        const isCandidate = candidateRef.current === client;
+        const isActive = clientRef.current === client;
+        if (!isCandidate && !isActive) {
           return;
         }
 
         logRemuxDebug('client:status', nextStatus);
         switch (nextStatus.type) {
           case 'connected':
-            void completeConnection(client, generation);
+            if (isCandidate) {
+              void completeConnection(client, generation).catch((handshakeError) => {
+                if (candidateRef.current !== client) {
+                  return;
+                }
+                candidateRef.current = null;
+                client.close(errorMessage(handshakeError));
+                scheduleReconnect(generation, errorMessage(handshakeError));
+              });
+            }
             break;
           case 'connecting':
             setConnectionStatus(
@@ -244,6 +310,12 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
             );
             break;
           case 'closed':
+            if (isCandidate) {
+              candidateRef.current = null;
+            }
+            if (isActive) {
+              clientRef.current = null;
+            }
             if (shouldReconnectRef.current) {
               scheduleReconnect(generation, nextStatus.reason ?? 'WebSocket closed');
             } else {
@@ -252,6 +324,12 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
             }
             break;
           case 'error':
+            if (isCandidate) {
+              candidateRef.current = null;
+            }
+            if (isActive && !client.isOpen()) {
+              clientRef.current = null;
+            }
             if (shouldReconnectRef.current) {
               scheduleReconnect(generation, nextStatus.message);
             } else {
@@ -269,12 +347,13 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
       url: wsUrl,
     });
 
-    clientRef.current = client;
+    candidateRef.current = client;
 
     try {
       await client.connect();
     } catch (connectError) {
-      if (clientRef.current === client && generationRef.current === generation) {
+      if (candidateRef.current === client && generationRef.current === generation) {
+        candidateRef.current = null;
         scheduleReconnect(generation, errorMessage(connectError));
       }
     }
@@ -300,16 +379,22 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
       return;
     }
 
-    clientRef.current = null;
-    logRemuxDebug('connection:client:discarded', { reason });
-    client.close(reason);
+    const socketClosed = !client.isOpen();
+    if (socketClosed) {
+      clientRef.current = null;
+      client.close(reason);
+    }
+    logRemuxDebug('connection:client:suspect', { reason, socketClosed });
+    void classifyHttpHealth(origin, token).then((classification) => {
+      logRemuxDebug('connection:http-classification', classification);
+    });
     if (shouldReconnectRef.current) {
       scheduleReconnect(generationRef.current, reason, options);
     } else {
       setConnectionStatus({ type: 'disconnected' });
       rejectConnectedWaiters(reason);
     }
-  }, [rejectConnectedWaiters, scheduleReconnect, setConnectionStatus]);
+  }, [origin, rejectConnectedWaiters, scheduleReconnect, setConnectionStatus, token]);
 
   const verifyResumedConnection = useCallback((client: RemuxRpcClient) => {
     if (resumePingInFlightRef.current) {
@@ -317,15 +402,14 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
     }
 
     resumePingInFlightRef.current = true;
-    client.request(remuxSystemPingMethod, undefined, resumePingTimeoutMs)
+    client.request(rpcPolicies['system-ping'])
       .then(() => {
         logRemuxDebug('connection:resume-ping:ok');
       })
       .catch((pingError) => {
         // Any response — even an error from an older daemon without the ping
         // route — proves the socket is alive; only silence means it is dead.
-        const timedOut = pingError instanceof Error &&
-          pingError.message === `${remuxSystemPingMethod} timed out`;
+        const timedOut = pingError instanceof RemuxRequestTimeoutError;
         if (!timedOut) {
           logRemuxDebug('connection:resume-ping:ok', { error: errorMessage(pingError) });
           return;
@@ -400,6 +484,24 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
   }, [ensureConnectionAfterResume]);
 
   useEffect(() => {
+    const timer = setInterval(() => {
+      if (AppState.currentState !== 'active' || statusRef.current.type !== 'connected') {
+        return;
+      }
+      const client = clientRef.current;
+      if (!client?.isOpen() || Date.now() - lastInboundAtRef.current < foregroundIdlePingMs) {
+        return;
+      }
+      logRemuxDebug('connection:heartbeat:idle', {
+        idleMs: Date.now() - lastInboundAtRef.current,
+      });
+      verifyResumedConnection(client);
+    }, heartbeatCheckMs);
+
+    return () => clearInterval(timer);
+  }, [verifyResumedConnection]);
+
+  useEffect(() => {
     void loadSettings();
   }, [loadSettings]);
 
@@ -424,6 +526,8 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
       clearReconnectTimer();
       clientRef.current?.close();
       clientRef.current = null;
+      candidateRef.current?.close();
+      candidateRef.current = null;
       rejectConnectedWaiters('WebSocket closed');
     };
   }, [clearReconnectTimer, openConnection, origin, rejectConnectedWaiters, settingsLoaded, wsUrl]);
@@ -460,26 +564,84 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
     });
   }, [markClientConnectionLost]);
 
-  const request = useCallback<RemuxConnection['request']>(async (method, params, timeoutMs, context) => {
-    const retryable = isRetryableRemuxRequest(method);
+  const request = useCallback<RemuxConnection['request']>(async (policy, params, context) => {
+    let requestParams = params;
+    if (policy.name === 'client-register') {
+      const registration = {
+        params,
+        revision: (desiredRegistrationRef.current?.revision ?? 0) + 1,
+      };
+      desiredRegistrationRef.current = registration;
+      requestParams = withRegistrationMetadata(
+        params,
+        connectionGenerationRef.current,
+        registration.revision,
+      );
+    }
+    const startedAt = Date.now();
+    const deadlineAt = startedAt + policy.budget.totalMs;
+    const retryable = policy.retry === 'read-safe';
     let retryCount = 0;
 
     for (;;) {
-      const client = await waitForConnectedClient(timeoutMs);
+      const remainingBeforeConnect = deadlineAt - Date.now();
+      if (remainingBeforeConnect <= 0) {
+        throw new RemuxRequestTimeoutError(policy, 'connection-wait', policy.budget.totalMs, {
+          connectionGeneration: connectionGenerationRef.current,
+          lastInboundAt: lastInboundAtRef.current,
+          sentAt: startedAt,
+        });
+      }
+      const client = await waitForConnectedClient(Math.min(
+        policy.budget.connectWaitMs,
+        remainingBeforeConnect,
+      ));
       try {
-        return await client.request(method, params, timeoutMs, context);
+        const remaining = deadlineAt - Date.now();
+        if (remaining <= 0) {
+          throw new RemuxRequestTimeoutError(policy, 'before-send', policy.budget.totalMs, {
+            connectionGeneration: connectionGenerationRef.current,
+            lastInboundAt: lastInboundAtRef.current,
+            sentAt: startedAt,
+          });
+        }
+        const phaseBudget = policy.budget.queueMs
+          + policy.budget.executionMs
+          + policy.budget.transferMs;
+        return await client.request(
+          policy,
+          requestParams,
+          context,
+          Math.min(remaining, phaseBudget),
+          remaining,
+        );
       } catch (requestError) {
+        let timedOutConnection = false;
+        if (requestError instanceof RemuxRequestTimeoutError) {
+          const shouldRecoverConnection = policy.timeoutHealth === 'connection-failed' || (
+            policy.timeoutHealth === 'probe-connection' &&
+            lastInboundAtRef.current <= startedAt
+          );
+          if (shouldRecoverConnection) {
+            timedOutConnection = true;
+            markClientConnectionLost(client, requestError.message, { immediate: true });
+          }
+        }
         if (
           retryable &&
           retryCount < maxRequestReconnectRetries &&
-          requestError instanceof RemuxConnectionClosedError &&
+          (requestError instanceof RemuxConnectionClosedError || timedOutConnection) &&
           shouldReconnectRef.current
         ) {
           retryCount += 1;
-          markClientConnectionLost(client, requestError.message, { immediate: true });
+          const reconnectError = requestError as
+            | RemuxConnectionClosedError
+            | RemuxRequestTimeoutError;
+          markClientConnectionLost(client, reconnectError.message, { immediate: true });
           logRemuxDebug('connection:request:retry-after-reconnect', {
-            method,
-            phase: requestError.phase,
+            method: policy.method,
+            policy: policy.name,
+            phase: reconnectError.phase,
             retryCount,
           });
           continue;
@@ -558,38 +720,50 @@ function errorMessage(error: unknown) {
 }
 
 async function readRemuxSystemInfo(client: RemuxRpcClient): Promise<{ cwd: string | null }> {
-  try {
-    const response = await client.request<unknown>(
-      remuxSystemInfoMethod,
-      undefined,
-      remuxSystemInfoTimeoutMs,
-    );
-    if (isRecord(response) && (typeof response.cwd === 'string' || response.cwd === null)) {
-      return {
-        cwd: typeof response.cwd === 'string' && response.cwd.trim().length > 0 ? response.cwd : null,
-      };
-    }
-  } catch {
-    // Older Remux CLIs may not support system info; keep the connection usable.
+  const response = await client.request<unknown>(rpcPolicies['system-info']);
+  if (!isRecord(response) || (typeof response.cwd !== 'string' && response.cwd !== null)) {
+    throw new Error('Invalid remux/system/info response');
   }
-
-  return { cwd: null };
+  return {
+    cwd: typeof response.cwd === 'string' && response.cwd.trim().length > 0 ? response.cwd : null,
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
-function isRetryableRemuxRequest(method: string) {
-  if (
-    method === 'remux/codex/files' ||
-    method === 'remux/extensions/status'
-  ) {
-    return true;
-  }
+async function classifyHttpHealth(origin: string, token: string | null) {
+  const request = async (path: string, authenticated: boolean) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5_000);
+    try {
+      const response = await fetch(`${origin}${path}`, {
+        cache: 'no-store',
+        headers: authenticated && token ? { Authorization: `Bearer ${token}` } : undefined,
+        signal: controller.signal,
+      });
+      return { ok: response.ok, status: response.status };
+    } catch (error) {
+      return {
+        error: controller.signal.aborted ? 'timeout' : errorMessage(error),
+        ok: false,
+        status: null,
+      };
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
 
-  return method.endsWith('/read') ||
-    method.endsWith('/status') ||
-    method.includes('/resources/read') ||
-    method.startsWith('remux/fs/read');
+  const [health, status] = await Promise.all([
+    request('/healthz', false),
+    request('/api/status', true),
+  ]);
+  return { health, status };
+}
+
+function withRegistrationMetadata(params: unknown, connectionGeneration: number, revision: number) {
+  return isRecord(params)
+    ? { ...params, connectionGeneration, registrationRevision: revision }
+    : params;
 }

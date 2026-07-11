@@ -7,12 +7,12 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 const SOCKET_RELATIVE_PATH: &[&str] = &["app-server-control", "app-server-control.sock"];
-const APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const APP_SERVER_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const DIAGNOSTIC_MAX_JSON_CHARS: usize = 6000;
 const DIAGNOSTIC_MAX_STRING_CHARS: usize = 500;
 const DIAGNOSTIC_MAX_ARRAY_ITEMS: usize = 20;
@@ -67,33 +67,26 @@ impl AppServerRuntime {
     }
 
     pub(crate) fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+        let timeout = app_server_request_timeout(method)
+            .ok_or_else(|| format!("unregistered app-server RPC policy: {method}"))?;
         debug_log(format_args!(
-            "[codex:app-server] request begin method={method}"
+            "[codex:app-server] request begin method={method} timeout_ms={}",
+            timeout.as_millis()
         ));
-        match self.request_once(method, params.clone()) {
-            Ok(value) => {
-                debug_log(format_args!(
-                    "[codex:app-server] request ok method={method} summary={}",
-                    summarize_app_server_value(&value)
-                ));
-                Ok(value)
-            }
-            Err(first_error) => {
-                eprintln!(
-                    "[codex:app-server] request failed method={method} error={first_error}; retrying"
-                );
-                self.clear_connection();
-                self.request_once(method, params).map_err(|second_error| {
-                    eprintln!(
-                        "[codex:app-server] request retry failed method={method} error={second_error}"
-                    );
-                    format!("{first_error}; retry failed: {second_error}")
-                })
-            }
-        }
+        let value = self.request_once(method, params, timeout)?;
+        debug_log(format_args!(
+            "[codex:app-server] request ok method={method} summary={}",
+            summarize_app_server_value(&value)
+        ));
+        Ok(value)
     }
 
-    fn request_once(&self, method: &str, params: Value) -> Result<Value, String> {
+    fn request_once(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let connection = self.ensure_connected()?;
         if !connection.alive.load(Ordering::SeqCst) {
             return Err("app-server connection is closed".to_string());
@@ -127,7 +120,7 @@ impl AppServerRuntime {
             return Err(format!("failed to send app-server request: {error}"));
         }
 
-        match response_rx.recv_timeout(APP_SERVER_REQUEST_TIMEOUT) {
+        match response_rx.recv_timeout(timeout) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let _ = connection
@@ -166,7 +159,8 @@ impl AppServerRuntime {
     }
 
     fn connect_or_start(&self) -> Result<AppServerConnection, String> {
-        if let Ok(connection) = self.connect_and_initialize_runtime() {
+        let deadline = Instant::now() + APP_SERVER_INITIALIZE_TIMEOUT;
+        if let Ok(connection) = self.connect_and_initialize_runtime(Duration::from_secs(2)) {
             debug_log(format_args!(
                 "[codex:app-server] connected existing runtime"
             ));
@@ -176,15 +170,19 @@ impl AppServerRuntime {
         eprintln!("[codex:app-server] starting runtime");
         self.start_app_server()?;
         let mut last_error = String::new();
-        for _ in 0..50 {
-            match self.connect_and_initialize_runtime() {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match self.connect_and_initialize_runtime(remaining.min(Duration::from_secs(2))) {
                 Ok(connection) => {
                     debug_log(format_args!("[codex:app-server] connected started runtime"));
                     return Ok(connection);
                 }
                 Err(error) => {
                     last_error = error;
-                    thread::sleep(Duration::from_millis(100));
+                    thread::sleep(remaining.min(Duration::from_millis(100)));
                 }
             }
         }
@@ -192,8 +190,11 @@ impl AppServerRuntime {
         Err(format!("failed to connect to app-server: {last_error}"))
     }
 
-    fn connect_and_initialize_runtime(&self) -> Result<AppServerConnection, String> {
-        let mut socket = UnixWebSocket::connect(self.socket_path())?;
+    fn connect_and_initialize_runtime(
+        &self,
+        timeout: Duration,
+    ) -> Result<AppServerConnection, String> {
+        let mut socket = UnixWebSocket::connect(self.socket_path(), timeout)?;
         self.initialize_socket(&mut socket)?;
         socket
             .stream
@@ -314,18 +315,17 @@ impl AppServerRuntime {
     fn next_request_id(&self) -> u64 {
         self.inner.next_id.fetch_add(1, Ordering::SeqCst)
     }
+}
 
-    fn clear_connection(&self) {
-        if let Ok(mut connection) = self.inner.connection.lock() {
-            if let Some(connection) = connection.take() {
-                connection.alive.store(false, Ordering::SeqCst);
-                drain_pending(
-                    &connection.pending,
-                    "app-server connection reset".to_string(),
-                );
-            }
-        }
-    }
+fn app_server_request_timeout(method: &str) -> Option<Duration> {
+    let seconds = match method {
+        "model/list" | "thread/list" | "thread/read" | "thread/resume" | "thread/rollback"
+        | "turn/steer" | "turn/interrupt" => 10,
+        "thread/turns/list" => 5,
+        "thread/start" | "thread/fork" | "turn/start" | "thread/compact/start" => 15,
+        _ => return None,
+    };
+    Some(Duration::from_secs(seconds))
 }
 
 impl Default for AppServerEventSink {
@@ -718,14 +718,14 @@ struct UnixWebSocketWriter {
 }
 
 impl UnixWebSocket {
-    fn connect(path: PathBuf) -> Result<Self, String> {
+    fn connect(path: PathBuf, timeout: Duration) -> Result<Self, String> {
         let mut stream = UnixStream::connect(&path)
             .map_err(|error| format!("failed to connect {}: {error}", path.display()))?;
         stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
+            .set_read_timeout(Some(timeout))
             .map_err(|error| error.to_string())?;
         stream
-            .set_write_timeout(Some(Duration::from_secs(30)))
+            .set_write_timeout(Some(timeout))
             .map_err(|error| error.to_string())?;
         stream
             .write_all(
@@ -881,6 +881,29 @@ fn read_frame(stream: &mut UnixStream) -> Result<(u8, Vec<u8>), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_used_business_method_has_a_bounded_policy() {
+        for method in [
+            "model/list",
+            "thread/list",
+            "thread/read",
+            "thread/turns/list",
+            "thread/resume",
+            "thread/start",
+            "thread/rollback",
+            "thread/fork",
+            "turn/start",
+            "turn/steer",
+            "thread/compact/start",
+            "turn/interrupt",
+        ] {
+            let timeout = app_server_request_timeout(method)
+                .unwrap_or_else(|| panic!("missing policy for {method}"));
+            assert!(timeout <= Duration::from_secs(15));
+        }
+        assert!(app_server_request_timeout("unknown/mutation").is_none());
+    }
 
     #[test]
     fn routes_response_to_matching_pending_request() {

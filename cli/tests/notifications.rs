@@ -30,6 +30,10 @@ impl MockClient {
 }
 
 impl PushClient for MockClient {
+    fn connection_key(&self) -> u64 {
+        self as *const Self as usize as u64
+    }
+
     fn request_visibility(&self, intent: Value) -> BoxFuture<'_, Result<Value, JsonRpcError>> {
         Box::pin(async move {
             self.visibility_checks.lock().unwrap().push(intent);
@@ -120,6 +124,25 @@ async fn register(fixture: &Fixture, client: &Arc<MockClient>) {
         )
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn disconnecting_replaced_socket_does_not_remove_new_session_owner() {
+    let fixture = fixture();
+    let old = MockClient::new(false);
+    let replacement = MockClient::new(true);
+    register(&fixture, &old).await;
+    register(&fixture, &replacement).await;
+
+    fixture.manager.on_client_disconnected(old.as_ref());
+    record_turn(&fixture, &replacement, "remux/codex/thread/message/send");
+    fixture
+        .manager
+        .handle_extension_notification(&turn_completed_intent())
+        .await;
+
+    assert!(fixture.pushes.lock().unwrap().is_empty());
+    assert_eq!(replacement.visibility_checks.lock().unwrap().len(), 1);
 }
 
 fn record_turn(fixture: &Fixture, client: &Arc<MockClient>, method: &str) {
@@ -367,8 +390,18 @@ async fn keeps_terminal_session_audiences_until_kill_or_extension_release() {
         &json!({ "sessionId": "terminal-session-1", "status": "running" }),
     );
 
-    assert!(fixture.manager.handle_extension_notification(&terminal_intent("1")).await);
-    assert!(fixture.manager.handle_extension_notification(&terminal_intent("2")).await);
+    assert!(
+        fixture
+            .manager
+            .handle_extension_notification(&terminal_intent("1"))
+            .await
+    );
+    assert!(
+        fixture
+            .manager
+            .handle_extension_notification(&terminal_intent("2"))
+            .await
+    );
     assert_eq!(fixture.pushes.lock().unwrap().len(), 2);
 
     // Kill removes the audience.
@@ -380,7 +413,12 @@ async fn keeps_terminal_session_audiences_until_kill_or_extension_release() {
         }),
         &json!({ "ok": true }),
     );
-    assert!(fixture.manager.handle_extension_notification(&terminal_intent("3")).await);
+    assert!(
+        fixture
+            .manager
+            .handle_extension_notification(&terminal_intent("3"))
+            .await
+    );
     assert_eq!(fixture.pushes.lock().unwrap().len(), 2);
 }
 
@@ -409,8 +447,18 @@ async fn removes_terminal_audiences_from_extension_release() {
             "viewId": "main",
         }
     });
-    assert!(fixture.manager.handle_extension_notification(&release).await);
-    assert!(fixture.manager.handle_extension_notification(&terminal_intent("1")).await);
+    assert!(
+        fixture
+            .manager
+            .handle_extension_notification(&release)
+            .await
+    );
+    assert!(
+        fixture
+            .manager
+            .handle_extension_notification(&terminal_intent("1"))
+            .await
+    );
     assert_eq!(fixture.pushes.lock().unwrap().len(), 0);
 }
 
@@ -425,7 +473,10 @@ async fn persists_clients_json_v1_and_clears_token_on_device_not_registered() {
     let client = MockClient::new(false);
     register(&fixture, &client).await;
 
-    let store_path = fixture.root.path().join(".remux/notifications/clients.json");
+    let store_path = fixture
+        .root
+        .path()
+        .join(".remux/notifications/clients.json");
     let stored: Value =
         serde_json::from_str(&std::fs::read_to_string(&store_path).unwrap()).unwrap();
     assert_eq!(stored["version"], 1);
@@ -536,7 +587,12 @@ async fn intents_without_audience_are_owned_but_not_pushed() {
 // Pass 2 — system pushes (notify_system).
 // ---------------------------------------------------------------------------
 
-async fn register_as(fixture: &Fixture, client: &Arc<MockClient>, client_id: &str, token: Option<&str>) {
+async fn register_as(
+    fixture: &Fixture,
+    client: &Arc<MockClient>,
+    client_id: &str,
+    token: Option<&str>,
+) {
     let mut params = json!({ "clientId": client_id, "sessionId": format!("{client_id}-session") });
     if let Some(token) = token {
         params["expoPushToken"] = json!(token);
@@ -555,7 +611,13 @@ async fn notify_system_fans_out_to_all_tokened_clients_with_exact_payload() {
     let tablet = MockClient::new(false);
     let tokenless = MockClient::new(false);
     register_as(&fixture, &phone, "client-1", Some("ExponentPushToken[one]")).await;
-    register_as(&fixture, &tablet, "client-2", Some("ExponentPushToken[two]")).await;
+    register_as(
+        &fixture,
+        &tablet,
+        "client-2",
+        Some("ExponentPushToken[two]"),
+    )
+    .await;
     register_as(&fixture, &tokenless, "client-3", None).await;
 
     fixture
@@ -616,7 +678,13 @@ async fn notify_system_clears_tokens_on_device_not_registered() {
         "data": [{ "status": "error", "details": { "error": "DeviceNotRegistered" } }],
     }));
     let client = MockClient::new(false);
-    register_as(&fixture, &client, "client-1", Some("ExponentPushToken[dead]")).await;
+    register_as(
+        &fixture,
+        &client,
+        "client-1",
+        Some("ExponentPushToken[dead]"),
+    )
+    .await;
 
     fixture
         .manager
@@ -631,7 +699,10 @@ async fn notify_system_clears_tokens_on_device_not_registered() {
         .await;
     assert_eq!(fixture.pushes.lock().unwrap().len(), 1);
     let store = std::fs::read_to_string(
-        fixture.root.path().join(".remux/notifications/clients.json"),
+        fixture
+            .root
+            .path()
+            .join(".remux/notifications/clients.json"),
     )
     .unwrap();
     let store: Value = serde_json::from_str(&store).unwrap();

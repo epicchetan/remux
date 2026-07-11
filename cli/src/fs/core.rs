@@ -27,6 +27,7 @@ pub const READ_FILE_METHOD: &str = "remux/fs/readFile";
 pub const DIRECTORY_BATCH_CONCURRENCY: usize = 4;
 pub const DIRECTORY_CACHE_TTL_MS: u64 = 3_000;
 pub const DIRECTORY_ENTRY_CONCURRENCY: usize = 24;
+pub const MAX_DIRECTORY_BATCH_PATHS: usize = 128;
 pub const MAX_BINARY_FILE_BYTES: u64 = 5 * 1024 * 1024;
 pub const MAX_TEXT_FILE_BYTES: u64 = 1024 * 1024;
 pub const GIT_REPO_ROOT_CACHE_TTL_MS: u64 = 5_000;
@@ -133,7 +134,8 @@ impl FsCore {
     }
 
     async fn read_directory(&self, params: Option<&Value>) -> RpcResult {
-        let target_path = resolve_requested_path(&self.default_path, params, READ_DIRECTORY_METHOD)?;
+        let target_path =
+            resolve_requested_path(&self.default_path, params, READ_DIRECTORY_METHOD)?;
         let force = params
             .and_then(|params| params.get("force"))
             .and_then(Value::as_bool)
@@ -143,7 +145,9 @@ impl FsCore {
 
     async fn read_directories(&self, params: Option<&Value>) -> RpcResult {
         let record = params.and_then(Value::as_object);
-        let paths_param = record.and_then(|record| record.get("paths")).and_then(Value::as_array);
+        let paths_param = record
+            .and_then(|record| record.get("paths"))
+            .and_then(Value::as_array);
         let Some(paths_param) = paths_param else {
             return Err(JsonRpcError::new(
                 INVALID_PARAMS,
@@ -158,6 +162,14 @@ impl FsCore {
             return Err(JsonRpcError::new(
                 INVALID_PARAMS,
                 format!("Invalid {READ_DIRECTORIES_METHOD} paths"),
+            ));
+        }
+        if paths_param.len() > MAX_DIRECTORY_BATCH_PATHS {
+            return Err(JsonRpcError::new(
+                INVALID_PARAMS,
+                format!(
+                    "Invalid {READ_DIRECTORIES_METHOD} paths: maximum {MAX_DIRECTORY_BATCH_PATHS}"
+                ),
             ));
         }
 
@@ -336,7 +348,10 @@ impl FsCore {
             Value::from(target_path.to_string_lossy().into_owned()),
         );
         result.insert("sizeBytes".to_string(), Value::from(stats.len()));
-        result.insert("tooLarge".to_string(), Value::from(stats.len() > max_file_bytes));
+        result.insert(
+            "tooLarge".to_string(),
+            Value::from(stats.len() > max_file_bytes),
+        );
 
         if stats.len() > max_file_bytes {
             result.insert("content".to_string(), Value::Null);
@@ -354,7 +369,10 @@ impl FsCore {
             result.insert("content".to_string(), Value::Null);
             result.insert("dataBase64".to_string(), Value::from(to_base64(&buffer)));
             result.insert("encoding".to_string(), Value::from("base64"));
-            result.insert("isBinary".to_string(), Value::from(is_likely_binary(&buffer)));
+            result.insert(
+                "isBinary".to_string(),
+                Value::from(is_likely_binary(&buffer)),
+            );
             result.insert(
                 "mimeType".to_string(),
                 mime_type_from_path(&target_path)
@@ -393,8 +411,8 @@ impl FsCore {
             return Ok(result);
         };
         let include_base = options.get("includeBase").and_then(Value::as_bool) == Some(true);
-        let include_status = options.get("includeStatus").and_then(Value::as_bool) == Some(true)
-            || include_base;
+        let include_status =
+            options.get("includeStatus").and_then(Value::as_bool) == Some(true) || include_base;
         if !include_base && !include_status {
             return Ok(result);
         }
@@ -663,7 +681,9 @@ fn kind_from_file_type(file_type: std::fs::FileType) -> &'static str {
 }
 
 fn modified_at_ms(stats: &std::fs::Metadata) -> Value {
-    modified_at_ms_meta(stats).map(Value::from).unwrap_or(Value::Null)
+    modified_at_ms_meta(stats)
+        .map(Value::from)
+        .unwrap_or(Value::Null)
 }
 
 fn modified_at_ms_meta(stats: &std::fs::Metadata) -> Option<i64> {
@@ -840,10 +860,9 @@ async fn read_git_file_base(
         .output()
         .await;
     let size_bytes: Option<u64> = match &size_output {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse()
-            .ok(),
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+        }
         _ => {
             return empty_git_file_base(
                 target_path,
@@ -1006,7 +1025,10 @@ mod tests {
     fn natural_compare_orders_numerically_and_case_insensitively() {
         let mut names = vec!["file10.txt", "file2.txt", "File1.txt", "alpha", "Beta"];
         names.sort_by(|a, b| natural_compare(a, b));
-        assert_eq!(names, vec!["alpha", "Beta", "File1.txt", "file2.txt", "file10.txt"]);
+        assert_eq!(
+            names,
+            vec!["alpha", "Beta", "File1.txt", "file2.txt", "file10.txt"]
+        );
     }
 
     #[test]

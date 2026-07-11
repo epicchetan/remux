@@ -491,7 +491,7 @@ Expose in `/api/status`:
 - per-phase timeout counts, oldest host-pending request, and registration owner/revision;
 - extension child ingress/egress depth and last response-line age;
 - Terminal per-session input bytes, accepted/deduped/gap sequences, output/replay gaps, and subscription count;
-- Codex downstream connection generation, pending count, retries by proof class, and quarantined operations.
+- Codex downstream connection generation, pending count, and retries by proof class per primary/narration adapter, plus quarantined operations.
 
 ### App incident ring
 
@@ -592,7 +592,7 @@ These calls never enter the Remux socket and never influence backend connection 
 | `remux/codex/composer/config/write` | Bounded local work; global config mutation | 3s / 5s | Probe connection | Reconcile by config read; identical state write is convergent |
 | `remux/codex/thread/queue/remove` | Local-immediate; thread FIFO | 1s / 3s | Probe connection | Reconcile queue; missing operation is accepted |
 | `remux/codex/narration/cancel` | Local-immediate admission; artifact/global narration lane | 1s / 3s | Probe connection | Reconcile narration state; detached interrupt is best effort |
-| `remux/codex/narration/start` | Job ACK after validation; global narration admission/artifact | 10s / 15s | Probe connection | Dedupe only within the same extension generation by deterministic artifact/operation ID; completed disk cache remains reusable |
+| `remux/codex/narration/start` | Job ACK after bounded validation; global narration admission/artifact | 10s / 15s | Probe connection | Dedupe only within the same extension generation by deterministic artifact/operation ID; request/job caps below apply; completed disk cache remains reusable |
 | `remux/codex/thread/queue/run-now` | Downstream ACK when active; thread FIFO | 25s / 30s | Route only | On ambiguous steer, quarantine as `outcomeUnknown`; do not retain/redrive until authoritative reconciliation |
 | `remux/codex/thread/message/send` | Downstream ACK or local queue acceptance; thread FIFO | 25s / 30s | Route only | Never until one client operation ID dedupes both queue admission and downstream turn creation |
 | `remux/codex/thread/compact` | Downstream ACK or local queue acceptance; thread FIFO | 25s / 30s | Route only | Never until operation ID dedupes queue and direct paths |
@@ -604,6 +604,16 @@ These calls never enter the Remux socket and never influence backend connection 
 `thread/resources/read` and `files` are closed param-resolved policies, not wildcards. For thread resources, `threadRuntime`, `threadOperationQueue`, and `threadTokenUsage` are local; `threadHistory` uses `thread/list`; `threadSummary` uses `thread/read`; and `threadComposerState` uses `thread/read` plus rollout-file work. A heterogeneous batch is validated once, split into bounded local and app-server read subjobs, and rejoined by `requestIndex`; app-server subjobs use one global bounded read pool while per-thread cache work retains its keyed synchronization.
 
 Normative admission caps are 32 file subrequests, 64 thread-resource descriptors, and 64 transcript-resource descriptors. Encoded responses are capped at 12MiB for `remux/codex/files` and 8MiB for thread/transcript resource reads. A files byte subrequest is capped at 8MiB raw, replacing the current 64MiB single-line allowance; search returns at most 200 results while visiting at most 30,000 entries, plus the encoded-response limit. Oversized work receives a typed too-large error and must be split/paged by the caller. The extension child protocol caps an encoded line at 16MiB, large enough for the allowed single response plus envelope but not an exemption from response caps.
+
+Narration admission is bounded before deserialization/validation performs expensive cloning, hashing, or transcript work:
+
+- `narration/start` params are at most 2MiB encoded and `sourceText` is at most 512KiB UTF-8;
+- a source document contains at most 2,048 blocks, 8,192 targets, and 32,768 total inline-range/target-reference associations;
+- individual IDs and paths are at most 1KiB UTF-8;
+- only one narration job is active, and the in-memory job index retains at most 128 inactive entries with LRU eviction of ready/failed/cancelled metadata; validated completed artifacts remain authoritative on disk;
+- at most one planning-event subscription belongs to an attempt and at most four exist globally as a defensive cap; every exit path removes its subscription.
+
+The Kokoro worker boundary is bounded independently of the Codex child protocol. Its encoded request and any one stdout event are at most 8MiB; its event relay holds at most 64 events/16MiB, coalescing progress to the latest value while preserving terminal manifest/error events. Captured stderr is capped at 1MiB with explicit truncation. Oversized/no-newline output or relay overflow terminates and reaps the worker, fails the job, and cleans temporary artifacts rather than growing memory.
 
 The Codex queue is process-memory state, so `send` and `compact` are not described as durable jobs. A later queue-first/durable operation protocol may make them retryable, but P0/P1 reports ambiguous outcomes honestly.
 
@@ -630,11 +640,15 @@ Interactive calls consume the outer request's remaining absolute deadline. Detac
 
 Application/protocol errors are final for the attempt. A downstream connection failure affects only requests actually tied to that connection; it must not clear the adapter and drain every unrelated pending request. Pending calls retain their own IDs and deadlines, and reconnect is single-flight. Codex's current “retry every error once for another 300 seconds” behavior is a P0 removal gate.
 
-The app-server transport handshake is policy-covered too: connect plus JSON-RPC `initialize` has a 10-second total budget, and `initialized` is emitted only after the matching successful response. Initialization application/protocol errors end that connection attempt; wrong-ID traffic is dispatched/ignored within bounds and cannot extend the deadline. Silent, malformed, and deadline-exhausted initialization closes the candidate downstream connection.
+Both current app-server adapters—the primary interactive adapter and narration's dedicated adapter—use the same mandatory downstream registry, handshake rules, pending isolation, and bounded reconnect machinery. They retain separate connection generations, pending maps, budgets, and metrics; failure or reset of one adapter cannot drain or reconnect the other. Narration requests additionally carry their job-owned remaining budget.
+
+Each app-server transport handshake is policy-covered: connect plus JSON-RPC `initialize` has a 10-second total budget, and `initialized` is emitted only after the matching successful response. Initialization application/protocol errors end that connection attempt; wrong-ID traffic is dispatched/ignored within bounds and cannot extend the deadline. Silent, malformed, and deadline-exhausted initialization closes only that candidate downstream connection.
 
 The current substring-triggered second `thread/resume` call for missing `persistExtendedHistory` is removed in favor of capability/version negotiation during initialization. During a versioned migration only, a typed invalid-params response that proves the first call was not applied may select the legacy payload once; no message-substring or generic application-error retry remains.
 
 Narration jobs have a named 15-minute absolute budget and a 60-second no-progress/stall budget. Expiry cancels the job, terminates the synthesis child, waits up to 5 seconds, kills/reaps if necessary, cleans temporary files, records a terminal job state, and emits the resource invalidation. In-progress deduplication is extension-generation-local: a socket reconnect may retry the same operation against the same generation, but an extension restart never auto-replays it. Startup cleans/tolerates orphaned internal narration turns and reuses only completed validated artifacts.
+
+Narration planning does not retry `plan_complex_blocks` after an arbitrary error. It may make at most one explicit semantic-output retry, and only after a matched `turn/completed` proves the prior turn finished but its returned JSON failed the declared schema/semantic validation. Transport timeout/disconnect, ambiguous `thread/start` or `turn/start`, cancellation, and app-server protocol/application errors are final for that job attempt. Before an allowed second semantic attempt, the first attempt's subscription is removed and any still-active internal turn is interrupted/cleaned; an RAII/finally guard enforces cleanup on every return path. Both attempts share the job deadline, carry distinct `planningAttemptId` values, and are observable as intentional job sub-attempts rather than transport retries.
 
 If `turn/steer` may have been written but its response is lost, `queue/run-now` moves the entry to an explicit `outcomeUnknown` quarantine rather than ordinary `retained`. Automatic queue drive and manual retry are blocked until transcript/runtime reconciliation finds the `clientMessageId` or the user explicitly resolves the ambiguous entry.
 
@@ -810,6 +824,12 @@ Use an injectable WebSocket factory, clock, AppState source, and health fetcher.
 - Replay transfer is chunked so control ping can complete between chunks.
 - Codex app-server connect/`initialize` covers silence, wrong IDs, malformed/error responses, and deadline exhaustion; `initialized` follows one matched success.
 - Narration background downstream calls consume a job deadline independent of the completed viewer request; a permanently hung worker is terminated/reaped and temporary files are cleaned.
+- Primary and narration app-server adapters both pass policy/handshake coverage; a failure/reset in either adapter leaves the other's pending calls and connection generation untouched.
+- Narration planning transport ambiguity, timeout, cancellation, and app-server errors never start a second internal thread/turn; a known-completed schema-invalid result permits at most one labeled semantic retry after subscription/turn cleanup.
+- Every narration planning return path removes its event subscription, including `turn/start` failure and timeout; semantic retry cannot leak the first attempt's internal subscription or active turn.
+- Narration start rejects encoded payload, source-text, block, target, association, ID/path, active-job, and retained-job limits before expensive work.
+- Narration job-index churn evicts only inactive metadata within its LRU bound while completed disk artifacts remain readable.
+- Kokoro progress flood, oversized/no-newline stdout, excessive stderr, and relay saturation stay within event/byte caps, terminate/reap the worker when required, and clean temporary artifacts.
 - Resume compatibility uses negotiated capability or the one typed not-applied fallback, never error-substring matching.
 - Fork pagination rejects cyclic cursors and the 9th page/2,001st turn; its 30-second pagination aggregate leaves the remaining 50-second execution budget for resume/fork/optional rollback/turn-start hops.
 - Every `thread/resources/read` discriminator and a heterogeneous multi-thread batch returns results by `requestIndex` within pool bounds.
@@ -871,6 +891,8 @@ Server P0 reader isolation can roll out before the app migration. Strict policy 
 - Every core, local host, Codex, Terminal, server-originated, downstream, and notification method appears in the normative audit with an enforced policy; registry parity tests pass in both directions.
 - No built-in viewer or app feature uses an implicit 300-second default.
 - No mutation is automatically replayed after an ambiguous send/timeout.
+- Narration cannot repeat its internal thread/turn flow after transport ambiguity; its sole optional semantic retry is known-completed, bounded, labeled, and cleans the prior attempt.
+- Narration request/job/worker memory and event streams remain inside their declared count/byte caps under malformed input, progress flood, and worker stalls.
 - Terminal cannot silently discard accepted UI input: every chunk is visibly gated or sequence-ACKed, bounded, and deduplicated; live output gaps always trigger replay/resync.
 - A fast-ack timeout replaces the client socket without restarting the worker.
 - Candidate registration/promotion cannot be undone by closing the old same-session socket, and source-socket host responses remain correct during overlap.

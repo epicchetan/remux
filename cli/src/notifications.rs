@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Map, Value};
 
-use crate::rpc::jsonrpc::JsonRpcError;
+use crate::rpc::jsonrpc::{JsonRpcError, EXTENSION_ERROR};
 use crate::rpc::router::{BoxFuture, RpcResult};
 use crate::time::{now_iso8601, now_ms};
 
@@ -41,12 +41,17 @@ const CODEX_TURN_REQUEST_METHODS: [&str; 4] = [
 /// The slice of a WS client the manager needs; `WsClient` implements it, and
 /// tests substitute mocks.
 pub trait PushClient: Send + Sync {
+    fn connection_key(&self) -> u64;
     fn request_visibility(&self, intent: Value) -> BoxFuture<'_, Result<Value, JsonRpcError>>;
     fn identity(&self) -> (Option<String>, Option<String>);
     fn set_identity(&self, client_id: &str, session_id: &str);
 }
 
 impl PushClient for crate::rpc::ws::WsClient {
+    fn connection_key(&self) -> u64 {
+        self.connection_id
+    }
+
     fn request_visibility(&self, intent: Value) -> BoxFuture<'_, Result<Value, JsonRpcError>> {
         Box::pin(self.request(
             VISIBILITY_CHECK_METHOD,
@@ -102,7 +107,11 @@ pub type FetchFn =
     Arc<dyn Fn(String, Value) -> BoxFuture<'static, Result<PushResponse, String>> + Send + Sync>;
 
 pub fn production_fetch() -> FetchFn {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .expect("valid notification HTTP client");
     Arc::new(move |url, payload| {
         let client = client.clone();
         Box::pin(async move {
@@ -146,6 +155,9 @@ struct Audience {
 
 struct SessionState {
     client: Arc<dyn PushClient>,
+    connection_key: u64,
+    connection_generation: u64,
+    registration_revision: u64,
     session_id: String,
 }
 
@@ -189,18 +201,42 @@ impl NotificationManager {
         params: Option<&Value>,
     ) -> RpcResult {
         if method != CLIENT_REGISTER_METHOD {
-            return Err(JsonRpcError::internal(format!("Method not found: {method}")));
+            return Err(JsonRpcError::internal(format!(
+                "Method not found: {method}"
+            )));
         }
 
         let registration = parse_client_registration(params)
             .ok_or_else(|| JsonRpcError::internal("Invalid client registration params"))?;
-        self.register_client_session(client, registration);
+        if !self.register_client_session(client, registration) {
+            return Err(JsonRpcError::new(
+                EXTENSION_ERROR,
+                "stale client registration",
+            ));
+        }
         Ok(serde_json::json!({ "ok": true }))
     }
 
-    fn register_client_session(&self, client: Arc<dyn PushClient>, registration: Registration) {
+    fn register_client_session(
+        &self,
+        client: Arc<dyn PushClient>,
+        registration: Registration,
+    ) -> bool {
         let has_token = {
             let mut clients = self.clients.lock().unwrap();
+            if clients
+                .get(&registration.client_id)
+                .and_then(|state| state.sessions.get(&registration.session_id))
+                .is_some_and(|current| {
+                    (current.connection_generation, current.registration_revision)
+                        > (
+                            registration.connection_generation,
+                            registration.registration_revision,
+                        )
+                })
+            {
+                return false;
+            }
             let state = clients
                 .entry(registration.client_id.clone())
                 .or_insert_with(|| ClientState {
@@ -236,6 +272,9 @@ impl NotificationManager {
             state.sessions.insert(
                 registration.session_id.clone(),
                 SessionState {
+                    connection_key: client.connection_key(),
+                    connection_generation: registration.connection_generation,
+                    registration_revision: registration.registration_revision,
                     client,
                     session_id: registration.session_id.clone(),
                 },
@@ -259,6 +298,7 @@ impl NotificationManager {
             })),
             true,
         );
+        true
     }
 
     pub fn on_client_disconnected(&self, client: &dyn PushClient) {
@@ -268,7 +308,13 @@ impl NotificationManager {
         };
 
         if let Some(state) = self.clients.lock().unwrap().get_mut(&client_id) {
-            state.sessions.remove(&session_id);
+            if state
+                .sessions
+                .get(&session_id)
+                .is_some_and(|session| session.connection_key == client.connection_key())
+            {
+                state.sessions.remove(&session_id);
+            }
         }
         self.log.event(
             "notifications:client:disconnected",
@@ -282,6 +328,18 @@ impl NotificationManager {
         let (Some(client_id), session_id) = client.identity() else {
             return;
         };
+        if let Some(session_id) = session_id.as_deref() {
+            let owns_session = self
+                .clients
+                .lock()
+                .unwrap()
+                .get(&client_id)
+                .and_then(|state| state.sessions.get(session_id))
+                .is_some_and(|session| session.connection_key == client.connection_key());
+            if !owns_session {
+                return;
+            }
+        }
 
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
         let Some(change) = audience_change_for_client_request(method, request, result) else {
@@ -575,7 +633,10 @@ impl NotificationManager {
         for (client_id, token) in recipients {
             let mut payload = Map::new();
             payload.insert("body".to_string(), Value::from(body));
-            payload.insert("channelId".to_string(), Value::from(NOTIFICATION_CHANNEL_ID));
+            payload.insert(
+                "channelId".to_string(),
+                Value::from(NOTIFICATION_CHANNEL_ID),
+            );
             payload.insert("data".to_string(), data.clone());
             payload.insert("interruptionLevel".to_string(), Value::from("active"));
             payload.insert("priority".to_string(), Value::from("high"));
@@ -592,7 +653,10 @@ impl NotificationManager {
         if let Some(body) = intent.get("body").and_then(Value::as_str) {
             payload.insert("body".to_string(), Value::from(body));
         }
-        payload.insert("channelId".to_string(), Value::from(NOTIFICATION_CHANNEL_ID));
+        payload.insert(
+            "channelId".to_string(),
+            Value::from(NOTIFICATION_CHANNEL_ID),
+        );
         payload.insert(
             "data".to_string(),
             serde_json::json!({ NOTIFICATION_DATA_KEY: intent }),
@@ -600,11 +664,18 @@ impl NotificationManager {
         payload.insert("interruptionLevel".to_string(), Value::from("active"));
         payload.insert("priority".to_string(), Value::from("high"));
         payload.insert("sound".to_string(), Value::from("default"));
-        payload.insert("title".to_string(), intent.get("title").cloned().unwrap_or(Value::Null));
+        payload.insert(
+            "title".to_string(),
+            intent.get("title").cloned().unwrap_or(Value::Null),
+        );
         payload.insert("to".to_string(), Value::from(token));
 
-        self.dispatch_expo_push(client_id, Value::Object(payload), notification_log_detail(intent))
-            .await;
+        self.dispatch_expo_push(
+            client_id,
+            Value::Object(payload),
+            notification_log_detail(intent),
+        )
+        .await;
     }
 
     /// Shared Expo send + ticket handling (DeviceNotRegistered clears the
@@ -722,9 +793,11 @@ struct Registration {
     active_target: Option<Value>,
     app_state: String,
     client_id: String,
+    connection_generation: u64,
     expo_push_token: Option<String>,
     #[allow(dead_code)]
     platform: String,
+    registration_revision: u64,
     session_id: String,
 }
 
@@ -737,8 +810,16 @@ fn parse_client_registration(value: Option<&Value>) -> Option<Registration> {
         active_target: parse_browser_resource_target(record.get("activeTarget")),
         app_state: optional_string(record.get("appState")).unwrap_or_else(|| "unknown".to_string()),
         client_id,
+        connection_generation: record
+            .get("connectionGeneration")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         expo_push_token: optional_string(record.get("expoPushToken")),
         platform: optional_string(record.get("platform")).unwrap_or_else(|| "unknown".to_string()),
+        registration_revision: record
+            .get("registrationRevision")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         session_id,
     })
 }
@@ -797,8 +878,11 @@ fn audience_change_for_client_request(
     }
 
     if method == TERMINAL_SESSION_KILL_METHOD {
-        let session_id =
-            required_string(request.get("params").and_then(|params| params.get("sessionId")))?;
+        let session_id = required_string(
+            request
+                .get("params")
+                .and_then(|params| params.get("sessionId")),
+        )?;
         return Some(AudienceChange::Remove {
             target: terminal_notification_target(&session_id),
         });
@@ -873,14 +957,18 @@ fn parse_notification_intent(value: Option<&Value>) -> Option<Value> {
     ] {
         normalized_target.insert(
             key.to_string(),
-            optional_string(target.get(key)).map(Value::from).unwrap_or(Value::Null),
+            optional_string(target.get(key))
+                .map(Value::from)
+                .unwrap_or(Value::Null),
         );
     }
 
     let mut intent = Map::new();
     intent.insert(
         "body".to_string(),
-        optional_string(record.get("body")).map(Value::from).unwrap_or(Value::Null),
+        optional_string(record.get("body"))
+            .map(Value::from)
+            .unwrap_or(Value::Null),
     );
     intent.insert("extensionId".to_string(), Value::from(extension_id));
     intent.insert("id".to_string(), Value::from(id));
@@ -915,10 +1003,19 @@ fn parse_notification_audience_target(value: Option<&Value>) -> Option<Value> {
 
     let mut normalized = Map::new();
     normalized.insert("extensionId".to_string(), Value::from(extension_id));
-    for key in ["focusId", "focusKind", "handlerId", "launch", "resourceId", "resourceKind"] {
+    for key in [
+        "focusId",
+        "focusKind",
+        "handlerId",
+        "launch",
+        "resourceId",
+        "resourceKind",
+    ] {
         normalized.insert(
             key.to_string(),
-            optional_string(target.get(key)).map(Value::from).unwrap_or(Value::Null),
+            optional_string(target.get(key))
+                .map(Value::from)
+                .unwrap_or(Value::Null),
         );
     }
     normalized.insert(
@@ -1123,8 +1220,7 @@ impl crate::rpc::ws::NotificationsHook for NotificationManager {
     ) -> BoxFuture<'_, RpcResult> {
         Box::pin(async move {
             let client: Arc<dyn PushClient> = client;
-            NotificationManager::handle_client_request(self, client, &method, params.as_ref())
-                .await
+            NotificationManager::handle_client_request(self, client, &method, params.as_ref()).await
         })
     }
 

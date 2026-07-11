@@ -20,10 +20,11 @@ mod thread_usage;
 mod transcript;
 mod util;
 
+use std::collections::HashMap;
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use serde_json::{Value, json};
@@ -65,6 +66,13 @@ const THREAD_MESSAGE_SEND_METHOD: &str = "remux/codex/thread/message/send";
 const THREAD_MESSAGE_START_METHOD: &str = "remux/codex/thread/message/start";
 const THREAD_TURN_INTERRUPT_METHOD: &str = "remux/codex/thread/turn/interrupt";
 
+const CODEX_OUTPUT_QUEUE_CAPACITY: usize = 256;
+const CODEX_READ_WORKERS: usize = 4;
+const CODEX_READ_QUEUE_CAPACITY: usize = 64;
+const CODEX_MAX_THREAD_LANES: usize = 128;
+const CODEX_THREAD_LANE_CAPACITY: usize = 32;
+const CODEX_SINGLETON_LANE_CAPACITY: usize = 16;
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.get(1).is_some_and(|value| value == "validate") {
@@ -83,9 +91,13 @@ fn main() {
 
 fn run_stdio_server() -> Result<(), String> {
     let stdin = io::stdin();
-    let (output_tx, output_rx) = mpsc::channel::<Value>();
+    let (output_tx, output_rx) = mpsc::sync_channel::<Value>(CODEX_OUTPUT_QUEUE_CAPACITY);
     spawn_stdout_writer(output_rx);
-    let mut server = CodexExtensionServer::new(default_codex_home(), output_tx.clone());
+    let server = Arc::new(CodexExtensionServer::new(
+        default_codex_home(),
+        output_tx.clone(),
+    ));
+    let dispatcher = CodexRequestDispatcher::new(server, output_tx.clone());
 
     for line in stdin.lock().lines() {
         let line = line.map_err(|error| error.to_string())?;
@@ -93,24 +105,22 @@ fn run_stdio_server() -> Result<(), String> {
             continue;
         }
 
-        let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
-            Ok(request) => handle_request(&mut server, request),
-            Err(error) => JsonRpcResponse::error(
-                Value::Null,
-                JsonRpcError::new(-32700, format!("Parse error: {error}")),
-            ),
-        };
-
-        let response = serde_json::to_value(response).map_err(|error| error.to_string())?;
-        output_tx
-            .send(response)
-            .map_err(|error| format!("failed to write response: {error}"))?;
+        match serde_json::from_str::<JsonRpcRequest>(&line) {
+            Ok(request) => dispatcher.dispatch(request),
+            Err(error) => send_response(
+                &output_tx,
+                JsonRpcResponse::error(
+                    Value::Null,
+                    JsonRpcError::new(-32700, format!("Parse error: {error}")),
+                ),
+            )?,
+        }
     }
 
     Ok(())
 }
 
-fn handle_request(server: &mut CodexExtensionServer, request: JsonRpcRequest) -> JsonRpcResponse {
+fn handle_request(server: &CodexExtensionServer, request: JsonRpcRequest) -> JsonRpcResponse {
     let result = match request.method.as_str() {
         FILES_METHOD => server
             .files
@@ -132,7 +142,11 @@ fn handle_request(server: &mut CodexExtensionServer, request: JsonRpcRequest) ->
             .start(request.params.unwrap_or(Value::Null)),
         TRANSCRIPT_RESOURCES_READ_METHOD => server
             .transcript
-            .read_resources(request.params.unwrap_or(Value::Null)),
+            .lock()
+            .map_err(|_| "transcript store poisoned".to_string())
+            .and_then(|mut transcript| {
+                transcript.read_resources(request.params.unwrap_or(Value::Null))
+            }),
         THREAD_RESOURCES_READ_METHOD => server
             .threads
             .read_resources(request.params.unwrap_or(Value::Null)),
@@ -182,6 +196,167 @@ fn handle_request(server: &mut CodexExtensionServer, request: JsonRpcRequest) ->
     }
 }
 
+struct CodexRequestDispatcher {
+    config_tx: mpsc::SyncSender<JsonRpcRequest>,
+    narration_tx: mpsc::SyncSender<JsonRpcRequest>,
+    output_tx: mpsc::SyncSender<Value>,
+    read_txs: Vec<mpsc::SyncSender<JsonRpcRequest>>,
+    read_cursor: std::sync::atomic::AtomicUsize,
+    server: Arc<CodexExtensionServer>,
+    thread_txs: Mutex<HashMap<String, mpsc::SyncSender<JsonRpcRequest>>>,
+}
+
+impl CodexRequestDispatcher {
+    fn new(server: Arc<CodexExtensionServer>, output_tx: mpsc::SyncSender<Value>) -> Self {
+        let config_tx = spawn_request_worker(
+            "codex-config",
+            CODEX_SINGLETON_LANE_CAPACITY,
+            server.clone(),
+            output_tx.clone(),
+        );
+        let narration_tx = spawn_request_worker(
+            "codex-narration",
+            CODEX_SINGLETON_LANE_CAPACITY,
+            server.clone(),
+            output_tx.clone(),
+        );
+        let read_txs = (0..CODEX_READ_WORKERS)
+            .map(|index| {
+                spawn_request_worker(
+                    &format!("codex-read-{index}"),
+                    CODEX_READ_QUEUE_CAPACITY / CODEX_READ_WORKERS,
+                    server.clone(),
+                    output_tx.clone(),
+                )
+            })
+            .collect();
+        Self {
+            config_tx,
+            narration_tx,
+            output_tx,
+            read_txs,
+            read_cursor: std::sync::atomic::AtomicUsize::new(0),
+            server,
+            thread_txs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn dispatch(&self, request: JsonRpcRequest) {
+        let method = request.method.clone();
+        let tx = match method.as_str() {
+            COMPOSER_CONFIG_WRITE_METHOD => self.config_tx.clone(),
+            NARRATION_START_METHOD | NARRATION_CANCEL_METHOD => self.narration_tx.clone(),
+            FILES_METHOD
+            | COMPOSER_CONFIG_READ_METHOD
+            | MODELS_READ_METHOD
+            | NARRATION_AUDIO_READ_METHOD
+            | NARRATION_READ_METHOD
+            | TRANSCRIPT_RESOURCES_READ_METHOD
+            | THREAD_RESOURCES_READ_METHOD => {
+                let index = self
+                    .read_cursor
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    % self.read_txs.len();
+                self.read_txs[index].clone()
+            }
+            THREAD_COMPACT_METHOD
+            | THREAD_QUEUE_REMOVE_METHOD
+            | THREAD_QUEUE_RUN_NOW_METHOD
+            | THREAD_MESSAGE_EDIT_METHOD
+            | THREAD_MESSAGE_FORK_METHOD
+            | THREAD_MESSAGE_SEND_METHOD
+            | THREAD_MESSAGE_START_METHOD
+            | THREAD_TURN_INTERRUPT_METHOD => {
+                let key = request
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("__new_thread__")
+                    .to_string();
+                let mut lanes = self
+                    .thread_txs
+                    .lock()
+                    .expect("Codex thread lanes available");
+                if let Some(tx) = lanes.get(&key) {
+                    tx.clone()
+                } else if lanes.len() < CODEX_MAX_THREAD_LANES {
+                    let tx = spawn_request_worker(
+                        &format!("codex-thread-{}", lanes.len() + 1),
+                        CODEX_THREAD_LANE_CAPACITY,
+                        self.server.clone(),
+                        self.output_tx.clone(),
+                    );
+                    lanes.insert(key, tx.clone());
+                    tx
+                } else {
+                    let response = JsonRpcResponse::error(
+                        request.id,
+                        JsonRpcError::new(-32001, "Codex thread lane limit reached".to_string()),
+                    );
+                    let _ = send_response(&self.output_tx, response);
+                    return;
+                }
+            }
+            _ => {
+                let response = JsonRpcResponse::error(
+                    request.id,
+                    JsonRpcError::new(-32601, format!("Unknown method: {method}")),
+                );
+                let _ = send_response(&self.output_tx, response);
+                return;
+            }
+        };
+
+        if let Err(error) = tx.try_send(request) {
+            let request = match error {
+                mpsc::TrySendError::Full(request) | mpsc::TrySendError::Disconnected(request) => {
+                    request
+                }
+            };
+            let response = JsonRpcResponse::error(
+                request.id,
+                JsonRpcError::new(
+                    -32001,
+                    format!("Codex request lane busy: {}", request.method),
+                ),
+            );
+            let _ = send_response(&self.output_tx, response);
+        }
+    }
+}
+
+fn spawn_request_worker(
+    name: &str,
+    capacity: usize,
+    server: Arc<CodexExtensionServer>,
+    output_tx: mpsc::SyncSender<Value>,
+) -> mpsc::SyncSender<JsonRpcRequest> {
+    let (tx, rx) = mpsc::sync_channel::<JsonRpcRequest>(capacity);
+    thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            for request in rx {
+                let response = handle_request(&server, request);
+                if send_response(&output_tx, response).is_err() {
+                    break;
+                }
+            }
+        })
+        .expect("failed to spawn Codex request worker");
+    tx
+}
+
+fn send_response(
+    output_tx: &mpsc::SyncSender<Value>,
+    response: JsonRpcResponse,
+) -> Result<(), String> {
+    let response = serde_json::to_value(response).map_err(|error| error.to_string())?;
+    output_tx
+        .send(response)
+        .map_err(|error| format!("failed to write response: {error}"))
+}
+
 struct CodexExtensionServer {
     composer_config: ComposerConfigStore,
     files: CodexFileResourcesServer,
@@ -190,11 +365,11 @@ struct CodexExtensionServer {
     operation_queue: CodexOperationQueueServer,
     thread_commands: CodexThreadCommandServer,
     threads: CodexThreadResourcesServer,
-    transcript: CodexTranscriptServer,
+    transcript: Mutex<CodexTranscriptServer>,
 }
 
 impl CodexExtensionServer {
-    fn new(codex_home: PathBuf, output_tx: mpsc::Sender<Value>) -> Self {
+    fn new(codex_home: PathBuf, output_tx: mpsc::SyncSender<Value>) -> Self {
         let (event_sink, event_rx) = AppServerEventSink::channel();
         let (narration_event_sink, narration_event_rx) = AppServerEventSink::channel();
         let composer_config =
@@ -245,10 +420,10 @@ impl CodexExtensionServer {
                 thread_runtime,
                 thread_usage,
             ),
-            transcript: CodexTranscriptServer::new_with_live_transcript(
+            transcript: Mutex::new(CodexTranscriptServer::new_with_live_transcript(
                 codex_home,
                 live_transcript,
-            ),
+            )),
         }
     }
 }
@@ -272,7 +447,7 @@ fn spawn_stdout_writer(output_rx: mpsc::Receiver<Value>) {
 
 fn spawn_app_server_event_forwarder(
     event_rx: mpsc::Receiver<AppServerEvent>,
-    output_tx: mpsc::Sender<Value>,
+    output_tx: mpsc::SyncSender<Value>,
     live_transcript: LiveTranscriptStore,
     thread_runtime: ThreadRuntimeStore,
     thread_usage: ThreadUsageStore,

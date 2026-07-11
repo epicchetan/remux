@@ -1,3 +1,8 @@
+import {
+  isRegisteredRpcRequestMethod,
+  type RpcRequestPolicy,
+} from './rpcPolicy';
+
 export type JsonRpcId = number | string;
 
 export type JsonRpcMessage = {
@@ -21,7 +26,8 @@ type WebViewRequest =
       id: JsonRpcId;
       method: string;
       params?: unknown;
-      timeoutMs?: number;
+      policy: string;
+      timeoutMs: number;
       type: 'remux/request';
     };
 
@@ -49,7 +55,7 @@ type WebViewEvent = {
 export type RemuxViewHostStatus =
   | { type: 'idle' }
   | { type: 'connecting' }
-  | { cwd: string | null; type: 'connected' }
+  | { cwd: string | null; generation: number; type: 'connected' }
   | { type: 'reconnecting'; attempt: number }
   | { type: 'closed'; reason?: string }
   | { type: 'error'; message: string };
@@ -63,6 +69,8 @@ type WebViewStatus = {
 type NativeMessage = WebViewEvent | WebViewResponse | WebViewStatus;
 
 type PendingRequest = {
+  method: string;
+  policyName: string;
   reject: (error: Error) => void;
   resolve: (value: unknown) => void;
   timer: number;
@@ -77,8 +85,6 @@ export type IpcStatusSnapshot = {
 };
 
 const requestIdPrefix = 'remux-extension-viewer';
-const defaultRequestTimeoutMs = 300_000;
-
 let initialized = false;
 let nextId = 1;
 let eventFlushScheduled = false;
@@ -99,18 +105,33 @@ declare global {
   }
 }
 
-export function requestIpc<T>(method: string, params?: unknown, timeoutMs = defaultRequestTimeoutMs) {
+export class IpcRequestTimeoutError extends Error {
+  constructor(
+    readonly method: string,
+    readonly policyName: string,
+    readonly timeoutMs: number,
+  ) {
+    super(`${method} timed out after ${timeoutMs}ms (${policyName})`);
+    this.name = 'IpcRequestTimeoutError';
+  }
+}
+
+export function requestIpc<T>(policy: RpcRequestPolicy, params?: unknown) {
   initializeIpc();
 
   const id = `${requestIdPrefix}:${nextId++}`;
+  const { method } = policy;
+  const timeoutMs = policy.budget.totalMs;
 
   return new Promise<T>((resolve, reject) => {
     const timer = window.setTimeout(() => {
       pendingRequests.delete(id);
-      reject(new Error(`${method} timed out`));
+      reject(new IpcRequestTimeoutError(method, policy.name, timeoutMs));
     }, timeoutMs);
 
     pendingRequests.set(id, {
+      method,
+      policyName: policy.name,
       reject,
       resolve: resolve as (value: unknown) => void,
       timer,
@@ -119,8 +140,8 @@ export function requestIpc<T>(method: string, params?: unknown, timeoutMs = defa
     try {
       postMessage(
         params === undefined
-          ? { id, method, timeoutMs, type: 'remux/request' }
-          : { id, method, params, timeoutMs, type: 'remux/request' },
+          ? { id, method, policy: policy.name, timeoutMs, type: 'remux/request' }
+          : { id, method, params, policy: policy.name, timeoutMs, type: 'remux/request' },
       );
     } catch (error) {
       window.clearTimeout(timer);
@@ -131,6 +152,9 @@ export function requestIpc<T>(method: string, params?: unknown, timeoutMs = defa
 }
 
 export function notifyIpc(method: string, params?: unknown) {
+  if (isRegisteredRpcRequestMethod(method)) {
+    throw new Error(`${method} requires an acknowledged request policy`);
+  }
   initializeIpc();
   postMessage(
     params === undefined
@@ -317,13 +341,8 @@ function handleNativeMessage(event: MessageEvent) {
 
   const pending = pendingRequests.get(message.id);
   if (!pending) {
-    if (message.type === 'remux/error') {
-      updateStatus({
-        error: message.error.message,
-        status: { message: message.error.message, type: 'error' },
-      });
-      rejectPendingRequests(message.error.message);
-    }
+    // A request may have timed out locally or belonged to a prior WebView
+    // epoch. Late results are method-local evidence, never bridge health.
     return;
   }
 

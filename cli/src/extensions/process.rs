@@ -15,6 +15,8 @@ use tokio::sync::mpsc;
 
 use crate::extensions::manifest::ServerSpec;
 
+const MAX_EXTENSION_LINE_BYTES: usize = 16 * 1024 * 1024;
+
 pub enum StdinCommand {
     Line(String),
     /// Drop ChildStdin so the extension sees EOF.
@@ -27,7 +29,7 @@ pub struct SpawnedChild {
     /// Process-group id — equals `pid` because the child is spawned as a
     /// group leader (`process_group(0)`). Group signals reach grandchildren.
     pub pgid: u32,
-    pub stdin: mpsc::UnboundedSender<StdinCommand>,
+    pub stdin: mpsc::Sender<StdinCommand>,
     pub stdout: ChildStdout,
     pub stderr: ChildStderr,
 }
@@ -68,7 +70,7 @@ pub fn spawn_extension(
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
 
-    let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<StdinCommand>();
+    let (stdin_tx, mut stdin_rx) = mpsc::channel::<StdinCommand>(128);
     tokio::spawn(async move {
         while let Some(command) = stdin_rx.recv().await {
             match command {
@@ -104,9 +106,48 @@ pub async fn read_lines<R>(reader: R, mut on_line: impl FnMut(String))
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut lines = BufReader::new(reader).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        on_line(line);
+    let mut reader = BufReader::new(reader);
+    let mut line = Vec::new();
+    loop {
+        let available = match reader.fill_buf().await {
+            Ok(available) => available,
+            Err(_) => return,
+        };
+        if available.is_empty() {
+            if !line.is_empty() {
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                if let Ok(text) = String::from_utf8(std::mem::take(&mut line)) {
+                    on_line(text);
+                }
+            }
+            return;
+        }
+
+        if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+            if line.len().saturating_add(newline) > MAX_EXTENSION_LINE_BYTES {
+                return;
+            }
+            line.extend_from_slice(&available[..newline]);
+            reader.consume(newline + 1);
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            if let Ok(text) = String::from_utf8(std::mem::take(&mut line)) {
+                on_line(text);
+            } else {
+                return;
+            }
+            continue;
+        }
+
+        if line.len().saturating_add(available.len()) > MAX_EXTENSION_LINE_BYTES {
+            return;
+        }
+        let consumed = available.len();
+        line.extend_from_slice(available);
+        reader.consume(consumed);
     }
 }
 

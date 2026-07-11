@@ -11,6 +11,9 @@ use crate::thread_runtime::ThreadRuntimeStore;
 use crate::thread_usage::ThreadUsageStore;
 use crate::util::stable_revision_value;
 
+const MAX_THREAD_RESOURCE_REQUESTS: usize = 64;
+const MAX_THREAD_RESOURCE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Debug)]
 pub(crate) struct CodexThreadResourcesServer {
     app_server: AppServerRuntime,
@@ -86,6 +89,12 @@ impl CodexThreadResourcesServer {
     pub(crate) fn read_resources(&self, params: Value) -> Result<Value, String> {
         let params: ThreadResourcesReadParams = serde_json::from_value(params)
             .map_err(|error| format!("invalid thread resources/read params: {error}"))?;
+        if params.requests.len() > MAX_THREAD_RESOURCE_REQUESTS {
+            return Err(format!(
+                "too many thread resource requests: {}>{MAX_THREAD_RESOURCE_REQUESTS}",
+                params.requests.len()
+            ));
+        }
         let mut results = Vec::new();
 
         for (request_index, request) in params.requests.into_iter().enumerate() {
@@ -144,7 +153,16 @@ impl CodexThreadResourcesServer {
             results.push(result);
         }
 
-        Ok(json!({ "resources": results }))
+        let response = json!({ "resources": results });
+        let encoded_len = serde_json::to_vec(&response)
+            .map_err(|error| format!("failed to encode thread resources response: {error}"))?
+            .len();
+        if encoded_len > MAX_THREAD_RESOURCE_RESPONSE_BYTES {
+            return Err(format!(
+                "thread resources response is too large: {encoded_len}>{MAX_THREAD_RESOURCE_RESPONSE_BYTES}"
+            ));
+        }
+        Ok(response)
     }
 
     fn read_thread_history_resource(

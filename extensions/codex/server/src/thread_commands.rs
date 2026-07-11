@@ -525,24 +525,7 @@ impl CodexThreadCommandServer {
             "excludeTurns": true,
         });
 
-        match self.app_server.request("thread/resume", params) {
-            Ok(_) => Ok(()),
-            Err(first_error) if should_retry_legacy_resume(&first_error) => self
-                .app_server
-                .request(
-                    "thread/resume",
-                    json!({
-                        "threadId": thread_id,
-                        "excludeTurns": true,
-                        "persistExtendedHistory": false,
-                    }),
-                )
-                .map(|_| ())
-                .map_err(|second_error| {
-                    format!("{first_error}; legacy resume retry failed: {second_error}")
-                }),
-            Err(error) => Err(error),
-        }
+        self.app_server.request("thread/resume", params).map(|_| ())
     }
 
     fn resolve_fork_target(
@@ -819,11 +802,6 @@ impl MentionTextRun {
             "text_elements": std::mem::take(&mut self.elements),
         }));
     }
-}
-
-fn should_retry_legacy_resume(error: &str) -> bool {
-    error.contains("persistExtendedHistory")
-        || (error.contains("missing field") && error.contains("thread/resume"))
 }
 
 #[cfg(test)]
@@ -1671,28 +1649,24 @@ mod tests {
     }
 
     #[test]
-    fn retries_resume_with_legacy_persist_field_for_older_app_server() {
-        let app_server = FakeAppServer::new(vec![
-            Err("thread/resume failed: missing field `persistExtendedHistory`".to_string()),
-            Ok(json!({ "thread": { "id": "thread-1" } })),
-            Ok(json!({ "turn": { "id": "turn-1" } })),
-        ]);
+    fn does_not_retry_resume_after_application_error() {
+        let app_server = FakeAppServer::new(vec![Err(
+            "thread/resume failed: missing field `persistExtendedHistory`".to_string(),
+        )]);
         let server = CodexThreadCommandServer::with_requester(app_server.clone());
 
-        server
+        let error = server
             .send_message(json!({
                 "threadId": "thread-1",
                 "parts": [{ "type": "text", "text": "hello" }]
             }))
-            .unwrap();
+            .unwrap_err();
 
         let calls = app_server.calls();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "thread/resume");
         assert_eq!(calls[0].1.get("persistExtendedHistory"), None);
-        assert_eq!(calls[1].0, "thread/resume");
-        assert_eq!(calls[1].1["persistExtendedHistory"], false);
-        assert_eq!(calls[2].0, "turn/start");
+        assert!(error.contains("persistExtendedHistory"));
     }
 
     #[test]

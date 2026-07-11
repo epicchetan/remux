@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
@@ -29,6 +29,20 @@ const PLANNING_TIMEOUT: Duration = Duration::from_secs(240);
 const WORKER_POLL: Duration = Duration::from_millis(100);
 const MAX_AUDIO_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_START_PARAMS_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SOURCE_TEXT_BYTES: usize = 512 * 1024;
+const MAX_SOURCE_BLOCKS: usize = 2_048;
+const MAX_SOURCE_TARGETS: usize = 8_192;
+const MAX_SOURCE_ASSOCIATIONS: usize = 32_768;
+const MAX_IDENTIFIER_BYTES: usize = 1_024;
+const MAX_INACTIVE_JOBS: usize = 128;
+const MAX_PLANNING_SUBSCRIPTIONS: usize = 4;
+const MAX_WORKER_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_WORKER_RELAY_EVENTS: usize = 64;
+const MAX_WORKER_RELAY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_WORKER_STDERR_BYTES: u64 = 1024 * 1024;
+const NARRATION_JOB_BUDGET: Duration = Duration::from_secs(15 * 60);
+const NARRATION_STALL_BUDGET: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
 pub(crate) struct CodexNarrationServer {
@@ -41,9 +55,22 @@ struct NarrationInner {
     cache_root: PathBuf,
     codex_home: PathBuf,
     jobs: Mutex<HashMap<String, NarrationJob>>,
-    output_tx: mpsc::Sender<Value>,
+    output_tx: mpsc::SyncSender<Value>,
     subscriptions: Mutex<HashMap<String, mpsc::Sender<Value>>>,
     transcript: Mutex<CodexTranscriptServer>,
+}
+
+struct PlanningSubscriptionGuard {
+    inner: Arc<NarrationInner>,
+    thread_id: String,
+}
+
+impl Drop for PlanningSubscriptionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut subscriptions) = self.inner.subscriptions.lock() {
+            subscriptions.remove(&self.thread_id);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +82,7 @@ struct NarrationJob {
     error: Option<String>,
     internal_thread_id: Option<String>,
     internal_turn_id: Option<String>,
+    last_access_ms: u128,
     manifest: Option<Value>,
     revision: u64,
     stage: Option<&'static str>,
@@ -155,7 +183,7 @@ impl CodexNarrationServer {
         codex_home: PathBuf,
         app_server: AppServerRuntime,
         event_rx: mpsc::Receiver<AppServerEvent>,
-        output_tx: mpsc::Sender<Value>,
+        output_tx: mpsc::SyncSender<Value>,
         live_transcript: LiveTranscriptStore,
     ) -> Self {
         let inner = Arc::new(NarrationInner {
@@ -176,6 +204,14 @@ impl CodexNarrationServer {
     }
 
     pub(crate) fn start(&self, params: Value) -> Result<Value, String> {
+        let encoded_len = serde_json::to_vec(&params)
+            .map_err(|error| format!("failed to encode narration/start params: {error}"))?
+            .len();
+        if encoded_len > MAX_START_PARAMS_BYTES {
+            return Err(format!(
+                "narration/start params are too large: {encoded_len}>{MAX_START_PARAMS_BYTES}"
+            ));
+        }
         let params: NarrationStartParams = serde_json::from_value(params)
             .map_err(|error| format!("invalid narration/start params: {error}"))?;
         validate_start_params(&params)?;
@@ -191,6 +227,7 @@ impl CodexNarrationServer {
             let job = NarrationJob::ready(artifact_key.clone(), params, manifest);
             let resource = job.resource_value();
             jobs.insert(artifact_key.clone(), job);
+            evict_inactive_jobs(&mut jobs, Some(&artifact_key));
             return Ok(json!({
                 "artifactKey": artifact_key,
                 "resource": resource,
@@ -203,7 +240,8 @@ impl CodexNarrationServer {
             .jobs
             .lock()
             .map_err(|_| "narration job store poisoned".to_string())?;
-        if let Some(job) = jobs.get(&artifact_key) {
+        if let Some(job) = jobs.get_mut(&artifact_key) {
+            job.last_access_ms = now_millis();
             return Ok(json!({
                 "artifactKey": artifact_key,
                 "resource": job.resource_value(),
@@ -217,6 +255,7 @@ impl CodexNarrationServer {
         let job = NarrationJob::planning(artifact_key.clone(), params);
         let resource = job.resource_value();
         jobs.insert(artifact_key.clone(), job);
+        evict_inactive_jobs(&mut jobs, Some(&artifact_key));
         drop(jobs);
 
         let inner = self.inner.clone();
@@ -234,14 +273,15 @@ impl CodexNarrationServer {
         let params: NarrationReadParams = serde_json::from_value(params)
             .map_err(|error| format!("invalid narration/resources/read params: {error}"))?;
         let artifact_key = non_empty(&params.artifact_key, "artifactKey")?;
-        let jobs = self
+        let mut jobs = self
             .inner
             .jobs
             .lock()
             .map_err(|_| "narration job store poisoned".to_string())?;
-        let Some(job) = jobs.get(artifact_key) else {
+        let Some(job) = jobs.get_mut(artifact_key) else {
             return Ok(json!({ "resource": Value::Null, "status": "missing" }));
         };
+        job.last_access_ms = now_millis();
         let resource = job.resource_value();
         let revision = resource.get("revision").and_then(Value::as_str);
         if params.known_revision.as_deref() == revision {
@@ -270,6 +310,7 @@ impl CodexNarrationServer {
             job.status = NarrationStatus::Cancelled;
             job.stage = None;
             job.revision += 1;
+            job.last_access_ms = now_millis();
             (job.internal_thread_id.clone(), job.internal_turn_id.clone())
         };
         self.inner.notify(&artifact_key);
@@ -399,6 +440,10 @@ impl NarrationInner {
         {
             update(job);
             job.revision += 1;
+            job.last_access_ms = now_millis();
+        }
+        if let Ok(mut jobs) = self.jobs.lock() {
+            evict_inactive_jobs(&mut jobs, Some(artifact_key));
         }
         self.notify(artifact_key);
     }
@@ -414,6 +459,7 @@ impl NarrationJob {
             error: None,
             internal_thread_id: None,
             internal_turn_id: None,
+            last_access_ms: now_millis(),
             manifest: None,
             revision: 1,
             stage: Some("planning"),
@@ -432,6 +478,7 @@ impl NarrationJob {
             error: None,
             internal_thread_id: None,
             internal_turn_id: None,
+            last_access_ms: now_millis(),
             manifest: Some(manifest),
             revision: 1,
             stage: None,
@@ -615,13 +662,11 @@ fn build_narration_plan(
     let transformed = if complex.is_empty() {
         HashMap::new()
     } else {
-        match plan_complex_blocks(inner, artifact_key, &complex, &document.targets) {
-            Ok(plan) => plan,
-            Err(first_error) => plan_complex_blocks(inner, artifact_key, &complex, &document.targets)
-                .map_err(|second_error| format!(
-                    "narration planning failed after retry: {second_error} (first attempt: {first_error})"
-                ))?,
-        }
+        // Transport/application failures are ambiguous because this flow
+        // creates an internal thread and turn. Never replay the whole flow.
+        // A future semantic-only retry must begin after a matched completion
+        // and carry an explicit planning attempt id.
+        plan_complex_blocks(inner, artifact_key, &complex, &document.targets)?
     };
 
     blocks
@@ -769,11 +814,22 @@ fn plan_complex_blocks(
         .ok_or_else(|| "narration thread/start response missing thread.id".to_string())?
         .to_string();
     let (event_tx, event_rx) = mpsc::channel();
-    inner
-        .subscriptions
-        .lock()
-        .map_err(|_| "narration event subscriptions poisoned".to_string())?
-        .insert(thread_id.clone(), event_tx);
+    {
+        let mut subscriptions = inner
+            .subscriptions
+            .lock()
+            .map_err(|_| "narration event subscriptions poisoned".to_string())?;
+        if subscriptions.len() >= MAX_PLANNING_SUBSCRIPTIONS {
+            return Err(format!(
+                "narration planning subscription limit reached: {MAX_PLANNING_SUBSCRIPTIONS}"
+            ));
+        }
+        subscriptions.insert(thread_id.clone(), event_tx);
+    }
+    let _subscription = PlanningSubscriptionGuard {
+        inner: inner.clone(),
+        thread_id: thread_id.clone(),
+    };
     inner.update_job(artifact_key, |job| {
         job.internal_thread_id = Some(thread_id.clone())
     });
@@ -802,9 +858,6 @@ fn plan_complex_blocks(
     });
 
     let result = wait_for_plan(inner, artifact_key, &thread_id, &turn_id, event_rx);
-    if let Ok(mut subscriptions) = inner.subscriptions.lock() {
-        subscriptions.remove(&thread_id);
-    }
     let text = result?;
     let value: Value = serde_json::from_str(&text)
         .map_err(|error| format!("Codex returned invalid narration JSON: {error}"))?;
@@ -1041,11 +1094,21 @@ fn run_kokoro_worker(
         "targets": targets,
         "voice": KOKORO_VOICE,
     });
+    let encoded_request = serde_json::to_vec(&request)
+        .map_err(|error| format!("failed to encode Kokoro request: {error}"))?;
+    if encoded_request.len() > MAX_WORKER_MESSAGE_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!(
+            "Kokoro request is too large: {}>{MAX_WORKER_MESSAGE_BYTES}",
+            encoded_request.len()
+        ));
+    }
     child
         .stdin
         .as_mut()
         .ok_or_else(|| "Kokoro worker stdin unavailable".to_string())?
-        .write_all(request.to_string().as_bytes())
+        .write_all(&encoded_request)
         .and_then(|_| child.stdin.as_mut().unwrap().write_all(b"\n"))
         .map_err(|error| format!("failed to send Kokoro request: {error}"))?;
     drop(child.stdin.take());
@@ -1058,34 +1121,59 @@ fn run_kokoro_worker(
         .stderr
         .take()
         .ok_or_else(|| "Kokoro worker stderr unavailable".to_string())?;
-    let (line_tx, line_rx) = mpsc::channel::<String>();
+    let (line_tx, line_rx) = mpsc::sync_channel::<WorkerLine>(MAX_WORKER_RELAY_EVENTS);
+    let (reader_error_tx, reader_error_rx) = mpsc::sync_channel::<String>(1);
+    let relay_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reader_relay_bytes = relay_bytes.clone();
     thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            let _ = line_tx.send(line);
-        }
+        read_bounded_worker_lines(stdout, line_tx, reader_error_tx, reader_relay_bytes);
     });
-    let (stderr_tx, stderr_rx) = mpsc::channel();
+    let (stderr_tx, stderr_rx) = mpsc::sync_channel(1);
     thread::spawn(move || {
-        let text = BufReader::new(stderr)
-            .lines()
-            .map_while(Result::ok)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut bytes = Vec::new();
+        let _ = stderr
+            .take(MAX_WORKER_STDERR_BYTES + 1)
+            .read_to_end(&mut bytes);
+        let truncated = bytes.len() as u64 > MAX_WORKER_STDERR_BYTES;
+        bytes.truncate(MAX_WORKER_STDERR_BYTES as usize);
+        let mut text = String::from_utf8_lossy(&bytes).into_owned();
+        if truncated {
+            text.push_str("\n[stderr truncated]");
+        }
         let _ = stderr_tx.send(text);
     });
 
     let mut manifest = None;
     let mut last_progress_update = std::time::Instant::now() - Duration::from_secs(1);
+    let job_started = std::time::Instant::now();
+    let mut last_worker_progress = job_started;
     loop {
         if inner.cancelled(artifact_key) {
             let _ = child.kill();
             let _ = child.wait();
             return Err("narration cancelled".to_string());
         }
+        if job_started.elapsed() >= NARRATION_JOB_BUDGET {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("narration job deadline exceeded".to_string());
+        }
+        if last_worker_progress.elapsed() >= NARRATION_STALL_BUDGET {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Kokoro worker made no progress for 60 seconds".to_string());
+        }
+        if let Ok(error) = reader_error_rx.try_recv() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
         while let Ok(line) = line_rx.try_recv() {
-            let Ok(event) = serde_json::from_str::<Value>(&line) else {
+            relay_bytes.fetch_sub(line.bytes, std::sync::atomic::Ordering::SeqCst);
+            let Ok(event) = serde_json::from_str::<Value>(&line.text) else {
                 continue;
             };
+            last_worker_progress = std::time::Instant::now();
             match event.get("type").and_then(Value::as_str) {
                 Some("progress") => {
                     let completed = event
@@ -1122,7 +1210,8 @@ fn run_kokoro_worker(
         match child.try_wait() {
             Ok(Some(status)) => {
                 while let Ok(line) = line_rx.try_recv() {
-                    if let Ok(event) = serde_json::from_str::<Value>(&line)
+                    relay_bytes.fetch_sub(line.bytes, std::sync::atomic::Ordering::SeqCst);
+                    if let Ok(event) = serde_json::from_str::<Value>(&line.text)
                         && event.get("type").and_then(Value::as_str) == Some("done")
                     {
                         manifest = event.get("manifest").cloned();
@@ -1143,6 +1232,73 @@ fn run_kokoro_worker(
             }
             Ok(None) => thread::sleep(WORKER_POLL),
             Err(error) => return Err(format!("failed to poll Kokoro worker: {error}")),
+        }
+    }
+}
+
+struct WorkerLine {
+    bytes: usize,
+    text: String,
+}
+
+fn read_bounded_worker_lines(
+    stdout: impl Read,
+    line_tx: mpsc::SyncSender<WorkerLine>,
+    error_tx: mpsc::SyncSender<String>,
+    relay_bytes: Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let mut reader = BufReader::new(stdout);
+    let mut line = Vec::new();
+    loop {
+        let buffer = match reader.fill_buf() {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                let _ = error_tx.try_send(format!("failed to read Kokoro output: {error}"));
+                return;
+            }
+        };
+        if buffer.is_empty() {
+            if !line.is_empty() {
+                let _ = error_tx.try_send("Kokoro output ended without a newline".to_string());
+            }
+            return;
+        }
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(buffer.len(), |index| index + 1);
+        let payload_len = newline.unwrap_or(buffer.len());
+        if line.len().saturating_add(payload_len) > MAX_WORKER_MESSAGE_BYTES {
+            let _ = error_tx.try_send(format!(
+                "Kokoro output event exceeds {MAX_WORKER_MESSAGE_BYTES} bytes"
+            ));
+            return;
+        }
+        line.extend_from_slice(&buffer[..payload_len]);
+        reader.consume(consumed);
+        if newline.is_none() {
+            continue;
+        }
+
+        let bytes = line.len();
+        let previous = relay_bytes.fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+        if previous.saturating_add(bytes) > MAX_WORKER_RELAY_BYTES {
+            relay_bytes.fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
+            let _ = error_tx.try_send(format!(
+                "Kokoro output relay exceeds {MAX_WORKER_RELAY_BYTES} bytes"
+            ));
+            return;
+        }
+        let text = match String::from_utf8(std::mem::take(&mut line)) {
+            Ok(text) => text,
+            Err(_) => {
+                relay_bytes.fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
+                let _ = error_tx.try_send("Kokoro output is not UTF-8".to_string());
+                return;
+            }
+        };
+        if line_tx.try_send(WorkerLine { bytes, text }).is_err() {
+            relay_bytes.fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
+            let _ = error_tx.try_send("Kokoro output event relay is full".to_string());
+            return;
         }
     }
 }
@@ -1194,11 +1350,47 @@ fn spawn_narration_event_router(
 }
 
 fn validate_start_params(params: &NarrationStartParams) -> Result<(), String> {
+    if params.source_text.len() > MAX_SOURCE_TEXT_BYTES {
+        return Err(format!(
+            "sourceText is too large: {}>{MAX_SOURCE_TEXT_BYTES}",
+            params.source_text.len()
+        ));
+    }
+    if params.document.blocks.len() > MAX_SOURCE_BLOCKS {
+        return Err(format!(
+            "too many narration blocks: {}>{MAX_SOURCE_BLOCKS}",
+            params.document.blocks.len()
+        ));
+    }
+    if params.document.targets.len() > MAX_SOURCE_TARGETS {
+        return Err(format!(
+            "too many narration targets: {}>{MAX_SOURCE_TARGETS}",
+            params.document.targets.len()
+        ));
+    }
     non_empty(&params.target.thread_id, "threadId")?;
     non_empty(&params.target.turn_id, "turnId")?;
     non_empty(&params.target.assistant_message_id, "assistantMessageId")?;
     non_empty(&params.target.message_revision, "messageRevision")?;
     non_empty(&params.target.source_hash, "sourceHash")?;
+    for (field, value) in [
+        ("threadId", params.target.thread_id.as_str()),
+        ("turnId", params.target.turn_id.as_str()),
+        (
+            "assistantMessageId",
+            params.target.assistant_message_id.as_str(),
+        ),
+        ("messageRevision", params.target.message_revision.as_str()),
+        ("sourceHash", params.target.source_hash.as_str()),
+        ("document.messageId", params.document.message_id.as_str()),
+        (
+            "document.messageRevision",
+            params.document.message_revision.as_str(),
+        ),
+        ("document.sourceHash", params.document.source_hash.as_str()),
+    ] {
+        validate_identifier_len(value, field)?;
+    }
     if params.source_text.trim().is_empty() {
         return Err("sourceText is required".to_string());
     }
@@ -1218,6 +1410,7 @@ fn validate_start_params(params: &NarrationStartParams) -> Result<(), String> {
     }
     let mut ids = HashSet::new();
     let mut target_ids = HashSet::new();
+    let mut association_count = 0usize;
     for target in &params.document.targets {
         let id = target
             .get("id")
@@ -1229,6 +1422,8 @@ fn validate_start_params(params: &NarrationStartParams) -> Result<(), String> {
             .ok_or_else(|| format!("narration target {id} is missing blockId"))?;
         non_empty(id, "target.id")?;
         non_empty(block_id, "target.blockId")?;
+        validate_identifier_len(id, "target.id")?;
+        validate_identifier_len(block_id, "target.blockId")?;
         if !target_ids.insert(id) {
             return Err(format!("duplicate narration target id {id}"));
         }
@@ -1237,6 +1432,19 @@ fn validate_start_params(params: &NarrationStartParams) -> Result<(), String> {
     for block in &params.document.blocks {
         non_empty(&block.id, "block.id")?;
         non_empty(&block.path, "block.path")?;
+        validate_identifier_len(&block.id, "block.id")?;
+        validate_identifier_len(&block.path, "block.path")?;
+        association_count = association_count
+            .saturating_add(block.inline_ranges.len())
+            .saturating_add(block.target_ids.len());
+        if association_count > MAX_SOURCE_ASSOCIATIONS {
+            return Err(format!(
+                "too many narration associations: {association_count}>{MAX_SOURCE_ASSOCIATIONS}"
+            ));
+        }
+        for target_id in &block.target_ids {
+            validate_identifier_len(target_id, "block.targetIds[]")?;
+        }
         if block.display_text.trim().is_empty() {
             return Err(format!(
                 "narration block {} has empty displayText",
@@ -1314,6 +1522,33 @@ fn validate_start_params(params: &NarrationStartParams) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn validate_identifier_len(value: &str, field: &str) -> Result<(), String> {
+    if value.len() > MAX_IDENTIFIER_BYTES {
+        Err(format!(
+            "{field} is too large: {}>{MAX_IDENTIFIER_BYTES}",
+            value.len()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn evict_inactive_jobs(jobs: &mut HashMap<String, NarrationJob>, preserve: Option<&str>) {
+    while jobs.values().filter(|job| !job.status.active()).count() > MAX_INACTIVE_JOBS {
+        let candidate = jobs
+            .iter()
+            .filter(|(key, job)| {
+                !job.status.active() && preserve.is_none_or(|preserve| key.as_str() != preserve)
+            })
+            .min_by_key(|(_, job)| job.last_access_ms)
+            .map(|(key, _)| key.clone());
+        let Some(candidate) = candidate else {
+            break;
+        };
+        jobs.remove(&candidate);
+    }
 }
 
 fn artifact_key(params: &NarrationStartParams) -> String {

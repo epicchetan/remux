@@ -35,6 +35,7 @@ pub(crate) struct CodexOperationQueueServer {
 #[derive(Clone, Debug, Default)]
 struct ThreadPendingQueue {
     entries: VecDeque<PendingQueueEntry>,
+    outcome_unknown: HashSet<String>,
     revision: u64,
 }
 
@@ -124,6 +125,13 @@ impl PendingQueueStore {
     fn pop_front(&self, thread_id: &str) -> Option<PendingQueueEntry> {
         let mut inner = self.inner.lock().ok()?;
         let queue = inner.get_mut(thread_id)?;
+        if queue
+            .entries
+            .front()
+            .is_some_and(|entry| queue.outcome_unknown.contains(entry.id()))
+        {
+            return None;
+        }
         let entry = queue.entries.pop_front()?;
         bump(queue);
         Some(entry)
@@ -147,6 +155,7 @@ impl PendingQueueStore {
         };
         let before = queue.entries.len();
         queue.entries.retain(|entry| entry.id() != entry_id);
+        queue.outcome_unknown.remove(entry_id);
         if queue.entries.len() == before {
             return false;
         }
@@ -165,6 +174,7 @@ impl PendingQueueStore {
             return false;
         }
         queue.entries.clear();
+        queue.outcome_unknown.clear();
         bump(queue);
         true
     }
@@ -179,6 +189,7 @@ impl PendingQueueStore {
                 continue;
             }
             queue.entries.clear();
+            queue.outcome_unknown.clear();
             bump(queue);
             changed.push(thread_id.clone());
         }
@@ -194,6 +205,41 @@ impl PendingQueueStore {
             inner
                 .get(thread_id)
                 .is_some_and(|queue| !queue.entries.is_empty())
+        })
+    }
+
+    fn has_drivable_entries(&self, thread_id: &str) -> bool {
+        self.inner.lock().ok().is_some_and(|inner| {
+            inner.get(thread_id).is_some_and(|queue| {
+                queue
+                    .entries
+                    .front()
+                    .is_some_and(|entry| !queue.outcome_unknown.contains(entry.id()))
+            })
+        })
+    }
+
+    fn mark_outcome_unknown(&self, thread_id: &str, entry_id: &str) -> bool {
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        let Some(queue) = inner.get_mut(thread_id) else {
+            return false;
+        };
+        if !queue.entries.iter().any(|entry| entry.id() == entry_id)
+            || !queue.outcome_unknown.insert(entry_id.to_string())
+        {
+            return false;
+        }
+        bump(queue);
+        true
+    }
+
+    fn is_outcome_unknown(&self, thread_id: &str, entry_id: &str) -> bool {
+        self.inner.lock().ok().is_some_and(|inner| {
+            inner
+                .get(thread_id)
+                .is_some_and(|queue| queue.outcome_unknown.contains(entry_id))
         })
     }
 
@@ -216,7 +262,13 @@ impl PendingQueueStore {
         let entries = queue
             .entries
             .iter()
-            .map(PendingQueueEntry::resource_value)
+            .map(|entry| {
+                let mut resource = entry.resource_value();
+                if queue.outcome_unknown.contains(entry.id()) {
+                    resource["status"] = json!("outcomeUnknown");
+                }
+                resource
+            })
             .collect::<Vec<_>>();
         json!({
             "entries": entries,
@@ -387,6 +439,12 @@ impl CodexOperationQueueServer {
         else {
             return Ok(self.mutation_response(&thread_id, "retained"));
         };
+        if self
+            .store
+            .is_outcome_unknown(&thread_id, &params.operation_id)
+        {
+            return Ok(self.mutation_response(&thread_id, "outcomeUnknown"));
+        }
         let Some(turn_id) = self.runtime.active_turn_id(&thread_id) else {
             self.drive_if_idle(&thread_id);
             let status = if self.store.contains(&thread_id, &params.operation_id) {
@@ -409,7 +467,11 @@ impl CodexOperationQueueServer {
                 self.store.remove(&thread_id, &params.operation_id);
                 Ok(self.mutation_response(&thread_id, "accepted"))
             }
-            Err(_) => Ok(self.mutation_response(&thread_id, "retained")),
+            Err(_) => {
+                self.store
+                    .mark_outcome_unknown(&thread_id, &params.operation_id);
+                Ok(self.mutation_response(&thread_id, "outcomeUnknown"))
+            }
         }
     }
 
@@ -516,7 +578,9 @@ impl CodexOperationQueueServer {
         if let Ok(mut driving_threads) = self.driving_threads.lock() {
             driving_threads.remove(thread_id);
         }
-        if !effect.started && self.store.has_entries(thread_id) && !self.runtime.is_busy(thread_id)
+        if !effect.started
+            && self.store.has_drivable_entries(thread_id)
+            && !self.runtime.is_busy(thread_id)
         {
             return self.drive_if_idle(thread_id);
         }
@@ -866,7 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn send_now_removes_only_after_successful_steer() {
+    fn ambiguous_send_now_is_quarantined_and_not_replayed() {
         let (server, app_server) = test_server();
         let started = started_notification("turn-active");
         server.runtime.record_notification(&started);
@@ -877,13 +941,13 @@ mod tests {
             .to_string();
 
         *app_server.fail_steer.lock().unwrap() = true;
-        let retained = server
+        let quarantined = server
             .run_now(json!({
                 "operationId": entry_id,
                 "threadId": "thread-1",
             }))
             .unwrap();
-        assert_eq!(retained["status"], "retained");
+        assert_eq!(quarantined["status"], "outcomeUnknown");
         assert_eq!(
             server.resource_value("thread-1")["entries"]
                 .as_array()
@@ -891,20 +955,25 @@ mod tests {
                 .len(),
             1
         );
+        assert_eq!(
+            server.resource_value("thread-1")["entries"][0]["status"],
+            "outcomeUnknown"
+        );
 
         *app_server.fail_steer.lock().unwrap() = false;
-        let accepted = server
+        let still_quarantined = server
             .run_now(json!({
                 "operationId": entry_id,
                 "threadId": "thread-1",
             }))
             .unwrap();
-        assert_eq!(accepted["status"], "accepted");
-        assert!(
+        assert_eq!(still_quarantined["status"], "outcomeUnknown");
+        assert_eq!(
             server.resource_value("thread-1")["entries"]
                 .as_array()
                 .unwrap()
-                .is_empty()
+                .len(),
+            1
         );
     }
 

@@ -13,9 +13,10 @@ import {
   type ViewStyle,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { rpcPolicies } from '@remux/viewer-kit/rpc-policy';
 
 import { FilesOverview } from '../files/FilesOverview';
-import { useRemuxConnection } from '../remote/RemuxConnectionProvider';
+import { useRemuxConnection, type RemuxConnection } from '../remote/RemuxConnectionProvider';
 import { remuxImageSource, themedIconUrl } from '../remote/remuxExtensions';
 import { SettingsOverview } from '../settings/SettingsOverview';
 import { useTheme, type RemuxTheme } from '../theme/ThemeProvider';
@@ -281,14 +282,13 @@ function closeViewerTab(
   tab: BrowserTab,
   options: {
     closeTab: (tabId: string) => void;
-    request: (method: string, params?: unknown, timeoutMs?: number) => Promise<unknown>;
+    request: RemuxConnection['request'];
   },
 ) {
   if (tab.extensionId === 'terminal' && tab.resourceKind === 'terminalSession' && tab.resourceId) {
     void options.request(
-      'remux/terminal/session/kill',
+      rpcPolicies['terminal-session-kill'],
       { sessionId: tab.resourceId },
-      1_000,
     ).catch(() => undefined);
   }
 

@@ -1,4 +1,5 @@
 import type { RemuxConnection } from '../remote/RemuxConnectionProvider';
+import { rpcPolicies } from '@remux/viewer-kit/rpc-policy';
 import type { FileTreeEntry, FileTreeGitStatus } from './filesTypes';
 
 const readDirectoryMethod = 'remux/fs/readDirectory';
@@ -39,7 +40,7 @@ export async function readRemuxDirectory(
   options: { force?: boolean } = {},
 ): Promise<RemuxReadDirectoryResponse> {
   const response = await request<unknown>(
-    readDirectoryMethod,
+    rpcPolicies['fs-directory-read'],
     path || options.force ? { force: options.force === true, ...(path ? { path } : {}) } : undefined,
   );
 
@@ -52,7 +53,7 @@ export async function readRemuxDirectories(
   options: { force?: boolean } = {},
 ): Promise<RemuxReadDirectoriesResponse> {
   const response = await request<unknown>(
-    readDirectoriesMethod,
+    rpcPolicies['fs-directories-read'],
     { force: options.force === true, paths },
   );
 

@@ -13,6 +13,7 @@ import type {
   CodexThreadTurnInterruptResponse,
 } from '../../shared/threadCommands';
 import { requestIpc } from '@remux/viewer-kit/ipc';
+import { rpcPolicies } from '@remux/viewer-kit/rpc-policy';
 
 export const threadCompactMethod = 'remux/codex/thread/compact';
 export const threadMessageEditMethod = 'remux/codex/thread/message/edit';
@@ -22,25 +23,25 @@ export const threadMessageStartMethod = 'remux/codex/thread/message/start';
 export const threadTurnInterruptMethod = 'remux/codex/thread/turn/interrupt';
 
 export function compactThread(params: CodexThreadCompactParams) {
-  return requestIpc<CodexThreadCompactResponse>(threadCompactMethod, params);
+  return requestIpc<CodexThreadCompactResponse>(rpcPolicies['codex-compact'], params);
 }
 
 export function editThreadMessage(params: CodexThreadMessageEditParams) {
-  return requestIpc<CodexThreadMessageEditResponse>(threadMessageEditMethod, params);
+  return requestIpc<CodexThreadMessageEditResponse>(rpcPolicies['codex-message-edit'], params);
 }
 
 export function forkThreadMessage(params: CodexThreadMessageForkParams) {
-  return requestIpc<CodexThreadMessageForkResponse>(threadMessageForkMethod, params);
+  return requestIpc<CodexThreadMessageForkResponse>(rpcPolicies['codex-message-fork'], params);
 }
 
 export function sendThreadMessage(params: CodexThreadMessageSendParams) {
-  return requestIpc<CodexThreadMessageSendResponse>(threadMessageSendMethod, params);
+  return requestIpc<CodexThreadMessageSendResponse>(rpcPolicies['codex-message-send'], params);
 }
 
 export function startThreadMessage(params: CodexThreadMessageStartParams) {
-  return requestIpc<CodexThreadMessageStartResponse>(threadMessageStartMethod, params);
+  return requestIpc<CodexThreadMessageStartResponse>(rpcPolicies['codex-message-start'], params);
 }
 
 export function interruptThreadTurn(params: CodexThreadTurnInterruptParams) {
-  return requestIpc<CodexThreadTurnInterruptResponse>(threadTurnInterruptMethod, params);
+  return requestIpc<CodexThreadTurnInterruptResponse>(rpcPolicies['codex-turn-interrupt'], params);
 }

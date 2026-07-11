@@ -204,9 +204,7 @@ pub trait ExtensionServer: Send + Sync {
     /// gating build failed — the facet in the status says so). Errors when
     /// no view declares a watch spec.
     fn watch_start(&self) -> BoxFuture<'_, Result<(ServerStatus, bool), JsonRpcError>> {
-        Box::pin(async {
-            Err(JsonRpcError::new(EXTENSION_ERROR, "watch not declared"))
-        })
+        Box::pin(async { Err(JsonRpcError::new(EXTENSION_ERROR, "watch not declared")) })
     }
     /// Stops the view-watch sidecar. Idempotent: the bool is `stopped`.
     fn watch_stop(&self) -> BoxFuture<'_, (ServerStatus, bool)> {
@@ -229,7 +227,10 @@ pub trait ExtensionServer: Send + Sync {
     /// `build_server`.
     fn build_views(&self) -> BoxFuture<'_, Result<ServerStatus, JsonRpcError>> {
         Box::pin(async {
-            Err(JsonRpcError::new(EXTENSION_ERROR, "view build not declared"))
+            Err(JsonRpcError::new(
+                EXTENSION_ERROR,
+                "view build not declared",
+            ))
         })
     }
     fn handle_rpc(&self, method: String, params: Option<Value>) -> BoxFuture<'_, RpcResult>;
@@ -314,7 +315,9 @@ impl RpcRouter {
         }
 
         if is_extension_management_method(method) {
-            return self.handle_extension_management_request(method, params).await;
+            return self
+                .handle_extension_management_request(method, params)
+                .await;
         }
 
         if is_core_method(method) {
@@ -324,8 +327,8 @@ impl RpcRouter {
             return core.handle_rpc(method.to_string(), params.cloned()).await;
         }
 
-        let extension_id = extension_id_from_method(method)
-            .or(self.default_extension_id.as_deref());
+        let extension_id =
+            extension_id_from_method(method).or(self.default_extension_id.as_deref());
         let server = extension_id.and_then(|id| self.server(id));
         let Some(server) = server else {
             return Err(JsonRpcError::method_not_found(method));
@@ -344,14 +347,14 @@ impl RpcRouter {
         {
             return false;
         }
-        let extension_id = extension_id_from_method(method)
-            .or(self.default_extension_id.as_deref());
+        let extension_id =
+            extension_id_from_method(method).or(self.default_extension_id.as_deref());
         extension_id.and_then(|id| self.server(id)).is_some()
     }
 
     pub fn handle_notification(&self, method: &str, params: Option<Value>) {
-        let extension_id = extension_id_from_method(method)
-            .or(self.default_extension_id.as_deref());
+        let extension_id =
+            extension_id_from_method(method).or(self.default_extension_id.as_deref());
         if let Some(server) = extension_id.and_then(|id| self.server(id)) {
             server.handle_notification(method.to_string(), params);
         }
@@ -546,7 +549,10 @@ pub fn is_extension_management_method(method: &str) -> bool {
 }
 
 pub fn is_core_method(method: &str) -> bool {
-    method.starts_with("remux/fs/")
+    matches!(
+        method,
+        "remux/fs/readDirectory" | "remux/fs/readDirectories" | "remux/fs/readFile"
+    )
 }
 
 pub fn extension_id_from_method(method: &str) -> Option<&str> {
@@ -723,9 +729,7 @@ mod tests {
 
     impl CoreRpc for FixtureCore {
         fn handle_rpc(&self, method: String, params: Option<Value>) -> BoxFuture<'_, RpcResult> {
-            Box::pin(async move {
-                Ok(json!({ "core": true, "method": method, "params": params }))
-            })
+            Box::pin(async move { Ok(json!({ "core": true, "method": method, "params": params })) })
         }
     }
 
@@ -752,7 +756,10 @@ mod tests {
             SystemHooks {
                 info: Some(Box::new(|| json!({ "cwd": "/tmp/remux-runtime" }))),
                 restart: Some(Box::new(move || {
-                    system_calls.lock().unwrap().push("system:restart".to_string());
+                    system_calls
+                        .lock()
+                        .unwrap()
+                        .push("system:restart".to_string());
                 })),
                 resources: None,
             },
@@ -878,15 +885,24 @@ mod tests {
         );
 
         assert_eq!(
-            router.handle_request(SYSTEM_PING_METHOD, None).await.unwrap(),
+            router
+                .handle_request(SYSTEM_PING_METHOD, None)
+                .await
+                .unwrap(),
             json!({ "ok": true })
         );
         assert_eq!(
-            router.handle_request(SYSTEM_INFO_METHOD, None).await.unwrap(),
+            router
+                .handle_request(SYSTEM_INFO_METHOD, None)
+                .await
+                .unwrap(),
             json!({ "cwd": "/tmp/remux-runtime" })
         );
         assert_eq!(
-            router.handle_request(SYSTEM_RESTART_METHOD, None).await.unwrap(),
+            router
+                .handle_request(SYSTEM_RESTART_METHOD, None)
+                .await
+                .unwrap(),
             json!({ "restartable": true, "restarting": true })
         );
 
@@ -982,7 +998,11 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(err.code, EXTENSION_ERROR);
-            assert!(err.message.ends_with("build not declared"), "{}", err.message);
+            assert!(
+                err.message.ends_with("build not declared"),
+                "{}",
+                err.message
+            );
 
             let err = router
                 .handle_request(method, Some(&json!({ "extensionId": "nope" })))

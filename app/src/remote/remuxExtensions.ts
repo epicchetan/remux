@@ -96,7 +96,23 @@ type RawFileHandler = {
 };
 
 export async function fetchRemuxExtensionCatalog(origin = currentRemuxOrigin()): Promise<RemuxExtensionCatalog> {
-  const response = await fetch(`${origin}/remux/extensions`, { headers: authHeaders() });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5_000);
+  let response: Response;
+  try {
+    response = await fetch(`${origin}/remux/extensions`, {
+      cache: 'no-store',
+      headers: authHeaders(),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error('Remux extension catalog timed out after 5000ms');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 
   if (!response.ok) {
     throw new Error(response.status === 401

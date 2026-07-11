@@ -20,6 +20,9 @@ use crate::util::stable_revision_value;
 
 pub use crate::transcript::ValidationOptions;
 
+const MAX_TRANSCRIPT_RESOURCE_REQUESTS: usize = 64;
+const MAX_TRANSCRIPT_RESOURCE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Debug)]
 pub struct CodexTranscriptServer {
     codex_home: PathBuf,
@@ -63,6 +66,12 @@ impl CodexTranscriptServer {
     pub fn read_resources(&mut self, params: Value) -> Result<Value, String> {
         let params: ResourcesReadParams = serde_json::from_value(params)
             .map_err(|error| format!("invalid resources/read params: {error}"))?;
+        if params.requests.len() > MAX_TRANSCRIPT_RESOURCE_REQUESTS {
+            return Err(format!(
+                "too many transcript resource requests: {}>{MAX_TRANSCRIPT_RESOURCE_REQUESTS}",
+                params.requests.len()
+            ));
+        }
         if params.thread_id.trim().is_empty() {
             return Err("threadId is required".to_string());
         }
@@ -134,10 +143,19 @@ impl CodexTranscriptServer {
             results.push(result);
         }
 
-        Ok(json!({
+        let response = json!({
             "threadId": params.thread_id,
             "resources": results,
-        }))
+        });
+        let encoded_len = serde_json::to_vec(&response)
+            .map_err(|error| format!("failed to encode transcript resources response: {error}"))?
+            .len();
+        if encoded_len > MAX_TRANSCRIPT_RESOURCE_RESPONSE_BYTES {
+            return Err(format!(
+                "transcript resources response is too large: {encoded_len}>{MAX_TRANSCRIPT_RESOURCE_RESPONSE_BYTES}"
+            ));
+        }
+        Ok(response)
     }
 
     fn read_thread_transcript_resource(

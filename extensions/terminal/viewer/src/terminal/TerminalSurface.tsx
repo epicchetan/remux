@@ -70,6 +70,7 @@ import {
 import {
   attachTerminalSession,
   bytesFromBase64,
+  detachTerminalSession,
   getTerminalTmuxContext,
   killTerminalSession,
   readRemuxSystemInfo,
@@ -77,7 +78,7 @@ import {
   runTerminalTmuxAction,
   startTerminalSession,
   subscribeTerminalEvents,
-  writeTerminalSessionInput,
+  writeTerminalSession,
   type TerminalTmuxAction,
   type TerminalTmuxActionTarget,
   type TerminalTmuxContext,
@@ -241,6 +242,16 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   const lastResizeRef = useRef<{ cols: number; rows: number } | null>(null);
   const lastSeqRef = useRef(0);
   const sessionIdRef = useRef<string | null>(null);
+  const sessionGenerationRef = useRef<number | null>(null);
+  const inputStreamIdRef = useRef<string | null>(null);
+  const nextInputSeqRef = useRef(1);
+  const pendingInputRef = useRef<Array<{ data: Uint8Array; seq: number }>>([]);
+  const pendingInputBytesRef = useRef(0);
+  const inputPumpRunningRef = useRef(false);
+  const hostConnectionGenerationRef = useRef(0);
+  const startOperationIdRef = useRef(
+    globalThis.crypto?.randomUUID?.() ?? `terminal-start-${Date.now()}-${Math.random()}`,
+  );
   const resyncPendingFramesRef = useRef<TerminalSessionOutputFrame[] | null>(null);
   const hostActiveRef = useRef(true);
   const terminalRef = useRef<Terminal | null>(null);
@@ -348,7 +359,8 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
 
     lastResizeRef.current = normalized;
     const currentSessionId = sessionIdRef.current;
-    if (!currentSessionId) {
+    const sessionGeneration = sessionGenerationRef.current;
+    if (!currentSessionId || sessionGeneration === null) {
       return;
     }
 
@@ -356,6 +368,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       cols: normalized.cols,
       rows: normalized.rows,
       sessionId: currentSessionId,
+      sessionGeneration,
     }).catch(() => undefined);
   }, []);
 
@@ -427,6 +440,9 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     frame: TerminalSessionOutputFrame,
     options: { suppressTerminalData?: boolean } = {},
   ) => {
+    if (frame.sessionGeneration !== sessionGenerationRef.current) {
+      return;
+    }
     if (frame.seq <= lastSeqRef.current) {
       return;
     }
@@ -446,18 +462,104 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     setSessionId(nextSessionId);
   }, []);
 
+  const bindSessionProtocol = useCallback((protocol: {
+    inputStreamId: string;
+    nextInputSeq: number;
+    sessionGeneration: number;
+  }) => {
+    const sameProducer =
+      sessionGenerationRef.current === protocol.sessionGeneration &&
+      inputStreamIdRef.current === protocol.inputStreamId;
+    if (!sameProducer) {
+      pendingInputRef.current = [];
+      pendingInputBytesRef.current = 0;
+    } else {
+      pendingInputRef.current = pendingInputRef.current.filter(
+        (chunk) => chunk.seq >= protocol.nextInputSeq,
+      );
+      pendingInputBytesRef.current = pendingInputRef.current.reduce(
+        (total, chunk) => total + chunk.data.byteLength,
+        0,
+      );
+    }
+    sessionGenerationRef.current = protocol.sessionGeneration;
+    inputStreamIdRef.current = protocol.inputStreamId;
+    nextInputSeqRef.current = Math.max(
+      protocol.nextInputSeq,
+      pendingInputRef.current.at(-1)?.seq ? pendingInputRef.current.at(-1)!.seq + 1 : 1,
+    );
+  }, []);
+
+  const pumpInput = useCallback(async () => {
+    if (inputPumpRunningRef.current || !connected) {
+      return;
+    }
+    inputPumpRunningRef.current = true;
+    try {
+      while (pendingInputRef.current.length > 0) {
+        const sessionId = sessionIdRef.current;
+        const sessionGeneration = sessionGenerationRef.current;
+        const inputStreamId = inputStreamIdRef.current;
+        if (!sessionId || sessionGeneration === null || !inputStreamId) {
+          return;
+        }
+        const chunk = pendingInputRef.current[0];
+        const response = await writeTerminalSession({
+          data: chunk.data,
+          inputSeq: chunk.seq,
+          inputStreamId,
+          sessionId,
+          sessionGeneration,
+        });
+        if (
+          response.sessionGeneration !== sessionGeneration ||
+          pendingInputRef.current[0] !== chunk
+        ) {
+          return;
+        }
+        pendingInputRef.current.shift();
+        pendingInputBytesRef.current = Math.max(
+          0,
+          pendingInputBytesRef.current - chunk.data.byteLength,
+        );
+      }
+    } catch {
+      // The exact chunk remains queued. Reattach reconciles nextInputSeq and
+      // retries only the same generation/stream/sequence.
+    } finally {
+      inputPumpRunningRef.current = false;
+    }
+  }, [connected]);
+
   const sendBytes = useCallback((data: Uint8Array, options: { clearModifiers?: boolean } = {}) => {
     const currentSessionId = sessionIdRef.current;
-    if (!currentSessionId || data.length === 0) {
+    if (
+      !currentSessionId ||
+      sessionGenerationRef.current === null ||
+      !inputStreamIdRef.current ||
+      data.length === 0
+    ) {
       return;
     }
 
-    writeTerminalSessionInput(currentSessionId, data);
+    const inputChunkBytes = 48 * 1024;
+    const maxPendingInputBytes = 1024 * 1024;
+    for (let offset = 0; offset < data.length; offset += inputChunkBytes) {
+      const chunk = data.slice(offset, offset + inputChunkBytes);
+      if (pendingInputBytesRef.current + chunk.byteLength > maxPendingInputBytes) {
+        setStatus({ message: 'Terminal input is paused while reconnecting.', type: 'error' });
+        break;
+      }
+      pendingInputRef.current.push({ data: chunk, seq: nextInputSeqRef.current });
+      nextInputSeqRef.current += 1;
+      pendingInputBytesRef.current += chunk.byteLength;
+    }
+    void pumpInput();
 
     if (options.clearModifiers) {
       resetModifiers();
     }
-  }, [resetModifiers]);
+  }, [pumpInput, resetModifiers]);
 
   const sendText = useCallback((value: string, options: { clearModifiers?: boolean } = {}) => {
     sendBytes(textEncoder.encode(value), options);
@@ -530,13 +632,24 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       try {
         const attached = await attachTerminalSession({
           cols: size.cols,
+          inputStreamId: inputStreamIdRef.current,
           replaySeq: lastSeqRef.current > 0 ? lastSeqRef.current + 1 : null,
           rows: size.rows,
           sessionId: attachSessionId,
+          sessionGeneration: sessionGenerationRef.current,
         });
 
+        if (
+          sessionGenerationRef.current !== null &&
+          sessionGenerationRef.current !== attached.sessionGeneration
+        ) {
+          terminal.clear();
+          lastSeqRef.current = 0;
+        }
         bindSession(attached.sessionId);
+        bindSessionProtocol(attached);
         writeReplay(attached.replay);
+        void pumpInput();
         initialAttachCompletedRef.current = true;
         await updateHostTab({
           resourceId: attached.sessionId,
@@ -564,11 +677,14 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     const started = await startTerminalSession({
       cols: size.cols,
       cwd: systemInfo.cwd,
+      operationId: startOperationIdRef.current,
       rows: size.rows,
       sessionId: preferredSessionId,
     });
 
     bindSession(started.sessionId);
+    bindSessionProtocol(started);
+    void pumpInput();
     initialAttachCompletedRef.current = true;
     await updateHostTab({
       resourceId: started.sessionId,
@@ -580,7 +696,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       type: 'running',
     });
     sendResize(started.cols, started.rows);
-  }, [bindSession, fitTerminal, resetShellState, route, sendResize, writeReplay]);
+  }, [bindSession, bindSessionProtocol, fitTerminal, pumpInput, resetShellState, route, sendResize, writeReplay]);
 
   const resyncSession = useCallback(async () => {
     const currentSessionId = sessionIdRef.current;
@@ -594,20 +710,32 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       const size = currentSize();
       const attached = await attachTerminalSession({
         cols: size.cols,
+        inputStreamId: inputStreamIdRef.current,
         replaySeq: lastSeqRef.current > 0 ? lastSeqRef.current + 1 : null,
         rows: size.rows,
         sessionId: currentSessionId,
+        sessionGeneration: sessionGenerationRef.current,
       });
 
+      if (
+        sessionGenerationRef.current !== null &&
+        sessionGenerationRef.current !== attached.sessionGeneration
+      ) {
+        terminalRef.current?.clear();
+        lastSeqRef.current = 0;
+      }
+      bindSessionProtocol(attached);
       if (attached.replayTruncated) {
         terminalRef.current?.clear();
         lastSeqRef.current = 0;
         setReplayGap(true);
-        return;
       }
 
-      setReplayGap(false);
+      if (!attached.replayTruncated) {
+        setReplayGap(false);
+      }
       writeReplay(attached.replay);
+      void pumpInput();
       if (attached.status === 'exited') {
         setStatus({
           code: attached.exitCode ?? null,
@@ -633,7 +761,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
         setReplayGap(false);
       }
     }
-  }, [currentSize, writeFrame, writeReplay]);
+  }, [bindSessionProtocol, currentSize, pumpInput, writeFrame, writeReplay]);
 
   const restartSession = useCallback(() => {
     const currentSessionId = sessionIdRef.current;
@@ -641,7 +769,11 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     lastSeqRef.current = 0;
     setReplayGap(false);
     if (currentSessionId) {
-      void killTerminalSession(currentSessionId)
+      const sessionGeneration = sessionGenerationRef.current;
+      if (sessionGeneration === null) {
+        return;
+      }
+      void killTerminalSession(currentSessionId, sessionGeneration)
         .catch(() => undefined)
         .finally(() => {
           void startOrAttachSession({ forceStart: true }).catch((error) => {
@@ -1519,6 +1651,16 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
 
     return () => {
       disposed = true;
+      const sessionId = sessionIdRef.current;
+      const sessionGeneration = sessionGenerationRef.current;
+      const inputStreamId = inputStreamIdRef.current;
+      if (sessionId && sessionGeneration !== null && inputStreamId) {
+        void detachTerminalSession({
+          inputStreamId,
+          sessionId,
+          sessionGeneration,
+        }).catch(() => undefined);
+      }
       if (fitTimerRef.current !== null) {
         window.clearTimeout(fitTimerRef.current);
         fitTimerRef.current = null;
@@ -1560,6 +1702,18 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     }
 
     if (event.type === 'output' && event.event.sessionId === currentSessionId) {
+      if (event.event.sessionGeneration !== sessionGenerationRef.current) {
+        return;
+      }
+      if (
+        lastSeqRef.current > 0 &&
+        event.event.frame.seq > lastSeqRef.current + 1
+      ) {
+        resyncPendingFramesRef.current ??= [];
+        resyncPendingFramesRef.current.push(event.event.frame);
+        void resyncSession();
+        return;
+      }
       // Frames landing while a resync attach is in flight wait for its
       // replay: writing them first would advance the seq cursor past the
       // replay and silently drop the frames the resync went to fetch.
@@ -1574,7 +1728,11 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       return;
     }
 
-    if (event.type === 'exited' && event.event.sessionId === currentSessionId) {
+    if (
+      event.type === 'exited' &&
+      event.event.sessionId === currentSessionId &&
+      event.event.sessionGeneration === sessionGenerationRef.current
+    ) {
       setStatus({
         code: event.event.exitCode,
         signal: event.event.exitSignal,
@@ -1582,13 +1740,25 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       });
       setTmuxContext(null);
     }
-  }), [writeFrame]);
+  }), [resyncSession, writeFrame]);
 
-  // Reconnect and foreground resyncs are owned by the resume subscription
-  // below; this only tracks the connected flag for input gating.
-  useEffect(() => subscribeHostConnection((nextStatus) => {
+  useEffect(() => subscribeHostConnection((nextStatus, generation = 0) => {
+    const wasConnected = connected;
+    const nextGeneration = generation ?? 0;
+    const generationChanged = nextGeneration > hostConnectionGenerationRef.current;
+    hostConnectionGenerationRef.current = Math.max(
+      hostConnectionGenerationRef.current,
+      nextGeneration,
+    );
     setConnected(nextStatus === 'connected');
-  }), []);
+    if (
+      nextStatus === 'connected' &&
+      initialAttachCompletedRef.current &&
+      (!wasConnected || generationChanged)
+    ) {
+      void resyncSession();
+    }
+  }), [connected, resyncSession]);
 
   useEffect(() => subscribeHostActive((active) => {
     const wasActive = hostActiveRef.current;

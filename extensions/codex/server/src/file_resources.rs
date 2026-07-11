@@ -9,8 +9,10 @@ use serde_json::{Value, json};
 
 use crate::util::stable_revision_value;
 
-const DEFAULT_FILE_BYTES_LIMIT: u64 = 16 * 1024 * 1024;
-const MAX_FILE_BYTES_LIMIT: u64 = 64 * 1024 * 1024;
+const DEFAULT_FILE_BYTES_LIMIT: u64 = 8 * 1024 * 1024;
+const MAX_FILE_BYTES_LIMIT: u64 = 8 * 1024 * 1024;
+const MAX_FILE_REQUESTS: usize = 32;
+const MAX_FILE_RESPONSE_BYTES: usize = 12 * 1024 * 1024;
 const DEFAULT_SEARCH_LIMIT: usize = 80;
 const MAX_SEARCH_LIMIT: usize = 200;
 const MAX_SEARCH_VISITED: usize = 30_000;
@@ -62,6 +64,12 @@ impl CodexFileResourcesServer {
     pub(crate) fn read_resources(&self, params: Value) -> Result<Value, String> {
         let params: FileResourcesReadParams = serde_json::from_value(params)
             .map_err(|error| format!("invalid remux/codex/files params: {error}"))?;
+        if params.requests.len() > MAX_FILE_REQUESTS {
+            return Err(format!(
+                "too many file requests: {}>{MAX_FILE_REQUESTS}",
+                params.requests.len()
+            ));
+        }
         let resources = params
             .requests
             .into_iter()
@@ -69,7 +77,16 @@ impl CodexFileResourcesServer {
             .map(|(request_index, request)| self.read_resource(request_index, request))
             .collect::<Vec<_>>();
 
-        Ok(json!({ "resources": resources }))
+        let response = json!({ "resources": resources });
+        let encoded_len = serde_json::to_vec(&response)
+            .map_err(|error| format!("failed to encode files response: {error}"))?
+            .len();
+        if encoded_len > MAX_FILE_RESPONSE_BYTES {
+            return Err(format!(
+                "files response is too large: {encoded_len}>{MAX_FILE_RESPONSE_BYTES}"
+            ));
+        }
+        Ok(response)
     }
 
     fn read_resource(&self, request_index: usize, request: FileResourceRequest) -> Value {

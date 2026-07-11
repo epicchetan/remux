@@ -1,15 +1,13 @@
 import {
-  notifyIpc,
   requestIpc,
   subscribeIpcEvents,
   type JsonRpcMessage,
 } from '@remux/viewer-kit/ipc';
-
-const terminalRequestTimeoutMs = 300_000;
-const terminalTmuxRequestTimeoutMs = 5_000;
+import { rpcPolicies } from '@remux/viewer-kit/rpc-policy';
 
 export type TerminalSessionOutputFrame = {
   dataBase64: string;
+  sessionGeneration: number;
   seq: number;
 };
 
@@ -21,8 +19,13 @@ export type TerminalSessionStartResponse = {
   pid: number | null;
   rows: number;
   sessionId: string;
+  sessionGeneration: number;
   shell: string;
   tty?: string | null;
+  inputStreamId: string;
+  nextInputSeq: number;
+  firstAvailableSeq: number;
+  nextOutputSeq: number;
 };
 
 export type TerminalSessionAttachResponse = {
@@ -32,18 +35,25 @@ export type TerminalSessionAttachResponse = {
   replay: TerminalSessionOutputFrame[];
   replayTruncated?: boolean;
   sessionId: string;
+  sessionGeneration: number;
   status: TerminalSessionStatus;
+  inputStreamId: string;
+  nextInputSeq: number;
+  firstAvailableSeq: number;
+  nextOutputSeq: number;
 };
 
 export type TerminalSessionExitedEvent = {
   exitCode: number | null;
   exitSignal: string | null;
   sessionId: string;
+  sessionGeneration: number;
 };
 
 export type TerminalSessionOutputEvent = {
   frame: TerminalSessionOutputFrame;
   sessionId: string;
+  sessionGeneration: number;
 };
 
 export type TerminalTmuxMode = 'attached' | 'available' | 'none';
@@ -137,46 +147,80 @@ export type TerminalEvent =
 export function startTerminalSession(params: {
   cols: number;
   cwd?: string | null;
+  operationId: string;
   rows: number;
   sessionId?: string | null;
   shell?: string | null;
 }) {
   return requestIpc<TerminalSessionStartResponse>(
-    'remux/terminal/session/start',
+    rpcPolicies['terminal-session-start'],
     params,
-    terminalRequestTimeoutMs,
   );
 }
 
 export function attachTerminalSession(params: {
   cols: number;
+  inputStreamId?: string | null;
   replaySeq?: number | null;
   rows: number;
   sessionId: string;
+  sessionGeneration?: number | null;
 }) {
   return requestIpc<TerminalSessionAttachResponse>(
-    'remux/terminal/session/attach',
+    rpcPolicies['terminal-session-attach'],
     params,
-    terminalRequestTimeoutMs,
   );
 }
 
-export function writeTerminalSession(sessionId: string, data: Uint8Array) {
-  return requestIpc<{ ok: boolean }>(
-    'remux/terminal/session/write',
+export function writeTerminalSession(params: {
+  data: Uint8Array;
+  inputSeq: number;
+  inputStreamId: string;
+  sessionId: string;
+  sessionGeneration: number;
+}) {
+  const { data, ...wireParams } = params;
+  return requestIpc<{
+    acceptedInputSeq: number;
+    duplicate: boolean;
+    nextInputSeq: number;
+    ok: boolean;
+    sessionGeneration: number;
+  }>(
+    rpcPolicies['terminal-session-write'],
     {
+      ...wireParams,
       dataBase64: bytesToBase64(data),
-      sessionId,
     },
-    terminalRequestTimeoutMs,
   );
 }
 
-export function writeTerminalSessionInput(sessionId: string, data: Uint8Array) {
-  notifyIpc('remux/terminal/session/write', {
-    dataBase64: bytesToBase64(data),
-    sessionId,
-  });
+export function detachTerminalSession(params: {
+  inputStreamId: string;
+  sessionId: string;
+  sessionGeneration: number;
+}) {
+  return requestIpc<{ ok: boolean; sessionGeneration: number }>(
+    rpcPolicies['terminal-session-detach'],
+    params,
+  );
+}
+
+export function readTerminalReplay(params: {
+  fromSeq: number;
+  maxBytes?: number;
+  sessionId: string;
+  sessionGeneration: number;
+}) {
+  return requestIpc<{
+    complete: boolean;
+    firstAvailableSeq: number;
+    frames: TerminalSessionOutputFrame[];
+    nextSeq: number;
+    sessionGeneration: number;
+    sessionId: string;
+    truncated: boolean;
+  }>(rpcPolicies['terminal-session-replay-read'], params);
 }
 
 export function resizeTerminalSession(params: {
@@ -185,27 +229,25 @@ export function resizeTerminalSession(params: {
   pixelWidth?: number | null;
   rows: number;
   sessionId: string;
+  sessionGeneration: number;
 }) {
   return requestIpc<{ ok: boolean }>(
-    'remux/terminal/session/resize',
+    rpcPolicies['terminal-session-resize'],
     params,
-    5_000,
   );
 }
 
-export function killTerminalSession(sessionId: string) {
+export function killTerminalSession(sessionId: string, sessionGeneration: number) {
   return requestIpc<{ ok: boolean }>(
-    'remux/terminal/session/kill',
-    { sessionId },
-    2_000,
+    rpcPolicies['terminal-session-kill'],
+    { sessionGeneration, sessionId },
   );
 }
 
 export function getTerminalTmuxContext(sessionId: string) {
   return requestIpc<{ context: TerminalTmuxContext }>(
-    'remux/terminal/tmux/context/get',
+    rpcPolicies['terminal-tmux-context-read'],
     { sessionId },
-    terminalTmuxRequestTimeoutMs,
   );
 }
 
@@ -217,15 +259,16 @@ export function runTerminalTmuxAction(params: {
   target?: TerminalTmuxActionTarget | null;
 }) {
   return requestIpc<{ context?: TerminalTmuxContext; ok: boolean }>(
-    'remux/terminal/tmux/action',
+    params.action === 'refresh'
+      ? rpcPolicies['terminal-tmux-refresh']
+      : rpcPolicies['terminal-tmux-mutation'],
     params,
-    terminalTmuxRequestTimeoutMs,
   );
 }
 
 export async function readRemuxSystemInfo() {
   try {
-    const result = await requestIpc<unknown>('remux/system/info', undefined, 2_000);
+    const result = await requestIpc<unknown>(rpcPolicies['system-info']);
     if (isRecord(result) && (typeof result.cwd === 'string' || result.cwd === null)) {
       return {
         cwd: typeof result.cwd === 'string' && result.cwd.trim().length > 0 ? result.cwd : null,
@@ -278,17 +321,21 @@ function parseTerminalEvent(message: JsonRpcMessage): TerminalEvent | null {
     const frame = isRecord(params.frame) ? params.frame : null;
     if (
       typeof params.sessionId === 'string' &&
+      typeof params.sessionGeneration === 'number' &&
       frame &&
       typeof frame.seq === 'number' &&
+      typeof frame.sessionGeneration === 'number' &&
       typeof frame.dataBase64 === 'string'
     ) {
       return {
         event: {
           frame: {
             dataBase64: frame.dataBase64,
+            sessionGeneration: frame.sessionGeneration,
             seq: frame.seq,
           },
           sessionId: params.sessionId,
+          sessionGeneration: params.sessionGeneration,
         },
         type: 'output',
       };
@@ -297,12 +344,16 @@ function parseTerminalEvent(message: JsonRpcMessage): TerminalEvent | null {
 
   if (message.method === 'remux/terminal/session/exited' && isRecord(message.params)) {
     const params = message.params;
-    if (typeof params.sessionId === 'string') {
+    if (
+      typeof params.sessionId === 'string' &&
+      typeof params.sessionGeneration === 'number'
+    ) {
       return {
         event: {
           exitCode: typeof params.exitCode === 'number' ? params.exitCode : null,
           exitSignal: typeof params.exitSignal === 'string' ? params.exitSignal : null,
           sessionId: params.sessionId,
+          sessionGeneration: params.sessionGeneration,
         },
         type: 'exited',
       };

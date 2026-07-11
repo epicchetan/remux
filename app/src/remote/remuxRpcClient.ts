@@ -1,3 +1,5 @@
+import type { RpcRequestPolicy } from '@remux/viewer-kit/rpc-policy';
+
 import { logRemuxDebug } from './remuxDebug';
 
 export type JsonRpcId = number | string;
@@ -10,6 +12,7 @@ type JsonRpcError = {
 
 type PendingRequest = {
   method: string;
+  policy: RpcRequestPolicy;
   reject: (error: Error) => void;
   resolve: (value: unknown) => void;
   timer: ReturnType<typeof setTimeout>;
@@ -23,9 +26,11 @@ export type RemuxRpcRequestContext = {
 };
 
 type RemuxRpcClientOptions = {
+  connectionGeneration?: number;
   connectTimeoutMs?: number;
   /** Sent on the upgrade request (RN WebSocket third-arg headers). */
   headers?: Record<string, string>;
+  onInbound?: (receivedAt: number) => void;
   onMessage?: (message: RemuxRpcMessage) => void;
   onStatus?: (status: RemuxRpcStatus) => void;
   url: string;
@@ -58,6 +63,23 @@ export class RemuxConnectionClosedError extends Error {
   }
 }
 
+export class RemuxRequestTimeoutError extends Error {
+  constructor(
+    readonly policy: RpcRequestPolicy,
+    readonly phase: 'before-send' | 'connection-wait' | 'response',
+    readonly timeoutMs: number,
+    readonly details: {
+      connectionGeneration?: number;
+      lastInboundAt?: number;
+      requestId?: JsonRpcId;
+      sentAt?: number;
+    } = {},
+  ) {
+    super(`${policy.method} timed out in ${phase} after ${timeoutMs}ms (${policy.name})`);
+    this.name = 'RemuxRequestTimeoutError';
+  }
+}
+
 export class RemuxRpcClient {
   private connectAbort: ((reason: string) => void) | null = null;
   private connectPromise: Promise<void> | null = null;
@@ -65,6 +87,7 @@ export class RemuxRpcClient {
   private pending = new Map<JsonRpcId, PendingRequest>();
   private sendBlockedLog = { lastLoggedAtMs: 0, suppressedCount: 0 };
   private socket: WebSocket | null = null;
+  private lastInboundAt = 0;
 
   constructor(private readonly options: RemuxRpcClientOptions) {}
 
@@ -207,29 +230,40 @@ export class RemuxRpcClient {
   }
 
   request<T>(
-    method: string,
+    policy: RpcRequestPolicy,
     params?: unknown,
-    timeoutMs = 300_000,
     context?: RemuxRpcRequestContext | null,
+    timeoutMs = policy.budget.totalMs,
+    operationRemainingMs = timeoutMs,
   ): Promise<T> {
+    const { method } = policy;
     const id = this.nextId++;
+    const sentAt = Date.now();
     logRemuxDebug('rpc:request', `${method}#${id}`);
     this.send(requestMessage({
       context,
       id,
       method,
       params,
+      policy,
+      timeoutMs: operationRemainingMs,
     }));
 
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         logRemuxDebug('rpc:timeout', `${method}#${id}`);
-        reject(new Error(`${method} timed out`));
+        reject(new RemuxRequestTimeoutError(policy, 'response', timeoutMs, {
+          connectionGeneration: this.options.connectionGeneration,
+          lastInboundAt: this.lastInboundAt,
+          requestId: id,
+          sentAt,
+        }));
       }, timeoutMs);
 
       this.pending.set(id, {
         method,
+        policy,
         reject,
         resolve: resolve as (value: unknown) => void,
         timer,
@@ -273,6 +307,8 @@ export class RemuxRpcClient {
     if (!isRecord(message)) {
       return;
     }
+    this.options.onInbound?.(Date.now());
+    this.lastInboundAt = Date.now();
 
     if (isJsonRpcResponseMessage(message) && this.pending.has(message.id)) {
       const pending = this.pending.get(message.id)!;
@@ -349,16 +385,21 @@ function requestMessage({
   id,
   method,
   params,
+  policy,
+  timeoutMs,
 }: {
   context?: RemuxRpcRequestContext | null;
   id: JsonRpcId;
   method: string;
   params?: unknown;
+  policy: RpcRequestPolicy;
+  timeoutMs: number;
 }) {
   return {
     jsonrpc: '2.0',
     id,
     method,
+    remuxPolicy: { name: policy.name, remainingMs: timeoutMs },
     ...(params === undefined ? {} : { params }),
     ...(context ? { remuxContext: context } : {}),
   };

@@ -816,6 +816,7 @@ test.describe('terminal viewer route', () => {
           exitCode: 0,
           exitSignal: null,
           sessionId: 'session-from-host',
+          sessionGeneration: 1,
         },
       });
     });
@@ -1287,8 +1288,17 @@ async function installMockRemuxHost(page: Page) {
         case 'host/view/reload':
         case 'remux/terminal/session/kill':
         case 'remux/terminal/session/resize':
-        case 'remux/terminal/session/write':
           postResult(request, { ok: true });
+          return;
+
+        case 'remux/terminal/session/write':
+          postResult(request, {
+            acceptedInputSeq: params.inputSeq,
+            duplicate: false,
+            nextInputSeq: Number(params.inputSeq) + 1,
+            ok: true,
+            sessionGeneration: 1,
+          });
           return;
 
         case 'host/clipboard/read':
@@ -1323,9 +1333,16 @@ async function installMockRemuxHost(page: Page) {
             exitCode: null,
             exitSignal: null,
             nextSeq: 1,
+            nextOutputSeq: 1,
+            firstAvailableSeq: 1,
+            nextInputSeq: typeof params.inputSeq === 'number' ? params.inputSeq : 1,
+            inputStreamId: typeof params.inputStreamId === 'string'
+              ? params.inputStreamId
+              : 'mock-input-stream',
             replay: window.__remuxTerminalAttachReplay ?? [],
             replayTruncated: false,
             sessionId,
+            sessionGeneration: 1,
             status: 'running',
           });
           return;
@@ -1340,7 +1357,12 @@ async function installMockRemuxHost(page: Page) {
             pid: 12345,
             rows: typeof params.rows === 'number' ? params.rows : 24,
             sessionId,
+            sessionGeneration: 1,
             shell: '/bin/sh',
+            inputStreamId: 'mock-input-stream',
+            nextInputSeq: 1,
+            firstAvailableSeq: 1,
+            nextOutputSeq: 1,
           });
           return;
         }
@@ -1416,6 +1438,7 @@ async function sendTerminalOutput(
       params: {
         frame,
         sessionId,
+        sessionGeneration: 1,
       },
     });
   }, { frame: replayFrame(seq, data), sessionId });
@@ -1526,6 +1549,7 @@ function decodeWrites(writes: HostRequest[]) {
 function replayFrame(seq: number, data: string) {
   return {
     dataBase64: Buffer.from(data, 'utf8').toString('base64'),
+    sessionGeneration: 1,
     seq,
   };
 }

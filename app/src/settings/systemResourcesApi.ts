@@ -1,4 +1,5 @@
 import type { RemuxConnection } from '../remote/RemuxConnectionProvider';
+import { rpcPolicies } from '@remux/viewer-kit/rpc-policy';
 
 const systemResourcesMethod = 'remux/system/resources';
 const systemResourcesSubscribeMethod = 'remux/system/resources/subscribe';
@@ -46,7 +47,7 @@ export async function readSystemResources(
 ): Promise<SystemResourcesSample | null> {
   let response: unknown;
   try {
-    response = await request<unknown>(systemResourcesMethod, undefined, 8_000);
+    response = await request<unknown>(rpcPolicies['system-resources-read']);
   } catch (error) {
     if (isMethodNotFound(error)) {
       return null;
@@ -57,11 +58,11 @@ export async function readSystemResources(
 }
 
 export async function subscribeSystemResources(request: RemuxConnection['request']): Promise<void> {
-  await request<unknown>(systemResourcesSubscribeMethod, undefined, 8_000);
+  await request<unknown>(rpcPolicies['system-resources-subscribe']);
 }
 
 export async function unsubscribeSystemResources(request: RemuxConnection['request']): Promise<void> {
-  await request<unknown>(systemResourcesUnsubscribeMethod, undefined, 8_000);
+  await request<unknown>(rpcPolicies['system-resources-unsubscribe']);
 }
 
 export function parseSystemResourcesSample(raw: unknown): SystemResourcesSample | null {

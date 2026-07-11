@@ -25,6 +25,7 @@ import type {
   WebViewRenderProcessGoneEvent,
   WebViewTerminatedEvent,
 } from 'react-native-webview/lib/WebViewTypes';
+import { resolveRpcPolicy } from '@remux/viewer-kit/rpc-policy';
 
 import { logRemuxDebug } from '../../remote/remuxDebug';
 import {
@@ -45,7 +46,7 @@ type JsonRpcId = number | string;
 type RemuxViewHostStatus =
   | { type: 'idle' }
   | { type: 'connecting' }
-  | { cwd: string | null; type: 'connected' }
+  | { cwd: string | null; generation: number; type: 'connected' }
   | { type: 'reconnecting'; attempt: number }
   | { type: 'closed'; reason?: string }
   | { type: 'error'; message: string };
@@ -55,7 +56,8 @@ type WebViewToNativeMessage =
       id: JsonRpcId;
       method: string;
       params?: unknown;
-      timeoutMs?: number;
+      policy: string;
+      timeoutMs: number;
       type: 'remux/request';
     }
   | {
@@ -410,11 +412,14 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
     postToWebView({
       message: {
         method: 'host/connection',
-        params: { status: remux.status.type },
+        params: {
+          generation: remux.status.type === 'connected' ? remux.status.generation : null,
+          status: remux.status.type,
+        },
       },
       type: 'remux/event',
     });
-  }, [postToWebView, remux.status.type]);
+  }, [postToWebView, remux.status]);
 
   const postActive = useCallback((nextActive: boolean) => {
     postToWebView({
@@ -724,6 +729,18 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
           break;
         case 'remux/request': {
           const requestEpoch = pageEpochRef.current;
+          const requestPolicy = resolveRpcPolicy(message.policy, message.method);
+          if (!requestPolicy || message.timeoutMs <= 0 || message.timeoutMs > requestPolicy.budget.totalMs) {
+            postToWebView({
+              error: {
+                code: -32600,
+                message: `Unregistered or invalid RPC policy for ${message.method}`,
+              },
+              id: message.id,
+              type: 'remux/error',
+            }, { epoch: requestEpoch });
+            break;
+          }
           if (message.method === 'host/viewport/get') {
             postToWebView({
               id: message.id,
@@ -920,7 +937,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
           }
 
           void remux
-            .request(message.method, message.params, message.timeoutMs, remuxRequestContext)
+            .request(requestPolicy, message.params, remuxRequestContext)
             .then((result) => {
               postToWebView({
                 id: message.id,
@@ -1325,10 +1342,10 @@ function parseWebViewMessage(data: string): WebViewToNativeMessage | InvalidWebV
       };
     }
 
-    if (parsed.timeoutMs !== undefined && typeof parsed.timeoutMs !== 'number') {
+    if (typeof parsed.policy !== 'string' || typeof parsed.timeoutMs !== 'number') {
       return {
         id,
-        message: 'Invalid Remux request timeout',
+        message: 'Invalid Remux request policy or timeout',
         type: 'remux/invalid-request',
       };
     }
@@ -1337,6 +1354,7 @@ function parseWebViewMessage(data: string): WebViewToNativeMessage | InvalidWebV
       id,
       method: parsed.method,
       params: parsed.params,
+      policy: parsed.policy,
       timeoutMs: parsed.timeoutMs,
       type: 'remux/request',
     };
@@ -1351,7 +1369,7 @@ function mapConnectionStatus(
 ): RemuxViewHostStatus {
   switch (status.type) {
     case 'connected':
-      return { cwd: status.cwd, type: 'connected' };
+      return { cwd: status.cwd, generation: status.generation, type: 'connected' };
     case 'reconnecting':
       return { attempt: status.attempt, type: 'reconnecting' };
     case 'disconnected':

@@ -1,4 +1,5 @@
 import type { RemuxConnection } from '../remote/RemuxConnectionProvider';
+import { rpcPolicies } from '@remux/viewer-kit/rpc-policy';
 
 const extensionStatusMethod = 'remux/extensions/status';
 const extensionStartMethod = 'remux/extensions/start';
@@ -84,7 +85,7 @@ export type ExtensionLogLine = {
 export async function readExtensionServerStatuses(
   request: RemuxConnection['request'],
 ): Promise<ExtensionServerStatus[]> {
-  const response = await request<unknown>(extensionStatusMethod, undefined, 8_000);
+  const response = await request<unknown>(rpcPolicies['extensions-status-read']);
   if (!isRecord(response) || !Array.isArray(response.extensions)) {
     throw new Error('Invalid extension status response');
   }
@@ -102,9 +103,8 @@ export async function restartExtensionServer(
 ): Promise<ExtensionServerStatus & { restarted: boolean }> {
   const rebuild = options?.rebuild === true;
   const response = await request<unknown>(
-    extensionRestartMethod,
+    rpcPolicies['extension-restart'],
     { extensionId, ...(rebuild ? { rebuild: true } : {}) },
-    rebuild ? rebuildTimeoutMs : 30_000,
   );
   const status = parseExtensionServerStatus(response);
   if (!status || !isRecord(response)) {
@@ -125,9 +125,8 @@ export async function setExtensionServerRunning(
 ): Promise<ExtensionServerStatus & { changed: boolean }> {
   const rebuild = running && options?.rebuild === true;
   const response = await request<unknown>(
-    running ? extensionStartMethod : extensionStopMethod,
+    running ? rpcPolicies['extension-start'] : rpcPolicies['extension-stop'],
     { extensionId, ...(rebuild ? { rebuild: true } : {}) },
-    rebuild ? rebuildTimeoutMs : 30_000,
   );
   const status = parseExtensionServerStatus(response);
   if (!status || !isRecord(response)) {
@@ -150,9 +149,8 @@ export async function setExtensionWatchRunning(
   running: boolean,
 ): Promise<ExtensionServerStatus & { changed: boolean }> {
   const response = await request<unknown>(
-    running ? extensionWatchStartMethod : extensionWatchStopMethod,
+    running ? rpcPolicies['extension-watch-start'] : rpcPolicies['extension-watch-stop'],
     { extensionId },
-    running ? rebuildTimeoutMs : 30_000,
   );
   const status = parseExtensionServerStatus(response);
   if (!status || !isRecord(response)) {
@@ -176,9 +174,10 @@ export async function buildExtension(
   target: 'server' | 'views',
 ): Promise<ExtensionServerStatus & { changed: boolean }> {
   const response = await request<unknown>(
-    target === 'server' ? extensionServerBuildMethod : extensionViewsBuildMethod,
+    target === 'server'
+      ? rpcPolicies['extension-server-build']
+      : rpcPolicies['extension-views-build'],
     { extensionId },
-    rebuildTimeoutMs,
   );
   const status = parseExtensionServerStatus(response);
   if (!status || !isRecord(response)) {
@@ -196,7 +195,7 @@ export async function readExtensionLogs(
   extensionId: string,
   lines = 500,
 ): Promise<ExtensionLogLine[]> {
-  const response = await request<unknown>(extensionLogsMethod, { extensionId, lines }, 8_000);
+  const response = await request<unknown>(rpcPolicies['extension-logs-read'], { extensionId, lines });
   if (!isRecord(response) || !Array.isArray(response.lines)) {
     throw new Error('Invalid extension logs response');
   }
@@ -208,14 +207,14 @@ export async function subscribeExtensionLogs(
   request: RemuxConnection['request'],
   extensionId: string,
 ): Promise<void> {
-  await request<unknown>(extensionLogsSubscribeMethod, { extensionId }, 8_000);
+  await request<unknown>(rpcPolicies['extension-logs-subscribe'], { extensionId });
 }
 
 export async function unsubscribeExtensionLogs(
   request: RemuxConnection['request'],
   extensionId: string,
 ): Promise<void> {
-  await request<unknown>(extensionLogsUnsubscribeMethod, { extensionId }, 8_000);
+  await request<unknown>(rpcPolicies['extension-logs-unsubscribe'], { extensionId });
 }
 
 /** Params of a `remux/extensions/logs/didAppend` notification. */

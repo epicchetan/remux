@@ -1,4 +1,5 @@
 import { requestIpc } from '@remux/viewer-kit/ipc';
+import { rpcPolicies } from '@remux/viewer-kit/rpc-policy';
 
 import type {
   CodexNarrationAudioReadParams,
@@ -17,13 +18,13 @@ export const narrationReadMethod = 'remux/codex/narration/resources/read';
 export const narrationStartMethod = 'remux/codex/narration/start';
 
 export const readNarration = (params: CodexNarrationReadParams) =>
-  requestIpc<CodexNarrationReadResponse>(narrationReadMethod, params);
+  requestIpc<CodexNarrationReadResponse>(rpcPolicies['codex-narration-read'], params);
 
 export const startNarration = (params: CodexNarrationStartParams) =>
-  requestIpc<CodexNarrationStartResponse>(narrationStartMethod, params);
+  requestIpc<CodexNarrationStartResponse>(rpcPolicies['codex-narration-start'], params);
 
 export const cancelNarration = (params: CodexNarrationCancelParams) =>
-  requestIpc<CodexNarrationCancelResponse>(narrationCancelMethod, params);
+  requestIpc<CodexNarrationCancelResponse>(rpcPolicies['codex-narration-cancel'], params);
 
 export const readNarrationAudio = (params: CodexNarrationAudioReadParams) =>
-  requestIpc<CodexNarrationAudioReadResponse>(narrationAudioReadMethod, params);
+  requestIpc<CodexNarrationAudioReadResponse>(rpcPolicies['codex-narration-audio-read'], params);

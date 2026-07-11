@@ -30,7 +30,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot};
@@ -48,7 +48,7 @@ use crate::rpc::router::{
 };
 use crate::time::now_ms;
 
-pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 300_000;
+pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 120_000;
 pub const BACKOFF_BASE_MS: u64 = 500;
 pub const BACKOFF_CAP_MS: u64 = 10_000;
 pub const CRASH_BUDGET: usize = 5;
@@ -61,6 +61,8 @@ pub const BUILD_FAILED_REASON: &str = "build-failed";
 
 pub const DID_CHANGE_STATUS_METHOD: &str = "remux/extensions/didChangeStatus";
 const REMUX_NOTIFICATION_METHOD_PREFIX: &str = "remux/notifications/";
+const EXTENSION_NOTIFICATION_WORKERS: usize = 32;
+static EXTENSION_NOTIFICATION_PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 /// What the supervisor needs from the runtime: client broadcast, the
 /// notification manager's first-refusal hook, and the failed-state alert
@@ -172,7 +174,7 @@ enum Cmd {
 
 pub struct ExtensionSupervisor {
     extension_id: String,
-    commands: mpsc::UnboundedSender<Cmd>,
+    commands: mpsc::Sender<Cmd>,
     status: Arc<Mutex<ServerStatus>>,
     logs: Arc<ExtensionLogs>,
     /// Entries of views with a declared build — `views.built` is recomputed
@@ -220,14 +222,11 @@ impl ExtensionSupervisor {
                 last_build_at_ms: None,
             },
             watch: WatchFacet {
-                declared: extension
-                    .views
-                    .iter()
-                    .any(|(_, view)| view.watch.is_some()),
+                declared: extension.views.iter().any(|(_, view)| view.watch.is_some()),
                 ..WatchFacet::default()
             },
         }));
-        let (commands, mailbox) = mpsc::unbounded_channel();
+        let (commands, mailbox) = mpsc::channel(128);
 
         let supervisor = Arc::new(Self {
             extension_id: extension.id.clone(),
@@ -287,7 +286,7 @@ impl ExtensionSupervisor {
         make: impl FnOnce(oneshot::Sender<ServerStatus>) -> Cmd,
     ) -> ServerStatus {
         let (ack, response) = oneshot::channel();
-        if self.commands.send(make(ack)).is_err() {
+        if self.commands.send(make(ack)).await.is_err() {
             return self.snapshot();
         }
         response.await.unwrap_or_else(|_| self.snapshot())
@@ -304,7 +303,7 @@ impl ExtensionSupervisor {
             )
         };
         let (ack, response) = oneshot::channel();
-        if self.commands.send(make(ack)).is_err() {
+        if self.commands.send(make(ack)).await.is_err() {
             return Err(unavailable());
         }
         response.await.unwrap_or_else(|_| Err(unavailable()))
@@ -333,7 +332,7 @@ impl ExtensionServer for ExtensionSupervisor {
                 )
             };
             let (ack, response) = oneshot::channel();
-            if self.commands.send(Cmd::WatchStart(ack)).is_err() {
+            if self.commands.send(Cmd::WatchStart(ack)).await.is_err() {
                 return Err(unavailable());
             }
             response.await.unwrap_or_else(|_| Err(unavailable()))
@@ -343,7 +342,7 @@ impl ExtensionServer for ExtensionSupervisor {
     fn watch_stop(&self) -> BoxFuture<'_, (ServerStatus, bool)> {
         Box::pin(async move {
             let (ack, response) = oneshot::channel();
-            if self.commands.send(Cmd::WatchStop(ack)).is_err() {
+            if self.commands.send(Cmd::WatchStop(ack)).await.is_err() {
                 return (self.snapshot(), false);
             }
             response.await.unwrap_or_else(|_| (self.snapshot(), false))
@@ -363,7 +362,12 @@ impl ExtensionServer for ExtensionSupervisor {
             let (ack, response) = oneshot::channel();
             if self
                 .commands
-                .send(Cmd::Rpc { method, params, ack })
+                .send(Cmd::Rpc {
+                    method,
+                    params,
+                    ack,
+                })
+                .await
                 .is_err()
             {
                 return Err(JsonRpcError::new(
@@ -381,7 +385,7 @@ impl ExtensionServer for ExtensionSupervisor {
     }
 
     fn handle_notification(&self, method: String, params: Option<Value>) {
-        let _ = self.commands.send(Cmd::Notify { method, params });
+        let _ = self.commands.try_send(Cmd::Notify { method, params });
     }
 
     fn status(&self) -> ServerStatus {
@@ -410,12 +414,12 @@ struct Actor {
     status: Arc<Mutex<ServerStatus>>,
     run_state: Arc<RunState>,
     /// Loops back into our own mailbox (watch child exit reports).
-    self_commands: mpsc::UnboundedSender<Cmd>,
+    self_commands: mpsc::Sender<Cmd>,
     pending: PendingMap,
     generation: Arc<AtomicU64>,
     state: Lifecycle,
     child: Option<tokio::process::Child>,
-    stdin: Option<mpsc::UnboundedSender<StdinCommand>>,
+    stdin: Option<mpsc::Sender<StdinCommand>>,
     pid: Option<u32>,
     pgid: Option<u32>,
     started_at_ms: Option<i64>,
@@ -444,7 +448,7 @@ struct Actor {
 }
 
 impl Actor {
-    async fn run(mut self, mut mailbox: mpsc::UnboundedReceiver<Cmd>) {
+    async fn run(mut self, mut mailbox: mpsc::Receiver<Cmd>) {
         loop {
             let backoff_deadline = self.backoff_deadline;
             let watch_backoff_deadline = self.watch_backoff_deadline;
@@ -527,7 +531,11 @@ impl Actor {
                 let result = self.handle_views_build().await;
                 let _ = ack.send(result);
             }
-            Cmd::Rpc { method, params, ack } => self.handle_rpc(method, params, ack),
+            Cmd::Rpc {
+                method,
+                params,
+                ack,
+            } => self.handle_rpc(method, params, ack),
             Cmd::Notify { method, params } => self.handle_notify(method, params),
         }
     }
@@ -595,9 +603,7 @@ impl Actor {
                 continue;
             };
             if self.watch_enabled && view.watch.is_some() {
-                self.append_build_log(&format!(
-                    "skipping view {view_id}: watch owns the bundle"
-                ));
+                self.append_build_log(&format!("skipping view {view_id}: watch owns the bundle"));
                 continue;
             }
             let needed = self.failed_view_builds.contains(&view_id) || !view.entry.exists();
@@ -703,10 +709,7 @@ impl Actor {
                 signal_group(pid, nix::sys::signal::Signal::SIGKILL);
                 let _ = child.wait().await;
                 self.run_state.remove(&self.extension.id, RunRole::Build);
-                self.append_build_log(&format!(
-                    "timed out after {}ms",
-                    self.cfg.build_timeout_ms
-                ));
+                self.append_build_log(&format!("timed out after {}ms", self.cfg.build_timeout_ms));
                 return Err((None, None, "build timed out".to_string()));
             }
         };
@@ -893,15 +896,16 @@ impl Actor {
             .cloned()
             .collect();
         if declared.is_empty() {
-            return Err(JsonRpcError::new(EXTENSION_ERROR, "view build not declared"));
+            return Err(JsonRpcError::new(
+                EXTENSION_ERROR,
+                "view build not declared",
+            ));
         }
 
         for (view_id, view) in declared {
             let build = view.build.as_ref().expect("filtered");
             if self.watch_enabled && view.watch.is_some() {
-                self.append_build_log(&format!(
-                    "skipping view {view_id}: watch owns the bundle"
-                ));
+                self.append_build_log(&format!("skipping view {view_id}: watch owns the bundle"));
                 continue;
             }
             match self.exec_build(build).await {
@@ -954,8 +958,7 @@ impl Actor {
             .views
             .iter()
             .filter(|(view_id, view)| {
-                view.watch.is_some()
-                    && !self.watch_children.iter().any(|(id, _)| id == view_id)
+                view.watch.is_some() && !self.watch_children.iter().any(|(id, _)| id == view_id)
             })
             .map(|(view_id, view)| (view_id.clone(), view.watch.clone().expect("filtered")))
             .collect();
@@ -1046,14 +1049,17 @@ impl Actor {
             let exited_view = view_id.clone();
             tokio::spawn(async move {
                 let status = child.wait().await.ok();
-                let _ = sender.send(Cmd::WatchChildExited {
-                    generation,
-                    view_id: exited_view,
-                    status,
-                });
+                let _ = sender
+                    .send(Cmd::WatchChildExited {
+                        generation,
+                        view_id: exited_view,
+                        status,
+                    })
+                    .await;
             });
 
-            self.watch_children.push((view_id, WatchChild { pid, pgid: pid }));
+            self.watch_children
+                .push((view_id, WatchChild { pid, pgid: pid }));
         }
         self.broadcast_status();
     }
@@ -1067,8 +1073,7 @@ impl Actor {
         if generation != self.watch_generation.load(Ordering::SeqCst) {
             return; // Stale: this child belonged to a stopped watch session.
         }
-        let Some(index) = self.watch_children.iter().position(|(id, _)| id == view_id)
-        else {
+        let Some(index) = self.watch_children.iter().position(|(id, _)| id == view_id) else {
             return;
         };
         let (_, child) = self.watch_children.remove(index);
@@ -1207,7 +1212,19 @@ impl Actor {
         true
     }
 
-    fn handle_rpc(&mut self, method: String, params: Option<Value>, ack: oneshot::Sender<RpcResult>) {
+    fn handle_rpc(
+        &mut self,
+        method: String,
+        mut params: Option<Value>,
+        ack: oneshot::Sender<RpcResult>,
+    ) {
+        let request_timeout_ms = params
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .and_then(|params| params.remove("_remuxExecutionTimeoutMs"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(self.cfg.request_timeout_ms)
+            .max(1);
         let stdin = match (&self.stdin, self.state) {
             (Some(stdin), Lifecycle::Running) => stdin.clone(),
             _ => {
@@ -1230,14 +1247,28 @@ impl Actor {
             message.insert("params".to_string(), params);
         }
 
-        self.pending
-            .lock()
-            .unwrap()
-            .insert(id, PendingRpc { method: method.clone(), ack });
+        self.pending.lock().unwrap().insert(
+            id,
+            PendingRpc {
+                method: method.clone(),
+                ack,
+            },
+        );
+
+        let line = format!("{}\n", Value::Object(message));
+        if stdin.try_send(StdinCommand::Line(line)).is_err() {
+            if let Some(entry) = self.pending.lock().unwrap().remove(&id) {
+                let _ = entry.ack.send(Err(JsonRpcError::new(
+                    EXTENSION_ERROR,
+                    format!("extension {} input queue is full", self.extension.id),
+                )));
+            }
+            return;
+        }
 
         // Timeout: reject with the same -32000 "<method> timed out".
         let pending = self.pending.clone();
-        let timeout_ms = self.cfg.request_timeout_ms;
+        let timeout_ms = request_timeout_ms;
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
             if let Some(entry) = pending.lock().unwrap().remove(&id) {
@@ -1247,23 +1278,33 @@ impl Actor {
                 )));
             }
         });
-
-        let line = format!("{}\n", Value::Object(message));
-        let _ = stdin.send(StdinCommand::Line(line));
     }
 
     fn handle_notify(&mut self, method: String, params: Option<Value>) {
-        let Some(stdin) = self.stdin.as_ref().filter(|_| self.state == Lifecycle::Running)
+        let Some(stdin) = self
+            .stdin
+            .as_ref()
+            .filter(|_| self.state == Lifecycle::Running)
         else {
             return;
         };
+        let method_for_log = method.clone();
         let mut message = Map::new();
         message.insert("jsonrpc".to_string(), Value::from("2.0"));
         message.insert("method".to_string(), Value::from(method));
         if let Some(params) = params {
             message.insert("params".to_string(), params);
         }
-        let _ = stdin.send(StdinCommand::Line(format!("{}\n", Value::Object(message))));
+        if stdin
+            .try_send(StdinCommand::Line(format!("{}\n", Value::Object(message))))
+            .is_err()
+        {
+            self.journal_lifecycle(
+                "extension:notification-input-overflow",
+                Some(serde_json::json!({ "method": method_for_log })),
+                "warn",
+            );
+        }
     }
 
     fn spawn_child(&mut self, server: &ServerSpec) {
@@ -1449,7 +1490,7 @@ impl Actor {
         // Close the stdin channel and drop ChildStdin -> the extension sees
         // EOF.
         if let Some(stdin) = self.stdin.take() {
-            let _ = stdin.send(StdinCommand::Close);
+            let _ = stdin.try_send(StdinCommand::Close);
         }
 
         let Some(mut child) = self.child.take() else {
@@ -1460,7 +1501,8 @@ impl Actor {
             return;
         };
         self.set_state(Lifecycle::Stopping);
-        self.logs.append(&self.extension.id, "lifecycle", "stopping");
+        self.logs
+            .append(&self.extension.id, "lifecycle", "stopping");
 
         let eof_wait = std::time::Duration::from_millis(self.cfg.stop_eof_wait_ms);
         let term_wait = std::time::Duration::from_millis(self.cfg.stop_term_wait_ms);
@@ -1538,21 +1580,13 @@ impl Actor {
         let extension_id = self.extension.id.clone();
 
         tokio::spawn(async move {
-            let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
-            let reader = tokio::spawn(async move {
-                read_lines(stdout, move |line| {
-                    let _ = line_tx.send(line);
-                })
-                .await;
-            });
-
-            while let Some(line) = line_rx.recv().await {
+            read_lines(stdout, move |line| {
                 if generations.load(Ordering::SeqCst) != generation {
-                    break;
+                    return;
                 }
-                handle_protocol_line(&line, &extension_id, &pending, &ctx, &journal).await;
-            }
-            let _ = reader.await;
+                handle_protocol_line(&line, &extension_id, &pending, &ctx, &journal);
+            })
+            .await;
         });
     }
 
@@ -1705,7 +1739,7 @@ fn last_stderr_line(snapshot: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-async fn handle_protocol_line(
+fn handle_protocol_line(
     line: &str,
     extension_id: &str,
     pending: &PendingMap,
@@ -1735,7 +1769,9 @@ async fn handle_protocol_line(
         };
         match message.get("error") {
             Some(error) if !error.is_null() => {
-                let _ = entry.ack.send(Err(error_from_response(error, &entry.method)));
+                let _ = entry
+                    .ack
+                    .send(Err(error_from_response(error, &entry.method)));
             }
             _ => {
                 let _ = entry
@@ -1759,11 +1795,27 @@ async fn handle_protocol_line(
             .unwrap_or_default();
         if method.starts_with(REMUX_NOTIFICATION_METHOD_PREFIX) {
             // Offer to the notification manager first; broadcast only when
-            // unhandled.
-            let handled = ctx.handle_extension_notification(normalized.clone()).await;
-            if !handled {
-                ctx.broadcast(normalized);
-            }
+            // unhandled. Delivery may perform visibility and Expo HTTP work,
+            // so it must never hold the child protocol reader.
+            let permits = EXTENSION_NOTIFICATION_PERMITS
+                .get_or_init(|| {
+                    Arc::new(tokio::sync::Semaphore::new(EXTENSION_NOTIFICATION_WORKERS))
+                })
+                .clone();
+            let Ok(permit) = permits.try_acquire_owned() else {
+                journal.warn(&format!(
+                    "[remux] extension notification worker full extension={extension_id} method={method}"
+                ));
+                return;
+            };
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                let handled = ctx.handle_extension_notification(normalized.clone()).await;
+                if !handled {
+                    ctx.broadcast(normalized);
+                }
+                drop(permit);
+            });
             return;
         }
         ctx.broadcast(normalized);
@@ -1799,7 +1851,10 @@ fn is_extension_response(message: &Value) -> bool {
 }
 
 fn error_from_response(error: &Value, method: &str) -> JsonRpcError {
-    let code = error.get("code").and_then(Value::as_i64).unwrap_or(EXTENSION_ERROR);
+    let code = error
+        .get("code")
+        .and_then(Value::as_i64)
+        .unwrap_or(EXTENSION_ERROR);
     let message = error
         .get("message")
         .and_then(Value::as_str)
