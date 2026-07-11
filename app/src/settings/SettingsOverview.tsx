@@ -108,21 +108,27 @@ export function SettingsOverview() {
   const refreshCodexAppServerStatus = useCallback(async () => {
     if (
       connection.status.type !== 'connected'
-      || detailExtensionId !== 'codex'
       || extensionStatuses.codex?.running !== true
     ) {
       setCodexAppServerStatus(null);
       return;
     }
     try {
-      setCodexAppServerStatus(await readCodexAppServerStatus(connection.request));
+      const next = await readCodexAppServerStatus(connection.request);
+      setCodexAppServerStatus((current) => (
+        codexAppServerStatusesEqual(current, next) ? current : next
+      ));
     } catch (error) {
-      setExtensionStatusError(error instanceof Error ? error.message : String(error));
+      if (detailExtensionId === 'codex') {
+        setExtensionStatusError(error instanceof Error ? error.message : String(error));
+      }
       setCodexAppServerStatus(null);
     }
   }, [connection.request, connection.status.type, detailExtensionId, extensionStatuses.codex?.running]);
 
   useEffect(() => {
+    // Warm the facet once when Codex becomes available so opening the sheet
+    // does not insert a whole section after its presentation animation.
     void refreshCodexAppServerStatus();
     if (detailExtensionId !== 'codex' || extensionStatuses.codex?.running !== true) {
       return undefined;
@@ -497,6 +503,27 @@ function useMinuteTick() {
   }, []);
 
   return nowMs;
+}
+
+function codexAppServerStatusesEqual(
+  left: CodexAppServerStatus | null,
+  right: CodexAppServerStatus | null,
+): boolean {
+  if (left === right) {
+    return true;
+  }
+  if (!left || !right) {
+    return false;
+  }
+  return left.state === right.state
+    && left.socketPath === right.socketPath
+    && left.managedCodexPath === right.managedCodexPath
+    && left.installedVersion === right.installedVersion
+    && left.runningVersion === right.runningVersion
+    && left.restartRequired === right.restartRequired
+    && left.lastError === right.lastError
+    && left.activeTurnIds.length === right.activeTurnIds.length
+    && left.activeTurnIds.every((turnId, index) => turnId === right.activeTurnIds[index]);
 }
 
 function SystemSection({ sample }: { sample: SystemResourcesSample }) {

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { BottomSheet, Group, Host, RNHostView } from '@expo/ui/swift-ui';
 import { presentationDetents, presentationDragIndicator } from '@expo/ui/swift-ui/modifiers';
 import {
@@ -36,6 +36,10 @@ import {
 import type { ExtensionResourceSample } from './systemResourcesApi';
 
 const logRingLines = 500;
+const sheetPresentationModifiers = [
+  presentationDetents(['medium']),
+  presentationDragIndicator('visible'),
+];
 
 export type ExtensionDetailAction =
   | 'start'
@@ -71,29 +75,40 @@ export function ExtensionDetailSheet({
 }) {
   const { styles } = useSheetTheme();
   const insets = useSafeAreaInsets();
-  const connection = useRemuxConnection();
+  const {
+    request,
+    status: connectionStatus,
+    subscribe,
+  } = useRemuxConnection();
   const extensionId = status?.extensionId ?? null;
   const [logLines, setLogLines] = useState<ExtensionLogLine[]>([]);
   const [logsError, setLogsError] = useState<string | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
 
-  // Live log tail: snapshot, then subscribe; the subscription dies with the
-  // sheet (and, server-side, with the socket).
+  // A different extension gets a fresh local tail. Connection transitions do
+  // not blank a visible panel; its next snapshot is merged into what the user
+  // was already reading.
   useEffect(() => {
-    if (!visible || !extensionId || connection.status.type !== 'connected') {
+    setLogLines([]);
+    setLogsError(null);
+  }, [extensionId]);
+
+  // Live log tail: subscribe first, then merge the snapshot so entries that
+  // arrive in between are neither lost nor duplicated.
+  useEffect(() => {
+    if (!visible || !extensionId || connectionStatus.type !== 'connected') {
       return undefined;
     }
 
     let cancelled = false;
-    setLogLines([]);
     setLogsError(null);
 
     void (async () => {
       try {
-        await subscribeExtensionLogs(connection.request, extensionId);
-        const snapshot = await readExtensionLogs(connection.request, extensionId, logRingLines);
+        await subscribeExtensionLogs(request, extensionId);
+        const snapshot = await readExtensionLogs(request, extensionId, logRingLines);
         if (!cancelled) {
-          setLogLines((current) => trimLog([...snapshot, ...current]));
+          setLogLines((current) => mergeLogLines(snapshot, current));
         }
       } catch (error) {
         if (!cancelled) {
@@ -102,7 +117,7 @@ export function ExtensionDetailSheet({
       }
     })();
 
-    const unsubscribeMessages = connection.subscribe((message) => {
+    const unsubscribeMessages = subscribe((message) => {
       if (message.method !== extensionLogsDidAppendMethod) {
         return;
       }
@@ -110,23 +125,24 @@ export function ExtensionDetailSheet({
       if (!batch || batch.extensionId !== extensionId) {
         return;
       }
-      setLogLines((current) => trimLog([...current, ...batch.lines]));
+      setLogLines((current) => mergeLogLines(current, batch.lines));
     });
 
     return () => {
       cancelled = true;
       unsubscribeMessages();
-      void unsubscribeExtensionLogs(connection.request, extensionId).catch(() => undefined);
+      void unsubscribeExtensionLogs(request, extensionId).catch(() => undefined);
     };
-  }, [connection, extensionId, visible]);
+  }, [connectionStatus.type, extensionId, request, subscribe, visible]);
 
-  // Seconds tick for the uptime row while the sheet is open.
+  // Uptime is diagnostic context, not a stopwatch. Avoid rebuilding the
+  // native SwiftUI host and its RN subtree every second.
   useEffect(() => {
     if (!visible) {
       return undefined;
     }
     setNowMs(Date.now());
-    const timer = setInterval(() => setNowMs(Date.now()), 1_000);
+    const timer = setInterval(() => setNowMs(Date.now()), 30_000);
     return () => clearInterval(timer);
   }, [visible]);
 
@@ -187,20 +203,23 @@ export function ExtensionDetailSheet({
           }
         }}
       >
-        <Group modifiers={[presentationDetents(['medium', 'large']), presentationDragIndicator('visible')]}>
+        <Group modifiers={sheetPresentationModifiers}>
           <RNHostView>
             <View style={[styles.sheet, { paddingBottom: Math.max(insets.bottom, 16) }]}>
-              <View style={styles.headerRow}>
-                <Text numberOfLines={1} style={styles.title}>{name}</Text>
-                <StateBadge state={state} />
+              <View style={styles.sheetHeader}>
+                <View style={styles.headerRow}>
+                  <Text numberOfLines={1} style={styles.title}>{name}</Text>
+                  <StateBadge state={state} />
+                </View>
+
+                {aggregateResourceText ? (
+                  <Text style={styles.sharedResources}>{aggregateResourceText}</Text>
+                ) : null}
+                {logsError ? <Text style={styles.errorText}>{logsError}</Text> : null}
               </View>
 
-              {aggregateResourceText ? (
-                <Text style={styles.sharedResources}>{aggregateResourceText}</Text>
-              ) : null}
-              {logsError ? <Text style={styles.errorText}>{logsError}</Text> : null}
-
               <ScrollView
+                contentInsetAdjustmentBehavior="never"
                 contentContainerStyle={styles.sectionContent}
                 nestedScrollEnabled
                 style={styles.sectionScroll}
@@ -389,6 +408,28 @@ function trimLog(lines: ExtensionLogLine[]): ExtensionLogLine[] {
   return kept;
 }
 
+function mergeLogLines(
+  before: ExtensionLogLine[],
+  after: ExtensionLogLine[],
+): ExtensionLogLine[] {
+  const seen = new Set<string>();
+  return trimLog([...before, ...after].filter((entry) => {
+    const key = [
+      entry.ts,
+      entry.componentId,
+      entry.source,
+      entry.channel ?? '',
+      entry.level ?? '',
+      entry.line,
+    ].join('\u0000');
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  }));
+}
+
 function OperationalSection({
   actions,
   emptyText,
@@ -419,7 +460,7 @@ function OperationalSection({
  * native sheet unmounts its children on dismiss, so the refs reset on every
  * open for free.
  */
-function LogPanel({
+const LogPanel = memo(function LogPanel({
   emptyText,
   lines,
 }: {
@@ -445,6 +486,8 @@ function LogPanel({
   return (
     <View style={styles.logPanel}>
       <ScrollView
+        contentContainerStyle={styles.logScrollContent}
+        nestedScrollEnabled
         onScroll={onScroll}
         ref={scrollRef}
         scrollEventThrottle={64}
@@ -460,13 +503,13 @@ function LogPanel({
       </ScrollView>
     </View>
   );
-}
+});
 
 /**
  * One log entry: muted timestamp, structured source/channel tag, and wrapped
  * message. Severity comes only from `level`; raw stderr remains neutral.
  */
-function LogEntryLine({ entry }: { entry: ExtensionLogLine }) {
+const LogEntryLine = memo(function LogEntryLine({ entry }: { entry: ExtensionLogLine }) {
   const { styles } = useSheetTheme();
   const tag = logEntryTag(entry);
   const messageStyle = entry.level === 'error'
@@ -484,7 +527,7 @@ function LogEntryLine({ entry }: { entry: ExtensionLogLine }) {
       <Text style={messageStyle}>{logMessage(entry)}</Text>
     </Text>
   );
-}
+});
 
 type LogTagTone = 'bad' | 'warn' | 'build' | 'muted';
 
@@ -753,19 +796,19 @@ function createStyles(theme: RemuxTheme) {
       lineHeight: 17,
       marginBottom: 2,
     },
-    // Flexes into whatever the active detent leaves over: a sliver at
-    // medium, the full remainder at large.
     logPanel: {
       backgroundColor: theme.surface,
       borderColor: theme.border,
       borderRadius: 14,
       borderWidth: 1,
-      maxHeight: 180,
+      height: 160,
       marginTop: 8,
-      minHeight: 96,
       overflow: 'hidden',
     },
     logScroll: {
+      flex: 1,
+    },
+    logScrollContent: {
       paddingHorizontal: 12,
       paddingVertical: 8,
     },
@@ -827,14 +870,17 @@ function createStyles(theme: RemuxTheme) {
     // detent-sized RNHostView.
     sheet: {
       flex: 1,
-      paddingHorizontal: 18,
       paddingTop: 20,
     },
     sectionContent: {
       paddingBottom: 16,
+      paddingHorizontal: 18,
     },
     sectionScroll: {
       flex: 1,
+    },
+    sheetHeader: {
+      paddingHorizontal: 18,
     },
     sharedResources: {
       color: theme.textMuted,
