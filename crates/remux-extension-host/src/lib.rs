@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};

@@ -1,90 +1,158 @@
 # Remux
 
-Remux is a local-first mobile shell and extension runtime for small embeddable viewers. The runtime runs on your machine, serves extension viewers, proxies JSON-RPC between the mobile app and extension servers, and lets the Expo app host those viewers as native tabs.
+Remux is a local-first mobile workspace for tools that run on your own machine.
+An Expo app hosts extension viewers as native tabs while a Rust runtime serves
+their assets, routes JSON-RPC, supervises extension processes, and keeps the
+control plane responsive under heavy extension workloads.
 
-The first production-focused extension is Codex. The repo also includes markdown and editor viewers that exercise the same extension model.
+Codex is the most complete extension today. Terminal, Markdown, and Editor
+exercise the same manifest, viewer, and optional stdio-server model.
 
-Remux is early-stage local tooling. The runtime is intended for a trusted local machine or trusted LAN; it currently has no authentication layer and exposes filesystem/RPC capabilities to connected clients.
+## Architecture
 
-## Quick Start
+```mermaid
+flowchart LR
+    Phone["Expo mobile app"]
 
-Install dependencies:
+    subgraph Core["Remux core · reserved CPU"]
+        Guardian["L0.5 guardian<br/>recovery on :48124"]
+        Runtime["Runtime worker<br/>HTTP and WebSocket on :48123"]
+    end
+
+    subgraph ExtensionSlices["Equal-weight extension slices"]
+        Codex["Codex server"]
+        Terminal["Terminal server"]
+        External["Out-of-tree extension"]
+        Workload["Managed child workload"]
+    end
+
+    Phone -->|"authenticated HTTP and WebSocket"| Runtime
+    Phone -.->|"emergency recovery"| Guardian
+    Guardian -->|"restart or protect"| Runtime
+    Runtime -->|"stdio JSON-RPC"| Codex
+    Runtime -->|"stdio JSON-RPC"| Terminal
+    Runtime -->|"stdio JSON-RPC"| External
+    Codex -->|"declared workload"| Workload
+```
+
+The runtime and guardian live in `remux-core.slice` on reserved logical CPUs.
+Each extension gets an equal-weight child slice under
+`remux-extensions.slice`; an extension can subdivide its own allocation into
+declared interactive, background, or research workloads. Resource placement
+is cooperative protection for trusted local code, not a same-user security
+sandbox.
+
+See [Runtime Architecture](docs/architecture/remux-runtime.md) for the process,
+resource, RPC, and recovery model.
+
+## Repository layout
+
+| Path | Purpose |
+| --- | --- |
+| `app/` | Expo/React Native shell, tabs, WebView bridge, connection state, and native integrations |
+| `crates/remux/` | Rust runtime, guardian, CLI, HTTP/WebSocket router, extension supervisor, and resource manager |
+| `crates/remux-extension-host/` | Rust helper for launching extension-owned processes as declared Remux workloads |
+| `extensions/` | Bundled extension manifests, viewers, and optional stdio servers |
+| `packages/` | Shared TypeScript packages, currently `@remux/viewer-kit` |
+| `deploy/` | systemd units and host integrations installed by Remux |
+| `docs/` | Maintained architecture, development guides, and implementation records |
+
+Rust workspace members belong under `crates/`; npm workspaces belong under
+`app/`, `extensions/`, and `packages/`. Extension roots may live outside this
+repository and are discovered from `.remux/config.toml`.
+
+## Quick start
+
+Prerequisites are Linux with systemd user services, Rust/Cargo, Node/npm, and
+the Expo toolchain needed by your target device.
+
+Install JavaScript dependencies and build the bundled viewers:
 
 ```bash
 npm install
-```
-
-Build the bundled extension viewers:
-
-```bash
 npm run viewers:build
 ```
 
-Start the Remux runtime:
+For a foreground development runtime:
 
 ```bash
 REMUX_HOST=127.0.0.1 npm run dev
 ```
 
-For device testing, use a host address that the device can reach:
-
-```bash
-REMUX_HOST=0.0.0.0 npm run dev
-```
-
-Run the mobile app separately from `app/`:
+Use `REMUX_HOST=0.0.0.0` when a physical device must reach the host. Start the
+mobile app separately:
 
 ```bash
 npm --workspace @remux/app run start
 ```
 
-or build to a device:
+For the normal resilient installation, build the release binary and let it
+install the CLI symlink, systemd units, and Codex workload skill:
 
 ```bash
-npm --workspace @remux/app run ios
+npm run build:runtime
+./target/release/remux install
+./target/release/remux restart
 ```
 
-The runtime defaults to port `48123`, serves the extension catalog at `/remux/extensions`, serves viewers under their manifest routes, and exposes the Remux websocket at `/ws`.
+Pair the app with the bearer token printed by:
 
-## Architecture
-
-Remux has four main pieces:
-
-- `app/`: Expo/React Native mobile shell, browser tabs, WebView host bridge, connection settings, local tab persistence, and push notification registration.
-- `cli/`: Rust runtime (crash-restart supervisor + worker), HTTP server, websocket JSON-RPC router, extension discovery, extension process supervision, filesystem APIs, logging, and notification delivery.
-- `extensions/`: bundled Remux extensions. Each extension has a `remux-extension.json` manifest, a static viewer, and optionally a stdio JSON-RPC server.
-- `packages/`: shared extension APIs and UI primitives used by viewers.
-
-The high-level flow is:
-
-```text
-Expo app -> WebView host bridge -> Remux websocket /ws -> runtime router -> extension stdio server
-       \-> HTTP viewer assets and extension catalog served by the runtime
+```bash
+remux token
 ```
 
-See [docs/architecture/remux-runtime.md](docs/architecture/remux-runtime.md) and [docs/architecture/codex-extension.md](docs/architecture/codex-extension.md) for the maintained architecture notes.
+The main runtime defaults to port `48123`; its minimal guardian listens on
+`48124`. The guardian remains available when the worker is unhealthy and can
+restart it or temporarily freeze non-interactive workloads.
 
-## Commands
+## Common commands
 
 | Command | Purpose |
 | --- | --- |
-| `npm run dev` | Start the Remux runtime (cargo run) with extension discovery and `/ws`. |
-| `npm run build:cli` | Build the release runtime binary at `target/release/remux`. |
-| `npm run viewers:build` | Build bundled extension viewer assets. |
-| `npm run typecheck` | Typecheck the root TypeScript project. |
-| `npm run app:typecheck` | Typecheck the Expo app workspace. |
-| `npm run test:cli` | Run the Rust runtime tests (unit, chaos, and e2e). |
-| `npm run test:codex-server` | Run the Rust Codex extension server tests. |
-| `npm run test:codex` | Run Codex viewer Playwright tests. |
+| `npm run dev` | Run the supervisor and worker in the foreground |
+| `npm run build:runtime` | Build `target/release/remux` |
+| `npm run test:runtime` | Run the Rust runtime unit, integration, chaos, and process tests |
+| `npm run viewers:build` | Build bundled viewer assets |
+| `npm run typecheck` | Typecheck the root project and linked viewers |
+| `npm run app:typecheck` | Typecheck the Expo app |
+| `npm run test:codex-server` | Test the Codex extension server |
+| `npm run test:codex` | Run Codex viewer Playwright tests |
+| `remux status` | Show runtime, resource, and extension status |
+| `remux doctor` | Run read-only host diagnostics |
+| `remux logs [extension] -f` | Follow runtime or extension logs |
+
+## Extension model
+
+Every extension is rooted by `remux-extension.json`. A manifest can declare:
+
+- one or more static viewers and their build/watch commands;
+- launchers and file handlers for the mobile shell;
+- an optional newline-delimited stdio JSON-RPC server; and
+- in manifest version 2, named child workloads with a resource class,
+  lifetime, and thread default.
+
+The runtime remains transcript and process authoritative. Viewers communicate
+through `@remux/viewer-kit`; Rust servers can use
+`remux-extension-host` when they need a separately managed child process.
+Start with the [Extension Authoring Guide](docs/guides/extension-authoring.md).
+
+## Security
+
+Remux exposes shell-grade local capabilities. All HTTP and WebSocket surfaces
+except the health probes require a shared bearer token stored at
+`.remux/auth-token` with mode `0600`. This is authentication, not transport
+encryption: run Remux only on a trusted host and network, normally a tailnet.
+Remux does not terminate TLS itself.
 
 ## Documentation
 
-Start with [docs/README.md](docs/README.md).
+- [Documentation map](docs/README.md)
+- [Development Guide](docs/guides/development.md)
+- [Runtime Architecture](docs/architecture/remux-runtime.md)
+- [Extension Authoring](docs/guides/extension-authoring.md)
+- [Testing](docs/guides/testing.md)
+- [Codex Extension Architecture](docs/architecture/codex-extension.md)
 
-The root README is for orientation and day-one setup. Current architecture and guides live under `docs/architecture/` and `docs/guides/`. Implementation specs and historical phase plans live under `docs/specs/` with lifecycle labels.
-
-## Public Notes
-
-- The root package is private and this repo is source-oriented, not published as an npm package.
-- Native Expo generated folders, build output, local Remux state, credentials, and Rust targets are ignored.
-- `codex/` and `t3code/` are local reference checkouts used during development; they are not part of a fresh clone.
+Implementation specs under `docs/specs/` preserve design history. Treat
+documents marked `Current` as runtime truth and verify older paths against the
+repository layout above.

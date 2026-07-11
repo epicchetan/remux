@@ -5,10 +5,10 @@ Use this directory as the maintained map of the project. The root README should 
 ## Start Here
 
 - [Development Guide](guides/development.md): install, run the runtime, run the mobile app, and know which folders are generated.
-- [Runtime Architecture](architecture/remux-runtime.md): CLI server, websocket, extension discovery, viewer serving, app responsibilities, and notifications.
+- [Runtime Architecture](architecture/remux-runtime.md): guardian, runtime, resource hierarchy, RPC, extension supervision, and app responsibilities.
 - [Codex Extension Architecture](architecture/codex-extension.md): Codex viewer/server data flow, transcript resources, invalidations, and app-server integration.
 - [Extension Authoring](guides/extension-authoring.md): manifest shape, viewer build contract, launchers, file handlers, and stdio servers.
-- [Testing](guides/testing.md): root, mobile, CLI, Rust, and Playwright test commands.
+- [Testing](guides/testing.md): root, mobile, runtime, extension-server, and Playwright test commands.
 
 ## Current References
 

@@ -261,7 +261,7 @@ pub fn installed_unit_source() -> Result<Option<String>, String> {
 }
 
 pub fn embedded_unit() -> &'static str {
-    include_str!("../../../deploy/systemd/remux.service")
+    include_str!("../../../../deploy/systemd/remux.service")
 }
 
 pub fn embedded_static_units() -> [(&'static str, &'static str); 4] {
@@ -269,15 +269,15 @@ pub fn embedded_static_units() -> [(&'static str, &'static str); 4] {
         (UNIT_NAME, embedded_unit()),
         (
             "remux.slice",
-            include_str!("../../../deploy/systemd/remux.slice"),
+            include_str!("../../../../deploy/systemd/remux.slice"),
         ),
         (
             "remux-core.slice",
-            include_str!("../../../deploy/systemd/remux-core.slice"),
+            include_str!("../../../../deploy/systemd/remux-core.slice"),
         ),
         (
             "remux-extensions.slice",
-            include_str!("../../../deploy/systemd/remux-extensions.slice"),
+            include_str!("../../../../deploy/systemd/remux-extensions.slice"),
         ),
     ]
 }

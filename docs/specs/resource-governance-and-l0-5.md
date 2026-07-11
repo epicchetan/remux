@@ -1,6 +1,6 @@
 Status: Active Spec
 Last verified: 2026-07-11
-Canonical code: `deploy/systemd/remux.service`, `deploy/systemd/remux*.slice`, `cli/src/guardian.rs`, `cli/src/resource/`, `cli/src/cli/workload.rs`, `cli/src/supervise.rs`, `cli/src/runtime.rs`, `cli/src/extensions/process.rs`, `cli/src/extensions/supervisor.rs`, `cli/src/extensions/manifest.rs`, `cli/src/monitor.rs`, `cli/src/watchdog.rs`, `cli/src/rpc/ws.rs`, `crates/remux-extension-host/`, `packages/viewer-kit/src/rpc.ts`, `packages/viewer-kit/src/ipc.ts`, `packages/viewer-kit/src/host.ts`, `app/src/browser/BrowserShell.tsx`, `app/src/remote/RemuxConnectionProvider.tsx`, `app/src/remote/remuxRpcClient.ts`, `app/src/surfaces/viewer/ExtensionWebView.tsx`, `app/src/notifications/RemuxNotificationProvider.tsx`, `extensions/codex/remux-extension.json`, `extensions/codex/server/src/app_server.rs`, `extensions/codex/server/src/narration.rs`, `deploy/codex/skills/remux-workloads/`, `../ledger/remux-extension.json`
+Canonical code: `deploy/systemd/remux.service`, `deploy/systemd/remux*.slice`, `crates/remux/src/guardian.rs`, `crates/remux/src/resource/`, `crates/remux/src/cli/workload.rs`, `crates/remux/src/supervise.rs`, `crates/remux/src/runtime.rs`, `crates/remux/src/extensions/process.rs`, `crates/remux/src/extensions/supervisor.rs`, `crates/remux/src/extensions/manifest.rs`, `crates/remux/src/monitor.rs`, `crates/remux/src/watchdog.rs`, `crates/remux/src/rpc/ws.rs`, `crates/remux-extension-host/`, `packages/viewer-kit/src/rpc.ts`, `packages/viewer-kit/src/ipc.ts`, `packages/viewer-kit/src/host.ts`, `app/src/browser/BrowserShell.tsx`, `app/src/remote/RemuxConnectionProvider.tsx`, `app/src/remote/remuxRpcClient.ts`, `app/src/surfaces/viewer/ExtensionWebView.tsx`, `app/src/notifications/RemuxNotificationProvider.tsx`, `extensions/codex/remux-extension.json`, `extensions/codex/server/src/app_server.rs`, `extensions/codex/server/src/narration.rs`, `deploy/codex/skills/remux-workloads/`, `../ledger/remux-extension.json`
 
 # Resource governance, equal extension isolation, and L0.5 recovery
 
@@ -109,11 +109,11 @@ surface, manifest-v2 workloads and the Rust/CLI launch helpers, Codex workload
 adoption, cgroup accounting, semantic cancellable RPCs, bounded observable
 jobs, connection generation draining, and the global heavy-compute skill.
 
-The spec remains active until the new static units are installed, Remux is
-restarted into the hierarchy, and the Linux saturation/phone recovery gates in
-the test matrix are exercised on the live host. Static unit verification and
-all repository test suites pass without changing the currently running
-service.
+The static units are installed on the reference host, Remux is running in
+protected mode, and runtime, Codex, Ledger, Terminal, and the persistent Codex
+App Server have verified cgroup placement. Initial saturation recovery passed.
+The spec remains active for the broader soak/phone matrix and optional
+extension-specific splits described below.
 
 ## Relationship to existing specs
 
@@ -161,8 +161,8 @@ owns their application lifecycle.
 12. `RemuxConnectionProvider` currently adds queue, execution, and transfer
     budgets into one client response timer. Those phases are not independently
     observed, so the apparent precision does not describe where time was spent.
-13. `cli/src/rpc/ws.rs` separately hard-codes extension execution budgets by
-    method, while `cli/src/extensions/supervisor.rs` consumes an injected
+13. `crates/remux/src/rpc/ws.rs` separately hard-codes extension execution budgets by
+    method, while `crates/remux/src/extensions/supervisor.rs` consumes an injected
     `_remuxExecutionTimeoutMs` field and starts another response timer. A new
     extension RPC therefore requires policy knowledge in both TypeScript and
     Rust.
@@ -1351,13 +1351,13 @@ Files:
 
 - `deploy/systemd/remux.service`
 - new top-level slice units
-- new `cli/src/resource/systemd.rs`
-- new `cli/src/resource/topology.rs`
-- `cli/src/cli/systemd.rs`
-- `cli/src/cli/doctor.rs`
-- `cli/src/extensions/supervisor.rs`
-- `cli/src/extensions/process.rs`
-- `cli/src/monitor.rs`
+- new `crates/remux/src/resource/systemd.rs`
+- new `crates/remux/src/resource/topology.rs`
+- `crates/remux/src/cli/systemd.rs`
+- `crates/remux/src/cli/doctor.rs`
+- `crates/remux/src/extensions/supervisor.rs`
+- `crates/remux/src/extensions/process.rs`
+- `crates/remux/src/monitor.rs`
 
 Work:
 
@@ -1376,9 +1376,9 @@ equal extension parents; full CPU load does not block local Remux ping.
 
 Files:
 
-- `cli/src/supervise.rs`
-- new `cli/src/guardian/*`
-- `cli/src/runtime.rs`
+- `crates/remux/src/supervise.rs`
+- new `crates/remux/src/guardian.rs`
+- `crates/remux/src/runtime.rs`
 - guardian HTTP client/server
 - app System settings and native emergency UI
 
@@ -1405,8 +1405,8 @@ Files:
 - `app/src/remote/remuxRpcClient.ts`
 - `app/src/surfaces/viewer/ExtensionWebView.tsx`
 - `app/src/notifications/RemuxNotificationProvider.tsx`
-- `cli/src/rpc/ws.rs`
-- `cli/src/extensions/supervisor.rs`
+- `crates/remux/src/rpc/ws.rs`
+- `crates/remux/src/extensions/supervisor.rs`
 - settings, files, build, update, and extension viewer RPC call sites
 - resource stores
 
@@ -1438,9 +1438,9 @@ a job, not an open request.
 
 Files:
 
-- `cli/src/extensions/manifest.rs`
-- `cli/src/cli/workload.rs`
-- `cli/src/resource/systemd.rs`
+- `crates/remux/src/extensions/manifest.rs`
+- `crates/remux/src/cli/workload.rs`
+- `crates/remux/src/resource/systemd.rs`
 - CLI `remux workload *`
 - new `crates/remux-extension-host` Rust workspace crate
 - Settings workload rows

@@ -1,7 +1,7 @@
 # Testing
 
 Status: Current
-Last verified: 2026-07-07
+Last verified: 2026-07-11
 
 ## Root Typecheck
 
@@ -15,13 +15,15 @@ npm run typecheck
 npm run app:typecheck
 ```
 
-## CLI Tests
+## Runtime Tests
 
 ```bash
-npm run test:cli
+npm run test:runtime
 ```
 
-This runs the Cargo test suite for the Rust runtime in `cli/`: unit tests (including the `/proc` parsers and the watchdog staleness logic), integration tests (HTTP, WS, auth middleware matrix, fs core, fs relay, notifications incl. system pushes), the chaos suite (extension crash loops, kill-resistant extension *trees*, dead-pipe writes, grandchild reap, restart-storm stray-process checks, boot orphan sweep with pid-reuse guard, build-phase success/failure/rebuild), and process-level e2e tests (restart round-trip, `kill -9` self-healing, full-tree shutdown, build-phase boot with resources + `didSample` streaming), all running against enforced bearer auth.
+This runs the Cargo suite for `crates/remux/`: unit tests, HTTP/WebSocket and
+authentication integration tests, resource/guardian coverage, extension
+process chaos tests, and process-level restart/recovery tests.
 
 ## Codex Rust Server Tests
 

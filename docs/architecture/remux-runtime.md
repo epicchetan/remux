@@ -1,105 +1,227 @@
 # Remux Runtime Architecture
 
 Status: Current
-Last verified: 2026-07-07
+Last verified: 2026-07-11
 
-Remux is split between a local Rust runtime and an Expo mobile shell. The runtime owns extension discovery, HTTP serving, websocket JSON-RPC, stdio extension servers, filesystem APIs, logging, restart behavior, and push notification delivery. The mobile shell owns tabs, WebViews, connection state, native file/media pickers, viewport metrics, keyboard behavior, and notification registration.
+Remux is split between a local Rust control plane and an Expo mobile shell.
+The runtime owns process and resource supervision, extension discovery, viewer
+serving, JSON-RPC routing, filesystem access, logs, and notifications. The app
+owns tabs, WebViews, connection state, native pickers, viewport and keyboard
+integration, and push registration.
 
-## Runtime Process
+The `remux` package and binary live in `crates/remux/`. The CLI is one surface
+of that runtime crate, not a separate application.
 
-The runtime is the `remux` binary built from the `cli/` Cargo crate, layered for reliability:
+## Process and resource hierarchy
 
+```mermaid
+flowchart TB
+    subgraph Root["remux.slice"]
+        subgraph Core["remux-core.slice · reserved sibling CPUs"]
+            Service["remux.service"]
+            Supervisor["L1 supervisor"]
+            Guardian["L0.5 guardian"]
+            Worker["runtime worker"]
+            Watchdog["event-loop watchdog"]
+        end
+
+        subgraph Extensions["remux-extensions.slice · remaining CPUs"]
+            subgraph OneExtension["equal-weight extension parent slice"]
+                Server["stdio server"]
+                Build["build or watch scope"]
+                Interactive["interactive workload"]
+                Background["background or research workload"]
+            end
+        end
+    end
+
+    Service --> Supervisor
+    Supervisor --> Guardian
+    Supervisor --> Worker
+    Worker --> Watchdog
+    Worker --> Server
+    Worker --> Build
+    Server --> Interactive
+    Server --> Background
+    Guardian -.->|"restart worker"| Worker
+    Guardian -.->|"freeze under pressure"| Background
 ```
-L0  systemd user service   — boot start, supervisor death (deploy/systemd/remux.service)
-L1  remux supervisor       — worker crash restart with backoff (cli/src/supervise.rs)
-L2  extension containment  — crash budget, failed state (cli/src/extensions/supervisor.rs)
-L3  process hygiene        — pgroups, PDEATHSIG, orphan sweep (cli/src/extensions/)
+
+The reliability layers are deliberately small:
+
+1. **L0 — systemd:** `deploy/systemd/remux.service` starts at boot, owns the
+   whole control cgroup, and restarts the supervisor if that process exits.
+2. **L0.5 — guardian:** a minimal HTTP and pressure-control service inside the
+   supervisor process remains responsive when the worker is wedged. It can
+   restart the worker and freeze or thaw lower-priority scopes.
+3. **L1 — supervisor:** `crates/remux/src/supervise.rs` restarts the worker on
+   abnormal exit with capped backoff. Exit `75` is an intentional hot restart;
+   exit `0` stops the tree.
+4. **L2 — extension actors:** each extension server has an independent state
+   machine and crash budget. A failed extension cannot terminate Remux.
+5. **L3 — process hygiene:** process groups, parent-death signals, run-state
+   records, and startup sweeps prevent stale extension trees from surviving a
+   worker generation.
+
+The worker also has an event-loop watchdog. A Tokio task stamps a heartbeat;
+an OS thread aborts the worker when that heartbeat exceeds the configured
+stale interval. L1 then replaces it.
+
+### Guardian surface
+
+The main worker listens on `48123` by default. The guardian listens on `48124`
+and intentionally exposes a much smaller authenticated control API:
+
+- `GET /healthz` without authentication;
+- authenticated status and extension inventory reads;
+- idempotent worker restart, protection engage/release, and extension
+  pause/resume/stop/restart operations.
+
+Mutations require an `X-Remux-Operation-Id`. The guardian is a recovery path,
+not a second general-purpose application server.
+
+## Resource governance
+
+The installed systemd units reserve the first physical core's sibling threads
+for `remux-core.slice`. Extension work is restricted to the complementary CPU
+set. Runtime discovery creates one stable, root-qualified parent slice per
+extension and gives every extension parent the same CPU weight, including
+extensions discovered outside this repository.
+
+Within its parent slice, an extension may consume:
+
+- the supervised server scope;
+- lower-weight build and viewer-watch scopes; and
+- manifest-declared `interactive`, `background`, or `research` workloads.
+
+Manifest version 2 adds `resources.workloads`. Workload names and policy are
+declared by the manifest; callers provide only the semantic workload name,
+operation ID, optional thread request, and program. `remux workload exec`
+validates ownership, clamps thread counts, publishes common native-library
+thread variables, and replaces itself with the child in a transient systemd
+scope. The Rust `remux-extension-host` crate is a typed launch adapter over the
+same CLI contract.
+
+Background and research workloads are refused when protected placement is not
+available. On a compatible cgroup-v2 host, the guardian watches CPU pressure
+and worker heartbeat age; when both indicate starvation it freezes lower
+priority build/background/research scopes and thaws them after recovery.
+
+This model is designed to protect responsiveness from trusted, accidentally
+greedy extensions. It is not a hostile-code sandbox: all processes still run
+as the same user.
+
+## Extension lifecycle
+
+Discovery scans each configured extension root for child directories that
+contain `remux-extension.json`. The default root is `extensions/`; absolute
+out-of-tree roots are supported through `.remux/config.toml` or
+`REMUX_EXTENSION_ROOTS`.
+
+`crates/remux/src/extensions/supervisor.rs` owns one actor per extension with
+states such as `stopped`, `building`, `starting`, `running`, `backingOff`, and
+`failed`. Five crashes within sixty seconds exhaust the crash budget until a
+manual start. Stop closes stdin, then escalates through process-group SIGTERM
+and SIGKILL, and returns only after the child is reaped.
+
+Server, viewer-build, and viewer-watch commands are all manifest-owned. Missing
+build artifacts are produced automatically; explicit rebuild operations can
+be launched from Settings. Production executes the declared artifact instead
+of `cargo run`. Logs go to an in-memory ring and rotated files under
+`.remux/logs/extensions/`.
+
+Each spawned server receives its extension ID/root, protected-mode status, and
+the path to the workload launcher. A server can therefore place its own heavy
+children without knowing cgroup names or systemd policy.
+
+## HTTP, WebSocket, and RPC
+
+The worker serves health probes, the extension catalog and icons, built viewer
+assets, and `/ws`. Viewer routes fall back to their entry HTML and reject path
+traversal.
+
+```mermaid
+sequenceDiagram
+    participant V as Extension viewer
+    participant A as Expo host
+    participant R as Remux WebSocket
+    participant E as Extension server
+
+    V->>A: request(method, params, semantic contract)
+    A->>R: JSON-RPC plus remuxContract
+    R->>R: admit to bounded semantic lane
+    R->>E: newline-delimited JSON-RPC
+    E-->>R: result or error
+    R-->>A: JSON-RPC response
+    A-->>V: resolve request
+
+    opt viewer cancels
+        V->>A: remux/cancel(request id)
+        A->>R: cancellation frame
+        R->>E: $/cancelRequest when supported
+    end
 ```
 
-`remux start` runs a two-process tree:
+Requests carry a small semantic contract: `query`, `command`, `subscription`,
+`job-start`, or `liveness`. Callers do not choose transport lanes or assemble
+queue/execution/transfer timeouts. Remux assigns bounded control and extension
+lanes, makes query retry behavior explicit, and preserves operation IDs for
+commands and job admission.
 
-- **Supervisor** (`cli/src/supervise.rs`): a minimal, std-only parent that spawns the worker and restarts it on *any* abnormal exit with capped backoff. Exit `75` is a deliberate restart request (`remux/system/restart`); exit `0` shuts the tree down. The supervisor never gives up, so the runtime stays remotely recoverable even after a worker crash.
-- **Worker** (`cli/src/runtime.rs`): the actual runtime, marked by `REMUX_WORKER=<supervisor pid>` (honored only when it matches the parent pid, so shells spawned inside remux terminal sessions cannot accidentally start supervisor-less workers).
+Ordinary business RPCs have no arbitrary response deadline. They remain
+cancellable and are removed on response, connection close, extension
+generation change, or explicit cancellation. Transport handshakes, visibility
+checks, shutdown escalation, and similar protocol boundaries retain
+subsystem-owned deadlines.
 
-In production the tree runs under a systemd user service (`deploy/systemd/remux.service`, install runbook in the development guide) with linger enabled, so it starts on boot and outlives SSH sessions. A **hang watchdog** (`cli/src/watchdog.rs`) inside the worker converts a wedged event loop into a crash: a tokio task stamps a heartbeat every second, an OS thread aborts the process when the heartbeat is older than `watchdog_stale_seconds` (default 30, `0` disables), and the SIGABRT death takes L1's backoff path.
+Long operations use observable jobs. A `job-start` request admits an operation
+idempotently and returns its operation ID; `remux/jobs/read`,
+`remux/jobs/cancel`, and `remux/jobs/didChange` expose progress and terminal
+state without holding an opaque multi-minute request open.
 
-The worker assembles:
+Core RPC families include system status/resources/restart, extension
+start/stop/restart/build/watch/logs, filesystem operations, notification
+registration, and extension-prefixed methods such as `remux/codex/*`.
 
-- `REMUX_HOST` / `REMUX_PORT`, with `.remux/config.toml` as the fallback (`cli/src/config.rs`)
-- extension discovery from configured roots, defaulting to `extensions/` (`cli/src/extensions/`)
-- one supervised stdio server per extension manifest that defines one
-- viewer static serving for extension main views
-- the HTTP server and the websocket server at `/ws`
-- notification handling, the runtime journal, and graceful shutdown
+## Monitoring and recovery
 
-The default bind is `0.0.0.0:48123`. Use `REMUX_HOST=127.0.0.1` for local-only development.
+The resource monitor combines cgroup accounting with `/proc` fallbacks and
+publishes system, runtime, extension, role, and process usage through
+`remux/system/resources`. Client-scoped subscriptions stream samples only
+while needed. Optional extension memory ceilings generate throttled warnings
+and system pushes; they do not kill the extension automatically.
 
-## Extension Supervision
+Runtime events are written to `.remux/logs/runtime-<runId>.jsonl`. Live process
+groups are recorded under `.remux/run/` with process start ticks as PID-reuse
+guards. `remux status`, `remux doctor`, and `remux logs` read these surfaces
+without depending on the mobile app.
 
-`cli/src/extensions/supervisor.rs` runs one actor per extension with a state machine (`stopped`, `building`, `starting`, `running`, `stopping`, `backingOff`, `failed`). Crashes restart with capped backoff; five crashes in sixty seconds marks the extension `failed` until a manual start. An extension crash never terminates the runtime. Stop is stdin-EOF first, then SIGTERM to the process group, then SIGKILL to the group, and stop/restart RPCs only respond after the direct child is confirmed reaped and the group verified empty.
+## Mobile shell
 
-**Process hygiene (L3).** Every extension server (and build job) leads its own process group and takes `PDEATHSIG(SIGKILL)` at spawn (`cli/src/extensions/process.rs`). Group signals make kill escalation reach grandchildren; the crash path sweeps the dead child's group before any respawn. Live groups are recorded in `.remux/run/extensions.json` (`cli/src/extensions/runstate.rs`) with `/proc` start-ticks as a pid-reuse guard, and a boot-time sweep kills anything a previous worker left behind — a respawned worker can never coexist with a hung predecessor's extension servers.
+The Expo app under `app/` owns the authenticated connection and native viewer
+host. Important boundaries are:
 
-**Build phase.** A manifest's `server.build` declares how to produce the server binary that `server.command` points at (both real extensions run `cargo build --release` into `/tmp` target dirs). The build runs when the binary is missing (e.g. after a reboot cleared `/tmp`), when a start/restart RPC passes `rebuild: true`, or under `remux start --rebuild`. Build output lands in the extension log ring prefixed `[build]`; a failed build lands the extension in `failed` with `lastExit` reason `build-failed` without consuming crash budget. Production never runs `cargo run`.
+- `RemuxConnectionProvider`: socket generations, reconnect, semantic request
+  routing, and diagnostics;
+- `BrowserShell` and browser store: extension catalog, tabs, launch targets,
+  and restored session state;
+- `ExtensionWebView`: viewer bridge, forwarded RPC, native attachments,
+  viewport metrics, theme, and reload behavior; and
+- Settings and notification providers: runtime/extension operations, resource
+  visibility, pairing, push registration, and target navigation.
 
-Extension stderr goes to rotated per-extension files under `.remux/logs/extensions/` plus an in-memory ring served over `remux/extensions/logs` (with subscribe/follow variants). The runtime journal is written to `.remux/logs/runtime-<runId>.jsonl` with retention controlled by `log_retention_days`.
+Hidden viewer tabs remain mounted so extension UI state survives switching.
+The server-owned transcript or domain state remains authoritative.
 
-## Resource Monitoring
+## Security model
 
-`cli/src/monitor.rs` samples every `resource_poll_seconds` (default 5) from `/proc` directly (no extra dependencies): per-extension CPU/RSS/process-count by scanning process groups, system load/memory/disk, and the runtime's own usage. The latest sample is served over `remux/system/resources`; `remux/system/resources/subscribe|unsubscribe` are client-scoped and stream `remux/system/resources/didSample` per tick while the app's Settings surface is visible. An optional `extension_memory_ceiling_mb` raises a journal warning plus a system push (hourly-throttled per extension) when an extension's group RSS crosses it — alert only, no auto-kill.
+All worker HTTP and WebSocket requests except `/health`, `/healthz`, and
+`/readyz` require the shared token generated at `.remux/auth-token` with mode
+`0600`. Header authentication can establish the cookie needed by WebView
+subresources; a query token is supported for constrained clients. The guardian
+uses the same token for its control surface.
 
-## HTTP Surface
-
-`cli/src/http/` serves:
-
-- `/health`, `/healthz`, `/readyz`
-- `/remux/extensions`
-- `/remux/extensions/<id>/icon`
-- `/`, which redirects to the default extension viewer
-- extension viewer routes such as `/viewers/codex`
-
-The viewer provider serves built static viewer assets from each manifest's `views.main.entry`. It blocks path traversal and falls back to the entry HTML for viewer routes.
-
-## Websocket And RPC
-
-`cli/src/rpc/ws.rs` accepts JSON-RPC websocket connections at `/ws`.
-
-`cli/src/rpc/router.rs` routes:
-
-- `remux/system/restart`
-- `remux/system/resources` (plus client-scoped `resources/subscribe` and `resources/unsubscribe`)
-- `remux/extensions/status`
-- `remux/extensions/start` (optional `rebuild: true`)
-- `remux/extensions/stop`
-- `remux/extensions/restart` (optional `rebuild: true`)
-- `remux/extensions/logs` (plus `logs/subscribe` and `logs/unsubscribe`)
-- `remux/fs/*`
-- extension-prefixed methods such as `remux/codex/*`
-
-`cli/src/extensions/process.rs` launches stdio extension servers and forwards newline-delimited JSON-RPC to them through a single writer task, so a dying extension's closed pipe can never crash the runtime.
-
-## Mobile Shell
-
-The app is an Expo/React Native shell under `app/`.
-
-Important ownership:
-
-- `app/src/remote/remuxSettingsStore.ts`: host/port settings and origin building.
-- `app/src/remote/RemuxConnectionProvider.tsx`: websocket lifecycle, reconnects, request dispatch, and app diagnostics.
-- `app/src/browser/browserStore.ts`: extension catalog, tabs, active surface, restored session, and notification target opening.
-- `app/src/surfaces/viewer/ExtensionWebView.tsx`: WebView bridge, viewer readiness, request forwarding, health checks, automatic reloads, attachments, tab updates, file opening, keyboard dismissal, and viewport metrics.
-- `app/src/settings/SettingsOverview.tsx`: reconnect, runtime restart, and extension controls.
-
-Hidden viewer tabs remain mounted so tab state survives switching. That is good for continuity, but it can affect memory and background activity.
-
-## Notifications
-
-`cli/src/notifications.rs` receives extension notification requests, correlates them with earlier client requests, checks whether a registered client is already viewing the target, and sends Expo push notifications when needed.
-
-`app/src/notifications/RemuxNotificationProvider.tsx` registers a persistent client id, obtains an Expo push token, reports the active tab target to the runtime, suppresses foreground notifications for the visible target, and opens the matching tab when a notification is tapped.
-
-The notification system is extension-shaped, but the current concrete long-running actions are Codex turns and compactions. Separately, **system pushes** (`data.kind: "system"`, reasons `extension-failed` / `memory-ceiling`) go to every registered client with a token, are never visibility-suppressed, and open the Settings surface when tapped.
-
-## Security Model
-
-Remux assumes a trusted runtime host. The `/ws` upgrade and all HTTP (except the health endpoints) require a shared bearer token generated at `.remux/auth-token` (0600) — accepted as an `Authorization: Bearer` header, a `remux_auth` cookie (set automatically on header-authenticated responses so viewer WebView subresources authenticate), or a `?token=` query parameter. `remux token` prints it for pairing; `require_auth = false` in `.remux/config.toml` disables enforcement. The token is a second layer, not transport security: it exposes shell-grade RPC to any holder, so keep the runtime on a trusted network (the tailnet) — transport encryption is WireGuard's job, and there is no TLS. Design intent and threat model: `docs/specs/cli-rust-port-pass-3-auth.md`.
+The token does not provide transport encryption. Remux exposes shell-grade
+capabilities to its holder and should run only on a trusted host/network,
+normally behind WireGuard or a tailnet. `require_auth = false` is an explicit
+lockout-recovery escape hatch, not a normal deployment mode.

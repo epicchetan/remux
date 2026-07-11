@@ -2,6 +2,9 @@
 name = "remux-extension-host"
 version = "0.1.0"
 edition = "2021"
+description = "Rust process-launch helpers for Remux extension workloads"
+readme = "README.md"
+repository = "https://github.com/epicchetan/remux"
 publish = false
 
 [lib]

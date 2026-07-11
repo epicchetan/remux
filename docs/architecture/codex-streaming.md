@@ -603,13 +603,15 @@ See `resource_invalidations.rs:230`.
 
 ## Process Bridge
 
-### Rust to CLI
+### Extension server to runtime
 
 The Rust server writes JSON-RPC responses and notifications to stdout. `spawn_stdout_writer()` writes one JSON value per line. See `extensions/codex/server/src/main.rs:176`.
 
-The CLI extension process reads stdout line-by-line. If a line is a JSON-RPC response, it resolves the pending request. If it is a JSON-RPC notification with a method, it broadcasts it. See `cli/extensionProcess.cjs:188`.
+The runtime supervisor reads stdout line-by-line. A JSON-RPC response resolves
+the routed pending request; a notification with a method is broadcast to
+connected clients. See `crates/remux/src/extensions/supervisor.rs`.
 
-### CLI to React Native WebView
+### Runtime to React Native WebView
 
 `ExtensionWebView` sends viewer requests to Remux via `remux.request(...)` and posts responses back into the WebView. See `app/src/surfaces/viewer/ExtensionWebView.tsx:523`.
 

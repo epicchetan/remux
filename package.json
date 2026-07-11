@@ -7,14 +7,14 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "cargo run --manifest-path cli/Cargo.toml -- start",
-    "build:cli": "cargo build --release --manifest-path cli/Cargo.toml",
+    "dev": "cargo run -p remux -- start --foreground",
+    "build:runtime": "cargo build --release -p remux",
     "app:typecheck": "npm --workspace @remux/app run typecheck",
     "mobile:typecheck": "npm --workspace @remux/app run typecheck",
     "viewers:build": "npm --workspaces --if-present run build",
     "typecheck": "tsc --noEmit && node scripts/typecheck-linked-viewers.mjs",
     "lint": "npm run typecheck",
-    "test:cli": "cargo test --manifest-path cli/Cargo.toml",
+    "test:runtime": "cargo test -p remux",
     "test:codex-server": "cargo test --manifest-path extensions/codex/server/Cargo.toml --offline",
     "test:codex": "playwright test -c extensions/codex/playwright.config.ts",
     "test:terminal-server": "cargo test --manifest-path extensions/terminal/server/Cargo.toml",

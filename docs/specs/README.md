@@ -2,6 +2,10 @@
 
 Specs capture design intent and implementation plans. They are useful for rationale, but they are not automatically current runtime documentation.
 
+Historical specs preserve paths and command names from the implementation pass
+they describe. The Rust runtime moved from `cli/` to `crates/remux/` on
+2026-07-11; use the current architecture and guides for today's layout.
+
 ## Statuses
 
 - `Active Spec`: still informs ongoing implementation or design.
@@ -51,7 +55,7 @@ Canonical code: ...
 | [files-tab.md](files-tab.md) | Active Spec | Files tab overhaul: freshness model (tab re-entry + expanded-descendant refresh with an explicit concurrency/failure contract), `remux/fs/didChange` push invalidation (3-layer detection: served-dir watchers + `.git` watchers + git-status poller; fs-core invalidate/subscribe API; shared `isPathWithin` contract), SF Symbol icon redesign with PNG fallback. |
 | [tab-identity-and-routing.md](tab-identity-and-routing.md) | Active Spec | Tab identity = resource key (no alias history); single `openResource` choke point with reuse dispositions; `host/navigate` intent delivery on reuse; codex host-bridge migration to viewer-kit (P2); RPC origin attribution to fix the codex draft→thread notification race; key-based tray dismissal so arriving at a resource clears its notifications. |
 | [rpc-concurrency-and-mobile-resilience.md](rpc-concurrency-and-mobile-resilience.md) | Active Spec | P0/P1 transport hardening: non-blocking WebSocket/extension protocol readers, exhaustive typed RPC policies, bounded ordered lanes, mobile liveness and make-before-break reconnect, Codex retry safety, and sequenced Terminal input/replay recovery. |
-| [resource-governance-and-l0-5.md](resource-governance-and-l0-5.md) | Active Spec | Implementation is in-tree for Remux-first scheduling, equal extension isolation, trusted child workloads, L0.5 phone recovery, semantic cancellable RPCs, persistent Codex containment, and safe connection generations; live unit activation and saturation validation remain. |
+| [resource-governance-and-l0-5.md](resource-governance-and-l0-5.md) | Active Spec | Remux-first scheduling, equal extension isolation, trusted child workloads, L0.5 phone recovery, semantic cancellable RPCs, persistent Codex containment, and safe connection generations are in-tree and active on the reference host; the broader soak/phone matrix and optional extension splits remain. |
 | [cli-rust-port.md](cli-rust-port.md) | Active Spec | CLI audit (EPIPE crash root cause, restart-policy and orphan-process defects) + Rust port roadmap: four-layer supervision (systemd/supervisor/crash containment/process hygiene), extension lifecycle state machine, per-extension logs, resource monitoring. |
 | [cli-rust-port-pass-1.md](cli-rust-port-pass-1.md) | Implemented | Pass 1 implementation spec: full Rust replacement of the Node CLI in one pass — L1 crash-restart supervisor, L2 extension state machine with crash budget, EOF→SIGTERM→SIGKILL stop with confirmed reap, per-extension logs RPC, journal rotation, chaos test suite, cutover. Punts L0/systemd, full L3, resource monitoring (pass 2). Landed as the `cli/` Rust crate. |
 | [cli-rust-port-pass-2.md](cli-rust-port-pass-2.md) | Implemented | Pass 2 implementation spec: L0 systemd user service, worker hang watchdog, full L3 process hygiene (pgroups + PDEATHSIG + boot orphan sweep), manifest `build` phase (no `cargo run` in production), `/proc` resource monitoring + `remux/system/resources*` RPCs, failed-state push notifications, and the app Settings ops UI (live badges, log tail, System section). Punts auth token and CLI subcommands to pass 3. |
