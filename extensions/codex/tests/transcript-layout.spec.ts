@@ -12,6 +12,7 @@ import {
 import {
   anchorTurnUserMessageScrollTop,
   autoScrollModeAfterNativeScrollSettles,
+  autoScrollModeForStreamingTurn,
   initialTranscriptScrollTarget,
   nativeScrollOwnsTranscriptViewport,
   transcriptMessageAnchorTopOffset,
@@ -467,6 +468,27 @@ test.describe('transcript work disclosure', () => {
     });
   });
 
+  test('preserves existing auto-open work across refreshes after manual scroll break', () => {
+    const runningTurn = turn('turn-1', workSegment('work-1', { state: 'running' }));
+    runningTurn.status = 'inProgress';
+    const runningLayout = measureCollapsedTranscript({ turns: [runningTurn], width: 600 });
+    const opened = reconcileTranscriptDisclosure(emptyDisclosure(), runningLayout.turns, 'turn-1');
+
+    const refreshedTurn = turn('turn-1', workSegment('work-1', { revision: 'streamed', state: 'running' }));
+    refreshedTurn.status = 'inProgress';
+    const refreshedLayout = measureCollapsedTranscript({ turns: [refreshedTurn], width: 600 });
+    const reconciled = reconcileTranscriptDisclosure(opened, refreshedLayout.turns, 'turn-1', {
+      autoWorkManaged: false,
+    });
+
+    expect(reconciled.autoOpenWorkKey).toBe('turn-1:work-1');
+    expect(reconciled.openWorkByKey['turn-1:work-1']).toMatchObject({
+      rowId: 'turn-1:work-1',
+      source: 'auto',
+      turnId: 'turn-1',
+    });
+  });
+
   test('collapses previous auto-open work when assistant streaming starts after manual scroll break', () => {
     const runningTurn = turn('turn-1', workSegment('work-1', { state: 'running' }));
     runningTurn.status = 'inProgress';
@@ -526,7 +548,7 @@ test.describe('transcript work disclosure', () => {
     const runningLayout = measureCollapsedTranscript({ turns: [runningTurn], width: 600 });
     const opened = reconcileTranscriptDisclosure(emptyDisclosure(), runningLayout.turns, 'turn-1');
 
-    const openedWithChild = {
+    const openedWithChild = promoteOpenWorkDisclosure({
       ...opened,
       openWorkByKey: {
         ...opened.openWorkByKey,
@@ -535,7 +557,7 @@ test.describe('transcript work disclosure', () => {
           openChildByKey: { 'tool:1': true },
         },
       },
-    };
+    }, 'turn-1:work-1');
     const streamingAnswerTurn = turn(
       'turn-1',
       workSegment('work-1', { state: 'completed' }),
@@ -596,6 +618,47 @@ test.describe('transcript work disclosure', () => {
       source: 'user',
       turnId: 'turn-1',
     });
+  });
+
+  test('preserves work reopened by the user while the assistant continues streaming', () => {
+    const streamingTurn = turn(
+      'turn-1',
+      workSegment('work-1', { state: 'completed' }),
+      assistantSegment('assistant-1', 'streaming answer'),
+    );
+    streamingTurn.status = 'inProgress';
+    const streamingLayout = measureCollapsedTranscript({ turns: [streamingTurn], width: 600 });
+    const reopened = {
+      autoOpenWorkKey: null,
+      expandedUserMessageByKey: {},
+      manuallyClosedAutoWorkByTurnId: {},
+      openWorkByKey: {
+        'turn-1:work-1': {
+          additionalHeight: 96,
+          key: 'turn-1:work-1',
+          openChildByKey: {},
+          rowId: 'turn-1:work-1',
+          segmentId: 'work-1',
+          source: 'user' as const,
+          turnId: 'turn-1',
+        },
+      },
+    };
+
+    const refreshedTurn = turn(
+      'turn-1',
+      workSegment('work-1', { revision: 'refreshed', state: 'completed' }),
+      assistantSegment('assistant-1', 'longer streaming answer'),
+    );
+    refreshedTurn.status = 'inProgress';
+    const refreshedLayout = measureCollapsedTranscript({ turns: [refreshedTurn], width: 600 });
+    const reconciled = reconcileTranscriptDisclosure(reopened, refreshedLayout.turns, 'turn-1');
+
+    expect(reconciled.openWorkByKey['turn-1:work-1']).toMatchObject({
+      additionalHeight: 96,
+      source: 'user',
+    });
+    expect(streamingLayout.turns[0]?.rows.some((row) => row.segment.type === 'assistantMessage')).toBe(true);
   });
 
   test('does not auto-reopen running work after the user closes that turn', () => {
@@ -909,19 +972,41 @@ test.describe('transcript virtualizer scroll targets', () => {
     expect(nativeScrollOwnsTranscriptViewport(phase)).toBe(false);
   });
 
-  test('restores stickiness only after native scrolling settles near its target', () => {
+  test('restores bottom stickiness only after native scrolling settles at the bottom', () => {
     expect(autoScrollModeAfterNativeScrollSettles({
       nearBottom: false,
-      streamingTurnId: 'turn-1',
     })).toEqual({ type: 'off' });
     expect(autoScrollModeAfterNativeScrollSettles({
       nearBottom: true,
+    })).toEqual({ type: 'bottom' });
+  });
+
+  test('keeps bottom and sent-message auto-scroll modes distinct as streaming changes', () => {
+    expect(autoScrollModeForStreamingTurn({
+      currentMode: { type: 'bottom' },
+      nearBottom: true,
+      streamingTurnId: 'turn-1',
+    })).toEqual({ type: 'bottom' });
+    expect(autoScrollModeForStreamingTurn({
+      currentMode: { type: 'off' },
+      nearBottom: true,
+      streamingTurnId: 'turn-1',
+    })).toEqual({ type: 'bottom' });
+    expect(autoScrollModeForStreamingTurn({
+      currentMode: { type: 'sent-message-anchor', turnId: 'turn-1' },
+      nearBottom: false,
       streamingTurnId: 'turn-1',
     })).toEqual({ type: 'sent-message-anchor', turnId: 'turn-1' });
-    expect(autoScrollModeAfterNativeScrollSettles({
-      nearBottom: true,
+    expect(autoScrollModeForStreamingTurn({
+      currentMode: { type: 'sent-message-anchor', turnId: 'turn-1' },
+      nearBottom: false,
       streamingTurnId: null,
-    })).toEqual({ type: 'bottom' });
+    })).toEqual({ type: 'off' });
+    expect(autoScrollModeForStreamingTurn({
+      currentMode: { type: 'sent-message-anchor', turnId: 'turn-1' },
+      nearBottom: false,
+      streamingTurnId: 'turn-2',
+    })).toEqual({ type: 'off' });
   });
 
   test('uses safe-area-aware offset for sent message targets', () => {
@@ -958,7 +1043,7 @@ test.describe('transcript virtualizer scroll targets', () => {
       ],
       streamingTurnId: 'turn-1',
     })).toEqual({
-      mode: { type: 'sent-message-anchor', turnId: 'turn-1' },
+      mode: { type: 'off' },
       scrollTop: 10,
     });
 

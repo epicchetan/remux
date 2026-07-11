@@ -46,17 +46,39 @@ export function nativeScrollOwnsTranscriptViewport(phase: TranscriptNativeScroll
 
 export function autoScrollModeAfterNativeScrollSettles({
   nearBottom,
+}: {
+  nearBottom: boolean;
+}): TranscriptAutoScrollMode {
+  return nearBottom ? { type: 'bottom' } : { type: 'off' };
+}
+
+export function autoScrollModeForStreamingTurn({
+  currentMode,
+  nearBottom,
   streamingTurnId,
 }: {
+  currentMode: TranscriptAutoScrollMode;
   nearBottom: boolean;
   streamingTurnId: string | null;
 }): TranscriptAutoScrollMode {
-  if (!nearBottom) {
-    return { type: 'off' };
+  // Streaming lifecycle changes must not turn bottom stickiness into a
+  // sent-message anchor. That anchor is entered explicitly by turn navigation.
+  if (!streamingTurnId) {
+    return currentMode.type === 'sent-message-anchor' ? { type: 'off' } : currentMode;
   }
-  return streamingTurnId
-    ? { type: 'sent-message-anchor', turnId: streamingTurnId }
-    : { type: 'bottom' };
+
+  if (currentMode.type === 'sent-message-anchor') {
+    if (currentMode.turnId === streamingTurnId) {
+      return currentMode;
+    }
+    return nearBottom ? { type: 'bottom' } : { type: 'off' };
+  }
+
+  if (currentMode.type === 'bottom' || nearBottom) {
+    return { type: 'bottom' };
+  }
+
+  return { type: 'off' };
 }
 
 export function userMessageAnchorScrollTop(rowTop: number, topPadding: number) {
@@ -75,7 +97,7 @@ export function initialTranscriptScrollTarget({
     : null;
   if (streamingAnchor && streamingTurnId) {
     return {
-      mode: { type: 'sent-message-anchor', turnId: streamingTurnId },
+      mode: { type: 'off' },
       scrollTop: streamingAnchor.scrollTop,
     };
   }

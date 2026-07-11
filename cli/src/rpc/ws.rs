@@ -38,16 +38,22 @@ pub struct WsClient {
     pending: Mutex<HashMap<String, oneshot::Sender<Result<Value, JsonRpcError>>>>,
     pub client_id: Mutex<Option<String>>,
     pub session_id: Mutex<Option<String>>,
+    connection_id: u64,
+    next_origin_id: AtomicU64,
+    origins: Mutex<HashMap<String, String>>,
 }
 
 impl WsClient {
-    fn new(outbound: mpsc::UnboundedSender<Message>) -> Arc<Self> {
+    fn new(outbound: mpsc::UnboundedSender<Message>, connection_id: u64) -> Arc<Self> {
         Arc::new(Self {
             outbound,
             next_request_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             client_id: Mutex::new(None),
             session_id: Mutex::new(None),
+            connection_id,
+            next_origin_id: AtomicU64::new(1),
+            origins: Mutex::new(HashMap::new()),
         })
     }
 
@@ -128,6 +134,31 @@ impl WsClient {
     fn close(&self) {
         let _ = self.outbound.send(Message::Close(None));
     }
+
+    fn origin_for_context(&self, context: Option<&Value>) -> String {
+        let context_key = context
+            .and_then(|value| serde_json::to_string(value).ok())
+            .unwrap_or_else(|| "null".to_string());
+        let mut origins = self.origins.lock().unwrap();
+        origins
+            .entry(context_key)
+            .or_insert_with(|| {
+                format!(
+                    "remux-origin-{}-{}",
+                    self.connection_id,
+                    self.next_origin_id.fetch_add(1, Ordering::Relaxed)
+                )
+            })
+            .clone()
+    }
+
+    fn owns_origin(&self, origin: &str) -> bool {
+        self.origins
+            .lock()
+            .unwrap()
+            .values()
+            .any(|candidate| candidate == origin)
+    }
 }
 
 /// Hooks the notification manager registers with the WS layer
@@ -192,6 +223,7 @@ pub struct WsServer {
     router: Arc<RpcRouter>,
     hooks: WsHooks,
     log: Arc<dyn WsLog>,
+    next_connection_id: AtomicU64,
 }
 
 impl WsServer {
@@ -201,6 +233,7 @@ impl WsServer {
             router,
             hooks,
             log,
+            next_connection_id: AtomicU64::new(1),
         })
     }
 
@@ -229,6 +262,19 @@ impl WsServer {
         });
     }
 
+    /// Deliver one extension notification only to the downstream origin that
+    /// issued the subscription request. Origins are opaque to extensions and
+    /// disappear with the owning socket.
+    pub fn send_to_origin(&self, origin: &str, message: Value) -> bool {
+        let payload = with_json_rpc_version(message);
+        let clients = self.clients.lock().unwrap();
+        let Some(client) = clients.iter().find(|client| client.owns_origin(origin)) else {
+            return false;
+        };
+        client.send_message(&payload);
+        true
+    }
+
     pub fn close(&self) {
         let clients: Vec<Arc<WsClient>> = self.clients.lock().unwrap().drain(..).collect();
         for client in clients {
@@ -249,7 +295,10 @@ impl WsServer {
 
     async fn handle_socket(self: Arc<Self>, socket: WebSocket, remote: Option<String>) {
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Message>();
-        let client = WsClient::new(outbound_tx);
+        let client = WsClient::new(
+            outbound_tx,
+            self.next_connection_id.fetch_add(1, Ordering::Relaxed),
+        );
 
         {
             let mut clients = self.clients.lock().unwrap();
@@ -385,7 +434,13 @@ impl WsServer {
                 .handle_client_request(client.clone(), method.clone(), params.cloned())
                 .await
         } else {
-            self.router.handle_request(&method, params).await
+            let routed_params = if self.router.routes_to_extension(&method) {
+                let origin = client.origin_for_context(message.get("remuxContext"));
+                params_with_origin(params, origin)
+            } else {
+                params.cloned()
+            };
+            self.router.handle_request(&method, routed_params.as_ref()).await
         };
 
         match result {
@@ -398,6 +453,22 @@ impl WsServer {
             Err(error) => {
                 client.send_message(&error_message(&id, &error));
             }
+        }
+    }
+}
+
+fn params_with_origin(params: Option<&Value>, origin: String) -> Option<Value> {
+    match params {
+        Some(Value::Object(params)) => {
+            let mut params = params.clone();
+            params.insert("_remuxOrigin".to_string(), Value::from(origin));
+            Some(Value::Object(params))
+        }
+        Some(other) => Some(other.clone()),
+        None => {
+            let mut params = serde_json::Map::new();
+            params.insert("_remuxOrigin".to_string(), Value::from(origin));
+            Some(Value::Object(params))
         }
     }
 }

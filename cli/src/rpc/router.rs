@@ -334,6 +334,21 @@ impl RpcRouter {
         server.handle_rpc(method.to_string(), params.cloned()).await
     }
 
+    /// True when a request will be forwarded to an extension server rather
+    /// than handled by Remux itself. The WS layer uses this boundary to attach
+    /// an opaque downstream origin without changing built-in RPC contracts.
+    pub fn routes_to_extension(&self, method: &str) -> bool {
+        if is_system_method(method)
+            || is_extension_management_method(method)
+            || is_core_method(method)
+        {
+            return false;
+        }
+        let extension_id = extension_id_from_method(method)
+            .or(self.default_extension_id.as_deref());
+        extension_id.and_then(|id| self.server(id)).is_some()
+    }
+
     pub fn handle_notification(&self, method: &str, params: Option<Value>) {
         let extension_id = extension_id_from_method(method)
             .or(self.default_extension_id.as_deref());

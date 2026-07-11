@@ -367,38 +367,6 @@ export function reconcileTranscriptDisclosure(
     ? turns.find((turn) => turn.turn.status === 'inProgress') ?? null
     : turns.find((turn) => turn.turnId === autoOpenTurnId && turn.turn.status === 'inProgress') ?? null;
 
-  const preserveUnmanagedPreviousAutoWork = () => {
-    if (!previousAutoOpenWork || manuallyClosedAutoWorkByTurnId[previousAutoOpenWork.turnId]) {
-      return null;
-    }
-    if (!hasOpenWorkChild(previousAutoOpenWork)) {
-      return null;
-    }
-
-    return {
-      autoOpenWorkKey: null,
-      expandedUserMessageByKey,
-      manuallyClosedAutoWorkByTurnId,
-      openWorkByKey: {
-        ...openWorkByKey,
-        [previousAutoOpenWork.key]: {
-          ...previousAutoOpenWork,
-          source: 'user' as const,
-        },
-      },
-    };
-  };
-
-  if (!autoWorkManaged) {
-    const preserved = preserveUnmanagedPreviousAutoWork();
-    return preserved ?? {
-      autoOpenWorkKey: null,
-      expandedUserMessageByKey,
-      manuallyClosedAutoWorkByTurnId,
-      openWorkByKey,
-    };
-  }
-
   if (!workingTurn) {
     return {
       autoOpenWorkKey: null,
@@ -419,6 +387,21 @@ export function reconcileTranscriptDisclosure(
 
   if (turnHasAssistantMessage(workingTurn)) {
     return {
+      autoOpenWorkKey: null,
+      expandedUserMessageByKey,
+      manuallyClosedAutoWorkByTurnId,
+      openWorkByKey,
+    };
+  }
+
+  if (!autoWorkManaged) {
+    // Leaving an auto-scroll mode stops new work from opening, but it should
+    // not close work that was already visible. Assistant output and turn
+    // completion are handled above as the intentional collapse boundaries.
+    const preserved = previousAutoOpenWork?.turnId === workingTurn.turnId
+      ? preservePreviousAutoWork()
+      : null;
+    return preserved ?? {
       autoOpenWorkKey: null,
       expandedUserMessageByKey,
       manuallyClosedAutoWorkByTurnId,
@@ -567,10 +550,6 @@ function transcriptViewportAllowsAutoWork(disclosure: TranscriptDisclosureState)
 
 function hasAutoOpenWork(disclosure: TranscriptDisclosureState) {
   return Object.values(disclosure.openWorkByKey).some((openWork) => openWork.source === 'auto');
-}
-
-function hasOpenWorkChild(openWork: TranscriptOpenWorkDisclosure) {
-  return Object.values(openWork.openChildByKey).some(Boolean);
 }
 
 function workRowForDisclosure(

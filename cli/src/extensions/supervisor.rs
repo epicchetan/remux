@@ -67,6 +67,11 @@ const REMUX_NOTIFICATION_METHOD_PREFIX: &str = "remux/notifications/";
 /// (system push notification; no-op default keeps test contexts small).
 pub trait ExtensionCtx: Send + Sync {
     fn broadcast(&self, message: Value);
+    /// Sends a notification to one opaque origin previously attached to an
+    /// extension request. The default keeps fixture contexts source-compatible.
+    fn send_to_origin(&self, _origin: &str, _message: Value) -> bool {
+        false
+    }
     fn handle_extension_notification(&self, message: Value) -> BoxFuture<'_, bool>;
     /// Fires once per `failed` entry (crash budget exhausted or build failed).
     fn on_extension_failed(&self, _extension_id: &str, _name: &str, _body: String) {}
@@ -1742,7 +1747,12 @@ async fn handle_protocol_line(
     }
 
     if message.get("method").and_then(Value::as_str).is_some() {
+        let (target_origin, message) = take_extension_target(message);
         let normalized = normalize_extension_notification(message, extension_id);
+        if let Some(origin) = target_origin {
+            let _ = ctx.send_to_origin(&origin, normalized);
+            return;
+        }
         let method = normalized
             .get("method")
             .and_then(Value::as_str)
@@ -1757,6 +1767,21 @@ async fn handle_protocol_line(
             return;
         }
         ctx.broadcast(normalized);
+    }
+}
+
+fn take_extension_target(message: Value) -> (Option<String>, Value) {
+    match message {
+        Value::Object(mut record) => {
+            let origin = record.remove("remuxTarget").and_then(|target| {
+                target
+                    .get("origin")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+            (origin, Value::Object(record))
+        }
+        other => (None, other),
     }
 }
 

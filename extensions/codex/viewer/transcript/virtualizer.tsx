@@ -26,6 +26,7 @@ import {
 import {
   anchorTurnUserMessageScrollTop,
   autoScrollModeAfterNativeScrollSettles,
+  autoScrollModeForStreamingTurn,
   initialTranscriptScrollTarget,
   nativeScrollOwnsTranscriptViewport,
   transcriptNativeScrollPhaseAfterEvent,
@@ -376,7 +377,10 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       return;
     }
 
-    scrollToPosition(anchor.scrollTop, { type: 'off' }, 'scroll-navigation');
+    const nextMode = anchor === lastScrollAnchor(navigationAnchorsRef.current) && anchor.turnId === streamingTurnIdRef.current
+      ? { type: 'sent-message-anchor' as const, turnId: anchor.turnId }
+      : { type: 'off' as const };
+    scrollToPosition(anchor.scrollTop, nextMode, 'scroll-navigation');
   }, [scrollToPosition]);
 
   const scrollDown = useCallback(() => {
@@ -498,7 +502,6 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
 
       const mode = autoScrollModeAfterNativeScrollSettles({
         nearBottom: isNearBottom(viewport),
-        streamingTurnId: streamingTurnIdRef.current,
       });
       setViewportAutoScrollMode(mode, 'scroll-settled');
       if (mode.type === 'off') {
@@ -631,10 +634,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
 
   useEffect(() => {
     const viewport = viewportRef.current;
-    if (
-      !streamingTurnId ||
-      nativeScrollOwnsTranscriptViewport(nativeScrollPhaseRef.current)
-    ) {
+    if (nativeScrollOwnsTranscriptViewport(nativeScrollPhaseRef.current)) {
       return;
     }
 
@@ -642,13 +642,13 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       return;
     }
 
-    if (autoScrollModeRef.current.type === 'sent-message-anchor') {
-      scheduleAutoScroll();
-      return;
-    }
-
-    if (autoScrollModeRef.current.type === 'bottom' || isNearBottom(viewport)) {
-      setViewportAutoScrollMode({ type: 'sent-message-anchor', turnId: streamingTurnId }, 'streaming-turn');
+    const mode = autoScrollModeForStreamingTurn({
+      currentMode: autoScrollModeRef.current,
+      nearBottom: isNearBottom(viewport),
+      streamingTurnId,
+    });
+    setViewportAutoScrollMode(mode, 'streaming-turn');
+    if (mode.type !== 'off') {
       scheduleAutoScroll();
     }
   }, [scheduleAutoScroll, setViewportAutoScrollMode, streamingTurnId]);

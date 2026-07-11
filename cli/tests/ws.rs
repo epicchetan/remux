@@ -323,3 +323,70 @@ async fn broadcast_adds_jsonrpc_version_and_reaches_clients() {
         })
     );
 }
+
+#[tokio::test]
+async fn extension_origins_are_opaque_stable_and_target_one_downstream_context() {
+    let fixture = start_fixture().await;
+    let mut first = connect(fixture.addr).await;
+    let mut second = connect(fixture.addr).await;
+
+    first
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 41,
+                "method": "remux/terminal/projections/subscribe",
+                "params": { "projection": "bars:1m" },
+                "remuxContext": { "tabId": "tab-a", "resourceKey": "replay-a" }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let response = next_text(&mut first).await;
+    let origin = response["result"]["params"]["_remuxOrigin"]
+        .as_str()
+        .expect("origin injected into extension params")
+        .to_string();
+    assert!(origin.starts_with("remux-origin-"));
+
+    first
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "remux/terminal/projections/subscribe",
+                "params": {},
+                "remuxContext": { "tabId": "tab-a", "resourceKey": "replay-a" }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let repeated = next_text(&mut first).await;
+    assert_eq!(
+        repeated["result"]["params"]["_remuxOrigin"],
+        Value::from(origin.clone())
+    );
+
+    assert!(fixture.server.send_to_origin(
+        &origin,
+        json!({ "method": "remux/terminal/projections/frame", "params": { "seq": 1 } })
+    ));
+    assert_eq!(
+        next_text(&mut first).await,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "remux/terminal/projections/frame",
+            "params": { "seq": 1 }
+        })
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), second.next())
+            .await
+            .is_err(),
+        "unrelated socket must not receive a targeted extension frame"
+    );
+}

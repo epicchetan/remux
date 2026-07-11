@@ -18,6 +18,7 @@ use remux::rpc::router::{BoxFuture, ExtensionServer, ServerStatus};
 #[derive(Default)]
 struct TestCtx {
     broadcasts: Mutex<Vec<Value>>,
+    targeted: Mutex<Vec<(String, Value)>>,
     notifications: Mutex<Vec<Value>>,
     failures: Mutex<Vec<(String, String)>>,
 }
@@ -25,6 +26,13 @@ struct TestCtx {
 impl ExtensionCtx for TestCtx {
     fn broadcast(&self, message: Value) {
         self.broadcasts.lock().unwrap().push(message);
+    }
+    fn send_to_origin(&self, origin: &str, message: Value) -> bool {
+        self.targeted
+            .lock()
+            .unwrap()
+            .push((origin.to_string(), message));
+        true
     }
     fn handle_extension_notification(&self, message: Value) -> BoxFuture<'_, bool> {
         Box::pin(async move {
@@ -376,6 +384,42 @@ async fn notifications_inject_extension_id_and_broadcast_when_not_notification_s
         .find(|message| message["method"] == "custom/event")
         .expect("custom/event broadcast");
     assert_eq!(custom["params"], serde_json::json!({ "intent": "test" }));
+}
+
+#[tokio::test]
+async fn targeted_extension_notifications_bypass_broadcast_and_strip_routing_metadata() {
+    let harness = harness(&[], fast_config());
+    harness.supervisor.start(false).await;
+    harness
+        .supervisor
+        .handle_rpc(
+            "fixture/notify".to_string(),
+            Some(serde_json::json!({
+                "method": "custom/targeted",
+                "targetOrigin": "opaque-origin-7"
+            })),
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..100 {
+        if !harness.ctx.targeted.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let targeted = harness.ctx.targeted.lock().unwrap().clone();
+    assert_eq!(targeted.len(), 1, "{targeted:?}");
+    assert_eq!(targeted[0].0, "opaque-origin-7");
+    assert_eq!(targeted[0].1["method"], "custom/targeted");
+    assert!(targeted[0].1.get("remuxTarget").is_none());
+    assert!(!harness
+        .ctx
+        .broadcasts
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|message| message["method"] == "custom/targeted"));
 }
 
 #[tokio::test]

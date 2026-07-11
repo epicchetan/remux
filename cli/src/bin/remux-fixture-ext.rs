@@ -150,7 +150,7 @@ fn main() {
                 }
             }
             "fixture/notify" => {
-                emit(serde_json::json!({
+                let mut notification = serde_json::json!({
                     "jsonrpc": "2.0",
                     "method": params
                         .as_ref()
@@ -158,7 +158,15 @@ fn main() {
                         .and_then(|method| method.as_str())
                         .unwrap_or("remux/notifications/request"),
                     "params": { "intent": "test" },
-                }));
+                });
+                if let Some(origin) = params
+                    .as_ref()
+                    .and_then(|params| params.get("targetOrigin"))
+                    .and_then(|origin| origin.as_str())
+                {
+                    notification["remuxTarget"] = serde_json::json!({ "origin": origin });
+                }
+                emit(notification);
                 if let Some(id) = id {
                     emit(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "sent": true } }));
                 }

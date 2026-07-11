@@ -84,6 +84,13 @@ impl ExtensionCtx for RuntimeCtx {
         }
     }
 
+    fn send_to_origin(&self, origin: &str, message: Value) -> bool {
+        self.shared
+            .ws
+            .get()
+            .is_some_and(|ws| ws.send_to_origin(origin, message))
+    }
+
     fn handle_extension_notification(&self, message: Value) -> BoxFuture<'_, bool> {
         Box::pin(async move {
             match self.shared.notifications.get() {
