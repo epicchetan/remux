@@ -6,6 +6,7 @@ import { AssistantMessage } from './components/assistantMessage';
 import { Compaction } from './components/compaction';
 import { UserMessage } from './components/userMessage';
 import { WorkSection } from './components/work/WorkSection';
+import { resolveNarrationTargetElements } from '../narration/targetRegistry';
 import { transcriptLayout } from './layout/constants';
 import type { TranscriptMeasuredRow, TranscriptMeasuredTurn } from './layout/types';
 import { useThreadRuntimeStore } from '../threads/runtimeStore';
@@ -15,7 +16,12 @@ import {
   workDetailsResourceKey,
   type TranscriptStatus,
 } from './resourceStore';
-import { type TranscriptAutoScrollMode, useTranscriptViewportStore } from './viewportStore';
+import {
+  notifyTranscriptNarrationManualScroll,
+  type TranscriptAutoScrollMode,
+  type TranscriptNarrationFocusRequest,
+  useTranscriptViewportStore,
+} from './viewportStore';
 import {
   computeTranscriptSpacerRange,
   computeTranscriptVirtualRange,
@@ -59,6 +65,7 @@ type TranscriptViewportModeChangeReason =
   | 'initial-scroll'
   | 'mount-stickiness'
   | 'manual-scroll'
+  | 'narration-focus'
   | 'scroll-navigation'
   | 'scroll-navigation-bottom'
   | 'scroll-settled'
@@ -316,6 +323,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     scrollTop: number,
     nextAutoScrollMode: TranscriptAutoScrollMode,
     reason: TranscriptViewportModeChangeReason,
+    animated = true,
   ) => {
     const viewport = viewportRef.current;
     if (!viewport) {
@@ -346,6 +354,16 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       return;
     }
 
+    if (!animated) {
+      viewport.scrollTop = targetScrollTop;
+      lastScrollTopRef.current = viewport.scrollTop;
+      scheduleRangeUpdate();
+      window.requestAnimationFrame(() => {
+        programmaticScrollRef.current = false;
+      });
+      return;
+    }
+
     const startedAt = performance.now();
     const step = (now: number) => {
       const progress = Math.min(1, (now - startedAt) / scrollNavigationDurationMs);
@@ -365,6 +383,54 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
 
     scrollAnimationRafRef.current = window.requestAnimationFrame(step);
   }, [cancelScrollAnimation, scheduleRangeUpdate, setViewportAutoScrollMode]);
+
+  const focusNarration = useCallback((request: TranscriptNarrationFocusRequest) => {
+    if (request.threadId !== activeThreadId) return;
+    let attempts = 0;
+    const focusWhenMounted = () => {
+      const viewport = viewportRef.current;
+      if (!viewport) return;
+      const elements = resolveNarrationTargetElements(request.assistantMessageId, request.targetIds);
+      if (elements.length === 0) {
+        if (attempts === 0 && turnsRef.current.some((turn) => turn.turnId === request.turnId)) {
+          const nextIds = Array.from(new Set([...activeTurnIdsRef.current, request.turnId]));
+          activeTurnIdsRef.current = nextIds;
+          setActiveTurnIds(nextIds);
+          scheduleRangeUpdate();
+        }
+        attempts += 1;
+        if (attempts <= 8) window.requestAnimationFrame(focusWhenMounted);
+        return;
+      }
+      if (request.reason === 'follow' && nativeScrollOwnsTranscriptViewport(nativeScrollPhaseRef.current)) {
+        return;
+      }
+      const viewportBounds = viewport.getBoundingClientRect();
+      const composerTop = document.querySelector<HTMLElement>('[data-remux-composer-root]')
+        ?.getBoundingClientRect().top ?? viewportBounds.bottom;
+      const usableBottom = Math.min(viewportBounds.bottom, composerTop);
+      const usableHeight = Math.max(1, usableBottom - viewportBounds.top);
+      const bounds = elements.map((element) => element.getBoundingClientRect());
+      const targetTop = Math.min(...bounds.map((bound) => bound.top));
+      const targetBottom = Math.max(...bounds.map((bound) => bound.bottom));
+      const bandTop = viewportBounds.top + usableHeight * 0.22;
+      const bandBottom = viewportBounds.top + usableHeight * 0.65;
+      if (request.reason === 'follow' && targetTop >= bandTop && targetBottom <= bandBottom) {
+        return;
+      }
+      const desiredScrollTop = viewport.scrollTop
+        + targetTop
+        - viewportBounds.top
+        - usableHeight * 0.30;
+      scrollToPosition(
+        desiredScrollTop,
+        { type: 'off' },
+        'narration-focus',
+        request.reason !== 'follow',
+      );
+    };
+    focusWhenMounted();
+  }, [activeThreadId, scheduleRangeUpdate, scrollToPosition, setActiveTurnIds]);
 
   const scrollUp = useCallback(() => {
     const viewport = viewportRef.current;
@@ -406,9 +472,9 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
   }, [scrollToPosition]);
 
   useEffect(() => {
-    setScrollNavigationController({ scrollDown, scrollUp });
+    setScrollNavigationController({ focusNarration, scrollDown, scrollUp });
     return () => setScrollNavigationController(null);
-  }, [scrollDown, scrollUp, setScrollNavigationController]);
+  }, [focusNarration, scrollDown, scrollUp, setScrollNavigationController]);
 
   useLayoutEffect(() => {
     if (
@@ -514,6 +580,9 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       scrollSettleTimer = window.setTimeout(finishUserScroll, touchScrollSettleDelayMs);
     };
     const onScroll = () => {
+      if (!programmaticScrollRef.current && nativeScrollPhaseRef.current === 'momentum') {
+        notifyTranscriptNarrationManualScroll();
+      }
       updateStickiness();
       scheduleRangeUpdate();
       if (nativeScrollPhaseRef.current === 'momentum') {
@@ -533,6 +602,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       );
       setViewportAutoScrollMode({ type: 'off' }, 'touch-start');
     };
+    const onWheel = () => notifyTranscriptNarrationManualScroll();
     const onTouchEnd = () => {
       nativeScrollPhaseRef.current = transcriptNativeScrollPhaseAfterEvent(
         nativeScrollPhaseRef.current,
@@ -546,6 +616,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     viewport.addEventListener('touchstart', onTouchStart, { passive: true });
     viewport.addEventListener('touchcancel', onTouchEnd, { passive: true });
     viewport.addEventListener('touchend', onTouchEnd, { passive: true });
+    viewport.addEventListener('wheel', onWheel, { passive: true });
     viewport.addEventListener('scrollend', finishUserScroll, { passive: true });
     observer.observe(viewport);
     lastScrollTopRef.current = viewport.scrollTop;
@@ -557,6 +628,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       viewport.removeEventListener('touchstart', onTouchStart);
       viewport.removeEventListener('touchcancel', onTouchEnd);
       viewport.removeEventListener('touchend', onTouchEnd);
+      viewport.removeEventListener('wheel', onWheel);
       viewport.removeEventListener('scrollend', finishUserScroll);
       clearScrollSettleTimer();
       nativeScrollPhaseRef.current = 'idle';

@@ -4,6 +4,12 @@ Status: Active Spec
 Last verified: 2026-07-11
 Canonical code: `extensions/codex/viewer/transcript/components/assistantMessage.tsx`, `extensions/codex/viewer/composer/actions/ActionButtons.tsx`, `extensions/codex/viewer/composer/content.tsx`, `extensions/codex/viewer/transcript/components/markdown/`, `extensions/codex/server/src/app_server.rs`, `extensions/codex/server/src/main.rs`
 
+> This document describes the initial narration architecture and remains the
+> behavioral baseline. The versioned cleanup, alignment, viewport, and provider
+> architecture for the next implementation pass is specified in
+> `docs/specs/codex/assistant-narration-v2.md`. Where the documents differ, the
+> v2 spec governs new work.
+
 ## Summary
 
 Add on-demand, cached narration for completed Codex assistant responses.
@@ -715,4 +721,3 @@ The feature is complete when:
 14. Partial, malformed, stale, or cancelled artifacts are never served as ready.
 15. Completed artifacts survive viewer and extension-server reloads.
 16. Server, viewer, Playwright, layout, and device validation suites pass.
-

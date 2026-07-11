@@ -17,6 +17,7 @@ import {
 export type TranscriptOpenWorkDisclosure = {
   additionalHeight: number;
   key: string;
+  openedAfterAssistantStarted?: boolean;
   openChildByKey: Record<string, boolean>;
   rowId: string;
   segmentId: string;
@@ -232,6 +233,7 @@ const actions: Pick<
     }
 
     openWorkByKey[workKey] = workDisclosureForRow({
+      openedAfterAssistantStarted: turnHasAssistantMessage(state.turnsById[input.turnId]),
       previous: openWork ?? null,
       row,
       source: 'user',
@@ -341,6 +343,14 @@ export function reconcileTranscriptDisclosure(
       continue;
     }
     if (existingOpenWork.source === 'user') {
+      const turn = turnsById[existingOpenWork.turnId];
+      if (
+        turn &&
+        turnHasAssistantMessage(turn) &&
+        !existingOpenWork.openedAfterAssistantStarted
+      ) {
+        continue;
+      }
       openWorkByKey[existingOpenWork.key] = existingOpenWork;
     } else if (disclosure.autoOpenWorkKey === existingOpenWork.key) {
       previousAutoOpenWork = existingOpenWork;
@@ -535,8 +545,8 @@ function preferredAutoOpenWorkRow(turn: TranscriptMeasuredTurn) {
   );
 }
 
-function turnHasAssistantMessage(turn: TranscriptMeasuredTurn) {
-  return turn.rows.some((row) => row.segment.type === 'assistantMessage');
+function turnHasAssistantMessage(turn: TranscriptMeasuredTurn | undefined) {
+  return Boolean(turn?.rows.some((row) => row.segment.type === 'assistantMessage'));
 }
 
 function transcriptViewportAllowsAutoWork(disclosure: TranscriptDisclosureState) {
@@ -574,10 +584,12 @@ function workRowForDisclosure(
 }
 
 function workDisclosureForRow({
+  openedAfterAssistantStarted,
   previous,
   row,
   source,
 }: {
+  openedAfterAssistantStarted?: boolean;
   previous: TranscriptOpenWorkDisclosure | null;
   row: TranscriptMeasuredTurn['rows'][number];
   source: TranscriptOpenWorkDisclosure['source'];
@@ -587,6 +599,9 @@ function workDisclosureForRow({
   return {
     additionalHeight: sameWork ? previous.additionalHeight : 0,
     key,
+    openedAfterAssistantStarted:
+      openedAfterAssistantStarted ??
+      (sameWork ? Boolean(previous.openedAfterAssistantStarted) : false),
     openChildByKey: sameWork ? previous.openChildByKey : {},
     rowId: row.id,
     segmentId: row.segmentId,

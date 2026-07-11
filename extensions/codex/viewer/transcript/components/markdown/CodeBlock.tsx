@@ -7,6 +7,9 @@ import {
   type CodeHighlightResult,
   type CodeHighlightToken,
 } from './codeHighlight';
+import type { CodexNarrationSourceTarget } from '../../../../shared/narration';
+import { useNarrationTargetRef } from '../../../narration/targetRegistry';
+import { cn } from '@remux/viewer-kit/shadcn';
 
 type CodeLayoutBlock = Extract<MarkdownLayoutBlock, { type: 'code' }>;
 
@@ -16,11 +19,17 @@ type HighlightState =
   | { status: 'plain' };
 
 export function CodeBlock({
+  activeTargets,
+  assistantMessageId,
   block,
   style,
+  targets,
 }: {
+  activeTargets: CodexNarrationSourceTarget[];
+  assistantMessageId: string | null;
   block: CodeLayoutBlock;
   style: CSSProperties;
+  targets: CodexNarrationSourceTarget[];
 }) {
   const highlightInput = useMemo(
     () => ({
@@ -75,15 +84,47 @@ export function CodeBlock({
     >
       <code style={{ minHeight: `${block.textHeight}px` }}>
         {block.lines.map((line, index) => (
-          <div className="codex-md-code-line" key={`${index}:${line.text}`}>
-            <CodeLineText
-              fallbackText={line.text}
-              tokens={highlightState.status === 'ready' ? highlightState.result.lines[index]?.tokens : null}
-            />
-          </div>
+          <NarratedCodeLine
+            activeTargets={activeTargets}
+            assistantMessageId={assistantMessageId}
+            blockId={block.narrationId}
+            fallbackText={line.text}
+            key={`${index}:${line.text}`}
+            line={index}
+            targets={targets}
+            tokens={highlightState.status === 'ready' ? highlightState.result.lines[index]?.tokens : null}
+          />
         ))}
       </code>
     </pre>
+  );
+}
+
+function NarratedCodeLine({
+  activeTargets,
+  assistantMessageId,
+  blockId,
+  fallbackText,
+  line,
+  targets,
+  tokens,
+}: {
+  activeTargets: CodexNarrationSourceTarget[];
+  assistantMessageId: string | null;
+  blockId: string;
+  fallbackText: string;
+  line: number;
+  targets: CodexNarrationSourceTarget[];
+  tokens: CodeHighlightToken[] | null | undefined;
+}) {
+  const lineTargets = targets.filter((target) =>
+    target.blockId === blockId && target.kind === 'codeLines' && line >= target.lineStart && line <= target.lineEnd);
+  const active = activeTargets.some((target) => lineTargets.some((candidate) => candidate.id === target.id));
+  const targetRef = useNarrationTargetRef(assistantMessageId, lineTargets.map((target) => target.id));
+  return (
+    <div className={cn('codex-md-code-line', active && 'codex-md-target-narrating')} ref={targetRef}>
+      <CodeLineText fallbackText={fallbackText} tokens={tokens} />
+    </div>
   );
 }
 

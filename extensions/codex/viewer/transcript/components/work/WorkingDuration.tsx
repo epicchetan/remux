@@ -6,7 +6,13 @@ import {
   nextRunningWorkDurationUpdateMs,
 } from './workDuration';
 
-export const WorkingDuration = memo(function WorkingDuration({ turnId }: { turnId: string }) {
+export const WorkingDuration = memo(function WorkingDuration({
+  completed = false,
+  turnId,
+}: {
+  completed?: boolean;
+  turnId: string;
+}) {
   const elapsedAnchorMs = useThreadRuntimeStore((state) =>
     state.activeTurnId === turnId && (state.status === 'running' || state.status === 'stopping')
       ? state.activeTurnElapsedMs
@@ -15,7 +21,8 @@ export const WorkingDuration = memo(function WorkingDuration({ turnId }: { turnI
 
   useEffect(() => {
     if (elapsedAnchorMs === null) {
-      setElapsedMs(0);
+      // Runtime completion can be published just before the transcript's
+      // authoritative duration. Keep the last provisional value for that gap.
       return;
     }
 
@@ -36,11 +43,12 @@ export const WorkingDuration = memo(function WorkingDuration({ turnId }: { turnI
   }, [elapsedAnchorMs]);
 
   const duration = formatRunningWorkDuration(elapsedMs);
+  const label = completed ? 'Worked' : 'Working';
   return duration ? (
     <span>
-      Working for <span className="tabular-nums">{duration}</span>
+      {label} for <span className="tabular-nums">{duration}</span>
     </span>
   ) : (
-    <span>Working</span>
+    <span>{label}</span>
   );
 });

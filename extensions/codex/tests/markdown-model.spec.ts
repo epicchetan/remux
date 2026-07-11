@@ -4,6 +4,8 @@ import {
   cappedMarkdownLayoutDocumentHeight,
   getMarkdownLayoutDocument,
   markdownMetrics,
+  narrationSourceBlocks,
+  narrationSourceDocument,
   parseMarkdownDocument,
 } from '../viewer/transcript/components/markdown/markdownModel';
 
@@ -20,6 +22,65 @@ if (typeof globalThis.OffscreenCanvas === 'undefined') {
 }
 
 test.describe('markdownModel', () => {
+  test('builds stable speakable block identities for complex Markdown', () => {
+    const markdown = [
+      '# Overview',
+      '',
+      'Plain prose.',
+      '',
+      '- First item',
+      '- Second `item`',
+      '',
+      '> Quoted text.',
+      '',
+      '```ts',
+      'const value = 1;',
+      '```',
+      '',
+      '| Name | Price |',
+      '| --- | ---: |',
+      '| Plan | $5 |',
+    ].join('\n');
+
+    const first = narrationSourceBlocks(markdown);
+    const second = narrationSourceBlocks(markdown);
+
+    expect(second).toEqual(first);
+    expect(first.map((block) => block.id)).toEqual([
+      'md:0',
+      'md:1',
+      'md:2/list/0/0',
+      'md:2/list/1/0',
+      'md:3/blockquote/0',
+      'md:4',
+      'md:5',
+    ]);
+    expect(first.map((block) => block.kind)).toEqual([
+      'heading',
+      'paragraph',
+      'listItem',
+      'listItem',
+      'blockquote',
+      'code',
+      'table',
+    ]);
+    expect(first.find((block) => block.displayText === 'Plain prose.')?.needsTransform).toBe(false);
+    expect(first.find((block) => block.kind === 'heading')?.needsTransform).toBe(false);
+    expect(first.find((block) => block.displayText === 'Second item')?.needsTransform).toBe(true);
+    expect(first.at(-1)).toMatchObject({ kind: 'table', needsTransform: true });
+
+    const document = narrationSourceDocument(markdown, {
+      messageId: 'assistant-1',
+      messageRevision: 'revision-1',
+      sourceHash: 'source-1',
+    });
+    expect(document.schemaVersion).toBe(2);
+    expect(document.targets.some((target) => target.kind === 'textRange' && target.role === 'word')).toBe(true);
+    expect(document.targets.filter((target) => target.kind === 'codeLines')).toHaveLength(1);
+    expect(document.targets.filter((target) => target.kind === 'tableCell')).toHaveLength(4);
+    expect(document.blocks.every((block) => block.targetIds.some((id) => id.endsWith('/target/block')))).toBe(true);
+  });
+
   test('ends an ordered list before following unindented paragraphs', () => {
     const blocks = parseMarkdownDocument(
       [

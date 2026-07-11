@@ -19,6 +19,13 @@ import type { AlignType, BlockContent, DefinitionContent, PhrasingContent, RootC
 import { hostFileHrefInfoFromHref, webUrlFromHref } from '@remux/viewer-kit/links';
 
 import { mentionPathFromHref } from '../../model/userMessageMarkdown';
+import type {
+  CodexNarrationBlockKind,
+  CodexNarrationInlineRange,
+  CodexNarrationSourceDocument,
+  CodexNarrationSourceBlock,
+  CodexNarrationSourceTarget,
+} from '../../../../shared/narration';
 
 export type MarkdownDensity = 'default' | 'user' | 'work';
 
@@ -63,7 +70,9 @@ export type MarkdownFileLink = {
 };
 
 export type PreparedMarkdownInlineLine = {
+  displayLength: number;
   inlines: MarkdownInline[];
+  itemStarts: number[];
   prepared: PreparedRichInline | null;
   sources: MarkdownInlineSource[];
 };
@@ -72,33 +81,40 @@ export type PreparedMarkdownBlock =
   | {
       depth: 1 | 2 | 3;
       lines: PreparedMarkdownInlineLine[];
+      narrationId: string;
       type: 'heading';
     }
   | {
       lines: PreparedMarkdownInlineLine[];
+      narrationId: string;
       type: 'paragraph';
     }
   | {
       language: string | null;
+      narrationId: string;
       text: string;
       type: 'code';
     }
   | {
       children: PreparedMarkdownBlock[];
+      narrationId: string;
       type: 'blockquote';
     }
   | {
       items: PreparedMarkdownListItem[];
+      narrationId: string;
       ordered: boolean;
       start: number;
       type: 'list';
     }
   | {
       align: MarkdownTableAlignment[];
+      narrationId: string;
       rows: PreparedMarkdownTableRow[];
       type: 'table';
     }
   | {
+      narrationId: string;
       type: 'rule';
     };
 
@@ -132,6 +148,8 @@ export type MarkdownInlineSource = {
 };
 
 export type MarkdownLayoutLineFragment = {
+  displayEnd: number;
+  displayStart: number;
   gapBefore: number;
   source: MarkdownInlineSource;
   text: string;
@@ -145,6 +163,7 @@ export type MarkdownLayoutTextLine = {
 export type MarkdownLayoutBlockBase = {
   contentHeight: number;
   height: number;
+  narrationId: string;
   topGap: number;
 };
 
@@ -225,33 +244,40 @@ export type RawMarkdownBlock =
   | {
       depth: 1 | 2 | 3;
       lines: MarkdownInline[][];
+      narrationId: string;
       type: 'heading';
     }
   | {
       lines: MarkdownInline[][];
+      narrationId: string;
       type: 'paragraph';
     }
   | {
       language: string | null;
+      narrationId: string;
       text: string;
       type: 'code';
     }
   | {
       children: RawMarkdownBlock[];
+      narrationId: string;
       type: 'blockquote';
     }
   | {
       items: RawMarkdownListItem[];
+      narrationId: string;
       ordered: boolean;
       start: number;
       type: 'list';
     }
   | {
       align: MarkdownTableAlignment[];
+      narrationId: string;
       rows: RawMarkdownTableRow[];
       type: 'table';
     }
   | {
+      narrationId: string;
       type: 'rule';
     };
 
@@ -420,6 +446,32 @@ export function parseMarkdownDocument(markdown: string, options: MarkdownRenderO
   return parseMarkdownBlocks(markdown, markdownParseOptions(options));
 }
 
+export function narrationSourceBlocks(markdown: string): CodexNarrationSourceBlock[] {
+  const blocks = parseMarkdownBlocks(markdown, markdownParseOptions({ richFileLinks: true }));
+  const output: CodexNarrationSourceBlock[] = [];
+  collectNarrationSourceBlocks(blocks, output, []);
+  return output;
+}
+
+export function narrationSourceDocument(
+  markdown: string,
+  identity: Pick<CodexNarrationSourceDocument, 'messageId' | 'messageRevision' | 'sourceHash'>,
+): CodexNarrationSourceDocument {
+  const parsed = parseMarkdownBlocks(markdown, markdownParseOptions({ richFileLinks: true }));
+  const blocks: CodexNarrationSourceBlock[] = [];
+  const targets: CodexNarrationSourceTarget[] = [];
+  collectNarrationSourceBlocks(parsed, blocks, targets);
+  return {
+    blocks,
+    documentVersion: '2',
+    messageId: identity.messageId,
+    messageRevision: identity.messageRevision,
+    schemaVersion: 2,
+    sourceHash: identity.sourceHash,
+    targets,
+  };
+}
+
 export function getMarkdownLayoutDocument(
   markdown: string,
   density: MarkdownDensity,
@@ -520,6 +572,7 @@ function layoutPreparedMarkdownBlock(
         height: topGap + contentHeight,
         lineHeight,
         lines,
+        narrationId: block.narrationId,
         topGap,
         type: 'paragraph',
       };
@@ -535,6 +588,7 @@ function layoutPreparedMarkdownBlock(
         height: topGap + contentHeight,
         lineHeight: metrics.lineHeight,
         lines,
+        narrationId: block.narrationId,
         topGap,
         type: 'heading',
       };
@@ -554,6 +608,7 @@ function layoutPreparedMarkdownBlock(
         lineHeight,
         lines,
         naturalOuterHeight,
+        narrationId: block.narrationId,
         text: block.text,
         textHeight,
         topGap,
@@ -571,6 +626,7 @@ function layoutPreparedMarkdownBlock(
         children: children.blocks,
         contentHeight: children.height,
         height: topGap + children.height,
+        narrationId: block.narrationId,
         topGap,
         type: 'blockquote',
       };
@@ -600,6 +656,7 @@ function layoutPreparedMarkdownBlock(
         contentHeight,
         height: topGap + contentHeight,
         items,
+        narrationId: block.narrationId,
         ordered: block.ordered,
         start: block.start,
         topGap,
@@ -612,6 +669,7 @@ function layoutPreparedMarkdownBlock(
       return {
         contentHeight: markdownMetrics.ruleHeight,
         height: topGap + markdownMetrics.ruleHeight,
+        narrationId: block.narrationId,
         topGap,
         type: 'rule',
       };
@@ -632,6 +690,7 @@ function layoutPreparedMarkdownTable(
       contentHeight: 0,
       height: topGap,
       lineHeight: markdownMetrics.paragraph.lineHeight[density],
+      narrationId: block.narrationId,
       rows: [],
       tableWidth: 0,
       topGap,
@@ -695,6 +754,7 @@ function layoutPreparedMarkdownTable(
     contentHeight,
     height: topGap + contentHeight,
     lineHeight,
+    narrationId: block.narrationId,
     rows,
     tableWidth,
     topGap,
@@ -833,6 +893,7 @@ function cappedMarkdownBlockHeight(block: MarkdownLayoutBlock, remainingLines: n
 
 function layoutInlineLines(lines: PreparedMarkdownInlineLine[], width: number) {
   const laidOutLines: MarkdownLayoutTextLine[] = [];
+  let logicalLineStart = 0;
 
   for (const line of lines) {
     if (!line.prepared) {
@@ -840,19 +901,28 @@ function layoutInlineLines(lines: PreparedMarkdownInlineLine[], width: number) {
         fragments: [],
         width: 0,
       });
+      logicalLineStart += line.displayLength + 1;
       continue;
     }
 
     let emitted = false;
+    const itemConsumed = line.itemStarts.map(() => 0);
     walkRichInlineLineRanges(line.prepared, Math.max(1, width), (range) => {
       const materialized = materializeRichInlineLineRange(line.prepared!, range);
       emitted = true;
       laidOutLines.push({
-        fragments: materialized.fragments.map((fragment) => ({
-          gapBefore: fragment.gapBefore,
-          source: line.sources[fragment.itemIndex] ?? fallbackInlineSource,
-          text: fragment.text,
-        })),
+        fragments: materialized.fragments.map((fragment) => {
+          const itemIndex = fragment.itemIndex;
+          const displayStart = logicalLineStart + (line.itemStarts[itemIndex] ?? 0) + (itemConsumed[itemIndex] ?? 0);
+          itemConsumed[itemIndex] = (itemConsumed[itemIndex] ?? 0) + fragment.text.length;
+          return {
+            displayEnd: displayStart + fragment.text.length,
+            displayStart,
+            gapBefore: fragment.gapBefore,
+            source: line.sources[itemIndex] ?? fallbackInlineSource,
+            text: fragment.text,
+          };
+        }),
         width: materialized.width,
       });
     });
@@ -863,6 +933,7 @@ function layoutInlineLines(lines: PreparedMarkdownInlineLine[], width: number) {
         width: 0,
       });
     }
+    logicalLineStart += line.displayLength + 1;
   }
 
   return laidOutLines;
@@ -940,23 +1011,27 @@ function prepareMarkdownBlock(block: RawMarkdownBlock, density: MarkdownDensity)
     case 'paragraph':
       return {
         lines: block.lines.map((line) => prepareInlineLine(line, density, 'body')),
+        narrationId: block.narrationId,
         type: 'paragraph',
       };
     case 'heading':
       return {
         depth: block.depth,
         lines: block.lines.map((line) => prepareInlineLine(line, density, headingVariant(block.depth))),
+        narrationId: block.narrationId,
         type: 'heading',
       };
     case 'code':
       return {
         language: block.language,
+        narrationId: block.narrationId,
         text: stripSingleTrailingNewline(block.text),
         type: 'code',
       };
     case 'blockquote':
       return {
         children: block.children.map((child) => prepareMarkdownBlock(child, density)),
+        narrationId: block.narrationId,
         type: 'blockquote',
       };
     case 'list':
@@ -965,6 +1040,7 @@ function prepareMarkdownBlock(block: RawMarkdownBlock, density: MarkdownDensity)
           blocks: item.blocks.map((child) => prepareMarkdownBlock(child, density)),
           marker: item.marker,
         })),
+        narrationId: block.narrationId,
         ordered: block.ordered,
         start: block.start,
         type: 'list',
@@ -972,6 +1048,7 @@ function prepareMarkdownBlock(block: RawMarkdownBlock, density: MarkdownDensity)
     case 'table':
       return {
         align: block.align,
+        narrationId: block.narrationId,
         rows: block.rows.map((row) => ({
           cells: row.cells.map((cell) => ({
             lines: cell.lines.map((line) => prepareInlineLine(
@@ -986,7 +1063,7 @@ function prepareMarkdownBlock(block: RawMarkdownBlock, density: MarkdownDensity)
         type: 'table',
       };
     case 'rule':
-      return block;
+      return { narrationId: block.narrationId, type: 'rule' };
   }
 }
 
@@ -997,9 +1074,17 @@ function prepareInlineLine(
   initialMarks: InlineMarks = emptyMarks,
 ): PreparedMarkdownInlineLine {
   const { items, sources } = inlineRichItems(inlines, density, variant, initialMarks);
+  const itemStarts: number[] = [];
+  let displayLength = 0;
+  for (const item of items) {
+    itemStarts.push(displayLength);
+    displayLength += item.text.length;
+  }
 
   return {
+    displayLength,
     inlines,
+    itemStarts,
     prepared: items.length > 0 ? prepareRichInline(items) : null,
     sources,
   };
@@ -1158,10 +1243,231 @@ function markdownParseOptions(options: MarkdownRenderOptions = {}): MarkdownPars
 }
 
 function parseMarkdownBlocks(markdown: string, options: MarkdownParseOptions): RawMarkdownBlock[] {
-  return rootContentToRawBlocks(fromMarkdown(markdown, {
+  const blocks = rootContentToRawBlocks(fromMarkdown(markdown, {
     extensions: [gfmTable()],
     mdastExtensions: [gfmTableFromMarkdown()],
   }).children, options);
+  assignNarrationIds(blocks, '');
+  return blocks;
+}
+
+function assignNarrationIds(blocks: RawMarkdownBlock[], parentPath: string) {
+  blocks.forEach((block, blockIndex) => {
+    const path = parentPath ? `${parentPath}/${blockIndex}` : String(blockIndex);
+    block.narrationId = `md:${path}`;
+    if (block.type === 'blockquote') {
+      assignNarrationIds(block.children, `${path}/blockquote`);
+    } else if (block.type === 'list') {
+      block.items.forEach((item, itemIndex) => {
+        assignNarrationIds(item.blocks, `${path}/list/${itemIndex}`);
+      });
+    }
+  });
+}
+
+function collectNarrationSourceBlocks(
+  blocks: RawMarkdownBlock[],
+  output: CodexNarrationSourceBlock[],
+  targets: CodexNarrationSourceTarget[],
+  containerKind?: 'blockquote' | 'listItem',
+) {
+  for (const block of blocks) {
+    if (block.type === 'blockquote') {
+      collectNarrationSourceBlocks(block.children, output, targets, 'blockquote');
+      continue;
+    }
+    if (block.type === 'list') {
+      for (const item of block.items) {
+        collectNarrationSourceBlocks(item.blocks, output, targets, 'listItem');
+      }
+      continue;
+    }
+    if (block.type === 'rule') {
+      continue;
+    }
+
+    const source = narrationSourceForBlock(block, targets, containerKind);
+    if (source.displayText.trim()) {
+      output.push(source);
+    }
+  }
+}
+
+function narrationSourceForBlock(
+  block: Exclude<RawMarkdownBlock, { type: 'blockquote' | 'list' | 'rule' }>,
+  targets: CodexNarrationSourceTarget[],
+  containerKind?: 'blockquote' | 'listItem',
+): CodexNarrationSourceBlock {
+  let displayText = '';
+  let inlineRanges: CodexNarrationInlineRange[] = [];
+  let kind: CodexNarrationBlockKind;
+
+  switch (block.type) {
+    case 'paragraph': {
+      const inline = narrationInlineText(block.lines);
+      displayText = inline.text;
+      inlineRanges = inline.ranges;
+      kind = containerKind ?? 'paragraph';
+      break;
+    }
+    case 'heading': {
+      const inline = narrationInlineText(block.lines);
+      displayText = inline.text;
+      inlineRanges = inline.ranges;
+      kind = 'heading';
+      break;
+    }
+    case 'code':
+      displayText = stripSingleTrailingNewline(block.text);
+      kind = block.language === 'mermaid' ? 'diagram' : 'code';
+      break;
+    case 'table':
+      displayText = block.rows
+        .map((row) => row.cells.map((cell) => narrationInlineText(cell.lines).text).join(' | '))
+        .join('\n');
+      kind = 'table';
+      break;
+  }
+
+  const targetIds: string[] = [];
+  const blockTargetId = `${block.narrationId}/target/block`;
+  targets.push({ blockId: block.narrationId, id: blockTargetId, kind: 'block' });
+  targetIds.push(blockTargetId);
+
+  if (kind !== 'code' && kind !== 'diagram' && kind !== 'table') {
+    for (const match of displayText.matchAll(/[\p{L}\p{N}]+(?:['’._-][\p{L}\p{N}]+)*/gu)) {
+      const displayStart = match.index;
+      const displayEnd = displayStart + match[0].length;
+      const id = `${block.narrationId}/target/word/${displayStart}-${displayEnd}`;
+      targets.push({ blockId: block.narrationId, displayEnd, displayStart, id, kind: 'textRange', role: 'word' });
+      targetIds.push(id);
+    }
+
+    inlineRanges.forEach((range, index) => {
+      if (range.kind === 'text') return;
+      const id = `${block.narrationId}/target/${range.kind}/${index}`;
+      targets.push({
+        blockId: block.narrationId,
+        displayEnd: range.displayEnd,
+        displayStart: range.displayStart,
+        id,
+        kind: 'textRange',
+        role: range.kind,
+      });
+      targetIds.push(id);
+    });
+
+    for (const match of displayText.matchAll(/https?:\/\/\S+|[$€£¥]\s?\d+(?:[.,]\d+)*|\b[A-Z]{2,}\b|\b\w+(?:<[^>]+>|::\w+|\/\w+)\b/giu)) {
+      const displayStart = match.index;
+      const displayEnd = displayStart + match[0].length;
+      if (targets.some((target) => target.kind === 'textRange' && target.blockId === block.narrationId && target.displayStart === displayStart && target.displayEnd === displayEnd)) continue;
+      const id = `${block.narrationId}/target/expression/${displayStart}-${displayEnd}`;
+      targets.push({ blockId: block.narrationId, displayEnd, displayStart, id, kind: 'textRange', role: 'expression' });
+      targetIds.push(id);
+    }
+  }
+
+  if (block.type === 'table') {
+    block.rows.forEach((row, rowIndex) => {
+      row.cells.forEach((_cell, column) => {
+        const id = `${block.narrationId}/target/cell/${rowIndex}/${column}`;
+        targets.push({
+          blockId: block.narrationId,
+          column,
+          id,
+          kind: 'tableCell',
+          role: row.header ? 'header' : 'body',
+          row: rowIndex,
+        });
+        targetIds.push(id);
+      });
+    });
+  } else if (block.type === 'code') {
+    const lineCount = Math.max(1, displayText.split('\n').length);
+    for (let line = 0; line < lineCount; line += 1) {
+      const id = `${block.narrationId}/target/line/${line}`;
+      targets.push({ blockId: block.narrationId, id, kind: 'codeLines', lineEnd: line, lineStart: line });
+      targetIds.push(id);
+    }
+  }
+
+  return {
+    displayText,
+    id: block.narrationId,
+    inlineRanges,
+    kind,
+    needsTransform:
+      kind === 'code' ||
+      kind === 'diagram' ||
+      kind === 'table' ||
+      inlineRanges.some((range) => range.kind !== 'text') ||
+      pronunciationSensitiveText(displayText),
+    path: block.narrationId.slice('md:'.length),
+    targetIds,
+  };
+}
+
+function narrationInlineText(lines: MarkdownInline[][]) {
+  const ranges: CodexNarrationInlineRange[] = [];
+  let text = '';
+
+  const append = (value: string, kind: CodexNarrationInlineRange['kind']) => {
+    if (!value) return;
+    const displayStart = text.length;
+    text += value;
+    ranges.push({ displayEnd: text.length, displayStart, kind });
+  };
+  const walk = (inlines: MarkdownInline[], inheritedKind: CodexNarrationInlineRange['kind'] = 'text') => {
+    for (const inline of inlines) {
+      switch (inline.type) {
+        case 'text':
+          append(inline.text, inheritedKind);
+          break;
+        case 'code':
+          append(inline.text, 'inlineCode');
+          break;
+        case 'fileLink':
+          append(inline.file.displayName, 'link');
+          break;
+        case 'link':
+          walk(inline.children, 'link');
+          break;
+        case 'strong':
+        case 'emphasis':
+          walk(inline.children, inheritedKind);
+          break;
+      }
+    }
+  };
+
+  lines.forEach((line, index) => {
+    if (index > 0) text += '\n';
+    walk(line);
+  });
+
+  return { ranges: mergeNarrationRanges(ranges), text };
+}
+
+function mergeNarrationRanges(ranges: CodexNarrationInlineRange[]) {
+  const merged: CodexNarrationInlineRange[] = [];
+  for (const range of ranges) {
+    const previous = merged.at(-1);
+    if (previous && previous.kind === range.kind && previous.displayEnd === range.displayStart) {
+      previous.displayEnd = range.displayEnd;
+    } else {
+      merged.push({ ...range });
+    }
+  }
+  return merged;
+}
+
+function pronunciationSensitiveText(text: string) {
+  return (
+    /https?:\/\//iu.test(text) ||
+    /[$€£¥]\s?\d/u.test(text) ||
+    /\b[A-Z]{2,}\b/u.test(text) ||
+    /(?:<[^>]+>|::|->|=>|\w+\/\w+)/u.test(text)
+  );
 }
 
 function sanitizeHref(href: string) {
@@ -1209,6 +1515,7 @@ function blockContentToRawBlock(node: BlockContent, options: MarkdownParseOption
       return [
         {
           lines: phrasingToInlineLines(node.children, options),
+          narrationId: '',
           type: 'paragraph',
         },
       ];
@@ -1217,6 +1524,7 @@ function blockContentToRawBlock(node: BlockContent, options: MarkdownParseOption
         {
           depth: Math.min(node.depth, 3) as 1 | 2 | 3,
           lines: phrasingToInlineLines(node.children, options),
+          narrationId: '',
           type: 'heading',
         },
       ];
@@ -1224,6 +1532,7 @@ function blockContentToRawBlock(node: BlockContent, options: MarkdownParseOption
       return [
         {
           language: node.lang?.trim() || null,
+          narrationId: '',
           text: node.value,
           type: 'code',
         },
@@ -1232,6 +1541,7 @@ function blockContentToRawBlock(node: BlockContent, options: MarkdownParseOption
       return [
         {
           children: blockContentToRawBlocks(node.children, options),
+          narrationId: '',
           type: 'blockquote',
         },
       ];
@@ -1244,6 +1554,7 @@ function blockContentToRawBlock(node: BlockContent, options: MarkdownParseOption
             blocks: blockContentToRawBlocks(item.children, options),
             marker: ordered ? `${start + index}.` : '•',
           })),
+          narrationId: '',
           ordered,
           start,
           type: 'list',
@@ -1251,13 +1562,14 @@ function blockContentToRawBlock(node: BlockContent, options: MarkdownParseOption
       ];
     }
     case 'thematicBreak':
-      return [{ type: 'rule' }];
+      return [{ narrationId: '', type: 'rule' }];
     case 'html':
       return textToParagraphBlocks(node.value);
     case 'table':
       return [
         {
           align: (node.align ?? []).map((alignment) => alignment ?? null),
+          narrationId: '',
           rows: node.children.map((row, rowIndex) => ({
             cells: row.children.map((cell) => ({
               lines: phrasingToInlineLines(cell.children, options),
@@ -1277,6 +1589,7 @@ function textToParagraphBlocks(text: string): RawMarkdownBlock[] {
     ? [
         {
           lines: [[{ text, type: 'text' }]],
+          narrationId: '',
           type: 'paragraph',
         },
       ]

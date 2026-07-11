@@ -6,6 +6,7 @@ mod history;
 mod item_identity;
 mod live_transcript;
 mod models;
+mod narration;
 mod operation_queue;
 mod projection;
 mod resource_invalidations;
@@ -33,6 +34,7 @@ use crate::composer_config::ComposerConfigStore;
 use crate::file_resources::CodexFileResourcesServer;
 use crate::live_transcript::LiveTranscriptStore;
 use crate::models::CodexModelsServer;
+use crate::narration::CodexNarrationServer;
 use crate::operation_queue::{CodexOperationQueueServer, PendingQueueStore};
 use crate::resource_invalidations::{
     invalidations_for_app_server_notification, resources_invalidated_notification,
@@ -48,6 +50,10 @@ const FILES_METHOD: &str = "remux/codex/files";
 const COMPOSER_CONFIG_READ_METHOD: &str = "remux/codex/composer/config/read";
 const COMPOSER_CONFIG_WRITE_METHOD: &str = "remux/codex/composer/config/write";
 const MODELS_READ_METHOD: &str = "remux/codex/models/read";
+const NARRATION_AUDIO_READ_METHOD: &str = "remux/codex/narration/audio/read";
+const NARRATION_CANCEL_METHOD: &str = "remux/codex/narration/cancel";
+const NARRATION_READ_METHOD: &str = "remux/codex/narration/resources/read";
+const NARRATION_START_METHOD: &str = "remux/codex/narration/start";
 const TRANSCRIPT_RESOURCES_READ_METHOD: &str = "remux/codex/transcript/resources/read";
 const THREAD_RESOURCES_READ_METHOD: &str = "remux/codex/thread/resources/read";
 const THREAD_COMPACT_METHOD: &str = "remux/codex/thread/compact";
@@ -114,6 +120,16 @@ fn handle_request(server: &mut CodexExtensionServer, request: JsonRpcRequest) ->
             .composer_config
             .write_config(request.params.unwrap_or(Value::Null)),
         MODELS_READ_METHOD => server.models.read_models(),
+        NARRATION_AUDIO_READ_METHOD => server
+            .narration
+            .read_audio(request.params.unwrap_or(Value::Null)),
+        NARRATION_CANCEL_METHOD => server
+            .narration
+            .cancel(request.params.unwrap_or(Value::Null)),
+        NARRATION_READ_METHOD => server.narration.read(request.params.unwrap_or(Value::Null)),
+        NARRATION_START_METHOD => server
+            .narration
+            .start(request.params.unwrap_or(Value::Null)),
         TRANSCRIPT_RESOURCES_READ_METHOD => server
             .transcript
             .read_resources(request.params.unwrap_or(Value::Null)),
@@ -170,6 +186,7 @@ struct CodexExtensionServer {
     composer_config: ComposerConfigStore,
     files: CodexFileResourcesServer,
     models: CodexModelsServer,
+    narration: CodexNarrationServer,
     operation_queue: CodexOperationQueueServer,
     thread_commands: CodexThreadCommandServer,
     threads: CodexThreadResourcesServer,
@@ -179,12 +196,15 @@ struct CodexExtensionServer {
 impl CodexExtensionServer {
     fn new(codex_home: PathBuf, output_tx: mpsc::Sender<Value>) -> Self {
         let (event_sink, event_rx) = AppServerEventSink::channel();
+        let (narration_event_sink, narration_event_rx) = AppServerEventSink::channel();
         let composer_config =
             ComposerConfigStore::new(codex_home.join("remux").join("composer-config.json"));
         let live_transcript = LiveTranscriptStore::default();
         let thread_runtime = ThreadRuntimeStore::default();
         let thread_usage = ThreadUsageStore::default();
         let app_server = AppServerRuntime::new_with_event_sink(codex_home.clone(), event_sink);
+        let narration_app_server =
+            AppServerRuntime::new_with_event_sink(codex_home.clone(), narration_event_sink);
         let thread_commands = CodexThreadCommandServer::new(
             app_server.clone(),
             composer_config.clone(),
@@ -199,7 +219,7 @@ impl CodexExtensionServer {
         );
         spawn_app_server_event_forwarder(
             event_rx,
-            output_tx,
+            output_tx.clone(),
             live_transcript.clone(),
             thread_runtime.clone(),
             thread_usage.clone(),
@@ -209,6 +229,13 @@ impl CodexExtensionServer {
             composer_config: composer_config.clone(),
             files: CodexFileResourcesServer::new(),
             models: CodexModelsServer::new(app_server.clone()),
+            narration: CodexNarrationServer::new(
+                codex_home.clone(),
+                narration_app_server,
+                narration_event_rx,
+                output_tx,
+                live_transcript.clone(),
+            ),
             operation_queue: operation_queue.clone(),
             thread_commands,
             threads: CodexThreadResourcesServer::new(

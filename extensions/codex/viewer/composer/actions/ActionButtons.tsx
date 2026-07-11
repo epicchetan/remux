@@ -1,4 +1,3 @@
-import { useCallback, useRef, type ReactNode } from 'react';
 import { ArrowDown, ArrowLeft, ArrowUp, Check, History, Loader2, PanelRightOpen, Send, Square } from 'lucide-react';
 
 import { openHostOverview } from '@remux/viewer-kit/host';
@@ -8,17 +7,9 @@ import { useTranscriptViewportControls } from '../../transcript';
 import { ComposerAttachmentButton } from '../attachments/AttachmentButton';
 import { ComposerConfigButton } from '../config/ConfigButton';
 import { useComposerTurnAction } from './turnAction';
-
-type ComposerAction = {
-  busy?: boolean;
-  className?: string;
-  disabled?: boolean;
-  icon: ReactNode;
-  label: string;
-  onClick?: () => void;
-  preserveFocus?: boolean;
-  tone?: 'default' | 'send';
-};
+import { NarrationPlaybackActions } from '../../narration/PlaybackActions';
+import { useNarrationStore } from '../../narration/store';
+import { ComposerActionKey, type ComposerAction } from './ActionKey';
 
 export function ComposerActionButtons() {
   const { canScrollDown, canScrollUp, scrollDown, scrollUp } = useTranscriptViewportControls();
@@ -30,6 +21,8 @@ export function ComposerActionButtons() {
   const goToParentDirectory = useThreadsStore((state) => state.goToParentDirectory);
   const selectDirectoryPickerPath = useThreadsStore((state) => state.selectDirectoryPickerPath);
   const turn = useComposerTurnAction();
+  const narrationPhase = useNarrationStore((state) => state.phase);
+  const narrationPlaybackActive = narrationPhase === 'ready' || narrationPhase === 'playing' || narrationPhase === 'paused';
   const pickingDirectory = Boolean(draft && directoryPickerOpen);
   const directoryParent = directoryPickerPath ? parentDirectory(directoryPickerPath) : null;
 
@@ -109,79 +102,28 @@ export function ComposerActionButtons() {
         {leftActions.map((action) => (
           <ComposerActionKey action={action} key={action.label} />
         ))}
-        <ComposerConfigButton disabled={pickingDirectory} />
+        {narrationPlaybackActive ? null : <ComposerConfigButton disabled={pickingDirectory} />}
       </div>
       <div className="remux-composer-action-group remux-composer-action-group-right">
-        {(pickingDirectory ? directoryActions : scrollActions).map((action) => (
-          <ComposerActionKey action={action} key={action.label} />
-        ))}
-        {pickingDirectory ? null : (
+        {narrationPlaybackActive && !pickingDirectory ? (
+          <NarrationPlaybackActions />
+        ) : (
           <>
-            <ComposerAttachmentButton />
-            {turn.isWorking ? <ComposerActionKey action={stopAction} /> : null}
-            {!turn.isWorking || (turn.hasSendableContent && !turn.isStopping) ? (
-              <ComposerActionKey action={sendAction} />
-            ) : null}
+            {(pickingDirectory ? directoryActions : scrollActions).map((action) => (
+              <ComposerActionKey action={action} key={action.label} />
+            ))}
+            {pickingDirectory ? null : (
+              <>
+                <ComposerAttachmentButton />
+                {turn.isWorking ? <ComposerActionKey action={stopAction} /> : null}
+                {!turn.isWorking || (turn.hasSendableContent && !turn.isStopping) ? (
+                  <ComposerActionKey action={sendAction} />
+                ) : null}
+              </>
+            )}
           </>
         )}
       </div>
     </div>
-  );
-}
-
-function ComposerActionKey({ action }: { action: ComposerAction }) {
-  const lastActivationMsRef = useRef<number | null>(null);
-  const activateOnce = useCallback(() => {
-    const now = performance.now();
-    if (lastActivationMsRef.current !== null && now - lastActivationMsRef.current < 350) {
-      return;
-    }
-
-    lastActivationMsRef.current = now;
-    action.onClick?.();
-  }, [action]);
-
-  return (
-    <button
-      aria-label={action.label}
-      className={`remux-composer-action-button${action.tone === 'send' ? ' remux-composer-send-button' : ''}${action.busy ? ' is-busy' : ''}${action.className ? ` ${action.className}` : ''}`}
-      data-remux-preserve-focus={action.preserveFocus ? 'true' : undefined}
-      disabled={action.disabled}
-      onClick={(event) => {
-        if (action.preserveFocus) {
-          event.preventDefault();
-          event.stopPropagation();
-          activateOnce();
-          return;
-        }
-
-        if (!action.preserveFocus) {
-          event.currentTarget.blur();
-        }
-        action.onClick?.();
-      }}
-      onMouseDown={action.preserveFocus ? (event) => event.preventDefault() : undefined}
-      onPointerDown={action.preserveFocus ? (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-      } : undefined}
-      onPointerUp={action.preserveFocus ? (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        activateOnce();
-      } : undefined}
-      onTouchStart={action.preserveFocus ? (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-      } : undefined}
-      onTouchEnd={action.preserveFocus ? (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        activateOnce();
-      } : undefined}
-      type="button"
-    >
-      {action.icon}
-    </button>
   );
 }

@@ -21,6 +21,7 @@ import { CodexSidebar } from './threads/Sidebar';
 import { shortenPath, threadTitle } from './threads/threadFormat';
 import { CodexTranscript } from './transcript';
 import { requestTranscriptTurnScroll } from './transcript/viewportStore';
+import { subscribeNarrationUpdates, useNarrationStore } from './narration/store';
 
 export function App() {
   const connectionStatus = useHostStore((state) => state.connectionStatus);
@@ -65,6 +66,9 @@ export function App() {
   const mentionSession = useComposerStore((state) => state.mentionSession);
   const setComposerDocument = useComposerStore((state) => state.setComposerDocument);
   const snapshot = useComposerStore((state) => state.snapshot);
+  const closeNarration = useNarrationStore((state) => state.close);
+  const narrationPhase = useNarrationStore((state) => state.phase);
+  const narrationTargetThreadId = useNarrationStore((state) => state.target?.threadId ?? null);
   const mainPaneRef = useRef<HTMLElement | null>(null);
   const bottomBarSlotRef = useRef<HTMLDivElement | null>(null);
   const draftRestorePendingRef = useRef<string | null>(null);
@@ -320,6 +324,24 @@ export function App() {
   }, [loadThreadHistory]);
 
   useEffect(() => subscribeCodexResourceInvalidations(), []);
+  useEffect(() => subscribeNarrationUpdates(), []);
+
+  useEffect(() => {
+    if (narrationTargetThreadId && narrationTargetThreadId !== activeThreadId) {
+      closeNarration();
+      return;
+    }
+
+    const playbackActive = narrationPhase === 'ready' || narrationPhase === 'playing' || narrationPhase === 'paused';
+    if (!playbackActive) return;
+    if (
+      activeThreadRuntimeStatus === 'running' ||
+      activeThreadRuntimeStatus === 'stopping' ||
+      Boolean(editTarget || forkTarget || directoryPickerOpen)
+    ) {
+      closeNarration();
+    }
+  }, [activeThreadId, activeThreadRuntimeStatus, closeNarration, directoryPickerOpen, editTarget, forkTarget, narrationPhase, narrationTargetThreadId]);
 
   useEffect(() => subscribeHostNavigate((navigation) => {
     if (navigation.resourceKind !== 'thread' || !navigation.resourceId) {

@@ -3,8 +3,17 @@ import { createExternalStore } from './externalStore';
 import { initialTranscriptActiveTurnIds, sameTurnIds } from './virtualizerRange';
 
 type TranscriptScrollNavigationController = {
+  focusNarration: (request: TranscriptNarrationFocusRequest) => void;
   scrollDown: () => void;
   scrollUp: () => void;
+};
+
+export type TranscriptNarrationFocusRequest = {
+  assistantMessageId: string;
+  reason: 'explicitSeek' | 'follow' | 'followReenabled';
+  targetIds: string[];
+  threadId: string;
+  turnId: string;
 };
 
 export type TranscriptAutoScrollMode =
@@ -17,6 +26,7 @@ type TranscriptViewportStoreState = {
   autoScrollMode: TranscriptAutoScrollMode;
   canScrollDown: boolean;
   canScrollUp: boolean;
+  focusNarration: (request: TranscriptNarrationFocusRequest) => void;
   requestedTurnScroll: TranscriptTurnScrollRequest | null;
   requestTurnScroll: (threadId: string, turnId: string) => void;
   scrollDown: () => void;
@@ -34,6 +44,8 @@ type TranscriptTurnScrollRequest = {
 };
 
 const noopScrollNavigation = () => undefined;
+const noopNarrationFocus = (_request: TranscriptNarrationFocusRequest) => undefined;
+let narrationManualScrollHandler: (() => void) | null = null;
 let turnScrollRequestId = 0;
 
 const actions: Pick<
@@ -90,6 +102,7 @@ const actions: Pick<
     viewportStore.setState({
       canScrollDown: controller ? state.canScrollDown : false,
       canScrollUp: controller ? state.canScrollUp : false,
+      focusNarration: controller?.focusNarration ?? noopNarrationFocus,
       scrollDown: controller?.scrollDown ?? noopScrollNavigation,
       scrollUp: controller?.scrollUp ?? noopScrollNavigation,
     });
@@ -101,6 +114,7 @@ const viewportStore = createExternalStore<TranscriptViewportStoreState>({
   autoScrollMode: { type: 'off' },
   canScrollDown: false,
   canScrollUp: false,
+  focusNarration: noopNarrationFocus,
   requestedTurnScroll: null,
   scrollDown: noopScrollNavigation,
   scrollUp: noopScrollNavigation,
@@ -131,6 +145,18 @@ export function resetTranscriptViewportForThread(threadId?: string | null) {
 
 export function requestTranscriptTurnScroll(threadId: string, turnId: string) {
   viewportStore.getState().requestTurnScroll(threadId, turnId);
+}
+
+export function focusTranscriptNarration(request: TranscriptNarrationFocusRequest) {
+  viewportStore.getState().focusNarration(request);
+}
+
+export function setTranscriptNarrationManualScrollHandler(handler: (() => void) | null) {
+  narrationManualScrollHandler = handler;
+}
+
+export function notifyTranscriptNarrationManualScroll() {
+  narrationManualScrollHandler?.();
 }
 
 export function reconcileTranscriptViewportForLayout(

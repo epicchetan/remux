@@ -542,7 +542,7 @@ test.describe('transcript work disclosure', () => {
     expect(disclosure.openWorkByKey).toEqual({});
   });
 
-  test('preserves previous auto-open work with child disclosure after manual scroll break', () => {
+  test('collapses interacted work when assistant streaming starts after manual scroll break', () => {
     const runningTurn = turn('turn-1', workSegment('work-1', { state: 'running' }));
     runningTurn.status = 'inProgress';
     const runningLayout = measureCollapsedTranscript({ turns: [runningTurn], width: 600 });
@@ -571,15 +571,10 @@ test.describe('transcript work disclosure', () => {
     });
 
     expect(reconciled.autoOpenWorkKey).toBeNull();
-    expect(reconciled.openWorkByKey['turn-1:work-1']).toMatchObject({
-      openChildByKey: { 'tool:1': true },
-      rowId: 'turn-1:work-1',
-      source: 'user',
-      turnId: 'turn-1',
-    });
+    expect(reconciled.openWorkByKey).toEqual({});
   });
 
-  test('preserves auto-open work promoted by child interaction when assistant streaming starts', () => {
+  test('collapses auto-open work promoted by child interaction when assistant streaming starts', () => {
     const runningTurn = turn('turn-1', workSegment('work-1', { state: 'running' }));
     runningTurn.status = 'inProgress';
     const runningLayout = measureCollapsedTranscript({ turns: [runningTurn], width: 600 });
@@ -612,12 +607,7 @@ test.describe('transcript work disclosure', () => {
 
     const reconciled = reconcileTranscriptDisclosure(promoted, streamingAnswerLayout.turns, 'turn-1');
 
-    expect(reconciled.openWorkByKey['turn-1:work-1']).toMatchObject({
-      openChildByKey: { 'tool:1': true },
-      rowId: 'turn-1:work-1',
-      source: 'user',
-      turnId: 'turn-1',
-    });
+    expect(reconciled.openWorkByKey).toEqual({});
   });
 
   test('preserves work reopened by the user while the assistant continues streaming', () => {
@@ -636,6 +626,7 @@ test.describe('transcript work disclosure', () => {
         'turn-1:work-1': {
           additionalHeight: 96,
           key: 'turn-1:work-1',
+          openedAfterAssistantStarted: true,
           openChildByKey: {},
           rowId: 'turn-1:work-1',
           segmentId: 'work-1',
@@ -656,6 +647,7 @@ test.describe('transcript work disclosure', () => {
 
     expect(reconciled.openWorkByKey['turn-1:work-1']).toMatchObject({
       additionalHeight: 96,
+      openedAfterAssistantStarted: true,
       source: 'user',
     });
     expect(streamingLayout.turns[0]?.rows.some((row) => row.segment.type === 'assistantMessage')).toBe(true);

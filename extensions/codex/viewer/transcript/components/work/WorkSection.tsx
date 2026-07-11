@@ -615,11 +615,11 @@ function WorkTitle({ segment, turnId }: { segment: CodexWorkSegment; turnId: str
     return <WorkingDuration turnId={turnId} />;
   }
 
-  return (
-    <>
-      Worked{segment.durationMs !== null ? ` for ${formatWorkDuration(segment.durationMs)}` : ''}
-    </>
-  );
+  if (segment.durationMs !== null) {
+    return <>Worked for {formatWorkDuration(segment.durationMs)}</>;
+  }
+
+  return <WorkingDuration completed turnId={turnId} />;
 }
 
 function useLocalDisclosure() {

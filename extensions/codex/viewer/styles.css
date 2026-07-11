@@ -331,6 +331,10 @@
     opacity: 0.34;
   }
 
+  .codex-user-action-button.is-active {
+    color: color-mix(in srgb, var(--composer-accent) 84%, var(--foreground) 16%);
+  }
+
   .codex-user-action-button:not(:disabled):active,
   .codex-user-action-button:not(:disabled):hover {
     color: var(--foreground);
@@ -441,6 +445,23 @@
   .codex-md-block-frame {
     min-width: 0;
     overflow: visible;
+  }
+
+  .codex-md-block-frame.codex-md-block-narrating {
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--composer-accent) 9%, transparent);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--composer-accent) 12%, transparent);
+  }
+
+  .codex-md-narrated-word {
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--composer-accent) 30%, transparent);
+    color: var(--foreground);
+  }
+
+  .codex-md-target-narrating {
+    background: color-mix(in srgb, var(--composer-accent) 22%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--composer-accent) 28%, transparent);
   }
 
   .codex-md-paragraph {
@@ -698,6 +719,10 @@
   .codex-md-table-row[data-header="true"] .codex-md-table-cell {
     background: color-mix(in srgb, var(--muted) 72%, transparent);
     color: var(--foreground);
+  }
+
+  .codex-md-table-cell.codex-md-target-narrating {
+    background: color-mix(in srgb, var(--composer-accent) 22%, transparent);
   }
 
   .codex-md-table-cell[data-align="center"] .codex-md-text-line {
@@ -1001,6 +1026,45 @@
     min-width: 0;
     align-items: center;
     gap: 6px;
+  }
+
+  .remux-narration-bar {
+    justify-content: space-between;
+    gap: 12px;
+    font-weight: 500;
+  }
+
+  .remux-narration-label {
+    display: inline-flex;
+    min-width: 0;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .remux-narration-copy {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .remux-narration-bar-actions {
+    display: inline-flex;
+    flex-shrink: 0;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .remux-narration-text-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    border-radius: 999px;
+    color: var(--foreground);
+    padding: 2px 5px;
+  }
+
+  .remux-narration-text-button:hover {
+    background: color-mix(in srgb, var(--foreground) 8%, transparent);
   }
 
   .remux-new-chat-bar {
@@ -1690,6 +1754,19 @@
       var(--rmx-shadow-menu);
   }
 
+  .remux-narration-speed-panel {
+    right: 0;
+    left: auto;
+    width: 124px;
+  }
+
+  .remux-narration-rate-button {
+    color: var(--foreground);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+  }
+
   .remux-composer-preferences-menu .remux-composer-config-panel {
     left: calc(-1 * var(--remux-composer-menu-edge-offset));
   }
@@ -1930,6 +2007,11 @@
 
   .remux-composer-action-button.is-busy:disabled {
     opacity: 1;
+  }
+
+  .remux-composer-action-button.is-active {
+    border-color: color-mix(in srgb, var(--composer-accent) 55%, var(--border));
+    color: color-mix(in srgb, var(--composer-accent) 76%, var(--foreground));
   }
 
   .remux-composer-action-button:focus,
