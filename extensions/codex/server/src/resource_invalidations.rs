@@ -35,6 +35,23 @@ pub(crate) fn thread_operation_queue_invalidation(thread_id: &str, reason: &str)
     })
 }
 
+pub(crate) fn app_server_reconnected_invalidations(thread_ids: &[String]) -> Vec<Value> {
+    // Reuse the established wire reason so mixed-version Viewers accept the
+    // invalidations; component logs carry the more specific reconnect cause.
+    let mut invalidations = vec![thread_history_invalidation("appServerEvent")];
+    for thread_id in thread_ids {
+        invalidations.extend([
+            thread_summary_invalidation(thread_id, "appServerEvent"),
+            thread_runtime_invalidation(thread_id, "appServerEvent"),
+            thread_composer_state_invalidation(thread_id, "appServerEvent"),
+            thread_token_usage_invalidation(thread_id, "appServerEvent"),
+            thread_transcript_invalidation(thread_id, "appServerEvent"),
+            thread_operation_queue_invalidation(thread_id, "appServerEvent"),
+        ]);
+    }
+    invalidations
+}
+
 pub(crate) fn invalidations_for_app_server_notification(
     notification: &Value,
     canonical_item_id: Option<&str>,
@@ -366,6 +383,27 @@ fn push_unique(invalidations: &mut Vec<Value>, seen: &mut HashSet<String>, inval
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_invalidates_history_and_every_thread_projection() {
+        let invalidations = app_server_reconnected_invalidations(&["thread-1".to_string()]);
+
+        assert_eq!(invalidations.len(), 7);
+        for expected in [
+            "threadHistory",
+            "threadSummary",
+            "threadRuntime",
+            "threadComposerState",
+            "threadTokenUsage",
+            "threadTranscript",
+            "threadOperationQueue",
+        ] {
+            assert!(
+                invalidations.iter().any(|value| value["type"] == expected),
+                "missing {expected}: {invalidations:?}"
+            );
+        }
+    }
 
     #[test]
     fn send_accepted_invalidates_thread_resources() {

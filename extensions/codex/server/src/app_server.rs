@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::env;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -13,6 +13,8 @@ use serde_json::{Value, json};
 
 const SOCKET_RELATIVE_PATH: &[&str] = &["app-server-control", "app-server-control.sock"];
 const APP_SERVER_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
+const APP_SERVER_MANAGEMENT_TIMEOUT: Duration = Duration::from_secs(30);
+const CODEX_UPDATE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const DIAGNOSTIC_MAX_JSON_CHARS: usize = 6000;
 const DIAGNOSTIC_MAX_STRING_CHARS: usize = 500;
 const DIAGNOSTIC_MAX_ARRAY_ITEMS: usize = 20;
@@ -27,18 +29,30 @@ pub(crate) struct AppServerRuntime {
 
 #[derive(Debug)]
 struct AppServerRuntimeInner {
-    app_server_process: Mutex<Option<Child>>,
     codex_home: PathBuf,
+    codex_command: Mutex<Option<PathBuf>>,
+    command_runner: Arc<dyn CodexCommandRunner>,
     connection: Mutex<Option<AppServerConnection>>,
     events: AppServerEventSink,
+    ever_connected: AtomicBool,
     next_id: AtomicU64,
+    suppress_next_reconnect_event: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
 struct AppServerConnection {
     alive: Arc<AtomicBool>,
     pending: PendingResponses,
+    shutdown: Arc<UnixStream>,
     writer_tx: mpsc::Sender<String>,
+}
+
+impl AppServerConnection {
+    fn close(&self, reason: &str) {
+        self.alive.store(false, Ordering::SeqCst);
+        let _ = self.shutdown.shutdown(std::net::Shutdown::Both);
+        drain_pending(&self.pending, reason.to_string());
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -48,22 +62,216 @@ pub(crate) struct AppServerEventSink {
 
 #[derive(Debug, Clone)]
 pub(crate) enum AppServerEvent {
+    Reconnected,
     Disconnected(String),
+    ManagementLog {
+        source: &'static str,
+        channel: Option<&'static str>,
+        level: Option<&'static str>,
+        line: String,
+    },
     Notification(Value),
     ServerRequest(Value),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexAppServerStatus {
+    pub(crate) state: String,
+    pub(crate) socket_path: Option<String>,
+    pub(crate) managed_codex_path: Option<String>,
+    pub(crate) installed_version: Option<String>,
+    pub(crate) running_version: Option<String>,
+    pub(crate) restart_required: bool,
+    pub(crate) last_error: Option<String>,
+}
+
+impl CodexAppServerStatus {
+    pub(crate) fn to_value(&self, active_turn_ids: Vec<String>) -> Value {
+        json!({
+            "state": self.state,
+            "socketPath": self.socket_path,
+            "managedCodexPath": self.managed_codex_path,
+            "installedVersion": self.installed_version,
+            "runningVersion": self.running_version,
+            "restartRequired": self.restart_required,
+            "lastError": self.last_error,
+            "activeTurnIds": active_turn_ids,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct CodexCommandOutput {
+    stdout: String,
+    #[cfg(test)]
+    stderr: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CodexCommandChannel {
+    Stdout,
+    Stderr,
+}
+
+impl CodexCommandChannel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CodexCommandLine {
+    channel: CodexCommandChannel,
+    line: String,
+}
+
+trait CodexCommandRunner: std::fmt::Debug + Send + Sync {
+    fn run(
+        &self,
+        command: &PathBuf,
+        args: &[&str],
+        codex_home: &PathBuf,
+        timeout: Duration,
+        on_line: &mut dyn FnMut(CodexCommandLine),
+    ) -> Result<CodexCommandOutput, String>;
+}
+
+#[derive(Debug)]
+struct ProcessCodexCommandRunner;
+
 impl AppServerRuntime {
     pub(crate) fn new_with_event_sink(codex_home: PathBuf, events: AppServerEventSink) -> Self {
+        Self::new_with_runner(codex_home, events, Arc::new(ProcessCodexCommandRunner))
+    }
+
+    fn new_with_runner(
+        codex_home: PathBuf,
+        events: AppServerEventSink,
+        command_runner: Arc<dyn CodexCommandRunner>,
+    ) -> Self {
         Self {
             inner: Arc::new(AppServerRuntimeInner {
-                app_server_process: Mutex::new(None),
                 codex_home,
+                codex_command: Mutex::new(None),
+                command_runner,
                 connection: Mutex::new(None),
                 events,
+                ever_connected: AtomicBool::new(false),
                 next_id: AtomicU64::new(1),
+                suppress_next_reconnect_event: AtomicBool::new(false),
             }),
         }
+    }
+
+    pub(crate) fn daemon_status(&self) -> CodexAppServerStatus {
+        match self.run_codex_command(
+            &["app-server", "daemon", "version"],
+            APP_SERVER_MANAGEMENT_TIMEOUT,
+            "lifecycle",
+            false,
+        ) {
+            Ok(output) => {
+                let status = parse_daemon_status(&output.stdout, None, self.socket_path());
+                if let Some(path) = status.managed_codex_path.as_deref()
+                    && let Ok(mut command) = self.inner.codex_command.lock()
+                {
+                    *command = Some(PathBuf::from(path));
+                }
+                status
+            }
+            Err(error) => {
+                CodexAppServerStatus {
+                    state: "failed".to_string(),
+                    socket_path: Some(self.socket_path().to_string_lossy().into_owned()),
+                    managed_codex_path: self.inner.codex_command.lock().ok().and_then(|command| {
+                        command.as_ref().map(|path| path.display().to_string())
+                    }),
+                    installed_version: None,
+                    running_version: None,
+                    restart_required: false,
+                    last_error: Some(error),
+                }
+            }
+        }
+    }
+
+    pub(crate) fn daemon_start(&self) -> Result<CodexAppServerStatus, String> {
+        self.emit_management_log("lifecycle", None, Some("info"), "starting");
+        self.start_app_server()?;
+        self.disconnect_connection("app-server reconnecting");
+        self.inner
+            .suppress_next_reconnect_event
+            .store(true, Ordering::SeqCst);
+        if let Err(error) = self.ensure_connected() {
+            self.inner
+                .suppress_next_reconnect_event
+                .store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+        Ok(self.daemon_status())
+    }
+
+    pub(crate) fn daemon_stop(&self) -> Result<CodexAppServerStatus, String> {
+        self.emit_management_log("lifecycle", None, Some("info"), "stopping");
+        // Close our client first so the reader treats the EOF as intentional
+        // and does not race the explicit Stop with automatic reconnect.
+        self.disconnect_connection("app-server stopping");
+        self.run_codex_command(
+            &["app-server", "daemon", "stop"],
+            APP_SERVER_MANAGEMENT_TIMEOUT,
+            "lifecycle",
+            true,
+        )?;
+        self.emit_management_log("lifecycle", None, Some("info"), "stopped");
+        Ok(self.daemon_status())
+    }
+
+    pub(crate) fn daemon_restart(&self) -> Result<CodexAppServerStatus, String> {
+        self.emit_management_log("lifecycle", None, Some("info"), "restarting");
+        // Suppress both the intentional disconnect and the reconnect event;
+        // the management caller reconciles synchronously after this returns.
+        self.disconnect_connection("app-server restarting");
+        self.inner
+            .suppress_next_reconnect_event
+            .store(true, Ordering::SeqCst);
+        if let Err(error) = self.run_codex_command(
+            &["app-server", "daemon", "restart"],
+            APP_SERVER_MANAGEMENT_TIMEOUT,
+            "lifecycle",
+            true,
+        ) {
+            self.inner
+                .suppress_next_reconnect_event
+                .store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+        if let Err(error) = self.ensure_connected() {
+            self.inner
+                .suppress_next_reconnect_event
+                .store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+        self.emit_management_log("lifecycle", None, Some("info"), "reconnected");
+        Ok(self.daemon_status())
+    }
+
+    pub(crate) fn update_codex(&self) -> Result<CodexAppServerStatus, String> {
+        self.emit_management_log("update", None, Some("info"), "checking for update");
+        self.run_codex_command(&["update"], CODEX_UPDATE_TIMEOUT, "update", true)?;
+        self.emit_management_log("update", None, Some("info"), "update completed");
+        Ok(self.daemon_status())
+    }
+
+    pub(crate) fn management_log(
+        &self,
+        source: &'static str,
+        level: Option<&'static str>,
+        line: &str,
+    ) {
+        self.emit_management_log(source, None, level, line);
     }
 
     pub(crate) fn request(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -79,6 +287,10 @@ impl AppServerRuntime {
             summarize_app_server_value(&value)
         ));
         Ok(value)
+    }
+
+    pub(crate) fn reconnect(&self) -> Result<(), String> {
+        self.ensure_connected().map(|_| ())
     }
 
     fn request_once(
@@ -164,10 +376,17 @@ impl AppServerRuntime {
             debug_log(format_args!(
                 "[codex:app-server] connected existing runtime"
             ));
+            self.emit_management_log(
+                "connection",
+                None,
+                Some("info"),
+                "connected existing daemon",
+            );
+            self.emit_reconnected_if_needed();
             return Ok(connection);
         }
 
-        eprintln!("[codex:app-server] starting runtime");
+        self.emit_management_log("connection", None, Some("info"), "starting daemon");
         self.start_app_server()?;
         let mut last_error = String::new();
         loop {
@@ -178,6 +397,13 @@ impl AppServerRuntime {
             match self.connect_and_initialize_runtime(remaining.min(Duration::from_secs(2))) {
                 Ok(connection) => {
                     debug_log(format_args!("[codex:app-server] connected started runtime"));
+                    self.emit_management_log(
+                        "connection",
+                        None,
+                        Some("info"),
+                        "connected started daemon",
+                    );
+                    self.emit_reconnected_if_needed();
                     return Ok(connection);
                 }
                 Err(error) => {
@@ -201,12 +427,24 @@ impl AppServerRuntime {
             .set_read_timeout(None)
             .map_err(|error| error.to_string())?;
 
+        let shutdown = Arc::new(
+            socket
+                .stream
+                .try_clone()
+                .map_err(|error| error.to_string())?,
+        );
         let (reader, writer) = socket.split()?;
         let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let (writer_tx, writer_rx) = mpsc::channel::<String>();
 
-        spawn_app_server_writer(writer, writer_rx, alive.clone(), pending.clone());
+        spawn_app_server_writer(
+            writer,
+            writer_rx,
+            alive.clone(),
+            pending.clone(),
+            self.inner.events.clone(),
+        );
         spawn_app_server_reader(
             reader,
             writer_tx.clone(),
@@ -218,6 +456,7 @@ impl AppServerRuntime {
         Ok(AppServerConnection {
             alive,
             pending,
+            shutdown,
             writer_tx,
         })
     }
@@ -264,44 +503,103 @@ impl AppServerRuntime {
     }
 
     fn start_app_server(&self) -> Result<(), String> {
-        let mut process_guard = self
-            .inner
-            .app_server_process
-            .lock()
-            .map_err(|_| "app-server process lock poisoned".to_string())?;
-        if process_guard.is_some() {
-            return Ok(());
-        }
-
-        let mut errors = Vec::new();
-        for candidate in codex_command_candidates() {
-            match self.spawn_app_server(&candidate) {
-                Ok(child) => {
-                    debug_log(format_args!(
-                        "[codex:app-server] spawned command={}",
-                        candidate.display()
-                    ));
-                    *process_guard = Some(child);
-                    return Ok(());
-                }
-                Err(error) => errors.push(format!("{}: {error}", candidate.display())),
-            }
-        }
-
-        Err(format!(
-            "failed to start codex app-server using known codex commands: {}",
-            errors.join("; ")
-        ))
+        self.run_codex_command(
+            &["app-server", "daemon", "start"],
+            APP_SERVER_MANAGEMENT_TIMEOUT,
+            "lifecycle",
+            true,
+        )
+        .map(|_| ())
     }
 
-    fn spawn_app_server(&self, command: &PathBuf) -> Result<Child, std::io::Error> {
-        Command::new(command)
-            .args(["app-server", "--listen", "unix://"])
-            .env("CODEX_HOME", &self.inner.codex_home)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
+    fn run_codex_command(
+        &self,
+        args: &[&str],
+        timeout: Duration,
+        source: &'static str,
+        emit_output: bool,
+    ) -> Result<CodexCommandOutput, String> {
+        let selected = self
+            .inner
+            .codex_command
+            .lock()
+            .map_err(|_| "codex command lock poisoned".to_string())?
+            .clone();
+        let candidates = selected
+            .map(|command| vec![command])
+            .unwrap_or_else(codex_command_candidates);
+        let mut errors = Vec::new();
+        for candidate in candidates {
+            let mut on_line = |entry: CodexCommandLine| {
+                if emit_output {
+                    self.emit_management_log(
+                        source,
+                        Some(entry.channel.as_str()),
+                        None,
+                        &entry.line,
+                    );
+                }
+            };
+            match self.inner.command_runner.run(
+                &candidate,
+                args,
+                &self.inner.codex_home,
+                timeout,
+                &mut on_line,
+            ) {
+                Ok(output) => {
+                    if let Ok(mut selected) = self.inner.codex_command.lock() {
+                        *selected = Some(candidate);
+                    }
+                    return Ok(output);
+                }
+                Err(error) if error.starts_with("spawn failed:") => {
+                    errors.push(format!("{}: {error}", candidate.display()));
+                }
+                Err(error) => {
+                    let error = format!("Codex command failed: {}: {error}", candidate.display());
+                    self.emit_management_log(source, None, Some("error"), &error);
+                    return Err(error);
+                }
+            }
+        }
+        let error = format!("Codex command failed: {}", errors.join("; "));
+        self.emit_management_log(source, None, Some("error"), &error);
+        Err(error)
+    }
+
+    fn emit_management_log(
+        &self,
+        source: &'static str,
+        channel: Option<&'static str>,
+        level: Option<&'static str>,
+        line: &str,
+    ) {
+        self.inner.events.emit(AppServerEvent::ManagementLog {
+            source,
+            channel,
+            level,
+            line: line.to_string(),
+        });
+    }
+
+    fn emit_reconnected_if_needed(&self) {
+        let was_connected = self.inner.ever_connected.swap(true, Ordering::SeqCst);
+        let suppressed = self
+            .inner
+            .suppress_next_reconnect_event
+            .swap(false, Ordering::SeqCst);
+        if was_connected && !suppressed {
+            self.inner.events.emit(AppServerEvent::Reconnected);
+        }
+    }
+
+    fn disconnect_connection(&self, reason: &str) {
+        if let Ok(mut connection) = self.inner.connection.lock() {
+            if let Some(connection) = connection.take() {
+                connection.close(reason);
+            }
+        }
     }
 
     fn socket_path(&self) -> PathBuf {
@@ -347,8 +645,17 @@ impl AppServerEventSink {
 
     fn emit(&self, event: AppServerEvent) {
         match &event {
+            AppServerEvent::Reconnected => {}
             AppServerEvent::Disconnected(reason) => {
                 let _ = reason;
+            }
+            AppServerEvent::ManagementLog {
+                source,
+                channel,
+                level,
+                line,
+            } => {
+                let _ = (source, channel, level, line);
             }
             AppServerEvent::Notification(notification)
             | AppServerEvent::ServerRequest(notification) => {
@@ -366,18 +673,7 @@ impl Drop for AppServerRuntimeInner {
     fn drop(&mut self) {
         if let Ok(mut connection) = self.connection.lock() {
             if let Some(connection) = connection.take() {
-                connection.alive.store(false, Ordering::SeqCst);
-                drain_pending(
-                    &connection.pending,
-                    "app-server runtime stopped".to_string(),
-                );
-            }
-        }
-
-        if let Ok(mut process) = self.app_server_process.lock() {
-            if let Some(mut child) = process.take() {
-                let _ = child.kill();
-                let _ = child.wait();
+                connection.close("app-server runtime stopped");
             }
         }
     }
@@ -395,9 +691,11 @@ fn spawn_app_server_reader(
             let message = match reader.read_text() {
                 Ok(message) => message,
                 Err(error) => {
-                    alive.store(false, Ordering::SeqCst);
+                    let was_alive = alive.swap(false, Ordering::SeqCst);
                     drain_pending(&pending, error.clone());
-                    events.emit(AppServerEvent::Disconnected(error));
+                    if was_alive {
+                        events.emit(AppServerEvent::Disconnected(error));
+                    }
                     break;
                 }
             };
@@ -421,6 +719,7 @@ fn spawn_app_server_writer(
     writer_rx: mpsc::Receiver<String>,
     alive: Arc<AtomicBool>,
     pending: PendingResponses,
+    events: AppServerEventSink,
 ) {
     thread::spawn(move || {
         while alive.load(Ordering::SeqCst) {
@@ -429,8 +728,11 @@ fn spawn_app_server_writer(
                 Err(_) => break,
             };
             if let Err(error) = writer.send_text(&message) {
-                alive.store(false, Ordering::SeqCst);
-                drain_pending(&pending, error);
+                let was_alive = alive.swap(false, Ordering::SeqCst);
+                drain_pending(&pending, error.clone());
+                if was_alive {
+                    events.emit(AppServerEvent::Disconnected(error));
+                }
                 break;
             }
         }
@@ -702,6 +1004,156 @@ fn codex_command_candidates() -> Vec<PathBuf> {
     candidates
 }
 
+impl CodexCommandRunner for ProcessCodexCommandRunner {
+    fn run(
+        &self,
+        command: &PathBuf,
+        args: &[&str],
+        codex_home: &PathBuf,
+        timeout: Duration,
+        on_line: &mut dyn FnMut(CodexCommandLine),
+    ) -> Result<CodexCommandOutput, String> {
+        let mut child = Command::new(command)
+            .args(args)
+            .env("CODEX_HOME", codex_home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("spawn failed: {error}"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Codex command stdout unavailable".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "Codex command stderr unavailable".to_string())?;
+        let (line_tx, line_rx) = mpsc::channel::<CodexCommandLine>();
+        let stdout_reader =
+            spawn_command_pipe_reader(stdout, CodexCommandChannel::Stdout, line_tx.clone());
+        let stderr_reader =
+            spawn_command_pipe_reader(stderr, CodexCommandChannel::Stderr, line_tx.clone());
+        drop(line_tx);
+
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut record_line = |entry: CodexCommandLine| {
+            let output = match entry.channel {
+                CodexCommandChannel::Stdout => &mut stdout,
+                CodexCommandChannel::Stderr => &mut stderr,
+            };
+            output.push_str(&entry.line);
+            output.push('\n');
+            on_line(entry);
+        };
+
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            while let Ok(entry) = line_rx.try_recv() {
+                record_line(entry);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(format!("command timed out after {}ms", timeout.as_millis()));
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(format!("command wait failed: {error}"));
+                }
+            }
+        };
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
+        while let Ok(entry) = line_rx.try_recv() {
+            record_line(entry);
+        }
+        let status = status?;
+        if !status.success() {
+            return Err(format!(
+                "command exited code={}{}",
+                status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                if stderr.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", stderr.trim())
+                }
+            ));
+        }
+        Ok(CodexCommandOutput {
+            stdout,
+            #[cfg(test)]
+            stderr,
+        })
+    }
+}
+
+fn spawn_command_pipe_reader(
+    pipe: impl Read + Send + 'static,
+    channel: CodexCommandChannel,
+    sender: mpsc::Sender<CodexCommandLine>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        for line in std::io::BufReader::new(pipe).lines().map_while(Result::ok) {
+            if !line.trim().is_empty() && sender.send(CodexCommandLine { channel, line }).is_err() {
+                break;
+            }
+        }
+    })
+}
+
+fn parse_daemon_status(
+    stdout: &str,
+    last_error: Option<String>,
+    fallback_socket_path: PathBuf,
+) -> CodexAppServerStatus {
+    let value = serde_json::from_str::<Value>(stdout.trim()).unwrap_or(Value::Null);
+    let installed_version = value
+        .get("cliVersion")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let running_version = value
+        .get("appServerVersion")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let state = match value.get("status").and_then(Value::as_str) {
+        Some("running") => "running",
+        Some("starting") => "starting",
+        Some("stopping") => "stopping",
+        Some("failed") => "failed",
+        _ => "stopped",
+    }
+    .to_string();
+    CodexAppServerStatus {
+        state,
+        socket_path: value
+            .get("socketPath")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| Some(fallback_socket_path.to_string_lossy().into_owned())),
+        managed_codex_path: value
+            .get("managedCodexPath")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        restart_required: installed_version.is_some()
+            && running_version.is_some()
+            && installed_version != running_version,
+        installed_version,
+        running_version,
+        last_error,
+    }
+}
+
 #[derive(Debug)]
 struct UnixWebSocket {
     stream: UnixStream,
@@ -881,6 +1333,79 @@ fn read_frame(stream: &mut UnixStream) -> Result<(u8, Vec<u8>), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    #[derive(Debug)]
+    struct MockCommandRunner {
+        calls: Mutex<Vec<Vec<String>>>,
+        outputs: Mutex<VecDeque<Result<CodexCommandOutput, String>>>,
+    }
+
+    impl MockCommandRunner {
+        fn new(outputs: Vec<Result<CodexCommandOutput, String>>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                outputs: Mutex::new(outputs.into()),
+            })
+        }
+    }
+
+    impl CodexCommandRunner for MockCommandRunner {
+        fn run(
+            &self,
+            _command: &PathBuf,
+            args: &[&str],
+            _codex_home: &PathBuf,
+            _timeout: Duration,
+            on_line: &mut dyn FnMut(CodexCommandLine),
+        ) -> Result<CodexCommandOutput, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(args.iter().map(|arg| (*arg).to_string()).collect());
+            let result = self
+                .outputs
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err("missing mock output".to_string()));
+            if let Ok(output) = &result {
+                for line in output.stdout.lines().filter(|line| !line.trim().is_empty()) {
+                    on_line(CodexCommandLine {
+                        channel: CodexCommandChannel::Stdout,
+                        line: line.to_string(),
+                    });
+                }
+                for line in output.stderr.lines().filter(|line| !line.trim().is_empty()) {
+                    on_line(CodexCommandLine {
+                        channel: CodexCommandChannel::Stderr,
+                        line: line.to_string(),
+                    });
+                }
+            }
+            result
+        }
+    }
+
+    fn runtime_with_runner(
+        runner: Arc<dyn CodexCommandRunner>,
+        events: AppServerEventSink,
+    ) -> AppServerRuntime {
+        let runtime = AppServerRuntime::new_with_runner(
+            PathBuf::from("/tmp/remux-codex-app-server-test-home"),
+            events,
+            runner,
+        );
+        *runtime.inner.codex_command.lock().unwrap() = Some(PathBuf::from("/fake/codex"));
+        runtime
+    }
+
+    fn output(stdout: &str, stderr: &str) -> Result<CodexCommandOutput, String> {
+        Ok(CodexCommandOutput {
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        })
+    }
 
     #[test]
     fn every_used_business_method_has_a_bounded_policy() {
@@ -903,6 +1428,144 @@ mod tests {
             assert!(timeout <= Duration::from_secs(15));
         }
         assert!(app_server_request_timeout("unknown/mutation").is_none());
+    }
+
+    #[test]
+    fn daemon_status_parses_installed_and_running_versions() {
+        let runner = MockCommandRunner::new(vec![output(
+            r#"{"status":"running","managedCodexPath":"/managed/codex","socketPath":"/tmp/codex.sock","cliVersion":"0.145.0","appServerVersion":"0.144.0"}"#,
+            "",
+        )]);
+        let runtime = runtime_with_runner(runner.clone(), AppServerEventSink::default());
+
+        let status = runtime.daemon_status();
+
+        assert_eq!(status.state, "running");
+        assert_eq!(status.installed_version.as_deref(), Some("0.145.0"));
+        assert_eq!(status.running_version.as_deref(), Some("0.144.0"));
+        assert!(status.restart_required);
+        assert_eq!(
+            runner.calls.lock().unwrap().as_slice(),
+            &[vec![
+                "app-server".to_string(),
+                "daemon".to_string(),
+                "version".to_string()
+            ]]
+        );
+    }
+
+    #[test]
+    fn update_never_restarts_and_emits_typed_output() {
+        let runner = MockCommandRunner::new(vec![
+            output("installed 0.145.0\n", "download warning\n"),
+            output(
+                r#"{"status":"running","cliVersion":"0.145.0","appServerVersion":"0.144.0"}"#,
+                "",
+            ),
+        ]);
+        let (events, receiver) = AppServerEventSink::channel();
+        let runtime = runtime_with_runner(runner.clone(), events);
+
+        let status = runtime.update_codex().unwrap();
+
+        assert!(status.restart_required);
+        let calls = runner.calls.lock().unwrap().clone();
+        assert_eq!(calls[0], vec!["update"]);
+        assert_eq!(calls[1], vec!["app-server", "daemon", "version"]);
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.contains(&"restart".to_string()))
+        );
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AppServerEvent::ManagementLog {
+                source: "update",
+                channel: Some("stdout"),
+                line,
+                ..
+            } if line == "installed 0.145.0"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AppServerEvent::ManagementLog {
+                source: "update",
+                channel: Some("stderr"),
+                line,
+                ..
+            } if line == "download warning"
+        )));
+        let output_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AppServerEvent::ManagementLog {
+                        source: "update",
+                        channel: Some("stdout"),
+                        line,
+                        ..
+                    } if line == "installed 0.145.0"
+                )
+            })
+            .unwrap();
+        let completed_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AppServerEvent::ManagementLog {
+                        source: "update",
+                        channel: None,
+                        line,
+                        ..
+                    } if line == "update completed"
+                )
+            })
+            .unwrap();
+        assert!(output_index < completed_index);
+    }
+
+    #[test]
+    fn executed_management_failure_is_not_retried_with_another_binary() {
+        let runner = MockCommandRunner::new(vec![
+            Err("command exited code=1: update failed".to_string()),
+            output("unexpected retry", ""),
+        ]);
+        let runtime = AppServerRuntime::new_with_runner(
+            PathBuf::from("/tmp/remux-codex-app-server-test-home"),
+            AppServerEventSink::default(),
+            runner.clone(),
+        );
+
+        assert!(runtime.update_codex().is_err());
+        assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dropping_runtime_does_not_run_daemon_stop() {
+        let runner = MockCommandRunner::new(Vec::new());
+        let runtime = runtime_with_runner(runner.clone(), AppServerEventSink::default());
+        drop(runtime);
+        assert!(runner.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn lazy_start_uses_daemon_manager_not_foreground_listen() {
+        let runner = MockCommandRunner::new(vec![output("", "")]);
+        let runtime = runtime_with_runner(runner.clone(), AppServerEventSink::default());
+
+        runtime.start_app_server().unwrap();
+
+        assert_eq!(
+            runner.calls.lock().unwrap().as_slice(),
+            &[vec![
+                "app-server".to_string(),
+                "daemon".to_string(),
+                "start".to_string()
+            ]]
+        );
     }
 
     #[test]

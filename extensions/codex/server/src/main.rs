@@ -40,7 +40,8 @@ use crate::models::CodexModelsServer;
 use crate::narration::CodexNarrationServer;
 use crate::operation_queue::{CodexOperationQueueServer, PendingQueueStore};
 use crate::resource_invalidations::{
-    invalidations_for_app_server_notification, resources_invalidated_notification,
+    app_server_reconnected_invalidations, invalidations_for_app_server_notification,
+    resources_invalidated_notification,
 };
 use crate::resources::{CodexTranscriptServer, ValidationOptions};
 use crate::server::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
@@ -53,6 +54,11 @@ const FILES_METHOD: &str = "remux/codex/files";
 const COMPOSER_CONFIG_READ_METHOD: &str = "remux/codex/composer/config/read";
 const COMPOSER_CONFIG_WRITE_METHOD: &str = "remux/codex/composer/config/write";
 const MODELS_READ_METHOD: &str = "remux/codex/models/read";
+const APP_SERVER_STATUS_READ_METHOD: &str = "remux/codex/app-server/status/read";
+const APP_SERVER_START_METHOD: &str = "remux/codex/app-server/start";
+const APP_SERVER_STOP_METHOD: &str = "remux/codex/app-server/stop";
+const APP_SERVER_RESTART_METHOD: &str = "remux/codex/app-server/restart";
+const APP_SERVER_UPDATE_METHOD: &str = "remux/codex/app-server/update";
 const NARRATION_AUDIO_READ_METHOD: &str = "remux/codex/narration/audio/read";
 const NARRATION_CANCEL_METHOD: &str = "remux/codex/narration/cancel";
 const NARRATION_DIAGNOSTICS_READ_METHOD: &str = "remux/codex/narration/diagnostics/read";
@@ -133,6 +139,11 @@ fn handle_request(server: &CodexExtensionServer, request: JsonRpcRequest) -> Jso
             .composer_config
             .write_config(request.params.unwrap_or(Value::Null)),
         MODELS_READ_METHOD => server.models.read_models(),
+        APP_SERVER_STATUS_READ_METHOD => Ok(server.app_server_status()),
+        APP_SERVER_START_METHOD => server.app_server_start(),
+        APP_SERVER_STOP_METHOD => server.app_server_stop(),
+        APP_SERVER_RESTART_METHOD => server.app_server_restart(),
+        APP_SERVER_UPDATE_METHOD => server.app_server_update(),
         NARRATION_AUDIO_READ_METHOD => server
             .narration
             .read_audio(request.params.unwrap_or(Value::Null)),
@@ -201,6 +212,7 @@ fn handle_request(server: &CodexExtensionServer, request: JsonRpcRequest) -> Jso
 }
 
 struct CodexRequestDispatcher {
+    app_server_tx: mpsc::SyncSender<JsonRpcRequest>,
     config_tx: mpsc::SyncSender<JsonRpcRequest>,
     narration_tx: mpsc::SyncSender<JsonRpcRequest>,
     output_tx: mpsc::SyncSender<Value>,
@@ -212,6 +224,12 @@ struct CodexRequestDispatcher {
 
 impl CodexRequestDispatcher {
     fn new(server: Arc<CodexExtensionServer>, output_tx: mpsc::SyncSender<Value>) -> Self {
+        let app_server_tx = spawn_request_worker(
+            "codex-app-server-management",
+            CODEX_SINGLETON_LANE_CAPACITY,
+            server.clone(),
+            output_tx.clone(),
+        );
         let config_tx = spawn_request_worker(
             "codex-config",
             CODEX_SINGLETON_LANE_CAPACITY,
@@ -235,6 +253,7 @@ impl CodexRequestDispatcher {
             })
             .collect();
         Self {
+            app_server_tx,
             config_tx,
             narration_tx,
             output_tx,
@@ -248,11 +267,16 @@ impl CodexRequestDispatcher {
     fn dispatch(&self, request: JsonRpcRequest) {
         let method = request.method.clone();
         let tx = match method.as_str() {
+            APP_SERVER_START_METHOD
+            | APP_SERVER_STOP_METHOD
+            | APP_SERVER_RESTART_METHOD
+            | APP_SERVER_UPDATE_METHOD => self.app_server_tx.clone(),
             COMPOSER_CONFIG_WRITE_METHOD => self.config_tx.clone(),
             NARRATION_START_METHOD | NARRATION_CANCEL_METHOD => self.narration_tx.clone(),
             FILES_METHOD
             | COMPOSER_CONFIG_READ_METHOD
             | MODELS_READ_METHOD
+            | APP_SERVER_STATUS_READ_METHOD
             | NARRATION_AUDIO_READ_METHOD
             | NARRATION_DIAGNOSTICS_READ_METHOD
             | NARRATION_READ_METHOD
@@ -363,12 +387,17 @@ fn send_response(
 }
 
 struct CodexExtensionServer {
+    app_server: AppServerRuntime,
     composer_config: ComposerConfigStore,
     files: CodexFileResourcesServer,
+    live_transcript: LiveTranscriptStore,
     models: CodexModelsServer,
     narration: CodexNarrationServer,
     operation_queue: CodexOperationQueueServer,
+    output_tx: mpsc::SyncSender<Value>,
     thread_commands: CodexThreadCommandServer,
+    thread_runtime: ThreadRuntimeStore,
+    thread_usage: ThreadUsageStore,
     threads: CodexThreadResourcesServer,
     transcript: Mutex<CodexTranscriptServer>,
 }
@@ -400,24 +429,30 @@ impl CodexExtensionServer {
         spawn_app_server_event_forwarder(
             event_rx,
             output_tx.clone(),
+            app_server.clone(),
             live_transcript.clone(),
             thread_runtime.clone(),
             thread_usage.clone(),
             operation_queue.clone(),
         );
-        Self {
+        let server = Self {
+            app_server: app_server.clone(),
             composer_config: composer_config.clone(),
             files: CodexFileResourcesServer::new(),
+            live_transcript: live_transcript.clone(),
             models: CodexModelsServer::new(app_server.clone()),
             narration: CodexNarrationServer::new(
                 codex_home.clone(),
                 narration_app_server,
                 narration_event_rx,
-                output_tx,
+                output_tx.clone(),
                 live_transcript.clone(),
             ),
             operation_queue: operation_queue.clone(),
+            output_tx: output_tx.clone(),
             thread_commands,
+            thread_runtime: thread_runtime.clone(),
+            thread_usage: thread_usage.clone(),
             threads: CodexThreadResourcesServer::new(
                 app_server,
                 composer_config,
@@ -429,8 +464,183 @@ impl CodexExtensionServer {
                 codex_home,
                 live_transcript,
             )),
+        };
+        match server.reconcile_app_server() {
+            Ok(thread_ids) => server.publish_reconciliation_invalidations(&thread_ids),
+            Err(error) => server.app_server.management_log(
+                "connection",
+                Some("warn"),
+                &format!("initial reconciliation failed: {error}"),
+            ),
+        }
+        server
+    }
+
+    fn app_server_status(&self) -> Value {
+        self.app_server
+            .daemon_status()
+            .to_value(self.thread_runtime.active_turn_ids())
+    }
+
+    fn app_server_start(&self) -> Result<Value, String> {
+        self.app_server.daemon_start()?;
+        let thread_ids = self.reconcile_app_server()?;
+        self.publish_reconciliation_invalidations(&thread_ids);
+        Ok(self
+            .app_server
+            .daemon_status()
+            .to_value(self.thread_runtime.active_turn_ids()))
+    }
+
+    fn app_server_stop(&self) -> Result<Value, String> {
+        let thread_ids = self.ensure_app_server_idle()?;
+        let status = self.app_server.daemon_stop()?;
+        self.live_transcript.clear();
+        self.thread_runtime.clear();
+        self.thread_usage.clear();
+        self.publish_reconciliation_invalidations(&thread_ids);
+        Ok(status.to_value(Vec::new()))
+    }
+
+    fn app_server_restart(&self) -> Result<Value, String> {
+        self.ensure_app_server_idle()?;
+        self.app_server.daemon_restart()?;
+        let thread_ids = self.reconcile_app_server()?;
+        self.publish_reconciliation_invalidations(&thread_ids);
+        Ok(self
+            .app_server
+            .daemon_status()
+            .to_value(self.thread_runtime.active_turn_ids()))
+    }
+
+    fn app_server_update(&self) -> Result<Value, String> {
+        self.app_server
+            .update_codex()
+            .map(|status| status.to_value(self.thread_runtime.active_turn_ids()))
+    }
+
+    fn ensure_app_server_idle(&self) -> Result<Vec<String>, String> {
+        let thread_ids = self.reconcile_app_server()?;
+        self.publish_reconciliation_invalidations(&thread_ids);
+        let active = self.thread_runtime.active_turn_ids();
+        if active.is_empty() {
+            Ok(thread_ids)
+        } else {
+            Err(format!(
+                "Codex App Server has {} active turn{}; finish or interrupt before restarting",
+                active.len(),
+                if active.len() == 1 { "" } else { "s" }
+            ))
         }
     }
+
+    fn reconcile_app_server(&self) -> Result<Vec<String>, String> {
+        reconcile_app_server_state(
+            &self.app_server,
+            &self.live_transcript,
+            &self.thread_runtime,
+            &self.thread_usage,
+        )
+    }
+
+    fn publish_reconciliation_invalidations(&self, thread_ids: &[String]) {
+        let invalidations = reconciliation_invalidations(thread_ids);
+        if !invalidations.is_empty() {
+            let _ = self
+                .output_tx
+                .send(resources_invalidated_notification(invalidations));
+        }
+    }
+}
+
+fn reconcile_app_server_state(
+    app_server: &AppServerRuntime,
+    live_transcript: &LiveTranscriptStore,
+    thread_runtime: &ThreadRuntimeStore,
+    thread_usage: &ThreadUsageStore,
+) -> Result<Vec<String>, String> {
+    let response = app_server.request(
+        "thread/list",
+        json!({
+            "archived": false,
+            "limit": 100,
+            "sortDirection": "desc",
+            "sortKey": "updated_at",
+            "useStateDbOnly": false,
+        }),
+    )?;
+    live_transcript.clear();
+    thread_runtime.clear();
+    thread_usage.clear();
+    let mut all_threads = Vec::new();
+    let mut active_threads = Vec::new();
+    for thread in response
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(thread_id) = thread.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        all_threads.push(thread_id.to_string());
+        if !thread_status_is_active(thread.get("status")) {
+            continue;
+        }
+        active_threads.push(thread_id.to_string());
+        let detail = app_server.request(
+            "thread/read",
+            json!({ "threadId": thread_id, "includeTurns": true }),
+        )?;
+        let full_thread = detail.get("thread").unwrap_or(thread);
+        let turns = full_thread
+            .get("turns")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for turn in &turns {
+            live_transcript.record_turn(thread_id, turn);
+        }
+        let active_turn_id = turns
+            .iter()
+            .rev()
+            .find(|turn| turn_status_is_active(turn.get("status")))
+            .and_then(|turn| turn.get("id"))
+            .and_then(Value::as_str)
+            .or_else(|| full_thread.get("activeTurnId").and_then(Value::as_str));
+        thread_runtime.record_turn_started(thread_id, active_turn_id);
+    }
+    live_transcript.set_authoritative_active_threads(&active_threads);
+    app_server.management_log(
+        "connection",
+        Some("info"),
+        &format!(
+            "reconciled {} active thread{}",
+            active_threads.len(),
+            if active_threads.len() == 1 { "" } else { "s" }
+        ),
+    );
+    Ok(all_threads)
+}
+
+fn thread_status_is_active(status: Option<&Value>) -> bool {
+    status.and_then(Value::as_str) == Some("active")
+        || status
+            .and_then(Value::as_object)
+            .and_then(|status| status.get("type"))
+            .and_then(Value::as_str)
+            == Some("active")
+}
+
+fn turn_status_is_active(status: Option<&Value>) -> bool {
+    matches!(
+        status.and_then(Value::as_str),
+        Some("inProgress" | "running" | "active")
+    )
+}
+
+fn reconciliation_invalidations(thread_ids: &[String]) -> Vec<Value> {
+    app_server_reconnected_invalidations(thread_ids)
 }
 
 fn spawn_stdout_writer(output_rx: mpsc::Receiver<Value>) {
@@ -453,6 +663,7 @@ fn spawn_stdout_writer(output_rx: mpsc::Receiver<Value>) {
 fn spawn_app_server_event_forwarder(
     event_rx: mpsc::Receiver<AppServerEvent>,
     output_tx: mpsc::SyncSender<Value>,
+    app_server: AppServerRuntime,
     live_transcript: LiveTranscriptStore,
     thread_runtime: ThreadRuntimeStore,
     thread_usage: ThreadUsageStore,
@@ -461,8 +672,30 @@ fn spawn_app_server_event_forwarder(
     thread::spawn(move || {
         for event in event_rx {
             let notification = match event {
+                AppServerEvent::Reconnected => {
+                    match reconcile_app_server_state(
+                        &app_server,
+                        &live_transcript,
+                        &thread_runtime,
+                        &thread_usage,
+                    ) {
+                        Ok(thread_ids) => {
+                            let invalidations = reconciliation_invalidations(&thread_ids);
+                            if !invalidations.is_empty() {
+                                let _ = output_tx
+                                    .send(resources_invalidated_notification(invalidations));
+                            }
+                        }
+                        Err(error) => app_server.management_log(
+                            "connection",
+                            Some("error"),
+                            &format!("reconciliation failed: {error}"),
+                        ),
+                    }
+                    continue;
+                }
                 AppServerEvent::Notification(notification) => notification,
-                AppServerEvent::Disconnected(_) => {
+                AppServerEvent::Disconnected(reason) => {
                     let invalidations = operation_queue
                         .clear_all()
                         .into_iter()
@@ -476,6 +709,37 @@ fn spawn_app_server_event_forwarder(
                     if !invalidations.is_empty() {
                         let _ = output_tx.send(resources_invalidated_notification(invalidations));
                     }
+                    app_server.management_log(
+                        "connection",
+                        Some("warn"),
+                        &format!("disconnected: {reason}; reconnecting"),
+                    );
+                    if let Err(error) = app_server.reconnect() {
+                        app_server.management_log(
+                            "connection",
+                            Some("error"),
+                            &format!("automatic reconnect failed: {error}"),
+                        );
+                    }
+                    continue;
+                }
+                AppServerEvent::ManagementLog {
+                    source,
+                    channel,
+                    level,
+                    line,
+                } => {
+                    let _ = output_tx.send(json!({
+                        "jsonrpc": "2.0",
+                        "method": "remux/extension/managementLog",
+                        "params": {
+                            "componentId": "codex-app-server",
+                            "source": source,
+                            "channel": channel,
+                            "level": level,
+                            "line": line,
+                        }
+                    }));
                     continue;
                 }
                 AppServerEvent::ServerRequest(_) => continue,

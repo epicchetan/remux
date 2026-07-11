@@ -23,6 +23,12 @@ pub(crate) struct ThreadUsageSnapshot {
 }
 
 impl ThreadUsageStore {
+    pub(crate) fn clear(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.clear();
+        }
+    }
+
     pub(crate) fn record_notification(&self, notification: &Value) {
         if notification.get("method").and_then(Value::as_str) != Some("thread/tokenUsage/updated") {
             return;
@@ -143,6 +149,25 @@ mod tests {
         assert_eq!(value["turnId"], json!("turn-1"));
         assert_eq!(value["tokenUsage"]["last"]["inputTokens"], json!(1000));
         assert!(value["revision"].is_string());
+    }
+
+    #[test]
+    fn clear_drops_usage_from_a_previous_connection() {
+        let store = ThreadUsageStore::default();
+        store.record_notification(&json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "tokenUsage": token_usage(1000),
+            },
+        }));
+
+        store.clear();
+
+        let value = store.resource_value("thread-1");
+        assert_eq!(value["turnId"], Value::Null);
+        assert_eq!(value["tokenUsage"], Value::Null);
     }
 
     #[test]

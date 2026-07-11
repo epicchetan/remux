@@ -33,11 +33,14 @@ import {
   buildExtension,
   extensionDidChangeStatusMethod,
   parseExtensionServerStatus,
+  readCodexAppServerStatus,
   readExtensionServerStatuses,
   restartExtensionServer,
+  runCodexAppServerAction,
   setExtensionServerRunning,
   setExtensionWatchRunning,
   type ExtensionServerStatus,
+  type CodexAppServerStatus,
 } from './extensionServerApi';
 import {
   formatBytes,
@@ -69,6 +72,7 @@ export function SettingsOverview() {
   const [extensionStatusLoading, setExtensionStatusLoading] = useState(false);
   const [detailExtensionId, setDetailExtensionId] = useState<string | null>(null);
   const [detailBusyAction, setDetailBusyAction] = useState<ExtensionDetailAction | null>(null);
+  const [codexAppServerStatus, setCodexAppServerStatus] = useState<CodexAppServerStatus | null>(null);
   const resources = useSystemResources(connection);
   const nowMinuteMs = useMinuteTick();
   const bottomPadding = getBottomBarHeight(insets.bottom) + tabGridGap;
@@ -101,6 +105,34 @@ export function SettingsOverview() {
     void refreshServerStatuses();
   }, [extensions.length, refreshServerStatuses]);
 
+  const refreshCodexAppServerStatus = useCallback(async () => {
+    if (
+      connection.status.type !== 'connected'
+      || detailExtensionId !== 'codex'
+      || extensionStatuses.codex?.running !== true
+    ) {
+      setCodexAppServerStatus(null);
+      return;
+    }
+    try {
+      setCodexAppServerStatus(await readCodexAppServerStatus(connection.request));
+    } catch (error) {
+      setExtensionStatusError(error instanceof Error ? error.message : String(error));
+      setCodexAppServerStatus(null);
+    }
+  }, [connection.request, connection.status.type, detailExtensionId, extensionStatuses.codex?.running]);
+
+  useEffect(() => {
+    void refreshCodexAppServerStatus();
+    if (detailExtensionId !== 'codex' || extensionStatuses.codex?.running !== true) {
+      return undefined;
+    }
+    const timer = setInterval(() => {
+      void refreshCodexAppServerStatus();
+    }, 5_000);
+    return () => clearInterval(timer);
+  }, [refreshCodexAppServerStatus]);
+
   // Live states: merge `didChangeStatus` broadcasts so crash → backingOff →
   // running is visible without a manual refresh.
   useEffect(() => connection.subscribe((message) => {
@@ -121,6 +153,14 @@ export function SettingsOverview() {
     setExtensionStatusError(null);
     setDetailBusyAction(action);
     try {
+      if (action.startsWith('app-server-')) {
+        const appAction = action.slice('app-server-'.length) as 'start' | 'stop' | 'restart' | 'update';
+        setCodexAppServerStatus(await runCodexAppServerAction(connection.request, appAction));
+        if (appAction === 'start' || appAction === 'restart') {
+          reloadExtensionTabs(extensionId);
+        }
+        return;
+      }
       const status = action === 'watch-start' || action === 'watch-stop'
         ? await setExtensionWatchRunning(connection.request, extensionId, action === 'watch-start')
         : action === 'server-build' || action === 'views-build'
@@ -135,8 +175,14 @@ export function SettingsOverview() {
       // Stopping the watcher changes nothing on disk; everything else may
       // have rewritten the served bundle or restarted the server. A viewer
       // build rewrites the bundle even when no server runs.
-      if (action === 'views-build' || (status.running && action !== 'watch-stop')) {
+      if (
+        action === 'views-build'
+        || ((action === 'start' || action === 'restart' || action === 'watch-start') && status.running)
+      ) {
         reloadExtensionTabs(extensionId);
+      }
+      if (extensionId === 'codex' && (action === 'start' || action === 'restart')) {
+        await refreshCodexAppServerStatus();
       }
     } catch (error) {
       setExtensionStatusError(error instanceof Error ? error.message : String(error));
@@ -254,6 +300,7 @@ export function SettingsOverview() {
       </ScrollView>
 
       <ExtensionDetailSheet
+        appServerStatus={detailExtensionId === 'codex' ? codexAppServerStatus : null}
         busyAction={detailBusyAction}
         name={extensions.find((extension) => extension.id === detailExtensionId)?.display.title ?? detailExtensionId ?? ''}
         onAction={(action) => {

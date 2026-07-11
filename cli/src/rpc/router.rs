@@ -211,9 +211,9 @@ pub trait ExtensionServer: Send + Sync {
         Box::pin(async { (self.status(), false) })
     }
     /// Manual server build: rebuilds the binary while any running server
-    /// keeps serving, then restarts it into the new build. A stopped server
-    /// stays stopped. Build failure is a plain error — the lifecycle (and a
-    /// live server) stays untouched.
+    /// keeps serving. Explicit Restart (or the next Start) applies it. A
+    /// stopped server stays stopped. Build failure is a plain error — the
+    /// lifecycle and a live server stay untouched.
     fn build_server(&self) -> BoxFuture<'_, Result<ServerStatus, JsonRpcError>> {
         Box::pin(async {
             Err(JsonRpcError::new(

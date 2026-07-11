@@ -36,6 +36,17 @@ export type ExtensionResourceSample = {
   rssBytes: number;
   uptimeMs: number | null;
   restartCount: number;
+  roles: {
+    server: ExtensionRoleResourceSample | null;
+    watch: ExtensionRoleResourceSample | null;
+  };
+};
+
+export type ExtensionRoleResourceSample = {
+  pid: number;
+  processCount: number;
+  cpuPercent: number;
+  rssBytes: number;
 };
 
 /**
@@ -108,7 +119,28 @@ function parseExtensionResourceSample(raw: unknown): ExtensionResourceSample[] {
     rssBytes: numberOrZero(raw.rssBytes),
     uptimeMs: typeof raw.uptimeMs === 'number' ? raw.uptimeMs : null,
     restartCount: numberOrZero(raw.restartCount),
+    roles: parseExtensionResourceRoles(raw.roles),
   }];
+}
+
+function parseExtensionResourceRoles(raw: unknown): ExtensionResourceSample['roles'] {
+  const roles = isRecord(raw) ? raw : {};
+  return {
+    server: parseExtensionRoleResourceSample(roles.server),
+    watch: parseExtensionRoleResourceSample(roles.watch),
+  };
+}
+
+function parseExtensionRoleResourceSample(raw: unknown): ExtensionRoleResourceSample | null {
+  if (!isRecord(raw) || typeof raw.pid !== 'number') {
+    return null;
+  }
+  return {
+    pid: raw.pid,
+    processCount: numberOrZero(raw.processCount),
+    cpuPercent: numberOrZero(raw.cpuPercent),
+    rssBytes: numberOrZero(raw.rssBytes),
+  };
 }
 
 function isMethodNotFound(error: unknown) {

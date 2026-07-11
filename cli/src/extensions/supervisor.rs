@@ -41,7 +41,9 @@ use crate::extensions::process::{
     spawn_extension, SpawnedChild, StdinCommand,
 };
 use crate::extensions::runstate::{read_start_ticks, RunEntry, RunRole, RunState};
-use crate::logs::{ExtensionLogs, Journal, JournalEvent};
+use crate::logs::{
+    ExtensionLogMeta, ExtensionLogs, Journal, JournalEvent, LogChannel, LogLevel, LogSource,
+};
 use crate::rpc::jsonrpc::{JsonRpcError, EXTENSION_ERROR};
 use crate::rpc::router::{
     BoxFuture, ExtensionServer, LastExit, RpcResult, ServerStatus, ViewsFacet, WatchFacet,
@@ -60,6 +62,7 @@ pub const BUILD_TIMEOUT_MS: u64 = 600_000;
 pub const BUILD_FAILED_REASON: &str = "build-failed";
 
 pub const DID_CHANGE_STATUS_METHOD: &str = "remux/extensions/didChangeStatus";
+const MANAGEMENT_LOG_METHOD: &str = "remux/extension/managementLog";
 const REMUX_NOTIFICATION_METHOD_PREFIX: &str = "remux/notifications/";
 const EXTENSION_NOTIFICATION_WORKERS: usize = 32;
 static EXTENSION_NOTIFICATION_PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
@@ -405,6 +408,25 @@ struct WatchChild {
     pgid: u32,
 }
 
+#[derive(Debug, Clone)]
+enum BuildTarget {
+    ExtensionServer,
+    Viewer { view_id: String },
+}
+
+impl BuildTarget {
+    fn meta(&self, channel: Option<LogChannel>, level: Option<LogLevel>) -> ExtensionLogMeta {
+        match self {
+            Self::ExtensionServer => {
+                ExtensionLogMeta::extension_server(LogSource::Build, channel, level, "build")
+            }
+            Self::Viewer { view_id } => {
+                ExtensionLogMeta::viewer(view_id.clone(), LogSource::Build, channel, level, "build")
+            }
+        }
+    }
+}
+
 struct Actor {
     extension: ExtensionManifest,
     cfg: SupervisorConfig,
@@ -577,7 +599,7 @@ impl Actor {
     /// deterministic; retry is manual.
     async fn run_server_build(&mut self, build: &BuildSpec) -> bool {
         self.set_state(Lifecycle::Building);
-        match self.exec_build(build).await {
+        match self.exec_build(BuildTarget::ExtensionServer, build).await {
             Ok(()) => {
                 self.last_build_failed = false;
                 true
@@ -603,7 +625,13 @@ impl Actor {
                 continue;
             };
             if self.watch_enabled && view.watch.is_some() {
-                self.append_build_log(&format!("skipping view {view_id}: watch owns the bundle"));
+                self.append_build_log(
+                    &BuildTarget::Viewer {
+                        view_id: view_id.clone(),
+                    },
+                    &format!("skipping: watch owns the bundle"),
+                    Some(LogLevel::Info),
+                );
                 continue;
             }
             let needed = self.failed_view_builds.contains(&view_id) || !view.entry.exists();
@@ -611,7 +639,15 @@ impl Actor {
                 continue;
             }
             self.set_state(Lifecycle::Building);
-            match self.exec_build(build).await {
+            match self
+                .exec_build(
+                    BuildTarget::Viewer {
+                        view_id: view_id.clone(),
+                    },
+                    build,
+                )
+                .await
+            {
                 Ok(()) => {
                     self.failed_view_builds.remove(&view_id);
                     self.last_view_build_at_ms = Some(now_ms());
@@ -633,6 +669,7 @@ impl Actor {
     /// whole time.
     async fn exec_build(
         &mut self,
+        target: BuildTarget,
         build: &BuildSpec,
     ) -> Result<(), (Option<i32>, Option<String>, String)> {
         self.journal_lifecycle(
@@ -644,11 +681,11 @@ impl Actor {
             })),
             "info",
         );
-        self.append_build_log(&format!(
-            "starting: {} {}",
-            build.command,
-            build.args.join(" ")
-        ));
+        self.append_build_log(
+            &target,
+            &format!("starting: {} {}", build.command, build.args.join(" ")),
+            Some(LogLevel::Info),
+        );
 
         let mut command = tokio::process::Command::new(&build.command);
         command
@@ -661,7 +698,11 @@ impl Actor {
         let mut child = match harden_command(&mut command).spawn() {
             Ok(child) => child,
             Err(error) => {
-                self.append_build_log(&format!("spawn failed: {error}"));
+                self.append_build_log(
+                    &target,
+                    &format!("spawn failed: {error}"),
+                    Some(LogLevel::Error),
+                );
                 return Err((None, None, format!("build spawn failed: {error}")));
             }
         };
@@ -678,8 +719,8 @@ impl Actor {
             },
         );
 
-        // Stream both pipes into the extension log ring with the [build]
-        // prefix — build errors are readable from the phone.
+        // Stream both pipes with typed target/channel metadata. Raw stderr is
+        // transport, not severity.
         for stream in [
             child.stdout.take().map(BuildPipe::Stdout),
             child.stderr.take().map(BuildPipe::Stderr),
@@ -689,10 +730,15 @@ impl Actor {
         {
             let logs = self.logs.clone();
             let extension_id = self.extension.id.clone();
+            let target = target.clone();
             tokio::spawn(async move {
+                let channel = match &stream {
+                    BuildPipe::Stdout(_) => LogChannel::Stdout,
+                    BuildPipe::Stderr(_) => LogChannel::Stderr,
+                };
                 let append = move |line: String| {
                     if !line.trim().is_empty() {
-                        logs.append(&extension_id, "build", &format!("[build] {line}"));
+                        logs.append(&extension_id, target.meta(Some(channel), None), &line);
                     }
                 };
                 match stream {
@@ -709,7 +755,11 @@ impl Actor {
                 signal_group(pid, nix::sys::signal::Signal::SIGKILL);
                 let _ = child.wait().await;
                 self.run_state.remove(&self.extension.id, RunRole::Build);
-                self.append_build_log(&format!("timed out after {}ms", self.cfg.build_timeout_ms));
+                self.append_build_log(
+                    &target,
+                    &format!("timed out after {}ms", self.cfg.build_timeout_ms),
+                    Some(LogLevel::Error),
+                );
                 return Err((None, None, "build timed out".to_string()));
             }
         };
@@ -717,12 +767,16 @@ impl Actor {
 
         let (code, signal) = status.map(exit_parts).unwrap_or((None, None));
         if signal.is_none() && code == Some(0) {
-            self.append_build_log("completed");
+            self.append_build_log(&target, "completed", Some(LogLevel::Info));
             self.journal_lifecycle("extension:build-done", None, "info");
             return Ok(());
         }
 
-        self.append_build_log(&format!("failed {}", exit_summary(code, &signal)));
+        self.append_build_log(
+            &target,
+            &format!("failed {}", exit_summary(code, &signal)),
+            Some(LogLevel::Error),
+        );
         Err((code, signal, "build failed".to_string()))
     }
 
@@ -746,14 +800,41 @@ impl Actor {
         );
     }
 
-    fn append_build_log(&self, message: &str) {
+    fn append_build_log(&self, target: &BuildTarget, message: &str, level: Option<LogLevel>) {
         self.logs
-            .append(&self.extension.id, "build", &format!("[build] {message}"));
+            .append(&self.extension.id, target.meta(None, level), message);
     }
 
-    fn append_watch_log(&self, message: &str) {
-        self.logs
-            .append(&self.extension.id, "watch", &format!("[watch] {message}"));
+    fn append_lifecycle_log(&self, message: &str, level: LogLevel) {
+        self.logs.append(
+            &self.extension.id,
+            ExtensionLogMeta::extension_server(
+                LogSource::Lifecycle,
+                None,
+                Some(level),
+                "lifecycle",
+            ),
+            message,
+        );
+    }
+
+    fn append_watch_log(&self, view_id: &str, message: &str, level: Option<LogLevel>) {
+        self.logs.append(
+            &self.extension.id,
+            ExtensionLogMeta::viewer(view_id, LogSource::Watch, None, level, "watch"),
+            message,
+        );
+    }
+
+    fn append_watch_log_all(&self, message: &str, level: Option<LogLevel>) {
+        for (view_id, _) in self
+            .extension
+            .views
+            .iter()
+            .filter(|(_, view)| view.watch.is_some())
+        {
+            self.append_watch_log(view_id, message, level);
+        }
     }
 
     /// `watch/start`: gate on a one-shot view build when the entry is
@@ -786,7 +867,15 @@ impl Actor {
             if view.entry.exists() && !self.failed_view_builds.contains(view_id) {
                 continue;
             }
-            match self.exec_build(build).await {
+            match self
+                .exec_build(
+                    BuildTarget::Viewer {
+                        view_id: view_id.clone(),
+                    },
+                    build,
+                )
+                .await
+            {
                 Ok(()) => {
                     self.failed_view_builds.remove(view_id);
                     self.last_view_build_at_ms = Some(now_ms());
@@ -806,9 +895,11 @@ impl Actor {
                         })),
                         "error",
                     );
-                    self.append_watch_log(&format!(
-                        "start aborted: initial build of view {view_id} failed"
-                    ));
+                    self.append_watch_log(
+                        view_id,
+                        "start aborted: initial build failed",
+                        Some(LogLevel::Error),
+                    );
                     self.broadcast_status();
                     return Ok((self.current_status(), false));
                 }
@@ -824,13 +915,10 @@ impl Actor {
         Ok((self.current_status(), true))
     }
 
-    /// Manual server build (`server/build` RPC): the build runs while any
-    /// live server keeps serving (cargo swaps the artifact under it — the
-    /// running binary's inode persists), then the server restarts into the
-    /// new build. Build failure is a plain error: the lifecycle — and a
-    /// running server — stays untouched, and there is no push (the user is
-    /// looking at the screen). `last_build_failed` still flips so the next
-    /// start re-runs the build.
+    /// Manual server build (`server/build` RPC): build-only. A live server
+    /// keeps serving its mapped inode; explicit Restart (or the next Start)
+    /// applies the new artifact. Failure leaves the lifecycle and live PID
+    /// untouched.
     async fn handle_server_build(&mut self) -> Result<ServerStatus, JsonRpcError> {
         let Some(server) = self.extension.server.clone() else {
             return Err(JsonRpcError::new(
@@ -845,19 +933,18 @@ impl Actor {
             ));
         };
 
-        match self.exec_build(&build).await {
+        match self.exec_build(BuildTarget::ExtensionServer, &build).await {
             Ok(()) => {
                 self.last_build_failed = false;
-                match self.state {
-                    Lifecycle::Running | Lifecycle::Starting => {
-                        self.journal_lifecycle("extension:restart", None, "info");
-                        self.journal_lifecycle("extension:stop", None, "info");
-                        self.stop_child().await;
-                        self.spawn_child(&server);
-                    }
+                if matches!(self.state, Lifecycle::Running | Lifecycle::Starting) {
+                    self.append_build_log(
+                        &BuildTarget::ExtensionServer,
+                        "restart to apply",
+                        Some(LogLevel::Info),
+                    );
+                } else if self.state == Lifecycle::Failed {
                     // A successful build resolves an earlier build failure.
-                    Lifecycle::Failed => self.set_state(Lifecycle::Stopped),
-                    _ => {}
+                    self.set_state(Lifecycle::Stopped);
                 }
                 Ok(self.current_status())
             }
@@ -905,10 +992,24 @@ impl Actor {
         for (view_id, view) in declared {
             let build = view.build.as_ref().expect("filtered");
             if self.watch_enabled && view.watch.is_some() {
-                self.append_build_log(&format!("skipping view {view_id}: watch owns the bundle"));
+                self.append_build_log(
+                    &BuildTarget::Viewer {
+                        view_id: view_id.clone(),
+                    },
+                    "skipping: watch owns the bundle",
+                    Some(LogLevel::Info),
+                );
                 continue;
             }
-            match self.exec_build(build).await {
+            match self
+                .exec_build(
+                    BuildTarget::Viewer {
+                        view_id: view_id.clone(),
+                    },
+                    build,
+                )
+                .await
+            {
                 Ok(()) => {
                     self.failed_view_builds.remove(&view_id);
                     self.last_view_build_at_ms = Some(now_ms());
@@ -974,11 +1075,11 @@ impl Actor {
                 })),
                 "info",
             );
-            self.append_watch_log(&format!(
-                "starting: {} {}",
-                spec.command,
-                spec.args.join(" ")
-            ));
+            self.append_watch_log(
+                &view_id,
+                &format!("starting: {} {}", spec.command, spec.args.join(" ")),
+                Some(LogLevel::Info),
+            );
 
             let mut command = tokio::process::Command::new(&spec.command);
             command
@@ -991,13 +1092,17 @@ impl Actor {
             let mut child = match harden_command(&mut command).spawn() {
                 Ok(child) => child,
                 Err(error) => {
-                    self.append_watch_log(&format!("spawn failed: {error}"));
+                    self.append_watch_log(
+                        &view_id,
+                        &format!("spawn failed: {error}"),
+                        Some(LogLevel::Error),
+                    );
                     self.journal_lifecycle(
                         "extension:watch-error",
                         Some(serde_json::json!({ "message": error.to_string() })),
                         "error",
                     );
-                    self.record_watch_crash();
+                    self.record_watch_crash(&view_id);
                     continue;
                 }
             };
@@ -1026,7 +1131,12 @@ impl Actor {
                 let logs = self.logs.clone();
                 let extension_id = self.extension.id.clone();
                 let generations = self.watch_generation.clone();
+                let watched_view_id = view_id.clone();
                 tokio::spawn(async move {
+                    let channel = match &stream {
+                        BuildPipe::Stdout(_) => LogChannel::Stdout,
+                        BuildPipe::Stderr(_) => LogChannel::Stderr,
+                    };
                     let append = move |line: String| {
                         if line.trim().is_empty() {
                             return;
@@ -1034,7 +1144,17 @@ impl Actor {
                         if generations.load(Ordering::SeqCst) != generation {
                             return;
                         }
-                        logs.append(&extension_id, "watch", &format!("[watch] {line}"));
+                        logs.append(
+                            &extension_id,
+                            ExtensionLogMeta::viewer(
+                                watched_view_id.clone(),
+                                LogSource::Watch,
+                                Some(channel),
+                                None,
+                                "watch",
+                            ),
+                            &line,
+                        );
                     };
                     match stream {
                         BuildPipe::Stdout(pipe) => read_lines(pipe, append).await,
@@ -1090,7 +1210,11 @@ impl Actor {
             Some(serde_json::json!({ "code": code, "signal": signal, "view": view_id })),
             "warn",
         );
-        self.append_watch_log(&format!("exited {}", exit_summary(code, &signal)));
+        self.append_watch_log(
+            view_id,
+            &format!("exited {}", exit_summary(code, &signal)),
+            Some(LogLevel::Warn),
+        );
 
         if !self.watch_enabled {
             self.broadcast_status();
@@ -1098,14 +1222,14 @@ impl Actor {
         }
         // A watcher is a keep-alive service: any unprompted exit (clean or
         // not) goes through the crash/backoff path.
-        self.record_watch_crash();
+        self.record_watch_crash(view_id);
     }
 
     /// Watch analog of `record_crash`, on its own counter. Budget exhaustion
     /// lands the *facet* on `failed` — journal event and broadcast, but no
     /// system push (a dev watcher dying is not an ops page). During backoff
     /// the facet stays `running`: watch is enabled and being kept alive.
-    fn record_watch_crash(&mut self) {
+    fn record_watch_crash(&mut self, view_id: &str) {
         let now = std::time::Instant::now();
         let window = std::time::Duration::from_millis(self.cfg.crash_window_ms);
         self.watch_crash_times.push_back(now);
@@ -1127,9 +1251,11 @@ impl Actor {
                 })),
                 "error",
             );
-            self.append_watch_log(&format!(
-                "failed: crash budget exceeded ({crashes} crashes)"
-            ));
+            self.append_watch_log(
+                view_id,
+                &format!("failed: crash budget exceeded ({crashes} crashes)"),
+                Some(LogLevel::Error),
+            );
             self.watch_backoff_deadline = None;
             self.watch_crash_times.clear();
             self.watch_enabled = false;
@@ -1170,7 +1296,7 @@ impl Actor {
             self.watch_started_at_ms = None;
             if was_enabled {
                 self.journal_lifecycle("extension:watch-stop", None, "info");
-                self.append_watch_log("stopped");
+                self.append_watch_log_all("stopped", Some(LogLevel::Info));
             }
             self.broadcast_status();
             return was_enabled;
@@ -1207,7 +1333,9 @@ impl Actor {
         }
         self.run_state.remove(&self.extension.id, RunRole::Watch);
         self.watch_started_at_ms = None;
-        self.append_watch_log("stopped");
+        for (view_id, _) in &children {
+            self.append_watch_log(view_id, "stopped", Some(LogLevel::Info));
+        }
         self.broadcast_status();
         true
     }
@@ -1318,8 +1446,7 @@ impl Actor {
             })),
             "info",
         );
-        self.logs
-            .append(&self.extension.id, "lifecycle", "starting");
+        self.append_lifecycle_log("starting", LogLevel::Info);
 
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -1367,11 +1494,7 @@ impl Actor {
                     Some(serde_json::json!({ "message": error.to_string() })),
                     "error",
                 );
-                self.logs.append(
-                    &self.extension.id,
-                    "lifecycle",
-                    &format!("spawn failed: {error}"),
-                );
+                self.append_lifecycle_log(&format!("spawn failed: {error}"), LogLevel::Error);
                 self.record_crash();
             }
         }
@@ -1385,10 +1508,13 @@ impl Actor {
             Some(serde_json::json!({ "code": code, "signal": signal, "stopping": false })),
             if clean { "info" } else { "error" },
         );
-        self.logs.append(
-            &self.extension.id,
-            "lifecycle",
+        self.append_lifecycle_log(
             &format!("exited {}", exit_summary(code, &signal)),
+            if clean {
+                LogLevel::Info
+            } else {
+                LogLevel::Error
+            },
         );
 
         self.reject_pending(&format!("extension {} exited", self.extension.id));
@@ -1444,10 +1570,9 @@ impl Actor {
                 })),
                 "error",
             );
-            self.logs.append(
-                &self.extension.id,
-                "lifecycle",
+            self.append_lifecycle_log(
                 &format!("failed: crash budget exceeded ({crashes} crashes)"),
+                LogLevel::Error,
             );
             self.backoff_deadline = None;
             self.crash_times.clear();
@@ -1501,8 +1626,7 @@ impl Actor {
             return;
         };
         self.set_state(Lifecycle::Stopping);
-        self.logs
-            .append(&self.extension.id, "lifecycle", "stopping");
+        self.append_lifecycle_log("stopping", LogLevel::Info);
 
         let eof_wait = std::time::Duration::from_millis(self.cfg.stop_eof_wait_ms);
         let term_wait = std::time::Duration::from_millis(self.cfg.stop_term_wait_ms);
@@ -1554,10 +1678,9 @@ impl Actor {
             Some(serde_json::json!({ "code": code, "signal": signal, "stopping": true })),
             "info",
         );
-        self.logs.append(
-            &self.extension.id,
-            "lifecycle",
+        self.append_lifecycle_log(
             &format!("stopped {}", exit_summary(code, &signal)),
+            LogLevel::Info,
         );
         self.last_exit = Some(LastExit {
             code,
@@ -1577,6 +1700,7 @@ impl Actor {
         let generations = self.generation.clone();
         let ctx = self.ctx.clone();
         let journal = self.journal.clone();
+        let logs = self.logs.clone();
         let extension_id = self.extension.id.clone();
 
         tokio::spawn(async move {
@@ -1584,7 +1708,7 @@ impl Actor {
                 if generations.load(Ordering::SeqCst) != generation {
                     return;
                 }
-                handle_protocol_line(&line, &extension_id, &pending, &ctx, &journal);
+                handle_protocol_line(&line, &extension_id, &pending, &ctx, &journal, &logs);
             })
             .await;
         });
@@ -1603,7 +1727,16 @@ impl Actor {
                 if generations.load(Ordering::SeqCst) != generation {
                     return;
                 }
-                logs.append(&extension_id, "stderr", &line);
+                logs.append(
+                    &extension_id,
+                    ExtensionLogMeta::extension_server(
+                        LogSource::Process,
+                        Some(LogChannel::Stderr),
+                        None,
+                        "stderr",
+                    ),
+                    &line,
+                );
             })
             .await;
         });
@@ -1745,6 +1878,7 @@ fn handle_protocol_line(
     pending: &PendingMap,
     ctx: &Arc<dyn ExtensionCtx>,
     journal: &Arc<Journal>,
+    logs: &Arc<ExtensionLogs>,
 ) {
     if line.trim().is_empty() {
         return;
@@ -1783,6 +1917,15 @@ fn handle_protocol_line(
     }
 
     if message.get("method").and_then(Value::as_str).is_some() {
+        if message.get("method").and_then(Value::as_str) == Some(MANAGEMENT_LOG_METHOD) {
+            match parse_management_log(&message, extension_id) {
+                Some((meta, line)) => logs.append(extension_id, meta, &line),
+                None => journal.warn(&format!(
+                    "[remux] ignored invalid management log from extension {extension_id}"
+                )),
+            }
+            return;
+        }
         let (target_origin, message) = take_extension_target(message);
         let normalized = normalize_extension_notification(message, extension_id);
         if let Some(origin) = target_origin {
@@ -1820,6 +1963,43 @@ fn handle_protocol_line(
         }
         ctx.broadcast(normalized);
     }
+}
+
+fn parse_management_log(message: &Value, extension_id: &str) -> Option<(ExtensionLogMeta, String)> {
+    if extension_id != "codex" {
+        return None;
+    }
+    let params = message.get("params")?.as_object()?;
+    if params.get("componentId")?.as_str()? != "codex-app-server" {
+        return None;
+    }
+    let source = match params.get("source")?.as_str()? {
+        "connection" => LogSource::Connection,
+        "lifecycle" => LogSource::Lifecycle,
+        "update" => LogSource::Update,
+        _ => return None,
+    };
+    let channel = match params.get("channel") {
+        None | Some(Value::Null) => None,
+        Some(value) if value.as_str() == Some("stdout") => Some(LogChannel::Stdout),
+        Some(value) if value.as_str() == Some("stderr") => Some(LogChannel::Stderr),
+        _ => return None,
+    };
+    let level = match params.get("level") {
+        None | Some(Value::Null) => None,
+        Some(value) if value.as_str() == Some("info") => Some(LogLevel::Info),
+        Some(value) if value.as_str() == Some("warn") => Some(LogLevel::Warn),
+        Some(value) if value.as_str() == Some("error") => Some(LogLevel::Error),
+        _ => return None,
+    };
+    let line = params.get("line")?.as_str()?.trim();
+    if line.is_empty() || line.len() > 16 * 1024 {
+        return None;
+    }
+    Some((
+        ExtensionLogMeta::codex_app_server(source, channel, level),
+        line.to_string(),
+    ))
 }
 
 fn take_extension_target(message: Value) -> (Option<String>, Value) {
@@ -1889,5 +2069,43 @@ pub fn normalize_extension_notification(message: Value, extension_id: &str) -> V
             Value::Object(record)
         }
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn management_log_accepts_only_codex_app_server_metadata() {
+        let message = serde_json::json!({
+            "method": MANAGEMENT_LOG_METHOD,
+            "params": {
+                "componentId": "codex-app-server",
+                "source": "connection",
+                "channel": "stderr",
+                "level": null,
+                "line": "connected"
+            }
+        });
+        let (meta, line) = parse_management_log(&message, "codex").unwrap();
+        assert_eq!(meta.area.as_str(), "server");
+        assert_eq!(meta.component_id, "codex-app-server");
+        assert_eq!(meta.source, LogSource::Connection);
+        assert_eq!(meta.channel, Some(LogChannel::Stderr));
+        assert_eq!(meta.level, None);
+        assert_eq!(line, "connected");
+
+        assert!(parse_management_log(&message, "terminal").is_none());
+
+        let spoofed = serde_json::json!({
+            "method": MANAGEMENT_LOG_METHOD,
+            "params": {
+                "componentId": "extension-server",
+                "source": "connection",
+                "line": "spoof"
+            }
+        });
+        assert!(parse_management_log(&spoofed, "codex").is_none());
     }
 }

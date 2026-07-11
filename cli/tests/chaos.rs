@@ -178,14 +178,18 @@ async fn incident_regression_write_to_dead_pipe_never_kills_the_runtime() {
     // The fixture dies 30ms in while we spam notifications straight into the
     // dying pipe. In the Node CLI this was the EPIPE crash class that took
     // the whole runtime down.
-    let harness = harness(&["FIXTURE_EXIT_AFTER_MS=30", "FIXTURE_EXIT_CODE=7"], fast_config());
+    let harness = harness(
+        &["FIXTURE_EXIT_AFTER_MS=30", "FIXTURE_EXIT_CODE=7"],
+        fast_config(),
+    );
     let status = harness.supervisor.start(false).await;
     assert!(status.running);
 
     for _ in 0..200 {
-        harness
-            .supervisor
-            .handle_notification("fixture/poke".to_string(), Some(serde_json::json!({ "x": 1 })));
+        harness.supervisor.handle_notification(
+            "fixture/poke".to_string(),
+            Some(serde_json::json!({ "x": 1 })),
+        );
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
 
@@ -197,13 +201,19 @@ async fn incident_regression_write_to_dead_pipe_never_kills_the_runtime() {
     assert_eq!(status.last_exit.as_ref().unwrap().code, Some(7));
 
     let states = harness.ctx.states();
-    assert!(states.iter().any(|state| state == "backingOff"), "{states:?}");
+    assert!(
+        states.iter().any(|state| state == "backingOff"),
+        "{states:?}"
+    );
     assert!(states.iter().any(|state| state == "failed"), "{states:?}");
 }
 
 #[tokio::test]
 async fn stop_kills_sigterm_and_eof_ignoring_extensions_within_budget() {
-    let harness = harness(&["FIXTURE_IGNORE_EOF=1", "FIXTURE_IGNORE_SIGTERM=1"], fast_config());
+    let harness = harness(
+        &["FIXTURE_IGNORE_EOF=1", "FIXTURE_IGNORE_SIGTERM=1"],
+        fast_config(),
+    );
     let status = harness.supervisor.start(false).await;
     let pid = status.pid.expect("running fixture has a pid");
     assert!(process_alive(pid));
@@ -245,7 +255,10 @@ async fn crash_on_start_loops_through_backoff_to_failed_and_manual_start_recover
 
 #[tokio::test]
 async fn unprompted_clean_exit_lands_stopped_without_restart() {
-    let harness = harness(&["FIXTURE_EXIT_AFTER_MS=30", "FIXTURE_EXIT_CODE=0"], fast_config());
+    let harness = harness(
+        &["FIXTURE_EXIT_AFTER_MS=30", "FIXTURE_EXIT_CODE=0"],
+        fast_config(),
+    );
     harness.supervisor.start(false).await;
 
     let status = wait_for_state(&harness.supervisor, "stopped", 5_000).await;
@@ -271,7 +284,10 @@ async fn garbage_stdout_lines_are_skipped_and_later_rpc_still_correlates() {
 
     let result = harness
         .supervisor
-        .handle_rpc("fixture/echo".to_string(), Some(serde_json::json!({ "n": 1 })))
+        .handle_rpc(
+            "fixture/echo".to_string(),
+            Some(serde_json::json!({ "n": 1 })),
+        )
         .await
         .unwrap();
     assert_eq!(result["echo"], "fixture/echo");
@@ -327,7 +343,11 @@ async fn restart_yields_exactly_one_live_child() {
     // Stop rejects in-flight RPCs with the stopped message.
     let pending = tokio::spawn({
         let supervisor = harness.supervisor.clone();
-        async move { supervisor.handle_rpc("fixture/block".to_string(), None).await }
+        async move {
+            supervisor
+                .handle_rpc("fixture/block".to_string(), None)
+                .await
+        }
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
     let stopped = harness.supervisor.stop().await;
@@ -339,7 +359,10 @@ async fn restart_yields_exactly_one_live_child() {
 
 #[tokio::test]
 async fn notifications_inject_extension_id_and_broadcast_when_not_notification_scoped() {
-    let harness = harness(&["FIXTURE_STARTUP_NOTIFICATION=remux/notifications/request"], fast_config());
+    let harness = harness(
+        &["FIXTURE_STARTUP_NOTIFICATION=remux/notifications/request"],
+        fast_config(),
+    );
     harness.supervisor.start(false).await;
 
     // remux/notifications/* goes to the manager first, with extensionId
@@ -429,7 +452,11 @@ async fn start_is_idempotent_while_running() {
     let pid = first.pid.unwrap();
 
     let second = harness.supervisor.start(false).await;
-    assert_eq!(second.pid, Some(pid), "start while running must not respawn");
+    assert_eq!(
+        second.pid,
+        Some(pid),
+        "start while running must not respawn"
+    );
     assert_eq!(second.state, "running");
 
     harness.supervisor.stop().await;
@@ -478,7 +505,11 @@ async fn crash_restart_reaps_reparented_grandchildren() {
     // The fixture spawns a `sleep 300` grandchild then crashes; the crash
     // path must SIGKILL the old process group before any respawn.
     let harness = harness(
-        &["FIXTURE_SPAWN_CHILD=1", "FIXTURE_EXIT_AFTER_MS=100", "FIXTURE_EXIT_CODE=5"],
+        &[
+            "FIXTURE_SPAWN_CHILD=1",
+            "FIXTURE_EXIT_AFTER_MS=100",
+            "FIXTURE_EXIT_CODE=5",
+        ],
         fast_config(),
     );
     let first = harness.supervisor.start(false).await;
@@ -490,7 +521,10 @@ async fn crash_restart_reaps_reparented_grandchildren() {
         if harness.supervisor.status().restart_count >= 1 {
             break;
         }
-        assert!(tokio::time::Instant::now() < deadline, "no restart observed");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no restart observed"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
@@ -503,19 +537,30 @@ async fn stop_kills_a_kill_resistant_tree_within_budget() {
     // EOF- and SIGTERM-ignoring server *with* a grandchild: the group
     // SIGKILL must take both down, and the stop RPC returns promptly.
     let harness = harness(
-        &["FIXTURE_IGNORE_EOF=1", "FIXTURE_IGNORE_SIGTERM=1", "FIXTURE_SPAWN_CHILD=1"],
+        &[
+            "FIXTURE_IGNORE_EOF=1",
+            "FIXTURE_IGNORE_SIGTERM=1",
+            "FIXTURE_SPAWN_CHILD=1",
+        ],
         fast_config(),
     );
     let status = harness.supervisor.start(false).await;
     let pgid = status.pid.expect("running fixture has a pid");
     // Let the grandchild spawn.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(group_members(pgid).len() >= 2, "expected fixture + sleep child");
+    assert!(
+        group_members(pgid).len() >= 2,
+        "expected fixture + sleep child"
+    );
 
     let started = tokio::time::Instant::now();
     let stopped = harness.supervisor.stop().await;
     assert_eq!(stopped.state, "stopped");
-    assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
     wait_for_group_empty(pgid, 1_000).await;
 }
 
@@ -595,12 +640,18 @@ async fn boot_sweep_kills_recorded_groups_and_skips_stale_records() {
         if decoy.try_wait().unwrap().is_some() {
             break;
         }
-        assert!(tokio::time::Instant::now() < deadline, "decoy survived the sweep");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "decoy survived the sweep"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     // Mismatched start ticks: skipped.
-    assert!(survivor.try_wait().unwrap().is_none(), "stale record must be skipped");
+    assert!(
+        survivor.try_wait().unwrap().is_none(),
+        "stale record must be skipped"
+    );
     survivor.kill().unwrap();
     survivor.wait().unwrap();
 
@@ -635,7 +686,10 @@ async fn run_state_file_tracks_spawn_and_reap() {
 /// Manifest whose server is produced by a scripted build step: the build
 /// copies a shell wrapper (which execs the fixture binary) into place.
 fn build_manifest(root: &Path, build_script: &str) -> ExtensionManifest {
-    let wrapper = format!("#!/bin/sh\nexec {} \"$@\"\n", env!("CARGO_BIN_EXE_remux-fixture-ext"));
+    let wrapper = format!(
+        "#!/bin/sh\nexec {} \"$@\"\n",
+        env!("CARGO_BIN_EXE_remux-fixture-ext")
+    );
     std::fs::write(root.join("server-src.sh"), wrapper).unwrap();
     fixture_manifest_with_server(
         root,
@@ -675,23 +729,27 @@ async fn missing_binary_builds_then_runs_with_build_logs() {
     let states = harness.ctx.states();
     assert!(states.contains(&"building".to_string()), "{states:?}");
 
-    // Build output lands in the extension log ring with the [build] prefix.
+    // Build output lands in the extension-server component log with typed
+    // build/stdout metadata.
     let logs = harness.supervisor.logs(100);
-    let lines: Vec<String> = logs
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|line| line["line"].as_str().unwrap().to_string())
-        .collect();
     assert!(
-        lines.iter().any(|line| line == "[build] built-ok"),
-        "{lines:?}"
+        logs.as_array().unwrap().iter().any(|line| {
+            line["line"] == "built-ok"
+                && line["componentId"] == "extension-server"
+                && line["source"] == "build"
+                && line["channel"] == "stdout"
+                && line["level"].is_null()
+        }),
+        "{logs}"
     );
 
     // The built server is the fixture: RPCs round-trip.
     let result = harness
         .supervisor
-        .handle_rpc("fixture/echo".to_string(), Some(serde_json::json!({ "n": 2 })))
+        .handle_rpc(
+            "fixture/echo".to_string(),
+            Some(serde_json::json!({ "n": 2 })),
+        )
         .await
         .unwrap();
     assert_eq!(result["params"]["n"], 2);
@@ -790,17 +848,6 @@ fn view_build_count(root: &Path) -> usize {
         .unwrap_or(0)
 }
 
-fn log_lines(harness: &Harness) -> Vec<String> {
-    harness
-        .supervisor
-        .logs(200)
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|line| line["line"].as_str().unwrap().to_string())
-        .collect()
-}
-
 /// Watch facet states carried by didChangeStatus broadcasts, in order.
 fn watch_states(ctx: &TestCtx) -> Vec<String> {
     ctx.broadcasts
@@ -858,8 +905,17 @@ async fn serverless_start_runs_view_build_then_lands_stopped_and_built() {
     assert_eq!(rebuilt.state, "stopped");
     assert_eq!(view_build_count(harness.root.path()), 1);
 
-    let lines = log_lines(&harness);
-    assert!(lines.iter().any(|line| line == "[build] view-built"), "{lines:?}");
+    let logs = harness.supervisor.logs(200);
+    assert!(
+        logs.as_array().unwrap().iter().any(|line| {
+            line["line"] == "view-built"
+                && line["componentId"] == "viewer:main"
+                && line["source"] == "build"
+                && line["channel"] == "stdout"
+                && line["level"].is_null()
+        }),
+        "{logs}"
+    );
 }
 
 #[tokio::test]
@@ -909,13 +965,21 @@ async fn build_sequence_skips_watch_owned_views_and_logs_the_skip() {
     // A forced rebuild skips the watch-owned view instead of racing vite.
     let rebuilt = harness.supervisor.restart(true).await;
     assert_eq!(rebuilt.state, "stopped");
-    assert_eq!(view_build_count(harness.root.path()), 1, "build must be skipped");
-    let lines = log_lines(&harness);
+    assert_eq!(
+        view_build_count(harness.root.path()),
+        1,
+        "build must be skipped"
+    );
+    let logs = harness.supervisor.logs(200);
     assert!(
-        lines
-            .iter()
-            .any(|line| line == "[build] skipping view main: watch owns the bundle"),
-        "{lines:?}"
+        logs.as_array().unwrap().iter().any(|line| {
+            line["line"] == "skipping: watch owns the bundle"
+                && line["componentId"] == "viewer:main"
+                && line["source"] == "build"
+                && line["channel"].is_null()
+                && line["level"] == "info"
+        }),
+        "{logs}"
     );
 
     // watch/start is idempotent while enabled.
@@ -983,8 +1047,14 @@ async fn gating_build_failure_fails_the_watch_facet_and_spares_a_running_server(
     assert!(status.running);
     assert_eq!(status.pid, Some(server_pid));
     assert!(process_alive(server_pid));
-    assert!(status.last_exit.is_none(), "no build-failed lastExit on the lifecycle");
-    assert!(harness.ctx.failures.lock().unwrap().is_empty(), "no push for watch failures");
+    assert!(
+        status.last_exit.is_none(),
+        "no build-failed lastExit on the lifecycle"
+    );
+    assert!(
+        harness.ctx.failures.lock().unwrap().is_empty(),
+        "no push for watch failures"
+    );
 
     harness.supervisor.stop().await;
 }
@@ -1090,12 +1160,18 @@ async fn extension_stop_and_restart_leave_the_watcher_untouched() {
 
     let restarted = harness.supervisor.restart(false).await;
     assert_eq!(restarted.state, "running");
-    assert!(process_alive(watch_pid), "server restart must not kill the watcher");
+    assert!(
+        process_alive(watch_pid),
+        "server restart must not kill the watcher"
+    );
     assert_eq!(restarted.watch.state, "running");
 
     let stopped = harness.supervisor.stop().await;
     assert_eq!(stopped.state, "stopped");
-    assert!(process_alive(watch_pid), "server stop must not kill the watcher");
+    assert!(
+        process_alive(watch_pid),
+        "server stop must not kill the watcher"
+    );
     assert_eq!(stopped.watch.state, "running");
 
     let (final_status, changed) = harness.supervisor.watch_stop().await;
@@ -1146,7 +1222,10 @@ async fn boot_sweep_reads_v1_files_and_kills_their_groups() {
         if decoy.try_wait().unwrap().is_some() {
             break;
         }
-        assert!(tokio::time::Instant::now() < deadline, "v1 decoy survived the sweep");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "v1 decoy survived the sweep"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(!root.path().join(".remux/run/extensions.json").exists());
@@ -1188,7 +1267,10 @@ async fn boot_sweep_kills_orphaned_watch_role_groups() {
         if watcher.try_wait().unwrap().is_some() {
             break;
         }
-        assert!(tokio::time::Instant::now() < deadline, "orphaned watcher survived the sweep");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "orphaned watcher survived the sweep"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -1198,7 +1280,7 @@ async fn boot_sweep_kills_orphaned_watch_role_groups() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn manual_server_build_rebuilds_and_restarts_a_running_server() {
+async fn manual_server_build_stages_until_explicit_restart() {
     let harness = harness_with_manifest(tempfile::tempdir().unwrap(), fast_config(), |root| {
         build_manifest(root, BUILD_OK)
     });
@@ -1211,9 +1293,24 @@ async fn manual_server_build_rebuilds_and_restarts_a_running_server() {
 
     let status = harness.supervisor.build_server().await.unwrap();
     assert_eq!(status.state, "running");
-    assert_eq!(build_count(harness.root.path()), 2, "manual build always runs");
-    let second_pid = status.pid.unwrap();
-    assert_ne!(first_pid, second_pid, "running server restarts into the new build");
+    assert_eq!(
+        build_count(harness.root.path()),
+        2,
+        "manual build always runs"
+    );
+    assert_eq!(
+        status.pid,
+        Some(first_pid),
+        "build preserves the live server"
+    );
+    assert!(process_alive(first_pid));
+
+    let restarted = harness.supervisor.restart(false).await;
+    let second_pid = restarted.pid.unwrap();
+    assert_ne!(
+        first_pid, second_pid,
+        "explicit restart applies the staged build"
+    );
     assert!(!process_alive(first_pid));
     assert!(process_alive(second_pid));
 
@@ -1241,7 +1338,11 @@ async fn manual_server_build_failure_spares_the_running_server() {
     let pid = started.pid.unwrap();
 
     let err = harness.supervisor.build_server().await.unwrap_err();
-    assert!(err.message.starts_with("server build failed"), "{}", err.message);
+    assert!(
+        err.message.starts_with("server build failed"),
+        "{}",
+        err.message
+    );
     // Lifecycle — and the live server — untouched; no push.
     let status = harness.supervisor.status();
     assert_eq!(status.state, "running");
@@ -1270,7 +1371,11 @@ async fn manual_views_build_forces_a_rebuild_without_lifecycle_changes() {
     assert_eq!(view_build_count(harness.root.path()), 2);
     let started = harness.supervisor.start(false).await;
     assert_eq!(started.state, "stopped");
-    assert_eq!(view_build_count(harness.root.path()), 2, "start must not rebuild");
+    assert_eq!(
+        view_build_count(harness.root.path()),
+        2,
+        "start must not rebuild"
+    );
 
     // The lifecycle never left stopped/building territory — no failed.
     assert!(!harness.ctx.states().contains(&"failed".to_string()));
@@ -1286,7 +1391,11 @@ async fn manual_views_build_failure_errors_and_marks_the_view_for_rebuild() {
     });
 
     let err = harness.supervisor.build_views().await.unwrap_err();
-    assert!(err.message.starts_with("view build failed"), "{}", err.message);
+    assert!(
+        err.message.starts_with("view build failed"),
+        "{}",
+        err.message
+    );
     // No lifecycle change; the stale bundle keeps serving (views.built true).
     let status = harness.supervisor.status();
     assert_eq!(status.state, "stopped");
@@ -1313,7 +1422,11 @@ async fn manual_views_build_skips_watch_owned_views() {
     assert_eq!(view_build_count(harness.root.path()), 1, "gating build");
 
     let status = harness.supervisor.build_views().await.unwrap();
-    assert_eq!(view_build_count(harness.root.path()), 1, "watch owns the bundle");
+    assert_eq!(
+        view_build_count(harness.root.path()),
+        1,
+        "watch owns the bundle"
+    );
     assert_eq!(status.watch.state, "running");
 
     harness.supervisor.watch_stop().await;
@@ -1366,7 +1479,11 @@ async fn rebuild_flag_is_scoped_to_the_server_build() {
 
     let rebuilt = harness.supervisor.restart(true).await;
     assert_eq!(rebuilt.state, "running");
-    assert_eq!(build_count(harness.root.path()), 2, "rebuild forces the server build");
+    assert_eq!(
+        build_count(harness.root.path()),
+        2,
+        "rebuild forces the server build"
+    );
     assert_eq!(
         view_build_count(harness.root.path()),
         1,

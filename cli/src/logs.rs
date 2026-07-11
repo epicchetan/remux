@@ -180,15 +180,10 @@ impl Journal {
         }
         let entry = Value::Object(entry);
 
-        let _ = self
-            .writer
-            .send(WriterCommand::Line(format!("{entry}\n")));
+        let _ = self.writer.send(WriterCommand::Line(format!("{entry}\n")));
 
         if event.terminal != TerminalMode::Silent {
-            let fallback = event
-                .label
-                .clone()
-                .unwrap_or_else(|| event.source.clone());
+            let fallback = event.label.clone().unwrap_or_else(|| event.source.clone());
             let message = event.message.clone().unwrap_or(fallback);
             let text = match &event.detail {
                 None => message,
@@ -345,11 +340,162 @@ pub struct ExtensionLogLine {
     pub ts: String,
     pub stream: String,
     pub line: String,
+    pub area: LogArea,
+    pub component_id: String,
+    pub source: LogSource,
+    pub channel: Option<LogChannel>,
+    pub level: Option<LogLevel>,
+    pub view_id: Option<String>,
 }
 
 impl ExtensionLogLine {
     fn to_value(&self) -> Value {
-        serde_json::json!({ "ts": self.ts, "stream": self.stream, "line": self.line })
+        serde_json::json!({
+            "ts": self.ts,
+            "stream": self.stream,
+            "line": self.line,
+            "area": self.area.as_str(),
+            "componentId": self.component_id,
+            "source": self.source.as_str(),
+            "channel": self.channel.map(LogChannel::as_str),
+            "level": self.level.map(LogLevel::as_str),
+            "viewId": self.view_id,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogArea {
+    Server,
+    Viewer,
+}
+
+impl LogArea {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Server => "server",
+            Self::Viewer => "viewer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogSource {
+    Lifecycle,
+    Process,
+    Connection,
+    Build,
+    Watch,
+    Update,
+}
+
+impl LogSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lifecycle => "lifecycle",
+            Self::Process => "process",
+            Self::Connection => "connection",
+            Self::Build => "build",
+            Self::Watch => "watch",
+            Self::Update => "update",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogChannel {
+    Stdout,
+    Stderr,
+}
+
+impl LogChannel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensionLogMeta {
+    pub area: LogArea,
+    pub component_id: String,
+    pub source: LogSource,
+    pub channel: Option<LogChannel>,
+    pub level: Option<LogLevel>,
+    pub view_id: Option<String>,
+    pub legacy_stream: &'static str,
+}
+
+impl ExtensionLogMeta {
+    pub fn extension_server(
+        source: LogSource,
+        channel: Option<LogChannel>,
+        level: Option<LogLevel>,
+        legacy_stream: &'static str,
+    ) -> Self {
+        Self {
+            area: LogArea::Server,
+            component_id: "extension-server".to_string(),
+            source,
+            channel,
+            level,
+            view_id: None,
+            legacy_stream,
+        }
+    }
+
+    pub fn viewer(
+        view_id: impl Into<String>,
+        source: LogSource,
+        channel: Option<LogChannel>,
+        level: Option<LogLevel>,
+        legacy_stream: &'static str,
+    ) -> Self {
+        let view_id = view_id.into();
+        Self {
+            area: LogArea::Viewer,
+            component_id: format!("viewer:{view_id}"),
+            source,
+            channel,
+            level,
+            view_id: Some(view_id),
+            legacy_stream,
+        }
+    }
+
+    pub fn codex_app_server(
+        source: LogSource,
+        channel: Option<LogChannel>,
+        level: Option<LogLevel>,
+    ) -> Self {
+        Self {
+            area: LogArea::Server,
+            component_id: "codex-app-server".to_string(),
+            source,
+            channel,
+            level,
+            view_id: None,
+            legacy_stream: "lifecycle",
+        }
     }
 }
 
@@ -375,18 +521,36 @@ impl ExtensionLogs {
         })
     }
 
-    pub fn append(self: &Arc<Self>, extension_id: &str, stream: &str, line: &str) {
+    pub fn append(self: &Arc<Self>, extension_id: &str, meta: ExtensionLogMeta, line: &str) {
         let entry = ExtensionLogLine {
             ts: now_iso8601(),
-            stream: stream.to_string(),
+            stream: meta.legacy_stream.to_string(),
             line: line.to_string(),
+            area: meta.area,
+            component_id: meta.component_id,
+            source: meta.source,
+            channel: meta.channel,
+            level: meta.level,
+            view_id: meta.view_id,
         };
 
         let mut states = self.states.lock().unwrap();
         let state = self.state_entry(&mut states, extension_id);
 
         // Rotated file write.
-        let file_line = format!("{} [{}] {}\n", entry.ts, entry.stream, entry.line);
+        let channel = entry
+            .channel
+            .map(|channel| format!(":{}", channel.as_str()))
+            .unwrap_or_default();
+        let file_line = format!(
+            "{} [{}/{}/{}{}] {}\n",
+            entry.ts,
+            entry.area.as_str(),
+            entry.component_id,
+            entry.source.as_str(),
+            channel,
+            entry.line
+        );
         let line_bytes = file_line.len() as u64;
         if state.size + line_bytes > EXTENSION_LOG_MAX_BYTES {
             state.file = None;
@@ -415,10 +579,8 @@ impl ExtensionLogs {
                 let logs = self.clone();
                 let extension_id = extension_id.to_string();
                 tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        EXTENSION_LOG_FLUSH_MS,
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(EXTENSION_LOG_FLUSH_MS))
+                        .await;
                     logs.flush_pending(&extension_id);
                 });
             }
@@ -432,7 +594,11 @@ impl ExtensionLogs {
                 return;
             };
             state.flush_scheduled = false;
-            let lines: Vec<Value> = state.pending.drain(..).map(|line| line.to_value()).collect();
+            let lines: Vec<Value> = state
+                .pending
+                .drain(..)
+                .map(|line| line.to_value())
+                .collect();
             (lines, state.subscribers.clone())
         };
         if lines.is_empty() {
@@ -494,25 +660,23 @@ impl ExtensionLogs {
         states: &'a mut HashMap<String, ExtensionLogState>,
         extension_id: &str,
     ) -> &'a mut ExtensionLogState {
-        states
-            .entry(extension_id.to_string())
-            .or_insert_with(|| {
-                let _ = std::fs::create_dir_all(&self.dir);
-                let file = open_extension_log(&self.dir, extension_id);
-                let size = file
-                    .as_ref()
-                    .and_then(|file| file.metadata().ok())
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(0);
-                ExtensionLogState {
-                    ring: VecDeque::new(),
-                    file,
-                    size,
-                    subscribers: Vec::new(),
-                    pending: Vec::new(),
-                    flush_scheduled: false,
-                }
-            })
+        states.entry(extension_id.to_string()).or_insert_with(|| {
+            let _ = std::fs::create_dir_all(&self.dir);
+            let file = open_extension_log(&self.dir, extension_id);
+            let size = file
+                .as_ref()
+                .and_then(|file| file.metadata().ok())
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            ExtensionLogState {
+                ring: VecDeque::new(),
+                file,
+                size,
+                subscribers: Vec::new(),
+                pending: Vec::new(),
+                flush_scheduled: false,
+            }
+        })
     }
 }
 
@@ -629,7 +793,10 @@ mod tests {
         assert_eq!(entries[0]["label"], "test:event");
         assert_eq!(entries[0]["source"], "test");
         assert_eq!(entries[0]["runId"], Value::from(journal.run_id.clone()));
-        assert_eq!(entries[0]["detail"], serde_json::json!({ "nested": { "ok": true } }));
+        assert_eq!(
+            entries[0]["detail"],
+            serde_json::json!({ "nested": { "ok": true } })
+        );
         assert_eq!(entries[1]["level"], "warn");
         assert_eq!(entries[1]["message"], "visible warning");
         assert_eq!(
@@ -640,7 +807,12 @@ mod tests {
         // No current.jsonl double-write.
         assert!(!journal.logs_dir.join("current.jsonl").exists());
         // Run file uses the runtime- prefix and the [:.] -> '-' run id format.
-        let name = journal.run_path.file_name().unwrap().to_string_lossy().into_owned();
+        let name = journal
+            .run_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         assert!(name.starts_with("runtime-"), "{name}");
         assert!(!name.contains(':') && name.ends_with("Z.jsonl"), "{name}");
     }
@@ -696,7 +868,9 @@ mod tests {
     fn set_mtime(path: &Path, time: std::time::SystemTime) {
         let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         file.set_times(
-            std::fs::FileTimes::new().set_accessed(time).set_modified(time),
+            std::fs::FileTimes::new()
+                .set_accessed(time)
+                .set_modified(time),
         )
         .unwrap();
     }
@@ -707,29 +881,64 @@ mod tests {
         let logs = ExtensionLogs::new(root.path());
 
         for index in 0..(EXTENSION_LOG_RING_LINES + 10) {
-            logs.append("codex", "stderr", &format!("line {index}"));
+            logs.append(
+                "codex",
+                ExtensionLogMeta::extension_server(
+                    LogSource::Process,
+                    Some(LogChannel::Stderr),
+                    None,
+                    "stderr",
+                ),
+                &format!("line {index}"),
+            );
         }
 
         let snapshot = logs.snapshot("codex", 3);
         let lines = snapshot.as_array().unwrap();
         assert_eq!(lines.len(), 3);
-        assert_eq!(lines[2]["line"], format!("line {}", EXTENSION_LOG_RING_LINES + 9));
+        assert_eq!(
+            lines[2]["line"],
+            format!("line {}", EXTENSION_LOG_RING_LINES + 9)
+        );
         assert_eq!(lines[2]["stream"], "stderr");
+        assert_eq!(lines[2]["area"], "server");
+        assert_eq!(lines[2]["componentId"], "extension-server");
+        assert_eq!(lines[2]["source"], "process");
+        assert_eq!(lines[2]["channel"], "stderr");
+        assert!(lines[2]["level"].is_null());
 
         let full = logs.snapshot("codex", 10_000);
         assert_eq!(full.as_array().unwrap().len(), EXTENSION_LOG_RING_LINES);
 
-        assert!(root.path().join(".remux/logs/extensions/codex.log").exists());
+        assert!(root
+            .path()
+            .join(".remux/logs/extensions/codex.log")
+            .exists());
 
         // Rotation: force by writing oversized lines.
         let big = "y".repeat(1024 * 1024);
         for _ in 0..7 {
-            logs.append("bulky", "stderr", &big);
+            logs.append(
+                "bulky",
+                ExtensionLogMeta::viewer(
+                    "main",
+                    LogSource::Watch,
+                    Some(LogChannel::Stdout),
+                    None,
+                    "watch",
+                ),
+                &big,
+            );
         }
         let dir = root.path().join(".remux/logs/extensions");
         assert!(dir.join("bulky.log").exists());
         assert!(dir.join("bulky.log.1").exists());
         // Never more rotations than configured.
-        assert!(!dir.join(format!("bulky.log.{}", EXTENSION_LOG_ROTATIONS + 1)).exists());
+        assert!(!dir
+            .join(format!("bulky.log.{}", EXTENSION_LOG_ROTATIONS + 1))
+            .exists());
+
+        let text = std::fs::read_to_string(dir.join("codex.log")).unwrap();
+        assert!(text.contains("[server/extension-server/process:stderr]"));
     }
 }

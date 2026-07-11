@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { BottomSheet, Group, Host, RNHostView } from '@expo/ui/swift-ui';
 import { presentationDetents, presentationDragIndicator } from '@expo/ui/swift-ui/modifiers';
 import {
@@ -21,6 +21,7 @@ import {
   readExtensionLogs,
   subscribeExtensionLogs,
   unsubscribeExtensionLogs,
+  type CodexAppServerStatus,
   type ExtensionLogLine,
   type ExtensionServerStatus,
 } from './extensionServerApi';
@@ -43,9 +44,14 @@ export type ExtensionDetailAction =
   | 'server-build'
   | 'views-build'
   | 'watch-start'
-  | 'watch-stop';
+  | 'watch-stop'
+  | 'app-server-start'
+  | 'app-server-stop'
+  | 'app-server-restart'
+  | 'app-server-update';
 
 export function ExtensionDetailSheet({
+  appServerStatus,
   busyAction,
   name,
   onAction,
@@ -54,6 +60,7 @@ export function ExtensionDetailSheet({
   status,
   visible,
 }: {
+  appServerStatus: CodexAppServerStatus | null;
   busyAction: ExtensionDetailAction | null;
   name: string;
   onAction: (action: ExtensionDetailAction) => void;
@@ -62,7 +69,7 @@ export function ExtensionDetailSheet({
   status: ExtensionServerStatus | null;
   visible: boolean;
 }) {
-  const { styles, theme } = useSheetTheme();
+  const { styles } = useSheetTheme();
   const insets = useSafeAreaInsets();
   const connection = useRemuxConnection();
   const extensionId = status?.extensionId ?? null;
@@ -127,9 +134,13 @@ export function ExtensionDetailSheet({
   const state = status?.state ?? 'stopped';
   const uptime = formatUptime(status?.startedAtMs ?? null, nowMs);
   const lastExit = formatLastExit(status?.lastExit ?? null);
-  const resourceText = resources && status?.running
-    ? `${resources.cpuPercent.toFixed(1)}% CPU · ${formatBytes(resources.rssBytes)} · ${resources.processCount} ${resources.processCount === 1 ? 'process' : 'processes'}`
+  const serverResources = resources?.roles.server ?? null;
+  const watchResources = resources?.roles.watch ?? null;
+  const aggregateResourceText = resources && !serverResources && !watchResources
+    ? formatResourceSample(resources)
     : null;
+  const serverResourceText = serverResources ? formatResourceSample(serverResources) : null;
+  const watchResourceText = watchResources ? formatResourceSample(watchResources) : null;
   // Serverless extensions (view builds/watch only): the Server group is
   // meaningless — the Viewer group (Build/Watch) is all they get.
   const hasServer = status?.hasServer !== false;
@@ -144,17 +155,20 @@ export function ExtensionDetailSheet({
         ? `failed (${watch.restartCount} ${watch.restartCount === 1 ? 'restart' : 'restarts'})`
         : 'stopped'
     : null;
-  // Watch output gets its own section — vite recompile chatter mingled with
-  // server stderr made both harder to read.
-  const serverLines = useMemo(
-    () => logLines.filter((entry) => entry.stream !== 'watch'),
+  const extensionServerLines = useMemo(
+    () => logLines.filter((entry) => entry.componentId === 'extension-server'),
     [logLines],
   );
-  const watchLines = useMemo(
-    () => logLines.filter((entry) => entry.stream === 'watch'),
+  const appServerLines = useMemo(
+    () => logLines.filter((entry) => entry.componentId === 'codex-app-server'),
     [logLines],
   );
-  const showWatchLogs = Boolean(watch?.declared) || watchLines.length > 0;
+  const viewerLines = useMemo(
+    () => logLines.filter((entry) => entry.area === 'viewer'),
+    [logLines],
+  );
+  const showViewer = (status?.views.declared ?? 0) > 0 || Boolean(watch?.declared);
+  const activeAppTurns = appServerStatus?.activeTurnIds.length ?? 0;
 
   // Native SwiftUI sheet: system detents, drag indicator, dimming, and the
   // liquid-glass chrome all come from UIKit. Sizing flows native → RN: the
@@ -181,110 +195,176 @@ export function ExtensionDetailSheet({
                 <StateBadge state={state} />
               </View>
 
-              <View style={styles.statusBlock}>
-                <StatusRow label="State" value={serverStateLabel(state)} />
-                <StatusRow label="PID" value={status?.pid !== null && status?.pid !== undefined ? String(status.pid) : '—'} />
-                <StatusRow label="Uptime" value={uptime ?? '—'} />
-                <StatusRow label="Restarts" value={String(status?.restartCount ?? 0)} />
-                <StatusRow label="Last exit" value={lastExit ?? '—'} />
-                {watchText ? <StatusRow label="Watch" value={watchText} /> : null}
-                {resourceText ? <StatusRow label="Resources" value={resourceText} /> : null}
-              </View>
-
-              {hasServer ? (
-                <>
-                  <Text style={styles.groupTitle}>Server</Text>
-                  <View style={styles.actionsRow}>
-                    {status?.running ? (
-                      <SheetButton
-                        busy={busyAction === 'stop'}
-                        disabled={busy}
-                        label="Stop"
-                        onPress={() => onAction('stop')}
-                      />
-                    ) : (
-                      <SheetButton
-                        busy={busyAction === 'start'}
-                        disabled={busy}
-                        label="Start"
-                        onPress={() => onAction('start')}
-                      />
-                    )}
-                    <SheetButton
-                      busy={busyAction === 'restart'}
-                      disabled={busy || !status?.running}
-                      label="Restart"
-                      onPress={() => onAction('restart')}
-                    />
-                    {status?.hasServerBuild ? (
-                      <SheetButton
-                        busy={busyAction === 'server-build'}
-                        disabled={busy}
-                        label={
-                          busyAction === 'server-build'
-                            ? 'Building'
-                            : status?.running
-                              ? 'Build & Restart'
-                              : 'Build'
-                        }
-                        onPress={() => onAction('server-build')}
-                        variant="primary"
-                      />
-                    ) : null}
-                  </View>
-                </>
+              {aggregateResourceText ? (
+                <Text style={styles.sharedResources}>{aggregateResourceText}</Text>
               ) : null}
-              {(status?.views.declared ?? 0) > 0 || watch?.declared ? (
-                <>
-                  <Text style={styles.groupTitle}>Viewer</Text>
-                  <View style={styles.actionsRow}>
-                    {(status?.views.declared ?? 0) > 0 ? (
-                      <SheetButton
-                        busy={busyAction === 'views-build'}
-                        // The watcher owns the bundle while it runs — a
-                        // manual build would be skipped anyway.
-                        disabled={busy || watchRunning}
-                        label={busyAction === 'views-build' ? 'Building' : 'Build'}
-                        onPress={() => onAction('views-build')}
-                        variant={hasServer ? 'secondary' : 'primary'}
-                      />
-                    ) : null}
-                    {watch?.declared ? (
-                      <SheetButton
-                        busy={busyAction === 'watch-start' || busyAction === 'watch-stop'}
-                        disabled={busy}
-                        label={
-                          busyAction === 'watch-start'
-                            ? 'Starting Watch'
-                            : busyAction === 'watch-stop'
-                              ? 'Stopping Watch'
-                              : watchRunning
-                                ? 'Stop Watch'
-                                : 'Start Watch'
-                        }
-                        onPress={() => onAction(watchRunning ? 'watch-stop' : 'watch-start')}
-                      />
-                    ) : null}
-                  </View>
-                </>
-              ) : null}
-
-              <Text style={styles.groupTitle}>Logs</Text>
               {logsError ? <Text style={styles.errorText}>{logsError}</Text> : null}
-              <LogPanel
-                emptyText="No output yet — servers only log errors, builds, and lifecycle events, so quiet is healthy."
-                lines={serverLines}
-              />
-              {showWatchLogs ? (
-                <>
-                  <Text style={styles.groupTitle}>Watch</Text>
-                  <LogPanel
-                    emptyText="No watch output yet — start Watch to stream rebuild notices here."
-                    hideTags
-                    lines={watchLines}
+
+              <ScrollView
+                contentContainerStyle={styles.sectionContent}
+                nestedScrollEnabled
+                style={styles.sectionScroll}
+              >
+                {hasServer ? (
+                  <OperationalSection
+                    actions={(
+                      <>
+                        {status?.running ? (
+                          <SheetButton
+                            busy={busyAction === 'stop'}
+                            disabled={busy}
+                            label="Stop"
+                            onPress={() => onAction('stop')}
+                          />
+                        ) : (
+                          <SheetButton
+                            busy={busyAction === 'start'}
+                            disabled={busy}
+                            label="Start"
+                            onPress={() => onAction('start')}
+                          />
+                        )}
+                        <SheetButton
+                          busy={busyAction === 'restart'}
+                          disabled={busy || !status?.running}
+                          label="Restart"
+                          onPress={() => onAction('restart')}
+                        />
+                        {status?.hasServerBuild ? (
+                          <SheetButton
+                            busy={busyAction === 'server-build'}
+                            disabled={busy}
+                            label={busyAction === 'server-build' ? 'Building' : 'Build'}
+                            onPress={() => onAction('server-build')}
+                            variant="primary"
+                          />
+                        ) : null}
+                      </>
+                    )}
+                    emptyText="No Extension Server output yet."
+                    logs={extensionServerLines}
+                    status={(
+                      <>
+                        <StatusRow label="State" value={serverStateLabel(state)} />
+                        <StatusRow label="PID" value={status?.pid !== null && status?.pid !== undefined ? String(status.pid) : '—'} />
+                        <StatusRow label="Uptime" value={uptime ?? '—'} />
+                        <StatusRow label="Restarts" value={String(status?.restartCount ?? 0)} />
+                        <StatusRow label="Last exit" value={lastExit ?? '—'} />
+                        {serverResourceText ? <StatusRow label="Resources" value={serverResourceText} /> : null}
+                      </>
+                    )}
+                    title="Extension Server"
                   />
-                </>
-              ) : null}
+                ) : null}
+
+                {appServerStatus ? (
+                  <OperationalSection
+                    actions={(
+                      <>
+                        {appServerStatus.state === 'running' ? (
+                          <SheetButton
+                            busy={busyAction === 'app-server-stop'}
+                            disabled={busy || activeAppTurns > 0}
+                            label="Stop"
+                            onPress={() => onAction('app-server-stop')}
+                          />
+                        ) : (
+                          <SheetButton
+                            busy={busyAction === 'app-server-start'}
+                            disabled={busy}
+                            label="Start"
+                            onPress={() => onAction('app-server-start')}
+                          />
+                        )}
+                        <SheetButton
+                          busy={busyAction === 'app-server-restart'}
+                          disabled={busy || appServerStatus.state !== 'running' || activeAppTurns > 0}
+                          label="Restart"
+                          onPress={() => onAction('app-server-restart')}
+                        />
+                        <SheetButton
+                          busy={busyAction === 'app-server-update'}
+                          disabled={busy}
+                          label={busyAction === 'app-server-update' ? 'Updating' : 'Update Codex'}
+                          onPress={() => onAction('app-server-update')}
+                          variant="primary"
+                        />
+                      </>
+                    )}
+                    emptyText="No Codex App Server output yet."
+                    logs={appServerLines}
+                    status={(
+                      <>
+                        <StatusRow label="State" value={capitalize(appServerStatus.state)} />
+                        <StatusRow label="Installed" value={appServerStatus.installedVersion ?? '—'} />
+                        <StatusRow label="Running" value={appServerStatus.runningVersion ?? '—'} />
+                        {appServerStatus.restartRequired ? (
+                          <StatusRow label="Update" value="Restart required to apply" />
+                        ) : null}
+                        {activeAppTurns > 0 ? (
+                          <StatusRow
+                            label="Active turns"
+                            value={String(activeAppTurns)}
+                          />
+                        ) : null}
+                        {appServerStatus.lastError ? (
+                          <StatusRow label="Last error" value={appServerStatus.lastError} />
+                        ) : null}
+                      </>
+                    )}
+                    title="Codex App Server"
+                  />
+                ) : null}
+
+                {showViewer ? (
+                  <OperationalSection
+                    actions={(
+                      <>
+                        {(status?.views.declared ?? 0) > 0 ? (
+                          <SheetButton
+                            busy={busyAction === 'views-build'}
+                            disabled={busy || watchRunning}
+                            label={busyAction === 'views-build' ? 'Building' : 'Build'}
+                            onPress={() => onAction('views-build')}
+                            variant={hasServer ? 'secondary' : 'primary'}
+                          />
+                        ) : null}
+                        {watch?.declared ? (
+                          <SheetButton
+                            busy={busyAction === 'watch-start' || busyAction === 'watch-stop'}
+                            disabled={busy}
+                            label={
+                              busyAction === 'watch-start'
+                                ? 'Starting Watch'
+                                : busyAction === 'watch-stop'
+                                  ? 'Stopping Watch'
+                                  : watchRunning
+                                    ? 'Stop Watch'
+                                    : 'Start Watch'
+                            }
+                            onPress={() => onAction(watchRunning ? 'watch-stop' : 'watch-start')}
+                          />
+                        ) : null}
+                      </>
+                    )}
+                    emptyText="No Viewer output yet — Build or start Watch to see output here."
+                    logs={viewerLines}
+                    status={(
+                      <>
+                        {(status?.views.declared ?? 0) > 0 ? (
+                          <StatusRow label="Build" value={status?.views.built ? 'Built' : 'Not built'} />
+                        ) : null}
+                        {status?.views.lastBuildAtMs ? (
+                          <StatusRow label="Last build" value={formatStatusTime(status.views.lastBuildAtMs)} />
+                        ) : null}
+                        {watchText ? <StatusRow label="Watch" value={watchText} /> : null}
+                        {watchResourceText ? <StatusRow label="Resources" value={watchResourceText} /> : null}
+                      </>
+                    )}
+                    title="Viewer"
+                  />
+                ) : null}
+              </ScrollView>
             </View>
           </RNHostView>
         </Group>
@@ -294,7 +374,44 @@ export function ExtensionDetailSheet({
 }
 
 function trimLog(lines: ExtensionLogLine[]): ExtensionLogLine[] {
-  return lines.length > logRingLines ? lines.slice(lines.length - logRingLines) : lines;
+  const keptPerComponent = new Map<string, number>();
+  const kept: ExtensionLogLine[] = [];
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const entry = lines[index];
+    const count = keptPerComponent.get(entry.componentId) ?? 0;
+    if (count >= logRingLines) {
+      continue;
+    }
+    keptPerComponent.set(entry.componentId, count + 1);
+    kept.push(entry);
+  }
+  kept.reverse();
+  return kept;
+}
+
+function OperationalSection({
+  actions,
+  emptyText,
+  logs,
+  status,
+  title,
+}: {
+  actions: ReactNode;
+  emptyText: string;
+  logs: ExtensionLogLine[];
+  status: ReactNode;
+  title: string;
+}) {
+  const { styles } = useSheetTheme();
+  return (
+    <View style={styles.operationalSection}>
+      <Text style={styles.groupTitle}>{title}</Text>
+      <View style={styles.statusBlock}>{status}</View>
+      <View style={styles.actionsRow}>{actions}</View>
+      <Text style={styles.logsTitle}>Logs</Text>
+      <LogPanel emptyText={emptyText} lines={logs} />
+    </View>
+  );
 }
 
 /**
@@ -304,11 +421,9 @@ function trimLog(lines: ExtensionLogLine[]): ExtensionLogLine[] {
  */
 function LogPanel({
   emptyText,
-  hideTags = false,
   lines,
 }: {
   emptyText: string;
-  hideTags?: boolean;
   lines: ExtensionLogLine[];
 }) {
   const { styles } = useSheetTheme();
@@ -339,7 +454,7 @@ function LogPanel({
           <Text style={styles.logEmpty}>{emptyText}</Text>
         ) : (
           lines.map((entry, index) => (
-            <LogEntryLine entry={entry} hideTag={hideTags} key={`${entry.ts}:${index}`} />
+            <LogEntryLine entry={entry} key={`${entry.ts}:${index}`} />
           ))
         )}
       </ScrollView>
@@ -348,44 +463,49 @@ function LogPanel({
 }
 
 /**
- * One log entry: muted timestamp, colored stream tag, wrapped message.
- * Lifecycle lines are runtime narration and render fully muted with no tag;
- * single-stream panels (Watch) hide the tag — it would repeat on every line.
+ * One log entry: muted timestamp, structured source/channel tag, and wrapped
+ * message. Severity comes only from `level`; raw stderr remains neutral.
  */
-function LogEntryLine({ entry, hideTag = false }: { entry: ExtensionLogLine; hideTag?: boolean }) {
+function LogEntryLine({ entry }: { entry: ExtensionLogLine }) {
   const { styles } = useSheetTheme();
-  const tag = hideTag ? null : logStreamTag(entry.stream);
+  const tag = logEntryTag(entry);
+  const messageStyle = entry.level === 'error'
+    ? styles.logTextBad
+    : entry.level === 'warn'
+      ? styles.logTextWarn
+      : entry.source === 'lifecycle' || entry.source === 'connection'
+        ? styles.logTextMuted
+        : styles.logText;
 
   return (
     <Text selectable style={styles.logLine}>
       <Text style={styles.logTime}>{`${formatLogTime(entry.ts)} `}</Text>
       {tag ? <Text style={[styles.logTag, logTagStyle(styles, tag.tone)]}>{`${tag.label} `}</Text> : null}
-      <Text style={entry.stream === 'lifecycle' ? styles.logTextMuted : styles.logText}>
-        {logMessage(entry)}
-      </Text>
+      <Text style={messageStyle}>{logMessage(entry)}</Text>
     </Text>
   );
 }
 
-type LogTagTone = 'bad' | 'build' | 'muted';
+type LogTagTone = 'bad' | 'warn' | 'build' | 'muted';
 
-function logStreamTag(stream: string): { label: string; tone: LogTagTone } | null {
-  switch (stream) {
-    case 'lifecycle':
-      return null;
-    case 'stderr':
-      return { label: 'err', tone: 'bad' };
-    case 'build':
-      return { label: 'build', tone: 'build' };
-    default:
-      return { label: stream, tone: 'muted' };
-  }
+function logEntryTag(entry: ExtensionLogLine): { label: string; tone: LogTagTone } | null {
+  const label = entry.channel ? `${entry.source}·${entry.channel}` : entry.source;
+  const tone = entry.level === 'error'
+    ? 'bad'
+    : entry.level === 'warn'
+      ? 'warn'
+      : entry.source === 'build' || entry.source === 'update'
+        ? 'build'
+        : 'muted';
+  return { label, tone };
 }
 
 function logTagStyle(styles: SheetStyles, tone: LogTagTone) {
   switch (tone) {
     case 'bad':
       return styles.logTagBad;
+    case 'warn':
+      return styles.logTagWarn;
     case 'build':
       return styles.logTagBuild;
     default:
@@ -400,6 +520,23 @@ function logMessage(entry: ExtensionLogLine): string {
   return (entry.stream === 'build' || entry.stream === 'watch') && entry.line.startsWith(prefix)
     ? entry.line.slice(prefix.length)
     : entry.line;
+}
+
+function formatResourceSample(sample: {
+  cpuPercent: number;
+  rssBytes: number;
+  processCount: number;
+}): string {
+  return `${sample.cpuPercent.toFixed(1)}% CPU · ${formatBytes(sample.rssBytes)} · ${sample.processCount} ${sample.processCount === 1 ? 'process' : 'processes'}`;
+}
+
+function formatStatusTime(value: number): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString();
+}
+
+function capitalize(value: string): string {
+  return value.length > 0 ? `${value[0].toUpperCase()}${value.slice(1)}` : value;
 }
 
 /** Local HH:MM:SS, with a MM-DD prefix once the entry is from another day. */
@@ -623,7 +760,7 @@ function createStyles(theme: RemuxTheme) {
       borderColor: theme.border,
       borderRadius: 14,
       borderWidth: 1,
-      flex: 1,
+      maxHeight: 180,
       marginTop: 8,
       minHeight: 96,
       overflow: 'hidden',
@@ -641,14 +778,23 @@ function createStyles(theme: RemuxTheme) {
     logTagBuild: {
       color: theme.focusRing,
     },
+    logTagWarn: {
+      color: theme.warning,
+    },
     logTagMuted: {
       color: theme.textMuted,
     },
     logText: {
       color: theme.text,
     },
+    logTextBad: {
+      color: theme.danger,
+    },
     logTextMuted: {
       color: theme.textMuted,
+    },
+    logTextWarn: {
+      color: theme.warning,
     },
     logTime: {
       color: alpha(theme.textMuted, 0.8),
@@ -662,6 +808,16 @@ function createStyles(theme: RemuxTheme) {
       marginTop: 18,
       textTransform: 'uppercase',
     },
+    logsTitle: {
+      color: theme.textMuted,
+      fontSize: 12,
+      fontWeight: '700',
+      lineHeight: 17,
+      marginTop: 14,
+    },
+    operationalSection: {
+      flexShrink: 0,
+    },
     primaryButton: {
       backgroundColor: alpha(theme.focusRing, 0.16),
       borderColor: theme.focusRing,
@@ -673,6 +829,18 @@ function createStyles(theme: RemuxTheme) {
       flex: 1,
       paddingHorizontal: 18,
       paddingTop: 20,
+    },
+    sectionContent: {
+      paddingBottom: 16,
+    },
+    sectionScroll: {
+      flex: 1,
+    },
+    sharedResources: {
+      color: theme.textMuted,
+      fontSize: 12,
+      lineHeight: 17,
+      marginTop: 8,
     },
     statusBlock: {
       gap: 8,

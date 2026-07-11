@@ -80,7 +80,28 @@ export type ExtensionLogLine = {
   ts: string;
   stream: string;
   line: string;
+  area: 'server' | 'viewer';
+  componentId: string;
+  source: 'lifecycle' | 'process' | 'connection' | 'build' | 'watch' | 'update';
+  channel: 'stdout' | 'stderr' | null;
+  level: 'info' | 'warn' | 'error' | null;
+  viewId: string | null;
 };
+
+export type CodexAppServerState = 'running' | 'stopped' | 'starting' | 'stopping' | 'failed';
+
+export type CodexAppServerStatus = {
+  state: CodexAppServerState;
+  socketPath: string | null;
+  managedCodexPath: string | null;
+  installedVersion: string | null;
+  runningVersion: string | null;
+  restartRequired: boolean;
+  lastError: string | null;
+  activeTurnIds: string[];
+};
+
+export type CodexAppServerAction = 'start' | 'stop' | 'restart' | 'update';
 
 export async function readExtensionServerStatuses(
   request: RemuxConnection['request'],
@@ -164,9 +185,8 @@ export async function setExtensionWatchRunning(
 }
 
 /**
- * Manual builds. `server` rebuilds the binary (restarting a running server
- * into it); `views` force-runs every declared view build. Build failure
- * arrives as a thrown error — the runtime leaves the lifecycle untouched.
+ * Manual builds. `server` stages a new binary without restarting a running
+ * server; `views` force-runs every declared view build.
  */
 export async function buildExtension(
   request: RemuxConnection['request'],
@@ -215,6 +235,39 @@ export async function unsubscribeExtensionLogs(
   extensionId: string,
 ): Promise<void> {
   await request<unknown>(rpcPolicies['extension-logs-unsubscribe'], { extensionId });
+}
+
+export async function readCodexAppServerStatus(
+  request: RemuxConnection['request'],
+): Promise<CodexAppServerStatus | null> {
+  try {
+    const response = await request<unknown>(rpcPolicies['codex-app-server-status-read']);
+    return parseCodexAppServerStatus(response);
+  } catch (error) {
+    if (isMethodNotFound(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+export async function runCodexAppServerAction(
+  request: RemuxConnection['request'],
+  action: CodexAppServerAction,
+): Promise<CodexAppServerStatus> {
+  const policy = action === 'start'
+    ? rpcPolicies['codex-app-server-start']
+    : action === 'stop'
+      ? rpcPolicies['codex-app-server-stop']
+      : action === 'restart'
+        ? rpcPolicies['codex-app-server-restart']
+        : rpcPolicies['codex-app-server-update'];
+  const response = await request<unknown>(policy);
+  const status = parseCodexAppServerStatus(response);
+  if (!status) {
+    throw new Error(`Invalid Codex App Server ${action} response`);
+  }
+  return status;
 }
 
 /** Params of a `remux/extensions/logs/didAppend` notification. */
@@ -332,16 +385,125 @@ function parseLastExit(value: unknown): ExtensionServerLastExit | null {
   };
 }
 
-function parseExtensionLogLine(raw: unknown): ExtensionLogLine[] {
+export function parseExtensionLogLine(raw: unknown): ExtensionLogLine[] {
   if (!isRecord(raw) || typeof raw.line !== 'string') {
     return [];
   }
 
+  const stream = typeof raw.stream === 'string' ? raw.stream : 'stderr';
+  const structuredArea = raw.area === 'server' || raw.area === 'viewer' ? raw.area : null;
+  const structuredSource = parseLogSource(raw.source);
+  const structuredComponent = typeof raw.componentId === 'string' && raw.componentId.length > 0
+    ? raw.componentId
+    : null;
+  const structuredChannel = raw.channel === null
+    ? null
+    : raw.channel === 'stdout' || raw.channel === 'stderr'
+      ? raw.channel
+      : undefined;
+  const structuredLevel = raw.level === null
+    ? null
+    : raw.level === 'info' || raw.level === 'warn' || raw.level === 'error'
+      ? raw.level
+      : undefined;
+  const hasStructuredMetadata = structuredArea !== null
+    && structuredSource !== null
+    && structuredComponent !== null
+    && structuredChannel !== undefined
+    && structuredLevel !== undefined;
+  const legacy = legacyLogMetadata(stream);
+
   return [{
     ts: typeof raw.ts === 'string' ? raw.ts : '',
-    stream: typeof raw.stream === 'string' ? raw.stream : 'stderr',
+    stream,
     line: raw.line,
+    area: hasStructuredMetadata ? structuredArea : legacy.area,
+    componentId: hasStructuredMetadata ? structuredComponent : legacy.componentId,
+    source: hasStructuredMetadata ? structuredSource : legacy.source,
+    channel: hasStructuredMetadata ? structuredChannel : legacy.channel,
+    level: hasStructuredMetadata ? structuredLevel : null,
+    viewId: hasStructuredMetadata && (typeof raw.viewId === 'string' || raw.viewId === null)
+      ? raw.viewId
+      : legacy.viewId,
   }];
+}
+
+function legacyLogMetadata(stream: string): Pick<
+  ExtensionLogLine,
+  'area' | 'componentId' | 'source' | 'channel' | 'viewId'
+> {
+  if (stream === 'watch') {
+    return {
+      area: 'viewer',
+      componentId: 'viewer:main',
+      source: 'watch',
+      channel: null,
+      viewId: 'main',
+    };
+  }
+  return {
+    area: 'server',
+    componentId: 'extension-server',
+    source: stream === 'build' ? 'build' : stream === 'lifecycle' ? 'lifecycle' : 'process',
+    channel: stream === 'stderr' ? 'stderr' : null,
+    viewId: null,
+  };
+}
+
+function parseLogSource(value: unknown): ExtensionLogLine['source'] | null {
+  switch (value) {
+    case 'lifecycle':
+    case 'process':
+    case 'connection':
+    case 'build':
+    case 'watch':
+    case 'update':
+      return value;
+    default:
+      return null;
+  }
+}
+
+export function parseCodexAppServerStatus(raw: unknown): CodexAppServerStatus | null {
+  if (!isRecord(raw)) {
+    return null;
+  }
+  const state = parseCodexAppServerState(raw.state);
+  if (!state) {
+    return null;
+  }
+  const installedVersion = typeof raw.installedVersion === 'string' ? raw.installedVersion : null;
+  const runningVersion = typeof raw.runningVersion === 'string' ? raw.runningVersion : null;
+  return {
+    state,
+    socketPath: typeof raw.socketPath === 'string' ? raw.socketPath : null,
+    managedCodexPath: typeof raw.managedCodexPath === 'string' ? raw.managedCodexPath : null,
+    installedVersion,
+    runningVersion,
+    restartRequired: raw.restartRequired === true
+      || (installedVersion !== null && runningVersion !== null && installedVersion !== runningVersion),
+    lastError: typeof raw.lastError === 'string' ? raw.lastError : null,
+    activeTurnIds: Array.isArray(raw.activeTurnIds)
+      ? raw.activeTurnIds.filter((id): id is string => typeof id === 'string')
+      : [],
+  };
+}
+
+function parseCodexAppServerState(value: unknown): CodexAppServerState | null {
+  switch (value) {
+    case 'running':
+    case 'stopped':
+    case 'starting':
+    case 'stopping':
+    case 'failed':
+      return value;
+    default:
+      return null;
+  }
+}
+
+function isMethodNotFound(error: unknown): boolean {
+  return error instanceof Error && /method not found/i.test(error.message);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

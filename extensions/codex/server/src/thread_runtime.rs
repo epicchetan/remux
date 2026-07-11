@@ -46,6 +46,12 @@ impl Default for ThreadRuntimeState {
 }
 
 impl ThreadRuntimeStore {
+    pub(crate) fn clear(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.clear();
+        }
+    }
+
     pub(crate) fn record_turn_accepted(&self, thread_id: &str, turn_id: Option<&str>) {
         self.update_thread(thread_id, |state| {
             if let Some(turn_id) = turn_id {
@@ -175,6 +181,37 @@ impl ThreadRuntimeStore {
                 .get(thread_id)
                 .and_then(|state| state.active_turn_id.clone())
         })
+    }
+
+    pub(crate) fn active_turn_ids(&self) -> Vec<String> {
+        let mut ids = self
+            .inner
+            .lock()
+            .ok()
+            .map(|inner| {
+                inner
+                    .iter()
+                    .filter_map(|(thread_id, state)| {
+                        if matches!(
+                            state.status,
+                            ThreadRuntimeStatus::Running | ThreadRuntimeStatus::Stopping
+                        ) {
+                            Some(
+                                state
+                                    .active_turn_id
+                                    .clone()
+                                    .unwrap_or_else(|| format!("thread:{thread_id}")),
+                            )
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        ids.sort();
+        ids.dedup();
+        ids
     }
 
     pub(crate) fn is_busy(&self, thread_id: &str) -> bool {
@@ -494,5 +531,20 @@ mod tests {
         let value = store.resource_value("thread-1");
         assert_eq!(value["status"], json!("ready"));
         assert_eq!(value["activeTurnId"], Value::Null);
+    }
+
+    #[test]
+    fn active_turn_ids_include_authoritative_thread_sentinel_when_turn_id_is_unknown() {
+        let store = ThreadRuntimeStore::default();
+        store.record_turn_started("thread-b", None);
+        store.record_turn_started("thread-a", Some("turn-a"));
+
+        assert_eq!(
+            store.active_turn_ids(),
+            vec!["thread:thread-b".to_string(), "turn-a".to_string()]
+        );
+
+        store.clear();
+        assert!(store.active_turn_ids().is_empty());
     }
 }

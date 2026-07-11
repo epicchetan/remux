@@ -889,6 +889,24 @@ fn dispatch_lane(client: &WsClient, method: &str, work: &DispatchWork) -> (Strin
     }
     if method.starts_with("remux/codex/") {
         let params = dispatch_params(work);
+        if method == "remux/codex/app-server/status/read" {
+            return (
+                "extension:codex:app-server-status".to_string(),
+                DispatchMode::ConcurrentBusiness,
+            );
+        }
+        if matches!(
+            method,
+            "remux/codex/app-server/start"
+                | "remux/codex/app-server/stop"
+                | "remux/codex/app-server/restart"
+                | "remux/codex/app-server/update"
+        ) {
+            return (
+                "extension:codex:app-server-management".to_string(),
+                DispatchMode::Serial,
+            );
+        }
         if matches!(
             method,
             "remux/codex/files"
@@ -1024,6 +1042,11 @@ fn extension_execution_budget_ms(method: &str, message: &Value) -> Option<u64> {
         "remux/codex/models/read"
         | "remux/codex/narration/start"
         | "remux/codex/thread/turn/interrupt" => 15_000,
+        "remux/codex/app-server/status/read" => 15_000,
+        "remux/codex/app-server/start"
+        | "remux/codex/app-server/stop"
+        | "remux/codex/app-server/restart" => 40_000,
+        "remux/codex/app-server/update" => 600_000,
         "remux/codex/thread/resources/read" => 20_000,
         "remux/codex/transcript/resources/read"
         | "remux/codex/thread/message/send"

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
@@ -27,7 +27,9 @@ pub(crate) struct LiveNotificationEffect {
 
 #[derive(Debug, Default)]
 struct LiveTranscriptInner {
+    authoritative_active_threads: Option<HashSet<String>>,
     identity: ItemIdentityState,
+    reconciliation_revision: u64,
     threads: HashMap<String, LiveThread>,
 }
 
@@ -52,6 +54,21 @@ struct LiveItemDelta {
 }
 
 impl LiveTranscriptStore {
+    pub(crate) fn clear(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            let next_revision = inner.reconciliation_revision.wrapping_add(1);
+            *inner = LiveTranscriptInner::default();
+            inner.reconciliation_revision = next_revision;
+        }
+    }
+
+    pub(crate) fn set_authoritative_active_threads(&self, thread_ids: &[String]) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.authoritative_active_threads = Some(thread_ids.iter().cloned().collect());
+            inner.reconciliation_revision = inner.reconciliation_revision.wrapping_add(1);
+        }
+    }
+
     pub(crate) fn record_turn(&self, thread_id: &str, turn: &Value) {
         let Some(turn_id) = turn.get("id").and_then(Value::as_str).map(str::to_string) else {
             return;
@@ -121,6 +138,8 @@ impl LiveTranscriptStore {
         }) else {
             return LiveNotificationEffect::default();
         };
+
+        self.update_authoritative_thread_activity(thread_id, method, params);
 
         if let Some(turn) = params.get("turn") {
             self.record_turn(thread_id, turn);
@@ -313,7 +332,23 @@ impl LiveTranscriptStore {
         record_raw_turn_aliases(&mut inner, thread_id, raw_turn);
     }
 
-    pub(crate) fn apply_overlay(&self, thread_id: &str, projected: ProjectedTurn) -> ProjectedTurn {
+    pub(crate) fn apply_overlay(
+        &self,
+        thread_id: &str,
+        mut projected: ProjectedTurn,
+    ) -> ProjectedTurn {
+        let should_interrupt_orphan = self.inner.lock().ok().is_some_and(|inner| {
+            projected.raw_turn.status == "inProgress"
+                && inner
+                    .authoritative_active_threads
+                    .as_ref()
+                    .is_some_and(|active| !active.contains(thread_id))
+        });
+        if should_interrupt_orphan {
+            let mut raw_turn = projected.raw_turn.clone();
+            raw_turn.status = "interrupted".to_string();
+            projected = project_raw_turn(raw_turn);
+        }
         let turn_id = projected.raw_turn.id.clone();
         let live_turn = {
             let mut inner = match self.inner.lock() {
@@ -349,26 +384,66 @@ impl LiveTranscriptStore {
         _disk_turn_order: &[String],
     ) -> Option<String> {
         let inner = self.inner.lock().ok()?;
-        let thread = inner.threads.get(thread_id)?;
-        let live_turns = thread
-            .turn_order
-            .iter()
-            .filter_map(|turn_id| {
-                let turn = thread.turns.get(turn_id)?;
-                if _disk_turn_order.iter().any(|disk_id| disk_id == turn_id) {
-                    Some(live_revision_value(turn_id, turn))
-                } else if live_turn_is_visible(turn) {
-                    project_app_server_turn(&turn.turn).map(|turn| turn.turn)
-                } else {
-                    None
-                }
+        let live_turns = inner
+            .threads
+            .get(thread_id)
+            .map(|thread| {
+                thread
+                    .turn_order
+                    .iter()
+                    .filter_map(|turn_id| {
+                        let turn = thread.turns.get(turn_id)?;
+                        if _disk_turn_order.iter().any(|disk_id| disk_id == turn_id) {
+                            Some(live_revision_value(turn_id, turn))
+                        } else if live_turn_is_visible(turn) {
+                            project_app_server_turn(&turn.turn).map(|turn| turn.turn)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
             })
-            .collect::<Vec<_>>();
-        if live_turns.is_empty() {
+            .unwrap_or_default();
+        if live_turns.is_empty() && inner.reconciliation_revision == 0 {
             return None;
         }
 
-        Some(stable_revision_value(&json!(live_turns)))
+        Some(stable_revision_value(&json!({
+            "liveTurns": live_turns,
+            "reconciliationRevision": inner.reconciliation_revision,
+        })))
+    }
+
+    fn update_authoritative_thread_activity(&self, thread_id: &str, method: &str, params: &Value) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let Some(active) = inner.authoritative_active_threads.as_mut() else {
+            return;
+        };
+        match method {
+            "turn/started" | "item/started" => {
+                active.insert(thread_id.to_string());
+            }
+            "turn/completed" | "error" => {
+                active.remove(thread_id);
+            }
+            "thread/status/changed" => {
+                let is_active = params
+                    .get("status")
+                    .or_else(|| params.get("thread").and_then(|thread| thread.get("status")))
+                    .is_some_and(|status| {
+                        status.as_str() == Some("active")
+                            || status.get("type").and_then(Value::as_str) == Some("active")
+                    });
+                if is_active {
+                    active.insert(thread_id.to_string());
+                } else {
+                    active.remove(thread_id);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1261,4 +1336,59 @@ fn live_delta_value(delta: &LiveItemDelta) -> Value {
         "replaceFields": delta.replace_fields,
         "stringFields": delta.string_fields,
     })
+}
+
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::*;
+
+    fn in_progress_turn() -> ProjectedTurn {
+        project_raw_turn(RawTurn {
+            completed_at: None,
+            duration_ms: None,
+            error: None,
+            id: "turn-1".to_string(),
+            items: vec![json!({
+                "content": [{ "text": "hello", "type": "text" }],
+                "id": "user-1",
+                "type": "userMessage",
+            })],
+            started_at: Some(1),
+            status: "inProgress".to_string(),
+        })
+    }
+
+    #[test]
+    fn authoritative_idle_thread_interrupts_orphaned_disk_turn() {
+        let store = LiveTranscriptStore::default();
+        store.set_authoritative_active_threads(&[]);
+
+        let projected = store.apply_overlay("thread-1", in_progress_turn());
+
+        assert_eq!(projected.raw_turn.status, "interrupted");
+        assert_eq!(projected.turn["status"], "interrupted");
+    }
+
+    #[test]
+    fn authoritative_active_thread_preserves_in_progress_turn() {
+        let store = LiveTranscriptStore::default();
+        store.set_authoritative_active_threads(&["thread-1".to_string()]);
+
+        let projected = store.apply_overlay("thread-1", in_progress_turn());
+
+        assert_eq!(projected.raw_turn.status, "inProgress");
+    }
+
+    #[test]
+    fn reconciliation_revision_changes_across_connection_gaps() {
+        let store = LiveTranscriptStore::default();
+        store.set_authoritative_active_threads(&[]);
+        let first = store.revision_for_thread("thread-1", &[]).unwrap();
+
+        store.clear();
+        store.set_authoritative_active_threads(&[]);
+        let second = store.revision_for_thread("thread-1", &[]).unwrap();
+
+        assert_ne!(first, second);
+    }
 }

@@ -1080,6 +1080,7 @@ fn spawn_narration_event_router(
     thread::spawn(move || {
         for event in event_rx {
             match event {
+                AppServerEvent::Reconnected => {}
                 AppServerEvent::Notification(notification) => {
                     let thread_id = notification
                         .get("params")
@@ -1113,6 +1114,7 @@ fn spawn_narration_event_router(
                         }
                     }
                 }
+                AppServerEvent::ManagementLog { .. } => {}
                 AppServerEvent::ServerRequest(_) => {}
             }
         }
