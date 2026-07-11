@@ -523,9 +523,11 @@
 
   .codex-md-file-link {
     display: inline-flex;
-    max-width: 100%;
+    min-width: 0;
+    max-width: min(100%, var(--codex-md-file-link-max-width));
     height: var(--codex-md-file-link-height);
     align-items: center;
+    box-sizing: border-box;
     border: 1px solid color-mix(in srgb, var(--border) 85%, transparent);
     border-radius: 5px;
     background: color-mix(in srgb, var(--muted) 70%, transparent);
@@ -533,6 +535,7 @@
     font-weight: 500;
     line-height: inherit;
     padding: 0 var(--codex-md-file-link-padding-x);
+    overflow: hidden;
     text-decoration: none;
     white-space: nowrap;
     vertical-align: text-bottom;
@@ -554,6 +557,7 @@
     justify-content: center;
     width: var(--codex-md-file-icon-size);
     height: var(--codex-md-file-icon-size);
+    flex: 0 0 var(--codex-md-file-icon-size);
     margin-right: var(--codex-md-file-icon-gap);
     transform: translateY(var(--codex-md-file-icon-baseline-shift));
     vertical-align: baseline;
@@ -575,7 +579,11 @@
   }
 
   .codex-md-file-link-name {
+    min-width: 0;
+    overflow: hidden;
     line-height: inherit;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .codex-md-blockquote {

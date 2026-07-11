@@ -948,6 +948,55 @@ test.describe('codex viewer route', () => {
     )).toBeLessThan(0.5);
   });
 
+  test('ellipsizes long file chips without drifting from the modeled markdown height', async ({ page }) => {
+    const label = 'RPC Concurrency and Mobile Transport Resilience implementation specification and rollout notes';
+    await installMockRemuxHost(page, {
+      turns: [completedTurn({
+        assistantText: `Before [${label}](/tmp/specs/rpc-concurrency-and-mobile-transport-resilience.md:128) after`,
+      })],
+    });
+
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+
+    const markdown = page.locator('[data-row-kind="assistantMessage"] .codex-markdown');
+    const chip = markdown.locator('.codex-md-file-link');
+    await expect(chip).toBeVisible();
+    await expect(chip).toHaveText(`${label} (line 128)`);
+    await expect(chip).toHaveAttribute(
+      'title',
+      '/tmp/specs/rpc-concurrency-and-mobile-transport-resilience.md:128',
+    );
+
+    const geometry = await markdown.evaluate((element) => {
+      const root = element as HTMLElement;
+      const chipNode = root.querySelector<HTMLElement>('.codex-md-file-link');
+      const labelNode = root.querySelector<HTMLElement>('.codex-md-file-link-name');
+      if (!chipNode || !labelNode) {
+        throw new Error('Expected rendered file chip geometry');
+      }
+      const blockHeight = Array.from(root.children).reduce(
+        (total, child) => total + (child as HTMLElement).getBoundingClientRect().height,
+        0,
+      );
+
+      return {
+        blockHeight,
+        chipWidth: chipNode.getBoundingClientRect().width,
+        labelClientWidth: labelNode.clientWidth,
+        labelOverflow: getComputedStyle(labelNode).textOverflow,
+        labelScrollWidth: labelNode.scrollWidth,
+        modeledHeight: Number.parseFloat(root.style.height),
+        rootHeight: root.getBoundingClientRect().height,
+      };
+    });
+
+    expect(geometry.chipWidth).toBeLessThanOrEqual(280.5);
+    expect(geometry.labelScrollWidth).toBeGreaterThan(geometry.labelClientWidth);
+    expect(geometry.labelOverflow).toBe('ellipsis');
+    expect(Math.abs(geometry.rootHeight - geometry.modeledHeight)).toBeLessThan(0.5);
+    expect(Math.abs(geometry.rootHeight - geometry.blockHeight)).toBeLessThan(0.5);
+  });
+
   test('labels only explicitly projected steering messages inside work', async ({ page }) => {
     const turn: CodexTranscriptTurn = {
       completedAt: 1782000001000,

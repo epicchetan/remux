@@ -11,6 +11,7 @@ import {
   type MarkdownLayoutLineFragment,
 } from './markdownModel';
 import { CodeBlock } from './CodeBlock';
+import { fileReferenceStyle } from '../file/FileReferenceChip';
 import { FileTypeIcon } from '../file/fileTypeIcons';
 import { cn } from '@remux/viewer-kit/shadcn';
 import { openHostHref, openHostTarget } from '@remux/viewer-kit/links';
@@ -446,12 +447,8 @@ function FileLink({
 }) {
   const title = file.line ? `${file.path}:${file.line}` : file.path;
   const linkStyle = {
+    ...fileReferenceStyle(),
     ...style,
-    '--codex-md-file-icon-baseline-shift': `${markdownMetrics.fileLink.iconBaselineShift}px`,
-    '--codex-md-file-icon-gap': `${markdownMetrics.fileLink.iconGap}px`,
-    '--codex-md-file-icon-size': `${markdownMetrics.fileLink.iconSize}px`,
-    '--codex-md-file-link-height': `${markdownMetrics.fileLink.height}px`,
-    '--codex-md-file-link-padding-x': `${markdownMetrics.fileLink.paddingX}px`,
   } as CSSProperties;
 
   return (

@@ -35,6 +35,7 @@ export function fileReferenceStyle(): CSSProperties {
     '--codex-md-file-icon-gap': `${markdownMetrics.fileLink.iconGap}px`,
     '--codex-md-file-icon-size': `${markdownMetrics.fileLink.iconSize}px`,
     '--codex-md-file-link-height': `${markdownMetrics.fileLink.height}px`,
+    '--codex-md-file-link-max-width': `${markdownMetrics.fileLink.maxWidth}px`,
     '--codex-md-file-link-padding-x': `${markdownMetrics.fileLink.paddingX}px`,
   } as CSSProperties;
 }

@@ -1,6 +1,8 @@
 import {
   layout,
+  measureNaturalWidth,
   prepare,
+  prepareWithSegments,
   type PreparedText,
 } from '@chenglou/pretext';
 import {
@@ -374,6 +376,7 @@ export const markdownMetrics = {
     iconBaselineShift: 0,
     iconGap: 4,
     iconSize: 12,
+    maxWidth: 280,
     paddingX: 4,
   },
   list: {
@@ -1136,16 +1139,26 @@ function inlineRichItems(
         case 'link':
           extraWidth = walk(child.children, { ...marks, linkHref: child.href }, extraWidth);
           break;
-        case 'fileLink':
+        case 'fileLink': {
+          const font = fontForInlineText(density, variant, { ...marks, linkHref: child.href });
+          const chromeWidth =
+            markdownMetrics.fileLink.iconSize +
+            markdownMetrics.fileLink.iconGap +
+            markdownMetrics.fileLink.paddingX * 2 +
+            markdownMetrics.fileLink.borderWidth * 2 +
+            extraWidth;
+          const textWidth = measureNaturalWidth(prepareWithSegments(child.file.displayName, font));
+          const occupiedWidth = Math.min(
+            textWidth + chromeWidth,
+            markdownMetrics.fileLink.maxWidth,
+          );
           items.push({
             break: 'never',
-            extraWidth:
-              markdownMetrics.fileLink.iconSize +
-              markdownMetrics.fileLink.iconGap +
-              markdownMetrics.fileLink.paddingX * 2 +
-              markdownMetrics.fileLink.borderWidth * 2 +
-              extraWidth,
-            font: fontForInlineText(density, variant, { ...marks, linkHref: child.href }),
+            // PreText keeps the full label for narration and highlighting, while
+            // this adjustment gives its atomic box the same capped width as the
+            // rendered, ellipsized file chip.
+            extraWidth: occupiedWidth - textWidth,
+            font,
             text: child.file.displayName,
           });
           sources.push({
@@ -1157,6 +1170,7 @@ function inlineRichItems(
           });
           extraWidth = 0;
           break;
+        }
       }
     }
 

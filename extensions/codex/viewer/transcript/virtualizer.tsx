@@ -35,6 +35,7 @@ import {
   autoScrollModeForStreamingTurn,
   initialTranscriptScrollTarget,
   nativeScrollOwnsTranscriptViewport,
+  resolveInitialTranscriptScrollTarget,
   transcriptNativeScrollPhaseAfterEvent,
   userMessageAnchorScrollTop,
   type TranscriptNativeScrollPhase,
@@ -775,13 +776,13 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       anchors: navigationAnchors,
       streamingTurnId,
     });
-    const initialMode = initialTarget?.mode ?? { type: 'bottom' as const };
-    const initialScrollTop = initialTarget
-      ? Math.max(0, Math.min(initialTarget.scrollTop, maxScrollableTop(viewport)))
-      : maxScrollableTop(viewport);
-    setViewportAutoScrollMode(initialMode, 'initial-scroll');
+    const resolvedInitialTarget = resolveInitialTranscriptScrollTarget({
+      maxScrollTop: maxScrollableTop(viewport),
+      target: initialTarget,
+    });
+    setViewportAutoScrollMode(resolvedInitialTarget.mode, 'initial-scroll');
     programmaticScrollRef.current = true;
-    viewport.scrollTop = initialScrollTop;
+    viewport.scrollTop = resolvedInitialTarget.scrollTop;
     lastScrollTopRef.current = viewport.scrollTop;
     window.requestAnimationFrame(() => {
       programmaticScrollRef.current = false;

@@ -106,6 +106,28 @@ export function initialTranscriptScrollTarget({
   return anchor ? { mode: { type: 'off' }, scrollTop: anchor.scrollTop } : null;
 }
 
+export function resolveInitialTranscriptScrollTarget({
+  maxScrollTop,
+  target,
+}: {
+  maxScrollTop: number;
+  target: TranscriptInitialScrollTarget | null;
+}): TranscriptInitialScrollTarget {
+  const normalizedMaxScrollTop = Math.max(0, maxScrollTop);
+  if (!target) {
+    return {
+      mode: { type: 'bottom' },
+      scrollTop: normalizedMaxScrollTop,
+    };
+  }
+
+  const targetWasClampedToBottom = target.scrollTop > normalizedMaxScrollTop;
+  return {
+    mode: targetWasClampedToBottom ? { type: 'bottom' } : target.mode,
+    scrollTop: Math.max(0, Math.min(target.scrollTop, normalizedMaxScrollTop)),
+  };
+}
+
 export function anchorTurnUserMessageScrollTop({
   expandedRows,
   topPadding,

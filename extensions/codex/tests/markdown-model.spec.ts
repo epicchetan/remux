@@ -456,6 +456,29 @@ test.describe('markdownModel', () => {
     expect(table.tableWidth).toBeGreaterThan(document.width);
   });
 
+  test('measures long file chips at the same capped width used by the renderer', () => {
+    const label = `RPC concurrency and mobile transport resilience ${'details '.repeat(8).trim()}`;
+    const document = getMarkdownLayoutDocument(
+      `[${label}](/tmp/specs/rpc-concurrency.md) then`,
+      'default',
+      340,
+    );
+    const paragraph = document.blocks[0];
+
+    expect(paragraph).toMatchObject({ type: 'paragraph' });
+    if (paragraph?.type !== 'paragraph') {
+      throw new Error('Expected paragraph block');
+    }
+
+    expect(paragraph.lines).toHaveLength(1);
+    expect(paragraph.lines[0]?.width).toBeGreaterThan(markdownMetrics.fileLink.maxWidth);
+    expect(paragraph.lines[0]?.width).toBeLessThan(340);
+    expect(paragraph.lines[0]?.fragments[0]).toMatchObject({
+      source: { kind: 'fileLink' },
+      text: label,
+    });
+  });
+
   test('lays out a long fenced code line as one logical line at narrow width', () => {
     const document = getMarkdownLayoutDocument(
       ['```ts', `const value = '${'x'.repeat(180)}';`, '```'].join('\n'),

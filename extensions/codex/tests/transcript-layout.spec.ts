@@ -15,6 +15,7 @@ import {
   autoScrollModeForStreamingTurn,
   initialTranscriptScrollTarget,
   nativeScrollOwnsTranscriptViewport,
+  resolveInitialTranscriptScrollTarget,
   transcriptMessageAnchorTopOffset,
   transcriptNativeScrollPhaseAfterEvent,
 } from '../viewer/transcript/virtualizerScroll';
@@ -1059,6 +1060,30 @@ test.describe('transcript virtualizer scroll targets', () => {
     })).toEqual({
       mode: { type: 'off' },
       scrollTop: 40,
+    });
+  });
+
+  test('resolves initial positioning to either an exact message anchor or sticky bottom', () => {
+    expect(resolveInitialTranscriptScrollTarget({
+      maxScrollTop: 100,
+      target: { mode: { type: 'off' }, scrollTop: 40 },
+    })).toEqual({
+      mode: { type: 'off' },
+      scrollTop: 40,
+    });
+    expect(resolveInitialTranscriptScrollTarget({
+      maxScrollTop: 100,
+      target: { mode: { type: 'off' }, scrollTop: 140 },
+    })).toEqual({
+      mode: { type: 'bottom' },
+      scrollTop: 100,
+    });
+    expect(resolveInitialTranscriptScrollTarget({
+      maxScrollTop: 100,
+      target: null,
+    })).toEqual({
+      mode: { type: 'bottom' },
+      scrollTop: 100,
     });
   });
 });
