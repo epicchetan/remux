@@ -12,7 +12,7 @@
     "app:typecheck": "npm --workspace @remux/app run typecheck",
     "mobile:typecheck": "npm --workspace @remux/app run typecheck",
     "viewers:build": "npm --workspaces --if-present run build",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && node scripts/typecheck-linked-viewers.mjs",
     "lint": "npm run typecheck",
     "test:cli": "cargo test --manifest-path cli/Cargo.toml",
     "test:codex-server": "cargo test --manifest-path extensions/codex/server/Cargo.toml --offline",

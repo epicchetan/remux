@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpuTopology {
@@ -60,7 +61,11 @@ impl ResourceCapabilities {
         let cgroup_v2 = std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
         let controllers =
             std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers").unwrap_or_default();
-        let freeze = std::path::Path::new("/sys/fs/cgroup/cgroup.freeze").exists();
+        // cgroup v2 intentionally omits cgroup.freeze from the hierarchy
+        // root. Check the caller's delegated cgroup instead; Remux and its
+        // CLI run in non-root user-manager cgroups where freezer control is
+        // actually exercised.
+        let freeze = current_cgroup_path().is_some_and(|path| path.join("cgroup.freeze").exists());
         let pressure = std::path::Path::new("/proc/pressure/cpu").exists();
         let process_affinity = std::path::Path::new("/proc/self/status").exists();
         let cpu_weight = controllers.split_whitespace().any(|item| item == "cpu");
@@ -91,6 +96,16 @@ impl ResourceCapabilities {
             reasons,
         }
     }
+}
+
+fn current_cgroup_path() -> Option<PathBuf> {
+    let source = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    cgroup_v2_relative_path(&source)
+        .map(|path| PathBuf::from("/sys/fs/cgroup").join(path.trim_start_matches('/')))
+}
+
+fn cgroup_v2_relative_path(source: &str) -> Option<&str> {
+    source.lines().find_map(|line| line.strip_prefix("0::"))
 }
 
 fn read_thread_siblings(cpu: usize) -> Option<Vec<usize>> {
@@ -130,5 +145,14 @@ mod tests {
     fn parses_ranges_and_formats_an_affinity_list() {
         assert_eq!(parse_cpu_list("0,4-6"), Some(vec![0, 4, 5, 6]));
         assert_eq!(format_cpu_list(&[1, 2, 7]), "1,2,7");
+    }
+
+    #[test]
+    fn resolves_the_unified_cgroup_path_without_assuming_root_has_freezer() {
+        assert_eq!(
+            cgroup_v2_relative_path("0::/user.slice/example.scope\n"),
+            Some("/user.slice/example.scope")
+        );
+        assert_eq!(cgroup_v2_relative_path("1:name=/legacy\n"), None);
     }
 }

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use crate::extensions::manifest::{
     load_extension_manifest, WorkloadClass, WorkloadLifetime, MANIFEST_FILENAME,
 };
-use crate::resource::systemd::extension_slice_name;
+use crate::resource::systemd::{extension_slice_name, scoped_program_args};
 
 pub fn capacity() -> Result<i32, String> {
     let topology = crate::resource::CpuTopology::detect();
@@ -174,11 +174,9 @@ pub fn exec(
             &format!("--unit={unit}"),
             &format!("--slice={slice}"),
             &format!("--property=CPUWeight={weight}"),
-            &format!("--property=Nice={nice}"),
             "--",
-            &command[0],
         ]);
-        process.args(&command[1..]);
+        process.args(scoped_program_args(&command[0], &command[1..], nice));
         process
     } else {
         let mut process = std::process::Command::new(&command[0]);

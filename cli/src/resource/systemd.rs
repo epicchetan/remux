@@ -130,11 +130,9 @@ impl ResourcePlacement {
                 &format!("--unit={scope}"),
                 &format!("--slice={}", self.slice),
                 &format!("--property=CPUWeight={}", class.weight()),
-                &format!("--property=Nice={}", class.nice()),
                 "--",
-                program,
             ]);
-            command.args(args);
+            command.args(scoped_program_args(program, args, class.nice()));
             command
         } else if self.requested && !self.topology.allowed_extension_cpus.is_empty() {
             let mut command = Command::new("taskset");
@@ -193,6 +191,21 @@ impl ResourcePlacement {
         }
         Ok(())
     }
+}
+
+pub(crate) fn scoped_program_args(program: &str, args: &[String], nice: i8) -> Vec<String> {
+    let mut scoped = Vec::with_capacity(args.len() + if nice == 0 { 1 } else { 5 });
+    if nice != 0 {
+        scoped.extend([
+            "nice".to_string(),
+            "-n".to_string(),
+            nice.to_string(),
+            "--".to_string(),
+        ]);
+    }
+    scoped.push(program.to_string());
+    scoped.extend(args.iter().cloned());
+    scoped
 }
 
 pub fn extension_slice_name(extension_id: &str, canonical_root: &str) -> String {
@@ -290,5 +303,48 @@ mod tests {
         assert!(first.starts_with("remux-extensions-ledger-dev-"));
         assert_eq!(first, extension_slice_name("Ledger Dev", "/tmp/ledger"));
         assert_ne!(first, extension_slice_name("Ledger Dev", "/tmp/ledger-two"));
+    }
+
+    #[test]
+    fn scope_niceness_wraps_the_program_instead_of_becoming_a_scope_property() {
+        let args = scoped_program_args("cargo", &["build".to_string()], 10);
+        assert_eq!(args, ["nice", "-n", "10", "--", "cargo", "build"]);
+        assert!(!args.iter().any(|arg| arg.starts_with("Nice=")));
+
+        assert_eq!(
+            scoped_program_args("server", &["--stdio".to_string()], 0),
+            ["server", "--stdio"]
+        );
+    }
+
+    #[test]
+    fn transient_scope_accepts_the_production_weight_and_nice_shape() {
+        if !systemd_user_manager_available() {
+            return;
+        }
+        let unit = format!("remux-test-scope-{}", std::process::id());
+        let output = std::process::Command::new("systemd-run")
+            .args([
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                &format!("--unit={unit}"),
+                "--slice=remux-extensions.slice",
+                "--property=CPUWeight=20",
+                "--",
+                "nice",
+                "-n",
+                "10",
+                "--",
+                "/usr/bin/true",
+            ])
+            .output()
+            .expect("systemd-run should start");
+        assert!(
+            output.status.success(),
+            "systemd-run rejected the production scope shape: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
