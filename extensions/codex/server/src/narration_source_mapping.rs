@@ -248,6 +248,19 @@ fn select_semantic_target(
     display_start: usize,
     display_end: usize,
 ) -> Option<&SemanticTarget> {
+    // A target that covers the whole spoken run's display range beats any
+    // partial overlap, no matter how short: a two-character expression inside
+    // an inline-code span must not win the span's own narration run. Among
+    // covering targets the shortest is the most specific.
+    let sort_key = |target: &SemanticTarget| {
+        let covers = target.start <= display_start && display_end <= target.end;
+        (
+            !covers,
+            target.end.saturating_sub(target.start),
+            target.priority,
+            target.start,
+        )
+    };
     targets
         .iter()
         .filter(|target| {
@@ -258,19 +271,7 @@ fn select_semantic_target(
             }
         })
         .min_by(|left, right| {
-            let left_key = (
-                left.end.saturating_sub(left.start),
-                left.priority,
-                left.start,
-                left.id.as_str(),
-            );
-            let right_key = (
-                right.end.saturating_sub(right.start),
-                right.priority,
-                right.start,
-                right.id.as_str(),
-            );
-            left_key.cmp(&right_key)
+            (sort_key(left), left.id.as_str()).cmp(&(sort_key(right), right.id.as_str()))
         })
 }
 
@@ -398,6 +399,34 @@ mod tests {
         assert!(hints.iter().any(
             |hint| hint["origin"] == "sourceSemantic" && hint["targetIds"] == json!(["inline"])
         ));
+    }
+
+    #[test]
+    fn semantic_run_prefers_targets_covering_the_whole_run() {
+        // "live_transcript.rs: filters" — one word target for the file name,
+        // the inline-code span covering it, and a stray short expression
+        // ("rs") inside it. The spelled-out spoken run must map to the span,
+        // not the two-character overlap.
+        let source = block("live_transcript.rs: filters");
+        let targets = vec![
+            json!({ "blockId": "md:0", "displayEnd": 18, "displayStart": 0, "id": "word:file", "kind": "textRange", "role": "word" }),
+            json!({ "blockId": "md:0", "displayEnd": 27, "displayStart": 20, "id": "word:filters", "kind": "textRange", "role": "word" }),
+            json!({ "blockId": "md:0", "displayEnd": 18, "displayStart": 0, "id": "inline", "kind": "textRange", "role": "inlineCode" }),
+            json!({ "blockId": "md:0", "displayEnd": 18, "displayStart": 16, "id": "expr:rs", "kind": "textRange", "role": "expression" }),
+        ];
+        let (hints, stats) = normalized_alignment_hints(
+            &source,
+            "live transcript dot R S filters",
+            &targets,
+        )
+        .unwrap();
+        assert_eq!(stats.exact_word_mappings, 1);
+        assert!(stats.semantic_run_mappings > 0);
+        let semantic = hints
+            .iter()
+            .find(|hint| hint["origin"] == "sourceSemantic")
+            .expect("spelled-out file name maps to a semantic run");
+        assert_eq!(semantic["targetIds"], json!(["inline"]));
     }
 
     #[test]

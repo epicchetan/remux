@@ -2736,7 +2736,7 @@ test.describe('codex viewer route', () => {
     await expect(composer.getByRole('button', { name: 'Pause narration' })).toBeVisible();
   });
 
-  test('resolves semantic narration cues to table cells without changing layout', async ({ page }) => {
+  test('keeps table narration paint at the table frame without changing layout', async ({ page }) => {
     await installMockRemuxHost(page, {
       turns: [completedTurn({
         assistantText: ['| Plan | Price |', '| --- | ---: |', '| Starter | $5 |'].join('\n'),
@@ -2753,8 +2753,11 @@ test.describe('codex viewer route', () => {
     await expect(markdown.locator('.codex-md-table')).toHaveClass(/codex-md-structural-target-narrating/);
     await expect(markdown.locator('.codex-md-table-scroll')).not.toHaveClass(/codex-md-structural-target-narrating/);
     await page.locator('[data-remux-composer-root]').getByRole('button', { name: 'Play narration' }).click();
-    await expect(markdown.locator('.codex-md-table-cell.codex-md-table-cell-narrating')).toBeVisible();
-    await expect(markdown.locator('.codex-md-table')).not.toHaveClass(/codex-md-structural-target-narrating/);
+    await expect(page.locator('[data-remux-composer-root]').getByRole('button', { name: 'Pause narration' })).toBeVisible();
+    // Cell-level cues keep painting at the element level: the table frame
+    // stays lit and no per-cell highlight appears.
+    await expect(markdown.locator('.codex-md-table')).toHaveClass(/codex-md-structural-target-narrating/);
+    await expect(markdown.locator('.codex-md-table-cell-narrating')).toHaveCount(0);
     expect(await markdown.evaluate((element) => element.getBoundingClientRect().height)).toBe(initialHeight);
   });
 
@@ -2773,9 +2776,60 @@ test.describe('codex viewer route', () => {
     await expect(markdown.locator('.codex-md-code-block')).toHaveClass(/codex-md-structural-target-narrating/);
     await expect(markdown.locator('[data-narration-block-id="md:0"]')).not.toHaveClass(/codex-md-structural-target-narrating/);
     await page.locator('[data-remux-composer-root]').getByRole('button', { name: 'Play narration' }).click();
-    await expect(markdown.locator('.codex-md-code-line.codex-md-code-line-narrating')).toBeVisible();
-    await expect(markdown.locator('.codex-md-code-block')).not.toHaveClass(/codex-md-structural-target-narrating/);
+    await expect(page.locator('[data-remux-composer-root]').getByRole('button', { name: 'Pause narration' })).toBeVisible();
+    // Line-level cues keep painting at the element level: the code frame
+    // stays lit and no per-line highlight appears.
+    await expect(markdown.locator('.codex-md-code-block')).toHaveClass(/codex-md-structural-target-narrating/);
+    await expect(markdown.locator('.codex-md-code-line-narrating')).toHaveCount(0);
     expect(await markdown.evaluate((element) => element.getBoundingClientRect().height)).toBe(initialHeight);
+  });
+
+  test('ends prose context highlights at the text instead of the row edge', async ({ page }) => {
+    await installMockRemuxHost(page, {
+      turns: [completedTurn({
+        assistantText: `${'Wrapped context line words '.repeat(18).trim()}\n\nTiny.`,
+      })],
+    });
+
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    await page.getByRole('button', { name: 'Narrate response' }).click();
+    const markdown = page.locator('[data-row-kind="assistantMessage"] .codex-markdown');
+    const firstBlock = markdown.locator('[data-narration-block-id="md:0"]');
+    await expect(firstBlock.locator('.codex-narration-context-rect').first()).toBeVisible();
+
+    const contextGeometry = (blockId: string) => page.evaluate((id) => {
+      // Scope to the rendered transcript row: layout measurement can mount
+      // detached copies of the markdown with the same block ids.
+      const frame = document.querySelector<HTMLElement>(
+        `[data-row-kind="assistantMessage"] [data-narration-block-id="${id}"]`,
+      )!;
+      const surface = frame.querySelector<HTMLElement>('[data-narration-surface="prose"]')!;
+      const surfaceBounds = surface.getBoundingClientRect();
+      const rects = [...frame.querySelectorAll<HTMLElement>('.codex-narration-context-rect')]
+        .map((rect) => rect.getBoundingClientRect())
+        .sort((left, right) => left.top - right.top);
+      return {
+        maxRight: Math.max(...rects.map((rect) => rect.right)),
+        rectCount: rects.length,
+        surfaceRight: surfaceBounds.right,
+        surfaceWidth: surfaceBounds.width,
+        widths: rects.map((rect) => rect.width),
+      };
+    }, blockId);
+
+    // A wrapped paragraph paints one rect per visual line instead of a
+    // single full-width slab over the element box.
+    const wrapped = await contextGeometry('md:0');
+    expect(wrapped.rectCount).toBeGreaterThan(1);
+    expect(wrapped.maxRight).toBeLessThanOrEqual(wrapped.surfaceRight + 1);
+
+    // Seek to the short paragraph: its single-line highlight ends at the
+    // last word, far from the row edge.
+    await markdown.locator('[data-narration-block-id="md:1"]').click();
+    await expect(markdown.locator('[data-narration-block-id="md:1"] .codex-narration-context-rect')).toBeVisible();
+    const tiny = await contextGeometry('md:1');
+    expect(tiny.rectCount).toBe(1);
+    expect(tiny.widths[0]).toBeLessThan(tiny.surfaceWidth * 0.4);
   });
 
   test('automatically follows narration blocks through the virtualized viewport', async ({ page }) => {

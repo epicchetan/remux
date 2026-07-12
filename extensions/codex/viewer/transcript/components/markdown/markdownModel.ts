@@ -1377,13 +1377,24 @@ function narrationSourceForBlock(
       targetIds.push(id);
     });
 
-    for (const match of displayText.matchAll(/https?:\/\/\S+|[$€£¥]\s?\d+(?:[.,]\d+)*|\b[A-Z]{2,}\b|\b\w+(?:<[^>]+>|::\w+|\/\w+)\b/giu)) {
-      const displayStart = match.index;
-      const displayEnd = displayStart + match[0].length;
-      if (targets.some((target) => target.kind === 'textRange' && target.blockId === block.narrationId && target.displayStart === displayStart && target.displayEnd === displayEnd)) continue;
-      const id = `${block.narrationId}/target/expression/${displayStart}-${displayEnd}`;
-      targets.push({ blockId: block.narrationId, displayEnd, displayStart, id, kind: 'textRange', role: 'expression' });
-      targetIds.push(id);
+    // The acronym alternative must stay case-sensitive and outside the
+    // case-insensitive pass: under the `i` flag, `\b[A-Z]{2,}\b` matched any
+    // letter run between boundaries, minting bogus expression targets like
+    // the "rs" inside `live_transcript.rs` that then out-competed the full
+    // span during narration alignment.
+    const expressionPatterns = [
+      /https?:\/\/\S+|[$€£¥]\s?\d+(?:[.,]\d+)*|\b\w+(?:<[^>]+>|::\w+|\/\w+)\b/giu,
+      /\b[A-Z]{2,}\b/gu,
+    ];
+    for (const pattern of expressionPatterns) {
+      for (const match of displayText.matchAll(pattern)) {
+        const displayStart = match.index;
+        const displayEnd = displayStart + match[0].length;
+        if (targets.some((target) => target.kind === 'textRange' && target.blockId === block.narrationId && target.displayStart === displayStart && target.displayEnd === displayEnd)) continue;
+        const id = `${block.narrationId}/target/expression/${displayStart}-${displayEnd}`;
+        targets.push({ blockId: block.narrationId, displayEnd, displayStart, id, kind: 'textRange', role: 'expression' });
+        targetIds.push(id);
+      }
     }
   }
 

@@ -77,7 +77,10 @@ class NarrationPaintController {
     const selected = state.currentTargetIds
       .map((id) => this.indexedTargets.get(id))
       .filter((candidate): candidate is CodexNarrationSourceTarget => Boolean(candidate));
-    const targets = primaryTargets(selected, state.currentCue?.granularity ?? null);
+    const targets = elementLevelPaintTargets(
+      primaryTargets(selected, state.currentCue?.granularity ?? null),
+      manifest.targets,
+    );
     if (targets.length === 0) return;
 
     const ranges: Range[] = [];
@@ -101,45 +104,16 @@ class NarrationPaintController {
       }
       const elements = resolveNarrationTargetElements(target.assistantMessageId, [sourceTarget.id]);
       for (const element of elements) geometryElements.add(element);
-      switch (sourceTarget.kind) {
-        case 'block':
-          for (const element of elements) {
-            const surface = narrationSurface(element);
-            if (surface.dataset.narrationSurface === 'prose') {
-              proseContextElements.add(surface);
-            } else {
-              this.addClass(surface, 'codex-md-structural-target-narrating');
-            }
-            geometryElements.delete(element);
-            geometryElements.add(surface);
-          }
-          break;
-        case 'codeLines':
-          for (const element of elements) this.addClass(element, 'codex-md-code-line-narrating');
-          break;
-        case 'diagramNode':
-          for (const element of elements) this.addClass(element, 'codex-md-diagram-node-narrating');
-          break;
-        case 'tableCell':
-          for (const element of elements) {
-            this.addClass(element, 'codex-md-table-cell-narrating');
-            this.addClass(element, 'codex-md-table-cell-edge-top');
-            this.addClass(element, 'codex-md-table-cell-edge-right');
-            this.addClass(element, 'codex-md-table-cell-edge-bottom');
-            this.addClass(element, 'codex-md-table-cell-edge-left');
-          }
-          break;
-        case 'tableRegion':
-          for (const element of elements) {
-            this.addClass(element, 'codex-md-table-cell-narrating');
-            const row = Number(element.dataset.narrationRow);
-            const column = Number(element.dataset.narrationColumn);
-            if (row === sourceTarget.rowStart) this.addClass(element, 'codex-md-table-cell-edge-top');
-            if (column === sourceTarget.columnEnd) this.addClass(element, 'codex-md-table-cell-edge-right');
-            if (row === sourceTarget.rowEnd) this.addClass(element, 'codex-md-table-cell-edge-bottom');
-            if (column === sourceTarget.columnStart) this.addClass(element, 'codex-md-table-cell-edge-left');
-          }
-          break;
+      if (sourceTarget.kind !== 'block') continue;
+      for (const element of elements) {
+        const surface = narrationSurface(element);
+        if (surface.dataset.narrationSurface === 'prose') {
+          proseContextElements.add(surface);
+        } else {
+          this.addClass(surface, 'codex-md-structural-target-narrating');
+        }
+        geometryElements.delete(element);
+        geometryElements.add(surface);
       }
     }
     this.paintTextOverlays(ranges, proseContextElements);
@@ -205,10 +179,9 @@ class NarrationPaintController {
     for (const element of contextElements) {
       const frame = element.closest<HTMLElement>('.codex-md-block-frame');
       if (!frame) continue;
-      addOverlayPaint(paintsByFrame, frame, {
-        kind: 'context',
-        rect: element.getBoundingClientRect(),
-      });
+      for (const rect of proseLineRects(element)) {
+        addOverlayPaint(paintsByFrame, frame, { kind: 'context', rect });
+      }
     }
     for (const range of ranges) {
       const frame = blockFrameForRange(range);
@@ -270,6 +243,57 @@ export function installNarrationPaintController() {
     unsubscribeLeaves();
     controller.destroy();
   };
+}
+
+// Code, table, and diagram cues paint at the element level: lighting up
+// individual lines, cells, or nodes inside dense structures reads as noise,
+// so precise targets collapse to their containing block frame. The precise
+// targets stay in the manifest for timing and scroll bounds.
+function elementLevelPaintTargets(
+  targets: CodexNarrationSourceTarget[],
+  sourceTargets: CodexNarrationSourceTarget[],
+) {
+  const resolved: CodexNarrationSourceTarget[] = [];
+  const seen = new Set<string>();
+  for (const target of targets) {
+    const paintTarget = target.kind === 'block' || target.kind === 'textRange'
+      ? target
+      : sourceTargets.find((candidate) => candidate.kind === 'block' && candidate.blockId === target.blockId);
+    if (!paintTarget || seen.has(paintTarget.id)) continue;
+    seen.add(paintTarget.id);
+    resolved.push(paintTarget);
+  }
+  return resolved;
+}
+
+// A prose surface is a block element spanning the full column, so its
+// bounding box would wash the entire row past where the text ends. Measure
+// the text nodes instead (line containers are also full-width) and merge
+// their rects per visual line, so each context rect ends at that line's last
+// glyph.
+function proseLineRects(element: HTMLElement) {
+  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+  const range = document.createRange();
+  const lines: { bottom: number; left: number; right: number; top: number }[] = [];
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (!node.textContent?.trim()) continue;
+    range.selectNodeContents(node);
+    for (const rect of range.getClientRects()) {
+      if (rect.width <= 0 || rect.height <= 0) continue;
+      const line = lines.find((candidate) =>
+        Math.min(candidate.bottom, rect.bottom) - Math.max(candidate.top, rect.top) >=
+          Math.min(candidate.bottom - candidate.top, rect.height) / 2);
+      if (line) {
+        line.top = Math.min(line.top, rect.top);
+        line.bottom = Math.max(line.bottom, rect.bottom);
+        line.left = Math.min(line.left, rect.left);
+        line.right = Math.max(line.right, rect.right);
+      } else {
+        lines.push({ bottom: rect.bottom, left: rect.left, right: rect.right, top: rect.top });
+      }
+    }
+  }
+  return lines.map((line) => new DOMRect(line.left, line.top, line.right - line.left, line.bottom - line.top));
 }
 
 function blockTargetsFor(

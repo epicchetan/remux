@@ -81,6 +81,40 @@ test.describe('markdownModel', () => {
     expect(document.blocks.every((block) => block.targetIds.some((id) => id.endsWith('/target/block')))).toBe(true);
   });
 
+  test('keeps expression targets case-sensitive for acronym runs', () => {
+    const document = narrationSourceDocument(
+      '`live_transcript.rs`: filters HTTP APIs and notification-only state.',
+      {
+        messageId: 'assistant-1',
+        messageRevision: 'revision-1',
+        sourceHash: 'source-1',
+      },
+    );
+    const block = document.blocks[0];
+    const expressions = document.targets
+      .filter((target) => target.kind === 'textRange' && target.role === 'expression')
+      .map((target) =>
+        block.displayText.slice(
+          (target as { displayStart: number }).displayStart,
+          (target as { displayEnd: number }).displayEnd,
+        ));
+
+    // Lowercase runs inside a joined token ("rs" in live_transcript.rs,
+    // "notification"/"only") must not become expression targets: a stray
+    // short expression would out-compete the full inline-code span when the
+    // narration alignment maps a spelled-out spoken run.
+    expect(expressions).not.toContain('rs');
+    expect(expressions).not.toContain('notification');
+    expect(expressions).not.toContain('only');
+    // True acronyms keep their targets (deduped against same-range words).
+    expect(document.targets.some((target) =>
+      target.kind === 'textRange' &&
+      block.displayText.slice(
+        (target as { displayStart: number }).displayStart,
+        (target as { displayEnd: number }).displayEnd,
+      ) === 'HTTP')).toBe(true);
+  });
+
   test('ends an ordered list before following unindented paragraphs', () => {
     const blocks = parseMarkdownDocument(
       [
