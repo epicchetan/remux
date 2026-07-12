@@ -55,6 +55,10 @@
   }
 
   .remux-transcript-viewport {
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
     overflow-anchor: none;
   }
 
@@ -443,6 +447,7 @@
   }
 
   .codex-markdown {
+    max-width: 100%;
     min-width: 0;
     color: color-mix(in srgb, var(--foreground) 88%, var(--muted-foreground));
     font-size: var(--remux-font-work-size);
@@ -465,10 +470,12 @@
 
   .codex-md-block {
     margin: 0;
+    max-width: 100%;
     min-width: 0;
   }
 
   .codex-md-block-frame {
+    max-width: 100%;
     min-width: 0;
     overflow: visible;
     isolation: isolate;

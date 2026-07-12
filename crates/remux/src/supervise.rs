@@ -9,8 +9,8 @@
 //! SIGKILL.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub const REMUX_RESTART_EXIT_CODE: i32 = 75;
@@ -76,10 +76,10 @@ pub fn supervise(root_dir: &Path, rebuild: bool) -> i32 {
         }
     }
 
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(error) => {
-            eprintln!("remux: cannot locate own executable: {error}");
+    let exe = match crate::resource::systemd::remux_launcher_path() {
+        Some(exe) => exe,
+        None => {
+            eprintln!("remux: cannot locate a live launcher executable");
             return 1;
         }
     };
@@ -92,6 +92,7 @@ pub fn supervise(root_dir: &Path, rebuild: bool) -> i32 {
         command
             .arg("start")
             .env(WORKER_ENV, std::process::id().to_string())
+            .env(crate::resource::systemd::REMUX_WORKLOAD_EXEC_ENV, &exe)
             .env(crate::cli::root::REMUX_ROOT_ENV, root_dir);
         command.current_dir(root_dir);
         if rebuild {

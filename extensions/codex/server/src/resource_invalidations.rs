@@ -13,6 +13,7 @@ pub(crate) fn send_accepted_invalidations(thread_id: &str) -> Vec<Value> {
         thread_runtime_invalidation(thread_id, "sendAccepted"),
         thread_summary_invalidation(thread_id, "sendAccepted"),
         thread_transcript_invalidation(thread_id, "sendAccepted"),
+        transcript_render_invalidation(thread_id, None, true, true, "sendAccepted"),
     ]
 }
 
@@ -23,6 +24,7 @@ pub(crate) fn command_accepted_invalidations(thread_id: &str) -> Vec<Value> {
         thread_runtime_invalidation(thread_id, "commandAccepted"),
         thread_summary_invalidation(thread_id, "commandAccepted"),
         thread_transcript_invalidation(thread_id, "commandAccepted"),
+        transcript_render_invalidation(thread_id, None, true, true, "commandAccepted"),
     ]
 }
 
@@ -46,6 +48,7 @@ pub(crate) fn app_server_reconnected_invalidations(thread_ids: &[String]) -> Vec
             thread_composer_state_invalidation(thread_id, "appServerEvent"),
             thread_token_usage_invalidation(thread_id, "appServerEvent"),
             thread_transcript_invalidation(thread_id, "appServerEvent"),
+            transcript_render_invalidation(thread_id, None, true, true, "appServerEvent"),
             thread_operation_queue_invalidation(thread_id, "appServerEvent"),
         ]);
     }
@@ -123,6 +126,31 @@ pub(crate) fn invalidations_for_app_server_notification(
             &mut invalidations,
             &mut seen,
             thread_transcript_invalidation(thread_id, "appServerEvent"),
+        );
+        push_unique(
+            &mut invalidations,
+            &mut seen,
+            transcript_render_invalidation(
+                thread_id,
+                notification.get("params").and_then(turn_id_from_params),
+                invalidates_thread_history(method),
+                !method.ends_with("outputDelta"),
+                "appServerEvent",
+            ),
+        );
+    }
+
+    if invalidates_turn(method) || invalidates_work_item(method) {
+        push_unique(
+            &mut invalidations,
+            &mut seen,
+            transcript_render_invalidation(
+                thread_id,
+                notification.get("params").and_then(turn_id_from_params),
+                false,
+                !method.ends_with("outputDelta"),
+                "appServerEvent",
+            ),
         );
     }
 
@@ -219,6 +247,24 @@ fn thread_transcript_invalidation(thread_id: &str, reason: &str) -> Value {
         "reason": reason,
         "threadId": thread_id,
         "type": "threadTranscript",
+    })
+}
+
+fn transcript_render_invalidation(
+    thread_id: &str,
+    turn_id: Option<&str>,
+    affects_order: bool,
+    affects_layout: bool,
+    reason: &str,
+) -> Value {
+    json!({
+        "affectsLayout": affects_layout,
+        "affectsOrder": affects_order,
+        "key": format!("transcriptSync:{thread_id}"),
+        "reason": reason,
+        "threadId": thread_id,
+        "turnId": turn_id,
+        "type": "transcript",
     })
 }
 
@@ -388,7 +434,7 @@ mod tests {
     fn reconnect_invalidates_history_and_every_thread_projection() {
         let invalidations = app_server_reconnected_invalidations(&["thread-1".to_string()]);
 
-        assert_eq!(invalidations.len(), 7);
+        assert_eq!(invalidations.len(), 8);
         for expected in [
             "threadHistory",
             "threadSummary",
@@ -397,6 +443,7 @@ mod tests {
             "threadTokenUsage",
             "threadTranscript",
             "threadOperationQueue",
+            "transcript",
         ] {
             assert!(
                 invalidations.iter().any(|value| value["type"] == expected),
@@ -409,12 +456,13 @@ mod tests {
     fn send_accepted_invalidates_thread_resources() {
         let invalidations = send_accepted_invalidations("thread-1");
 
-        assert_eq!(invalidations.len(), 5);
+        assert_eq!(invalidations.len(), 6);
         assert_eq!(invalidations[0]["type"], "threadHistory");
         assert_eq!(invalidations[1]["key"], "threadComposerState:thread-1");
         assert_eq!(invalidations[2]["key"], "threadRuntime:thread-1");
         assert_eq!(invalidations[3]["key"], "threadSummary:thread-1");
         assert_eq!(invalidations[4]["key"], "threadTranscript:thread-1");
+        assert_eq!(invalidations[5]["key"], "transcriptSync:thread-1");
     }
 
     #[test]
@@ -428,7 +476,7 @@ mod tests {
             &[],
         );
 
-        assert_eq!(invalidations.len(), 5);
+        assert_eq!(invalidations.len(), 6);
         assert!(
             invalidations
                 .iter()
@@ -453,6 +501,11 @@ mod tests {
             invalidations
                 .iter()
                 .any(|value| value["type"] == "threadTranscript")
+        );
+        assert!(
+            invalidations
+                .iter()
+                .any(|value| value["type"] == "transcript")
         );
     }
 
@@ -493,6 +546,13 @@ mod tests {
             invalidations,
             vec![
                 turn_invalidation("thread-3", "turn-1", "appServerEvent"),
+                transcript_render_invalidation(
+                    "thread-3",
+                    Some("turn-1"),
+                    false,
+                    true,
+                    "appServerEvent",
+                ),
                 work_item_invalidation("thread-3", "turn-1", "agent-1", "appServerEvent"),
             ]
         );
@@ -515,12 +575,16 @@ mod tests {
 
         assert_eq!(
             invalidations,
-            vec![work_item_invalidation(
-                "thread-3",
-                "turn-1",
-                "cmd-1",
-                "appServerEvent"
-            )]
+            vec![
+                transcript_render_invalidation(
+                    "thread-3",
+                    Some("turn-1"),
+                    false,
+                    false,
+                    "appServerEvent",
+                ),
+                work_item_invalidation("thread-3", "turn-1", "cmd-1", "appServerEvent"),
+            ]
         );
     }
 
@@ -541,12 +605,21 @@ mod tests {
 
         assert_eq!(
             invalidations,
-            vec![work_item_invalidation(
-                "thread-3",
-                "turn-1",
-                "cxitem:v1:turn-1:call:cmd-1",
-                "appServerEvent"
-            )]
+            vec![
+                transcript_render_invalidation(
+                    "thread-3",
+                    Some("turn-1"),
+                    false,
+                    false,
+                    "appServerEvent",
+                ),
+                work_item_invalidation(
+                    "thread-3",
+                    "turn-1",
+                    "cxitem:v1:turn-1:call:cmd-1",
+                    "appServerEvent",
+                ),
+            ]
         );
     }
 
@@ -574,6 +647,13 @@ mod tests {
             invalidations,
             vec![
                 thread_transcript_invalidation("thread-3", "appServerEvent"),
+                transcript_render_invalidation(
+                    "thread-3",
+                    Some("turn-1"),
+                    false,
+                    true,
+                    "appServerEvent",
+                ),
                 work_item_invalidation(
                     "thread-3",
                     "turn-1",
@@ -600,6 +680,7 @@ mod tests {
             vec![
                 thread_runtime_invalidation("thread-4", "appServerEvent"),
                 thread_transcript_invalidation("thread-4", "appServerEvent"),
+                transcript_render_invalidation("thread-4", None, false, true, "appServerEvent",),
             ]
         );
     }

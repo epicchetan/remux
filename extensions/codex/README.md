@@ -32,6 +32,7 @@ The Rust server exposes:
 
 - `remux/codex/thread/resources/read`
 - `remux/codex/transcript/resources/read`
+- `remux/codex/transcript/capabilities/read`
 - `remux/codex/files`
 - `remux/codex/composer/config/read`
 - `remux/codex/composer/config/write`

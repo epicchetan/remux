@@ -128,6 +128,36 @@ export type CodexResourceInvalidation =
       threadId: string;
       turnId: string;
       type: 'workItem';
+    }
+  | {
+      affectsLayout: boolean;
+      affectsOrder: boolean;
+      key: string;
+      reason: CodexResourceInvalidationReason;
+      threadId: string;
+      turnId?: string;
+      type: 'transcript';
+    }
+  | {
+      affectsLayout: boolean;
+      groupId: string;
+      key: string;
+      reason: CodexResourceInvalidationReason;
+      segmentId: string;
+      threadId: string;
+      turnId: string;
+      type: 'workGroup';
+    }
+  | {
+      affectsLayout: boolean;
+      groupId: string;
+      key: string;
+      reason: CodexResourceInvalidationReason;
+      rowId: string;
+      segmentId: string;
+      threadId: string;
+      turnId: string;
+      type: 'workEntryDetail';
     };
 
 export type CodexResourceInvalidationReason = 'appServerEvent' | 'commandAccepted' | 'sendAccepted';

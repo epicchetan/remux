@@ -54,12 +54,16 @@ export function reconcileMeasuredTranscript({
       previousTurn.rows.every((row, index) => row.segmentId === turn.segments[index]?.id);
 
     if (canReusePreviousTurn) {
-      const measuredTurn = previousTurn.collapsedTop === turnTop
-        ? previousTurn
-        : {
-            ...previousTurn,
-            collapsedTop: turnTop,
-          };
+      const measuredTurn = {
+        ...previousTurn,
+        collapsedTop: turnTop,
+        rows: previousTurn.rows.map((row, index) => ({
+          ...row,
+          segment: turn.segments[index]!,
+          turn,
+        })),
+        turn,
+      };
       top += measuredTurn.collapsedHeight;
       measuredTurns.push(measuredTurn);
       continue;

@@ -8,7 +8,6 @@ import { parseComposerMentionQuery } from './composer/mentions/mentionSearch';
 import { useComposerStore } from './composer/store';
 import { subscribeHostNavigate, updateHostTab } from '@remux/viewer-kit/host';
 import { useHostStore } from './ipc/hostStore';
-import { subscribeCodexResourceInvalidations } from './ipc/resourceInvalidations';
 import type { RemuxHostViewportMetrics } from './ipc/types';
 import { useThreadHistoryStore } from './threads/historyStore';
 import { readThreadComposerPreference, useThreadComposerStateStore } from './threads/composerStateStore';
@@ -324,7 +323,6 @@ export function App() {
     void loadThreadHistory();
   }, [loadThreadHistory]);
 
-  useEffect(() => subscribeCodexResourceInvalidations(), []);
   useEffect(() => subscribeNarrationUpdates(), []);
   useEffect(() => installNarrationPaintController(), []);
 

@@ -17,13 +17,16 @@ export async function applyCodexResourceInvalidations(invalidations: CodexResour
     return;
   }
 
+  // Transcript presentation is the user-visible critical path. Start it in
+  // the same task as the invalidation instead of waiting for history, queue,
+  // composer, and runtime reads to finish first.
   await Promise.all([
+    invalidateTranscriptResources(uniqueInvalidations),
     invalidateThreadResources(uniqueInvalidations),
     invalidateThreadComposerStateResources(uniqueInvalidations),
     invalidateThreadRuntimeResources(uniqueInvalidations),
     invalidateOperationQueueResources(uniqueInvalidations),
   ]);
-  await invalidateTranscriptResources(uniqueInvalidations);
 }
 
 export function subscribeCodexResourceInvalidations() {
@@ -83,28 +86,49 @@ function isCodexResourceInvalidation(value: unknown): value is CodexResourceInva
     return false;
   }
 
-  if (invalidation.type === 'threadHistory') {
-    return true;
+  switch (invalidation.type) {
+    case 'threadHistory':
+      return true;
+    case 'threadRuntime':
+    case 'threadOperationQueue':
+    case 'threadComposerState':
+    case 'threadSummary':
+    case 'threadTokenUsage':
+    case 'threadTranscript':
+      return typeof invalidation.threadId === 'string';
+    case 'turn':
+      return typeof invalidation.threadId === 'string' && typeof invalidation.turnId === 'string';
+    case 'workItem':
+      return (
+        typeof invalidation.threadId === 'string' &&
+        typeof invalidation.turnId === 'string' &&
+        typeof invalidation.itemId === 'string'
+      );
+    case 'transcript':
+      return (
+        typeof invalidation.threadId === 'string' &&
+        (invalidation.turnId === undefined || typeof invalidation.turnId === 'string') &&
+        typeof invalidation.affectsLayout === 'boolean' &&
+        typeof invalidation.affectsOrder === 'boolean'
+      );
+    case 'workGroup':
+      return (
+        typeof invalidation.threadId === 'string' &&
+        typeof invalidation.turnId === 'string' &&
+        typeof invalidation.segmentId === 'string' &&
+        typeof invalidation.groupId === 'string' &&
+        typeof invalidation.affectsLayout === 'boolean'
+      );
+    case 'workEntryDetail':
+      return (
+        typeof invalidation.threadId === 'string' &&
+        typeof invalidation.turnId === 'string' &&
+        typeof invalidation.segmentId === 'string' &&
+        typeof invalidation.groupId === 'string' &&
+        typeof invalidation.rowId === 'string' &&
+        typeof invalidation.affectsLayout === 'boolean'
+      );
+    default:
+      return false;
   }
-
-  return (
-    (
-      invalidation.type === 'threadRuntime' ||
-      invalidation.type === 'threadOperationQueue' ||
-      invalidation.type === 'threadComposerState' ||
-      invalidation.type === 'threadSummary' ||
-      invalidation.type === 'threadTokenUsage' ||
-      invalidation.type === 'threadTranscript'
-    ) &&
-    typeof invalidation.threadId === 'string'
-  ) || (
-    invalidation.type === 'turn' &&
-    typeof invalidation.threadId === 'string' &&
-    typeof invalidation.turnId === 'string'
-  ) || (
-    invalidation.type === 'workItem' &&
-    typeof invalidation.threadId === 'string' &&
-    typeof invalidation.turnId === 'string' &&
-    typeof invalidation.itemId === 'string'
-  );
 }

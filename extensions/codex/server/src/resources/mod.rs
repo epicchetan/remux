@@ -9,12 +9,16 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::history::{
-    build_session_index, discover_session_files, file_revision, read_rows_range, session_meta_id,
+    IncrementalSessionIndex, discover_session_files, file_revision, read_rows_range,
+    refresh_session_index, session_meta_id,
 };
 use crate::live_transcript::LiveTranscriptStore;
 use crate::projection::{ProjectedTurn, RawTurn, project_raw_turn, project_rows_to_raw_turn};
 use crate::transcript::{
-    MAX_TAIL_TURNS, ResourceRequest, ResourcesReadParams, SessionIndex, TurnRange,
+    DEFAULT_TRANSCRIPT_TAIL_TURNS, DEFAULT_WORK_GROUP_ROWS, MAX_TAIL_TURNS,
+    MAX_TRANSCRIPT_KNOWN_TURNS, MAX_TRANSCRIPT_WINDOW_TURNS, MAX_WORK_GROUP_ROWS, ResourceRequest,
+    ResourcesReadParams, SessionIndex, TRANSCRIPT_PROJECTION_VERSION,
+    TRANSCRIPT_RENDER_PROTOCOL_VERSION, TranscriptWindowRequest, TurnRange,
 };
 use crate::util::stable_revision_value;
 
@@ -22,27 +26,21 @@ pub use crate::transcript::ValidationOptions;
 
 const MAX_TRANSCRIPT_RESOURCE_REQUESTS: usize = 64;
 const MAX_TRANSCRIPT_RESOURCE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const TARGET_TRANSCRIPT_SYNC_RESPONSE_BYTES: usize = 6 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct CodexTranscriptServer {
     codex_home: PathBuf,
     live_transcript: LiveTranscriptStore,
     path_cache: HashMap<String, PathBuf>,
-    index_cache: HashMap<PathBuf, CachedIndex>,
+    index_cache: HashMap<PathBuf, IncrementalSessionIndex>,
     turn_cache: HashMap<String, CachedTurn>,
 }
 
 #[derive(Debug, Clone)]
-struct CachedIndex {
-    file_revision: String,
-    index: SessionIndex,
-}
-
-#[derive(Debug, Clone)]
 struct CachedTurn {
-    file_revision: String,
     range: TurnRange,
-    turn: ProjectedTurn,
+    raw_turn: RawTurn,
 }
 
 impl CodexTranscriptServer {
@@ -139,6 +137,66 @@ impl CodexTranscriptServer {
                     &item_id,
                     known_revision,
                 ),
+                ResourceRequest::TranscriptSync {
+                    protocol_version,
+                    projection_version,
+                    window,
+                    known_thread_revision,
+                    known_turns,
+                } => self.read_transcript_sync_resource(
+                    &params.thread_id,
+                    &path,
+                    &file_revision,
+                    &index,
+                    request_index,
+                    protocol_version,
+                    &projection_version,
+                    window,
+                    known_thread_revision,
+                    known_turns,
+                ),
+                ResourceRequest::WorkGroup {
+                    protocol_version,
+                    turn_id,
+                    segment_id,
+                    group_id,
+                    cursor,
+                    limit,
+                    known_revision,
+                } => self.read_work_group_resource(
+                    &params.thread_id,
+                    &path,
+                    &file_revision,
+                    &index,
+                    request_index,
+                    protocol_version,
+                    &turn_id,
+                    &segment_id,
+                    &group_id,
+                    cursor,
+                    limit,
+                    known_revision,
+                ),
+                ResourceRequest::WorkEntryDetail {
+                    protocol_version,
+                    turn_id,
+                    segment_id,
+                    group_id,
+                    row_id,
+                    known_revision,
+                } => self.read_work_entry_detail_resource(
+                    &params.thread_id,
+                    &path,
+                    &file_revision,
+                    &index,
+                    request_index,
+                    protocol_version,
+                    &turn_id,
+                    &segment_id,
+                    &group_id,
+                    &row_id,
+                    known_revision,
+                ),
             };
             results.push(result);
         }
@@ -156,6 +214,316 @@ impl CodexTranscriptServer {
             ));
         }
         Ok(response)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_transcript_sync_resource(
+        &mut self,
+        thread_id: &str,
+        path: &Path,
+        file_revision: &str,
+        index: &SessionIndex,
+        request_index: usize,
+        protocol_version: u8,
+        projection_version: &str,
+        window: TranscriptWindowRequest,
+        _known_thread_revision: Option<String>,
+        known_turns: Vec<crate::transcript::KnownTurnRevision>,
+    ) -> Value {
+        let key = format!("transcriptSync:{thread_id}");
+        if protocol_version != TRANSCRIPT_RENDER_PROTOCOL_VERSION
+            || projection_version != TRANSCRIPT_PROJECTION_VERSION
+        {
+            return error_result(request_index, key, "unsupportedProtocolVersion".to_string());
+        }
+        if known_turns.len() > MAX_TRANSCRIPT_KNOWN_TURNS {
+            return error_result(request_index, key, "tooManyKnownTurns".to_string());
+        }
+
+        let turn_order = self
+            .live_transcript
+            .overlay_turn_order(thread_id, &index.visible_turn_ids);
+        let Some((mut start, mut end, anchor)) = resolve_window(&turn_order, &window) else {
+            return missing_result(request_index, key, "turn_not_found".to_string());
+        };
+        let known = known_turns
+            .iter()
+            .map(|known| (known.turn_id.as_str(), known.render_revision.as_str()))
+            .collect::<HashMap<_, _>>();
+        let removed_turn_ids = known_turns
+            .iter()
+            .filter(|known| !turn_order.iter().any(|turn_id| turn_id == &known.turn_id))
+            .map(|known| known.turn_id.clone())
+            .collect::<Vec<_>>();
+
+        let mut projected_results = Vec::new();
+        for turn_id in &turn_order[start..end] {
+            projected_results.push(self.render_turn_result(
+                thread_id,
+                path,
+                file_revision,
+                index,
+                turn_id,
+                known.get(turn_id.as_str()).copied(),
+            ));
+        }
+
+        let active_turn_id = turn_order.last().and_then(|turn_id| {
+            self.project_turn_or_live(thread_id, path, file_revision, index, turn_id)
+                .ok()
+                .filter(|projected| {
+                    projected.render_frame.get("status").and_then(Value::as_str)
+                        == Some("inProgress")
+                })
+                .map(|_| turn_id.clone())
+        });
+        let thread_revision = stable_revision_value(&json!({
+            "activeTurnId": active_turn_id,
+            "kind": "transcriptThreadV2",
+            "sessionId": index.session_id,
+            "turnOrder": turn_order,
+        }));
+
+        loop {
+            let window_turn_ids = turn_order[start..end].to_vec();
+            let result_offset = start.saturating_sub(
+                resolve_window(&turn_order, &window)
+                    .map(|v| v.0)
+                    .unwrap_or(start),
+            );
+            let result_end = result_offset + window_turn_ids.len();
+            let turns = projected_results
+                .get(result_offset..result_end)
+                .unwrap_or(&[])
+                .to_vec();
+            let value = json!({
+                "activeTurnId": active_turn_id,
+                "projectionVersion": TRANSCRIPT_PROJECTION_VERSION,
+                "protocolVersion": TRANSCRIPT_RENDER_PROTOCOL_VERSION,
+                "removedTurnIds": removed_turn_ids,
+                "sessionId": index.session_id,
+                "threadId": thread_id,
+                "threadRevision": thread_revision,
+                "turnOrder": turn_order,
+                "turns": turns,
+                "window": {
+                    "endIndexExclusive": end,
+                    "hasEarlier": start > 0,
+                    "hasLater": end < turn_order.len(),
+                    "startIndex": start,
+                    "turnIds": window_turn_ids,
+                },
+            });
+            let encoded = serde_json::to_vec(&value)
+                .map(|bytes| bytes.len())
+                .unwrap_or(usize::MAX);
+            if encoded <= TARGET_TRANSCRIPT_SYNC_RESPONSE_BYTES || end.saturating_sub(start) <= 1 {
+                let revision = stable_revision_value(&json!([
+                    TRANSCRIPT_RENDER_PROTOCOL_VERSION,
+                    TRANSCRIPT_PROJECTION_VERSION,
+                    thread_revision,
+                    start,
+                    end,
+                    value.get("turns"),
+                ]));
+                return ok_result(request_index, key, revision, value);
+            }
+
+            let left_distance = anchor.saturating_sub(start);
+            let right_distance = end.saturating_sub(1).saturating_sub(anchor);
+            if left_distance >= right_distance && start < anchor {
+                start += 1;
+            } else if end > anchor + 1 {
+                end -= 1;
+            } else {
+                break;
+            }
+        }
+
+        error_result(request_index, key, "frameTooLarge".to_string())
+    }
+
+    fn render_turn_result(
+        &mut self,
+        thread_id: &str,
+        path: &Path,
+        file_revision: &str,
+        index: &SessionIndex,
+        turn_id: &str,
+        known_revision: Option<&str>,
+    ) -> Value {
+        match self.project_turn_or_live(thread_id, path, file_revision, index, turn_id) {
+            Ok(projected) => {
+                let revision = projected
+                    .render_frame
+                    .get("renderRevision")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if known_revision == Some(revision.as_str()) {
+                    json!({
+                        "renderRevision": revision,
+                        "status": "notModified",
+                        "turnId": turn_id,
+                    })
+                } else if serde_json::to_vec(&projected.render_frame)
+                    .map(|bytes| bytes.len() > MAX_TRANSCRIPT_RESOURCE_RESPONSE_BYTES)
+                    .unwrap_or(true)
+                {
+                    json!({
+                        "code": "frameTooLarge",
+                        "message": "turn render frame exceeds the transcript response limit",
+                        "status": "error",
+                        "turnId": turn_id,
+                    })
+                } else {
+                    json!({
+                        "frame": projected.render_frame,
+                        "renderRevision": revision,
+                        "status": "ok",
+                        "turnId": turn_id,
+                    })
+                }
+            }
+            Err(error) => json!({
+                "code": "projectionFailed",
+                "message": error,
+                "status": "error",
+                "turnId": turn_id,
+            }),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_work_group_resource(
+        &mut self,
+        thread_id: &str,
+        path: &Path,
+        file_revision: &str,
+        index: &SessionIndex,
+        request_index: usize,
+        protocol_version: u8,
+        turn_id: &str,
+        segment_id: &str,
+        group_id: &str,
+        cursor: Option<String>,
+        limit: Option<usize>,
+        known_revision: Option<String>,
+    ) -> Value {
+        let key = format!("workGroup:{thread_id}:{turn_id}:{segment_id}:{group_id}");
+        if protocol_version != TRANSCRIPT_RENDER_PROTOCOL_VERSION {
+            return error_result(request_index, key, "unsupportedProtocolVersion".to_string());
+        }
+        if cursor.is_some() && known_revision.is_some() {
+            return error_result(request_index, key, "knownRevisionWithCursor".to_string());
+        }
+        let projected =
+            match self.project_turn_or_live(thread_id, path, file_revision, index, turn_id) {
+                Ok(projected) => projected,
+                Err(error) => return missing_result(request_index, key, error),
+            };
+        let resource_key = format!("{segment_id}:{group_id}");
+        let Some(group) = projected.work_groups_by_key.get(&resource_key) else {
+            return missing_result(request_index, key, "group_not_found".to_string());
+        };
+        let revision = group
+            .get("revision")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if cursor.is_none() && known_revision.as_deref() == Some(revision.as_str()) {
+            return not_modified_result(request_index, key, revision);
+        }
+        let offset = match cursor.as_deref() {
+            Some(cursor) => match parse_group_cursor(cursor, &revision) {
+                Some(offset) => offset,
+                None => return error_result(request_index, key, "staleCursor".to_string()),
+            },
+            None => 0,
+        };
+        let limit = limit
+            .unwrap_or(DEFAULT_WORK_GROUP_ROWS)
+            .clamp(1, MAX_WORK_GROUP_ROWS);
+        let rows = group
+            .get("rows")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if offset > rows.len() {
+            return error_result(request_index, key, "staleCursor".to_string());
+        }
+        let end = (offset + limit).min(rows.len());
+        let value = json!({
+            "groupId": group_id,
+            "layoutRevision": group.get("layoutRevision").cloned().unwrap_or(Value::Null),
+            "nextCursor": (end < rows.len()).then(|| group_cursor(&revision, end)),
+            "revision": revision,
+            "rows": rows[offset..end],
+            "segmentId": segment_id,
+            "threadId": thread_id,
+            "title": group.get("title").cloned().unwrap_or_else(|| json!("Tools")),
+            "turnId": turn_id,
+            "type": group.get("type").cloned().unwrap_or_else(|| json!("tools")),
+        });
+        ok_result(request_index, key, revision, value)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_work_entry_detail_resource(
+        &mut self,
+        thread_id: &str,
+        path: &Path,
+        file_revision: &str,
+        index: &SessionIndex,
+        request_index: usize,
+        protocol_version: u8,
+        turn_id: &str,
+        segment_id: &str,
+        group_id: &str,
+        row_id: &str,
+        known_revision: Option<String>,
+    ) -> Value {
+        let key = format!("workEntryDetail:{thread_id}:{turn_id}:{segment_id}:{group_id}:{row_id}");
+        if protocol_version != TRANSCRIPT_RENDER_PROTOCOL_VERSION {
+            return error_result(request_index, key, "unsupportedProtocolVersion".to_string());
+        }
+        let projected =
+            match self.project_turn_or_live(thread_id, path, file_revision, index, turn_id) {
+                Ok(projected) => projected,
+                Err(error) => return missing_result(request_index, key, error),
+            };
+        let resource_key = format!("{segment_id}:{group_id}:{row_id}");
+        let Some(detail) = projected.entry_details_by_key.get(&resource_key) else {
+            return missing_result(request_index, key, "entry_detail_not_found".to_string());
+        };
+        let revision = detail
+            .get("revision")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if known_revision.as_deref() == Some(revision.as_str()) {
+            return not_modified_result(request_index, key, revision);
+        }
+        let detail_value = detail.get("detail").cloned().unwrap_or(Value::Null);
+        let returned_bytes = serde_json::to_vec(&detail_value)
+            .map(|bytes| bytes.len())
+            .unwrap_or(0);
+        let value = json!({
+            "detail": detail_value,
+            "groupId": group_id,
+            "layoutRevision": detail.get("layoutRevision").cloned().unwrap_or(Value::Null),
+            "revision": revision,
+            "rowId": row_id,
+            "segmentId": segment_id,
+            "threadId": thread_id,
+            "truncation": {
+                "originalBytes": returned_bytes,
+                "returnedBytes": returned_bytes,
+                "truncated": false,
+            },
+            "turnId": turn_id,
+        });
+        ok_result(request_index, key, revision, value)
     }
 
     fn read_thread_transcript_resource(
@@ -375,24 +743,24 @@ impl CodexTranscriptServer {
         Err("thread_not_found".to_string())
     }
 
-    fn session_index(&mut self, path: &Path, file_revision: &str) -> Result<&SessionIndex, String> {
-        let rebuild = self
-            .index_cache
-            .get(path)
-            .map(|cached| cached.file_revision != file_revision)
-            .unwrap_or(true);
-
-        if rebuild {
-            let index = build_session_index(path)?;
-            self.index_cache.insert(
-                path.to_path_buf(),
-                CachedIndex {
-                    file_revision: file_revision.to_string(),
-                    index,
-                },
-            );
+    fn session_index(
+        &mut self,
+        path: &Path,
+        _file_revision: &str,
+    ) -> Result<&SessionIndex, String> {
+        let cached = self.index_cache.remove(path);
+        let refreshed = refresh_session_index(path, cached)?;
+        self.index_cache.insert(path.to_path_buf(), refreshed);
+        if self.index_cache.len() > 8 {
+            let evict = self
+                .index_cache
+                .keys()
+                .find(|candidate| candidate.as_path() != path)
+                .cloned();
+            if let Some(evict) = evict {
+                self.index_cache.remove(&evict);
+            }
         }
-
         self.index_cache
             .get(path)
             .map(|cached| &cached.index)
@@ -403,7 +771,7 @@ impl CodexTranscriptServer {
         &mut self,
         thread_id: &str,
         path: &Path,
-        file_revision: &str,
+        _file_revision: &str,
         index: &SessionIndex,
         turn_id: &str,
     ) -> Result<ProjectedTurn, String> {
@@ -411,30 +779,29 @@ impl CodexTranscriptServer {
             .turns
             .get(turn_id)
             .ok_or_else(|| "turn_not_found".to_string())?;
-        let cache_key = format!(
-            "{}:{}:{}:{}",
-            path.display(),
-            turn_id,
-            range.start_offset,
-            range.end_offset
-        );
+        let cache_key = format!("{}:{turn_id}", path.display());
         if let Some(cached) = self.turn_cache.get(&cache_key) {
-            if cached.file_revision == file_revision && cached.range == *range {
-                return Ok(self.project_disk_turn(thread_id, cached.turn.raw_turn.clone()));
+            if cached.range == *range {
+                return Ok(self.project_disk_turn(thread_id, cached.raw_turn.clone()));
             }
         }
 
         let rows = read_rows_range(path, range)?;
         let raw_turn = project_rows_to_raw_turn(turn_id, &rows, range);
-        let projected = self.project_disk_turn(thread_id, raw_turn);
+        let projected = self.project_disk_turn(thread_id, raw_turn.clone());
         self.turn_cache.insert(
             cache_key,
             CachedTurn {
-                file_revision: file_revision.to_string(),
                 range: range.clone(),
-                turn: projected.clone(),
+                raw_turn,
             },
         );
+        if self.turn_cache.len() > 512 {
+            let evict = self.turn_cache.keys().next().cloned();
+            if let Some(evict) = evict {
+                self.turn_cache.remove(&evict);
+            }
+        }
         Ok(projected)
     }
 
@@ -488,4 +855,86 @@ fn missing_result(request_index: usize, key: String, reason: String) -> Value {
         "requestIndex": request_index,
         "status": "missing",
     })
+}
+
+fn error_result(request_index: usize, key: String, reason: String) -> Value {
+    json!({
+        "key": key,
+        "reason": reason,
+        "requestIndex": request_index,
+        "status": "error",
+    })
+}
+
+fn resolve_window(
+    turn_order: &[String],
+    request: &TranscriptWindowRequest,
+) -> Option<(usize, usize, usize)> {
+    if turn_order.is_empty() {
+        return match request {
+            TranscriptWindowRequest::Tail { .. } => Some((0, 0, 0)),
+            _ => None,
+        };
+    }
+
+    match request {
+        TranscriptWindowRequest::Tail { count } => {
+            let count = count
+                .unwrap_or(DEFAULT_TRANSCRIPT_TAIL_TURNS)
+                .clamp(1, MAX_TRANSCRIPT_WINDOW_TURNS);
+            let end = turn_order.len();
+            Some((end.saturating_sub(count), end, end - 1))
+        }
+        TranscriptWindowRequest::Around {
+            turn_id,
+            before,
+            after,
+        } => {
+            let anchor = turn_order
+                .iter()
+                .position(|candidate| candidate == turn_id)?;
+            let mut start = anchor.saturating_sub(*before);
+            let mut end = (anchor + after.saturating_add(1)).min(turn_order.len());
+            while end.saturating_sub(start) > MAX_TRANSCRIPT_WINDOW_TURNS {
+                let left_distance = anchor.saturating_sub(start);
+                let right_distance = end.saturating_sub(1).saturating_sub(anchor);
+                if left_distance >= right_distance && start < anchor {
+                    start += 1;
+                } else if end > anchor + 1 {
+                    end -= 1;
+                } else {
+                    break;
+                }
+            }
+            Some((start, end, anchor))
+        }
+        TranscriptWindowRequest::Range {
+            start_turn_id,
+            end_turn_id,
+        } => {
+            let requested_start = turn_order
+                .iter()
+                .position(|candidate| candidate == start_turn_id)?;
+            let requested_end = turn_order
+                .iter()
+                .position(|candidate| candidate == end_turn_id)?;
+            if requested_start > requested_end {
+                return None;
+            }
+            let end = requested_end + 1;
+            let start = requested_start.max(end.saturating_sub(MAX_TRANSCRIPT_WINDOW_TURNS));
+            Some((start, end, requested_end))
+        }
+    }
+}
+
+fn group_cursor(revision: &str, offset: usize) -> String {
+    format!("{revision}.{offset}")
+}
+
+fn parse_group_cursor(cursor: &str, revision: &str) -> Option<usize> {
+    let (cursor_revision, offset) = cursor.rsplit_once('.')?;
+    (cursor_revision == revision)
+        .then(|| offset.parse::<usize>().ok())
+        .flatten()
 }

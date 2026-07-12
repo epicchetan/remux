@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useRef, useSyncExternalStore } from 'react';
 
 export type ExternalStoreApi<State> = {
   getState: () => State;
@@ -9,6 +9,25 @@ export type ExternalStoreApi<State> = {
     isEqual?: (left: Selected, right: Selected) => boolean,
   ) => Selected;
 };
+
+let externalStoreBatchDepth = 0;
+const pendingExternalStoreListeners = new Set<() => void>();
+
+export function batchExternalStoreUpdates<T>(update: () => T): T {
+  externalStoreBatchDepth += 1;
+  try {
+    return update();
+  } finally {
+    externalStoreBatchDepth -= 1;
+    if (externalStoreBatchDepth === 0) {
+      const listeners = Array.from(pendingExternalStoreListeners);
+      pendingExternalStoreListeners.clear();
+      for (const listener of listeners) {
+        listener();
+      }
+    }
+  }
+}
 
 export function createExternalStore<State>(initialState: State): ExternalStoreApi<State> {
   let state = initialState;
@@ -23,7 +42,11 @@ export function createExternalStore<State>(initialState: State): ExternalStoreAp
     };
 
     for (const listener of listeners) {
-      listener();
+      if (externalStoreBatchDepth > 0) {
+        pendingExternalStoreListeners.add(listener);
+      } else {
+        listener();
+      }
     }
   };
 
@@ -41,29 +64,23 @@ export function createExternalStore<State>(initialState: State): ExternalStoreAp
     const selectorRef = useRef(selector);
     const isEqualRef = useRef(isEqual);
     const selectedRef = useRef<{ value: Selected } | null>(null);
-    const [, setRevision] = useState(0);
 
     selectorRef.current = selector;
     isEqualRef.current = isEqual;
 
-    const selected = selector(state);
-    if (selectedRef.current === null || !isEqualRef.current(selectedRef.current.value, selected)) {
+    const getSelectedSnapshot = useCallback(() => {
+      const selected = selectorRef.current(state);
+      if (
+        selectedRef.current !== null &&
+        isEqualRef.current(selectedRef.current.value, selected)
+      ) {
+        return selectedRef.current.value;
+      }
       selectedRef.current = { value: selected };
-    }
-
-    useEffect(() => {
-      return subscribe(() => {
-        const next = selectorRef.current(state);
-        if (selectedRef.current !== null && isEqualRef.current(selectedRef.current.value, next)) {
-          return;
-        }
-
-        selectedRef.current = { value: next };
-        setRevision((revision) => revision + 1);
-      });
+      return selected;
     }, []);
 
-    return selectedRef.current.value;
+    return useSyncExternalStore(subscribe, getSelectedSnapshot, getSelectedSnapshot);
   };
 
   return {

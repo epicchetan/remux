@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef } from 'react';
 
 import {
+  getHostLifecycleSnapshot,
   getHostStatusSnapshot,
+  subscribeHostLifecycle,
   subscribeHostResume,
   type RemuxHostResumeReason,
 } from '@remux/viewer-kit/host';
@@ -10,6 +12,7 @@ import { refreshActiveThreadComposerState } from './threads/composerStateStore';
 import { refreshActiveThreadRuntime } from './threads/runtimeStore';
 import { refreshActiveOperationQueue } from './threads/operationQueueStore';
 import { refreshActiveTranscriptResources } from './transcript/store';
+import { setTranscriptLifecycleState } from './transcript/resourceStore';
 
 export type CodexResumeSyncReason = RemuxHostResumeReason;
 
@@ -30,38 +33,29 @@ export async function syncCodexViewerAfterResume(params: CodexResumeSyncParams) 
     reason: params.reason,
   });
 
-  const threadTasks: Array<[string, Promise<void>]> = [
-    ['threadHistory', params.loadThreadHistory({ preserveReady: true })],
-  ];
+  const threadTasks: Array<[string, Promise<void>]> = [];
 
   if (params.activeThreadId) {
     threadTasks.push(
-      ['threadSummary', params.ensureThreadSummary(params.activeThreadId)],
+      ['transcript', refreshActiveTranscriptResources({
+        forceFullMeasure: false,
+        preserveReady: true,
+      })],
       ['threadRuntime', refreshActiveThreadRuntime({ preserveReady: true })],
+      ['threadHistory', params.loadThreadHistory({ preserveReady: true })],
+      ['threadSummary', params.ensureThreadSummary(params.activeThreadId)],
       ['threadOperationQueue', refreshActiveOperationQueue()],
       ['threadComposerState', refreshActiveThreadComposerState({ preserveReady: true })],
     );
   } else {
-    threadTasks.push(['composerConfig', params.loadComposerConfig()]);
+    threadTasks.push(
+      ['threadHistory', params.loadThreadHistory({ preserveReady: true })],
+      ['composerConfig', params.loadComposerConfig()],
+    );
   }
 
   const threadResults = await Promise.allSettled(threadTasks.map(([, task]) => task));
   const failures = collectFailures(threadTasks, threadResults);
-
-  if (params.activeThreadId) {
-    const transcriptResult = await settlePromise(
-      refreshActiveTranscriptResources({
-        forceFullMeasure: false,
-        preserveReady: true,
-      }),
-    );
-    if (transcriptResult.status === 'rejected') {
-      failures.push({
-        message: errorMessage(transcriptResult.reason),
-        task: 'transcript',
-      });
-    }
-  }
 
   logResumeSync('done', {
     activeThreadId: params.activeThreadId,
@@ -92,6 +86,9 @@ export function useCodexResumeSync(params: UseCodexResumeSyncParams) {
     // A sync skipped while disconnected needs no bookkeeping — viewer-kit
     // fires 'connected' when the socket comes back.
     if (getHostStatusSnapshot().status.type !== 'connected') {
+      return;
+    }
+    if (getHostLifecycleSnapshot().state !== 'active') {
       return;
     }
 
@@ -131,7 +128,15 @@ export function useCodexResumeSync(params: UseCodexResumeSyncParams) {
   useEffect(() => {
     // The visible/pageshow/connected triggers and their coalescing live in
     // viewer-kit (subscribeHostResume); this hook only owns what to refetch.
-    const unsubscribe = subscribeHostResume(runResumeSync);
+    const unsubscribeResume = subscribeHostResume(runResumeSync);
+    let initialLifecycleSnapshot = true;
+    const unsubscribeLifecycle = subscribeHostLifecycle((lifecycle) => {
+      setTranscriptLifecycleState(lifecycle.state);
+      if (initialLifecycleSnapshot && lifecycle.state === 'active') {
+        runResumeSync(lifecycle.reason === 'tabActive' ? 'tab-active' : 'app-active');
+      }
+      initialLifecycleSnapshot = false;
+    });
 
     // A connect landing between the first render and this effect is
     // dispatched to nobody; catch it from the snapshot.
@@ -142,7 +147,10 @@ export function useCodexResumeSync(params: UseCodexResumeSyncParams) {
       runResumeSync('connected');
     }
 
-    return unsubscribe;
+    return () => {
+      unsubscribeLifecycle();
+      unsubscribeResume();
+    };
   }, [runResumeSync]);
 }
 
@@ -160,20 +168,6 @@ function collectFailures(
     }
   }
   return failures;
-}
-
-async function settlePromise<T>(promise: Promise<T>): Promise<PromiseSettledResult<T>> {
-  try {
-    return {
-      status: 'fulfilled',
-      value: await promise,
-    };
-  } catch (reason) {
-    return {
-      reason,
-      status: 'rejected',
-    };
-  }
 }
 
 function logResumeSync(label: string, payload: unknown, warn = false) {

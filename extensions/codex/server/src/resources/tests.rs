@@ -12,6 +12,277 @@ use crate::transcript::ValidationOptions;
 static TEMP_SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[test]
+fn transcript_sync_inlines_commentary_between_work_groups() {
+    let (home, _path) = write_temp_session(
+        r#"{"type":"session_meta","payload":{"id":"019test"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","started_at":1}}
+{"type":"event_msg","payload":{"type":"user_message","message":"help"}}
+{"type":"response_item","payload":{"type":"function_call","name":"first_tool","call_id":"call-1","arguments":"{}"}}
+{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"one"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"I checked the first result.","phase":"commentary"}}
+{"type":"response_item","payload":{"type":"function_call","name":"second_tool","call_id":"call-2","arguments":"{}"}}
+{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-2","output":"two"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":2,"duration_ms":1}}
+"#,
+    );
+    let mut server = CodexTranscriptServer::new(home.clone());
+    let response = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [{
+                "type": "transcriptSync",
+                "protocolVersion": 2,
+                "projectionVersion": "turn-render-v2",
+                "window": { "kind": "tail", "count": 24 }
+            }]
+        }))
+        .expect("sync should succeed");
+
+    let resource = &response["resources"][0];
+    assert_eq!(resource["status"], json!("ok"));
+    let frame = &resource["value"]["turns"][0]["frame"];
+    let work = frame["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|segment| segment["type"] == json!("work"))
+        .expect("work segment");
+    let timeline = work["timeline"].as_array().expect("timeline");
+    assert_eq!(timeline.len(), 3);
+    assert_eq!(timeline[0]["type"], json!("group"));
+    assert_eq!(timeline[1]["type"], json!("message"));
+    assert_eq!(timeline[1]["text"], json!("I checked the first result."));
+    assert_eq!(timeline[2]["type"], json!("group"));
+    assert_ne!(timeline[0]["id"], timeline[2]["id"]);
+
+    let known_revision = resource["value"]["turns"][0]["renderRevision"]
+        .as_str()
+        .unwrap();
+    let unchanged = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [{
+                "type": "transcriptSync",
+                "protocolVersion": 2,
+                "projectionVersion": "turn-render-v2",
+                "window": { "kind": "tail" },
+                "knownTurns": [{ "turnId": "turn-1", "renderRevision": known_revision }]
+            }]
+        }))
+        .expect("known sync should succeed");
+    assert_eq!(
+        unchanged["resources"][0]["value"]["turns"][0]["status"],
+        json!("notModified")
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn transcript_sync_accepts_documented_camel_case_windows() {
+    let (home, _path) = write_temp_session(
+        r#"{"type":"session_meta","payload":{"id":"019test"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","started_at":1}}
+{"type":"event_msg","payload":{"type":"user_message","message":"first"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":2,"duration_ms":1}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2","started_at":3}}
+{"type":"event_msg","payload":{"type":"user_message","message":"second"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","completed_at":4,"duration_ms":1}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-3","started_at":5}}
+{"type":"event_msg","payload":{"type":"user_message","message":"third"}}
+"#,
+    );
+    let mut server = CodexTranscriptServer::new(home.clone());
+
+    let range = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [{
+                "type": "transcriptSync",
+                "protocolVersion": 2,
+                "projectionVersion": "turn-render-v2",
+                "window": {
+                    "kind": "range",
+                    "startTurnId": "turn-2",
+                    "endTurnId": "turn-3"
+                }
+            }]
+        }))
+        .expect("camelCase range window should deserialize");
+    assert_eq!(
+        range["resources"][0]["value"]["window"]["turnIds"],
+        json!(["turn-2", "turn-3"])
+    );
+
+    let around = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [{
+                "type": "transcriptSync",
+                "protocolVersion": 2,
+                "projectionVersion": "turn-render-v2",
+                "window": {
+                    "kind": "around",
+                    "turnId": "turn-2",
+                    "before": 1,
+                    "after": 0
+                }
+            }]
+        }))
+        .expect("camelCase around window should deserialize");
+    assert_eq!(
+        around["resources"][0]["value"]["window"]["turnIds"],
+        json!(["turn-1", "turn-2"])
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn version_two_group_and_entry_detail_are_bounded_resources() {
+    let (home, _path) = write_temp_session(
+        r#"{"type":"session_meta","payload":{"id":"019test"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","started_at":1}}
+{"type":"event_msg","payload":{"type":"user_message","message":"help"}}
+{"type":"response_item","payload":{"type":"function_call","name":"a_tool","call_id":"call-1","arguments":"{\"value\":1}"}}
+{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"result"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":2,"duration_ms":1}}
+"#,
+    );
+    let mut server = CodexTranscriptServer::new(home.clone());
+    let sync = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [{
+                "type": "transcriptSync",
+                "protocolVersion": 2,
+                "projectionVersion": "turn-render-v2",
+                "window": { "kind": "tail" }
+            }]
+        }))
+        .unwrap();
+    let work = sync["resources"][0]["value"]["turns"][0]["frame"]["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|segment| segment["type"] == json!("work"))
+        .unwrap();
+    let segment_id = work["id"].as_str().unwrap();
+    let group_id = work["timeline"][0]["id"].as_str().unwrap();
+    assert_eq!(work["timeline"][0]["summary"]["tools"], json!(1));
+    let group = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [{
+                "type": "workGroup",
+                "protocolVersion": 2,
+                "turnId": "turn-1",
+                "segmentId": segment_id,
+                "groupId": group_id
+            }]
+        }))
+        .unwrap();
+    assert_eq!(group["resources"][0]["status"], json!("ok"));
+    assert_eq!(
+        group["resources"][0]["value"]["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let row_id = group["resources"][0]["value"]["rows"][0]["id"]
+        .as_str()
+        .unwrap();
+    let detail = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [{
+                "type": "workEntryDetail",
+                "protocolVersion": 2,
+                "turnId": "turn-1",
+                "segmentId": segment_id,
+                "groupId": group_id,
+                "rowId": row_id
+            }]
+        }))
+        .unwrap();
+    assert_eq!(detail["resources"][0]["status"], json!("ok"));
+    assert_eq!(
+        detail["resources"][0]["value"]["detail"]["type"],
+        json!("tool")
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn version_two_patch_apply_groups_expose_named_files_and_diffs() {
+    let (home, _path) = write_temp_session(
+        r#"{"type":"session_meta","payload":{"id":"019test"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","started_at":1}}
+{"type":"event_msg","payload":{"type":"user_message","message":"help"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"Applying the change.","phase":"commentary"}}
+{"type":"event_msg","payload":{"type":"patch_apply_end","call_id":"patch-1","turn_id":"turn-1","success":true,"changes":{"/repo/src/app.rs":{"type":"update","unified_diff":"@@ -1 +1 @@\n-old\n+new\n","move_path":null},"/repo/src/new.rs":{"type":"add","unified_diff":"@@ -0,0 +1 @@\n+new\n","move_path":null}}}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":2,"duration_ms":1}}
+"#,
+    );
+    let mut server = CodexTranscriptServer::new(home.clone());
+    let sync = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [{
+                "type": "transcriptSync",
+                "protocolVersion": 2,
+                "projectionVersion": "turn-render-v2",
+                "window": { "kind": "tail" }
+            }]
+        }))
+        .unwrap();
+    let work = sync["resources"][0]["value"]["turns"][0]["frame"]["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|segment| segment["type"] == json!("work"))
+        .unwrap();
+    let file_group = work["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["groupType"] == json!("files"))
+        .expect("file group");
+    assert_eq!(file_group["summary"]["files"], json!(2));
+    assert_eq!(
+        file_group["summary"]["fileNames"],
+        json!(["/repo/src/app.rs", "/repo/src/new.rs"])
+    );
+
+    let group = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [{
+                "type": "workGroup",
+                "protocolVersion": 2,
+                "turnId": "turn-1",
+                "segmentId": work["id"],
+                "groupId": file_group["id"]
+            }]
+        }))
+        .unwrap();
+    let rows = group["resources"][0]["value"]["rows"]
+        .as_array()
+        .expect("file rows");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["path"], json!("/repo/src/app.rs"));
+    assert_eq!(rows[0]["hasDetail"], json!(true));
+    assert_eq!(rows[1]["path"], json!("/repo/src/new.rs"));
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
 fn rollback_hides_removed_turns_from_direct_reads() {
     let (home, _path) = write_temp_session(
         r#"{"type":"session_meta","payload":{"id":"019test"}}
@@ -1472,7 +1743,7 @@ fn live_notifications_stream_agent_message_deltas() {
             "turnId": "turn-live"
         }
     }));
-    let mut server = CodexTranscriptServer::new_with_live_transcript(home.clone(), live);
+    let mut server = CodexTranscriptServer::new_with_live_transcript(home.clone(), live.clone());
 
     let response = server
         .read_resources(json!({
@@ -1491,6 +1762,58 @@ fn live_notifications_stream_agent_message_deltas() {
     assert_eq!(
         response["resources"][1]["value"]["turn"]["segments"][1]["text"],
         json!("Hello world")
+    );
+
+    let initial_sync = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [{
+                "type": "transcriptSync",
+                "protocolVersion": 2,
+                "projectionVersion": "turn-render-v2",
+                "window": { "kind": "tail" }
+            }]
+        }))
+        .expect("initial live transcript sync should succeed");
+    let known_revision = initial_sync["resources"][0]["value"]["turns"][0]["renderRevision"]
+        .as_str()
+        .expect("render revision")
+        .to_string();
+
+    live.record_notification(&json!({
+        "method": "item/agentMessage/delta",
+        "params": {
+            "delta": "!",
+            "itemId": "agent-1",
+            "threadId": "019test",
+            "turnId": "turn-live"
+        }
+    }));
+    let streamed_sync = server
+        .read_resources(json!({
+            "threadId": "019test",
+            "requests": [{
+                "type": "transcriptSync",
+                "protocolVersion": 2,
+                "projectionVersion": "turn-render-v2",
+                "knownTurns": [{
+                    "turnId": "turn-live",
+                    "renderRevision": known_revision
+                }],
+                "window": {
+                    "kind": "range",
+                    "startTurnId": "turn-live",
+                    "endTurnId": "turn-live"
+                }
+            }]
+        }))
+        .expect("streaming range sync should succeed");
+    let streamed_turn = &streamed_sync["resources"][0]["value"]["turns"][0];
+    assert_eq!(streamed_turn["status"], json!("ok"));
+    assert_ne!(streamed_turn["renderRevision"], json!(known_revision));
+    assert_eq!(
+        streamed_turn["frame"]["segments"][1]["text"],
+        json!("Hello world!")
     );
 
     let _ = fs::remove_dir_all(home);

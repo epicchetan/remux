@@ -1234,6 +1234,7 @@ fn dispatch_lane(client: &WsClient, method: &str, work: &DispatchWork) -> (Strin
                 | "remux/codex/narration/audio/read"
                 | "remux/codex/narration/resources/read"
                 | "remux/codex/thread/resources/read"
+                | "remux/codex/transcript/capabilities/read"
                 | "remux/codex/transcript/resources/read"
         ) {
             return (

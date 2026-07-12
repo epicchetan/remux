@@ -1,13 +1,16 @@
 import {
+  getIpcLifecycleSnapshot,
   getIpcStatusSnapshot,
   rpc,
   signalIpcPreviewChanged,
   subscribeIpcEvents,
+  subscribeIpcLifecycle,
   subscribeIpcResume,
   subscribeIpcStatus,
   type IpcResumeReason,
   type IpcStatusSnapshot,
   type JsonRpcMessage,
+  type RemuxHostLifecycleEvent,
   type RemuxViewHostStatus,
 } from './ipc';
 
@@ -171,6 +174,17 @@ export function subscribeHostConnection(
 }
 
 export type RemuxHostResumeReason = IpcResumeReason;
+export type { RemuxHostLifecycleEvent };
+
+export function getHostLifecycleSnapshot() {
+  return getIpcLifecycleSnapshot();
+}
+
+export function subscribeHostLifecycle(
+  subscriber: (lifecycle: RemuxHostLifecycleEvent) => void,
+) {
+  return subscribeIpcLifecycle(subscriber);
+}
 
 // The view may have missed events while iOS had the webview suspended or the
 // host's socket was down — neither is replayed. Fires (coalesced) when the

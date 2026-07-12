@@ -757,8 +757,13 @@ REMUX_EXTENSION_ID=<id>
 REMUX_EXTENSION_ROOT=<canonical-root>
 REMUX_RESOURCE_PROTECTED=1|0
 REMUX_RESOURCE_SOCKET=<guardian-socket>
-REMUX_WORKLOAD_EXEC=<absolute-remux-binary>
+REMUX_WORKLOAD_EXEC=<stable-remux-launcher-path>
 ```
+
+The launcher path must remain spawnable across an atomic release-binary
+replacement. Installed services use `%h/.local/bin/remux`; ad-hoc runs retain
+their live launch pathname. Never derive a newly supervised extension's value
+from a `current_exe()` identity ending in ` (deleted)`.
 
 No knowledge of systemd is required.
 

@@ -146,15 +146,23 @@ pub(super) fn file_change_item(payload: &Value, id: &str) -> Value {
     if let Some(array) = payload.get("changes").and_then(Value::as_array) {
         for change in array {
             changes.push(json!({
-                "diff": truncate_text(change.get("diff").and_then(Value::as_str).unwrap_or(""), MAX_DIFF_CHARS),
-                "kind": change.get("kind").cloned().unwrap_or_else(|| json!({ "type": "update" })),
+                "diff": truncate_text(file_change_diff(change), MAX_DIFF_CHARS),
+                "kind": normalized_file_change_kind(change),
                 "path": change.get("path").and_then(Value::as_str).unwrap_or(""),
+            }));
+        }
+    } else if let Some(object) = payload.get("changes").and_then(Value::as_object) {
+        for (path, change) in object {
+            changes.push(json!({
+                "diff": truncate_text(file_change_diff(change), MAX_DIFF_CHARS),
+                "kind": normalized_file_change_kind(change),
+                "path": path,
             }));
         }
     } else {
         changes.push(json!({
-            "diff": truncate_text(payload.get("diff").and_then(Value::as_str).unwrap_or(""), MAX_DIFF_CHARS),
-            "kind": { "type": "update" },
+            "diff": truncate_text(file_change_diff(payload), MAX_DIFF_CHARS),
+            "kind": normalized_file_change_kind(payload),
             "path": payload.get("path").and_then(Value::as_str).unwrap_or(""),
         }));
     }
@@ -164,6 +172,24 @@ pub(super) fn file_change_item(payload: &Value, id: &str) -> Value {
         "id": id,
         "status": if payload.get("success").and_then(Value::as_bool) == Some(false) { "failed" } else { "completed" },
         "type": "fileChange",
+    })
+}
+
+fn file_change_diff(change: &Value) -> &str {
+    change
+        .get("unified_diff")
+        .and_then(Value::as_str)
+        .or_else(|| change.get("diff").and_then(Value::as_str))
+        .unwrap_or("")
+}
+
+fn normalized_file_change_kind(change: &Value) -> Value {
+    if let Some(kind) = change.get("kind") {
+        return kind.clone();
+    }
+    json!({
+        "move_path": change.get("move_path").cloned().unwrap_or(Value::Null),
+        "type": change.get("type").and_then(Value::as_str).unwrap_or("update"),
     })
 }
 
@@ -191,4 +217,38 @@ fn command_actions(command: &str) -> Vec<Value> {
         return vec![json!({ "type": "search", "command": command })];
     }
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_patch_apply_end_change_maps() {
+        let item = file_change_item(
+            &json!({
+                "changes": {
+                    "/repo/src/app.rs": {
+                        "move_path": null,
+                        "type": "update",
+                        "unified_diff": "@@ -1 +1 @@\n-old\n+new\n"
+                    },
+                    "/repo/src/new.rs": {
+                        "type": "add",
+                        "unified_diff": "@@ -0,0 +1 @@\n+new\n"
+                    }
+                },
+                "success": true
+            }),
+            "patch-1",
+        );
+
+        let changes = item["changes"].as_array().expect("normalized changes");
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0]["path"], "/repo/src/app.rs");
+        assert_eq!(changes[0]["diff"], "@@ -1 +1 @@\n-old\n+new\n");
+        assert_eq!(changes[0]["kind"]["type"], "update");
+        assert_eq!(changes[1]["path"], "/repo/src/new.rs");
+        assert_eq!(changes[1]["kind"]["type"], "add");
+    }
 }

@@ -72,7 +72,18 @@ type WebViewStatus = {
   type: 'remux/status';
 };
 
-type NativeMessage = WebViewEvent | WebViewResponse | WebViewStatus;
+export type RemuxHostLifecycleEvent = {
+  epoch: number;
+  reason: 'appState' | 'connect' | 'tabActive';
+  state: 'active' | 'background' | 'inactive';
+};
+
+type WebViewLifecycle = {
+  lifecycle: RemuxHostLifecycleEvent;
+  type: 'remux/lifecycle';
+};
+
+type NativeMessage = WebViewEvent | WebViewLifecycle | WebViewResponse | WebViewStatus;
 
 type PendingRequest = {
   abort: (() => void) | null;
@@ -83,6 +94,7 @@ type PendingRequest = {
 
 type IpcEventSubscriber = (events: JsonRpcMessage[]) => void;
 type IpcStatusSubscriber = (status: IpcStatusSnapshot) => void;
+type IpcLifecycleSubscriber = (lifecycle: RemuxHostLifecycleEvent) => void;
 
 export type IpcStatusSnapshot = {
   error: string | null;
@@ -101,6 +113,12 @@ const eventQueue: JsonRpcMessage[] = [];
 const eventSubscribers = new Set<IpcEventSubscriber>();
 const pendingRequests = new Map<JsonRpcId, PendingRequest>();
 const statusSubscribers = new Set<IpcStatusSubscriber>();
+const lifecycleSubscribers = new Set<IpcLifecycleSubscriber>();
+let lifecycleSnapshot: RemuxHostLifecycleEvent = {
+  epoch: 0,
+  reason: 'connect',
+  state: 'inactive',
+};
 
 declare global {
   interface Window {
@@ -236,7 +254,7 @@ export function subscribeIpcResume(subscriber: IpcResumeSubscriber) {
   };
 }
 
-export type IpcResumeReason = 'connected' | 'pageshow' | 'visible';
+export type IpcResumeReason = 'app-active' | 'connected' | 'pageshow' | 'tab-active' | 'visible';
 
 type IpcResumeSubscriber = (reason: IpcResumeReason) => void;
 
@@ -246,8 +264,21 @@ let resumeLastDispatchedAt = 0;
 let resumeTrailingTimer: number | null = null;
 let resumeTrailingReason: IpcResumeReason | null = null;
 
-function dispatchResume(reason: IpcResumeReason) {
+function dispatchResume(reason: IpcResumeReason, immediate = false) {
   if (resumeSubscribers.size === 0) {
+    return;
+  }
+
+  if (immediate) {
+    if (resumeTrailingTimer !== null) {
+      window.clearTimeout(resumeTrailingTimer);
+      resumeTrailingTimer = null;
+    }
+    resumeTrailingReason = null;
+    resumeLastDispatchedAt = Date.now();
+    for (const subscriber of resumeSubscribers) {
+      subscriber(reason);
+    }
     return;
   }
 
@@ -289,8 +320,8 @@ function observeResumeSignals() {
 }
 
 export function subscribeIpcEvents(subscriber: IpcEventSubscriber) {
-  initializeIpc();
   eventSubscribers.add(subscriber);
+  initializeIpc();
   return () => {
     eventSubscribers.delete(subscriber);
   };
@@ -303,6 +334,19 @@ export function subscribeIpcStatus(subscriber: IpcStatusSubscriber) {
   return () => {
     statusSubscribers.delete(subscriber);
   };
+}
+
+export function subscribeIpcLifecycle(subscriber: IpcLifecycleSubscriber) {
+  initializeIpc();
+  lifecycleSubscribers.add(subscriber);
+  subscriber(lifecycleSnapshot);
+  return () => {
+    lifecycleSubscribers.delete(subscriber);
+  };
+}
+
+export function getIpcLifecycleSnapshot() {
+  return lifecycleSnapshot;
 }
 
 export function getIpcStatusSnapshot() {
@@ -331,6 +375,21 @@ function handleNativeMessage(event: MessageEvent) {
 
   if (message.type === 'remux/event') {
     enqueueEvent(message.message);
+    return;
+  }
+
+  if (message.type === 'remux/lifecycle') {
+    const previous = lifecycleSnapshot;
+    lifecycleSnapshot = message.lifecycle;
+    if (previous.epoch === message.lifecycle.epoch && previous.state === message.lifecycle.state) {
+      return;
+    }
+    for (const subscriber of lifecycleSubscribers) {
+      subscriber(lifecycleSnapshot);
+    }
+    if (message.lifecycle.state === 'active') {
+      dispatchResume(message.lifecycle.reason === 'tabActive' ? 'tab-active' : 'app-active', true);
+    }
     return;
   }
 
@@ -386,7 +445,7 @@ function updateStatus(snapshot: IpcStatusSnapshot) {
   // Dispatched after the status subscribers so a resume handler that reads
   // the snapshot sees the connected state it is reacting to.
   if (!wasConnected && snapshot.status.type === 'connected') {
-    dispatchResume('connected');
+    dispatchResume('connected', true);
   }
 }
 
@@ -427,6 +486,7 @@ function parseNativeMessage(data: unknown): NativeMessage | null {
       message.type === 'remux/response' ||
       message.type === 'remux/error' ||
       message.type === 'remux/event' ||
+      message.type === 'remux/lifecycle' ||
       message.type === 'remux/status'
     ) {
       return message;

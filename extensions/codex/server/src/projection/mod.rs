@@ -1,4 +1,5 @@
 mod items;
+mod render;
 mod segments;
 mod work;
 
@@ -16,6 +17,7 @@ use items::{
     agent_message_item, agent_message_key, complete_call_item, custom_tool_call_item,
     file_change_item, function_call_item, mcp_tool_call_item, user_message_item,
 };
+use render::build_render_projection;
 use segments::{assistant_segment, compaction_segment, push_compaction_segment, user_segment};
 use work::{build_work_entries, build_work_item};
 
@@ -370,8 +372,11 @@ fn decode_xml_entities(text: &str) -> String {
 #[derive(Debug, Clone)]
 pub(crate) struct ProjectedTurn {
     pub(crate) details_by_segment_id: HashMap<String, Value>,
+    pub(crate) entry_details_by_key: HashMap<String, Value>,
     pub(crate) raw_turn: RawTurn,
+    pub(crate) render_frame: Value,
     pub(crate) turn: Value,
+    pub(crate) work_groups_by_key: HashMap<String, Value>,
     pub(crate) work_items_by_id: HashMap<String, Value>,
 }
 
@@ -1245,10 +1250,15 @@ pub(crate) fn project_raw_turn(turn: RawTurn) -> ProjectedTurn {
         "status": turn.status,
     });
 
+    let render = build_render_projection(&projected, &details_by_segment_id, &work_items_by_id);
+
     ProjectedTurn {
         details_by_segment_id,
+        entry_details_by_key: render.entry_details_by_key,
         raw_turn: turn,
+        render_frame: render.frame,
         turn: projected,
+        work_groups_by_key: render.work_groups_by_key,
         work_items_by_id,
     }
 }

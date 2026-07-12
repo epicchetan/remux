@@ -34,6 +34,7 @@ WorkingDirectory=%h/remux
 # (and cargo-run manifests) need cargo on PATH.
 Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=REMUX_RESOURCE_GOVERNANCE=1
+Environment=REMUX_WORKLOAD_EXEC=%h/.local/bin/remux
 Restart=always
 RestartSec=1
 TimeoutStopSec=15

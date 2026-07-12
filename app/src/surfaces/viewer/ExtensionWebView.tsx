@@ -12,6 +12,7 @@ import {
   StyleSheet,
   Text,
   View,
+  type AppStateStatus,
   type KeyboardEvent,
 } from 'react-native';
 import WebView, {
@@ -40,6 +41,19 @@ import { serializedResourceKey } from '../../browser/resourceKeys';
 import { noteTabPreviewContentChanged } from '../../browser/tabPreviewCapture';
 
 let nextWebViewInstanceId = 1;
+
+function effectiveLifecycleState(
+  appState: AppStateStatus,
+  active: boolean,
+): HostLifecycleEvent['state'] {
+  if (appState === 'background') {
+    return 'background';
+  }
+  if (appState !== 'active' || !active) {
+    return 'inactive';
+  }
+  return 'active';
+}
 
 type JsonRpcId = number | string;
 
@@ -129,7 +143,17 @@ type NativeToWebViewMessage =
   | {
       id: string;
       type: 'remux/health/ping';
+    }
+  | {
+      lifecycle: HostLifecycleEvent;
+      type: 'remux/lifecycle';
     };
+
+type HostLifecycleEvent = {
+  epoch: number;
+  reason: 'appState' | 'connect' | 'tabActive';
+  state: 'active' | 'background' | 'inactive';
+};
 
 type WebViewPageState =
   | { type: 'loading' }
@@ -267,6 +291,11 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
   const [reloadTargetUrl, setReloadTargetUrl] = useState(sourceUrl);
   const automaticReloadAttemptsRef = useRef(0);
   const activeRef = useRef(active);
+  const appStateRef = useRef(AppState.currentState);
+  const lifecycleEpochRef = useRef(0);
+  const lifecycleStateRef = useRef<HostLifecycleEvent['state']>(
+    effectiveLifecycleState(AppState.currentState, active),
+  );
   const healthPingIdRef = useRef(0);
   const healthPingWaitersRef = useRef(new Map<string, HealthPingWaiter>());
   const pageEpochRef = useRef(0);
@@ -444,6 +473,22 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
         params: { active: nextActive },
       },
       type: 'remux/event',
+    });
+  }, [postToWebView]);
+
+  const postLifecycle = useCallback((reason: HostLifecycleEvent['reason']) => {
+    const state = effectiveLifecycleState(appStateRef.current, activeRef.current);
+    if (state !== lifecycleStateRef.current) {
+      lifecycleStateRef.current = state;
+      lifecycleEpochRef.current += 1;
+    }
+    postToWebView({
+      lifecycle: {
+        epoch: lifecycleEpochRef.current,
+        reason,
+        state,
+      },
+      type: 'remux/lifecycle',
     });
   }, [postToWebView]);
 
@@ -696,6 +741,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
           postStatus();
           postConnection();
           postActive(active);
+          postLifecycle('connect');
           postTheme();
           break;
         case 'remux/health/pong': {
@@ -998,6 +1044,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
       pickAttachments,
       active,
       postActive,
+      postLifecycle,
       postConnection,
       postStatus,
       postTheme,
@@ -1033,16 +1080,18 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
     const wasActive = activeRef.current;
     activeRef.current = active;
     postActive(active);
+    postLifecycle('tabActive');
     if (active && !wasActive) {
       postConnection();
     }
-  }, [active, postActive, postConnection]);
+  }, [active, postActive, postConnection, postLifecycle]);
 
   useEffect(() => {
     postStatus();
     postConnection();
+    postLifecycle('connect');
     postTheme();
-  }, [postConnection, postStatus, postTheme]);
+  }, [postConnection, postLifecycle, postStatus, postTheme]);
 
   useEffect(() => {
     postPendingNavigation();
@@ -1061,6 +1110,8 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
 
   useEffect(() => {
     const subscription = AppState.addEventListener('change', (state) => {
+      appStateRef.current = state;
+      postLifecycle('appState');
       if (state !== 'active') {
         return;
       }
@@ -1080,7 +1131,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
     return () => {
       subscription.remove();
     };
-  }, [autoReloadWebView, checkWebViewHealth, title]);
+  }, [autoReloadWebView, checkWebViewHealth, postLifecycle, title]);
 
   useEffect(() => {
     const descriptor = descriptorRef.current;

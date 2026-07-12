@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha1::{Digest, Sha1};
@@ -7,6 +8,7 @@ use tokio::process::Command;
 use super::topology::{CpuTopology, ResourceCapabilities};
 
 static NEXT_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
+pub(crate) const REMUX_WORKLOAD_EXEC_ENV: &str = "REMUX_WORKLOAD_EXEC";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceClass {
@@ -163,8 +165,8 @@ impl ResourcePlacement {
                     "0"
                 },
             );
-        if let Ok(executable) = std::env::current_exe() {
-            command.env("REMUX_WORKLOAD_EXEC", executable);
+        if let Some(executable) = remux_launcher_path() {
+            command.env(REMUX_WORKLOAD_EXEC_ENV, executable);
         }
         command
     }
@@ -191,6 +193,53 @@ impl ResourcePlacement {
         }
         Ok(())
     }
+}
+
+/// Return a pathname that can be used to start a *new* Remux process.
+///
+/// `current_exe()` describes the inode executing this process. After a release
+/// build atomically replaces that inode Linux reports it as `... (deleted)`,
+/// which is useful diagnostics but is not spawnable. Prefer the stable path
+/// supplied by the service, then argv[0] (which retains the launch pathname),
+/// and use current_exe only as a final fallback.
+pub(crate) fn remux_launcher_path() -> Option<PathBuf> {
+    select_remux_launcher_path(
+        std::env::var_os(REMUX_WORKLOAD_EXEC_ENV),
+        std::env::args_os().next(),
+        std::env::current_exe().ok(),
+        std::env::var_os("PATH"),
+    )
+}
+
+fn select_remux_launcher_path(
+    configured: Option<OsString>,
+    argv0: Option<OsString>,
+    current_exe: Option<PathBuf>,
+    search_path: Option<OsString>,
+) -> Option<PathBuf> {
+    executable_candidate(configured, search_path.as_ref())
+        .or_else(|| executable_candidate(argv0, search_path.as_ref()))
+        .or_else(|| current_exe.filter(|path| executable_path_is_live(path)))
+}
+
+fn executable_candidate(
+    value: Option<OsString>,
+    search_path: Option<&OsString>,
+) -> Option<PathBuf> {
+    let value = value?;
+    let path = PathBuf::from(value);
+    if path.components().count() > 1 {
+        return executable_path_is_live(&path).then_some(path);
+    }
+
+    let search_path = search_path?;
+    std::env::split_paths(&search_path)
+        .map(|directory| directory.join(&path))
+        .find(|candidate| executable_path_is_live(candidate))
+}
+
+fn executable_path_is_live(path: &Path) -> bool {
+    !path.to_string_lossy().ends_with(" (deleted)") && path.is_file()
 }
 
 pub(crate) fn scoped_program_args(program: &str, args: &[String], nice: i8) -> Vec<String> {
@@ -315,6 +364,37 @@ mod tests {
             scoped_program_args("server", &["--stdio".to_string()], 0),
             ["server", "--stdio"]
         );
+    }
+
+    #[test]
+    fn deleted_executable_identity_is_never_reused_as_a_launcher() {
+        assert!(!executable_path_is_live(Path::new(
+            "/tmp/remux/target/release/remux (deleted)",
+        )));
+    }
+
+    #[test]
+    fn stale_configured_launcher_falls_back_to_live_argv_path() {
+        let live = std::env::current_exe().expect("test executable");
+        let selected = select_remux_launcher_path(
+            Some(OsString::from("/tmp/remux (deleted)")),
+            Some(live.clone().into_os_string()),
+            None,
+            None,
+        );
+        assert_eq!(selected.as_deref(), Some(live.as_path()));
+    }
+
+    #[test]
+    fn configured_launcher_wins_when_it_is_live() {
+        let live = std::env::current_exe().expect("test executable");
+        let selected = select_remux_launcher_path(
+            Some(live.clone().into_os_string()),
+            Some(OsString::from("/definitely/not/remux")),
+            None,
+            None,
+        );
+        assert_eq!(selected.as_deref(), Some(live.as_path()));
     }
 
     #[test]

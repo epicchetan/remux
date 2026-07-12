@@ -3,6 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 
 import { App } from './App';
 import { useHostStore } from './ipc/hostStore';
+import { subscribeCodexResourceInvalidations } from './ipc/resourceInvalidations';
 
 import './app.css';
 import './styles.css';
@@ -12,6 +13,7 @@ const rootLifecycleMigrationKey = 'remux-codex-root-lifecycle-v1';
 declare global {
   interface Window {
     __remuxCodexRoot?: Root;
+    __remuxCodexResourceInvalidationsUnsubscribe?: () => void;
   }
 }
 
@@ -33,6 +35,8 @@ if (shouldReloadLegacyUntrackedRoot(root)) {
   window.sessionStorage.setItem(rootLifecycleMigrationKey, 'done');
   window.location.reload();
 } else {
+  window.__remuxCodexResourceInvalidationsUnsubscribe ??=
+    subscribeCodexResourceInvalidations();
   const reactRoot = window.__remuxCodexRoot ?? createRoot(root);
   window.__remuxCodexRoot = reactRoot;
 
@@ -40,6 +44,8 @@ if (shouldReloadLegacyUntrackedRoot(root)) {
 
   if (import.meta.hot) {
     import.meta.hot.dispose(() => {
+      window.__remuxCodexResourceInvalidationsUnsubscribe?.();
+      delete window.__remuxCodexResourceInvalidationsUnsubscribe;
       reactRoot.unmount();
       if (window.__remuxCodexRoot === reactRoot) {
         delete window.__remuxCodexRoot;

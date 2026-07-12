@@ -28,7 +28,11 @@ import type {
   CodexWorkGroup,
   CodexWorkGroupRef,
   CodexWorkItem,
+  CodexWorkEntryDetailResource,
+  CodexWorkGroupResource,
+  CodexWorkRowSummary,
   CodexWorkSegment,
+  CodexWorkTimelineEntry,
 } from '../../../../shared/transcript';
 import { imageSourceLabel, inferImageMime } from './mediaTypes';
 import { readLocalFileBase64 } from '../../../ipc/media';
@@ -36,7 +40,12 @@ import { DiffBlock } from '../diff/DiffBlock';
 import { MarkdownBlock } from '../markdown/MarkdownBlock';
 import { Separator, cn } from '@remux/viewer-kit/shadcn';
 import { transcriptWorkDisclosureKey, useTranscriptLayoutStore } from '../../layoutStore';
-import { useTranscriptResourceStore, workItemResourceKey } from '../../resourceStore';
+import {
+  useTranscriptResourceStore,
+  workEntryDetailResourceKey,
+  workGroupResourceKey,
+  workItemResourceKey,
+} from '../../resourceStore';
 import { Compaction } from '../compaction';
 import { UserMessage } from '../userMessage';
 import { WorkingDuration } from './WorkingDuration';
@@ -76,8 +85,9 @@ export function WorkSection({
   const toggleWorkDisclosure = useTranscriptLayoutStore((state) => state.toggleWorkDisclosure);
   const ensureWorkDetails = useTranscriptResourceStore((state) => state.ensureWorkDetails);
   const entries = details?.entries ?? [];
+  const inlineTimeline = segment.timeline ?? null;
   const workOpen = openWork?.rowId === rowId && openWork.segmentId === segment.id && openWork.turnId === turnId;
-  const waitingForDetails = workOpen && segment.hasDetails && !details;
+  const waitingForDetails = workOpen && !inlineTimeline && segment.hasDetails && !details;
   const disclosure = useMemo<LocalDisclosure>(
     () => ({
       isOpen(id, defaultOpen = false) {
@@ -94,12 +104,12 @@ export function WorkSection({
   );
 
   useEffect(() => {
-    if (!workOpen || !segment.hasDetails || details) {
+    if (!workOpen || inlineTimeline || !segment.hasDetails || details) {
       return;
     }
 
     void ensureWorkDetails({ segmentId: segment.id, turnId });
-  }, [details, ensureWorkDetails, segment.hasDetails, segment.id, turnId, workOpen]);
+  }, [details, ensureWorkDetails, inlineTimeline, segment.hasDetails, segment.id, turnId, workOpen]);
 
   useLayoutEffect(() => {
     if (!workOpen) {
@@ -122,7 +132,7 @@ export function WorkSection({
       });
     };
 
-    if (!details) {
+    if (!details && !inlineTimeline) {
       scheduleHeightUpdate(0);
       return () => {
         if (heightRafRef.current !== null) {
@@ -154,7 +164,7 @@ export function WorkSection({
       }
       pendingHeightRef.current = null;
     };
-  }, [details, rowId, setOpenWorkAdditionalHeight, workKey, workOpen]);
+  }, [details, inlineTimeline, rowId, setOpenWorkAdditionalHeight, workKey, workOpen]);
 
   return (
     <LocalDisclosureContext.Provider value={disclosure}>
@@ -183,14 +193,406 @@ export function WorkSection({
         </button>
         <Separator className="mt-1" />
 
-        {workOpen && details ? (
+        {workOpen && (details || inlineTimeline) ? (
           <div className="codex-work-section-body" ref={bodyRef}>
-            <WorkEntries entries={entries} threadId={threadId} turnId={turnId} width={width} workId={segment.id} />
+            {inlineTimeline ? (
+              <WorkTimelineV2
+                entries={inlineTimeline}
+                threadId={threadId}
+                turnId={turnId}
+                width={width}
+                workId={segment.id}
+              />
+            ) : (
+              <WorkEntries entries={entries} threadId={threadId} turnId={turnId} width={width} workId={segment.id} />
+            )}
           </div>
         ) : null}
       </section>
     </LocalDisclosureContext.Provider>
   );
+}
+
+function WorkTimelineV2({
+  entries,
+  threadId,
+  turnId,
+  width,
+  workId,
+}: {
+  entries: CodexWorkTimelineEntry[];
+  threadId: string | null;
+  turnId: string;
+  width: number;
+  workId: string;
+}) {
+  const actionRunIds = workActionRunIdsV2(workId, entries);
+  const rendered: ReactNode[] = [];
+
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (!entry) continue;
+    if (entry.type === 'message') {
+      rendered.push(<WorkMessage item={entry} key={entry.id} width={width} />);
+      continue;
+    }
+    if (entry.type === 'userMessage') {
+      rendered.push(<WorkUserMessage item={entry} key={entry.id} width={width} />);
+      continue;
+    }
+    if (entry.type === 'compaction') {
+      rendered.push(
+        <Compaction
+          density="work"
+          key={entry.id}
+          segment={{ id: entry.id, revision: entry.revision, status: entry.status, type: 'compaction' }}
+        />,
+      );
+      continue;
+    }
+
+    const groups: Extract<CodexWorkTimelineEntry, { type: 'group' }>[] = [];
+    while (index < entries.length && entries[index]?.type === 'group') {
+      groups.push(entries[index] as Extract<CodexWorkTimelineEntry, { type: 'group' }>);
+      index += 1;
+    }
+    index -= 1;
+    rendered.push(
+      <WorkActionRunV2
+        entries={groups}
+        key={workActionRunIdV2(workId, groups)}
+        siblingDisclosureIds={actionRunIds}
+        threadId={threadId}
+        turnId={turnId}
+        workId={workId}
+      />,
+    );
+  }
+
+  return <>{rendered}</>;
+}
+
+function WorkActionRunV2({
+  entries,
+  siblingDisclosureIds,
+  threadId,
+  turnId,
+  workId,
+}: {
+  entries: Extract<CodexWorkTimelineEntry, { type: 'group' }>[];
+  siblingDisclosureIds: string[];
+  threadId: string | null;
+  turnId: string;
+  workId: string;
+}) {
+  const disclosure = useLocalDisclosure();
+  const ensureWorkGroups = useTranscriptResourceStore((state) => state.ensureWorkGroups);
+  const disclosureId = workActionRunIdV2(workId, entries);
+  const isOpen = disclosure.isOpen(disclosureId, false);
+  const canOpen = entries.some((entry) => entry.rowCount > 0);
+  const Icon = actionRunSummaryIconV2(entries);
+
+  useEffect(() => {
+    if (isOpen && threadId) {
+      void ensureWorkGroups({
+        groupIds: entries.map((entry) => entry.id),
+        segmentId: workId,
+        turnId,
+      });
+    }
+  }, [ensureWorkGroups, entries, isOpen, threadId, turnId, workId]);
+
+  const toggle = () => {
+    disclosure.setOnlyOpen(siblingDisclosureIds, isOpen ? null : disclosureId);
+  };
+
+  return (
+    <div className="codex-work-group-run">
+      <button
+        className="codex-work-row-button codex-work-summary-button"
+        data-work-group-ids={entries.map((entry) => entry.id).join(' ')}
+        data-testid={`work-summary-${disclosureId}`}
+        disabled={!canOpen}
+        onClick={toggle}
+        type="button"
+      >
+        <Icon className="size-4 shrink-0" />
+        <span className="min-w-0 flex-1 truncate">{summarizeActionRunV2(entries)}</span>
+        {canOpen ? (isOpen
+          ? <ChevronDown className="size-4 shrink-0" />
+          : <ChevronRight className="size-4 shrink-0" />) : null}
+      </button>
+      {isOpen ? (
+        <div className="codex-work-group-run-body">
+          {entries.map((entry) => (
+            <WorkGroupBodyV2
+              entry={entry}
+              key={entry.id}
+              threadId={threadId}
+              turnId={turnId}
+              workId={workId}
+            />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function WorkGroupBodyV2({
+  entry,
+  threadId,
+  turnId,
+  workId,
+}: {
+  entry: Extract<CodexWorkTimelineEntry, { type: 'group' }>;
+  threadId: string | null;
+  turnId: string;
+  workId: string;
+}) {
+  const ensureWorkGroup = useTranscriptResourceStore((state) => state.ensureWorkGroup);
+  const resourceKey = threadId ? workGroupResourceKey(threadId, turnId, workId, entry.id) : null;
+  const groupEntry = useTranscriptResourceStore((state) =>
+    resourceKey ? state.workGroupsByKey[resourceKey] ?? null : null);
+
+  if (groupEntry?.status === 'ready') {
+    return <WorkGroupRowsV2 group={groupEntry.resource} />;
+  }
+  if (groupEntry?.status === 'error' || groupEntry?.status === 'missing') {
+    return (
+      <button
+        className="codex-work-row-button text-destructive"
+        onClick={() => void ensureWorkGroup({ groupId: entry.id, segmentId: workId, turnId })}
+        type="button"
+      >
+        Could not load {entry.title.toLowerCase()}. Tap to retry.
+      </button>
+    );
+  }
+  return (
+    <div className="codex-work-row-button text-muted-foreground">
+      <Loader2 aria-hidden="true" className="size-3 animate-spin" />
+      Loading {entry.title.toLowerCase()}…
+    </div>
+  );
+}
+
+function WorkGroupRowsV2({ group }: { group: CodexWorkGroupResource }) {
+  const loadMore = useTranscriptResourceStore((state) => state.loadMoreWorkGroup);
+  return (
+    <div className="codex-work-group" data-work-group-type={group.type}>
+      {group.rows.map((row) => (
+        <WorkRowV2 group={group} key={row.id} row={row} />
+      ))}
+      {group.nextCursor ? (
+        <button
+          className="codex-work-row-button text-muted-foreground"
+          onClick={() => void loadMore({
+            groupId: group.groupId,
+            segmentId: group.segmentId,
+            turnId: group.turnId,
+          })}
+          type="button"
+        >
+          Load more
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function WorkRowV2({ group, row }: { group: CodexWorkGroupResource; row: CodexWorkRowSummary }) {
+  const disclosure = useLocalDisclosure();
+  const ensureDetail = useTranscriptResourceStore((state) => state.ensureWorkEntryDetail);
+  const disclosureId = `${group.groupId}:row:${row.id}`;
+  const rowStatus = row.type === 'text' ? 'completed' : row.status;
+  const defaultOpen = rowStatus === 'failed' || rowStatus === 'inProgress';
+  const isOpen = disclosure.isOpen(disclosureId, defaultOpen);
+  const detailKey = workEntryDetailResourceKey(
+    group.threadId,
+    group.turnId,
+    group.segmentId,
+    group.groupId,
+    row.id,
+  );
+  const detailEntry = useTranscriptResourceStore((state) =>
+    state.workEntryDetailsByKey[detailKey] ?? null);
+
+  useEffect(() => {
+    if (!isOpen || !row.hasDetail) {
+      return;
+    }
+    void ensureDetail({
+      groupId: group.groupId,
+      rowId: row.id,
+      segmentId: group.segmentId,
+      turnId: group.turnId,
+    });
+  }, [detailEntry?.status, ensureDetail, group.groupId, group.segmentId, group.turnId, isOpen, row.hasDetail, row.id]);
+
+  return (
+    <div className="codex-work-detail-group">
+      <button
+        className={cn('codex-work-row-button', row.type === 'fileChange' && 'codex-file-row-button')}
+        data-testid={`work-row-v2-${row.id}`}
+        disabled={!row.hasDetail}
+        onClick={() => disclosure.toggle(disclosureId, defaultOpen)}
+        type="button"
+      >
+        <WorkRowSummaryV2 row={row} />
+        <StatusIcon status={rowStatus} />
+        {row.hasDetail ? (
+          isOpen ? <ChevronDown className="size-4 shrink-0" /> : <ChevronRight className="size-4 shrink-0" />
+        ) : null}
+      </button>
+      {isOpen && row.hasDetail ? (
+        detailEntry?.status === 'ready' ? (
+          <WorkRowDetailV2 detail={detailEntry.resource} row={row} />
+        ) : detailEntry?.status === 'error' || detailEntry?.status === 'missing' ? (
+          <button
+            className="codex-detail-panel text-destructive"
+            onClick={() => void ensureDetail({
+              groupId: group.groupId,
+              rowId: row.id,
+              segmentId: group.segmentId,
+              turnId: group.turnId,
+            })}
+            type="button"
+          >
+            Could not load details. Tap to retry.
+          </button>
+        ) : (
+          <div className="codex-detail-panel text-muted-foreground">Loading details…</div>
+        )
+      ) : null}
+    </div>
+  );
+}
+
+function WorkRowSummaryV2({ row }: { row: CodexWorkRowSummary }) {
+  if (row.type === 'fileChange') {
+    return (
+      <>
+        <span className="shrink-0">{kindLabel(row.kind)}</span>
+        <span className="codex-file-name" title={row.path}>{fileName(row.path)}</span>
+        <span className="shrink-0 font-mono text-success">+{row.additions}</span>
+        <span className="shrink-0 font-mono text-destructive">-{row.deletions}</span>
+      </>
+    );
+  }
+  return <span className="min-w-0 flex-1 truncate">{row.type === 'activity' ? row.text : row.type === 'tool' ? row.label : row.text}</span>;
+}
+
+function WorkRowDetailV2({
+  detail,
+  row,
+}: {
+  detail: CodexWorkEntryDetailResource;
+  row: CodexWorkRowSummary;
+}) {
+  if (row.type === 'fileChange' && detail.detail.type === 'fileChange') {
+    return <DiffBlock diff={detail.detail.diff} />;
+  }
+  if (row.type === 'activity' && detail.detail.type === 'activity') {
+    return (
+      <ActivityDetailBlock activity={{
+        command: row.command,
+        detail: detail.detail.detail,
+        durationMs: row.durationMs,
+        exitCode: row.exitCode,
+        id: row.id,
+        kind: row.kind,
+        output: detail.detail.output,
+        path: row.path,
+        status: row.status,
+        text: row.text,
+      }} />
+    );
+  }
+  if (row.type === 'tool' && detail.detail.type === 'tool') {
+    return <ToolDetailBlock row={{
+      category: row.category,
+      detail: detail.detail.detail,
+      id: row.id,
+      label: row.label,
+      media: detail.detail.media,
+      result: detail.detail.result,
+      status: row.status,
+    }} />;
+  }
+  return null;
+}
+
+function workActionRunIdsV2(workId: string, entries: CodexWorkTimelineEntry[]) {
+  const ids: string[] = [];
+  for (let index = 0; index < entries.length; index += 1) {
+    if (entries[index]?.type !== 'group') continue;
+    const groups: Extract<CodexWorkTimelineEntry, { type: 'group' }>[] = [];
+    while (index < entries.length && entries[index]?.type === 'group') {
+      groups.push(entries[index] as Extract<CodexWorkTimelineEntry, { type: 'group' }>);
+      index += 1;
+    }
+    index -= 1;
+    ids.push(workActionRunIdV2(workId, groups));
+  }
+  return ids;
+}
+
+function workActionRunIdV2(
+  workId: string,
+  entries: Extract<CodexWorkTimelineEntry, { type: 'group' }>[],
+) {
+  return `${workId}:groups:${entries.map((entry) => entry.id).join(':')}`;
+}
+
+function summarizeActionRunV2(entries: Extract<CodexWorkTimelineEntry, { type: 'group' }>[]) {
+  const summary = entries.reduce((total, entry) => {
+    const fallback = {
+      commands: 0,
+      fileNames: [] as string[],
+      files: entry.groupType === 'files' ? entry.rowCount : 0,
+      reads: 0,
+      searches: 0,
+      tools: entry.groupType === 'tools' ? entry.rowCount : 0,
+    };
+    const current = entry.summary ?? fallback;
+    total.commands += current.commands;
+    total.files += current.files;
+    total.reads += current.reads;
+    total.searches += current.searches;
+    total.tools += current.tools;
+    total.fileNames.push(...current.fileNames);
+    return total;
+  }, { commands: 0, fileNames: [] as string[], files: 0, reads: 0, searches: 0, tools: 0 });
+  const fileNames = Array.from(new Set(summary.fileNames.map(fileName).filter(Boolean)));
+  const fileSummary = summary.files === 1 && fileNames.length === 1
+    ? `Edited ${fileNames[0]}`
+    : summary.files === 2 && fileNames.length === 2
+      ? `Edited ${fileNames[0]} and ${fileNames[1]}`
+      : summary.files > 0
+        ? `Edited ${formatCount(summary.files, 'file')}`
+        : null;
+  const deterministic = joinSummaryParts([
+    summary.commands ? `Ran ${formatCount(summary.commands, 'command')}` : null,
+    fileSummary,
+    summary.searches ? `Searched ${formatCount(summary.searches, 'time')}` : null,
+    summary.reads ? `Read ${formatCount(summary.reads, 'file')}` : null,
+    summary.tools ? `Used ${formatCount(summary.tools, 'tool')}` : null,
+  ]);
+  return deterministic || entries.map((entry) => entry.title).filter(Boolean).join(', ');
+}
+
+function actionRunSummaryIconV2(entries: Extract<CodexWorkTimelineEntry, { type: 'group' }>[]) {
+  if (entries.some((entry) => (entry.summary?.commands ?? 0) > 0 || entry.groupType === 'activity')) {
+    return TerminalSquare;
+  }
+  if (entries.some((entry) => entry.groupType === 'files')) {
+    return FilePenLine;
+  }
+  if (entries.some((entry) => entry.groupType === 'tools')) {
+    return Wrench;
+  }
+  return Sparkles;
 }
 
 function WorkEntries({

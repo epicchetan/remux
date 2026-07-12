@@ -21,6 +21,7 @@ type MockHostOptions = {
   cwd?: string;
   fuzzyFiles?: Array<{ path: string; isDirectory?: boolean }>;
   narrationStatus?: 'planning' | 'ready';
+  sendUpdatesTranscript?: boolean;
   runtime?: {
     activeTurnElapsedMs: number | null;
     activeTurnId: string | null;
@@ -28,6 +29,8 @@ type MockHostOptions = {
   };
   threadCwd?: string;
   tokenUsage?: ThreadTokenUsage | null;
+  transcriptV2?: boolean;
+  transcriptReadDelayMs?: number;
   turns?: CodexTranscriptTurn[];
   workDetails?: Record<string, CodexWorkDetails>;
   workItems?: Record<string, CodexWorkItem>;
@@ -47,6 +50,7 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
   const cwd = options.cwd ?? '/tmp/remux';
   const fuzzyFiles = options.fuzzyFiles ?? defaultFuzzyFiles;
   const narrationStatus = options.narrationStatus ?? 'ready';
+  const sendUpdatesTranscript = options.sendUpdatesTranscript ?? false;
   const runtime = options.runtime ?? {
     activeTurnElapsedMs: null,
     activeTurnId: null,
@@ -54,15 +58,18 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
   };
   const threadCwd = options.threadCwd ?? cwd;
   const tokenUsage = options.tokenUsage ?? null;
+  const transcriptV2 = options.transcriptV2 ?? false;
+  const transcriptReadDelayMs = options.transcriptReadDelayMs ?? 0;
   const turns = options.turns ?? [];
   const workDetails = options.workDetails ?? {};
   const workItems = options.workItems ?? {};
 
   await page.addInitScript(
-    ({ attachments, commandErrors, cwd, files, narrationStatus, runtime, threadCwd, tokenUsage, turns, workDetails, workItems }) => {
+    ({ attachments, commandErrors, cwd, files, narrationStatus, runtime, sendUpdatesTranscript, threadCwd, tokenUsage, transcriptReadDelayMs, transcriptV2, turns, workDetails, workItems }) => {
       const capturedMessages: HostRequest[] = [];
       const narrationResources = new Map<string, Record<string, unknown>>();
       let queueRevision = 0;
+      let sentTurnCount = 0;
       const queuedEntries: Array<Record<string, unknown>> = [];
 
       function dispatchHostMessage(message: unknown) {
@@ -73,12 +80,26 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
         document.dispatchEvent(event);
       }
 
+      const mockWindow = window as typeof window & {
+        __remuxDispatchMockHostMessage?: (message: unknown) => void;
+        __remuxSetMockTranscriptTurns?: (nextTurns: CodexTranscriptTurn[]) => void;
+      };
+      mockWindow.__remuxDispatchMockHostMessage = dispatchHostMessage;
+      mockWindow.__remuxSetMockTranscriptTurns = (nextTurns) => {
+        turns.splice(0, turns.length, ...nextTurns);
+      };
+
       function postResult(request: HostRequest, result: unknown) {
-        dispatchHostMessage({
+        const deliver = () => dispatchHostMessage({
           id: request.id,
           result,
           type: 'remux/response',
         });
+        if (request.method === 'remux/codex/transcript/resources/read' && transcriptReadDelayMs > 0) {
+          window.setTimeout(deliver, transcriptReadDelayMs);
+          return;
+        }
+        deliver();
       }
 
       function postError(request: HostRequest, message: string) {
@@ -122,6 +143,18 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
 
       function resultFor(request: HostRequest) {
         switch (request.method) {
+          case 'remux/codex/transcript/capabilities/read':
+            return transcriptV2 ? {
+              limits: {
+                maxGroupRows: 256,
+                maxKnownTurns: 80,
+                maxResponseBytes: 8 * 1024 * 1024,
+                maxWindowTurns: 40,
+              },
+              preferredProtocolVersion: 2,
+              projectionVersions: { 2: 'turn-render-v2' },
+              protocolVersions: [1, 2],
+            } : null;
           case 'remux/codex/thread/resources/read': {
             const params =
               request.params && typeof request.params === 'object'
@@ -289,6 +322,7 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
                         segmentId?: unknown;
                         turnId?: unknown;
                         type?: unknown;
+                        window?: unknown;
                       })
                     : {};
 
@@ -302,6 +336,143 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
                       revision: 'mock-transcript-revision',
                       threadId,
                       turnOrder: turns.map((turn) => turn.id),
+                    },
+                  };
+                }
+
+                if (typedRequest.type === 'transcriptSync') {
+                  const requestedWindow = typedRequest.window && typeof typedRequest.window === 'object'
+                    ? typedRequest.window as {
+                        after?: unknown;
+                        before?: unknown;
+                        count?: unknown;
+                        endTurnId?: unknown;
+                        kind?: unknown;
+                        startTurnId?: unknown;
+                        turnId?: unknown;
+                      }
+                    : { count: 24, kind: 'tail' };
+                  let startIndex = 0;
+                  let endIndexExclusive = turns.length;
+                  if (requestedWindow.kind === 'tail') {
+                    const count = typeof requestedWindow.count === 'number' ? requestedWindow.count : 24;
+                    startIndex = Math.max(0, turns.length - count);
+                  } else if (requestedWindow.kind === 'around' && typeof requestedWindow.turnId === 'string') {
+                    const index = Math.max(0, turns.findIndex((turn) => turn.id === requestedWindow.turnId));
+                    const before = typeof requestedWindow.before === 'number' ? requestedWindow.before : 12;
+                    const after = typeof requestedWindow.after === 'number' ? requestedWindow.after : 12;
+                    startIndex = Math.max(0, index - before);
+                    endIndexExclusive = Math.min(turns.length, index + after + 1);
+                  } else if (
+                    requestedWindow.kind === 'range' &&
+                    typeof requestedWindow.startTurnId === 'string' &&
+                    typeof requestedWindow.endTurnId === 'string'
+                  ) {
+                    startIndex = Math.max(0, turns.findIndex((turn) => turn.id === requestedWindow.startTurnId));
+                    const endIndex = turns.findIndex((turn) => turn.id === requestedWindow.endTurnId);
+                    endIndexExclusive = endIndex < startIndex ? startIndex + 1 : endIndex + 1;
+                  }
+                  const windowTurns = turns.slice(startIndex, endIndexExclusive);
+                  return {
+                    key: `transcriptSync:${threadId}`,
+                    requestIndex,
+                    revision: 'mock-transcript-v2-resource-revision',
+                    status: 'ok',
+                    value: {
+                      activeTurnId: windowTurns.find((turn) => turn.status === 'inProgress')?.id ?? null,
+                      projectionVersion: 'turn-render-v2',
+                      protocolVersion: 2,
+                      removedTurnIds: [],
+                      sessionId: threadId,
+                      threadId,
+                      threadRevision: 'mock-transcript-v2-thread-revision',
+                      turnOrder: turns.map((turn) => turn.id),
+                      turns: windowTurns.map((turn) => ({
+                        frame: {
+                          ...turn,
+                          layoutRevision: turn.revision,
+                          renderRevision: turn.revision,
+                        },
+                        renderRevision: turn.revision,
+                        status: 'ok',
+                        turnId: turn.id,
+                      })),
+                      window: {
+                        endIndexExclusive,
+                        hasEarlier: startIndex > 0,
+                        hasLater: endIndexExclusive < turns.length,
+                        startIndex,
+                        turnIds: windowTurns.map((turn) => turn.id),
+                      },
+                    },
+                  };
+                }
+
+                if (
+                  transcriptV2 &&
+                  typedRequest.type === 'workGroup' &&
+                  typeof typedRequest.segmentId === 'string' &&
+                  typeof typedRequest.turnId === 'string'
+                ) {
+                  const groupId = String((typedRequest as { groupId?: unknown }).groupId ?? 'group');
+                  return {
+                    key: `workGroup:${threadId}:${typedRequest.turnId}:${typedRequest.segmentId}:${groupId}`,
+                    requestIndex,
+                    revision: `mock-group-revision:${groupId}`,
+                    status: 'ok',
+                    value: {
+                      groupId,
+                      layoutRevision: `mock-group-layout:${groupId}`,
+                      nextCursor: null,
+                      revision: `mock-group-revision:${groupId}`,
+                      rows: [{
+                        category: 'generic',
+                        detailPreview: 'Arguments',
+                        hasDetail: true,
+                        id: `row:${groupId}`,
+                        label: 'Mock tool call',
+                        mediaCount: 0,
+                        revision: `mock-row-revision:${groupId}`,
+                        status: 'completed',
+                        type: 'tool',
+                      }],
+                      segmentId: typedRequest.segmentId,
+                      threadId,
+                      title: 'Tools',
+                      turnId: typedRequest.turnId,
+                      type: 'tools',
+                    },
+                  };
+                }
+
+                if (
+                  transcriptV2 &&
+                  typedRequest.type === 'workEntryDetail' &&
+                  typeof typedRequest.segmentId === 'string' &&
+                  typeof typedRequest.turnId === 'string'
+                ) {
+                  const groupId = String((typedRequest as { groupId?: unknown }).groupId ?? 'group');
+                  const rowId = String((typedRequest as { rowId?: unknown }).rowId ?? 'row');
+                  return {
+                    key: `workEntryDetail:${threadId}:${typedRequest.turnId}:${typedRequest.segmentId}:${groupId}:${rowId}`,
+                    requestIndex,
+                    revision: `mock-detail-revision:${rowId}`,
+                    status: 'ok',
+                    value: {
+                      detail: {
+                        detail: 'Mock arguments',
+                        media: [],
+                        result: 'Mock result',
+                        type: 'tool',
+                      },
+                      groupId,
+                      layoutRevision: `mock-detail-layout:${rowId}`,
+                      revision: `mock-detail-revision:${rowId}`,
+                      rowId,
+                      segmentId: typedRequest.segmentId,
+                      threadId,
+                      truncation: { originalBytes: 11, returnedBytes: 11, truncated: false },
+                      turnId: typedRequest.turnId,
                     },
                   };
                 }
@@ -388,7 +559,8 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
               parts?: Array<Record<string, unknown>>;
               threadId?: string;
             };
-            if (runtime.status === 'running') {
+            const wasRunning = runtime.status === 'running';
+            if (wasRunning) {
               queuedEntries.push({
                 createdAt: Date.now(),
                 id: `queued-message-${queuedEntries.length + 1}`,
@@ -404,19 +576,72 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
               });
               queueRevision += 1;
             }
+            let sentTurnId: string | undefined;
+            if (!wasRunning && sendUpdatesTranscript) {
+              sentTurnCount += 1;
+              sentTurnId = `mock-sent-turn-${sentTurnCount}`;
+              const userMessageId = `mock-sent-user-${sentTurnCount}`;
+              const userText = (params.parts ?? [])
+                .filter((part) => part.type === 'text')
+                .map((part) => String(part.text ?? ''))
+                .join('');
+              turns.push({
+                completedAt: null,
+                durationMs: null,
+                error: null,
+                id: sentTurnId,
+                revision: `${sentTurnId}-running-revision`,
+                segments: [{
+                  content: [{ text: userText, text_elements: [], type: 'text' }],
+                  id: userMessageId,
+                  revision: `${userMessageId}-revision`,
+                  type: 'userMessage',
+                }],
+                startedAt: Date.now(),
+                status: 'inProgress',
+              });
+              runtime.activeTurnElapsedMs = 0;
+              runtime.activeTurnId = sentTurnId;
+              runtime.status = 'running';
+            }
+            const sentInvalidations = sendUpdatesTranscript && sentTurnId
+              ? [
+                  {
+                    key: 'threadRuntime:mock-thread-1',
+                    reason: 'sendAccepted',
+                    threadId: 'mock-thread-1',
+                    type: 'threadRuntime',
+                  },
+                  {
+                    key: 'threadTranscript:mock-thread-1',
+                    reason: 'sendAccepted',
+                    threadId: 'mock-thread-1',
+                    type: 'threadTranscript',
+                  },
+                  {
+                    affectsLayout: true,
+                    affectsOrder: true,
+                    key: 'transcriptSync:mock-thread-1',
+                    reason: 'sendAccepted',
+                    threadId: 'mock-thread-1',
+                    turnId: sentTurnId,
+                    type: 'transcript',
+                  },
+                ]
+              : [
+                  {
+                    key: 'threadOperationQueue:mock-thread-1',
+                    reason: 'commandAccepted',
+                    threadId: 'mock-thread-1',
+                    type: 'threadOperationQueue',
+                  },
+                ];
             return {
-              invalidations: [
-                {
-                  key: 'threadOperationQueue:mock-thread-1',
-                  reason: 'commandAccepted',
-                  threadId: 'mock-thread-1',
-                  type: 'threadOperationQueue',
-                },
-              ],
-              delivery: runtime.status === 'running' ? 'queued' : 'sent',
+              invalidations: sentInvalidations,
+              delivery: wasRunning ? 'queued' : 'sent',
               status: 'accepted',
               threadId: 'mock-thread-1',
-              turnId: runtime.status === 'running' ? undefined : 'mock-turn-1',
+              turnId: sentTurnId ?? (wasRunning ? undefined : 'mock-turn-1'),
             };
           }
           case 'remux/codex/thread/compact': {
@@ -754,6 +979,10 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
                 },
                 type: 'remux/status',
               });
+              dispatchHostMessage({
+                lifecycle: { epoch: 1, reason: 'connect', state: 'active' },
+                type: 'remux/lifecycle',
+              });
               return;
             }
 
@@ -777,8 +1006,11 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
       files: fuzzyFiles,
       narrationStatus,
       runtime,
+      sendUpdatesTranscript,
       threadCwd,
       tokenUsage,
+      transcriptReadDelayMs,
+      transcriptV2,
       turns,
       workDetails,
       workItems,
@@ -821,6 +1053,553 @@ function hasFileResourceRequest(params: unknown, expected: { path: string; type:
 }
 
 test.describe('codex viewer route', () => {
+  test('version two renders commentary between work groups without item fan-out', async ({ page }) => {
+    const turn = {
+      completedAt: 20,
+      durationMs: 10,
+      error: null,
+      id: 'turn-v2-work',
+      revision: 'turn-v2-work-revision',
+      segments: [
+        {
+          content: [{ text: 'Inspect this', text_elements: [], type: 'text' as const }],
+          id: 'user-v2',
+          revision: 'user-v2-revision',
+          type: 'userMessage' as const,
+        },
+        {
+          durationMs: 10,
+          hasDetails: true,
+          id: 'work-v2',
+          layoutRevision: 'work-v2-layout',
+          revision: 'work-v2-revision',
+          state: 'completed' as const,
+          timeline: [
+            {
+              groupType: 'tools' as const,
+              hasMoreRows: false,
+              id: 'group-tools-one',
+              revision: 'group-tools-one-revision',
+              rowCount: 1,
+              status: 'completed' as const,
+              title: 'Tools',
+              type: 'group' as const,
+            },
+            {
+              id: 'commentary-v2',
+              phase: 'commentary' as const,
+              revision: 'commentary-v2-revision',
+              text: 'The first result changes the next step.',
+              type: 'message' as const,
+            },
+            {
+              groupType: 'tools' as const,
+              hasMoreRows: false,
+              id: 'group-tools-two',
+              revision: 'group-tools-two-revision',
+              rowCount: 1,
+              status: 'completed' as const,
+              title: 'Tools',
+              type: 'group' as const,
+            },
+          ],
+          type: 'work' as const,
+        },
+        {
+          id: 'assistant-v2',
+          phase: 'final_answer' as const,
+          revision: 'assistant-v2-revision',
+          text: 'Finished.',
+          type: 'assistantMessage' as const,
+        },
+      ],
+      startedAt: 10,
+      status: 'completed' as const,
+    } satisfies CodexTranscriptTurn;
+
+    await installMockRemuxHost(page, { transcriptV2: true, turns: [turn] });
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    await page.getByTestId('work-section-work-v2').click();
+
+    await expect(page.getByText('The first result changes the next step.')).toBeVisible();
+    await expect(page.locator('[data-work-group-ids^="group-tools-"]')).toHaveCount(2);
+    await page.locator('[data-work-group-ids="group-tools-one"]').click();
+    await expect(page.getByText('Mock tool call')).toBeVisible();
+    await page.getByTestId('work-row-v2-row:group-tools-one').click();
+    await expect(page.getByText('Mock result')).toBeVisible();
+    const transcriptRequests = await page.evaluate(() =>
+      ((window as typeof window & { __remuxWebViewMessages?: HostRequest[] }).__remuxWebViewMessages ?? [])
+        .filter((message) => message.method === 'remux/codex/transcript/resources/read'));
+    const requestTypes = transcriptRequests.flatMap((message) => {
+      const params = message.params as { requests?: Array<{ type?: string }> } | undefined;
+      return params?.requests?.map((request) => request.type) ?? [];
+    });
+    expect(requestTypes).toContain('transcriptSync');
+    expect(requestTypes.filter((type) => type === 'workGroup')).toHaveLength(1);
+    expect(requestTypes.filter((type) => type === 'workEntryDetail')).toHaveLength(1);
+    expect(requestTypes).not.toContain('turn');
+    expect(requestTypes).not.toContain('workDetails');
+    expect(requestTypes).not.toContain('workItem');
+  });
+
+  test('groups adjacent Version 2 actions into one deterministic summary', async ({ page }) => {
+    const base = completedTurn({ turnId: 'turn-action-run-v2' });
+    const turn: CodexTranscriptTurn = {
+      ...base,
+      segments: [
+        base.segments[0]!,
+        {
+          durationMs: 500,
+          hasDetails: true,
+          id: 'work-action-run-v2',
+          revision: 'work-action-run-v2-revision',
+          state: 'completed',
+          timeline: [
+            {
+              id: 'commentary-action-run-v2',
+              phase: null,
+              revision: 'commentary-action-run-v2-revision',
+              text: 'I applied and verified the change.',
+              type: 'message',
+            },
+            {
+              groupType: 'tools',
+              hasMoreRows: false,
+              id: 'group-tools-action-run-v2',
+              revision: 'group-tools-action-run-v2-revision',
+              rowCount: 3,
+              status: 'completed',
+              summary: { commands: 3, fileNames: [], files: 0, reads: 0, searches: 0, tools: 0 },
+              title: 'Tools',
+              type: 'group',
+            },
+            {
+              groupType: 'files',
+              hasMoreRows: false,
+              id: 'group-files-action-run-v2',
+              revision: 'group-files-action-run-v2-revision',
+              rowCount: 2,
+              status: 'completed',
+              summary: {
+                commands: 0,
+                fileNames: ['/repo/src/app.rs', '/repo/deploy/systemd.rs'],
+                files: 2,
+                reads: 0,
+                searches: 0,
+                tools: 0,
+              },
+              title: 'Changed files',
+              type: 'group',
+            },
+          ],
+          type: 'work',
+        },
+        base.segments[1]!,
+      ],
+    };
+    await installMockRemuxHost(page, { transcriptV2: true, turns: [turn] });
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    await page.getByTestId('work-section-work-action-run-v2').click();
+
+    const actionRun = page.locator('[data-work-group-ids="group-tools-action-run-v2 group-files-action-run-v2"]');
+    await expect(actionRun).toHaveCount(1);
+    await expect(actionRun).toContainText('Ran 3 commands, edited app.rs and systemd.rs');
+  });
+
+  test('defers transcript invalidations in background and verifies once active', async ({ page }) => {
+    await installMockRemuxHost(page, { transcriptV2: true, turns: [completedTurn()] });
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    await expect(page.getByText('mock assistant response')).toBeVisible();
+
+    const syncCount = () => page.evaluate(() =>
+      ((window as typeof window & { __remuxWebViewMessages?: HostRequest[] }).__remuxWebViewMessages ?? [])
+        .filter((message) => {
+          if (message.method !== 'remux/codex/transcript/resources/read') return false;
+          const params = message.params as { requests?: Array<{ type?: string }> } | undefined;
+          return params?.requests?.some((request) => request.type === 'transcriptSync') === true;
+        }).length);
+    const before = await syncCount();
+
+    await page.evaluate(() => {
+      const dispatch = (message: unknown) => window.dispatchEvent(new MessageEvent('message', {
+        data: JSON.stringify(message),
+      }));
+      dispatch({
+        lifecycle: { epoch: 1, reason: 'appState', state: 'background' },
+        type: 'remux/lifecycle',
+      });
+      dispatch({
+        message: {
+          jsonrpc: '2.0',
+          method: 'remux/codex/resources/invalidated',
+          params: {
+            invalidations: [{
+              affectsLayout: true,
+              affectsOrder: false,
+              key: 'transcriptSync:mock-thread-1',
+              reason: 'appServerEvent',
+              threadId: 'mock-thread-1',
+              turnId: 'mock-turn-completed',
+              type: 'transcript',
+            }],
+          },
+        },
+        type: 'remux/event',
+      });
+    });
+    await page.waitForTimeout(300);
+    expect(await syncCount()).toBe(before);
+
+    await page.evaluate(() => {
+      window.dispatchEvent(new MessageEvent('message', {
+        data: JSON.stringify({
+          lifecycle: { epoch: 2, reason: 'appState', state: 'active' },
+          type: 'remux/lifecycle',
+        }),
+      }));
+    });
+    await expect.poll(syncCount).toBeGreaterThan(before);
+  });
+
+  test('appends a Version 2 turn from a live invalidation without reloading', async ({ page }) => {
+    const completed = completedTurn();
+    const running: CodexTranscriptTurn = {
+      ...inProgressUserTurn({
+        turnId: 'turn-live-2',
+        userId: 'user-live-2',
+        userText: 'new live user message',
+      }),
+      segments: [
+        ...inProgressUserTurn({
+          turnId: 'turn-live-2',
+          userId: 'user-live-2',
+          userText: 'new live user message',
+        }).segments,
+        {
+          durationMs: null,
+          hasDetails: true,
+          id: 'work-live-2',
+          revision: 'work-live-2-revision',
+          state: 'running',
+          timeline: [{
+            id: 'work-live-message-2',
+            phase: null,
+            revision: 'work-live-message-2-revision',
+            text: 'live work commentary',
+            type: 'message',
+          }],
+          type: 'work',
+        },
+      ],
+    };
+    await installMockRemuxHost(page, { transcriptV2: true, turns: [completed] });
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    await expect(page.getByText('mock assistant response')).toBeVisible();
+
+    await page.evaluate(({ completed, running }) => {
+      const mockWindow = window as typeof window & {
+        __remuxDispatchMockHostMessage?: (message: unknown) => void;
+        __remuxSetMockTranscriptTurns?: (turns: CodexTranscriptTurn[]) => void;
+      };
+      mockWindow.__remuxSetMockTranscriptTurns?.([completed, running]);
+      mockWindow.__remuxDispatchMockHostMessage?.({
+        message: {
+          jsonrpc: '2.0',
+          method: 'remux/codex/resources/invalidated',
+          params: {
+            invalidations: [{
+              affectsLayout: true,
+              affectsOrder: true,
+              key: 'transcriptSync:mock-thread-1',
+              reason: 'appServerEvent',
+              threadId: 'mock-thread-1',
+              turnId: 'turn-live-2',
+              type: 'transcript',
+            }],
+          },
+        },
+        type: 'remux/event',
+      });
+    }, { completed, running });
+
+    await expect(page.getByText('new live user message')).toBeVisible();
+    await expect(page.getByTestId('work-section-work-live-2')).toBeVisible();
+    const latestWindow = await page.evaluate(() => {
+      const requests = ((window as typeof window & { __remuxWebViewMessages?: HostRequest[] }).__remuxWebViewMessages ?? [])
+        .filter((message) => message.method === 'remux/codex/transcript/resources/read');
+      const params = requests.at(-1)?.params as { requests?: Array<{ window?: unknown }> } | undefined;
+      return params?.requests?.find((request) => request.window)?.window;
+    });
+    expect(latestWindow).toMatchObject({ kind: 'tail' });
+  });
+
+  test('keeps an in-flight sent-turn tail sync authoritative over trailing streaming refreshes', async ({ page }) => {
+    const turns = Array.from({ length: 60 }, (_, index) => completedTurn({
+      assistantId: `assistant-${index + 1}`,
+      assistantText: `completed response ${index + 1}`,
+      turnId: `turn-${index + 1}`,
+      userId: `user-${index + 1}`,
+      userText: `completed prompt ${index + 1}`,
+    }));
+    await installMockRemuxHost(page, {
+      sendUpdatesTranscript: true,
+      transcriptReadDelayMs: 180,
+      transcriptV2: true,
+      turns,
+    });
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    await expect(page.getByText('completed response 60')).toBeVisible();
+
+    const transcriptSyncCount = () => page.evaluate(() =>
+      ((window as typeof window & { __remuxWebViewMessages?: HostRequest[] }).__remuxWebViewMessages ?? [])
+        .filter((message) => {
+          if (message.method !== 'remux/codex/transcript/resources/read') return false;
+          const params = message.params as { requests?: Array<{ type?: string }> } | undefined;
+          return params?.requests?.some((request) => request.type === 'transcriptSync') === true;
+        }).length);
+    const syncsBeforeSend = await transcriptSyncCount();
+
+    const editor = page.locator('.remux-composer-contenteditable');
+    await editor.click();
+    await editor.pressSequentially('sent while transcript syncs overlap');
+    await page.getByRole('button', { name: 'Send message' }).click();
+    await expect.poll(transcriptSyncCount).toBeGreaterThan(syncsBeforeSend);
+
+    await page.evaluate(() => {
+      const mockWindow = window as typeof window & {
+        __remuxDispatchMockHostMessage?: (message: unknown) => void;
+      };
+      mockWindow.__remuxDispatchMockHostMessage?.({
+        message: {
+          jsonrpc: '2.0',
+          method: 'remux/codex/resources/invalidated',
+          params: {
+            invalidations: [{
+              affectsLayout: true,
+              affectsOrder: false,
+              key: 'transcriptSync:mock-thread-1',
+              reason: 'appServerEvent',
+              threadId: 'mock-thread-1',
+              turnId: 'mock-sent-turn-1',
+              type: 'transcript',
+            }],
+          },
+        },
+        type: 'remux/event',
+      });
+    });
+
+    await expect(page.getByText('sent while transcript syncs overlap')).toBeVisible();
+    await expect(page.locator('[data-row-kind="userMessage"][data-turn-id="mock-sent-turn-1"]')).toBeVisible();
+  });
+
+  test('refreshes a visible Version 2 turn from a streaming invalidation', async ({ page }) => {
+    const running: CodexTranscriptTurn = {
+      ...inProgressUserTurn({ turnId: 'turn-stream-1' }),
+      revision: 'turn-stream-1-revision-a',
+      segments: [
+        ...inProgressUserTurn({ turnId: 'turn-stream-1' }).segments,
+        {
+          id: 'assistant-stream-1',
+          phase: null,
+          revision: 'assistant-stream-1-revision-a',
+          text: 'first streamed text',
+          type: 'assistantMessage',
+        },
+      ],
+    };
+    await installMockRemuxHost(page, {
+      transcriptReadDelayMs: 40,
+      transcriptV2: true,
+      turns: [running],
+    });
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    await expect(page.getByText('first streamed text')).toBeVisible();
+
+    const updated: CodexTranscriptTurn = {
+      ...running,
+      revision: 'turn-stream-1-revision-b',
+      segments: running.segments.map((segment) => segment.type === 'assistantMessage'
+        ? {
+            ...segment,
+            revision: 'assistant-stream-1-revision-b',
+            text: 'updated streamed text',
+          }
+        : segment),
+    };
+    await page.evaluate((updatedTurn) => {
+      const mockWindow = window as typeof window & {
+        __remuxDispatchMockHostMessage?: (message: unknown) => void;
+        __remuxSetMockTranscriptTurns?: (turns: CodexTranscriptTurn[]) => void;
+      };
+      mockWindow.__remuxSetMockTranscriptTurns?.([updatedTurn]);
+      mockWindow.__remuxDispatchMockHostMessage?.({
+        message: {
+          jsonrpc: '2.0',
+          method: 'remux/codex/resources/invalidated',
+          params: {
+            invalidations: [{
+              affectsLayout: true,
+              affectsOrder: false,
+              key: 'transcriptSync:mock-thread-1',
+              reason: 'appServerEvent',
+              threadId: 'mock-thread-1',
+              turnId: 'turn-stream-1',
+              type: 'transcript',
+            }],
+          },
+        },
+        type: 'remux/event',
+      });
+    }, updated);
+
+    await expect(page.getByText('updated streamed text')).toBeVisible();
+    await expect(page.getByText('first streamed text')).toHaveCount(0);
+
+    const finalUpdate: CodexTranscriptTurn = {
+      ...updated,
+      revision: 'turn-stream-1-revision-c',
+      segments: updated.segments.map((segment) => segment.type === 'assistantMessage'
+        ? {
+            ...segment,
+            revision: 'assistant-stream-1-revision-c',
+            text: 'final coalesced streamed text',
+          }
+        : segment),
+    };
+    await page.evaluate((updatedTurn) => {
+      const mockWindow = window as typeof window & {
+        __remuxDispatchMockHostMessage?: (message: unknown) => void;
+        __remuxSetMockTranscriptTurns?: (turns: CodexTranscriptTurn[]) => void;
+      };
+      mockWindow.__remuxSetMockTranscriptTurns?.([updatedTurn]);
+      mockWindow.__remuxDispatchMockHostMessage?.({
+        message: {
+          jsonrpc: '2.0',
+          method: 'remux/codex/resources/invalidated',
+          params: {
+            invalidations: [{
+              affectsLayout: true,
+              affectsOrder: false,
+              key: 'transcriptSync:mock-thread-1',
+              reason: 'appServerEvent',
+              threadId: 'mock-thread-1',
+              turnId: 'turn-stream-1',
+              type: 'transcript',
+            }],
+          },
+        },
+        type: 'remux/event',
+      });
+    }, finalUpdate);
+
+    await expect(page.getByText('final coalesced streamed text')).toBeVisible();
+    const latestWindow = await page.evaluate(() => {
+      const requests = ((window as typeof window & { __remuxWebViewMessages?: HostRequest[] }).__remuxWebViewMessages ?? [])
+        .filter((message) => message.method === 'remux/codex/transcript/resources/read');
+      const params = requests.at(-1)?.params as { requests?: Array<{ type?: string; window?: unknown }> } | undefined;
+      return params?.requests?.find((request) => request.type === 'transcriptSync')?.window;
+    });
+    expect(latestWindow).toEqual({
+      endTurnId: 'turn-stream-1',
+      kind: 'range',
+      startTurnId: 'turn-stream-1',
+    });
+  });
+
+  test('pages only after a user scroll and preserves the mounted row anchor', async ({ page }) => {
+    const turns = Array.from({ length: 60 }, (_, index) => completedTurn({
+      assistantId: `assistant-window-${index}`,
+      assistantText: `assistant window response ${index}`,
+      turnId: `turn-window-${String(index).padStart(2, '0')}`,
+      userId: `user-window-${index}`,
+      userText: `user window prompt ${index}`,
+    }));
+    await installMockRemuxHost(page, { transcriptV2: true, turns });
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    await expect(page.getByText('assistant window response 59')).toBeVisible();
+
+    const syncCount = () => page.evaluate(() =>
+      ((window as typeof window & { __remuxWebViewMessages?: HostRequest[] }).__remuxWebViewMessages ?? [])
+        .filter((message) => {
+          if (message.method !== 'remux/codex/transcript/resources/read') return false;
+          const params = message.params as { requests?: Array<{ type?: string }> } | undefined;
+          return params?.requests?.some((request) => request.type === 'transcriptSync') === true;
+        }).length);
+    await expect.poll(syncCount).toBe(1);
+
+    const viewport = page.locator('.remux-transcript-viewport');
+    await viewport.evaluate((node) => {
+      node.scrollTop = 0;
+      node.dispatchEvent(new Event('scrollend'));
+    });
+    await page.waitForTimeout(250);
+    expect(await syncCount()).toBe(1);
+
+    const anchor = page.locator('[data-transcript-row-id^="turn-window-36:"]').first();
+    await expect(anchor).toBeVisible();
+    const beforeTop = await anchor.evaluate((node) => node.getBoundingClientRect().top);
+    await viewport.evaluate((node) => {
+      node.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -12 }));
+      node.dispatchEvent(new Event('scrollend'));
+    });
+    await expect.poll(syncCount).toBe(2);
+    const lastSyncWindow = await page.evaluate(() => {
+      const requests = ((window as typeof window & { __remuxWebViewMessages?: HostRequest[] }).__remuxWebViewMessages ?? [])
+        .filter((message) => message.method === 'remux/codex/transcript/resources/read');
+      const params = requests.at(-1)?.params as { requests?: Array<{ window?: unknown }> } | undefined;
+      return params?.requests?.[0]?.window;
+    });
+    expect(lastSyncWindow).toMatchObject({
+      before: 16,
+      kind: 'around',
+      turnId: 'turn-window-36',
+    });
+    const afterTop = await anchor.evaluate((node) => node.getBoundingClientRect().top);
+    expect(Math.abs(afterTop - beforeTop)).toBeLessThanOrEqual(1);
+  });
+
+  test('contains pathological markdown width within the transcript viewport', async ({ page }) => {
+    const longToken = 'unbroken-path-segment-'.repeat(80);
+    const markdown = [
+      `Normal text before ${longToken} after.`,
+      '',
+      '| Name | Value |',
+      '| --- | --- |',
+      `| path | ${longToken} |`,
+      '',
+      '```text',
+      longToken,
+      '```',
+    ].join('\n');
+    await installMockRemuxHost(page, {
+      transcriptV2: true,
+      turns: [completedTurn({ assistantText: markdown })],
+    });
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    await expect(page.locator('.codex-md-code-block')).toBeVisible();
+
+    const geometry = await page.evaluate(() => {
+      const documentElement = document.documentElement;
+      const viewport = document.querySelector<HTMLElement>('.remux-transcript-viewport');
+      const markdown = document.querySelector<HTMLElement>('.codex-markdown');
+      if (!viewport || !markdown) throw new Error('Transcript geometry is unavailable');
+      const viewportBounds = viewport.getBoundingClientRect();
+      const markdownBounds = markdown.getBoundingClientRect();
+      return {
+        documentClientWidth: documentElement.clientWidth,
+        documentScrollWidth: documentElement.scrollWidth,
+        markdownLeft: markdownBounds.left,
+        markdownRight: markdownBounds.right,
+        viewportLeft: viewportBounds.left,
+        viewportRight: viewportBounds.right,
+      };
+    });
+    expect(geometry.documentScrollWidth).toBeLessThanOrEqual(geometry.documentClientWidth + 1);
+    expect(geometry.markdownLeft).toBeGreaterThanOrEqual(geometry.viewportLeft - 1);
+    expect(geometry.markdownRight).toBeLessThanOrEqual(geometry.viewportRight + 1);
+  });
+
   test('boots through the React Native WebView IPC bridge', async ({ page }, testInfo) => {
     await installMockRemuxHost(page);
 

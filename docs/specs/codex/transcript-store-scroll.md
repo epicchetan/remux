@@ -4,6 +4,8 @@ Status: Implemented
 Last verified: 2026-06-28
 Canonical code: `extensions/codex/viewer/transcript/resourceStore.ts`, `extensions/codex/viewer/transcript/layoutStore.ts`, `extensions/codex/viewer/transcript/viewportStore.ts`, `extensions/codex/viewer/transcript/virtualizer.tsx`
 
+Superseded in part by: [`server-authoritative-transcript-windows.md`](server-authoritative-transcript-windows.md). The resource/layout/viewport ownership split remains valid; the newer spec replaces per-turn/per-item hydration and all-turn refresh behavior.
+
 ## Goal
 
 Keep the Codex transcript viewer server-authoritative while making the client state easier to reason about.

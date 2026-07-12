@@ -64,6 +64,7 @@ const NARRATION_CANCEL_METHOD: &str = "remux/codex/narration/cancel";
 const NARRATION_DIAGNOSTICS_READ_METHOD: &str = "remux/codex/narration/diagnostics/read";
 const NARRATION_READ_METHOD: &str = "remux/codex/narration/resources/read";
 const NARRATION_START_METHOD: &str = "remux/codex/narration/start";
+const TRANSCRIPT_CAPABILITIES_READ_METHOD: &str = "remux/codex/transcript/capabilities/read";
 const TRANSCRIPT_RESOURCES_READ_METHOD: &str = "remux/codex/transcript/resources/read";
 const THREAD_RESOURCES_READ_METHOD: &str = "remux/codex/thread/resources/read";
 const THREAD_COMPACT_METHOD: &str = "remux/codex/thread/compact";
@@ -155,6 +156,19 @@ fn handle_request(server: &CodexExtensionServer, request: JsonRpcRequest) -> Jso
         NARRATION_START_METHOD => server
             .narration
             .start(request.params.unwrap_or(Value::Null)),
+        TRANSCRIPT_CAPABILITIES_READ_METHOD => Ok(json!({
+            "limits": {
+                "maxGroupRows": crate::transcript::MAX_WORK_GROUP_ROWS,
+                "maxKnownTurns": crate::transcript::MAX_TRANSCRIPT_KNOWN_TURNS,
+                "maxResponseBytes": 8 * 1024 * 1024,
+                "maxWindowTurns": crate::transcript::MAX_TRANSCRIPT_WINDOW_TURNS,
+            },
+            "preferredProtocolVersion": crate::transcript::TRANSCRIPT_RENDER_PROTOCOL_VERSION,
+            "projectionVersions": {
+                "2": crate::transcript::TRANSCRIPT_PROJECTION_VERSION,
+            },
+            "protocolVersions": [1, 2],
+        })),
         TRANSCRIPT_RESOURCES_READ_METHOD => server
             .transcript
             .lock()
@@ -280,6 +294,7 @@ impl CodexRequestDispatcher {
             | NARRATION_AUDIO_READ_METHOD
             | NARRATION_DIAGNOSTICS_READ_METHOD
             | NARRATION_READ_METHOD
+            | TRANSCRIPT_CAPABILITIES_READ_METHOD
             | TRANSCRIPT_RESOURCES_READ_METHOD
             | THREAD_RESOURCES_READ_METHOD => {
                 let index = self

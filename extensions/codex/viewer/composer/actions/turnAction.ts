@@ -15,8 +15,6 @@ import { createComposerNodeId } from '../model/composerModel';
 import { buildComposerSendParts } from '../model/sendProjection';
 import { useComposerStore } from '../store';
 
-const acceptedRefreshDelaysMs = [0, 350, 1200, 3000];
-
 export function useComposerTurnAction() {
   const activeThreadId = useThreadsStore((state) => state.activeThreadId);
   const activeDraft = useThreadsStore((state) =>
@@ -99,8 +97,7 @@ export function useComposerTurnAction() {
           setAutoScrollMode({ type: 'sent-message-anchor', turnId: response.turnId });
           clearComposer();
           clearMode();
-          await refreshAcceptedSend(response.invalidations, () =>
-            useComposerStore.getState().submission?.id === submission.id);
+          await applyCodexResourceInvalidations(response.invalidations);
           clearSubmission(submission.id);
         })
         .catch((error) => {
@@ -135,8 +132,7 @@ export function useComposerTurnAction() {
           setAutoScrollMode({ type: 'sent-message-anchor', turnId: response.turnId });
           clearComposer();
           clearMode();
-          await refreshAcceptedSend(response.invalidations, () =>
-            useComposerStore.getState().submission?.id === submission.id);
+          await applyCodexResourceInvalidations(response.invalidations);
           clearSubmission(submission.id);
         })
         .catch((error) => {
@@ -173,8 +169,7 @@ export function useComposerTurnAction() {
           setAutoScrollMode({ type: 'sent-message-anchor', turnId: response.turnId });
           clearComposer();
           clearMode();
-          await refreshAcceptedSend(response.invalidations, () =>
-            useComposerStore.getState().submission?.id === submission.id);
+          await applyCodexResourceInvalidations(response.invalidations);
           clearSubmission(submission.id);
         })
         .catch((error) => {
@@ -208,8 +203,7 @@ export function useComposerTurnAction() {
           setAutoScrollMode({ type: 'sent-message-anchor', turnId: response.turnId });
           clearComposer();
           clearMode();
-          await refreshAcceptedSend(response.invalidations, () =>
-            useComposerStore.getState().submission?.id === submission.id);
+          await applyCodexResourceInvalidations(response.invalidations);
           clearSubmission(submission.id);
           return;
         }
@@ -274,31 +268,4 @@ function commandErrorMessage(error: unknown, fallback: string) {
   }
 
   return fallback;
-}
-
-async function refreshAcceptedSend(
-  invalidations: Parameters<typeof applyCodexResourceInvalidations>[0],
-  shouldContinue: () => boolean,
-) {
-  for (const delayMs of acceptedRefreshDelaysMs) {
-    if (!shouldContinue()) {
-      return;
-    }
-
-    if (delayMs > 0) {
-      await delay(delayMs);
-    }
-
-    if (!shouldContinue()) {
-      return;
-    }
-
-    await applyCodexResourceInvalidations(invalidations);
-  }
-}
-
-function delay(delayMs: number) {
-  return new Promise<void>((resolve) => {
-    window.setTimeout(resolve, delayMs);
-  });
 }

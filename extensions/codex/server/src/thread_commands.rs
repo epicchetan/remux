@@ -909,7 +909,7 @@ mod tests {
 
         assert_eq!(response["status"], "accepted");
         assert_eq!(response["turnId"], "turn-1");
-        assert_eq!(response["invalidations"].as_array().unwrap().len(), 5);
+        assert_eq!(response["invalidations"].as_array().unwrap().len(), 6);
 
         let calls = app_server.calls();
         assert_eq!(calls.len(), 2);

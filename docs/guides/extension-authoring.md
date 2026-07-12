@@ -204,6 +204,9 @@ Rust servers can add a path dependency on
 `REMUX_WORKLOAD_EXEC workload exec ...`; the CLI validates the manifest owner,
 class, lifetime, and thread ceiling before entering the child scope. See the
 [crate README](../../crates/remux-extension-host/README.md) for the Rust API.
+The value is a stable launcher pathname rather than the running executable's
+inode identity, so rebuilding the release binary does not strand an already
+running extension with an unspawnable `(... deleted)` path.
 
 A workload subdivides its extension's existing allocation. It never gives the
 extension additional top-level CPU weight. Background and research launches

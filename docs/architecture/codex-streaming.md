@@ -1,8 +1,8 @@
 # Codex App Server, Remux Backend, and Viewer Streaming Current State
 
 Status: Current
-Last verified: 2026-06-28
-Canonical code: `extensions/codex/server/src/main.rs`, `extensions/codex/server/src/app_server.rs`, `extensions/codex/server/src/live_transcript.rs`, `extensions/codex/viewer/transcript/resourceStore.ts`
+Last verified: 2026-07-11
+Canonical code: `extensions/codex/server/src/main.rs`, `extensions/codex/server/src/history/`, `extensions/codex/server/src/projection/render.rs`, `extensions/codex/server/src/resources/mod.rs`, `extensions/codex/viewer/transcript/resourceStore.ts`, `packages/viewer-kit/src/ipc.ts`, `app/src/surfaces/viewer/ExtensionWebView.tsx`
 
 ## Purpose
 
@@ -10,13 +10,15 @@ This document describes how the Codex app-server, the Remux Rust extension backe
 
 It is a current-state walkthrough, not an implementation proposal. The goal is to make the read path and notification path understandable enough to reason about streaming behavior, compaction rendering, and duplicated work detail rows.
 
-The central point is that the viewer is not applying transcript deltas directly. The current system is read-oriented:
+The central point is that the viewer is not applying transcript deltas directly. The current Version 2 system is read-oriented:
 
 1. Codex app-server emits notifications while a thread/turn is running.
 2. The Rust extension records a small in-memory overlay from selected notifications.
 3. The Rust extension emits Remux resource invalidations.
 4. The viewer responds by rereading resources with known revisions.
-5. The Rust transcript server answers those reads from disk-projected Codex history plus the live overlay.
+5. The Rust transcript server answers one bounded window read from disk-projected Codex history plus the live overlay.
+
+The implementation is governed by [`../specs/codex/server-authoritative-transcript-windows.md`](../specs/codex/server-authoritative-transcript-windows.md). Version 1 resource readers remain temporarily available for mixed viewer/server deployments, but the negotiated Version 2 path is the default when the server advertises it.
 
 ## Source Map
 
@@ -28,10 +30,13 @@ Primary Remux files:
 - `extensions/codex/server/src/thread_resources.rs`
 - `extensions/codex/server/src/resources/mod.rs`
 - `extensions/codex/server/src/history/mod.rs`
+- `extensions/codex/server/src/history/index.rs`
+- `extensions/codex/server/src/history/reader.rs`
 - `extensions/codex/server/src/projection/mod.rs`
 - `extensions/codex/server/src/projection/items.rs`
 - `extensions/codex/server/src/projection/work.rs`
 - `extensions/codex/server/src/projection/segments.rs`
+- `extensions/codex/server/src/projection/render.rs`
 - `extensions/codex/server/src/live_transcript.rs`
 - `extensions/codex/server/src/resource_invalidations.rs`
 - `extensions/codex/server/src/thread_runtime.rs`
@@ -42,6 +47,9 @@ Primary Remux files:
 - `extensions/codex/viewer/transcript/resourceStore.ts`
 - `extensions/codex/viewer/transcript/layoutStore.ts`
 - `extensions/codex/viewer/transcript/components/work/WorkSection.tsx`
+- `packages/viewer-kit/src/ipc.ts`
+- `packages/viewer-kit/src/host.ts`
+- `app/src/surfaces/viewer/ExtensionWebView.tsx`
 
 Primary Codex source files:
 
@@ -88,6 +96,35 @@ Codex app-server notification
 ```
 
 This means the viewer usually sees streaming as repeated resource rereads, not as direct mutation from app-server payloads.
+
+## Version 2 Transcript Path
+
+The viewer probes `remux/codex/transcript/capabilities/read` once per host connection generation. A Version 2 server advertises `turn-render-v2`; an old or unavailable server keeps the viewer on the compatibility path for that connection.
+
+One `transcriptSync` request returns:
+
+- the complete visible turn-ID order;
+- one contiguous render window, initially the latest 24 turns and capped at 40;
+- complete collapsed render frames for changed turns;
+- `notModified` markers for known frames;
+- rollback removals and active-turn identity.
+
+Each frame contains user, assistant, compaction, and work segments. A work segment contains its commentary/steering/compaction timeline and stable group summaries inline. The viewer therefore never reconstructs commentary order from independently admitted item requests.
+
+Disclosure is layered:
+
+1. Opening a work section uses the timeline already present in the frame.
+2. Opening a group reads one `workGroup` resource with lightweight rows.
+3. Opening a row reads one `workEntryDetail` resource containing output, diff, or media.
+4. Groups beyond 200 rows expose explicit cursor-backed `Load more` paging.
+
+History indexing is incremental. The server retains file identity, scanned and newline-parsed offsets, an incomplete trailing line, a boundary fingerprint, visible order, rollback state, and turn byte ranges. Normal appends read only new bytes. Completed-turn projection cache validity uses the stable range plus its content hash, not the rollout's global mtime/length revision.
+
+The active presentation window is contiguous. Only a settled user touch/wheel gesture near its top or bottom may slide the window by up to 16 turns; programmatic scroll settlement and resize cannot page. The virtualizer consumes turn order and measured rows from one layout snapshot and preserves prepend position against an actual mounted row when possible. Direct turn and narration navigation request a 12-before/12-after window when the target is not loaded.
+
+The transcript uses one width-contained flex scroller. Safe-area top padding remains in its measured lane and is tracked separately from turn heights. Code blocks, tables, diffs, and detail panels own their local horizontal scrolling; their min-content width cannot enlarge the transcript or document.
+
+Native lifecycle state is explicit. React Native sends an epoch-tagged `active`, `inactive`, or `background` state derived from both `AppState` and active-tab state. Backgrounded viewers preserve ready content, cancel/defer reads, and mark matching invalidations dirty. On activation, transcript and runtime verification start immediately and in parallel; history, summary, queue, and composer refreshes do not block transcript hydration.
 
 ## Codex App-Server Mechanics
 
@@ -301,7 +338,9 @@ Examples:
 
 This store is used by interrupt handling when no explicit turn ID is supplied, and by the viewer through `threadRuntime` resources.
 
-## Remux Transcript Reads
+## Legacy Version 1 Transcript Reads (Compatibility)
+
+The following resource shapes remain for one mixed-version compatibility period. They are not used by a viewer that negotiated Version 2.
 
 ### Resource Contract
 
@@ -627,7 +666,9 @@ Incoming native events are queued and flushed on the next animation frame. See `
 
 This batching means multiple Rust notifications can be applied together by viewer subscribers.
 
-## Viewer Resource Store
+## Legacy Version 1 Viewer Hydration
+
+The details below describe the compatibility store behavior retained for an old server. The same store module now selects and atomically applies Version 2 frames when supported.
 
 ### Store Shape
 

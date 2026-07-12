@@ -556,6 +556,10 @@ impl AppServerRuntime {
                 Err(error) if error.starts_with("spawn failed:") => {
                     errors.push(format!("{}: {error}", candidate.display()));
                 }
+                Err(error) if error.starts_with("Remux workload launcher unavailable:") => {
+                    self.emit_management_log(source, None, Some("error"), &error);
+                    return Err(error);
+                }
                 Err(error) => {
                     let error = format!("Codex command failed: {}: {error}", candidate.display());
                     self.emit_management_log(source, None, Some("error"), &error);
@@ -1014,6 +1018,13 @@ impl CodexCommandRunner for ProcessCodexCommandRunner {
         on_line: &mut dyn FnMut(CodexCommandLine),
     ) -> Result<CodexCommandOutput, String> {
         let mut process = if let Ok(wrapper) = env::var("REMUX_WORKLOAD_EXEC") {
+            let wrapper_path = PathBuf::from(&wrapper);
+            if wrapper_path.components().count() > 1 && !wrapper_path.is_file() {
+                return Err(format!(
+                    "Remux workload launcher unavailable: {}",
+                    wrapper_path.display(),
+                ));
+            }
             let operation = format!("codex-app-server:{}", args.join("-"));
             let mut process = Command::new(wrapper);
             process.args([
@@ -1558,6 +1569,26 @@ mod tests {
         );
 
         assert!(runtime.update_codex().is_err());
+        assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unavailable_workload_launcher_is_reported_once_without_blame_on_codex() {
+        let runner = MockCommandRunner::new(vec![
+            Err("Remux workload launcher unavailable: /tmp/remux (deleted)".to_string()),
+            output("unexpected retry", ""),
+        ]);
+        let runtime = AppServerRuntime::new_with_runner(
+            PathBuf::from("/tmp/remux-codex-app-server-test-home"),
+            AppServerEventSink::default(),
+            runner.clone(),
+        );
+
+        let error = runtime.update_codex().unwrap_err();
+        assert_eq!(
+            error,
+            "Remux workload launcher unavailable: /tmp/remux (deleted)"
+        );
         assert_eq!(runner.calls.lock().unwrap().len(), 1);
     }
 

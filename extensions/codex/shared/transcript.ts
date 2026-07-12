@@ -30,7 +30,251 @@ export type CodexTranscriptResourceRequest =
       knownRevision?: string;
       turnId: string;
       type: 'workItem';
+    }
+  | CodexTranscriptSyncRequest
+  | CodexWorkGroupRequest
+  | CodexWorkEntryDetailRequest;
+
+export const CODEX_TRANSCRIPT_RENDER_PROTOCOL_VERSION = 2 as const;
+export const CODEX_TRANSCRIPT_PROJECTION_VERSION = 'turn-render-v2' as const;
+export const DEFAULT_TRANSCRIPT_TAIL_TURNS = 24;
+export const DEFAULT_TRANSCRIPT_PREPEND_TURNS = 16;
+export const MAX_TRANSCRIPT_WINDOW_TURNS = 40;
+export const MAX_TRANSCRIPT_KNOWN_TURNS = 80;
+export const DEFAULT_WORK_GROUP_ROWS = 200;
+export const MAX_WORK_GROUP_ROWS = 256;
+
+export type CodexTranscriptCapabilities = {
+  limits: {
+    maxGroupRows: number;
+    maxKnownTurns: number;
+    maxResponseBytes: number;
+    maxWindowTurns: number;
+  };
+  preferredProtocolVersion: 2;
+  projectionVersions: {
+    2: typeof CODEX_TRANSCRIPT_PROJECTION_VERSION;
+  };
+  protocolVersions: Array<1 | 2>;
+};
+
+export type CodexTranscriptSyncRequest = {
+  knownThreadRevision?: string;
+  knownTurns?: Array<{
+    renderRevision: string;
+    turnId: string;
+  }>;
+  projectionVersion: typeof CODEX_TRANSCRIPT_PROJECTION_VERSION;
+  protocolVersion: 2;
+  type: 'transcriptSync';
+  window:
+    | {
+        count?: number;
+        kind: 'tail';
+      }
+    | {
+        after: number;
+        before: number;
+        kind: 'around';
+        turnId: string;
+      }
+    | {
+        endTurnId: string;
+        kind: 'range';
+        startTurnId: string;
+      };
+};
+
+export type CodexWorkGroupRequest = {
+  cursor?: string;
+  groupId: string;
+  knownRevision?: string;
+  limit?: number;
+  protocolVersion: 2;
+  segmentId: string;
+  turnId: string;
+  type: 'workGroup';
+};
+
+export type CodexWorkEntryDetailRequest = {
+  groupId: string;
+  knownRevision?: string;
+  protocolVersion: 2;
+  rowId: string;
+  segmentId: string;
+  turnId: string;
+  type: 'workEntryDetail';
+};
+
+export type CodexTranscriptSyncResource = {
+  activeTurnId: string | null;
+  projectionVersion: typeof CODEX_TRANSCRIPT_PROJECTION_VERSION;
+  protocolVersion: 2;
+  removedTurnIds: string[];
+  sessionId: string | null;
+  threadId: string;
+  threadRevision: string;
+  turnOrder: string[];
+  turns: CodexTurnRenderResult[];
+  window: {
+    endIndexExclusive: number;
+    hasEarlier: boolean;
+    hasLater: boolean;
+    startIndex: number;
+    turnIds: string[];
+  };
+};
+
+export type CodexTurnRenderResult =
+  | {
+      frame: CodexTurnRenderFrame;
+      renderRevision: string;
+      status: 'ok';
+      turnId: string;
+    }
+  | {
+      renderRevision: string;
+      status: 'notModified';
+      turnId: string;
+    }
+  | {
+      code: 'frameTooLarge' | 'projectionFailed';
+      message: string;
+      status: 'error';
+      turnId: string;
     };
+
+export type CodexTurnRenderFrame = {
+  completedAt: number | null;
+  durationMs: number | null;
+  error: TurnError | null;
+  id: string;
+  layoutRevision: string;
+  renderRevision: string;
+  segments: CodexTurnRenderSegment[];
+  startedAt: number | null;
+  status: TurnStatus;
+};
+
+export type CodexTurnRenderSegment =
+  | CodexUserMessageSegment
+  | CodexAssistantMessageSegment
+  | CodexCompactionSegment
+  | CodexWorkRenderSegment;
+
+export type CodexWorkRenderSegment = {
+  durationMs: number | null;
+  id: string;
+  layoutRevision: string;
+  revision: string;
+  state: 'completed' | 'failed' | 'interrupted' | 'running';
+  timeline: CodexWorkTimelineEntry[];
+  type: 'work';
+};
+
+export type CodexWorkTimelineEntry =
+  | (CodexWorkItem & { revision: string })
+  | {
+      groupType: 'activity' | 'files' | 'text' | 'tools';
+      hasMoreRows: boolean;
+      id: string;
+      revision: string;
+      rowCount: number;
+      status: 'completed' | 'failed' | 'interrupted' | 'running';
+      summary?: CodexWorkGroupSummary;
+      title: string;
+      type: 'group';
+    };
+
+export type CodexWorkGroupSummary = {
+  commands: number;
+  fileNames: string[];
+  files: number;
+  reads: number;
+  searches: number;
+  tools: number;
+};
+
+export type CodexWorkGroupResource = {
+  groupId: string;
+  layoutRevision: string;
+  nextCursor: string | null;
+  revision: string;
+  rows: CodexWorkRowSummary[];
+  segmentId: string;
+  threadId: string;
+  title: string;
+  turnId: string;
+  type: 'activity' | 'files' | 'text' | 'tools';
+};
+
+export type CodexWorkRowSummary =
+  | {
+      command: string | null;
+      durationMs: number | null;
+      exitCode: number | null;
+      hasDetail: boolean;
+      id: string;
+      kind: CodexWorkActivity['kind'];
+      path: string | null;
+      revision: string;
+      status: string;
+      text: string;
+      type: 'activity';
+    }
+  | {
+      additions: number;
+      deletions: number;
+      hasDetail: boolean;
+      id: string;
+      kind: CodexFileChange['kind'];
+      path: string;
+      revision: string;
+      status: string;
+      type: 'fileChange';
+    }
+  | {
+      category: CodexToolRow['category'];
+      detailPreview: string | null;
+      hasDetail: boolean;
+      id: string;
+      label: string;
+      mediaCount: number;
+      revision: string;
+      status: string;
+      type: 'tool';
+    }
+  | {
+      hasDetail: false;
+      id: string;
+      revision: string;
+      text: string;
+      type: 'text';
+    };
+
+export type CodexWorkEntryDetailResource = {
+  detail:
+    | { detail: string | null; output: string | null; type: 'activity' }
+    | { diff: string; type: 'fileChange' }
+    | {
+        detail: string | null;
+        media: CodexMediaPreview[];
+        result: string | null;
+        type: 'tool';
+      };
+  groupId: string;
+  layoutRevision: string;
+  revision: string;
+  rowId: string;
+  segmentId: string;
+  threadId: string;
+  truncation: {
+    originalBytes: number;
+    returnedBytes: number;
+    truncated: boolean;
+  };
+  turnId: string;
+};
 
 export type CodexTranscriptResourcesReadResponse = {
   resources: CodexTranscriptResourceResult[];
@@ -115,8 +359,10 @@ export type CodexWorkSegment = {
   durationMs: number | null;
   hasDetails: boolean;
   id: string;
+  layoutRevision?: string;
   revision: string;
   state: 'running' | 'completed' | 'interrupted' | 'failed';
+  timeline?: CodexWorkTimelineEntry[];
   type: 'work';
 };
 
