@@ -340,6 +340,12 @@ export type CodexTranscriptSegment =
   | CodexCompactionSegment;
 
 export type CodexUserMessageSegment = {
+  /**
+   * Composer-assigned id echoed back through codex (`client_id`). Present only
+   * for messages sent with a clientMessageId; lets viewers reconcile a locally
+   * tracked send against the authoritative segment id.
+   */
+  clientId?: string | null;
   content: UserInput[];
   id: string;
   isSteering?: boolean;

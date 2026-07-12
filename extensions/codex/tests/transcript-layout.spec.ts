@@ -11,11 +11,13 @@ import {
 } from '../viewer/transcript/layoutStore';
 import {
   anchorTurnUserMessageScrollTop,
+  anchorUserMessageScrollTop,
   autoScrollModeAfterNativeScrollSettles,
   autoScrollModeForStreamingTurn,
   initialTranscriptScrollTarget,
   nativeScrollOwnsTranscriptViewport,
   resolveInitialTranscriptScrollTarget,
+  resolveSentMessageScroll,
   transcriptMessageAnchorTopOffset,
   transcriptNativeScrollPhaseAfterEvent,
 } from '../viewer/transcript/virtualizerScroll';
@@ -25,6 +27,12 @@ import {
   initialTranscriptActiveTurnIds,
   transcriptInitialRenderTurns,
 } from '../viewer/transcript/virtualizerRange';
+import {
+  getTranscriptViewportState,
+  reconcileTranscriptViewportForLayout,
+  resetTranscriptViewportForThread,
+  trackTranscriptUserMessage,
+} from '../viewer/transcript/viewportStore';
 
 if (typeof globalThis.OffscreenCanvas === 'undefined') {
   globalThis.OffscreenCanvas = class {
@@ -972,6 +980,12 @@ test.describe('transcript virtualizer scroll targets', () => {
     expect(autoScrollModeAfterNativeScrollSettles({
       nearBottom: true,
     })).toEqual({ type: 'bottom' });
+    const currentMode = sentMessageMode('turn-1');
+    expect(autoScrollModeAfterNativeScrollSettles({
+      currentMode,
+      nearBottom: true,
+      userInitiated: false,
+    })).toEqual(currentMode);
   });
 
   test('keeps bottom and sent-message auto-scroll modes distinct as streaming changes', () => {
@@ -986,20 +1000,33 @@ test.describe('transcript virtualizer scroll targets', () => {
       streamingTurnId: 'turn-1',
     })).toEqual({ type: 'bottom' });
     expect(autoScrollModeForStreamingTurn({
-      currentMode: { type: 'sent-message-anchor', turnId: 'turn-1' },
+      currentMode: sentMessageMode('turn-1'),
       nearBottom: false,
       streamingTurnId: 'turn-1',
-    })).toEqual({ type: 'sent-message-anchor', turnId: 'turn-1' });
+    })).toEqual(sentMessageMode('turn-1'));
     expect(autoScrollModeForStreamingTurn({
-      currentMode: { type: 'sent-message-anchor', turnId: 'turn-1' },
+      currentMode: sentMessageMode('turn-1'),
       nearBottom: false,
       streamingTurnId: null,
-    })).toEqual({ type: 'off' });
+    })).toEqual(sentMessageMode('turn-1'));
     expect(autoScrollModeForStreamingTurn({
-      currentMode: { type: 'sent-message-anchor', turnId: 'turn-1' },
+      currentMode: sentMessageMode('turn-1'),
       nearBottom: false,
       streamingTurnId: 'turn-2',
-    })).toEqual({ type: 'off' });
+    })).toEqual(sentMessageMode('turn-1'));
+  });
+
+  test('streaming never steals viewport ownership from narration follow', () => {
+    expect(autoScrollModeForStreamingTurn({
+      currentMode: { type: 'narration-follow' },
+      nearBottom: true,
+      streamingTurnId: 'turn-1',
+    })).toEqual({ type: 'narration-follow' });
+    expect(autoScrollModeForStreamingTurn({
+      currentMode: { type: 'narration-follow' },
+      nearBottom: false,
+      streamingTurnId: null,
+    })).toEqual({ type: 'narration-follow' });
   });
 
   test('uses safe-area-aware offset for sent message targets', () => {
@@ -1028,11 +1055,218 @@ test.describe('transcript virtualizer scroll targets', () => {
     })).toBe(rowTop);
   });
 
+  test('resolves an exact user message rather than the first message in a turn', () => {
+    const layout = measureCollapsedTranscript({
+      turns: [turn(
+        'turn-1',
+        userTextSegment('user-1', 'first'),
+        userTextSegment('user-2', 'second'),
+      )],
+      width: 600,
+    });
+    const first = anchorTurnUserMessageScrollTop({
+      expandedRows: [],
+      topPadding: 24,
+      turnId: 'turn-1',
+      turns: layout.turns,
+    });
+    const second = anchorUserMessageScrollTop({
+      expandedRows: [],
+      segmentId: 'user-2',
+      topPadding: 24,
+      turnId: 'turn-1',
+      turns: layout.turns,
+    });
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+    expect(second!).toBeGreaterThan(first!);
+  });
+
+  test('resolves a sent message tracked by its composer clientId', () => {
+    const layout = measureCollapsedTranscript({
+      turns: [turn(
+        'turn-1',
+        userTextSegment('user-1', 'first'),
+        userTextSegment('server-item-2', 'second', 'client-message-2'),
+      )],
+      width: 600,
+    });
+    const byAuthoritativeId = anchorUserMessageScrollTop({
+      expandedRows: [],
+      segmentId: 'server-item-2',
+      topPadding: 24,
+      turnId: 'turn-1',
+      turns: layout.turns,
+    });
+    const byClientId = anchorUserMessageScrollTop({
+      expandedRows: [],
+      segmentId: 'client-message-2',
+      topPadding: 24,
+      turnId: 'turn-1',
+      turns: layout.turns,
+    });
+    expect(byClientId).not.toBeNull();
+    expect(byClientId).toBe(byAuthoritativeId);
+    expect(anchorUserMessageScrollTop({
+      expandedRows: [],
+      segmentId: 'client-message-unknown',
+      topPadding: 24,
+      turnId: 'turn-1',
+      turns: layout.turns,
+    })).toBeNull();
+  });
+
+  test('activates queued message tracking when its authoritative row appears', () => {
+    resetTranscriptViewportForThread('thread-1');
+    trackTranscriptUserMessage('thread-1', 'client-queued');
+    expect(getTranscriptViewportState().autoScrollMode).toEqual({ type: 'off' });
+
+    const layout = measureCollapsedTranscript({
+      turns: [turn('turn-queued', userTextSegment('user-queued', 'queued message', 'client-queued'))],
+      width: 600,
+    });
+    reconcileTranscriptViewportForLayout(layout.turns, layout.turnsById);
+    expect(getTranscriptViewportState().autoScrollMode).toEqual({
+      phase: 'catching-up',
+      segmentId: 'user-queued',
+      threadId: 'thread-1',
+      type: 'sent-message-anchor',
+      turnId: 'turn-queued',
+    });
+    expect(getTranscriptViewportState().pendingUserMessageIds).toEqual([]);
+    resetTranscriptViewportForThread();
+  });
+
+  test('anchors a sent message only when the natural scroll range reaches it', () => {
+    expect(resolveSentMessageScroll({
+      currentScrollTop: 180,
+      desiredScrollTop: 300,
+      naturalMaxScrollTop: 180,
+      phase: 'catching-up',
+      runwayHeight: 0,
+      viewportGrew: false,
+      wasPinned: false,
+    })).toEqual({
+      phase: 'catching-up',
+      runwayHeight: 0,
+      scrollTop: 180,
+    });
+    expect(resolveSentMessageScroll({
+      currentScrollTop: 320,
+      desiredScrollTop: 300,
+      naturalMaxScrollTop: 320,
+      phase: 'catching-up',
+      runwayHeight: 0,
+      viewportGrew: false,
+      wasPinned: false,
+    })).toEqual({
+      phase: 'anchored',
+      runwayHeight: 0,
+      scrollTop: 300,
+    });
+  });
+
+  test('holds a pinned anchor with runway when content collapses under it', () => {
+    // Collapse clamps the DOM scroll before the managed scroll runs, so the
+    // current position is already below the anchor; wasPinned carries the
+    // evidence forward.
+    expect(resolveSentMessageScroll({
+      currentScrollTop: 160,
+      desiredScrollTop: 300,
+      naturalMaxScrollTop: 160,
+      phase: 'anchored',
+      runwayHeight: 0,
+      viewportGrew: false,
+      wasPinned: true,
+    })).toEqual({
+      phase: 'anchored',
+      runwayHeight: 140,
+      scrollTop: 300,
+    });
+    // Content streaming back in shrinks the runway until it disappears.
+    expect(resolveSentMessageScroll({
+      currentScrollTop: 300,
+      desiredScrollTop: 300,
+      naturalMaxScrollTop: 240,
+      phase: 'anchored',
+      runwayHeight: 140,
+      viewportGrew: false,
+      wasPinned: true,
+    })).toEqual({
+      phase: 'anchored',
+      runwayHeight: 60,
+      scrollTop: 300,
+    });
+    expect(resolveSentMessageScroll({
+      currentScrollTop: 300,
+      desiredScrollTop: 300,
+      naturalMaxScrollTop: 320,
+      phase: 'anchored',
+      runwayHeight: 60,
+      viewportGrew: false,
+      wasPinned: true,
+    })).toEqual({
+      phase: 'anchored',
+      runwayHeight: 0,
+      scrollTop: 300,
+    });
+  });
+
+  test('releases a premature anchor instead of materializing runway when the viewport grows', () => {
+    // An anchor satisfied only against a keyboard-shrunken viewport must not
+    // survive the keyboard closing: the message goes back to catching up.
+    expect(resolveSentMessageScroll({
+      currentScrollTop: 300,
+      desiredScrollTop: 300,
+      naturalMaxScrollTop: 160,
+      phase: 'anchored',
+      runwayHeight: 0,
+      viewportGrew: true,
+      wasPinned: true,
+    })).toEqual({
+      phase: 'catching-up',
+      runwayHeight: 0,
+      scrollTop: 160,
+    });
+    // Same when the anchor is currently held by runway from a collapse.
+    expect(resolveSentMessageScroll({
+      currentScrollTop: 300,
+      desiredScrollTop: 300,
+      naturalMaxScrollTop: 120,
+      phase: 'anchored',
+      runwayHeight: 100,
+      viewportGrew: true,
+      wasPinned: true,
+    })).toEqual({
+      phase: 'catching-up',
+      runwayHeight: 0,
+      scrollTop: 120,
+    });
+  });
+
+  test('never fabricates runway for an anchored phase that was not actually pinned', () => {
+    // Navigation can enter the anchored phase optimistically; if the browser
+    // clamped the scroll before the anchor was reachable, resume catching up.
+    expect(resolveSentMessageScroll({
+      currentScrollTop: 180,
+      desiredScrollTop: 300,
+      naturalMaxScrollTop: 180,
+      phase: 'anchored',
+      runwayHeight: 0,
+      viewportGrew: false,
+      wasPinned: false,
+    })).toEqual({
+      phase: 'catching-up',
+      runwayHeight: 0,
+      scrollTop: 180,
+    });
+  });
+
   test('initial scroll target prefers active streaming turn then last user message', () => {
     expect(initialTranscriptScrollTarget({
       anchors: [
-        { scrollTop: 10, turnId: 'turn-1' },
-        { scrollTop: 40, turnId: 'turn-2' },
+        { segmentId: 'user-1', scrollTop: 10, turnId: 'turn-1' },
+        { segmentId: 'user-2', scrollTop: 40, turnId: 'turn-2' },
       ],
       streamingTurnId: 'turn-1',
     })).toEqual({
@@ -1042,8 +1276,8 @@ test.describe('transcript virtualizer scroll targets', () => {
 
     expect(initialTranscriptScrollTarget({
       anchors: [
-        { scrollTop: 10, turnId: 'turn-1' },
-        { scrollTop: 40, turnId: 'turn-2' },
+        { segmentId: 'user-1', scrollTop: 10, turnId: 'turn-1' },
+        { segmentId: 'user-2', scrollTop: 40, turnId: 'turn-2' },
       ],
       streamingTurnId: null,
     })).toEqual({
@@ -1053,8 +1287,8 @@ test.describe('transcript virtualizer scroll targets', () => {
 
     expect(initialTranscriptScrollTarget({
       anchors: [
-        { scrollTop: 10, turnId: 'turn-1' },
-        { scrollTop: 40, turnId: 'turn-2' },
+        { segmentId: 'user-1', scrollTop: 10, turnId: 'turn-1' },
+        { segmentId: 'user-2', scrollTop: 40, turnId: 'turn-2' },
       ],
       streamingTurnId: 'turn-3',
     })).toEqual({
@@ -1087,6 +1321,16 @@ test.describe('transcript virtualizer scroll targets', () => {
     });
   });
 });
+
+function sentMessageMode(turnId: string) {
+  return {
+    phase: 'catching-up' as const,
+    segmentId: `user:${turnId}`,
+    threadId: 'thread-1',
+    type: 'sent-message-anchor' as const,
+    turnId,
+  };
+}
 
 function turn(id: string, ...segments: CodexTranscriptSegment[]): CodexTranscriptTurn {
   return {
@@ -1146,15 +1390,16 @@ function userSegment(id: string, text: string): CodexTranscriptSegment {
   };
 }
 
-function userTextSegment(id: string, text: string): CodexTranscriptSegment {
+function userTextSegment(id: string, text: string, clientId?: string): CodexTranscriptSegment {
   return {
+    clientId: clientId ?? null,
     content: [{
       text,
       text_elements: [],
       type: 'text',
     }],
     id,
-    revision: `user:${id}:${text}`,
+    revision: `user:${id}:${clientId ?? ''}:${text}`,
     type: 'userMessage',
   };
 }

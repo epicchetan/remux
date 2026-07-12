@@ -9,11 +9,17 @@ use super::{RawTurn, compaction_status, item_id, merge_compaction_status, normal
 pub(super) fn user_segment(item: &Value, is_steering: bool) -> Value {
     let content = normalize_user_content(item.get("content"));
     let id = item_id(item).unwrap_or("user");
+    // The composer-assigned id travels separately from the authoritative item
+    // id; viewers use it to reconcile locally tracked sends against the
+    // server-authoritative row. It participates in the revision so rows
+    // published before the live item merged its clientId are re-hydrated.
+    let client_id = item.get("clientId").and_then(Value::as_str);
     json!({
+        "clientId": client_id,
         "content": content,
         "id": id,
         "isSteering": is_steering,
-        "revision": stable_revision_value(&json!(["user", id, is_steering, content])),
+        "revision": stable_revision_value(&json!(["user", id, client_id, is_steering, content])),
         "type": "userMessage",
     })
 }
@@ -65,4 +71,36 @@ pub(super) fn push_compaction_segment(segments: &mut Vec<Value>, segment: Value)
         }
     }
     segments.push(segment);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn user_segment_carries_client_id_and_revises_when_it_appears() {
+        let without = user_segment(
+            &json!({
+                "content": [{ "text": "hello", "type": "text" }],
+                "id": "item-1",
+                "type": "userMessage",
+            }),
+            false,
+        );
+        let with = user_segment(
+            &json!({
+                "clientId": "client-message-1",
+                "content": [{ "text": "hello", "type": "text" }],
+                "id": "item-1",
+                "type": "userMessage",
+            }),
+            false,
+        );
+
+        assert_eq!(without["clientId"], Value::Null);
+        assert_eq!(with["clientId"], "client-message-1");
+        assert_eq!(with["id"], "item-1");
+        assert_ne!(without["revision"], with["revision"]);
+    }
 }

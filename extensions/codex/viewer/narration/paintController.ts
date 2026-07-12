@@ -65,7 +65,7 @@ class NarrationPaintController {
 
   private paint(
     token: number,
-    focusReason: 'explicitSeek' | 'follow' | 'followReenabled' | null,
+    focusReason: 'explicitSeek' | 'explicitSeekInPlace' | 'follow' | 'followReenabled' | null,
   ) {
     const state = useNarrationStore.getState();
     const { manifest, target } = state;

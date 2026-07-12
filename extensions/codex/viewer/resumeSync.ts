@@ -13,6 +13,7 @@ import { refreshActiveThreadRuntime } from './threads/runtimeStore';
 import { refreshActiveOperationQueue } from './threads/operationQueueStore';
 import { refreshActiveTranscriptResources } from './transcript/store';
 import { setTranscriptLifecycleState } from './transcript/resourceStore';
+import { setTranscriptViewportLifecycleState } from './transcript/viewportStore';
 
 export type CodexResumeSyncReason = RemuxHostResumeReason;
 
@@ -132,6 +133,7 @@ export function useCodexResumeSync(params: UseCodexResumeSyncParams) {
     let initialLifecycleSnapshot = true;
     const unsubscribeLifecycle = subscribeHostLifecycle((lifecycle) => {
       setTranscriptLifecycleState(lifecycle.state);
+      setTranscriptViewportLifecycleState(lifecycle.state);
       if (initialLifecycleSnapshot && lifecycle.state === 'active') {
         runResumeSync(lifecycle.reason === 'tabActive' ? 'tab-active' : 'app-active');
       }

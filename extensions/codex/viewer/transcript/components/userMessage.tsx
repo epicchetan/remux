@@ -20,6 +20,7 @@ import { userBubbleContentWidth } from '../layout/constants';
 import { useTranscriptLayoutStore } from '../layoutStore';
 import type { TranscriptUserMessageDisclosure } from '../layout/types';
 import { useOperationQueueStore } from '../../threads/operationQueueStore';
+import { useThreadRuntimeStore } from '../../threads/runtimeStore';
 
 export function UserMessage({
   disclosure,
@@ -102,8 +103,13 @@ function UserMessageActions({
   const startEdit = useComposerStore((state) => state.startEdit);
   const queueBlocksEdit = useOperationQueueStore((state) =>
     state.queue?.threadId === threadId && state.queue.entries.length > 0);
+  const runtimeStatus = useThreadRuntimeStore((state) => state.status);
   const [copied, setCopied] = useState(false);
-  const editDisabled = queueBlocksEdit || !editEnabled || !composerUserInputCanStartEdit(segment.content);
+  // Editing rolls back the thread, which cannot happen underneath a running
+  // turn (forking has no such restriction — it branches to a new thread).
+  const threadWorking = runtimeStatus === 'running' || runtimeStatus === 'stopping';
+  const editDisabled =
+    queueBlocksEdit || threadWorking || !editEnabled || !composerUserInputCanStartEdit(segment.content);
 
   useEffect(() => () => {
     if (copiedTimeoutRef.current !== null) {

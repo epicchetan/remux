@@ -332,16 +332,17 @@ export function App() {
       return;
     }
 
+    // A running turn no longer closes narration: playback of a completed
+    // message coexists with streaming, and the transcript auto-scroll mode
+    // decides which of them drives the viewport. Entering edit/fork or the
+    // directory picker still dismisses playback since they replace the
+    // composer surface narration controls live in.
     const playbackActive = narrationPhase === 'ready' || narrationPhase === 'playing' || narrationPhase === 'paused';
     if (!playbackActive) return;
-    if (
-      activeThreadRuntimeStatus === 'running' ||
-      activeThreadRuntimeStatus === 'stopping' ||
-      Boolean(editTarget || forkTarget || directoryPickerOpen)
-    ) {
+    if (editTarget || forkTarget || directoryPickerOpen) {
       closeNarration();
     }
-  }, [activeThreadId, activeThreadRuntimeStatus, closeNarration, directoryPickerOpen, editTarget, forkTarget, narrationPhase, narrationTargetThreadId]);
+  }, [activeThreadId, closeNarration, directoryPickerOpen, editTarget, forkTarget, narrationPhase, narrationTargetThreadId]);
 
   useEffect(() => subscribeHostNavigate((navigation) => {
     if (navigation.resourceKind !== 'thread' || !navigation.resourceId) {

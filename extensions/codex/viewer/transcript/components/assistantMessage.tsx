@@ -1,11 +1,10 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import { AudioLines, Check, Copy, GitFork, Loader2 } from 'lucide-react';
 
 import type { CodexAssistantMessageSegment, CodexTranscriptTurn } from '../../../shared/transcript';
 import { useComposerStore } from '../../composer/store';
 import { MarkdownBlock } from './markdown/MarkdownBlock';
 import { useOperationQueueStore } from '../../threads/operationQueueStore';
-import { useThreadRuntimeStore } from '../../threads/runtimeStore';
 import { narrationSourceDocument } from './markdown/markdownModel';
 import { narrationSourceHash, useNarrationStore } from '../../narration/store';
 
@@ -28,13 +27,33 @@ export function AssistantMessage({
 }) {
   const narrationTargetMessageId = useNarrationStore((state) => state.target?.assistantMessageId ?? null);
   const narrationSourceTargets = useNarrationStore((state) => state.manifest?.targets ?? noNarrationTargets);
+  const narrationPhase = useNarrationStore((state) => state.phase);
+  const seekNarrationToBlock = useNarrationStore((state) => state.seekToBlock);
   if (!segment.text.trim()) {
     return null;
   }
 
   const streaming = turnStatus === 'inProgress';
+  // Tap-to-seek is narration-only and block-level: while this message is the
+  // playback target, tapping a narrated block seeks the audio to its start.
+  const narrationSeekable = narrationTargetMessageId === segment.id &&
+    (narrationPhase === 'ready' || narrationPhase === 'playing' || narrationPhase === 'paused');
+  const seekToTappedBlock = (event: ReactMouseEvent<HTMLDivElement>) => {
+    if (!(event.target instanceof Element)) return;
+    if (event.target.closest('a, button, [data-remux-no-composer-focus]')) return;
+    const selection = window.getSelection();
+    if (selection && !selection.isCollapsed) return;
+    const blockId = event.target
+      .closest('[data-narration-block-id]')
+      ?.getAttribute('data-narration-block-id');
+    if (!blockId) return;
+    void seekNarrationToBlock(blockId);
+  };
   return (
-    <div className="codex-assistant-message">
+    <div
+      className="codex-assistant-message"
+      onClick={narrationSeekable ? seekToTappedBlock : undefined}
+    >
       <MarkdownBlock
         narrationAssistantMessageId={narrationTargetMessageId === segment.id ? segment.id : null}
         narrationTargets={narrationTargetMessageId === segment.id ? narrationSourceTargets : []}
@@ -42,7 +61,12 @@ export function AssistantMessage({
         width={width}
       >{segment.text}</MarkdownBlock>
       {showActions && threadId && turnId ? (
-        <AssistantMessageActions segment={segment} threadId={threadId} turnId={turnId} />
+        <AssistantMessageActions
+          segment={segment}
+          streaming={streaming}
+          threadId={threadId}
+          turnId={turnId}
+        />
       ) : null}
     </div>
   );
@@ -50,10 +74,12 @@ export function AssistantMessage({
 
 function AssistantMessageActions({
   segment,
+  streaming,
   threadId,
   turnId,
 }: {
   segment: CodexAssistantMessageSegment;
+  streaming: boolean;
   threadId: string;
   turnId: string;
 }) {
@@ -61,19 +87,22 @@ function AssistantMessageActions({
   const editTarget = useComposerStore((state) => state.editTarget);
   const forkTarget = useComposerStore((state) => state.forkTarget);
   const startFork = useComposerStore((state) => state.startFork);
-  const runtimeStatus = useThreadRuntimeStore((state) => state.status);
   const narrationPhase = useNarrationStore((state) => state.phase);
   const narrationTargetMessageId = useNarrationStore((state) => state.target?.assistantMessageId ?? null);
   const playNarration = useNarrationStore((state) => state.play);
   const closeNarration = useNarrationStore((state) => state.close);
   const startNarration = useNarrationStore((state) => state.start);
-  const forkDisabled = useOperationQueueStore((state) =>
+  const queueBlocksFork = useOperationQueueStore((state) =>
     state.queue?.threadId === threadId && state.queue.entries.length > 0);
   const [copied, setCopied] = useState(false);
   const narrationIsTarget = narrationTargetMessageId === segment.id;
   const narrationPreparing = narrationIsTarget && narrationPhase === 'preparing';
   const narrationPlaying = narrationIsTarget && narrationPhase === 'playing';
-  const narrationDisabled = Boolean(editTarget || forkTarget) || runtimeStatus === 'running' || runtimeStatus === 'stopping';
+  // A message in an in-progress turn is still mutable: codex rejects it as a
+  // fork point and its text would go stale under a narration. Completed
+  // messages stay forkable and narratable while a newer turn runs.
+  const forkDisabled = queueBlocksFork || streaming;
+  const narrationDisabled = Boolean(editTarget || forkTarget) || streaming;
 
   useEffect(() => () => {
     if (copiedTimeoutRef.current !== null) {

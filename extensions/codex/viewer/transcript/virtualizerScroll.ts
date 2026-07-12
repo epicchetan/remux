@@ -5,8 +5,15 @@ import type { TranscriptExpandedRow } from './virtualizerRange';
 export const sentMessageAnchorTopOffsetPx = 24;
 
 export type TranscriptScrollAnchor = {
+  segmentId: string;
   scrollTop: number;
   turnId: string;
+};
+
+export type SentMessageScrollResolution = {
+  phase: 'anchored' | 'catching-up';
+  runwayHeight: number;
+  scrollTop: number;
 };
 
 export type TranscriptInitialScrollTarget = {
@@ -45,10 +52,17 @@ export function nativeScrollOwnsTranscriptViewport(phase: TranscriptNativeScroll
 }
 
 export function autoScrollModeAfterNativeScrollSettles({
+  currentMode = { type: 'off' },
   nearBottom,
+  userInitiated = true,
 }: {
+  currentMode?: TranscriptAutoScrollMode;
   nearBottom: boolean;
+  userInitiated?: boolean;
 }): TranscriptAutoScrollMode {
+  if (!userInitiated) {
+    return currentMode;
+  }
   return nearBottom ? { type: 'bottom' } : { type: 'off' };
 }
 
@@ -64,14 +78,21 @@ export function autoScrollModeForStreamingTurn({
   // Streaming lifecycle changes must not turn bottom stickiness into a
   // sent-message anchor. That anchor is entered explicitly by turn navigation.
   if (!streamingTurnId) {
-    return currentMode.type === 'sent-message-anchor' ? { type: 'off' } : currentMode;
+    return currentMode;
   }
 
   if (currentMode.type === 'sent-message-anchor') {
-    if (currentMode.turnId === streamingTurnId) {
-      return currentMode;
-    }
-    return nearBottom ? { type: 'bottom' } : { type: 'off' };
+    // An explicit message intent survives runtime/transcript ordering, work
+    // collapse, completion, and background hydration. Only user input or a
+    // newer message intent may replace it.
+    return currentMode;
+  }
+
+  if (currentMode.type === 'narration-follow') {
+    // Narration owns the viewport; a streaming turn must not convert its
+    // focus into bottom stickiness. The user or the narration store decides
+    // when that ownership ends.
+    return currentMode;
   }
 
   if (currentMode.type === 'bottom' || nearBottom) {
@@ -83,6 +104,64 @@ export function autoScrollModeForStreamingTurn({
 
 export function userMessageAnchorScrollTop(rowTop: number, topPadding: number) {
   return Math.max(0, topPadding + rowTop - transcriptMessageAnchorTopOffset(topPadding));
+}
+
+const anchorPinTolerancePx = 2;
+
+export function resolveSentMessageScroll({
+  currentScrollTop,
+  desiredScrollTop,
+  naturalMaxScrollTop,
+  phase,
+  runwayHeight,
+  viewportGrew,
+  wasPinned,
+}: {
+  currentScrollTop: number;
+  desiredScrollTop: number;
+  naturalMaxScrollTop: number;
+  phase: 'anchored' | 'catching-up';
+  runwayHeight: number;
+  viewportGrew: boolean;
+  /**
+   * Whether the previous resolution ended pinned. Content collapse clamps the
+   * DOM scroll position before the next managed scroll runs, so pinned-ness
+   * cannot be re-derived from the live scrollTop at that moment.
+   */
+  wasPinned: boolean;
+}): SentMessageScrollResolution {
+  const desired = Math.max(0, desiredScrollTop);
+  const naturalMax = Math.max(0, naturalMaxScrollTop);
+  if (desired <= naturalMax + 1) {
+    return {
+      phase: 'anchored',
+      runwayHeight: 0,
+      scrollTop: desired,
+    };
+  }
+
+  // The anchor lies beyond the natural scroll range. Hold it with a runway
+  // spacer only when the message is already pinned and the shortfall comes
+  // from content collapsing under it — never from the viewport growing back
+  // (keyboard dismissal). A viewport measured while shrunken can satisfy the
+  // anchor condition far too early; once it grows, the honest position is to
+  // resume following the bottom until real content fills the screen.
+  const pinned =
+    phase === 'anchored' &&
+    (runwayHeight > 0 || wasPinned || Math.abs(currentScrollTop - desired) <= anchorPinTolerancePx);
+  if (pinned && !viewportGrew) {
+    return {
+      phase: 'anchored',
+      runwayHeight: desired - naturalMax,
+      scrollTop: desired,
+    };
+  }
+
+  return {
+    phase: 'catching-up',
+    runwayHeight: 0,
+    scrollTop: naturalMax,
+  };
 }
 
 export function initialTranscriptScrollTarget({
@@ -159,6 +238,47 @@ export function anchorTurnUserMessageScrollTop({
   }
 
   return null;
+}
+
+export function anchorUserMessageScrollTop({
+  expandedRows,
+  segmentId,
+  topPadding,
+  turnId,
+  turns,
+}: {
+  expandedRows: TranscriptExpandedRow[];
+  segmentId: string;
+  topPadding: number;
+  turnId: string;
+  turns: TranscriptMeasuredTurn[];
+}) {
+  const expanded = expandedRowGeometry(turns, expandedRows);
+
+  for (let turnIndex = 0; turnIndex < turns.length; turnIndex += 1) {
+    const turn = turns[turnIndex];
+    if (!turn || turn.turnId !== turnId) continue;
+    let rowTop = turn.collapsedTop + expanded.heightBeforeTurnIndex(turnIndex);
+    for (const row of turn.rows) {
+      if (row.segment.type === 'userMessage' && userMessageRowMatchesId(row.segmentId, row.segment.clientId, segmentId)) {
+        return userMessageAnchorScrollTop(rowTop, topPadding);
+      }
+      rowTop += row.height + expanded.heightAfterRow(turn.turnId, row.id);
+    }
+  }
+
+  return null;
+}
+
+// Anchors created by the composer reference the clientMessageId; the
+// authoritative transcript keys the same message by the codex item id and
+// echoes the composer id as clientId.
+export function userMessageRowMatchesId(
+  segmentId: string,
+  clientId: string | null | undefined,
+  trackedId: string,
+) {
+  return segmentId === trackedId || clientId === trackedId;
 }
 
 function expandedRowGeometry(turns: TranscriptMeasuredTurn[], expandedRows: TranscriptExpandedRow[]): ExpandedRowGeometry {

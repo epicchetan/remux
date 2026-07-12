@@ -11,11 +11,19 @@ import type {
   CodexNarrationTarget,
 } from '../../shared/narration';
 import { cancelNarration, readNarration, startNarration } from '../ipc/narration';
-import { setTranscriptNarrationManualScrollHandler } from '../transcript/viewportStore';
+import {
+  getTranscriptViewportState,
+  subscribeTranscriptViewport,
+} from '../transcript/viewportStore';
 import { NarrationAudioEngine } from './audioEngine';
 import { resolveNarrationPosition } from './cueResolver';
 
 export type NarrationPhase = 'failed' | 'idle' | 'paused' | 'playing' | 'preparing' | 'ready';
+
+// 'explicitSeekInPlace' marks seeks born from tapping a visible block: the
+// focus paints and seeks like an explicit seek but must not pull the tapped
+// block into the reading band underneath the user's finger.
+export type NarrationFocusReason = 'explicitSeek' | 'explicitSeekInPlace' | 'follow' | 'followReenabled';
 
 type NarrationRequest = {
   document: CodexNarrationSourceDocument;
@@ -36,7 +44,7 @@ type NarrationStoreState = {
   currentUnitIndex: number;
   error: string | null;
   followEnabled: boolean;
-  focusIntent: { id: number; reason: 'explicitSeek' | 'follow' | 'followReenabled' } | null;
+  focusIntent: { id: number; reason: NarrationFocusReason } | null;
   followSuspendedByUser: boolean;
   manifest: CodexNarrationManifest | null;
   nextBlock: () => Promise<void>;
@@ -47,6 +55,7 @@ type NarrationStoreState = {
   previousBlock: () => Promise<void>;
   refresh: () => Promise<void>;
   retry: () => Promise<void>;
+  seekToBlock: (blockId: string) => Promise<void>;
   setPlaybackRate: (rate: number) => void;
   stage: CodexNarrationResource['stage'];
   start: (request: NarrationRequest) => Promise<void>;
@@ -59,7 +68,7 @@ const storedRate = Number.parseFloat(localStorage.getItem('narrationPlaybackRate
 const defaultRate = [0.75, 1, 1.25, 1.5, 2].includes(storedRate) ? storedRate : 1;
 let lastRequest: NarrationRequest | null = null;
 let refreshTimer: number | null = null;
-let pendingFocusReason: 'explicitSeek' | 'followReenabled' | null = null;
+let pendingFocusReason: 'explicitSeek' | 'explicitSeekInPlace' | 'followReenabled' | null = null;
 let focusIntentId = 0;
 
 const audioEngine = new NarrationAudioEngine({
@@ -78,11 +87,13 @@ export const useNarrationStore = create<NarrationStoreState>((set, get) => ({
       try { await cancelNarration({ artifactKey }); } catch { /* Cancellation is best effort. */ }
     }
     audioEngine.close();
+    releaseNarrationScrollOwnership();
     set(idleState());
   },
   close() {
     clearRefreshTimer();
     audioEngine.close();
+    releaseNarrationScrollOwnership();
     set(idleState());
   },
   completedUnits: null,
@@ -105,8 +116,9 @@ export const useNarrationStore = create<NarrationStoreState>((set, get) => ({
   },
   phase: 'idle',
   async play() {
-    const { artifactKey, manifest } = get();
+    const { artifactKey, followEnabled, manifest } = get();
     if (!artifactKey || !manifest) return;
+    if (followEnabled) claimNarrationScrollOwnership();
     try {
       await audioEngine.play(artifactKey, manifest);
       set({ error: null, phase: 'playing' });
@@ -131,6 +143,9 @@ export const useNarrationStore = create<NarrationStoreState>((set, get) => ({
   async retry() {
     if (lastRequest) await get().start(lastRequest);
   },
+  async seekToBlock(blockId) {
+    await seekToBlockId(blockId, get);
+  },
   setPlaybackRate(rate) {
     if (![0.75, 1, 1.25, 1.5, 2].includes(rate)) return;
     localStorage.setItem('narrationPlaybackRate', String(rate));
@@ -152,6 +167,11 @@ export const useNarrationStore = create<NarrationStoreState>((set, get) => ({
   target: null,
   toggleFollow() {
     const enabled = !get().followEnabled;
+    if (enabled) {
+      claimNarrationScrollOwnership();
+    } else {
+      releaseNarrationScrollOwnership();
+    }
     set({
       focusIntent: enabled ? nextFocusIntent('followReenabled') : null,
       followEnabled: enabled,
@@ -174,11 +194,16 @@ audioEngine.setCallbacks({
 });
 audioEngine.setPlaybackRate(defaultRate);
 
-setTranscriptNarrationManualScrollHandler(() => {
+// Follow is owned by the transcript viewport's auto-scroll mode. Whenever
+// something else takes ownership (manual scroll → off, a sent message →
+// sent-message-anchor, bottom stickiness), mirror the loss as a user
+// suspension so playback continues without moving the viewport.
+subscribeTranscriptViewport(() => {
   const state = useNarrationStore.getState();
-  if (state.phase === 'ready' || state.phase === 'playing' || state.phase === 'paused') {
-    useNarrationStore.setState({ followEnabled: false, followSuspendedByUser: true });
-  }
+  if (state.phase !== 'ready' && state.phase !== 'playing' && state.phase !== 'paused') return;
+  if (!state.followEnabled) return;
+  if (getTranscriptViewportState().autoScrollMode.type === 'narration-follow') return;
+  useNarrationStore.setState({ followEnabled: false, followSuspendedByUser: true });
 });
 
 export function subscribeNarrationUpdates() {
@@ -212,6 +237,7 @@ function applyResource(
   if (resource.status === 'ready' && resource.manifest) {
     clearRefreshTimer();
     const position = resolveNarrationPosition(resource.manifest, resource.manifest.units[0]?.start ?? 0);
+    if (get().followEnabled) claimNarrationScrollOwnership();
     set({
       activeTargets: position.targets,
       completedUnits: resource.completedUnits,
@@ -237,6 +263,7 @@ function applyResource(
   if (resource.status === 'cancelled') {
     clearRefreshTimer();
     audioEngine.close();
+    releaseNarrationScrollOwnership();
     set(idleState());
     return;
   }
@@ -266,6 +293,21 @@ function applyAudioTime(globalTime: number) {
     currentUnitIndex: position.unitIndex,
     focusIntent: reason ? nextFocusIntent(reason) : null,
   });
+}
+
+async function seekToBlockId(blockId: string, get: () => NarrationStoreState) {
+  const { artifactKey, currentUnitIndex, manifest, phase } = get();
+  if (!artifactKey || !manifest) return;
+  const destination = manifest.units.findIndex((unit) => unit.blockId === blockId);
+  if (destination === -1) return;
+  await audioEngine.prepare(artifactKey, manifest);
+  const current = Math.max(0, currentUnitIndex);
+  pendingFocusReason = 'explicitSeekInPlace';
+  await audioEngine.seek(blockNavigationTime(manifest, destination), phase === 'playing');
+  if (destination === current) {
+    pendingFocusReason = null;
+    useNarrationStore.setState({ focusIntent: nextFocusIntent('explicitSeekInPlace') });
+  }
 }
 
 async function seekBlock(direction: -1 | 1, get: () => NarrationStoreState) {
@@ -342,9 +384,21 @@ function idleState(): Pick<
   };
 }
 
-function nextFocusIntent(reason: 'explicitSeek' | 'follow' | 'followReenabled') {
+function nextFocusIntent(reason: NarrationFocusReason) {
   focusIntentId += 1;
   return { id: focusIntentId, reason } as const;
+}
+
+function claimNarrationScrollOwnership() {
+  getTranscriptViewportState().setAutoScrollMode({ type: 'narration-follow' });
+}
+
+function releaseNarrationScrollOwnership() {
+  const viewport = getTranscriptViewportState();
+  // Only release what narration owns; another mode may have taken over.
+  if (viewport.autoScrollMode.type === 'narration-follow') {
+    viewport.setAutoScrollMode({ type: 'off' });
+  }
 }
 
 function errorMessage(error: unknown) {

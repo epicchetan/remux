@@ -10,7 +10,7 @@ import {
 import { applyCodexResourceInvalidations } from '../../ipc/resourceInvalidations';
 import { useThreadRuntimeStore } from '../../threads/runtimeStore';
 import { useThreadsStore } from '../../threads/store';
-import { useTranscriptViewportStore } from '../../transcript/viewportStore';
+import { trackTranscriptUserMessage } from '../../transcript/viewportStore';
 import { useHostStore } from '../../ipc/hostStore';
 import { createComposerNodeId } from '../model/composerModel';
 import { buildComposerSendParts } from '../model/sendProjection';
@@ -43,17 +43,18 @@ export function useComposerTurnAction() {
   const runtimeStatus = useThreadRuntimeStore((state) => state.status);
   const isStopping = runtimeStatus === 'stopping';
   const isWorking = runtimeStatus === 'running' || isStopping;
-  const setAutoScrollMode = useTranscriptViewportStore((state) => state.setAutoScrollMode);
   const canEditThread = Boolean(editTarget?.threadId);
   const canForkThread = Boolean(forkTarget?.threadId);
   const canSendExistingThread = Boolean(activeThreadId);
   const canStartDraftThread = Boolean(activeDraft?.cwd);
+  // Editing rolls back the running thread and is blocked while it works;
+  // forking branches onto a fresh thread, so an in-progress turn is fine.
   const sendDisabled = Boolean(
     isSubmitting ||
       !snapshot.canSend ||
       (!canEditThread && !canForkThread && !canSendExistingThread && !canStartDraftThread) ||
-      isStopping ||
-      (isWorking && (canEditThread || canForkThread)),
+      (isStopping && !canForkThread) ||
+      (isWorking && canEditThread),
   );
 
   useEffect(() => {
@@ -88,6 +89,7 @@ export function useComposerTurnAction() {
     }
 
     if (editTarget) {
+      const clientMessageId = createComposerNodeId();
       const submission = beginSubmission({
         kind: 'edit',
         phase: connectionStatus.type === 'connected' ? 'starting-turn' : 'waiting-for-connection',
@@ -97,7 +99,7 @@ export function useComposerTurnAction() {
       });
 
       void editThreadMessage({
-        clientMessageId: createComposerNodeId(),
+        clientMessageId,
         parts: projection.parts,
         threadId: editTarget.threadId,
         turnId: editTarget.turnId,
@@ -109,7 +111,7 @@ export function useComposerTurnAction() {
             threadId: response.threadId,
             turnId: response.turnId,
           });
-          setAutoScrollMode({ type: 'sent-message-anchor', turnId: response.turnId });
+          trackTranscriptUserMessage(response.threadId, clientMessageId, response.turnId);
           clearComposer();
           clearMode();
           await applyCodexResourceInvalidations(response.invalidations);
@@ -122,6 +124,7 @@ export function useComposerTurnAction() {
     }
 
     if (forkTarget) {
+      const clientMessageId = createComposerNodeId();
       const submission = beginSubmission({
         kind: 'fork',
         phase: connectionStatus.type === 'connected' ? 'starting-thread' : 'waiting-for-connection',
@@ -132,7 +135,7 @@ export function useComposerTurnAction() {
 
       void forkThreadMessage({
         assistantMessageId: forkTarget.assistantMessageId,
-        clientMessageId: createComposerNodeId(),
+        clientMessageId,
         parts: projection.parts,
         threadId: forkTarget.threadId,
         turnId: forkTarget.turnId,
@@ -144,7 +147,7 @@ export function useComposerTurnAction() {
             threadId: response.threadId,
             turnId: response.turnId,
           });
-          setAutoScrollMode({ type: 'sent-message-anchor', turnId: response.turnId });
+          trackTranscriptUserMessage(response.threadId, clientMessageId, response.turnId);
           clearComposer();
           clearMode();
           await applyCodexResourceInvalidations(response.invalidations);
@@ -157,6 +160,7 @@ export function useComposerTurnAction() {
     }
 
     if (!activeThreadId && activeDraft?.cwd) {
+      const clientMessageId = createComposerNodeId();
       const submission = beginSubmission({
         kind: 'new-chat',
         phase: connectionStatus.type === 'connected' ? 'starting-thread' : 'waiting-for-connection',
@@ -164,7 +168,7 @@ export function useComposerTurnAction() {
       });
 
       void startThreadMessage({
-        clientMessageId: createComposerNodeId(),
+        clientMessageId,
         composerConfig: {
           intelligence,
           model,
@@ -181,7 +185,7 @@ export function useComposerTurnAction() {
             threadId: response.threadId,
             turnId: response.turnId,
           });
-          setAutoScrollMode({ type: 'sent-message-anchor', turnId: response.turnId });
+          trackTranscriptUserMessage(response.threadId, clientMessageId, response.turnId);
           clearComposer();
           clearMode();
           await applyCodexResourceInvalidations(response.invalidations);
@@ -203,8 +207,9 @@ export function useComposerTurnAction() {
       snapshot,
       threadId: activeThreadId,
     });
+    const clientMessageId = createComposerNodeId();
     void sendThreadMessage({
-      clientMessageId: createComposerNodeId(),
+      clientMessageId,
       parts: projection.parts,
       threadId: activeThreadId,
     })
@@ -215,13 +220,14 @@ export function useComposerTurnAction() {
             threadId: response.threadId,
             turnId: response.turnId,
           });
-          setAutoScrollMode({ type: 'sent-message-anchor', turnId: response.turnId });
+          trackTranscriptUserMessage(response.threadId, clientMessageId, response.turnId);
           clearComposer();
           clearMode();
           await applyCodexResourceInvalidations(response.invalidations);
           clearSubmission(submission.id);
           return;
         }
+        trackTranscriptUserMessage(response.threadId, clientMessageId);
         clearComposer();
         clearMode();
         await applyCodexResourceInvalidations(response.invalidations);
@@ -251,7 +257,6 @@ export function useComposerTurnAction() {
     sendDisabled,
     setSubmissionTurn,
     speed,
-    setAutoScrollMode,
     snapshot,
   ]);
 

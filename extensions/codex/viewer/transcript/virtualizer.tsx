@@ -17,7 +17,6 @@ import {
   type TranscriptStatus,
 } from './resourceStore';
 import {
-  notifyTranscriptNarrationManualScroll,
   type TranscriptAutoScrollMode,
   type TranscriptNarrationFocusRequest,
   useTranscriptViewportStore,
@@ -31,11 +30,13 @@ import {
 } from './virtualizerRange';
 import {
   anchorTurnUserMessageScrollTop,
+  anchorUserMessageScrollTop,
   autoScrollModeAfterNativeScrollSettles,
   autoScrollModeForStreamingTurn,
   initialTranscriptScrollTarget,
   nativeScrollOwnsTranscriptViewport,
   resolveInitialTranscriptScrollTarget,
+  resolveSentMessageScroll,
   transcriptNativeScrollPhaseAfterEvent,
   userMessageAnchorScrollTop,
   type TranscriptNativeScrollPhase,
@@ -45,7 +46,6 @@ import {
 const bottomStickThresholdPx = 12;
 const scrollNavigationDurationMs = 170;
 const scrollNavigationThresholdPx = 12;
-const scrollDirectionThresholdPx = 4;
 // A scrollTop write after touchend cancels native iOS deceleration. Older WebViews
 // lack scrollend, so release ownership only after scroll events have gone quiet.
 const touchScrollSettleDelayMs = 180;
@@ -101,6 +101,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
   const setAutoScrollMode = useTranscriptViewportStore((state) => state.setAutoScrollMode);
   const setScrollAvailability = useTranscriptViewportStore((state) => state.setScrollAvailability);
   const setScrollNavigationController = useTranscriptViewportStore((state) => state.setScrollNavigationController);
+  const viewportLifecycleState = useTranscriptViewportStore((state) => state.lifecycleState);
   const requestedTurnScroll = useTranscriptViewportStore((state) => state.requestedTurnScroll);
   const turns = useMemo(
     () => turnOrder.map((turnId) => turnsById[turnId]).filter((turn): turn is TranscriptMeasuredTurn => Boolean(turn)),
@@ -112,6 +113,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       : null;
   const expandedRows = useMemo(() => Object.values(openWorkByKey), [openWorkByKey]);
   const [viewportTopPadding, setViewportTopPadding] = useState<number>(transcriptLayout.viewport.padY);
+  const [anchorRunwayHeight, setAnchorRunwayHeight] = useState(0);
   const navigationAnchors = useMemo(
     () =>
       userMessageScrollAnchors({
@@ -137,7 +139,13 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
   const programmaticScrollRef = useRef(false);
   const scrollAnchorRef = useRef<TranscriptViewportAnchor | null>(null);
   const autoScrollModeRef = useRef<TranscriptAutoScrollMode>(autoScrollMode);
+  const anchorRunwayHeightRef = useRef(0);
+  // Seeded so the first managed scroll never registers as viewport growth.
+  const managedClientHeightRef = useRef(Number.POSITIVE_INFINITY);
+  // Segment id of the anchor that ended the last managed scroll pinned.
+  const anchorPinnedSegmentIdRef = useRef<string | null>(null);
   const nativeScrollPhaseRef = useRef<TranscriptNativeScrollPhase>('idle');
+  const userScrollArmedRef = useRef(false);
   const turnsRef = useRef(turns);
   const streamingTurnIdRef = useRef(streamingTurnId);
   const [width, setWidth] = useState<number | null>(null);
@@ -211,9 +219,19 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     }
   }, [setAutoScrollMode]);
 
+  const setAnchorRunway = useCallback((height: number) => {
+    const normalized = Math.max(0, height);
+    if (Math.abs(anchorRunwayHeightRef.current - normalized) <= 1) {
+      return false;
+    }
+    anchorRunwayHeightRef.current = normalized;
+    setAnchorRunwayHeight(normalized);
+    return true;
+  }, []);
+
   const captureViewportAnchor = useCallback(() => {
     const viewport = viewportRef.current;
-    if (!viewport) {
+    if (!viewport || viewportLifecycleState !== 'active') {
       scrollAnchorRef.current = null;
       return null;
     }
@@ -254,7 +272,11 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       const nextActiveTurnIds = range.activeTurnIds;
 
       captureViewportAnchor();
-      setScrollAvailability(scrollNavigationAvailability(viewport, navigationAnchorsRef.current));
+      setScrollAvailability(scrollNavigationAvailability(
+        viewport,
+        navigationAnchorsRef.current,
+        autoScrollModeRef.current,
+      ));
 
       if (sameTurnIds(activeTurnIdsRef.current, nextActiveTurnIds)) {
         return;
@@ -270,6 +292,87 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     viewportTopPadding,
   ]);
 
+  const applyManagedScroll = useCallback(() => {
+    const viewport = viewportRef.current;
+    const mode = autoScrollModeRef.current;
+    if (!viewport) {
+      return;
+    }
+
+    // Narration focus scrolls are driven by cue changes through
+    // focusNarration; content growth must not move the viewport.
+    if (mode.type === 'off' || mode.type === 'narration-follow') {
+      managedClientHeightRef.current = viewport.clientHeight;
+      anchorPinnedSegmentIdRef.current = null;
+      setAnchorRunway(0);
+      return;
+    }
+    if (nativeScrollOwnsTranscriptViewport(nativeScrollPhaseRef.current)) {
+      return;
+    }
+
+    const viewportGrew = viewport.clientHeight > managedClientHeightRef.current + 1;
+    managedClientHeightRef.current = viewport.clientHeight;
+    const naturalMaxScrollTop = Math.max(
+      0,
+      maxScrollableTop(viewport) - anchorRunwayHeightRef.current,
+    );
+    let targetScrollTop = naturalMaxScrollTop;
+    let nextRunwayHeight = 0;
+
+    if (mode.type === 'sent-message-anchor') {
+      const desiredScrollTop = anchorUserMessageScrollTop({
+        expandedRows: expandedRowsRef.current,
+        segmentId: mode.segmentId,
+        topPadding: viewportTopPadding,
+        turnId: mode.turnId,
+        turns: turnsRef.current,
+      });
+      if (desiredScrollTop === null) {
+        return;
+      }
+      const resolution = resolveSentMessageScroll({
+        currentScrollTop: viewport.scrollTop,
+        desiredScrollTop,
+        naturalMaxScrollTop,
+        phase: mode.phase,
+        runwayHeight: anchorRunwayHeightRef.current,
+        viewportGrew,
+        wasPinned: anchorPinnedSegmentIdRef.current === mode.segmentId,
+      });
+      anchorPinnedSegmentIdRef.current = resolution.phase === 'anchored' ? mode.segmentId : null;
+      targetScrollTop = resolution.scrollTop;
+      nextRunwayHeight = resolution.runwayHeight;
+      if (resolution.phase !== mode.phase) {
+        setViewportAutoScrollMode({ ...mode, phase: resolution.phase }, 'mount-stickiness');
+      }
+    } else {
+      anchorPinnedSegmentIdRef.current = null;
+    }
+
+    setAnchorRunway(nextRunwayHeight);
+    const reachableTarget = Math.min(
+      targetScrollTop,
+      naturalMaxScrollTop + anchorRunwayHeightRef.current,
+    );
+    if (Math.abs(reachableTarget - viewport.scrollTop) > 1) {
+      programmaticScrollRef.current = true;
+      viewport.scrollTop = reachableTarget;
+      lastScrollTopRef.current = viewport.scrollTop;
+      scheduleRangeUpdate();
+    }
+
+    window.requestAnimationFrame(() => {
+      programmaticScrollRef.current = false;
+    });
+  }, [
+    scheduleRangeUpdate,
+    setAnchorRunway,
+    setViewportAutoScrollMode,
+    viewportLifecycleState,
+    viewportTopPadding,
+  ]);
+
   const scheduleAutoScroll = useCallback(() => {
     if (
       bottomScrollRafRef.current !== null ||
@@ -277,50 +380,37 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     ) {
       return;
     }
-
     bottomScrollRafRef.current = window.requestAnimationFrame(() => {
       bottomScrollRafRef.current = null;
-
-      const viewport = viewportRef.current;
-      if (
-        !viewport ||
-        autoScrollModeRef.current.type === 'off' ||
-        nativeScrollOwnsTranscriptViewport(nativeScrollPhaseRef.current)
-      ) {
-        return;
-      }
-
-      const target = autoScrollTarget({
-        mode: autoScrollModeRef.current,
-        expandedRows: expandedRowsRef.current,
-        topPadding: viewportTopPadding,
-        turns: turnsRef.current,
-        viewport,
-      });
-
-      if (target === null) {
-        return;
-      }
-
-      if (Math.abs(target.scrollTop - viewport.scrollTop) > 1) {
-        programmaticScrollRef.current = true;
-        viewport.scrollTop = target.scrollTop;
-        lastScrollTopRef.current = viewport.scrollTop;
-        scheduleRangeUpdate();
-      }
-
-      window.requestAnimationFrame(() => {
-        programmaticScrollRef.current = false;
-      });
+      applyManagedScroll();
     });
-  }, [scheduleRangeUpdate, viewportTopPadding]);
+  }, [applyManagedScroll]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     autoScrollModeRef.current = autoScrollMode;
     if (autoScrollMode.type !== 'off') {
       scheduleAutoScroll();
     }
   }, [autoScrollMode, scheduleAutoScroll]);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) {
+      return;
+    }
+
+    // Composer lift (keyboard) resizes the viewport; managed modes must react
+    // immediately — bottom stickiness re-pins, and a sent-message anchor that
+    // was only satisfiable in a shrunken viewport releases its pin instead of
+    // materializing runway once the viewport grows back.
+    const observer = new ResizeObserver(() => {
+      if (autoScrollModeRef.current.type !== 'off') {
+        scheduleAutoScroll();
+      }
+    });
+    observer.observe(viewport);
+    return () => observer.disconnect();
+  }, [scheduleAutoScroll]);
 
   const cancelScrollAnimation = useCallback(() => {
     if (scrollAnimationRafRef.current !== null) {
@@ -445,6 +535,11 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       if (request.reason === 'follow' && explicitNarrationFocusTokenRef.current !== 0) {
         return;
       }
+      // Passive follow scrolls only while narration owns the viewport;
+      // explicit seeks and follow re-enablement re-claim it below.
+      if (request.reason === 'follow' && autoScrollModeRef.current.type !== 'narration-follow') {
+        return;
+      }
       const viewportBounds = viewport.getBoundingClientRect();
       const composerTop = document.querySelector<HTMLElement>('[data-remux-composer-root]')
         ?.getBoundingClientRect().top ?? viewportBounds.bottom;
@@ -458,17 +553,35 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       if (request.reason === 'follow' && targetTop >= bandTop && targetBottom <= bandBottom) {
         return;
       }
+      // A tapped block is already under the user's finger; only scroll when
+      // it is partially outside the usable area.
+      if (
+        request.reason === 'explicitSeekInPlace' &&
+        targetTop >= viewportBounds.top &&
+        targetBottom <= usableBottom
+      ) {
+        return;
+      }
+      const explicitReason =
+        request.reason === 'explicitSeek' || request.reason === 'explicitSeekInPlace';
       const desiredScrollTop = viewport.scrollTop
         + targetTop
         - viewportBounds.top
         - usableHeight * 0.30;
-      const explicitFocusToken = request.reason === 'explicitSeek'
+      const explicitFocusToken = explicitReason
         ? explicitNarrationFocusTokenRef.current + 1
         : 0;
       if (explicitFocusToken !== 0) explicitNarrationFocusTokenRef.current = explicitFocusToken;
+      // Follow-driven focus keeps (or re-claims) narration's viewport
+      // ownership; explicit seeks scroll once without changing who owns it.
+      const nextAutoScrollMode: TranscriptAutoScrollMode = explicitReason
+        ? (autoScrollModeRef.current.type === 'narration-follow'
+          ? autoScrollModeRef.current
+          : { type: 'off' })
+        : { type: 'narration-follow' };
       scrollToPosition(
         desiredScrollTop,
-        { type: 'off' },
+        nextAutoScrollMode,
         'narration-focus',
         request.reason !== 'follow',
         explicitFocusToken === 0
@@ -495,10 +608,16 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     }
 
     const nextMode = anchor === lastScrollAnchor(navigationAnchorsRef.current) && anchor.turnId === streamingTurnIdRef.current
-      ? { type: 'sent-message-anchor' as const, turnId: anchor.turnId }
+      ? {
+          phase: 'anchored' as const,
+          segmentId: anchor.segmentId,
+          threadId: activeThreadId ?? '',
+          type: 'sent-message-anchor' as const,
+          turnId: anchor.turnId,
+        }
       : { type: 'off' as const };
     scrollToPosition(anchor.scrollTop, nextMode, 'scroll-navigation');
-  }, [scrollToPosition]);
+  }, [activeThreadId, scrollToPosition]);
 
   const scrollDown = useCallback(() => {
     const viewport = viewportRef.current;
@@ -509,18 +628,26 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     const anchor = nextScrollAnchor(navigationAnchorsRef.current, viewport);
     if (anchor) {
       const nextMode = anchor === lastScrollAnchor(navigationAnchorsRef.current) && anchor.turnId === streamingTurnIdRef.current
-        ? { type: 'sent-message-anchor' as const, turnId: anchor.turnId }
+        ? {
+            phase: 'anchored' as const,
+            segmentId: anchor.segmentId,
+            threadId: activeThreadId ?? '',
+            type: 'sent-message-anchor' as const,
+            turnId: anchor.turnId,
+          }
         : { type: 'off' as const };
       scrollToPosition(anchor.scrollTop, nextMode, 'scroll-navigation');
       return;
     }
 
     if (isNearBottom(viewport)) {
+      setViewportAutoScrollMode({ type: 'bottom' }, 'scroll-navigation-bottom');
+      setAnchorRunway(0);
       return;
     }
 
     scrollToPosition(viewport.scrollHeight, { type: 'bottom' }, 'scroll-navigation-bottom');
-  }, [scrollToPosition]);
+  }, [activeThreadId, scrollToPosition, setAnchorRunway, setViewportAutoScrollMode]);
 
   useEffect(() => {
     setScrollNavigationController({ focusNarration, scrollDown, scrollUp });
@@ -574,31 +701,12 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       return;
     }
 
-    const updateStickiness = () => {
+    const updateScrollPosition = () => {
       const currentScrollTop = viewport.scrollTop;
-
-      if (
-        programmaticScrollRef.current ||
-        nativeScrollOwnsTranscriptViewport(nativeScrollPhaseRef.current)
-      ) {
-        lastScrollTopRef.current = currentScrollTop;
-        return;
-      }
-
-      const nearBottom = isNearBottom(viewport);
-      const movedManually = Math.abs(currentScrollTop - lastScrollTopRef.current) > scrollDirectionThresholdPx;
-
-      if (nearBottom) {
-        setViewportAutoScrollMode({ type: 'bottom' }, 'manual-scroll');
-      } else if (movedManually) {
-        setViewportAutoScrollMode({ type: 'off' }, 'manual-scroll');
-      }
-
       lastScrollTopRef.current = currentScrollTop;
     };
 
     let scrollSettleTimer: number | null = null;
-    let boundaryPagingArmedByUser = false;
     const clearScrollSettleTimer = () => {
       if (scrollSettleTimer === null) {
         return;
@@ -608,8 +716,8 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     };
     const finishUserScroll = () => {
       clearScrollSettleTimer();
-      const userInitiated = boundaryPagingArmedByUser && !programmaticScrollRef.current;
-      boundaryPagingArmedByUser = false;
+      const userInitiated = userScrollArmedRef.current && !programmaticScrollRef.current;
+      userScrollArmedRef.current = false;
       if (nativeScrollPhaseRef.current === 'momentum') {
         nativeScrollPhaseRef.current = transcriptNativeScrollPhaseAfterEvent(
           nativeScrollPhaseRef.current,
@@ -628,24 +736,23 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
         }
       }
 
-      const mode = autoScrollModeAfterNativeScrollSettles({
-        nearBottom: isNearBottom(viewport),
-      });
-      setViewportAutoScrollMode(mode, 'scroll-settled');
-      if (mode.type === 'off') {
+      if (!userInitiated) {
         return;
       }
-      scheduleAutoScroll();
+      const mode = autoScrollModeAfterNativeScrollSettles({
+        currentMode: autoScrollModeRef.current,
+        nearBottom: isNearBottom(viewport),
+        userInitiated,
+      });
+      setViewportAutoScrollMode(mode, 'scroll-settled');
+      if (mode.type !== 'off') scheduleAutoScroll();
     };
     const scheduleUserScrollSettleFallback = () => {
       clearScrollSettleTimer();
       scrollSettleTimer = window.setTimeout(finishUserScroll, touchScrollSettleDelayMs);
     };
     const onScroll = () => {
-      if (!programmaticScrollRef.current && nativeScrollPhaseRef.current === 'momentum') {
-        notifyTranscriptNarrationManualScroll();
-      }
-      updateStickiness();
+      updateScrollPosition();
       scheduleRangeUpdate();
       if (nativeScrollPhaseRef.current === 'momentum') {
         scheduleUserScrollSettleFallback();
@@ -653,7 +760,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     };
     const onTouchStart = () => {
       clearScrollSettleTimer();
-      boundaryPagingArmedByUser = true;
+      userScrollArmedRef.current = true;
       cancelScrollAnimation();
       if (bottomScrollRafRef.current !== null) {
         window.cancelAnimationFrame(bottomScrollRafRef.current);
@@ -667,8 +774,8 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     };
     const onWheel = () => {
       cancelScrollAnimation();
-      notifyTranscriptNarrationManualScroll();
-      boundaryPagingArmedByUser = true;
+      userScrollArmedRef.current = true;
+      setViewportAutoScrollMode({ type: 'off' }, 'manual-scroll');
       scheduleUserScrollSettleFallback();
     };
     const onTouchEnd = () => {
@@ -678,6 +785,21 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       );
       scheduleUserScrollSettleFallback();
     };
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') {
+        clearScrollSettleTimer();
+        userScrollArmedRef.current = false;
+        nativeScrollPhaseRef.current = 'idle';
+        cancelScrollAnimation();
+        return;
+      }
+      lastScrollTopRef.current = viewport.scrollTop;
+      captureViewportAnchor();
+      scheduleRangeUpdate();
+      if (autoScrollModeRef.current.type !== 'off') {
+        scheduleAutoScroll();
+      }
+    };
     const observer = new ResizeObserver(scheduleRangeUpdate);
 
     viewport.addEventListener('scroll', onScroll, { passive: true });
@@ -686,9 +808,12 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     viewport.addEventListener('touchend', onTouchEnd, { passive: true });
     viewport.addEventListener('wheel', onWheel, { passive: true });
     viewport.addEventListener('scrollend', finishUserScroll, { passive: true });
+    document.addEventListener('visibilitychange', onVisibilityChange);
     observer.observe(viewport);
     lastScrollTopRef.current = viewport.scrollTop;
-    setViewportAutoScrollMode(isNearBottom(viewport) ? { type: 'bottom' } : { type: 'off' }, 'mount-stickiness');
+    if (autoScrollModeRef.current.type === 'off') {
+      setViewportAutoScrollMode(isNearBottom(viewport) ? { type: 'bottom' } : { type: 'off' }, 'mount-stickiness');
+    }
     scheduleRangeUpdate();
 
     return () => {
@@ -698,6 +823,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       viewport.removeEventListener('touchend', onTouchEnd);
       viewport.removeEventListener('wheel', onWheel);
       viewport.removeEventListener('scrollend', finishUserScroll);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
       clearScrollSettleTimer();
       nativeScrollPhaseRef.current = 'idle';
       observer.disconnect();
@@ -721,6 +847,32 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     scheduleAutoScroll,
     scheduleRangeUpdate,
     setViewportAutoScrollMode,
+  ]);
+
+  useEffect(() => {
+    if (viewportLifecycleState !== 'active') {
+      userScrollArmedRef.current = false;
+      nativeScrollPhaseRef.current = 'idle';
+      cancelScrollAnimation();
+      if (bottomScrollRafRef.current !== null) {
+        window.cancelAnimationFrame(bottomScrollRafRef.current);
+        bottomScrollRafRef.current = null;
+      }
+      return;
+    }
+
+    lastScrollTopRef.current = viewportRef.current?.scrollTop ?? 0;
+    captureViewportAnchor();
+    scheduleRangeUpdate();
+    if (autoScrollModeRef.current.type !== 'off') {
+      scheduleAutoScroll();
+    }
+  }, [
+    cancelScrollAnimation,
+    captureViewportAnchor,
+    scheduleAutoScroll,
+    scheduleRangeUpdate,
+    viewportLifecycleState,
   ]);
 
   useEffect(() => {
@@ -801,15 +953,13 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
   useLayoutEffect(() => {
     if (
       status !== 'ready' ||
-      width === null ||
-      autoScrollModeRef.current.type === 'off' ||
-      nativeScrollOwnsTranscriptViewport(nativeScrollPhaseRef.current)
+      width === null
     ) {
       return;
     }
 
-    scheduleAutoScroll();
-  }, [autoScrollMode, expandedRows, scheduleAutoScroll, status, turns, width]);
+    applyManagedScroll();
+  }, [anchorRunwayHeight, applyManagedScroll, autoScrollMode, expandedRows, status, turns, width]);
 
   const validActiveTurnIds = activeTurnIds.filter((turnId) => Boolean(turnsById[turnId]));
   const sentAnchorNeedsMaterialization =
@@ -898,7 +1048,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
         >
           {width === null ? null : (
             <VirtualizedTranscriptBody
-              bottomSpacerHeight={spacerRange.bottomSpacerHeight}
+              bottomSpacerHeight={spacerRange.bottomSpacerHeight + anchorRunwayHeight}
               status={status}
               threadId={activeThreadId}
               topSpacerHeight={spacerRange.topSpacerHeight}
@@ -924,50 +1074,26 @@ function isNearBottom(node: HTMLElement) {
 function sameTranscriptAutoScrollMode(left: TranscriptAutoScrollMode, right: TranscriptAutoScrollMode) {
   return left.type === right.type && (
     left.type !== 'sent-message-anchor' ||
-    (right.type === 'sent-message-anchor' && left.turnId === right.turnId)
+    (
+      right.type === 'sent-message-anchor' &&
+      left.phase === right.phase &&
+      left.segmentId === right.segmentId &&
+      left.threadId === right.threadId &&
+      left.turnId === right.turnId
+    )
   );
 }
 
-function autoScrollTarget({
-  expandedRows,
-  mode,
-  topPadding,
-  turns,
-  viewport,
-}: {
-  expandedRows: TranscriptExpandedRow[];
-  mode: TranscriptAutoScrollMode;
-  topPadding: number;
-  turns: TranscriptMeasuredTurn[];
-  viewport: HTMLElement;
-}): { scrollTop: number } | null {
-  if (mode.type === 'bottom') {
-    return { scrollTop: maxScrollableTop(viewport) };
-  }
-
-  if (mode.type !== 'sent-message-anchor') {
-    return null;
-  }
-
-  const desiredScrollTop = anchorTurnUserMessageScrollTop({
-    expandedRows,
-    topPadding,
-    turns,
-    turnId: mode.turnId,
-  });
-
-  if (desiredScrollTop === null) {
-    return null;
-  }
-
-  const maxScrollTop = maxScrollableTop(viewport);
-  const scrollTop = Math.max(0, Math.min(desiredScrollTop, maxScrollTop));
-  return { scrollTop };
-}
-
-function scrollNavigationAvailability(node: HTMLElement, anchors: TranscriptScrollAnchor[]) {
+function scrollNavigationAvailability(
+  node: HTMLElement,
+  anchors: TranscriptScrollAnchor[],
+  mode: TranscriptAutoScrollMode,
+) {
   return {
-    canScrollDown: Boolean(nextScrollAnchor(anchors, node)) || !isNearBottom(node),
+    canScrollDown:
+      Boolean(nextScrollAnchor(anchors, node)) ||
+      !isNearBottom(node) ||
+      mode.type !== 'bottom',
     canScrollUp: Boolean(previousScrollAnchor(anchors, node)),
   };
 }
@@ -1230,6 +1356,7 @@ function userMessageScrollAnchors({
     for (const row of turn.rows) {
       if (row.segment.type === 'userMessage') {
         anchors.push({
+          segmentId: row.segmentId,
           scrollTop: userMessageAnchorScrollTop(rowTop, topPadding),
           turnId: turn.turnId,
         });

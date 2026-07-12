@@ -46,6 +46,9 @@ pub(super) fn user_message_item(payload: &Value, id: &str) -> Value {
     }
 
     json!({
+        // Legacy `user_message` events carry the composer-assigned id as
+        // snake_case `client_id`; live v2 items already use `clientId`.
+        "clientId": payload.get("client_id").and_then(Value::as_str),
         "content": normalize_user_content(Some(&Value::Array(content))),
         "id": id,
         "type": "userMessage",
@@ -222,6 +225,22 @@ fn command_actions(command: &str) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_message_item_carries_client_id() {
+        let item = user_message_item(
+            &json!({
+                "client_id": "client-message-1",
+                "message": "hello",
+            }),
+            "item-1",
+        );
+        assert_eq!(item["clientId"], "client-message-1");
+        assert_eq!(item["id"], "item-1");
+
+        let without = user_message_item(&json!({ "message": "hello" }), "item-2");
+        assert_eq!(without["clientId"], Value::Null);
+    }
 
     #[test]
     fn normalizes_patch_apply_end_change_maps() {

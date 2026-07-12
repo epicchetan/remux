@@ -580,6 +580,8 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
             if (!wasRunning && sendUpdatesTranscript) {
               sentTurnCount += 1;
               sentTurnId = `mock-sent-turn-${sentTurnCount}`;
+              // Match production: the segment id is server-assigned; the
+              // composer's clientMessageId only comes back as clientId.
               const userMessageId = `mock-sent-user-${sentTurnCount}`;
               const userText = (params.parts ?? [])
                 .filter((part) => part.type === 'text')
@@ -592,6 +594,7 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
                 id: sentTurnId,
                 revision: `${sentTurnId}-running-revision`,
                 segments: [{
+                  clientId: params.clientMessageId ?? null,
                   content: [{ text: userText, text_elements: [], type: 'text' }],
                   id: userMessageId,
                   revision: `${userMessageId}-revision`,
@@ -1393,6 +1396,264 @@ test.describe('codex viewer route', () => {
     await expect(page.locator('[data-row-kind="userMessage"][data-turn-id="mock-sent-turn-1"]')).toBeVisible();
   });
 
+  test('keeps a sent user message anchored when work collapses and assistant output starts', async ({ page }) => {
+    const initialTurns = Array.from({ length: 12 }, (_, index) => completedTurn({
+      assistantId: `assistant-anchor-${index}`,
+      assistantText: `completed anchor response ${index}\n\n${'history '.repeat(80)}`,
+      turnId: `turn-anchor-${index}`,
+      userId: `user-anchor-${index}`,
+      userText: `completed anchor prompt ${index}`,
+    }));
+    await installMockRemuxHost(page, {
+      sendUpdatesTranscript: true,
+      transcriptV2: true,
+      turns: initialTurns,
+    });
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    await expect(page.getByText('completed anchor response 11')).toBeVisible();
+
+    const editor = page.locator('.remux-composer-contenteditable');
+    await editor.click();
+    await editor.pressSequentially('message whose anchor survives collapse');
+    await page.getByRole('button', { name: 'Send message' }).click();
+    const sentRow = page.locator('[data-row-kind="userMessage"][data-turn-id="mock-sent-turn-1"]');
+    await expect(sentRow).toBeVisible();
+
+    const publishTurn = async (assistantStarted: boolean) => {
+      await page.evaluate(({ assistantStarted, initialTurns }) => {
+        const mockWindow = window as typeof window & {
+          __remuxDispatchMockHostMessage?: (message: unknown) => void;
+          __remuxSetMockTranscriptTurns?: (turns: CodexTranscriptTurn[]) => void;
+          __remuxWebViewMessages?: HostRequest[];
+        };
+        const sendRequest = [...(mockWindow.__remuxWebViewMessages ?? [])]
+          .reverse()
+          .find((message) => message.method === 'remux/codex/thread/message/send');
+        const clientMessageId = (sendRequest?.params as { clientMessageId?: string } | undefined)?.clientMessageId;
+        if (!clientMessageId) throw new Error('missing client message id');
+        const work = {
+          durationMs: assistantStarted ? 900 : null,
+          hasDetails: true,
+          id: 'work-anchor-live',
+          revision: assistantStarted ? 'work-anchor-complete' : 'work-anchor-running',
+          state: assistantStarted ? 'completed' as const : 'running' as const,
+          timeline: [{
+            id: 'work-anchor-commentary',
+            phase: null,
+            revision: assistantStarted ? 'commentary-complete' : 'commentary-running',
+            text: Array.from({ length: 80 }, (_, index) => `Work line ${index}`).join('\n\n'),
+            type: 'message' as const,
+          }],
+          type: 'work' as const,
+        };
+        const liveTurn: CodexTranscriptTurn = {
+          completedAt: null,
+          durationMs: null,
+          error: null,
+          id: 'mock-sent-turn-1',
+          revision: assistantStarted ? 'anchor-turn-assistant' : 'anchor-turn-work',
+          segments: [
+            {
+              // The authoritative segment keeps its server-assigned id; the
+              // composer id only ever appears as clientId.
+              clientId: clientMessageId,
+              content: [{
+                text: 'message whose anchor survives collapse',
+                text_elements: [],
+                type: 'text',
+              }],
+              id: 'mock-sent-user-1',
+              revision: 'user:mock-sent-user-1',
+              type: 'userMessage',
+            },
+            work,
+            ...(assistantStarted ? [{
+              id: 'assistant-anchor-live',
+              phase: null,
+              revision: 'assistant-anchor-live-revision',
+              text: 'Assistant output has started.',
+              type: 'assistantMessage' as const,
+            }] : []),
+          ],
+          startedAt: Date.now(),
+          status: 'inProgress',
+        };
+        mockWindow.__remuxSetMockTranscriptTurns?.([...initialTurns, liveTurn]);
+        mockWindow.__remuxDispatchMockHostMessage?.({
+          message: {
+            jsonrpc: '2.0',
+            method: 'remux/codex/resources/invalidated',
+            params: {
+              invalidations: [{
+                affectsLayout: true,
+                affectsOrder: false,
+                key: 'transcriptSync:mock-thread-1',
+                reason: 'appServerEvent',
+                threadId: 'mock-thread-1',
+                turnId: 'mock-sent-turn-1',
+                type: 'transcript',
+              }],
+            },
+          },
+          type: 'remux/event',
+        });
+      }, { assistantStarted, initialTurns });
+    };
+
+    await publishTurn(false);
+    await expect(page.getByText('Work line 79')).toBeVisible();
+    const viewport = page.locator('.remux-transcript-viewport');
+    const rowOffset = () => sentRow.evaluate((row) => {
+      const viewport = document.querySelector<HTMLElement>('.remux-transcript-viewport')!;
+      return row.getBoundingClientRect().top - viewport.getBoundingClientRect().top;
+    });
+    await expect.poll(rowOffset).toBeLessThan(80);
+    const anchoredOffset = await rowOffset();
+
+    await viewport.evaluate((node) => node.dispatchEvent(new Event('scrollend')));
+    await page.evaluate(() => {
+      window.dispatchEvent(new MessageEvent('message', {
+        data: JSON.stringify({
+          lifecycle: { epoch: 10, reason: 'appState', state: 'background' },
+          type: 'remux/lifecycle',
+        }),
+      }));
+    });
+    await publishTurn(true);
+    await page.waitForTimeout(150);
+    await expect(page.getByText('Assistant output has started.')).toHaveCount(0);
+    await page.evaluate(() => {
+      window.dispatchEvent(new MessageEvent('message', {
+        data: JSON.stringify({
+          lifecycle: { epoch: 11, reason: 'appState', state: 'active' },
+          type: 'remux/lifecycle',
+        }),
+      }));
+    });
+    await expect(page.getByText('Assistant output has started.')).toBeVisible();
+    await expect.poll(async () => Math.abs((await rowOffset()) - anchoredOffset)).toBeLessThanOrEqual(2);
+  });
+
+  test('releases a sent message anchor pinned in a shrunken viewport once it grows', async ({ page }) => {
+    const initialTurns = Array.from({ length: 6 }, (_, index) => completedTurn({
+      assistantId: `assistant-shrunk-${index}`,
+      assistantText: `completed shrunk response ${index}\n\n${'history '.repeat(40)}`,
+      turnId: `turn-shrunk-${index}`,
+      userId: `user-shrunk-${index}`,
+      userText: `completed shrunk prompt ${index}`,
+    }));
+    await installMockRemuxHost(page, {
+      sendUpdatesTranscript: true,
+      transcriptV2: true,
+      turns: initialTurns,
+    });
+    // Mimic the keyboard-open state: the transcript viewport is at its
+    // smallest exactly when a message is sent.
+    await page.setViewportSize({ height: 360, width: 390 });
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    await expect(page.getByText('completed shrunk response 5')).toBeVisible();
+
+    const editor = page.locator('.remux-composer-contenteditable');
+    await editor.click();
+    await editor.pressSequentially('message pinned only while shrunken');
+    await page.getByRole('button', { name: 'Send message' }).click();
+    const sentRow = page.locator('[data-row-kind="userMessage"][data-turn-id="mock-sent-turn-1"]');
+    await expect(sentRow).toBeVisible();
+
+    const publishWork = async (lineCount: number) => {
+      await page.evaluate(({ initialTurns, lineCount }) => {
+        const mockWindow = window as typeof window & {
+          __remuxDispatchMockHostMessage?: (message: unknown) => void;
+          __remuxSetMockTranscriptTurns?: (turns: CodexTranscriptTurn[]) => void;
+          __remuxWebViewMessages?: HostRequest[];
+        };
+        const sendRequest = [...(mockWindow.__remuxWebViewMessages ?? [])]
+          .reverse()
+          .find((message) => message.method === 'remux/codex/thread/message/send');
+        const clientMessageId = (sendRequest?.params as { clientMessageId?: string } | undefined)?.clientMessageId;
+        if (!clientMessageId) throw new Error('missing client message id');
+        const liveTurn: CodexTranscriptTurn = {
+          completedAt: null,
+          durationMs: null,
+          error: null,
+          id: 'mock-sent-turn-1',
+          revision: `shrunk-turn-${lineCount}`,
+          segments: [
+            {
+              clientId: clientMessageId,
+              content: [{
+                text: 'message pinned only while shrunken',
+                text_elements: [],
+                type: 'text',
+              }],
+              id: 'mock-sent-user-1',
+              revision: 'user:mock-sent-user-1',
+              type: 'userMessage',
+            },
+            {
+              durationMs: null,
+              hasDetails: true,
+              id: 'work-shrunk-live',
+              revision: `work-shrunk-${lineCount}`,
+              state: 'running' as const,
+              timeline: [{
+                id: 'work-shrunk-commentary',
+                phase: null,
+                revision: `commentary-shrunk-${lineCount}`,
+                text: Array.from({ length: lineCount }, (_, index) => `Shrunk work line ${index}`).join('\n\n'),
+                type: 'message' as const,
+              }],
+              type: 'work' as const,
+            },
+          ],
+          startedAt: Date.now(),
+          status: 'inProgress',
+        };
+        mockWindow.__remuxSetMockTranscriptTurns?.([...initialTurns, liveTurn]);
+        mockWindow.__remuxDispatchMockHostMessage?.({
+          message: {
+            jsonrpc: '2.0',
+            method: 'remux/codex/resources/invalidated',
+            params: {
+              invalidations: [{
+                affectsLayout: true,
+                affectsOrder: false,
+                key: 'transcriptSync:mock-thread-1',
+                reason: 'appServerEvent',
+                threadId: 'mock-thread-1',
+                turnId: 'mock-sent-turn-1',
+                type: 'transcript',
+              }],
+            },
+          },
+          type: 'remux/event',
+        });
+      }, { initialTurns, lineCount });
+    };
+
+    const rowOffset = () => sentRow.evaluate((row) => {
+      const viewport = document.querySelector<HTMLElement>('.remux-transcript-viewport')!;
+      return row.getBoundingClientRect().top - viewport.getBoundingClientRect().top;
+    });
+
+    await publishWork(8);
+    await expect(page.getByText('Shrunk work line 7')).toBeVisible();
+    await expect.poll(rowOffset).toBeLessThan(80);
+
+    // The keyboard closes: the viewport grows back and the early pin must
+    // release to bottom-following instead of holding blank runway space.
+    await page.setViewportSize({ height: 900, width: 390 });
+    await expect.poll(rowOffset).toBeGreaterThan(120);
+    const viewport = page.locator('.remux-transcript-viewport');
+    await expect.poll(() => viewport.evaluate((node) =>
+      node.scrollHeight - node.clientHeight - node.scrollTop)).toBeLessThanOrEqual(4);
+
+    // Once real content fills the grown viewport, the anchor pins again.
+    await publishWork(60);
+    await expect(page.getByText('Shrunk work line 59')).toBeVisible();
+    await expect.poll(rowOffset).toBeLessThan(80);
+  });
+
   test('refreshes a visible Version 2 turn from a streaming invalidation', async ({ page }) => {
     const running: CodexTranscriptTurn = {
       ...inProgressUserTurn({ turnId: 'turn-stream-1' }),
@@ -2142,6 +2403,50 @@ test.describe('codex viewer route', () => {
     await expect(page.getByRole('button', { name: 'Fork from response' })).not.toBeVisible();
   });
 
+  test('allows fork and narration but not edit while a turn is running', async ({ page }) => {
+    await installMockRemuxHost(page, {
+      runtime: {
+        activeTurnElapsedMs: 2400,
+        activeTurnId: 'active-turn-1',
+        status: 'running',
+      },
+      turns: [completedTurn()],
+    });
+
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    await expect(page.getByRole('button', { name: 'Stop turn' })).toBeVisible();
+
+    // Editing rolls back the running thread; forking and narrating a
+    // completed response do not touch it.
+    await expect(page.getByRole('button', { name: 'Edit message' })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Fork from response' })).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Narrate response' })).toBeEnabled();
+
+    await page.getByRole('button', { name: 'Narrate response' }).click();
+    const composer = page.locator('[data-remux-composer-root]');
+    await expect(composer.getByRole('button', { name: 'Play narration' })).toBeVisible();
+    await composer.getByRole('button', { name: 'Close narration' }).click();
+
+    await page.getByRole('button', { name: 'Fork from response' }).click();
+    const editor = page.locator('.remux-composer-contenteditable');
+    await editor.click();
+    await editor.pressSequentially('branch while the turn still runs');
+    const sendButton = page.getByRole('button', { name: 'Send forked message' });
+    await expect(sendButton).toBeEnabled();
+    await sendButton.click();
+
+    await expect
+      .poll(() => capturedHostMethods(page))
+      .toContain('remux/codex/thread/message/fork');
+    const requests = await capturedHostRequests(page);
+    const forkRequest = requests.find((request) => request.method === 'remux/codex/thread/message/fork');
+    expect(forkRequest?.params).toMatchObject({
+      assistantMessageId: 'assistant-message-1',
+      threadId: 'mock-thread-1',
+      turnId: 'turn-1',
+    });
+  });
+
   test('renders fork action for every completed assistant response', async ({ page }) => {
     await installMockRemuxHost(page, {
       turns: [
@@ -2506,6 +2811,46 @@ test.describe('codex viewer route', () => {
     });
     await expect.poll(readingPosition).toBeLessThan(0.38);
     expect(await readingPosition()).toBeGreaterThan(0.22);
+  });
+
+  test('taps a narrated block to seek playback to its start', async ({ page }) => {
+    await installMockRemuxHost(page, {
+      turns: [completedTurn({
+        assistantText: 'First narrated block.\n\nSecond narrated block.\n\nThird narrated block.',
+      })],
+    });
+
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    await page.getByRole('button', { name: 'Narrate response' }).click();
+    const composer = page.locator('[data-remux-composer-root]');
+    await expect(composer.getByRole('button', { name: 'Play narration' })).toBeVisible();
+
+    const markdown = page.locator('[data-row-kind="assistantMessage"] .codex-markdown');
+    await expect(markdown.locator('[data-narration-block-id="md:0"] .codex-narration-context-rect')).toBeVisible();
+
+    // Tapping a later block moves the narration focus there without playback.
+    await markdown.locator('[data-narration-block-id="md:2"]').click();
+    await expect(markdown.locator('[data-narration-block-id="md:2"] .codex-narration-context-rect')).toBeVisible();
+    const firstLayer = markdown.locator('[data-narration-block-id="md:0"] .codex-narration-paint-layer');
+    await expect(firstLayer).toHaveAttribute('hidden', '');
+
+    // Tapping while playing seeks and keeps playing from the tapped block.
+    await composer.getByRole('button', { name: 'Play narration' }).click();
+    await expect(composer.getByRole('button', { name: 'Pause narration' })).toBeVisible();
+    await markdown.locator('[data-narration-block-id="md:1"]').click();
+    await expect(markdown.locator('[data-narration-block-id="md:1"] .codex-narration-word-rect')).toBeVisible();
+    await expect(composer.getByRole('button', { name: 'Pause narration' })).toBeVisible();
+
+    // Selected text suppresses tap-to-seek so copying prose does not scrub.
+    await markdown.locator('[data-narration-block-id="md:0"]').evaluate((element) => {
+      const selection = window.getSelection()!;
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    });
+    await markdown.locator('[data-narration-block-id="md:0"]').click({ position: { x: 8, y: 8 } });
+    await expect(markdown.locator('[data-narration-block-id="md:1"] .codex-narration-word-rect')).toBeVisible();
   });
 
   test('sends forked composer content through the fork thread command', async ({ page }) => {

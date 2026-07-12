@@ -310,6 +310,11 @@ export function reconcileTranscriptLayoutFromResources(
 
   const runtime = getThreadRuntimeState();
   const autoOpenTurnId = runtime.status === 'running' || runtime.status === 'stopping' ? runtime.activeTurnId : null;
+  // Resolve locally tracked messages against the authoritative measured rows
+  // before disclosure reconciliation. A queued message that has just become a
+  // real turn should enter managed scroll mode in time for its work section to
+  // use the same auto-open policy as a directly started turn.
+  reconcileTranscriptViewportForLayout(layout.turns, layout.turnsById);
   layoutStore.setState({
     disclosure: reconcileTranscriptDisclosure(previousState.disclosure, layout.turns, autoOpenTurnId, {
       autoWorkManaged: transcriptViewportAllowsAutoWork(previousState.disclosure),
@@ -318,7 +323,6 @@ export function reconcileTranscriptLayoutFromResources(
     turnsById: layout.turnsById,
     width: layout.width,
   });
-  reconcileTranscriptViewportForLayout(layout.turns, layout.turnsById);
 }
 
 export function reconcileTranscriptDisclosure(
