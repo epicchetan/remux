@@ -245,10 +245,9 @@ export function installNarrationPaintController() {
   };
 }
 
-// Code, table, and diagram cues paint at the element level: lighting up
-// individual lines, cells, or nodes inside dense structures reads as noise,
-// so precise targets collapse to their containing block frame. The precise
-// targets stay in the manifest for timing and scroll bounds.
+// Legacy v2 artifacts can still contain line, cell, region, or node cues.
+// New v3 source documents emit one block target for dense structures, while
+// this adapter keeps old cached artifacts painting and scrolling by block.
 function elementLevelPaintTargets(
   targets: CodexNarrationSourceTarget[],
   sourceTargets: CodexNarrationSourceTarget[],

@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 
-use crate::util::stable_revision_value;
 use crate::media::rewrite_render_media;
+use crate::util::stable_revision_value;
 
 const DEFAULT_GROUP_ROWS: usize = 200;
 

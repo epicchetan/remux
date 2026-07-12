@@ -84,6 +84,13 @@ pub enum WorkloadCommand {
         #[arg(long)]
         extension: Option<String>,
     },
+    /// Inspect the managed workload scope containing a process.
+    Inspect {
+        #[arg(long)]
+        pid: u32,
+        #[arg(long)]
+        json: bool,
+    },
     /// Freeze a running workload operation.
     Pause { operation: String },
     /// Thaw a frozen workload operation.
@@ -157,6 +164,7 @@ fn run_inner(cli: Cli) -> Result<i32, String> {
         Command::Workload { command } => match command {
             WorkloadCommand::Capacity => workload::capacity(),
             WorkloadCommand::Status { extension } => workload::status(extension.as_deref()),
+            WorkloadCommand::Inspect { pid, json } => workload::inspect(pid, json),
             WorkloadCommand::Pause { operation } => workload::control(&operation, "freeze"),
             WorkloadCommand::Resume { operation } => workload::control(&operation, "thaw"),
             WorkloadCommand::Stop { operation } => workload::control(&operation, "stop"),

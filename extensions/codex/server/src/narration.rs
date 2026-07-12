@@ -1,15 +1,18 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use remux_compute::{Registry as ComputeRegistry, TaskOptions};
+use remux_tts::{KokoroSynthesis, SynthesisProgress, SynthesisRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::app_server::{AppServerEvent, AppServerRuntime};
 use crate::file_resources::base64_encode;
@@ -20,13 +23,13 @@ use crate::narration_planning::{
     resolve_planning_profile,
 };
 use crate::narration_source_mapping::{normalized_alignment_hints, verbatim_alignment_hints};
+use crate::narration_synthesis::{NarrationSynthesisProfile, resolve_synthesis_profile};
 use crate::resources::CodexTranscriptServer;
 use crate::util::stable_revision_value;
 
 pub(crate) const NARRATION_UPDATED_METHOD: &str = "remux/codex/narration/updated";
-const NARRATION_SOURCE_DOCUMENT_VERSION: &str = "2";
+const NARRATION_SOURCE_DOCUMENT_VERSION: &str = "3";
 const NARRATION_MANIFEST_VERSION: u64 = 2;
-const KOKORO_VOICE: &str = "af_heart";
 const WORKER_POLL: Duration = Duration::from_millis(100);
 const MAX_AUDIO_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -38,12 +41,10 @@ const MAX_SOURCE_ASSOCIATIONS: usize = 32_768;
 const MAX_IDENTIFIER_BYTES: usize = 1_024;
 const MAX_INACTIVE_JOBS: usize = 128;
 const MAX_PLANNING_SUBSCRIPTIONS: usize = 4;
-const MAX_WORKER_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_WORKER_RELAY_EVENTS: usize = 64;
-const MAX_WORKER_RELAY_BYTES: usize = 16 * 1024 * 1024;
-const MAX_WORKER_STDERR_BYTES: u64 = 1024 * 1024;
 const NARRATION_JOB_BUDGET: Duration = Duration::from_secs(15 * 60);
 const NARRATION_STALL_BUDGET: Duration = Duration::from_secs(60);
+const WORKLOAD_INSPECT_AFTER: Duration = Duration::from_secs(2);
+const WORKLOAD_INSPECT_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 pub(crate) struct CodexNarrationServer {
@@ -55,6 +56,7 @@ pub(crate) struct NarrationInner {
     app_server: AppServerRuntime,
     cache_root: PathBuf,
     codex_home: PathBuf,
+    compute: ComputeRegistry,
     diagnostics: Mutex<VecDeque<Value>>,
     jobs: Mutex<HashMap<String, NarrationJob>>,
     output_tx: mpsc::SyncSender<Value>,
@@ -89,6 +91,7 @@ struct NarrationJob {
     revision: u64,
     stage: Option<&'static str>,
     status: NarrationStatus,
+    synthesis_profile: NarrationSynthesisProfile,
     target: NarrationTarget,
     total_units: Option<usize>,
 }
@@ -187,11 +190,13 @@ impl CodexNarrationServer {
         event_rx: mpsc::Receiver<AppServerEvent>,
         output_tx: mpsc::SyncSender<Value>,
         live_transcript: LiveTranscriptStore,
+        compute: ComputeRegistry,
     ) -> Self {
         let inner = Arc::new(NarrationInner {
             app_server,
             cache_root: codex_home.join("remux").join("narration").join("v2"),
             codex_home: codex_home.clone(),
+            compute,
             diagnostics: Mutex::new(VecDeque::new()),
             jobs: Mutex::new(HashMap::new()),
             output_tx,
@@ -224,14 +229,21 @@ impl CodexNarrationServer {
         // capability before lookup so a standard-tier fallback cannot collide
         // with a Priority artifact.
         let planning_profile = resolve_planning_profile(&self.inner)?;
-        let artifact_key = artifact_key(&params, &planning_profile);
+        let synthesis_profile = resolve_synthesis_profile(&self.inner.codex_home)?;
+        let artifact_key = artifact_key(&params, &planning_profile, &synthesis_profile);
         if let Some(manifest) = read_cached_manifest(&self.inner.cache_root, &artifact_key) {
             let mut jobs = self
                 .inner
                 .jobs
                 .lock()
                 .map_err(|_| "narration job store poisoned".to_string())?;
-            let job = NarrationJob::ready(artifact_key.clone(), params, manifest, planning_profile);
+            let job = NarrationJob::ready(
+                artifact_key.clone(),
+                params,
+                manifest,
+                planning_profile,
+                synthesis_profile,
+            );
             let resource = job.resource_value();
             jobs.insert(artifact_key.clone(), job);
             evict_inactive_jobs(&mut jobs, Some(&artifact_key));
@@ -259,7 +271,12 @@ impl CodexNarrationServer {
             return Err("another narration is already being prepared".to_string());
         }
 
-        let job = NarrationJob::planning(artifact_key.clone(), params, planning_profile);
+        let job = NarrationJob::planning(
+            artifact_key.clone(),
+            params,
+            planning_profile,
+            synthesis_profile,
+        );
         let resource = job.resource_value();
         jobs.insert(artifact_key.clone(), job);
         evict_inactive_jobs(&mut jobs, Some(&artifact_key));
@@ -477,7 +494,7 @@ impl NarrationInner {
         self.update_job(artifact_key, |job| job.planning_turns.push(identity));
     }
 
-    pub(crate) fn record_planning_diagnostic(&self, diagnostic: Value) {
+    pub(crate) fn record_narration_diagnostic(&self, diagnostic: Value) {
         if let Ok(mut diagnostics) = self.diagnostics.lock() {
             diagnostics.push_back(diagnostic);
             while diagnostics.len() > 50 {
@@ -538,6 +555,7 @@ impl NarrationJob {
         artifact_key: String,
         params: NarrationStartParams,
         planning_profile: NarrationPlanningProfile,
+        synthesis_profile: NarrationSynthesisProfile,
     ) -> Self {
         Self {
             artifact_key,
@@ -552,6 +570,7 @@ impl NarrationJob {
             revision: 1,
             stage: Some("planning"),
             status: NarrationStatus::Planning,
+            synthesis_profile,
             target: params.target,
             total_units: None,
         }
@@ -562,6 +581,7 @@ impl NarrationJob {
         params: NarrationStartParams,
         manifest: Value,
         planning_profile: NarrationPlanningProfile,
+        synthesis_profile: NarrationSynthesisProfile,
     ) -> Self {
         Self {
             artifact_key,
@@ -576,6 +596,7 @@ impl NarrationJob {
             revision: 1,
             stage: None,
             status: NarrationStatus::Ready,
+            synthesis_profile,
             target: params.target,
             total_units: None,
         }
@@ -632,7 +653,7 @@ fn run_narration_job_inner(
     inner: &Arc<NarrationInner>,
     artifact_key: &str,
 ) -> Result<Value, String> {
-    let (document, planning_profile, source_hash) = {
+    let (document, planning_profile, synthesis_profile, source_hash) = {
         let jobs = inner
             .jobs
             .lock()
@@ -641,9 +662,11 @@ fn run_narration_job_inner(
         (
             job.document.clone(),
             job.planning_profile.clone(),
+            job.synthesis_profile.clone(),
             job.target.source_hash.clone(),
         )
     };
+    ensure_native_synthesis_assets(&synthesis_profile)?;
     let plan = build_narration_plan_v3(inner, artifact_key, &document, &planning_profile)?;
     if inner.cancelled(artifact_key) {
         return Err("narration cancelled".to_string());
@@ -668,7 +691,7 @@ fn run_narration_job_inner(
     fs::create_dir_all(temp_dir.join("audio"))
         .map_err(|error| format!("failed to create narration temporary directory: {error}"))?;
 
-    let profile = planning_profile.provider_descriptor();
+    let profile = planning_profile.provider_descriptor(synthesis_profile.descriptor.clone());
     let source_document_key = stable_revision_value(
         &serde_json::to_value(&document)
             .map_err(|error| format!("failed to encode narration source document: {error}"))?,
@@ -704,7 +727,7 @@ fn run_narration_job_inner(
         "scriptKey": script_key,
         "sourceDocumentKey": source_document_key,
     }));
-    let worker_result = run_kokoro_worker(
+    let worker_result = run_native_synthesis_worker(
         inner,
         artifact_key,
         &temp_dir,
@@ -716,6 +739,7 @@ fn run_narration_job_inner(
         &script_key,
         &audio_key,
         &alignment_key,
+        &synthesis_profile,
     );
     let manifest = match worker_result {
         Ok(manifest) => manifest,
@@ -725,6 +749,23 @@ fn run_narration_job_inner(
         }
     };
     validate_manifest(&manifest, &temp_dir, artifact_key, &source_hash)?;
+    if let Some(metrics) = manifest.get("synthesisMetrics") {
+        inner.record_narration_diagnostic(json!({
+            "artifactKey": artifact_key,
+            "backend": synthesis_profile.descriptor.get("provider"),
+            "metrics": metrics,
+            "phase": "synthesis",
+            "profileHash": stable_revision_value(&synthesis_profile.descriptor),
+        }));
+        eprintln!(
+            "[codex:narration] synthesis backend={} metrics={metrics}",
+            synthesis_profile
+                .descriptor
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        );
+    }
     if inner.cancelled(artifact_key) {
         let _ = fs::remove_dir_all(&temp_dir);
         return Err("narration cancelled".to_string());
@@ -818,7 +859,53 @@ fn build_narration_plan_v3(
     Ok(units)
 }
 
-fn run_kokoro_worker(
+fn verify_synthesis_assets(directory: &Path, expected: &Value) -> Result<(), String> {
+    let assets = expected
+        .as_object()
+        .ok_or_else(|| "narration model asset descriptor is invalid".to_string())?;
+    for (name, digest) in assets {
+        let expected_digest = digest
+            .as_str()
+            .ok_or_else(|| format!("narration model hash is invalid for {name}"))?;
+        let path = directory.join(name);
+        let mut file = fs::File::open(&path)
+            .map_err(|error| format!("narration model asset {name} is missing: {error}"))?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 1024 * 1024];
+        loop {
+            let count = file.read(&mut buffer).map_err(|error| {
+                format!("failed to verify narration model asset {name}: {error}")
+            })?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        let actual = format!("{:x}", hasher.finalize());
+        if actual != expected_digest {
+            return Err(format!("narration model asset {name} failed verification"));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_native_synthesis_assets(
+    synthesis_profile: &NarrationSynthesisProfile,
+) -> Result<(), String> {
+    if !synthesis_profile.assets_ready() {
+        return Err(format!(
+            "native Kokoro model assets are not installed at {}",
+            synthesis_profile.model_dir.display()
+        ));
+    }
+    verify_synthesis_assets(
+        &synthesis_profile.model_dir,
+        &synthesis_profile.model_assets,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_native_synthesis_worker(
     inner: &NarrationInner,
     artifact_key: &str,
     temp_dir: &Path,
@@ -830,265 +917,157 @@ fn run_kokoro_worker(
     script_key: &str,
     audio_key: &str,
     alignment_key: &str,
+    synthesis_profile: &NarrationSynthesisProfile,
 ) -> Result<Value, String> {
-    let python = narration_python(&inner.codex_home);
-    let worker = narration_worker_path();
-    if !worker.is_file() {
-        return Err(format!("Kokoro worker is missing at {}", worker.display()));
-    }
-    let mut command = if let Ok(wrapper) = std::env::var("REMUX_WORKLOAD_EXEC") {
-        let mut command = Command::new(wrapper);
-        command.args([
-            "workload",
-            "exec",
-            "--workload",
-            "narration",
-            "--operation",
-            &format!("narration:{artifact_key}"),
-            "--threads",
-            "7",
-            "--",
-        ]);
-        command.arg(&python).arg(&worker);
-        command
-    } else {
-        let mut command = Command::new(&python);
-        command.arg(&worker);
-        command
-    };
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            format!(
-                "failed to start Kokoro worker with {}: {error}",
-                python.display()
-            )
-        })?;
-    let request = json!({
+    let request: SynthesisRequest = serde_json::from_value(json!({
         "alignmentKey": alignment_key,
         "artifactKey": artifact_key,
         "audioKey": audio_key,
-        "capabilities": ["raw-token-timing", "spoken-character-offsets", "renderer-target-cues"],
-        "operation": "synthesize",
+        "modelDir": synthesis_profile.model_dir,
+        "modelAssets": synthesis_profile.model_assets,
         "outputDir": temp_dir,
         "profile": profile,
-        "protocolVersion": 2,
         "script": script,
         "scriptKey": script_key,
         "sourceDocumentKey": source_document_key,
         "sourceHash": source_hash,
         "targets": targets,
-        "voice": KOKORO_VOICE,
-    });
-    let encoded_request = serde_json::to_vec(&request)
-        .map_err(|error| format!("failed to encode Kokoro request: {error}"))?;
-    if encoded_request.len() > MAX_WORKER_MESSAGE_BYTES {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(format!(
-            "Kokoro request is too large: {}>{MAX_WORKER_MESSAGE_BYTES}",
-            encoded_request.len()
-        ));
-    }
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| "Kokoro worker stdin unavailable".to_string())?
-        .write_all(&encoded_request)
-        .and_then(|_| child.stdin.as_mut().unwrap().write_all(b"\n"))
-        .map_err(|error| format!("failed to send Kokoro request: {error}"))?;
-    drop(child.stdin.take());
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Kokoro worker stdout unavailable".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "Kokoro worker stderr unavailable".to_string())?;
-    let (line_tx, line_rx) = mpsc::sync_channel::<WorkerLine>(MAX_WORKER_RELAY_EVENTS);
-    let (reader_error_tx, reader_error_rx) = mpsc::sync_channel::<String>(1);
-    let relay_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let reader_relay_bytes = relay_bytes.clone();
-    thread::spawn(move || {
-        read_bounded_worker_lines(stdout, line_tx, reader_error_tx, reader_relay_bytes);
-    });
-    let (stderr_tx, stderr_rx) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stderr
-            .take(MAX_WORKER_STDERR_BYTES + 1)
-            .read_to_end(&mut bytes);
-        let truncated = bytes.len() as u64 > MAX_WORKER_STDERR_BYTES;
-        bytes.truncate(MAX_WORKER_STDERR_BYTES as usize);
-        let mut text = String::from_utf8_lossy(&bytes).into_owned();
-        if truncated {
-            text.push_str("\n[stderr truncated]");
-        }
-        let _ = stderr_tx.send(text);
-    });
-
-    let mut manifest = None;
-    let mut last_progress_update = std::time::Instant::now() - Duration::from_secs(1);
-    let job_started = std::time::Instant::now();
-    let mut last_worker_progress = job_started;
+    }))
+    .map_err(|error| format!("failed to create native TTS request: {error}"))?;
+    let mut task = inner
+        .compute
+        .spawn::<KokoroSynthesis>(
+            TaskOptions::new("narration", format!("narration:{artifact_key}")),
+            request,
+        )
+        .map_err(|error| format!("failed to start native TTS task: {error}"))?;
+    let mut last_progress_update = Instant::now() - Duration::from_secs(1);
+    let mut last_tick = Instant::now();
+    let mut active_clock = ActiveWorkerClock::default();
+    let mut last_inspect = Instant::now() - WORKLOAD_INSPECT_INTERVAL;
+    let mut inspect_warned = false;
     loop {
+        let now = Instant::now();
+        active_clock.advance(now.saturating_duration_since(last_tick));
+        last_tick = now;
         if inner.cancelled(artifact_key) {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = task.cancel();
             return Err("narration cancelled".to_string());
         }
-        if job_started.elapsed() >= NARRATION_JOB_BUDGET {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("narration job deadline exceeded".to_string());
-        }
-        if last_worker_progress.elapsed() >= NARRATION_STALL_BUDGET {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("Kokoro worker made no progress for 60 seconds".to_string());
-        }
-        if let Ok(error) = reader_error_rx.try_recv() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-        while let Ok(line) = line_rx.try_recv() {
-            relay_bytes.fetch_sub(line.bytes, std::sync::atomic::Ordering::SeqCst);
-            let Ok(event) = serde_json::from_str::<Value>(&line.text) else {
-                continue;
-            };
-            last_worker_progress = std::time::Instant::now();
-            match event.get("type").and_then(Value::as_str) {
-                Some("progress") => {
-                    let completed = event
-                        .get("completed")
-                        .and_then(Value::as_u64)
-                        .map(|value| value as usize);
-                    let total = event
-                        .get("total")
-                        .and_then(Value::as_u64)
-                        .map(|value| value as usize);
-                    if last_progress_update.elapsed() >= Duration::from_millis(500)
-                        || completed == total
-                    {
-                        inner.update_job(artifact_key, |job| {
-                            job.completed_units = completed;
-                            job.total_units = total;
-                        });
-                        last_progress_update = std::time::Instant::now();
+        if active_clock.stall_time >= WORKLOAD_INSPECT_AFTER
+            && last_inspect.elapsed() >= WORKLOAD_INSPECT_INTERVAL
+        {
+            match inspect_workload_state(task.id()) {
+                Ok(WorkloadState::Frozen) => active_clock.set_frozen(true),
+                Ok(WorkloadState::Running | WorkloadState::Missing) => {
+                    active_clock.set_frozen(false)
+                }
+                Err(error) => {
+                    active_clock.set_frozen(false);
+                    if !inspect_warned {
+                        eprintln!(
+                            "[codex:narration] compute inspection failed pid={}: {error}",
+                            task.id()
+                        );
+                        inspect_warned = true;
                     }
                 }
-                Some("done") => manifest = event.get("manifest").cloned(),
-                Some("error") => {
-                    let message = event
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Kokoro worker failed");
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(message.to_string());
-                }
-                _ => {}
             }
+            last_inspect = Instant::now();
         }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                while let Ok(line) = line_rx.try_recv() {
-                    relay_bytes.fetch_sub(line.bytes, std::sync::atomic::Ordering::SeqCst);
-                    if let Ok(event) = serde_json::from_str::<Value>(&line.text)
-                        && event.get("type").and_then(Value::as_str) == Some("done")
-                    {
-                        manifest = event.get("manifest").cloned();
-                    }
-                }
-                if status.success() {
-                    return manifest
-                        .ok_or_else(|| "Kokoro worker completed without a manifest".to_string());
-                }
-                let stderr = stderr_rx
-                    .recv_timeout(Duration::from_millis(100))
-                    .unwrap_or_default();
-                return Err(if stderr.trim().is_empty() {
-                    format!("Kokoro worker exited with {status}")
-                } else {
-                    format!("Kokoro worker exited with {status}: {stderr}")
+        if let Some(kind) = active_clock.expired(NARRATION_JOB_BUDGET, NARRATION_STALL_BUDGET) {
+            let _ = task.cancel();
+            return Err(match kind {
+                "job" => "narration job deadline exceeded".to_string(),
+                _ => "native TTS task made no progress for 60 seconds".to_string(),
+            });
+        }
+        while let Some(SynthesisProgress { completed, total }) = task
+            .try_progress()
+            .map_err(|error| format!("native TTS task failed: {error}"))?
+        {
+            active_clock.progress();
+            if last_progress_update.elapsed() >= Duration::from_millis(500) || completed == total {
+                inner.update_job(artifact_key, |job| {
+                    job.completed_units = Some(completed);
+                    job.total_units = Some(total);
                 });
+                last_progress_update = Instant::now();
             }
-            Ok(None) => thread::sleep(WORKER_POLL),
-            Err(error) => return Err(format!("failed to poll Kokoro worker: {error}")),
         }
+        if let Some(output) = task
+            .try_join()
+            .map_err(|error| format!("native TTS task failed: {error}"))?
+        {
+            return Ok(output.manifest);
+        }
+        thread::sleep(WORKER_POLL);
     }
 }
 
-struct WorkerLine {
-    bytes: usize,
-    text: String,
+#[derive(Debug, Default)]
+struct ActiveWorkerClock {
+    frozen: bool,
+    job_time: Duration,
+    stall_time: Duration,
 }
 
-fn read_bounded_worker_lines(
-    stdout: impl Read,
-    line_tx: mpsc::SyncSender<WorkerLine>,
-    error_tx: mpsc::SyncSender<String>,
-    relay_bytes: Arc<std::sync::atomic::AtomicUsize>,
-) {
-    let mut reader = BufReader::new(stdout);
-    let mut line = Vec::new();
-    loop {
-        let buffer = match reader.fill_buf() {
-            Ok(buffer) => buffer,
-            Err(error) => {
-                let _ = error_tx.try_send(format!("failed to read Kokoro output: {error}"));
-                return;
-            }
-        };
-        if buffer.is_empty() {
-            if !line.is_empty() {
-                let _ = error_tx.try_send("Kokoro output ended without a newline".to_string());
-            }
+impl ActiveWorkerClock {
+    fn advance(&mut self, elapsed: Duration) {
+        if self.frozen {
             return;
         }
-        let newline = buffer.iter().position(|byte| *byte == b'\n');
-        let consumed = newline.map_or(buffer.len(), |index| index + 1);
-        let payload_len = newline.unwrap_or(buffer.len());
-        if line.len().saturating_add(payload_len) > MAX_WORKER_MESSAGE_BYTES {
-            let _ = error_tx.try_send(format!(
-                "Kokoro output event exceeds {MAX_WORKER_MESSAGE_BYTES} bytes"
-            ));
-            return;
-        }
-        line.extend_from_slice(&buffer[..payload_len]);
-        reader.consume(consumed);
-        if newline.is_none() {
-            continue;
-        }
+        self.job_time = self.job_time.saturating_add(elapsed);
+        self.stall_time = self.stall_time.saturating_add(elapsed);
+    }
 
-        let bytes = line.len();
-        let previous = relay_bytes.fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
-        if previous.saturating_add(bytes) > MAX_WORKER_RELAY_BYTES {
-            relay_bytes.fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
-            let _ = error_tx.try_send(format!(
-                "Kokoro output relay exceeds {MAX_WORKER_RELAY_BYTES} bytes"
-            ));
-            return;
+    fn expired(&self, job_budget: Duration, stall_budget: Duration) -> Option<&'static str> {
+        if self.frozen {
+            None
+        } else if self.job_time >= job_budget {
+            Some("job")
+        } else if self.stall_time >= stall_budget {
+            Some("stall")
+        } else {
+            None
         }
-        let text = match String::from_utf8(std::mem::take(&mut line)) {
-            Ok(text) => text,
-            Err(_) => {
-                relay_bytes.fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
-                let _ = error_tx.try_send("Kokoro output is not UTF-8".to_string());
-                return;
-            }
-        };
-        if line_tx.try_send(WorkerLine { bytes, text }).is_err() {
-            relay_bytes.fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
-            let _ = error_tx.try_send("Kokoro output event relay is full".to_string());
-            return;
-        }
+    }
+
+    fn progress(&mut self) {
+        self.frozen = false;
+        self.stall_time = Duration::ZERO;
+    }
+
+    fn set_frozen(&mut self, frozen: bool) {
+        self.frozen = frozen;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkloadState {
+    Frozen,
+    Missing,
+    Running,
+}
+
+fn inspect_workload_state(pid: u32) -> Result<WorkloadState, String> {
+    let Some(wrapper) = env::var_os("REMUX_WORKLOAD_EXEC") else {
+        return Ok(WorkloadState::Missing);
+    };
+    let output = Command::new(wrapper)
+        .args(["workload", "inspect", "--pid", &pid.to_string(), "--json"])
+        .output()
+        .map_err(|error| format!("failed to start workload inspection: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("invalid workload inspection output: {error}"))?;
+    match value.get("state").and_then(Value::as_str) {
+        Some("frozen") => Ok(WorkloadState::Frozen),
+        Some("running") => Ok(WorkloadState::Running),
+        Some("missing") => Ok(WorkloadState::Missing),
+        _ => Err("workload inspection returned an unknown state".to_string()),
     }
 }
 
@@ -1219,6 +1198,14 @@ fn validate_start_params(params: &NarrationStartParams) -> Result<(), String> {
             return Err(format!("duplicate narration target id {id}"));
         }
         validate_source_target(target)?;
+        if matches!(
+            target.get("kind").and_then(Value::as_str),
+            Some("tableCell" | "tableRegion" | "codeLines" | "diagramNode")
+        ) {
+            return Err(format!(
+                "narration source document v3 contains legacy structural target {id}"
+            ));
+        }
     }
     for block in &params.document.blocks {
         non_empty(&block.id, "block.id")?;
@@ -1345,11 +1332,12 @@ fn evict_inactive_jobs(jobs: &mut HashMap<String, NarrationJob>, preserve: Optio
 fn artifact_key(
     params: &NarrationStartParams,
     planning_profile: &NarrationPlanningProfile,
+    synthesis_profile: &NarrationSynthesisProfile,
 ) -> String {
     stable_revision_value(&json!({
         "document": params.document,
         "manifestVersion": NARRATION_MANIFEST_VERSION,
-        "profile": planning_profile.provider_descriptor(),
+        "profile": planning_profile.provider_descriptor(synthesis_profile.descriptor.clone()),
         "sourceText": params.source_text,
     }))
 }
@@ -1543,8 +1531,15 @@ fn validate_manifest(
         ) {
             return Err(format!("narration manifest unit {id} has an invalid mode"));
         }
+        let mode = unit
+            .get("mode")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("narration manifest unit {id} has an invalid mode"))?;
         if unit_bounds
-            .insert(id, (start, end, spoken_text.encode_utf16().count() as u64))
+            .insert(
+                id,
+                (start, end, spoken_text.encode_utf16().count() as u64, mode),
+            )
             .is_some()
         {
             return Err(format!("narration manifest duplicated unit {id}"));
@@ -1570,6 +1565,7 @@ fn validate_manifest(
         .ok_or_else(|| "narration manifest missing cues".to_string())?;
     let mut cued_units = HashSet::new();
     let mut cue_ids = HashSet::new();
+    let mut summary_cue_counts = HashMap::<&str, usize>::new();
     let mut previous_start = 0.0;
     for cue in cues {
         let unit_id = cue
@@ -1584,7 +1580,7 @@ fn validate_manifest(
         if !cue_ids.insert(cue_id) {
             return Err(format!("narration manifest duplicated cue {cue_id}"));
         }
-        let (unit_start, unit_end, spoken_length) = unit_bounds
+        let (unit_start, unit_end, spoken_length, unit_mode) = unit_bounds
             .get(unit_id)
             .ok_or_else(|| format!("narration cue references unknown unit {unit_id}"))?;
         let start = finite_number(cue.get("start"), "cue start")?;
@@ -1651,6 +1647,20 @@ fn validate_manifest(
         {
             return Err("narration cue references an unknown target".to_string());
         }
+        if *unit_mode == "summary" {
+            *summary_cue_counts.entry(unit_id).or_default() += 1;
+            if cue.get("granularity").and_then(Value::as_str) != Some("block")
+                || cue.get("origin").and_then(Value::as_str) != Some("fallback")
+                || (start - unit_start).abs() > 0.001
+                || (end - unit_end).abs() > 0.001
+                || spoken_start != 0
+                || spoken_end != *spoken_length
+            {
+                return Err(format!(
+                    "narration summary unit {unit_id} must use one whole-block cue"
+                ));
+            }
+        }
         cued_units.insert(unit_id);
         previous_start = start;
     }
@@ -1659,6 +1669,11 @@ fn validate_manifest(
         .any(|unit_id| !cued_units.contains(unit_id))
     {
         return Err("narration manifest contains a unit without a visual cue".to_string());
+    }
+    if unit_bounds.iter().any(|(unit_id, (_, _, _, mode))| {
+        *mode == "summary" && summary_cue_counts.get(unit_id).copied() != Some(1)
+    }) {
+        return Err("narration manifest summary unit must contain exactly one cue".to_string());
     }
     Ok(())
 }
@@ -1741,38 +1756,6 @@ fn cleanup_temporary_artifacts(cache_root: &Path) {
     }
 }
 
-fn narration_worker_path() -> PathBuf {
-    env::var_os("REMUX_CODEX_NARRATION_WORKER")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join("narration")
-                .join("kokoro_worker.py")
-        })
-}
-
-fn narration_python(codex_home: &Path) -> PathBuf {
-    if let Some(path) = env::var_os("REMUX_KOKORO_PYTHON") {
-        return PathBuf::from(path);
-    }
-    let managed = codex_home
-        .join("remux")
-        .join("narration")
-        .join("runtime")
-        .join("bin")
-        .join("python");
-    if managed.is_file() {
-        return managed;
-    }
-    let development = PathBuf::from("/tmp/remux-kokoro-venv/bin/python");
-    if development.is_file() {
-        return development;
-    }
-    PathBuf::from("python3")
-}
-
 fn non_empty<'a>(value: &'a str, field: &str) -> Result<&'a str, String> {
     let value = value.trim();
     if value.is_empty() {
@@ -1804,8 +1787,9 @@ mod tests {
     fn artifact_key_changes_with_source_content() {
         let params = sample_params("one");
         let profile = sample_profile();
-        let first = artifact_key(&params, &profile);
-        let second = artifact_key(&sample_params("two"), &profile);
+        let synthesis = sample_synthesis_profile("onnxruntime");
+        let first = artifact_key(&params, &profile, &synthesis);
+        let second = artifact_key(&sample_params("two"), &profile, &synthesis);
         assert_ne!(first, second);
         assert!(safe_component(&first));
     }
@@ -1825,15 +1809,97 @@ mod tests {
     }
 
     #[test]
+    fn source_document_v3_rejects_legacy_structural_targets() {
+        let mut params = sample_params("one");
+        params.document.targets.push(json!({
+            "blockId": "md:0",
+            "id": "md:0/target/line/0",
+            "kind": "codeLines",
+            "lineEnd": 0,
+            "lineStart": 0,
+        }));
+        params.document.blocks[0]
+            .target_ids
+            .push("md:0/target/line/0".to_string());
+        assert!(
+            validate_start_params(&params)
+                .unwrap_err()
+                .contains("legacy structural target")
+        );
+    }
+
+    #[test]
     fn artifact_key_separates_priority_and_standard_profiles() {
         let params = sample_params("one");
         let priority = sample_profile();
         let mut standard = priority.clone();
         standard.service_tier = crate::narration_planning::PlanningServiceTier::Standard;
+        let synthesis = sample_synthesis_profile("onnxruntime");
         assert_ne!(
-            artifact_key(&params, &priority),
-            artifact_key(&params, &standard)
+            artifact_key(&params, &priority, &synthesis),
+            artifact_key(&params, &standard, &synthesis)
         );
+    }
+
+    #[test]
+    fn artifact_key_separates_synthesis_profiles() {
+        let params = sample_params("one");
+        let planning = sample_profile();
+        assert_ne!(
+            artifact_key(
+                &params,
+                &planning,
+                &sample_synthesis_profile("onnxruntime-rust-v1")
+            ),
+            artifact_key(
+                &params,
+                &planning,
+                &sample_synthesis_profile("onnxruntime-rust-v2")
+            )
+        );
+    }
+
+    #[test]
+    fn synthesis_asset_verification_rejects_corruption() {
+        let directory = env::temp_dir().join(format!(
+            "remux-narration-asset-test-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("model.onnx"), b"model").unwrap();
+        let expected = json!({
+            "model.onnx": "9372c470eeadd5ecd9c3c74c2b3cb633f8e2f2fad799250a0f70d652b6b825e4"
+        });
+        assert!(verify_synthesis_assets(&directory, &expected).is_ok());
+        fs::write(directory.join("model.onnx"), b"corrupt").unwrap();
+        assert!(
+            verify_synthesis_assets(&directory, &expected)
+                .unwrap_err()
+                .contains("failed verification")
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn frozen_worker_time_does_not_consume_deadlines() {
+        let mut clock = ActiveWorkerClock::default();
+        clock.advance(Duration::from_secs(59));
+        clock.set_frozen(true);
+        clock.advance(Duration::from_secs(120));
+        assert_eq!(
+            clock.expired(Duration::from_secs(900), Duration::from_secs(60)),
+            None
+        );
+        clock.set_frozen(false);
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(
+            clock.expired(Duration::from_secs(900), Duration::from_secs(60)),
+            Some("stall")
+        );
+        clock.progress();
+        assert_eq!(clock.stall_time, Duration::ZERO);
+        assert_eq!(clock.job_time, Duration::from_secs(60));
     }
 
     fn sample_params(text: &str) -> NarrationStartParams {
@@ -1848,7 +1914,7 @@ mod tests {
                     path: "0".to_string(),
                     target_ids: vec!["md:0/target/block".to_string()],
                 }],
-                document_version: "2".to_string(),
+                document_version: "3".to_string(),
                 message_id: "assistant".to_string(),
                 message_revision: "revision".to_string(),
                 schema_version: 2,
@@ -1878,9 +1944,24 @@ mod tests {
             effort: "low",
             reasoning_summary: "none",
             context_profile_version: "1",
-            base_instructions_version: "1",
-            prompt_version: "5",
-            contract_version: 2,
+            base_instructions_version: "2",
+            prompt_version: "6",
+            contract_version: 3,
+        }
+    }
+
+    fn sample_synthesis_profile(provider: &str) -> NarrationSynthesisProfile {
+        NarrationSynthesisProfile {
+            descriptor: json!({
+                "provider": provider,
+                "model": "hexgrad/Kokoro-82M",
+                "modelRevision": "fixture",
+                "optionsVersion": "3",
+                "sampleRate": 24_000,
+                "voice": "af_heart",
+            }),
+            model_assets: json!({}),
+            model_dir: PathBuf::new(),
         }
     }
 }

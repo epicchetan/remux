@@ -328,23 +328,32 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
         turnId: mode.turnId,
         turns: turnsRef.current,
       });
-      if (desiredScrollTop === null) {
+      if (desiredScrollTop === null && mode.phase !== 'catching-up') {
         return;
       }
-      const resolution = resolveSentMessageScroll({
-        currentScrollTop: viewport.scrollTop,
-        desiredScrollTop,
-        naturalMaxScrollTop,
-        phase: mode.phase,
-        runwayHeight: anchorRunwayHeightRef.current,
-        viewportGrew,
-        wasPinned: anchorPinnedSegmentIdRef.current === mode.segmentId,
-      });
-      anchorPinnedSegmentIdRef.current = resolution.phase === 'anchored' ? mode.segmentId : null;
-      targetScrollTop = resolution.scrollTop;
-      nextRunwayHeight = resolution.runwayHeight;
-      if (resolution.phase !== mode.phase) {
-        setViewportAutoScrollMode({ ...mode, phase: resolution.phase }, 'mount-stickiness');
+      if (desiredScrollTop === null) {
+        // The anchor row is not measured yet — a fork or new thread whose
+        // turn has not reached the transcript. Catching-up follows the
+        // bottom until the message can be anchored; the anchored phase keeps
+        // its early return so a pinned view is never yanked by a transiently
+        // missing row.
+        anchorPinnedSegmentIdRef.current = null;
+      } else {
+        const resolution = resolveSentMessageScroll({
+          currentScrollTop: viewport.scrollTop,
+          desiredScrollTop,
+          naturalMaxScrollTop,
+          phase: mode.phase,
+          runwayHeight: anchorRunwayHeightRef.current,
+          viewportGrew,
+          wasPinned: anchorPinnedSegmentIdRef.current === mode.segmentId,
+        });
+        anchorPinnedSegmentIdRef.current = resolution.phase === 'anchored' ? mode.segmentId : null;
+        targetScrollTop = resolution.scrollTop;
+        nextRunwayHeight = resolution.runwayHeight;
+        if (resolution.phase !== mode.phase) {
+          setViewportAutoScrollMode({ ...mode, phase: resolution.phase }, 'mount-stickiness');
+        }
       }
     } else {
       anchorPinnedSegmentIdRef.current = null;
@@ -1007,6 +1016,22 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     }
 
     initialScrollThreadIdRef.current = activeThreadId;
+    const currentMode = autoScrollModeRef.current;
+    if (currentMode.type === 'sent-message-anchor' && currentMode.threadId === activeThreadId) {
+      // A send intent (fork, new thread) predates this mount and the on-load
+      // heuristic must not clobber it: the anchor row may not even be in the
+      // transcript yet. Start at the bottom and let the managed scroll own
+      // positioning from here.
+      programmaticScrollRef.current = true;
+      viewport.scrollTop = maxScrollableTop(viewport);
+      lastScrollTopRef.current = viewport.scrollTop;
+      window.requestAnimationFrame(() => {
+        programmaticScrollRef.current = false;
+      });
+      scheduleRangeUpdate();
+      scheduleAutoScroll();
+      return;
+    }
     const initialTarget = initialTranscriptScrollTarget({
       anchors: navigationAnchors,
       streamingTurnId,
@@ -1028,6 +1053,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     navigationAnchors,
     runtimeResourceStatus,
     runtimeThreadId,
+    scheduleAutoScroll,
     scheduleRangeUpdate,
     setViewportAutoScrollMode,
     status,

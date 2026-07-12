@@ -1167,9 +1167,7 @@ mod tests {
         let validator = RecordingForkTargetValidator::rejecting(
             "assistantMessageId projected-assistant was not found in turn turn-target",
         );
-        let app_server = FakeAppServer::new(vec![
-            Ok(json!({ "thread": { "id": "thread-1" } })),
-        ]);
+        let app_server = FakeAppServer::new(vec![Ok(json!({ "thread": { "id": "thread-1" } }))]);
         let server = CodexThreadCommandServer::with_requester_and_fork_target_validator(
             app_server.clone(),
             validator,

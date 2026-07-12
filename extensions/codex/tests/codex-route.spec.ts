@@ -727,6 +727,10 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
               turnId: 'mock-new-turn-1',
             };
           case 'remux/codex/thread/message/fork':
+            // A fork starts a turn on the new thread immediately.
+            runtime.activeTurnElapsedMs = 0;
+            runtime.activeTurnId = 'mock-fork-turn-1';
+            runtime.status = 'running';
             return {
               invalidations: [
                 {
@@ -739,6 +743,12 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
                   reason: 'forkAccepted',
                   threadId: 'mock-fork-thread-1',
                   type: 'threadSummary',
+                },
+                {
+                  key: 'threadRuntime:mock-fork-thread-1',
+                  reason: 'forkAccepted',
+                  threadId: 'mock-fork-thread-1',
+                  type: 'threadRuntime',
                 },
                 {
                   key: 'threadTranscript:mock-fork-thread-1',
@@ -2749,7 +2759,8 @@ test.describe('codex viewer route', () => {
     await page.getByRole('button', { name: 'Narrate response' }).click();
     const startRequest = (await capturedHostRequests(page)).find((request) => request.method === 'remux/codex/narration/start');
     const sourceTargets = (startRequest?.params as { document?: { targets?: Array<{ kind?: string }> } })?.document?.targets ?? [];
-    expect(sourceTargets.some((target) => target.kind === 'tableCell')).toBe(true);
+    // Element-level narration: the document carries no per-cell targets.
+    expect(sourceTargets.every((target) => target.kind !== 'tableCell')).toBe(true);
     await expect(markdown.locator('.codex-md-table')).toHaveClass(/codex-md-structural-target-narrating/);
     await expect(markdown.locator('.codex-md-table-scroll')).not.toHaveClass(/codex-md-structural-target-narrating/);
     await page.locator('[data-remux-composer-root]').getByRole('button', { name: 'Play narration' }).click();
@@ -2933,6 +2944,124 @@ test.describe('codex viewer route', () => {
       threadId: 'mock-thread-1',
       turnId: 'turn-1',
     });
+  });
+
+  test('anchors a forked message instead of landing on the previous message', async ({ page }) => {
+    const initialTurns = Array.from({ length: 5 }, (_, index) => completedTurn({
+      assistantId: `assistant-fork-${index}`,
+      assistantText: `completed fork response ${index}\n\n${'history '.repeat(80)}`,
+      turnId: `turn-fork-${index}`,
+      userId: `user-fork-${index}`,
+      userText: `completed fork prompt ${index}`,
+    }));
+    await installMockRemuxHost(page, {
+      sendUpdatesTranscript: true,
+      transcriptV2: true,
+      turns: initialTurns,
+    });
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    await expect(page.getByText('completed fork response 4')).toBeVisible();
+
+    await page.getByRole('button', { name: 'Fork from response' }).last().click();
+    const editor = page.locator('.remux-composer-contenteditable');
+    await editor.click();
+    await editor.pressSequentially('forked message that must anchor');
+    await page.getByRole('button', { name: 'Send forked message' }).click();
+    await expect
+      .poll(() => capturedHostMethods(page))
+      .toContain('remux/codex/thread/message/fork');
+
+    // The fork thread mounts with only the copied history — the new turn is
+    // not in its transcript yet. The viewport must wait at the bottom for it
+    // instead of loading into the previous user message.
+    const viewport = page.locator('.remux-transcript-viewport');
+    await expect.poll(() => viewport.evaluate((node) =>
+      node.scrollHeight - node.clientHeight - node.scrollTop)).toBeLessThanOrEqual(4);
+
+    // The forked turn reaches the fork thread's transcript and streams work:
+    // the sent message catches up and anchors.
+    await page.evaluate(({ initialTurns }) => {
+      const mockWindow = window as typeof window & {
+        __remuxDispatchMockHostMessage?: (message: unknown) => void;
+        __remuxSetMockTranscriptTurns?: (turns: CodexTranscriptTurn[]) => void;
+        __remuxWebViewMessages?: HostRequest[];
+      };
+      const forkRequest = [...(mockWindow.__remuxWebViewMessages ?? [])]
+        .reverse()
+        .find((message) => message.method === 'remux/codex/thread/message/fork');
+      const clientMessageId = (forkRequest?.params as { clientMessageId?: string } | undefined)?.clientMessageId;
+      if (!clientMessageId) throw new Error('missing fork client message id');
+      const liveTurn: CodexTranscriptTurn = {
+        completedAt: null,
+        durationMs: null,
+        error: null,
+        id: 'mock-fork-turn-1',
+        revision: 'fork-turn-live',
+        segments: [
+          {
+            clientId: clientMessageId,
+            content: [{
+              text: 'forked message that must anchor',
+              text_elements: [],
+              type: 'text',
+            }],
+            id: 'mock-fork-user-1',
+            revision: 'user:mock-fork-user-1',
+            type: 'userMessage',
+          },
+          {
+            durationMs: null,
+            hasDetails: true,
+            id: 'work-fork-live',
+            revision: 'work-fork-running',
+            state: 'running' as const,
+            timeline: [{
+              id: 'work-fork-commentary',
+              phase: null,
+              revision: 'commentary-fork-running',
+              text: Array.from({ length: 80 }, (_, index) => `Fork work line ${index}`).join('\n\n'),
+              type: 'message' as const,
+            }],
+            type: 'work' as const,
+          },
+        ],
+        startedAt: Date.now(),
+        status: 'inProgress',
+      };
+      mockWindow.__remuxSetMockTranscriptTurns?.([...initialTurns, liveTurn]);
+      mockWindow.__remuxDispatchMockHostMessage?.({
+        message: {
+          jsonrpc: '2.0',
+          method: 'remux/codex/resources/invalidated',
+          params: {
+            invalidations: [{
+              affectsLayout: true,
+              affectsOrder: true,
+              key: 'transcriptSync:mock-fork-thread-1',
+              reason: 'appServerEvent',
+              threadId: 'mock-fork-thread-1',
+              turnId: 'mock-fork-turn-1',
+              type: 'transcript',
+            }],
+          },
+        },
+        type: 'remux/event',
+      });
+    }, { initialTurns });
+
+    const sentRow = page.locator('[data-row-kind="userMessage"][data-turn-id="mock-fork-turn-1"]');
+    await expect(sentRow).toBeVisible();
+    await expect(page.getByText('Fork work line 79')).toBeVisible();
+    // The message must PIN near the top of the viewport. Plain bottom
+    // stickiness would push it above the fold (negative offset) once the
+    // work content exceeds a screen.
+    await expect.poll(async () => {
+      const offset = await sentRow.evaluate((row) => {
+        const transcript = document.querySelector<HTMLElement>('.remux-transcript-viewport')!;
+        return row.getBoundingClientRect().top - transcript.getBoundingClientRect().top;
+      });
+      return offset >= 0 && offset < 80;
+    }).toBe(true);
   });
 
   test('shows edit command failures in the composer status', async ({ page }) => {

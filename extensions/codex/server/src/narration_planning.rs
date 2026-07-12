@@ -11,25 +11,21 @@ use serde_json::{Value, json};
 use crate::narration::{NarrationInner, NarrationSourceBlock};
 
 pub(crate) const NARRATION_CONTEXT_PROFILE_VERSION: &str = "1";
-pub(crate) const NARRATION_BASE_INSTRUCTIONS_VERSION: &str = "1";
-pub(crate) const NARRATION_PROMPT_VERSION: &str = "5";
-pub(crate) const NARRATION_PLANNING_CONTRACT_VERSION: u64 = 2;
+pub(crate) const NARRATION_BASE_INSTRUCTIONS_VERSION: &str = "2";
+pub(crate) const NARRATION_PROMPT_VERSION: &str = "6";
+pub(crate) const NARRATION_PLANNING_CONTRACT_VERSION: u64 = 3;
 pub(crate) const NARRATION_SOURCE_MAPPING_VERSION: &str = "6";
 pub(crate) const NARRATION_ACOUSTIC_TIMING_PROVIDER_VERSION: &str = "kokoro-native-v1";
 pub(crate) const MAX_PLANNING_BATCH_BLOCKS: usize = 20;
 pub(crate) const MAX_PLANNING_BATCH_UTF16: usize = 4_000;
 pub(crate) const MAX_CONCURRENT_PLANNING_BATCHES: usize = 3;
-const MAX_COMPACT_LABEL_BYTES: usize = 160;
 const MAX_PLANNING_SEGMENT_BYTES: usize = 16 * 1024;
 const MAX_PLANNING_RESPONSE_BYTES: usize = 256 * 1024;
-const MAX_ASSOCIATIONS_PER_SEGMENT: usize = 64;
-const MAX_TARGETS_PER_ASSOCIATION: usize = 16;
-const MAX_ASSOCIATION_TEXT_BYTES: usize = 1_024;
 const PLANNING_TIMEOUT: Duration = Duration::from_secs(240);
 
-pub(crate) const NARRATION_BASE_INSTRUCTIONS_V1: &str = "You produce speakable narration for supplied Markdown blocks.\n\nReturn only JSON matching the supplied output schema. Do not return Markdown,\ncommentary, explanations, confidence, or reasoning. Do not use tools, browse,\nread files, or refer to this task.\n\nThe input is compact JSON with version v and ordered blocks b.\nEach block has:\n- i: its zero-based index in this request;\n- k: p paragraph, h heading, li list item, q blockquote, c code, tb table, or d diagram;\n- m: n for pronunciation normalization or s for structural summary;\n- x: exact display text;\n- t: zero or more semantic targets local to the block.\n\nSemantic target kinds are:\n- expr, code, or link with UTF-16 display offsets s inclusive and e exclusive;\n- cell with row r, column c, and source label x;\n- lines with inclusive line indexes s and e and source label x;\n- node with node identifier n and source label x.\n\nReturn version v equal to 2 and one output segment in s for every input block,\nin the same order. Each segment has:\n- b: the unchanged input block index;\n- x: non-empty spoken text;\n- a: ordered semantic associations.\n\nNever choose a mode, omit a block, merge blocks, split a block, or reproduce a\ndurable renderer identifier.\n\nFor mode n:\n- preserve the source meaning and sentence order;\n- preserve every display word outside semantic target ranges, in the same order;\n- rewrite only technical notation inside semantic target ranges and the minimum adjacent grammar required for natural speech;\n- pronounce units, symbols, URLs, identifiers, abbreviations, and inline code naturally rather than reading punctuation literally;\n- do not summarize, shorten, expand with new facts, or paraphrase ordinary prose;\n- return a as an empty array. The server aligns normalized speech.\n\nFor mode s:\n- produce a concise natural explanation of the structure and its meaning;\n- preserve material behavior, relationships, ordering, quantities, and caveats;\n- do not read Markdown syntax, code punctuation, type syntax, table separators,\n  every table cell, or every diagram edge literally;\n- keep the summary proportional to the source and do not add facts;\n- a may associate an exact non-empty substring of spoken x with the narrowest\n  relevant semantic target indexes from input t;\n- associations must be non-overlapping, in spoken order, and must not map an\n  entire summary sentence or ordinary prose to a broad target;\n- return an empty a when no narrow semantic association is honest.\n\nFor every segment, use only target indexes owned by that input block. Do not\ninvent target indexes. Keep technical names recognizable while making their\npronunciation natural.";
+pub(crate) const NARRATION_BASE_INSTRUCTIONS_V2: &str = "You produce speakable narration for supplied Markdown blocks.\n\nReturn only JSON matching the supplied output schema. Do not return Markdown,\ncommentary, explanations, confidence, or reasoning. Do not use tools, browse,\nread files, or refer to this task.\n\nThe input is compact JSON with version v and ordered blocks b. Each block has:\n- i: its zero-based index in this request;\n- k: p paragraph, h heading, li list item, q blockquote, c code, tb table, or d diagram;\n- m: n for pronunciation normalization or s for structural summary;\n- x: exact display text;\n- optional t: inline technical ranges with kind k and UTF-16 offsets s inclusive and e exclusive.\n\nReturn version v equal to 3 and one output segment in s for every input block,\nin the same order. Each segment has b, the unchanged input block index, and x,\nnon-empty spoken text.\n\nNever choose a mode, omit a block, merge blocks, split a block, reproduce a\nrenderer identifier, or output source alignment.\n\nFor mode n:\n- preserve the source meaning and sentence order;\n- preserve every display word outside supplied technical ranges, in the same order;\n- rewrite only technical notation inside supplied ranges and the minimum adjacent grammar required for natural speech;\n- pronounce units, symbols, URLs, identifiers, abbreviations, and inline code naturally rather than reading punctuation literally;\n- do not summarize, shorten, expand with new facts, or paraphrase ordinary prose.\n\nFor mode s:\n- produce a concise natural explanation of the complete structure and its meaning;\n- preserve material behavior, relationships, ordering, quantities, and caveats;\n- do not read Markdown syntax, code punctuation, type syntax, table separators,\n  every table cell, or every diagram edge literally;\n- keep the summary proportional to the source and do not add facts.\n\nKeep technical names recognizable while making their pronunciation natural.";
 
-pub(crate) const COMPACT_PLAN_SCHEMA_V2_JSON: &str = r#"{"type":"object","additionalProperties":false,"required":["v","s"],"properties":{"v":{"type":"integer","enum":[2]},"s":{"type":"array","minItems":1,"maxItems":20,"items":{"type":"object","additionalProperties":false,"required":["b","x","a"],"properties":{"b":{"type":"integer"},"x":{"type":"string"},"a":{"type":"array","maxItems":64,"items":{"type":"object","additionalProperties":false,"required":["x","t"],"properties":{"x":{"type":"string"},"t":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"integer"}}}}}}}}}}"#;
+pub(crate) const COMPACT_PLAN_SCHEMA_V3_JSON: &str = r#"{"type":"object","additionalProperties":false,"required":["v","s"],"properties":{"v":{"type":"integer","enum":[3]},"s":{"type":"array","minItems":1,"maxItems":20,"items":{"type":"object","additionalProperties":false,"required":["b","x"],"properties":{"b":{"type":"integer"},"x":{"type":"string"}}}}}}"#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,9 +65,9 @@ pub(crate) struct NarrationPlanningProfile {
 }
 
 impl NarrationPlanningProfile {
-    pub(crate) fn provider_descriptor(&self) -> Value {
+    pub(crate) fn provider_descriptor(&self, synthesizer: Value) -> Value {
         json!({
-            "id": "codex-kokoro-source-map-v3",
+            "id": "codex-kokoro-source-map-v4",
             "scriptGenerator": {
                 "provider": self.provider,
                 "model": self.model,
@@ -91,14 +87,7 @@ impl NarrationPlanningProfile {
                 "provider": "kokoro-native",
                 "algorithmVersion": "1",
             },
-            "synthesizer": {
-                "provider": "kokoro",
-                "model": "hexgrad/Kokoro-82M",
-                "modelRevision": "hexgrad/Kokoro-82M@0.9.4",
-                "optionsVersion": "2",
-                "sampleRate": 24_000,
-                "voice": "af_heart",
-            },
+            "synthesizer": synthesizer,
         })
     }
 }
@@ -144,6 +133,7 @@ struct CompactPlanningBlock {
     #[serde(rename = "x")]
     display_text: String,
     #[serde(rename = "t")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     targets: Vec<Value>,
 }
 
@@ -151,7 +141,6 @@ struct CompactPlanningBlock {
 struct PreparedCompactBlock {
     block: NarrationSourceBlock,
     compact: CompactPlanningBlock,
-    target_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,17 +159,6 @@ struct CompactPlanningSegment {
     block: usize,
     #[serde(rename = "x")]
     spoken_text: String,
-    #[serde(rename = "a")]
-    associations: Vec<CompactSemanticAssociation>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CompactSemanticAssociation {
-    #[serde(rename = "x")]
-    spoken_text: String,
-    #[serde(rename = "t")]
-    targets: Vec<usize>,
 }
 
 pub(crate) fn resolve_planning_profile(
@@ -338,7 +316,8 @@ pub(crate) fn plan_transformed_blocks(
         if expected_source_start != blocks.len() {
             return Err("narration planning did not cover every source block".to_string());
         }
-        inner.record_planning_diagnostic(json!({
+        inner.record_narration_diagnostic(json!({
+            "phase": "planning",
             "batchCount": batches.len(),
             "completionMs": started.elapsed().as_millis(),
             "maxConcurrentBatches": worker_count,
@@ -468,7 +447,7 @@ fn thread_start_params(profile: &NarrationPlanningProfile, context_dir: &std::pa
     json!({
         "model": profile.model,
         "serviceTier": profile.service_tier.wire(),
-        "baseInstructions": NARRATION_BASE_INSTRUCTIONS_V1,
+        "baseInstructions": NARRATION_BASE_INSTRUCTIONS_V2,
         "approvalPolicy": "never",
         "cwd": context_dir,
         "config": {
@@ -513,7 +492,7 @@ fn turn_start_params(
         "effort": profile.effort,
         "summary": profile.reasoning_summary,
         "input": [{ "type": "text", "text": compact_json, "text_elements": [] }],
-        "outputSchema": compact_plan_schema_v2(),
+        "outputSchema": compact_plan_schema_v3(),
     })
 }
 
@@ -538,15 +517,10 @@ fn prepare_block(
         other => return Err(format!("unsupported narration block kind {other}")),
     };
     let mut compact_targets = Vec::new();
-    let mut target_ids = Vec::new();
     for target in targets
         .iter()
         .filter(|target| target.get("blockId").and_then(Value::as_str) == Some(block.id.as_str()))
     {
-        let Some(target_id) = target.get("id").and_then(Value::as_str) else {
-            continue;
-        };
-        let compact_index = compact_targets.len();
         let compact = match target.get("kind").and_then(Value::as_str) {
             Some("textRange") => {
                 let compact_kind = match target.get("role").and_then(Value::as_str) {
@@ -556,68 +530,14 @@ fn prepare_block(
                     _ => continue,
                 };
                 json!({
-                    "i": compact_index,
                     "k": compact_kind,
                     "s": required_usize(target, "displayStart")?,
                     "e": required_usize(target, "displayEnd")?,
                 })
             }
-            Some("tableCell") => {
-                let row = required_usize(target, "row")?;
-                let column = required_usize(target, "column")?;
-                json!({
-                    "i": compact_index,
-                    "k": "cell",
-                    "r": row,
-                    "c": column,
-                    "x": compact_label(&table_cell_label(&block.display_text, row, column)),
-                })
-            }
-            Some("tableRegion") => {
-                let row = required_usize(target, "rowStart")?;
-                let column = required_usize(target, "columnStart")?;
-                json!({
-                    "i": compact_index,
-                    "k": "cell",
-                    "r": row,
-                    "c": column,
-                    "x": compact_label(&table_cell_label(&block.display_text, row, column)),
-                })
-            }
-            Some("codeLines") => {
-                let start = required_usize(target, "lineStart")?;
-                let end = required_usize(target, "lineEnd")?;
-                let label = block
-                    .display_text
-                    .lines()
-                    .skip(start)
-                    .take(end.saturating_sub(start) + 1)
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                json!({
-                    "i": compact_index,
-                    "k": "lines",
-                    "s": start,
-                    "e": end,
-                    "x": compact_label(&label),
-                })
-            }
-            Some("diagramNode") => {
-                let node = target
-                    .get("nodeId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| "diagram narration target is missing nodeId".to_string())?;
-                json!({
-                    "i": compact_index,
-                    "k": "node",
-                    "n": node,
-                    "x": compact_label(node),
-                })
-            }
             _ => continue,
         };
         compact_targets.push(compact);
-        target_ids.push(target_id.to_string());
     }
 
     Ok(PreparedCompactBlock {
@@ -629,7 +549,6 @@ fn prepare_block(
             display_text: block.display_text.clone(),
             targets: compact_targets,
         },
-        target_ids,
     })
 }
 
@@ -664,61 +583,8 @@ fn validate_response(
                 "compact narration segment {index} has invalid spoken text"
             ));
         }
-        if prepared.compact.mode == "n" && !segment.associations.is_empty() {
-            return Err(format!(
-                "normalized narration segment {index} contains associations"
-            ));
-        }
-        if segment.associations.len() > MAX_ASSOCIATIONS_PER_SEGMENT {
-            return Err(format!(
-                "compact narration segment {index} has too many associations"
-            ));
-        }
-        let mut association_cursor = 0;
-        let mut hints = Vec::new();
-        for association in segment.associations {
-            if association.spoken_text.is_empty()
-                || association.spoken_text.trim() != association.spoken_text
-                || association.spoken_text.len() > MAX_ASSOCIATION_TEXT_BYTES
-            {
-                return Err(format!(
-                    "compact narration segment {index} has an invalid association"
-                ));
-            }
-            if association.targets.is_empty()
-                || association.targets.len() > MAX_TARGETS_PER_ASSOCIATION
-            {
-                return Err(format!(
-                    "compact narration segment {index} has invalid association targets"
-                ));
-            }
-            let mut unique = HashSet::new();
-            let mut durable_targets = Vec::new();
-            for target in association.targets {
-                if !unique.insert(target) {
-                    return Err(format!(
-                        "compact narration segment {index} duplicated an association target"
-                    ));
-                }
-                let durable = prepared.target_ids.get(target).ok_or_else(|| {
-                    format!("compact narration segment {index} references unknown target {target}")
-                })?;
-                durable_targets.push(durable.clone());
-            }
-            let relative = segment.spoken_text[association_cursor..]
-                .find(&association.spoken_text)
-                .ok_or_else(|| {
-                    format!("compact narration segment {index} has an unmatched association")
-                })?;
-            association_cursor += relative + association.spoken_text.len();
-            hints.push(json!({
-                "origin": "summarySemantic",
-                "spokenText": association.spoken_text,
-                "targetIds": durable_targets,
-            }));
-        }
         output.push(PlannedSegment {
-            alignment_hints: hints,
+            alignment_hints: Vec::new(),
             block_id: prepared.block.id.clone(),
             mode: if prepared.compact.mode == "n" {
                 "normalized"
@@ -809,9 +675,9 @@ fn wait_for_plan(
     }
 }
 
-fn compact_plan_schema_v2() -> Value {
-    serde_json::from_str(COMPACT_PLAN_SCHEMA_V2_JSON)
-        .expect("COMPACT_PLAN_SCHEMA_V2_JSON must remain valid")
+fn compact_plan_schema_v3() -> Value {
+    serde_json::from_str(COMPACT_PLAN_SCHEMA_V3_JSON)
+        .expect("COMPACT_PLAN_SCHEMA_V3_JSON must remain valid")
 }
 
 fn required_usize(value: &Value, field: &str) -> Result<usize, String> {
@@ -820,27 +686,6 @@ fn required_usize(value: &Value, field: &str) -> Result<usize, String> {
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
         .ok_or_else(|| format!("narration target is missing {field}"))
-}
-
-fn table_cell_label(display_text: &str, row: usize, column: usize) -> String {
-    display_text
-        .lines()
-        .nth(row)
-        .and_then(|line| line.split(" | ").nth(column))
-        .unwrap_or_default()
-        .to_string()
-}
-
-fn compact_label(value: &str) -> String {
-    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.len() <= MAX_COMPACT_LABEL_BYTES {
-        return normalized;
-    }
-    let mut end = MAX_COMPACT_LABEL_BYTES;
-    while !normalized.is_char_boundary(end) {
-        end -= 1;
-    }
-    normalized[..end].to_string()
 }
 
 #[cfg(test)]
@@ -855,9 +700,9 @@ mod tests {
             effort: "low",
             reasoning_summary: "none",
             context_profile_version: "1",
-            base_instructions_version: "1",
-            prompt_version: "5",
-            contract_version: 2,
+            base_instructions_version: "2",
+            prompt_version: "6",
+            contract_version: 3,
         }
     }
 
@@ -875,19 +720,19 @@ mod tests {
 
     #[test]
     fn prompt_and_schema_are_versioned_static_bytes() {
-        assert!(NARRATION_BASE_INSTRUCTIONS_V1.starts_with("You produce speakable narration"));
-        assert!(NARRATION_BASE_INSTRUCTIONS_V1.ends_with("pronunciation natural."));
-        let schema = compact_plan_schema_v2();
-        assert_eq!(schema["properties"]["v"]["enum"], json!([2]));
-        assert_eq!(COMPACT_PLAN_SCHEMA_V2_JSON.len(), 527);
-        assert!(!COMPACT_PLAN_SCHEMA_V2_JSON.contains("blockId"));
+        assert!(NARRATION_BASE_INSTRUCTIONS_V2.starts_with("You produce speakable narration"));
+        assert!(NARRATION_BASE_INSTRUCTIONS_V2.ends_with("pronunciation natural."));
+        let schema = compact_plan_schema_v3();
+        assert_eq!(schema["properties"]["v"]["enum"], json!([3]));
+        assert!(!COMPACT_PLAN_SCHEMA_V3_JSON.contains("blockId"));
+        assert!(!COMPACT_PLAN_SCHEMA_V3_JSON.contains("\"a\""));
     }
 
     #[test]
     fn app_server_params_are_isolated_and_do_not_prefix_compact_json() {
         let profile = profile(PlanningServiceTier::Priority);
         let thread = thread_start_params(&profile, std::path::Path::new("/neutral"));
-        assert_eq!(thread["baseInstructions"], NARRATION_BASE_INSTRUCTIONS_V1);
+        assert_eq!(thread["baseInstructions"], NARRATION_BASE_INSTRUCTIONS_V2);
         assert_eq!(thread["serviceTier"], "priority");
         assert_eq!(thread["cwd"], "/neutral");
         assert_eq!(thread["dynamicTools"], json!([]));
@@ -897,10 +742,10 @@ mod tests {
         assert_eq!(thread["config"]["skills"]["include_instructions"], false);
         assert!(thread.get("developerInstructions").is_none());
 
-        let turn = turn_start_params(&profile, "thread-1", "{\"v\":2,\"b\":[]}");
+        let turn = turn_start_params(&profile, "thread-1", "{\"v\":3,\"b\":[]}");
         assert_eq!(turn["effort"], "low");
         assert_eq!(turn["summary"], "none");
-        assert_eq!(turn["input"][0]["text"], "{\"v\":2,\"b\":[]}");
+        assert_eq!(turn["input"][0]["text"], "{\"v\":3,\"b\":[]}");
         assert_eq!(turn["input"][0]["text_elements"], json!([]));
     }
 
@@ -930,10 +775,48 @@ mod tests {
     }
 
     #[test]
-    fn compact_labels_end_on_unicode_boundaries() {
-        let label = compact_label(&"é".repeat(100));
-        assert!(label.len() <= MAX_COMPACT_LABEL_BYTES);
-        assert!(label.is_char_boundary(label.len()));
+    fn compact_request_omits_empty_targets_and_target_indexes() {
+        let prose = block(0, "Read Arc<T> now");
+        let empty = prepare_block(0, &prose, &[]).unwrap();
+        let encoded = serde_json::to_value(&empty.compact).unwrap();
+        assert!(encoded.get("t").is_none());
+
+        let prepared = prepare_block(
+            0,
+            &prose,
+            &[json!({
+                "blockId": "md:0",
+                "displayEnd": 11,
+                "displayStart": 5,
+                "id": "md:0/target/expression/5-11",
+                "kind": "textRange",
+                "role": "expression",
+            })],
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(&prepared.compact).unwrap();
+        assert_eq!(encoded["t"], json!([{ "e": 11, "k": "expr", "s": 5 }]));
+        assert!(encoded["t"][0].get("i").is_none());
+    }
+
+    #[test]
+    fn structural_segments_have_no_alignment_associations() {
+        let mut summary = block(0, "name | value");
+        summary.kind = "table".to_string();
+        let prepared = vec![prepare_block(0, &summary, &[]).unwrap()];
+        let output = validate_response(
+            CompactPlanningResponse {
+                version: 3,
+                segments: vec![CompactPlanningSegment {
+                    block: 0,
+                    spoken_text: "The table compares names and values.".to_string(),
+                }],
+            },
+            &prepared,
+        )
+        .unwrap();
+        assert_eq!(output[0].mode, "summary");
+        assert!(output[0].alignment_hints.is_empty());
     }
 
     #[test]

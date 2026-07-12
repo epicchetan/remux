@@ -28,6 +28,8 @@ export type CodexNarrationTextTarget = {
   role: 'expression' | 'inlineCode' | 'link' | 'word';
 };
 
+// Structural subtargets are retained only to read cached v2 manifests. Source
+// document v3 emits a single block target for code, tables, and diagrams.
 export type CodexNarrationTableCellTarget = {
   blockId: string;
   column: number;
@@ -186,12 +188,27 @@ export type CodexNarrationProviderDescriptor = {
     provider: string;
   };
   synthesizer: {
+    execution?: string;
+    exportVersion?: number;
+    frontend?: {
+      fallback?: string;
+      provider: string;
+      spacyVersion?: string;
+      version: string;
+    };
     model: string;
+    modelAssetSha256?: string;
     modelRevision: string;
+    onnxOpset?: number;
+    onnxRuntimeVersion?: string;
     optionsVersion: string;
+    precision?: string;
     provider: string;
     sampleRate: number;
+    vocabAssetSha256?: string;
     voice: string;
+    voiceAssetSha256?: string;
+    workerProtocolVersion?: number;
   };
 };
 

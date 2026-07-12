@@ -55,5 +55,9 @@ extensions/codex/dev/fixtures/captures/*.json
 # typescript
 *.tsbuildinfo
 
+# python
+__pycache__/
+*.py[cod]
+
 /t3*
 /codex*

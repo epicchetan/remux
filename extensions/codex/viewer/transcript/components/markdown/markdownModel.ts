@@ -467,7 +467,7 @@ export function narrationSourceDocument(
   collectNarrationSourceBlocks(parsed, blocks, targets);
   return {
     blocks,
-    documentVersion: '2',
+    documentVersion: '3',
     messageId: identity.messageId,
     messageRevision: identity.messageRevision,
     schemaVersion: 2,
@@ -1395,30 +1395,6 @@ function narrationSourceForBlock(
         targets.push({ blockId: block.narrationId, displayEnd, displayStart, id, kind: 'textRange', role: 'expression' });
         targetIds.push(id);
       }
-    }
-  }
-
-  if (block.type === 'table') {
-    block.rows.forEach((row, rowIndex) => {
-      row.cells.forEach((_cell, column) => {
-        const id = `${block.narrationId}/target/cell/${rowIndex}/${column}`;
-        targets.push({
-          blockId: block.narrationId,
-          column,
-          id,
-          kind: 'tableCell',
-          role: row.header ? 'header' : 'body',
-          row: rowIndex,
-        });
-        targetIds.push(id);
-      });
-    });
-  } else if (block.type === 'code') {
-    const lineCount = Math.max(1, displayText.split('\n').length);
-    for (let line = 0; line < lineCount; line += 1) {
-      const id = `${block.narrationId}/target/line/${line}`;
-      targets.push({ blockId: block.narrationId, id, kind: 'codeLines', lineEnd: line, lineStart: line });
-      targetIds.push(id);
     }
   }
 

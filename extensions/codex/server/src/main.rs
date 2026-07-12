@@ -10,6 +10,7 @@ mod models;
 mod narration;
 mod narration_planning;
 mod narration_source_mapping;
+mod narration_synthesis;
 mod operation_queue;
 mod projection;
 mod resource_invalidations;
@@ -30,6 +31,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
+use remux_compute::Registry as ComputeRegistry;
+use remux_tts::KokoroSynthesis;
 use serde_json::{Value, json};
 
 use crate::app_notifications::notification_for_app_server_notification;
@@ -85,6 +88,21 @@ const CODEX_THREAD_LANE_CAPACITY: usize = 32;
 const CODEX_SINGLETON_LANE_CAPACITY: usize = 16;
 
 fn main() {
+    let compute = match ComputeRegistry::new().register::<KokoroSynthesis>() {
+        Ok(compute) => compute,
+        Err(error) => {
+            eprintln!("compute registration failed: {error}");
+            std::process::exit(1);
+        }
+    };
+    match compute.dispatch_worker_if_requested() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("compute worker failed: {error}");
+            std::process::exit(1);
+        }
+    }
     let args: Vec<String> = env::args().collect();
     if args.get(1).is_some_and(|value| value == "validate") {
         if let Err(error) = run_validate(&args[2..]) {
@@ -94,19 +112,20 @@ fn main() {
         return;
     }
 
-    if let Err(error) = run_stdio_server() {
+    if let Err(error) = run_stdio_server(compute) {
         eprintln!("server failed: {error}");
         std::process::exit(1);
     }
 }
 
-fn run_stdio_server() -> Result<(), String> {
+fn run_stdio_server(compute: ComputeRegistry) -> Result<(), String> {
     let stdin = io::stdin();
     let (output_tx, output_rx) = mpsc::sync_channel::<Value>(CODEX_OUTPUT_QUEUE_CAPACITY);
     spawn_stdout_writer(output_rx);
     let server = Arc::new(CodexExtensionServer::new(
         default_codex_home(),
         output_tx.clone(),
+        compute,
     ));
     let dispatcher = CodexRequestDispatcher::new(server, output_tx.clone());
 
@@ -419,7 +438,11 @@ struct CodexExtensionServer {
 }
 
 impl CodexExtensionServer {
-    fn new(codex_home: PathBuf, output_tx: mpsc::SyncSender<Value>) -> Self {
+    fn new(
+        codex_home: PathBuf,
+        output_tx: mpsc::SyncSender<Value>,
+        compute: ComputeRegistry,
+    ) -> Self {
         let (event_sink, event_rx) = AppServerEventSink::channel();
         let (narration_event_sink, narration_event_rx) = AppServerEventSink::channel();
         let composer_config =
@@ -463,6 +486,7 @@ impl CodexExtensionServer {
                 narration_event_rx,
                 output_tx.clone(),
                 live_transcript.clone(),
+                compute,
             ),
             operation_queue: operation_queue.clone(),
             output_tx: output_tx.clone(),

@@ -76,8 +76,10 @@ test.describe('markdownModel', () => {
     });
     expect(document.schemaVersion).toBe(2);
     expect(document.targets.some((target) => target.kind === 'textRange' && target.role === 'word')).toBe(true);
-    expect(document.targets.filter((target) => target.kind === 'codeLines')).toHaveLength(1);
-    expect(document.targets.filter((target) => target.kind === 'tableCell')).toHaveLength(4);
+    // Code and table narration paints at the element level; the model no
+    // longer emits per-line or per-cell targets.
+    expect(document.targets.filter((target) => target.kind === 'codeLines')).toHaveLength(0);
+    expect(document.targets.filter((target) => target.kind === 'tableCell')).toHaveLength(0);
     expect(document.blocks.every((block) => block.targetIds.some((id) => id.endsWith('/target/block')))).toBe(true);
   });
 

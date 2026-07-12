@@ -1,0 +1,27 @@
+{
+  "assetVersion": "kokoro-82m-onnx-duration-v1",
+  "assets": {
+    "af_heart.npy": "0212418aafafb1e9878f3300787937aa401ac937cff8c0310ffa32963d96c77b",
+    "model.onnx": "7f17d3e342571da0ff6764eb0996f4601e32a958d1073ad287870a921ad1ffd4",
+    "vocab.json": "5977eee9e44024553a1511cbc7f2c9320fbd4f6409228bcab0b5d26922260beb"
+  },
+  "exportVersion": 1,
+  "frontend": {
+    "fallback": "none",
+    "provider": "misaki-en",
+    "spacyVersion": "3.8.14",
+    "version": "0.9.4"
+  },
+  "model": "hexgrad/Kokoro-82M",
+  "modelRevision": "f3ff3571791e39611d31c381e3a41a3af07b4987",
+  "onnxOpset": 18,
+  "onnxRuntimeVersion": "1.27.0",
+  "precision": "fp32",
+  "sampleRate": 24000,
+  "source": {
+    "checkpointSha256": "496dba118d1a58f5f3db2efc88dbdc216e0483fc89fe6e47ee1f2c53f18ad1e4",
+    "configSha256": "5abb01e2403b072bf03d04fde160443e209d7a0dad49a423be15196b9b43c17f",
+    "voiceSha256": "0ab5709b8ffab19bfd849cd11d98f75b60af7733253ad0d67b12382a102cb4ff"
+  },
+  "voice": "af_heart"
+}

@@ -414,12 +414,9 @@ mod tests {
             json!({ "blockId": "md:0", "displayEnd": 18, "displayStart": 0, "id": "inline", "kind": "textRange", "role": "inlineCode" }),
             json!({ "blockId": "md:0", "displayEnd": 18, "displayStart": 16, "id": "expr:rs", "kind": "textRange", "role": "expression" }),
         ];
-        let (hints, stats) = normalized_alignment_hints(
-            &source,
-            "live transcript dot R S filters",
-            &targets,
-        )
-        .unwrap();
+        let (hints, stats) =
+            normalized_alignment_hints(&source, "live transcript dot R S filters", &targets)
+                .unwrap();
         assert_eq!(stats.exact_word_mappings, 1);
         assert!(stats.semantic_run_mappings > 0);
         let semantic = hints

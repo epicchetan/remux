@@ -46,6 +46,72 @@ pub fn status(extension: Option<&str>) -> Result<i32, String> {
     Ok(0)
 }
 
+pub fn inspect(pid: u32, json: bool) -> Result<i32, String> {
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok();
+    let unit = cgroup.as_deref().and_then(workload_unit_from_cgroup);
+    let state = unit.and_then(systemd_workload_state).unwrap_or("missing");
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "pid": pid,
+                "state": state,
+                "unit": unit,
+            })
+        );
+    } else if let Some(unit) = unit {
+        println!("{state} {unit}");
+    } else {
+        println!("{state}");
+    }
+    Ok(0)
+}
+
+fn workload_unit_from_cgroup(value: &str) -> Option<&str> {
+    value
+        .lines()
+        .filter_map(|line| line.split_once("::").map(|(_, path)| path))
+        .flat_map(|path| path.split('/'))
+        .find(|component| component.starts_with("remux-workload-") && component.ends_with(".scope"))
+}
+
+fn systemd_workload_state(unit: &str) -> Option<&'static str> {
+    let output = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            unit,
+            "--property=ActiveState",
+            "--property=FreezerState",
+            "--no-pager",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    workload_state_from_properties(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn workload_state_from_properties(value: &str) -> Option<&'static str> {
+    let mut active = None;
+    let mut freezer = None;
+    for line in value.lines() {
+        if let Some(value) = line.strip_prefix("ActiveState=") {
+            active = Some(value);
+        } else if let Some(value) = line.strip_prefix("FreezerState=") {
+            freezer = Some(value);
+        }
+    }
+    if matches!(freezer, Some("frozen" | "freezing")) {
+        Some("frozen")
+    } else if matches!(active, Some("active" | "activating")) {
+        Some("running")
+    } else {
+        Some("missing")
+    }
+}
+
 pub fn control(operation: &str, action: &str) -> Result<i32, String> {
     let needle = sanitize(operation);
     let output = std::process::Command::new("systemctl")
@@ -112,10 +178,7 @@ pub fn exec(
     let logical_cpus = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1);
-    let threads = threads
-        .or(spec.threads)
-        .unwrap_or(logical_cpus)
-        .clamp(1, logical_cpus);
+    let threads = granted_threads(threads, spec.threads, logical_cpus);
     let protected = std::env::var("REMUX_RESOURCE_PROTECTED").as_deref() == Ok("1");
     if !protected
         && matches!(
@@ -219,4 +282,59 @@ fn sanitize(value: &str) -> String {
         })
         .take(40)
         .collect()
+}
+
+fn granted_threads(
+    requested: Option<usize>,
+    manifest_ceiling: Option<usize>,
+    logical_cpus: usize,
+) -> usize {
+    let machine_ceiling = logical_cpus.max(1);
+    let ceiling = manifest_ceiling
+        .unwrap_or(machine_ceiling)
+        .clamp(1, machine_ceiling);
+    requested.unwrap_or(ceiling).clamp(1, ceiling)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_exact_workload_scope_in_cgroup() {
+        let value = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/remux-workload-codex-narration-background-operation-job-12.scope\n";
+        assert_eq!(
+            workload_unit_from_cgroup(value),
+            Some("remux-workload-codex-narration-background-operation-job-12.scope")
+        );
+        assert_eq!(
+            workload_unit_from_cgroup("0::/user.slice/app.slice\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn maps_systemd_freezer_and_active_states() {
+        assert_eq!(
+            workload_state_from_properties("ActiveState=active\nFreezerState=frozen\n"),
+            Some("frozen")
+        );
+        assert_eq!(
+            workload_state_from_properties("ActiveState=active\nFreezerState=running\n"),
+            Some("running")
+        );
+        assert_eq!(
+            workload_state_from_properties("ActiveState=inactive\nFreezerState=running\n"),
+            Some("missing")
+        );
+    }
+
+    #[test]
+    fn manifest_threads_are_a_hard_ceiling() {
+        assert_eq!(granted_threads(None, Some(7), 16), 7);
+        assert_eq!(granted_threads(Some(4), Some(7), 16), 4);
+        assert_eq!(granted_threads(Some(12), Some(7), 16), 7);
+        assert_eq!(granted_threads(Some(12), None, 16), 12);
+        assert_eq!(granted_threads(Some(32), None, 16), 16);
+    }
 }

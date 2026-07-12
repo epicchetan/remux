@@ -128,10 +128,8 @@ function MarkdownBlockContent({
     }
     case 'code':
       return <CodeBlock
-        assistantMessageId={assistantMessageId}
         block={block}
         style={style}
-        targets={targets}
       />;
     case 'blockquote':
       return (
@@ -170,7 +168,6 @@ function MarkdownBlockContent({
         assistantMessageId={assistantMessageId}
         block={block}
         style={style}
-        targets={targets}
       />;
     case 'rule':
       return <hr className="codex-md-block codex-md-rule" style={style} />;
@@ -181,12 +178,10 @@ function MarkdownTable({
   assistantMessageId,
   block,
   style,
-  targets,
 }: {
   assistantMessageId: string | null;
   block: Extract<MarkdownLayoutBlock, { type: 'table' }>;
   style: CSSProperties;
-  targets: CodexNarrationSourceTarget[];
 }) {
   const gridTemplateColumns = block.columnWidths.map((columnWidth) => `${columnWidth}px`).join(' ');
 
@@ -223,7 +218,6 @@ function MarkdownTable({
                 lineHeight={block.lineHeight}
                 lines={cell.lines}
                 row={rowIndex}
-                targets={targets}
               />
             ))}
           </div>
@@ -242,7 +236,6 @@ function MarkdownTableCell({
   lineHeight,
   lines,
   row,
-  targets,
 }: {
   align: string | null;
   assistantMessageId: string | null;
@@ -252,21 +245,13 @@ function MarkdownTableCell({
   lineHeight: number;
   lines: Extract<MarkdownLayoutBlock, { type: 'table' }>['rows'][number]['cells'][number]['lines'];
   row: number;
-  targets: CodexNarrationSourceTarget[];
 }) {
-  const cellTargets = targets.filter((target) =>
-    target.blockId === blockId && (
-      (target.kind === 'tableCell' && target.row === row && target.column === column) ||
-      (target.kind === 'tableRegion' && row >= target.rowStart && row <= target.rowEnd && column >= target.columnStart && column <= target.columnEnd)
-    ));
-  const targetRef = useNarrationTargetRef(assistantMessageId, cellTargets.map((target) => target.id));
   return (
     <div
       className="codex-md-table-cell"
       data-align={align ?? 'left'}
       data-narration-column={column}
       data-narration-row={row}
-      ref={targetRef}
       role={header ? 'columnheader' : 'cell'}
     >
       <MarkdownTextLines assistantMessageId={assistantMessageId} blockId={blockId} lineHeight={lineHeight} lines={lines} />

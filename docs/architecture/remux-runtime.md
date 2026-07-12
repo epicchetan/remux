@@ -99,8 +99,8 @@ declared by the manifest; callers provide only the semantic workload name,
 operation ID, optional thread request, and program. `remux workload exec`
 validates ownership, clamps thread counts, publishes common native-library
 thread variables, and replaces itself with the child in a transient systemd
-scope. The Rust `remux-extension-host` crate is a typed launch adapter over the
-same CLI contract.
+scope. The Rust `remux-compute` crate adds typed, finite tasks over the same CLI
+contract by re-executing an extension's existing server binary in worker mode.
 
 Background and research workloads are refused when protected placement is not
 available. On a compatible cgroup-v2 host, the guardian watches CPU pressure

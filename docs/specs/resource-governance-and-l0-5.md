@@ -1,6 +1,6 @@
 Status: Active Spec
 Last verified: 2026-07-11
-Canonical code: `deploy/systemd/remux.service`, `deploy/systemd/remux*.slice`, `crates/remux/src/guardian.rs`, `crates/remux/src/resource/`, `crates/remux/src/cli/workload.rs`, `crates/remux/src/supervise.rs`, `crates/remux/src/runtime.rs`, `crates/remux/src/extensions/process.rs`, `crates/remux/src/extensions/supervisor.rs`, `crates/remux/src/extensions/manifest.rs`, `crates/remux/src/monitor.rs`, `crates/remux/src/watchdog.rs`, `crates/remux/src/rpc/ws.rs`, `crates/remux-extension-host/`, `packages/viewer-kit/src/rpc.ts`, `packages/viewer-kit/src/ipc.ts`, `packages/viewer-kit/src/host.ts`, `app/src/browser/BrowserShell.tsx`, `app/src/remote/RemuxConnectionProvider.tsx`, `app/src/remote/remuxRpcClient.ts`, `app/src/surfaces/viewer/ExtensionWebView.tsx`, `app/src/notifications/RemuxNotificationProvider.tsx`, `extensions/codex/remux-extension.json`, `extensions/codex/server/src/app_server.rs`, `extensions/codex/server/src/narration.rs`, `deploy/codex/skills/remux-workloads/`, `../ledger/remux-extension.json`
+Canonical code: `deploy/systemd/remux.service`, `deploy/systemd/remux*.slice`, `crates/remux/src/guardian.rs`, `crates/remux/src/resource/`, `crates/remux/src/cli/workload.rs`, `crates/remux/src/supervise.rs`, `crates/remux/src/runtime.rs`, `crates/remux/src/extensions/process.rs`, `crates/remux/src/extensions/supervisor.rs`, `crates/remux/src/extensions/manifest.rs`, `crates/remux/src/monitor.rs`, `crates/remux/src/watchdog.rs`, `crates/remux/src/rpc/ws.rs`, `crates/remux-compute/`, `packages/viewer-kit/src/rpc.ts`, `packages/viewer-kit/src/ipc.ts`, `packages/viewer-kit/src/host.ts`, `app/src/browser/BrowserShell.tsx`, `app/src/remote/RemuxConnectionProvider.tsx`, `app/src/remote/remuxRpcClient.ts`, `app/src/surfaces/viewer/ExtensionWebView.tsx`, `app/src/notifications/RemuxNotificationProvider.tsx`, `extensions/codex/remux-extension.json`, `extensions/codex/server/src/app_server.rs`, `extensions/codex/server/src/narration.rs`, `deploy/codex/skills/remux-workloads/`, `../ledger/remux-extension.json`
 
 # Resource governance, equal extension isolation, and L0.5 recovery
 
@@ -665,22 +665,26 @@ remux workload exec \
 
 ### Rust API
 
-Provide a small `remux-extension-host` crate:
+Provide a small `remux-compute` crate for finite, typed work:
 
 ```rust
-use remux_extension_host::WorkloadCommand;
+use remux_compute::{Registry, TaskOptions};
 
-let mut child = WorkloadCommand::new("runtime", "ledger-runtime-worker")
-    .operation(format!("session:{session_id}"))
-    .threads(threads)
-    .args(args)
-    .spawn()?;
+let compute = Registry::new().register::<RebuildIndex>()?;
+if compute.dispatch_worker_if_requested()? {
+    return Ok(());
+}
+let task = compute.spawn::<RebuildIndex>(
+    TaskOptions::new("rebuild-index", format!("index:{revision}")),
+    input,
+)?;
 ```
 
-`WorkloadCommand` wraps the real command with the installed `remux workload
-exec` binary and preserves normal stdin/stdout/stderr, environment, cwd,
-kill-on-drop, and child-wait behavior. It is a thin launch helper, not a remote
-task API.
+Task definitions, input, progress, and output types live in Rust rather than
+the extension manifest. The registry re-executes the current extension binary
+through `remux workload exec`, uses a bounded private protocol, and owns
+kill-on-drop and child-wait behavior. It is intentionally synchronous and
+finite: no generic process handles, daemon API, or persistent job database.
 
 Node or other extensions can call the language-neutral command directly. A
 small `@remux/extension-host` wrapper may be added when a Node extension needs
@@ -939,9 +943,9 @@ At that time Ledger may declare:
 }
 ```
 
-Ledger then moves projection execution to a child process launched with the
-same `remux-extension-host::WorkloadCommand` used by Codex. The existing
-`ledger-remux` process becomes the adapter/control surface.
+Ledger may later move projection execution to a child process after its actual
+lifecycle and communication needs are measured. The first compute API does not
+add a generic long-running process abstraction merely for that possible use.
 
 The extension owns the adapter/runtime protocol. Start with the simplest
 ordinary Unix socket or pipe protocol that satisfies measured needs. Do not
@@ -1447,14 +1451,14 @@ Files:
 - `crates/remux/src/cli/workload.rs`
 - `crates/remux/src/resource/systemd.rs`
 - CLI `remux workload *`
-- new `crates/remux-extension-host` Rust workspace crate
+- new `crates/remux-compute` Rust workspace crate
 - Settings workload rows
 
 Work:
 
 1. Add manifest-v2 optional resource schema.
 2. Add attach-and-exec wrapper.
-3. Add Rust `WorkloadCommand`.
+3. Add the typed Rust task registry and same-binary worker dispatch.
 4. Add thread environment and affinity.
 5. Add operation/extension/persistent lifetimes.
 6. Add workload status/pause/resume/stop.

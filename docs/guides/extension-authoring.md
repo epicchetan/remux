@@ -214,12 +214,12 @@ REMUX_RESOURCE_PROTECTED
 REMUX_WORKLOAD_EXEC
 ```
 
-Rust servers can add a path dependency on
-`crates/remux-extension-host` and launch a declared workload with
-`remux_extension_host::WorkloadCommand`. Other languages may execute
+Rust servers with finite CPU-heavy operations can add a path dependency on
+`crates/remux-compute`, register typed tasks, and run them by re-executing the
+same extension binary inside a declared workload. Other languages may execute
 `REMUX_WORKLOAD_EXEC workload exec ...`; the CLI validates the manifest owner,
 class, lifetime, and thread ceiling before entering the child scope. See the
-[crate README](../../crates/remux-extension-host/README.md) for the Rust API.
+[crate README](../../crates/remux-compute/README.md) for the Rust API.
 The value is a stable launcher pathname rather than the running executable's
 inode identity, so rebuilding the release binary does not strand an already
 running extension with an unspawnable `(... deleted)` path.

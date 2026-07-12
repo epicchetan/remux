@@ -2,7 +2,7 @@
 
 Status: Active Spec
 Last verified: 2026-07-11
-Canonical code: `extensions/codex/server/src/narration.rs`, `extensions/codex/server/src/narration_planning.rs`, `extensions/codex/server/src/narration_source_mapping.rs`, `extensions/codex/narration/kokoro_worker.py`, `extensions/codex/shared/narration.ts`, `extensions/codex/viewer/narration/paintController.ts`, `extensions/codex/viewer/narration/textLeafRegistry.ts`
+Canonical code: `extensions/codex/server/src/narration.rs`, `extensions/codex/server/src/narration_planning.rs`, `extensions/codex/server/src/narration_source_mapping.rs`, `crates/remux-tts/`, `extensions/codex/shared/narration.ts`, `extensions/codex/viewer/narration/paintController.ts`, `extensions/codex/viewer/narration/textLeafRegistry.ts`
 Extends: `docs/specs/codex/assistant-narration-v2.md`
 
 Implementation state: the production code path and automated coverage for
@@ -1635,7 +1635,7 @@ Keep orchestration readable by splitting new behavior at these boundaries:
 | `extensions/codex/server/src/narration.rs` | Job lifecycle, cache publication, cancellation, worker launch, and composition of planning/mapping results. |
 | `extensions/codex/server/src/narration_planning.rs` | Versioned base prompt, compact types, exact schema, profile resolution, batching, app-server turns, validation, and atomic reassembly. |
 | `extensions/codex/server/src/narration_source_mapping.rs` | Renderer-word extraction, spoken tokenization, bounded LCS, semantic hunk selection, and durable hint generation. |
-| `extensions/codex/narration/kokoro_worker.py` | Kokoro-native token timing, prepared hint offsets, cue precedence, audio chunks, and final manifest. |
+| `crates/remux-tts/` | Native Kokoro inference, token timing, prepared hint offsets, cue precedence, audio chunks, and final manifest. |
 | `extensions/codex/shared/narration.ts` | Add `sourceWord`, `sourceSemantic`, and `summarySemantic` cue origins while retaining legacy origins for cached v2 artifact reads. |
 | `extensions/codex/viewer/narration/textLeafRegistry.ts` | Mounted text-leaf registration and display-range-to-DOM-range resolution. |
 | `extensions/codex/viewer/narration/paintController.ts` | Imperative cue paint transaction, structural class cleanup, geometry union, materialization guards, and lifecycle clearing. |

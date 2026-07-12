@@ -7,8 +7,6 @@ import {
   type CodeHighlightResult,
   type CodeHighlightToken,
 } from './codeHighlight';
-import type { CodexNarrationSourceTarget } from '../../../../shared/narration';
-import { useNarrationTargetRef } from '../../../narration/targetRegistry';
 
 type CodeLayoutBlock = Extract<MarkdownLayoutBlock, { type: 'code' }>;
 
@@ -18,15 +16,11 @@ type HighlightState =
   | { status: 'plain' };
 
 export function CodeBlock({
-  assistantMessageId,
   block,
   style,
-  targets,
 }: {
-  assistantMessageId: string | null;
   block: CodeLayoutBlock;
   style: CSSProperties;
-  targets: CodexNarrationSourceTarget[];
 }) {
   const highlightInput = useMemo(
     () => ({
@@ -83,12 +77,8 @@ export function CodeBlock({
       <code style={{ minHeight: `${block.textHeight}px` }}>
         {block.lines.map((line, index) => (
           <NarratedCodeLine
-            assistantMessageId={assistantMessageId}
-            blockId={block.narrationId}
             fallbackText={line.text}
             key={`${index}:${line.text}`}
-            line={index}
-            targets={targets}
             tokens={highlightState.status === 'ready' ? highlightState.result.lines[index]?.tokens : null}
           />
         ))}
@@ -98,25 +88,14 @@ export function CodeBlock({
 }
 
 function NarratedCodeLine({
-  assistantMessageId,
-  blockId,
   fallbackText,
-  line,
-  targets,
   tokens,
 }: {
-  assistantMessageId: string | null;
-  blockId: string;
   fallbackText: string;
-  line: number;
-  targets: CodexNarrationSourceTarget[];
   tokens: CodeHighlightToken[] | null | undefined;
 }) {
-  const lineTargets = targets.filter((target) =>
-    target.blockId === blockId && target.kind === 'codeLines' && line >= target.lineStart && line <= target.lineEnd);
-  const targetRef = useNarrationTargetRef(assistantMessageId, lineTargets.map((target) => target.id));
   return (
-    <div className="codex-md-code-line" ref={targetRef}>
+    <div className="codex-md-code-line">
       <CodeLineText fallbackText={fallbackText} tokens={tokens} />
     </div>
   );

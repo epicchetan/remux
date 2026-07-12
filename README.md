@@ -51,7 +51,8 @@ resource, RPC, and recovery model.
 | --- | --- |
 | `app/` | Expo/React Native shell, tabs, WebView bridge, connection state, and native integrations |
 | `crates/remux/` | Rust runtime, guardian, CLI, HTTP/WebSocket router, extension supervisor, and resource manager |
-| `crates/remux-extension-host/` | Rust helper for launching extension-owned processes as declared Remux workloads |
+| `crates/remux-compute/` | Typed finite tasks that re-execute extension servers in declared Remux workloads |
+| `crates/remux-tts/` | Native Kokoro narration inference and artifact assembly |
 | `extensions/` | Bundled extension manifests, viewers, and optional stdio servers |
 | `packages/` | Shared TypeScript packages, currently `@remux/viewer-kit` |
 | `deploy/` | systemd units and host integrations installed by Remux |
@@ -132,8 +133,8 @@ Every extension is rooted by `remux-extension.json`. A manifest can declare:
   lifetime, and thread default.
 
 The runtime remains transcript and process authoritative. Viewers communicate
-through `@remux/viewer-kit`; Rust servers can use
-`remux-extension-host` when they need a separately managed child process.
+through `@remux/viewer-kit`; Rust servers can use `remux-compute` for typed,
+finite process-isolated work inside a declared workload.
 Start with the [Extension Authoring Guide](docs/guides/extension-authoring.md).
 
 ## Security

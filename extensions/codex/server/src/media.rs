@@ -99,10 +99,8 @@ impl MediaCache {
             .is_some_and(|metadata| {
                 metadata.get("schemaVersion").and_then(Value::as_u64) == Some(1)
                     && metadata.get("sha256").and_then(Value::as_str) == Some(hash.as_str())
-                    && metadata.get("mimeType").and_then(Value::as_str)
-                        == Some(mime_type.as_str())
-                    && metadata.get("sizeBytes").and_then(Value::as_u64)
-                        == Some(bytes.len() as u64)
+                    && metadata.get("mimeType").and_then(Value::as_str) == Some(mime_type.as_str())
+                    && metadata.get("sizeBytes").and_then(Value::as_u64) == Some(bytes.len() as u64)
             });
         if !sidecar_valid {
             let now = now_ms();
@@ -285,7 +283,15 @@ mod tests {
         let second = cache.materialize_data_url(url).unwrap().unwrap();
         assert_eq!(first, second);
         let hash = first.rsplit('/').next().unwrap();
-        assert_eq!(fs::read(temp.join("sha256").join(&hash[..2]).join(format!("{hash}.blob"))).unwrap(), b"hello");
+        assert_eq!(
+            fs::read(
+                temp.join("sha256")
+                    .join(&hash[..2])
+                    .join(format!("{hash}.blob"))
+            )
+            .unwrap(),
+            b"hello"
+        );
     }
 
     #[test]
