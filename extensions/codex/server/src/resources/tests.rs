@@ -1420,7 +1420,7 @@ fn live_turns_overlay_disk_backed_transcript_reads() {
 }
 
 #[test]
-fn live_overlay_keeps_distinct_user_steering_after_matching_disk_message() {
+fn live_overlay_keeps_distinct_user_steering_when_live_work_is_hidden() {
     let (home, _path) = write_temp_session(
         r#"{"type":"session_meta","payload":{"id":"019test"}}
 {"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","started_at":1}}
@@ -1488,44 +1488,20 @@ fn live_overlay_keeps_distinct_user_steering_after_matching_disk_message() {
             .iter()
             .filter(|segment| segment["type"] == json!("userMessage"))
             .count(),
-        1
+        2
     );
-    let work = segments
-        .iter()
-        .find(|segment| segment["type"] == json!("work"))
-        .expect("work segment");
-    let work_id = work["id"].as_str().expect("work id");
-
-    let details_response = server
-        .read_resources(json!({
-            "threadId": "019test",
-            "requests": [
-                { "type": "workDetails", "turnId": "turn-1", "segmentId": work_id }
-            ]
-        }))
-        .expect("details read should succeed");
-    let steering_item_id = details_response["resources"][0]["value"]["details"]["entries"]
-        .as_array()
-        .expect("entries")
-        .iter()
-        .find(|entry| entry["type"] == json!("userMessage"))
-        .and_then(|entry| entry["itemId"].as_str())
-        .expect("steering item id");
-
-    let item_response = server
-        .read_resources(json!({
-            "threadId": "019test",
-            "requests": [
-                { "type": "workItem", "turnId": "turn-1", "itemId": steering_item_id }
-            ]
-        }))
-        .expect("work item read should succeed");
-    assert_eq!(
-        item_response["resources"][0]["value"]["item"]["isSteering"],
-        json!(true)
+    assert!(
+        segments
+            .iter()
+            .all(|segment| segment["type"] != json!("work"))
     );
+    let steering = segments
+        .iter()
+        .filter(|segment| segment["type"] == json!("userMessage"))
+        .nth(1)
+        .expect("steering segment");
     assert_eq!(
-        item_response["resources"][0]["value"]["item"]["content"][0]["text"],
+        steering["content"][0]["text"],
         json!("Change the output format")
     );
 
@@ -1533,7 +1509,7 @@ fn live_overlay_keeps_distinct_user_steering_after_matching_disk_message() {
 }
 
 #[test]
-fn live_work_segment_id_stays_stable_and_items_are_readable() {
+fn live_only_work_items_do_not_materialize_transcript_resources() {
     let (home, _path) = write_temp_session(
         r#"{"type":"session_meta","payload":{"id":"019test"}}
 "#,
@@ -1573,90 +1549,9 @@ fn live_work_segment_id_stays_stable_and_items_are_readable() {
             "status": "inProgress"
         }),
     );
-    let mut server = CodexTranscriptServer::new_with_live_transcript(home.clone(), live.clone());
+    let mut server = CodexTranscriptServer::new_with_live_transcript(home.clone(), live);
 
-    let first = server
-        .read_resources(json!({
-            "threadId": "019test",
-            "requests": [
-                { "type": "turn", "turnId": "turn-live" }
-            ]
-        }))
-        .expect("read should succeed");
-    let first_work_id = first["resources"][0]["value"]["turn"]["segments"][1]["id"]
-        .as_str()
-        .expect("work segment id")
-        .to_string();
-    let cmd_1_id = canonical_call("turn-live", "cmd-1");
-    assert_eq!(first_work_id, format!("turn-live:work:{cmd_1_id}"));
-
-    let details = server
-        .read_resources(json!({
-            "threadId": "019test",
-            "requests": [
-                { "type": "workDetails", "turnId": "turn-live", "segmentId": first_work_id },
-                { "type": "workItem", "turnId": "turn-live", "itemId": cmd_1_id }
-            ]
-        }))
-        .expect("details read should succeed");
-    assert_eq!(
-        details["resources"][0]["value"]["details"]["entries"][0]["group"]["itemIds"],
-        json!([canonical_call("turn-live", "cmd-1")])
-    );
-    assert_eq!(
-        details["resources"][1]["value"]["item"]["activity"]["output"],
-        json!("first output")
-    );
-
-    live.record_turn(
-        "019test",
-        &json!({
-            "completedAt": null,
-            "durationMs": null,
-            "error": null,
-            "id": "turn-live",
-            "items": [
-                {
-                    "content": [
-                        { "type": "text", "text": "run command", "text_elements": [] }
-                    ],
-                    "id": "user-live",
-                    "type": "userMessage"
-                },
-                {
-                    "aggregatedOutput": "second output",
-                    "command": "node -e 1",
-                    "commandActions": [],
-                    "cwd": "/tmp",
-                    "durationMs": null,
-                    "exitCode": null,
-                    "id": "cmd-1",
-                    "processId": null,
-                    "source": "agent",
-                    "status": "completed",
-                    "type": "commandExecution"
-                },
-                {
-                    "aggregatedOutput": "",
-                    "command": "node -e 2",
-                    "commandActions": [],
-                    "cwd": "/tmp",
-                    "durationMs": null,
-                    "exitCode": null,
-                    "id": "cmd-2",
-                    "processId": null,
-                    "source": "agent",
-                    "status": "inProgress",
-                    "type": "commandExecution"
-                }
-            ],
-            "itemsView": "full",
-            "startedAt": 3,
-            "status": "inProgress"
-        }),
-    );
-
-    let second = server
+    let response = server
         .read_resources(json!({
             "threadId": "019test",
             "requests": [
@@ -1664,18 +1559,13 @@ fn live_work_segment_id_stays_stable_and_items_are_readable() {
                 { "type": "workItem", "turnId": "turn-live", "itemId": canonical_call("turn-live", "cmd-1") }
             ]
         }))
-        .expect("second read should succeed");
-    assert_eq!(
-        second["resources"][0]["value"]["turn"]["segments"][1]["id"],
-        json!(format!(
-            "turn-live:work:{}",
-            canonical_call("turn-live", "cmd-1")
-        ))
-    );
-    assert_eq!(
-        second["resources"][1]["value"]["item"]["activity"]["output"],
-        json!("second output")
-    );
+        .expect("read should succeed");
+    let segments = response["resources"][0]["value"]["turn"]["segments"]
+        .as_array()
+        .expect("segments");
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0]["type"], json!("userMessage"));
+    assert_eq!(response["resources"][1]["status"], json!("missing"));
 
     let _ = fs::remove_dir_all(home);
 }
@@ -1823,57 +1713,34 @@ fn live_notifications_stream_agent_message_deltas() {
 fn live_work_segment_completes_when_final_agent_message_starts() {
     let (home, _path) = write_temp_session(
         r#"{"type":"session_meta","payload":{"id":"019test"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","started_at":1}}
+{"type":"event_msg","payload":{"type":"user_message","message":"run command"}}
+{"type":"response_item","payload":{"type":"function_call","id":"fc-1","name":"exec_command","call_id":"cmd-1","arguments":"{\"cmd\":\"node -e 1\",\"workdir\":\"/tmp\"}"}}
+{"type":"response_item","payload":{"type":"function_call_output","id":"fco-1","call_id":"cmd-1","output":"done"}}
 "#,
     );
     let live = LiveTranscriptStore::default();
-    live.record_turn(
-        "019test",
-        &json!({
-            "completedAt": null,
-            "durationMs": null,
-            "error": null,
-            "id": "turn-live",
-            "items": [
-                {
-                    "content": [
-                        { "type": "text", "text": "run command", "text_elements": [] }
-                    ],
-                    "id": "user-live",
-                    "type": "userMessage"
-                },
-                {
-                    "aggregatedOutput": "done",
-                    "command": "node -e 1",
-                    "commandActions": [],
-                    "cwd": "/tmp",
-                    "durationMs": null,
-                    "exitCode": 0,
-                    "id": "cmd-1",
-                    "processId": null,
-                    "source": "agent",
-                    "status": "completed",
-                    "type": "commandExecution"
-                },
-                {
-                    "id": "agent-1",
-                    "memoryCitation": null,
-                    "phase": null,
-                    "text": "",
-                    "type": "agentMessage"
-                }
-            ],
-            "itemsView": "full",
-            "startedAt": 3,
-            "status": "inProgress"
-        }),
-    );
+    live.record_notification(&json!({
+        "method": "item/started",
+        "params": {
+            "item": {
+                "id": "agent-1",
+                "memoryCitation": null,
+                "phase": null,
+                "text": "",
+                "type": "agentMessage"
+            },
+            "threadId": "019test",
+            "turnId": "turn-1"
+        }
+    }));
     let mut server = CodexTranscriptServer::new_with_live_transcript(home.clone(), live);
 
     let response = server
         .read_resources(json!({
             "threadId": "019test",
             "requests": [
-                { "type": "turn", "turnId": "turn-live" }
+                { "type": "turn", "turnId": "turn-1" }
             ]
         }))
         .expect("read should succeed");
@@ -1889,7 +1756,7 @@ fn live_work_segment_completes_when_final_agent_message_starts() {
 }
 
 #[test]
-fn live_notifications_stream_command_output_deltas_into_work_item() {
+fn live_notification_command_output_does_not_materialize_work_item() {
     let (home, _path) = write_temp_session(
         r#"{"type":"session_meta","payload":{"id":"019test"}}
 "#,
@@ -1959,37 +1826,21 @@ fn live_notifications_stream_command_output_deltas_into_work_item() {
     }));
     let mut server = CodexTranscriptServer::new_with_live_transcript(home.clone(), live);
 
-    let turn = server
+    let response = server
         .read_resources(json!({
             "threadId": "019test",
             "requests": [
-                { "type": "turn", "turnId": "turn-live" }
-            ]
-        }))
-        .expect("turn read should succeed");
-    let work_id = turn["resources"][0]["value"]["turn"]["segments"][1]["id"]
-        .as_str()
-        .expect("work segment id")
-        .to_string();
-
-    let details = server
-        .read_resources(json!({
-            "threadId": "019test",
-            "requests": [
-                { "type": "workDetails", "turnId": "turn-live", "segmentId": work_id },
+                { "type": "turn", "turnId": "turn-live" },
                 { "type": "workItem", "turnId": "turn-live", "itemId": canonical_call("turn-live", "cmd-1") }
             ]
         }))
-        .expect("details read should succeed");
-
-    assert_eq!(
-        details["resources"][0]["value"]["details"]["itemIds"],
-        json!([canonical_call("turn-live", "cmd-1")])
-    );
-    assert_eq!(
-        details["resources"][1]["value"]["item"]["activity"]["output"],
-        json!("first second")
-    );
+        .expect("turn read should succeed");
+    let segments = response["resources"][0]["value"]["turn"]["segments"]
+        .as_array()
+        .expect("segments");
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0]["type"], json!("userMessage"));
+    assert_eq!(response["resources"][1]["status"], json!("missing"));
 
     let _ = fs::remove_dir_all(home);
 }
@@ -2081,63 +1932,20 @@ fn synthetic_live_agent_delta_merges_with_legacy_disk_agent_item() {
 fn work_details_dedupe_duplicate_canonical_group_membership() {
     let (home, _path) = write_temp_session(
         r#"{"type":"session_meta","payload":{"id":"019test"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","started_at":1}}
+{"type":"event_msg","payload":{"type":"user_message","message":"run command"}}
+{"type":"response_item","payload":{"type":"function_call","id":"fc-1","name":"exec_command","call_id":"cmd-1","arguments":"{\"cmd\":\"node -e 1\",\"workdir\":\"/tmp\"}"}}
+{"type":"response_item","payload":{"type":"function_call","id":"fc-2","name":"exec_command","call_id":"cmd-1","arguments":"{\"cmd\":\"node -e 1\",\"workdir\":\"/tmp\"}"}}
 "#,
     );
     let live = LiveTranscriptStore::default();
-    live.record_turn(
-        "019test",
-        &json!({
-            "completedAt": null,
-            "durationMs": null,
-            "error": null,
-            "id": "turn-live",
-            "items": [
-                {
-                    "content": [
-                        { "type": "text", "text": "run command", "text_elements": [] }
-                    ],
-                    "id": "user-live",
-                    "type": "userMessage"
-                },
-                {
-                    "aggregatedOutput": "first",
-                    "command": "node -e 1",
-                    "commandActions": [],
-                    "cwd": "/tmp",
-                    "durationMs": null,
-                    "exitCode": null,
-                    "id": "cmd-1",
-                    "processId": null,
-                    "source": "agent",
-                    "status": "completed",
-                    "type": "commandExecution"
-                },
-                {
-                    "aggregatedOutput": "second",
-                    "command": "node -e 1",
-                    "commandActions": [],
-                    "cwd": "/tmp",
-                    "durationMs": null,
-                    "exitCode": null,
-                    "id": "cmd-1",
-                    "processId": null,
-                    "source": "agent",
-                    "status": "completed",
-                    "type": "commandExecution"
-                }
-            ],
-            "itemsView": "full",
-            "startedAt": 3,
-            "status": "inProgress"
-        }),
-    );
     let mut server = CodexTranscriptServer::new_with_live_transcript(home.clone(), live);
 
     let turn = server
         .read_resources(json!({
             "threadId": "019test",
             "requests": [
-                { "type": "turn", "turnId": "turn-live" }
+                { "type": "turn", "turnId": "turn-1" }
             ]
         }))
         .expect("turn read should succeed");
@@ -2150,11 +1958,11 @@ fn work_details_dedupe_duplicate_canonical_group_membership() {
         .read_resources(json!({
             "threadId": "019test",
             "requests": [
-                { "type": "workDetails", "turnId": "turn-live", "segmentId": work_id }
+                { "type": "workDetails", "turnId": "turn-1", "segmentId": work_id }
             ]
         }))
         .expect("details read should succeed");
-    let expected_item_ids = json!([canonical_call("turn-live", "cmd-1")]);
+    let expected_item_ids = json!([canonical_call("turn-1", "cmd-1")]);
     assert_eq!(
         details["resources"][0]["value"]["details"]["itemIds"],
         expected_item_ids
@@ -2223,7 +2031,7 @@ fn completed_disk_turn_ignores_live_snapshot() {
 }
 
 #[test]
-fn active_disk_turn_applies_command_output_overlay() {
+fn active_disk_turn_ignores_notification_only_command_output() {
     let (home, _path) = write_temp_session(
         r#"{"type":"session_meta","payload":{"id":"019test"}}
 {"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","started_at":1}}
@@ -2272,14 +2080,14 @@ fn active_disk_turn_applies_command_output_overlay() {
     );
     assert_eq!(
         details["resources"][1]["value"]["item"]["activity"]["output"],
-        json!("streamed output")
+        json!("")
     );
 
     let _ = fs::remove_dir_all(home);
 }
 
 #[test]
-fn active_disk_turn_merges_call_live_delta_into_durable_response_item_id() {
+fn active_disk_turn_keeps_durable_identity_without_overlaying_live_output() {
     let (home, _path) = write_temp_session(
         r#"{"type":"session_meta","payload":{"id":"019test"}}
 {"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","started_at":1}}
@@ -2329,12 +2137,12 @@ fn active_disk_turn_merges_call_live_delta_into_durable_response_item_id() {
     );
     assert_eq!(
         details["resources"][1]["value"]["item"]["activity"]["output"],
-        json!("streamed output")
+        json!("")
     );
     assert_eq!(details["resources"][2]["status"], json!("ok"));
     assert_eq!(
         details["resources"][2]["value"]["item"]["activity"]["output"],
-        json!("streamed output")
+        json!("")
     );
 
     let turn_json = serde_json::to_string(&turn["resources"][0]["value"]["turn"]).expect("json");
@@ -2401,7 +2209,7 @@ fn live_command_delta_does_not_duplicate_disk_output_when_disk_catches_up() {
 }
 
 #[test]
-fn live_command_delta_rekeys_when_disk_reveals_call_id() {
+fn live_command_delta_rekeys_without_overlaying_disk_work() {
     let (home, _path) = write_temp_session(
         r#"{"type":"session_meta","payload":{"id":"019test"}}
 {"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","started_at":1}}
@@ -2450,7 +2258,7 @@ fn live_command_delta_rekeys_when_disk_reveals_call_id() {
     );
     assert_eq!(
         details["resources"][1]["value"]["item"]["activity"]["output"],
-        json!("streamed output")
+        json!("")
     );
     assert_eq!(details["resources"][2]["status"], json!("ok"));
     assert_eq!(
@@ -2466,7 +2274,7 @@ fn live_command_delta_rekeys_when_disk_reveals_call_id() {
 }
 
 #[test]
-fn raw_response_item_completed_rekeys_live_command_before_disk_catches_up() {
+fn raw_response_item_completed_does_not_publish_work_before_disk_catches_up() {
     let (home, _path) = write_temp_session(
         r#"{"type":"session_meta","payload":{"id":"019test"}}
 "#,
@@ -2521,39 +2329,21 @@ fn raw_response_item_completed_rekeys_live_command_before_disk_catches_up() {
     }));
     let mut server = CodexTranscriptServer::new_with_live_transcript(home.clone(), live);
 
-    let turn = server
+    let response = server
         .read_resources(json!({
             "threadId": "019test",
             "requests": [
-                { "type": "turn", "turnId": "turn-live" }
-            ]
-        }))
-        .expect("turn read should succeed");
-    let work_id = turn["resources"][0]["value"]["turn"]["segments"][1]["id"]
-        .as_str()
-        .expect("work segment id")
-        .to_string();
-    let details = server
-        .read_resources(json!({
-            "threadId": "019test",
-            "requests": [
-                { "type": "workDetails", "turnId": "turn-live", "segmentId": work_id },
+                { "type": "turn", "turnId": "turn-live" },
                 { "type": "workItem", "turnId": "turn-live", "itemId": canonical_call("turn-live", "cmd-1") }
             ]
         }))
-        .expect("details read should succeed");
-
-    assert_eq!(
-        details["resources"][0]["value"]["details"]["itemIds"],
-        json!([canonical_call("turn-live", "cmd-1")])
-    );
-    assert_eq!(
-        details["resources"][1]["value"]["item"]["activity"]["output"],
-        json!("streamed output")
-    );
-    let turn_json = serde_json::to_string(&turn["resources"][0]["value"]["turn"]).expect("json");
-    assert!(turn_json.contains(&canonical_call("turn-live", "cmd-1")));
-    assert!(!turn_json.contains(&canonical_call("turn-live", "fc-1")));
+        .expect("turn read should succeed");
+    let segments = response["resources"][0]["value"]["turn"]["segments"]
+        .as_array()
+        .expect("segments");
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0]["type"], json!("userMessage"));
+    assert_eq!(response["resources"][1]["status"], json!("missing"));
 
     let _ = fs::remove_dir_all(home);
 }

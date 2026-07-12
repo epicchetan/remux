@@ -401,10 +401,6 @@ fn invalidates_work_item(method: &str) -> bool {
             | "item/completed"
             | "item/agentMessage/delta"
             | "item/plan/delta"
-            | "item/commandExecution/outputDelta"
-            | "item/fileChange/outputDelta"
-            | "item/fileChange/patchUpdated"
-            | "item/mcpToolCall/progress"
             | "item/reasoning/summaryTextDelta"
             | "item/reasoning/summaryPartAdded"
             | "item/reasoning/textDelta"
@@ -559,64 +555,63 @@ mod tests {
     }
 
     #[test]
-    fn command_output_delta_invalidates_work_item() {
-        let invalidations = invalidations_for_app_server_notification(
-            &json!({
-                "method": "item/commandExecution/outputDelta",
-                "params": {
-                    "itemId": "cmd-1",
-                    "threadId": "thread-3",
-                    "turnId": "turn-1"
-                },
-            }),
-            None,
-            &[],
-        );
+    fn live_only_work_deltas_do_not_invalidate_visible_transcript_resources() {
+        for method in [
+            "item/commandExecution/outputDelta",
+            "item/fileChange/outputDelta",
+            "item/fileChange/patchUpdated",
+            "item/mcpToolCall/progress",
+        ] {
+            let invalidations = invalidations_for_app_server_notification(
+                &json!({
+                    "method": method,
+                    "params": {
+                        "itemId": "work-1",
+                        "threadId": "thread-3",
+                        "turnId": "turn-1"
+                    },
+                }),
+                None,
+                &[],
+            );
 
-        assert_eq!(
-            invalidations,
-            vec![
-                transcript_render_invalidation(
-                    "thread-3",
-                    Some("turn-1"),
-                    false,
-                    false,
-                    "appServerEvent",
-                ),
-                work_item_invalidation("thread-3", "turn-1", "cmd-1", "appServerEvent"),
-            ]
-        );
+            assert!(
+                invalidations.is_empty(),
+                "unexpected invalidations for {method}"
+            );
+        }
     }
 
     #[test]
     fn work_item_invalidation_uses_canonical_item_id_when_available() {
         let invalidations = invalidations_for_app_server_notification(
             &json!({
-                "method": "item/commandExecution/outputDelta",
+                "method": "item/agentMessage/delta",
                 "params": {
-                    "itemId": "cmd-1",
+                    "itemId": "agent-1",
                     "threadId": "thread-3",
                     "turnId": "turn-1"
                 },
             }),
-            Some("cxitem:v1:turn-1:call:cmd-1"),
+            Some("cxitem:v1:turn-1:item:agent-1"),
             &[],
         );
 
         assert_eq!(
             invalidations,
             vec![
+                turn_invalidation("thread-3", "turn-1", "appServerEvent"),
                 transcript_render_invalidation(
                     "thread-3",
                     Some("turn-1"),
                     false,
-                    false,
+                    true,
                     "appServerEvent",
                 ),
                 work_item_invalidation(
                     "thread-3",
                     "turn-1",
-                    "cxitem:v1:turn-1:call:cmd-1",
+                    "cxitem:v1:turn-1:item:agent-1",
                     "appServerEvent",
                 ),
             ]

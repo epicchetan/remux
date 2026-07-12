@@ -302,7 +302,9 @@ impl LiveTranscriptStore {
         self.inner.lock().ok().and_then(|inner| {
             let turn = inner.threads.get(thread_id)?.turns.get(turn_id)?;
             if live_turn_is_visible(turn) {
-                project_app_server_turn(&turn.turn)
+                let mut visible_turn = turn.turn.clone();
+                remove_live_only_work_items(&mut visible_turn);
+                project_app_server_turn(&visible_turn)
             } else {
                 None
             }
@@ -396,7 +398,9 @@ impl LiveTranscriptStore {
                         if _disk_turn_order.iter().any(|disk_id| disk_id == turn_id) {
                             Some(live_revision_value(turn_id, turn))
                         } else if live_turn_is_visible(turn) {
-                            project_app_server_turn(&turn.turn).map(|turn| turn.turn)
+                            let mut visible_turn = turn.turn.clone();
+                            remove_live_only_work_items(&mut visible_turn);
+                            project_app_server_turn(&visible_turn).map(|turn| turn.turn)
                         } else {
                             None
                         }
@@ -1044,6 +1048,9 @@ fn merge_live_item_snapshot(
         return;
     };
     let live_item_type = item_type(live_item).unwrap_or("unknown");
+    if is_durable_only_work_item(live_item_type) {
+        return;
+    }
     if let Some(index) = raw_turn.items.iter().position(|item| {
         item_id(item) == Some(live_item_id)
             || item_has_canonical_alias(raw_turn, item, live_item_id)
@@ -1226,6 +1233,9 @@ fn is_placeholder_value(value: &Value) -> bool {
 }
 
 fn apply_live_item_delta(raw_turn: &mut RawTurn, item_id: &str, delta: &LiveItemDelta) {
+    if is_durable_only_work_item(&delta.item_type) {
+        return;
+    }
     let item = ensure_raw_item(raw_turn, item_id, &delta.item_type);
     for (field, text_delta) in &delta.string_fields {
         merge_string_field(item, field, text_delta);
@@ -1309,14 +1319,38 @@ fn item_type(item: &Value) -> Option<&str> {
     item.get("type").and_then(Value::as_str)
 }
 
+fn is_durable_only_work_item(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "commandExecution"
+            | "webSearch"
+            | "fileChange"
+            | "mcpToolCall"
+            | "dynamicToolCall"
+            | "hookPrompt"
+    )
+}
+
+fn remove_live_only_work_items(turn: &mut Value) {
+    let Some(items) = turn.get_mut("items").and_then(Value::as_array_mut) else {
+        return;
+    };
+    items.retain(|item| !item_type(item).is_some_and(is_durable_only_work_item));
+}
+
 fn live_revision_value(turn_id: &str, turn: &LiveTurn) -> Value {
     let mut deltas = serde_json::Map::new();
     for (item_id, delta) in &turn.deltas {
+        if is_durable_only_work_item(&delta.item_type) {
+            continue;
+        }
         deltas.insert(item_id.clone(), live_delta_value(delta));
     }
+    let mut visible_turn = turn.turn.clone();
+    remove_live_only_work_items(&mut visible_turn);
     json!({
         "deltas": Value::Object(deltas),
-        "turn": turn.turn,
+        "turn": visible_turn,
         "turnId": turn_id,
     })
 }
@@ -1358,6 +1392,32 @@ mod reconciliation_tests {
         })
     }
 
+    fn in_progress_turn_with_durable_exec() -> ProjectedTurn {
+        project_raw_turn(RawTurn {
+            completed_at: None,
+            duration_ms: None,
+            error: None,
+            id: "turn-1".to_string(),
+            items: vec![
+                json!({
+                    "content": [{ "text": "hello", "type": "text" }],
+                    "id": "user-1",
+                    "type": "userMessage",
+                }),
+                json!({
+                    "arguments": { "source": "nested orchestration" },
+                    "contentItems": [{ "text": "durable result", "type": "text" }],
+                    "id": "exec-1",
+                    "status": "completed",
+                    "tool": "exec",
+                    "type": "dynamicToolCall",
+                }),
+            ],
+            started_at: Some(1),
+            status: "inProgress".to_string(),
+        })
+    }
+
     #[test]
     fn authoritative_idle_thread_interrupts_orphaned_disk_turn() {
         let store = LiveTranscriptStore::default();
@@ -1390,5 +1450,225 @@ mod reconciliation_tests {
         let second = store.revision_for_thread("thread-1", &[]).unwrap();
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn live_only_command_does_not_change_disk_backed_work_projection() {
+        let store = LiveTranscriptStore::default();
+        store.record_notification(&json!({
+            "method": "item/started",
+            "params": {
+                "item": {
+                    "aggregatedOutput": "",
+                    "command": "rg durable-only",
+                    "id": "command-live-1",
+                    "status": "inProgress",
+                    "type": "commandExecution"
+                },
+                "threadId": "thread-1",
+                "turnId": "turn-1"
+            }
+        }));
+        store.record_notification(&json!({
+            "method": "item/commandExecution/outputDelta",
+            "params": {
+                "delta": "notification-only output",
+                "itemId": "command-live-1",
+                "threadId": "thread-1",
+                "turnId": "turn-1"
+            }
+        }));
+
+        let disk = in_progress_turn_with_durable_exec();
+        let reloaded = project_raw_turn(disk.raw_turn.clone());
+        let streamed = store.apply_overlay("thread-1", disk);
+
+        assert_eq!(streamed.raw_turn.items, reloaded.raw_turn.items);
+        assert_eq!(
+            streamed.details_by_segment_id,
+            reloaded.details_by_segment_id
+        );
+        assert_eq!(streamed.work_groups_by_key, reloaded.work_groups_by_key);
+        assert_eq!(streamed.work_items_by_id, reloaded.work_items_by_id);
+        assert!(
+            streamed
+                .raw_turn
+                .items
+                .iter()
+                .all(|item| item_type(item) != Some("commandExecution"))
+        );
+
+        let mut completed_raw = reloaded.raw_turn.clone();
+        completed_raw.status = "completed".to_string();
+        completed_raw.completed_at = Some(2);
+        completed_raw.duration_ms = Some(1);
+        let completed_reload = project_raw_turn(completed_raw.clone());
+        let completed = store.apply_overlay("thread-1", project_raw_turn(completed_raw));
+
+        assert_eq!(completed.raw_turn.items, completed_reload.raw_turn.items);
+        assert_eq!(
+            completed.details_by_segment_id,
+            completed_reload.details_by_segment_id
+        );
+        assert_eq!(
+            completed.work_groups_by_key,
+            completed_reload.work_groups_by_key
+        );
+        assert_eq!(
+            completed.work_items_by_id,
+            completed_reload.work_items_by_id
+        );
+    }
+
+    #[test]
+    fn live_work_snapshot_cannot_mutate_matching_durable_item() {
+        let store = LiveTranscriptStore::default();
+        store.record_notification(&json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "arguments": { "source": "live replacement" },
+                    "contentItems": [{ "text": "notification result", "type": "text" }],
+                    "id": "exec-1",
+                    "status": "failed",
+                    "tool": "exec",
+                    "type": "dynamicToolCall"
+                },
+                "threadId": "thread-1",
+                "turnId": "turn-1"
+            }
+        }));
+
+        let projected = store.apply_overlay("thread-1", in_progress_turn_with_durable_exec());
+        let exec = projected
+            .raw_turn
+            .items
+            .iter()
+            .find(|item| item_id(item) == Some("exec-1"))
+            .expect("durable exec");
+
+        assert_eq!(exec["status"], json!("completed"));
+        assert_eq!(exec["contentItems"][0]["text"], json!("durable result"));
+        assert_eq!(exec["arguments"]["source"], json!("nested orchestration"));
+    }
+
+    #[test]
+    fn live_only_turn_filters_work_but_keeps_user_message() {
+        let store = LiveTranscriptStore::default();
+        store.record_turn(
+            "thread-1",
+            &json!({
+                "completedAt": null,
+                "durationMs": null,
+                "error": null,
+                "id": "turn-live",
+                "items": [
+                    {
+                        "content": [{ "text": "hello", "type": "text" }],
+                        "id": "user-live",
+                        "type": "userMessage"
+                    },
+                    {
+                        "aggregatedOutput": "notification-only output",
+                        "command": "rg durable-only",
+                        "id": "command-live",
+                        "status": "completed",
+                        "type": "commandExecution"
+                    },
+                    {
+                        "arguments": {},
+                        "contentItems": [],
+                        "id": "tool-live",
+                        "status": "completed",
+                        "tool": "exec",
+                        "type": "dynamicToolCall"
+                    }
+                ],
+                "itemsView": "full",
+                "startedAt": 1,
+                "status": "inProgress"
+            }),
+        );
+
+        let projected = store
+            .projected_turn("thread-1", "turn-live")
+            .expect("live turn");
+
+        assert_eq!(projected.raw_turn.items.len(), 1);
+        assert_eq!(item_type(&projected.raw_turn.items[0]), Some("userMessage"));
+        assert!(projected.work_items_by_id.is_empty());
+    }
+
+    #[test]
+    fn live_work_delta_cannot_create_a_raw_item() {
+        let mut raw_turn = in_progress_turn().raw_turn;
+        let original_items = raw_turn.items.clone();
+        let delta = LiveItemDelta {
+            item_type: "commandExecution".to_string(),
+            string_fields: HashMap::from([(
+                "aggregatedOutput".to_string(),
+                "notification-only output".to_string(),
+            )]),
+            ..LiveItemDelta::default()
+        };
+
+        apply_live_item_delta(&mut raw_turn, "command-live", &delta);
+
+        assert_eq!(raw_turn.items, original_items);
+    }
+
+    #[test]
+    fn live_only_work_does_not_change_visible_thread_revision() {
+        let store = LiveTranscriptStore::default();
+        store.record_turn(
+            "thread-1",
+            &json!({
+                "completedAt": null,
+                "durationMs": null,
+                "error": null,
+                "id": "turn-1",
+                "items": [{
+                    "content": [{ "text": "hello", "type": "text" }],
+                    "id": "user-1",
+                    "type": "userMessage"
+                }],
+                "itemsView": "full",
+                "startedAt": 1,
+                "status": "inProgress"
+            }),
+        );
+        let disk_turns = ["turn-1".to_string()];
+        let before = store
+            .revision_for_thread("thread-1", &disk_turns)
+            .expect("revision");
+
+        store.record_notification(&json!({
+            "method": "item/started",
+            "params": {
+                "item": {
+                    "aggregatedOutput": "",
+                    "command": "rg durable-only",
+                    "id": "command-live-1",
+                    "status": "inProgress",
+                    "type": "commandExecution"
+                },
+                "threadId": "thread-1",
+                "turnId": "turn-1"
+            }
+        }));
+        store.record_notification(&json!({
+            "method": "item/commandExecution/outputDelta",
+            "params": {
+                "delta": "notification-only output",
+                "itemId": "command-live-1",
+                "threadId": "thread-1",
+                "turnId": "turn-1"
+            }
+        }));
+        let after = store
+            .revision_for_thread("thread-1", &disk_turns)
+            .expect("revision");
+
+        assert_eq!(after, before);
     }
 }
