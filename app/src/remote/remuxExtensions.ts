@@ -1,6 +1,8 @@
 import { authHeaders, currentRemuxOrigin } from './remuxSettingsStore';
 
 export type RemuxExtensionView = {
+  entryUrl: string;
+  revision: string | null;
   route: string;
   url: string;
 };
@@ -72,6 +74,8 @@ type RawExtensionDisplay = {
 };
 
 type RawView = {
+  entryUrl?: unknown;
+  revision?: unknown;
   route?: unknown;
 };
 
@@ -97,7 +101,7 @@ type RawFileHandler = {
 
 export async function fetchRemuxExtensionCatalog(origin = currentRemuxOrigin()): Promise<RemuxExtensionCatalog> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5_000);
+  const timeout = setTimeout(() => controller.abort(), 15_000);
   let response: Response;
   try {
     response = await fetch(`${origin}/remux/extensions`, {
@@ -107,7 +111,7 @@ export async function fetchRemuxExtensionCatalog(origin = currentRemuxOrigin()):
     });
   } catch (error) {
     if (controller.signal.aborted) {
-      throw new Error('Remux extension catalog timed out after 5000ms');
+      throw new Error('Remux extension catalog timed out after 15000ms');
     }
     throw error;
   } finally {
@@ -133,7 +137,7 @@ export function remuxImageSource(uri: string): { headers?: { Authorization: stri
   return headers && uri.startsWith(`${currentRemuxOrigin()}/`) ? { headers, uri } : { uri };
 }
 
-function parseRemuxExtensionCatalog(raw: unknown, origin: string): RemuxExtensionCatalog {
+export function parseRemuxExtensionCatalog(raw: unknown, origin: string): RemuxExtensionCatalog {
   if (!isRecord(raw)) {
     throw new Error('Invalid Remux extension catalog');
   }
@@ -191,9 +195,17 @@ function parseViews(rawViews: Record<string, unknown>, origin: string) {
       continue;
     }
 
+    const entryUrl = typeof view.entryUrl === 'string' && view.entryUrl.trim().length > 0
+      ? view.entryUrl
+      : view.route;
+
     parsedViews[viewId] = {
+      entryUrl: remuxPublicUrl(entryUrl, origin) ?? remuxViewerUrl(view.route, origin),
+      revision: typeof view.revision === 'string' && view.revision.trim().length > 0
+        ? view.revision
+        : null,
       route: view.route,
-      url: remuxViewerUrl(view.route, origin),
+      url: remuxViewerUrl(entryUrl, origin),
     };
   }
 
@@ -283,8 +295,8 @@ export function themedIconUrl(
 }
 
 function remuxViewerUrl(route: string, origin: string) {
-  const normalizedRoute = route.endsWith('/') ? route : `${route}/`;
-  return `${origin}${normalizedRoute}`;
+  const resolved = remuxPublicUrl(route, origin) ?? `${origin}/${route.replace(/^\/+/, '')}`;
+  return resolved.endsWith('/') ? resolved : `${resolved}/`;
 }
 
 function remuxPublicUrl(url: string, origin: string) {

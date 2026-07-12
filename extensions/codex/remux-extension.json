@@ -31,6 +31,7 @@
     "main": {
       "route": "/viewers/codex",
       "entry": "viewer/dist/index.html",
+      "cache": "immutable",
       "build": {
         "command": "npm",
         "args": [

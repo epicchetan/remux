@@ -4,18 +4,21 @@
 
 pub mod catalog;
 pub mod icons;
+pub mod media;
+pub mod viewer_bundles;
 pub mod viewers;
 
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, StatusCode, Uri};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use axum::routing::get;
 use serde_json::Value;
 
 use crate::extensions::manifest::ExtensionManifest;
+use crate::http::viewer_bundles::ViewerBundleRegistry;
 use crate::rpc::router::{RpcRouter, EXTENSION_STATUS_METHOD, SYSTEM_RESOURCES_METHOD};
 use viewers::ViewerProvider;
 
@@ -23,6 +26,8 @@ pub struct HttpState {
     pub default_extension: ExtensionManifest,
     pub extensions: Vec<ExtensionManifest>,
     pub viewer_providers: Vec<ViewerProvider>,
+    pub viewer_bundles: Arc<ViewerBundleRegistry>,
+    pub media_root: std::path::PathBuf,
 }
 
 pub struct ApiStatusState {
@@ -58,7 +63,11 @@ pub fn build_router_with_status(
         .with_state(state)
 }
 
-async fn handle_request(State(state): State<Arc<HttpState>>, uri: Uri) -> Response {
+async fn handle_request(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
     // Node compared `request.url` (path + query) exactly for these two.
     let raw_url = uri
         .path_and_query()
@@ -79,7 +88,12 @@ async fn handle_request(State(state): State<Arc<HttpState>>, uri: Uri) -> Respon
         return json_response(catalog::extension_catalog(
             Some(&state.default_extension),
             &state.extensions,
+            &state.viewer_bundles,
         ));
+    }
+
+    if let Some(response) = media::serve_media(&state.media_root, pathname, &headers).await {
+        return response;
     }
 
     if let Some(icon_path) = icons::icon_for_icon_path(pathname, query, &state.extensions) {
@@ -98,7 +112,7 @@ async fn handle_request(State(state): State<Arc<HttpState>>, uri: Uri) -> Respon
     }
 
     for provider in &state.viewer_providers {
-        if let Some(response) = provider.handle(pathname).await {
+        if let Some(response) = provider.handle(pathname, &headers).await {
             return response;
         }
     }

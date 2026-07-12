@@ -37,7 +37,11 @@ export type ComposerPresentationRequest = {
 
 export type ComposerSubmissionKind = 'edit' | 'fork' | 'new-chat' | 'send';
 
-export type ComposerSubmissionPhase = 'awaiting-transcript' | 'starting-thread' | 'starting-turn';
+export type ComposerSubmissionPhase =
+  | 'awaiting-transcript'
+  | 'starting-thread'
+  | 'starting-turn'
+  | 'waiting-for-connection';
 
 export type ComposerSubmission = {
   id: number;

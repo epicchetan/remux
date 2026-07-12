@@ -87,6 +87,7 @@ fn fixture_manifest_with_server(root: &Path, server: ServerSpec) -> ExtensionMan
         views: vec![(
             "main".to_string(),
             View {
+                cache: Default::default(),
                 entry: root.join("index.html"),
                 route: "/viewers/fixture".to_string(),
                 build: None,
@@ -841,6 +842,7 @@ fn view_manifest(
         views: vec![(
             "main".to_string(),
             View {
+                cache: Default::default(),
                 entry: root.join("dist/index.html"),
                 route: "/viewers/fixture".to_string(),
                 build: build.map(job),

@@ -8,6 +8,7 @@ import {
   AppState,
   Keyboard,
   Linking,
+  Platform,
   Pressable,
   StyleSheet,
   Text,
@@ -1285,6 +1286,10 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
         allowsInlineMediaPlayback
         applicationNameForUserAgent="RemuxMobile"
         bounces={false}
+        cacheEnabled
+        {...(Platform.OS === 'android' && tab.viewRevision
+          ? { cacheMode: 'LOAD_CACHE_ELSE_NETWORK' as const }
+          : {})}
         domStorageEnabled
         hideKeyboardAccessoryView
         javaScriptEnabled

@@ -58,7 +58,12 @@ type DesiredRegistration = {
 
 export type RemuxConnectionStatus =
   | { type: 'connecting' }
-  | { cwd: string | null; generation: number; type: 'connected' }
+  | {
+      cwd: string | null;
+      generation: number;
+      serverInstanceId: string | null;
+      type: 'connected';
+    }
   | { attempt: number; type: 'reconnecting' }
   | { type: 'disconnected' };
 
@@ -113,6 +118,8 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
   const resourceQueriesRef = useRef(new Map<string, AbortController>());
   const resumePingInFlightRef = useRef(false);
   const retryInFlightRef = useRef(0);
+  const serverInstanceIdRef = useRef<string | null>(null);
+  const durableCommandProtocolVersionRef = useRef<number | null>(null);
   const shouldReconnectRef = useRef(false);
   const statusRef = useRef<RemuxConnectionStatus>({ type: 'connecting' });
   const subscribersRef = useRef(new Set<(message: RemuxRpcMessage) => void>());
@@ -190,7 +197,7 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
       () => handshake.abort('candidate-handshake-timeout'),
       remuxWebSocketConnectTimeoutMs,
     );
-    let info: { cwd: string | null };
+    let info: RemuxSystemInfo;
     try {
       await client.ping();
       info = await readRemuxSystemInfo(client, handshake.signal);
@@ -230,9 +237,11 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
         candidateRef.current = null;
         client.close('Promotion breaker retained healthy active connection');
         setError(null);
+        const retainedStatus = statusRef.current;
         setConnectionStatus({
-          cwd: info.cwd,
+          cwd: retainedStatus.type === 'connected' ? retainedStatus.cwd : info.cwd,
           generation: connectionGenerationRef.current,
+          serverInstanceId: serverInstanceIdRef.current,
           type: 'connected',
         });
         resolveConnectedWaiters(oldClient);
@@ -249,6 +258,8 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
     clientRef.current = client;
     candidateRef.current = null;
     connectionGenerationRef.current += 1;
+    serverInstanceIdRef.current = info.serverInstanceId;
+    durableCommandProtocolVersionRef.current = info.durableCommandProtocolVersion;
     lastInboundAtRef.current = Date.now();
     reconnectAttemptRef.current = 0;
     setError(null);
@@ -256,6 +267,7 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
     setConnectionStatus({
       cwd: info.cwd,
       generation: connectionGenerationRef.current,
+      serverInstanceId: info.serverInstanceId,
       type: 'connected',
     });
     flushPendingLogEntries(client);
@@ -668,13 +680,25 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
         registration.revision,
       );
     }
-    const retryable = contract.kind === 'query';
+    const retryableQuery = contract.kind === 'query';
+    const durableCommand = contract.kind === 'command' && Boolean(contract.operationId);
     let retryCount = 0;
     let holdsRetryPermit = false;
+    let admittedServerInstanceId: string | null | undefined;
 
     try {
       for (;;) {
         const client = await waitForConnectedClient(options.signal);
+        if (durableCommand && admittedServerInstanceId !== undefined) {
+          if (serverInstanceIdRef.current !== admittedServerInstanceId) {
+            throw new Error(
+              'Remux restarted while the command outcome was unknown; reconcile server state before retrying.',
+            );
+          }
+        }
+        if (durableCommand && admittedServerInstanceId === undefined) {
+          admittedServerInstanceId = serverInstanceIdRef.current;
+        }
         try {
           return await client.request(
             method,
@@ -684,12 +708,15 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
             options,
           );
         } catch (requestError) {
+          const mayRetryQuery = retryableQuery && retryCount < maxRequestReconnectRetries;
+          const mayRetryDurableCommand = durableCommand
+            && durableCommandProtocolVersionRef.current === 1
+            && admittedServerInstanceId !== null;
           if (
-            retryable &&
-            retryCount < maxRequestReconnectRetries &&
+            (mayRetryQuery || mayRetryDurableCommand) &&
             requestError instanceof RemuxConnectionClosedError &&
             shouldReconnectRef.current &&
-            retryInFlightRef.current < 8
+            (holdsRetryPermit || retryInFlightRef.current < 8)
           ) {
             retryCount += 1;
             if (!holdsRetryPermit) {
@@ -871,10 +898,16 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
+type RemuxSystemInfo = {
+  cwd: string | null;
+  durableCommandProtocolVersion: number | null;
+  serverInstanceId: string | null;
+};
+
 async function readRemuxSystemInfo(
   client: RemuxRpcClient,
   signal?: AbortSignal,
-): Promise<{ cwd: string | null }> {
+): Promise<RemuxSystemInfo> {
   const response = await client.request<unknown>(
     'remux/system/info',
     undefined,
@@ -887,6 +920,14 @@ async function readRemuxSystemInfo(
   }
   return {
     cwd: typeof response.cwd === 'string' && response.cwd.trim().length > 0 ? response.cwd : null,
+    durableCommandProtocolVersion: isRecord(response.capabilities)
+      && response.capabilities.durableCommandProtocolVersion === 1
+      ? 1
+      : null,
+    serverInstanceId: typeof response.serverInstanceId === 'string'
+      && response.serverInstanceId.trim().length > 0
+      ? response.serverInstanceId
+      : null,
   };
 }
 

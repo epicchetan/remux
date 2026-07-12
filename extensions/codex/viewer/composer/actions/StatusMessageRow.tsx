@@ -36,6 +36,8 @@ function runtimeErrorLabel(message: string) {
 
 function submissionStatusLabel(phase: string) {
   switch (phase) {
+    case 'waiting-for-connection':
+      return 'Waiting for connection';
     case 'awaiting-transcript':
       return 'Updating transcript';
     case 'starting-thread':

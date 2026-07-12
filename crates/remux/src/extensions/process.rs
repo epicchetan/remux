@@ -55,6 +55,7 @@ pub fn harden_command(command: &mut Command) -> &mut Command {
 pub fn spawn_extension(
     spec: &ServerSpec,
     placement: &ResourcePlacement,
+    media_dir: Option<&std::path::Path>,
     on_write_error: impl Fn(String) + Send + 'static,
 ) -> std::io::Result<SpawnedChild> {
     let mut command =
@@ -64,6 +65,9 @@ pub fn spawn_extension(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some(media_dir) = media_dir {
+        command.env("REMUX_MEDIA_DIR", media_dir);
+    }
     let mut child = harden_command(&mut command).spawn()?;
 
     let pid = child.id().unwrap_or_default();

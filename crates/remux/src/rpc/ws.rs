@@ -19,6 +19,9 @@ use axum::response::Response;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
+use crate::rpc::commands::{
+    await_outcome, operation_id_hash, CommandAdmission, CommandRegistry, RpcOutcome,
+};
 use crate::rpc::jsonrpc::{
     error_message, is_json_rpc_request, is_json_rpc_response, parse_json_rpc_frame,
     response_message, with_json_rpc_version, JsonRpcError, EXTENSION_ERROR, INVALID_REQUEST,
@@ -402,6 +405,7 @@ pub struct WsServer {
     control_permits: Arc<Semaphore>,
     business_permits: Arc<Semaphore>,
     jobs: Mutex<HashMap<String, JobState>>,
+    commands: CommandRegistry,
 }
 
 #[derive(Clone)]
@@ -440,6 +444,7 @@ impl WsServer {
             control_permits: Arc::new(Semaphore::new(CONTROL_CONCURRENCY)),
             business_permits: Arc::new(Semaphore::new(BUSINESS_CONCURRENCY)),
             jobs: Mutex::new(HashMap::new()),
+            commands: CommandRegistry::default(),
         })
     }
 
@@ -875,6 +880,19 @@ impl WsServer {
         let Some(cancellation) = client.begin_request(&id) else {
             return;
         };
+        if let Some(operation_id) = durable_command_operation_id(&message).map(str::to_string) {
+            self.clone()
+                .handle_durable_command(
+                    client.clone(),
+                    message,
+                    method,
+                    operation_id,
+                    id.clone(),
+                )
+                .await;
+            client.finish_request(&id);
+            return;
+        }
         if message
             .get("remuxContract")
             .and_then(|contract| contract.get("kind"))
@@ -907,6 +925,147 @@ impl WsServer {
             ) => {}
         }
         client.finish_request(&id);
+    }
+
+    async fn handle_durable_command(
+        self: Arc<Self>,
+        client: Arc<WsClient>,
+        message: Value,
+        method: String,
+        operation_id: String,
+        id: Value,
+    ) {
+        let admission = self
+            .commands
+            .admit(&method, &operation_id, message.get("params"));
+        let operation_id_hash = operation_id_hash(&operation_id);
+        let execution_started = std::time::Instant::now();
+        let outcome = match admission {
+            Err(error) => {
+                self.log.event(DiagnosticEvent {
+                    detail: Some(serde_json::json!({
+                        "admission": if error.data.as_ref().and_then(|data| data.get("detail")).and_then(Value::as_str) == Some("operation_id_conflict") {
+                            "conflict"
+                        } else {
+                            "capacity-rejected"
+                        },
+                        "connectionGeneration": client.connection_id,
+                        "method": &method,
+                        "operationIdHash": &operation_id_hash,
+                    })),
+                    label: "rpc:durable-command".to_string(),
+                    level: "warn",
+                    message: "durable command rejected".to_string(),
+                    ts: None,
+                });
+                RpcOutcome::Error(error)
+            }
+            Ok(CommandAdmission::Replay { completed, receiver }) => {
+                self.log.event(DiagnosticEvent {
+                    detail: Some(serde_json::json!({
+                        "admission": if completed { "replayed" } else { "joined" },
+                        "connectionGeneration": client.connection_id,
+                        "method": &method,
+                        "operationIdHash": &operation_id_hash,
+                    })),
+                    label: "rpc:durable-command".to_string(),
+                    level: "info",
+                    message: "durable command replay".to_string(),
+                    ts: None,
+                });
+                match await_outcome(receiver).await {
+                    Ok(outcome) => outcome,
+                    Err(error) => RpcOutcome::Error(error),
+                }
+            }
+            Ok(CommandAdmission::Execute(execution)) => {
+                self.log.event(DiagnosticEvent {
+                    detail: Some(serde_json::json!({
+                        "admission": "new",
+                        "connectionGeneration": client.connection_id,
+                        "method": &method,
+                        "operationIdHash": &operation_id_hash,
+                    })),
+                    label: "rpc:durable-command".to_string(),
+                    level: "info",
+                    message: "durable command admitted".to_string(),
+                    ts: None,
+                });
+                let outcome = match self
+                    .execute_routed_request(&client, &message, &method)
+                    .await
+                {
+                    Ok(result) => {
+                        if let Some(notifications) = &self.hooks.notifications {
+                            notifications.record_client_request(&client, &message, &result);
+                        }
+                        RpcOutcome::Result(result)
+                    }
+                    Err(error) => RpcOutcome::Error(error),
+                };
+                let (outcome, retained_bytes) = self.commands.complete(execution, outcome);
+                self.log.event(DiagnosticEvent {
+                    detail: Some(serde_json::json!({
+                        "connectionGeneration": client.connection_id,
+                        "executionMs": execution_started.elapsed().as_millis(),
+                        "method": &method,
+                        "operationIdHash": &operation_id_hash,
+                        "retainedBytes": retained_bytes,
+                    })),
+                    label: "rpc:durable-command-completed".to_string(),
+                    level: "info",
+                    message: "durable command completed".to_string(),
+                    ts: None,
+                });
+                outcome
+            }
+        };
+
+        match outcome {
+            RpcOutcome::Result(result) => {
+                client.send_control_message(&response_message(&id, result));
+            }
+            RpcOutcome::Error(error) => {
+                client.send_control_message(&error_message(&id, &error));
+            }
+        }
+    }
+
+    async fn execute_routed_request(
+        &self,
+        client: &Arc<WsClient>,
+        message: &Value,
+        method: &str,
+    ) -> RpcResult {
+        let params = message.get("params");
+        let handled_by_notifications = self
+            .hooks
+            .notifications
+            .as_ref()
+            .map(|notifications| notifications.can_handle_client_request(method))
+            .unwrap_or(false);
+
+        if handled_by_notifications {
+            return self
+                .hooks
+                .notifications
+                .as_ref()
+                .expect("checked above")
+                .handle_client_request(client.clone(), method.to_string(), params.cloned())
+                .await;
+        }
+
+        let routed_params = if self.router.routes_to_extension(method) {
+            let origin = client.origin_for_context(message.get("remuxContext"));
+            let viewer_key = message
+                .get("remuxContext")
+                .map(Value::to_string)
+                .unwrap_or_else(|| origin.clone());
+            params_with_origin(params, origin, viewer_key)
+        } else {
+            params.cloned()
+        };
+        self.router.handle_request(method, routed_params.as_ref()).await
     }
 
     async fn start_job(
@@ -1110,33 +1269,7 @@ impl WsServer {
             }
         }
 
-        let handled_by_notifications = self
-            .hooks
-            .notifications
-            .as_ref()
-            .map(|notifications| notifications.can_handle_client_request(&method))
-            .unwrap_or(false);
-
-        let result = if handled_by_notifications {
-            let notifications = self.hooks.notifications.as_ref().expect("checked above");
-            notifications
-                .handle_client_request(client.clone(), method.clone(), params.cloned())
-                .await
-        } else {
-            let routed_params = if self.router.routes_to_extension(&method) {
-                let origin = client.origin_for_context(message.get("remuxContext"));
-                let viewer_key = message
-                    .get("remuxContext")
-                    .map(Value::to_string)
-                    .unwrap_or_else(|| origin.clone());
-                params_with_origin(params, origin, viewer_key)
-            } else {
-                params.cloned()
-            };
-            self.router
-                .handle_request(&method, routed_params.as_ref())
-                .await
-        };
+        let result = self.execute_routed_request(&client, &message, &method).await;
 
         match result {
             Ok(result) => {
@@ -1150,6 +1283,13 @@ impl WsServer {
             }
         }
     }
+}
+
+fn durable_command_operation_id(message: &Value) -> Option<&str> {
+    let contract = message.get("remuxContract")?;
+    (contract.get("kind").and_then(Value::as_str) == Some("command"))
+        .then(|| contract.get("operationId").and_then(Value::as_str))
+        .flatten()
 }
 
 fn dispatch_lane(client: &WsClient, method: &str, work: &DispatchWork) -> (String, DispatchMode) {

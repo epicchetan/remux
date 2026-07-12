@@ -3,7 +3,12 @@ import { create } from 'zustand';
 import {
   fetchRemuxExtensionCatalog,
   type RemuxExtension,
+  type RemuxExtensionCatalog,
 } from '../remote/remuxExtensions';
+import {
+  readCachedRemuxExtensionCatalog,
+  writeCachedRemuxExtensionCatalog,
+} from '../remote/remuxExtensionCatalogCache';
 import { currentRemuxOrigin } from '../remote/remuxSettingsStore';
 import {
   deleteTabPreview,
@@ -28,11 +33,13 @@ import type {
 import { serializedResourceKey } from './resourceKeys';
 
 type BrowserCatalogStatus = 'error' | 'idle' | 'loading' | 'ready';
+export type BrowserCatalogSource = 'cache' | 'network' | null;
 
 type BrowserStore = {
   activeTabId: string | null;
   catalogError: string | null;
   catalogOrigin: string | null;
+  catalogSource: BrowserCatalogSource;
   catalogStatus: BrowserCatalogStatus;
   clearPendingNavigation: (tabId: string, nonce: string) => void;
   closeOverview: () => void;
@@ -96,6 +103,7 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
   activeTabId: null,
   catalogError: null,
   catalogOrigin: null,
+  catalogSource: null,
   catalogStatus: 'idle',
   clearPendingNavigation: (tabId, nonce) => {
     set((state) => ({
@@ -146,47 +154,56 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
 
     set({ catalogError: null, catalogStatus: 'loading' });
     extensionLoadOrigin = origin;
-    extensionLoadPromise = fetchRemuxExtensionCatalog(origin)
-      .then(async (catalog) => {
-        const persistedSession = await loadPersistedBrowserSession();
-        set((state) => {
-          const restoredSession =
-            state.tabs.length === 0 && persistedSession
-              ? restoreBrowserSession(persistedSession, catalog.extensions)
-              : null;
-          const tabs = restoredSession?.tabs ?? rebuildBrowserTabs(state.tabs, catalog.extensions);
-          const activeTab = state.activeTabId
-            ? tabs.find((tab) => tab.id === state.activeTabId)
-            : null;
-          const activeTabId = restoredSession
-            ? restoredSession.activeTabId
-            : activeTab?.id ?? nextActiveTabId(tabs);
+    extensionLoadPromise = (async () => {
+      const persistedSessionPromise = loadPersistedBrowserSession();
+      let cachedCatalog: RemuxExtensionCatalog | null = null;
+      try {
+        cachedCatalog = await readCachedRemuxExtensionCatalog(origin);
+      } catch {
+        cachedCatalog = null;
+      }
 
-          return {
-            activeTabId,
-            catalogError: null,
-            catalogOrigin: origin,
-            catalogStatus: 'ready',
-            defaultExtensionId: catalog.defaultExtensionId,
-            extensions: catalog.extensions,
-            mode: restoredSession ? 'overview' : activeTabId ? state.mode : 'overview',
-            section: restoredSession?.section ?? state.section,
-            tabs,
-          };
-        });
-        persistCurrentBrowserSession(get());
-      })
-      .catch((error: unknown) => {
+      if (cachedCatalog && currentRemuxOrigin() === origin) {
+        applyExtensionCatalog(
+          set,
+          get,
+          cachedCatalog,
+          origin,
+          'cache',
+          await persistedSessionPromise,
+        );
+      }
+
+      try {
+        const catalog = await fetchRemuxExtensionCatalog(origin);
+        if (currentRemuxOrigin() !== origin) {
+          return;
+        }
+        applyExtensionCatalog(set, get, catalog, origin, 'network', await persistedSessionPromise);
+        await writeCachedRemuxExtensionCatalog(origin, catalog).catch(() => undefined);
+      } catch (error) {
+        if (currentRemuxOrigin() !== origin) {
+          return;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        if (cachedCatalog) {
+          set({ catalogError: message, catalogStatus: 'ready' });
+          return;
+        }
         set({
-          catalogError: error instanceof Error ? error.message : String(error),
+          catalogError: message,
+          catalogSource: null,
           catalogStatus: 'error',
           defaultExtensionId: null,
           extensions: [],
         });
-      })
+      }
+    })()
       .finally(() => {
-        extensionLoadPromise = null;
-        extensionLoadOrigin = null;
+        if (extensionLoadOrigin === origin) {
+          extensionLoadPromise = null;
+          extensionLoadOrigin = null;
+        }
       });
 
     return extensionLoadPromise;
@@ -308,10 +325,7 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
     set((state) => ({
       tabs: state.tabs.map((tab) => (
         tab.extensionId === extensionId
-          ? {
-              ...tab,
-              reloadNonce: tab.reloadNonce + 1,
-            }
+          ? adoptLatestViewRevision(tab, state.extensions, true)
           : tab
       )),
     }));
@@ -324,7 +338,7 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
       tabs: state.tabs.map((tab) => (
         tab.id === tabId
           ? {
-              ...tab,
+              ...adoptLatestViewRevision(tab, state.extensions),
               lastActiveAt: Date.now(),
             }
           : tab
@@ -505,6 +519,7 @@ function createViewerTab(
     status: options.status?.trim() || null,
     title: options.title?.trim() || extension.display.title,
     viewId: extension.views[viewId] ? viewId : 'main',
+    viewRevision: view.revision,
   };
 
   return {
@@ -529,6 +544,7 @@ function applyTabResourceTarget(
     status: target.status?.trim() || tab.status,
     title: target.title?.trim() || tab.title,
     viewId: extension.views[viewId] ? viewId : 'main',
+    viewRevision: view.revision,
   };
 
   return {
@@ -563,6 +579,7 @@ function createRestoredViewerTab(
     status: tab.status?.trim() || null,
     title: tab.title.trim() || extension.display.title,
     viewId: extension.views[tab.viewId] ? tab.viewId : 'main',
+    viewRevision: view.revision,
   };
 
   return {
@@ -683,6 +700,80 @@ function rebuildBrowserTabs(
 
     return [createRestoredViewerTab(tab, extension)];
   });
+}
+
+function applyExtensionCatalog(
+  set: typeof useBrowserStore.setState,
+  get: typeof useBrowserStore.getState,
+  catalog: RemuxExtensionCatalog,
+  origin: string,
+  source: BrowserCatalogSource,
+  persistedSession: PersistedBrowserSession | null,
+) {
+  set((state) => {
+    const restoredSession = state.tabs.length === 0 && persistedSession
+      ? restoreBrowserSession(persistedSession, catalog.extensions)
+      : null;
+    const tabs = restoredSession?.tabs ?? reconcileBrowserTabs(state.tabs, catalog.extensions);
+    const activeTab = state.activeTabId
+      ? tabs.find((tab) => tab.id === state.activeTabId)
+      : null;
+    const activeTabId = restoredSession
+      ? restoredSession.activeTabId
+      : activeTab?.id ?? nextActiveTabId(tabs);
+
+    return {
+      activeTabId,
+      catalogError: null,
+      catalogOrigin: origin,
+      catalogSource: source,
+      catalogStatus: 'ready',
+      defaultExtensionId: catalog.defaultExtensionId,
+      extensions: catalog.extensions,
+      mode: restoredSession ? 'overview' : activeTabId ? state.mode : 'overview',
+      section: restoredSession?.section ?? state.section,
+      tabs,
+    };
+  });
+  persistCurrentBrowserSession(get());
+}
+
+function reconcileBrowserTabs(tabs: BrowserTab[], extensions: RemuxExtension[]) {
+  return tabs.flatMap((tab) => {
+    const extension = extensions.find((candidate) => candidate.id === tab.extensionId);
+    if (!extension || !extension.views[tab.viewId]) {
+      return [];
+    }
+    return [{
+      ...tab,
+      iconDarkUrl: extension.display.iconDarkUrl,
+      iconUrl: extension.display.iconUrl,
+    }];
+  });
+}
+
+function adoptLatestViewRevision(
+  tab: ViewerTab,
+  extensions: RemuxExtension[],
+  forceReload = false,
+): ViewerTab {
+  const extension = extensions.find((candidate) => candidate.id === tab.extensionId);
+  const view = extension?.views[tab.viewId];
+  if (!view) {
+    return forceReload ? { ...tab, reloadNonce: tab.reloadNonce + 1 } : tab;
+  }
+
+  const revisionChanged = tab.viewRevision !== view.revision;
+  if (!revisionChanged && !forceReload) {
+    return tab;
+  }
+
+  return {
+    ...tab,
+    reloadNonce: tab.reloadNonce + 1,
+    url: withViewerTabParams(view.url, { ...tab, viewRevision: view.revision }),
+    viewRevision: view.revision,
+  };
 }
 
 function persistCurrentBrowserSession(state: Pick<BrowserStore, 'activeTabId' | 'section' | 'tabs'>) {

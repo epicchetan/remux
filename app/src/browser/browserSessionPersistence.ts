@@ -27,6 +27,7 @@ export type PersistedViewerTab = {
   status: string | null;
   title: string;
   viewId: string;
+  viewRevision: string | null;
 };
 
 export async function readBrowserSession(): Promise<PersistedBrowserSession | null> {
@@ -69,6 +70,7 @@ export function browserSessionSnapshot({
       status: tab.status,
       title: tab.title,
       viewId: tab.viewId,
+      viewRevision: tab.viewRevision,
     })),
     version: browserSessionVersion,
   };
@@ -127,6 +129,7 @@ function parseViewerTab(value: unknown): PersistedViewerTab | null {
     status: stringOrNull(value.status),
     title,
     viewId,
+    viewRevision: stringOrNull(value.viewRevision),
   };
 }
 

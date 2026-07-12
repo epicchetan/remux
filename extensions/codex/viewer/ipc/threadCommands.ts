@@ -13,6 +13,7 @@ import type {
   CodexThreadTurnInterruptResponse,
 } from '../../shared/threadCommands';
 import { rpc } from '@remux/viewer-kit/ipc';
+import { createComposerNodeId } from '../composer/model/composerModel';
 
 export const threadCompactMethod = 'remux/codex/thread/compact';
 export const threadMessageEditMethod = 'remux/codex/thread/message/edit';
@@ -22,7 +23,9 @@ export const threadMessageStartMethod = 'remux/codex/thread/message/start';
 export const threadTurnInterruptMethod = 'remux/codex/thread/turn/interrupt';
 
 export function compactThread(params: CodexThreadCompactParams) {
-  return rpc.command<CodexThreadCompactResponse>(threadCompactMethod, params);
+  return rpc.command<CodexThreadCompactResponse>(threadCompactMethod, params, {
+    operationId: `compact:${params.threadId}:${createComposerNodeId()}`,
+  });
 }
 
 export function editThreadMessage(params: CodexThreadMessageEditParams) {

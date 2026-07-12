@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Value, json};
 
 use crate::util::stable_revision_value;
+use crate::media::rewrite_render_media;
 
 const DEFAULT_GROUP_ROWS: usize = 200;
 
@@ -69,6 +70,12 @@ pub(super) fn build_render_projection(
             "type": "work",
         }));
     }
+
+    let mut render_segments = Value::Array(segments);
+    rewrite_render_media(&mut render_segments);
+    let Value::Array(segments) = render_segments else {
+        unreachable!("render segments remain an array");
+    };
 
     let layout_segments = segments
         .iter()

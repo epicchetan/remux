@@ -13,8 +13,10 @@ use tokio_tungstenite::tungstenite::Message;
 
 use remux::auth::{require_auth, AuthState};
 use remux::extensions::manifest::{Display, ExtensionManifest, FileHandler, View};
+use remux::http::viewer_bundles::ViewerBundleRegistry;
 use remux::http::viewers::ViewerProvider;
 use remux::http::{build_router, HttpState};
+use remux::logs::{Journal, StdTerminal};
 use remux::rpc::router::{RpcRouter, SystemHooks};
 use remux::rpc::ws::{DiagnosticEvent, WsHooks, WsLog, WsServer};
 
@@ -53,6 +55,7 @@ fn fixture_extension(root: &std::path::Path) -> ExtensionManifest {
         views: vec![(
             "main".to_string(),
             View {
+                cache: Default::default(),
                 entry: dist.join("index.html"),
                 route: "/viewers/fixture".to_string(),
                 build: None,
@@ -74,10 +77,15 @@ struct Harness {
 /// auth layered over both, ConnectInfo enabled.
 async fn serve(root: &std::path::Path, require: bool) -> Harness {
     let extension = fixture_extension(root);
+    let journal = Journal::new(root, 1, Arc::new(StdTerminal)).unwrap();
+    let viewer_bundles = ViewerBundleRegistry::new(root, &[extension.clone()], journal);
+    viewer_bundles.publish_all().await;
     let state = Arc::new(HttpState {
-        viewer_providers: vec![ViewerProvider::new(&extension)],
+        viewer_providers: ViewerProvider::for_extension(&extension, viewer_bundles.clone()),
+        viewer_bundles,
         default_extension: extension.clone(),
         extensions: vec![extension],
+        media_root: root.join(".remux/cache/media"),
     });
     let router = Arc::new(RpcRouter::new(
         Vec::new(),
@@ -131,7 +139,13 @@ async fn health_is_exempt_and_everything_else_401s_without_a_token() {
         assert_eq!(get(harness.addr, path, &[]).await.status(), 200, "{path}");
     }
 
-    for path in ["/remux/extensions", "/viewers/fixture/", "/", "/nope"] {
+    for path in [
+        "/remux/extensions",
+        "/remux/media/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "/viewers/fixture/",
+        "/",
+        "/nope",
+    ] {
         let response = get(harness.addr, path, &[]).await;
         assert_eq!(response.status(), 401, "{path}");
         let body: Value = response.json().await.unwrap();

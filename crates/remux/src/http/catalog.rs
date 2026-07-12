@@ -7,10 +7,12 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
 use crate::extensions::manifest::{ExtensionManifest, LauncherRoute};
+use crate::http::viewer_bundles::ViewerBundleRegistry;
 
 pub fn extension_catalog(
     default_extension: Option<&ExtensionManifest>,
     extensions: &[ExtensionManifest],
+    bundles: &ViewerBundleRegistry,
 ) -> Value {
     let extensions: Vec<Value> = extensions
         .iter()
@@ -84,9 +86,18 @@ pub fn extension_catalog(
 
             let mut views = Map::new();
             for (view_id, view) in &extension.views {
+                let published = bundles.current(&extension.id, view_id);
+                let entry_url = published
+                    .as_ref()
+                    .map(|bundle| format!("{}/_bundle/{}/", view.route, bundle.revision))
+                    .unwrap_or_else(|| format!("{}/", view.route.trim_end_matches('/')));
                 views.insert(
                     view_id.clone(),
-                    serde_json::json!({ "route": view.route }),
+                    serde_json::json!({
+                        "entryUrl": entry_url,
+                        "revision": published.map(|bundle| bundle.revision),
+                        "route": view.route,
+                    }),
                 );
             }
 

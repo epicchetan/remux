@@ -2,6 +2,7 @@
 //! round-trip and host→client request coverage.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_util::{SinkExt, StreamExt};
@@ -41,6 +42,7 @@ impl WsLog for CapturingLog {
 
 struct EchoServer {
     notifications: NotificationLog,
+    rpc_count: Arc<AtomicUsize>,
 }
 
 impl ExtensionServer for EchoServer {
@@ -54,6 +56,7 @@ impl ExtensionServer for EchoServer {
         Box::pin(async { self.status() })
     }
     fn handle_rpc(&self, method: String, params: Option<Value>) -> BoxFuture<'_, RpcResult> {
+        self.rpc_count.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             if params
                 .as_ref()
@@ -102,6 +105,7 @@ struct Fixture {
     addr: SocketAddr,
     log: Arc<CapturingLog>,
     notifications: NotificationLog,
+    rpc_count: Arc<AtomicUsize>,
     server: Arc<WsServer>,
 }
 
@@ -111,8 +115,10 @@ async fn start_fixture() -> Fixture {
 
 async fn start_fixture_with_hooks(hooks: WsHooks) -> Fixture {
     let notifications = Arc::new(Mutex::new(Vec::new()));
+    let rpc_count = Arc::new(AtomicUsize::new(0));
     let echo = Arc::new(EchoServer {
         notifications: notifications.clone(),
+        rpc_count: rpc_count.clone(),
     });
     let router = Arc::new(RpcRouter::new(
         vec![
@@ -142,8 +148,59 @@ async fn start_fixture_with_hooks(hooks: WsHooks) -> Fixture {
         addr,
         log,
         notifications,
+        rpc_count,
         server,
     }
+}
+
+#[tokio::test]
+async fn durable_command_survives_disconnect_and_replays_once() {
+    let fixture = start_fixture().await;
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 91,
+        "method": "remux/terminal/tmux/action",
+        "remuxContract": { "kind": "command", "operationId": "durable-op-91" },
+        "params": { "testSlow": true, "value": 1 }
+    });
+
+    let mut first = connect(fixture.addr).await;
+    first
+        .send(Message::Text(request.to_string().into()))
+        .await
+        .unwrap();
+    for _ in 0..50 {
+        if fixture.rpc_count.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(fixture.rpc_count.load(Ordering::SeqCst), 1);
+    first.close(None).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let mut second = connect(fixture.addr).await;
+    let mut retry = request;
+    retry["id"] = json!(92);
+    second
+        .send(Message::Text(retry.to_string().into()))
+        .await
+        .unwrap();
+    let response = next_text(&mut second).await;
+    assert_eq!(response["id"], 92);
+    assert_eq!(response["result"]["echo"], "remux/terminal/tmux/action");
+    assert_eq!(fixture.rpc_count.load(Ordering::SeqCst), 1);
+
+    retry["id"] = json!(93);
+    retry["params"]["value"] = json!(2);
+    second
+        .send(Message::Text(retry.to_string().into()))
+        .await
+        .unwrap();
+    let conflict = next_text(&mut second).await;
+    assert_eq!(conflict["error"]["code"], -32600);
+    assert_eq!(conflict["error"]["data"]["detail"], "operation_id_conflict");
+    assert_eq!(fixture.rpc_count.load(Ordering::SeqCst), 1);
 }
 
 struct HostRoundTripHook;

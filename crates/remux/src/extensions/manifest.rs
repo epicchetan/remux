@@ -71,8 +71,16 @@ pub struct BuildSpec {
     pub cwd: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ViewCachePolicy {
+    Immutable,
+    #[default]
+    Revalidate,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct View {
+    pub cache: ViewCachePolicy,
     pub entry: PathBuf,
     pub route: String,
     /// Optional build phase: when present, `entry` legitimately may not
@@ -248,6 +256,11 @@ fn parse_views(extension_id: &str, raw_views: &Value, root_dir: &Path) -> Vec<(S
         views.push((
             view_id.clone(),
             View {
+                cache: match raw_view.get("cache").and_then(Value::as_str) {
+                    Some("immutable") => ViewCachePolicy::Immutable,
+                    None | Some("revalidate") => ViewCachePolicy::Revalidate,
+                    _ => unreachable!("validated"),
+                },
                 entry: resolve_manifest_path(
                     root_dir,
                     raw_view["entry"].as_str().expect("validated"),
@@ -634,6 +647,13 @@ fn validate_main_view(manifest: &Value, id: &str) -> Result<(), String> {
             Some(entry) if !entry.is_empty() => {}
             _ => return invalid(format!("views.{view_id}.entry must be a non-empty string")),
         }
+        if let Some(cache) = view.get("cache") {
+            if !matches!(cache.as_str(), Some("immutable" | "revalidate")) {
+                return invalid(format!(
+                    "views.{view_id}.cache must be immutable or revalidate"
+                ));
+            }
+        }
         if view.get("dev").is_some() {
             return invalid(format!("views.{view_id}.dev is not supported"));
         }
@@ -976,6 +996,13 @@ mod tests {
                 "views": { "main": { "route": "viewers/bad", "entry": "index.html" } }
             }),
             "views.main.route must start with /",
+        );
+        assert_invalid(
+            json!({
+                "version": 1, "id": "bad",
+                "views": { "main": { "entry": "index.html", "cache": "forever" } }
+            }),
+            "views.main.cache must be immutable or revalidate",
         );
         assert_invalid(
             json!({
@@ -1353,6 +1380,23 @@ mod tests {
         assert_eq!(extension.server, None);
         assert!(extension.launchers.is_empty());
         assert!(extension.file_handlers.is_empty());
+        assert_eq!(extension.main_view().cache, ViewCachePolicy::Revalidate);
+    }
+
+    #[test]
+    fn parses_immutable_view_cache_policy() {
+        let raw = json!({
+            "version": 1,
+            "id": "immutable-cache",
+            "views": { "main": { "entry": "index.html", "cache": "immutable" } }
+        });
+        validate_manifest(&raw, "immutable.json").unwrap();
+        assert_eq!(
+            parse_manifest(&raw, Path::new("/tmp/immutable"))
+                .main_view()
+                .cache,
+            ViewCachePolicy::Immutable
+        );
     }
 
     #[test]

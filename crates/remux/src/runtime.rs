@@ -21,6 +21,7 @@ use crate::extensions::runstate::{sweep_orphans, RunState};
 use crate::extensions::supervisor::{ExtensionCtx, ExtensionSupervisor, SupervisorConfig};
 use crate::fs::core::FsCore;
 use crate::fs::relay::{FsRelay, FsRelayOptions};
+use crate::http::viewer_bundles::ViewerBundleRegistry;
 use crate::http::viewers::ViewerProvider;
 use crate::http::{build_router_with_status, HttpState};
 use crate::logs::{ExtensionLogs, Journal, JournalEvent, StdTerminal, TerminalMode};
@@ -29,6 +30,7 @@ use crate::notifications::{production_fetch, NotificationManager};
 use crate::rpc::router::{BoxFuture, ExtensionServer, RpcRouter, SystemHooks};
 use crate::rpc::ws::{ClientCountListener, WsHooks, WsServer, REMUX_WEB_SOCKET_PATH};
 use crate::supervise::REMUX_RESTART_EXIT_CODE;
+use tower_http::compression::CompressionLayer;
 
 pub const RESTART_DELAY_MS: u64 = 200;
 pub const RESTART_FORCE_EXIT_DELAY_MS: u64 = 2_000;
@@ -75,6 +77,8 @@ impl Shared {
 
 struct RuntimeCtx {
     shared: Arc<Shared>,
+    viewer_bundles: Arc<ViewerBundleRegistry>,
+    media_root: std::path::PathBuf,
 }
 
 impl ExtensionCtx for RuntimeCtx {
@@ -111,6 +115,14 @@ impl ExtensionCtx for RuntimeCtx {
                 .notify_system(&title, &body, "extension-failed", &extension_id)
                 .await;
         });
+    }
+
+    fn publish_view_bundle(&self, extension_id: &str, view_id: &str) {
+        self.viewer_bundles.schedule_publish(extension_id, view_id);
+    }
+
+    fn media_dir(&self) -> Option<std::path::PathBuf> {
+        Some(self.media_root.clone())
     }
 }
 
@@ -179,6 +191,8 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
     let started_at_ms = crate::time::now_ms();
     start_guardian_heartbeat(&root_dir);
 
+    let media_root = crate::http::media::initialize_media_cache(&root_dir)?;
+
     // Config + journal (journal applies log retention on boot).
     let config = load_remux_config(&root_dir)?;
     let journal = Journal::new(
@@ -232,6 +246,12 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
 
     let shared = Arc::new(Shared::default());
 
+    let viewer_bundles = ViewerBundleRegistry::new(&root_dir, &extensions, journal.clone());
+    viewer_bundles.publish_all().await;
+    if let Err(error) = viewer_bundles.start_watching() {
+        journal.warn(&format!("viewer bundle watching unavailable: {error}"));
+    }
+
     // Notifications + logs.
     let notifications = NotificationManager::new(&root_dir, production_fetch(), journal.clone());
     let _ = shared.notifications.set(notifications.clone());
@@ -241,6 +261,8 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
     // dying unexpectedly exits 75.
     let ctx: Arc<dyn ExtensionCtx> = Arc::new(RuntimeCtx {
         shared: shared.clone(),
+        viewer_bundles: viewer_bundles.clone(),
+        media_root: media_root.clone(),
     });
     let run_state = RunState::new(&root_dir);
     let mut servers: Vec<(String, Arc<dyn ExtensionServer>)> = Vec::new();
@@ -335,7 +357,14 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
     let system = SystemHooks {
         info: Some(Box::new({
             let cwd = root_dir.to_string_lossy().into_owned();
-            move || serde_json::json!({ "cwd": cwd })
+            let server_instance_id = journal.run_id.clone();
+            move || serde_json::json!({
+                "capabilities": {
+                    "durableCommandProtocolVersion": 1,
+                },
+                "cwd": cwd,
+                "serverInstanceId": server_instance_id,
+            })
         })),
         restart: Some(Box::new({
             let shared = shared.clone();
@@ -365,12 +394,16 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
     let _ = shared.router.set(router.clone());
 
     // HTTP + WS.
-    let viewer_providers: Vec<ViewerProvider> =
-        extensions.iter().map(ViewerProvider::new).collect();
+    let viewer_providers: Vec<ViewerProvider> = extensions
+        .iter()
+        .flat_map(|extension| ViewerProvider::for_extension(extension, viewer_bundles.clone()))
+        .collect();
     let http_state = Arc::new(HttpState {
         default_extension: default_extension.clone(),
         extensions: extensions.clone(),
         viewer_providers,
+        viewer_bundles: viewer_bundles.clone(),
+        media_root,
     });
     let ws = WsServer::new(
         router.clone(),
@@ -406,6 +439,7 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
             auth_state,
             crate::auth::require_auth,
         ))
+        .layer(CompressionLayer::new())
         .into_make_service_with_connect_info::<std::net::SocketAddr>();
 
     log_start_config(

@@ -80,6 +80,10 @@ pub trait ExtensionCtx: Send + Sync {
     fn handle_extension_notification(&self, message: Value) -> BoxFuture<'_, bool>;
     /// Fires once per `failed` entry (crash budget exhausted or build failed).
     fn on_extension_failed(&self, _extension_id: &str, _name: &str, _body: String) {}
+    fn publish_view_bundle(&self, _extension_id: &str, _view_id: &str) {}
+    fn media_dir(&self) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -685,6 +689,7 @@ impl Actor {
                 Ok(()) => {
                     self.failed_view_builds.remove(&view_id);
                     self.last_view_build_at_ms = Some(now_ms());
+                    self.ctx.publish_view_bundle(&self.extension.id, &view_id);
                 }
                 Err((code, signal, message)) => {
                     self.failed_view_builds.insert(view_id);
@@ -916,6 +921,7 @@ impl Actor {
                 Ok(()) => {
                     self.failed_view_builds.remove(view_id);
                     self.last_view_build_at_ms = Some(now_ms());
+                    self.ctx.publish_view_bundle(&self.extension.id, view_id);
                 }
                 Err((code, signal, message)) => {
                     // Watch-facet failure only: the extension lifecycle (and
@@ -1050,6 +1056,7 @@ impl Actor {
                 Ok(()) => {
                     self.failed_view_builds.remove(&view_id);
                     self.last_view_build_at_ms = Some(now_ms());
+                    self.ctx.publish_view_bundle(&self.extension.id, &view_id);
                 }
                 Err((code, signal, message)) => {
                     self.failed_view_builds.insert(view_id.clone());
@@ -1497,11 +1504,17 @@ impl Actor {
 
         let journal = self.journal.clone();
         let extension_id = self.extension.id.clone();
-        let spawned = spawn_extension(server, &self.resource_placement, move |error| {
-            journal.warn(&format!(
-                "[remux] failed to write to extension {extension_id}: {error}"
-            ));
-        });
+        let media_dir = self.ctx.media_dir();
+        let spawned = spawn_extension(
+            server,
+            &self.resource_placement,
+            media_dir.as_deref(),
+            move |error| {
+                journal.warn(&format!(
+                    "[remux] failed to write to extension {extension_id}: {error}"
+                ));
+            },
+        );
 
         match spawned {
             Ok(SpawnedChild {

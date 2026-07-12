@@ -5,6 +5,7 @@ mod file_resources;
 mod history;
 mod item_identity;
 mod live_transcript;
+mod media;
 mod models;
 mod narration;
 mod narration_planning;

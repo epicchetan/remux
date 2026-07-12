@@ -11,6 +11,7 @@ import { applyCodexResourceInvalidations } from '../../ipc/resourceInvalidations
 import { useThreadRuntimeStore } from '../../threads/runtimeStore';
 import { useThreadsStore } from '../../threads/store';
 import { useTranscriptViewportStore } from '../../transcript/viewportStore';
+import { useHostStore } from '../../ipc/hostStore';
 import { createComposerNodeId } from '../model/composerModel';
 import { buildComposerSendParts } from '../model/sendProjection';
 import { useComposerStore } from '../store';
@@ -33,6 +34,8 @@ export function useComposerTurnAction() {
   const model = useComposerStore((state) => state.model);
   const reviewMode = useComposerStore((state) => state.reviewMode);
   const setSubmissionTurn = useComposerStore((state) => state.setSubmissionTurn);
+  const setSubmissionPhase = useComposerStore((state) => state.setSubmissionPhase);
+  const connectionStatus = useHostStore((state) => state.connectionStatus);
   const speed = useComposerStore((state) => state.speed);
   const submission = useComposerStore((state) => state.submission);
   const snapshot = useComposerStore((state) => state.snapshot);
@@ -62,6 +65,18 @@ export function useComposerTurnAction() {
     }
   }, [clearSubmission, runtimeStatus, submission]);
 
+  useEffect(() => {
+    if (connectionStatus.type !== 'connected' || submission?.phase !== 'waiting-for-connection') {
+      return;
+    }
+    setSubmissionPhase(
+      submission.id,
+      submission.kind === 'fork' || submission.kind === 'new-chat'
+        ? 'starting-thread'
+        : 'starting-turn',
+    );
+  }, [connectionStatus.type, setSubmissionPhase, submission]);
+
   const handleSendAction = useCallback(() => {
     if (sendDisabled) {
       return;
@@ -75,7 +90,7 @@ export function useComposerTurnAction() {
     if (editTarget) {
       const submission = beginSubmission({
         kind: 'edit',
-        phase: 'starting-turn',
+        phase: connectionStatus.type === 'connected' ? 'starting-turn' : 'waiting-for-connection',
         snapshot,
         threadId: editTarget.threadId,
         turnId: editTarget.turnId,
@@ -109,7 +124,7 @@ export function useComposerTurnAction() {
     if (forkTarget) {
       const submission = beginSubmission({
         kind: 'fork',
-        phase: 'starting-thread',
+        phase: connectionStatus.type === 'connected' ? 'starting-thread' : 'waiting-for-connection',
         snapshot,
         threadId: forkTarget.threadId,
         turnId: forkTarget.turnId,
@@ -144,7 +159,7 @@ export function useComposerTurnAction() {
     if (!activeThreadId && activeDraft?.cwd) {
       const submission = beginSubmission({
         kind: 'new-chat',
-        phase: 'starting-thread',
+        phase: connectionStatus.type === 'connected' ? 'starting-thread' : 'waiting-for-connection',
         snapshot,
       });
 
@@ -184,7 +199,7 @@ export function useComposerTurnAction() {
 
     const submission = beginSubmission({
       kind: 'send',
-      phase: 'starting-turn',
+      phase: connectionStatus.type === 'connected' ? 'starting-turn' : 'waiting-for-connection',
       snapshot,
       threadId: activeThreadId,
     });
@@ -222,6 +237,7 @@ export function useComposerTurnAction() {
     clearComposer,
     clearMode,
     clearSubmission,
+    connectionStatus.type,
     completeDraftAsThread,
     editTarget,
     failSubmission,

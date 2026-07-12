@@ -30,6 +30,7 @@ export type ViewerTab = {
   title: string;
   url: string;
   viewId: string;
+  viewRevision: string | null;
 };
 
 export type BrowserTab = ViewerTab;

@@ -58,6 +58,7 @@ workloads under `resources`.
     "main": {
       "route": "/viewers/example",
       "entry": "viewer/dist/index.html",
+      "cache": "immutable",
       "build": {
         "command": "npm",
         "args": ["run", "build"],
@@ -101,6 +102,21 @@ Important rules enforced by the runtime:
 Viewers are static web applications served from the directory containing each
 view's entry HTML. Requests below the view route fall back to that entry, so a
 client-side router works without a separate web server.
+
+Use `"cache": "immutable"` when the built viewer is relocatable and all local
+assets resolve relative to the entry document or importing module. Remux then
+publishes a content-addressed snapshot and advertises its immutable entry URL
+in the extension catalog. Vite viewers should pair that manifest field with:
+
+```ts
+export default defineConfig({
+  base: './',
+});
+```
+
+Omit `cache` (or use `"cache": "revalidate"`) for compatibility with viewers
+that construct root-relative asset URLs. Those views remain compressed and use
+ETag revalidation, but their stable route is never marked immutable.
 
 `views.<id>.build` is a finite artifact build. `views.<id>.watch` is a
 long-lived development sidecar supervised independently. The app Settings

@@ -30,6 +30,7 @@
     "main": {
       "route": "/viewers/terminal",
       "entry": "viewer/dist/index.html",
+      "cache": "immutable",
       "build": {
         "command": "npm",
         "args": [
