@@ -8,28 +8,26 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use remux_compute::{Registry as ComputeRegistry, TaskOptions};
+use remux_extension_rpc::Peer as ExtensionRpcPeer;
 use remux_tts::{KokoroSynthesis, SynthesisProgress, SynthesisRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::app_server::{AppServerEvent, AppServerRuntime};
-use crate::file_resources::base64_encode;
-use crate::live_transcript::LiveTranscriptStore;
-use crate::narration_planning::{
+use crate::planning::{
     NARRATION_ACOUSTIC_TIMING_PROVIDER_VERSION, NARRATION_SOURCE_MAPPING_VERSION,
-    NarrationPlanningProfile, PlanningTurnIdentity, plan_transformed_blocks,
+    NarrationPlanningProfile, PlanningCoordinator, plan_transformed_blocks,
     resolve_planning_profile,
 };
-use crate::narration_source_mapping::{normalized_alignment_hints, verbatim_alignment_hints};
-use crate::narration_synthesis::{NarrationSynthesisProfile, resolve_synthesis_profile};
-use crate::resources::CodexTranscriptServer;
+use crate::source_mapping::{normalized_alignment_hints, verbatim_alignment_hints};
+use crate::synthesis_profile::{NarrationSynthesisProfile, resolve_synthesis_profile};
 use crate::util::stable_revision_value;
 
-pub(crate) const NARRATION_UPDATED_METHOD: &str = "remux/codex/narration/updated";
+pub(crate) const NARRATION_UPDATED_METHOD: &str = "remux/narrate/narration/updated";
 const NARRATION_SOURCE_DOCUMENT_VERSION: &str = "3";
-const NARRATION_MANIFEST_VERSION: u64 = 2;
+const NARRATION_MANIFEST_VERSION: u64 = 3;
 const WORKER_POLL: Duration = Duration::from_millis(100);
 const MAX_AUDIO_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -40,46 +38,31 @@ const MAX_SOURCE_TARGETS: usize = 8_192;
 const MAX_SOURCE_ASSOCIATIONS: usize = 32_768;
 const MAX_IDENTIFIER_BYTES: usize = 1_024;
 const MAX_INACTIVE_JOBS: usize = 128;
-const MAX_PLANNING_SUBSCRIPTIONS: usize = 4;
 const NARRATION_JOB_BUDGET: Duration = Duration::from_secs(15 * 60);
 const NARRATION_STALL_BUDGET: Duration = Duration::from_secs(60);
 const WORKLOAD_INSPECT_AFTER: Duration = Duration::from_secs(2);
 const WORKLOAD_INSPECT_INTERVAL: Duration = Duration::from_secs(1);
 
-#[derive(Clone, Debug)]
-pub(crate) struct CodexNarrationServer {
+#[derive(Clone)]
+pub(crate) struct NarrationServer {
     inner: Arc<NarrationInner>,
 }
 
-#[derive(Debug)]
 pub(crate) struct NarrationInner {
-    app_server: AppServerRuntime,
     cache_root: PathBuf,
-    codex_home: PathBuf,
     compute: ComputeRegistry,
     diagnostics: Mutex<VecDeque<Value>>,
     jobs: Mutex<HashMap<String, NarrationJob>>,
+    host_rpc: ExtensionRpcPeer,
     output_tx: mpsc::SyncSender<Value>,
-    subscriptions: Mutex<HashMap<String, mpsc::Sender<Value>>>,
-    transcript: Mutex<CodexTranscriptServer>,
-}
-
-pub(crate) struct PlanningSubscriptionGuard {
-    inner: Arc<NarrationInner>,
-    thread_id: String,
-}
-
-impl Drop for PlanningSubscriptionGuard {
-    fn drop(&mut self) {
-        if let Ok(mut subscriptions) = self.inner.subscriptions.lock() {
-            subscriptions.remove(&self.thread_id);
-        }
-    }
+    remux_root: PathBuf,
+    codex_home: PathBuf,
 }
 
 #[derive(Clone, Debug)]
 struct NarrationJob {
     artifact_key: String,
+    available_segments: Vec<Value>,
     document: NarrationSourceDocument,
     cancel_requested: bool,
     completed_units: Option<usize>,
@@ -87,11 +70,12 @@ struct NarrationJob {
     last_access_ms: u128,
     manifest: Option<Value>,
     planning_profile: NarrationPlanningProfile,
-    planning_turns: Vec<PlanningTurnIdentity>,
+    planning_operations: Vec<String>,
     revision: u64,
     stage: Option<&'static str>,
     status: NarrationStatus,
     synthesis_profile: NarrationSynthesisProfile,
+    staging_dir: Option<PathBuf>,
     target: NarrationTarget,
     total_units: Option<usize>,
 }
@@ -183,31 +167,29 @@ struct NarrationAudioReadParams {
     chunk_id: String,
 }
 
-impl CodexNarrationServer {
+impl NarrationServer {
     pub(crate) fn new(
+        remux_root: PathBuf,
         codex_home: PathBuf,
-        app_server: AppServerRuntime,
-        event_rx: mpsc::Receiver<AppServerEvent>,
         output_tx: mpsc::SyncSender<Value>,
-        live_transcript: LiveTranscriptStore,
+        host_rpc: ExtensionRpcPeer,
         compute: ComputeRegistry,
     ) -> Self {
         let inner = Arc::new(NarrationInner {
-            app_server,
-            cache_root: codex_home.join("remux").join("narration").join("v2"),
+            cache_root: remux_root
+                .join(".remux")
+                .join("cache")
+                .join("narrate")
+                .join("v1"),
             codex_home: codex_home.clone(),
             compute,
             diagnostics: Mutex::new(VecDeque::new()),
+            host_rpc,
             jobs: Mutex::new(HashMap::new()),
             output_tx,
-            subscriptions: Mutex::new(HashMap::new()),
-            transcript: Mutex::new(CodexTranscriptServer::new_with_live_transcript(
-                codex_home,
-                live_transcript,
-            )),
+            remux_root,
         });
         cleanup_temporary_artifacts(&inner.cache_root);
-        spawn_narration_event_router(inner.clone(), event_rx);
         Self { inner }
     }
 
@@ -223,13 +205,13 @@ impl CodexNarrationServer {
         let params: NarrationStartParams = serde_json::from_value(params)
             .map_err(|error| format!("invalid narration/start params: {error}"))?;
         validate_start_params(&params)?;
-        self.validate_target(&params)?;
 
         // The resolved model and service tier are part of cache identity. Resolve
         // capability before lookup so a standard-tier fallback cannot collide
         // with a Priority artifact.
-        let planning_profile = resolve_planning_profile(&self.inner)?;
-        let synthesis_profile = resolve_synthesis_profile(&self.inner.codex_home)?;
+        let planning_profile = resolve_planning_profile()?;
+        let synthesis_profile =
+            resolve_synthesis_profile(&self.inner.remux_root, &self.inner.codex_home)?;
         let artifact_key = artifact_key(&params, &planning_profile, &synthesis_profile);
         if let Some(manifest) = read_cached_manifest(&self.inner.cache_root, &artifact_key) {
             let mut jobs = self
@@ -260,12 +242,15 @@ impl CodexNarrationServer {
             .lock()
             .map_err(|_| "narration job store poisoned".to_string())?;
         if let Some(job) = jobs.get_mut(&artifact_key) {
-            job.last_access_ms = now_millis();
-            return Ok(json!({
-                "artifactKey": artifact_key,
-                "resource": job.resource_value(),
-                "status": "accepted",
-            }));
+            if reuses_existing_job(job.status) {
+                job.last_access_ms = now_millis();
+                return Ok(json!({
+                    "artifactKey": artifact_key,
+                    "resource": job.resource_value(),
+                    "status": "accepted",
+                }));
+            }
+            jobs.remove(&artifact_key);
         }
         if jobs.values().any(|job| job.status.active()) {
             return Err("another narration is already being prepared".to_string());
@@ -318,7 +303,7 @@ impl CodexNarrationServer {
         let params: NarrationCancelParams = serde_json::from_value(params)
             .map_err(|error| format!("invalid narration/cancel params: {error}"))?;
         let artifact_key = non_empty(&params.artifact_key, "artifactKey")?.to_string();
-        let planning_turns = {
+        let (planning_operations, staging_dir) = {
             let mut jobs = self
                 .inner
                 .jobs
@@ -330,23 +315,13 @@ impl CodexNarrationServer {
             if !job.status.active() {
                 return Ok(json!({ "artifactKey": artifact_key, "status": "accepted" }));
             }
-            job.cancel_requested = true;
-            job.status = NarrationStatus::Cancelled;
-            job.stage = None;
-            job.revision += 1;
-            job.last_access_ms = now_millis();
-            job.planning_turns.clone()
+            let planning_operations = std::mem::take(&mut job.planning_operations);
+            let staging_dir = job.finish_cancelled();
+            (planning_operations, staging_dir)
         };
+        remove_staging_dir(staging_dir);
         self.inner.notify(&artifact_key);
-        for identity in planning_turns {
-            let app_server = self.inner.app_server.clone();
-            thread::spawn(move || {
-                let _ = app_server.request(
-                    "turn/interrupt",
-                    json!({ "threadId": identity.thread_id, "turnId": identity.turn_id }),
-                );
-            });
-        }
+        self.inner.cancel_planning_operations(planning_operations);
 
         Ok(json!({ "artifactKey": artifact_key, "status": "accepted" }))
     }
@@ -360,26 +335,59 @@ impl CodexNarrationServer {
             return Err("invalid narration artifact or chunk identifier".to_string());
         }
 
-        let manifest = read_cached_manifest(&self.inner.cache_root, artifact_key)
-            .ok_or_else(|| "narration artifact is not ready".to_string())?;
-        let known_chunk = manifest
-            .get("chunks")
-            .and_then(Value::as_array)
-            .is_some_and(|chunks| {
-                chunks
-                    .iter()
-                    .any(|chunk| chunk.get("id").and_then(Value::as_str) == Some(chunk_id))
-            });
-        if !known_chunk {
-            return Err("narration audio chunk was not found".to_string());
-        }
-
-        let path = self
-            .inner
-            .cache_root
-            .join(artifact_key)
-            .join("audio")
-            .join(format!("{chunk_id}.wav"));
+        let final_dir = self.inner.cache_root.join(artifact_key);
+        let path =
+            if let Some(manifest) = read_cached_manifest(&self.inner.cache_root, artifact_key) {
+                let known = manifest
+                    .get("chunks")
+                    .and_then(Value::as_array)
+                    .is_some_and(|chunks| {
+                        chunks
+                            .iter()
+                            .any(|chunk| chunk.get("id").and_then(Value::as_str) == Some(chunk_id))
+                    });
+                if !known {
+                    return Err("narration audio chunk was not found".to_string());
+                }
+                final_dir.join("audio").join(format!("{chunk_id}.wav"))
+            } else {
+                let jobs = self
+                    .inner
+                    .jobs
+                    .lock()
+                    .map_err(|_| "narration job store poisoned".to_string())?;
+                let job = jobs
+                    .get(artifact_key)
+                    .ok_or_else(|| "narration artifact was not found".to_string())?;
+                if !job.available_segments.iter().any(|segment| {
+                    segment
+                        .get("audio")
+                        .and_then(|audio| audio.get("id"))
+                        .and_then(Value::as_str)
+                        == Some(chunk_id)
+                }) {
+                    return Err("narration audio chunk is not available".to_string());
+                }
+                let staging_path = job
+                    .staging_dir
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or(final_dir)
+                    .join("audio")
+                    .join(format!("{chunk_id}.wav"));
+                if staging_path.is_file() {
+                    staging_path
+                } else {
+                    // Final promotion is an atomic directory rename followed by
+                    // a job-state update. A read in that narrow interval must
+                    // follow the file into its final directory.
+                    self.inner
+                        .cache_root
+                        .join(artifact_key)
+                        .join("audio")
+                        .join(format!("{chunk_id}.wav"))
+                }
+            };
         let metadata = fs::metadata(&path)
             .map_err(|error| format!("narration audio chunk unavailable: {error}"))?;
         if metadata.len() > MAX_AUDIO_CHUNK_BYTES {
@@ -393,7 +401,7 @@ impl CodexNarrationServer {
         Ok(json!({
             "artifactKey": artifact_key,
             "chunkId": chunk_id,
-            "dataBase64": base64_encode(&bytes),
+            "dataBase64": base64::engine::general_purpose::STANDARD.encode(&bytes),
             "mimeType": "audio/wav",
             "sizeBytes": bytes.len(),
         }))
@@ -407,91 +415,50 @@ impl CodexNarrationServer {
             .map_err(|_| "narration diagnostics poisoned".to_string())?;
         Ok(json!({ "runs": diagnostics.iter().collect::<Vec<_>>() }))
     }
-
-    fn validate_target(&self, params: &NarrationStartParams) -> Result<(), String> {
-        let response = self
-            .inner
-            .transcript
-            .lock()
-            .map_err(|_| "narration transcript validator poisoned".to_string())?
-            .read_resources(json!({
-                "threadId": params.target.thread_id,
-                "requests": [{ "type": "turn", "turnId": params.target.turn_id }],
-            }))?;
-        let turn = response
-            .get("resources")
-            .and_then(Value::as_array)
-            .and_then(|resources| resources.first())
-            .filter(|resource| resource.get("status").and_then(Value::as_str) == Some("ok"))
-            .and_then(|resource| resource.get("value"))
-            .and_then(|value| value.get("turn"))
-            .ok_or_else(|| "narration target turn was not found".to_string())?;
-        let message = turn
-            .get("segments")
-            .and_then(Value::as_array)
-            .and_then(|segments| {
-                segments.iter().find(|segment| {
-                    segment.get("type").and_then(Value::as_str) == Some("assistantMessage")
-                        && segment.get("id").and_then(Value::as_str)
-                            == Some(params.target.assistant_message_id.as_str())
-                })
-            })
-            .ok_or_else(|| "narration target assistant message was not found".to_string())?;
-        if message.get("revision").and_then(Value::as_str)
-            != Some(params.target.message_revision.as_str())
-        {
-            return Err("narration target message revision changed".to_string());
-        }
-        if message.get("text").and_then(Value::as_str) != Some(params.source_text.as_str()) {
-            return Err("narration source text does not match the transcript".to_string());
-        }
-        Ok(())
-    }
 }
 
 impl NarrationInner {
-    pub(crate) fn app_server_request(&self, method: &str, params: Value) -> Result<Value, String> {
-        self.app_server.request(method, params)
-    }
-
-    pub(crate) fn planning_context_directory(&self) -> Result<PathBuf, String> {
-        let path = self
-            .codex_home
-            .join("remux")
-            .join("narration")
-            .join("context-v1");
-        fs::create_dir_all(&path)
-            .map_err(|error| format!("failed to create neutral narration context: {error}"))?;
-        Ok(path)
-    }
-
-    pub(crate) fn subscribe_to_planning_thread(
-        self: &Arc<Self>,
-        thread_id: &str,
-    ) -> Result<(mpsc::Receiver<Value>, PlanningSubscriptionGuard), String> {
-        let (event_tx, event_rx) = mpsc::channel();
-        let mut subscriptions = self
-            .subscriptions
-            .lock()
-            .map_err(|_| "narration event subscriptions poisoned".to_string())?;
-        if subscriptions.len() >= MAX_PLANNING_SUBSCRIPTIONS {
-            return Err(format!(
-                "narration planning subscription limit reached: {MAX_PLANNING_SUBSCRIPTIONS}"
-            ));
+    pub(crate) fn structured_generate(
+        &self,
+        artifact_key: &str,
+        batch_index: usize,
+        instructions: &str,
+        input: &str,
+        output_schema: Value,
+        profile: &NarrationPlanningProfile,
+        coordinator: &PlanningCoordinator,
+    ) -> Result<Value, String> {
+        let operation_id = format!("narration:{artifact_key}:batch:{batch_index}");
+        coordinator.register(&operation_id)?;
+        if let Err(error) = self.register_planning_operation(artifact_key, &operation_id) {
+            coordinator.unregister(&operation_id);
+            return Err(error);
         }
-        subscriptions.insert(thread_id.to_string(), event_tx);
-        drop(subscriptions);
-        Ok((
-            event_rx,
-            PlanningSubscriptionGuard {
-                inner: self.clone(),
-                thread_id: thread_id.to_string(),
-            },
-        ))
-    }
-
-    pub(crate) fn record_planning_turn(&self, artifact_key: &str, identity: PlanningTurnIdentity) {
-        self.update_job(artifact_key, |job| job.planning_turns.push(identity));
+        let result = self
+            .host_rpc
+            .request(
+                "remux/codex/inference/structured/generate",
+                Some(json!({
+                    "apiVersion": 1,
+                    "operationId": operation_id,
+                    "model": profile.model,
+                    "serviceTier": profile.service_tier.persisted(),
+                    "effort": profile.effort,
+                    "instructions": instructions,
+                    "input": input,
+                    "outputSchema": output_schema,
+                })),
+                Duration::from_secs(260),
+            )
+            .map_err(|error| format!("Codex structured inference failed: {error}"));
+        coordinator.unregister(&operation_id);
+        self.unregister_planning_operation(artifact_key, &operation_id);
+        result.and_then(|response| {
+            response
+                .get("value")
+                .cloned()
+                .ok_or_else(|| "Codex structured inference response is missing value".to_string())
+        })
     }
 
     pub(crate) fn record_narration_diagnostic(&self, diagnostic: Value) {
@@ -503,28 +470,58 @@ impl NarrationInner {
         }
     }
 
-    pub(crate) fn interrupt_planning_turns(&self, artifact_key: &str) {
-        let mut identities = self
-            .jobs
-            .lock()
-            .ok()
-            .and_then(|jobs| jobs.get(artifact_key).map(|job| job.planning_turns.clone()))
-            .unwrap_or_default();
-        identities.sort_by_key(|identity| identity.batch_index);
-        for identity in identities {
-            let _ = self.app_server.request(
-                "turn/interrupt",
-                json!({ "threadId": identity.thread_id, "turnId": identity.turn_id }),
-            );
+    pub(crate) fn cancel_planning_operations(&self, operation_ids: Vec<String>) {
+        for operation_id in operation_ids {
+            let host_rpc = self.host_rpc.clone();
+            thread::spawn(move || {
+                let _ = host_rpc.request(
+                    "remux/codex/inference/structured/cancel",
+                    Some(json!({ "operationId": operation_id })),
+                    Duration::from_secs(10),
+                );
+            });
         }
     }
 
+    fn register_planning_operation(
+        &self,
+        artifact_key: &str,
+        operation_id: &str,
+    ) -> Result<(), String> {
+        {
+            let mut jobs = self
+                .jobs
+                .lock()
+                .map_err(|_| "narration job store poisoned".to_string())?;
+            let job = jobs
+                .get_mut(artifact_key)
+                .ok_or_else(|| "narration job disappeared".to_string())?;
+            if job.cancel_requested || !job.status.active() {
+                return Err("narration cancelled".to_string());
+            }
+            job.planning_operations.push(operation_id.to_string());
+            job.revision += 1;
+            job.last_access_ms = now_millis();
+        }
+        self.notify(artifact_key);
+        Ok(())
+    }
+
+    fn unregister_planning_operation(&self, artifact_key: &str, operation_id: &str) {
+        self.update_job(artifact_key, |job| {
+            job.planning_operations
+                .retain(|candidate| candidate != operation_id)
+        });
+    }
+
     fn notify(&self, artifact_key: &str) {
-        let _ = self.output_tx.send(json!({
-            "jsonrpc": "2.0",
-            "method": NARRATION_UPDATED_METHOD,
-            "params": { "artifactKey": artifact_key },
-        }));
+        for method in [NARRATION_UPDATED_METHOD, "remux/codex/narration/updated"] {
+            let _ = self.output_tx.send(json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": { "artifactKey": artifact_key },
+            }));
+        }
     }
 
     pub(crate) fn cancelled(&self, artifact_key: &str) -> bool {
@@ -559,6 +556,7 @@ impl NarrationJob {
     ) -> Self {
         Self {
             artifact_key,
+            available_segments: Vec::new(),
             document: params.document,
             cancel_requested: false,
             completed_units: None,
@@ -566,11 +564,12 @@ impl NarrationJob {
             last_access_ms: now_millis(),
             manifest: None,
             planning_profile,
-            planning_turns: Vec::new(),
+            planning_operations: Vec::new(),
             revision: 1,
             stage: Some("planning"),
             status: NarrationStatus::Planning,
             synthesis_profile,
+            staging_dir: None,
             target: params.target,
             total_units: None,
         }
@@ -585,6 +584,11 @@ impl NarrationJob {
     ) -> Self {
         Self {
             artifact_key,
+            available_segments: manifest
+                .get("segments")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
             document: params.document,
             cancel_requested: false,
             completed_units: None,
@@ -592,20 +596,37 @@ impl NarrationJob {
             last_access_ms: now_millis(),
             manifest: Some(manifest),
             planning_profile,
-            planning_turns: Vec::new(),
+            planning_operations: Vec::new(),
             revision: 1,
             stage: None,
             status: NarrationStatus::Ready,
             synthesis_profile,
+            staging_dir: None,
             target: params.target,
             total_units: None,
         }
     }
 
     fn resource_value(&self) -> Value {
+        let available_chunks = self
+            .available_segments
+            .iter()
+            .filter_map(|segment| segment.get("audio").cloned())
+            .collect::<Vec<_>>();
+        let available_duration = self
+            .available_segments
+            .last()
+            .and_then(|segment| segment.get("audio"))
+            .and_then(|audio| audio.get("end"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
         json!({
             "artifactKey": self.artifact_key,
+            "availableChunks": available_chunks,
+            "availableDuration": available_duration,
+            "availableSegments": self.available_segments,
             "completedUnits": self.completed_units,
+            "complete": self.status == NarrationStatus::Ready,
             "error": self.error,
             "manifest": self.manifest,
             "revision": self.revision.to_string(),
@@ -621,32 +642,69 @@ impl NarrationJob {
             "totalUnits": self.total_units,
         })
     }
+
+    fn clear_transient_state(&mut self) -> Option<PathBuf> {
+        self.available_segments.clear();
+        self.planning_operations.clear();
+        self.completed_units = None;
+        self.total_units = None;
+        self.staging_dir.take()
+    }
+
+    fn finish_ready(&mut self, manifest: Value) -> Option<PathBuf> {
+        let staging_dir = self.staging_dir.take();
+        self.cancel_requested = false;
+        self.available_segments = manifest
+            .get("segments")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        self.completed_units = self.total_units;
+        self.error = None;
+        self.manifest = Some(manifest);
+        self.planning_operations.clear();
+        self.stage = None;
+        self.status = NarrationStatus::Ready;
+        staging_dir
+    }
+
+    fn finish_failed(&mut self, error: String) -> Option<PathBuf> {
+        let staging_dir = self.clear_transient_state();
+        self.error = Some(error);
+        self.manifest = None;
+        self.stage = None;
+        self.status = NarrationStatus::Failed;
+        staging_dir
+    }
+
+    fn finish_cancelled(&mut self) -> Option<PathBuf> {
+        self.cancel_requested = true;
+        let staging_dir = self.clear_transient_state();
+        self.error = None;
+        self.manifest = None;
+        self.stage = None;
+        self.status = NarrationStatus::Cancelled;
+        self.revision += 1;
+        self.last_access_ms = now_millis();
+        staging_dir
+    }
 }
 
 fn run_narration_job(inner: Arc<NarrationInner>, artifact_key: String) {
     let result = run_narration_job_inner(&inner, &artifact_key);
-    match result {
-        Ok(manifest) => inner.update_job(&artifact_key, |job| {
-            if job.cancel_requested {
-                return;
-            }
-            job.completed_units = job.total_units;
-            job.error = None;
-            job.manifest = Some(manifest);
-            job.stage = None;
-            job.status = NarrationStatus::Ready;
-        }),
-        Err(error) => inner.update_job(&artifact_key, |job| {
-            if job.cancel_requested {
-                job.stage = None;
-                job.status = NarrationStatus::Cancelled;
-                return;
-            }
-            job.error = Some(error);
-            job.stage = None;
-            job.status = NarrationStatus::Failed;
-        }),
-    }
+    let mut cleanup = None;
+    inner.update_job(&artifact_key, |job| {
+        cleanup = Some(match result {
+            // An Ok result means the staging directory was already atomically
+            // promoted. That complete immutable artifact wins a cancellation
+            // racing after promotion, so state never points at a cancelled job
+            // while a valid final artifact exists.
+            Ok(manifest) => job.finish_ready(manifest),
+            Err(_) if job.cancel_requested => job.finish_cancelled(),
+            Err(error) => job.finish_failed(error),
+        });
+    });
+    remove_staging_dir(cleanup.flatten());
 }
 
 fn run_narration_job_inner(
@@ -690,6 +748,10 @@ fn run_narration_job_inner(
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(temp_dir.join("audio"))
         .map_err(|error| format!("failed to create narration temporary directory: {error}"))?;
+    inner.update_job(artifact_key, |job| {
+        job.available_segments.clear();
+        job.staging_dir = Some(temp_dir.clone());
+    });
 
     let profile = planning_profile.provider_descriptor(synthesis_profile.descriptor.clone());
     let source_document_key = stable_revision_value(
@@ -758,7 +820,7 @@ fn run_narration_job_inner(
             "profileHash": stable_revision_value(&synthesis_profile.descriptor),
         }));
         eprintln!(
-            "[codex:narration] synthesis backend={} metrics={metrics}",
+            "[narrate] synthesis backend={} metrics={metrics}",
             synthesis_profile
                 .descriptor
                 .get("provider")
@@ -854,7 +916,7 @@ fn build_narration_plan_v3(
         }));
     }
     eprintln!(
-        "[codex:narration] source mapping exact_words={exact_words} semantic_words={semantic_words} fallback_words={fallback_words}"
+        "[narrate] source mapping exact_words={exact_words} semantic_words={semantic_words} fallback_words={fallback_words}"
     );
     Ok(units)
 }
@@ -966,7 +1028,7 @@ fn run_native_synthesis_worker(
                     active_clock.set_frozen(false);
                     if !inspect_warned {
                         eprintln!(
-                            "[codex:narration] compute inspection failed pid={}: {error}",
+                            "[narrate] compute inspection failed pid={}: {error}",
                             task.id()
                         );
                         inspect_warned = true;
@@ -982,17 +1044,38 @@ fn run_native_synthesis_worker(
                 _ => "native TTS task made no progress for 60 seconds".to_string(),
             });
         }
-        while let Some(SynthesisProgress { completed, total }) = task
+        while let Some(progress) = task
             .try_progress()
             .map_err(|error| format!("native TTS task failed: {error}"))?
         {
             active_clock.progress();
-            if last_progress_update.elapsed() >= Duration::from_millis(500) || completed == total {
-                inner.update_job(artifact_key, |job| {
-                    job.completed_units = Some(completed);
-                    job.total_units = Some(total);
-                });
-                last_progress_update = Instant::now();
+            match progress {
+                SynthesisProgress::Units { completed, total } => {
+                    if last_progress_update.elapsed() >= Duration::from_millis(500)
+                        || completed == total
+                    {
+                        inner.update_job(artifact_key, |job| {
+                            job.completed_units = Some(completed);
+                            job.total_units = Some(total);
+                        });
+                        last_progress_update = Instant::now();
+                    }
+                }
+                SynthesisProgress::SegmentReady { segment } => {
+                    let segment = serde_json::to_value(segment).map_err(|error| {
+                        format!("failed to encode native TTS segment progress: {error}")
+                    })?;
+                    inner.update_job(artifact_key, |job| {
+                        let index = segment.get("index").and_then(Value::as_u64);
+                        if index.is_some()
+                            && !job.available_segments.iter().any(|candidate| {
+                                candidate.get("index").and_then(Value::as_u64) == index
+                            })
+                        {
+                            job.available_segments.push(segment);
+                        }
+                    });
+                }
             }
         }
         if let Some(output) = task
@@ -1069,54 +1152,6 @@ fn inspect_workload_state(pid: u32) -> Result<WorkloadState, String> {
         Some("missing") => Ok(WorkloadState::Missing),
         _ => Err("workload inspection returned an unknown state".to_string()),
     }
-}
-
-fn spawn_narration_event_router(
-    inner: Arc<NarrationInner>,
-    event_rx: mpsc::Receiver<AppServerEvent>,
-) {
-    thread::spawn(move || {
-        for event in event_rx {
-            match event {
-                AppServerEvent::Reconnected => {}
-                AppServerEvent::Notification(notification) => {
-                    let thread_id = notification
-                        .get("params")
-                        .and_then(|params| params.get("threadId"))
-                        .and_then(Value::as_str)
-                        .or_else(|| {
-                            notification
-                                .get("params")
-                                .and_then(|params| params.get("thread"))
-                                .and_then(|thread| thread.get("id"))
-                                .and_then(Value::as_str)
-                        });
-                    if let Some(sender) = thread_id.and_then(|thread_id| {
-                        inner
-                            .subscriptions
-                            .lock()
-                            .ok()
-                            .and_then(|subscriptions| subscriptions.get(thread_id).cloned())
-                    }) {
-                        let _ = sender.send(notification);
-                    }
-                }
-                AppServerEvent::Disconnected(reason) => {
-                    let notification = json!({
-                        "method": "app-server/disconnected",
-                        "params": { "reason": reason },
-                    });
-                    if let Ok(subscriptions) = inner.subscriptions.lock() {
-                        for sender in subscriptions.values() {
-                            let _ = sender.send(notification.clone());
-                        }
-                    }
-                }
-                AppServerEvent::ManagementLog { .. } => {}
-                AppServerEvent::ServerRequest(_) => {}
-            }
-        }
-    });
 }
 
 fn validate_start_params(params: &NarrationStartParams) -> Result<(), String> {
@@ -1675,6 +1710,69 @@ fn validate_manifest(
     }) {
         return Err("narration manifest summary unit must contain exactly one cue".to_string());
     }
+    validate_progressive_segments(manifest, artifact_dir)?;
+    Ok(())
+}
+
+fn validate_progressive_segments(manifest: &Value, artifact_dir: &Path) -> Result<(), String> {
+    let chunks = manifest
+        .get("chunks")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "narration manifest missing chunks".to_string())?;
+    let units = manifest
+        .get("units")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "narration manifest missing units".to_string())?;
+    let cues = manifest
+        .get("cues")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "narration manifest missing cues".to_string())?;
+    let segments = manifest
+        .get("segments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "narration manifest missing progressive segments".to_string())?;
+    if segments.len() != chunks.len() || segments.is_empty() {
+        return Err("narration manifest segment coverage mismatch".to_string());
+    }
+
+    let mut segmented_units = Vec::new();
+    let mut segmented_cues = Vec::new();
+    for (index, (segment, chunk)) in segments.iter().zip(chunks).enumerate() {
+        if segment.get("index").and_then(Value::as_u64) != Some(index as u64)
+            || segment.get("audio") != Some(chunk)
+        {
+            return Err("narration manifest segment audio mismatch".to_string());
+        }
+        let segment_units = segment
+            .get("units")
+            .and_then(Value::as_array)
+            .filter(|units| !units.is_empty())
+            .ok_or_else(|| "narration manifest segment has no units".to_string())?;
+        let segment_cues = segment
+            .get("cues")
+            .and_then(Value::as_array)
+            .filter(|cues| !cues.is_empty())
+            .ok_or_else(|| "narration manifest segment has no cues".to_string())?;
+        segmented_units.extend(segment_units.iter().cloned());
+        segmented_cues.extend(segment_cues.iter().cloned());
+
+        let id = chunk
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "narration manifest segment audio has no id".to_string())?;
+        let sidecar = fs::read(artifact_dir.join("segments").join(format!("{id}.json")))
+            .map_err(|error| format!("narration segment sidecar missing: {error}"))?;
+        let sidecar: Value = serde_json::from_slice(&sidecar)
+            .map_err(|error| format!("narration segment sidecar is invalid: {error}"))?;
+        if &sidecar != segment {
+            return Err("narration segment sidecar does not match the manifest".to_string());
+        }
+    }
+    if segmented_units != *units || segmented_cues != *cues {
+        return Err(
+            "narration manifest segments do not exactly partition units and cues".to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -1756,6 +1854,16 @@ fn cleanup_temporary_artifacts(cache_root: &Path) {
     }
 }
 
+fn remove_staging_dir(path: Option<PathBuf>) {
+    if let Some(path) = path {
+        let _ = fs::remove_dir_all(path);
+    }
+}
+
+fn reuses_existing_job(status: NarrationStatus) -> bool {
+    status == NarrationStatus::Ready || status.active()
+}
+
 fn non_empty<'a>(value: &'a str, field: &str) -> Result<&'a str, String> {
     let value = value.trim();
     if value.is_empty() {
@@ -1783,185 +1891,73 @@ fn now_millis() -> u128 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn artifact_key_changes_with_source_content() {
-        let params = sample_params("one");
-        let profile = sample_profile();
-        let synthesis = sample_synthesis_profile("onnxruntime");
-        let first = artifact_key(&params, &profile, &synthesis);
-        let second = artifact_key(&sample_params("two"), &profile, &synthesis);
-        assert_ne!(first, second);
-        assert!(safe_component(&first));
-    }
-
-    #[test]
-    fn validates_unique_non_empty_blocks() {
-        let mut params = sample_params("one");
-        params
-            .document
-            .blocks
-            .push(params.document.blocks[0].clone());
-        assert!(
-            validate_start_params(&params)
-                .unwrap_err()
-                .contains("duplicate")
-        );
-    }
-
-    #[test]
-    fn source_document_v3_rejects_legacy_structural_targets() {
-        let mut params = sample_params("one");
-        params.document.targets.push(json!({
-            "blockId": "md:0",
-            "id": "md:0/target/line/0",
-            "kind": "codeLines",
-            "lineEnd": 0,
-            "lineStart": 0,
-        }));
-        params.document.blocks[0]
-            .target_ids
-            .push("md:0/target/line/0".to_string());
-        assert!(
-            validate_start_params(&params)
-                .unwrap_err()
-                .contains("legacy structural target")
-        );
-    }
-
-    #[test]
-    fn artifact_key_separates_priority_and_standard_profiles() {
-        let params = sample_params("one");
-        let priority = sample_profile();
-        let mut standard = priority.clone();
-        standard.service_tier = crate::narration_planning::PlanningServiceTier::Standard;
-        let synthesis = sample_synthesis_profile("onnxruntime");
-        assert_ne!(
-            artifact_key(&params, &priority, &synthesis),
-            artifact_key(&params, &standard, &synthesis)
-        );
-    }
-
-    #[test]
-    fn artifact_key_separates_synthesis_profiles() {
-        let params = sample_params("one");
-        let planning = sample_profile();
-        assert_ne!(
-            artifact_key(
-                &params,
-                &planning,
-                &sample_synthesis_profile("onnxruntime-rust-v1")
-            ),
-            artifact_key(
-                &params,
-                &planning,
-                &sample_synthesis_profile("onnxruntime-rust-v2")
-            )
-        );
-    }
-
-    #[test]
-    fn synthesis_asset_verification_rejects_corruption() {
-        let directory = env::temp_dir().join(format!(
-            "remux-narration-asset-test-{}-{}",
-            std::process::id(),
-            now_millis()
-        ));
-        fs::create_dir_all(&directory).unwrap();
-        fs::write(directory.join("model.onnx"), b"model").unwrap();
-        let expected = json!({
-            "model.onnx": "9372c470eeadd5ecd9c3c74c2b3cb633f8e2f2fad799250a0f70d652b6b825e4"
-        });
-        assert!(verify_synthesis_assets(&directory, &expected).is_ok());
-        fs::write(directory.join("model.onnx"), b"corrupt").unwrap();
-        assert!(
-            verify_synthesis_assets(&directory, &expected)
-                .unwrap_err()
-                .contains("failed verification")
-        );
-        let _ = fs::remove_dir_all(directory);
-    }
-
-    #[test]
-    fn frozen_worker_time_does_not_consume_deadlines() {
-        let mut clock = ActiveWorkerClock::default();
-        clock.advance(Duration::from_secs(59));
-        clock.set_frozen(true);
-        clock.advance(Duration::from_secs(120));
-        assert_eq!(
-            clock.expired(Duration::from_secs(900), Duration::from_secs(60)),
-            None
-        );
-        clock.set_frozen(false);
-        clock.advance(Duration::from_secs(1));
-        assert_eq!(
-            clock.expired(Duration::from_secs(900), Duration::from_secs(60)),
-            Some("stall")
-        );
-        clock.progress();
-        assert_eq!(clock.stall_time, Duration::ZERO);
-        assert_eq!(clock.job_time, Duration::from_secs(60));
-    }
-
-    fn sample_params(text: &str) -> NarrationStartParams {
-        NarrationStartParams {
+    fn fixture_job() -> NarrationJob {
+        let params = NarrationStartParams {
             document: NarrationSourceDocument {
-                blocks: vec![NarrationSourceBlock {
-                    display_text: text.to_string(),
-                    id: "md:0".to_string(),
-                    inline_ranges: Vec::new(),
-                    kind: "paragraph".to_string(),
-                    needs_transform: false,
-                    path: "0".to_string(),
-                    target_ids: vec!["md:0/target/block".to_string()],
-                }],
-                document_version: "3".to_string(),
-                message_id: "assistant".to_string(),
+                blocks: Vec::new(),
+                document_version: "fixture".to_string(),
+                message_id: "message".to_string(),
                 message_revision: "revision".to_string(),
-                schema_version: 2,
-                source_hash: "hash".to_string(),
-                targets: vec![json!({
-                    "blockId": "md:0",
-                    "id": "md:0/target/block",
-                    "kind": "block",
-                })],
+                schema_version: 3,
+                source_hash: "source".to_string(),
+                targets: Vec::new(),
             },
-            source_text: text.to_string(),
+            source_text: "fixture".to_string(),
             target: NarrationTarget {
-                assistant_message_id: "assistant".to_string(),
+                assistant_message_id: "message".to_string(),
                 message_revision: "revision".to_string(),
-                source_hash: "hash".to_string(),
+                source_hash: "source".to_string(),
                 thread_id: "thread".to_string(),
                 turn_id: "turn".to_string(),
             },
-        }
+        };
+        NarrationJob::planning(
+            "artifact".to_string(),
+            params,
+            resolve_planning_profile().unwrap(),
+            resolve_synthesis_profile(Path::new("/tmp/remux"), Path::new("/tmp/codex")).unwrap(),
+        )
     }
 
-    fn sample_profile() -> NarrationPlanningProfile {
-        NarrationPlanningProfile {
-            provider: "codex-app-server",
-            model: "gpt-5.6-sol".to_string(),
-            service_tier: crate::narration_planning::PlanningServiceTier::Priority,
-            effort: "low",
-            reasoning_summary: "none",
-            context_profile_version: "1",
-            base_instructions_version: "2",
-            prompt_version: "6",
-            contract_version: 3,
-        }
+    #[test]
+    fn terminal_transitions_clear_every_transient_reference() {
+        let mut job = fixture_job();
+        job.available_segments.push(json!({ "index": 0 }));
+        job.completed_units = Some(2);
+        job.total_units = Some(3);
+        job.planning_operations.push("operation".to_string());
+        job.staging_dir = Some(PathBuf::from("/tmp/narration-staging"));
+
+        assert_eq!(
+            job.finish_cancelled(),
+            Some(PathBuf::from("/tmp/narration-staging"))
+        );
+        assert_eq!(job.status, NarrationStatus::Cancelled);
+        assert!(job.available_segments.is_empty());
+        assert!(job.planning_operations.is_empty());
+        assert!(job.completed_units.is_none());
+        assert!(job.total_units.is_none());
+        assert!(job.staging_dir.is_none());
+
+        let mut job = fixture_job();
+        job.available_segments.push(json!({ "index": 0 }));
+        job.staging_dir = Some(PathBuf::from("/tmp/narration-staging"));
+        assert_eq!(
+            job.finish_failed("fixture failure".to_string()),
+            Some(PathBuf::from("/tmp/narration-staging"))
+        );
+        assert_eq!(job.status, NarrationStatus::Failed);
+        assert_eq!(job.error.as_deref(), Some("fixture failure"));
+        assert!(job.available_segments.is_empty());
+        assert!(job.staging_dir.is_none());
     }
 
-    fn sample_synthesis_profile(provider: &str) -> NarrationSynthesisProfile {
-        NarrationSynthesisProfile {
-            descriptor: json!({
-                "provider": provider,
-                "model": "hexgrad/Kokoro-82M",
-                "modelRevision": "fixture",
-                "optionsVersion": "3",
-                "sampleRate": 24_000,
-                "voice": "af_heart",
-            }),
-            model_assets: json!({}),
-            model_dir: PathBuf::new(),
-        }
+    #[test]
+    fn only_active_and_ready_jobs_are_reusable() {
+        assert!(reuses_existing_job(NarrationStatus::Planning));
+        assert!(reuses_existing_job(NarrationStatus::Synthesizing));
+        assert!(reuses_existing_job(NarrationStatus::Ready));
+        assert!(!reuses_existing_job(NarrationStatus::Failed));
+        assert!(!reuses_existing_job(NarrationStatus::Cancelled));
     }
 }

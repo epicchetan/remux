@@ -7,15 +7,12 @@ mod item_identity;
 mod live_transcript;
 mod media;
 mod models;
-mod narration;
-mod narration_planning;
-mod narration_source_mapping;
-mod narration_synthesis;
 mod operation_queue;
 mod projection;
 mod resource_invalidations;
 mod resources;
 mod server;
+mod structured_inference;
 mod thread_commands;
 mod thread_composer_state;
 mod thread_resources;
@@ -31,8 +28,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
-use remux_compute::Registry as ComputeRegistry;
-use remux_tts::KokoroSynthesis;
+use remux_extension_rpc::Peer as ExtensionRpcPeer;
 use serde_json::{Value, json};
 
 use crate::app_notifications::notification_for_app_server_notification;
@@ -41,7 +37,6 @@ use crate::composer_config::ComposerConfigStore;
 use crate::file_resources::CodexFileResourcesServer;
 use crate::live_transcript::LiveTranscriptStore;
 use crate::models::CodexModelsServer;
-use crate::narration::CodexNarrationServer;
 use crate::operation_queue::{CodexOperationQueueServer, PendingQueueStore};
 use crate::resource_invalidations::{
     app_server_reconnected_invalidations, invalidations_for_app_server_notification,
@@ -49,6 +44,7 @@ use crate::resource_invalidations::{
 };
 use crate::resources::{CodexTranscriptServer, ValidationOptions};
 use crate::server::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+use crate::structured_inference::StructuredInferenceServer;
 use crate::thread_commands::CodexThreadCommandServer;
 use crate::thread_resources::CodexThreadResourcesServer;
 use crate::thread_runtime::ThreadRuntimeStore;
@@ -68,6 +64,8 @@ const NARRATION_CANCEL_METHOD: &str = "remux/codex/narration/cancel";
 const NARRATION_DIAGNOSTICS_READ_METHOD: &str = "remux/codex/narration/diagnostics/read";
 const NARRATION_READ_METHOD: &str = "remux/codex/narration/resources/read";
 const NARRATION_START_METHOD: &str = "remux/codex/narration/start";
+const STRUCTURED_INFERENCE_GENERATE_METHOD: &str = "remux/codex/inference/structured/generate";
+const STRUCTURED_INFERENCE_CANCEL_METHOD: &str = "remux/codex/inference/structured/cancel";
 const TRANSCRIPT_CAPABILITIES_READ_METHOD: &str = "remux/codex/transcript/capabilities/read";
 const TRANSCRIPT_RESOURCES_READ_METHOD: &str = "remux/codex/transcript/resources/read";
 const THREAD_RESOURCES_READ_METHOD: &str = "remux/codex/thread/resources/read";
@@ -88,21 +86,6 @@ const CODEX_THREAD_LANE_CAPACITY: usize = 32;
 const CODEX_SINGLETON_LANE_CAPACITY: usize = 16;
 
 fn main() {
-    let compute = match ComputeRegistry::new().register::<KokoroSynthesis>() {
-        Ok(compute) => compute,
-        Err(error) => {
-            eprintln!("compute registration failed: {error}");
-            std::process::exit(1);
-        }
-    };
-    match compute.dispatch_worker_if_requested() {
-        Ok(true) => return,
-        Ok(false) => {}
-        Err(error) => {
-            eprintln!("compute worker failed: {error}");
-            std::process::exit(1);
-        }
-    }
     let args: Vec<String> = env::args().collect();
     if args.get(1).is_some_and(|value| value == "validate") {
         if let Err(error) = run_validate(&args[2..]) {
@@ -112,20 +95,28 @@ fn main() {
         return;
     }
 
-    if let Err(error) = run_stdio_server(compute) {
+    if let Err(error) = run_stdio_server() {
         eprintln!("server failed: {error}");
         std::process::exit(1);
     }
 }
 
-fn run_stdio_server(compute: ComputeRegistry) -> Result<(), String> {
+fn run_stdio_server() -> Result<(), String> {
     let stdin = io::stdin();
     let (output_tx, output_rx) = mpsc::sync_channel::<Value>(CODEX_OUTPUT_QUEUE_CAPACITY);
     spawn_stdout_writer(output_rx);
+    let host_rpc = ExtensionRpcPeer::new("codex", {
+        let output_tx = output_tx.clone();
+        move |message| {
+            output_tx
+                .send(message)
+                .map_err(|error| format!("failed to write host RPC request: {error}"))
+        }
+    });
     let server = Arc::new(CodexExtensionServer::new(
         default_codex_home(),
         output_tx.clone(),
-        compute,
+        host_rpc.clone(),
     ));
     let dispatcher = CodexRequestDispatcher::new(server, output_tx.clone());
 
@@ -135,7 +126,23 @@ fn run_stdio_server(compute: ComputeRegistry) -> Result<(), String> {
             continue;
         }
 
-        match serde_json::from_str::<JsonRpcRequest>(&line) {
+        let message: Value = match serde_json::from_str(&line) {
+            Ok(message) => message,
+            Err(error) => {
+                send_response(
+                    &output_tx,
+                    JsonRpcResponse::error(
+                        Value::Null,
+                        JsonRpcError::new(-32700, format!("Parse error: {error}")),
+                    ),
+                )?;
+                continue;
+            }
+        };
+        if host_rpc.resolve(&message) {
+            continue;
+        }
+        match serde_json::from_value::<JsonRpcRequest>(message) {
             Ok(request) => dispatcher.dispatch(request),
             Err(error) => send_response(
                 &output_tx,
@@ -165,17 +172,31 @@ fn handle_request(server: &CodexExtensionServer, request: JsonRpcRequest) -> Jso
         APP_SERVER_STOP_METHOD => server.app_server_stop(),
         APP_SERVER_RESTART_METHOD => server.app_server_restart(),
         APP_SERVER_UPDATE_METHOD => server.app_server_update(),
-        NARRATION_AUDIO_READ_METHOD => server
-            .narration
-            .read_audio(request.params.unwrap_or(Value::Null)),
-        NARRATION_CANCEL_METHOD => server
-            .narration
+        NARRATION_AUDIO_READ_METHOD => server.proxy_narration(
+            "remux/narrate/narration/audio/read",
+            request.params.unwrap_or(Value::Null),
+        ),
+        NARRATION_CANCEL_METHOD => server.proxy_narration(
+            "remux/narrate/narration/cancel",
+            request.params.unwrap_or(Value::Null),
+        ),
+        NARRATION_DIAGNOSTICS_READ_METHOD => {
+            server.proxy_narration("remux/narrate/narration/diagnostics/read", Value::Null)
+        }
+        NARRATION_READ_METHOD => server.proxy_narration(
+            "remux/narrate/narration/resources/read",
+            request.params.unwrap_or(Value::Null),
+        ),
+        NARRATION_START_METHOD => server.proxy_narration(
+            "remux/narrate/narration/start",
+            request.params.unwrap_or(Value::Null),
+        ),
+        STRUCTURED_INFERENCE_GENERATE_METHOD => server
+            .structured_inference
+            .generate(request.params.unwrap_or(Value::Null)),
+        STRUCTURED_INFERENCE_CANCEL_METHOD => server
+            .structured_inference
             .cancel(request.params.unwrap_or(Value::Null)),
-        NARRATION_DIAGNOSTICS_READ_METHOD => server.narration.read_diagnostics(),
-        NARRATION_READ_METHOD => server.narration.read(request.params.unwrap_or(Value::Null)),
-        NARRATION_START_METHOD => server
-            .narration
-            .start(request.params.unwrap_or(Value::Null)),
         TRANSCRIPT_CAPABILITIES_READ_METHOD => Ok(json!({
             "limits": {
                 "maxGroupRows": crate::transcript::MAX_WORK_GROUP_ROWS,
@@ -249,6 +270,8 @@ struct CodexRequestDispatcher {
     app_server_tx: mpsc::SyncSender<JsonRpcRequest>,
     config_tx: mpsc::SyncSender<JsonRpcRequest>,
     narration_tx: mpsc::SyncSender<JsonRpcRequest>,
+    inference_txs: Vec<mpsc::SyncSender<JsonRpcRequest>>,
+    inference_cursor: std::sync::atomic::AtomicUsize,
     output_tx: mpsc::SyncSender<Value>,
     read_txs: Vec<mpsc::SyncSender<JsonRpcRequest>>,
     read_cursor: std::sync::atomic::AtomicUsize,
@@ -276,6 +299,16 @@ impl CodexRequestDispatcher {
             server.clone(),
             output_tx.clone(),
         );
+        let inference_txs = (0..4)
+            .map(|index| {
+                spawn_request_worker(
+                    &format!("codex-structured-inference-{index}"),
+                    2,
+                    server.clone(),
+                    output_tx.clone(),
+                )
+            })
+            .collect();
         let read_txs = (0..CODEX_READ_WORKERS)
             .map(|index| {
                 spawn_request_worker(
@@ -289,6 +322,8 @@ impl CodexRequestDispatcher {
         Self {
             app_server_tx,
             config_tx,
+            inference_txs,
+            inference_cursor: std::sync::atomic::AtomicUsize::new(0),
             narration_tx,
             output_tx,
             read_txs,
@@ -307,6 +342,14 @@ impl CodexRequestDispatcher {
             | APP_SERVER_UPDATE_METHOD => self.app_server_tx.clone(),
             COMPOSER_CONFIG_WRITE_METHOD => self.config_tx.clone(),
             NARRATION_START_METHOD | NARRATION_CANCEL_METHOD => self.narration_tx.clone(),
+            STRUCTURED_INFERENCE_GENERATE_METHOD => {
+                let index = self
+                    .inference_cursor
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    % self.inference_txs.len();
+                self.inference_txs[index].clone()
+            }
+            STRUCTURED_INFERENCE_CANCEL_METHOD => self.app_server_tx.clone(),
             FILES_METHOD
             | COMPOSER_CONFIG_READ_METHOD
             | MODELS_READ_METHOD
@@ -426,8 +469,9 @@ struct CodexExtensionServer {
     composer_config: ComposerConfigStore,
     files: CodexFileResourcesServer,
     live_transcript: LiveTranscriptStore,
+    host_rpc: ExtensionRpcPeer,
     models: CodexModelsServer,
-    narration: CodexNarrationServer,
+    structured_inference: StructuredInferenceServer,
     operation_queue: CodexOperationQueueServer,
     output_tx: mpsc::SyncSender<Value>,
     thread_commands: CodexThreadCommandServer,
@@ -441,18 +485,18 @@ impl CodexExtensionServer {
     fn new(
         codex_home: PathBuf,
         output_tx: mpsc::SyncSender<Value>,
-        compute: ComputeRegistry,
+        host_rpc: ExtensionRpcPeer,
     ) -> Self {
         let (event_sink, event_rx) = AppServerEventSink::channel();
-        let (narration_event_sink, narration_event_rx) = AppServerEventSink::channel();
+        let (inference_event_sink, inference_event_rx) = AppServerEventSink::channel();
         let composer_config =
             ComposerConfigStore::new(codex_home.join("remux").join("composer-config.json"));
         let live_transcript = LiveTranscriptStore::default();
         let thread_runtime = ThreadRuntimeStore::default();
         let thread_usage = ThreadUsageStore::default();
         let app_server = AppServerRuntime::new_with_event_sink(codex_home.clone(), event_sink);
-        let narration_app_server =
-            AppServerRuntime::new_with_event_sink(codex_home.clone(), narration_event_sink);
+        let inference_app_server =
+            AppServerRuntime::new_with_event_sink(codex_home.clone(), inference_event_sink);
         let thread_commands = CodexThreadCommandServer::new(
             app_server.clone(),
             composer_config.clone(),
@@ -479,14 +523,12 @@ impl CodexExtensionServer {
             composer_config: composer_config.clone(),
             files: CodexFileResourcesServer::new(),
             live_transcript: live_transcript.clone(),
+            host_rpc,
             models: CodexModelsServer::new(app_server.clone()),
-            narration: CodexNarrationServer::new(
+            structured_inference: StructuredInferenceServer::new(
                 codex_home.clone(),
-                narration_app_server,
-                narration_event_rx,
-                output_tx.clone(),
-                live_transcript.clone(),
-                compute,
+                inference_app_server,
+                inference_event_rx,
             ),
             operation_queue: operation_queue.clone(),
             output_tx: output_tx.clone(),
@@ -520,6 +562,16 @@ impl CodexExtensionServer {
         self.app_server
             .daemon_status()
             .to_value(self.thread_runtime.active_turn_ids())
+    }
+
+    fn proxy_narration(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.host_rpc
+            .request(
+                method,
+                (!params.is_null()).then_some(params),
+                std::time::Duration::from_secs(300),
+            )
+            .map_err(|error| format!("Narrate service request failed: {error}"))
     }
 
     fn app_server_start(&self) -> Result<Value, String> {

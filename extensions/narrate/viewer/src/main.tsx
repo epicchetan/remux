@@ -9,6 +9,6 @@ import 'katex/dist/katex.min.css';
 import './styles.css';
 
 mountViewer(<App />, {
-  name: 'markdown',
+  name: 'narrate',
   initialize: initializeIpc,
 });

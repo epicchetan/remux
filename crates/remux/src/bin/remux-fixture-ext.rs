@@ -18,10 +18,13 @@
 //! `params.line` to stderr), `fixture/garbage` (emits invalid stdout lines,
 //! then responds).
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 
 fn env_flag(name: &str) -> bool {
-    std::env::var(name).map(|value| value == "1").unwrap_or(false)
+    std::env::var(name)
+        .map(|value| value == "1")
+        .unwrap_or(false)
 }
 
 fn emit(message: serde_json::Value) {
@@ -96,6 +99,8 @@ fn main() {
     }
 
     let stdin = std::io::stdin();
+    let mut outbound = HashMap::<String, serde_json::Value>::new();
+    let mut outbound_sequence = 1u64;
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -112,7 +117,51 @@ fn main() {
             .to_string();
         let params = message.get("params").cloned();
 
+        if method.is_empty() {
+            if let Some(original_id) = message
+                .get("id")
+                .and_then(|id| id.as_str())
+                .and_then(|outbound_id| outbound.remove(outbound_id))
+            {
+                let response = match message.get("error") {
+                    Some(error) if !error.is_null() => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": original_id,
+                        "error": error,
+                    }),
+                    _ => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": original_id,
+                        "result": message.get("result").cloned().unwrap_or(serde_json::Value::Null),
+                    }),
+                };
+                emit(response);
+                continue;
+            }
+        }
+
         match method.as_str() {
+            "fixture/call" | "remux/caller/call" => {
+                if let Some(original_id) = id {
+                    let outbound_id = format!("fixture:{}:{outbound_sequence}", std::process::id());
+                    outbound_sequence += 1;
+                    outbound.insert(outbound_id.clone(), original_id);
+                    emit(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": outbound_id,
+                        "method": params
+                            .as_ref()
+                            .and_then(|params| params.get("method"))
+                            .and_then(|method| method.as_str())
+                            .unwrap_or("remux/target/echo"),
+                        "params": params
+                            .as_ref()
+                            .and_then(|params| params.get("params"))
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                    }));
+                }
+            }
             "fixture/block" => {}
             "fixture/crash" => {
                 let code = params
@@ -130,17 +179,21 @@ fn main() {
                     .unwrap_or("fixture stderr");
                 eprintln!("{text}");
                 if let Some(id) = id {
-                    emit(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } }));
+                    emit(
+                        serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } }),
+                    );
                 }
             }
             "fixture/garbage" => {
                 println!("this is not json");
                 println!("{{\"partial\":");
                 if let Some(id) = id {
-                    emit(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } }));
+                    emit(
+                        serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } }),
+                    );
                 }
             }
-            "fixture/fail" => {
+            "fixture/fail" | "remux/target/fail" => {
                 if let Some(id) = id {
                     emit(serde_json::json!({
                         "jsonrpc": "2.0",
@@ -168,7 +221,9 @@ fn main() {
                 }
                 emit(notification);
                 if let Some(id) = id {
-                    emit(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "sent": true } }));
+                    emit(
+                        serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "sent": true } }),
+                    );
                 }
             }
             _ => {

@@ -10,7 +10,7 @@ export default defineConfig({
   resolve: {
     alias: [
       {
-        find: /^@remux\/markdown$/,
+        find: /^@remux\/narrate$/,
         replacement: path.resolve(__dirname, './src/index.ts'),
       },
       { find: '@', replacement: path.resolve(__dirname, '../../..') },

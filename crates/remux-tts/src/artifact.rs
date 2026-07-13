@@ -14,11 +14,14 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::frontend::{EnglishFrontend, FrontendChunk};
 use crate::model::KokoroModel;
-use crate::{AlignmentHint, ScriptUnit, SynthesisOutput, SynthesisProgress, SynthesisRequest};
+use crate::{
+    AlignmentHint, NarrationSegmentManifest, ScriptUnit, SynthesisOutput, SynthesisProgress,
+    SynthesisRequest,
+};
 
 const SAMPLE_RATE: usize = 24_000;
 const BLOCK_PAUSE_SAMPLES: usize = 1_920;
-const TARGET_CHUNK_SAMPLES: usize = 50 * SAMPLE_RATE;
+const TARGET_CHUNK_SAMPLES: usize = 15 * SAMPLE_RATE;
 
 struct PreparedUnit {
     index: usize,
@@ -85,68 +88,95 @@ pub fn synthesize(
     let audio_dir = request.output_dir.join("audio");
     fs::create_dir_all(&audio_dir)
         .map_err(|error| format!("failed to create narration audio directory: {error}"))?;
+    let segment_dir = request.output_dir.join("segments");
+    fs::create_dir_all(&segment_dir)
+        .map_err(|error| format!("failed to create narration segment directory: {error}"))?;
     let mut chunks = Vec::new();
+    let mut segments = Vec::new();
     let mut units = Vec::new();
     let mut cues = Vec::new();
     let mut raw_timing = Vec::new();
     let mut chunk_audio = Vec::new();
     let mut chunk_start_samples = 0;
     let mut total_samples = 0;
+    let mut segment_unit_start = 0;
+    let mut segment_cue_start = 0;
     let mut inference_seconds = 0.0;
     let mut wav_seconds = 0.0;
     let target_by_id = targets_by_id(&request.targets)?;
 
-    for result in run_parallel(prepared, model, concurrency, &spill_dir, &context)? {
-        let mut result = result?;
-        if let Some(path) = result.audio_path.take() {
-            result.audio = read_f32(&path)?;
-            fs::remove_file(path)
-                .map_err(|error| format!("failed to remove narration spill: {error}"))?;
-        }
-        inference_seconds += result.inference_seconds;
-        if !chunk_audio.is_empty() && chunk_audio.len() + result.audio.len() > TARGET_CHUNK_SAMPLES
-        {
-            wav_seconds += flush_chunk(
-                &audio_dir,
-                &mut chunks,
-                &mut chunk_audio,
-                chunk_start_samples,
-            )?;
-            chunk_start_samples = total_samples;
-        }
-        let chunk_id = format!("{:03}", chunks.len());
-        let unit_start_samples = total_samples;
-        let unit_start = seconds(unit_start_samples);
-        let unit_end = seconds(unit_start_samples + result.audio.len());
-        clamp_token_times(&mut result.timed_tokens, unit_start, unit_end);
-        chunk_audio.extend_from_slice(&result.audio);
-        total_samples += result.audio.len();
-        chunk_audio.resize(chunk_audio.len() + BLOCK_PAUSE_SAMPLES, 0.0);
-        total_samples += BLOCK_PAUSE_SAMPLES;
+    run_parallel(
+        prepared,
+        model,
+        concurrency,
+        &spill_dir,
+        &context,
+        |result| {
+            let mut result = result?;
+            if let Some(path) = result.audio_path.take() {
+                result.audio = read_f32(&path)?;
+                fs::remove_file(path)
+                    .map_err(|error| format!("failed to remove narration spill: {error}"))?;
+            }
+            inference_seconds += result.inference_seconds;
+            let chunk_id = format!("{:03}", chunks.len());
+            let unit_start_samples = total_samples;
+            let unit_start = seconds(unit_start_samples);
+            let unit_end = seconds(unit_start_samples + result.audio.len());
+            clamp_token_times(&mut result.timed_tokens, unit_start, unit_end);
+            chunk_audio.extend_from_slice(&result.audio);
+            total_samples += result.audio.len();
+            chunk_audio.resize(chunk_audio.len() + BLOCK_PAUSE_SAMPLES, 0.0);
+            total_samples += BLOCK_PAUSE_SAMPLES;
 
-        cues.extend(build_cues(
-            &result.unit,
-            &result.timed_tokens,
-            &target_by_id,
-            unit_start,
-            unit_end,
-        )?);
-        raw_timing.push(json!({
-            "unitId": result.unit.id,
-            "tokens": result.timed_tokens.iter().map(timed_token_json).collect::<Vec<_>>(),
-        }));
-        units.push(json!({
-            "id": result.unit.id,
-            "blockId": result.unit.block_id,
-            "chunkId": chunk_id,
-            "end": unit_end,
-            "fallbackTargetIds": result.unit.fallback_target_ids,
-            "mode": result.unit.mode,
-            "sentenceRanges": sentence_ranges(&result.timed_tokens, &result.unit.spoken_text, unit_start, unit_end),
-            "spokenText": result.unit.spoken_text,
-            "start": unit_start,
-        }));
-    }
+            cues.extend(build_cues(
+                &result.unit,
+                &result.timed_tokens,
+                &target_by_id,
+                unit_start,
+                unit_end,
+            )?);
+            raw_timing.push(json!({
+                "unitId": result.unit.id,
+                "tokens": result.timed_tokens.iter().map(timed_token_json).collect::<Vec<_>>(),
+            }));
+            units.push(json!({
+                "id": result.unit.id,
+                "blockId": result.unit.block_id,
+                "chunkId": chunk_id,
+                "end": unit_end,
+                "fallbackTargetIds": result.unit.fallback_target_ids,
+                "mode": result.unit.mode,
+                "sentenceRanges": sentence_ranges(&result.timed_tokens, &result.unit.spoken_text, unit_start, unit_end),
+                "spokenText": result.unit.spoken_text,
+                "start": unit_start,
+            }));
+            if chunk_audio.len() >= TARGET_CHUNK_SAMPLES {
+                wav_seconds += flush_chunk(
+                    &audio_dir,
+                    &mut chunks,
+                    &mut chunk_audio,
+                    chunk_start_samples,
+                )?;
+                let segment = publish_segment(
+                    &segment_dir,
+                    &chunks,
+                    &units,
+                    &cues,
+                    segment_unit_start,
+                    segment_cue_start,
+                )?;
+                segment_unit_start = units.len();
+                segment_cue_start = cues.len();
+                context.progress(SynthesisProgress::SegmentReady {
+                    segment: segment.clone(),
+                })?;
+                segments.push(segment);
+                chunk_start_samples = total_samples;
+            }
+            Ok(())
+        },
+    )?;
     if !chunk_audio.is_empty() {
         wav_seconds += flush_chunk(
             &audio_dir,
@@ -154,13 +184,25 @@ pub fn synthesize(
             &mut chunk_audio,
             chunk_start_samples,
         )?;
+        let segment = publish_segment(
+            &segment_dir,
+            &chunks,
+            &units,
+            &cues,
+            segment_unit_start,
+            segment_cue_start,
+        )?;
+        context.progress(SynthesisProgress::SegmentReady {
+            segment: segment.clone(),
+        })?;
+        segments.push(segment);
     }
     fs::remove_dir(&spill_dir)
         .map_err(|error| format!("failed to remove narration spill directory: {error}"))?;
     let duration_seconds = seconds(total_samples);
     let total_seconds = total_started.elapsed().as_secs_f64();
     let manifest = json!({
-        "version": 2,
+        "version": 3,
         "alignmentKey": request.alignment_key,
         "artifactKey": request.artifact_key,
         "audioKey": request.audio_key,
@@ -169,6 +211,7 @@ pub fn synthesize(
         "durationSeconds": duration_seconds,
         "profile": request.profile,
         "rawTiming": raw_timing,
+        "segments": segments,
         "scriptKey": request.script_key,
         "sourceDocumentKey": request.source_document_key,
         "sourceHash": request.source_hash,
@@ -188,6 +231,44 @@ pub fn synthesize(
         "units": units,
     });
     Ok(SynthesisOutput { manifest })
+}
+
+fn publish_segment(
+    segment_dir: &Path,
+    chunks: &[Value],
+    units: &[Value],
+    cues: &[Value],
+    unit_start: usize,
+    cue_start: usize,
+) -> Result<NarrationSegmentManifest, String> {
+    let index = chunks
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| "native TTS segment has no audio descriptor".to_string())?;
+    let audio = chunks[index].clone();
+    let id = audio
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "native TTS segment audio has no id".to_string())?
+        .to_string();
+    if unit_start >= units.len() {
+        return Err("native TTS segment has no units".to_string());
+    }
+    let segment = NarrationSegmentManifest {
+        index,
+        audio,
+        units: units[unit_start..].to_vec(),
+        cues: cues[cue_start..].to_vec(),
+    };
+    let encoded = serde_json::to_vec_pretty(&segment)
+        .map_err(|error| format!("failed to encode narration segment: {error}"))?;
+    let final_path = segment_dir.join(format!("{id}.json"));
+    let temporary_path = segment_dir.join(format!(".{id}.json.tmp"));
+    fs::write(&temporary_path, encoded)
+        .map_err(|error| format!("failed to write narration segment sidecar: {error}"))?;
+    fs::rename(&temporary_path, &final_path)
+        .map_err(|error| format!("failed to publish narration segment sidecar: {error}"))?;
+    Ok(segment)
 }
 
 fn validate_request(request: &SynthesisRequest) -> Result<(), String> {
@@ -215,12 +296,14 @@ fn run_parallel(
     concurrency: usize,
     spill_dir: &Path,
     context: &TaskContext<SynthesisProgress>,
-) -> Result<Vec<Result<UnitResult, String>>, String> {
+    mut consume: impl FnMut(Result<UnitResult, String>) -> Result<(), String>,
+) -> Result<(), String> {
     let total = prepared.len();
     let prepared = Arc::new(prepared);
     let next = Arc::new(AtomicUsize::new(0));
     let (sender, receiver) = mpsc::sync_channel(concurrency);
-    let mut ordered = Vec::with_capacity(total);
+    let mut consumed = 0;
+    let mut consume_error = None;
     thread::scope(|scope| {
         for _ in 0..concurrency {
             let prepared = prepared.clone();
@@ -248,7 +331,7 @@ fn run_parallel(
         let mut completed = 0;
         while let Ok((index, result)) = receiver.recv() {
             completed += 1;
-            let _ = context.progress(SynthesisProgress { completed, total });
+            let _ = context.progress(SynthesisProgress::Units { completed, total });
             let mut result = result;
             if index != next_flush
                 && let Ok(value) = result.as_mut()
@@ -264,18 +347,27 @@ fn run_parallel(
             }
             buffered.insert(index, result);
             while let Some(result) = buffered.remove(&next_flush) {
-                ordered.push(result);
+                if consume_error.is_none() {
+                    if let Err(error) = consume(result) {
+                        consume_error = Some(error);
+                        next.store(total, Ordering::SeqCst);
+                    }
+                }
+                consumed += 1;
                 next_flush += 1;
             }
         }
     });
-    if ordered.len() != total {
+    if let Some(error) = consume_error {
+        return Err(error);
+    }
+    if consumed != total {
         return Err(format!(
             "native TTS worker returned {} of {total} units",
-            ordered.len()
+            consumed
         ));
     }
-    Ok(ordered)
+    Ok(())
 }
 
 fn synthesize_unit(unit: &PreparedUnit, model: &KokoroModel) -> Result<UnitResult, String> {
@@ -786,6 +878,37 @@ fn peak_rss_bytes() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_segments_are_complete_immutable_sidecars() {
+        let directory = std::env::temp_dir().join(format!(
+            "remux-tts-segment-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let chunks = vec![json!({
+            "id": "000",
+            "start": 0.0,
+            "end": 1.0,
+            "sampleRate": SAMPLE_RATE,
+            "sizeBytes": 48_044,
+        })];
+        let units = vec![json!({ "id": "unit:one", "chunkId": "000" })];
+        let cues = vec![json!({ "id": "unit:one/cue/0", "unitId": "unit:one" })];
+        let segment = publish_segment(&directory, &chunks, &units, &cues, 0, 0).unwrap();
+        assert_eq!(segment.index, 0);
+        assert_eq!(segment.audio, chunks[0]);
+        assert_eq!(segment.units, units);
+        assert_eq!(segment.cues, cues);
+        let sidecar: NarrationSegmentManifest =
+            serde_json::from_slice(&fs::read(directory.join("000.json")).unwrap()).unwrap();
+        assert_eq!(sidecar.index, segment.index);
+        assert_eq!(sidecar.audio, segment.audio);
+        assert_eq!(sidecar.units, segment.units);
+        assert_eq!(sidecar.cues, segment.cues);
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn duration_join_is_monotonic_and_accounts_for_spaces() {

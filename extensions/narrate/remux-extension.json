@@ -1,11 +1,11 @@
 {
   "version": 2,
-  "id": "codex",
-  "name": "Codex",
+  "id": "narrate",
+  "name": "Narrate",
   "display": {
-    "title": "Codex",
-    "icon": "assets/codex.png",
-    "iconDark": "assets/codex-dark.png"
+    "title": "Narrate",
+    "icon": "assets/markdown.png",
+    "iconDark": "assets/markdown-dark.png"
   },
   "server": {
     "transport": "stdio",
@@ -17,19 +17,19 @@
         "--manifest-path",
         "server/Cargo.toml",
         "--target-dir",
-        "/tmp/remux-codex-server-target",
+        "/tmp/remux-narrate-server-target",
         "--offline",
         "--quiet"
       ],
       "cwd": "."
     },
-    "command": "/tmp/remux-codex-server-target/release/remux-codex-server",
+    "command": "/tmp/remux-narrate-server-target/release/remux-narrate-server",
     "args": [],
     "cwd": "."
   },
   "views": {
     "main": {
-      "route": "/viewers/codex",
+      "route": "/viewers/narrate",
       "entry": "viewer/dist/index.html",
       "cache": "immutable",
       "build": {
@@ -52,29 +52,24 @@
   },
   "resources": {
     "workloads": {
-      "app-server": {
-        "class": "interactive",
-        "lifetime": "persistent",
-        "threads": "auto"
-      },
-      "research": {
-        "class": "research",
+      "narration": {
+        "class": "background",
         "lifetime": "operation",
-        "threads": "auto"
+        "threads": 7
       }
     }
   },
-  "launchers": [
+  "launchers": [],
+  "fileHandlers": [
     {
-      "id": "new-chat",
+      "id": "narrate-viewer",
       "view": "main",
-      "label": "Codex",
-      "route": {
-        "kind": "launch",
-        "launch": "new-chat",
-        "resourceKind": "draft"
-      }
+      "label": "Narrate",
+      "extensions": [
+        "md",
+        "markdown",
+        "mdown"
+      ]
     }
-  ],
-  "fileHandlers": []
+  ]
 }

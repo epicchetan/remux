@@ -36,6 +36,12 @@ Canonical code: ...
 | [codex/archive/current-thread-send-invalidation.md](codex/archive/current-thread-send-invalidation.md) | Archived | Historical send/invalidation phase. |
 | [codex/archive/rust-transcript-server.md](codex/archive/rust-transcript-server.md) | Archived | Historical Rust transcript server phase. |
 
+## Narrate Specs
+
+| Spec | Status | Notes |
+| --- | --- | --- |
+| [narrate-service.md](narrate-service.md) | Implemented | Reusable Narrate-owned transcript, cache, progressive audio, and Kokoro pipeline; duplex extension RPC; Codex structured-inference gateway and temporary UI compatibility proxy. |
+
 ## Terminal Specs
 
 | Spec | Status | Notes |

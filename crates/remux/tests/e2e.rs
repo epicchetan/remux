@@ -55,6 +55,32 @@ fn write_fixture_extension_with_server(root: &Path, server: Value) {
     .unwrap();
 }
 
+fn write_cross_extension_fixtures(root: &Path) {
+    for id in ["caller", "target"] {
+        let ext_dir = root.join("extensions").join(id);
+        let dist = ext_dir.join("viewer/dist");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(dist.join("index.html"), format!("<h1>{id}</h1>")).unwrap();
+        let manifest = json!({
+            "version": 1,
+            "id": id,
+            "name": id,
+            "launchers": if id == "caller" { json!([{ "id": "open", "label": "Open" }]) } else { json!([]) },
+            "server": {
+                "transport": "stdio",
+                "command": env!("CARGO_BIN_EXE_remux-fixture-ext"),
+                "args": [],
+            },
+            "views": { "main": { "entry": "viewer/dist/index.html" } },
+        });
+        std::fs::write(
+            ext_dir.join("remux-extension.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
 /// Build-phase manifest: the binary is missing at boot and produced by a
 /// scripted build step (a wrapper that execs the fixture binary).
 fn write_build_fixture_extension(root: &Path) {
@@ -137,6 +163,8 @@ impl Runtime {
             // Hermetic: a stray REMUX_WORKER in the invoking environment
             // would turn the supervisor into a bare worker.
             .env_remove("REMUX_WORKER")
+            .env_remove("REMUX_WORKLOAD_EXEC")
+            .env_remove("REMUX_RESOURCE_GOVERNANCE")
             .env_remove("REMUX_EXTENSION_ROOTS")
             .env("REMUX_HOST", "127.0.0.1")
             .env("REMUX_PORT", port.to_string())
@@ -407,6 +435,87 @@ async fn boots_serves_catalog_and_runs_the_fixture_extension() {
     runtime.shutdown();
 }
 
+#[tokio::test]
+async fn extension_servers_can_call_other_extension_servers() {
+    let runtime = Runtime::start_with(write_cross_extension_fixtures);
+    runtime.wait_for_health(Duration::from_secs(30)).await;
+    let mut socket = ws_connect(runtime.port).await;
+
+    let direct = ws_request(&mut socket, 99, "remux/caller/echo", None).await;
+    assert_eq!(direct["result"]["echo"], "remux/caller/echo");
+
+    let response = ws_request(
+        &mut socket,
+        1,
+        "remux/caller/call",
+        Some(json!({
+            "method": "remux/target/echo",
+            "params": { "value": 42 },
+        })),
+    )
+    .await;
+    assert_eq!(response["result"]["echo"], "remux/target/echo");
+    assert_eq!(response["result"]["params"]["value"], 42);
+
+    let error = ws_request(
+        &mut socket,
+        2,
+        "remux/caller/call",
+        Some(json!({ "method": "remux/target/fail" })),
+    )
+    .await;
+    assert_eq!(error["error"]["code"], -32001);
+    assert!(error["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("fixture failure")));
+
+    let builtin = ws_request(
+        &mut socket,
+        3,
+        "remux/caller/call",
+        Some(json!({ "method": "remux/system/info" })),
+    )
+    .await;
+    assert_eq!(builtin["error"]["code"], -32601);
+
+    let stopped = ws_request(
+        &mut socket,
+        4,
+        "remux/extensions/stop",
+        Some(json!({ "extensionId": "target" })),
+    )
+    .await;
+    assert_eq!(stopped["result"]["running"], false);
+    let unavailable = ws_request(
+        &mut socket,
+        5,
+        "remux/caller/call",
+        Some(json!({ "method": "remux/target/echo" })),
+    )
+    .await;
+    assert!(unavailable["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("target") && message.contains("not running")));
+
+    let started = ws_request(
+        &mut socket,
+        6,
+        "remux/extensions/start",
+        Some(json!({ "extensionId": "target" })),
+    )
+    .await;
+    assert_eq!(started["result"]["running"], true);
+    let after_restart = ws_request(
+        &mut socket,
+        7,
+        "remux/caller/call",
+        Some(json!({ "method": "remux/target/echo" })),
+    )
+    .await;
+    assert_eq!(after_restart["result"]["echo"], "remux/target/echo");
+
+    runtime.shutdown();
+}
 #[tokio::test]
 async fn system_restart_round_trips_with_exit_75() {
     let runtime = Runtime::start();

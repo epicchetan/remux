@@ -146,6 +146,9 @@ export type CodexNarrationAudioReadResponse = {
 
 export type CodexNarrationResource = {
   artifactKey: string;
+  availableChunks: CodexNarrationAudioChunk[];
+  availableDuration: number;
+  availableSegments: CodexNarrationSegment[];
   completedUnits: number | null;
   error: string | null;
   manifest: CodexNarrationManifest | null;
@@ -220,12 +223,20 @@ export type CodexNarrationManifest = {
   cues: CodexNarrationCue[];
   durationSeconds: number;
   profile: CodexNarrationProviderDescriptor;
+  segments: CodexNarrationSegment[];
   scriptKey: string;
   sourceDocumentKey: string;
   sourceHash: string;
   targets: CodexNarrationSourceTarget[];
   units: CodexNarrationUnit[];
-  version: 2;
+  version: 3;
+};
+
+export type CodexNarrationSegment = {
+  audio: CodexNarrationAudioChunk;
+  cues: CodexNarrationCue[];
+  index: number;
+  units: CodexNarrationUnit[];
 };
 
 export type CodexNarrationAudioChunk = {

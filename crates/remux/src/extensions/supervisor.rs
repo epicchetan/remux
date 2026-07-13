@@ -65,6 +65,8 @@ pub const DID_CHANGE_STATUS_METHOD: &str = "remux/extensions/didChangeStatus";
 const MANAGEMENT_LOG_METHOD: &str = "remux/extension/managementLog";
 const REMUX_NOTIFICATION_METHOD_PREFIX: &str = "remux/notifications/";
 const EXTENSION_NOTIFICATION_WORKERS: usize = 32;
+const EXTENSION_OUTBOUND_REQUESTS: usize = 32;
+const EXTENSION_OUTBOUND_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 static EXTENSION_NOTIFICATION_PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 /// What the supervisor needs from the runtime: client broadcast, the
@@ -72,6 +74,16 @@ static EXTENSION_NOTIFICATION_PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = O
 /// (system push notification; no-op default keeps test contexts small).
 pub trait ExtensionCtx: Send + Sync {
     fn broadcast(&self, message: Value);
+    /// Routes one extension-originated JSON-RPC request through the runtime.
+    /// The default keeps test and fixture contexts source-compatible.
+    fn handle_extension_request(
+        &self,
+        _source_extension_id: String,
+        method: String,
+        _params: Option<Value>,
+    ) -> BoxFuture<'_, RpcResult> {
+        Box::pin(async move { Err(JsonRpcError::method_not_found(&method)) })
+    }
     /// Sends a notification to one opaque origin previously attached to an
     /// extension request. The default keeps fixture contexts source-compatible.
     fn send_to_origin(&self, _origin: &str, _message: Value) -> bool {
@@ -1760,13 +1772,24 @@ impl Actor {
         let journal = self.journal.clone();
         let logs = self.logs.clone();
         let extension_id = self.extension.id.clone();
+        let stdin = self.stdin.clone().expect("running extension stdin");
+        let outbound_permits = Arc::new(tokio::sync::Semaphore::new(EXTENSION_OUTBOUND_REQUESTS));
 
         tokio::spawn(async move {
             read_lines(stdout, move |line| {
                 if generations.load(Ordering::SeqCst) != generation {
                     return;
                 }
-                handle_protocol_line(&line, &extension_id, &pending, &ctx, &journal, &logs);
+                handle_protocol_line(
+                    &line,
+                    &extension_id,
+                    &pending,
+                    &ctx,
+                    &journal,
+                    &logs,
+                    &stdin,
+                    &outbound_permits,
+                );
             })
             .await;
         });
@@ -1937,6 +1960,8 @@ fn handle_protocol_line(
     ctx: &Arc<dyn ExtensionCtx>,
     journal: &Arc<Journal>,
     logs: &Arc<ExtensionLogs>,
+    stdin: &mpsc::Sender<StdinCommand>,
+    outbound_permits: &Arc<tokio::sync::Semaphore>,
 ) {
     if line.trim().is_empty() {
         return;
@@ -1951,11 +1976,7 @@ fn handle_protocol_line(
             return;
         }
     };
-
-    if is_extension_response(&message) {
-        let Some(id) = message.get("id").and_then(Value::as_u64) else {
-            return;
-        };
+    if let Some(id) = extension_response_id(&message) {
         let Some(entry) = pending.lock().unwrap().remove(&id) else {
             return;
         };
@@ -1971,6 +1992,61 @@ fn handle_protocol_line(
                     .send(Ok(message.get("result").cloned().unwrap_or(Value::Null)));
             }
         }
+        return;
+    }
+
+    if let Some((id, method, params)) = extension_request(&message) {
+        let Ok(permit) = outbound_permits.clone().try_acquire_owned() else {
+            journal.warn(&format!(
+                "[remux] extension outbound RPC queue full extension={extension_id} method={method}"
+            ));
+            send_extension_request_response(
+                stdin,
+                id,
+                Err(JsonRpcError::new(
+                    EXTENSION_ERROR,
+                    format!("extension {extension_id} outbound RPC queue is full"),
+                )),
+            );
+            return;
+        };
+        let ctx = ctx.clone();
+        let stdin = stdin.clone();
+        let journal = journal.clone();
+        let extension_id = extension_id.to_string();
+        tokio::spawn(async move {
+            journal.event(JournalEvent {
+                detail: Some(serde_json::json!({ "method": &method })),
+                label: Some("extension:outbound-rpc-start".to_string()),
+                level: "info",
+                source: format!("extension:{extension_id}"),
+                ..Default::default()
+            });
+            let result = match tokio::time::timeout(
+                EXTENSION_OUTBOUND_REQUEST_TIMEOUT,
+                ctx.handle_extension_request(extension_id.clone(), method.clone(), params),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(JsonRpcError::new(
+                    EXTENSION_ERROR,
+                    format!("{method} timed out"),
+                )),
+            };
+            journal.event(JournalEvent {
+                detail: Some(serde_json::json!({
+                    "method": &method,
+                    "ok": result.is_ok(),
+                })),
+                label: Some("extension:outbound-rpc-complete".to_string()),
+                level: if result.is_ok() { "info" } else { "warn" },
+                source: format!("extension:{extension_id}"),
+                ..Default::default()
+            });
+            send_extension_request_response(&stdin, id, result);
+            drop(permit);
+        });
         return;
     }
 
@@ -2021,6 +2097,39 @@ fn handle_protocol_line(
         }
         ctx.broadcast(normalized);
     }
+}
+
+fn extension_request(message: &Value) -> Option<(Value, String, Option<Value>)> {
+    let record = message.as_object()?;
+    let id = record.get("id")?;
+    if !id.is_string() && !id.is_number() {
+        return None;
+    }
+    let method = record.get("method")?.as_str()?.to_string();
+    Some((id.clone(), method, record.get("params").cloned()))
+}
+
+fn send_extension_request_response(
+    stdin: &mpsc::Sender<StdinCommand>,
+    id: Value,
+    result: RpcResult,
+) {
+    let message = match result {
+        Ok(result) => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        }),
+        Err(error) => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": error.payload(),
+        }),
+    };
+    let stdin = stdin.clone();
+    tokio::spawn(async move {
+        let _ = stdin.send(StdinCommand::Line(format!("{message}\n"))).await;
+    });
 }
 
 fn parse_management_log(message: &Value, extension_id: &str) -> Option<(ExtensionLogMeta, String)> {
@@ -2075,17 +2184,14 @@ fn take_extension_target(message: Value) -> (Option<String>, Value) {
     }
 }
 
-fn is_extension_response(message: &Value) -> bool {
+fn extension_response_id(message: &Value) -> Option<u64> {
     let Some(record) = message.as_object() else {
-        return false;
+        return None;
     };
-    let id_ok = record
-        .get("id")
-        .map(|id| id.is_string() || id.is_number())
-        .unwrap_or(false);
-    id_ok
-        && !record.get("method").map(Value::is_string).unwrap_or(false)
-        && (record.contains_key("result") || record.contains_key("error"))
+    let id = record.get("id")?.as_u64()?;
+    (!record.get("method").is_some_and(Value::is_string)
+        && (record.contains_key("result") || record.contains_key("error")))
+    .then_some(id)
 }
 
 fn error_from_response(error: &Value, method: &str) -> JsonRpcError {
@@ -2165,5 +2271,47 @@ mod tests {
             }
         });
         assert!(parse_management_log(&spoofed, "codex").is_none());
+    }
+
+    #[test]
+    fn protocol_classification_keeps_host_and_extension_id_domains_separate() {
+        assert_eq!(
+            extension_response_id(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "result": { "ok": true },
+            })),
+            Some(7)
+        );
+        assert_eq!(
+            extension_request(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "narrate:123:1",
+                "method": "remux/codex/inference/structured/generate",
+                "params": { "value": 1 },
+            })),
+            Some((
+                Value::from("narrate:123:1"),
+                "remux/codex/inference/structured/generate".to_string(),
+                Some(serde_json::json!({ "value": 1 })),
+            ))
+        );
+        assert_eq!(
+            extension_request(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "remux/target/echo",
+            }))
+            .map(|(id, method, _)| (id, method)),
+            Some((Value::from(9), "remux/target/echo".to_string()))
+        );
+        assert_eq!(
+            extension_response_id(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "extension-owned-response",
+                "result": null,
+            })),
+            None
+        );
     }
 }

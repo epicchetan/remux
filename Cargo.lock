@@ -1521,6 +1521,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "remux-extension-rpc"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "remux-tts"
 version = "0.1.0"
 dependencies = [

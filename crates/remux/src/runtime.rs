@@ -95,6 +95,26 @@ impl ExtensionCtx for RuntimeCtx {
             .is_some_and(|ws| ws.send_to_origin(origin, message))
     }
 
+    fn handle_extension_request(
+        &self,
+        _source_extension_id: String,
+        method: String,
+        params: Option<Value>,
+    ) -> BoxFuture<'_, crate::rpc::router::RpcResult> {
+        Box::pin(async move {
+            let Some(router) = self.shared.router.get() else {
+                return Err(crate::rpc::jsonrpc::JsonRpcError::new(
+                    crate::rpc::jsonrpc::EXTENSION_ERROR,
+                    "extension router is not ready",
+                ));
+            };
+            if !router.routes_to_extension(&method) {
+                return Err(crate::rpc::jsonrpc::JsonRpcError::method_not_found(&method));
+            }
+            router.handle_request(&method, params.as_ref()).await
+        })
+    }
+
     fn handle_extension_notification(&self, message: Value) -> BoxFuture<'_, bool> {
         Box::pin(async move {
             match self.shared.notifications.get() {

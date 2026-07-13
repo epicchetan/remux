@@ -12,7 +12,7 @@ use serde_json::Value;
 pub use artifact::synthesize;
 
 pub const TASK_NAME: &str = "tts.kokoro.synthesize";
-pub const TASK_VERSION: u32 = 2;
+pub const TASK_VERSION: u32 = 4;
 
 pub struct KokoroSynthesis;
 
@@ -75,10 +75,19 @@ pub struct AlignmentHint {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum SynthesisProgress {
+    Units { completed: usize, total: usize },
+    SegmentReady { segment: NarrationSegmentManifest },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SynthesisProgress {
-    pub completed: usize,
-    pub total: usize,
+pub struct NarrationSegmentManifest {
+    pub index: usize,
+    pub audio: Value,
+    pub units: Vec<Value>,
+    pub cues: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

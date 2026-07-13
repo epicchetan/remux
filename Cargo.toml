@@ -1,6 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/remux", "crates/remux-compute", "crates/remux-tts"]
+members = [
+  "crates/remux",
+  "crates/remux-compute",
+  "crates/remux-extension-rpc",
+  "crates/remux-tts",
+]
 # Extension server crates keep their standalone builds (codex builds --offline;
 # do not perturb its lockfile).
-exclude = ["extensions/codex/server", "extensions/terminal/server", "extensions/*"]
+exclude = [
+  "extensions/codex/server",
+  "extensions/narrate/server",
+  "extensions/terminal/server",
+  "extensions/*",
+]

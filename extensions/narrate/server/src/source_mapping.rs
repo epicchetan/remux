@@ -73,7 +73,7 @@ pub(crate) fn normalized_alignment_hints(
     let spoken = spoken_words(spoken_text);
     if display.len() > MAX_MAPPING_WORDS_PER_UNIT || spoken.len() > MAX_MAPPING_WORDS_PER_UNIT {
         eprintln!(
-            "[codex:narration] source mapping capped block={} display_words={} spoken_words={}",
+            "[narrate] source mapping capped block={} display_words={} spoken_words={}",
             block.id,
             display.len(),
             spoken.len(),
