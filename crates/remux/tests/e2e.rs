@@ -34,6 +34,24 @@ fn write_fixture_extension(root: &Path) {
     );
 }
 
+fn write_fixture_with_invalid_extension(root: &Path) {
+    write_fixture_extension(root);
+    let ext_dir = root.join("extensions/invalid");
+    std::fs::create_dir_all(ext_dir.join("viewer/dist")).unwrap();
+    std::fs::write(ext_dir.join("viewer/dist/index.html"), "invalid").unwrap();
+    std::fs::write(
+        ext_dir.join("remux-extension.json"),
+        serde_json::to_string_pretty(&json!({
+            "version": 1,
+            "id": "invalid",
+            "resources": { "workloads": {} },
+            "views": { "main": { "entry": "viewer/dist/index.html" } },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
 fn write_fixture_extension_with_server(root: &Path, server: Value) {
     let ext_dir = root.join("extensions/fixture");
     let dist = ext_dir.join("viewer/dist");
@@ -436,6 +454,26 @@ async fn boots_serves_catalog_and_runs_the_fixture_extension() {
 }
 
 #[tokio::test]
+async fn invalid_extension_is_quarantined_without_blocking_runtime_boot() {
+    let runtime = Runtime::start_with(write_fixture_with_invalid_extension);
+    runtime.wait_for_health(Duration::from_secs(30)).await;
+
+    let catalog: Value = http_get(format!("{}/remux/extensions", runtime.base_url()))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(catalog["extensions"].as_array().unwrap().len(), 1);
+    assert_eq!(catalog["extensions"][0]["id"], "fixture");
+    assert_eq!(catalog["invalidExtensions"][0]["id"], "invalid");
+    assert!(catalog["invalidExtensions"][0]["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("resources requires version 2")));
+
+    runtime.shutdown();
+}
+
+#[tokio::test]
 async fn extension_servers_can_call_other_extension_servers() {
     let runtime = Runtime::start_with(write_cross_extension_fixtures);
     runtime.wait_for_health(Duration::from_secs(30)).await;
@@ -516,6 +554,7 @@ async fn extension_servers_can_call_other_extension_servers() {
 
     runtime.shutdown();
 }
+
 #[tokio::test]
 async fn system_restart_round_trips_with_exit_75() {
     let runtime = Runtime::start();

@@ -259,7 +259,26 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
         &config,
         &root_dir,
     );
-    let extensions = discover_extensions(&roots)?;
+    let discovery = discover_extensions(&roots);
+    for invalid in &discovery.invalid {
+        journal.event(JournalEvent {
+            detail: Some(serde_json::json!({
+                "extensionId": invalid.id,
+                "manifestPath": invalid.manifest_path,
+                "error": invalid.error,
+            })),
+            label: Some("extension:manifest-invalid".to_string()),
+            level: "error",
+            message: Some(format!(
+                "quarantined invalid extension {}: {}",
+                invalid.id.as_deref().unwrap_or("<unknown>"),
+                invalid.error
+            )),
+            ..Default::default()
+        });
+    }
+    let invalid_extensions = discovery.invalid;
+    let extensions = discovery.valid;
     let default_extension = default_launch_extension(&extensions)
         .cloned()
         .ok_or_else(|| "No Remux extensions found under extensions/*".to_string())?;
@@ -378,17 +397,44 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
         info: Some(Box::new({
             let cwd = root_dir.to_string_lossy().into_owned();
             let server_instance_id = journal.run_id.clone();
-            move || serde_json::json!({
-                "capabilities": {
-                    "durableCommandProtocolVersion": 1,
-                },
-                "cwd": cwd,
-                "serverInstanceId": server_instance_id,
-            })
+            move || {
+                serde_json::json!({
+                    "capabilities": {
+                        "durableCommandProtocolVersion": 1,
+                    },
+                    "cwd": cwd,
+                    "serverInstanceId": server_instance_id,
+                })
+            }
         })),
         restart: Some(Box::new({
             let shared = shared.clone();
+            let root_dir = root_dir.clone();
             move || {
+                let quarantined = restart_preflight(&root_dir).map_err(|error| {
+                    crate::rpc::jsonrpc::JsonRpcError::new(
+                        crate::rpc::jsonrpc::EXTENSION_ERROR,
+                        format!("restart preflight failed: {error}"),
+                    )
+                })?;
+                // The graceful path runs on Tokio, so its deadline cannot
+                // protect us if that runtime is the component wedged during a
+                // restart. An independent OS thread is the actual force-exit
+                // backstop promised by the restart contract.
+                std::thread::Builder::new()
+                    .name("remux-restart-deadline".to_string())
+                    .spawn(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            RESTART_DELAY_MS + RESTART_FORCE_EXIT_DELAY_MS,
+                        ));
+                        std::process::exit(REMUX_RESTART_EXIT_CODE);
+                    })
+                    .map_err(|error| {
+                        crate::rpc::jsonrpc::JsonRpcError::new(
+                            crate::rpc::jsonrpc::EXTENSION_ERROR,
+                            format!("failed to arm restart deadline: {error}"),
+                        )
+                    })?;
                 let shared = shared.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(RESTART_DELAY_MS)).await;
@@ -397,6 +443,14 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
                         .await;
                     std::process::exit(REMUX_RESTART_EXIT_CODE);
                 });
+                let mut response = serde_json::json!({
+                    "restartable": true,
+                    "restarting": true,
+                });
+                if !quarantined.is_empty() {
+                    response["quarantinedExtensions"] = Value::Array(quarantined);
+                }
+                Ok(response)
             }
         })),
         resources: Some(Box::new({
@@ -421,6 +475,7 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
     let http_state = Arc::new(HttpState {
         default_extension: default_extension.clone(),
         extensions: extensions.clone(),
+        invalid_extensions,
         viewer_providers,
         viewer_bundles: viewer_bundles.clone(),
         media_root,
@@ -535,6 +590,10 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
             );
         }
     });
+    let ready_path = root_dir.join(".remux/worker-ready");
+    if let Err(error) = std::fs::write(&ready_path, std::process::id().to_string()) {
+        journal.warn(&format!("failed to publish worker readiness: {error}"));
+    }
 
     // Signal-driven shutdown with a hard deadline.
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
@@ -558,6 +617,34 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
         .await;
     journal.flush();
     Ok(0)
+}
+
+fn restart_preflight(root_dir: &std::path::Path) -> Result<Vec<Value>, String> {
+    let config = load_remux_config(root_dir)?;
+    load_runtime_values(
+        std::env::var("REMUX_HOST").ok().as_deref(),
+        std::env::var("REMUX_PORT").ok().as_deref(),
+        &config,
+    )?;
+    let roots = extension_roots(
+        std::env::var("REMUX_EXTENSION_ROOTS").ok().as_deref(),
+        &config,
+        root_dir,
+    );
+    let discovery = discover_extensions(&roots);
+    default_launch_extension(&discovery.valid)
+        .ok_or_else(|| "no valid Remux extensions found".to_string())?;
+    Ok(discovery
+        .invalid
+        .into_iter()
+        .map(|invalid| {
+            serde_json::json!({
+                "id": invalid.id,
+                "manifestPath": invalid.manifest_path,
+                "error": invalid.error,
+            })
+        })
+        .collect())
 }
 
 fn start_guardian_heartbeat(root_dir: &std::path::Path) {
@@ -657,4 +744,67 @@ fn log_start_config(
             .join(", ")
     ));
     journal.log("");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_manifest(root: &std::path::Path, directory: &str, manifest: Value) {
+        let extension_dir = root.join("extensions").join(directory);
+        std::fs::create_dir_all(&extension_dir).unwrap();
+        std::fs::write(
+            extension_dir.join(crate::extensions::manifest::MANIFEST_FILENAME),
+            manifest.to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn restart_preflight_allows_quarantined_optional_extension() {
+        let root = tempfile::tempdir().unwrap();
+        write_manifest(
+            root.path(),
+            "codex",
+            serde_json::json!({
+                "version": 1,
+                "id": "codex",
+                "views": { "main": { "entry": "viewer/dist/index.html" } },
+                "launchers": [{ "id": "codex", "view": "main" }],
+            }),
+        );
+        write_manifest(
+            root.path(),
+            "narrate",
+            serde_json::json!({
+                "version": 1,
+                "id": "narrate",
+                "resources": { "workloads": {} },
+                "views": { "main": { "entry": "viewer/dist/index.html" } },
+            }),
+        );
+
+        let quarantined = restart_preflight(root.path()).unwrap();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(quarantined[0]["id"], "narrate");
+    }
+
+    #[test]
+    fn restart_preflight_rejects_tree_without_valid_extension() {
+        let root = tempfile::tempdir().unwrap();
+        write_manifest(
+            root.path(),
+            "narrate",
+            serde_json::json!({
+                "version": 1,
+                "id": "narrate",
+                "resources": { "workloads": {} },
+                "views": { "main": { "entry": "viewer/dist/index.html" } },
+            }),
+        );
+
+        assert!(restart_preflight(root.path())
+            .unwrap_err()
+            .contains("no valid Remux extensions"));
+    }
 }

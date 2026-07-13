@@ -12,6 +12,11 @@ import {
   remuxOriginFromSettings,
   useRemuxSettingsStore,
 } from '../remote/remuxSettingsStore';
+import {
+  readGuardianExtensions,
+  runGuardianAction,
+  type GuardianExtension,
+} from '../remote/remuxGuardianClient';
 import type { ExtensionWebViewHandle } from '../surfaces/viewer/ExtensionWebView';
 import { useTheme, type RemuxTheme } from '../theme/ThemeProvider';
 import { ActiveSurface } from './ActiveSurface';
@@ -27,6 +32,7 @@ import {
 // Webviews re-theme via an injected script; give them a beat to repaint
 // before photographing the new appearance.
 const themeRepaintGraceMs = 300;
+const recoveryGraceMs = 1_000;
 
 export function BrowserShell() {
   const catalogOrigin = useBrowserStore((state) => state.catalogOrigin);
@@ -42,29 +48,42 @@ export function BrowserShell() {
   const theme = useTheme();
   const activeSurfaceRef = useRef<ExtensionWebViewHandle | null>(null);
   const styles = useMemo(() => createStyles(theme), [theme]);
-  const [guardianExtensions, setGuardianExtensions] = useState<Array<{ id: string; name: string }>>([]);
+  const [guardianExtensions, setGuardianExtensions] = useState<GuardianExtension[]>([]);
+  const [recoveryError, setRecoveryError] = useState<string | null>(null);
+  const [recoveryVisible, setRecoveryVisible] = useState(false);
+  const guardianAvailable = remux.guardian.state === 'available';
+  const runtimeUnavailable = remux.status.type !== 'connected';
 
   useEffect(() => {
-    if (remux.status.type !== 'disconnected' || !remux.guardianAvailable) {
+    if (!runtimeUnavailable || !guardianAvailable) {
+      setRecoveryVisible(false);
+      return undefined;
+    }
+    const timer = setTimeout(() => setRecoveryVisible(true), recoveryGraceMs);
+    return () => clearTimeout(timer);
+  }, [guardianAvailable, runtimeUnavailable]);
+
+  useEffect(() => {
+    if (!recoveryVisible) {
       setGuardianExtensions([]);
       return;
     }
-    void guardianRequest(remuxOrigin, remuxToken, 'extensions')
-      .then((value) => {
-        const extensions = isRecord(value) && Array.isArray(value.extensions)
-          ? value.extensions.flatMap((extension) => (
-            isRecord(extension) && typeof extension.id === 'string'
-              ? [{
-                id: extension.id,
-                name: typeof extension.name === 'string' ? extension.name : extension.id,
-              }]
-              : []
-          ))
-          : [];
-        setGuardianExtensions(extensions);
-      })
+    void readGuardianExtensions(remuxOrigin, remuxToken)
+      .then(setGuardianExtensions)
       .catch(() => setGuardianExtensions([]));
-  }, [remux.guardianAvailable, remux.status.type, remuxOrigin, remuxToken]);
+  }, [recoveryVisible, remuxOrigin, remuxToken]);
+
+  const performRecoveryAction = useCallback(async (action: string) => {
+    setRecoveryError(null);
+    try {
+      await runGuardianAction(remuxOrigin, remuxToken, action);
+      if (action.startsWith('extensions/')) {
+        setGuardianExtensions(await readGuardianExtensions(remuxOrigin, remuxToken));
+      }
+    } catch (error) {
+      setRecoveryError(error instanceof Error ? error.message : String(error));
+    }
+  }, [remuxOrigin, remuxToken]);
 
   const refreshTabPreview = useCallback(async (tabId: string) => {
     const prepared = await (activeSurfaceRef.current?.prepareForPreviewCapture() ?? Promise.resolve(true));
@@ -152,69 +171,61 @@ export function BrowserShell() {
       </View>
 
       {mode === 'overview' ? <BrowserOverview /> : null}
-      {remux.status.type === 'disconnected' && remux.guardianAvailable ? (
+      {recoveryVisible ? (
         <View style={styles.recovery}>
           <Text style={styles.recoveryTitle}>Remux recovery</Text>
           <Text style={styles.recoveryBody}>
-            The core app is unavailable, but its guardian is responding.
+            {guardianRecoverySummary(remux.guardian)}
           </Text>
           <View style={styles.recoveryActions}>
             <Pressable
-              onPress={() => void guardianAction(remuxOrigin, remuxToken, 'protection/release')}
+              onPress={() => void performRecoveryAction('protection/release')}
               style={styles.recoveryButton}
             >
               <Text style={styles.recoveryButtonText}>Resume work</Text>
             </Pressable>
             <Pressable
-              onPress={() => void guardianAction(remuxOrigin, remuxToken, 'worker/restart')}
+              onPress={() => void performRecoveryAction('worker/restart')}
               style={styles.recoveryButton}
             >
               <Text style={styles.recoveryButtonText}>Restart Remux</Text>
             </Pressable>
           </View>
+          {recoveryError ? <Text style={styles.recoveryError}>{recoveryError}</Text> : null}
           {guardianExtensions.map((extension) => (
             <View key={extension.id} style={styles.recoveryExtension}>
               <Text style={styles.recoveryExtensionName}>{extension.name}</Text>
-              <Pressable
-                onPress={() => void guardianAction(
-                  remuxOrigin,
-                  remuxToken,
-                  `extensions/${extension.id}/pause`,
-                )}
-                style={styles.recoveryButton}
-              >
-                <Text style={styles.recoveryButtonText}>Pause</Text>
-              </Pressable>
-              <Pressable
-                onPress={() => void guardianAction(
-                  remuxOrigin,
-                  remuxToken,
-                  `extensions/${extension.id}/resume`,
-                )}
-                style={styles.recoveryButton}
-              >
-                <Text style={styles.recoveryButtonText}>Resume</Text>
-              </Pressable>
-              <Pressable
-                onPress={() => void guardianAction(
-                  remuxOrigin,
-                  remuxToken,
-                  `extensions/${extension.id}/stop`,
-                )}
-                style={styles.recoveryButton}
-              >
-                <Text style={styles.recoveryButtonText}>Stop</Text>
-              </Pressable>
-              <Pressable
-                onPress={() => void guardianAction(
-                  remuxOrigin,
-                  remuxToken,
-                  `extensions/${extension.id}/restart`,
-                )}
-                style={styles.recoveryButton}
-              >
-                <Text style={styles.recoveryButtonText}>Restart</Text>
-              </Pressable>
+              {extension.error ? (
+                <Text style={styles.recoveryBody}>{extension.error}</Text>
+              ) : null}
+              {extension.state === 'valid' ? (
+                <>
+                  <Pressable
+                    onPress={() => void performRecoveryAction(`extensions/${extension.id}/pause`)}
+                    style={styles.recoveryButton}
+                  >
+                    <Text style={styles.recoveryButtonText}>Pause</Text>
+                  </Pressable>
+                  <Pressable
+                    onPress={() => void performRecoveryAction(`extensions/${extension.id}/resume`)}
+                    style={styles.recoveryButton}
+                  >
+                    <Text style={styles.recoveryButtonText}>Resume</Text>
+                  </Pressable>
+                  <Pressable
+                    onPress={() => void performRecoveryAction(`extensions/${extension.id}/stop`)}
+                    style={styles.recoveryButton}
+                  >
+                    <Text style={styles.recoveryButtonText}>Stop</Text>
+                  </Pressable>
+                  <Pressable
+                    onPress={() => void performRecoveryAction(`extensions/${extension.id}/restart`)}
+                    style={styles.recoveryButton}
+                  >
+                    <Text style={styles.recoveryButtonText}>Restart</Text>
+                  </Pressable>
+                </>
+              ) : null}
             </View>
           ))}
         </View>
@@ -280,6 +291,11 @@ function createStyles(theme: RemuxTheme) {
     fontSize: 13,
     fontWeight: '700',
   },
+  recoveryError: {
+    color: theme.danger,
+    fontSize: 13,
+    lineHeight: 18,
+  },
   recoveryTitle: {
     color: theme.text,
     fontSize: 17,
@@ -288,34 +304,13 @@ function createStyles(theme: RemuxTheme) {
   });
 }
 
-async function guardianAction(origin: string, token: string | null, action: string) {
-  await guardianRequest(origin, token, action, 'POST');
-}
-
-async function guardianRequest(
-  origin: string,
-  token: string | null,
-  action: string,
-  method: 'GET' | 'POST' = 'GET',
-) {
-  const url = new URL(origin);
-  const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
-  url.port = String(port + 1);
-  const response = await fetch(`${url.origin}/control/v1/${action}`, {
-    method,
-    headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(method === 'POST'
-        ? { 'X-Remux-Operation-Id': `phone:${action}:${Date.now()}` }
-        : {}),
-    },
-  });
-  if (!response.ok) {
-    throw new Error(`Guardian request failed (${response.status})`);
+function guardianRecoverySummary(guardian: ReturnType<typeof useRemuxConnection>['guardian']) {
+  if (guardian.state !== 'available' || !guardian.status) {
+    return 'The core app is unavailable, but its guardian is responding.';
   }
-  return response.json() as Promise<unknown>;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+  const failures = guardian.status.consecutiveBootFailures;
+  const failureText = failures > 0
+    ? ` · ${failures} failed ${failures === 1 ? 'start' : 'starts'}`
+    : '';
+  return `Runtime ${guardian.status.workerState}${failureText}. Guardian controls remain available.`;
 }

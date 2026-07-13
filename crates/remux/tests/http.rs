@@ -86,6 +86,7 @@ async fn serve_fixture(root: &std::path::Path) -> (SocketAddr, String) {
         viewer_bundles,
         default_extension: extension.clone(),
         extensions: vec![extension],
+        invalid_extensions: Vec::new(),
         media_root: root.join(".remux/cache/media"),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -161,6 +162,7 @@ async fn serves_health_catalog_redirect_icons_viewers_and_404() {
         catalog.json::<serde_json::Value>().await.unwrap(),
         json!({
             "defaultExtensionId": "codex",
+            "invalidExtensions": [],
             "extensions": [
                 {
                     "display": {
@@ -263,7 +265,10 @@ async fn serves_health_catalog_redirect_icons_viewers_and_404() {
         .starts_with("console.log('asset')"));
 
     let compressed = get_gzip(addr, &format!("{versioned_route}/assets/index.js")).await;
-    assert_eq!(compressed.headers().get("content-encoding").unwrap(), "gzip");
+    assert_eq!(
+        compressed.headers().get("content-encoding").unwrap(),
+        "gzip"
+    );
     assert_eq!(compressed.headers().get("vary").unwrap(), "accept-encoding");
 
     let missing_versioned_asset = get(addr, &format!("{versioned_route}/assets/missing.js")).await;

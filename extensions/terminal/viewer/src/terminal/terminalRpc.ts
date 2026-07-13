@@ -13,6 +13,7 @@ export type TerminalSessionOutputFrame = {
 export type TerminalSessionStatus = 'exited' | 'running';
 
 export type TerminalSessionStartResponse = {
+  catchupEndSeq: number;
   cols: number;
   cwd: string;
   pid: number | null;
@@ -25,22 +26,59 @@ export type TerminalSessionStartResponse = {
   nextInputSeq: number;
   firstAvailableSeq: number;
   nextOutputSeq: number;
+  subscriptionToken?: string | null;
 };
 
 export type TerminalSessionAttachResponse = {
+  catchupEndSeq: number;
   exitCode?: number | null;
   exitSignal?: string | null;
   nextSeq: number;
   replay: TerminalSessionOutputFrame[];
+  replayComplete: boolean;
+  replayNextSeq: number;
   replayTruncated?: boolean;
+  restore?: TerminalSessionRestore;
   sessionId: string;
   sessionGeneration: number;
   status: TerminalSessionStatus;
+  subscriptionToken?: string | null;
   inputStreamId: string;
   nextInputSeq: number;
   firstAvailableSeq: number;
   nextOutputSeq: number;
 };
+
+export type TerminalSessionRestore =
+  | { kind: 'incremental'; throughSeq: number }
+  | {
+      cols: number;
+      dataBase64: string;
+      encoding: 'base64' | 'gzip-base64';
+      kind: 'snapshot';
+      rows: number;
+      throughSeq: number;
+    }
+  | { kind: 'reset'; throughSeq: number }
+  | { kind: 'unavailable'; throughSeq: number };
+
+export async function decodeTerminalSnapshot(
+  dataBase64: string,
+  encoding: 'base64' | 'gzip-base64',
+) {
+  const data = bytesFromBase64(dataBase64);
+  if (encoding === 'base64') {
+    return data;
+  }
+  if (typeof DecompressionStream === 'undefined') {
+    throw new Error('This browser cannot restore compressed terminal snapshots.');
+  }
+  const compressed = Uint8Array.from(data);
+  const decompressed = new Blob([compressed])
+    .stream()
+    .pipeThrough(new DecompressionStream('gzip'));
+  return new Uint8Array(await new Response(decompressed).arrayBuffer());
+}
 
 export type TerminalSessionExitedEvent = {
   exitCode: number | null;
@@ -157,6 +195,7 @@ export function startTerminalSession(params: {
 }
 
 export function attachTerminalSession(params: {
+  clientState?: { throughSeq: number; valid: boolean } | null;
   cols: number;
   inputStreamId?: string | null;
   replaySeq?: number | null;
@@ -166,6 +205,20 @@ export function attachTerminalSession(params: {
 }) {
   return rpc.subscribe<TerminalSessionAttachResponse>('remux/terminal/session/attach', params, {
     resourceKey: `terminal:${params.sessionId}`,
+  });
+}
+
+export function readyTerminalSession(params: {
+  sessionId: string;
+  sessionGeneration: number;
+  subscriptionToken: string;
+  throughSeq: number;
+}) {
+  return rpc.command<
+    | { nextOutputSeq: number; ok: true }
+    | { ok: false; reason: 'catchup-too-large' | 'gap' | 'stale-subscription' }
+  >('remux/terminal/session/ready', params, {
+    preconditionRevision: params.sessionGeneration,
   });
 }
 
@@ -209,6 +262,7 @@ export function readTerminalReplay(params: {
   maxBytes?: number;
   sessionId: string;
   sessionGeneration: number;
+  toSeqExclusive?: number;
 }) {
   return rpc.query<{
     complete: boolean;
@@ -218,6 +272,7 @@ export function readTerminalReplay(params: {
     sessionGeneration: number;
     sessionId: string;
     truncated: boolean;
+    toSeqExclusive: number;
   }>('remux/terminal/session/replay/read', params, {
     resourceKey: `terminal-replay:${params.sessionId}:${params.sessionGeneration}:${params.fromSeq}`,
   });

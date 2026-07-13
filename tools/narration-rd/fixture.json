@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "blocks": [
+    {
+      "kind": "heading",
+      "mode": "normalized",
+      "text": "Streaming G2P design"
+    },
+    {
+      "kind": "paragraph",
+      "mode": "normalized",
+      "text": "Kokoro uses Misaki's lexicon, but Codex must infer pronunciations for ONNX, G2P, UTF-16, WKWebView, JSON-RPC, and remux/codex/narration/start."
+    },
+    {
+      "kind": "heading",
+      "mode": "normalized",
+      "text": "Context-sensitive words"
+    },
+    {
+      "kind": "paragraph",
+      "mode": "normalized",
+      "text": "The lead developer will lead the migration after inspecting the lead pipe."
+    },
+    {
+      "kind": "paragraph",
+      "mode": "normalized",
+      "text": "Record the record before you close the close handler, then read the cache that you read yesterday."
+    },
+    {
+      "kind": "heading",
+      "mode": "normalized",
+      "text": "Measurements"
+    },
+    {
+      "kind": "listItem",
+      "mode": "normalized",
+      "text": "p95 time to first audio fell from 1.2 s to 240 ms on an M2 Max."
+    },
+    {
+      "kind": "listItem",
+      "mode": "normalized",
+      "text": "The cache stores @scope/my_package, serde_json::from_value, gpt-5.6-sol, and error EPIPE."
+    },
+    {
+      "kind": "heading",
+      "mode": "summary",
+      "text": "Cancellation code"
+    },
+    {
+      "kind": "code",
+      "mode": "summary",
+      "text": "if cancelled.load(Ordering::SeqCst) { turn.interrupt().await?; staging.remove_dir_all()?; return Err(Error::Cancelled); }"
+    },
+    {
+      "kind": "heading",
+      "mode": "normalized",
+      "text": "Short fragments"
+    },
+    {
+      "kind": "paragraph",
+      "mode": "normalized",
+      "text": "During planning:"
+    },
+    {
+      "kind": "listItem",
+      "mode": "normalized",
+      "text": "one retry."
+    },
+    {
+      "kind": "paragraph",
+      "mode": "normalized",
+      "text": "During synthesis:"
+    },
+    {
+      "kind": "listItem",
+      "mode": "normalized",
+      "text": "cancel the native task and retain completed WAV chunks."
+    },
+    {
+      "kind": "paragraph",
+      "mode": "normalized",
+      "text": "Dr. Nguyen routed SQL through nginx on Kubernetes, while the SQLite worker served cache_v2.db at 10.0.0.8:8080."
+    }
+  ]
+}

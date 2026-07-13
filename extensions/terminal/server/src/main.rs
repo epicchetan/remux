@@ -3,6 +3,8 @@ use std::env;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child as StdChild, ChildStdin, Command as ProcessCommand, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -18,6 +20,7 @@ mod tmux;
 const SESSION_LIST_METHOD: &str = "remux/terminal/session/list";
 const SESSION_START_METHOD: &str = "remux/terminal/session/start";
 const SESSION_ATTACH_METHOD: &str = "remux/terminal/session/attach";
+const SESSION_READY_METHOD: &str = "remux/terminal/session/ready";
 const SESSION_DETACH_METHOD: &str = "remux/terminal/session/detach";
 const SESSION_REPLAY_READ_METHOD: &str = "remux/terminal/session/replay/read";
 const SESSION_WRITE_METHOD: &str = "remux/terminal/session/write";
@@ -33,6 +36,8 @@ const REMUX_NOTIFICATION_REQUEST_METHOD: &str = "remux/notifications/request";
 
 const MAX_REPLAY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_REPLAY_FRAMES: usize = 10_000;
+const MAX_ATTACH_REPLAY_BYTES: usize = 256 * 1024;
+const MAX_READY_CATCHUP_BYTES: usize = 256 * 1024;
 const MAX_INPUT_CHUNK_BYTES: usize = 64 * 1024;
 const SESSION_INPUT_QUEUE_CAPACITY: usize = 128;
 const MAX_INPUT_STREAMS: usize = 8;
@@ -55,6 +60,10 @@ const BELL_NOTIFICATION_MIN_INTERVAL_MS: u64 = 10_000;
 const DUPLICATE_NOTIFICATION_MIN_INTERVAL_MS: u64 = 2_000;
 const SHELL_INTEGRATION_ENV: &str = "REMUX_TERMINAL_SHELL_INTEGRATION";
 const TMUX_CONTEXT_CACHE_FRESH_MS: u64 = 1_000;
+const HEADLESS_STATE_QUEUE_CAPACITY: usize = 1_024;
+const HEADLESS_STATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const HEADLESS_STABLE_UPTIME: Duration = Duration::from_secs(5);
+const HEADLESS_MAX_RESTART_BACKOFF: Duration = Duration::from_secs(8);
 
 fn main() {
     if let Err(error) = run_stdio_server() {
@@ -113,26 +122,11 @@ fn handle_envelope(
         }
     }
 
-    let activation_origin = if matches!(
-        method.as_str(),
-        SESSION_START_METHOD | SESSION_ATTACH_METHOD
-    ) {
-        params
-            .as_ref()
-            .and_then(|params| params.get("_remuxOrigin"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    } else {
-        None
-    };
     let result = handle_request(server, JsonRpcRequest { method, params });
     if let Some(id) = id {
         match result {
             Ok(value) => {
-                send_jsonrpc_response(output_tx, JsonRpcResponse::result(id, value.clone()))?;
-                if let Some(origin) = activation_origin {
-                    server.activate_subscription(&origin, &value)?;
-                }
+                send_jsonrpc_response(output_tx, JsonRpcResponse::result(id, value))?;
             }
             Err(error) => {
                 send_jsonrpc_response(output_tx, JsonRpcResponse::error(id, error))?;
@@ -156,6 +150,9 @@ fn handle_request(
             .map_err(internal_rpc_error),
         SESSION_ATTACH_METHOD => server
             .attach_session(request.params.unwrap_or(Value::Null))
+            .map_err(internal_rpc_error),
+        SESSION_READY_METHOD => server
+            .ready_session(request.params.unwrap_or(Value::Null))
             .map_err(internal_rpc_error),
         SESSION_DETACH_METHOD => server
             .detach_session(request.params.unwrap_or(Value::Null))
@@ -226,7 +223,651 @@ fn send_jsonrpc_response(
 }
 
 #[derive(Clone)]
+struct HeadlessStateWorker {
+    desynced: Arc<AtomicBool>,
+    next_request_id: Arc<AtomicU64>,
+    pending: HeadlessPendingRequests,
+    tx: mpsc::SyncSender<HeadlessWorkerCommand>,
+}
+
+struct HeadlessPendingRequest {
+    sender: mpsc::Sender<Result<Value, String>>,
+    worker_epoch: u64,
+}
+
+type HeadlessPendingRequests = Arc<Mutex<HashMap<u64, HeadlessPendingRequest>>>;
+type HeadlessCheckpoints = Arc<Mutex<HashMap<String, Value>>>;
+
+enum HeadlessWorkerCommand {
+    Message(Value),
+    Restart,
+}
+
+struct HeadlessWorkerProcess {
+    child: StdChild,
+    epoch: u64,
+    started_at: Instant,
+    stdin: ChildStdin,
+}
+
+struct HeadlessJournalEvent {
+    byte_len: usize,
+    message: Value,
+    position: u64,
+}
+
+struct HeadlessSessionJournal {
+    complete: bool,
+    create: Value,
+    events: VecDeque<HeadlessJournalEvent>,
+    next_position: u64,
+    output_bytes: usize,
+}
+
+#[derive(Debug)]
+struct HeadlessSnapshot {
+    cols: u16,
+    data_base64: String,
+    encoding: String,
+    rows: u16,
+    through_seq: u64,
+}
+
+impl HeadlessStateWorker {
+    fn spawn() -> Result<Self, String> {
+        if cfg!(test) {
+            return Err("disabled in tests".to_string());
+        }
+
+        let worker_path = terminal_extension_root().join("state-worker/dist/main.mjs");
+        if !worker_path.is_file() {
+            return Err(format!(
+                "state worker bundle is missing: {}",
+                worker_path.display()
+            ));
+        }
+
+        let pending = Arc::new(Mutex::new(HashMap::<u64, HeadlessPendingRequest>::new()));
+        let checkpoints = Arc::new(Mutex::new(HashMap::new()));
+        let desynced = Arc::new(AtomicBool::new(false));
+        let next_worker_epoch = Arc::new(AtomicU64::new(1));
+        let initial_process = spawn_headless_worker_process(
+            &worker_path,
+            pending.clone(),
+            checkpoints.clone(),
+            next_worker_epoch.fetch_add(1, Ordering::Relaxed),
+        )?;
+        let (tx, rx) = mpsc::sync_channel::<HeadlessWorkerCommand>(HEADLESS_STATE_QUEUE_CAPACITY);
+        let manager_pending = pending.clone();
+        let manager_desynced = desynced.clone();
+        let manager_next_worker_epoch = next_worker_epoch.clone();
+        thread::spawn(move || {
+            let mut process = Some(initial_process);
+            let mut journals = HashMap::<String, HeadlessSessionJournal>::new();
+            let mut restart_failures = 0_u32;
+            let mut retry_after = Instant::now();
+            for command in rx {
+                if manager_desynced.swap(false, Ordering::AcqRel) {
+                    for journal in journals.values_mut() {
+                        journal.complete = false;
+                    }
+                    if let Ok(mut checkpoint_values) = checkpoints.lock() {
+                        checkpoint_values.clear();
+                    }
+                    stop_headless_worker(&mut process, &manager_pending);
+                    restart_failures = restart_failures.saturating_add(1);
+                    retry_after = Instant::now() + headless_restart_backoff(restart_failures);
+                }
+                match command {
+                    HeadlessWorkerCommand::Restart => {
+                        stop_headless_worker(&mut process, &manager_pending);
+                        restart_failures = restart_failures.saturating_add(1);
+                        retry_after = Instant::now() + headless_restart_backoff(restart_failures);
+                    }
+                    HeadlessWorkerCommand::Message(mut message) => {
+                        update_headless_journal(&mut journals, &checkpoints, &mut message);
+                        let request_id = message.get("id").and_then(Value::as_u64);
+
+                        let worker_exited = process
+                            .as_mut()
+                            .is_some_and(|worker| worker.child.try_wait().ok().flatten().is_some());
+                        if worker_exited {
+                            let stable = process.as_ref().is_some_and(|worker| {
+                                worker.started_at.elapsed() >= HEADLESS_STABLE_UPTIME
+                            });
+                            stop_headless_worker(&mut process, &manager_pending);
+                            restart_failures = if stable {
+                                1
+                            } else {
+                                restart_failures.saturating_add(1)
+                            };
+                            retry_after =
+                                Instant::now() + headless_restart_backoff(restart_failures);
+                        }
+
+                        if process.as_ref().is_some_and(|worker| {
+                            worker.started_at.elapsed() >= HEADLESS_STABLE_UPTIME
+                        }) {
+                            restart_failures = 0;
+                        }
+
+                        let mut restored_now = false;
+                        if process.is_none() && Instant::now() >= retry_after {
+                            restored_now = restart_headless_worker(
+                                &worker_path,
+                                &manager_pending,
+                                &checkpoints,
+                                &journals,
+                                &manager_next_worker_epoch,
+                                &mut process,
+                            );
+                            if !restored_now {
+                                restart_failures = restart_failures.saturating_add(1);
+                                retry_after =
+                                    Instant::now() + headless_restart_backoff(restart_failures);
+                            }
+                        }
+
+                        if restored_now && request_id.is_none() {
+                            continue;
+                        }
+
+                        let Some(worker) = process.as_mut() else {
+                            if let Some(id) = request_id {
+                                fail_headless_pending_request(
+                                    &manager_pending,
+                                    id,
+                                    "headless state worker is restarting",
+                                );
+                            }
+                            continue;
+                        };
+                        if let Some(id) = request_id {
+                            assign_headless_pending_epoch(&manager_pending, id, worker.epoch);
+                        }
+                        if write_headless_message(&mut worker.stdin, &message).is_err() {
+                            if let Some(id) = request_id {
+                                fail_headless_pending_request(
+                                    &manager_pending,
+                                    id,
+                                    "headless state worker write failed",
+                                );
+                            }
+                            stop_headless_worker(&mut process, &manager_pending);
+                            restart_failures = restart_failures.saturating_add(1);
+                            retry_after =
+                                Instant::now() + headless_restart_backoff(restart_failures);
+                        }
+                    }
+                }
+            }
+            stop_headless_worker(&mut process, &manager_pending);
+        });
+
+        Ok(Self {
+            desynced,
+            next_request_id: Arc::new(AtomicU64::new(0)),
+            pending,
+            tx,
+        })
+    }
+
+    fn create(&self, session_id: &str, generation: u64, size: PtySize) {
+        self.notify(json!({
+            "type": "create",
+            "sessionId": session_id,
+            "generation": generation,
+            "cols": size.cols,
+            "rows": size.rows,
+        }));
+    }
+
+    fn drop_session(&self, session_id: &str, generation: u64) {
+        self.notify(json!({
+            "type": "drop",
+            "sessionId": session_id,
+            "generation": generation,
+        }));
+    }
+
+    fn output(&self, session_id: &str, generation: u64, frame: &OutputFrame) {
+        self.notify(json!({
+            "type": "output",
+            "sessionId": session_id,
+            "generation": generation,
+            "seq": frame.seq,
+            "dataBase64": frame.data_base64,
+        }));
+    }
+
+    fn resize(&self, session_id: &str, generation: u64, size: PtySize) {
+        self.notify(json!({
+            "type": "resize",
+            "sessionId": session_id,
+            "generation": generation,
+            "cols": size.cols,
+            "rows": size.rows,
+        }));
+    }
+
+    fn snapshot(&self, session_id: &str, generation: u64) -> Result<HeadlessSnapshot, String> {
+        let response = self.request(json!({
+            "type": "snapshot",
+            "sessionId": session_id,
+            "generation": generation,
+        }))?;
+        if response.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(response
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("headless snapshot failed")
+                .to_string());
+        }
+        Ok(HeadlessSnapshot {
+            cols: response
+                .get("cols")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .ok_or_else(|| "headless snapshot is missing cols".to_string())?,
+            data_base64: response
+                .get("dataBase64")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "headless snapshot is missing data".to_string())?
+                .to_string(),
+            encoding: response
+                .get("encoding")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "headless snapshot is missing encoding".to_string())?
+                .to_string(),
+            rows: response
+                .get("rows")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .ok_or_else(|| "headless snapshot is missing rows".to_string())?,
+            through_seq: response
+                .get("throughSeq")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "headless snapshot is missing throughSeq".to_string())?,
+        })
+    }
+
+    fn notify(&self, message: Value) {
+        if let Err(error) = self.tx.try_send(HeadlessWorkerCommand::Message(message)) {
+            self.desynced.store(true, Ordering::Release);
+            eprintln!("headless state worker queue is unavailable: {error}");
+        }
+    }
+
+    fn request(&self, mut message: Value) -> Result<Value, String> {
+        let id = self.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
+        message
+            .as_object_mut()
+            .ok_or_else(|| "headless state request must be an object".to_string())?
+            .insert("id".to_string(), json!(id));
+        let (response_tx, response_rx) = mpsc::channel();
+        self.pending
+            .lock()
+            .map_err(|_| "headless state request lock is poisoned".to_string())?
+            .insert(
+                id,
+                HeadlessPendingRequest {
+                    sender: response_tx,
+                    worker_epoch: 0,
+                },
+            );
+        if let Err(error) = self.tx.try_send(HeadlessWorkerCommand::Message(message)) {
+            self.desynced.store(true, Ordering::Release);
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.remove(&id);
+            }
+            return Err(format!("headless state worker write failed: {error}"));
+        }
+        match response_rx.recv_timeout(HEADLESS_STATE_REQUEST_TIMEOUT) {
+            Ok(response) => response,
+            Err(error) => {
+                if let Ok(mut pending) = self.pending.lock() {
+                    pending.remove(&id);
+                }
+                let _ = self.tx.try_send(HeadlessWorkerCommand::Restart);
+                Err(format!("headless state worker timed out: {error}"))
+            }
+        }
+    }
+}
+
+fn spawn_headless_worker_process(
+    worker_path: &Path,
+    pending: HeadlessPendingRequests,
+    checkpoints: HeadlessCheckpoints,
+    epoch: u64,
+) -> Result<HeadlessWorkerProcess, String> {
+    let mut child = ProcessCommand::new("node")
+        .arg(worker_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| format!("failed to start {}: {error}", worker_path.display()))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "headless state worker stdin is unavailable".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "headless state worker stdout is unavailable".to_string())?;
+    thread::spawn(move || {
+        let reader = io::BufReader::new(stdout);
+        for line in reader.lines() {
+            let response = match line {
+                Ok(line) => match serde_json::from_str::<Value>(&line) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        eprintln!("ignored invalid headless state response: {error}");
+                        continue;
+                    }
+                },
+                Err(error) => {
+                    eprintln!("headless state worker read failed: {error}");
+                    break;
+                }
+            };
+            if response.get("type").and_then(Value::as_str) == Some("checkpoint") {
+                let session_id = response.get("sessionId").and_then(Value::as_str);
+                let generation = response.get("generation").and_then(Value::as_u64);
+                if let (Some(session_id), Some(generation)) = (session_id, generation)
+                    && let Ok(mut checkpoints) = checkpoints.lock()
+                {
+                    let key = format!("{session_id}:{generation}");
+                    let position = response
+                        .get("journalPosition")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let current_position = checkpoints
+                        .get(&key)
+                        .and_then(|checkpoint| checkpoint.get("journalPosition"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    if position >= current_position {
+                        checkpoints.insert(key, response);
+                    }
+                }
+                continue;
+            }
+            let Some(id) = response.get("id").and_then(Value::as_u64) else {
+                continue;
+            };
+            let sender = pending
+                .lock()
+                .ok()
+                .and_then(|mut pending| pending.remove(&id));
+            if let Some(pending_request) = sender {
+                let _ = pending_request.sender.send(Ok(response));
+            }
+        }
+        fail_headless_pending_epoch(
+            &pending,
+            epoch,
+            "headless state worker exited before responding",
+        );
+    });
+    Ok(HeadlessWorkerProcess {
+        child,
+        epoch,
+        started_at: Instant::now(),
+        stdin,
+    })
+}
+
+fn write_headless_message(stdin: &mut ChildStdin, message: &Value) -> Result<(), String> {
+    serde_json::to_writer(&mut *stdin, message)
+        .map_err(|error| format!("failed to encode headless state message: {error}"))?;
+    stdin
+        .write_all(b"\n")
+        .and_then(|_| stdin.flush())
+        .map_err(|error| format!("failed to write headless state message: {error}"))
+}
+
+fn assign_headless_pending_epoch(pending: &HeadlessPendingRequests, id: u64, epoch: u64) {
+    if let Ok(mut pending) = pending.lock()
+        && let Some(request) = pending.get_mut(&id)
+    {
+        request.worker_epoch = epoch;
+    }
+}
+
+fn fail_headless_pending_request(pending: &HeadlessPendingRequests, id: u64, message: &str) {
+    let request = pending
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.remove(&id));
+    if let Some(request) = request {
+        let _ = request.sender.send(Err(message.to_string()));
+    }
+}
+
+fn fail_headless_pending_epoch(pending: &HeadlessPendingRequests, epoch: u64, message: &str) {
+    let requests = pending
+        .lock()
+        .map(|mut pending| {
+            let ids = pending
+                .iter()
+                .filter(|(_, request)| request.worker_epoch == epoch)
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| pending.remove(&id))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for request in requests {
+        let _ = request.sender.send(Err(message.to_string()));
+    }
+}
+
+fn stop_headless_worker(
+    process: &mut Option<HeadlessWorkerProcess>,
+    pending: &HeadlessPendingRequests,
+) {
+    if let Some(mut worker) = process.take() {
+        fail_headless_pending_epoch(
+            pending,
+            worker.epoch,
+            "headless state worker restarted before responding",
+        );
+        let _ = worker.child.kill();
+        let _ = worker.child.wait();
+    }
+}
+
+fn headless_restart_backoff(failure_count: u32) -> Duration {
+    let shift = failure_count.saturating_sub(1).min(5);
+    let millis = 250_u64.saturating_mul(1_u64 << shift);
+    Duration::from_millis(millis).min(HEADLESS_MAX_RESTART_BACKOFF)
+}
+
+fn restart_headless_worker(
+    worker_path: &Path,
+    pending: &HeadlessPendingRequests,
+    checkpoints: &HeadlessCheckpoints,
+    journals: &HashMap<String, HeadlessSessionJournal>,
+    next_worker_epoch: &AtomicU64,
+    process: &mut Option<HeadlessWorkerProcess>,
+) -> bool {
+    stop_headless_worker(process, pending);
+    let Ok(mut worker) = spawn_headless_worker_process(
+        worker_path,
+        pending.clone(),
+        checkpoints.clone(),
+        next_worker_epoch.fetch_add(1, Ordering::Relaxed),
+    ) else {
+        return false;
+    };
+    let checkpoint_values = checkpoints
+        .lock()
+        .map(|checkpoints| checkpoints.clone())
+        .unwrap_or_default();
+    for (key, journal) in journals {
+        let checkpoint = checkpoint_values.get(key);
+        if !journal.complete && checkpoint.is_none() {
+            continue;
+        }
+        let checkpoint_position = checkpoint
+            .and_then(|checkpoint| checkpoint.get("journalPosition"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let events_after_checkpoint = journal
+            .events
+            .iter()
+            .filter(|event| event.position > checkpoint_position)
+            .collect::<Vec<_>>();
+        let replay_is_contiguous = if checkpoint.is_some() {
+            events_after_checkpoint
+                .first()
+                .map(|event| event.position == checkpoint_position.saturating_add(1))
+                .unwrap_or(journal.next_position == checkpoint_position)
+        } else {
+            journal.complete
+        };
+        if !replay_is_contiguous {
+            continue;
+        }
+        if write_headless_message(&mut worker.stdin, &journal.create).is_err() {
+            let _ = worker.child.kill();
+            let _ = worker.child.wait();
+            return false;
+        }
+        let checkpoint_through = checkpoint
+            .and_then(|checkpoint| checkpoint.get("throughSeq"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if let Some(checkpoint) = checkpoint {
+            let restore = json!({
+                "type": "restore",
+                "sessionId": checkpoint.get("sessionId"),
+                "generation": checkpoint.get("generation"),
+                "cols": checkpoint.get("cols"),
+                "rows": checkpoint.get("rows"),
+                "journalPosition": checkpoint_position,
+                "throughSeq": checkpoint_through,
+                "encoding": checkpoint.get("encoding"),
+                "dataBase64": checkpoint.get("dataBase64"),
+            });
+            if write_headless_message(&mut worker.stdin, &restore).is_err() {
+                let _ = worker.child.kill();
+                let _ = worker.child.wait();
+                return false;
+            }
+        }
+        for event in events_after_checkpoint {
+            if write_headless_message(&mut worker.stdin, &event.message).is_err() {
+                let _ = worker.child.kill();
+                let _ = worker.child.wait();
+                return false;
+            }
+        }
+    }
+    *process = Some(worker);
+    true
+}
+
+fn update_headless_journal(
+    journals: &mut HashMap<String, HeadlessSessionJournal>,
+    checkpoints: &HeadlessCheckpoints,
+    message: &mut Value,
+) {
+    let Some(kind) = message
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let Some(session_id) = message
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let Some(generation) = message.get("generation").and_then(Value::as_u64) else {
+        return;
+    };
+    let key = format!("{session_id}:{generation}");
+    match kind.as_str() {
+        "create" => {
+            if let Ok(mut checkpoints) = checkpoints.lock() {
+                checkpoints.remove(&key);
+            }
+            journals.insert(
+                key,
+                HeadlessSessionJournal {
+                    complete: true,
+                    create: message.clone(),
+                    events: VecDeque::new(),
+                    next_position: 0,
+                    output_bytes: 0,
+                },
+            );
+        }
+        "drop" => {
+            if let Ok(mut checkpoints) = checkpoints.lock() {
+                checkpoints.remove(&key);
+            }
+            journals.remove(&key);
+        }
+        "output" | "resize" => {
+            let Some(journal) = journals.get_mut(&key) else {
+                return;
+            };
+            journal.next_position = journal.next_position.saturating_add(1);
+            if let Some(record) = message.as_object_mut() {
+                record.insert("journalPosition".to_string(), json!(journal.next_position));
+            }
+            let byte_len = if kind == "output" {
+                message
+                    .get("dataBase64")
+                    .and_then(Value::as_str)
+                    .map(|data| data.len().saturating_mul(3) / 4)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            journal.output_bytes = journal.output_bytes.saturating_add(byte_len);
+            journal.events.push_back(HeadlessJournalEvent {
+                byte_len,
+                message: message.clone(),
+                position: journal.next_position,
+            });
+            while journal.output_bytes > MAX_REPLAY_BYTES
+                || journal.events.len() > MAX_REPLAY_FRAMES.saturating_mul(2)
+            {
+                let Some(removed) = journal.events.pop_front() else {
+                    break;
+                };
+                journal.output_bytes = journal.output_bytes.saturating_sub(removed.byte_len);
+                journal.complete = false;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn terminal_extension_root() -> PathBuf {
+    env::var("REMUX_EXTENSION_ROOT")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        })
+}
+
+#[derive(Clone)]
 struct TerminalExtensionServer {
+    headless: Option<HeadlessStateWorker>,
     output_tx: mpsc::SyncSender<Value>,
     state: Arc<Mutex<TerminalState>>,
     tmux_cache: Arc<Mutex<TmuxCacheState>>,
@@ -235,6 +876,12 @@ struct TerminalExtensionServer {
 impl TerminalExtensionServer {
     fn new(output_tx: mpsc::SyncSender<Value>) -> Self {
         Self {
+            headless: HeadlessStateWorker::spawn()
+                .map_err(|error| {
+                    eprintln!("terminal headless state is unavailable: {error}");
+                    error
+                })
+                .ok(),
             output_tx,
             state: Arc::new(Mutex::new(TerminalState::default())),
             tmux_cache: Arc::new(Mutex::new(TmuxCacheState::default())),
@@ -287,6 +934,9 @@ impl TerminalExtensionServer {
         }
 
         if let Some(mut session) = self.remove_session_record(&session_id) {
+            if let Some(headless) = self.headless.as_ref() {
+                headless.drop_session(&session.session_id, session.generation);
+            }
             session.cleanup_shell_integration();
         }
 
@@ -317,7 +967,7 @@ impl TerminalExtensionServer {
             .take_writer()
             .map_err(|error| format!("failed to open PTY writer: {error}"))?;
 
-        let (session_generation, input_stream_id, next_input_seq) = {
+        let (session_generation, input_stream_id, next_input_seq, subscription_token) = {
             let mut state = self.lock_state()?;
             state.next_session_generation += 1;
             let session_generation = state.next_session_generation;
@@ -336,7 +986,7 @@ impl TerminalExtensionServer {
                 writer,
             });
             let subscription_boundary = session.next_seq;
-            session.subscribe_pending(
+            let subscription_token = session.subscribe_pending(
                 params.remux_viewer_key.as_deref(),
                 remux_origin.as_deref(),
                 subscription_boundary,
@@ -346,12 +996,22 @@ impl TerminalExtensionServer {
                 .start_operations
                 .insert(operation_id.to_string(), input_stream_id.clone());
             state.sessions.insert(session_id.clone(), session);
-            (session_generation, input_stream_id, next_input_seq)
+            (
+                session_generation,
+                input_stream_id,
+                next_input_seq,
+                subscription_token,
+            )
         };
 
-        spawn_reader_thread(
+        if let Some(headless) = self.headless.as_ref() {
+            headless.create(&session_id, session_generation, size);
+        }
+
+        let reader_drained = spawn_reader_thread(
             self.state.clone(),
             self.output_tx.clone(),
+            self.headless.clone(),
             session_id.clone(),
             session_generation,
             reader,
@@ -362,6 +1022,7 @@ impl TerminalExtensionServer {
             session_id.clone(),
             session_generation,
             child,
+            reader_drained,
         );
 
         Ok(json!({
@@ -377,49 +1038,140 @@ impl TerminalExtensionServer {
             "nextInputSeq": next_input_seq,
             "firstAvailableSeq": 1,
             "nextOutputSeq": 1,
+            "catchupEndSeq": 1,
+            "subscriptionToken": subscription_token,
         }))
     }
 
     fn attach_session(&self, params: Value) -> Result<Value, String> {
         let params = parse_params::<TerminalSessionAttachParams>(params, SESSION_ATTACH_METHOD)?;
         let size = params.size();
+        let (generation, incremental_through) = {
+            let mut state = self.lock_state()?;
+            let session = state
+                .sessions
+                .get_mut(&params.session_id)
+                .ok_or_else(|| format!("terminal session not found: {}", params.session_id))?;
+
+            if let Some(expected_generation) = params.session_generation
+                && expected_generation != session.generation
+            {
+                return Err(format!(
+                    "stale terminal session generation: expected {}, current {}",
+                    expected_generation, session.generation
+                ));
+            }
+
+            if session.status == SessionStatus::Running {
+                session.resize(size)?;
+                if let Some(headless) = self.headless.as_ref() {
+                    headless.resize(&params.session_id, session.generation, size);
+                }
+            }
+
+            let first_available_seq = session
+                .replay
+                .front()
+                .map(|frame| frame.frame.seq)
+                .unwrap_or(session.next_seq);
+            let requested_through = params
+                .client_state
+                .as_ref()
+                .filter(|state| state.valid)
+                .map(|state| state.through_seq)
+                .or_else(|| params.replay_seq.filter(|seq| *seq > 0).map(|seq| seq - 1));
+            let incremental_through = requested_through.filter(|through| {
+                if *through >= session.next_seq || through.saturating_add(1) < first_available_seq {
+                    return false;
+                }
+                session
+                    .replay
+                    .iter()
+                    .filter(|frame| frame.frame.seq > *through)
+                    .map(|frame| frame.byte_len)
+                    .sum::<usize>()
+                    <= MAX_ATTACH_REPLAY_BYTES
+            });
+            (session.generation, incremental_through)
+        };
+
+        // A fresh or invalid client gets an authoritative terminal snapshot.
+        // The request is ordered behind all prior output/resize messages in the
+        // worker, so throughSeq is an exact boundary for the raw replay tail.
+        let snapshot = if incremental_through.is_none() {
+            self.headless
+                .as_ref()
+                .and_then(|headless| headless.snapshot(&params.session_id, generation).ok())
+        } else {
+            None
+        };
+
         let mut state = self.lock_state()?;
         let session = state
             .sessions
             .get_mut(&params.session_id)
             .ok_or_else(|| format!("terminal session not found: {}", params.session_id))?;
-
-        if let Some(expected_generation) = params.session_generation
-            && expected_generation != session.generation
-        {
+        if session.generation != generation {
             return Err(format!(
-                "stale terminal session generation: expected {}, current {}",
-                expected_generation, session.generation
+                "stale terminal session generation: expected {generation}, current {}",
+                session.generation
             ));
         }
 
-        if session.status == SessionStatus::Running {
-            session.resize(size)?;
-        }
-
-        let replay_seq = params.replay_seq.unwrap_or(0);
         let first_available_seq = session
             .replay
             .front()
             .map(|frame| frame.frame.seq)
             .unwrap_or(session.next_seq);
-        let replay_truncated = replay_seq > 0 && replay_seq < first_available_seq;
-        let replay = session
-            .replay
-            .iter()
-            .filter(|frame| frame.frame.seq >= replay_seq)
-            .map(|frame| frame.frame.clone())
-            .collect::<Vec<_>>();
-        let subscription_boundary = session.next_seq;
-        session.subscribe_pending(
+        let (restore, replay_from, replay_truncated) = if let Some(through_seq) =
+            incremental_through.filter(|through| {
+                through.saturating_add(1) >= first_available_seq && *through < session.next_seq
+            }) {
+            (
+                json!({ "kind": "incremental", "throughSeq": through_seq }),
+                through_seq.saturating_add(1),
+                false,
+            )
+        } else if let Some(snapshot) = snapshot
+            && snapshot.through_seq < session.next_seq
+            && snapshot.through_seq.saturating_add(1) >= first_available_seq
+        {
+            let through_seq = snapshot.through_seq;
+            (
+                json!({
+                    "kind": "snapshot",
+                    "cols": snapshot.cols,
+                    "rows": snapshot.rows,
+                    "throughSeq": through_seq,
+                    "encoding": snapshot.encoding,
+                    "dataBase64": snapshot.data_base64,
+                }),
+                through_seq.saturating_add(1),
+                false,
+            )
+        } else if first_available_seq <= 1 {
+            (json!({ "kind": "reset", "throughSeq": 0 }), 1, false)
+        } else {
+            (
+                json!({
+                    "kind": "unavailable",
+                    "throughSeq": first_available_seq.saturating_sub(1),
+                }),
+                first_available_seq,
+                true,
+            )
+        };
+        let catchup_end_seq = session.next_seq;
+        let replay_page = collect_replay_page(
+            session,
+            replay_from,
+            catchup_end_seq,
+            MAX_ATTACH_REPLAY_BYTES,
+        );
+        let subscription_token = session.subscribe_pending(
             params.remux_viewer_key.as_deref(),
             params.remux_origin.as_deref(),
-            subscription_boundary,
+            catchup_end_seq,
         )?;
         let (input_stream_id, next_input_seq) =
             session.allocate_input_stream(params.input_stream_id.as_deref())?;
@@ -432,8 +1184,13 @@ impl TerminalExtensionServer {
             "firstAvailableSeq": first_available_seq,
             "nextInputSeq": next_input_seq,
             "inputStreamId": input_stream_id,
-            "replay": replay,
+            "restore": restore,
+            "replay": replay_page.frames,
+            "replayComplete": replay_page.complete,
+            "replayNextSeq": replay_page.next_seq,
             "replayTruncated": replay_truncated,
+            "catchupEndSeq": catchup_end_seq,
+            "subscriptionToken": subscription_token,
             "sessionId": session.session_id,
             "sessionGeneration": session.generation,
             "status": session.status.as_str(),
@@ -467,48 +1224,64 @@ impl TerminalExtensionServer {
         }))
     }
 
-    fn activate_subscription(&self, origin: &str, response: &Value) -> Result<(), String> {
-        let session_id = response
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "terminal subscription response missing sessionId".to_string())?;
-        let generation = response
-            .get("sessionGeneration")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                "terminal subscription response missing sessionGeneration".to_string()
-            })?;
+    fn ready_session(&self, params: Value) -> Result<Value, String> {
+        let params = parse_params::<TerminalSessionReadyParams>(params, SESSION_READY_METHOD)?;
         let mut state = self.lock_state()?;
         let session = state
             .sessions
-            .get_mut(session_id)
-            .ok_or_else(|| format!("terminal session not found: {session_id}"))?;
-        if session.generation != generation {
-            return Ok(());
+            .get_mut(&params.session_id)
+            .ok_or_else(|| format!("terminal session not found: {}", params.session_id))?;
+        if session.generation != params.session_generation {
+            return Ok(json!({ "ok": false, "reason": "stale-subscription" }));
         }
-        let Some((subscription_key, boundary)) = session
+        let Some((subscription_key, subscription)) = session
             .subscriptions
             .iter()
-            .find(|(_, subscription)| subscription.origin == origin)
-            .map(|(key, subscription)| (key.clone(), subscription.next_seq))
+            .find(|(_, subscription)| subscription.token == params.subscription_token)
+            .map(|(key, subscription)| (key.clone(), subscription))
         else {
-            return Ok(());
+            return Ok(json!({ "ok": false, "reason": "stale-subscription" }));
         };
-        let frames = session
+        if subscription.active {
+            return Ok(json!({ "ok": true, "nextOutputSeq": subscription.next_seq }));
+        }
+        if params
+            .remux_origin
+            .as_deref()
+            .is_some_and(|origin| origin != subscription.origin)
+        {
+            return Ok(json!({ "ok": false, "reason": "stale-subscription" }));
+        }
+        if params.through_seq.saturating_add(1) != subscription.catchup_end_seq {
+            return Ok(json!({ "ok": false, "reason": "gap" }));
+        }
+        let first_available_seq = session
             .replay
-            .iter()
-            .filter(|replay| replay.frame.seq >= boundary)
-            .map(|replay| replay.frame.clone())
-            .collect::<Vec<_>>();
-        let origin_set = HashSet::from([origin.to_string()]);
-        for frame in frames {
+            .front()
+            .map(|frame| frame.frame.seq)
+            .unwrap_or(session.next_seq);
+        if subscription.next_seq < first_available_seq {
+            return Ok(json!({ "ok": false, "reason": "gap" }));
+        }
+        let replay_page = collect_replay_page(
+            session,
+            subscription.next_seq,
+            session.next_seq,
+            MAX_READY_CATCHUP_BYTES,
+        );
+        if !replay_page.complete {
+            return Ok(json!({ "ok": false, "reason": "catchup-too-large" }));
+        }
+        let origin = subscription.origin.clone();
+        let origin_set = HashSet::from([origin]);
+        for frame in replay_page.frames {
             let notification = json!({
                 "jsonrpc": "2.0",
                 "method": SESSION_OUTPUT_NOTIFICATION,
                 "params": {
                     "frame": frame,
-                    "sessionId": session_id,
-                    "sessionGeneration": generation,
+                    "sessionId": params.session_id,
+                    "sessionGeneration": params.session_generation,
                 },
             });
             for targeted in target_for_origins(notification, &origin_set) {
@@ -524,8 +1297,8 @@ impl TerminalExtensionServer {
                 "params": {
                     "exitCode": session.exit_code,
                     "exitSignal": session.exit_signal,
-                    "sessionId": session_id,
-                    "sessionGeneration": generation,
+                    "sessionId": params.session_id,
+                    "sessionGeneration": params.session_generation,
                 },
             });
             for targeted in target_for_origins(exited, &origin_set) {
@@ -538,7 +1311,7 @@ impl TerminalExtensionServer {
             subscription.next_seq = session.next_seq;
             subscription.active = true;
         }
-        Ok(())
+        Ok(json!({ "ok": true, "nextOutputSeq": session.next_seq }))
     }
 
     fn read_replay(&self, params: Value) -> Result<Value, String> {
@@ -563,27 +1336,20 @@ impl TerminalExtensionServer {
         let truncated = params.from_seq > 0 && params.from_seq < first_available_seq;
         let from_seq = params.from_seq.max(first_available_seq);
         let max_bytes = params.max_bytes.unwrap_or(256 * 1024).clamp(1, 256 * 1024);
-        let mut bytes = 0usize;
-        let mut frames = Vec::new();
-        for replay in session
-            .replay
-            .iter()
-            .filter(|replay| replay.frame.seq >= from_seq)
-        {
-            if !frames.is_empty() && bytes.saturating_add(replay.byte_len) > max_bytes {
-                break;
-            }
-            bytes = bytes.saturating_add(replay.byte_len);
-            frames.push(replay.frame.clone());
-        }
-        let next_seq = frames.last().map(|frame| frame.seq + 1).unwrap_or(from_seq);
+        let to_seq_exclusive = params
+            .to_seq_exclusive
+            .unwrap_or(session.next_seq)
+            .min(session.next_seq)
+            .max(from_seq);
+        let replay_page = collect_replay_page(session, from_seq, to_seq_exclusive, max_bytes);
         Ok(json!({
-            "complete": next_seq >= session.next_seq,
+            "complete": replay_page.complete,
             "firstAvailableSeq": first_available_seq,
-            "frames": frames,
-            "nextSeq": next_seq,
+            "frames": replay_page.frames,
+            "nextSeq": replay_page.next_seq,
             "sessionGeneration": session.generation,
             "sessionId": session.session_id,
+            "toSeqExclusive": to_seq_exclusive,
             "truncated": truncated,
         }))
     }
@@ -675,6 +1441,9 @@ impl TerminalExtensionServer {
             ));
         }
         session.resize(size)?;
+        if let Some(headless) = self.headless.as_ref() {
+            headless.resize(&params.session_id, session.generation, size);
+        }
 
         Ok(json!({ "ok": true, "sessionGeneration": session.generation }))
     }
@@ -694,6 +1463,9 @@ impl TerminalExtensionServer {
                 ));
             }
             state.sessions.remove(&session_id).and_then(|mut session| {
+                if let Some(headless) = self.headless.as_ref() {
+                    headless.drop_session(&session.session_id, session.generation);
+                }
                 session.cleanup_shell_integration();
                 session.killer.take()
             })
@@ -725,6 +1497,9 @@ impl TerminalExtensionServer {
         };
 
         for mut session in sessions {
+            if let Some(headless) = self.headless.as_ref() {
+                headless.drop_session(&session.session_id, session.generation);
+            }
             session.cleanup_shell_integration();
             if let Some(mut killer) = session.killer.take() {
                 let _ = killer.kill();
@@ -750,8 +1525,12 @@ impl TerminalExtensionServer {
         }
 
         session.resize(size)?;
+        if let Some(headless) = self.headless.as_ref() {
+            headless.resize(session_id, session.generation, size);
+        }
         let subscription_boundary = session.next_seq;
-        session.subscribe_pending(viewer_key, remux_origin, subscription_boundary)?;
+        let subscription_token =
+            session.subscribe_pending(viewer_key, remux_origin, subscription_boundary)?;
         let requested_stream = session.start_operations.get(operation_id).cloned();
         let (input_stream_id, next_input_seq) =
             session.allocate_input_stream(requested_stream.as_deref())?;
@@ -771,6 +1550,8 @@ impl TerminalExtensionServer {
             "nextInputSeq": next_input_seq,
             "firstAvailableSeq": session.replay.front().map(|frame| frame.frame.seq).unwrap_or(session.next_seq),
             "nextOutputSeq": session.next_seq,
+            "catchupEndSeq": subscription_boundary,
+            "subscriptionToken": subscription_token,
         })))
     }
 
@@ -938,6 +1719,7 @@ struct SessionRecord {
     master: Option<Box<dyn MasterPty + Send>>,
     next_notification_seq: u64,
     next_input_stream_id: u64,
+    next_subscription_id: u64,
     next_seq: u64,
     notification_parser: TerminalNotificationParser,
     pid: Option<u32>,
@@ -976,8 +1758,10 @@ struct InputStreamState {
 
 struct TerminalSubscription {
     active: bool,
+    catchup_end_seq: u64,
     next_seq: u64,
     origin: String,
+    token: String,
 }
 
 impl SessionRecord {
@@ -997,6 +1781,7 @@ impl SessionRecord {
             master: Some(init.master),
             next_notification_seq: 1,
             next_input_stream_id: 0,
+            next_subscription_id: 0,
             next_seq: 1,
             notification_parser: TerminalNotificationParser::default(),
             pid: init.pid,
@@ -1017,14 +1802,15 @@ impl SessionRecord {
     fn allocate_input_stream(&mut self, requested: Option<&str>) -> Result<(String, u64), String> {
         self.input_streams
             .retain(|_, stream| stream.last_seen.elapsed() < INPUT_STREAM_RECONNECT_LEASE);
-        if let Some(requested) = requested {
-            let next = self
-                .input_streams
-                .get_mut(requested)
-                .ok_or_else(|| format!("terminal input stream is not active: {requested}"))?;
+        if let Some(requested) = requested
+            && let Some(next) = self.input_streams.get_mut(requested)
+        {
             next.last_seen = Instant::now();
             return Ok((requested.to_string(), next.next_seq));
         }
+        // A viewer can legitimately return after the reconnect lease. Give it
+        // a fresh producer identity instead of making every subsequent attach
+        // retry the same permanently expired stream.
         if self.input_streams.len() >= MAX_INPUT_STREAMS {
             return Err(format!(
                 "TerminalInputStreamLimit: session {} already has {MAX_INPUT_STREAMS} input streams",
@@ -1051,7 +1837,7 @@ impl SessionRecord {
         viewer_key: Option<&str>,
         origin: Option<&str>,
         next_seq: u64,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         if let Some(origin) = origin.filter(|origin| !origin.is_empty()) {
             let key = viewer_key
                 .filter(|key| !key.is_empty())
@@ -1065,16 +1851,26 @@ impl SessionRecord {
                     self.session_id
                 ));
             }
+            self.next_subscription_id += 1;
+            let token = format!(
+                "terminal-subscription:{}:{}:{}",
+                self.generation,
+                self.next_subscription_id,
+                unix_millis(),
+            );
             self.subscriptions.insert(
                 key,
                 TerminalSubscription {
                     active: false,
+                    catchup_end_seq: next_seq,
                     next_seq,
                     origin: origin.to_string(),
+                    token: token.clone(),
                 },
             );
+            return Ok(Some(token));
         }
-        Ok(())
+        Ok(None)
     }
 
     fn active_origins(&self) -> HashSet<String> {
@@ -1208,6 +2004,42 @@ impl SessionRecord {
 struct ReplayFrame {
     byte_len: usize,
     frame: OutputFrame,
+}
+
+struct ReplayPage {
+    complete: bool,
+    frames: Vec<OutputFrame>,
+    next_seq: u64,
+}
+
+fn collect_replay_page(
+    session: &SessionRecord,
+    from_seq: u64,
+    to_seq_exclusive: u64,
+    max_bytes: usize,
+) -> ReplayPage {
+    let mut bytes = 0usize;
+    let mut frames = Vec::new();
+    for replay in session
+        .replay
+        .iter()
+        .filter(|replay| replay.frame.seq >= from_seq && replay.frame.seq < to_seq_exclusive)
+    {
+        if !frames.is_empty() && bytes.saturating_add(replay.byte_len) > max_bytes {
+            break;
+        }
+        bytes = bytes.saturating_add(replay.byte_len);
+        frames.push(replay.frame.clone());
+    }
+    let next_seq = frames
+        .last()
+        .map(|frame| frame.seq.saturating_add(1))
+        .unwrap_or(from_seq);
+    ReplayPage {
+        complete: next_seq >= to_seq_exclusive,
+        frames,
+        next_seq,
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -1631,10 +2463,12 @@ fn spawn_session_writer(mut writer: Box<dyn Write + Send>, input_rx: mpsc::Recei
 fn spawn_reader_thread(
     state: Arc<Mutex<TerminalState>>,
     output_tx: mpsc::SyncSender<Value>,
+    headless: Option<HeadlessStateWorker>,
     session_id: String,
     session_generation: u64,
     mut reader: Box<dyn Read + Send>,
-) {
+) -> mpsc::Receiver<()> {
+    let (drained_tx, drained_rx) = mpsc::channel();
     // Stage 1: block on the PTY and forward raw chunks as they arrive.
     let (chunk_tx, chunk_rx) = mpsc::sync_channel::<Vec<u8>>(64);
     thread::spawn(move || {
@@ -1698,6 +2532,12 @@ fn spawn_reader_thread(
                 }
                 let terminal_notifications = session.notification_requests_for_output(&acc);
                 let frame = session.append_output(&acc);
+                if let Some(headless) = headless.as_ref() {
+                    // Keep state-emulator ordering under the same lock used by
+                    // resize. Otherwise an attach could enqueue RESIZE between
+                    // assigning this frame's sequence and forwarding its bytes.
+                    headless.output(&session_id, session_generation, &frame);
+                }
                 let active_origins = session.active_origins();
                 let output_notification = json!({
                     "jsonrpc": "2.0",
@@ -1729,7 +2569,9 @@ fn spawn_reader_thread(
                 }
             }
         }
+        let _ = drained_tx.send(());
     });
+    drained_rx
 }
 
 fn spawn_wait_thread(
@@ -1738,9 +2580,14 @@ fn spawn_wait_thread(
     session_id: String,
     session_generation: u64,
     mut child: Box<dyn Child + Send + Sync>,
+    reader_drained: mpsc::Receiver<()>,
 ) {
     thread::spawn(move || {
         let status = child.wait();
+        // wait(2) may complete before the PTY master has drained the child's
+        // final teardown bytes. Give the reader/coalescer a bounded chance to
+        // publish sequences such as DECRST 1049 before announcing exit.
+        let _ = reader_drained.recv_timeout(Duration::from_secs(1));
         let (exit_code, exit_signal) = match status {
             Ok(status) => (
                 Some(status.exit_code()),
@@ -1832,6 +2679,7 @@ impl TerminalSessionStartParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TerminalSessionAttachParams {
+    client_state: Option<TerminalClientState>,
     cols: Option<u32>,
     input_stream_id: Option<String>,
     replay_seq: Option<u64>,
@@ -1842,6 +2690,24 @@ struct TerminalSessionAttachParams {
     remux_viewer_key: Option<String>,
     session_id: String,
     session_generation: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalSessionReadyParams {
+    #[serde(rename = "_remuxOrigin")]
+    remux_origin: Option<String>,
+    session_id: String,
+    session_generation: u64,
+    subscription_token: String,
+    through_seq: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalClientState {
+    through_seq: u64,
+    valid: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1863,6 +2729,7 @@ struct TerminalSessionReplayReadParams {
     max_bytes: Option<usize>,
     session_id: String,
     session_generation: u64,
+    to_seq_exclusive: Option<u64>,
 }
 
 impl TerminalSessionAttachParams {
@@ -2307,9 +3174,11 @@ impl JsonRpcError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::path::Path;
     use std::sync::mpsc::{self, Receiver};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use base64::Engine;
@@ -2318,11 +3187,12 @@ mod tests {
     use portable_pty::CommandBuilder;
 
     use super::{
-        BASE64, JsonRpcEnvelope, REMUX_NOTIFICATION_REQUEST_METHOD, SESSION_EXITED_NOTIFICATION,
-        SESSION_OUTPUT_NOTIFICATION, SESSION_START_METHOD, SESSION_WRITE_METHOD,
-        SHELL_INTEGRATION_ENV, TERMINAL_OUTPUT_QUEUE_CAPACITY, TerminalExtensionServer,
-        TerminalNotificationEvent, TerminalNotificationParser, clamp_u16,
-        configure_shell_integration, configure_terminal_environment, handle_envelope, pty_size,
+        BASE64, INPUT_STREAM_RECONNECT_LEASE, JsonRpcEnvelope, REMUX_NOTIFICATION_REQUEST_METHOD,
+        SESSION_EXITED_NOTIFICATION, SESSION_OUTPUT_NOTIFICATION, SESSION_START_METHOD,
+        SESSION_WRITE_METHOD, SHELL_INTEGRATION_ENV, TERMINAL_OUTPUT_QUEUE_CAPACITY,
+        TerminalExtensionServer, TerminalNotificationEvent, TerminalNotificationParser, clamp_u16,
+        configure_shell_integration, configure_terminal_environment, handle_envelope,
+        headless_restart_backoff, pty_size, update_headless_journal,
     };
 
     #[test]
@@ -2340,6 +3210,51 @@ mod tests {
         assert_eq!(clamp_u16(0, 2, 10), 2);
         assert_eq!(clamp_u16(7, 2, 10), 7);
         assert_eq!(clamp_u16(11, 2, 10), 10);
+    }
+
+    #[test]
+    fn headless_journal_assigns_a_total_order_to_output_and_resize() {
+        let mut journals = HashMap::new();
+        let checkpoints = Arc::new(Mutex::new(HashMap::new()));
+        let mut create = json!({
+            "type": "create",
+            "sessionId": "journal-test",
+            "generation": 1,
+            "cols": 80,
+            "rows": 24,
+        });
+        update_headless_journal(&mut journals, &checkpoints, &mut create);
+
+        let mut resize = json!({
+            "type": "resize",
+            "sessionId": "journal-test",
+            "generation": 1,
+            "cols": 100,
+            "rows": 30,
+        });
+        update_headless_journal(&mut journals, &checkpoints, &mut resize);
+        let mut output = json!({
+            "type": "output",
+            "sessionId": "journal-test",
+            "generation": 1,
+            "seq": 1,
+            "dataBase64": "eA==",
+        });
+        update_headless_journal(&mut journals, &checkpoints, &mut output);
+
+        assert_eq!(resize["journalPosition"], 1);
+        assert_eq!(output["journalPosition"], 2);
+        let journal = journals.get("journal-test:1").unwrap();
+        assert_eq!(journal.next_position, 2);
+        assert_eq!(journal.events[0].position, 1);
+        assert_eq!(journal.events[1].position, 2);
+    }
+
+    #[test]
+    fn headless_restart_backoff_is_bounded() {
+        assert_eq!(headless_restart_backoff(1), Duration::from_millis(250));
+        assert_eq!(headless_restart_backoff(2), Duration::from_millis(500));
+        assert_eq!(headless_restart_backoff(99), Duration::from_secs(8));
     }
 
     #[test]
@@ -2497,6 +3412,15 @@ mod tests {
                 dir.exists(),
                 "expected generated integration directory to exist for {shell}"
             );
+            let integration_path = command
+                .get_env("REMUX_SHELL_INTEGRATION_SCRIPT")
+                .expect("shell integration path should be exported");
+            let integration = fs::read_to_string(integration_path)
+                .expect("generated shell integration should be readable");
+            assert!(
+                !integration.contains("__remux_reset_terminal_modes"),
+                "shell integration should leave mode recovery to the terminal emulator"
+            );
 
             fs::remove_dir_all(dir).expect("expected test integration dir cleanup");
         }
@@ -2598,6 +3522,119 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("start response arrives");
         assert_eq!(first["id"], 91, "early output overtook the start response");
+        server.kill_all();
+    }
+
+    #[test]
+    fn ready_delivers_the_post_attach_tail_before_activating_subscription() {
+        let Some(shell) = test_shell() else {
+            return;
+        };
+        let (server, output_rx) = test_server();
+        let session_id = "terminal-test-ready-tail";
+        let started = start_test_session(&server, session_id, shell, 80, 24);
+        let generation = started["sessionGeneration"].as_u64().unwrap();
+
+        let attached = server
+            .attach_session(json!({
+                "_remuxOrigin": "ready-test-origin",
+                "cols": 80,
+                "rows": 24,
+                "sessionGeneration": generation,
+                "sessionId": session_id,
+            }))
+            .expect("attach should create a pending subscription");
+        let catchup_end = attached["catchupEndSeq"].as_u64().unwrap();
+        let token = attached["subscriptionToken"].as_str().unwrap();
+        {
+            let mut state = server.lock_state().unwrap();
+            let session = state.sessions.get_mut(session_id).unwrap();
+            let frame = session.append_output(b"after-attach");
+            assert_eq!(frame.seq, catchup_end);
+        }
+
+        let ready = server
+            .ready_session(json!({
+                "_remuxOrigin": "ready-test-origin",
+                "sessionId": session_id,
+                "sessionGeneration": generation,
+                "subscriptionToken": token,
+                "throughSeq": catchup_end - 1,
+            }))
+            .expect("ready should deliver the catchup tail");
+        assert_eq!(ready["ok"], true);
+        assert_eq!(ready["nextOutputSeq"], catchup_end + 1);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let message = output_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("ready catchup notification should arrive");
+            if message["params"]["frame"]["seq"] == catchup_end {
+                assert_eq!(message["remuxTarget"]["origin"], "ready-test-origin");
+                break;
+            }
+        }
+        server.kill_all();
+    }
+
+    #[test]
+    fn replay_pages_stay_pinned_to_the_requested_boundary() {
+        let Some(shell) = test_shell() else {
+            return;
+        };
+        let (server, _output_rx) = test_server();
+        let session_id = "terminal-test-fixed-replay-boundary";
+        let started = start_test_session(&server, session_id, shell, 80, 24);
+        let generation = started["sessionGeneration"].as_u64().unwrap();
+        let (from_seq, boundary) = {
+            let mut state = server.lock_state().unwrap();
+            let session = state.sessions.get_mut(session_id).unwrap();
+            let from_seq = session.next_seq;
+            session.append_output(b"one");
+            session.append_output(b"two");
+            session.append_output(b"three");
+            (from_seq, session.next_seq)
+        };
+
+        let first = server
+            .read_replay(json!({
+                "fromSeq": from_seq,
+                "maxBytes": 1,
+                "sessionId": session_id,
+                "sessionGeneration": generation,
+                "toSeqExclusive": boundary,
+            }))
+            .unwrap();
+        assert_eq!(first["frames"].as_array().unwrap().len(), 1);
+        assert_eq!(first["complete"], false);
+        let second_from = first["nextSeq"].as_u64().unwrap();
+
+        {
+            let mut state = server.lock_state().unwrap();
+            state
+                .sessions
+                .get_mut(session_id)
+                .unwrap()
+                .append_output(b"outside-boundary");
+        }
+        let second = server
+            .read_replay(json!({
+                "fromSeq": second_from,
+                "maxBytes": 64,
+                "sessionId": session_id,
+                "sessionGeneration": generation,
+                "toSeqExclusive": boundary,
+            }))
+            .unwrap();
+        assert_eq!(second["complete"], true);
+        assert!(
+            second["frames"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|frame| frame["seq"].as_u64().unwrap() < boundary)
+        );
         server.kill_all();
     }
 
@@ -2777,6 +3814,43 @@ mod tests {
             }))
             .unwrap_err();
         assert!(stale.contains("stale terminal session generation"));
+        server.kill_all();
+    }
+
+    #[test]
+    fn attach_replaces_an_expired_input_stream() {
+        let Some(shell) = test_shell() else {
+            return;
+        };
+        let (server, _output_rx) = test_server();
+        let session_id = "terminal-test-expired-input";
+        let started = start_test_session(&server, session_id, shell, 80, 24);
+        let generation = started["sessionGeneration"].as_u64().unwrap();
+        let expired_stream = started["inputStreamId"].as_str().unwrap().to_string();
+
+        {
+            let mut state = server.lock_state().unwrap();
+            state
+                .sessions
+                .get_mut(session_id)
+                .unwrap()
+                .input_streams
+                .get_mut(&expired_stream)
+                .unwrap()
+                .last_seen = Instant::now() - INPUT_STREAM_RECONNECT_LEASE - Duration::from_secs(1);
+        }
+
+        let attached = server
+            .attach_session(json!({
+                "cols": 80,
+                "inputStreamId": expired_stream,
+                "rows": 24,
+                "sessionGeneration": generation,
+                "sessionId": session_id,
+            }))
+            .expect("expired streams should be replaced during attach");
+        assert_ne!(attached["inputStreamId"], expired_stream);
+        assert_eq!(attached["nextInputSeq"], 1);
         server.kill_all();
     }
 

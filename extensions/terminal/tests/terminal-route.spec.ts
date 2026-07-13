@@ -1,4 +1,5 @@
 import { expect, type Page, test } from '@playwright/test';
+import { gzipSync } from 'node:zlib';
 
 import { terminalModifierAutoClearMs } from '../viewer/src/terminal/keyEncoding';
 
@@ -28,9 +29,15 @@ type TerminalHostMock = {
 
 declare global {
   interface Window {
-    __remuxTerminalAttachReplay?: Array<{ dataBase64: string; seq: number }>;
+    __remuxTerminalAttachReplay?: Array<{ dataBase64: string; seq: number; sessionGeneration: number }>;
+    __remuxTerminalAttachRestore?: unknown;
+    __remuxTerminalAttachRestoreSequence?: unknown[];
+    __remuxTerminalEventDuringAttach?: unknown;
+    __remuxTerminalFailAttachAfterFirst?: boolean;
+    __remuxTerminalFailNextAttachCount?: number;
     __remuxTerminalClipboardText?: string;
     __remuxTerminalInitialTmuxContext?: unknown;
+    __remuxTerminalReadyFailures?: Array<'catchup-too-large' | 'gap' | 'stale-subscription'>;
     __remuxTerminalHost?: TerminalHostMock;
   }
 }
@@ -135,6 +142,21 @@ test.describe('terminal viewer route', () => {
     const writeRequest = await waitForHostRequest(page, 'remux/terminal/session/write', writeCount + 1);
     const writeParams = recordParams(writeRequest);
     expect(Buffer.from(String(writeParams.dataBase64), 'base64').toString('utf8')).toBe('echo remux');
+  });
+
+  test('wraps menu paste when bracketed paste mode is active', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+    await sendTerminalOutput(page, 1, '\x1b[?2004h');
+    await page.evaluate(() => navigator.clipboard.writeText('echo bracketed'));
+
+    const writeCount = await hostRequestCount(page, 'remux/terminal/session/write');
+    await page.getByLabel('Terminal menu').click();
+    await page.getByRole('menuitem', { name: 'Paste' }).click();
+
+    await expect.poll(async () => (
+      decodeWrites((await hostRequests(page, 'remux/terminal/session/write')).slice(writeCount))
+    )).toContain('\x1b[200~echo bracketed\x1b[201~');
   });
 
   test('selects terminal text and copies it from selection mode', async ({ page }) => {
@@ -824,6 +846,240 @@ test.describe('terminal viewer route', () => {
     await expect(page.getByLabel('Start new shell')).toBeVisible();
   });
 
+  test('restores a headless snapshot before applying its replay tail', async ({ page }) => {
+    const snapshotData = gzipSync(
+      Buffer.from('\x1b[?1049h\x1b[Hsnapshot-state\x1b[?1h', 'utf8'),
+    ).toString('base64');
+    await page.addInitScript((dataBase64) => {
+      window.__remuxTerminalAttachRestore = {
+        cols: 80,
+        dataBase64,
+        encoding: 'gzip-base64',
+        kind: 'snapshot',
+        rows: 24,
+        throughSeq: 5,
+      };
+      window.__remuxTerminalAttachReplay = [{
+        dataBase64: btoa('\r\nreplay-tail'),
+        seq: 6,
+        sessionGeneration: 1,
+      }];
+    }, snapshotData);
+    await page.goto('/?remuxResourceKind=terminalSession&remuxResourceId=snapshot-session&remuxTabId=tab-1');
+
+    const attachRequest = await waitForHostRequest(page, 'remux/terminal/session/attach');
+    expect(recordParams(attachRequest).clientState).toEqual({ throughSeq: 0, valid: false });
+    await page.waitForTimeout(200);
+    await page.getByLabel('Terminal menu').click();
+    await page.getByRole('menuitem', { name: 'Copy screen' }).click();
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toContain('snapshot-state');
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toContain('replay-tail');
+  });
+
+  test('retries an existing-session attach without replacing it with start', async ({ page }) => {
+    await page.addInitScript(() => {
+      window.__remuxTerminalFailNextAttachCount = 1;
+      window.__remuxTerminalAttachReplay = [{
+        dataBase64: btoa('preserved-after-attach-retry\r\n'),
+        seq: 1,
+        sessionGeneration: 1,
+      }];
+    });
+    await page.goto('/?remuxResourceKind=terminalSession&remuxResourceId=retry-session&remuxTabId=tab-1');
+
+    await waitForHostRequest(page, 'remux/terminal/session/attach', 2);
+    expect(await hostRequestCount(page, 'remux/terminal/session/start')).toBe(0);
+    await page.getByLabel('Terminal menu').click();
+    await page.getByRole('menuitem', { name: 'Copy screen' }).click();
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toContain('preserved-after-attach-retry');
+  });
+
+  test('keeps snapshot client state invalid until restoration succeeds', async ({ page }) => {
+    const validSnapshot = gzipSync(Buffer.from('valid-snapshot-state', 'utf8')).toString('base64');
+    await page.addInitScript((dataBase64) => {
+      window.__remuxTerminalAttachRestoreSequence = [
+        {
+          cols: 80,
+          dataBase64: btoa('not-gzip'),
+          encoding: 'gzip-base64',
+          kind: 'snapshot',
+          rows: 24,
+          throughSeq: 1,
+        },
+        {
+          cols: 80,
+          dataBase64,
+          encoding: 'gzip-base64',
+          kind: 'snapshot',
+          rows: 24,
+          throughSeq: 1,
+        },
+      ];
+    }, validSnapshot);
+    await page.goto('/?remuxResourceKind=terminalSession&remuxResourceId=decode-retry&remuxTabId=tab-1');
+
+    await waitForHostRequest(page, 'remux/terminal/session/attach', 2);
+    const attaches = await hostRequests(page, 'remux/terminal/session/attach');
+    expect(recordParams(attaches[1]!).clientState).toEqual({ throughSeq: 0, valid: false });
+    await page.getByLabel('Terminal menu').click();
+    await page.getByRole('menuitem', { name: 'Copy screen' }).click();
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toContain('valid-snapshot-state');
+  });
+
+  test('reattaches when a newly started subscription catchup is too large', async ({ page }) => {
+    await page.addInitScript(() => {
+      window.__remuxTerminalReadyFailures = ['catchup-too-large'];
+      window.__remuxTerminalAttachReplay = [{
+        dataBase64: btoa('startup-catchup-recovered\r\n'),
+        seq: 1,
+        sessionGeneration: 1,
+      }];
+    });
+    await page.goto('/?remuxLaunch=new-terminal');
+
+    await waitForHostRequest(page, 'remux/terminal/session/attach');
+    await waitForHostRequest(page, 'remux/terminal/session/ready', 2);
+    await page.getByLabel('Terminal menu').click();
+    await page.getByRole('menuitem', { name: 'Copy screen' }).click();
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toContain('startup-catchup-recovered');
+  });
+
+  test('buffers live output that arrives while the initial attach is being parsed', async ({ page }) => {
+    await page.addInitScript(() => {
+      window.__remuxTerminalAttachReplay = [{
+        dataBase64: btoa('replay-before-ready\r\n'),
+        seq: 1,
+        sessionGeneration: 1,
+      }];
+      window.__remuxTerminalEventDuringAttach = {
+        jsonrpc: '2.0',
+        method: 'remux/terminal/session/output',
+        params: {
+          frame: {
+            dataBase64: btoa('live-during-attach\r\n'),
+            seq: 2,
+            sessionGeneration: 1,
+          },
+          sessionGeneration: 1,
+          sessionId: 'initial-race-session',
+        },
+      };
+    });
+    await page.goto('/?remuxResourceKind=terminalSession&remuxResourceId=initial-race-session&remuxTabId=tab-1');
+
+    await waitForHostRequest(page, 'remux/terminal/session/ready');
+    await page.getByLabel('Terminal menu').click();
+    await page.getByRole('menuitem', { name: 'Copy screen' }).click();
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toContain('replay-before-ready');
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toContain('live-during-attach');
+  });
+
+  test('keeps gap frames quarantined across a failed resync', async ({ page }) => {
+    await page.addInitScript(() => {
+      window.__remuxTerminalAttachReplay = [{
+        dataBase64: btoa('frame-one\r\n'),
+        seq: 1,
+        sessionGeneration: 1,
+      }];
+      window.__remuxTerminalFailAttachAfterFirst = true;
+    });
+    await page.goto('/?remuxResourceKind=terminalSession&remuxResourceId=failed-resync-session&remuxTabId=tab-1');
+    await waitForHostRequest(page, 'remux/terminal/session/ready');
+
+    await page.evaluate(() => {
+      window.__remuxTerminalHost?.sendTerminalEvent({
+        jsonrpc: '2.0',
+        method: 'remux/terminal/session/output',
+        params: {
+          frame: {
+            dataBase64: btoa('frame-three\r\n'),
+            seq: 3,
+            sessionGeneration: 1,
+          },
+          sessionGeneration: 1,
+          sessionId: 'failed-resync-session',
+        },
+      });
+    });
+    await waitForHostRequest(page, 'remux/terminal/session/attach', 2);
+    await page.waitForTimeout(100);
+    await page.getByLabel('Terminal menu').click();
+    await page.getByRole('menuitem', { name: 'Copy screen' }).click();
+    expect(await page.evaluate(() => navigator.clipboard.readText())).not.toContain('frame-three');
+
+    await page.evaluate(() => {
+      window.__remuxTerminalAttachReplay = [
+        { dataBase64: btoa('frame-one\r\n'), seq: 1, sessionGeneration: 1 },
+        { dataBase64: btoa('frame-two\r\n'), seq: 2, sessionGeneration: 1 },
+      ];
+      window.__remuxTerminalFailAttachAfterFirst = false;
+    });
+    await waitForHostRequest(page, 'remux/terminal/session/ready', 2);
+    await page.getByLabel('Terminal menu').click();
+    await page.getByRole('menuitem', { name: 'Copy screen' }).click();
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toContain('frame-two');
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toContain('frame-three');
+  });
+
+  test('reports effective focus across app lifecycle only after resync', async ({ page }) => {
+    await page.addInitScript(() => {
+      window.__remuxTerminalAttachReplay = [{
+        dataBase64: btoa('\x1b[?1004h'),
+        seq: 1,
+        sessionGeneration: 1,
+      }];
+    });
+    await page.goto('/?remuxResourceKind=terminalSession&remuxResourceId=focus-session&remuxTabId=tab-1');
+    await waitForHostRequest(page, 'remux/terminal/session/ready');
+    await page.evaluate(() => {
+      const event = new MessageEvent('message', {
+        data: JSON.stringify({
+          lifecycle: { epoch: 1, reason: 'connect', state: 'active' },
+          type: 'remux/lifecycle',
+        }),
+      });
+      window.dispatchEvent(event);
+      document.dispatchEvent(event);
+    });
+    await waitForHostRequest(page, 'remux/terminal/session/ready', 2);
+    await sendTerminalOutput(page, 2, '\x1b[?1004h');
+    await page.waitForTimeout(100);
+    const writeCount = await hostRequestCount(page, 'remux/terminal/session/write');
+
+    await page.evaluate(() => {
+      const event = new MessageEvent('message', {
+        data: JSON.stringify({
+          lifecycle: { epoch: 2, reason: 'appState', state: 'background' },
+          type: 'remux/lifecycle',
+        }),
+      });
+      window.dispatchEvent(event);
+      document.dispatchEvent(event);
+    });
+    await expect.poll(async () => (
+      decodeWrites((await hostRequests(page, 'remux/terminal/session/write')).slice(writeCount))
+    )).toContain('\x1b[O');
+
+    const readyCount = await hostRequestCount(page, 'remux/terminal/session/ready');
+    await page.evaluate(() => {
+      const event = new MessageEvent('message', {
+        data: JSON.stringify({
+          lifecycle: { epoch: 3, reason: 'appState', state: 'active' },
+          type: 'remux/lifecycle',
+        }),
+      });
+      window.dispatchEvent(event);
+      document.dispatchEvent(event);
+    });
+    await waitForHostRequest(page, 'remux/terminal/session/ready', readyCount + 1);
+    await expect.poll(async () => (
+      decodeWrites((await hostRequests(page, 'remux/terminal/session/write')).slice(writeCount))
+    )).toContain('\x1b[I');
+  });
+
   test('does not forward terminal query responses generated from replay', async ({ page }) => {
     await page.addInitScript((replay) => {
       window.__remuxTerminalAttachReplay = replay;
@@ -1123,6 +1379,20 @@ test.describe('terminal viewer route', () => {
     }).toEqual({ appCursorUp: true, csiUp: false });
   });
 
+  test('onscreen arrows honor application cursor mode', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+    await sendTerminalOutput(page, 1, '\x1b[?1h');
+    await page.waitForTimeout(100);
+
+    const writeCount = await hostRequestCount(page, 'remux/terminal/session/write');
+    await page.getByLabel('Arrow up').click();
+
+    await expect.poll(async () => (
+      decodeWrites((await hostRequests(page, 'remux/terminal/session/write')).slice(writeCount))
+    )).toContain('\x1bOA');
+  });
+
   test('keeps the keyboard up on a single tap and dismisses on a double tap', async ({ page }) => {
     await page.goto('/?remuxLaunch=new-terminal');
     await waitForHostRequest(page, 'remux/terminal/session/start');
@@ -1156,6 +1426,7 @@ test.describe('terminal viewer route', () => {
 async function installMockRemuxHost(page: Page) {
   await page.addInitScript(() => {
     const state = {
+      attachCount: 0,
       clipboardText: '',
       metrics: {
         keyboardHeight: 0,
@@ -1327,9 +1598,37 @@ async function installMockRemuxHost(page: Page) {
           return;
 
         case 'remux/terminal/session/attach': {
+          state.attachCount += 1;
+          if ((window.__remuxTerminalFailNextAttachCount ?? 0) > 0) {
+            window.__remuxTerminalFailNextAttachCount =
+              (window.__remuxTerminalFailNextAttachCount ?? 0) - 1;
+            postError(request, 'Injected transient attach failure');
+            return;
+          }
+          if (window.__remuxTerminalFailAttachAfterFirst && state.attachCount > 1) {
+            postError(request, 'Injected attach failure');
+            return;
+          }
           const sessionId = typeof params.sessionId === 'string' ? params.sessionId : state.sessionId;
+          const replay = window.__remuxTerminalAttachReplay ?? [];
+          const restore = window.__remuxTerminalAttachRestoreSequence?.length
+            ? window.__remuxTerminalAttachRestoreSequence.shift()
+            : window.__remuxTerminalAttachRestore;
+          const throughSeq = Math.max(
+            isRecord(restore) && typeof restore.throughSeq === 'number' ? restore.throughSeq : 0,
+            ...replay.map((frame) => frame.seq),
+          );
+          const catchupEndSeq = throughSeq + 1;
           state.sessionId = sessionId;
+          if (window.__remuxTerminalEventDuringAttach) {
+            dispatch({
+              message: window.__remuxTerminalEventDuringAttach,
+              type: 'remux/event',
+            });
+            window.__remuxTerminalEventDuringAttach = undefined;
+          }
           postResult(request, {
+            catchupEndSeq,
             exitCode: null,
             exitSignal: null,
             nextSeq: 1,
@@ -1339,11 +1638,28 @@ async function installMockRemuxHost(page: Page) {
             inputStreamId: typeof params.inputStreamId === 'string'
               ? params.inputStreamId
               : 'mock-input-stream',
-            replay: window.__remuxTerminalAttachReplay ?? [],
+            replay,
+            replayComplete: true,
+            replayNextSeq: catchupEndSeq,
             replayTruncated: false,
+            restore,
             sessionId,
             sessionGeneration: 1,
             status: 'running',
+            subscriptionToken: 'mock-subscription',
+          });
+          return;
+        }
+
+        case 'remux/terminal/session/ready': {
+          const readyFailure = window.__remuxTerminalReadyFailures?.shift();
+          if (readyFailure) {
+            postResult(request, { ok: false, reason: readyFailure });
+            return;
+          }
+          postResult(request, {
+            nextOutputSeq: typeof params.throughSeq === 'number' ? params.throughSeq + 1 : 1,
+            ok: true,
           });
           return;
         }
@@ -1352,6 +1668,7 @@ async function installMockRemuxHost(page: Page) {
           const sessionId = typeof params.sessionId === 'string' ? params.sessionId : state.sessionId;
           state.sessionId = sessionId;
           postResult(request, {
+            catchupEndSeq: 1,
             cols: typeof params.cols === 'number' ? params.cols : 80,
             cwd: typeof params.cwd === 'string' ? params.cwd : '/workspace/remux',
             pid: 12345,
@@ -1363,6 +1680,7 @@ async function installMockRemuxHost(page: Page) {
             nextInputSeq: 1,
             firstAvailableSeq: 1,
             nextOutputSeq: 1,
+            subscriptionToken: 'mock-subscription',
           });
           return;
         }

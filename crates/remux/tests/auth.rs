@@ -85,6 +85,7 @@ async fn serve(root: &std::path::Path, require: bool) -> Harness {
         viewer_bundles,
         default_extension: extension.clone(),
         extensions: vec![extension],
+        invalid_extensions: Vec::new(),
         media_root: root.join(".remux/cache/media"),
     });
     let router = Arc::new(RpcRouter::new(
@@ -103,7 +104,10 @@ async fn serve(root: &std::path::Path, require: bool) -> Harness {
     let app = ws
         .route()
         .merge(build_router(state))
-        .layer(axum::middleware::from_fn_with_state(auth_state, require_auth))
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            require_auth,
+        ))
         .into_make_service_with_connect_info::<SocketAddr>();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -152,11 +156,23 @@ async fn health_is_exempt_and_everything_else_401s_without_a_token() {
         assert_eq!(body, json!({ "error": "unauthorized" }));
     }
     assert!(
-        harness.log.warnings.lock().unwrap().iter().all(|w| w.starts_with("auth rejected 127.0.0.1 /")),
+        harness
+            .log
+            .warnings
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|w| w.starts_with("auth rejected 127.0.0.1 /")),
         "rejections journal IP + path"
     );
     assert!(
-        harness.log.warnings.lock().unwrap().iter().all(|w| !w.contains(TOKEN)),
+        harness
+            .log
+            .warnings
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|w| !w.contains(TOKEN)),
         "the token never hits the journal"
     );
 }
@@ -167,16 +183,31 @@ async fn wrong_or_truncated_tokens_reject_and_bad_header_does_not_fall_through()
     let harness = serve(dir.path(), true).await;
 
     let wrong = ("authorization", format!("Bearer {}x", TOKEN));
-    assert_eq!(get(harness.addr, "/remux/extensions", &[wrong]).await.status(), 401);
+    assert_eq!(
+        get(harness.addr, "/remux/extensions", &[wrong])
+            .await
+            .status(),
+        401
+    );
     let truncated = ("authorization", format!("Bearer {}", &TOKEN[..32]));
-    assert_eq!(get(harness.addr, "/remux/extensions", &[truncated]).await.status(), 401);
+    assert_eq!(
+        get(harness.addr, "/remux/extensions", &[truncated])
+            .await
+            .status(),
+        401
+    );
 
     // First present source wins: a bad header with a good cookie rejects.
     let mixed = [
         ("authorization", "Bearer wrong".to_string()),
         ("cookie", format!("remux_auth={TOKEN}")),
     ];
-    assert_eq!(get(harness.addr, "/remux/extensions", &mixed).await.status(), 401);
+    assert_eq!(
+        get(harness.addr, "/remux/extensions", &mixed)
+            .await
+            .status(),
+        401
+    );
 }
 
 #[tokio::test]
@@ -193,7 +224,10 @@ async fn header_auth_serves_and_hands_off_a_cookie() {
         .to_str()
         .unwrap()
         .to_string();
-    assert!(cookie.starts_with(&format!("remux_auth={TOKEN}; ")), "{cookie}");
+    assert!(
+        cookie.starts_with(&format!("remux_auth={TOKEN}; ")),
+        "{cookie}"
+    );
     assert!(cookie.contains("HttpOnly"), "{cookie}");
     assert!(cookie.contains("SameSite=Lax"), "{cookie}");
 
@@ -215,7 +249,12 @@ async fn cookie_and_query_auth_serve_without_setting_cookies() {
     assert_eq!(response.status(), 200);
     assert!(response.headers().get("set-cookie").is_none());
 
-    let response = get(harness.addr, &format!("/remux/extensions?token={TOKEN}"), &[]).await;
+    let response = get(
+        harness.addr,
+        &format!("/remux/extensions?token={TOKEN}"),
+        &[],
+    )
+    .await;
     assert_eq!(response.status(), 200);
     assert!(response.headers().get("set-cookie").is_none());
 }
@@ -224,7 +263,10 @@ async fn cookie_and_query_auth_serve_without_setting_cookies() {
 async fn require_auth_off_passes_everything() {
     let dir = tempfile::tempdir().unwrap();
     let harness = serve(dir.path(), false).await;
-    assert_eq!(get(harness.addr, "/remux/extensions", &[]).await.status(), 200);
+    assert_eq!(
+        get(harness.addr, "/remux/extensions", &[]).await.status(),
+        200
+    );
     assert!(harness.log.warnings.lock().unwrap().is_empty());
 }
 
@@ -245,10 +287,9 @@ async fn ws_upgrade_401s_without_a_token_and_connects_with_one() {
     }
 
     let mut request = url.into_client_request().unwrap();
-    request.headers_mut().insert(
-        "authorization",
-        format!("Bearer {TOKEN}").parse().unwrap(),
-    );
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
     let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
     socket
         .send(Message::Text(
@@ -258,8 +299,8 @@ async fn ws_upgrade_401s_without_a_token_and_connects_with_one() {
                 "method": "remux/system/ping",
                 "remuxContract": { "kind": "query" },
             })
-                .to_string()
-                .into(),
+            .to_string()
+            .into(),
         ))
         .await
         .unwrap();

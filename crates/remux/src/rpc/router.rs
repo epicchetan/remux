@@ -250,7 +250,7 @@ pub trait CoreRpc: Send + Sync {
 #[derive(Default)]
 pub struct SystemHooks {
     pub info: Option<Box<dyn Fn() -> Value + Send + Sync>>,
-    pub restart: Option<Box<dyn Fn() + Send + Sync>>,
+    pub restart: Option<Box<dyn Fn() -> RpcResult + Send + Sync>>,
     pub resources: Option<Box<dyn Fn() -> Value + Send + Sync>>,
 }
 
@@ -375,13 +375,13 @@ impl RpcRouter {
         }
 
         if method == SYSTEM_RESTART_METHOD {
-            return Ok(match &self.system.restart {
-                Some(restart) => {
-                    restart();
-                    serde_json::json!({ "restartable": true, "restarting": true })
-                }
-                None => serde_json::json!({ "restartable": false, "restarting": false }),
-            });
+            return match &self.system.restart {
+                Some(restart) => restart(),
+                None => Ok(serde_json::json!({
+                    "restartable": false,
+                    "restarting": false,
+                })),
+            };
         }
 
         if method == SYSTEM_RESOURCES_METHOD {
@@ -760,6 +760,7 @@ mod tests {
                         .lock()
                         .unwrap()
                         .push("system:restart".to_string());
+                    Ok(json!({ "restartable": true, "restarting": true }))
                 })),
                 resources: None,
             },

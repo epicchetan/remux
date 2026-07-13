@@ -32,6 +32,10 @@ import {
   useRemuxSettingsStore,
   websocketUrl,
 } from './remuxSettingsStore';
+import {
+  probeGuardian as probeGuardianConnection,
+  type GuardianConnection,
+} from './remuxGuardianClient';
 
 const reconnectDelaysMs = [400, 900, 1800, 3500, 5000];
 const remuxWebSocketConnectTimeoutMs = 6_000;
@@ -70,7 +74,7 @@ export type RemuxConnectionStatus =
 export type RemuxConnection = {
   command: <T>(method: string, params?: unknown, options?: RpcCommandOptions) => Promise<T>;
   error: string | null;
-  guardianAvailable: boolean;
+  guardian: GuardianConnection;
   notify: (method: string, params?: unknown) => void;
   query: <T>(method: string, params?: unknown, options?: RpcQueryOptions) => Promise<T>;
   routeRequest: <T>(
@@ -102,7 +106,7 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
   const token = useRemuxSettingsStore((state) => state.token);
   const [status, setStatus] = useState<RemuxConnectionStatus>({ type: 'connecting' });
   const [error, setError] = useState<string | null>(null);
-  const [guardianAvailable, setGuardianAvailable] = useState(false);
+  const [guardian, setGuardian] = useState<GuardianConnection>({ state: 'unknown' });
   const clientRef = useRef<RemuxRpcClient | null>(null);
   const candidateRef = useRef<RemuxRpcClient | null>(null);
   const connectedWaitersRef = useRef(new Set<ConnectedWaiter>());
@@ -160,9 +164,10 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
   }, [queueLogEntry, sendLogEntry]);
 
   const probeGuardian = useCallback(() => {
-    void classifyHttpHealth(origin, token).then((classification) => {
-      logRemuxDebug('connection:http-classification', classification);
-      setGuardianAvailable(classification.guardianHealth.ok);
+    setGuardian((current) => current.state === 'available' ? current : { state: 'probing' });
+    void probeGuardianConnection(origin, token).then((next) => {
+      logRemuxDebug('connection:guardian', next);
+      setGuardian(next);
     });
   }, [origin, token]);
 
@@ -263,7 +268,7 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
     lastInboundAtRef.current = Date.now();
     reconnectAttemptRef.current = 0;
     setError(null);
-    setGuardianAvailable(false);
+    setGuardian({ state: 'unknown' });
     setConnectionStatus({
       cwd: info.cwd,
       generation: connectionGenerationRef.current,
@@ -850,7 +855,7 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
     () => ({
       command,
       error,
-      guardianAvailable,
+      guardian,
       notify,
       query,
       routeRequest,
@@ -864,7 +869,7 @@ export function RemuxConnectionProvider({ children }: { children: ReactNode }) {
     [
       command,
       error,
-      guardianAvailable,
+      guardian,
       notify,
       query,
       respond,
@@ -948,49 +953,6 @@ function drainOldClient(client: RemuxRpcClient, ceilingMs: number) {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
-}
-
-async function classifyHttpHealth(origin: string, token: string | null) {
-  const request = async (base: string, path: string, authenticated: boolean) => {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5_000);
-    try {
-      const response = await fetch(`${base}${path}`, {
-        cache: 'no-store',
-        headers: authenticated && token ? { Authorization: `Bearer ${token}` } : undefined,
-        signal: controller.signal,
-      });
-      return { ok: response.ok, status: response.status };
-    } catch (error) {
-      return {
-        error: controller.signal.aborted ? 'timeout' : errorMessage(error),
-        ok: false,
-        status: null,
-      };
-    } finally {
-      clearTimeout(timeout);
-    }
-  };
-
-  const guardian = guardianOrigin(origin);
-  const [health, status, guardianHealth, guardianStatus] = await Promise.all([
-    request(origin, '/healthz', false),
-    request(origin, '/api/status', true),
-    request(guardian, '/healthz', false),
-    request(guardian, '/control/v1/status', true),
-  ]);
-  return { guardianHealth, guardianStatus, health, status };
-}
-
-function guardianOrigin(origin: string) {
-  try {
-    const url = new URL(origin);
-    const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
-    url.port = String(port + 1);
-    return url.origin;
-  } catch {
-    return origin;
-  }
 }
 
 function withRegistrationMetadata(params: unknown, connectionGeneration: number, revision: number) {

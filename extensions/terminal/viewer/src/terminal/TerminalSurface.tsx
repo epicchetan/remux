@@ -1,5 +1,6 @@
 import {
   dismissHostKeyboard,
+  getHostLifecycleSnapshot,
   getHostTheme,
   getHostViewportMetrics,
   openHostOverview,
@@ -8,6 +9,7 @@ import {
   signalHostPreviewChanged,
   subscribeHostActive,
   subscribeHostConnection,
+  subscribeHostLifecycle,
   subscribeHostResume,
   subscribeHostTheme,
   type RemuxHostTheme,
@@ -70,10 +72,13 @@ import {
 import {
   attachTerminalSession,
   bytesFromBase64,
+  decodeTerminalSnapshot,
   detachTerminalSession,
   getTerminalTmuxContext,
   killTerminalSession,
+  readTerminalReplay,
   readRemuxSystemInfo,
+  readyTerminalSession,
   resizeTerminalSession,
   runTerminalTmuxAction,
   startTerminalSession,
@@ -165,6 +170,8 @@ const terminalThemeLight = {
   yellow: '#9a6700',
 } as const;
 const textEncoder = new TextEncoder();
+const safeCommandBoundaryRecovery = '\x1b[!p\x1b[?1l\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?1016l\x1b[?2004l\x1b[?2026l\x1b>\x1b[0m\x1b[?25h';
+const alternateCommandBoundaryRecovery = `\x1b[?1049l\x1b[?1047l${safeCommandBoundaryRecovery}`;
 const fitDebounceMs = 180;
 const commandTitleDelayMs = 500;
 const terminalTouchClickSuppressMs = 500;
@@ -185,6 +192,7 @@ const tmuxScrollMaxQueuedTaps = 6;
 const tmuxScrollRepeatLines = 3;
 const tmuxScrollRepeatMs = 140;
 const tmuxScrollTapLines = 5;
+const initialAttachRetryDelaysMs = [0, 250, 750] as const;
 
 type TerminalSurfaceProps = {
   route: RemuxViewerRoute;
@@ -241,6 +249,8 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   const fitAddonRef = useRef<FitAddon | null>(null);
   const lastResizeRef = useRef<{ cols: number; rows: number } | null>(null);
   const lastSeqRef = useRef(0);
+  const lastParsedSeqRef = useRef(0);
+  const terminalWriteChainRef = useRef<Promise<void>>(Promise.resolve());
   const sessionIdRef = useRef<string | null>(null);
   const sessionGenerationRef = useRef<number | null>(null);
   const inputStreamIdRef = useRef<string | null>(null);
@@ -252,16 +262,22 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   const startOperationIdRef = useRef(
     globalThis.crypto?.randomUUID?.() ?? `terminal-start-${Date.now()}-${Math.random()}`,
   );
-  const resyncPendingFramesRef = useRef<TerminalSessionOutputFrame[] | null>(null);
+  const syncPendingFramesRef = useRef<Map<number, TerminalSessionOutputFrame> | null>(null);
+  const resyncRequestedRef = useRef(false);
+  const resyncFailureCountRef = useRef(0);
+  const resyncRunnerRef = useRef<(() => void) | null>(null);
   const hostActiveRef = useRef(true);
+  const hostLifecycleActiveRef = useRef(getHostLifecycleSnapshot().state === 'active');
+  const reportedFocusRef = useRef<boolean | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitTimerRef = useRef<number | null>(null);
   const hostViewportMetricsRef = useRef<RemuxHostViewportMetrics | null>(null);
   const initialAttachCompletedRef = useRef(false);
-  const resyncInFlightRef = useRef(false);
+  const syncInFlightRef = useRef(false);
   const modifierTimerRef = useRef<number | null>(null);
   const commandTitleTimerRef = useRef<number | null>(null);
   const suppressedTerminalDataWritesRef = useRef(0);
+  const commandBoundaryRecoveryRef = useRef<'alternate' | 'normal' | null>(null);
   const keyboardOpenRef = useRef(false);
   const lastTerminalTapMsRef = useRef(Number.NEGATIVE_INFINITY);
   const lastTouchTapMsRef = useRef(Number.NEGATIVE_INFINITY);
@@ -418,21 +434,37 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   const writeTerminalOutput = useCallback((data: Uint8Array, options: { suppressTerminalData?: boolean } = {}) => {
     const terminal = terminalRef.current;
     if (!terminal) {
-      return;
+      return Promise.resolve();
     }
 
-    // The terminal draws to canvas, which the viewer-kit mutation observer
-    // can't see; announce processed output so tab previews stay fresh. The
-    // write callback fires after xterm has parsed and rendered the data.
-    if (!options.suppressTerminalData) {
-      terminal.write(data, () => signalHostPreviewChanged());
-      return;
-    }
-
-    suppressedTerminalDataWritesRef.current += 1;
-    terminal.write(data, () => {
-      suppressedTerminalDataWritesRef.current = Math.max(0, suppressedTerminalDataWritesRef.current - 1);
-      signalHostPreviewChanged();
+    return new Promise<void>((resolve) => {
+      // The terminal draws to canvas, which the viewer-kit mutation observer
+      // can't see; announce processed output so tab previews stay fresh. The
+      // write callback fires after xterm has parsed and rendered the data.
+      if (options.suppressTerminalData) {
+        suppressedTerminalDataWritesRef.current += 1;
+      }
+      terminal.write(data, () => {
+        const recoveryKind = commandBoundaryRecoveryRef.current;
+        commandBoundaryRecoveryRef.current = null;
+        const finish = () => {
+          if (options.suppressTerminalData) {
+            suppressedTerminalDataWritesRef.current = Math.max(0, suppressedTerminalDataWritesRef.current - 1);
+          }
+          signalHostPreviewChanged();
+          resolve();
+        };
+        if (recoveryKind) {
+          terminal.write(
+            recoveryKind === 'alternate'
+              ? alternateCommandBoundaryRecovery
+              : safeCommandBoundaryRecovery,
+            finish,
+          );
+          return;
+        }
+        finish();
+      });
     });
   }, []);
 
@@ -441,20 +473,161 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     options: { suppressTerminalData?: boolean } = {},
   ) => {
     if (frame.sessionGeneration !== sessionGenerationRef.current) {
-      return;
+      return terminalWriteChainRef.current;
     }
     if (frame.seq <= lastSeqRef.current) {
-      return;
+      return terminalWriteChainRef.current;
+    }
+    if (frame.seq !== lastSeqRef.current + 1) {
+      return Promise.reject(new Error(
+        `terminal output sequence gap: expected ${lastSeqRef.current + 1}, received ${frame.seq}`,
+      ));
     }
 
     lastSeqRef.current = frame.seq;
-    writeTerminalOutput(bytesFromBase64(frame.dataBase64), options);
+    const write = terminalWriteChainRef.current.then(async () => {
+      await writeTerminalOutput(bytesFromBase64(frame.dataBase64), options);
+      if (frame.seq !== lastParsedSeqRef.current + 1) {
+        throw new Error(
+          `terminal parsed sequence gap: expected ${lastParsedSeqRef.current + 1}, received ${frame.seq}`,
+        );
+      }
+      lastParsedSeqRef.current = frame.seq;
+    });
+    terminalWriteChainRef.current = write.catch(() => undefined);
+    return write;
   }, [writeTerminalOutput]);
 
-  const writeReplay = useCallback((frames: TerminalSessionOutputFrame[]) => {
+  const writeReplay = useCallback(async (frames: TerminalSessionOutputFrame[]) => {
     for (const frame of frames) {
-      writeFrame(frame, { suppressTerminalData: true });
+      await writeFrame(frame, { suppressTerminalData: true });
     }
+  }, [writeFrame]);
+
+  const restoreAttachedTerminal = useCallback(async (
+    attached: Awaited<ReturnType<typeof attachTerminalSession>>,
+  ) => {
+    const restore = attached.restore;
+    if (restore && restore.kind !== 'incremental') {
+      const snapshotData = restore.kind === 'snapshot'
+        ? await decodeTerminalSnapshot(restore.dataBase64, restore.encoding)
+        : null;
+      const restoreWrite = terminalWriteChainRef.current.then(async () => {
+        const terminal = terminalRef.current;
+        if (!terminal) {
+          throw new Error('terminal was disposed during snapshot restoration');
+        }
+        terminal.reset();
+        if (restore.kind === 'snapshot') {
+          terminal.resize(restore.cols, restore.rows);
+          await writeTerminalOutput(snapshotData!, {
+            suppressTerminalData: true,
+          });
+        }
+        lastSeqRef.current = restore.throughSeq;
+        lastParsedSeqRef.current = restore.throughSeq;
+      });
+      terminalWriteChainRef.current = restoreWrite.catch(() => undefined);
+      try {
+        await restoreWrite;
+      } catch (error) {
+        terminalRef.current?.reset();
+        lastSeqRef.current = 0;
+        lastParsedSeqRef.current = 0;
+        throw error;
+      }
+    } else if (restore?.kind === 'incremental') {
+      lastSeqRef.current = Math.max(lastSeqRef.current, restore.throughSeq);
+      lastParsedSeqRef.current = Math.max(lastParsedSeqRef.current, restore.throughSeq);
+    }
+
+    await writeReplay(attached.replay);
+  }, [writeReplay, writeTerminalOutput]);
+
+  const completeAttachedTerminal = useCallback(async (
+    attached: Awaited<ReturnType<typeof attachTerminalSession>>,
+  ) => {
+    await restoreAttachedTerminal(attached);
+
+    let replayComplete = attached.replayComplete ?? true;
+    let replayNextSeq = attached.replayNextSeq
+      ?? (attached.replay.at(-1)?.seq ? attached.replay.at(-1)!.seq + 1 : attached.catchupEndSeq);
+    while (!replayComplete && replayNextSeq < attached.catchupEndSeq) {
+      const page = await readTerminalReplay({
+        fromSeq: replayNextSeq,
+        maxBytes: 256 * 1024,
+        sessionId: attached.sessionId,
+        sessionGeneration: attached.sessionGeneration,
+        toSeqExclusive: attached.catchupEndSeq,
+      });
+      if (page.truncated) {
+        throw new Error('terminal replay truncated while restoring snapshot');
+      }
+      await writeReplay(page.frames);
+      if (page.nextSeq <= replayNextSeq && !page.complete) {
+        throw new Error('terminal replay made no progress');
+      }
+      replayNextSeq = page.nextSeq;
+      replayComplete = page.complete;
+    }
+
+    const expectedThrough = Math.max(0, attached.catchupEndSeq - 1);
+    if (lastParsedSeqRef.current !== expectedThrough) {
+      throw new Error(
+        `terminal restore sequence mismatch: expected ${expectedThrough}, parsed ${lastParsedSeqRef.current}`,
+      );
+    }
+
+    if (attached.subscriptionToken) {
+      const ready = await readyTerminalSession({
+        sessionId: attached.sessionId,
+        sessionGeneration: attached.sessionGeneration,
+        subscriptionToken: attached.subscriptionToken,
+        throughSeq: expectedThrough,
+      });
+      if (!ready.ok) {
+        throw new Error(`terminal subscription activation failed: ${ready.reason}`);
+      }
+    }
+  }, [restoreAttachedTerminal, writeReplay]);
+
+  const beginTerminalSync = useCallback(() => {
+    syncInFlightRef.current = true;
+    syncPendingFramesRef.current ??= new Map();
+  }, []);
+
+  const finishTerminalSync = useCallback(async (succeeded: boolean) => {
+    const pending = syncPendingFramesRef.current;
+    syncInFlightRef.current = false;
+    if (!succeeded) {
+      syncPendingFramesRef.current = pending;
+      return false;
+    }
+    if (!pending) {
+      syncPendingFramesRef.current = null;
+      return false;
+    }
+
+    let gap = false;
+    const frames = [...pending.values()].sort((left, right) => left.seq - right.seq);
+    for (let index = 0; index < frames.length; index += 1) {
+      const frame = frames[index]!;
+      if (frame.seq <= lastSeqRef.current) {
+        continue;
+      }
+      if (frame.seq !== lastSeqRef.current + 1) {
+        gap = true;
+        syncPendingFramesRef.current = new Map(
+          frames.slice(index).map((pendingFrame) => [pendingFrame.seq, pendingFrame]),
+        );
+        break;
+      }
+      await writeFrame(frame);
+    }
+    if (!gap) {
+      syncPendingFramesRef.current = null;
+    }
+    return gap;
   }, [writeFrame]);
 
   const bindSession = useCallback((nextSessionId: string) => {
@@ -565,6 +738,24 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     sendBytes(textEncoder.encode(value), options);
   }, [sendBytes]);
 
+  const reportEffectiveFocus = useCallback(() => {
+    const terminal = terminalRef.current;
+    if (!terminal?.modes.sendFocusMode) {
+      reportedFocusRef.current = null;
+      return;
+    }
+
+    const focused = hostActiveRef.current && hostLifecycleActiveRef.current;
+    if (focused && (syncInFlightRef.current || !initialAttachCompletedRef.current)) {
+      return;
+    }
+    if (reportedFocusRef.current === focused) {
+      return;
+    }
+    reportedFocusRef.current = focused;
+    sendText(focused ? '\x1b[I' : '\x1b[O');
+  }, [sendText]);
+
   const resetShellState = useCallback(() => {
     setShellState(emptyShellState);
   }, []);
@@ -580,6 +771,9 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       commandOutputMarkersRef.current = { end: null, start: terminal.registerMarker(0) ?? null };
       setHasCommandOutput(false);
     } else if (terminal && (data === 'D' || data.startsWith('D;'))) {
+      commandBoundaryRecoveryRef.current = terminal.buffer.active.type === 'alternate'
+        ? 'alternate'
+        : 'normal';
       const markers = commandOutputMarkersRef.current;
       if (markers.start && !markers.start.isDisposed) {
         markers.end?.dispose();
@@ -621,6 +815,7 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     }
 
     initialAttachCompletedRef.current = false;
+    beginTerminalSync();
     setReplayGap(false);
     resetShellState();
     setStatus({ type: 'connecting' });
@@ -629,48 +824,95 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     const attachSessionId = preferredSessionId && !options.forceStart ? preferredSessionId : null;
 
     if (attachSessionId) {
-      try {
-        const attached = await attachTerminalSession({
-          cols: size.cols,
-          inputStreamId: inputStreamIdRef.current,
-          replaySeq: lastSeqRef.current > 0 ? lastSeqRef.current + 1 : null,
-          rows: size.rows,
-          sessionId: attachSessionId,
-          sessionGeneration: sessionGenerationRef.current,
-        });
-
-        if (
-          sessionGenerationRef.current !== null &&
-          sessionGenerationRef.current !== attached.sessionGeneration
-        ) {
-          terminal.clear();
-          lastSeqRef.current = 0;
+      // Bind the requested resource before issuing attach so output delivered
+      // ahead of the RPC response can be quarantined instead of discarded.
+      bindSession(attachSessionId);
+      let attachNotFound = false;
+      let attachError: unknown = null;
+      for (const [attempt, delayMs] of initialAttachRetryDelaysMs.entries()) {
+        if (delayMs > 0) {
+          await waitForTerminalRetry(delayMs);
         }
-        bindSession(attached.sessionId);
-        bindSessionProtocol(attached);
-        writeReplay(attached.replay);
-        void pumpInput();
-        initialAttachCompletedRef.current = true;
-        await updateHostTab({
-          resourceId: attached.sessionId,
-          resourceKind: 'terminalSession',
-        });
-
-        if (attached.status === 'exited') {
-          setStatus({
-            code: attached.exitCode ?? null,
-            signal: attached.exitSignal ?? null,
-            type: 'exited',
+        try {
+          const attached = await attachTerminalSession({
+            clientState: {
+              throughSeq: lastParsedSeqRef.current,
+              valid: lastParsedSeqRef.current > 0 && sessionGenerationRef.current !== null,
+            },
+            cols: size.cols,
+            inputStreamId: inputStreamIdRef.current,
+            replaySeq: lastSeqRef.current > 0 ? lastSeqRef.current + 1 : null,
+            rows: size.rows,
+            sessionId: attachSessionId,
+            sessionGeneration: sessionGenerationRef.current,
           });
-        } else {
-          setStatus({ cwd: '', shell: '', type: 'running' });
-          sendResize(size.cols, size.rows);
+
+          if (
+            sessionGenerationRef.current !== null &&
+            sessionGenerationRef.current !== attached.sessionGeneration
+          ) {
+            terminal.reset();
+            lastSeqRef.current = 0;
+            lastParsedSeqRef.current = 0;
+          }
+          bindSession(attached.sessionId);
+          bindSessionProtocol(attached);
+          await completeAttachedTerminal(attached);
+          fitTerminal();
+          void pumpInput();
+          initialAttachCompletedRef.current = true;
+          resyncFailureCountRef.current = 0;
+          resyncRequestedRef.current = await finishTerminalSync(true);
+          if (resyncRequestedRef.current) {
+            window.setTimeout(() => resyncRunnerRef.current?.(), 0);
+          }
+          reportEffectiveFocus();
+          await updateHostTab({
+            resourceId: attached.sessionId,
+            resourceKind: 'terminalSession',
+          });
+
+          if (attached.status === 'exited') {
+            setStatus({
+              code: attached.exitCode ?? null,
+              signal: attached.exitSignal ?? null,
+              type: 'exited',
+            });
+          } else {
+            setStatus({ cwd: '', shell: '', type: 'running' });
+            sendResize(size.cols, size.rows);
+          }
+          return;
+        } catch (error) {
+          attachError = error;
+          if (errorMessage(error).includes('terminal session not found')) {
+            attachNotFound = true;
+            break;
+          }
+          // A failed authoritative restore must never be advertised as valid
+          // on the next attempt.
+          if (lastParsedSeqRef.current !== lastSeqRef.current) {
+            terminal.reset();
+            lastSeqRef.current = 0;
+            lastParsedSeqRef.current = 0;
+          }
+          if (attempt + 1 === initialAttachRetryDelaysMs.length) {
+            break;
+          }
         }
-        return;
-      } catch {
-        lastSeqRef.current = 0;
-        terminal.clear();
       }
+
+      if (!attachNotFound) {
+        await finishTerminalSync(false);
+        throw attachError ?? new Error('terminal attach failed');
+      }
+
+      await finishTerminalSync(false);
+      lastSeqRef.current = 0;
+      lastParsedSeqRef.current = 0;
+      terminal.reset();
+      syncPendingFramesRef.current = new Map();
+      beginTerminalSync();
     }
 
     const systemInfo = await readRemuxSystemInfo();
@@ -684,8 +926,31 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
 
     bindSession(started.sessionId);
     bindSessionProtocol(started);
+    let startNeedsResync = false;
+    if (started.subscriptionToken) {
+      const ready = await readyTerminalSession({
+        sessionId: started.sessionId,
+        sessionGeneration: started.sessionGeneration,
+        subscriptionToken: started.subscriptionToken,
+        throughSeq: Math.max(0, started.catchupEndSeq - 1),
+      });
+      if (!ready.ok) {
+        await finishTerminalSync(false);
+        startNeedsResync = true;
+      }
+    }
+    if (!startNeedsResync) {
+      resyncFailureCountRef.current = 0;
+      resyncRequestedRef.current = await finishTerminalSync(true);
+    }
+    if (resyncRequestedRef.current || startNeedsResync) {
+      window.setTimeout(() => resyncRunnerRef.current?.(), 0);
+    }
     void pumpInput();
     initialAttachCompletedRef.current = true;
+    if (!startNeedsResync) {
+      reportEffectiveFocus();
+    }
     await updateHostTab({
       resourceId: started.sessionId,
       resourceKind: 'terminalSession',
@@ -696,19 +961,29 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
       type: 'running',
     });
     sendResize(started.cols, started.rows);
-  }, [bindSession, bindSessionProtocol, fitTerminal, pumpInput, resetShellState, route, sendResize, writeReplay]);
+  }, [beginTerminalSync, bindSession, bindSessionProtocol, completeAttachedTerminal, finishTerminalSync, fitTerminal, pumpInput, reportEffectiveFocus, resetShellState, route, sendResize]);
 
   const resyncSession = useCallback(async () => {
     const currentSessionId = sessionIdRef.current;
-    if (!currentSessionId || resyncInFlightRef.current) {
+    if (!currentSessionId) {
+      return;
+    }
+    if (syncInFlightRef.current) {
+      resyncRequestedRef.current = true;
       return;
     }
 
-    resyncInFlightRef.current = true;
-    resyncPendingFramesRef.current = [];
+    beginTerminalSync();
+    let succeeded = false;
+    let sessionMissing = false;
     try {
+      await terminalWriteChainRef.current;
       const size = currentSize();
       const attached = await attachTerminalSession({
+        clientState: {
+          throughSeq: lastParsedSeqRef.current,
+          valid: lastParsedSeqRef.current > 0 && sessionGenerationRef.current !== null,
+        },
         cols: size.cols,
         inputStreamId: inputStreamIdRef.current,
         replaySeq: lastSeqRef.current > 0 ? lastSeqRef.current + 1 : null,
@@ -721,20 +996,23 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
         sessionGenerationRef.current !== null &&
         sessionGenerationRef.current !== attached.sessionGeneration
       ) {
-        terminalRef.current?.clear();
+        terminalRef.current?.reset();
         lastSeqRef.current = 0;
+        lastParsedSeqRef.current = 0;
       }
       bindSessionProtocol(attached);
       if (attached.replayTruncated) {
-        terminalRef.current?.clear();
-        lastSeqRef.current = 0;
+        if (!attached.restore || attached.restore.kind === 'unavailable') {
+          terminalRef.current?.reset();
+        }
         setReplayGap(true);
       }
 
       if (!attached.replayTruncated) {
         setReplayGap(false);
       }
-      writeReplay(attached.replay);
+      await completeAttachedTerminal(attached);
+      fitTerminal();
       void pumpInput();
       if (attached.status === 'exited') {
         setStatus({
@@ -743,30 +1021,43 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
           type: 'exited',
         });
       }
+      succeeded = true;
     } catch (error) {
       // A daemon restart makes the bound session disappear; say so instead of
       // leaving a "running" terminal that silently ignores input. Transient
       // failures stay quiet — the next resume or reconnect retries.
       if (errorMessage(error).includes('terminal session not found')) {
+        sessionMissing = true;
         setStatus({ message: 'Terminal session ended while remux was away.', type: 'error' });
       }
     } finally {
-      const pendingFrames = resyncPendingFramesRef.current;
-      resyncPendingFramesRef.current = null;
-      resyncInFlightRef.current = false;
-      if (pendingFrames && pendingFrames.length > 0) {
-        for (const frame of pendingFrames) {
-          writeFrame(frame);
-        }
+      const gap = await finishTerminalSync(succeeded);
+      const rerun = !sessionMissing && (gap || resyncRequestedRef.current || !succeeded);
+      resyncRequestedRef.current = false;
+      if (succeeded && !gap) {
+        resyncFailureCountRef.current = 0;
         setReplayGap(false);
+        reportEffectiveFocus();
+      } else if (!succeeded) {
+        resyncFailureCountRef.current += 1;
+      }
+      if (rerun && connected) {
+        window.setTimeout(
+          () => resyncRunnerRef.current?.(),
+          succeeded ? 0 : terminalResyncBackoffMs(resyncFailureCountRef.current),
+        );
       }
     }
-  }, [bindSessionProtocol, currentSize, pumpInput, writeFrame, writeReplay]);
+  }, [beginTerminalSync, bindSessionProtocol, completeAttachedTerminal, connected, currentSize, finishTerminalSync, fitTerminal, pumpInput, reportEffectiveFocus]);
+  resyncRunnerRef.current = () => {
+    void resyncSession();
+  };
 
   const restartSession = useCallback(() => {
     const currentSessionId = sessionIdRef.current;
-    terminalRef.current?.clear();
+    terminalRef.current?.reset();
     lastSeqRef.current = 0;
+    lastParsedSeqRef.current = 0;
     setReplayGap(false);
     if (currentSessionId) {
       const sessionGeneration = sessionGenerationRef.current;
@@ -789,12 +1080,22 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
   }, [startOrAttachSession]);
 
   const sendArrow = useCallback((code: TerminalArrowCode) => {
+    const terminal = terminalRef.current;
+    if (
+      terminal?.modes.applicationCursorKeysMode
+      && !altActive
+      && !ctrlActive
+      && !shiftActive
+    ) {
+      sendText(`\x1bO${code}`);
+      return;
+    }
     sendBytes(encodeTerminalArrow(code, {
       alt: altActive,
       ctrl: ctrlActive,
       shift: shiftActive,
     }), { clearModifiers: altActive || ctrlActive || shiftActive });
-  }, [altActive, ctrlActive, sendBytes, shiftActive]);
+  }, [altActive, ctrlActive, sendBytes, sendText, shiftActive]);
 
   const sendTab = useCallback(() => {
     sendBytes(encodeTerminalTab({
@@ -816,7 +1117,13 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     try {
       const text = await readClipboardText();
       if (text) {
-        sendText(text, { clearModifiers: true });
+        const terminal = terminalRef.current;
+        if (terminal) {
+          terminal.paste(text);
+          resetModifiers();
+        } else {
+          sendText(text, { clearModifiers: true });
+        }
       }
     } catch {
       resetModifiers();
@@ -1542,6 +1849,12 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
           return;
         }
 
+        if (data === '\x1b[I') {
+          reportedFocusRef.current = true;
+        } else if (data === '\x1b[O') {
+          reportedFocusRef.current = false;
+        }
+
         sendBytes(textEncoder.encode(data));
       });
       const resizeDisposable = terminal.onResize(({ cols, rows }) => {
@@ -1702,24 +2015,24 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     }
 
     if (event.type === 'output' && event.event.sessionId === currentSessionId) {
-      if (event.event.sessionGeneration !== sessionGenerationRef.current) {
-        return;
-      }
       if (
-        lastSeqRef.current > 0 &&
-        event.event.frame.seq > lastSeqRef.current + 1
+        sessionGenerationRef.current !== null
+        && event.event.sessionGeneration !== sessionGenerationRef.current
       ) {
-        resyncPendingFramesRef.current ??= [];
-        resyncPendingFramesRef.current.push(event.event.frame);
-        void resyncSession();
         return;
       }
-      // Frames landing while a resync attach is in flight wait for its
-      // replay: writing them first would advance the seq cursor past the
-      // replay and silently drop the frames the resync went to fetch.
-      const pendingResyncFrames = resyncPendingFramesRef.current;
-      if (pendingResyncFrames) {
-        pendingResyncFrames.push(event.event.frame);
+      const pendingSyncFrames = syncPendingFramesRef.current;
+      if (pendingSyncFrames) {
+        pendingSyncFrames.set(event.event.frame.seq, event.event.frame);
+        return;
+      }
+      if (event.event.frame.seq <= lastSeqRef.current) {
+        return;
+      }
+      if (event.event.frame.seq !== lastSeqRef.current + 1) {
+        syncPendingFramesRef.current = new Map();
+        syncPendingFramesRef.current?.set(event.event.frame.seq, event.event.frame);
+        void resyncSession();
         return;
       }
 
@@ -1764,23 +2077,47 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
     const wasActive = hostActiveRef.current;
     hostActiveRef.current = active;
     setHostActive(active);
+    if (!active) {
+      reportEffectiveFocus();
+    }
     // host/active tracks tab activation, not app foregrounding (the resume
     // subscription owns that). Re-verify when this tab comes back anyway:
     // frames posted to it are dropped while the host reloads the webview.
     if (active && !wasActive) {
       void resyncSession();
     }
-  }), [resyncSession]);
+  }), [reportEffectiveFocus, resyncSession]);
+
+  useEffect(() => subscribeHostLifecycle((lifecycle) => {
+    const active = lifecycle.state === 'active';
+    const wasActive = hostLifecycleActiveRef.current;
+    hostLifecycleActiveRef.current = active;
+    if (!active) {
+      reportEffectiveFocus();
+    } else if (!wasActive && initialAttachCompletedRef.current) {
+      void resyncSession();
+    }
+  }), [reportEffectiveFocus, resyncSession]);
 
   useEffect(() => subscribeHostResume(() => {
     // Foregrounding resumes this webview after a suspension in which every
     // posted event was dropped; a reconnect means the daemon broadcast to a
     // dead socket. Both look the same from here: re-attach and replay the
     // missed seq range.
+    const terminal = terminalRef.current;
+    if (terminal) {
+      try {
+        terminal.clearTextureAtlas();
+      } catch {
+        // A disposed WebGL addon already fell back to the built-in renderer.
+      }
+      terminal.refresh(0, terminal.rows - 1);
+      fitTerminal();
+    }
     if (initialAttachCompletedRef.current) {
       void resyncSession();
     }
-  }), [resyncSession]);
+  }), [fitTerminal, resyncSession]);
 
   useEffect(() => subscribeHostTheme((theme) => {
     const terminal = terminalRef.current;
@@ -3066,6 +3403,15 @@ function clampSize(value: number, min: number, max: number) {
   }
 
   return Math.max(min, Math.min(max, Math.floor(value)));
+}
+
+function waitForTerminalRetry(delayMs: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, delayMs));
+}
+
+function terminalResyncBackoffMs(failureCount: number) {
+  const exponential = Math.min(8_000, 250 * (2 ** Math.max(0, failureCount - 1)));
+  return exponential + Math.floor(Math.random() * Math.min(500, exponential / 4));
 }
 
 function errorMessage(error: unknown) {

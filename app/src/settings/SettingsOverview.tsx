@@ -26,7 +26,11 @@ import { getBottomBarHeight, tabGridGap, tabGridHorizontalPadding } from '../bro
 import { useBrowserStore } from '../browser/browserStore';
 import { useRemuxConnection, type RemuxConnection } from '../remote/RemuxConnectionProvider';
 import { remuxImageSource, themedIconUrl } from '../remote/remuxExtensions';
-import { useRemuxSettingsStore } from '../remote/remuxSettingsStore';
+import {
+  remuxOriginFromSettings,
+  useRemuxSettingsStore,
+} from '../remote/remuxSettingsStore';
+import { runGuardianAction } from '../remote/remuxGuardianClient';
 import { alpha, useTheme, type RemuxTheme } from '../theme/ThemeProvider';
 import { ExtensionDetailSheet, type ExtensionDetailAction } from './ExtensionDetailSheet';
 import {
@@ -265,6 +269,7 @@ export function SettingsOverview() {
                 nowMs={nowMinuteMs}
                 onOpenDetails={setDetailExtensionId}
                 status={extensionStatuses[extension.id] ?? null}
+                unavailable={connection.status.type !== 'connected'}
               />
             ))}
             {extensions.length === 0 ? (
@@ -375,9 +380,19 @@ const ConnectionSection = memo(function ConnectionSection() {
     setActionError(null);
     setRestartingRemux(true);
     try {
-      const result = await restartRemuxCli(connection.command);
-      if (!result.restartable) {
-        throw new Error('Remux CLI restart is unavailable');
+      if (connection.status.type === 'connected') {
+        const result = await restartRemuxCli(connection.command);
+        if (!result.restartable) {
+          throw new Error('Remux CLI restart is unavailable');
+        }
+      } else if (connection.guardian.state === 'available') {
+        await runGuardianAction(
+          remuxOriginFromSettings({ host, port }),
+          token,
+          'worker/restart',
+        );
+      } else {
+        throw new Error('Remux and its guardian are unavailable');
       }
     } catch (error) {
       setActionError(error instanceof Error ? error.message : String(error));
@@ -385,6 +400,24 @@ const ConnectionSection = memo(function ConnectionSection() {
       setRestartingRemux(false);
     }
   };
+
+  const releaseProtection = async () => {
+    setActionError(null);
+    try {
+      await runGuardianAction(
+        remuxOriginFromSettings({ host, port }),
+        token,
+        'protection/release',
+      );
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const guardianConnected = connection.guardian.state === 'available';
+  const guardianStatus = connection.guardian.state === 'available'
+    ? connection.guardian.status
+    : null;
 
   return (
     <Section title="Connection">
@@ -425,12 +458,24 @@ const ConnectionSection = memo(function ConnectionSection() {
           variant="primary"
         />
         <SettingsButton
-          disabled={connection.status.type !== 'connected' || restartingRemux}
-          label={restartingRemux ? 'Restarting' : 'Restart Remux'}
+          disabled={(!guardianConnected && connection.status.type !== 'connected') || restartingRemux}
+          label={restartingRemux
+            ? 'Restarting'
+            : connection.status.type === 'connected'
+              ? 'Restart Remux'
+              : 'Restart Worker'}
           loading={restartingRemux}
           onPress={restartRemux}
         />
+        {connection.status.type !== 'connected' && guardianConnected ? (
+          <SettingsButton label="Resume work" onPress={releaseProtection} />
+        ) : null}
       </View>
+      {connection.status.type !== 'connected' && guardianConnected ? (
+        <Text style={styles.updateStatusText}>
+          {guardianSettingsSummary(guardianStatus)}
+        </Text>
+      ) : null}
       {connection.error ? <Text style={styles.errorText}>{connection.error}</Text> : null}
       {settingsError ? <Text style={styles.errorText}>{settingsError}</Text> : null}
       {actionError ? <Text style={styles.errorText}>{actionError}</Text> : null}
@@ -662,6 +707,7 @@ const ExtensionRow = memo(function ExtensionRow({
   nowMs,
   onOpenDetails,
   status,
+  unavailable,
 }: {
   extensionId: string;
   iconDarkUrl: string | null;
@@ -670,6 +716,7 @@ const ExtensionRow = memo(function ExtensionRow({
   nowMs: number;
   onOpenDetails: (extensionId: string) => void;
   status: ExtensionServerStatus | null;
+  unavailable: boolean;
 }) {
   const { styles, theme } = useSettingsTheme();
   const [imageFailed, setImageFailed] = useState(false);
@@ -677,7 +724,7 @@ const ExtensionRow = memo(function ExtensionRow({
   // statuses since the view-build-watch pass); the sheet decides which
   // verbs to show.
   const hasStatus = Boolean(status);
-  const badge = rowBadge(status, nowMs);
+  const badge = rowBadge(status, nowMs, unavailable);
   const themedUrl = themedIconUrl({ iconDarkUrl, iconUrl }, theme.isDark);
 
   return (
@@ -735,7 +782,11 @@ function StateDot({ tone }: { tone: ServerStateTone }) {
 function rowBadge(
   status: ExtensionServerStatus | null,
   nowMs: number,
+  unavailable: boolean,
 ): { text: string; tone: ServerStateTone | null } {
+  if (unavailable) {
+    return { text: 'Unavailable', tone: 'idle' };
+  }
   if (!status) {
     return { text: 'No server extension', tone: null };
   }
@@ -759,6 +810,18 @@ function rowBadge(
     text: serverStatusText(status, nowMs) + watching,
     tone: serverStateTone(status.state),
   };
+}
+
+function guardianSettingsSummary(
+  status: Extract<RemuxConnection['guardian'], { state: 'available' }>['status'],
+) {
+  if (!status) {
+    return 'Runtime unavailable · Guardian connected';
+  }
+  const failures = status.consecutiveBootFailures > 0
+    ? ` · ${status.consecutiveBootFailures} failed starts`
+    : '';
+  return `Runtime ${status.workerState} · Guardian connected${failures}`;
 }
 
 function serverStatusText(status: ExtensionServerStatus, nowMs: number) {

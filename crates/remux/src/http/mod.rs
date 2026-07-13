@@ -17,6 +17,7 @@ use axum::response::Response;
 use axum::routing::get;
 use serde_json::Value;
 
+use crate::extensions::discovery::InvalidExtension;
 use crate::extensions::manifest::ExtensionManifest;
 use crate::http::viewer_bundles::ViewerBundleRegistry;
 use crate::rpc::router::{RpcRouter, EXTENSION_STATUS_METHOD, SYSTEM_RESOURCES_METHOD};
@@ -25,6 +26,7 @@ use viewers::ViewerProvider;
 pub struct HttpState {
     pub default_extension: ExtensionManifest,
     pub extensions: Vec<ExtensionManifest>,
+    pub invalid_extensions: Vec<InvalidExtension>,
     pub viewer_providers: Vec<ViewerProvider>,
     pub viewer_bundles: Arc<ViewerBundleRegistry>,
     pub media_root: std::path::PathBuf,
@@ -85,11 +87,30 @@ async fn handle_request(
     }
 
     if pathname == "/remux/extensions" {
-        return json_response(catalog::extension_catalog(
+        let mut catalog = catalog::extension_catalog(
             Some(&state.default_extension),
             &state.extensions,
             &state.viewer_bundles,
-        ));
+        );
+        if let Some(catalog) = catalog.as_object_mut() {
+            catalog.insert(
+                "invalidExtensions".to_string(),
+                Value::Array(
+                    state
+                        .invalid_extensions
+                        .iter()
+                        .map(|invalid| {
+                            serde_json::json!({
+                                "id": invalid.id,
+                                "manifestPath": invalid.manifest_path,
+                                "error": invalid.error,
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        return json_response(catalog);
     }
 
     if let Some(response) = media::serve_media(&state.media_root, pathname, &headers).await {

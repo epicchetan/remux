@@ -10,15 +10,10 @@
   "server": {
     "transport": "stdio",
     "build": {
-      "command": "cargo",
+      "command": "npm",
       "args": [
-        "build",
-        "--release",
-        "--manifest-path",
-        "server/Cargo.toml",
-        "--target-dir",
-        "/tmp/remux-terminal-server-target",
-        "--quiet"
+        "run",
+        "build:server"
       ],
       "cwd": "."
     },
