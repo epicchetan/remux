@@ -16,7 +16,10 @@ use crate::time::now_ms;
 const MAX_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_SOURCE_FILES: usize = 20_000;
 const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
-const RETAIN_REVISIONS_PER_VIEW: usize = 3;
+// Long-lived mobile tabs keep immutable URLs across app backgrounding and
+// runtime restarts. Keep enough history for normal development rebuilds while
+// the global byte limit remains the final cache bound.
+const RETAIN_REVISIONS_PER_VIEW: usize = 16;
 const WATCH_QUIET_MS: u64 = 300;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);

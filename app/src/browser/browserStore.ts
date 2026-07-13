@@ -163,7 +163,10 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
         cachedCatalog = null;
       }
 
-      if (cachedCatalog && currentRemuxOrigin() === origin) {
+      // A forced refresh is used to recover immutable viewer URLs that no
+      // longer exist. Applying the cache first would briefly move tabs back
+      // onto the same stale revision before the network catalog arrives.
+      if (!options.force && cachedCatalog && currentRemuxOrigin() === origin) {
         applyExtensionCatalog(
           set,
           get,
@@ -745,7 +748,7 @@ function reconcileBrowserTabs(tabs: BrowserTab[], extensions: RemuxExtension[]) 
       return [];
     }
     return [{
-      ...tab,
+      ...adoptLatestViewRevision(tab, extensions),
       iconDarkUrl: extension.display.iconDarkUrl,
       iconUrl: extension.display.iconUrl,
     }];

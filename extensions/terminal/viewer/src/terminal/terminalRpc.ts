@@ -242,7 +242,11 @@ export function writeTerminalSession(params: {
       ...wireParams,
       dataBase64: bytesToBase64(data),
     },
-    { operationId: `input:${params.sessionId}:${params.sessionGeneration}:${params.inputSeq}` },
+    {
+      // inputStreamId is allocated from a server-global session generation,
+      // so producer + sequence is both retry-stable and unique after reattach.
+      operationId: `input:${params.inputStreamId}:${params.inputSeq}`,
+    },
   );
 }
 

@@ -696,9 +696,12 @@ export function TerminalSurface({ route }: TerminalSurfaceProps) {
           pendingInputBytesRef.current - chunk.data.byteLength,
         );
       }
-    } catch {
+    } catch (error) {
       // The exact chunk remains queued. Reattach reconciles nextInputSeq and
       // retries only the same generation/stream/sequence.
+      if (terminalInputNeedsReattach(error)) {
+        window.setTimeout(() => resyncRunnerRef.current?.(), 0);
+      }
     } finally {
       inputPumpRunningRef.current = false;
     }
@@ -3412,6 +3415,13 @@ function waitForTerminalRetry(delayMs: number) {
 function terminalResyncBackoffMs(failureCount: number) {
   const exponential = Math.min(8_000, 250 * (2 ** Math.max(0, failureCount - 1)));
   return exponential + Math.floor(Math.random() * Math.min(500, exponential / 4));
+}
+
+function terminalInputNeedsReattach(error: unknown) {
+  const message = errorMessage(error);
+  return message.includes('operationId was already admitted with different parameters')
+    || message.includes('terminal input stream is not active')
+    || message.includes('terminal input sequence gap');
 }
 
 function errorMessage(error: unknown) {

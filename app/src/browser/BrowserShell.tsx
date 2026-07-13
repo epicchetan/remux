@@ -47,6 +47,7 @@ export function BrowserShell() {
   const remuxOrigin = remuxOriginFromSettings({ host: remuxHost, port: remuxPort });
   const theme = useTheme();
   const activeSurfaceRef = useRef<ExtensionWebViewHandle | null>(null);
+  const catalogConnectionRef = useRef<{ generation: number; origin: string } | null>(null);
   const styles = useMemo(() => createStyles(theme), [theme]);
   const [guardianExtensions, setGuardianExtensions] = useState<GuardianExtension[]>([]);
   const [recoveryError, setRecoveryError] = useState<string | null>(null);
@@ -103,14 +104,30 @@ export function BrowserShell() {
   }, [openOverview, refreshTabPreview]);
 
   useEffect(() => {
-    if (
-      remux.status.type === 'connected'
-      && catalogStatus !== 'loading'
-      && (catalogStatus !== 'ready' || catalogOrigin !== remuxOrigin)
-    ) {
-      void loadExtensions({ force: catalogOrigin !== remuxOrigin });
+    if (remux.status.type !== 'connected') {
+      return;
     }
-  }, [catalogOrigin, catalogStatus, loadExtensions, remuxOrigin, remux.status.type]);
+
+    const previousConnection = catalogConnectionRef.current;
+    const connection = { generation: remux.status.generation, origin: remuxOrigin };
+    const connectionChanged = previousConnection !== null && (
+      previousConnection.generation !== connection.generation
+      || previousConnection.origin !== connection.origin
+    );
+    catalogConnectionRef.current = connection;
+
+    if (catalogStatus === 'loading') {
+      return;
+    }
+
+    if (catalogStatus !== 'ready' || catalogOrigin !== remuxOrigin) {
+      void loadExtensions({ force: catalogOrigin !== remuxOrigin });
+    } else if (connectionChanged) {
+      // A restarted runtime may publish new immutable viewer revisions at the
+      // same origin. Refresh before a restored tab tries an expired URL.
+      void loadExtensions({ force: true });
+    }
+  }, [catalogOrigin, catalogStatus, loadExtensions, remuxOrigin, remux.status]);
 
   // Theme flips re-render every mounted webview, so previews captured in the
   // old appearance are stale everywhere. Re-shoot what's on screen and leave

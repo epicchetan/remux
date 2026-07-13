@@ -17,6 +17,7 @@ export function ViewerSurface({ active, onOpenOverview, surfaceRef, tab }: Viewe
   const extensions = useBrowserStore((state) => state.extensions);
   const clearPendingNavigation = useBrowserStore((state) => state.clearPendingNavigation);
   const closeTab = useBrowserStore((state) => state.closeTab);
+  const loadExtensions = useBrowserStore((state) => state.loadExtensions);
   const openResource = useBrowserStore((state) => state.openResource);
   const updateTab = useBrowserStore((state) => state.updateTab);
   const sourceUrlRef = useRef(tab.url);
@@ -54,6 +55,20 @@ export function ViewerSurface({ active, onOpenOverview, surfaceRef, tab }: Viewe
   const closeCurrentTab = useCallback(() => {
     closeTab(tab.id, { returnToOverview: true });
   }, [closeTab, tab.id]);
+  const recoverUnavailableViewerBundle = useCallback(async () => {
+    const before = useBrowserStore.getState().tabs.find((candidate) => candidate.id === tab.id);
+    await loadExtensions({ force: true });
+    const after = useBrowserStore.getState().tabs.find((candidate) => candidate.id === tab.id);
+    return Boolean(
+      before
+      && after
+      && (
+        after.reloadNonce !== before.reloadNonce
+        || after.viewRevision !== before.viewRevision
+        || after.url !== before.url
+      )
+    );
+  }, [loadExtensions, tab.id]);
 
   useEffect(() => {
     const descriptor = descriptorRef.current;
@@ -70,6 +85,7 @@ export function ViewerSurface({ active, onOpenOverview, surfaceRef, tab }: Viewe
       onCloseTab={closeCurrentTab}
       onOpenFile={openFile}
       onOpenOverview={onOpenOverview}
+      onViewerBundleUnavailable={recoverUnavailableViewerBundle}
       onNavigationDelivered={(nonce) => clearPendingNavigation(tab.id, nonce)}
       ref={surfaceRef}
       onTabUpdate={(patch) => updateTab(tab.id, patch)}

@@ -56,6 +56,10 @@ function effectiveLifecycleState(
   return 'active';
 }
 
+function isImmutableViewerBundleUrl(url: string) {
+  return /\/viewers\/[^/]+\/_bundle\/sha256-[0-9a-f]+(?:\/|$)/u.test(url);
+}
+
 type JsonRpcId = number | string;
 
 type RemuxViewHostStatus =
@@ -256,6 +260,7 @@ type ExtensionWebViewProps = {
   onOpenFile?: (params: HostFileOpenParams) => HostFileOpenResult | Promise<HostFileOpenResult>;
   onOpenOverview?: (section?: BrowserSection) => Promise<void> | void;
   onTabUpdate?: (patch: ExtensionTabUpdate) => void;
+  onViewerBundleUnavailable?: () => boolean | Promise<boolean>;
   pendingNavigation?: BrowserPendingNavigation | null;
   reloadSourceUrl?: string;
   sourceUrl: string;
@@ -276,6 +281,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
     onOpenFile,
     onOpenOverview,
     onTabUpdate,
+    onViewerBundleUnavailable,
     pendingNavigation = null,
     reloadSourceUrl,
     sourceUrl,
@@ -291,6 +297,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
   const [reloadNonce, setReloadNonce] = useState(0);
   const [reloadTargetUrl, setReloadTargetUrl] = useState(sourceUrl);
   const automaticReloadAttemptsRef = useRef(0);
+  const bundleRecoveryPendingRef = useRef(false);
   const activeRef = useRef(active);
   const appStateRef = useRef(AppState.currentState);
   const lifecycleEpochRef = useRef(0);
@@ -1193,8 +1200,41 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
       instanceId: instanceIdRef.current,
       nativeEvent: event.nativeEvent,
     });
+
+    const requestUrl = event.nativeEvent.url || webViewSourceUrl;
+    if (
+      event.nativeEvent.statusCode === 404
+      && isImmutableViewerBundleUrl(requestUrl)
+      && onViewerBundleUnavailable
+    ) {
+      if (bundleRecoveryPendingRef.current) {
+        return;
+      }
+
+      bundleRecoveryPendingRef.current = true;
+      resetWebViewReadiness('viewer-bundle-unavailable');
+      setPageState({ type: 'loading' });
+      logRemuxDebug('webview:viewer-bundle:recovering', {
+        instanceId: instanceIdRef.current,
+        requestUrl,
+      });
+      void Promise.resolve(onViewerBundleUnavailable())
+        .then((recovered) => {
+          if (recovered) {
+            return;
+          }
+          bundleRecoveryPendingRef.current = false;
+          failWebView('This viewer bundle is no longer available. Retry to refresh the extension catalog.');
+        })
+        .catch((error) => {
+          bundleRecoveryPendingRef.current = false;
+          failWebView(error instanceof Error ? error.message : String(error));
+        });
+      return;
+    }
+
     autoReloadWebView('http-error', `HTTP ${event.nativeEvent.statusCode}`);
-  }, [autoReloadWebView]);
+  }, [autoReloadWebView, failWebView, onViewerBundleUnavailable, resetWebViewReadiness, webViewSourceUrl]);
 
   const handleContentProcessTerminated = useCallback((event: WebViewTerminatedEvent) => {
     logRemuxDebug('webview:process:terminated', {

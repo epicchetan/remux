@@ -4,6 +4,10 @@ import { gzipSync } from 'node:zlib';
 import { terminalModifierAutoClearMs } from '../viewer/src/terminal/keyEncoding';
 
 type HostRequest = {
+  contract?: {
+    kind?: string;
+    operationId?: string;
+  };
   id?: number | string;
   method?: string;
   params?: unknown;
@@ -37,6 +41,8 @@ declare global {
     __remuxTerminalFailNextAttachCount?: number;
     __remuxTerminalClipboardText?: string;
     __remuxTerminalInitialTmuxContext?: unknown;
+    __remuxTerminalReplacementInputStreamId?: string;
+    __remuxTerminalFailNextWrite?: boolean;
     __remuxTerminalReadyFailures?: Array<'catchup-too-large' | 'gap' | 'stale-subscription'>;
     __remuxTerminalHost?: TerminalHostMock;
   }
@@ -765,6 +771,70 @@ test.describe('terminal viewer route', () => {
     await expect(altButton).toHaveClass(/is-active/);
     await page.waitForTimeout(terminalModifierAutoClearMs + 250);
     await expect(altButton).not.toHaveClass(/is-active/);
+  });
+
+  test('scopes durable input ids to the replacement producer stream', async ({ page }) => {
+    await page.goto('/?remuxLaunch=new-terminal');
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+    await waitForHostRequest(page, 'remux/terminal/session/ready');
+
+    const enterKey = await settledTerminalKey(page, 'Enter');
+    await enterKey.click();
+    const firstWrite = await waitForHostRequest(page, 'remux/terminal/session/write');
+
+    const readyCount = await hostRequestCount(page, 'remux/terminal/session/ready');
+    await page.evaluate(() => {
+      window.__remuxTerminalReplacementInputStreamId = 'replacement-input-stream';
+      for (const lifecycle of [
+        { epoch: 1, reason: 'appState', state: 'background' },
+        { epoch: 2, reason: 'appState', state: 'active' },
+      ]) {
+        const event = new MessageEvent('message', {
+          data: JSON.stringify({ lifecycle, type: 'remux/lifecycle' }),
+        });
+        window.dispatchEvent(event);
+        document.dispatchEvent(event);
+      }
+    });
+    await waitForHostRequest(page, 'remux/terminal/session/attach');
+    await waitForHostRequest(page, 'remux/terminal/session/ready', readyCount + 1);
+
+    await enterKey.click();
+    const secondWrite = await waitForHostRequest(page, 'remux/terminal/session/write', 2);
+    expect(recordParams(firstWrite)).toMatchObject({
+      inputSeq: 1,
+      inputStreamId: 'mock-input-stream',
+    });
+    expect(recordParams(secondWrite)).toMatchObject({
+      inputSeq: 1,
+      inputStreamId: 'replacement-input-stream',
+    });
+    expect(firstWrite.contract?.operationId).toContain(':mock-input-stream:1');
+    expect(secondWrite.contract?.operationId).toContain(':replacement-input-stream:1');
+    expect(secondWrite.contract?.operationId).not.toBe(firstWrite.contract?.operationId);
+  });
+
+  test('reattaches after a permanent durable input conflict', async ({ page }) => {
+    await page.addInitScript(() => {
+      window.__remuxTerminalFailNextWrite = true;
+      window.__remuxTerminalReplacementInputStreamId = 'recovered-input-stream';
+    });
+    await page.goto('/?remuxLaunch=new-terminal');
+    await waitForHostRequest(page, 'remux/terminal/session/start');
+    const readyCount = await hostRequestCount(page, 'remux/terminal/session/ready');
+
+    const enterKey = await settledTerminalKey(page, 'Enter');
+    await enterKey.click();
+    await waitForHostRequest(page, 'remux/terminal/session/write');
+    await waitForHostRequest(page, 'remux/terminal/session/attach');
+    await waitForHostRequest(page, 'remux/terminal/session/ready', readyCount + 1);
+
+    await enterKey.click();
+    const recoveredWrite = await waitForHostRequest(page, 'remux/terminal/session/write', 2);
+    expect(recordParams(recoveredWrite)).toMatchObject({
+      inputSeq: 1,
+      inputStreamId: 'recovered-input-stream',
+    });
   });
 
   test('fires a key press for every rapid tap without debouncing', async ({ page }) => {
@@ -1563,6 +1633,11 @@ async function installMockRemuxHost(page: Page) {
           return;
 
         case 'remux/terminal/session/write':
+          if (window.__remuxTerminalFailNextWrite) {
+            window.__remuxTerminalFailNextWrite = false;
+            postError(request, 'operationId was already admitted with different parameters');
+            return;
+          }
           postResult(request, {
             acceptedInputSeq: params.inputSeq,
             duplicate: false,
@@ -1627,6 +1702,8 @@ async function installMockRemuxHost(page: Page) {
             });
             window.__remuxTerminalEventDuringAttach = undefined;
           }
+          const replacementInputStreamId = window.__remuxTerminalReplacementInputStreamId;
+          window.__remuxTerminalReplacementInputStreamId = undefined;
           postResult(request, {
             catchupEndSeq,
             exitCode: null,
@@ -1635,9 +1712,9 @@ async function installMockRemuxHost(page: Page) {
             nextOutputSeq: 1,
             firstAvailableSeq: 1,
             nextInputSeq: typeof params.inputSeq === 'number' ? params.inputSeq : 1,
-            inputStreamId: typeof params.inputStreamId === 'string'
+            inputStreamId: replacementInputStreamId ?? (typeof params.inputStreamId === 'string'
               ? params.inputStreamId
-              : 'mock-input-stream',
+              : 'mock-input-stream'),
             replay,
             replayComplete: true,
             replayNextSeq: catchupEndSeq,
