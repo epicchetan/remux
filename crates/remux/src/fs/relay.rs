@@ -62,8 +62,7 @@ pub type WatchPathFn = Box<
         + Send
         + Sync,
 >;
-pub type RunGitStatusFn =
-    Arc<dyn Fn(PathBuf) -> BoxFuture<'static, Option<String>> + Send + Sync>;
+pub type RunGitStatusFn = Arc<dyn Fn(PathBuf) -> BoxFuture<'static, Option<String>> + Send + Sync>;
 pub type BroadcastFn = Arc<dyn Fn(Value) + Send + Sync>;
 pub type InvalidateFn = Arc<dyn Fn(&[PathBuf], &[PathBuf]) + Send + Sync>;
 
@@ -604,10 +603,12 @@ impl FsRelay {
                 }
             }
 
-            let changed_paths: Vec<String> =
-                std::mem::take(&mut state.pending_changed_paths).into_iter().collect();
-            let git_dirty_roots: Vec<String> =
-                std::mem::take(&mut state.pending_git_dirty_roots).into_iter().collect();
+            let changed_paths: Vec<String> = std::mem::take(&mut state.pending_changed_paths)
+                .into_iter()
+                .collect();
+            let git_dirty_roots: Vec<String> = std::mem::take(&mut state.pending_git_dirty_roots)
+                .into_iter()
+                .collect();
             state.last_broadcast_at = Some(now);
             (
                 changed_paths,
@@ -677,7 +678,11 @@ pub fn changed_status_directories(
     changed.into_iter().collect()
 }
 
-fn add_record_directories(target: &mut BTreeSet<PathBuf>, repo_root: &Path, relative_paths: &[String]) {
+fn add_record_directories(
+    target: &mut BTreeSet<PathBuf>,
+    repo_root: &Path,
+    relative_paths: &[String],
+) {
     for relative_path in relative_paths {
         let relative_dir = match relative_path.rfind('/') {
             Some(index) => &relative_path[..index],
@@ -694,7 +699,10 @@ fn add_record_directories(target: &mut BTreeSet<PathBuf>, repo_root: &Path, rela
 /// Porcelain v1 `-z` records: `XY path` NUL-terminated; rename/copy records
 /// are followed by the original path as a bare NUL-terminated token.
 pub fn parse_porcelain_records(output: &str) -> HashMap<String, Vec<String>> {
-    let tokens: Vec<&str> = output.split('\0').filter(|token| !token.is_empty()).collect();
+    let tokens: Vec<&str> = output
+        .split('\0')
+        .filter(|token| !token.is_empty())
+        .collect();
     let mut records = HashMap::new();
 
     let mut index = 0;

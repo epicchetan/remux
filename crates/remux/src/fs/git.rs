@@ -71,7 +71,10 @@ pub async fn git_status_entries(repo_root: &Path) -> Vec<StatusEntry> {
 /// Porcelain v1 `-z` records: `XY <path>`, with the rename/copy source path
 /// as a separate following record that must be skipped.
 pub fn parse_git_porcelain(output: &str) -> Vec<StatusEntry> {
-    let records: Vec<&str> = output.split('\0').filter(|record| !record.is_empty()).collect();
+    let records: Vec<&str> = output
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .collect();
     let mut entries = Vec::new();
 
     let mut index = 0;
@@ -85,13 +88,12 @@ pub fn parse_git_porcelain(output: &str) -> Vec<StatusEntry> {
 
         let index_status = chars[0];
         let worktree_status = chars[1];
-        let relative_path = normalize_git_path(&record[record.char_indices().nth(3).map(|(i, _)| i).unwrap_or(3)..]);
+        let relative_path = normalize_git_path(
+            &record[record.char_indices().nth(3).map(|(i, _)| i).unwrap_or(3)..],
+        );
         if let Some(git) = git_status_from_porcelain(index_status, worktree_status) {
             if !relative_path.is_empty() {
-                entries.push(StatusEntry {
-                    git,
-                    relative_path,
-                });
+                entries.push(StatusEntry { git, relative_path });
             }
         }
 
@@ -253,7 +255,10 @@ pub fn relative_git_path(repo_root: &Path, entry_path: &Path) -> Option<String> 
 }
 
 pub fn normalize_git_path(value: &str) -> String {
-    value.trim_start_matches('/').trim_end_matches('/').to_string()
+    value
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .to_string()
 }
 
 #[cfg(test)]
@@ -269,15 +274,57 @@ mod tests {
             .map(|entry| (entry.relative_path.as_str(), entry.git))
             .collect();
 
-        assert_eq!(by_path["staged.txt"], GitStatus { staged: true, status: "modified" });
-        assert_eq!(by_path["modified.txt"], GitStatus { staged: false, status: "modified" });
-        assert_eq!(by_path["untracked.txt"], GitStatus { staged: false, status: "untracked" });
-        assert_eq!(by_path["new-name.txt"], GitStatus { staged: true, status: "renamed" });
+        assert_eq!(
+            by_path["staged.txt"],
+            GitStatus {
+                staged: true,
+                status: "modified"
+            }
+        );
+        assert_eq!(
+            by_path["modified.txt"],
+            GitStatus {
+                staged: false,
+                status: "modified"
+            }
+        );
+        assert_eq!(
+            by_path["untracked.txt"],
+            GitStatus {
+                staged: false,
+                status: "untracked"
+            }
+        );
+        assert_eq!(
+            by_path["new-name.txt"],
+            GitStatus {
+                staged: true,
+                status: "renamed"
+            }
+        );
         // Rename source record is skipped, not misparsed as a status record.
         assert!(!by_path.contains_key("old-name.txt"));
-        assert_eq!(by_path["added.txt"], GitStatus { staged: true, status: "added" });
-        assert_eq!(by_path["deleted.txt"], GitStatus { staged: false, status: "deleted" });
-        assert_eq!(by_path["conflicted.txt"], GitStatus { staged: true, status: "conflicted" });
+        assert_eq!(
+            by_path["added.txt"],
+            GitStatus {
+                staged: true,
+                status: "added"
+            }
+        );
+        assert_eq!(
+            by_path["deleted.txt"],
+            GitStatus {
+                staged: false,
+                status: "deleted"
+            }
+        );
+        assert_eq!(
+            by_path["conflicted.txt"],
+            GitStatus {
+                staged: true,
+                status: "conflicted"
+            }
+        );
     }
 
     #[test]
@@ -293,12 +340,21 @@ mod tests {
     #[test]
     fn summarize_ranks_worst_status_and_ors_staged() {
         let statuses = [
-            GitStatus { staged: false, status: "modified" },
-            GitStatus { staged: true, status: "untracked" },
+            GitStatus {
+                staged: false,
+                status: "modified",
+            },
+            GitStatus {
+                staged: true,
+                status: "untracked",
+            },
         ];
         assert_eq!(
             summarize_git_statuses(&statuses),
-            Some(GitStatus { staged: true, status: "untracked" })
+            Some(GitStatus {
+                staged: true,
+                status: "untracked"
+            })
         );
         assert_eq!(summarize_git_statuses(&[]), None);
     }
@@ -306,7 +362,10 @@ mod tests {
     #[test]
     fn is_path_within_keeps_the_boundary_contract() {
         assert!(is_path_within(Path::new("/repo"), Path::new("/repo")));
-        assert!(is_path_within(Path::new("/repo"), Path::new("/repo/src/main.rs")));
+        assert!(is_path_within(
+            Path::new("/repo"),
+            Path::new("/repo/src/main.rs")
+        ));
         assert!(!is_path_within(Path::new("/repo"), Path::new("/repo2")));
         assert!(!is_path_within(Path::new("/repo"), Path::new("/")));
     }
@@ -317,7 +376,13 @@ mod tests {
             relative_git_path(Path::new("/repo"), Path::new("/repo/src/a.txt")),
             Some("src/a.txt".to_string())
         );
-        assert_eq!(relative_git_path(Path::new("/repo"), Path::new("/repo")), None);
-        assert_eq!(relative_git_path(Path::new("/repo"), Path::new("/other/a.txt")), None);
+        assert_eq!(
+            relative_git_path(Path::new("/repo"), Path::new("/repo")),
+            None
+        );
+        assert_eq!(
+            relative_git_path(Path::new("/repo"), Path::new("/other/a.txt")),
+            None
+        );
     }
 }

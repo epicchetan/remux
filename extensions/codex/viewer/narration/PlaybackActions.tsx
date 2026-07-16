@@ -18,7 +18,7 @@ export function NarrationPlaybackActions() {
   const previousBlock = useNarrationStore((state) => state.previousBlock);
   const toggleFollow = useNarrationStore((state) => state.toggleFollow);
   const units = manifest?.units ?? [];
-  const playing = phase === 'playing';
+  const playing = phase === 'playing' || phase === 'buffering';
   const currentBlockId = units[currentUnitIndex]?.blockId;
   const hasPreviousBlock = units.slice(0, Math.max(0, currentUnitIndex)).some((unit) => unit.blockId !== currentBlockId);
   const hasNextBlock = units.slice(currentUnitIndex + 1).some((unit) => unit.blockId !== currentBlockId);

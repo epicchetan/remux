@@ -1,8 +1,13 @@
 # Narrate Service
 
-Status: Implemented
+Status: Archived — superseded by `docs/specs/narrate-local-g2p-sparse-patches.md`
 Last verified: 2026-07-13
 Canonical code: `extensions/narrate/server/`, `extensions/codex/server/src/structured_inference.rs`, `crates/remux-extension-rpc/`, `crates/remux-tts/`, `crates/remux/src/extensions/supervisor.rs`
+
+> Historical extraction spec. The current v6 runtime is specified by
+> `docs/specs/narrate-local-g2p-sparse-patches.md`: native Misaki owns final
+> phonemes and alignment, while Sol supplies only sparse text corrections.
+> This document is not current runtime documentation.
 
 ## Outcome
 

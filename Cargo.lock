@@ -1533,7 +1533,6 @@ version = "0.1.0"
 dependencies = [
  "misaki-rs",
  "ndarray",
- "num2words",
  "ort",
  "ort-sys",
  "remux-compute",

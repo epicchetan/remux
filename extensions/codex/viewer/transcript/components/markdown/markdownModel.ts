@@ -467,10 +467,10 @@ export function narrationSourceDocument(
   collectNarrationSourceBlocks(parsed, blocks, targets);
   return {
     blocks,
-    documentVersion: '3',
+    documentVersion: '4',
     messageId: identity.messageId,
     messageRevision: identity.messageRevision,
-    schemaVersion: 2,
+    schemaVersion: 3,
     sourceHash: identity.sourceHash,
     targets,
   };
@@ -1403,12 +1403,6 @@ function narrationSourceForBlock(
     id: block.narrationId,
     inlineRanges,
     kind,
-    needsTransform:
-      kind === 'code' ||
-      kind === 'diagram' ||
-      kind === 'table' ||
-      inlineRanges.some((range) => range.kind !== 'text') ||
-      pronunciationSensitiveText(displayText),
     path: block.narrationId.slice('md:'.length),
     targetIds,
   };
@@ -1466,15 +1460,6 @@ function mergeNarrationRanges(ranges: CodexNarrationInlineRange[]) {
     }
   }
   return merged;
-}
-
-function pronunciationSensitiveText(text: string) {
-  return (
-    /https?:\/\//iu.test(text) ||
-    /[$€£¥]\s?\d/u.test(text) ||
-    /\b[A-Z]{2,}\b/u.test(text) ||
-    /(?:<[^>]+>|::|->|=>|\w+\/\w+)/u.test(text)
-  );
 }
 
 function sanitizeHref(href: string) {

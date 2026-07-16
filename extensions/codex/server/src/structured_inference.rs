@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::app_server::{AppServerEvent, AppServerRuntime};
 
@@ -16,8 +17,9 @@ const MAX_ACTIVE_OPERATIONS: usize = 4;
 const MAX_INSTRUCTIONS_BYTES: usize = 64 * 1024;
 const MAX_INPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SCHEMA_BYTES: usize = 256 * 1024;
-const MAX_OUTPUT_BYTES: usize = 256 * 1024;
-const TURN_TIMEOUT: Duration = Duration::from_secs(240);
+const MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+const TURN_TIMEOUT: Duration = Duration::from_secs(14 * 60);
+const MAX_PROGRESS_DELTA_BYTES: usize = 12 * 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct StructuredInferenceServer {
@@ -30,6 +32,7 @@ struct Inner {
     app_server: AppServerRuntime,
     context_dir: PathBuf,
     subscriptions: Mutex<HashMap<String, mpsc::Sender<Value>>>,
+    output_tx: mpsc::SyncSender<Value>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -50,6 +53,24 @@ struct GenerateParams {
     operation_id: String,
     output_schema: Value,
     service_tier: String,
+    #[serde(default)]
+    progress: Option<ProgressParams>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProgressParams {
+    protocol_version: u64,
+    request_id: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProfileValidateParams {
+    api_version: u64,
+    effort: String,
+    model: String,
+    service_tier: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +84,7 @@ impl StructuredInferenceServer {
         codex_home: PathBuf,
         app_server: AppServerRuntime,
         event_rx: mpsc::Receiver<AppServerEvent>,
+        output_tx: mpsc::SyncSender<Value>,
     ) -> Self {
         let inner = Arc::new(Inner {
             active: Mutex::new(HashMap::new()),
@@ -72,6 +94,7 @@ impl StructuredInferenceServer {
                 .join("structured-inference")
                 .join("context-v1"),
             subscriptions: Mutex::new(HashMap::new()),
+            output_tx,
         });
         spawn_event_router(inner.clone(), event_rx);
         Self { inner }
@@ -106,6 +129,20 @@ impl StructuredInferenceServer {
         result
     }
 
+    pub(crate) fn validate_profile(&self, params: Value) -> Result<Value, String> {
+        let params: ProfileValidateParams = serde_json::from_value(params)
+            .map_err(|error| format!("invalid structured inference profile params: {error}"))?;
+        validate_profile_params(&params)?;
+        validate_available_profile(&self.inner.app_server, &params.model, &params.service_tier)?;
+        Ok(json!({
+            "apiVersion": API_VERSION,
+            "model": params.model,
+            "serviceTier": params.service_tier,
+            "effort": params.effort,
+            "profileDigest": profile_digest(),
+        }))
+    }
+
     pub(crate) fn cancel(&self, params: Value) -> Result<Value, String> {
         let params: CancelParams = serde_json::from_value(params)
             .map_err(|error| format!("invalid structured inference cancel params: {error}"))?;
@@ -131,7 +168,7 @@ impl StructuredInferenceServer {
 
     fn generate_inner(&self, params: &GenerateParams) -> Result<Value, String> {
         self.ensure_not_cancelled(&params.operation_id)?;
-        validate_profile(&self.inner.app_server, params)?;
+        validate_available_profile(&self.inner.app_server, &params.model, &params.service_tier)?;
         self.ensure_not_cancelled(&params.operation_id)?;
         fs::create_dir_all(&self.inner.context_dir)
             .map_err(|error| format!("failed to create structured inference context: {error}"))?;
@@ -191,10 +228,37 @@ impl StructuredInferenceServer {
             }
         };
 
-        let output = wait_for_output(&thread_id, &turn_id, event_rx, || {
-            self.operation_cancelled(&params.operation_id)
-                .unwrap_or(true)
-        });
+        let mut progress_sequence = 0;
+        let output = wait_for_output(
+            &thread_id,
+            &turn_id,
+            event_rx,
+            |delta| {
+                let Some(progress) = &params.progress else {
+                    return Ok(());
+                };
+                for delta in split_utf8(delta, MAX_PROGRESS_DELTA_BYTES) {
+                    let frame = json!({
+                        "jsonrpc": "2.0",
+                        "method": "$/progress",
+                        "params": {
+                            "id": progress.request_id,
+                            "sequence": progress_sequence,
+                            "value": { "type": "textDelta", "delta": delta },
+                        },
+                    });
+                    self.inner.output_tx.try_send(frame).map_err(|_| {
+                        "structured inference progress output overflowed".to_string()
+                    })?;
+                    progress_sequence += 1;
+                }
+                Ok(())
+            },
+            || {
+                self.operation_cancelled(&params.operation_id)
+                    .unwrap_or(true)
+            },
+        );
         self.unsubscribe(&thread_id);
         let output = match output {
             Ok(output) => output,
@@ -211,19 +275,28 @@ impl StructuredInferenceServer {
             }
         };
         self.ensure_not_cancelled(&params.operation_id)?;
-        if output.len() > MAX_OUTPUT_BYTES {
+        if output.completed_text.len() > MAX_OUTPUT_BYTES {
             return Err(format!(
                 "structured inference output is too large: {}>{MAX_OUTPUT_BYTES}",
-                output.len()
+                output.completed_text.len()
             ));
         }
-        let value: Value = serde_json::from_str(&output)
+        if params.progress.is_some() && output.delta_text != output.completed_text {
+            return Err(
+                "structured inference delta stream differs from completed output".to_string(),
+            );
+        }
+        let value: Value = serde_json::from_str(&output.completed_text)
             .map_err(|error| format!("structured inference returned invalid JSON: {error}"))?;
         Ok(json!({
             "apiVersion": API_VERSION,
             "gatewayVersion": GATEWAY_VERSION,
             "model": params.model,
             "serviceTier": params.service_tier,
+            "profileDigest": profile_digest(),
+            "completedTextSha256": sha256_hex(output.completed_text.as_bytes()),
+            "deltaTextSha256": sha256_hex(output.delta_text.as_bytes()),
+            "progressFrames": progress_sequence,
             "value": value,
         }))
     }
@@ -298,11 +371,20 @@ fn validate_generate_params(params: &GenerateParams) -> Result<(), String> {
     if params.model != "gpt-5.6-sol" {
         return Err("structured inference currently requires gpt-5.6-sol".to_string());
     }
-    if !matches!(params.service_tier.as_str(), "priority" | "standard") {
-        return Err("structured inference serviceTier is invalid".to_string());
+    if params.service_tier != "priority" {
+        return Err(
+            "structured inference currently requires the priority service tier".to_string(),
+        );
     }
     if params.effort != "low" {
         return Err("structured inference currently requires low effort".to_string());
+    }
+    if let Some(progress) = &params.progress {
+        if progress.protocol_version != 1
+            || (!progress.request_id.is_string() && !progress.request_id.is_number())
+        {
+            return Err("structured inference progress contract is invalid".to_string());
+        }
     }
     for (name, value, limit) in [
         (
@@ -324,7 +406,24 @@ fn validate_generate_params(params: &GenerateParams) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_profile(app_server: &AppServerRuntime, params: &GenerateParams) -> Result<(), String> {
+fn validate_profile_params(params: &ProfileValidateParams) -> Result<(), String> {
+    if params.api_version != API_VERSION
+        || params.model != "gpt-5.6-sol"
+        || params.service_tier != "priority"
+        || params.effort != "low"
+    {
+        return Err(
+            "structured inference profile is not the required Sol Priority profile".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_available_profile(
+    app_server: &AppServerRuntime,
+    model_id: &str,
+    service_tier: &str,
+) -> Result<(), String> {
     let response =
         app_server.request("model/list", json!({ "includeHidden": true, "limit": 100 }))?;
     let model = response
@@ -332,12 +431,12 @@ fn validate_profile(app_server: &AppServerRuntime, params: &GenerateParams) -> R
         .and_then(Value::as_array)
         .and_then(|models| {
             models.iter().find(|model| {
-                model.get("model").and_then(Value::as_str) == Some(params.model.as_str())
-                    || model.get("id").and_then(Value::as_str) == Some(params.model.as_str())
+                model.get("model").and_then(Value::as_str) == Some(model_id)
+                    || model.get("id").and_then(Value::as_str) == Some(model_id)
             })
         })
-        .ok_or_else(|| format!("structured inference model {} is unavailable", params.model))?;
-    if params.service_tier == "priority" {
+        .ok_or_else(|| format!("structured inference model {model_id} is unavailable"))?;
+    if service_tier == "priority" {
         let supports_priority = model
             .get("serviceTiers")
             .and_then(Value::as_array)
@@ -355,6 +454,31 @@ fn validate_profile(app_server: &AppServerRuntime, params: &GenerateParams) -> R
         }
     }
     Ok(())
+}
+
+fn profile_digest() -> String {
+    sha256_hex(b"remux-structured-profile-v1\0gpt-5.6-sol\0priority\0low\0none\0ephemeral\0read-only\0no-tools")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn split_utf8(text: &str, max_bytes: usize) -> Vec<&str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + max_bytes).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        chunks.push(&text[start..end]);
+        start = end;
+    }
+    chunks
 }
 
 fn thread_start_params(params: &GenerateParams, context_dir: &std::path::Path) -> Value {
@@ -406,15 +530,23 @@ fn turn_start_params(params: &GenerateParams, thread_id: &str) -> Value {
     })
 }
 
+#[derive(Debug)]
+struct CompletedOutput {
+    completed_text: String,
+    delta_text: String,
+}
+
 fn wait_for_output(
     thread_id: &str,
     turn_id: &str,
     event_rx: mpsc::Receiver<Value>,
+    mut on_delta: impl FnMut(&str) -> Result<(), String>,
     mut cancelled: impl FnMut() -> bool,
-) -> Result<String, String> {
+) -> Result<CompletedOutput, String> {
     let started = Instant::now();
     let mut completed_text = None;
     let mut completed_messages = 0;
+    let mut delta_text = String::new();
     loop {
         if cancelled() {
             return Err("structured inference cancelled".to_string());
@@ -441,6 +573,19 @@ fn wait_for_output(
             continue;
         }
         match method {
+            "item/agentMessage/delta"
+                if params.get("turnId").and_then(Value::as_str) == Some(turn_id) =>
+            {
+                let delta = params
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "structured inference delta is missing text".to_string())?;
+                if delta_text.len().saturating_add(delta.len()) > MAX_OUTPUT_BYTES {
+                    return Err("structured inference delta stream is too large".to_string());
+                }
+                on_delta(delta)?;
+                delta_text.push_str(delta);
+            }
             "item/completed" if params.get("turnId").and_then(Value::as_str) == Some(turn_id) => {
                 let item = params.get("item").unwrap_or(&Value::Null);
                 if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
@@ -466,9 +611,13 @@ fn wait_for_output(
                         "structured inference completed with {completed_messages} authoritative agent messages"
                     ));
                 }
-                return completed_text
+                let completed_text = completed_text
                     .filter(|text| !text.is_empty())
-                    .ok_or_else(|| "structured inference completed without output".to_string());
+                    .ok_or_else(|| "structured inference completed without output".to_string())?;
+                return Ok(CompletedOutput {
+                    completed_text,
+                    delta_text,
+                });
             }
             _ => {}
         }
@@ -544,6 +693,7 @@ mod tests {
             operation_id: "fixture:1".to_string(),
             output_schema: json!({ "type": "object" }),
             service_tier: "priority".to_string(),
+            progress: None,
         }
     }
 
@@ -556,13 +706,71 @@ mod tests {
         let mut params = valid_params();
         params.output_schema = Value::Null;
         assert!(validate_generate_params(&params).is_err());
+        let mut params = valid_params();
+        params.service_tier = "standard".to_string();
+        assert!(validate_generate_params(&params).is_err());
+    }
+
+    #[test]
+    fn forwards_only_exact_turn_deltas_and_preserves_the_completed_text() {
+        let (sender, receiver) = mpsc::channel();
+        for notification in [
+            json!({
+                "method": "item/agentMessage/delta",
+                "params": { "threadId": "thread", "turnId": "other", "delta": "ignored" },
+            }),
+            json!({
+                "method": "item/agentMessage/delta",
+                "params": { "threadId": "thread", "turnId": "turn", "delta": "{\"v\":" },
+            }),
+            json!({
+                "method": "item/agentMessage/delta",
+                "params": { "threadId": "thread", "turnId": "turn", "delta": "4}" },
+            }),
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread",
+                    "turnId": "turn",
+                    "item": { "type": "agentMessage", "text": "{\"v\":4}" },
+                },
+            }),
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread",
+                    "turn": { "id": "turn", "status": "completed" },
+                },
+            }),
+        ] {
+            sender.send(notification).unwrap();
+        }
+        let mut deltas = String::new();
+        let output = wait_for_output(
+            "thread",
+            "turn",
+            receiver,
+            |delta| {
+                deltas.push_str(delta);
+                Ok(())
+            },
+            || false,
+        )
+        .unwrap();
+        assert_eq!(deltas, "{\"v\":4}");
+        assert_eq!(output.delta_text, output.completed_text);
+    }
+
+    #[test]
+    fn splits_progress_on_utf8_boundaries() {
+        assert_eq!(split_utf8("ab😀cd", 4), ["ab", "😀", "cd"]);
     }
 
     #[test]
     fn wait_observes_cancellation_without_an_app_server_event() {
         let (_sender, receiver) = mpsc::channel();
         assert_eq!(
-            wait_for_output("thread", "turn", receiver, || true).unwrap_err(),
+            wait_for_output("thread", "turn", receiver, |_| Ok(()), || true).unwrap_err(),
             "structured inference cancelled"
         );
     }
@@ -577,6 +785,7 @@ mod tests {
                 sink,
             ),
             receiver,
+            mpsc::sync_channel(1).0,
         );
         server
             .inner
@@ -605,7 +814,7 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(
-            wait_for_output("thread", "turn", receiver, || false).unwrap_err(),
+            wait_for_output("thread", "turn", receiver, |_| Ok(()), || false).unwrap_err(),
             "structured inference app server disconnected"
         );
     }

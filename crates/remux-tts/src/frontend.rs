@@ -1,102 +1,66 @@
-use misaki_rs::{G2P, Language, MToken};
-use num2words::{Currency, Num2Words};
+use misaki_rs::{G2P, Language};
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
-const MAX_PHONEMES: usize = 510;
-
-#[derive(Debug, Clone)]
-pub struct FrontendChunk {
-    pub tokens: Vec<MToken>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnglishG2pToken {
+    pub text: String,
+    pub tag: String,
+    pub phonemes: String,
 }
 
-pub struct EnglishFrontend {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnglishG2pOutput {
+    pub phonemes: String,
+    pub tokens: Vec<EnglishG2pToken>,
+}
+
+pub struct EnglishG2p {
     g2p: G2P,
 }
 
-impl EnglishFrontend {
+impl EnglishG2p {
     pub fn new() -> Self {
-        let mut g2p = G2P::new(Language::EnglishUS);
-        // Match the existing Python configuration: fallback=None, unk="".
-        g2p.unk.clear();
-        Self { g2p }
+        Self {
+            g2p: G2P::new(Language::EnglishUS),
+        }
     }
 
-    pub fn chunks(&self, text: &str) -> Result<Vec<FrontendChunk>, String> {
+    pub fn phonemize(&self, text: &str) -> Result<EnglishG2pOutput, String> {
         let normalized = normalize_for_g2p(text);
-        let (_, mut tokens) = self
+        let (phonemes, tokens) = self
             .g2p
             .g2p(&normalized)
             .map_err(|error| format!("English G2P failed: {error}"))?;
-        repair_whitespace(&normalized, &mut tokens);
-        self.repair_tokens(&mut tokens)?;
-        let mut chunks = Vec::new();
-        let mut pending = Vec::new();
-        let mut count = 0;
-        for token in tokens {
-            let length = token
-                .phonemes
-                .as_deref()
-                .map(str::chars)
-                .map(Iterator::count)
-                .unwrap_or(0)
-                + usize::from(!token.whitespace.is_empty());
-            if count + length > MAX_PHONEMES && !pending.is_empty() {
-                chunks.push(make_chunk(std::mem::take(&mut pending))?);
-                count = 0;
-            }
-            count += length;
-            pending.push(token);
+        let tokens = tokens
+            .into_iter()
+            .filter_map(|token| {
+                let phonemes = normalize_phonemes(token.phonemes.as_deref().unwrap_or_default());
+                (!phonemes.is_empty()).then_some(EnglishG2pToken {
+                    text: token.text,
+                    tag: token.tag,
+                    phonemes,
+                })
+            })
+            .collect::<Vec<_>>();
+        if tokens.iter().any(|token| {
+            token.text.chars().any(char::is_alphanumeric) && token.phonemes.contains('❓')
+        }) {
+            return Err("English G2P left an unresolved word".to_string());
         }
-        if !pending.is_empty() {
-            chunks.push(make_chunk(pending)?);
-        }
-        if chunks.is_empty() {
+        let phonemes = normalize_phonemes(&phonemes)
+            .replace('❓', "")
+            .trim()
+            .to_string();
+        if phonemes.is_empty() || tokens.is_empty() {
             return Err("English G2P produced no phonemes".to_string());
         }
-        Ok(chunks)
+        Ok(EnglishG2pOutput { phonemes, tokens })
     }
+}
 
-    fn repair_tokens(&self, tokens: &mut [MToken]) -> Result<(), String> {
-        for token in tokens.iter_mut() {
-            if matches!(
-                token.text.as_str(),
-                ";" | ":" | "," | "." | "!" | "?" | "—" | "…"
-            ) {
-                token.phonemes = Some(token.text.clone());
-            }
-        }
-        for index in 0..tokens.len() {
-            let raw = tokens[index].text.replace(',', "");
-            if index > 0 && tokens[index - 1].text == "$" {
-                let Ok(value) = raw.parse::<f64>() else {
-                    continue;
-                };
-                let spoken = Num2Words::new(value)
-                    .currency(Currency::DOLLAR)
-                    .to_words()
-                    .map_err(|error| format!("failed to normalize currency: {error}"))?;
-                tokens[index - 1].phonemes = Some(String::new());
-                tokens[index].phonemes = Some(self.phonemize_phrase(&spoken)?);
-            } else if raw.len() == 4
-                && raw.chars().all(|character| character.is_ascii_digit())
-                && let Ok(value) = raw.parse::<i64>()
-                && (1000..=2999).contains(&value)
-            {
-                let spoken = Num2Words::new(value)
-                    .year()
-                    .to_words()
-                    .map_err(|error| format!("failed to normalize year: {error}"))?;
-                tokens[index].phonemes = Some(self.phonemize_phrase(&spoken)?);
-            }
-        }
-        Ok(())
-    }
-
-    fn phonemize_phrase(&self, value: &str) -> Result<String, String> {
-        self.g2p
-            .g2p(value)
-            .map(|(phonemes, _)| phonemes.trim().to_string())
-            .map_err(|error| format!("English G2P failed: {error}"))
+impl Default for EnglishG2p {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -108,104 +72,70 @@ fn normalize_for_g2p(value: &str) -> String {
         .collect()
 }
 
-fn make_chunk(tokens: Vec<MToken>) -> Result<FrontendChunk, String> {
-    let phonemes = tokens
-        .iter()
-        .map(|token| {
-            let mut value = token.phonemes.clone().unwrap_or_default();
-            if !token.whitespace.is_empty() {
-                value.push(' ');
-            }
-            value
+fn normalize_phonemes(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| {
+            !matches!(
+                *character,
+                '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}'
+            )
         })
         .collect::<String>()
         .trim()
-        .to_string();
-    if phonemes.is_empty() || phonemes.chars().count() > MAX_PHONEMES {
-        return Err("English G2P produced an invalid phoneme chunk".to_string());
-    }
-    Ok(FrontendChunk { tokens })
-}
-
-fn repair_whitespace(text: &str, tokens: &mut [MToken]) {
-    let mut cursor = 0;
-    for token in tokens {
-        let Some(relative) = text[cursor..].find(token.text.trim()) else {
-            token.whitespace.clear();
-            continue;
-        };
-        let end = cursor + relative + token.text.trim().len();
-        let whitespace = text[end..].chars().next().is_some_and(char::is_whitespace);
-        token.whitespace = if whitespace {
-            " ".to_string()
-        } else {
-            String::new()
-        };
-        cursor = end;
-    }
+        .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn lexical(output: &EnglishG2pOutput) -> Vec<&EnglishG2pToken> {
+        output
+            .tokens
+            .iter()
+            .filter(|token| token.text.chars().any(char::is_alphanumeric))
+            .collect()
+    }
+
     #[test]
-    fn frontend_is_bounded_and_preserves_words() {
-        let chunks = EnglishFrontend::new()
-            .chunks("Hello, world. This is a narration test.")
+    fn contextual_words_keep_pos_and_order_for_risk_detection() {
+        let frontend = EnglishG2p::new();
+        let output = frontend
+            .phonemize(
+                "Record the record, then close the close handler. I read it and had read it.",
+            )
             .unwrap();
-        assert!(!chunks.is_empty());
-        assert!(
-            chunks
+        let tokens = lexical(&output);
+        assert_eq!(
+            tokens
                 .iter()
-                .flat_map(|chunk| &chunk.tokens)
-                .any(|token| token.text.contains("Hello"))
+                .filter(|token| token.text.eq_ignore_ascii_case("record"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|token| token.text.eq_ignore_ascii_case("close"))
+                .count(),
+            2
+        );
+        assert!(
+            tokens
+                .iter()
+                .filter(|token| matches!(
+                    token.text.to_ascii_lowercase().as_str(),
+                    "record" | "close" | "read"
+                ))
+                .all(|token| !token.tag.is_empty() && !token.phonemes.is_empty())
         );
     }
 
     #[test]
-    fn frontend_repairs_common_python_misaki_semantics() {
-        let frontend = EnglishFrontend::new();
-        let chunks = frontend.chunks("Café — it’s $12.50 in 2026.").unwrap();
-        let tokens = chunks
-            .iter()
-            .flat_map(|chunk| &chunk.tokens)
-            .collect::<Vec<_>>();
-        assert!(tokens.iter().any(|token| token.text == "Cafe"));
-        assert!(tokens.iter().any(|token| token.text == "it's"));
-        assert_eq!(
-            tokens
-                .iter()
-                .find(|token| token.text == "—")
-                .and_then(|token| token.phonemes.as_deref()),
-            Some("—")
-        );
-        assert_eq!(
-            tokens
-                .iter()
-                .find(|token| token.text == ".")
-                .and_then(|token| token.phonemes.as_deref()),
-            Some(".")
-        );
-        let currency = tokens
-            .iter()
-            .find(|token| token.text == "12.50")
-            .and_then(|token| token.phonemes.as_deref())
-            .unwrap();
-        assert_eq!(
-            currency,
-            frontend
-                .phonemize_phrase("twelve dollars and fifty cents")
-                .unwrap()
-        );
-        let year = tokens
-            .iter()
-            .find(|token| token.text == "2026")
-            .and_then(|token| token.phonemes.as_deref())
-            .unwrap();
-        assert_eq!(
-            year,
-            frontend.phonemize_phrase("twenty twenty-six").unwrap()
-        );
+    fn local_rules_phonemize_oov_words_without_unknown_markers() {
+        let output = EnglishG2p::new().phonemize("xyzqwop").unwrap();
+        assert!(!output.phonemes.contains('❓'));
+        assert!(!output.phonemes.trim().is_empty());
     }
 }

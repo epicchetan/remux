@@ -9,6 +9,8 @@ they describe. The Rust runtime moved from `cli/` to `crates/remux/` on
 ## Statuses
 
 - `Active Spec`: still informs ongoing implementation or design.
+- `R&D evidence`: experiments and measurements retained as design evidence;
+  a linked active spec owns normative implementation decisions.
 - `Implemented`: the pass landed; use it for rationale and verify details against code.
 - `Archived`: historical phase plan, superseded by later implementation or architecture docs.
 
@@ -24,9 +26,9 @@ Canonical code: ...
 
 | Spec | Status | Notes |
 | --- | --- | --- |
-| [codex/assistant-narration.md](codex/assistant-narration.md) | Active Spec | On-demand cached narration for completed assistant responses, entered next to Fork and controlled through block seek, play/pause, speed, and close actions in the composer. |
-| [codex/assistant-narration-planning-optimization.md](codex/assistant-narration-planning-optimization.md) | Active Spec | Production path and automated phases 1–6 coverage implemented: exact Codex prompt/schema, Sol Priority batching, deterministic source mapping, Kokoro-native timing, DOM-range word paint, structural glow CSS, and version migration. iOS device and opt-in rollout benchmarks remain. |
-| [codex/narration-onnx-synthesis.md](codex/narration-onnx-synthesis.md) | Active Spec | Duration-aware concurrent ONNX Kokoro synthesis, extension/core ownership boundaries, source/planner contract v3, and removal of unused code/table subtargets while preserving cached artifact compatibility. |
+| [codex/assistant-narration.md](codex/assistant-narration.md) | Archived | Initial behavior and UI rationale; provider, RPC, cache, and readiness details are superseded by the implemented Narrate v5 spec. |
+| [codex/assistant-narration-planning-optimization.md](codex/assistant-narration-planning-optimization.md) | Archived | Historical v3 planning and highlighting rationale, superseded by the server-owned-group v5 replacement spec. |
+| [codex/narration-onnx-synthesis.md](codex/narration-onnx-synthesis.md) | Archived | Historical finite-task and native Kokoro rationale, superseded by task-v6 streaming in the Narrate v5 spec. |
 | [codex/thread-operation-queue.md](codex/thread-operation-queue.md) | Implemented | Hidden-when-empty process-memory queue for pending messages and compactions, with direct idle dispatch, steering, delete, and cancel-on-interrupt semantics. |
 | [codex/server-authoritative-transcript-windows.md](codex/server-authoritative-transcript-windows.md) | Active Spec | Version 2 implementation landed: self-contained turn frames, grouped work/detail disclosure, incremental rollout indexing, native lifecycle resume, window sliding, safe-area ownership, and Version 1 compatibility. Physical iOS validation and the observation-release cleanup remain. |
 | [codex/transcript-identity-reconciliation.md](codex/transcript-identity-reconciliation.md) | Active Spec | Canonical item identity model for persisted and live transcript items. |
@@ -40,7 +42,12 @@ Canonical code: ...
 
 | Spec | Status | Notes |
 | --- | --- | --- |
-| [narrate-service.md](narrate-service.md) | Implemented | Reusable Narrate-owned transcript, cache, progressive audio, and Kokoro pipeline; duplex extension RPC; Codex structured-inference gateway and temporary UI compatibility proxy. |
+| [narrate-local-g2p-sparse-patches.md](narrate-local-g2p-sparse-patches.md) | Implemented — Pending Live Validation | Hard v6 replacement: native Misaki owns phonemes and alignment, a reviewed lexicon stabilizes recurring names, and one whole-document Sol stream returns only id-addressed spoken-text patches and required summaries. |
+| [narrate-streaming-g2p.md](narrate-streaming-g2p.md) | Archived | Historical v5 complete model-generated token/phoneme contract, superseded by the local-G2P sparse-patch v6 implementation. |
+| [narrate-streaming-g2p-contract-rd.md](narrate-streaming-g2p-contract-rd.md) | R&D evidence | Real-thread contract/model benchmark that found the v4 cardinality failure, then live sparse-contract fragility, and motivated server-owned token structure, explicit risk metadata, and removal of repair turns. |
+| [narrate-streaming-g2p-rd.md](narrate-streaming-g2p-rd.md) | R&D evidence | Earlier model/contract/latency experiments supporting whole-document streaming and showing that complete per-token phonemes are viable; later contract conclusions are normative in the v5 spec. |
+| [narrate-baseline-patch-rd.md](narrate-baseline-patch-rd.md) | R&D evidence | Follow-up experiment where local G2P owns every phoneme and alignment while Sol returns only id-addressed spoken-text patches and required summaries; implemented in v6 with native Misaki. |
+| [narrate-service.md](narrate-service.md) | Archived | Historical service extraction and temporary Codex compatibility proxy, superseded by the direct v5 hard cut. |
 
 ## Terminal Specs
 

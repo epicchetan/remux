@@ -83,8 +83,7 @@ fn load_or_generate_token(root_dir: &Path) -> Result<TokenLoad, String> {
 fn generate_and_persist(path: &Path) -> Result<TokenLoad, String> {
     let token = generate_token()?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| format!("{}: {err}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
     }
     // Atomic temp + rename (the runstate.rs pattern) with 0600 from birth so
     // the token is never observable mid-write or group/other-readable.
@@ -100,8 +99,7 @@ fn generate_and_persist(path: &Path) -> Result<TokenLoad, String> {
         .and_then(|_| file.write_all(b"\n"))
         .map_err(|err| format!("{}: {err}", temp.display()))?;
     drop(file);
-    std::fs::rename(&temp, path)
-        .map_err(|err| format!("{}: {err}", path.display()))?;
+    std::fs::rename(&temp, path).map_err(|err| format!("{}: {err}", path.display()))?;
     Ok(TokenLoad {
         token,
         generated: true,
@@ -120,8 +118,7 @@ fn generate_token() -> Result<String, String> {
 }
 
 fn tighten_permissions(path: &Path) -> Result<bool, String> {
-    let metadata =
-        std::fs::metadata(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let metadata = std::fs::metadata(path).map_err(|err| format!("{}: {err}", path.display()))?;
     let mode = metadata.permissions().mode();
     if mode & 0o077 == 0 {
         return Ok(false);
@@ -135,10 +132,7 @@ fn tighten_permissions(path: &Path) -> Result<bool, String> {
 /// device-pairing story, and the rollout's answer to "the file doesn't exist
 /// until auth-aware code first runs".
 pub fn token_command(root_dir: &Path) -> Result<String, String> {
-    let load = resolve_token(
-        std::env::var("REMUX_AUTH_TOKEN").ok().as_deref(),
-        root_dir,
-    )?;
+    let load = resolve_token(std::env::var("REMUX_AUTH_TOKEN").ok().as_deref(), root_dir)?;
     Ok(load.token)
 }
 
@@ -271,7 +265,10 @@ mod tests {
         let first = resolve_token(None, root.path()).unwrap();
         assert!(first.generated);
         assert_eq!(first.token.len(), 64);
-        assert!(first.token.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(first
+            .token
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
 
         let path = root.path().join(TOKEN_RELATIVE_PATH);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();

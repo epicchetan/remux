@@ -587,12 +587,12 @@ These calls never enter the Remux socket and never influence backend connection 
 | `remux/codex/transcript/resources/read` | Bounded local work; per-thread transcript/cache read | 20s / 30s | Route only | Read; cache mutation remains synchronized |
 | `remux/codex/thread/resources/read` local-only resources | Bounded local work; per-thread read | 3s / 5s | Route only | Read |
 | `remux/codex/thread/resources/read` app-server-backed resources | Downstream ACK; per-thread/app-server read pool | 15s / 20s | Route only | Read; batch subrequests share the one deadline |
-| `remux/codex/narration/resources/read` | Local-immediate; artifact read | 1s / 3s | Probe connection | Read |
-| `remux/codex/narration/audio/read` | Bounded local work/transfer; Codex FS pool/artifact | 30s / 60s | Operation only | Read; existing 8MiB WAV cap |
+| `remux/narrate/narration/resources/read` | Local-immediate direct Narrate artifact read | 1s / 3s | Probe connection | Read |
+| `remux/narrate/narration/audio/read` | Bounded local work/transfer; Narrate artifact lane | 30s / 60s | Operation only | Read; 8MiB WAV cap |
 | `remux/codex/composer/config/write` | Bounded local work; global config mutation | 3s / 5s | Probe connection | Reconcile by config read; identical state write is convergent |
 | `remux/codex/thread/queue/remove` | Local-immediate; thread FIFO | 1s / 3s | Probe connection | Reconcile queue; missing operation is accepted |
-| `remux/codex/narration/cancel` | Local-immediate admission; artifact/global narration lane | 1s / 3s | Probe connection | Reconcile narration state; detached interrupt is best effort |
-| `remux/codex/narration/start` | Job ACK after bounded validation; global narration admission/artifact | 10s / 15s | Probe connection | Dedupe only within the same extension generation by deterministic artifact/operation ID; request/job caps below apply; completed disk cache remains reusable |
+| `remux/narrate/narration/cancel` | Local-immediate direct Narrate admission; artifact/global narration lane | 1s / 3s | Probe connection | Reconcile narration state; primary, repair, and compute cancellation are idempotent |
+| `remux/narrate/narration/start` | Job ACK after exact Sol Priority preflight and bounded validation; global narration admission/artifact | 30s / 35s | Probe connection | Same-key active jobs join; only ready manifest-v4 cache artifacts are reusable |
 | `remux/codex/thread/queue/run-now` | Downstream ACK when active; thread FIFO | 25s / 30s | Route only | On ambiguous steer, quarantine as `outcomeUnknown`; do not retain/redrive until authoritative reconciliation |
 | `remux/codex/thread/message/send` | Downstream ACK or local queue acceptance; thread FIFO | 25s / 30s | Route only | Never until one client operation ID dedupes both queue admission and downstream turn creation |
 | `remux/codex/thread/compact` | Downstream ACK or local queue acceptance; thread FIFO | 25s / 30s | Route only | Never until operation ID dedupes queue and direct paths |
@@ -719,7 +719,7 @@ Notifications have a separate mandatory policy with `lane`, `orderingKey`, `deli
 | Runtime → app `remux/system/resources/didSample` | Coalesce latest sample per client |
 | Runtime → app `remux/fs/didChange` | Coalesce union of paths/dirty roots within bounds; overflow degrades to a root/global invalidation |
 | Codex → app `remux/codex/resources/invalidated` | Coalesce by resource key; receiver re-reads authoritative resource |
-| Codex → app `remux/codex/narration/updated` | Coalesce latest by artifact key |
+| Narrate → app `remux/narrate/narration/updated` | Coalesce latest by artifact key; viewer re-reads the authoritative progressive resource |
 | Terminal → app `remux/terminal/session/output` | Replayable sequenced per session; explicit gap/reattach on loss or overflow |
 | Terminal → app `remux/terminal/session/exited` | Must-deliver-or-recover-by-attach; final session barrier |
 | Extension → runtime `remux/notifications/request` | Current notification form: admit to bounded notification-control worker or journal explicit admission failure by stable intent ID; stable intent ID dedupes Expo sends |

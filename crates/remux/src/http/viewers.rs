@@ -87,17 +87,7 @@ impl ViewerProvider {
                 .await,
             );
         }
-        Some(
-            serve_static_viewer(
-                &self.entry,
-                &self.route,
-                pathname,
-                false,
-                headers,
-                None,
-            )
-            .await,
-        )
+        Some(serve_static_viewer(&self.entry, &self.route, pathname, false, headers, None).await)
     }
 }
 
@@ -367,11 +357,8 @@ mod tests {
 <link href='/viewers/codex/assets/app.css'>
 <img srcset="/viewers/codex/a.png 1x, https://example.com/b.png 2x">
 <a href="https://example.com/viewers/codex/nope">external</a>"#;
-        let rebased = rebase_entry_html(
-            html,
-            "/viewers/codex",
-            "/viewers/codex/_bundle/sha256-test",
-        );
+        let rebased =
+            rebase_entry_html(html, "/viewers/codex", "/viewers/codex/_bundle/sha256-test");
         assert!(rebased.contains("/viewers/codex/_bundle/sha256-test/assets/app.js"));
         assert!(rebased.contains("/viewers/codex/_bundle/sha256-test/assets/app.css"));
         assert!(rebased.contains("/viewers/codex/_bundle/sha256-test/a.png 1x"));

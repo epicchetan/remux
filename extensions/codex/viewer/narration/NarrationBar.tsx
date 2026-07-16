@@ -5,12 +5,11 @@ import { useNarrationStore } from './store';
 export function NarrationBar() {
   const cancel = useNarrationStore((state) => state.cancel);
   const close = useNarrationStore((state) => state.close);
-  const completed = useNarrationStore((state) => state.completedUnits);
   const error = useNarrationStore((state) => state.error);
   const phase = useNarrationStore((state) => state.phase);
+  const progress = useNarrationStore((state) => state.progress);
   const retry = useNarrationStore((state) => state.retry);
-  const stage = useNarrationStore((state) => state.stage);
-  const total = useNarrationStore((state) => state.totalUnits);
+  const status = useNarrationStore((state) => state.status);
 
   if (phase !== 'preparing' && phase !== 'failed') return null;
 
@@ -33,17 +32,19 @@ export function NarrationBar() {
     );
   }
 
-  const progress = stage === 'synthesizing' && completed !== null && total
-    ? ` ${Math.round((completed / total) * 100)}%`
+  const percent = progress?.totalBlocks
+    ? ` ${Math.round((progress.committedBlocks / progress.totalBlocks) * 100)}%`
     : '';
-  const label = stage === 'synthesizing'
-    ? `Generating audio${progress}`
-    : 'Writing script';
+  const label = status === 'finalizing'
+    ? 'Finishing audio'
+    : status === 'streaming'
+      ? `Streaming audio${percent}`
+      : 'Writing the first spoken group';
 
   return (
     <div className="remux-composer-context-row remux-narration-bar" data-remux-no-composer-focus>
       <span className="remux-narration-label">
-        {stage === 'planning' ? <AudioLines className="size-3.5" /> : <Loader2 className="size-3.5 animate-spin" />}
+        {status === 'planning' ? <AudioLines className="size-3.5" /> : <Loader2 className="size-3.5 animate-spin" />}
         <span>Preparing narration · {label}</span>
       </span>
       <button

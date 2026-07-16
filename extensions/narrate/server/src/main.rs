@@ -1,6 +1,5 @@
 mod narration;
-mod planning;
-mod source_mapping;
+mod streaming;
 mod synthesis_profile;
 mod util;
 
@@ -10,7 +9,7 @@ use std::sync::{Arc, mpsc};
 
 use remux_compute::Registry as ComputeRegistry;
 use remux_extension_rpc::Peer as ExtensionRpcPeer;
-use remux_tts::KokoroSynthesis;
+use remux_tts::KokoroStreamingSynthesis;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -32,7 +31,7 @@ struct Request {
 }
 
 fn main() {
-    let compute = match ComputeRegistry::new().register::<KokoroSynthesis>() {
+    let compute = match ComputeRegistry::new().register::<KokoroStreamingSynthesis>() {
         Ok(compute) => compute,
         Err(error) => {
             eprintln!("compute registration failed: {error}");

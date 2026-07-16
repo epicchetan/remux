@@ -1,9 +1,11 @@
-import type { CodexNarrationAudioChunk, CodexNarrationManifest } from '../../shared/narration';
+import type { CodexNarrationAudioChunk, CodexNarrationTimeline } from '../../shared/narration';
 import { readNarrationAudio } from '../ipc/narration';
 
 export type NarrationAudioCallbacks = {
+  onBuffering: () => void;
   onEnded: () => void;
   onError: (message: string) => void;
+  onPlaying: () => void;
   onTime: (globalTime: number) => void;
 };
 
@@ -12,10 +14,13 @@ export class NarrationAudioEngine {
   private audio: HTMLAudioElement | null = null;
   private callbacks: NarrationAudioCallbacks;
   private chunkIndex = 0;
-  private manifest: CodexNarrationManifest | null = null;
+  private complete = false;
+  private loadEpoch = 0;
   private objectUrls = new Map<string, string>();
+  private playIntent = false;
   private playbackRate = 1;
   private raf = 0;
+  private timeline: CodexNarrationTimeline | null = null;
 
   constructor(callbacks: NarrationAudioCallbacks) {
     this.callbacks = callbacks;
@@ -25,46 +30,73 @@ export class NarrationAudioEngine {
     this.callbacks = callbacks;
   }
 
-  async prepare(artifactKey: string, manifest: CodexNarrationManifest) {
-    if (this.artifactKey !== artifactKey || this.manifest !== manifest) {
+  async update(artifactKey: string, timeline: CodexNarrationTimeline) {
+    if (this.artifactKey !== artifactKey) {
+      const playIntent = this.playIntent;
       this.close();
+      this.playIntent = playIntent;
       this.artifactKey = artifactKey;
-      this.manifest = manifest;
-      await this.loadChunk(0);
-      void this.preloadChunk(1);
-    } else if (!this.audio) {
-      await this.loadChunk(this.chunkIndex);
+    } else if (this.timeline && !isImmutablePrefix(this.timeline, timeline)) {
+      throw new Error('Narration segment prefix changed after publication');
     }
+    const previousLength = this.timeline?.chunks.length ?? 0;
+    this.timeline = timeline;
+    this.complete = timeline.complete;
+
+    if (!this.audio && timeline.chunks.length > 0 && (this.chunkIndex === 0 || previousLength === 0)) {
+      await this.loadChunk(this.chunkIndex);
+      if (this.playIntent) await this.resumeLoadedAudio();
+    } else if (
+      this.audio?.ended &&
+      this.playIntent &&
+      this.chunkIndex + 1 < timeline.chunks.length
+    ) {
+      await this.loadChunk(this.chunkIndex + 1);
+      await this.resumeLoadedAudio();
+    }
+    void this.preloadChunk(this.chunkIndex + 1);
   }
 
-  async play(artifactKey: string, manifest: CodexNarrationManifest) {
-    await this.prepare(artifactKey, manifest);
-    if (!this.audio) return;
-    if (this.audio.ended) this.audio.currentTime = 0;
-    this.audio.playbackRate = this.playbackRate;
-    this.audio.preservesPitch = true;
-    await this.audio.play();
-    this.startClock();
+  async prepare(artifactKey: string, timeline: CodexNarrationTimeline) {
+    await this.update(artifactKey, timeline);
+    if (!this.audio && timeline.chunks[this.chunkIndex]) await this.loadChunk(this.chunkIndex);
+  }
+
+  async play(artifactKey: string, timeline: CodexNarrationTimeline) {
+    this.playIntent = true;
+    await this.prepare(artifactKey, timeline);
+    if (!this.playIntent) return;
+    if (!this.audio) {
+      this.callbacks.onBuffering();
+      return;
+    }
+    if (this.audio.ended && this.chunkIndex + 1 >= timeline.chunks.length) {
+      this.audio.currentTime = 0;
+    }
+    await this.resumeLoadedAudio();
   }
 
   pause() {
+    this.playIntent = false;
     this.audio?.pause();
     this.stopClock();
     this.publishTime();
   }
 
   async seek(globalTime: number, keepPlaying: boolean) {
-    const manifest = this.manifest;
-    const artifactKey = this.artifactKey;
-    if (!manifest || !artifactKey) return;
-    const chunkIndex = Math.max(0, manifest.chunks.findIndex((chunk, index) =>
-      globalTime >= chunk.start && (globalTime < chunk.end || index === manifest.chunks.length - 1)));
-    await this.loadChunk(chunkIndex);
-    if (!this.audio) return;
-    const chunk = manifest.chunks[chunkIndex];
-    this.audio.currentTime = Math.max(0, Math.min(globalTime - chunk.start, chunk.end - chunk.start));
+    const timeline = this.timeline;
+    if (!timeline || !this.artifactKey || timeline.chunks.length === 0) return;
+    this.playIntent = keepPlaying;
+    const bounded = Math.max(0, Math.min(globalTime, timeline.durationSeconds));
+    const found = timeline.chunks.findIndex((chunk, index) =>
+      bounded >= chunk.start && (bounded < chunk.end || index === timeline.chunks.length - 1));
+    const chunkIndex = Math.max(0, found);
+    const audio = await this.loadChunk(chunkIndex);
+    if (!audio || this.audio !== audio) return;
+    const chunk = timeline.chunks[chunkIndex];
+    audio.currentTime = Math.max(0, Math.min(bounded - chunk.start, chunk.end - chunk.start));
     this.publishTime();
-    if (keepPlaying) await this.play(artifactKey, manifest);
+    if (keepPlaying) await this.resumeLoadedAudio();
   }
 
   setPlaybackRate(rate: number) {
@@ -73,6 +105,8 @@ export class NarrationAudioEngine {
   }
 
   close() {
+    this.playIntent = false;
+    this.loadEpoch += 1;
     this.stopClock();
     if (this.audio) {
       this.audio.pause();
@@ -83,56 +117,76 @@ export class NarrationAudioEngine {
     this.objectUrls.clear();
     this.audio = null;
     this.artifactKey = null;
-    this.manifest = null;
     this.chunkIndex = 0;
+    this.complete = false;
+    this.timeline = null;
+  }
+
+  private async resumeLoadedAudio() {
+    if (!this.audio || !this.playIntent) return;
+    this.audio.playbackRate = this.playbackRate;
+    this.audio.preservesPitch = true;
+    await this.audio.play();
+    this.callbacks.onPlaying();
+    this.startClock();
   }
 
   private async loadChunk(index: number) {
-    const manifest = this.manifest;
+    const chunk = this.timeline?.chunks[index];
     const artifactKey = this.artifactKey;
-    const chunk = manifest?.chunks[index];
-    if (!manifest || !artifactKey || !chunk) return;
+    if (!artifactKey || !chunk) return;
+    const epoch = ++this.loadEpoch;
     const url = await this.chunkUrl(artifactKey, chunk);
+    if (epoch !== this.loadEpoch) return null;
+    const audio = new Audio(url);
+    audio.preload = 'auto';
+    audio.playbackRate = this.playbackRate;
+    audio.preservesPitch = true;
+    await waitForAudioReady(audio);
+    if (epoch !== this.loadEpoch) {
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
+      return null;
+    }
     if (this.audio) {
       this.audio.pause();
       this.audio.onended = null;
       this.audio.onerror = null;
     }
-    const audio = new Audio(url);
-    audio.preload = 'auto';
-    audio.playbackRate = this.playbackRate;
-    audio.preservesPitch = true;
     audio.onended = () => void this.advanceChunk();
     audio.onerror = () => this.callbacks.onError('Narration audio could not be loaded');
     this.audio = audio;
     this.chunkIndex = index;
-    await waitForAudioReady(audio);
     this.releaseDistantChunks(index);
     void this.preloadChunk(index + 1);
+    return audio;
   }
 
   private async advanceChunk() {
-    const manifest = this.manifest;
-    const artifactKey = this.artifactKey;
-    if (!manifest || !artifactKey || this.chunkIndex + 1 >= manifest.chunks.length) {
+    if (!this.timeline || !this.artifactKey) return;
+    if (this.chunkIndex + 1 >= this.timeline.chunks.length) {
       this.stopClock();
-      this.callbacks.onEnded();
+      if (this.complete) {
+        this.playIntent = false;
+        this.callbacks.onEnded();
+      } else {
+        this.callbacks.onBuffering();
+      }
       return;
     }
     try {
       await this.loadChunk(this.chunkIndex + 1);
-      await this.play(artifactKey, manifest);
+      if (this.playIntent) await this.resumeLoadedAudio();
     } catch (error) {
       this.callbacks.onError(error instanceof Error ? error.message : 'Narration audio could not continue');
     }
   }
 
   private async preloadChunk(index: number) {
-    const manifest = this.manifest;
-    const artifactKey = this.artifactKey;
-    const chunk = manifest?.chunks[index];
-    if (manifest && artifactKey && chunk) {
-      try { await this.chunkUrl(artifactKey, chunk); } catch { /* Foreground loading reports errors. */ }
+    const chunk = this.timeline?.chunks[index];
+    if (this.artifactKey && chunk) {
+      try { await this.chunkUrl(this.artifactKey, chunk); } catch { /* Foreground loading reports errors. */ }
     }
   }
 
@@ -148,8 +202,8 @@ export class NarrationAudioEngine {
 
   private releaseDistantChunks(index: number) {
     const keep = new Set([
-      this.manifest?.chunks[index]?.id,
-      this.manifest?.chunks[index + 1]?.id,
+      this.timeline?.chunks[index]?.id,
+      this.timeline?.chunks[index + 1]?.id,
     ].filter((id): id is string => Boolean(id)));
     for (const [chunkId, url] of this.objectUrls) {
       if (!keep.has(chunkId)) {
@@ -175,9 +229,15 @@ export class NarrationAudioEngine {
   }
 
   private publishTime() {
-    const chunk = this.manifest?.chunks[this.chunkIndex];
+    const chunk = this.timeline?.chunks[this.chunkIndex];
     this.callbacks.onTime((chunk?.start ?? 0) + (this.audio?.currentTime ?? 0));
   }
+}
+
+function isImmutablePrefix(previous: CodexNarrationTimeline, next: CodexNarrationTimeline) {
+  if (next.chunks.length < previous.chunks.length) return false;
+  return previous.segments.every((segment, index) =>
+    JSON.stringify(segment) === JSON.stringify(next.segments[index]));
 }
 
 function decodeBase64(value: string) {

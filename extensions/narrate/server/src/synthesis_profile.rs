@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use remux_tts::TASK_VERSION;
+use std::collections::HashMap;
+
+use remux_tts::STREAMING_TASK_VERSION;
 use serde_json::{Value, json};
 
 const MODEL_MANIFEST: &str = include_str!(concat!(
@@ -11,17 +13,17 @@ const MODEL_MANIFEST: &str = include_str!(concat!(
 #[derive(Clone, Debug)]
 pub(crate) struct NarrationSynthesisProfile {
     pub(crate) descriptor: Value,
-    pub(crate) model_assets: Value,
+    pub(crate) model_assets: HashMap<String, String>,
     pub(crate) model_dir: PathBuf,
 }
 
 impl NarrationSynthesisProfile {
     pub(crate) fn assets_ready(&self) -> bool {
-        if self.model_assets.as_object().is_none_or(|assets| {
-            assets
-                .keys()
-                .any(|name| !self.model_dir.join(name).is_file())
-        }) {
+        if self
+            .model_assets
+            .keys()
+            .any(|name| !self.model_dir.join(name).is_file())
+        {
             return false;
         }
         let runtime_manifest = std::fs::read(self.model_dir.join("asset-manifest.json"))
@@ -30,7 +32,7 @@ impl NarrationSynthesisProfile {
         runtime_manifest
             .as_ref()
             .and_then(|manifest| manifest.get("assets"))
-            == Some(&self.model_assets)
+            == serde_json::to_value(&self.model_assets).ok().as_ref()
     }
 }
 
@@ -46,30 +48,33 @@ pub(crate) fn resolve_synthesis_profile(
             .and_then(Value::as_str)
             .ok_or_else(|| format!("narration model manifest is missing {field}"))
     };
-    let assets = manifest
-        .get("assets")
-        .filter(|value| value.is_object())
-        .cloned()
-        .ok_or_else(|| "narration model manifest is missing assets".to_string())?;
+    let assets: HashMap<String, String> = serde_json::from_value(
+        manifest
+            .get("assets")
+            .filter(|value| value.is_object())
+            .cloned()
+            .ok_or_else(|| "narration model manifest is missing assets".to_string())?,
+    )
+    .map_err(|error| format!("invalid narration model assets: {error}"))?;
     let asset_version = string("assetVersion")?;
     let descriptor = json!({
         "provider": "onnxruntime-rust",
         "model": string("model")?,
         "modelRevision": string("modelRevision")?,
-        "modelAssetSha256": assets.get("model.onnx").cloned().unwrap_or(Value::Null),
+        "modelAssetSha256": assets.get("model.onnx").cloned().map(Value::from).unwrap_or(Value::Null),
         "voice": string("voice")?,
-        "voiceAssetSha256": assets.get("af_heart.npy").cloned().unwrap_or(Value::Null),
-        "vocabAssetSha256": assets.get("vocab.json").cloned().unwrap_or(Value::Null),
+        "voiceAssetSha256": assets.get("af_heart.npy").cloned().map(Value::from).unwrap_or(Value::Null),
+        "vocabAssetSha256": assets.get("vocab.json").cloned().map(Value::from).unwrap_or(Value::Null),
         "exportVersion": manifest.get("exportVersion").cloned().unwrap_or(Value::Null),
         "onnxOpset": manifest.get("onnxOpset").cloned().unwrap_or(Value::Null),
         "onnxRuntimeVersion": string("onnxRuntimeVersion")?,
-        "frontend": "remux-english-v1+misaki-rs@0.3.0-us-no-fallback",
+        "frontend": "remux-misaki-local-g2p-v3+sparse-sol-text-patches",
         "precision": string("precision")?,
         "sampleRate": manifest.get("sampleRate").cloned().unwrap_or(Value::Null),
-        "optionsVersion": "6-progressive-segments",
-        "execution": "remux-compute-shared-session-unit-parallel",
-        "taskVersion": TASK_VERSION,
-        "workerProtocolVersion": 4,
+        "optionsVersion": "9-local-g2p-sparse-patches",
+        "execution": "remux-compute-streaming-spool",
+        "taskVersion": STREAMING_TASK_VERSION,
+        "workerProtocolVersion": 7,
     });
     let primary = remux_root
         .join(".remux")
@@ -101,10 +106,10 @@ mod tests {
         assert_eq!(profile.descriptor["provider"], "onnxruntime-rust");
         assert_eq!(
             profile.descriptor["optionsVersion"],
-            "6-progressive-segments"
+            "9-local-g2p-sparse-patches"
         );
-        assert_eq!(profile.descriptor["taskVersion"], TASK_VERSION);
-        assert_eq!(profile.descriptor["workerProtocolVersion"], 4);
+        assert_eq!(profile.descriptor["taskVersion"], STREAMING_TASK_VERSION);
+        assert_eq!(profile.descriptor["workerProtocolVersion"], 7);
         assert!(profile.descriptor["modelAssetSha256"].as_str().is_some());
     }
 }

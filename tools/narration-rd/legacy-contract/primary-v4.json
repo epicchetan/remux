@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "g"],
+  "properties": {
+    "v": { "type": "integer", "const": 4 },
+    "g": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 512,
+      "items": { "$ref": "#/$defs/group" }
+    }
+  },
+  "$defs": {
+    "group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["i", "b", "x", "r"],
+      "properties": {
+        "i": { "type": "integer", "minimum": 0 },
+        "b": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "x": { "type": "string", "minLength": 1, "maxLength": 16384 },
+        "r": { "type": "array", "items": { "$ref": "#/$defs/record" } }
+      }
+    },
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "n", "s", "b", "p"],
+      "properties": {
+        "x": { "type": "string", "minLength": 1 },
+        "n": { "type": "integer", "minimum": 0 },
+        "s": { "type": "array", "items": { "type": "integer", "minimum": 0 } },
+        "b": { "type": "array", "items": { "type": "integer", "minimum": 0 } },
+        "p": {
+          "anyOf": [
+            { "type": "null" },
+            { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } }
+          ]
+        }
+      }
+    }
+  }
+}

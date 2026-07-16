@@ -53,7 +53,8 @@ impl RemuxConfig {
     }
 
     pub fn log_retention_days(&self) -> u32 {
-        self.log_retention_days.unwrap_or(DEFAULT_LOG_RETENTION_DAYS)
+        self.log_retention_days
+            .unwrap_or(DEFAULT_LOG_RETENTION_DAYS)
     }
 
     pub fn resource_poll_seconds(&self) -> u32 {
@@ -84,9 +85,7 @@ pub fn load_remux_config(root_dir: &Path) -> Result<RemuxConfig, String> {
     let config_path = root_dir.join(CONFIG_RELATIVE_PATH);
     let source = match std::fs::read_to_string(&config_path) {
         Ok(source) => source,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(RemuxConfig::default())
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(RemuxConfig::default()),
         Err(err) => return Err(format!("{}: {err}", config_path.display())),
     };
     parse_remux_config_toml(&source, &config_path.to_string_lossy())
@@ -188,10 +187,7 @@ mod tests {
             RemuxConfig {
                 host: Some("127.0.0.1".to_string()),
                 port: Some(5999),
-                extension_roots: Some(vec![
-                    "extensions".to_string(),
-                    "/home/ubuntu".to_string()
-                ]),
+                extension_roots: Some(vec!["extensions".to_string(), "/home/ubuntu".to_string()]),
                 ..Default::default()
             }
         );
@@ -202,10 +198,7 @@ mod tests {
         let config =
             parse_remux_config_toml("extensionRoots = [\"extensions\"]", CONFIG_RELATIVE_PATH)
                 .unwrap();
-        assert_eq!(
-            config.extension_roots,
-            Some(vec!["extensions".to_string()])
-        );
+        assert_eq!(config.extension_roots, Some(vec!["extensions".to_string()]));
     }
 
     #[test]
@@ -213,15 +206,14 @@ mod tests {
         let err = parse_remux_config_toml("extensions = []", CONFIG_RELATIVE_PATH).unwrap_err();
         assert!(err.contains("unknown field `extensions`"), "{err}");
 
-        let err =
-            parse_remux_config_toml("[runtime]\nport = 1", CONFIG_RELATIVE_PATH).unwrap_err();
+        let err = parse_remux_config_toml("[runtime]\nport = 1", CONFIG_RELATIVE_PATH).unwrap_err();
         assert!(err.contains("unknown field `runtime`"), "{err}");
     }
 
     #[test]
     fn rejects_empty_extension_roots_entries() {
-        let err = parse_remux_config_toml("extension_roots = [\"\"]", CONFIG_RELATIVE_PATH)
-            .unwrap_err();
+        let err =
+            parse_remux_config_toml("extension_roots = [\"\"]", CONFIG_RELATIVE_PATH).unwrap_err();
         assert!(
             err.contains("extension_roots must be an array of non-empty strings"),
             "{err}"
@@ -248,7 +240,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.resource_poll_seconds(), 2);
-        assert_eq!(config.watchdog_stale_seconds(), 0, "0 disables the watchdog");
+        assert_eq!(
+            config.watchdog_stale_seconds(),
+            0,
+            "0 disables the watchdog"
+        );
         assert_eq!(config.extension_memory_ceiling_mb(), 512);
 
         let defaults = RemuxConfig::default();
@@ -265,19 +261,16 @@ mod tests {
     #[test]
     fn require_auth_defaults_on_and_parses_off() {
         assert!(RemuxConfig::default().require_auth());
-        let config =
-            parse_remux_config_toml("require_auth = false", CONFIG_RELATIVE_PATH).unwrap();
+        let config = parse_remux_config_toml("require_auth = false", CONFIG_RELATIVE_PATH).unwrap();
         assert!(!config.require_auth());
     }
 
     #[test]
     fn watch_autostart_parses_and_defaults_empty() {
         assert!(RemuxConfig::default().watch_autostart().is_empty());
-        let config = parse_remux_config_toml(
-            "watch = [\"ledger\", \"codex\"]",
-            CONFIG_RELATIVE_PATH,
-        )
-        .unwrap();
+        let config =
+            parse_remux_config_toml("watch = [\"ledger\", \"codex\"]", CONFIG_RELATIVE_PATH)
+                .unwrap();
         assert_eq!(config.watch_autostart(), ["ledger", "codex"]);
     }
 

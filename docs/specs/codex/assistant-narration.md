@@ -1,8 +1,11 @@
 # Codex Assistant Response Narration Spec
 
-Status: Active Spec
-Last verified: 2026-07-11
+Status: Archived — superseded by `docs/specs/narrate-streaming-g2p.md`
+Last verified: 2026-07-13
 Canonical code: `extensions/codex/viewer/transcript/components/assistantMessage.tsx`, `extensions/codex/viewer/composer/actions/ActionButtons.tsx`, `extensions/codex/viewer/composer/content.tsx`, `extensions/codex/viewer/transcript/components/markdown/`, `extensions/codex/server/src/app_server.rs`, `extensions/codex/server/src/main.rs`
+
+> Historical behavior/UI spec. Its provider, RPC, readiness, cache, and
+> compatibility contracts are not current after the direct Narrate v5 cutover.
 
 > This document describes the initial narration architecture and remains the
 > behavioral baseline. The versioned cleanup, alignment, viewport, and provider

@@ -11,10 +11,10 @@ import type {
   CodexNarrationStartResponse,
 } from '../../shared/narration';
 
-export const narrationAudioReadMethod = 'remux/codex/narration/audio/read';
-export const narrationCancelMethod = 'remux/codex/narration/cancel';
-export const narrationReadMethod = 'remux/codex/narration/resources/read';
-export const narrationStartMethod = 'remux/codex/narration/start';
+export const narrationAudioReadMethod = 'remux/narrate/narration/audio/read';
+export const narrationCancelMethod = 'remux/narrate/narration/cancel';
+export const narrationReadMethod = 'remux/narrate/narration/resources/read';
+export const narrationStartMethod = 'remux/narrate/narration/start';
 
 export const readNarration = (params: CodexNarrationReadParams) =>
   rpc.query<CodexNarrationReadResponse>(narrationReadMethod, params, {

@@ -1,6 +1,8 @@
-mod artifact;
+mod corpus;
 mod frontend;
 mod model;
+mod streaming_artifact;
+mod timing;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -9,88 +11,150 @@ use remux_compute::{Task, TaskContext};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use artifact::synthesize;
+pub use corpus::{
+    CorpusCompatibility, CorpusHint, CorpusOrigin, CorpusResolution, MisakiCorpus,
+    normalize_phonemes, validate_phonemes,
+};
+pub use frontend::{EnglishG2p, EnglishG2pOutput, EnglishG2pToken};
+pub use streaming_artifact::{atomic_json, group_digest, plan_digest, synthesize_stream};
 
-pub const TASK_NAME: &str = "tts.kokoro.synthesize";
-pub const TASK_VERSION: u32 = 4;
+pub const STREAMING_TASK_NAME: &str = "tts.kokoro.streaming";
+pub const STREAMING_TASK_VERSION: u32 = 7;
 
-pub struct KokoroSynthesis;
+pub struct KokoroStreamingSynthesis;
 
-impl Task for KokoroSynthesis {
-    const NAME: &'static str = TASK_NAME;
-    const VERSION: u32 = TASK_VERSION;
-    type Input = SynthesisRequest;
-    type Progress = SynthesisProgress;
-    type Output = SynthesisOutput;
+impl Task for KokoroStreamingSynthesis {
+    const NAME: &'static str = STREAMING_TASK_NAME;
+    const VERSION: u32 = STREAMING_TASK_VERSION;
+    type Input = KokoroStreamingRequest;
+    type Progress = StreamingProgress;
+    type Output = StreamingOutput;
 
     fn run(
         context: TaskContext<Self::Progress>,
         input: Self::Input,
     ) -> Result<Self::Output, String> {
-        synthesize(context, input)
+        synthesize_stream(context, input)
     }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SynthesisRequest {
-    pub alignment_key: String,
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KokoroStreamingRequest {
     pub artifact_key: String,
-    pub audio_key: String,
+    pub control_sha256: String,
+    pub deadline_ms: u64,
+    pub max_groups: usize,
     pub model_assets: HashMap<String, String>,
     pub model_dir: PathBuf,
-    pub output_dir: PathBuf,
-    pub profile: Value,
-    pub script: Script,
-    pub script_key: String,
-    pub source_document_key: String,
     pub source_hash: String,
+    pub staging_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StreamingControl {
+    pub version: u64,
+    pub artifact_key: String,
+    pub source_hash: String,
+    pub profile: Value,
+    pub block_ids: Vec<String>,
     pub targets: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Script {
-    pub units: Vec<ScriptUnit>,
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StreamingPlanFile {
+    pub version: u64,
+    pub artifact_key: String,
+    pub group_digest: String,
+    pub group: StreamingGroupPlan,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScriptUnit {
-    pub alignment_hints: Vec<AlignmentHint>,
-    pub block_id: String,
-    pub display_text: String,
-    pub fallback_target_ids: Vec<String>,
-    pub id: String,
-    pub mode: String,
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StreamingGroupPlan {
+    pub block_target_ids: Vec<Vec<String>>,
+    pub index: usize,
+    pub first_block: usize,
+    pub last_block: usize,
+    pub first_word_id: usize,
     pub spoken_text: String,
+    pub words: Vec<StreamingWordPlan>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AlignmentHint {
-    pub origin: Option<String>,
-    pub spoken_text: String,
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StreamingWordPlan {
+    pub id: usize,
+    pub text: String,
+    pub phonemes: String,
+    pub whitespace_after: bool,
     pub target_ids: Vec<String>,
+    pub source_block: usize,
+    pub mapping_origin: MappingOrigin,
+    pub pronunciation_origin: PronunciationOrigin,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MappingOrigin {
+    SourceWord,
+    SourceSemantic,
+    SummaryBlock,
+    BlockFallback,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PronunciationOrigin {
+    GoldCorpus,
+    SilverCorpus,
+    CompoundCorpus,
+    LocalG2p,
+    ReviewedLexicon,
+    SolAudioAlias,
+    SolTranscriptReplacement,
+    SolSummary,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StreamingCompletion {
+    pub version: u64,
+    pub group_count: usize,
+    pub last_block: usize,
+    pub plan_digest: String,
+    pub completed_text_digest: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
-pub enum SynthesisProgress {
-    Units { completed: usize, total: usize },
-    SegmentReady { segment: NarrationSegmentManifest },
+pub enum StreamingProgress {
+    ModelLoaded {
+        elapsed_ms: u64,
+    },
+    SegmentReady {
+        elapsed_ms: u64,
+        segment: StreamingSegment,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NarrationSegmentManifest {
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StreamingSegment {
     pub index: usize,
     pub audio: Value,
-    pub units: Vec<Value>,
+    pub audio_samples: usize,
     pub cues: Vec<Value>,
+    pub group: Value,
+    pub units: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SynthesisOutput {
-    pub manifest: Value,
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StreamingOutput {
+    pub duration_seconds: f64,
+    pub plan_digest: String,
+    pub segments: Vec<StreamingSegment>,
 }

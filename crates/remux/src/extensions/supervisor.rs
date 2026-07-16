@@ -79,6 +79,7 @@ pub trait ExtensionCtx: Send + Sync {
     fn handle_extension_request(
         &self,
         _source_extension_id: String,
+        _source_request_id: Value,
         method: String,
         _params: Option<Value>,
     ) -> BoxFuture<'_, RpcResult> {
@@ -87,6 +88,11 @@ pub trait ExtensionCtx: Send + Sync {
     /// Sends a notification to one opaque origin previously attached to an
     /// extension request. The default keeps fixture contexts source-compatible.
     fn send_to_origin(&self, _origin: &str, _message: Value) -> bool {
+        false
+    }
+    /// Routes a private progress frame emitted by a target extension back to
+    /// the extension that owns the correlated outbound request.
+    fn handle_extension_progress(&self, _target_extension_id: &str, _params: Value) -> bool {
         false
     }
     fn handle_extension_notification(&self, message: Value) -> BoxFuture<'_, bool>;
@@ -2024,7 +2030,12 @@ fn handle_protocol_line(
             });
             let result = match tokio::time::timeout(
                 EXTENSION_OUTBOUND_REQUEST_TIMEOUT,
-                ctx.handle_extension_request(extension_id.clone(), method.clone(), params),
+                ctx.handle_extension_request(
+                    extension_id.clone(),
+                    id.clone(),
+                    method.clone(),
+                    params,
+                ),
             )
             .await
             {
@@ -2051,6 +2062,16 @@ fn handle_protocol_line(
     }
 
     if message.get("method").and_then(Value::as_str).is_some() {
+        if message.get("method").and_then(Value::as_str) == Some("$/progress") {
+            if let Some(params) = message.get("params").cloned() {
+                if !ctx.handle_extension_progress(extension_id, params) {
+                    journal.warn(&format!(
+                        "[remux] ignored unowned progress frame from extension {extension_id}"
+                    ));
+                }
+            }
+            return;
+        }
         if message.get("method").and_then(Value::as_str) == Some(MANAGEMENT_LOG_METHOD) {
             match parse_management_log(&message, extension_id) {
                 Some((meta, line)) => logs.append(extension_id, meta, &line),

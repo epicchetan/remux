@@ -37,7 +37,7 @@ export function AssistantMessage({
   // Tap-to-seek is narration-only and block-level: while this message is the
   // playback target, tapping a narrated block seeks the audio to its start.
   const narrationSeekable = narrationTargetMessageId === segment.id &&
-    (narrationPhase === 'ready' || narrationPhase === 'playing' || narrationPhase === 'paused');
+    (narrationPhase === 'ready' || narrationPhase === 'playing' || narrationPhase === 'buffering' || narrationPhase === 'paused');
   const seekToTappedBlock = (event: ReactMouseEvent<HTMLDivElement>) => {
     if (!(event.target instanceof Element)) return;
     if (event.target.closest('a, button, [data-remux-no-composer-focus]')) return;

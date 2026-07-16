@@ -9,8 +9,9 @@
 //! hard deadline; a dead critical task (extension actor, HTTP accept loop)
 //! exits 75 so L1 restarts a coherent process; panics are journaled.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::Value;
 
@@ -46,6 +47,25 @@ struct Shared {
     router: OnceLock<Arc<RpcRouter>>,
     notifications: OnceLock<Arc<NotificationManager>>,
     shutting_down: AtomicBool,
+    extension_progress_routes: Mutex<HashMap<String, ExtensionProgressRoute>>,
+}
+
+struct ExtensionProgressRoute {
+    source_extension_id: String,
+    target_extension_id: String,
+}
+
+struct ExtensionProgressRouteGuard<'a> {
+    key: String,
+    routes: &'a Mutex<HashMap<String, ExtensionProgressRoute>>,
+}
+
+impl Drop for ExtensionProgressRouteGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut routes) = self.routes.lock() {
+            routes.remove(&self.key);
+        }
+    }
 }
 
 impl Shared {
@@ -97,7 +117,8 @@ impl ExtensionCtx for RuntimeCtx {
 
     fn handle_extension_request(
         &self,
-        _source_extension_id: String,
+        source_extension_id: String,
+        source_request_id: Value,
         method: String,
         params: Option<Value>,
     ) -> BoxFuture<'_, crate::rpc::router::RpcResult> {
@@ -111,7 +132,69 @@ impl ExtensionCtx for RuntimeCtx {
             if !router.routes_to_extension(&method) {
                 return Err(crate::rpc::jsonrpc::JsonRpcError::method_not_found(&method));
             }
-            router.handle_request(&method, params.as_ref()).await
+            let Some(source_request_key) = extension_request_key(&source_request_id) else {
+                return Err(crate::rpc::jsonrpc::JsonRpcError::new(
+                    crate::rpc::jsonrpc::EXTENSION_ERROR,
+                    "extension request id is invalid",
+                ));
+            };
+            let target_extension_id = crate::rpc::router::extension_id_from_method(&method)
+                .unwrap_or_default()
+                .to_string();
+            {
+                let mut routes = self.shared.extension_progress_routes.lock().unwrap();
+                if routes.contains_key(&source_request_key) {
+                    return Err(crate::rpc::jsonrpc::JsonRpcError::new(
+                        crate::rpc::jsonrpc::EXTENSION_ERROR,
+                        "extension request id is already active",
+                    ));
+                }
+                routes.insert(
+                    source_request_key.clone(),
+                    ExtensionProgressRoute {
+                        source_extension_id,
+                        target_extension_id,
+                    },
+                );
+            }
+            let _route_guard = ExtensionProgressRouteGuard {
+                key: source_request_key.clone(),
+                routes: &self.shared.extension_progress_routes,
+            };
+            let mut routed_params = params;
+            if let Some(progress) = routed_params
+                .as_mut()
+                .and_then(Value::as_object_mut)
+                .and_then(|params| params.get_mut("progress"))
+                .and_then(Value::as_object_mut)
+            {
+                progress.insert("requestId".to_string(), source_request_id.clone());
+            }
+            let result = router.handle_request(&method, routed_params.as_ref()).await;
+            result
+        })
+    }
+
+    fn handle_extension_progress(&self, target_extension_id: &str, params: Value) -> bool {
+        let Some(request_id) = params.get("id").and_then(extension_request_key) else {
+            return false;
+        };
+        let source_extension_id = {
+            let routes = self.shared.extension_progress_routes.lock().unwrap();
+            let Some(route) = routes.get(&request_id) else {
+                return false;
+            };
+            if route.target_extension_id != target_extension_id {
+                return false;
+            }
+            route.source_extension_id.clone()
+        };
+        self.shared.router.get().is_some_and(|router| {
+            router.handle_notification_for_extension(
+                &source_extension_id,
+                "$/progress",
+                Some(params),
+            )
         })
     }
 
@@ -144,6 +227,12 @@ impl ExtensionCtx for RuntimeCtx {
     fn media_dir(&self) -> Option<std::path::PathBuf> {
         Some(self.media_root.clone())
     }
+}
+
+fn extension_request_key(id: &Value) -> Option<String> {
+    (id.is_string() || id.is_number())
+        .then(|| serde_json::to_string(id).ok())
+        .flatten()
 }
 
 struct RelayClientCount(Arc<FsRelay>);

@@ -882,13 +882,7 @@ impl WsServer {
         };
         if let Some(operation_id) = durable_command_operation_id(&message).map(str::to_string) {
             self.clone()
-                .handle_durable_command(
-                    client.clone(),
-                    message,
-                    method,
-                    operation_id,
-                    id.clone(),
-                )
+                .handle_durable_command(client.clone(), message, method, operation_id, id.clone())
                 .await;
             client.finish_request(&id);
             return;
@@ -898,7 +892,7 @@ impl WsServer {
             .and_then(|contract| contract.get("kind"))
             .and_then(Value::as_str)
             == Some("job-start")
-            && method != "remux/codex/narration/start"
+            && method != "remux/narrate/narration/start"
         {
             self.clone()
                 .start_job(client.clone(), message, method, id.clone())
@@ -960,7 +954,10 @@ impl WsServer {
                 });
                 RpcOutcome::Error(error)
             }
-            Ok(CommandAdmission::Replay { completed, receiver }) => {
+            Ok(CommandAdmission::Replay {
+                completed,
+                receiver,
+            }) => {
                 self.log.event(DiagnosticEvent {
                     detail: Some(serde_json::json!({
                         "admission": if completed { "replayed" } else { "joined" },
@@ -1065,7 +1062,9 @@ impl WsServer {
         } else {
             params.cloned()
         };
-        self.router.handle_request(method, routed_params.as_ref()).await
+        self.router
+            .handle_request(method, routed_params.as_ref())
+            .await
     }
 
     async fn start_job(
@@ -1269,7 +1268,9 @@ impl WsServer {
             }
         }
 
-        let result = self.execute_routed_request(&client, &message, &method).await;
+        let result = self
+            .execute_routed_request(&client, &message, &method)
+            .await;
 
         match result {
             Ok(result) => {
@@ -1330,6 +1331,19 @@ fn dispatch_lane(client: &WsClient, method: &str, work: &DispatchWork) -> (Strin
             DispatchMode::ConcurrentBusiness,
         );
     }
+    if method.starts_with("remux/narrate/narration/") {
+        let mode = if matches!(
+            method,
+            "remux/narrate/narration/audio/read"
+                | "remux/narrate/narration/resources/read"
+                | "remux/narrate/narration/diagnostics/read"
+        ) {
+            DispatchMode::ConcurrentBusiness
+        } else {
+            DispatchMode::Serial
+        };
+        return ("extension:narrate:narration".to_string(), mode);
+    }
     if matches!(
         method,
         "remux/extensions/start"
@@ -1371,8 +1385,6 @@ fn dispatch_lane(client: &WsClient, method: &str, work: &DispatchWork) -> (Strin
             "remux/codex/files"
                 | "remux/codex/composer/config/read"
                 | "remux/codex/models/read"
-                | "remux/codex/narration/audio/read"
-                | "remux/codex/narration/resources/read"
                 | "remux/codex/thread/resources/read"
                 | "remux/codex/transcript/capabilities/read"
                 | "remux/codex/transcript/resources/read"
@@ -1384,15 +1396,6 @@ fn dispatch_lane(client: &WsClient, method: &str, work: &DispatchWork) -> (Strin
         }
         if method == "remux/codex/composer/config/write" {
             return ("extension:codex:config".to_string(), DispatchMode::Serial);
-        }
-        if matches!(
-            method,
-            "remux/codex/narration/start" | "remux/codex/narration/cancel"
-        ) {
-            return (
-                "extension:codex:narration".to_string(),
-                DispatchMode::Serial,
-            );
         }
         let thread_id = params
             .and_then(|params| params.get("threadId"))

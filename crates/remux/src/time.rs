@@ -26,9 +26,7 @@ pub fn iso8601_from_ms(epoch_ms: i64) -> String {
     let seconds = (ms_of_day % 60_000) / 1_000;
     let millis = ms_of_day % 1_000;
 
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z")
 }
 
 /// Days-since-epoch to civil date (Howard Hinnant's `civil_from_days`).
@@ -54,9 +52,18 @@ mod tests {
     fn formats_like_date_to_iso_string() {
         assert_eq!(iso8601_from_ms(0), "1970-01-01T00:00:00.000Z");
         // 2026-06-20T00:00:00.000Z
-        assert_eq!(iso8601_from_ms(1_781_913_600_000), "2026-06-20T00:00:00.000Z");
-        assert_eq!(iso8601_from_ms(1_781_913_600_123), "2026-06-20T00:00:00.123Z");
+        assert_eq!(
+            iso8601_from_ms(1_781_913_600_000),
+            "2026-06-20T00:00:00.000Z"
+        );
+        assert_eq!(
+            iso8601_from_ms(1_781_913_600_123),
+            "2026-06-20T00:00:00.123Z"
+        );
         // Leap-year day: 2024-02-29T12:00:00.000Z
-        assert_eq!(iso8601_from_ms(1_709_208_000_000), "2024-02-29T12:00:00.000Z");
+        assert_eq!(
+            iso8601_from_ms(1_709_208_000_000),
+            "2024-02-29T12:00:00.000Z"
+        );
     }
 }

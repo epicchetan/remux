@@ -1,9 +1,12 @@
 # Codex Narration ONNX Synthesis and Structural Contract Simplification
 
-Status: Active Spec
-Last verified: 2026-07-12
+Status: Archived — superseded by `docs/specs/narrate-streaming-g2p.md`
+Last verified: 2026-07-13
 Canonical code: `crates/remux-compute/`, `crates/remux-tts/`, `extensions/codex/narration/model-manifest.json`, `extensions/codex/server/src/narration.rs`, `extensions/codex/server/src/narration_planning.rs`, `extensions/codex/server/src/narration_source_mapping.rs`, `extensions/codex/shared/narration.ts`, `extensions/codex/viewer/narration/`, `extensions/codex/viewer/transcript/components/markdown/`, `crates/remux/`
 Extends: `docs/specs/codex/assistant-narration-planning-optimization.md`
+
+> Historical task-v4 synthesis spec. Task v6, streaming plans, segment
+> sidecars, and manifest v5 are normative in the replacement spec.
 
 Implementation state: source/planner contract v3, structural single-block
 cues, the pinned duration ONNX export, native Rust G2P/inference/artifact

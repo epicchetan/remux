@@ -178,7 +178,9 @@ fn icon_path_for_source(
         Some(("launcher", id)) => {
             let launcher = extension.launchers.iter().find(|entry| entry.id == id);
             launcher
-                .and_then(|entry| icon_variant_path(entry.icon.as_deref(), entry.icon_dark.as_deref(), variant))
+                .and_then(|entry| {
+                    icon_variant_path(entry.icon.as_deref(), entry.icon_dark.as_deref(), variant)
+                })
                 .or_else(|| {
                     icon_variant_path(
                         extension.display.icon.as_deref(),
@@ -190,7 +192,9 @@ fn icon_path_for_source(
         Some(("fileHandler", id)) => {
             let handler = extension.file_handlers.iter().find(|entry| entry.id == id);
             handler
-                .and_then(|entry| icon_variant_path(entry.icon.as_deref(), entry.icon_dark.as_deref(), variant))
+                .and_then(|entry| {
+                    icon_variant_path(entry.icon.as_deref(), entry.icon_dark.as_deref(), variant)
+                })
                 .or_else(|| {
                     icon_variant_path(
                         extension.display.icon.as_deref(),
@@ -233,8 +237,18 @@ pub fn encode_uri_component(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'!' | b'~'
-            | b'*' | b'\'' | b'(' | b')' => encoded.push(byte as char),
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'!'
+            | b'~'
+            | b'*'
+            | b'\''
+            | b'('
+            | b')' => encoded.push(byte as char),
             _ => encoded.push_str(&format!("%{byte:02X}")),
         }
     }

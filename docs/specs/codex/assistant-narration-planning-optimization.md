@@ -1,9 +1,12 @@
 # Codex Assistant Narration Planning, Alignment, and Highlighting Spec
 
-Status: Active Spec
-Last verified: 2026-07-11
+Status: Archived — superseded by `docs/specs/narrate-streaming-g2p.md`
+Last verified: 2026-07-13
 Canonical code: `extensions/codex/server/src/narration.rs`, `extensions/codex/server/src/narration_planning.rs`, `extensions/codex/server/src/narration_source_mapping.rs`, `crates/remux-tts/`, `extensions/codex/shared/narration.ts`, `extensions/codex/viewer/narration/paintController.ts`, `extensions/codex/viewer/narration/textLeafRegistry.ts`
 Extends: `docs/specs/codex/assistant-narration-v2.md`
+
+> Historical v3 planner/alignment spec. The whole-document streaming v5
+> contract replaces its planning, fallback, and compatibility decisions.
 
 Implementation state: the production code path and automated coverage for
 phases 1–6 are implemented. The minimum-iOS/WKWebView device matrix, opt-in

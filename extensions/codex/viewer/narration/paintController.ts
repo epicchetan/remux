@@ -245,19 +245,14 @@ export function installNarrationPaintController() {
   };
 }
 
-// Legacy v2 artifacts can still contain line, cell, region, or node cues.
-// New v3 source documents emit one block target for dense structures, while
-// this adapter keeps old cached artifacts painting and scrolling by block.
 function elementLevelPaintTargets(
   targets: CodexNarrationSourceTarget[],
-  sourceTargets: CodexNarrationSourceTarget[],
+  _sourceTargets: CodexNarrationSourceTarget[],
 ) {
   const resolved: CodexNarrationSourceTarget[] = [];
   const seen = new Set<string>();
   for (const target of targets) {
-    const paintTarget = target.kind === 'block' || target.kind === 'textRange'
-      ? target
-      : sourceTargets.find((candidate) => candidate.kind === 'block' && candidate.blockId === target.blockId);
+    const paintTarget = target;
     if (!paintTarget || seen.has(paintTarget.id)) continue;
     seen.add(paintTarget.id);
     resolved.push(paintTarget);
@@ -314,14 +309,6 @@ function primaryTargets(
       case 'word':
       case 'expression':
         return target.kind === 'textRange';
-      case 'codeLines':
-        return target.kind === 'codeLines';
-      case 'diagramNode':
-        return target.kind === 'diagramNode';
-      case 'tableCell':
-        return target.kind === 'tableCell';
-      case 'tableRegion':
-        return target.kind === 'tableRegion';
       case 'block':
         return target.kind === 'block';
       default:

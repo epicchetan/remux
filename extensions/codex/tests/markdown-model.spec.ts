@@ -64,22 +64,20 @@ test.describe('markdownModel', () => {
       'code',
       'table',
     ]);
-    expect(first.find((block) => block.displayText === 'Plain prose.')?.needsTransform).toBe(false);
-    expect(first.find((block) => block.kind === 'heading')?.needsTransform).toBe(false);
-    expect(first.find((block) => block.displayText === 'Second item')?.needsTransform).toBe(true);
-    expect(first.at(-1)).toMatchObject({ kind: 'table', needsTransform: true });
+    expect(first.every((block) => !('needsTransform' in block))).toBe(true);
+    expect(first.at(-1)).toMatchObject({ kind: 'table' });
 
     const document = narrationSourceDocument(markdown, {
       messageId: 'assistant-1',
       messageRevision: 'revision-1',
       sourceHash: 'source-1',
     });
-    expect(document.schemaVersion).toBe(2);
+    expect(document.schemaVersion).toBe(3);
+    expect(document.documentVersion).toBe('4');
     expect(document.targets.some((target) => target.kind === 'textRange' && target.role === 'word')).toBe(true);
     // Code and table narration paints at the element level; the model no
     // longer emits per-line or per-cell targets.
-    expect(document.targets.filter((target) => target.kind === 'codeLines')).toHaveLength(0);
-    expect(document.targets.filter((target) => target.kind === 'tableCell')).toHaveLength(0);
+    expect(document.targets.every((target) => target.kind === 'block' || target.kind === 'textRange')).toBe(true);
     expect(document.blocks.every((block) => block.targetIds.some((id) => id.endsWith('/target/block')))).toBe(true);
   });
 

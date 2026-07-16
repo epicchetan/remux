@@ -178,9 +178,10 @@ pub async fn await_outcome(
         if let Some(outcome) = receiver.borrow().clone() {
             return Ok(outcome);
         }
-        receiver.changed().await.map_err(|_| {
-            JsonRpcError::new(-32000, "Durable command outcome became unavailable")
-        })?;
+        receiver
+            .changed()
+            .await
+            .map_err(|_| JsonRpcError::new(-32000, "Durable command outcome became unavailable"))?;
     }
 }
 
@@ -271,10 +272,18 @@ mod tests {
     async fn duplicate_replays_one_terminal_outcome() {
         let registry = Arc::new(CommandRegistry::default());
         let first = registry
-            .admit("remux/example/write", "op-1", Some(&serde_json::json!({ "b": 2, "a": 1 })))
+            .admit(
+                "remux/example/write",
+                "op-1",
+                Some(&serde_json::json!({ "b": 2, "a": 1 })),
+            )
             .unwrap();
         let duplicate = registry
-            .admit("remux/example/write", "op-1", Some(&serde_json::json!({ "a": 1, "b": 2 })))
+            .admit(
+                "remux/example/write",
+                "op-1",
+                Some(&serde_json::json!({ "a": 1, "b": 2 })),
+            )
             .unwrap();
         let CommandAdmission::Execute(execution) = first else {
             panic!("first request must execute");
@@ -296,10 +305,18 @@ mod tests {
     fn conflicting_params_are_rejected() {
         let registry = CommandRegistry::default();
         registry
-            .admit("remux/example/write", "op-1", Some(&serde_json::json!({ "a": 1 })))
+            .admit(
+                "remux/example/write",
+                "op-1",
+                Some(&serde_json::json!({ "a": 1 })),
+            )
             .unwrap();
         let error = registry
-            .admit("remux/example/write", "op-1", Some(&serde_json::json!({ "a": 2 })))
+            .admit(
+                "remux/example/write",
+                "op-1",
+                Some(&serde_json::json!({ "a": 2 })),
+            )
             .err()
             .expect("conflict");
         assert_eq!(error.data.unwrap()["detail"], "operation_id_conflict");

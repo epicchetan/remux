@@ -48,7 +48,10 @@ impl JsonRpcError {
     pub fn from_value(error: &Value) -> Self {
         match error.as_object() {
             Some(record) => Self {
-                code: record.get("code").and_then(Value::as_i64).unwrap_or(INTERNAL_ERROR),
+                code: record
+                    .get("code")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(INTERNAL_ERROR),
                 message: record
                     .get("message")
                     .and_then(Value::as_str)
@@ -58,7 +61,10 @@ impl JsonRpcError {
             },
             None => Self::new(
                 INTERNAL_ERROR,
-                error.as_str().map(str::to_string).unwrap_or_else(|| "Internal error".to_string()),
+                error
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "Internal error".to_string()),
             ),
         }
     }
@@ -181,7 +187,9 @@ mod tests {
 
     #[test]
     fn classifies_requests_responses_and_server_originated_requests() {
-        assert!(is_json_rpc_request(&json!({ "id": 1, "method": "thread/list" })));
+        assert!(is_json_rpc_request(
+            &json!({ "id": 1, "method": "thread/list" })
+        ));
         assert!(is_json_rpc_response(&json!({ "id": 1, "result": {} })));
         assert!(!is_json_rpc_response(
             &json!({ "id": 1, "method": "approval/request", "params": {} })
@@ -206,7 +214,10 @@ mod tests {
             json!({ "jsonrpc": "2.0", "id": "a", "result": { "ok": true } })
         );
         assert_eq!(
-            error_message(&json!(7), &JsonRpcError::new(METHOD_NOT_FOUND, "Method not found")),
+            error_message(
+                &json!(7),
+                &JsonRpcError::new(METHOD_NOT_FOUND, "Method not found")
+            ),
             json!({
                 "jsonrpc": "2.0",
                 "id": 7,

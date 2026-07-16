@@ -1,6 +1,6 @@
 import type {
   CodexNarrationCue,
-  CodexNarrationManifest,
+  CodexNarrationTimeline,
   CodexNarrationSourceTarget,
   CodexNarrationUnit,
 } from '../../shared/narration';
@@ -15,7 +15,7 @@ export type NarrationResolvedPosition = {
 };
 
 export function resolveNarrationPosition(
-  manifest: CodexNarrationManifest,
+  manifest: CodexNarrationTimeline,
   globalTime: number,
 ): NarrationResolvedPosition {
   const unitIndex = findTimedIndex(manifest.units, globalTime);

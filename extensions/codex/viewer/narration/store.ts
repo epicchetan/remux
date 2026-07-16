@@ -3,12 +3,13 @@ import { subscribeIpcEvents } from '@remux/viewer-kit/ipc';
 
 import type {
   CodexNarrationCue,
-  CodexNarrationManifest,
+  CodexNarrationProgress,
   CodexNarrationResource,
   CodexNarrationSourceDocument,
   CodexNarrationSourceTarget,
   CodexNarrationStartParams,
   CodexNarrationTarget,
+  CodexNarrationTimeline,
 } from '../../shared/narration';
 import { cancelNarration, readNarration, startNarration } from '../ipc/narration';
 import {
@@ -18,12 +19,20 @@ import {
 import { NarrationAudioEngine } from './audioEngine';
 import { resolveNarrationPosition } from './cueResolver';
 
-export type NarrationPhase = 'failed' | 'idle' | 'paused' | 'playing' | 'preparing' | 'ready';
+export type NarrationPhase =
+  | 'buffering'
+  | 'failed'
+  | 'idle'
+  | 'paused'
+  | 'playing'
+  | 'preparing'
+  | 'ready';
 
-// 'explicitSeekInPlace' marks seeks born from tapping a visible block: the
-// focus paints and seeks like an explicit seek but must not pull the tapped
-// block into the reading band underneath the user's finger.
-export type NarrationFocusReason = 'explicitSeek' | 'explicitSeekInPlace' | 'follow' | 'followReenabled';
+export type NarrationFocusReason =
+  | 'explicitSeek'
+  | 'explicitSeekInPlace'
+  | 'follow'
+  | 'followReenabled';
 
 type NarrationRequest = {
   document: CodexNarrationSourceDocument;
@@ -36,7 +45,6 @@ type NarrationStoreState = {
   artifactKey: string | null;
   cancel: () => Promise<void>;
   close: () => void;
-  completedUnits: number | null;
   currentBlockId: string | null;
   currentCue: CodexNarrationCue | null;
   currentCueIndex: number;
@@ -46,22 +54,22 @@ type NarrationStoreState = {
   followEnabled: boolean;
   focusIntent: { id: number; reason: NarrationFocusReason } | null;
   followSuspendedByUser: boolean;
-  manifest: CodexNarrationManifest | null;
+  manifest: CodexNarrationTimeline | null;
   nextBlock: () => Promise<void>;
   pause: () => void;
   phase: NarrationPhase;
   play: () => Promise<void>;
   playbackRate: number;
   previousBlock: () => Promise<void>;
+  progress: CodexNarrationProgress | null;
   refresh: () => Promise<void>;
   retry: () => Promise<void>;
   seekToBlock: (blockId: string) => Promise<void>;
   setPlaybackRate: (rate: number) => void;
-  stage: CodexNarrationResource['stage'];
   start: (request: NarrationRequest) => Promise<void>;
+  status: CodexNarrationResource['status'] | null;
   target: CodexNarrationTarget | null;
   toggleFollow: () => void;
-  totalUnits: number | null;
 };
 
 const storedRate = Number.parseFloat(localStorage.getItem('narrationPlaybackRate') ?? '1');
@@ -72,8 +80,10 @@ let pendingFocusReason: 'explicitSeek' | 'explicitSeekInPlace' | 'followReenable
 let focusIntentId = 0;
 
 const audioEngine = new NarrationAudioEngine({
+  onBuffering: () => undefined,
   onEnded: () => undefined,
   onError: () => undefined,
+  onPlaying: () => undefined,
   onTime: () => undefined,
 });
 
@@ -84,7 +94,7 @@ export const useNarrationStore = create<NarrationStoreState>((set, get) => ({
     clearRefreshTimer();
     const artifactKey = get().artifactKey;
     if (artifactKey) {
-      try { await cancelNarration({ artifactKey }); } catch { /* Cancellation is best effort. */ }
+      try { await cancelNarration({ artifactKey }); } catch { /* Best effort. */ }
     }
     audioEngine.close();
     releaseNarrationScrollOwnership();
@@ -92,11 +102,14 @@ export const useNarrationStore = create<NarrationStoreState>((set, get) => ({
   },
   close() {
     clearRefreshTimer();
+    const artifactKey = get().artifactKey;
+    if (artifactKey && get().status && get().status !== 'ready') {
+      void cancelNarration({ artifactKey }).catch(() => undefined);
+    }
     audioEngine.close();
     releaseNarrationScrollOwnership();
     set(idleState());
   },
-  completedUnits: null,
   currentBlockId: null,
   currentCue: null,
   currentCueIndex: -1,
@@ -107,9 +120,7 @@ export const useNarrationStore = create<NarrationStoreState>((set, get) => ({
   focusIntent: null,
   followSuspendedByUser: false,
   manifest: null,
-  async nextBlock() {
-    await seekBlock(1, get);
-  },
+  async nextBlock() { await seekBlock(1, get); },
   pause() {
     audioEngine.pause();
     set({ phase: 'paused' });
@@ -121,15 +132,13 @@ export const useNarrationStore = create<NarrationStoreState>((set, get) => ({
     if (followEnabled) claimNarrationScrollOwnership();
     try {
       await audioEngine.play(artifactKey, manifest);
-      set({ error: null, phase: 'playing' });
     } catch (error) {
       set({ error: errorMessage(error), phase: 'ready' });
     }
   },
   playbackRate: defaultRate,
-  async previousBlock() {
-    await seekBlock(-1, get);
-  },
+  async previousBlock() { await seekBlock(-1, get); },
+  progress: null,
   async refresh() {
     const { artifactKey } = get();
     if (!artifactKey) return;
@@ -137,70 +146,70 @@ export const useNarrationStore = create<NarrationStoreState>((set, get) => ({
       const response = await readNarration({ artifactKey });
       if (response.status === 'ok' && response.resource) applyResource(response.resource, set, get);
     } catch (error) {
-      set({ error: errorMessage(error), phase: 'failed', stage: null });
+      set({ error: errorMessage(error), phase: 'failed', status: 'failed' });
     }
   },
   async retry() {
     if (lastRequest) await get().start(lastRequest);
   },
-  async seekToBlock(blockId) {
-    await seekToBlockId(blockId, get);
-  },
+  async seekToBlock(blockId) { await seekToBlockId(blockId, get); },
   setPlaybackRate(rate) {
     if (![0.75, 1, 1.25, 1.5, 2].includes(rate)) return;
     localStorage.setItem('narrationPlaybackRate', String(rate));
     audioEngine.setPlaybackRate(rate);
     set({ playbackRate: rate });
   },
-  stage: null,
   async start(request) {
     lastRequest = request;
-    set({ ...idleState(), phase: 'preparing', stage: 'planning', target: request.target });
+    set({
+      ...idleState(),
+      phase: 'preparing',
+      status: 'planning',
+      target: request.target,
+    });
     try {
       const response = await startNarration(request satisfies CodexNarrationStartParams);
       set({ artifactKey: response.artifactKey });
       applyResource(response.resource, set, get);
     } catch (error) {
-      set({ error: errorMessage(error), phase: 'failed', stage: null });
+      set({ error: errorMessage(error), phase: 'failed', status: 'failed' });
     }
   },
+  status: null,
   target: null,
   toggleFollow() {
     const enabled = !get().followEnabled;
-    if (enabled) {
-      claimNarrationScrollOwnership();
-    } else {
-      releaseNarrationScrollOwnership();
-    }
+    if (enabled) claimNarrationScrollOwnership();
+    else releaseNarrationScrollOwnership();
     set({
       focusIntent: enabled ? nextFocusIntent('followReenabled') : null,
       followEnabled: enabled,
       followSuspendedByUser: false,
     });
   },
-  totalUnits: null,
 }));
 
 audioEngine.setCallbacks({
-  onEnded: () => useNarrationStore.setState({
-    activeTargets: [],
-    currentCue: null,
-    currentCueIndex: -1,
-    currentTargetIds: [],
-    phase: 'paused',
-  }),
+  onBuffering: () => useNarrationStore.setState({ phase: 'buffering' }),
+  onEnded: () => {
+    const state = useNarrationStore.getState();
+    useNarrationStore.setState({
+      activeTargets: [],
+      currentCue: null,
+      currentCueIndex: -1,
+      currentTargetIds: [],
+      phase: state.error ? 'failed' : 'paused',
+    });
+  },
   onError: (error) => useNarrationStore.setState({ error, phase: 'ready' }),
+  onPlaying: () => useNarrationStore.setState({ error: null, phase: 'playing' }),
   onTime: (globalTime) => applyAudioTime(globalTime),
 });
 audioEngine.setPlaybackRate(defaultRate);
 
-// Follow is owned by the transcript viewport's auto-scroll mode. Whenever
-// something else takes ownership (manual scroll → off, a sent message →
-// sent-message-anchor, bottom stickiness), mirror the loss as a user
-// suspension so playback continues without moving the viewport.
 subscribeTranscriptViewport(() => {
   const state = useNarrationStore.getState();
-  if (state.phase !== 'ready' && state.phase !== 'playing' && state.phase !== 'paused') return;
+  if (!['buffering', 'paused', 'playing', 'ready'].includes(state.phase)) return;
   if (!state.followEnabled) return;
   if (getTranscriptViewportState().autoScrollMode.type === 'narration-follow') return;
   useNarrationStore.setState({ followEnabled: false, followSuspendedByUser: true });
@@ -211,7 +220,7 @@ export function subscribeNarrationUpdates() {
     const artifactKey = useNarrationStore.getState().artifactKey;
     if (!artifactKey) return;
     if (events.some((event) =>
-      event.method === 'remux/codex/narration/updated' &&
+      event.method === 'remux/narrate/narration/updated' &&
       event.params &&
       typeof event.params === 'object' &&
       (event.params as { artifactKey?: unknown }).artifactKey === artifactKey
@@ -234,32 +243,6 @@ function applyResource(
   get: () => NarrationStoreState,
 ) {
   if (get().artifactKey && resource.artifactKey !== get().artifactKey) return;
-  if (resource.status === 'ready' && resource.manifest) {
-    clearRefreshTimer();
-    const position = resolveNarrationPosition(resource.manifest, resource.manifest.units[0]?.start ?? 0);
-    if (get().followEnabled) claimNarrationScrollOwnership();
-    set({
-      activeTargets: position.targets,
-      completedUnits: resource.completedUnits,
-      currentBlockId: position.unit?.blockId ?? null,
-      currentCue: position.cue,
-      currentCueIndex: position.cueIndex,
-      currentTargetIds: position.targetIds,
-      currentUnitIndex: position.unitIndex,
-      error: null,
-      focusIntent: nextFocusIntent('follow'),
-      manifest: resource.manifest,
-      phase: 'ready',
-      stage: null,
-      totalUnits: resource.totalUnits,
-    });
-    return;
-  }
-  if (resource.status === 'failed') {
-    clearRefreshTimer();
-    set({ error: resource.error ?? 'Narration could not be prepared', phase: 'failed', stage: null });
-    return;
-  }
   if (resource.status === 'cancelled') {
     clearRefreshTimer();
     audioEngine.close();
@@ -267,14 +250,79 @@ function applyResource(
     set(idleState());
     return;
   }
-  set({
-    completedUnits: resource.completedUnits,
-    error: resource.error,
-    phase: 'preparing',
-    stage: resource.stage,
-    totalUnits: resource.totalUnits,
-  });
-  scheduleRefresh();
+
+  const timeline = timelineFromResource(resource);
+  const hadTimeline = Boolean(get().manifest);
+  const playWhenAvailable = !hadTimeline && get().phase === 'preparing';
+  const terminalFailure = resource.status === 'failed';
+  const error = terminalFailure
+    ? resource.error ?? 'Narration stopped before it was complete'
+    : null;
+
+  if (timeline) {
+    const position = resolveNarrationPosition(timeline, timeline.units[0]?.start ?? 0);
+    set({
+      activeTargets: get().currentCue ? get().activeTargets : position.targets,
+      currentBlockId: get().currentBlockId ?? position.unit?.blockId ?? null,
+      currentCue: get().currentCue ?? position.cue,
+      currentCueIndex: get().currentCueIndex >= 0 ? get().currentCueIndex : position.cueIndex,
+      currentTargetIds: get().currentTargetIds.length ? get().currentTargetIds : position.targetIds,
+      currentUnitIndex: get().currentUnitIndex || position.unitIndex,
+      error,
+      focusIntent: get().focusIntent ?? nextFocusIntent('follow'),
+      manifest: timeline,
+      progress: resource.progress,
+      status: resource.status,
+      target: resource.target,
+    });
+    const artifactKey = resource.artifactKey;
+    if (playWhenAvailable) {
+      if (get().followEnabled) claimNarrationScrollOwnership();
+      void audioEngine.play(artifactKey, timeline).catch((cause) => {
+        useNarrationStore.setState({ error: errorMessage(cause), phase: 'ready' });
+      });
+    } else {
+      void audioEngine.update(artifactKey, timeline).catch((cause) => {
+        useNarrationStore.setState({ error: errorMessage(cause), phase: 'ready' });
+      });
+    }
+  } else {
+    set({
+      error,
+      phase: terminalFailure ? 'failed' : 'preparing',
+      progress: resource.progress,
+      status: resource.status,
+      target: resource.target,
+    });
+  }
+
+  if (resource.status === 'ready' || terminalFailure) clearRefreshTimer();
+  else scheduleRefresh();
+}
+
+function timelineFromResource(resource: CodexNarrationResource): CodexNarrationTimeline | null {
+  if (resource.manifest) {
+    return {
+      chunks: resource.manifest.chunks,
+      complete: true,
+      cues: resource.manifest.cues,
+      durationSeconds: resource.manifest.durationSeconds,
+      segments: resource.manifest.segments,
+      targets: resource.manifest.targets,
+      units: resource.manifest.units,
+    };
+  }
+  if (resource.availableSegments.length === 0 || !lastRequest) return null;
+  const segments = resource.availableSegments;
+  return {
+    chunks: segments.map((segment) => segment.audio),
+    complete: resource.status === 'failed',
+    cues: segments.flatMap((segment) => segment.cues),
+    durationSeconds: resource.availableDuration,
+    segments,
+    targets: lastRequest.document.targets,
+    units: segments.flatMap((segment) => segment.units),
+  };
 }
 
 function applyAudioTime(globalTime: number) {
@@ -303,7 +351,7 @@ async function seekToBlockId(blockId: string, get: () => NarrationStoreState) {
   await audioEngine.prepare(artifactKey, manifest);
   const current = Math.max(0, currentUnitIndex);
   pendingFocusReason = 'explicitSeekInPlace';
-  await audioEngine.seek(blockNavigationTime(manifest, destination), phase === 'playing');
+  await audioEngine.seek(blockNavigationTime(manifest, destination), phase === 'playing' || phase === 'buffering');
   if (destination === current) {
     pendingFocusReason = null;
     useNarrationStore.setState({ focusIntent: nextFocusIntent('explicitSeekInPlace') });
@@ -324,22 +372,20 @@ async function seekBlock(direction: -1 | 1, get: () => NarrationStoreState) {
     }
   }
   pendingFocusReason = 'explicitSeek';
-  await audioEngine.seek(blockNavigationTime(manifest, destination), phase === 'playing');
+  await audioEngine.seek(blockNavigationTime(manifest, destination), phase === 'playing' || phase === 'buffering');
   if (destination === current) {
     pendingFocusReason = null;
     useNarrationStore.setState({ focusIntent: nextFocusIntent('explicitSeek') });
   }
 }
 
-function blockNavigationTime(manifest: CodexNarrationManifest, unitIndex: number) {
+function blockNavigationTime(manifest: CodexNarrationTimeline, unitIndex: number) {
   const unit = manifest.units[unitIndex];
   if (!unit) return 0;
   const firstCue = manifest.cues.find((cue) => cue.unitId === unit.id);
   if (!firstCue) return unit.start;
   const cueStart = Math.max(unit.start, Math.min(unit.end, firstCue.start));
   const cueEnd = Math.max(cueStart, Math.min(unit.end, firstCue.end));
-  // Unit and cue endpoints are inclusive in the resolver. Move just inside the
-  // first precise cue so a shared boundary cannot resolve to the prior cue.
   return cueStart + Math.min(0.001, Math.max(0, (cueEnd - cueStart) / 2));
 }
 
@@ -347,7 +393,6 @@ function idleState(): Pick<
   NarrationStoreState,
   | 'activeTargets'
   | 'artifactKey'
-  | 'completedUnits'
   | 'currentBlockId'
   | 'currentCue'
   | 'currentCueIndex'
@@ -359,14 +404,13 @@ function idleState(): Pick<
   | 'followSuspendedByUser'
   | 'manifest'
   | 'phase'
-  | 'stage'
+  | 'progress'
+  | 'status'
   | 'target'
-  | 'totalUnits'
 > {
   return {
     activeTargets: [],
     artifactKey: null,
-    completedUnits: null,
     currentBlockId: null,
     currentCue: null,
     currentCueIndex: -1,
@@ -378,9 +422,9 @@ function idleState(): Pick<
     followSuspendedByUser: false,
     manifest: null,
     phase: 'idle',
-    stage: null,
+    progress: null,
+    status: null,
     target: null,
-    totalUnits: null,
   };
 }
 
@@ -395,7 +439,6 @@ function claimNarrationScrollOwnership() {
 
 function releaseNarrationScrollOwnership() {
   const viewport = getTranscriptViewportState();
-  // Only release what narration owns; another mode may have taken over.
   if (viewport.autoScrollMode.type === 'narration-follow') {
     viewport.setAutoScrollMode({ type: 'off' });
   }

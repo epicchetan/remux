@@ -280,10 +280,11 @@ impl ViewerBundleRegistry {
             attempt += 1;
             let cache_root = self.cache_root.clone();
             let source = source.clone();
-            let result = tokio::task::spawn_blocking(move || publish_snapshot(&cache_root, &source))
-                .await
-                .map_err(|error| format!("snapshot worker: {error}"))
-                .and_then(|result| result);
+            let result =
+                tokio::task::spawn_blocking(move || publish_snapshot(&cache_root, &source))
+                    .await
+                    .map_err(|error| format!("snapshot worker: {error}"))
+                    .and_then(|result| result);
             if result
                 .as_ref()
                 .err()
@@ -319,12 +320,11 @@ impl ViewerBundleRegistry {
                 ));
                 let cache_root = self.cache_root.clone();
                 let published = self.published.read().unwrap().clone();
-                let cleanup = tokio::task::spawn_blocking(move || {
-                    cleanup_snapshots(&cache_root, &published)
-                })
-                .await
-                .map_err(|error| format!("snapshot cleanup worker: {error}"))
-                .and_then(|result| result);
+                let cleanup =
+                    tokio::task::spawn_blocking(move || cleanup_snapshots(&cache_root, &published))
+                        .await
+                        .map_err(|error| format!("snapshot cleanup worker: {error}"))
+                        .and_then(|result| result);
                 if let Err(error) = cleanup {
                     self.journal
                         .warn(&format!("viewer bundle cleanup failed: {error}"));
@@ -352,9 +352,9 @@ fn safe_cache_component(value: &str) -> bool {
     !value.is_empty()
         && value != "."
         && value != ".."
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-        })
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn publish_snapshot(
@@ -404,10 +404,9 @@ fn publish_snapshot(
         let _ = fs::remove_dir_all(&temp);
         return Err("published snapshot is missing its entry".to_string());
     }
-    if let Err(error) = validate_entry_asset_urls(
-        &temp.join(&source.entry_relative_path),
-        &source.route,
-    ) {
+    if let Err(error) =
+        validate_entry_asset_urls(&temp.join(&source.entry_relative_path), &source.route)
+    {
         let _ = fs::remove_dir_all(&temp);
         return Err(error);
     }
@@ -726,11 +725,7 @@ mod tests {
         let source = source(&temp);
         let first = publish_snapshot(&cache, &source).unwrap();
         std::thread::sleep(Duration::from_millis(2));
-        fs::write(
-            source.source_root.join("assets/app.js"),
-            "console.log('a')",
-        )
-        .unwrap();
+        fs::write(source.source_root.join("assets/app.js"), "console.log('a')").unwrap();
         let second = publish_snapshot(&cache, &source).unwrap();
         assert_eq!(first.revision, second.revision);
     }
@@ -755,11 +750,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let cache = temp.path().join("cache");
         let source = source(&temp);
-        fs::write(
-            &source.entry,
-            "<script src=\"/assets/app.js\"></script>",
-        )
-        .unwrap();
+        fs::write(&source.entry, "<script src=\"/assets/app.js\"></script>").unwrap();
         assert!(publish_snapshot(&cache, &source)
             .unwrap_err()
             .contains("root-relative asset"));

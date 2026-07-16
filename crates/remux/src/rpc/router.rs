@@ -360,6 +360,22 @@ impl RpcRouter {
         }
     }
 
+    /// Delivers a host-owned notification to one exact extension. This is
+    /// used for private correlated progress and deliberately bypasses normal
+    /// method namespace/default-extension routing.
+    pub fn handle_notification_for_extension(
+        &self,
+        extension_id: &str,
+        method: &str,
+        params: Option<Value>,
+    ) -> bool {
+        let Some(server) = self.server(extension_id) else {
+            return false;
+        };
+        server.handle_notification(method.to_string(), params);
+        true
+    }
+
     async fn handle_system_request(&self, method: &str) -> RpcResult {
         // Liveness probe: the app pings after foregrounding to detect half-open
         // sockets that still report OPEN. Any reply works; this one is cheapest.

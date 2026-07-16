@@ -28,48 +28,8 @@ export type CodexNarrationTextTarget = {
   role: 'expression' | 'inlineCode' | 'link' | 'word';
 };
 
-// Structural subtargets are retained only to read cached v2 manifests. Source
-// document v3 emits a single block target for code, tables, and diagrams.
-export type CodexNarrationTableCellTarget = {
-  blockId: string;
-  column: number;
-  id: string;
-  kind: 'tableCell';
-  role: 'body' | 'header';
-  row: number;
-};
-
-export type CodexNarrationTableRegionTarget = {
-  blockId: string;
-  columnEnd: number;
-  columnStart: number;
-  id: string;
-  kind: 'tableRegion';
-  rowEnd: number;
-  rowStart: number;
-};
-
-export type CodexNarrationCodeLinesTarget = {
-  blockId: string;
-  id: string;
-  kind: 'codeLines';
-  lineEnd: number;
-  lineStart: number;
-};
-
-export type CodexNarrationDiagramNodeTarget = {
-  blockId: string;
-  id: string;
-  kind: 'diagramNode';
-  nodeId: string;
-};
-
 export type CodexNarrationSourceTarget =
   | CodexNarrationBlockTarget
-  | CodexNarrationCodeLinesTarget
-  | CodexNarrationDiagramNodeTarget
-  | CodexNarrationTableCellTarget
-  | CodexNarrationTableRegionTarget
   | CodexNarrationTextTarget;
 
 export type CodexNarrationSourceBlock = {
@@ -77,17 +37,16 @@ export type CodexNarrationSourceBlock = {
   id: string;
   inlineRanges: CodexNarrationInlineRange[];
   kind: CodexNarrationBlockKind;
-  needsTransform: boolean;
   path: string;
   targetIds: string[];
 };
 
 export type CodexNarrationSourceDocument = {
   blocks: CodexNarrationSourceBlock[];
-  documentVersion: string;
+  documentVersion: '4';
   messageId: string;
   messageRevision: string;
-  schemaVersion: 2;
+  schemaVersion: 3;
   sourceHash: string;
   targets: CodexNarrationSourceTarget[];
 };
@@ -122,20 +81,9 @@ export type CodexNarrationReadResponse = {
   status: 'missing' | 'notModified' | 'ok';
 };
 
-export type CodexNarrationCancelParams = {
-  artifactKey: string;
-};
-
-export type CodexNarrationCancelResponse = {
-  artifactKey: string;
-  status: 'accepted';
-};
-
-export type CodexNarrationAudioReadParams = {
-  artifactKey: string;
-  chunkId: string;
-};
-
+export type CodexNarrationCancelParams = { artifactKey: string };
+export type CodexNarrationCancelResponse = { artifactKey: string; status: 'accepted' };
+export type CodexNarrationAudioReadParams = { artifactKey: string; chunkId: string };
 export type CodexNarrationAudioReadResponse = {
   artifactKey: string;
   chunkId: string;
@@ -144,97 +92,110 @@ export type CodexNarrationAudioReadResponse = {
   sizeBytes: number;
 };
 
+export type CodexNarrationProgress = {
+  committedBlocks: number;
+  committedGroups: number;
+  primaryModelComplete: boolean;
+  synthesizedGroups: number;
+  totalBlocks: number;
+  workerComplete: boolean;
+};
+
 export type CodexNarrationResource = {
   artifactKey: string;
-  availableChunks: CodexNarrationAudioChunk[];
   availableDuration: number;
   availableSegments: CodexNarrationSegment[];
-  completedUnits: number | null;
+  complete: boolean;
   error: string | null;
   manifest: CodexNarrationManifest | null;
+  progress: CodexNarrationProgress;
   revision: string;
-  stage: 'planning' | 'synthesizing' | null;
-  status: 'cancelled' | 'failed' | 'planning' | 'ready' | 'synthesizing';
+  status: 'planning' | 'streaming' | 'finalizing' | 'ready' | 'failed' | 'cancelled';
   target: CodexNarrationTarget;
-  totalUnits: number | null;
 };
 
-export type CodexNarrationUpdatedNotification = {
-  artifactKey: string;
-};
+export type CodexNarrationUpdatedNotification = { artifactKey: string };
 
 export type CodexNarrationProviderDescriptor = {
-  acousticTiming?: {
-    algorithmVersion: string;
-    provider: string;
-  };
-  aligner?: {
-    algorithmVersion: string;
-    model?: string;
-    modelRevision?: string;
-    provider: string;
-  };
-  id: string;
-  scriptGenerator: {
-    baseInstructionsVersion?: string;
-    contextProfileVersion?: string;
-    contractVersion?: number;
-    effort?: string;
-    model: string;
-    promptVersion: string;
-    provider: string;
-    reasoningSummary?: string;
-    serviceTier?: 'priority' | 'standard';
-  };
-  sourceMapper?: {
-    algorithmVersion: string;
-    provider: string;
-  };
-  synthesizer: {
-    execution?: string;
-    exportVersion?: number;
-    frontend?: {
-      fallback?: string;
-      provider: string;
-      spacyVersion?: string;
-      version: string;
+  id: 'narrate-codex-kokoro-streaming-v6';
+  corpus: {
+    compatibility: {
+      compatibleEntries: number;
+      entries: number;
+      incompatibleEntries: number;
+      unsupportedSymbols: Record<string, number>;
     };
-    model: string;
-    modelAssetSha256?: string;
-    modelRevision: string;
-    onnxOpset?: number;
-    onnxRuntimeVersion?: string;
-    optionsVersion: string;
-    precision?: string;
-    provider: string;
-    sampleRate: number;
-    vocabAssetSha256?: string;
-    voice: string;
-    voiceAssetSha256?: string;
-    workerProtocolVersion?: number;
+    goldSha256: string;
+    provider: 'misaki-us-gold-silver';
+    resolverVersion: '3';
+    silverSha256: string;
   };
+  localG2p: {
+    provider: 'misaki-rs';
+    role: 'authoritative-phoneme-and-token-alignment';
+    version: 'misaki-rs-0.3.0-us';
+  };
+  parserVersion: '5';
+  patchGenerator: {
+    baseInstructionsVersion: '6';
+    effort: 'low';
+    groupingPromptVersion: '4';
+    instructionsSha256: string;
+    model: 'gpt-5.6-sol';
+    profileDigest: string;
+    provider: 'codex-structured-inference';
+    reasoningSummary: 'none';
+    schemaSha256: string;
+    schemaTemplateSha256: string;
+    serviceTier: 'priority';
+  };
+  reviewedLexicon: {
+    role: 'stable-audio-aliases';
+    version: '1';
+  };
+  sourceMapperVersion: '11';
+  synthesizer: Record<string, unknown>;
+  tokenizerVersion: '2';
 };
 
 export type CodexNarrationManifest = {
-  alignmentKey: string;
   artifactKey: string;
-  audioKey: string;
   chunks: CodexNarrationAudioChunk[];
+  corpus: { goldSha256: string; silverSha256: string };
   cues: CodexNarrationCue[];
   durationSeconds: number;
+  groups: CodexNarrationGroup[];
+  planDigest: string;
   profile: CodexNarrationProviderDescriptor;
   segments: CodexNarrationSegment[];
-  scriptKey: string;
   sourceDocumentKey: string;
   sourceHash: string;
   targets: CodexNarrationSourceTarget[];
   units: CodexNarrationUnit[];
-  version: 3;
+  version: 6;
+};
+
+export type CodexNarrationTimeline = Pick<
+  CodexNarrationManifest,
+  'chunks' | 'cues' | 'durationSeconds' | 'segments' | 'targets' | 'units'
+> & { complete: boolean };
+
+export type CodexNarrationGroup = {
+  chunkId: string;
+  end: number;
+  firstBlockId: string;
+  id: string;
+  index: number;
+  lastBlockId: string;
+  spokenText: string;
+  start: number;
 };
 
 export type CodexNarrationSegment = {
   audio: CodexNarrationAudioChunk;
+  audioSamples: number;
   cues: CodexNarrationCue[];
+  group: CodexNarrationGroup;
   index: number;
   units: CodexNarrationUnit[];
 };
@@ -253,9 +214,6 @@ export type CodexNarrationUnit = {
   end: number;
   fallbackTargetIds: string[];
   id: string;
-  mode: 'normalized' | 'summary' | 'verbatim';
-  sentenceRanges: CodexNarrationSentence[];
-  spokenText: string;
   start: number;
 };
 
@@ -269,24 +227,9 @@ export type CodexNarrationSentence = {
 export type CodexNarrationCue = {
   confidence: number;
   end: number;
-  granularity:
-    | 'block'
-    | 'codeLines'
-    | 'diagramNode'
-    | 'expression'
-    | 'tableCell'
-    | 'tableRegion'
-    | 'word';
+  granularity: 'block' | 'expression' | 'word';
   id: string;
-  origin:
-    | 'deterministic'
-    | 'fallback'
-    | 'forcedAlignment'
-    | 'scriptHint'
-    | 'sourceSemantic'
-    | 'sourceWord'
-    | 'summarySemantic'
-    | 'ttsTiming';
+  origin: 'blockFallback' | 'sourceSemantic' | 'sourceWord' | 'summaryBlock';
   spokenEnd: number;
   spokenStart: number;
   start: number;

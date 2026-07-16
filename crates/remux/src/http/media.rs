@@ -151,7 +151,7 @@ fn collect_blobs(root: &Path, output: &mut Vec<(SystemTime, u64, PathBuf)>) -> R
                 .and_then(|bytes| serde_json::from_slice::<MediaMetadata>(&bytes).ok())
                 .and_then(|metadata| {
                     UNIX_EPOCH.checked_add(Duration::from_millis(
-                        metadata.last_access_at_ms.max(0) as u64,
+                        metadata.last_access_at_ms.max(0) as u64
                     ))
                 })
                 .unwrap_or_else(|| metadata.modified().unwrap_or(UNIX_EPOCH));

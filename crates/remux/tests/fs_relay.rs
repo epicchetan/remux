@@ -145,13 +145,19 @@ fn harness_with(options: FsRelayOptions, status_outputs: Vec<&'static str>) -> H
                 .push(TestEvent::Broadcast(message));
         }),
         Arc::new(move |paths, under_roots| {
-            invalidate_events.lock().unwrap().push(TestEvent::Invalidate {
-                paths: paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
-                under_roots: under_roots
-                    .iter()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect(),
-            });
+            invalidate_events
+                .lock()
+                .unwrap()
+                .push(TestEvent::Invalidate {
+                    paths: paths
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect(),
+                    under_roots: under_roots
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect(),
+                });
         }),
     );
 
@@ -201,7 +207,10 @@ async fn broadcasts_served_directory_events_with_repo_rollup_and_invalidates_fir
         .iter()
         .position(|event| matches!(event, TestEvent::Broadcast(_)))
         .expect("broadcast happened");
-    assert!(invalidate_index < broadcast_index, "invalidate must precede broadcast");
+    assert!(
+        invalidate_index < broadcast_index,
+        "invalidate must precede broadcast"
+    );
     assert_eq!(
         events[invalidate_index],
         TestEvent::Invalidate {
@@ -236,7 +245,11 @@ async fn throttles_broadcasts_with_a_merged_trailing_send() {
 
     delay(250).await;
     let broadcasts = harness.broadcasts();
-    assert_eq!(broadcasts.len(), 2, "trailing send fires after the interval");
+    assert_eq!(
+        broadcasts.len(),
+        2,
+        "trailing send fires after the interval"
+    );
     assert_eq!(
         broadcasts[1]["params"]["changedPaths"],
         json!(["/repo/a", "/repo/b"])
@@ -311,7 +324,11 @@ async fn git_confirm_stays_silent_when_the_status_snapshot_is_unchanged() {
 
     harness.registry.emit("/repo/.git", Some("HEAD"));
     delay(50).await;
-    assert_eq!(harness.broadcasts().len(), 0, "unchanged snapshot never emits");
+    assert_eq!(
+        harness.broadcasts().len(),
+        0,
+        "unchanged snapshot never emits"
+    );
 
     harness.relay.close();
 }

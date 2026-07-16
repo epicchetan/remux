@@ -19,7 +19,11 @@ async fn git(cwd: &Path, args: &[&str]) {
         .output()
         .await
         .unwrap();
-    assert!(status.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&status.stderr));
+    assert!(
+        status.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
 }
 
 fn entry_names(result: &Value) -> Vec<String> {
@@ -127,7 +131,11 @@ async fn annotates_directory_entries_and_file_reads_with_git_status() {
     std::fs::write(root_path.join("nested/clean.txt"), "base\n").unwrap();
 
     git(&root_path, &["init"]).await;
-    git(&root_path, &["config", "user.email", "remux@example.invalid"]).await;
+    git(
+        &root_path,
+        &["config", "user.email", "remux@example.invalid"],
+    )
+    .await;
     git(&root_path, &["config", "user.name", "Remux Test"]).await;
     git(&root_path, &["add", "."]).await;
     git(&root_path, &["commit", "-m", "initial"]).await;
@@ -177,7 +185,10 @@ async fn annotates_directory_entries_and_file_reads_with_git_status() {
     .unwrap();
     assert_eq!(tracked["content"], "changed\n");
     assert_eq!(tracked["git"]["status"], "modified");
-    assert_eq!(tracked["git"]["repoRoot"], root_path.to_string_lossy().as_ref());
+    assert_eq!(
+        tracked["git"]["repoRoot"],
+        root_path.to_string_lossy().as_ref()
+    );
     assert_eq!(tracked["git"]["base"]["status"], "modified");
     assert_eq!(tracked["git"]["base"]["content"], "base\n");
     assert_eq!(tracked["git"]["base"]["encoding"], "utf8");
@@ -267,7 +278,10 @@ async fn reads_utf8_base64_binary_and_oversized_files() {
     )
     .await
     .unwrap();
-    assert_eq!(result["path"], root_path.join("README.md").to_string_lossy().as_ref());
+    assert_eq!(
+        result["path"],
+        root_path.join("README.md").to_string_lossy().as_ref()
+    );
     assert_eq!(result["name"], "README.md");
     assert_eq!(result["content"], "# hello\n");
     assert_eq!(result["encoding"], "utf8");
@@ -348,9 +362,13 @@ async fn emits_directory_served_on_fresh_reads_and_honors_unsubscribe() {
     assert_eq!(served.lock().unwrap().len(), 1);
 
     core.unsubscribe(subscription);
-    rpc(&core, "remux/fs/readDirectory", Some(json!({ "force": true })))
-        .await
-        .unwrap();
+    rpc(
+        &core,
+        "remux/fs/readDirectory",
+        Some(json!({ "force": true })),
+    )
+    .await
+    .unwrap();
     assert_eq!(served.lock().unwrap().len(), 1);
 }
 

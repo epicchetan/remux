@@ -13,7 +13,6 @@ path = "src/lib.rs"
 [dependencies]
 misaki-rs = { version = "0.3.0", default-features = false }
 ndarray = "0.17"
-num2words = "0.4.1"
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "download-binaries", "copy-dylibs", "tls-native", "api-24"] }
 ort-sys = { version = "=2.0.0-rc.12", features = ["api-24"] }
 remux-compute = { path = "../remux-compute" }

@@ -1,9 +1,17 @@
 # Narrate Streaming Transcript and G2P R&D
 
-Status: R&D recommendation
+Status: R&D evidence
 Last verified: 2026-07-13
+Canonical code: `tools/narration-rd/`
 Related: `docs/specs/narrate-service.md`, `docs/specs/codex/narration-onnx-synthesis.md`
 Reproduction assets: `tools/narration-rd/`
+Normative implementation spec: `docs/specs/narrate-streaming-g2p.md`
+
+> Historical experiment. The later real-thread contract benchmark in
+> `narrate-streaming-g2p-contract-rd.md` supersedes the model-owned block ranges and targeted repair
+> recommendation below. Production v5 uses server-owned groups, token-local complete
+> pronunciations, and no repair model. The full-phoneme result below became more relevant once
+> streaming made total response size less important than first-group latency.
 
 ## Decision
 
@@ -18,9 +26,10 @@ when the stages were sequential. A Mini audit still took about 19 seconds, emitt
 phoneme, and failed to correct contextual homographs. Use a targeted Sol repair only when local
 validation finds an unresolved word or invalid override in one group.
 
-The first production milestone should stream to the Narrate service and native artifact builder.
-The viewer can consume progressive segments in the next milestone; the service already exposes
-immutable `availableSegments`.
+The experiment originally proposed a hard v4 replacement with no runtime fallback to the
+current planner, frontend, model profile, or cache reader. The active v4 spec
+was subsequently superseded by v5; the normative spec supersedes this R&D document wherever
+implementation details differ.
 
 ## What the experiment tested
 
@@ -187,7 +196,9 @@ message. Add correlated progress to extension RPC rather than a Narrate-specific
   to the originating JSON-RPC request id;
 - the host routes progress only to the calling extension, just as it routes the final response;
 - `remux-extension-rpc` accepts a bounded progress callback/channel;
-- cancellation and the existing five-minute host deadline remain correlated with the same request.
+- cancellation and the bounded host deadline remain correlated with the same request. The final
+  implementation aligns that turn deadline with the 15-minute Narrate job budget because a healthy
+  complete-token stream can outlive the earlier four-minute structured-inference limit.
 
 This keeps the structured gateway domain-neutral and avoids broadcasting private inference deltas to
 viewers or coupling Codex directly to Narrate.
@@ -300,14 +311,15 @@ a narration cache hit.
    target restart, and bounded buffering.
 3. Add the append-only synthesis spool and persistent Kokoro task; replay deterministic fake groups
    before enabling live inference.
-4. Enable streaming planning behind an environment/feature flag while still waiting for completion
-   in the viewer. Compare final transcript, phonemes, cues, and artifacts with the current path.
-5. Enable progressive viewer playback and buffering behavior.
+4. Exercise v4 through unreachable library/integration fixtures while production
+   still runs the current checked-in path; do not add a runtime selector.
+5. Atomically cut the service and viewer over to v4 and delete the v3 runtime
+   path.
 6. Run a sanitized real-response corpus plus blinded listening tests. Gate on semantic preservation,
    contextual pronunciation, OOV coverage, time to first audio, underrun rate, and cancellation
    cleanup.
-7. Make sparse Sol the default only after the replay and listening thresholds pass. Keep the current
-   planner as a rollback path for one artifact-version window.
+7. If live validation fails, fix v4 or revert with Git; do not add a runtime
+   fallback.
 
 ## Proposed rollout gates
 
@@ -339,4 +351,3 @@ remux workload exec \
        --service-tier priority \
        --result /tmp/narration-rd/sparse-sol.json
 ```
-

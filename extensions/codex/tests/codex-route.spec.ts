@@ -20,7 +20,7 @@ type MockHostOptions = {
   commandErrors?: Record<string, string>;
   cwd?: string;
   fuzzyFiles?: Array<{ path: string; isDirectory?: boolean }>;
-  narrationStatus?: 'planning' | 'ready';
+  narrationStatus?: 'planning' | 'ready' | 'streaming';
   sendUpdatesTranscript?: boolean;
   runtime?: {
     activeTurnElapsedMs: number | null;
@@ -761,7 +761,7 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
               threadId: 'mock-fork-thread-1',
               turnId: 'mock-fork-turn-1',
             };
-          case 'remux/codex/narration/start': {
+          case 'remux/narrate/narration/start': {
             const params = request.params as {
               document?: {
                 blocks?: Array<{ id?: string; displayText?: string; targetIds?: string[] }>;
@@ -778,9 +778,6 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
               end: index + 0.9,
               fallbackTargetIds: [block.targetIds?.find((id) => id.endsWith('/target/block')) ?? `${block.id}/target/block`],
               id: `unit:${block.id ?? `md:${index}`}`,
-              mode: 'verbatim',
-              sentenceRanges: [{ end: index + 0.9, spokenEnd: block.displayText?.length ?? 0, spokenStart: 0, start: index }],
-              spokenText: block.displayText ?? '',
               start: index,
             }));
             const cues = blocks.map((block, index) => {
@@ -790,9 +787,9 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
               return {
                 confidence: 0.98,
                 end: index + 0.8,
-                granularity: semanticTarget ? semanticTarget.kind : 'word',
+                granularity: semanticTarget ? 'block' : 'word',
                 id: `unit:${block.id}/cue/0`,
-                origin: 'deterministic',
+                origin: semanticTarget ? 'summaryBlock' : 'sourceWord',
                 spokenEnd: Math.min(4, block.displayText?.length ?? 0),
                 spokenStart: 0,
                 start: index + 0.1,
@@ -800,55 +797,91 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
                 unitId: `unit:${block.id ?? `md:${index}`}`,
               };
             });
+            const audio = { end: Math.max(1, units.length), id: '000', sampleRate: 24000, sizeBytes: 44, start: 0 };
+            const group = {
+              chunkId: '000',
+              end: Math.max(1, units.length),
+              firstBlockId: blocks[0]?.id ?? 'md:0',
+              id: 'group:0',
+              index: 0,
+              lastBlockId: blocks.at(-1)?.id ?? 'md:0',
+              spokenText: blocks.map((block) => block.displayText ?? '').join(' '),
+              start: 0,
+            };
+            const segment = { audio, audioSamples: 24000, cues, group, index: 0, units };
             const manifest = {
-              alignmentKey: 'mock-alignment-v2',
               artifactKey,
-              audioKey: 'mock-audio-v2',
-              chunks: [{ end: Math.max(1, units.length), id: '000', sampleRate: 24000, sizeBytes: 44, start: 0 }],
+              chunks: [audio],
+              corpus: { goldSha256: 'gold', silverSha256: 'silver' },
               cues,
               durationSeconds: Math.max(1, units.length),
+              groups: [group],
+              planDigest: 'mock-plan-v6',
               profile: {
-                aligner: { algorithmVersion: '2', provider: 'mock' },
-                id: 'mock-v2',
-                scriptGenerator: { model: 'mock', promptVersion: '2', provider: 'mock' },
-                synthesizer: { model: 'mock', modelRevision: '2', optionsVersion: '2', provider: 'mock', sampleRate: 24000, voice: 'mock' },
+                corpus: {
+                  compatibility: { compatibleEntries: 1, entries: 1, incompatibleEntries: 0, unsupportedSymbols: {} },
+                  goldSha256: 'gold', provider: 'misaki-us-gold-silver', resolverVersion: '3', silverSha256: 'silver',
+                },
+                id: 'narrate-codex-kokoro-streaming-v6',
+                localG2p: {
+                  provider: 'misaki-rs', role: 'authoritative-phoneme-and-token-alignment', version: 'misaki-rs-0.3.0-us',
+                },
+                parserVersion: '5',
+                patchGenerator: {
+                  baseInstructionsVersion: '6', effort: 'low', groupingPromptVersion: '4',
+                  instructionsSha256: 'instructions', model: 'gpt-5.6-sol', profileDigest: 'profile',
+                  provider: 'codex-structured-inference', reasoningSummary: 'none', schemaSha256: 'schema',
+                  schemaTemplateSha256: 'schema-template', serviceTier: 'priority',
+                },
+                reviewedLexicon: { role: 'stable-audio-aliases', version: '1' },
+                sourceMapperVersion: '11',
+                synthesizer: {},
+                tokenizerVersion: '2',
               },
-              scriptKey: 'mock-script-v2',
-              sourceDocumentKey: 'mock-source-v2',
+              segments: [segment],
+              sourceDocumentKey: 'mock-source-v6',
               sourceHash: params.target?.sourceHash,
               targets,
               units,
-              version: 2,
+              version: 6,
             };
             const resource = {
               artifactKey,
-              completedUnits: narrationStatus === 'ready' ? blocks.length : null,
+              availableDuration: narrationStatus === 'planning' ? 0 : manifest.durationSeconds,
+              availableSegments: narrationStatus === 'planning' ? [] : [segment],
+              complete: narrationStatus === 'ready',
               error: null,
               manifest: narrationStatus === 'ready' ? manifest : null,
+              progress: {
+                committedBlocks: narrationStatus === 'planning' ? 0 : blocks.length,
+                committedGroups: narrationStatus === 'planning' ? 0 : 1,
+                primaryModelComplete: narrationStatus === 'ready',
+                synthesizedGroups: narrationStatus === 'planning' ? 0 : 1,
+                totalBlocks: blocks.length,
+                workerComplete: narrationStatus === 'ready',
+              },
               revision: '1',
-              stage: narrationStatus === 'ready' ? null : 'planning',
               status: narrationStatus,
               target: params.target,
-              totalUnits: narrationStatus === 'ready' ? blocks.length : null,
             };
             narrationResources.set(artifactKey, resource);
             return { artifactKey, resource, status: 'accepted' };
           }
-          case 'remux/codex/narration/resources/read': {
+          case 'remux/narrate/narration/resources/read': {
             const artifactKey = (request.params as { artifactKey?: string }).artifactKey ?? '';
             const resource = narrationResources.get(artifactKey) ?? null;
             return { resource, status: resource ? 'ok' : 'missing' };
           }
-          case 'remux/codex/narration/cancel':
+          case 'remux/narrate/narration/cancel':
             return {
               artifactKey: (request.params as { artifactKey?: string }).artifactKey,
               status: 'accepted',
             };
-          case 'remux/codex/narration/audio/read':
+          case 'remux/narrate/narration/audio/read':
             return {
               artifactKey: (request.params as { artifactKey?: string }).artifactKey,
               chunkId: '000',
-              dataBase64: silentWavBase64(3),
+              dataBase64: silentWavBase64(30),
               mimeType: 'audio/wav',
               sizeBytes: 44,
             };
@@ -2434,7 +2467,7 @@ test.describe('codex viewer route', () => {
 
     await page.getByRole('button', { name: 'Narrate response' }).click();
     const composer = page.locator('[data-remux-composer-root]');
-    await expect(composer.getByRole('button', { name: 'Play narration' })).toBeVisible();
+    await expect(composer.getByRole('button', { name: 'Pause narration' })).toBeVisible();
     await composer.getByRole('button', { name: 'Close narration' }).click();
 
     await page.getByRole('button', { name: 'Fork from response' }).click();
@@ -2500,14 +2533,14 @@ test.describe('codex viewer route', () => {
     const heightBeforeNarration = await markdown.evaluate((element) => element.getBoundingClientRect().height);
 
     await assistantActions.nth(2).click();
-    await expect.poll(() => capturedHostMethods(page)).toContain('remux/codex/narration/start');
+    await expect.poll(() => capturedHostMethods(page)).toContain('remux/narrate/narration/start');
 
     const composer = page.locator('[data-remux-composer-root]');
     await expect(composer.getByRole('button', { name: 'Disable narration auto-scroll' })).toBeVisible();
     await expect(composer.getByRole('button', { name: 'Preferences' })).toHaveCount(0);
     await expect(composer.getByRole('button', { name: 'Previous narrated block' })).toBeDisabled();
     await expect(composer.getByRole('button', { name: 'Next narrated block' })).toBeEnabled();
-    await expect(composer.getByRole('button', { name: 'Play narration' })).toBeVisible();
+    await expect(composer.getByRole('button', { name: 'Pause narration' })).toBeVisible();
     await expect(composer.getByRole('button', { name: 'Narration speed 1×' })).toBeVisible();
     await expect(composer.getByRole('button', { name: 'Close narration' })).toBeVisible();
     await expect(composer.getByRole('button', { name: 'Attach' })).toHaveCount(0);
@@ -2525,7 +2558,6 @@ test.describe('codex viewer route', () => {
     await expect(composer.getByRole('button', { name: 'Previous narrated block' })).toBeEnabled();
     await composer.getByRole('button', { name: 'Previous narrated block' }).click();
 
-    await composer.getByRole('button', { name: 'Play narration' }).click();
     await expect(composer.getByRole('button', { name: 'Pause narration' })).toBeVisible();
     await expect(markdown.locator('.codex-narration-word-rect')).toBeVisible();
     await expect(markdown.locator('.codex-md-narrated-word')).toHaveCount(0);
@@ -2557,14 +2589,32 @@ test.describe('codex viewer route', () => {
     await page.getByRole('button', { name: 'Narrate response' }).click();
 
     const bar = page.locator('.remux-narration-bar');
-    await expect(bar).toContainText('Preparing narration · Writing script');
+    await expect(bar).toContainText('Preparing narration · Writing the first spoken group');
     await expect(bar.getByRole('button', { name: 'Cancel narration preparation' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Attach' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Send message' })).toBeVisible();
 
     await bar.getByRole('button', { name: 'Cancel narration preparation' }).click();
     await expect(bar).toHaveCount(0);
-    await expect.poll(() => capturedHostMethods(page)).toContain('remux/codex/narration/cancel');
+    await expect.poll(() => capturedHostMethods(page)).toContain('remux/narrate/narration/cancel');
+  });
+
+  test('starts playback from an available segment before the final manifest exists', async ({ page }) => {
+    await installMockRemuxHost(page, {
+      narrationStatus: 'streaming',
+      turns: [completedTurn({ assistantText: 'The first streamed narration segment.' })],
+    });
+
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    await page.getByRole('button', { name: 'Narrate response' }).click();
+
+    const composer = page.locator('[data-remux-composer-root]');
+    await expect(composer.getByRole('button', { name: 'Pause narration' })).toBeVisible();
+    await expect(page.locator('.remux-narration-bar')).toHaveCount(0);
+    await expect.poll(() => capturedHostMethods(page)).toContain('remux/narrate/narration/audio/read');
+
+    await composer.getByRole('button', { name: 'Close narration' }).click();
+    await expect.poll(() => capturedHostMethods(page)).toContain('remux/narrate/narration/cancel');
   });
 
   test('paints word ranges through nested Markdown leaves without changing layout', async ({ page }) => {
@@ -2583,6 +2633,8 @@ test.describe('codex viewer route', () => {
     const height = await markdown.evaluate((element) => element.getBoundingClientRect().height);
     await page.getByRole('button', { name: 'Narrate response' }).click();
     const composer = page.locator('[data-remux-composer-root]');
+    await expect(composer.getByRole('button', { name: 'Pause narration' })).toBeVisible();
+    await composer.getByRole('button', { name: 'Pause narration' }).click();
 
     const expectedWords = ['Nested', 'Linked', 'inlineCode'];
     for (const [index, expected] of expectedWords.entries()) {
@@ -2672,6 +2724,8 @@ test.describe('codex viewer route', () => {
     await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
     await page.getByRole('button', { name: 'Narrate response' }).click();
     const composer = page.locator('[data-remux-composer-root]');
+    await expect(composer.getByRole('button', { name: 'Pause narration' })).toBeVisible();
+    await composer.getByRole('button', { name: 'Pause narration' }).click();
     await composer.getByRole('button', { name: 'Next narrated block' }).click();
     await composer.getByRole('button', { name: 'Next narrated block' }).click();
     const target = page.locator('[data-narration-block-id="md:2"]');
@@ -2707,6 +2761,8 @@ test.describe('codex viewer route', () => {
     await page.getByRole('button', { name: 'Narrate response' }).click();
     const composer = page.locator('[data-remux-composer-root]');
     const markdown = page.locator('[data-row-kind="assistantMessage"] .codex-markdown');
+    await expect(composer.getByRole('button', { name: 'Pause narration' })).toBeVisible();
+    await composer.getByRole('button', { name: 'Pause narration' }).click();
     await composer.getByRole('button', { name: 'Next narrated block' }).click();
     await expect(markdown.locator('[data-narration-block-id="md:1"] .codex-narration-word-rect')).toBeVisible();
     await composer.getByRole('button', { name: 'Next narrated block' }).click();
@@ -2757,7 +2813,7 @@ test.describe('codex viewer route', () => {
     const markdown = page.locator('[data-row-kind="assistantMessage"] .codex-markdown');
     const initialHeight = await markdown.evaluate((element) => element.getBoundingClientRect().height);
     await page.getByRole('button', { name: 'Narrate response' }).click();
-    const startRequest = (await capturedHostRequests(page)).find((request) => request.method === 'remux/codex/narration/start');
+    const startRequest = (await capturedHostRequests(page)).find((request) => request.method === 'remux/narrate/narration/start');
     const sourceTargets = (startRequest?.params as { document?: { targets?: Array<{ kind?: string }> } })?.document?.targets ?? [];
     // Element-level narration: the document carries no per-cell targets.
     expect(sourceTargets.every((target) => target.kind !== 'tableCell')).toBe(true);
@@ -2888,7 +2944,8 @@ test.describe('codex viewer route', () => {
     await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
     await page.getByRole('button', { name: 'Narrate response' }).click();
     const composer = page.locator('[data-remux-composer-root]');
-    await expect(composer.getByRole('button', { name: 'Play narration' })).toBeVisible();
+    await expect(composer.getByRole('button', { name: 'Pause narration' })).toBeVisible();
+    await composer.getByRole('button', { name: 'Pause narration' }).click();
 
     const markdown = page.locator('[data-row-kind="assistantMessage"] .codex-markdown');
     await expect(markdown.locator('[data-narration-block-id="md:0"] .codex-narration-context-rect')).toBeVisible();

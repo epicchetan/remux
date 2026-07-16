@@ -637,6 +637,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "unicode-normalization",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -645,7 +646,6 @@ version = "0.1.0"
 dependencies = [
  "misaki-rs",
  "ndarray",
- "num2words",
  "ort",
  "ort-sys",
  "remux-compute",

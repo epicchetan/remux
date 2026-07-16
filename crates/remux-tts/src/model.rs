@@ -74,6 +74,7 @@ impl KokoroModel {
     }
 
     pub fn infer(&self, phonemes: &str) -> Result<InferenceOutput, String> {
+        self.validate_supported(phonemes)?;
         let mut token_ids = Vec::with_capacity(phonemes.chars().count() + 2);
         token_ids.push(0);
         for character in phonemes.chars() {
@@ -103,8 +104,16 @@ impl KokoroModel {
         )
     }
 
-    pub fn retain_supported(&self, value: &mut String) {
-        value.retain(|character| self.vocab.contains_key(&character));
+    pub fn validate_supported(&self, value: &str) -> Result<(), String> {
+        if let Some(character) = value
+            .chars()
+            .find(|character| !self.vocab.contains_key(character))
+        {
+            return Err(format!(
+                "Kokoro pronunciation contains unsupported symbol {character:?}"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -277,9 +286,7 @@ fn read_voice(path: &Path) -> Result<Vec<f32>, String> {
 mod tests {
     use super::*;
 
-    #[test]
-    #[ignore = "requires installed Kokoro model assets"]
-    fn installed_model_runs_with_duration_output() {
+    fn installed_model() -> Arc<KokoroModel> {
         let directory = PathBuf::from(
             std::env::var("REMUX_TTS_MODEL_DIR").expect("REMUX_TTS_MODEL_DIR is required"),
         );
@@ -287,9 +294,34 @@ mod tests {
             serde_json::from_slice(&fs::read(directory.join("asset-manifest.json")).unwrap())
                 .unwrap();
         let assets = serde_json::from_value(manifest["assets"].clone()).unwrap();
-        let model = KokoroModel::load(&directory, &assets).unwrap();
+        Arc::new(KokoroModel::load(&directory, &assets).unwrap())
+    }
+
+    #[test]
+    #[ignore = "requires installed Kokoro model assets"]
+    fn installed_model_runs_with_duration_output() {
+        let model = installed_model();
         let output = model.infer("həlˈO wˈɜɹld").unwrap();
         assert!(!output.waveform.is_empty());
         assert!(output.duration.len() > 2);
+    }
+
+    #[test]
+    #[ignore = "requires installed Kokoro model assets"]
+    fn installed_model_supports_bounded_concurrent_runs() {
+        let model = installed_model();
+        std::thread::scope(|scope| {
+            let handles = (0..4)
+                .map(|_| {
+                    let model = model.clone();
+                    scope.spawn(move || model.infer("stɹˈimɪŋ nˈeɪɹˈeɪʃən").unwrap())
+                })
+                .collect::<Vec<_>>();
+            for handle in handles {
+                let output = handle.join().unwrap();
+                assert!(!output.waveform.is_empty());
+                assert!(output.duration.len() > 2);
+            }
+        });
     }
 }
