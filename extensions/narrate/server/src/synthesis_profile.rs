@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use std::collections::HashMap;
 
-use remux_tts::STREAMING_TASK_VERSION;
+use remux_tts::BATCH_TASK_VERSION;
 use serde_json::{Value, json};
 
 const MODEL_MANIFEST: &str = include_str!(concat!(
@@ -68,13 +68,13 @@ pub(crate) fn resolve_synthesis_profile(
         "exportVersion": manifest.get("exportVersion").cloned().unwrap_or(Value::Null),
         "onnxOpset": manifest.get("onnxOpset").cloned().unwrap_or(Value::Null),
         "onnxRuntimeVersion": string("onnxRuntimeVersion")?,
-        "frontend": "remux-misaki-local-g2p-v3+sparse-sol-text-patches",
+        "frontend": "misaki-rs-0.3.0-us-no-default-features",
         "precision": string("precision")?,
         "sampleRate": manifest.get("sampleRate").cloned().unwrap_or(Value::Null),
-        "optionsVersion": "9-local-g2p-sparse-patches",
-        "execution": "remux-compute-streaming-spool",
-        "taskVersion": STREAMING_TASK_VERSION,
-        "workerProtocolVersion": 7,
+        "optionsVersion": "3-direct-phoneme-audit",
+        "execution": "remux-compute-reviewed-batch-artifact",
+        "taskVersion": BATCH_TASK_VERSION,
+        "workerProtocolVersion": 3,
     });
     let primary = remux_root
         .join(".remux")
@@ -106,10 +106,10 @@ mod tests {
         assert_eq!(profile.descriptor["provider"], "onnxruntime-rust");
         assert_eq!(
             profile.descriptor["optionsVersion"],
-            "9-local-g2p-sparse-patches"
+            "3-direct-phoneme-audit"
         );
-        assert_eq!(profile.descriptor["taskVersion"], STREAMING_TASK_VERSION);
-        assert_eq!(profile.descriptor["workerProtocolVersion"], 7);
+        assert_eq!(profile.descriptor["taskVersion"], BATCH_TASK_VERSION);
+        assert_eq!(profile.descriptor["workerProtocolVersion"], 3);
         assert!(profile.descriptor["modelAssetSha256"].as_str().is_some());
     }
 }

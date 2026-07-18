@@ -86,14 +86,41 @@ impl Guardian {
         if !self.resource_governance {
             return;
         }
+        let owned_slices = self.extension_slice_names();
         for unit in list_units("remux-ext-*") {
-            let _ = systemctl(&["--no-block", "stop", &unit]);
-        }
-        for unit in list_units("remux-workload-*") {
-            if !unit.contains("-persistent-") {
+            if unit_belongs_to_slices(&unit, &owned_slices) {
                 let _ = systemctl(&["--no-block", "stop", &unit]);
             }
         }
+        for unit in list_units("remux-workload-*") {
+            if !unit.contains("-persistent-") && unit_belongs_to_slices(&unit, &owned_slices) {
+                let _ = systemctl(&["--no-block", "stop", &unit]);
+            }
+        }
+    }
+
+    fn extension_slice_names(&self) -> HashSet<String> {
+        let Ok(config) = crate::config::load_remux_config(&self.root) else {
+            return HashSet::new();
+        };
+        let roots = crate::extensions::discovery::extension_roots(
+            std::env::var("REMUX_EXTENSION_ROOTS").ok().as_deref(),
+            &config,
+            &self.root,
+        );
+        crate::extensions::discovery::discover_extensions(&roots)
+            .valid
+            .into_iter()
+            .map(|extension| {
+                let canonical = extension
+                    .root_dir
+                    .canonicalize()
+                    .unwrap_or(extension.root_dir)
+                    .to_string_lossy()
+                    .into_owned();
+                crate::resource::systemd::extension_slice_name(&extension.id, &canonical)
+            })
+            .collect()
     }
 
     fn handle(&self, mut stream: TcpStream) {
@@ -393,6 +420,26 @@ fn list_units(pattern: &str) -> Vec<String> {
         .lines()
         .filter_map(|line| line.split_whitespace().next().map(str::to_string))
         .collect()
+}
+
+fn unit_belongs_to_slices(unit: &str, owned_slices: &HashSet<String>) -> bool {
+    if owned_slices.is_empty() {
+        return false;
+    }
+    let Ok(output) = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            unit,
+            "--property=Slice",
+            "--value",
+            "--no-pager",
+        ])
+        .output()
+    else {
+        return false;
+    };
+    output.status.success() && owned_slices.contains(String::from_utf8_lossy(&output.stdout).trim())
 }
 
 fn systemctl(args: &[&str]) -> Result<(), String> {

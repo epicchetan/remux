@@ -1,7 +1,9 @@
+mod inference_gate;
+mod media;
 mod narration;
-mod streaming;
+mod pronunciation_audit;
+mod structural_transcript;
 mod synthesis_profile;
-mod util;
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -9,7 +11,7 @@ use std::sync::{Arc, mpsc};
 
 use remux_compute::Registry as ComputeRegistry;
 use remux_extension_rpc::Peer as ExtensionRpcPeer;
-use remux_tts::KokoroStreamingSynthesis;
+use remux_tts::KokoroBatchSynthesis;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -17,7 +19,6 @@ use crate::narration::NarrationServer;
 
 const START_METHOD: &str = "remux/narrate/narration/start";
 const READ_METHOD: &str = "remux/narrate/narration/resources/read";
-const AUDIO_READ_METHOD: &str = "remux/narrate/narration/audio/read";
 const CANCEL_METHOD: &str = "remux/narrate/narration/cancel";
 const DIAGNOSTICS_READ_METHOD: &str = "remux/narrate/narration/diagnostics/read";
 const OUTPUT_QUEUE_CAPACITY: usize = 256;
@@ -31,7 +32,7 @@ struct Request {
 }
 
 fn main() {
-    let compute = match ComputeRegistry::new().register::<KokoroStreamingSynthesis>() {
+    let compute = match ComputeRegistry::new().register::<KokoroBatchSynthesis>() {
         Ok(compute) => compute,
         Err(error) => {
             eprintln!("compute registration failed: {error}");
@@ -109,7 +110,6 @@ fn run(compute: ComputeRegistry) -> Result<(), String> {
             let result = match request.method.as_str() {
                 START_METHOD => server.start(request.params.unwrap_or(Value::Null)),
                 READ_METHOD => server.read(request.params.unwrap_or(Value::Null)),
-                AUDIO_READ_METHOD => server.read_audio(request.params.unwrap_or(Value::Null)),
                 CANCEL_METHOD => server.cancel(request.params.unwrap_or(Value::Null)),
                 DIAGNOSTICS_READ_METHOD => server.read_diagnostics(),
                 _ => {

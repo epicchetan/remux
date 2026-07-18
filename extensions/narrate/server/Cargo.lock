@@ -628,7 +628,6 @@ dependencies = [
 name = "remux-narrate-server"
 version = "0.1.0"
 dependencies = [
- "base64",
  "regex",
  "remux-compute",
  "remux-extension-rpc",
@@ -636,8 +635,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "unicode-normalization",
- "unicode-segmentation",
 ]
 
 [[package]]
@@ -648,11 +645,13 @@ dependencies = [
  "ndarray",
  "ort",
  "ort-sys",
+ "regex",
  "remux-compute",
  "serde",
  "serde_json",
  "sha2",
  "unicode-normalization",
+ "unicode-segmentation",
 ]
 
 [[package]]

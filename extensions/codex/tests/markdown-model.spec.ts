@@ -67,52 +67,34 @@ test.describe('markdownModel', () => {
     expect(first.every((block) => !('needsTransform' in block))).toBe(true);
     expect(first.at(-1)).toMatchObject({ kind: 'table' });
 
-    const document = narrationSourceDocument(markdown, {
-      messageId: 'assistant-1',
-      messageRevision: 'revision-1',
-      sourceHash: 'source-1',
+    const document = narrationSourceDocument(markdown);
+    expect(document).toMatchObject({
+      offsetEncoding: 'utf16CodeUnit',
+      schemaVersion: 1,
     });
-    expect(document.schemaVersion).toBe(3);
-    expect(document.documentVersion).toBe('4');
-    expect(document.targets.some((target) => target.kind === 'textRange' && target.role === 'word')).toBe(true);
-    // Code and table narration paints at the element level; the model no
-    // longer emits per-line or per-cell targets.
-    expect(document.targets.every((target) => target.kind === 'block' || target.kind === 'textRange')).toBe(true);
-    expect(document.blocks.every((block) => block.targetIds.some((id) => id.endsWith('/target/block')))).toBe(true);
+    expect(document.blocks.map((block) => block.highlightMode)).toEqual([
+      'text',
+      'text',
+      'text',
+      'text',
+      'text',
+      'block',
+      'block',
+    ]);
+    expect(Object.keys(document).sort()).toEqual(['blocks', 'offsetEncoding', 'schemaVersion']);
+    expect(Object.keys(document.blocks[0]).sort()).toEqual(['highlightMode', 'id', 'kind', 'text']);
   });
 
-  test('keeps expression targets case-sensitive for acronym runs', () => {
+  test('leaves word and expression alignment to the narration artifact', () => {
     const document = narrationSourceDocument(
       '`live_transcript.rs`: filters HTTP APIs and notification-only state.',
-      {
-        messageId: 'assistant-1',
-        messageRevision: 'revision-1',
-        sourceHash: 'source-1',
-      },
     );
-    const block = document.blocks[0];
-    const expressions = document.targets
-      .filter((target) => target.kind === 'textRange' && target.role === 'expression')
-      .map((target) =>
-        block.displayText.slice(
-          (target as { displayStart: number }).displayStart,
-          (target as { displayEnd: number }).displayEnd,
-        ));
-
-    // Lowercase runs inside a joined token ("rs" in live_transcript.rs,
-    // "notification"/"only") must not become expression targets: a stray
-    // short expression would out-compete the full inline-code span when the
-    // narration alignment maps a spelled-out spoken run.
-    expect(expressions).not.toContain('rs');
-    expect(expressions).not.toContain('notification');
-    expect(expressions).not.toContain('only');
-    // True acronyms keep their targets (deduped against same-range words).
-    expect(document.targets.some((target) =>
-      target.kind === 'textRange' &&
-      block.displayText.slice(
-        (target as { displayStart: number }).displayStart,
-        (target as { displayEnd: number }).displayEnd,
-      ) === 'HTTP')).toBe(true);
+    expect(document.blocks).toEqual([{
+      highlightMode: 'text',
+      id: 'md:0',
+      kind: 'paragraph',
+      text: 'live_transcript.rs: filters HTTP APIs and notification-only state.',
+    }]);
   });
 
   test('ends an ordered list before following unindented paragraphs', () => {
@@ -529,12 +511,12 @@ test.describe('markdownModel', () => {
         const sourceById = new Map(narrationSourceBlocks(markdown).map((block) => [block.id, block]));
         for (const block of document.blocks) {
           if (block.type !== 'paragraph' && block.type !== 'heading') continue;
-          const displayText = sourceById.get(block.narrationId)?.displayText;
-          expect(displayText).toBeDefined();
+          const sourceText = sourceById.get(block.narrationId)?.text;
+          expect(sourceText).toBeDefined();
           for (const line of block.lines) {
             for (const fragment of line.fragments) {
               expect(
-                displayText!.slice(fragment.displayStart, fragment.displayEnd),
+                sourceText!.slice(fragment.displayStart, fragment.displayEnd),
                 `${JSON.stringify(markdown)} at ${width}px range ${fragment.displayStart}-${fragment.displayEnd}`,
               ).toBe(fragment.text);
             }

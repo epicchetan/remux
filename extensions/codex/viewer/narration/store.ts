@@ -1,15 +1,20 @@
 import { create } from 'zustand';
 import { subscribeIpcEvents } from '@remux/viewer-kit/ipc';
+import {
+  getHostLifecycleSnapshot,
+  subscribeHostLifecycle,
+  subscribeHostResume,
+} from '@remux/viewer-kit/host';
 
 import type {
-  CodexNarrationCue,
+  CodexNarrationArtifact,
   CodexNarrationProgress,
   CodexNarrationResource,
+  CodexNarrationSentence,
   CodexNarrationSourceDocument,
-  CodexNarrationSourceTarget,
-  CodexNarrationStartParams,
+  CodexNarrationStartResponse,
   CodexNarrationTarget,
-  CodexNarrationTimeline,
+  CodexNarrationWordCue,
 } from '../../shared/narration';
 import { cancelNarration, readNarration, startNarration } from '../ipc/narration';
 import {
@@ -36,25 +41,25 @@ export type NarrationFocusReason =
 
 type NarrationRequest = {
   document: CodexNarrationSourceDocument;
-  sourceText: string;
   target: CodexNarrationTarget;
 };
 
 type NarrationStoreState = {
-  activeTargets: CodexNarrationSourceTarget[];
+  artifact: CodexNarrationArtifact | null;
   artifactKey: string | null;
   cancel: () => Promise<void>;
   close: () => void;
   currentBlockId: string | null;
-  currentCue: CodexNarrationCue | null;
-  currentCueIndex: number;
-  currentTargetIds: string[];
-  currentUnitIndex: number;
+  currentBlockIndex: number;
+  currentSample: number;
+  currentSentence: CodexNarrationSentence | null;
+  currentSentenceIndex: number;
+  currentWordCue: CodexNarrationWordCue | null;
+  currentWordCueIndex: number;
   error: string | null;
   followEnabled: boolean;
   focusIntent: { id: number; reason: NarrationFocusReason } | null;
   followSuspendedByUser: boolean;
-  manifest: CodexNarrationTimeline | null;
   nextBlock: () => Promise<void>;
   pause: () => void;
   phase: NarrationPhase;
@@ -63,6 +68,7 @@ type NarrationStoreState = {
   previousBlock: () => Promise<void>;
   progress: CodexNarrationProgress | null;
   refresh: () => Promise<void>;
+  resourceRevision: string | null;
   retry: () => Promise<void>;
   seekToBlock: (blockId: string) => Promise<void>;
   setPlaybackRate: (rate: number) => void;
@@ -76,77 +82,130 @@ const storedRate = Number.parseFloat(localStorage.getItem('narrationPlaybackRate
 const defaultRate = [0.75, 1, 1.25, 1.5, 2].includes(storedRate) ? storedRate : 1;
 let lastRequest: NarrationRequest | null = null;
 let refreshTimer: number | null = null;
-let pendingFocusReason: 'explicitSeek' | 'explicitSeekInPlace' | 'followReenabled' | null = null;
+let pendingFocus: {
+  artifactKey: string;
+  epoch: number;
+  reason: 'explicitSeek' | 'explicitSeekInPlace' | 'followReenabled';
+} | null = null;
 let focusIntentId = 0;
+let storeEpoch = 0;
+let refreshSequence = 0;
+let pausedForLifecycle = false;
+let missingRecovery: Promise<void> | null = null;
+let pendingCancellation: Promise<void> | null = null;
+let pendingStart: Promise<CodexNarrationStartResponse> | null = null;
+let lastRefreshDiagnostic: {
+  artifactKey: string;
+  completedAt: number | null;
+  error: string | null;
+  sequence: number;
+  startedAt: number;
+  status: 'error' | 'missing' | 'notModified' | 'ok' | 'pending';
+} | null = null;
 
 const audioEngine = new NarrationAudioEngine({
   onBuffering: () => undefined,
   onEnded: () => undefined,
   onError: () => undefined,
+  onPaused: () => undefined,
   onPlaying: () => undefined,
-  onTime: () => undefined,
+  onSample: () => undefined,
 });
 
 export const useNarrationStore = create<NarrationStoreState>((set, get) => ({
-  activeTargets: [],
-  artifactKey: null,
+  ...idleState(),
   async cancel() {
+    storeEpoch += 1;
     clearRefreshTimer();
     const artifactKey = get().artifactKey;
-    if (artifactKey) {
-      try { await cancelNarration({ artifactKey }); } catch { /* Best effort. */ }
-    }
+    const start = pendingStart;
     audioEngine.close();
     releaseNarrationScrollOwnership();
     set(idleState());
+    if (artifactKey || start) {
+      try { await cancelPendingNarration(start, artifactKey); } catch { /* Best effort. */ }
+    }
   },
   close() {
+    storeEpoch += 1;
     clearRefreshTimer();
-    const artifactKey = get().artifactKey;
-    if (artifactKey && get().status && get().status !== 'ready') {
-      void cancelNarration({ artifactKey }).catch(() => undefined);
+    const { artifactKey, status } = get();
+    const start = pendingStart;
+    const activeArtifactKey = artifactKey && status && status !== 'ready' ? artifactKey : null;
+    if (activeArtifactKey || start) {
+      void cancelPendingNarration(start, activeArtifactKey).catch(() => undefined);
     }
     audioEngine.close();
     releaseNarrationScrollOwnership();
     set(idleState());
   },
-  currentBlockId: null,
-  currentCue: null,
-  currentCueIndex: -1,
-  currentTargetIds: [],
-  currentUnitIndex: 0,
-  error: null,
-  followEnabled: true,
-  focusIntent: null,
-  followSuspendedByUser: false,
-  manifest: null,
   async nextBlock() { await seekBlock(1, get); },
   pause() {
     audioEngine.pause();
     set({ phase: 'paused' });
   },
-  phase: 'idle',
   async play() {
-    const { artifactKey, followEnabled, manifest } = get();
-    if (!artifactKey || !manifest) return;
+    const { artifact, artifactKey, followEnabled } = get();
+    if (!artifactKey || !artifact) return;
+    const epoch = storeEpoch;
+    pausedForLifecycle = false;
     if (followEnabled) claimNarrationScrollOwnership();
     try {
-      await audioEngine.play(artifactKey, manifest);
+      await audioEngine.play(artifactKey, artifact);
     } catch (error) {
-      set({ error: errorMessage(error), phase: 'ready' });
+      if (epoch !== storeEpoch || get().artifactKey !== artifactKey) return;
+      set({
+        error: pausedForLifecycle ? null : errorMessage(error),
+        phase: pausedForLifecycle ? 'paused' : 'ready',
+      });
     }
   },
-  playbackRate: defaultRate,
   async previousBlock() { await seekBlock(-1, get); },
-  progress: null,
   async refresh() {
-    const { artifactKey } = get();
+    const { artifactKey, resourceRevision } = get();
     if (!artifactKey) return;
+    const epoch = storeEpoch;
+    const sequence = ++refreshSequence;
+    lastRefreshDiagnostic = {
+      artifactKey,
+      completedAt: null,
+      error: null,
+      sequence,
+      startedAt: Date.now(),
+      status: 'pending',
+    };
     try {
-      const response = await readNarration({ artifactKey });
-      if (response.status === 'ok' && response.resource) applyResource(response.resource, set, get);
+      const response = await readNarration({ artifactKey, knownRevision: resourceRevision });
+      if (
+        epoch !== storeEpoch
+        || get().artifactKey !== artifactKey
+        || sequence !== refreshSequence
+      ) return;
+      lastRefreshDiagnostic = {
+        ...lastRefreshDiagnostic,
+        completedAt: Date.now(),
+        status: response.status,
+      };
+      if (response.status === 'ok' && response.resource) {
+        applyResource(response.resource, set, get);
+      } else if (response.status === 'missing') {
+        await recoverMissingNarration(artifactKey, epoch, set, get);
+      } else if (isActiveStatus(get().status)) {
+        scheduleRefresh();
+      }
     } catch (error) {
-      set({ error: errorMessage(error), phase: 'failed', status: 'failed' });
+      if (epoch !== storeEpoch || get().artifactKey !== artifactKey) return;
+      lastRefreshDiagnostic = {
+        ...lastRefreshDiagnostic,
+        completedAt: Date.now(),
+        error: errorMessage(error),
+        status: 'error',
+      };
+      // Connection and extension restarts are recoverable. Keep the last
+      // truthful resource on screen and verify again instead of turning a
+      // transient read failure into a terminal narration failure.
+      set({ error: errorMessage(error) });
+      scheduleRefresh();
     }
   },
   async retry() {
@@ -160,23 +219,46 @@ export const useNarrationStore = create<NarrationStoreState>((set, get) => ({
     set({ playbackRate: rate });
   },
   async start(request) {
+    const epoch = ++storeEpoch;
+    clearRefreshTimer();
+    const previous = get();
+    const previousStart = pendingStart;
+    audioEngine.close();
+    releaseNarrationScrollOwnership();
+    pausedForLifecycle = getHostLifecycleSnapshot().state !== 'active';
     lastRequest = request;
     set({
       ...idleState(),
       phase: 'preparing',
-      status: 'planning',
+      status: 'preparing',
       target: request.target,
     });
     try {
-      const response = await startNarration(request satisfies CodexNarrationStartParams);
+      if (pendingCancellation) await pendingCancellation;
+      const uncancelledStart = previousStart === pendingStart ? previousStart : null;
+      const activeArtifactKey = previous.artifactKey && isActiveStatus(previous.status)
+        ? previous.artifactKey
+        : null;
+      if (uncancelledStart || activeArtifactKey) {
+        await cancelPendingNarration(uncancelledStart, activeArtifactKey);
+      }
+      if (epoch !== storeEpoch) return;
+      const start = startNarration({ document: request.document });
+      pendingStart = start;
+      let response: CodexNarrationStartResponse;
+      try {
+        response = await start;
+      } finally {
+        if (pendingStart === start) pendingStart = null;
+      }
+      if (epoch !== storeEpoch) return;
       set({ artifactKey: response.artifactKey });
       applyResource(response.resource, set, get);
     } catch (error) {
+      if (epoch !== storeEpoch) return;
       set({ error: errorMessage(error), phase: 'failed', status: 'failed' });
     }
   },
-  status: null,
-  target: null,
   toggleFollow() {
     const enabled = !get().followEnabled;
     if (enabled) claimNarrationScrollOwnership();
@@ -194,16 +276,24 @@ audioEngine.setCallbacks({
   onEnded: () => {
     const state = useNarrationStore.getState();
     useNarrationStore.setState({
-      activeTargets: [],
-      currentCue: null,
-      currentCueIndex: -1,
-      currentTargetIds: [],
+      currentBlockId: null,
+      currentBlockIndex: -1,
+      currentSentence: null,
+      currentSentenceIndex: -1,
+      currentWordCue: null,
+      currentWordCueIndex: -1,
       phase: state.error ? 'failed' : 'paused',
     });
   },
   onError: (error) => useNarrationStore.setState({ error, phase: 'ready' }),
+  onPaused: () => {
+    const state = useNarrationStore.getState();
+    if (state.artifact && (state.phase === 'buffering' || state.phase === 'playing')) {
+      useNarrationStore.setState({ phase: 'paused' });
+    }
+  },
   onPlaying: () => useNarrationStore.setState({ error: null, phase: 'playing' }),
-  onTime: (globalTime) => applyAudioTime(globalTime),
+  onSample: (sample) => applyAudioSample(sample),
 });
 audioEngine.setPlaybackRate(defaultRate);
 
@@ -216,7 +306,7 @@ subscribeTranscriptViewport(() => {
 });
 
 export function subscribeNarrationUpdates() {
-  return subscribeIpcEvents((events) => {
+  const unsubscribeEvents = subscribeIpcEvents((events) => {
     const artifactKey = useNarrationStore.getState().artifactKey;
     if (!artifactKey) return;
     if (events.some((event) =>
@@ -226,7 +316,50 @@ export function subscribeNarrationUpdates() {
       (event.params as { artifactKey?: unknown }).artifactKey === artifactKey
     )) void useNarrationStore.getState().refresh();
   });
+  const unsubscribeLifecycle = subscribeHostLifecycle((lifecycle) => {
+    if (lifecycle.state === 'active') return;
+    pausedForLifecycle = true;
+    const state = useNarrationStore.getState();
+    if (!state.artifact) return;
+    audioEngine.pause();
+    if (state.phase === 'buffering' || state.phase === 'playing') {
+      useNarrationStore.setState({ phase: 'paused' });
+    }
+  });
+  const unsubscribeResume = subscribeHostResume(() => {
+    const state = useNarrationStore.getState();
+    if (state.artifactKey) void state.refresh();
+  });
+  return () => {
+    unsubscribeEvents();
+    unsubscribeLifecycle();
+    unsubscribeResume();
+  };
 }
+
+export function getNarrationDebugSnapshot() {
+  const state = useNarrationStore.getState();
+  return {
+    audio: audioEngine.snapshot(),
+    lifecycle: getHostLifecycleSnapshot(),
+    refresh: lastRefreshDiagnostic,
+    store: {
+      artifactKey: state.artifactKey,
+      currentBlockId: state.currentBlockId,
+      currentSample: state.currentSample,
+      error: state.error,
+      phase: state.phase,
+      progress: state.progress,
+      resourceRevision: state.resourceRevision,
+      status: state.status,
+    },
+    visibilityState: document.visibilityState,
+  };
+}
+
+(globalThis as typeof globalThis & {
+  __remuxNarrationDebugSnapshot?: typeof getNarrationDebugSnapshot;
+}).__remuxNarrationDebugSnapshot = getNarrationDebugSnapshot;
 
 export function narrationSourceHash(text: string) {
   let hash = 0x811c9dc5;
@@ -243,6 +376,7 @@ function applyResource(
   get: () => NarrationStoreState,
 ) {
   if (get().artifactKey && resource.artifactKey !== get().artifactKey) return;
+  if (isOlderRevision(resource.revision, get().resourceRevision)) return;
   if (resource.status === 'cancelled') {
     clearRefreshTimer();
     audioEngine.close();
@@ -251,39 +385,57 @@ function applyResource(
     return;
   }
 
-  const timeline = timelineFromResource(resource);
-  const hadTimeline = Boolean(get().manifest);
-  const playWhenAvailable = !hadTimeline && get().phase === 'preparing';
   const terminalFailure = resource.status === 'failed';
   const error = terminalFailure
     ? resource.error ?? 'Narration stopped before it was complete'
     : null;
-
-  if (timeline) {
-    const position = resolveNarrationPosition(timeline, timeline.units[0]?.start ?? 0);
+  if (resource.manifest) {
+    const artifact = resource.manifest;
+    const hadArtifact = Boolean(get().artifact);
+    if (hadArtifact) {
+      set({
+        artifact,
+        error,
+        progress: resource.progress,
+        resourceRevision: resource.revision,
+        status: resource.status,
+      });
+      clearRefreshTimer();
+      return;
+    }
+    const firstSample = artifact.blocks[0]?.startSample ?? 0;
+    const position = resolveNarrationPosition(artifact, firstSample);
+    const shouldPlay = get().phase === 'preparing'
+      && !pausedForLifecycle
+      && getHostLifecycleSnapshot().state === 'active';
     set({
-      activeTargets: get().currentCue ? get().activeTargets : position.targets,
-      currentBlockId: get().currentBlockId ?? position.unit?.blockId ?? null,
-      currentCue: get().currentCue ?? position.cue,
-      currentCueIndex: get().currentCueIndex >= 0 ? get().currentCueIndex : position.cueIndex,
-      currentTargetIds: get().currentTargetIds.length ? get().currentTargetIds : position.targetIds,
-      currentUnitIndex: get().currentUnitIndex || position.unitIndex,
+      artifact,
+      currentBlockId: position.block?.blockId ?? position.sentence?.blockId ?? null,
+      currentBlockIndex: position.blockIndex,
+      currentSample: firstSample,
+      currentSentence: position.sentence,
+      currentSentenceIndex: position.sentenceIndex,
+      currentWordCue: position.wordCue,
+      currentWordCueIndex: position.wordCueIndex,
       error,
       focusIntent: get().focusIntent ?? nextFocusIntent('follow'),
-      manifest: timeline,
+      phase: shouldPlay ? 'buffering' : get().phase === 'preparing' ? 'ready' : get().phase,
       progress: resource.progress,
+      resourceRevision: resource.revision,
       status: resource.status,
-      target: resource.target,
     });
-    const artifactKey = resource.artifactKey;
-    if (playWhenAvailable) {
+    if (shouldPlay) {
       if (get().followEnabled) claimNarrationScrollOwnership();
-      void audioEngine.play(artifactKey, timeline).catch((cause) => {
-        useNarrationStore.setState({ error: errorMessage(cause), phase: 'ready' });
-      });
-    } else {
-      void audioEngine.update(artifactKey, timeline).catch((cause) => {
-        useNarrationStore.setState({ error: errorMessage(cause), phase: 'ready' });
+      const playEpoch = storeEpoch;
+      void audioEngine.play(resource.artifactKey, artifact).catch((cause) => {
+        if (
+          playEpoch !== storeEpoch
+          || useNarrationStore.getState().artifactKey !== resource.artifactKey
+        ) return;
+        useNarrationStore.setState({
+          error: pausedForLifecycle ? null : errorMessage(cause),
+          phase: pausedForLifecycle ? 'paused' : 'ready',
+        });
       });
     }
   } else {
@@ -291,8 +443,8 @@ function applyResource(
       error,
       phase: terminalFailure ? 'failed' : 'preparing',
       progress: resource.progress,
+      resourceRevision: resource.revision,
       status: resource.status,
-      target: resource.target,
     });
   }
 
@@ -300,129 +452,151 @@ function applyResource(
   else scheduleRefresh();
 }
 
-function timelineFromResource(resource: CodexNarrationResource): CodexNarrationTimeline | null {
-  if (resource.manifest) {
-    return {
-      chunks: resource.manifest.chunks,
-      complete: true,
-      cues: resource.manifest.cues,
-      durationSeconds: resource.manifest.durationSeconds,
-      segments: resource.manifest.segments,
-      targets: resource.manifest.targets,
-      units: resource.manifest.units,
-    };
-  }
-  if (resource.availableSegments.length === 0 || !lastRequest) return null;
-  const segments = resource.availableSegments;
-  return {
-    chunks: segments.map((segment) => segment.audio),
-    complete: resource.status === 'failed',
-    cues: segments.flatMap((segment) => segment.cues),
-    durationSeconds: resource.availableDuration,
-    segments,
-    targets: lastRequest.document.targets,
-    units: segments.flatMap((segment) => segment.units),
-  };
-}
-
-function applyAudioTime(globalTime: number) {
+function applyAudioSample(sample: number) {
   const state = useNarrationStore.getState();
-  if (!state.manifest) return;
-  const position = resolveNarrationPosition(state.manifest, globalTime);
-  if (position.cueIndex === state.currentCueIndex && position.unitIndex === state.currentUnitIndex) return;
-  const reason = pendingFocusReason ?? (state.followEnabled ? 'follow' : null);
-  pendingFocusReason = null;
+  if (!state.artifact) return;
+  const position = resolveNarrationPosition(state.artifact, sample);
+  if (
+    position.blockIndex === state.currentBlockIndex &&
+    position.sentenceIndex === state.currentSentenceIndex &&
+    position.wordCueIndex === state.currentWordCueIndex
+  ) {
+    if (sample !== state.currentSample) useNarrationStore.setState({ currentSample: sample });
+    return;
+  }
+  const reason = pendingFocus
+    && pendingFocus.epoch === storeEpoch
+    && pendingFocus.artifactKey === state.artifactKey
+    ? pendingFocus.reason
+    : state.followEnabled ? 'follow' : null;
+  pendingFocus = null;
   useNarrationStore.setState({
-    activeTargets: position.targets,
-    currentBlockId: position.unit?.blockId ?? null,
-    currentCue: position.cue,
-    currentCueIndex: position.cueIndex,
-    currentTargetIds: position.targetIds,
-    currentUnitIndex: position.unitIndex,
+    currentBlockId: position.block?.blockId ?? position.sentence?.blockId ?? null,
+    currentBlockIndex: position.blockIndex,
+    currentSample: sample,
+    currentSentence: position.sentence,
+    currentSentenceIndex: position.sentenceIndex,
+    currentWordCue: position.wordCue,
+    currentWordCueIndex: position.wordCueIndex,
     focusIntent: reason ? nextFocusIntent(reason) : null,
   });
 }
 
 async function seekToBlockId(blockId: string, get: () => NarrationStoreState) {
-  const { artifactKey, currentUnitIndex, manifest, phase } = get();
-  if (!artifactKey || !manifest) return;
-  const destination = manifest.units.findIndex((unit) => unit.blockId === blockId);
+  const { artifact, artifactKey, currentBlockIndex, phase } = get();
+  if (!artifactKey || !artifact) return;
+  const destination = artifact.blocks.findIndex((block) => block.blockId === blockId);
   if (destination === -1) return;
-  await audioEngine.prepare(artifactKey, manifest);
-  const current = Math.max(0, currentUnitIndex);
-  pendingFocusReason = 'explicitSeekInPlace';
-  await audioEngine.seek(blockNavigationTime(manifest, destination), phase === 'playing' || phase === 'buffering');
-  if (destination === current) {
-    pendingFocusReason = null;
-    useNarrationStore.setState({ focusIntent: nextFocusIntent('explicitSeekInPlace') });
-  }
+  await seekToSample({
+    artifact,
+    artifactKey,
+    currentBlockIndex,
+    destination,
+    get,
+    keepPlaying: phase === 'playing' || phase === 'buffering',
+    reason: 'explicitSeekInPlace',
+  });
 }
 
 async function seekBlock(direction: -1 | 1, get: () => NarrationStoreState) {
-  const { artifactKey, currentUnitIndex, manifest, phase } = get();
-  if (!artifactKey || !manifest || manifest.units.length === 0) return;
-  await audioEngine.prepare(artifactKey, manifest);
-  const current = Math.max(0, currentUnitIndex);
-  const currentBlock = manifest.units[current]?.blockId;
-  let destination = current;
-  for (let index = current + direction; index >= 0 && index < manifest.units.length; index += direction) {
-    if (manifest.units[index].blockId !== currentBlock) {
-      destination = index;
-      break;
-    }
-  }
-  pendingFocusReason = 'explicitSeek';
-  await audioEngine.seek(blockNavigationTime(manifest, destination), phase === 'playing' || phase === 'buffering');
-  if (destination === current) {
-    pendingFocusReason = null;
-    useNarrationStore.setState({ focusIntent: nextFocusIntent('explicitSeek') });
-  }
+  const { artifact, artifactKey, currentBlockIndex, phase } = get();
+  if (!artifactKey || !artifact || artifact.blocks.length === 0) return;
+  const current = currentBlockIndex >= 0 ? currentBlockIndex : 0;
+  const destination = Math.max(0, Math.min(artifact.blocks.length - 1, current + direction));
+  await seekToSample({
+    artifact,
+    artifactKey,
+    currentBlockIndex: current,
+    destination,
+    get,
+    keepPlaying: phase === 'playing' || phase === 'buffering',
+    reason: 'explicitSeek',
+  });
 }
 
-function blockNavigationTime(manifest: CodexNarrationTimeline, unitIndex: number) {
-  const unit = manifest.units[unitIndex];
-  if (!unit) return 0;
-  const firstCue = manifest.cues.find((cue) => cue.unitId === unit.id);
-  if (!firstCue) return unit.start;
-  const cueStart = Math.max(unit.start, Math.min(unit.end, firstCue.start));
-  const cueEnd = Math.max(cueStart, Math.min(unit.end, firstCue.end));
-  return cueStart + Math.min(0.001, Math.max(0, (cueEnd - cueStart) / 2));
+async function seekToSample({
+  artifact,
+  artifactKey,
+  currentBlockIndex,
+  destination,
+  get,
+  keepPlaying,
+  reason,
+}: {
+  artifact: CodexNarrationArtifact;
+  artifactKey: string;
+  currentBlockIndex: number;
+  destination: number;
+  get: () => NarrationStoreState;
+  keepPlaying: boolean;
+  reason: 'explicitSeek' | 'explicitSeekInPlace';
+}) {
+  const epoch = storeEpoch;
+  const focus = { artifactKey, epoch, reason } as const;
+  try {
+    const prepared = await audioEngine.prepare(artifactKey, artifact);
+    if (!prepared || epoch !== storeEpoch || get().artifactKey !== artifactKey) return;
+    pendingFocus = focus;
+    const sought = await audioEngine.seek(
+      artifactKey,
+      artifact.blocks[destination].startSample,
+      keepPlaying,
+    );
+    if (!sought || epoch !== storeEpoch || get().artifactKey !== artifactKey) return;
+    if (destination === currentBlockIndex) {
+      if (pendingFocus === focus) pendingFocus = null;
+      useNarrationStore.setState({ focusIntent: nextFocusIntent(reason) });
+    }
+  } catch (error) {
+    if (epoch !== storeEpoch || get().artifactKey !== artifactKey) return;
+    if (pendingFocus === focus) pendingFocus = null;
+    useNarrationStore.setState({
+      error: pausedForLifecycle ? null : errorMessage(error),
+      phase: pausedForLifecycle ? 'paused' : 'ready',
+    });
+  }
 }
 
 function idleState(): Pick<
   NarrationStoreState,
-  | 'activeTargets'
+  | 'artifact'
   | 'artifactKey'
   | 'currentBlockId'
-  | 'currentCue'
-  | 'currentCueIndex'
-  | 'currentTargetIds'
-  | 'currentUnitIndex'
+  | 'currentBlockIndex'
+  | 'currentSample'
+  | 'currentSentence'
+  | 'currentSentenceIndex'
+  | 'currentWordCue'
+  | 'currentWordCueIndex'
   | 'error'
   | 'followEnabled'
   | 'focusIntent'
   | 'followSuspendedByUser'
-  | 'manifest'
   | 'phase'
+  | 'playbackRate'
   | 'progress'
+  | 'resourceRevision'
   | 'status'
   | 'target'
 > {
   return {
-    activeTargets: [],
+    artifact: null,
     artifactKey: null,
     currentBlockId: null,
-    currentCue: null,
-    currentCueIndex: -1,
-    currentTargetIds: [],
-    currentUnitIndex: 0,
+    currentBlockIndex: -1,
+    currentSample: 0,
+    currentSentence: null,
+    currentSentenceIndex: -1,
+    currentWordCue: null,
+    currentWordCueIndex: -1,
     error: null,
     followEnabled: true,
     focusIntent: null,
     followSuspendedByUser: false,
-    manifest: null,
     phase: 'idle',
+    playbackRate: defaultRate,
     progress: null,
+    resourceRevision: null,
     status: null,
     target: null,
   };
@@ -446,6 +620,121 @@ function releaseNarrationScrollOwnership() {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : 'Narration request failed';
+}
+
+function isActiveStatus(status: CodexNarrationResource['status'] | null) {
+  return status === 'preparing' || status === 'synthesizing' || status === 'finalizing';
+}
+
+function isOlderRevision(candidate: string, current: string | null) {
+  if (current === null || candidate === current) return false;
+  if (/^\d+$/.test(candidate) && /^\d+$/.test(current)) {
+    return BigInt(candidate) < BigInt(current);
+  }
+  return false;
+}
+
+async function recoverMissingNarration(
+  artifactKey: string,
+  epoch: number,
+  set: (state: Partial<NarrationStoreState>) => void,
+  get: () => NarrationStoreState,
+) {
+  if (missingRecovery) return missingRecovery;
+  const request = lastRequest;
+  if (!request) {
+    set({
+      error: 'Narration state was lost after the service restarted. Start narration again.',
+      phase: 'failed',
+      status: 'failed',
+    });
+    return;
+  }
+  missingRecovery = (async () => {
+    const start = startNarration({ document: request.document });
+    pendingStart = start;
+    let response: CodexNarrationStartResponse;
+    try {
+      response = await start;
+    } finally {
+      if (pendingStart === start) pendingStart = null;
+    }
+    if (epoch !== storeEpoch || get().artifactKey !== artifactKey) return;
+    const resetArtifact = response.artifactKey !== artifactKey || !response.resource.manifest;
+    if (resetArtifact) {
+      audioEngine.close();
+    }
+    // A server restart begins a new revision epoch even when the deterministic
+    // artifact key is unchanged. Do not compare its revision 1 against the
+    // vanished process's higher in-memory revision.
+    set({
+      ...(resetArtifact ? {
+        artifact: null,
+        currentBlockId: null,
+        currentBlockIndex: -1,
+        currentSample: 0,
+        currentSentence: null,
+        currentSentenceIndex: -1,
+        currentWordCue: null,
+        currentWordCueIndex: -1,
+      } : {}),
+      artifactKey: response.artifactKey,
+      resourceRevision: null,
+    });
+    applyResource(response.resource, set, get);
+  })().finally(() => {
+    missingRecovery = null;
+  });
+  try {
+    await missingRecovery;
+  } catch (error) {
+    if (epoch !== storeEpoch || get().artifactKey !== artifactKey) return;
+    set({ error: errorMessage(error) });
+    scheduleRefresh();
+  }
+}
+
+async function waitForNarrationToStop(artifactKey: string) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const response = await readNarration({ artifactKey });
+    if (
+      response.status === 'missing'
+      || (response.status === 'ok' && response.resource && !isActiveStatus(response.resource.status))
+    ) return;
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+  }
+  throw new Error('The previous narration is still stopping. Please retry.');
+}
+
+function cancelAndWaitForNarration(artifactKey: string) {
+  return cancelPendingNarration(null, artifactKey);
+}
+
+function cancelPendingNarration(
+  start: Promise<CodexNarrationStartResponse> | null,
+  artifactKey: string | null,
+) {
+  const previous = pendingCancellation;
+  const cancellation = (async () => {
+    if (previous) {
+      try { await previous; } catch { /* Continue with the latest cancellation. */ }
+    }
+    const artifactKeys = new Set<string>();
+    if (start) {
+      try { artifactKeys.add((await start).artifactKey); } catch { /* No server job was accepted. */ }
+    }
+    if (artifactKey) artifactKeys.add(artifactKey);
+    for (const key of artifactKeys) {
+      await cancelNarration({ artifactKey: key });
+      await waitForNarrationToStop(key);
+    }
+  })();
+  pendingCancellation = cancellation;
+  void cancellation.finally(() => {
+    if (pendingCancellation === cancellation) pendingCancellation = null;
+  }).catch(() => undefined);
+  return cancellation;
 }
 
 function scheduleRefresh() {

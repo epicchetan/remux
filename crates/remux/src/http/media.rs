@@ -4,9 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
+use tower_http::services::ServeFile;
 
 use crate::time::now_ms;
 
@@ -32,7 +33,12 @@ pub fn initialize_media_cache(root_dir: &Path) -> Result<PathBuf, String> {
     Ok(root)
 }
 
-pub async fn serve_media(root: &Path, pathname: &str, headers: &HeaderMap) -> Option<Response> {
+pub async fn serve_media(
+    root: &Path,
+    pathname: &str,
+    method: &Method,
+    headers: &HeaderMap,
+) -> Option<Response> {
     let hash = pathname.strip_prefix("/remux/media/sha256/")?;
     if hash.len() != 64
         || !hash
@@ -54,10 +60,23 @@ pub async fn serve_media(root: &Path, pathname: &str, headers: &HeaderMap) -> Op
         Some(metadata) => metadata,
         None => return Some(not_found()),
     };
-    let blob = match tokio::fs::read(&blob_path).await {
-        Ok(blob) if blob.len() as u64 == metadata.size_bytes => blob,
+    let blob_metadata = match tokio::fs::metadata(&blob_path).await {
+        Ok(blob_metadata)
+            if blob_metadata.is_file() && blob_metadata.len() == metadata.size_bytes =>
+        {
+            blob_metadata
+        }
         _ => return Some(not_found()),
     };
+    if !matches!(*method, Method::GET | Method::HEAD) {
+        return Some(
+            Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .header(header::ALLOW, "GET, HEAD")
+                .body(Body::empty())
+                .expect("media response"),
+        );
+    }
 
     let etag = format!("\"{hash}\"");
     if headers
@@ -74,20 +93,44 @@ pub async fn serve_media(root: &Path, pathname: &str, headers: &HeaderMap) -> Op
         );
     }
 
+    let mut request = Request::new(Body::empty());
+    *request.method_mut() = method.clone();
+    *request.headers_mut() = headers.clone();
+    let mut service = ServeFile::new(blob_path).with_buf_chunk_size(64 * 1024);
+    let response = match service.try_call(request).await {
+        Ok(response) => response,
+        Err(_) => return Some(not_found()),
+    };
+    if !matches!(
+        response.status(),
+        StatusCode::OK | StatusCode::PARTIAL_CONTENT
+    ) {
+        return Some(response.map(Body::new));
+    }
+    if blob_metadata.len() != metadata.size_bytes {
+        return Some(not_found());
+    }
     maybe_touch_metadata(metadata_path, metadata.clone());
-    Some(
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, metadata.mime_type)
-            .header(header::CONTENT_LENGTH, metadata.size_bytes)
-            .header(header::ETAG, etag)
-            .header(
-                header::CACHE_CONTROL,
-                "private, max-age=31536000, immutable",
-            )
-            .body(Body::from(blob))
-            .expect("media response"),
-    )
+    let mut response = response.map(Body::new);
+    let response_headers = response.headers_mut();
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_str(&metadata.mime_type)
+            .expect("validated media MIME type is a header value"),
+    );
+    response_headers.insert(
+        header::ETAG,
+        header::HeaderValue::from_str(&etag).expect("media ETag is a header value"),
+    );
+    response_headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("private, max-age=31536000, immutable"),
+    );
+    response_headers.insert(
+        header::ACCEPT_RANGES,
+        header::HeaderValue::from_static("bytes"),
+    );
+    Some(response)
 }
 
 fn valid_metadata(metadata: &MediaMetadata, hash: &str) -> bool {
@@ -95,7 +138,7 @@ fn valid_metadata(metadata: &MediaMetadata, hash: &str) -> bool {
         && metadata.sha256 == hash
         && matches!(
             metadata.mime_type.as_str(),
-            "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+            "image/png" | "image/jpeg" | "image/webp" | "image/gif" | "audio/wav"
         )
 }
 

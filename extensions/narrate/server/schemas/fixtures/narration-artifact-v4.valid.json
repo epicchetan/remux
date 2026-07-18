@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 4,
+  "artifactKey": "sha256-0000000000000000000000000000000000000000000000000000000000000000",
+  "documentHash": "sha256-1111111111111111111111111111111111111111111111111111111111111111",
+  "pronunciationPlanSha256": "sha256-4444444444444444444444444444444444444444444444444444444444444444",
+  "structuralTranscriptPlanSha256": "sha256-5555555555555555555555555555555555555555555555555555555555555555",
+  "offsetEncoding": "utf16CodeUnit",
+  "audio": {
+    "url": "/remux/media/sha256/2222222222222222222222222222222222222222222222222222222222222222",
+    "mimeType": "audio/wav", "sampleRate": 24000, "channels": 1,
+    "totalSamples": 24000, "sizeBytes": 48044,
+    "sha256": "sha256-2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "blocks": [{ "blockId": "md:0", "startSample": 0, "endSample": 24000 }],
+  "sentences": [{ "id": "md:0/sentence/0", "blockId": "md:0", "textStart": 0, "textEnd": 13, "startSample": 0, "endSample": 24000 }],
+  "wordCues": [{ "sentenceId": "md:0/sentence/0", "blockId": "md:0", "textStart": 0, "textEnd": 5, "startSample": 0, "endSample": 9000 }],
+  "profile": {
+    "phonemizer": "misaki-rs-0.3.0-us-no-default-features",
+    "pronunciationReviewer": {
+      "model": "gpt-5.6-sol", "serviceTier": "priority", "effort": "low",
+      "profileDigest": "sha256-498e383cb5c7b7bc1dfe68df5667d8475156e67190d949e3b90029f52cf4a59c",
+      "promptVersion": 4, "outputSchemaVersion": 4, "windowPlannerVersion": 3,
+      "phoneAlphabetVersion": 1,
+      "phoneAlphabetSha256": "sha256-66c2e7ed0b07928fa5b5ff4426c53fbb4a643808d5bc4e5b4330ef59111f0bed",
+      "kokoroVocabularySha256": "sha256-5977eee9e44024553a1511cbc7f2c9320fbd4f6409228bcab0b5d26922260beb",
+      "directPhoneValidatorVersion": 1
+    },
+    "structuralTranscript": {
+      "model": "gpt-5.6-sol", "serviceTier": "priority", "effort": "low",
+      "profileDigest": "sha256-498e383cb5c7b7bc1dfe68df5667d8475156e67190d949e3b90029f52cf4a59c",
+      "promptVersion": 2, "outputSchemaVersion": 2, "windowPlannerVersion": 1
+    },
+    "sourceMapperVersion": 1, "wordSegmenterVersion": 2, "sentenceVersion": 1,
+    "plannerVersion": 1, "timingVersion": 2,
+    "synthesizerHash": "sha256-3333333333333333333333333333333333333333333333333333333333333333"
+  }
+}

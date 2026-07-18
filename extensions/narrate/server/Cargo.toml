@@ -4,13 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-base64 = "0.22"
-regex = "1"
 remux-compute = { path = "../../../crates/remux-compute" }
 remux-extension-rpc = { path = "../../../crates/remux-extension-rpc" }
 remux-tts = { path = "../../../crates/remux-tts" }
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-unicode-segmentation = "1.13"
-unicode-normalization = "0.1"

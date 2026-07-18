@@ -1,0 +1,5 @@
+{"type":"session_meta","payload":{"id":"019-narration-real-0000-7000-8000-000000000001","timestamp":"2026-07-17T00:00:00.000Z","cwd":"/tmp/remux-narration-real","originator":"codex_exec","cli_version":"0.144.0","source":"exec","model_provider":"openai"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-narration-real","started_at":1}}
+{"type":"event_msg","payload":{"type":"user_message","message":"Explain the real narration acceptance path."}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"# Narration acceptance\n\nCodex sends structured Markdown blocks through WebSocket to Narrate. Misaki phonemizes terms such as Kokoro, JSON, and UTF-16 before the model synthesizes natural speech.\n\nThe viewer then uses word timing and sentence timing to keep highlighting aligned with the real WAV file.","phase":"final_answer"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-narration-real","completed_at":2,"duration_ms":1}}

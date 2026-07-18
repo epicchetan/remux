@@ -8,8 +8,6 @@ import { useOperationQueueStore } from '../../threads/operationQueueStore';
 import { narrationSourceDocument } from './markdown/markdownModel';
 import { narrationSourceHash, useNarrationStore } from '../../narration/store';
 
-const noNarrationTargets: never[] = [];
-
 export function AssistantMessage({
   segment,
   showActions = false,
@@ -26,7 +24,6 @@ export function AssistantMessage({
   width: number;
 }) {
   const narrationTargetMessageId = useNarrationStore((state) => state.target?.assistantMessageId ?? null);
-  const narrationSourceTargets = useNarrationStore((state) => state.manifest?.targets ?? noNarrationTargets);
   const narrationPhase = useNarrationStore((state) => state.phase);
   const seekNarrationToBlock = useNarrationStore((state) => state.seekToBlock);
   if (!segment.text.trim()) {
@@ -56,7 +53,6 @@ export function AssistantMessage({
     >
       <MarkdownBlock
         narrationAssistantMessageId={narrationTargetMessageId === segment.id ? segment.id : null}
-        narrationTargets={narrationTargetMessageId === segment.id ? narrationSourceTargets : []}
         streaming={streaming}
         width={width}
       >{segment.text}</MarkdownBlock>
@@ -97,7 +93,7 @@ function AssistantMessageActions({
   const [copied, setCopied] = useState(false);
   const narrationIsTarget = narrationTargetMessageId === segment.id;
   const narrationPreparing = narrationIsTarget && narrationPhase === 'preparing';
-  const narrationPlaying = narrationIsTarget && narrationPhase === 'playing';
+  const narrationPlaying = narrationIsTarget && (narrationPhase === 'buffering' || narrationPhase === 'playing');
   // A message in an in-progress turn is still mutable: codex rejects it as a
   // fork point and its text would go stale under a narration. Completed
   // messages stay forkable and narratable while a newer turn runs.
@@ -140,12 +136,7 @@ function AssistantMessageActions({
     }
     const sourceHash = narrationSourceHash(segment.text);
     void startNarration({
-      document: narrationSourceDocument(segment.text, {
-        messageId: segment.id,
-        messageRevision: segment.revision,
-        sourceHash,
-      }),
-      sourceText: segment.text,
+      document: narrationSourceDocument(segment.text),
       target: {
         assistantMessageId: segment.id,
         messageRevision: segment.revision,

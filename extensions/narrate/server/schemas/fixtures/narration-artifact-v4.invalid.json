@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 4,
+  "artifactKey": "sha256-0000000000000000000000000000000000000000000000000000000000000000",
+  "documentHash": "sha256-1111111111111111111111111111111111111111111111111111111111111111",
+  "offsetEncoding": "utf16CodeUnit",
+  "audio": {}, "blocks": [], "sentences": [], "wordCues": [], "profile": {}
+}

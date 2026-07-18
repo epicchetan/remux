@@ -6,7 +6,7 @@ import { AssistantMessage } from './components/assistantMessage';
 import { Compaction } from './components/compaction';
 import { UserMessage } from './components/userMessage';
 import { WorkSection } from './components/work/WorkSection';
-import { resolveNarrationTargetElements } from '../narration/targetRegistry';
+import { resolveNarrationBlockElements } from '../narration/blockRegistry';
 import { transcriptLayout } from './layout/constants';
 import type { TranscriptMeasuredRow, TranscriptMeasuredTurn } from './layout/types';
 import { useThreadRuntimeStore } from '../threads/runtimeStore';
@@ -525,7 +525,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       }
       const viewport = viewportRef.current;
       if (!viewport) return;
-      const elements = resolveNarrationTargetElements(request.assistantMessageId, request.targetIds);
+      const elements = resolveNarrationBlockElements(request.assistantMessageId, request.blockIds);
       if (elements.length === 0) {
         if (attempts === 0 && turnsRef.current.some((turn) => turn.turnId === request.turnId)) {
           const nextIds = Array.from(new Set([...activeTurnIdsRef.current, request.turnId]));

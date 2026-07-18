@@ -5,47 +5,48 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use base64::Engine as _;
 use remux_compute::{Registry as ComputeRegistry, TaskOptions};
 use remux_extension_rpc::Peer as ExtensionRpcPeer;
 use remux_tts::{
-    CorpusCompatibility, EnglishG2p, KokoroStreamingRequest, KokoroStreamingSynthesis,
-    MisakiCorpus, StreamingCompletion, StreamingControl, StreamingGroupPlan, StreamingPlanFile,
-    StreamingProgress, StreamingSegment, StreamingWordPlan, atomic_json, group_digest, plan_digest,
+    AUDIT_WINDOW_PLANNER_VERSION, BatchSynthesisProgress, BatchSynthesisRequest,
+    DIRECT_PHONE_ALPHABET_VERSION, DIRECT_PHONE_VALIDATOR_VERSION, HighlightMode,
+    KokoroBatchSynthesis, KokoroVocabulary, NarrationArtifact, NarrationBlockKind,
+    NarrationDocument, NarrationProfile, PRONUNCIATION_OUTPUT_SCHEMA_VERSION,
+    PRONUNCIATION_PROMPT_VERSION, PronunciationReviewerProfile, ReviewedPronunciationPlan,
+    STRUCTURAL_TRANSCRIPT_OUTPUT_SCHEMA_VERSION, STRUCTURAL_TRANSCRIPT_PROMPT_VERSION,
+    STRUCTURAL_TRANSCRIPT_WINDOW_PLANNER_VERSION, StructuralTranscriptPlan,
+    StructuralTranscriptProfile, direct_phone_alphabet_sha256, narration_document_hash,
+    prepare_baseline, validate_batch_artifact, validate_structural_transcript_plan,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::streaming::{
-    BASE_INSTRUCTIONS_VERSION, CORPUS_RESOLVER_VERSION, GROUPING_PROMPT_VERSION,
-    INCREMENTAL_PARSER_VERSION, IncrementalGroupParser, LOCAL_G2P_VERSION, PRIMARY_INSTRUCTIONS,
-    PatchGroup, REVIEWED_LEXICON_VERSION, SOURCE_MAPPER_VERSION, TOKENIZER_VERSION, asset_sha256,
-    prepare_document, primary_schema, resolve_group, validate_patch_group, word_spans,
+use crate::inference_gate::InferenceGate;
+use crate::media::{media_url, publish_file};
+use crate::pronunciation_audit::{
+    AuditCallbacks, REVIEWER_EFFORT, REVIEWER_MODEL, REVIEWER_PROFILE_DIGEST,
+    REVIEWER_SERVICE_TIER, reviewer_profile_descriptor, run_pronunciation_audit,
+    validate_cached_plan,
+};
+use crate::structural_transcript::{
+    TranscriptCallbacks, run_structural_transcript, structural_transcript_profile_descriptor,
+    validate_cached_structural_transcript_plan,
 };
 use crate::synthesis_profile::{NarrationSynthesisProfile, resolve_synthesis_profile};
-use crate::util::stable_revision_value;
 
 pub(crate) const NARRATION_UPDATED_METHOD: &str = "remux/narrate/narration/updated";
 
-const SOURCE_DOCUMENT_VERSION: &str = "4";
-const SOURCE_DOCUMENT_SCHEMA: u64 = 3;
-const MANIFEST_VERSION: u64 = 6;
-const CACHE_NAMESPACE: &str = "v6";
+const CACHE_NAMESPACE: &str = "batch-alignment-v4-post-transcript-direct-review";
 const MAX_START_PARAMS_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SOURCE_TEXT_BYTES: usize = 64 * 1024;
 const MAX_SOURCE_BLOCKS: usize = 512;
-const MAX_SOURCE_TARGETS: usize = 8_192;
 const MAX_IDENTIFIER_BYTES: usize = 1_024;
-const MAX_AUDIO_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_AUDIO_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_INACTIVE_JOBS: usize = 128;
-const MAX_PENDING_GROUPS: usize = 32;
-const MAX_PENDING_GROUP_BYTES: usize = 512 * 1024;
-const MAX_COMMITTED_UNPUBLISHED_GROUPS: usize = 16;
-const MAX_COMMITTED_UNPUBLISHED_PHONEMES: usize = 4_000;
 const JOB_DEADLINE: Duration = Duration::from_secs(15 * 60);
-const STALL_DEADLINE: Duration = Duration::from_secs(60);
+const STALL_DEADLINE: Duration = Duration::from_secs(2 * 60);
 const LOOP_POLL: Duration = Duration::from_millis(25);
 
 #[derive(Clone)]
@@ -53,12 +54,13 @@ pub(crate) struct NarrationServer {
     inner: Arc<NarrationInner>,
 }
 
-pub(crate) struct NarrationInner {
+struct NarrationInner {
     cache_root: PathBuf,
     compute: ComputeRegistry,
     diagnostics: Mutex<VecDeque<Value>>,
     host_rpc: ExtensionRpcPeer,
     jobs: Mutex<HashMap<String, NarrationJob>>,
+    media_root: Option<PathBuf>,
     output_tx: mpsc::SyncSender<Value>,
     remux_root: PathBuf,
     codex_home: PathBuf,
@@ -67,25 +69,23 @@ pub(crate) struct NarrationInner {
 #[derive(Clone, Debug)]
 struct NarrationJob {
     artifact_key: String,
-    available_segments: Vec<StreamingSegment>,
+    active_operations: HashSet<String>,
     cancel_requested: bool,
-    document: NarrationSourceDocument,
+    document: NarrationDocument,
     error: Option<String>,
     last_access_ms: u128,
-    manifest: Option<Value>,
-    primary_operation: Option<String>,
+    manifest: Option<NarrationArtifact>,
     progress: JobProgress,
     revision: u64,
     staging_dir: Option<PathBuf>,
     status: NarrationStatus,
     synthesis_profile: NarrationSynthesisProfile,
-    target: NarrationTarget,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NarrationStatus {
-    Planning,
-    Streaming,
+    Preparing,
+    Synthesizing,
     Finalizing,
     Ready,
     Failed,
@@ -95,8 +95,8 @@ enum NarrationStatus {
 impl NarrationStatus {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Planning => "planning",
-            Self::Streaming => "streaming",
+            Self::Preparing => "preparing",
+            Self::Synthesizing => "synthesizing",
             Self::Finalizing => "finalizing",
             Self::Ready => "ready",
             Self::Failed => "failed",
@@ -105,60 +105,44 @@ impl NarrationStatus {
     }
 
     fn active(self) -> bool {
-        matches!(self, Self::Planning | Self::Streaming | Self::Finalizing)
+        matches!(
+            self,
+            Self::Preparing | Self::Synthesizing | Self::Finalizing
+        )
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum NarrationStage {
+    #[default]
+    Baseline,
+    LanguagePlanning,
+    Planning,
+    LoadingModel,
+    Synthesizing,
+    Finalizing,
+    Ready,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JobProgress {
-    committed_blocks: usize,
-    committed_groups: usize,
-    primary_model_complete: bool,
-    synthesized_groups: usize,
-    total_blocks: usize,
-    worker_complete: bool,
+    stage: NarrationStage,
+    audit_windows_completed: usize,
+    audit_windows_total: usize,
+    transcript_windows_completed: usize,
+    transcript_windows_total: usize,
+    chunks_completed: usize,
+    chunks_total: usize,
+    sentences: usize,
+    words: usize,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct NarrationStartParams {
-    document: NarrationSourceDocument,
-    source_text: String,
-    target: NarrationTarget,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct NarrationSourceDocument {
-    pub(crate) blocks: Vec<NarrationSourceBlock>,
-    pub(crate) document_version: String,
-    pub(crate) message_id: String,
-    pub(crate) message_revision: String,
-    pub(crate) schema_version: u64,
-    pub(crate) source_hash: String,
-    pub(crate) targets: Vec<Value>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct NarrationTarget {
-    assistant_message_id: String,
-    message_revision: String,
-    source_hash: String,
-    thread_id: String,
-    turn_id: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct NarrationSourceBlock {
-    pub(crate) display_text: String,
-    pub(crate) id: String,
-    pub(crate) inline_ranges: Vec<Value>,
-    pub(crate) kind: String,
-    pub(crate) path: String,
-    pub(crate) target_ids: Vec<String>,
+    document: NarrationDocument,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,13 +158,6 @@ struct NarrationCancelParams {
     artifact_key: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct NarrationAudioReadParams {
-    artifact_key: String,
-    chunk_id: String,
-}
-
 impl NarrationServer {
     pub(crate) fn new(
         remux_root: PathBuf,
@@ -189,13 +166,11 @@ impl NarrationServer {
         host_rpc: ExtensionRpcPeer,
         compute: ComputeRegistry,
     ) -> Self {
-        let cache_parent = remux_root.join(".remux").join("cache").join("narrate");
-        let cache_root = cache_parent.join(CACHE_NAMESPACE);
-        let _ = fs::remove_dir_all(cache_parent.join("v1"));
-        let _ = fs::remove_dir_all(cache_parent.join("v2"));
-        let _ = fs::remove_dir_all(cache_parent.join("v3"));
-        let _ = fs::remove_dir_all(cache_parent.join("v4"));
-        let _ = fs::remove_dir_all(cache_parent.join("v5"));
+        let cache_root = remux_root
+            .join(".remux")
+            .join("cache")
+            .join("narrate")
+            .join(CACHE_NAMESPACE);
         cleanup_temporary_artifacts(&cache_root);
         Self {
             inner: Arc::new(NarrationInner {
@@ -204,6 +179,7 @@ impl NarrationServer {
                 diagnostics: Mutex::new(VecDeque::new()),
                 host_rpc,
                 jobs: Mutex::new(HashMap::new()),
+                media_root: std::env::var_os("REMUX_MEDIA_DIR").map(PathBuf::from),
                 output_tx,
                 remux_root,
                 codex_home,
@@ -217,34 +193,33 @@ impl NarrationServer {
             .len();
         if encoded_len > MAX_START_PARAMS_BYTES {
             return Err(format!(
-                "narration/start params are too large: {encoded_len}>{MAX_START_PARAMS_BYTES}"
+                "sourceSchemaInvalid: narration/start params are too large: {encoded_len}>{MAX_START_PARAMS_BYTES}"
             ));
         }
         let params: NarrationStartParams = decode_routed_params(params, "narration/start")?;
-        validate_start_params(&params)?;
-
-        let profile = self.preflight_profile()?;
+        validate_document(&params.document)?;
         let synthesis_profile =
             resolve_synthesis_profile(&self.inner.remux_root, &self.inner.codex_home)?;
         ensure_synthesis_assets(&synthesis_profile)?;
-        let vocabulary = load_vocabulary(&synthesis_profile.model_dir.join("vocab.json"))?;
-        let corpus = MisakiCorpus::load_us();
-        let corpus_compatibility = corpus.audit_compatibility(&vocabulary);
-        let g2p = EnglishG2p::new();
-        let prepared = prepare_document(&params.document, &corpus, &vocabulary, &g2p)?;
-        let artifact_key = artifact_key(
-            &params,
+        let profile = narration_profile(&synthesis_profile)?;
+        let document_hash = narration_document_hash(&params.document)?;
+        let artifact_key = artifact_key(&document_hash, &profile, &synthesis_profile)?;
+
+        if let Some(manifest) = read_cached_manifest(
+            &self.inner.cache_root,
+            self.inner.media_root.as_deref(),
+            &artifact_key,
+            &params.document,
+            &document_hash,
             &profile,
             &synthesis_profile,
-            &corpus,
-            &prepared.compact_json,
-        );
-
-        if let Some(manifest) =
-            read_cached_manifest(&self.inner.cache_root, &artifact_key, &params.document)
-        {
-            let job =
-                NarrationJob::ready(artifact_key.clone(), params, manifest, synthesis_profile);
+        )? {
+            let job = NarrationJob::ready(
+                artifact_key.clone(),
+                params.document,
+                manifest,
+                synthesis_profile,
+            );
             let resource = job.resource_value();
             self.inner
                 .jobs
@@ -264,7 +239,7 @@ impl NarrationServer {
             .lock()
             .map_err(|_| "narration job store poisoned".to_string())?;
         if let Some(job) = jobs.get_mut(&artifact_key)
-            && (job.status.active() || job.status == NarrationStatus::Ready)
+            && job.status.active()
         {
             job.last_access_ms = now_millis();
             return Ok(json!({
@@ -277,7 +252,16 @@ impl NarrationServer {
         if jobs.values().any(|job| job.status.active()) {
             return Err("another narration is already active".to_string());
         }
-        let job = NarrationJob::planning(artifact_key.clone(), params, synthesis_profile);
+        let invalid_cache = self.inner.cache_root.join(&artifact_key);
+        if invalid_cache.exists() {
+            fs::remove_dir_all(&invalid_cache).map_err(|error| {
+                format!(
+                    "failed to remove invalid narration cache {}: {error}",
+                    invalid_cache.display()
+                )
+            })?;
+        }
+        let job = NarrationJob::preparing(artifact_key.clone(), params.document, synthesis_profile);
         let resource = job.resource_value();
         jobs.insert(artifact_key.clone(), job);
         evict_inactive_jobs(&mut jobs, Some(&artifact_key));
@@ -288,50 +272,12 @@ impl NarrationServer {
 
         let inner = self.inner.clone();
         let background_key = artifact_key.clone();
-        thread::spawn(move || {
-            run_job(
-                inner,
-                background_key,
-                profile,
-                corpus,
-                corpus_compatibility,
-                prepared,
-                g2p,
-            );
-        });
+        thread::spawn(move || run_job(inner, background_key, profile, document_hash));
         Ok(json!({
             "artifactKey": artifact_key,
             "resource": resource,
             "status": "accepted",
         }))
-    }
-
-    fn preflight_profile(&self) -> Result<Value, String> {
-        let response = self
-            .inner
-            .host_rpc
-            .request(
-                "remux/codex/inference/structured/profile/validate",
-                Some(json!({
-                    "apiVersion": 1,
-                    "model": "gpt-5.6-sol",
-                    "serviceTier": "priority",
-                    "effort": "low",
-                })),
-                Duration::from_secs(30),
-            )
-            .map_err(|error| format!("Codex Sol Priority preflight failed: {error}"))?;
-        if response.get("model").and_then(Value::as_str) != Some("gpt-5.6-sol")
-            || response.get("serviceTier").and_then(Value::as_str) != Some("priority")
-            || response.get("effort").and_then(Value::as_str) != Some("low")
-            || response
-                .get("profileDigest")
-                .and_then(Value::as_str)
-                .is_none_or(|digest| digest.len() != 64)
-        {
-            return Err("Codex returned a mismatched structured inference profile".to_string());
-        }
-        Ok(response)
     }
 
     pub(crate) fn read(&self, params: Value) -> Result<Value, String> {
@@ -345,6 +291,15 @@ impl NarrationServer {
         let Some(job) = jobs.get_mut(artifact_key) else {
             return Ok(json!({ "resource": Value::Null, "status": "missing" }));
         };
+        if job.status == NarrationStatus::Ready
+            && let Some(manifest) = &job.manifest
+        {
+            publish_manifest_audio(
+                self.inner.media_root.as_deref(),
+                &self.inner.cache_root.join(artifact_key).join("audio.wav"),
+                manifest,
+            )?;
+        }
         job.last_access_ms = now_millis();
         let resource = job.resource_value();
         if params.known_revision.as_deref() == resource.get("revision").and_then(Value::as_str) {
@@ -356,7 +311,7 @@ impl NarrationServer {
     pub(crate) fn cancel(&self, params: Value) -> Result<Value, String> {
         let params: NarrationCancelParams = decode_routed_params(params, "narration/cancel")?;
         let artifact_key = non_empty(&params.artifact_key, "artifactKey")?.to_string();
-        let operations = {
+        let (notify, operations) = {
             let mut jobs = self
                 .inner
                 .jobs
@@ -366,79 +321,23 @@ impl NarrationServer {
                 return Ok(json!({ "artifactKey": artifact_key, "status": "accepted" }));
             };
             if !job.status.active() {
-                return Ok(json!({ "artifactKey": artifact_key, "status": "accepted" }));
+                (false, Vec::new())
+            } else {
+                job.cancel_requested = true;
+                job.revision += 1;
+                (
+                    true,
+                    job.active_operations.iter().cloned().collect::<Vec<_>>(),
+                )
             }
-            job.cancel_requested = true;
-            job.available_segments.clear();
-            job.error = None;
-            job.progress = JobProgress {
-                total_blocks: job.document.blocks.len(),
-                ..JobProgress::default()
-            };
-            job.revision += 1;
-            job.primary_operation
-                .clone()
-                .into_iter()
-                .collect::<Vec<_>>()
         };
-        self.inner.notify(&artifact_key);
         for operation_id in operations {
-            self.inner.cancel_inference(operation_id);
+            self.inner.cancel_inference(&operation_id);
+        }
+        if notify {
+            self.inner.notify(&artifact_key);
         }
         Ok(json!({ "artifactKey": artifact_key, "status": "accepted" }))
-    }
-
-    pub(crate) fn read_audio(&self, params: Value) -> Result<Value, String> {
-        let params: NarrationAudioReadParams =
-            decode_routed_params(params, "narration/audio/read")?;
-        let artifact_key = non_empty(&params.artifact_key, "artifactKey")?;
-        let chunk_id = non_empty(&params.chunk_id, "chunkId")?;
-        if !safe_component(artifact_key) || !safe_component(chunk_id) {
-            return Err("invalid narration artifact or chunk identifier".to_string());
-        }
-        let (announced, staging) = {
-            let jobs = self
-                .inner
-                .jobs
-                .lock()
-                .map_err(|_| "narration job store poisoned".to_string())?;
-            let job = jobs
-                .get(artifact_key)
-                .ok_or_else(|| "narration artifact was not found".to_string())?;
-            let announced = job
-                .available_segments
-                .iter()
-                .any(|segment| segment.audio.get("id").and_then(Value::as_str) == Some(chunk_id));
-            (announced, job.staging_dir.clone())
-        };
-        if !announced {
-            return Err("narration audio segment is not announced".to_string());
-        }
-        let final_path = self
-            .inner
-            .cache_root
-            .join(artifact_key)
-            .join("audio")
-            .join(format!("{chunk_id}.wav"));
-        let staging_path =
-            staging.map(|directory| directory.join("audio").join(format!("{chunk_id}.wav")));
-        let path = staging_path
-            .filter(|path| path.is_file())
-            .unwrap_or(final_path);
-        let metadata = fs::metadata(&path)
-            .map_err(|error| format!("narration audio segment unavailable: {error}"))?;
-        if metadata.len() > MAX_AUDIO_CHUNK_BYTES {
-            return Err("narration audio segment exceeds the transport limit".to_string());
-        }
-        let bytes = fs::read(&path)
-            .map_err(|error| format!("failed to read narration audio segment: {error}"))?;
-        Ok(json!({
-            "artifactKey": artifact_key,
-            "chunkId": chunk_id,
-            "dataBase64": base64::engine::general_purpose::STANDARD.encode(&bytes),
-            "mimeType": "audio/wav",
-            "sizeBytes": bytes.len(),
-        }))
     }
 
     pub(crate) fn read_diagnostics(&self) -> Result<Value, String> {
@@ -452,836 +351,75 @@ impl NarrationServer {
 }
 
 impl NarrationJob {
-    fn planning(
+    fn preparing(
         artifact_key: String,
-        params: NarrationStartParams,
+        document: NarrationDocument,
         synthesis_profile: NarrationSynthesisProfile,
     ) -> Self {
-        let total_blocks = params.document.blocks.len();
         Self {
             artifact_key,
-            available_segments: Vec::new(),
+            active_operations: HashSet::new(),
             cancel_requested: false,
-            document: params.document,
+            document,
             error: None,
             last_access_ms: now_millis(),
             manifest: None,
-            primary_operation: None,
-            progress: JobProgress {
-                total_blocks,
-                ..JobProgress::default()
-            },
+            progress: JobProgress::default(),
             revision: 1,
             staging_dir: None,
-            status: NarrationStatus::Planning,
+            status: NarrationStatus::Preparing,
             synthesis_profile,
-            target: params.target,
         }
     }
 
     fn ready(
         artifact_key: String,
-        params: NarrationStartParams,
-        manifest: Value,
+        document: NarrationDocument,
+        manifest: NarrationArtifact,
         synthesis_profile: NarrationSynthesisProfile,
     ) -> Self {
-        let total_blocks = params.document.blocks.len();
-        let segments: Vec<StreamingSegment> = manifest
-            .get("segments")
-            .cloned()
-            .and_then(|value| serde_json::from_value(value).ok())
-            .unwrap_or_default();
-        let group_count = segments.len();
         Self {
             artifact_key,
-            available_segments: segments,
+            active_operations: HashSet::new(),
             cancel_requested: false,
-            document: params.document,
+            document,
             error: None,
             last_access_ms: now_millis(),
-            manifest: Some(manifest),
-            primary_operation: None,
             progress: JobProgress {
-                committed_blocks: total_blocks,
-                committed_groups: group_count,
-                primary_model_complete: true,
-                synthesized_groups: group_count,
-                total_blocks,
-                worker_complete: true,
+                stage: NarrationStage::Ready,
+                ..Default::default()
             },
+            manifest: Some(manifest),
             revision: 1,
             staging_dir: None,
             status: NarrationStatus::Ready,
             synthesis_profile,
-            target: params.target,
         }
     }
 
     fn resource_value(&self) -> Value {
-        let available_duration = self
-            .available_segments
-            .last()
-            .and_then(|segment| segment.audio.get("end"))
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
         json!({
             "artifactKey": self.artifact_key,
-            "availableDuration": available_duration,
-            "availableSegments": self.available_segments,
             "complete": self.status == NarrationStatus::Ready,
             "error": self.error,
             "manifest": self.manifest,
             "progress": self.progress,
             "revision": self.revision.to_string(),
             "status": self.status.as_str(),
-            "target": self.target,
         })
     }
-}
-
-fn run_job(
-    inner: Arc<NarrationInner>,
-    artifact_key: String,
-    profile: Value,
-    corpus: MisakiCorpus,
-    corpus_compatibility: CorpusCompatibility,
-    prepared: crate::streaming::PreparedDocument,
-    g2p: EnglishG2p,
-) {
-    let result = run_job_inner(
-        &inner,
-        &artifact_key,
-        &profile,
-        &corpus,
-        &corpus_compatibility,
-        prepared,
-        &g2p,
-    );
-    if result.is_err() {
-        let operations = inner
-            .jobs
-            .lock()
-            .ok()
-            .and_then(|jobs| jobs.get(&artifact_key).cloned())
-            .map(|job| job.primary_operation.into_iter().collect::<Vec<_>>())
-            .unwrap_or_default();
-        for operation in operations {
-            inner.cancel_inference(operation);
-        }
-    }
-    inner.record_diagnostic(match &result {
-        Ok(manifest) => json!({
-            "artifactKey": artifact_key,
-            "durationSeconds": manifest.get("durationSeconds"),
-            "groupCount": manifest.get("groups").and_then(Value::as_array).map(Vec::len),
-            "phase": "complete",
-        }),
-        Err(error) => json!({
-            "artifactKey": artifact_key,
-            "error": error,
-            "phase": "failed",
-        }),
-    });
-    let cancelled = inner.cancelled(&artifact_key);
-    let mut cleanup = None;
-    inner.update_job(&artifact_key, |job| match result {
-        Ok(manifest) => {
-            job.available_segments = manifest
-                .get("segments")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok())
-                .unwrap_or_default();
-            job.cancel_requested = false;
-            job.error = None;
-            job.manifest = Some(manifest);
-            job.primary_operation = None;
-            job.progress.primary_model_complete = true;
-            job.progress.worker_complete = true;
-            job.staging_dir = None;
-            job.status = NarrationStatus::Ready;
-        }
-        Err(_) if cancelled => {
-            cleanup = job.staging_dir.take();
-            job.available_segments.clear();
-            job.error = None;
-            job.manifest = None;
-            job.primary_operation = None;
-            job.status = NarrationStatus::Cancelled;
-        }
-        Err(error) => {
-            // A failed immutable prefix remains readable for this in-memory
-            // job, but is never promoted or reused.
-            job.error = Some(error);
-            job.manifest = None;
-            job.primary_operation = None;
-            job.status = NarrationStatus::Failed;
-            if job.available_segments.is_empty() {
-                cleanup = job.staging_dir.take();
-            }
-        }
-    });
-    if let Some(path) = cleanup {
-        let _ = fs::remove_dir_all(path);
-    }
-}
-
-fn run_job_inner(
-    inner: &Arc<NarrationInner>,
-    artifact_key: &str,
-    profile: &Value,
-    corpus: &MisakiCorpus,
-    corpus_compatibility: &CorpusCompatibility,
-    prepared: crate::streaming::PreparedDocument,
-    g2p: &EnglishG2p,
-) -> Result<Value, String> {
-    let (document, synthesis_profile, source_hash) = {
-        let jobs = inner
-            .jobs
-            .lock()
-            .map_err(|_| "narration job store poisoned".to_string())?;
-        let job = jobs
-            .get(artifact_key)
-            .ok_or_else(|| "narration job disappeared".to_string())?;
-        (
-            job.document.clone(),
-            job.synthesis_profile.clone(),
-            job.target.source_hash.clone(),
-        )
-    };
-    let staging = inner.cache_root.join(format!(
-        ".{artifact_key}.tmp-{}-{}",
-        std::process::id(),
-        now_millis()
-    ));
-    fs::create_dir_all(staging.join("plan"))
-        .map_err(|error| format!("failed to create narration staging: {error}"))?;
-    let output_schema = primary_schema();
-    let output_schema_sha256 = asset_sha256(
-        &serde_json::to_string(&output_schema)
-            .map_err(|error| format!("failed to encode v6 output schema: {error}"))?,
-    );
-    let provider_profile = provider_profile(
-        profile,
-        &synthesis_profile,
-        corpus,
-        corpus_compatibility,
-        &output_schema_sha256,
-    );
-    let control = StreamingControl {
-        version: 1,
-        artifact_key: artifact_key.to_string(),
-        source_hash: source_hash.clone(),
-        profile: provider_profile.clone(),
-        block_ids: document
-            .blocks
-            .iter()
-            .map(|block| block.id.clone())
-            .collect(),
-        targets: document.targets.clone(),
-    };
-    atomic_json(&staging.join("control.json"), &control)?;
-    let control_sha256 = sha256_file(&staging.join("control.json"))?;
-    inner.update_job(artifact_key, |job| {
-        job.staging_dir = Some(staging.clone());
-    });
-
-    let request = KokoroStreamingRequest {
-        artifact_key: artifact_key.to_string(),
-        control_sha256,
-        deadline_ms: JOB_DEADLINE.as_millis() as u64,
-        max_groups: 512,
-        model_assets: synthesis_profile.model_assets.clone(),
-        model_dir: synthesis_profile.model_dir.clone(),
-        source_hash: source_hash.clone(),
-        staging_dir: staging.clone(),
-    };
-    let mut worker = inner
-        .compute
-        .spawn::<KokoroStreamingSynthesis>(
-            TaskOptions::new("narration", format!("narration:{artifact_key}")),
-            request,
-        )
-        .map_err(|error| format!("failed to start streaming Kokoro task: {error}"))?;
-
-    let model_required = !prepared.hard_group_ids.is_empty();
-    inner.record_diagnostic(json!({
-        "artifactKey": artifact_key,
-        "groupCount": prepared.groups.len(),
-        "hardGroupCount": prepared.hard_group_ids.len(),
-        "immediateGroupCount": prepared.groups.len() - prepared.hard_group_ids.len(),
-        "riskCount": prepared.risks.len(),
-        "summaryBlockCount": prepared
-            .groups
-            .iter()
-            .map(|group| group.summary_block_ids.len())
-            .sum::<usize>(),
-        "phase": "baselinePrepared",
-    }));
-    let (progress_tx, progress_rx) = mpsc::sync_channel(32);
-    let (terminal_tx, terminal_rx) = mpsc::sync_channel(1);
-    let operation_id = format!("narration:{artifact_key}:primary");
-    let expected_profile_digest = profile["profileDigest"].as_str().unwrap().to_string();
-    if model_required {
-        inner.update_job(artifact_key, |job| {
-            job.primary_operation = Some(operation_id.clone());
-        });
-        let rpc = inner.host_rpc.clone();
-        let input = prepared.compact_json.clone();
-        let operation_for_thread = operation_id.clone();
-        thread::spawn(move || {
-            let result = rpc
-                .request_with_progress(
-                    "remux/codex/inference/structured/generate",
-                    Some(json!({
-                        "apiVersion": 1,
-                        "operationId": operation_for_thread,
-                        "model": "gpt-5.6-sol",
-                        "serviceTier": "priority",
-                        "effort": "low",
-                        "instructions": PRIMARY_INSTRUCTIONS,
-                        "input": input,
-                        "outputSchema": output_schema,
-                        "progress": { "protocolVersion": 1 },
-                    })),
-                    Duration::from_secs(14 * 60 + 30),
-                    progress_tx,
-                )
-                .map_err(|error| format!("Codex structured inference failed: {error}"));
-            let _ = terminal_tx.send(result);
-        });
-    } else {
-        inner.update_job(artifact_key, |job| {
-            job.primary_operation = None;
-            job.progress.primary_model_complete = true;
-        });
-    }
-
-    let vocabulary = load_vocabulary(&synthesis_profile.model_dir.join("vocab.json"))?;
-    let mut parser = model_required.then(IncrementalGroupParser::new);
-    let mut pending = BTreeMap::<usize, PatchGroup>::new();
-    let mut pending_bytes = 0usize;
-    let mut next_prepared_group = 0usize;
-    let mut next_acoustic_group = 0usize;
-    let mut next_block = 0usize;
-    let mut next_hard_group = 0usize;
-    let mut next_word_id = 0usize;
-    let mut group_digests = Vec::new();
-    let mut resolved_queue = VecDeque::<(crate::streaming::ResolvedAcousticGroup, usize)>::new();
-    let mut committed_unpublished = VecDeque::<(usize, usize)>::new();
-    let mut committed_unpublished_phonemes = 0usize;
-    let mut terminal: Option<Value> = None;
-    let mut primary_validated = !model_required;
-    let mut completed_text_digest = sha256_bytes(b"");
-    let started = Instant::now();
-    let mut last_progress = Instant::now();
-
-    loop {
-        if inner.cancelled(artifact_key) {
-            if model_required {
-                inner.cancel_inference(operation_id.clone());
-            }
-            let _ = worker.cancel();
-            return Err("narration cancelled".to_string());
-        }
-        if started.elapsed() > JOB_DEADLINE || last_progress.elapsed() > STALL_DEADLINE {
-            if model_required {
-                inner.cancel_inference(operation_id.clone());
-            }
-            let _ = worker.cancel();
-            return Err(if started.elapsed() > JOB_DEADLINE {
-                "narration job deadline exceeded".to_string()
-            } else {
-                "narration pipeline made no progress for 60 seconds".to_string()
-            });
-        }
-
-        while let Ok(value) = progress_rx.try_recv() {
-            let delta = value
-                .get("delta")
-                .and_then(Value::as_str)
-                .filter(|_| value.get("type").and_then(Value::as_str) == Some("textDelta"))
-                .ok_or_else(|| "structured inference emitted invalid progress".to_string())?;
-            let groups = parser
-                .as_mut()
-                .ok_or_else(|| {
-                    "structured inference emitted progress after completion".to_string()
-                })?
-                .push(delta)?;
-            for group in groups {
-                let expected_id =
-                    *prepared
-                        .hard_group_ids
-                        .get(next_hard_group)
-                        .ok_or_else(|| {
-                            format!(
-                                "v6 model emitted unexpected hard group {} after {} records",
-                                group.id,
-                                prepared.hard_group_ids.len()
-                            )
-                        })?;
-                if group.id != expected_id {
-                    return Err(format!(
-                        "v6 model emitted hard group {} where server expected {}",
-                        group.id, expected_id
-                    ));
-                }
-                let expected = &prepared.groups[expected_id];
-                validate_patch_group(&group, expected, &prepared, g2p, &vocabulary)?;
-                inner.record_diagnostic(json!({
-                    "artifactKey": artifact_key,
-                    "group": group.id,
-                    "patchCount": group.patches.len(),
-                    "summaryCount": group.summaries.len(),
-                    "phase": "patchGroupAccepted",
-                }));
-                let encoded_len = serde_json::to_vec(&group)
-                    .map_err(|error| error.to_string())?
-                    .len();
-                if pending.insert(group.id, group).is_some() {
-                    return Err(format!("v6 model duplicated hard group {expected_id}"));
-                }
-                pending_bytes += encoded_len;
-                next_hard_group += 1;
-            }
-            if pending.len() > MAX_PENDING_GROUPS || pending_bytes > MAX_PENDING_GROUP_BYTES {
-                return fail_with_cancel(
-                    inner,
-                    &mut worker,
-                    &operation_id,
-                    "streamed narration group queue exceeded its bound",
-                );
-            }
-            last_progress = Instant::now();
-        }
-
-        if terminal.is_none()
-            && let Ok(result) = terminal_rx.try_recv()
-        {
-            terminal = Some(result?);
-            last_progress = Instant::now();
-        }
-
-        while let Some(progress) = worker
-            .try_progress()
-            .map_err(|error| format!("streaming Kokoro task failed: {error}"))?
-        {
-            match progress {
-                StreamingProgress::ModelLoaded { .. } => {}
-                StreamingProgress::SegmentReady { segment, .. } => {
-                    accept_worker_segment(
-                        inner,
-                        artifact_key,
-                        segment,
-                        &mut committed_unpublished,
-                        &mut committed_unpublished_phonemes,
-                    )?;
-                }
-            }
-            last_progress = Instant::now();
-        }
-
-        loop {
-            if let Some((resolved, _)) = resolved_queue.front() {
-                let phoneme_count = resolved.phonemes.chars().count();
-                if !spool_has_capacity(
-                    &committed_unpublished,
-                    committed_unpublished_phonemes,
-                    phoneme_count,
-                ) {
-                    break;
-                }
-                let (mut resolved, committed_blocks) = resolved_queue
-                    .pop_front()
-                    .expect("resolved narration queue has a front item");
-                resolved.id = next_acoustic_group;
-                commit_group(
-                    inner,
-                    artifact_key,
-                    &staging,
-                    &document,
-                    resolved,
-                    committed_blocks,
-                    &mut next_word_id,
-                    &mut group_digests,
-                )?;
-                committed_unpublished.push_back((next_acoustic_group, phoneme_count));
-                committed_unpublished_phonemes += phoneme_count;
-                next_acoustic_group += 1;
-                next_block = committed_blocks;
-                last_progress = Instant::now();
-                continue;
-            }
-
-            let Some(prepared_group) = prepared.groups.get(next_prepared_group) else {
-                break;
-            };
-            let patch_group = if prepared_group.model_required() {
-                let Some(group) = pending.get(&prepared_group.id).cloned() else {
-                    break;
-                };
-                Some(group)
-            } else {
-                None
-            };
-            let resolved = resolve_group(
-                patch_group.as_ref(),
-                prepared_group,
-                &prepared,
-                &document,
-                corpus,
-                g2p,
-                &vocabulary,
-            )?;
-            if resolved.is_empty() {
-                return Err(format!(
-                    "v6 prepared group {} produced no acoustic groups",
-                    prepared_group.id
-                ));
-            }
-            if next_acoustic_group
-                .saturating_add(resolved_queue.len())
-                .saturating_add(resolved.len())
-                > 512
-            {
-                return Err("v6 narration exceeds 512 acoustic groups".to_string());
-            }
-            inner.record_diagnostic(json!({
-                "artifactKey": artifact_key,
-                "acousticGroupCount": resolved.len(),
-                "maxAcousticPhonemes": resolved
-                    .iter()
-                    .map(|group| group.phonemes.chars().count())
-                    .max()
-                    .unwrap_or(0),
-                "patchGroup": prepared_group.id,
-                "phase": "acousticGroupsPlanned",
-            }));
-            if let Some(removed) = pending.remove(&prepared_group.id) {
-                pending_bytes = pending_bytes.saturating_sub(
-                    serde_json::to_vec(&removed)
-                        .map_err(|error| error.to_string())?
-                        .len(),
-                );
-            }
-            let completed_blocks = prepared_group
-                .block_ids
-                .last()
-                .expect("server-owned groups are non-empty")
-                + 1;
-            for (index, acoustic_group) in resolved.iter().enumerate() {
-                let committed_blocks = resolved
-                    .get(index + 1)
-                    .map_or(completed_blocks, |next| next.block_range[0]);
-                resolved_queue.push_back((acoustic_group.clone(), committed_blocks));
-            }
-            next_prepared_group += 1;
-            last_progress = Instant::now();
-        }
-
-        if !primary_validated
-            && let Some(response) = terminal.as_ref()
-            && let Some(parser_ref) = parser.as_ref()
-        {
-            let accumulated = parser_ref.accumulated_text();
-            let accumulated_sha = sha256_bytes(accumulated.as_bytes());
-            let completed_sha = response
-                .get("completedTextSha256")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    "structured inference response is missing completed digest".to_string()
-                })?;
-            let delta_sha = response
-                .get("deltaTextSha256")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    "structured inference response is missing delta digest".to_string()
-                })?;
-            if response.get("profileDigest").and_then(Value::as_str)
-                != Some(expected_profile_digest.as_str())
-            {
-                return Err("structured inference profile changed after preflight".to_string());
-            }
-            if accumulated_sha == delta_sha {
-                if accumulated_sha != completed_sha {
-                    return Err(
-                        "structured inference completed and delta digests differ".to_string()
-                    );
-                }
-                let accumulated = accumulated.to_string();
-                let parser_value = parser.take().unwrap();
-                let envelope = parser_value.finish(&accumulated)?;
-                if response.get("value").is_none()
-                    || envelope.groups.len() != prepared.hard_group_ids.len()
-                    || next_hard_group != prepared.hard_group_ids.len()
-                    || envelope
-                        .groups
-                        .iter()
-                        .map(|group| group.id)
-                        .ne(prepared.hard_group_ids.iter().copied())
-                {
-                    return Err("structured inference terminal value is incomplete".to_string());
-                }
-                completed_text_digest = completed_sha.to_string();
-                primary_validated = true;
-                inner.update_job(artifact_key, |job| {
-                    job.primary_operation = None;
-                    job.progress.primary_model_complete = true;
-                });
-            }
-        }
-
-        if primary_validated && pending.is_empty() && resolved_queue.is_empty() {
-            if next_block != document.blocks.len()
-                || next_prepared_group != prepared.groups.len()
-                || next_acoustic_group == 0
-            {
-                return Err("streamed narration groups do not cover every source block".to_string());
-            }
-            let complete = StreamingCompletion {
-                version: 1,
-                group_count: next_acoustic_group,
-                last_block: next_block - 1,
-                plan_digest: plan_digest(&group_digests),
-                completed_text_digest: completed_text_digest.clone(),
-            };
-            atomic_json(&staging.join("complete.json"), &complete)?;
-            inner.update_job(artifact_key, |job| {
-                job.status = NarrationStatus::Finalizing;
-            });
-            break;
-        }
-        thread::sleep(LOOP_POLL);
-    }
-
-    let output = loop {
-        if inner.cancelled(artifact_key) {
-            let _ = worker.cancel();
-            return Err("narration cancelled".to_string());
-        }
-        while let Some(progress) = worker
-            .try_progress()
-            .map_err(|error| format!("streaming Kokoro task failed: {error}"))?
-        {
-            if let StreamingProgress::SegmentReady { segment, .. } = progress {
-                accept_worker_segment(
-                    inner,
-                    artifact_key,
-                    segment,
-                    &mut committed_unpublished,
-                    &mut committed_unpublished_phonemes,
-                )?;
-            }
-            last_progress = Instant::now();
-        }
-        if let Some(output) = worker
-            .try_join()
-            .map_err(|error| format!("streaming Kokoro task failed: {error}"))?
-        {
-            break output;
-        }
-        if last_progress.elapsed() > STALL_DEADLINE {
-            let _ = worker.cancel();
-            return Err("streaming Kokoro task made no progress for 60 seconds".to_string());
-        }
-        thread::sleep(LOOP_POLL);
-    };
-    inner.update_job(artifact_key, |job| job.progress.worker_complete = true);
-
-    let manifest = build_manifest(
-        artifact_key,
-        &source_hash,
-        &document,
-        provider_profile,
-        corpus,
-        output,
-    )?;
-    atomic_json(&staging.join("source-document.json"), &document)?;
-    validate_manifest_v6(&manifest, &staging, &document)?;
-    atomic_json(&staging.join("manifest.json"), &manifest)?;
-    fs::remove_dir_all(staging.join("plan"))
-        .map_err(|error| format!("failed to remove narration plan spool: {error}"))?;
-    for name in ["control.json", "complete.json", "worker-result.json"] {
-        fs::remove_file(staging.join(name))
-            .map_err(|error| format!("failed to remove narration spool file {name}: {error}"))?;
-    }
-    validate_final_artifact_layout(&staging, segments_count(&manifest)?)?;
-    if inner.cancelled(artifact_key) {
-        return Err("narration cancelled".to_string());
-    }
-    let final_dir = inner.cache_root.join(artifact_key);
-    if final_dir.exists() {
-        return Err("refusing to replace an existing narration v6 artifact".to_string());
-    }
-    fs::create_dir_all(&inner.cache_root)
-        .map_err(|error| format!("failed to create narration cache: {error}"))?;
-    fs::rename(&staging, &final_dir)
-        .map_err(|error| format!("failed to promote narration artifact: {error}"))?;
-    fs::File::open(&inner.cache_root)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| format!("failed to sync narration cache: {error}"))?;
-    enforce_cache_limit(&inner.cache_root, artifact_key);
-    Ok(manifest)
-}
-
-fn spool_has_capacity(
-    committed: &VecDeque<(usize, usize)>,
-    committed_phonemes: usize,
-    next_phonemes: usize,
-) -> bool {
-    committed.len() < MAX_COMMITTED_UNPUBLISHED_GROUPS
-        && committed_phonemes.saturating_add(next_phonemes) <= MAX_COMMITTED_UNPUBLISHED_PHONEMES
-}
-
-fn accept_worker_segment(
-    inner: &Arc<NarrationInner>,
-    artifact_key: &str,
-    segment: StreamingSegment,
-    committed: &mut VecDeque<(usize, usize)>,
-    committed_phonemes: &mut usize,
-) -> Result<(), String> {
-    let (expected_index, phoneme_count) = committed
-        .pop_front()
-        .ok_or_else(|| "streaming worker published an uncommitted segment".to_string())?;
-    if segment.index != expected_index {
-        return Err(format!(
-            "streaming worker published segment {} before committed segment {expected_index}",
-            segment.index
-        ));
-    }
-    *committed_phonemes = committed_phonemes.saturating_sub(phoneme_count);
-    let mut accepted = false;
-    inner.update_job(artifact_key, |job| {
-        if segment.index == job.available_segments.len() {
-            job.available_segments.push(segment);
-            job.progress.synthesized_groups = job.available_segments.len();
-            accepted = true;
-        }
-    });
-    accepted
-        .then_some(())
-        .ok_or_else(|| "streaming worker segment prefix is not contiguous".to_string())
-}
-
-fn commit_group(
-    inner: &Arc<NarrationInner>,
-    artifact_key: &str,
-    staging: &Path,
-    document: &NarrationSourceDocument,
-    resolved: crate::streaming::ResolvedAcousticGroup,
-    committed_blocks: usize,
-    next_word_id: &mut usize,
-    group_digests: &mut Vec<String>,
-) -> Result<(), String> {
-    let expected_phonemes = resolved.phonemes.clone();
-    let spans = word_spans(&resolved.text);
-    let mut words = Vec::with_capacity(resolved.words.len());
-    for (index, word) in resolved.words.into_iter().enumerate() {
-        let separator_end = spans
-            .get(index + 1)
-            .map_or(resolved.text.len(), |next| next.byte_start);
-        let separator = &resolved.text[word.byte_end..separator_end];
-        let whitespace_after =
-            index + 1 < spans.len() && separator.chars().any(char::is_whitespace);
-        let mut phonemes = word.phonemes;
-        phonemes.extend(
-            separator
-                .chars()
-                .filter(|character| !character.is_whitespace()),
-        );
-        let source_block = word
-            .source_block_ids
-            .first()
-            .copied()
-            .unwrap_or(resolved.block_range[0]);
-        words.push(StreamingWordPlan {
-            id: *next_word_id,
-            mapping_origin: word.mapping_origin,
-            phonemes,
-            pronunciation_origin: word.pronunciation_origin,
-            source_block,
-            target_ids: word.target_ids,
-            text: word.text,
-            whitespace_after,
-        });
-        *next_word_id += 1;
-    }
-    let reconstructed_phonemes = words
-        .iter()
-        .map(|word| {
-            format!(
-                "{}{}",
-                word.phonemes,
-                if word.whitespace_after { " " } else { "" }
-            )
-        })
-        .collect::<String>()
-        .trim()
-        .to_string();
-    if reconstructed_phonemes != expected_phonemes {
-        return Err("resolved group cannot be reconstructed by task-v6 phonemes".to_string());
-    }
-    let group = StreamingGroupPlan {
-        block_target_ids: (resolved.block_range[0]..=resolved.block_range[1])
-            .map(|block| document.blocks[block].target_ids.clone())
-            .collect(),
-        index: resolved.id,
-        first_block: resolved.block_range[0],
-        last_block: resolved.block_range[1],
-        first_word_id: words.first().map(|word| word.id).unwrap_or(*next_word_id),
-        spoken_text: resolved.text,
-        words,
-    };
-    let digest = group_digest(&group)?;
-    let plan = StreamingPlanFile {
-        version: 1,
-        artifact_key: artifact_key.to_string(),
-        group_digest: digest.clone(),
-        group,
-    };
-    atomic_json(
-        &staging
-            .join("plan")
-            .join(format!("{:06}.json", plan.group.index)),
-        &plan,
-    )?;
-    group_digests.push(digest);
-    inner.update_job(artifact_key, |job| {
-        job.progress.committed_blocks = committed_blocks;
-        job.progress.committed_groups += 1;
-        job.status = NarrationStatus::Streaming;
-    });
-    Ok(())
-}
-
-fn fail_with_cancel<T>(
-    inner: &Arc<NarrationInner>,
-    worker: &mut remux_compute::TaskHandle<KokoroStreamingSynthesis>,
-    operation_id: &str,
-    message: &str,
-) -> Result<T, String> {
-    inner.cancel_inference(operation_id.to_string());
-    let _ = worker.cancel();
-    Err(message.to_string())
 }
 
 impl NarrationInner {
-    fn notify(&self, artifact_key: &str) {
-        let _ = self.output_tx.send(json!({
-            "jsonrpc": "2.0",
-            "method": NARRATION_UPDATED_METHOD,
-            "params": { "artifactKey": artifact_key },
-        }));
-    }
-
     fn update_job(&self, artifact_key: &str, update: impl FnOnce(&mut NarrationJob)) {
         if let Ok(mut jobs) = self.jobs.lock()
             && let Some(job) = jobs.get_mut(artifact_key)
         {
             update(job);
             job.revision += 1;
-            job.last_access_ms = now_millis();
+            drop(jobs);
+            self.notify(artifact_key);
         }
-        self.notify(artifact_key);
     }
 
     fn cancelled(&self, artifact_key: &str) -> bool {
@@ -1292,634 +430,701 @@ impl NarrationInner {
             .unwrap_or(true)
     }
 
-    fn cancel_inference(&self, operation_id: String) {
-        let rpc = self.host_rpc.clone();
-        thread::spawn(move || {
-            let _ = rpc.request(
-                "remux/codex/inference/structured/cancel",
-                Some(json!({ "operationId": operation_id })),
-                Duration::from_secs(10),
-            );
-        });
+    fn register_operation(&self, artifact_key: &str, operation_id: &str) -> Result<(), String> {
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| "narration job store poisoned".to_string())?;
+        let job = jobs
+            .get_mut(artifact_key)
+            .ok_or_else(|| "narration job disappeared".to_string())?;
+        if job.cancel_requested {
+            return Err("narration cancelled".to_string());
+        }
+        if !job.active_operations.insert(operation_id.to_string()) {
+            return Err("languagePlanningFailed: duplicate operation id".to_string());
+        }
+        Ok(())
+    }
+
+    fn unregister_operation(&self, artifact_key: &str, operation_id: &str) {
+        if let Ok(mut jobs) = self.jobs.lock()
+            && let Some(job) = jobs.get_mut(artifact_key)
+        {
+            job.active_operations.remove(operation_id);
+        }
+    }
+
+    fn cancel_inference(&self, operation_id: &str) {
+        let _ = self.host_rpc.request(
+            "remux/codex/inference/structured/cancel",
+            Some(json!({ "operationId": operation_id })),
+            Duration::from_secs(5),
+        );
+    }
+
+    fn notify(&self, artifact_key: &str) {
+        let _ = self.output_tx.send(json!({
+            "jsonrpc": "2.0",
+            "method": NARRATION_UPDATED_METHOD,
+            "params": { "artifactKey": artifact_key },
+        }));
     }
 
     fn record_diagnostic(&self, value: Value) {
         if let Ok(mut diagnostics) = self.diagnostics.lock() {
             diagnostics.push_back(value);
-            while diagnostics.len() > 50 {
+            while diagnostics.len() > 64 {
                 diagnostics.pop_front();
             }
         }
     }
 }
 
-fn provider_profile(
-    profile: &Value,
-    synthesis: &NarrationSynthesisProfile,
-    corpus: &MisakiCorpus,
-    compatibility: &CorpusCompatibility,
-    output_schema_sha256: &str,
-) -> Value {
-    json!({
-        "id": "narrate-codex-kokoro-streaming-v6",
-        "patchGenerator": {
-            "provider": "codex-structured-inference",
-            "model": "gpt-5.6-sol",
-            "serviceTier": "priority",
-            "effort": "low",
-            "reasoningSummary": "none",
-            "profileDigest": profile["profileDigest"],
-            "baseInstructionsVersion": BASE_INSTRUCTIONS_VERSION,
-            "groupingPromptVersion": GROUPING_PROMPT_VERSION,
-            "instructionsSha256": asset_sha256(PRIMARY_INSTRUCTIONS),
-            "schemaTemplateSha256": asset_sha256(crate::streaming::PRIMARY_SCHEMA_JSON),
-            "schemaSha256": output_schema_sha256,
-        },
-        "corpus": {
-            "provider": "misaki-us-gold-silver",
-            "resolverVersion": CORPUS_RESOLVER_VERSION,
-            "goldSha256": corpus.gold_sha256(),
-            "silverSha256": corpus.silver_sha256(),
-            "compatibility": compatibility,
-        },
-        "localG2p": {
-            "provider": "misaki-rs",
-            "version": LOCAL_G2P_VERSION,
-            "role": "authoritative-phoneme-and-token-alignment",
-        },
-        "reviewedLexicon": {
-            "version": REVIEWED_LEXICON_VERSION,
-            "role": "stable-audio-aliases",
-        },
-        "tokenizerVersion": TOKENIZER_VERSION,
-        "parserVersion": INCREMENTAL_PARSER_VERSION,
-        "sourceMapperVersion": SOURCE_MAPPER_VERSION,
-        "synthesizer": synthesis.descriptor,
-    })
+fn run_job(
+    inner: Arc<NarrationInner>,
+    artifact_key: String,
+    profile: NarrationProfile,
+    document_hash: String,
+) {
+    let started = Instant::now();
+    let result = run_job_inner(&inner, &artifact_key, profile, document_hash, started);
+    let elapsed_ms = started.elapsed().as_millis();
+    match result {
+        Ok((manifest, diagnostics)) => {
+            inner.record_diagnostic(json!({
+                "artifactKey": artifact_key,
+                "diagnostics": diagnostics,
+                "elapsedMs": elapsed_ms,
+                "phase": "ready",
+            }));
+            inner.update_job(&artifact_key, |job| {
+                job.active_operations.clear();
+                job.error = None;
+                job.manifest = Some(manifest);
+                job.progress.stage = NarrationStage::Ready;
+                job.staging_dir = None;
+                job.status = NarrationStatus::Ready;
+            });
+        }
+        Err(error) => {
+            let cancelled = inner.cancelled(&artifact_key) || error == "narration cancelled";
+            let cleanup = inner.jobs.lock().ok().and_then(|jobs| {
+                jobs.get(&artifact_key)
+                    .and_then(|job| job.staging_dir.clone())
+            });
+            inner.record_diagnostic(json!({
+                "artifactKey": artifact_key,
+                "elapsedMs": elapsed_ms,
+                "error": error,
+                "phase": if cancelled { "cancelled" } else { "failed" },
+            }));
+            inner.update_job(&artifact_key, |job| {
+                job.active_operations.clear();
+                job.error = (!cancelled).then_some(error);
+                job.manifest = None;
+                job.staging_dir = None;
+                job.status = if cancelled {
+                    NarrationStatus::Cancelled
+                } else {
+                    NarrationStatus::Failed
+                };
+            });
+            if let Some(path) = cleanup {
+                let _ = fs::remove_dir_all(path);
+            }
+        }
+    }
 }
 
-fn build_manifest(
+fn run_job_inner(
+    inner: &Arc<NarrationInner>,
     artifact_key: &str,
-    source_hash: &str,
-    document: &NarrationSourceDocument,
-    profile: Value,
-    corpus: &MisakiCorpus,
-    output: remux_tts::StreamingOutput,
-) -> Result<Value, String> {
-    let chunks = output
-        .segments
-        .iter()
-        .map(|segment| segment.audio.clone())
-        .collect::<Vec<_>>();
-    let units = output
-        .segments
-        .iter()
-        .flat_map(|segment| segment.units.clone())
-        .collect::<Vec<_>>();
-    let cues = output
-        .segments
-        .iter()
-        .flat_map(|segment| segment.cues.clone())
-        .collect::<Vec<_>>();
-    let groups = output
-        .segments
-        .iter()
-        .map(|segment| segment.group.clone())
-        .collect::<Vec<_>>();
-    Ok(json!({
-        "version": MANIFEST_VERSION,
-        "artifactKey": artifact_key,
-        "sourceHash": source_hash,
-        "sourceDocumentKey": stable_revision_value(&serde_json::to_value(document).map_err(|error| error.to_string())?),
-        "profile": profile,
-        "corpus": {
-            "goldSha256": corpus.gold_sha256(),
-            "silverSha256": corpus.silver_sha256(),
-        },
-        "planDigest": output.plan_digest,
-        "durationSeconds": output.duration_seconds,
-        "chunks": chunks,
-        "groups": groups,
-        "segments": output.segments,
-        "targets": document.targets,
-        "units": units,
-        "cues": cues,
-    }))
-}
+    profile: NarrationProfile,
+    document_hash: String,
+    job_started: Instant,
+) -> Result<(NarrationArtifact, Value), String> {
+    let (document, synthesis_profile) = {
+        let jobs = inner
+            .jobs
+            .lock()
+            .map_err(|_| "narration job store poisoned".to_string())?;
+        let job = jobs
+            .get(artifact_key)
+            .ok_or_else(|| "narration job disappeared".to_string())?;
+        (job.document.clone(), job.synthesis_profile.clone())
+    };
+    let staging = inner.cache_root.join(format!(
+        ".{artifact_key}.tmp-{}-{}",
+        std::process::id(),
+        now_millis()
+    ));
+    fs::create_dir_all(&staging)
+        .map_err(|error| format!("failed to create narration staging: {error}"))?;
+    inner.update_job(artifact_key, |job| {
+        job.staging_dir = Some(staging.clone());
+        job.progress.stage = NarrationStage::Baseline;
+    });
 
-fn validate_manifest_v6(
-    manifest: &Value,
-    staging: &Path,
-    document: &NarrationSourceDocument,
-) -> Result<(), String> {
-    if manifest.get("version").and_then(Value::as_u64) != Some(MANIFEST_VERSION) {
-        return Err("streaming worker returned the wrong manifest version".to_string());
-    }
-    let document_value = serde_json::to_value(document)
-        .map_err(|error| format!("failed to encode narration source document: {error}"))?;
-    let disk_document: Value = serde_json::from_slice(
-        &fs::read(staging.join("source-document.json"))
-            .map_err(|error| format!("failed to read narration source document: {error}"))?,
-    )
-    .map_err(|error| format!("invalid narration source document: {error}"))?;
-    let source_document_key = stable_revision_value(&document_value);
-    if disk_document != document_value
-        || manifest.get("targets") != Some(&Value::Array(document.targets.clone()))
-        || manifest.get("sourceHash").and_then(Value::as_str) != Some(&document.source_hash)
-        || manifest.get("sourceDocumentKey").and_then(Value::as_str)
-            != Some(source_document_key.as_str())
-    {
-        return Err("narration manifest source identity is invalid".to_string());
-    }
-    let segments = manifest
-        .get("segments")
-        .and_then(Value::as_array)
-        .filter(|segments| !segments.is_empty())
-        .ok_or_else(|| "narration manifest has no segments".to_string())?;
-    let target_ids = document
-        .targets
-        .iter()
-        .filter_map(|target| target.get("id").and_then(Value::as_str))
-        .collect::<HashSet<_>>();
-    let mut chunks = Vec::new();
-    let mut groups = Vec::new();
-    let mut units = Vec::new();
-    let mut cues = Vec::new();
-    let mut unit_ids = HashSet::new();
-    let mut cue_ids = HashSet::new();
-    let mut covered_blocks = HashSet::new();
-    let mut previous_end = 0.0;
-    let mut last_block = None;
-    for (index, segment) in segments.iter().enumerate() {
-        if segment.get("index").and_then(Value::as_u64) != Some(index as u64) {
-            return Err("narration segments are not contiguous".to_string());
+    let gate = InferenceGate::new(3);
+    let transcript_callbacks = {
+        let cancelled_inner = inner.clone();
+        let cancelled_key = artifact_key.to_string();
+        let register_inner = inner.clone();
+        let register_key = artifact_key.to_string();
+        let unregister_inner = inner.clone();
+        let unregister_key = artifact_key.to_string();
+        let progress_inner = inner.clone();
+        let progress_key = artifact_key.to_string();
+        TranscriptCallbacks {
+            cancelled: Arc::new(move || cancelled_inner.cancelled(&cancelled_key)),
+            deadline_exceeded: Arc::new(move || job_started.elapsed() > JOB_DEADLINE),
+            register_operation: Arc::new(move |operation_id| {
+                register_inner.register_operation(&register_key, operation_id)
+            }),
+            unregister_operation: Arc::new(move |operation_id| {
+                unregister_inner.unregister_operation(&unregister_key, operation_id)
+            }),
+            window_completed: Arc::new(move |completed, total| {
+                progress_inner.update_job(&progress_key, |job| {
+                    job.progress.stage = NarrationStage::LanguagePlanning;
+                    job.progress.transcript_windows_completed = completed;
+                    job.progress.transcript_windows_total = total;
+                });
+            }),
         }
-        let audio = segment
-            .get("audio")
-            .ok_or_else(|| "narration segment is missing audio".to_string())?;
-        let id = audio
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "narration segment audio is missing id".to_string())?;
-        if id != format!("{index:06}") {
-            return Err("narration audio ids are not contiguous".to_string());
+    };
+    let transcript = run_structural_transcript(
+        &inner.host_rpc,
+        artifact_key,
+        &document,
+        gate.clone(),
+        transcript_callbacks,
+    )?;
+    let structural_transcript_plan = transcript.plan;
+    let structural_transcript_plan_sha256 = transcript.plan_sha256;
+    let speech_document =
+        validate_structural_transcript_plan(&document, &structural_transcript_plan)?;
+    let vocabulary = KokoroVocabulary::load(&synthesis_profile.model_dir.join("vocab.json"))?;
+    let baseline = prepare_baseline(&speech_document)?;
+    inner.update_job(artifact_key, |job| {
+        job.progress.stage = NarrationStage::LanguagePlanning;
+        job.progress.sentences = baseline.sentences.len();
+        job.progress.words = baseline.words.len();
+    });
+    let audit_callbacks = {
+        let cancelled_inner = inner.clone();
+        let cancelled_key = artifact_key.to_string();
+        let register_inner = inner.clone();
+        let register_key = artifact_key.to_string();
+        let unregister_inner = inner.clone();
+        let unregister_key = artifact_key.to_string();
+        let progress_inner = inner.clone();
+        let progress_key = artifact_key.to_string();
+        AuditCallbacks {
+            cancelled: Arc::new(move || cancelled_inner.cancelled(&cancelled_key)),
+            deadline_exceeded: Arc::new(move || job_started.elapsed() > JOB_DEADLINE),
+            register_operation: Arc::new(move |operation_id| {
+                register_inner.register_operation(&register_key, operation_id)
+            }),
+            unregister_operation: Arc::new(move |operation_id| {
+                unregister_inner.unregister_operation(&unregister_key, operation_id)
+            }),
+            window_completed: Arc::new(move |completed, total| {
+                progress_inner.update_job(&progress_key, |job| {
+                    job.progress.stage = NarrationStage::LanguagePlanning;
+                    job.progress.audit_windows_completed = completed;
+                    job.progress.audit_windows_total = total;
+                });
+            }),
         }
-        let start = audio
-            .get("start")
-            .and_then(Value::as_f64)
-            .ok_or_else(|| "narration segment has invalid start".to_string())?;
-        let end = audio
-            .get("end")
-            .and_then(Value::as_f64)
-            .ok_or_else(|| "narration segment has invalid end".to_string())?;
-        if !start.is_finite()
-            || !end.is_finite()
-            || (start - previous_end).abs() > 0.001
-            || end <= start
-        {
-            return Err("narration segment timing is not continuous".to_string());
-        }
-        previous_end = end;
-        let sidecar: Value = serde_json::from_slice(
-            &fs::read(staging.join("segments").join(format!("{id}.json")))
-                .map_err(|error| format!("failed to read segment sidecar {id}: {error}"))?,
+    };
+    let audit = run_pronunciation_audit(
+        &inner.host_rpc,
+        artifact_key,
+        &speech_document,
+        &baseline,
+        &vocabulary,
+        gate,
+        audit_callbacks,
+    )?;
+    let pronunciation_plan = audit.plan;
+    let pronunciation_plan_sha256 = audit.plan_sha256;
+    let redundant_direct_patches = audit.redundant_direct_patches;
+    atomic_json(
+        &staging.join("pronunciation-plan.json"),
+        &pronunciation_plan,
+    )?;
+    atomic_json(
+        &staging.join("structural-transcript-plan.json"),
+        &structural_transcript_plan,
+    )?;
+    inner.update_job(artifact_key, |job| {
+        job.status = NarrationStatus::Synthesizing;
+        job.progress.stage = NarrationStage::Planning;
+    });
+
+    let request = BatchSynthesisRequest {
+        artifact_key: artifact_key.to_string(),
+        document: document.clone(),
+        document_hash: document_hash.clone(),
+        model_assets: synthesis_profile.model_assets.clone(),
+        model_dir: synthesis_profile.model_dir.clone(),
+        profile: profile.clone(),
+        pronunciation_plan: pronunciation_plan.clone(),
+        pronunciation_plan_sha256: pronunciation_plan_sha256.clone(),
+        structural_transcript_plan: structural_transcript_plan.clone(),
+        structural_transcript_plan_sha256: structural_transcript_plan_sha256.clone(),
+        redundant_direct_patches,
+        max_wav_bytes: MAX_AUDIO_BYTES,
+        staging_dir: staging.clone(),
+    };
+    let mut worker = inner
+        .compute
+        .spawn::<KokoroBatchSynthesis>(
+            TaskOptions::new("narration", format!("narration:{artifact_key}")),
+            request,
         )
-        .map_err(|error| format!("invalid segment sidecar {id}: {error}"))?;
-        if &sidecar != segment {
-            return Err(format!("segment sidecar {id} differs from worker output"));
+        .map_err(|error| format!("failed to start batch Kokoro task: {error}"))?;
+
+    let mut last_progress = Instant::now();
+    let output = loop {
+        if inner.cancelled(artifact_key) {
+            let _ = worker.cancel();
+            return Err("narration cancelled".to_string());
         }
-        let wav = fs::read(staging.join("audio").join(format!("{id}.wav")))
-            .map_err(|error| format!("failed to read narration WAV {id}: {error}"))?;
-        let audio_samples = segment
-            .get("audioSamples")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| "narration segment is missing audioSamples".to_string())?;
-        let wav_size = audio_samples
-            .checked_mul(2)
-            .and_then(|size| size.checked_add(44))
-            .ok_or_else(|| "narration WAV size overflow".to_string())?;
-        if wav.len() as u64 != wav_size
-            || audio.get("sizeBytes").and_then(Value::as_u64) != Some(wav_size)
-            || audio.get("sampleRate").and_then(Value::as_u64) != Some(24_000)
-            || wav.get(..4) != Some(b"RIFF")
-            || wav.get(8..12) != Some(b"WAVE")
-            || wav.get(36..40) != Some(b"data")
+        while let Some(progress) = worker
+            .try_progress()
+            .map_err(|error| format!("batch Kokoro task failed: {error}"))?
         {
-            return Err(format!("narration WAV {id} failed integrity validation"));
+            last_progress = Instant::now();
+            match progress {
+                BatchSynthesisProgress::Planned {
+                    chunks,
+                    sentences,
+                    words,
+                } => inner.update_job(artifact_key, |job| {
+                    job.progress.stage = NarrationStage::LoadingModel;
+                    job.progress.chunks_total = chunks;
+                    job.progress.sentences = sentences;
+                    job.progress.words = words;
+                }),
+                BatchSynthesisProgress::ModelLoaded => {
+                    inner.update_job(artifact_key, |job| {
+                        job.progress.stage = NarrationStage::Synthesizing;
+                    });
+                }
+                BatchSynthesisProgress::ChunkSynthesized { completed, total } => {
+                    inner.update_job(artifact_key, |job| {
+                        job.progress.stage = NarrationStage::Synthesizing;
+                        job.progress.chunks_completed = completed;
+                        job.progress.chunks_total = total;
+                    });
+                }
+            }
         }
-        let group = segment
-            .get("group")
-            .ok_or_else(|| "narration segment is missing its group".to_string())?;
-        let first_id = group
-            .get("firstBlockId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "narration group is missing firstBlockId".to_string())?;
-        let last_id = group
-            .get("lastBlockId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "narration group is missing lastBlockId".to_string())?;
-        if group.get("index").and_then(Value::as_u64) != Some(index as u64)
-            || group.get("chunkId").and_then(Value::as_str) != Some(id)
-            || !same_number(group.get("start"), start)
-            || !same_number(group.get("end"), end)
+        if let Some(output) = worker
+            .try_join()
+            .map_err(|error| format!("batch Kokoro task failed: {error}"))?
         {
-            return Err("narration segment, group, and chunk identities differ".to_string());
+            break output;
         }
-        let first = document
-            .blocks
-            .iter()
-            .position(|block| block.id == first_id)
-            .ok_or_else(|| "narration group has an unknown first block".to_string())?;
-        let last = document
-            .blocks
-            .iter()
-            .position(|block| block.id == last_id)
-            .ok_or_else(|| "narration group has an unknown last block".to_string())?;
-        let valid_first = last_block.map_or(first == 0, |previous| {
-            first == previous || first == previous + 1
-        });
-        if !valid_first || last < first {
-            return Err("narration groups skip or reverse their ordered source blocks".to_string());
+        if job_started.elapsed() > JOB_DEADLINE || last_progress.elapsed() > STALL_DEADLINE {
+            let _ = worker.cancel();
+            return Err(if job_started.elapsed() > JOB_DEADLINE {
+                "narration job deadline exceeded".to_string()
+            } else {
+                "batch Kokoro task made no progress for 120 seconds".to_string()
+            });
         }
-        last_block = Some(last);
+        thread::sleep(LOOP_POLL);
+    };
+    if job_started.elapsed() > JOB_DEADLINE {
+        return Err("narration job deadline exceeded".to_string());
+    }
 
-        let segment_units = segment
-            .get("units")
-            .and_then(Value::as_array)
-            .ok_or_else(|| "narration segment units are invalid".to_string())?;
-        if segment_units.len() != last - first + 1 {
-            return Err("narration units do not match the group block range".to_string());
-        }
-        let mut ranges = HashMap::new();
-        for (offset, unit) in segment_units.iter().enumerate() {
-            let block_id = unit
-                .get("blockId")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "narration unit is missing blockId".to_string())?;
-            let unit_id = unit
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "narration unit is missing id".to_string())?;
-            let unit_start = unit
-                .get("start")
-                .and_then(Value::as_f64)
-                .ok_or_else(|| "narration unit has invalid start".to_string())?;
-            let unit_end = unit
-                .get("end")
-                .and_then(Value::as_f64)
-                .ok_or_else(|| "narration unit has invalid end".to_string())?;
-            if block_id != document.blocks[first + offset].id
-                || unit.get("chunkId").and_then(Value::as_str) != Some(id)
-                || unit_start < start - 0.001
-                || unit_end > end + 0.001
-                || unit_end < unit_start
-                || !unit_ids.insert(unit_id)
-                || invalid_targets(unit.get("fallbackTargetIds"), &target_ids)
-            {
-                return Err("narration units are not an exact source-block partition".to_string());
-            }
-            ranges.insert(unit_id, (unit_start, unit_end));
-            covered_blocks.insert(first + offset);
-            units.push(unit.clone());
-        }
-
-        let segment_cues = segment
-            .get("cues")
-            .and_then(Value::as_array)
-            .ok_or_else(|| "narration segment cues are invalid".to_string())?;
-        for cue in segment_cues {
-            let cue_id = cue
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "narration cue is missing id".to_string())?;
-            let unit_id = cue
-                .get("unitId")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "narration cue is missing unitId".to_string())?;
-            let cue_start = cue
-                .get("start")
-                .and_then(Value::as_f64)
-                .ok_or_else(|| "narration cue has invalid start".to_string())?;
-            let cue_end = cue
-                .get("end")
-                .and_then(Value::as_f64)
-                .ok_or_else(|| "narration cue has invalid end".to_string())?;
-            let Some((unit_start, unit_end)) = ranges.get(unit_id) else {
-                return Err("narration cue references an unknown unit".to_string());
-            };
-            if !cue_ids.insert(cue_id)
-                || cue_start < *unit_start - 0.001
-                || cue_end > *unit_end + 0.001
-                || cue_end < cue_start
-                || !matches!(
-                    cue.get("granularity").and_then(Value::as_str),
-                    Some("block" | "expression" | "word")
-                )
-                || !matches!(
-                    cue.get("origin").and_then(Value::as_str),
-                    Some("blockFallback" | "sourceSemantic" | "sourceWord" | "summaryBlock")
-                )
-                || cue
-                    .get("confidence")
-                    .and_then(Value::as_f64)
-                    .is_none_or(|confidence| !(0.0..=1.0).contains(&confidence))
-                || cue
-                    .get("spokenStart")
-                    .and_then(Value::as_u64)
-                    .zip(cue.get("spokenEnd").and_then(Value::as_u64))
-                    .is_none_or(|(start, end)| end < start)
-                || invalid_targets(cue.get("targetIds"), &target_ids)
-            {
-                return Err("narration cue failed range or target validation".to_string());
-            }
-            cues.push(cue.clone());
-        }
-        chunks.push(audio.clone());
-        groups.push(group.clone());
+    inner.update_job(artifact_key, |job| {
+        job.status = NarrationStatus::Finalizing;
+        job.progress.stage = NarrationStage::Finalizing;
+    });
+    let mut artifact = output.artifact;
+    artifact.audio.url = media_url(&artifact.audio.sha256)?;
+    validate_artifact_files(
+        &artifact,
+        &document,
+        &staging,
+        artifact_key,
+        &document_hash,
+        &profile,
+        &pronunciation_plan,
+        &structural_transcript_plan,
+    )?;
+    publish_manifest_audio(
+        inner.media_root.as_deref(),
+        &staging.join("audio.wav"),
+        &artifact,
+    )?;
+    atomic_json(&staging.join("source-document.json"), &document)?;
+    atomic_json(&staging.join("manifest.json"), &artifact)?;
+    validate_final_layout(&staging)?;
+    if inner.cancelled(artifact_key) {
+        return Err("narration cancelled".to_string());
     }
-    if last_block != document.blocks.len().checked_sub(1) {
-        return Err("narration manifest does not cover every source block".to_string());
+    if job_started.elapsed() > JOB_DEADLINE {
+        return Err("narration job deadline exceeded".to_string());
     }
-    if covered_blocks.len() != document.blocks.len()
-        || !(0..document.blocks.len()).all(|block| covered_blocks.contains(&block))
-        || manifest.get("chunks") != Some(&Value::Array(chunks))
-        || manifest.get("groups") != Some(&Value::Array(groups))
-        || manifest.get("units") != Some(&Value::Array(units))
-        || manifest.get("cues") != Some(&Value::Array(cues))
-        || !same_number(manifest.get("durationSeconds"), previous_end)
-        || manifest
-            .get("planDigest")
-            .and_then(Value::as_str)
-            .is_none_or(|digest| digest.len() != 64)
-    {
-        return Err("narration manifest does not exactly concatenate its segments".to_string());
+    let final_dir = inner.cache_root.join(artifact_key);
+    if final_dir.exists() {
+        return Err("refusing to replace an existing batch narration artifact".to_string());
     }
-    Ok(())
+    fs::create_dir_all(&inner.cache_root)
+        .map_err(|error| format!("failed to create narration cache: {error}"))?;
+    fs::rename(&staging, &final_dir)
+        .map_err(|error| format!("failed to promote narration artifact: {error}"))?;
+    fs::File::open(&inner.cache_root)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("failed to sync narration cache: {error}"))?;
+    enforce_cache_limit(&inner.cache_root, artifact_key);
+    Ok((
+        artifact,
+        serde_json::to_value(output.diagnostics).unwrap_or(Value::Null),
+    ))
 }
 
-fn same_number(value: Option<&Value>, expected: f64) -> bool {
-    value
-        .and_then(Value::as_f64)
-        .is_some_and(|actual| actual.is_finite() && (actual - expected).abs() <= 0.001)
-}
-
-fn invalid_targets(value: Option<&Value>, target_ids: &HashSet<&str>) -> bool {
-    value.and_then(Value::as_array).is_none_or(|ids| {
-        ids.is_empty()
-            || ids
-                .iter()
-                .any(|id| id.as_str().is_none_or(|id| !target_ids.contains(id)))
-    })
-}
-
-fn segments_count(manifest: &Value) -> Result<usize, String> {
-    manifest
-        .get("segments")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .filter(|count| *count > 0)
-        .ok_or_else(|| "narration manifest has no final segments".to_string())
-}
-
-fn validate_final_artifact_layout(staging: &Path, segment_count: usize) -> Result<(), String> {
-    let allowed = ["audio", "manifest.json", "segments", "source-document.json"]
-        .into_iter()
-        .collect::<HashSet<_>>();
-    for entry in fs::read_dir(staging)
-        .map_err(|error| format!("failed to inspect narration artifact: {error}"))?
-    {
-        let entry =
-            entry.map_err(|error| format!("failed to inspect narration artifact: {error}"))?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !allowed.contains(name.as_str()) {
-            return Err(format!("narration artifact contains spool entry {name}"));
-        }
+fn validate_document(document: &NarrationDocument) -> Result<(), String> {
+    if document.schema_version != 1 {
+        return Err("sourceSchemaInvalid: schemaVersion must be 1".to_string());
     }
-    for (directory, suffix) in [("audio", "wav"), ("segments", "json")] {
-        let mut names = fs::read_dir(staging.join(directory))
-            .map_err(|error| format!("failed to inspect narration {directory}: {error}"))?
-            .map(|entry| {
-                entry
-                    .map(|entry| entry.file_name().to_string_lossy().to_string())
-                    .map_err(|error| format!("failed to inspect narration {directory}: {error}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        names.sort();
-        let expected = (0..segment_count)
-            .map(|index| format!("{index:06}.{suffix}"))
-            .collect::<Vec<_>>();
-        if names != expected {
+    if document.blocks.is_empty() || document.blocks.len() > MAX_SOURCE_BLOCKS {
+        return Err("sourceSchemaInvalid: blocks must contain 1..512 entries".to_string());
+    }
+    let mut ids = HashSet::new();
+    let mut text_bytes = 0usize;
+    for block in &document.blocks {
+        if block.id.trim().is_empty()
+            || block.id.len() > MAX_IDENTIFIER_BYTES
+            || !ids.insert(block.id.as_str())
+        {
+            return Err("sourceSchemaInvalid: block ids must be unique and nonempty".to_string());
+        }
+        if block.text.trim().is_empty() {
             return Err(format!(
-                "narration {directory} does not contain the exact segment prefix"
+                "sourceSchemaInvalid: block {} has empty text",
+                block.id
+            ));
+        }
+        text_bytes = text_bytes.saturating_add(block.text.len());
+        let expected = if block.kind.structural() {
+            HighlightMode::Block
+        } else {
+            HighlightMode::Text
+        };
+        if block.highlight_mode != expected {
+            return Err(format!(
+                "sourceSchemaInvalid: block {} has an invalid highlightMode",
+                block.id
+            ));
+        }
+        if matches!(block.kind, NarrationBlockKind::Heading) && block.text.contains('\n') {
+            return Err(format!(
+                "sourceSchemaInvalid: heading {} may not contain a newline",
+                block.id
             ));
         }
     }
-    Ok(())
-}
-
-fn validate_start_params(params: &NarrationStartParams) -> Result<(), String> {
-    if params.source_text.len() > MAX_SOURCE_TEXT_BYTES {
-        return Err(format!("sourceText exceeds the v6 64 KB limit"));
-    }
-    if params.document.schema_version != SOURCE_DOCUMENT_SCHEMA
-        || params.document.document_version != SOURCE_DOCUMENT_VERSION
-    {
-        return Err("narration requires source document schema 3, version 4".to_string());
-    }
-    if params.document.blocks.is_empty() || params.document.blocks.len() > MAX_SOURCE_BLOCKS {
-        return Err("narration source block count is outside the v6 bounds".to_string());
-    }
-    if params.document.targets.is_empty() || params.document.targets.len() > MAX_SOURCE_TARGETS {
-        return Err("narration source target count is outside the v6 bounds".to_string());
-    }
-    for (field, value) in [
-        ("messageId", params.document.message_id.as_str()),
-        ("messageRevision", params.document.message_revision.as_str()),
-        ("sourceHash", params.document.source_hash.as_str()),
-        (
-            "assistantMessageId",
-            params.target.assistant_message_id.as_str(),
-        ),
-        ("threadId", params.target.thread_id.as_str()),
-        ("turnId", params.target.turn_id.as_str()),
-    ] {
-        if value.trim().is_empty() || value.len() > MAX_IDENTIFIER_BYTES {
-            return Err(format!("narration {field} is invalid"));
-        }
-    }
-    if params.target.assistant_message_id != params.document.message_id
-        || params.target.message_revision != params.document.message_revision
-        || params.target.source_hash != params.document.source_hash
-    {
-        return Err("narration target does not match its source document".to_string());
-    }
-    if narration_source_hash(&params.source_text) != params.document.source_hash {
-        return Err("narration sourceText does not match sourceHash".to_string());
-    }
-    let mut block_ids = HashSet::new();
-    for block in &params.document.blocks {
-        if !block_ids.insert(block.id.as_str())
-            || block.id.len() > MAX_IDENTIFIER_BYTES
-            || block.display_text.trim().is_empty()
-            || block.path.trim().is_empty()
-            || block.target_ids.is_empty()
-            || !matches!(
-                block.kind.as_str(),
-                "paragraph" | "heading" | "listItem" | "blockquote" | "code" | "table" | "diagram"
-            )
-        {
-            return Err("narration source block is incomplete or duplicated".to_string());
-        }
-        let display_len = block.display_text.encode_utf16().count();
-        for range in &block.inline_ranges {
-            let start = range.get("displayStart").and_then(Value::as_u64);
-            let end = range.get("displayEnd").and_then(Value::as_u64);
-            if start
-                .zip(end)
-                .is_none_or(|(start, end)| start >= end || end > display_len as u64)
-                || !matches!(
-                    range.get("kind").and_then(Value::as_str),
-                    Some("inlineCode" | "link" | "text")
-                )
-            {
-                return Err("narration source block has an invalid inline range".to_string());
-            }
-        }
-    }
-    let mut target_ids = HashSet::new();
-    let mut target_blocks = HashMap::new();
-    for target in &params.document.targets {
-        let id = target
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "narration source target is missing id".to_string())?;
-        let block_id = target
-            .get("blockId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "narration source target is missing blockId".to_string())?;
-        let block = params
-            .document
-            .blocks
-            .iter()
-            .find(|block| block.id == block_id)
-            .ok_or_else(|| "narration source target references an unknown block".to_string())?;
-        if id.is_empty()
-            || id.len() > MAX_IDENTIFIER_BYTES
-            || !target_ids.insert(id)
-            || !block.target_ids.iter().any(|target_id| target_id == id)
-        {
-            return Err("narration source targets contain invalid ids".to_string());
-        }
-        target_blocks.insert(id, block_id);
-        match target.get("kind").and_then(Value::as_str) {
-            Some("block") => {}
-            Some("textRange") => {
-                let start = target.get("displayStart").and_then(Value::as_u64);
-                let end = target.get("displayEnd").and_then(Value::as_u64);
-                let display_len = block.display_text.encode_utf16().count() as u64;
-                if start
-                    .zip(end)
-                    .is_none_or(|(start, end)| start >= end || end > display_len)
-                    || !matches!(
-                        target.get("role").and_then(Value::as_str),
-                        Some("expression" | "inlineCode" | "link" | "word")
-                    )
-                {
-                    return Err("narration source target has an invalid text range".to_string());
-                }
-            }
-            _ => return Err("narration source target has an unsupported kind".to_string()),
-        }
-    }
-    if params.document.blocks.iter().any(|block| {
-        let unique = block.target_ids.iter().collect::<HashSet<_>>();
-        unique.len() != block.target_ids.len()
-            || block.target_ids.iter().any(|target| {
-                !target_ids.contains(target.as_str())
-                    || target_blocks.get(target.as_str()).copied() != Some(block.id.as_str())
-            })
-    }) {
-        return Err("narration source block references an invalid target".to_string());
+    if text_bytes > MAX_SOURCE_TEXT_BYTES {
+        return Err(format!(
+            "sourceSchemaInvalid: block text is too large: {text_bytes}>{MAX_SOURCE_TEXT_BYTES}"
+        ));
     }
     Ok(())
 }
 
-fn narration_source_hash(text: &str) -> String {
-    let hash = text
-        .encode_utf16()
-        .fold(0x811c_9dc5_u32, |hash, code_unit| {
-            (hash ^ u32::from(code_unit)).wrapping_mul(0x0100_0193)
-        });
-    format!("{hash:08x}")
+fn narration_profile(
+    synthesis_profile: &NarrationSynthesisProfile,
+) -> Result<NarrationProfile, String> {
+    let synthesizer_hash = sha256_bytes(
+        &serde_json::to_vec(&synthesis_profile.descriptor)
+            .map_err(|error| format!("failed to encode synthesizer profile: {error}"))?,
+    );
+    Ok(NarrationProfile {
+        phonemizer: "misaki-rs-0.3.0-us-no-default-features".to_string(),
+        pronunciation_reviewer: PronunciationReviewerProfile {
+            model: REVIEWER_MODEL.to_string(),
+            service_tier: REVIEWER_SERVICE_TIER.to_string(),
+            effort: REVIEWER_EFFORT.to_string(),
+            profile_digest: REVIEWER_PROFILE_DIGEST.to_string(),
+            prompt_version: PRONUNCIATION_PROMPT_VERSION,
+            output_schema_version: PRONUNCIATION_OUTPUT_SCHEMA_VERSION,
+            window_planner_version: AUDIT_WINDOW_PLANNER_VERSION,
+            phone_alphabet_version: DIRECT_PHONE_ALPHABET_VERSION,
+            phone_alphabet_sha256: direct_phone_alphabet_sha256(),
+            kokoro_vocabulary_sha256: format!(
+                "sha256-{}",
+                synthesis_profile
+                    .model_assets
+                    .get("vocab.json")
+                    .ok_or_else(|| "narration model manifest is missing vocab.json".to_string())?
+            ),
+            direct_phone_validator_version: DIRECT_PHONE_VALIDATOR_VERSION,
+        },
+        structural_transcript: StructuralTranscriptProfile {
+            model: REVIEWER_MODEL.to_string(),
+            service_tier: REVIEWER_SERVICE_TIER.to_string(),
+            effort: REVIEWER_EFFORT.to_string(),
+            profile_digest: REVIEWER_PROFILE_DIGEST.to_string(),
+            prompt_version: STRUCTURAL_TRANSCRIPT_PROMPT_VERSION,
+            output_schema_version: STRUCTURAL_TRANSCRIPT_OUTPUT_SCHEMA_VERSION,
+            window_planner_version: STRUCTURAL_TRANSCRIPT_WINDOW_PLANNER_VERSION,
+        },
+        source_mapper_version: 1,
+        word_segmenter_version: 2,
+        sentence_version: 1,
+        planner_version: 1,
+        timing_version: 2,
+        synthesizer_hash: format!("sha256-{synthesizer_hash}"),
+    })
 }
 
 fn artifact_key(
-    params: &NarrationStartParams,
-    profile: &Value,
-    synthesis: &NarrationSynthesisProfile,
-    corpus: &MisakiCorpus,
-    compact_json: &str,
-) -> String {
-    stable_revision_value(&json!({
-        "cacheNamespace": CACHE_NAMESPACE,
-        "manifestVersion": MANIFEST_VERSION,
-        "sourceDocument": params.document,
-        "target": params.target,
-        "compactRequestSha256": sha256_bytes(compact_json.as_bytes()),
-        "baseInstructionsVersion": BASE_INSTRUCTIONS_VERSION,
-        "groupingPromptVersion": GROUPING_PROMPT_VERSION,
-        "tokenizerVersion": TOKENIZER_VERSION,
-        "parserVersion": INCREMENTAL_PARSER_VERSION,
-        "localG2pVersion": LOCAL_G2P_VERSION,
-        "reviewedLexiconVersion": REVIEWED_LEXICON_VERSION,
-        "resolverVersion": CORPUS_RESOLVER_VERSION,
-        "sourceMapperVersion": SOURCE_MAPPER_VERSION,
-        "profileDigest": profile["profileDigest"],
-        "goldCorpusSha256": corpus.gold_sha256(),
-        "silverCorpusSha256": corpus.silver_sha256(),
-        "synthesizer": synthesis.descriptor,
-    }))
-}
-
-fn load_vocabulary(path: &Path) -> Result<HashSet<char>, String> {
-    let raw: HashMap<String, i64> = serde_json::from_slice(
-        &fs::read(path).map_err(|error| format!("failed to read Kokoro vocabulary: {error}"))?,
-    )
-    .map_err(|error| format!("invalid Kokoro vocabulary: {error}"))?;
-    raw.into_keys()
-        .map(|key| {
-            let mut characters = key.chars();
-            characters
-                .next()
-                .filter(|_| characters.next().is_none())
-                .ok_or_else(|| "Kokoro vocabulary contains a non-character key".to_string())
-        })
-        .collect()
+    document_hash: &str,
+    profile: &NarrationProfile,
+    synthesis_profile: &NarrationSynthesisProfile,
+) -> Result<String, String> {
+    let model_assets = synthesis_profile
+        .model_assets
+        .iter()
+        .collect::<BTreeMap<_, _>>();
+    let identity = json!({
+        "namespace": CACHE_NAMESPACE,
+        "documentHash": document_hash,
+        "profile": profile,
+        "pronunciationReviewer": reviewer_profile_descriptor(
+            &profile.pronunciation_reviewer.kokoro_vocabulary_sha256,
+        ),
+        "structuralTranscript": structural_transcript_profile_descriptor(),
+        "modelAssets": model_assets,
+    });
+    Ok(format!(
+        "sha256-{}",
+        sha256_bytes(
+            &serde_json::to_vec(&identity)
+                .map_err(|error| format!("failed to encode artifact identity: {error}"))?
+        )
+    ))
 }
 
 fn ensure_synthesis_assets(profile: &NarrationSynthesisProfile) -> Result<(), String> {
-    if !profile.assets_ready() {
-        return Err(format!(
-            "native Kokoro model assets are not installed at {}",
+    profile.assets_ready().then_some(()).ok_or_else(|| {
+        format!(
+            "narration model assets are unavailable at {}",
             profile.model_dir.display()
-        ));
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_artifact_files(
+    artifact: &NarrationArtifact,
+    document: &NarrationDocument,
+    directory: &Path,
+    artifact_key: &str,
+    document_hash: &str,
+    profile: &NarrationProfile,
+    pronunciation_plan: &ReviewedPronunciationPlan,
+    structural_transcript_plan: &StructuralTranscriptPlan,
+) -> Result<(), String> {
+    let expected_media_url = media_url(&artifact.audio.sha256)?;
+    let pronunciation_plan_sha256 = pronunciation_plan.sha256()?;
+    let structural_transcript_plan_sha256 = structural_transcript_plan.sha256()?;
+    if artifact.schema_version != 4
+        || artifact.artifact_key != artifact_key
+        || artifact.document_hash != document_hash
+        || artifact.pronunciation_plan_sha256 != pronunciation_plan_sha256
+        || artifact.structural_transcript_plan_sha256 != structural_transcript_plan_sha256
+        || artifact.profile != *profile
+        || artifact.audio.url != expected_media_url
+        || artifact.audio.mime_type != "audio/wav"
+        || artifact.audio.sample_rate != 24_000
+        || artifact.audio.channels != 1
+    {
+        return Err("artifactAlignmentInvalid: manifest identity is invalid".to_string());
+    }
+    let mut synthesis_artifact = artifact.clone();
+    synthesis_artifact.audio.url = "audio.wav".to_string();
+    validate_batch_artifact(
+        document,
+        pronunciation_plan,
+        structural_transcript_plan,
+        &synthesis_artifact,
+        &directory.join("audio.wav"),
+        MAX_AUDIO_BYTES,
+    )?;
+    Ok(())
+}
+
+fn validate_final_layout(directory: &Path) -> Result<(), String> {
+    let mut names = fs::read_dir(directory)
+        .map_err(|error| format!("failed to inspect narration artifact: {error}"))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name().to_string_lossy().to_string())
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    names.sort();
+    if names
+        != [
+            "audio.wav",
+            "manifest.json",
+            "pronunciation-plan.json",
+            "source-document.json",
+            "structural-transcript-plan.json",
+        ]
+    {
+        return Err("narration artifact contains unexpected files".to_string());
     }
     Ok(())
 }
 
 fn read_cached_manifest(
     cache_root: &Path,
+    media_root: Option<&Path>,
     artifact_key: &str,
-    document: &NarrationSourceDocument,
-) -> Option<Value> {
-    if !safe_component(artifact_key) {
-        return None;
+    document: &NarrationDocument,
+    document_hash: &str,
+    profile: &NarrationProfile,
+    synthesis_profile: &NarrationSynthesisProfile,
+) -> Result<Option<NarrationArtifact>, String> {
+    let directory = cache_root.join(artifact_key);
+    let Some(manifest) = fs::read(directory.join("manifest.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<NarrationArtifact>(&bytes).ok())
+    else {
+        return Ok(None);
+    };
+    let Some(source) = fs::read(directory.join("source-document.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<NarrationDocument>(&bytes).ok())
+    else {
+        return Ok(None);
+    };
+    let Some(pronunciation_plan) = fs::read(directory.join("pronunciation-plan.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ReviewedPronunciationPlan>(&bytes).ok())
+    else {
+        return Ok(None);
+    };
+    let Some(structural_transcript_plan) =
+        fs::read(directory.join("structural-transcript-plan.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<StructuralTranscriptPlan>(&bytes).ok())
+    else {
+        return Ok(None);
+    };
+    if &source != document
+        || narration_document_hash(&source).ok().as_deref() != Some(document_hash)
+    {
+        return Ok(None);
     }
-    let artifact = cache_root.join(artifact_key);
-    let value: Value =
-        serde_json::from_slice(&fs::read(artifact.join("manifest.json")).ok()?).ok()?;
-    validate_manifest_v6(&value, &artifact, document).ok()?;
-    Some(value)
+    let vocabulary = match KokoroVocabulary::load(&synthesis_profile.model_dir.join("vocab.json")) {
+        Ok(vocabulary) => vocabulary,
+        Err(_) => return Ok(None),
+    };
+    if validate_cached_structural_transcript_plan(&source, &structural_transcript_plan).is_err() {
+        return Ok(None);
+    }
+    let speech_document =
+        match validate_structural_transcript_plan(&source, &structural_transcript_plan) {
+            Ok(document) => document,
+            Err(_) => return Ok(None),
+        };
+    let baseline = match prepare_baseline(&speech_document) {
+        Ok(baseline) => baseline,
+        Err(_) => return Ok(None),
+    };
+    if validate_cached_plan(
+        &speech_document,
+        &baseline,
+        &vocabulary,
+        &pronunciation_plan,
+    )
+    .is_err()
+    {
+        return Ok(None);
+    }
+    if validate_artifact_files(
+        &manifest,
+        &source,
+        &directory,
+        artifact_key,
+        document_hash,
+        profile,
+        &pronunciation_plan,
+        &structural_transcript_plan,
+    )
+    .is_err()
+        || validate_final_layout(&directory).is_err()
+    {
+        return Ok(None);
+    }
+    publish_manifest_audio(media_root, &directory.join("audio.wav"), &manifest)?;
+    Ok(Some(manifest))
+}
+
+fn publish_manifest_audio(
+    media_root: Option<&Path>,
+    audio_path: &Path,
+    manifest: &NarrationArtifact,
+) -> Result<(), String> {
+    let media_root = media_root.ok_or_else(|| {
+        "narration media publication is unavailable: REMUX_MEDIA_DIR is not set".to_string()
+    })?;
+    let published_url = publish_file(
+        media_root,
+        audio_path,
+        &manifest.audio.sha256,
+        manifest.audio.size_bytes,
+        &manifest.audio.mime_type,
+    )?;
+    if published_url != manifest.audio.url {
+        return Err("narration media URL does not match its published content".to_string());
+    }
+    Ok(())
+}
+
+fn atomic_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
+    let encoded = serde_json::to_vec(value)
+        .map_err(|error| format!("failed to encode {}: {error}", path.display()))?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&temporary, encoded)
+        .map_err(|error| format!("failed to write {}: {error}", temporary.display()))?;
+    fs::File::open(&temporary)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("failed to sync {}: {error}", temporary.display()))?;
+    fs::rename(&temporary, path)
+        .map_err(|error| format!("failed to publish {}: {error}", path.display()))
+}
+
+fn decode_routed_params<T: DeserializeOwned>(mut params: Value, method: &str) -> Result<T, String> {
+    if let Some(params) = params.as_object_mut() {
+        for field in ["_remuxOrigin", "_remuxViewerKey"] {
+            if let Some(value) = params.remove(field)
+                && !value.is_string()
+            {
+                return Err(format!(
+                    "invalid {method} params: reserved field {field} must be a string"
+                ));
+            }
+        }
+    }
+    serde_json::from_value(params).map_err(|error| format!("invalid {method} params: {error}"))
+}
+
+fn non_empty<'a>(value: &'a str, field: &str) -> Result<&'a str, String> {
+    (!value.trim().is_empty())
+        .then_some(value)
+        .ok_or_else(|| format!("{field} is required"))
 }
 
 fn cleanup_temporary_artifacts(cache_root: &Path) {
@@ -1969,9 +1174,11 @@ fn enforce_cache_limit(cache_root: &Path, protected_key: &str) {
             if name.starts_with('.') || name == protected_key {
                 return None;
             }
-            let manifest = entry.path().join("manifest.json");
             Some((
-                fs::metadata(&manifest).ok()?.modified().ok()?,
+                fs::metadata(entry.path().join("manifest.json"))
+                    .ok()?
+                    .modified()
+                    .ok()?,
                 directory_size(&entry.path()),
                 entry.path(),
             ))
@@ -1991,58 +1198,23 @@ fn enforce_cache_limit(cache_root: &Path, protected_key: &str) {
 }
 
 fn directory_size(path: &Path) -> u64 {
+    let Ok(metadata) = fs::metadata(path) else {
+        return 0;
+    };
+    if metadata.is_file() {
+        return metadata.len();
+    }
     fs::read_dir(path)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|entry| {
-                    if entry.path().is_dir() {
-                        directory_size(&entry.path())
-                    } else {
-                        entry.metadata().map(|metadata| metadata.len()).unwrap_or(0)
-                    }
-                })
-                .sum()
-        })
-        .unwrap_or(0)
-}
-
-fn sha256_file(path: &Path) -> Result<String, String> {
-    fs::read(path)
-        .map(|bytes| sha256_bytes(&bytes))
-        .map_err(|error| format!("failed to hash {}: {error}", path.display()))
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| directory_size(&entry.path()))
+        .sum()
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
-}
-
-fn decode_routed_params<T: DeserializeOwned>(mut params: Value, method: &str) -> Result<T, String> {
-    if let Some(params) = params.as_object_mut() {
-        for field in ["_remuxOrigin", "_remuxViewerKey"] {
-            if let Some(value) = params.remove(field)
-                && !value.is_string()
-            {
-                return Err(format!(
-                    "invalid {method} params: reserved field {field} must be a string"
-                ));
-            }
-        }
-    }
-    serde_json::from_value(params).map_err(|error| format!("invalid {method} params: {error}"))
-}
-
-fn non_empty<'a>(value: &'a str, field: &str) -> Result<&'a str, String> {
-    (!value.trim().is_empty())
-        .then_some(value)
-        .ok_or_else(|| format!("{field} is required"))
-}
-
-fn safe_component(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn now_millis() -> u128 {
@@ -2055,151 +1227,85 @@ fn now_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use remux_tts::{NarrationBlock, OffsetEncoding};
 
-    fn with_routing_metadata(mut params: Value) -> Value {
-        {
-            let object = params
-                .as_object_mut()
-                .expect("test params must be an object");
-            object.insert(
-                "_remuxOrigin".to_string(),
-                Value::String("viewer-origin".to_string()),
-            );
-            object.insert(
-                "_remuxViewerKey".to_string(),
-                Value::String("viewer-key".to_string()),
-            );
+    fn valid_document() -> NarrationDocument {
+        NarrationDocument {
+            schema_version: 1,
+            offset_encoding: OffsetEncoding::Utf16CodeUnit,
+            blocks: vec![NarrationBlock {
+                id: "md:0".to_string(),
+                kind: NarrationBlockKind::Paragraph,
+                text: "A valid sentence.".to_string(),
+                highlight_mode: HighlightMode::Text,
+            }],
         }
-        params
     }
 
     #[test]
-    fn routed_request_metadata_is_accepted_without_weakening_domain_params() {
-        let source_text = "Hello world.";
-        let source_hash = narration_source_hash(source_text);
-        let start: NarrationStartParams = decode_routed_params(
-            with_routing_metadata(json!({
-                "document": {
-                    "blocks": [{
-                        "displayText": source_text,
-                        "id": "md:0",
-                        "inlineRanges": [],
-                        "kind": "paragraph",
-                        "path": "0",
-                        "targetIds": ["md:0/target/block"]
-                    }],
-                    "documentVersion": "4",
-                    "messageId": "message",
-                    "messageRevision": "revision",
-                    "schemaVersion": 3,
-                    "sourceHash": source_hash,
-                    "targets": [{
-                        "blockId": "md:0",
-                        "id": "md:0/target/block",
-                        "kind": "block"
-                    }]
-                },
-                "sourceText": source_text,
-                "target": {
-                    "assistantMessageId": "message",
-                    "messageRevision": "revision",
-                    "sourceHash": source_hash,
-                    "threadId": "thread",
-                    "turnId": "turn"
-                }
-            })),
+    fn source_document_contract_is_strict() {
+        validate_document(&valid_document()).unwrap();
+        let mut invalid = valid_document();
+        invalid.blocks[0].highlight_mode = HighlightMode::Block;
+        assert!(
+            validate_document(&invalid)
+                .unwrap_err()
+                .contains("sourceSchemaInvalid")
+        );
+    }
+
+    #[test]
+    fn routed_params_remove_only_reserved_transport_fields() {
+        let value: NarrationStartParams = decode_routed_params(
+            json!({
+                "_remuxOrigin": "viewer",
+                "_remuxViewerKey": "codex",
+                "document": valid_document(),
+            }),
             "narration/start",
         )
-        .expect("start params should accept runtime routing metadata");
-        validate_start_params(&start).expect("routed start params should remain valid");
+        .unwrap();
+        assert_eq!(value.document.schema_version, 1);
+    }
 
-        let read: NarrationReadParams = decode_routed_params(
-            with_routing_metadata(json!({ "artifactKey": "artifact" })),
-            "narration/resources/read",
-        )
-        .expect("read params should accept runtime routing metadata");
-        assert_eq!(read.artifact_key, "artifact");
+    #[test]
+    fn checked_in_v4_fixtures_match_the_strict_rust_contract() {
+        let valid_document = include_str!("../schemas/fixtures/narration-document-v1.valid.json");
+        let invalid_document =
+            include_str!("../schemas/fixtures/narration-document-v1.invalid.json");
+        let valid_artifact = include_str!("../schemas/fixtures/narration-artifact-v4.valid.json");
+        let invalid_artifact =
+            include_str!("../schemas/fixtures/narration-artifact-v4.invalid.json");
+        assert!(serde_json::from_str::<NarrationDocument>(valid_document).is_ok());
+        assert!(serde_json::from_str::<NarrationDocument>(invalid_document).is_err());
+        assert!(serde_json::from_str::<NarrationArtifact>(valid_artifact).is_ok());
+        assert!(serde_json::from_str::<NarrationArtifact>(invalid_artifact).is_err());
+    }
 
-        let cancel: NarrationCancelParams = decode_routed_params(
-            with_routing_metadata(json!({ "artifactKey": "artifact" })),
-            "narration/cancel",
-        )
-        .expect("cancel params should accept runtime routing metadata");
-        assert_eq!(cancel.artifact_key, "artifact");
-
-        let audio: NarrationAudioReadParams = decode_routed_params(
-            with_routing_metadata(json!({
-                "artifactKey": "artifact",
-                "chunkId": "000000"
-            })),
-            "narration/audio/read",
-        )
-        .expect("audio params should accept runtime routing metadata");
-        assert_eq!(audio.artifact_key, "artifact");
-        assert_eq!(audio.chunk_id, "000000");
-
-        assert!(
-            decode_routed_params::<NarrationReadParams>(
-                with_routing_metadata(json!({
-                    "artifactKey": "artifact",
-                    "unexpected": true
-                })),
-                "narration/resources/read",
-            )
-            .is_err(),
-            "ordinary unknown fields must remain rejected"
+    #[test]
+    fn artifact_identity_is_independent_of_hash_map_iteration_order() {
+        let first =
+            resolve_synthesis_profile(Path::new("/tmp/remux-root"), Path::new("/tmp/codex-home"))
+                .unwrap();
+        let mut second = first.clone();
+        let mut entries = second.model_assets.drain().collect::<Vec<_>>();
+        entries.reverse();
+        second.model_assets.extend(entries);
+        let profile = narration_profile(&first).unwrap();
+        assert_eq!(profile.word_segmenter_version, 2);
+        assert_eq!(profile.pronunciation_reviewer.prompt_version, 4);
+        assert_eq!(profile.pronunciation_reviewer.output_schema_version, 4);
+        assert_eq!(profile.pronunciation_reviewer.window_planner_version, 3);
+        assert_eq!(profile.pronunciation_reviewer.phone_alphabet_version, 1);
+        assert_eq!(profile.structural_transcript.prompt_version, 2);
+        assert_eq!(profile.structural_transcript.output_schema_version, 2);
+        assert_eq!(
+            profile.pronunciation_reviewer.kokoro_vocabulary_sha256,
+            "sha256-5977eee9e44024553a1511cbc7f2c9320fbd4f6409228bcab0b5d26922260beb"
         );
-        assert!(
-            decode_routed_params::<NarrationReadParams>(
-                json!({ "artifactKey": "artifact", "_remuxOrigin": 42 }),
-                "narration/resources/read",
-            )
-            .is_err(),
-            "reserved routing fields must retain their string contract"
+        assert_eq!(
+            artifact_key("sha256-document", &profile, &first).unwrap(),
+            artifact_key("sha256-document", &profile, &second).unwrap(),
         );
-    }
-
-    #[test]
-    fn v6_source_contract_rejects_old_documents_and_needs_no_runtime_selector() {
-        let params = NarrationStartParams {
-            document: NarrationSourceDocument {
-                blocks: vec![],
-                document_version: "3".to_string(),
-                message_id: "message".to_string(),
-                message_revision: "revision".to_string(),
-                schema_version: 2,
-                source_hash: "source".to_string(),
-                targets: vec![],
-            },
-            source_text: "source".to_string(),
-            target: NarrationTarget {
-                assistant_message_id: "message".to_string(),
-                message_revision: "revision".to_string(),
-                source_hash: "source".to_string(),
-                thread_id: "thread".to_string(),
-                turn_id: "turn".to_string(),
-            },
-        };
-        assert!(validate_start_params(&params).is_err());
-        assert!(std::env::var_os("REMUX_NARRATION_MODEL").is_none());
-    }
-
-    #[test]
-    fn source_hash_matches_the_viewer_utf16_contract() {
-        assert_eq!(narration_source_hash("source"), "1bcf29d8");
-        assert_eq!(narration_source_hash("A😀"), "dfcb7cd9");
-        assert_eq!(narration_source_hash("Hello, world!"), "ed90f094");
-    }
-
-    #[test]
-    fn committed_spool_is_bounded_by_groups_and_phonemes() {
-        let mut committed = VecDeque::new();
-        for index in 0..15 {
-            committed.push_back((index, 250));
-        }
-        assert!(spool_has_capacity(&committed, 3_750, 250));
-        assert!(!spool_has_capacity(&committed, 3_750, 251));
-        committed.push_back((15, 0));
-        assert!(!spool_has_capacity(&committed, 3_750, 1));
     }
 }

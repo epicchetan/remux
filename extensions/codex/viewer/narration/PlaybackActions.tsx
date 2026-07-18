@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { ArrowDown, ArrowUp, Check, LocateFixed, Pause, Play, X } from 'lucide-react';
+import { ArrowDown, ArrowUp, Check, LoaderCircle, LocateFixed, Pause, Play, X } from 'lucide-react';
 
 import { ComposerActionKey, type ComposerAction } from '../composer/actions/ActionKey';
 import { useNarrationStore } from './store';
@@ -8,20 +8,20 @@ const rates = [0.75, 1, 1.25, 1.5, 2] as const;
 
 export function NarrationPlaybackActions() {
   const close = useNarrationStore((state) => state.close);
-  const currentUnitIndex = useNarrationStore((state) => state.currentUnitIndex);
+  const currentBlockIndex = useNarrationStore((state) => state.currentBlockIndex);
   const followEnabled = useNarrationStore((state) => state.followEnabled);
-  const manifest = useNarrationStore((state) => state.manifest);
+  const artifact = useNarrationStore((state) => state.artifact);
   const nextBlock = useNarrationStore((state) => state.nextBlock);
   const pause = useNarrationStore((state) => state.pause);
   const phase = useNarrationStore((state) => state.phase);
   const play = useNarrationStore((state) => state.play);
   const previousBlock = useNarrationStore((state) => state.previousBlock);
   const toggleFollow = useNarrationStore((state) => state.toggleFollow);
-  const units = manifest?.units ?? [];
-  const playing = phase === 'playing' || phase === 'buffering';
-  const currentBlockId = units[currentUnitIndex]?.blockId;
-  const hasPreviousBlock = units.slice(0, Math.max(0, currentUnitIndex)).some((unit) => unit.blockId !== currentBlockId);
-  const hasNextBlock = units.slice(currentUnitIndex + 1).some((unit) => unit.blockId !== currentBlockId);
+  const blocks = artifact?.blocks ?? [];
+  const buffering = phase === 'buffering';
+  const playing = phase === 'playing';
+  const hasPreviousBlock = currentBlockIndex > 0;
+  const hasNextBlock = currentBlockIndex >= 0 && currentBlockIndex + 1 < blocks.length;
 
   const followAction: ComposerAction = {
     className: followEnabled ? 'is-active' : undefined,
@@ -42,8 +42,13 @@ export function NarrationPlaybackActions() {
     onClick: () => void nextBlock(),
   };
   const playbackAction: ComposerAction = {
-    icon: playing ? <Pause className="size-4 fill-current" /> : <Play className="size-4 fill-current" />,
-    label: playing ? 'Pause narration' : 'Play narration',
+    disabled: buffering,
+    icon: buffering
+      ? <LoaderCircle className="size-4 animate-spin" />
+      : playing
+        ? <Pause className="size-4 fill-current" />
+        : <Play className="size-4 fill-current" />,
+    label: buffering ? 'Loading narration audio' : playing ? 'Pause narration' : 'Play narration',
     onClick: playing ? pause : () => void play(),
     tone: 'send',
   };

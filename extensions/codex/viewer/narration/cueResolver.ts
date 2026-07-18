@@ -1,54 +1,52 @@
 import type {
-  CodexNarrationCue,
-  CodexNarrationTimeline,
-  CodexNarrationSourceTarget,
-  CodexNarrationUnit,
+  CodexNarrationArtifact,
+  CodexNarrationBlockTiming,
+  CodexNarrationSentence,
+  CodexNarrationWordCue,
 } from '../../shared/narration';
 
 export type NarrationResolvedPosition = {
-  cue: CodexNarrationCue | null;
-  cueIndex: number;
-  targetIds: string[];
-  targets: CodexNarrationSourceTarget[];
-  unit: CodexNarrationUnit | null;
-  unitIndex: number;
+  block: CodexNarrationBlockTiming | null;
+  blockIndex: number;
+  sentence: CodexNarrationSentence | null;
+  sentenceIndex: number;
+  wordCue: CodexNarrationWordCue | null;
+  wordCueIndex: number;
 };
 
 export function resolveNarrationPosition(
-  manifest: CodexNarrationTimeline,
-  globalTime: number,
+  artifact: CodexNarrationArtifact,
+  sample: number,
 ): NarrationResolvedPosition {
-  const unitIndex = findTimedIndex(manifest.units, globalTime);
-  const unit = unitIndex >= 0 ? manifest.units[unitIndex] ?? null : null;
-  const resolvedCueIndex = unit ? findTimedIndex(manifest.cues, globalTime) : -1;
-  const cueIndex = resolvedCueIndex >= 0 && manifest.cues[resolvedCueIndex]?.unitId === unit?.id
-    ? resolvedCueIndex
-    : -1;
-  const cue = cueIndex >= 0 ? manifest.cues[cueIndex] ?? null : null;
-  const targetIds = cue?.targetIds ?? unit?.fallbackTargetIds ?? [];
-  const targetSet = new Set(targetIds);
+  const blockIndex = findHalfOpenSampleRange(artifact.blocks, sample);
+  const sentenceIndex = findHalfOpenSampleRange(artifact.sentences, sample);
+  const wordCueIndex = findHalfOpenSampleRange(artifact.wordCues, sample);
   return {
-    cue,
-    cueIndex,
-    targetIds,
-    targets: manifest.targets.filter((target) => targetSet.has(target.id)),
-    unit,
-    unitIndex,
+    block: blockIndex >= 0 ? artifact.blocks[blockIndex] ?? null : null,
+    blockIndex,
+    sentence: sentenceIndex >= 0 ? artifact.sentences[sentenceIndex] ?? null : null,
+    sentenceIndex,
+    wordCue: wordCueIndex >= 0 ? artifact.wordCues[wordCueIndex] ?? null : null,
+    wordCueIndex,
   };
 }
 
-function findTimedIndex<T extends { end: number; start: number }>(
+function findHalfOpenSampleRange<T extends { endSample: number; startSample: number }>(
   items: T[],
-  time: number,
+  sample: number,
 ) {
   let low = 0;
   let high = items.length - 1;
   while (low <= high) {
     const middle = (low + high) >> 1;
     const item = items[middle];
-    if (time < item.start) high = middle - 1;
-    else if (time > item.end) low = middle + 1;
-    else return middle;
+    if (sample < item.startSample) {
+      high = middle - 1;
+    } else if (sample >= item.endSample) {
+      low = middle + 1;
+    } else {
+      return middle;
+    }
   }
-  return Math.max(-1, Math.min(items.length - 1, high));
+  return -1;
 }

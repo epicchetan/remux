@@ -1,8 +1,7 @@
 # Narrate local G2P and sparse spoken-text patches v6
 
-Status: Implemented — pending live listening validation
+Status: Archived — superseded by narrate-batch-alignment.md and narrate-pronunciation-audit.md
 Last verified: 2026-07-14
-Canonical code: `extensions/narrate/server/src/streaming.rs`, `extensions/narrate/server/src/narration.rs`, `crates/remux-tts/src/frontend.rs`, `crates/remux-tts/src/streaming_artifact.rs`
 Evidence: `docs/specs/narrate-baseline-patch-rd.md`, `tools/narration-rd/run_baseline_patch_v6_experiment.py`
 
 ## Decision

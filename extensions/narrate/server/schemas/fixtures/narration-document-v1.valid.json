@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "offsetEncoding": "utf16CodeUnit",
+  "blocks": [
+    { "id": "md:0", "kind": "paragraph", "text": "Hello, world.", "highlightMode": "text" },
+    { "id": "md:1", "kind": "code", "text": "const answer = 42;", "highlightMode": "block" }
+  ]
+}

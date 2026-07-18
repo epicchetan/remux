@@ -1,0 +1,36 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "windowId", "phonemePatches"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 4
+    },
+    "windowId": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "phonemePatches": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["wordId", "phones"],
+        "properties": {
+          "wordId": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "phones": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 450,
+            "pattern": "^[AIOQSTWYabcdefhijklmnopqrstuvwxyzæçðøŋœɐɑɒɔɕɖəɚɛɜɟɡɣɤɥɨɪɯɰɲɳɴɸɹɻɽɾʁʂʃʈʊʋʌʎʒʔʝʣʤʥʦʧʨʰʲˈˌː̃βθχᵊᵝᵻꭧ]+(?: [AIOQSTWYabcdefhijklmnopqrstuvwxyzæçðøŋœɐɑɒɔɕɖəɚɛɜɟɡɣɤɥɨɪɯɰɲɳɴɸɹɻɽɾʁʂʃʈʊʋʌʎʒʔʝʣʤʥʦʧʨʰʲˈˌː̃βθχᵊᵝᵻꭧ]+)*$"
+          }
+        }
+      }
+    }
+  }
+}

@@ -15,8 +15,7 @@ import { fileReferenceStyle } from '../file/FileReferenceChip';
 import { FileTypeIcon } from '../file/fileTypeIcons';
 import { cn } from '@remux/viewer-kit/shadcn';
 import { openHostHref, openHostTarget } from '@remux/viewer-kit/links';
-import type { CodexNarrationSourceTarget } from '../../../../shared/narration';
-import { useNarrationTargetRef } from '../../../narration/targetRegistry';
+import { useNarrationBlockRef } from '../../../narration/blockRegistry';
 import { useNarrationTextLeafRegistration } from '../../../narration/textLeafRegistry';
 
 const fallbackMarkdownWidth = 868;
@@ -25,7 +24,6 @@ export function MarkdownBlock({
   children,
   density = 'default',
   narrationAssistantMessageId = null,
-  narrationTargets = [],
   maxLines,
   streaming = false,
   width = fallbackMarkdownWidth,
@@ -34,7 +32,6 @@ export function MarkdownBlock({
   density?: MarkdownDensity;
   maxLines?: number;
   narrationAssistantMessageId?: string | null;
-  narrationTargets?: CodexNarrationSourceTarget[];
   streaming?: boolean;
   width?: number;
 }) {
@@ -62,7 +59,6 @@ export function MarkdownBlock({
           assistantMessageId={narrationAssistantMessageId}
           block={block}
           key={`${block.type}:${index}`}
-          targets={narrationTargets}
         />
       ))}
     </div>
@@ -72,43 +68,36 @@ export function MarkdownBlock({
 const MarkdownBlockNode = memo(function MarkdownBlockNode({
   assistantMessageId,
   block,
-  targets,
 }: {
   assistantMessageId: string | null;
   block: MarkdownLayoutBlock;
-  targets: CodexNarrationSourceTarget[];
 }) {
-  const blockTargets = targets.filter((target) => target.blockId === block.narrationId && target.kind === 'block');
-  const targetRef = useNarrationTargetRef(assistantMessageId, blockTargets.map((target) => target.id));
+  const blockRef = useNarrationBlockRef(assistantMessageId, [block.narrationId]);
   return (
     <div
       className="codex-md-block-frame"
       data-narration-block-id={block.narrationId}
-      ref={targetRef}
+      ref={blockRef}
       style={{ height: `${block.height}px` }}
     >
       <div aria-hidden="true" className="codex-narration-paint-layer" hidden />
       <MarkdownBlockContent
         assistantMessageId={assistantMessageId}
         block={block}
-        targets={targets}
       />
     </div>
   );
 }, (previous, next) => (
   previous.assistantMessageId === next.assistantMessageId &&
-  previous.block === next.block &&
-  previous.targets === next.targets
+  previous.block === next.block
 ));
 
 function MarkdownBlockContent({
   assistantMessageId,
   block,
-  targets,
 }: {
   assistantMessageId: string | null;
   block: MarkdownLayoutBlock;
-  targets: CodexNarrationSourceTarget[];
 }) {
   const style = contentStyle(block);
   switch (block.type) {
@@ -135,7 +124,7 @@ function MarkdownBlockContent({
       return (
         <blockquote className="codex-md-block codex-md-blockquote" style={style}>
           {block.children.map((child, index) => (
-            <MarkdownBlockNode assistantMessageId={assistantMessageId} block={child} key={`${child.type}:${index}`} targets={targets} />
+            <MarkdownBlockNode assistantMessageId={assistantMessageId} block={child} key={`${child.type}:${index}`} />
           ))}
         </blockquote>
       );
@@ -155,7 +144,7 @@ function MarkdownBlockContent({
                 <span className="codex-md-list-marker">{item.marker}</span>
                 <div className="codex-md-list-content">
                   {item.blocks.map((child, childIndex) => (
-                    <MarkdownBlockNode assistantMessageId={assistantMessageId} block={child} key={`${child.type}:${childIndex}`} targets={targets} />
+                    <MarkdownBlockNode assistantMessageId={assistantMessageId} block={child} key={`${child.type}:${childIndex}`} />
                   ))}
                 </div>
               </div>

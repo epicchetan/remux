@@ -14,7 +14,7 @@ export type TranscriptNarrationFocusRequest = {
   bounds?: { bottom: number; top: number };
   materializeOnly?: boolean;
   reason: 'explicitSeek' | 'explicitSeekInPlace' | 'follow' | 'followReenabled';
-  targetIds: string[];
+  blockIds: string[];
   threadId: string;
   turnId: string;
 };

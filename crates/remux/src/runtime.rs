@@ -24,14 +24,13 @@ use crate::fs::core::FsCore;
 use crate::fs::relay::{FsRelay, FsRelayOptions};
 use crate::http::viewer_bundles::ViewerBundleRegistry;
 use crate::http::viewers::ViewerProvider;
-use crate::http::{build_router_with_status, HttpState};
+use crate::http::{build_router_with_status, compression_layer, HttpState};
 use crate::logs::{ExtensionLogs, Journal, JournalEvent, StdTerminal, TerminalMode};
 use crate::monitor::{MemoryAlert, ResourceMonitor};
 use crate::notifications::{production_fetch, NotificationManager};
 use crate::rpc::router::{BoxFuture, ExtensionServer, RpcRouter, SystemHooks};
 use crate::rpc::ws::{ClientCountListener, WsHooks, WsServer, REMUX_WEB_SOCKET_PATH};
 use crate::supervise::REMUX_RESTART_EXIT_CODE;
-use tower_http::compression::CompressionLayer;
 
 pub const RESTART_DELAY_MS: u64 = 200;
 pub const RESTART_FORCE_EXIT_DELAY_MS: u64 = 2_000;
@@ -603,7 +602,7 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
             auth_state,
             crate::auth::require_auth,
         ))
-        .layer(CompressionLayer::new())
+        .layer(compression_layer())
         .into_make_service_with_connect_info::<std::net::SocketAddr>();
 
     log_start_config(

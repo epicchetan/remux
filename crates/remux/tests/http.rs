@@ -4,16 +4,15 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use serde_json::json;
-use tower_http::compression::CompressionLayer;
-
 use remux::extensions::manifest::{
     Display, ExtensionManifest, FileHandler, Launcher, View, ViewCachePolicy,
 };
 use remux::http::viewer_bundles::ViewerBundleRegistry;
 use remux::http::viewers::ViewerProvider;
-use remux::http::{build_router, HttpState};
+use remux::http::{build_router, compression_layer, HttpState};
 use remux::logs::{Journal, StdTerminal};
+use serde_json::json;
+use sha2::{Digest, Sha256};
 
 fn fixture_extension(root: &std::path::Path) -> ExtensionManifest {
     let light_icon = root.join("light.png");
@@ -92,7 +91,7 @@ async fn serve_fixture(root: &std::path::Path) -> (SocketAddr, String) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(listener, build_router(state).layer(CompressionLayer::new()))
+        axum::serve(listener, build_router(state).layer(compression_layer()))
             .await
             .unwrap();
     });
@@ -123,6 +122,20 @@ async fn get_gzip(addr: SocketAddr, path: &str) -> reqwest::Response {
         .unwrap()
 }
 
+async fn request(
+    addr: SocketAddr,
+    method: reqwest::Method,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> reqwest::Response {
+    let client = reqwest::Client::builder().build().unwrap();
+    let mut request = client.request(method, format!("http://{addr}{path}"));
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    request.send().await.unwrap()
+}
+
 #[tokio::test]
 async fn serves_health_catalog_redirect_icons_viewers_and_404() {
     let dir = tempfile::tempdir().unwrap();
@@ -142,6 +155,43 @@ async fn serves_health_catalog_redirect_icons_viewers_and_404() {
             "sha256": media_hash,
             "mimeType": "image/png",
             "sizeBytes": 5,
+            "createdAtMs": 1,
+            "lastAccessAtMs": 1,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    // This is intentionally response-sized: the transport must handle the
+    // class of WAV that previously overflowed the 8 MiB WebSocket frame cap.
+    const WAV_SIZE: usize = 12_751_244;
+    let mut wav = vec![0u8; WAV_SIZE];
+    wav[0..4].copy_from_slice(b"RIFF");
+    wav[4..8].copy_from_slice(&((WAV_SIZE - 8) as u32).to_le_bytes());
+    wav[8..12].copy_from_slice(b"WAVE");
+    wav[12..16].copy_from_slice(b"fmt ");
+    wav[16..20].copy_from_slice(&16u32.to_le_bytes());
+    wav[20..22].copy_from_slice(&1u16.to_le_bytes());
+    wav[22..24].copy_from_slice(&1u16.to_le_bytes());
+    wav[24..28].copy_from_slice(&24_000u32.to_le_bytes());
+    wav[28..32].copy_from_slice(&(24_000u32 * 2).to_le_bytes());
+    wav[32..34].copy_from_slice(&2u16.to_le_bytes());
+    wav[34..36].copy_from_slice(&16u16.to_le_bytes());
+    wav[36..40].copy_from_slice(b"data");
+    wav[40..44].copy_from_slice(&((WAV_SIZE - 44) as u32).to_le_bytes());
+    let audio_hash = format!("{:x}", Sha256::digest(&wav));
+    let audio_dir = dir
+        .path()
+        .join(".remux/cache/media/sha256")
+        .join(&audio_hash[..2]);
+    std::fs::create_dir_all(&audio_dir).unwrap();
+    std::fs::write(audio_dir.join(format!("{audio_hash}.blob")), &wav).unwrap();
+    std::fs::write(
+        audio_dir.join(format!("{audio_hash}.json")),
+        json!({
+            "schemaVersion": 1,
+            "sha256": audio_hash,
+            "mimeType": "audio/wav",
+            "sizeBytes": wav.len(),
             "createdAtMs": 1,
             "lastAccessAtMs": 1,
         })
@@ -290,6 +340,49 @@ async fn serves_health_catalog_redirect_icons_viewers_and_404() {
         "private, max-age=31536000, immutable"
     );
     assert_eq!(media.bytes().await.unwrap().as_ref(), b"hello");
+
+    let audio_path = format!("/remux/media/sha256/{audio_hash}");
+    let audio = get_gzip(addr, &audio_path).await;
+    assert_eq!(audio.status(), 200);
+    assert_eq!(audio.headers().get("content-type").unwrap(), "audio/wav");
+    assert_eq!(audio.headers().get("accept-ranges").unwrap(), "bytes");
+    assert!(audio.headers().get("content-encoding").is_none());
+    assert_eq!(audio.bytes().await.unwrap().len(), wav.len());
+
+    let audio_head = request(addr, reqwest::Method::HEAD, &audio_path, &[]).await;
+    assert_eq!(audio_head.status(), 200);
+    assert_eq!(
+        audio_head.headers().get("content-length").unwrap(),
+        wav.len().to_string().as_str()
+    );
+    assert!(audio_head.bytes().await.unwrap().is_empty());
+
+    let audio_range = request(
+        addr,
+        reqwest::Method::GET,
+        &audio_path,
+        &[("range", "bytes=0-43")],
+    )
+    .await;
+    assert_eq!(audio_range.status(), 206);
+    assert_eq!(
+        audio_range.headers().get("content-range").unwrap(),
+        format!("bytes 0-43/{}", wav.len()).as_str()
+    );
+    assert_eq!(audio_range.bytes().await.unwrap().as_ref(), &wav[..44]);
+
+    let invalid_range = request(
+        addr,
+        reqwest::Method::GET,
+        &audio_path,
+        &[("range", "bytes=99999999-100000000")],
+    )
+    .await;
+    assert_eq!(invalid_range.status(), 416);
+    assert_eq!(
+        invalid_range.headers().get("content-range").unwrap(),
+        format!("bytes */{}", wav.len()).as_str()
+    );
 
     let invalid_media = get(addr, "/remux/media/sha256/ABC").await;
     assert_eq!(invalid_media.status(), 404);

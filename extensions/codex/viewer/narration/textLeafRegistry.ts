@@ -1,7 +1,5 @@
 import { useLayoutEffect, useRef, type RefCallback } from 'react';
 
-import type { CodexNarrationTextTarget } from '../../shared/narration';
-
 export type NarrationTextLeaf = {
   assistantMessageId: string;
   blockId: string;
@@ -44,15 +42,15 @@ export function subscribeNarrationTextLeaves(listener: () => void) {
 
 export function resolveNarrationTextPaint(
   assistantMessageId: string,
-  target: CodexNarrationTextTarget,
+  target: { blockId: string; textEnd: number; textStart: number },
 ): ResolvedTextPaint {
   const leaves = [...(leavesByBlock.get(blockKey(assistantMessageId, target.blockId)) ?? [])]
     .filter((leaf) => leaf.textNode.isConnected)
     .sort((left, right) => left.displayStart - right.displayStart || left.displayEnd - right.displayEnd);
   const ranges: Range[] = [];
   for (const leaf of leaves) {
-    const displayStart = Math.max(target.displayStart, leaf.displayStart);
-    const displayEnd = Math.min(target.displayEnd, leaf.displayEnd);
+    const displayStart = Math.max(target.textStart, leaf.displayStart);
+    const displayEnd = Math.min(target.textEnd, leaf.displayEnd);
     if (displayEnd <= displayStart) continue;
     const start = leaf.textStart + displayStart - leaf.displayStart;
     const end = leaf.textStart + displayEnd - leaf.displayStart;

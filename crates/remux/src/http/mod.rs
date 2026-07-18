@@ -12,10 +12,14 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode, Uri};
+use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::Response;
 use axum::routing::get;
 use serde_json::Value;
+use tower_http::compression::{
+    predicate::{DefaultPredicate, NotForContentType, Predicate},
+    CompressionLayer,
+};
 
 use crate::extensions::discovery::InvalidExtension;
 use crate::extensions::manifest::ExtensionManifest;
@@ -38,6 +42,14 @@ pub struct ApiStatusState {
     pub require_auth: bool,
     pub host: String,
     pub port: u16,
+}
+
+/// Keep byte-addressable media out of the global response compression layer.
+/// Compressing an audio response changes its representation and causes
+/// `CompressionLayer` to remove `Accept-Ranges` and `Content-Length`.
+pub fn compression_layer() -> CompressionLayer<impl Predicate> {
+    CompressionLayer::new()
+        .compress_when(DefaultPredicate::new().and(NotForContentType::const_new("audio/")))
 }
 
 pub fn build_router(state: Arc<HttpState>) -> axum::Router {
@@ -67,6 +79,7 @@ pub fn build_router_with_status(
 
 async fn handle_request(
     State(state): State<Arc<HttpState>>,
+    method: Method,
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
@@ -113,7 +126,8 @@ async fn handle_request(
         return json_response(catalog);
     }
 
-    if let Some(response) = media::serve_media(&state.media_root, pathname, &headers).await {
+    if let Some(response) = media::serve_media(&state.media_root, pathname, &method, &headers).await
+    {
         return response;
     }
 

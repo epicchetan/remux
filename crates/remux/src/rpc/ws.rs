@@ -1334,9 +1334,7 @@ fn dispatch_lane(client: &WsClient, method: &str, work: &DispatchWork) -> (Strin
     if method.starts_with("remux/narrate/narration/") {
         let mode = if matches!(
             method,
-            "remux/narrate/narration/audio/read"
-                | "remux/narrate/narration/resources/read"
-                | "remux/narrate/narration/diagnostics/read"
+            "remux/narrate/narration/resources/read" | "remux/narrate/narration/diagnostics/read"
         ) {
             DispatchMode::ConcurrentBusiness
         } else {

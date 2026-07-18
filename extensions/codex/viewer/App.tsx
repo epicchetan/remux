@@ -337,7 +337,7 @@ export function App() {
     // decides which of them drives the viewport. Entering edit/fork or the
     // directory picker still dismisses playback since they replace the
     // composer surface narration controls live in.
-    const playbackActive = narrationPhase === 'ready' || narrationPhase === 'playing' || narrationPhase === 'paused';
+    const playbackActive = narrationPhase === 'buffering' || narrationPhase === 'ready' || narrationPhase === 'playing' || narrationPhase === 'paused';
     if (!playbackActive) return;
     if (editTarget || forkTarget || directoryPickerOpen) {
       closeNarration();

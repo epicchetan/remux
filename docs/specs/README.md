@@ -42,7 +42,10 @@ Canonical code: ...
 
 | Spec | Status | Notes |
 | --- | --- | --- |
-| [narrate-local-g2p-sparse-patches.md](narrate-local-g2p-sparse-patches.md) | Implemented — Pending Live Validation | Hard v6 replacement: native Misaki owns phonemes and alignment, a reviewed lexicon stabilizes recurring names, and one whole-document Sol stream returns only id-addressed spoken-text patches and required summaries. |
+| [narrate-structural-transcripts.md](narrate-structural-transcripts.md) | Implemented | v5 text-only structural projection: Sol authors plain transcripts for code/table/diagram blocks, then every generated word flows through the shared Misaki baseline and pronunciation review. |
+| [narrate-pronunciation-audit.md](narrate-pronunciation-audit.md) | Implemented | v4 post-transcript review: one complete projected speech document, contextual Misaki baseline, raw unresolved-phone evidence, explicit Kokoro lexical vocabulary, and sparse Sol corrections before synthesis. |
+| [narrate-batch-alignment.md](narrate-batch-alignment.md) | Implemented | Current exact-source word/sentence alignment, NLP-aware acoustic planning, Kokoro duration projection, final-WAV artifact, and Codex-owned playback/highlighting contract. |
+| [narrate-local-g2p-sparse-patches.md](narrate-local-g2p-sparse-patches.md) | Archived | Historical v6 whole-document sparse-patch pipeline, superseded by batch alignment and bounded full-word pronunciation review. |
 | [narrate-streaming-g2p.md](narrate-streaming-g2p.md) | Archived | Historical v5 complete model-generated token/phoneme contract, superseded by the local-G2P sparse-patch v6 implementation. |
 | [narrate-streaming-g2p-contract-rd.md](narrate-streaming-g2p-contract-rd.md) | R&D evidence | Real-thread contract/model benchmark that found the v4 cardinality failure, then live sparse-contract fragility, and motivated server-owned token structure, explicit risk metadata, and removal of repair turns. |
 | [narrate-streaming-g2p-rd.md](narrate-streaming-g2p-rd.md) | R&D evidence | Earlier model/contract/latency experiments supporting whole-document streaming and showing that complete per-token phonemes are viable; later contract conclusions are normative in the v5 spec. |

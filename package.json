@@ -17,6 +17,8 @@
     "test:runtime": "cargo test -p remux",
     "test:codex-server": "cargo test --manifest-path extensions/codex/server/Cargo.toml --offline",
     "test:codex": "playwright test -c extensions/codex/playwright.config.ts",
+    "build:codex:narration-real": "npm --workspace @remux/codex run build && npm --workspace @remux/narrate run build && cargo build --release -p remux --offline && cargo build --release --manifest-path extensions/codex/server/Cargo.toml --target-dir /tmp/remux-codex-server-target --offline && cargo build --release --manifest-path extensions/narrate/server/Cargo.toml --target-dir /tmp/remux-narrate-server-target --offline",
+    "test:codex:narration-real": "npm run build:codex:narration-real && playwright test -c extensions/codex/playwright.narration-real.config.ts",
     "test:terminal-server": "cargo test --manifest-path extensions/terminal/server/Cargo.toml",
     "test:terminal-smoke": "node extensions/terminal/tests/ws-smoke.cjs",
     "test:terminal": "playwright test -c extensions/terminal/playwright.config.ts"
@@ -27,6 +29,7 @@
     "@types/node": "^25.6.2",
     "@types/react": "~19.1.0",
     "@types/react-dom": "^19.1.9",
+    "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^6.0.1",
     "typescript": "~5.9.2",
     "vite": "^8.0.11"

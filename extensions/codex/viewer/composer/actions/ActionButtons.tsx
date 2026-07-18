@@ -22,7 +22,7 @@ export function ComposerActionButtons() {
   const selectDirectoryPickerPath = useThreadsStore((state) => state.selectDirectoryPickerPath);
   const turn = useComposerTurnAction();
   const narrationPhase = useNarrationStore((state) => state.phase);
-  const narrationPlaybackActive = narrationPhase === 'ready' || narrationPhase === 'playing' || narrationPhase === 'paused';
+  const narrationPlaybackActive = narrationPhase === 'buffering' || narrationPhase === 'ready' || narrationPhase === 'playing' || narrationPhase === 'paused';
   const pickingDirectory = Boolean(draft && directoryPickerOpen);
   const directoryParent = directoryPickerPath ? parentDirectory(directoryPickerPath) : null;
 

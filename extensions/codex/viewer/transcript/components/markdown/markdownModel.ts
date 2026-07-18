@@ -23,10 +23,8 @@ import { hostFileHrefInfoFromHref, webUrlFromHref } from '@remux/viewer-kit/link
 import { mentionPathFromHref } from '../../model/userMessageMarkdown';
 import type {
   CodexNarrationBlockKind,
-  CodexNarrationInlineRange,
   CodexNarrationSourceDocument,
   CodexNarrationSourceBlock,
-  CodexNarrationSourceTarget,
 } from '../../../../shared/narration';
 
 export type MarkdownDensity = 'default' | 'user' | 'work';
@@ -412,9 +410,11 @@ export const markdownMetrics = {
 } as const;
 
 const documentCache = new Map<string, PreparedMarkdownDocument>();
+const rawDocumentCache = new Map<string, RawMarkdownBlock[]>();
 const preparedTextCache = new Map<string, PreparedText>();
 const layoutCache = new Map<string, MarkdownLayoutDocument>();
 const maxDocumentCacheEntries = 300;
+const maxRawDocumentCacheEntries = 300;
 const maxPreparedTextCacheEntries = 1000;
 const maxLayoutCacheEntries = 500;
 
@@ -453,26 +453,15 @@ export function parseMarkdownDocument(markdown: string, options: MarkdownRenderO
 export function narrationSourceBlocks(markdown: string): CodexNarrationSourceBlock[] {
   const blocks = parseMarkdownBlocks(markdown, markdownParseOptions({ richFileLinks: true }));
   const output: CodexNarrationSourceBlock[] = [];
-  collectNarrationSourceBlocks(blocks, output, []);
+  collectNarrationSourceBlocks(blocks, output);
   return output;
 }
 
-export function narrationSourceDocument(
-  markdown: string,
-  identity: Pick<CodexNarrationSourceDocument, 'messageId' | 'messageRevision' | 'sourceHash'>,
-): CodexNarrationSourceDocument {
-  const parsed = parseMarkdownBlocks(markdown, markdownParseOptions({ richFileLinks: true }));
-  const blocks: CodexNarrationSourceBlock[] = [];
-  const targets: CodexNarrationSourceTarget[] = [];
-  collectNarrationSourceBlocks(parsed, blocks, targets);
+export function narrationSourceDocument(markdown: string): CodexNarrationSourceDocument {
   return {
-    blocks,
-    documentVersion: '4',
-    messageId: identity.messageId,
-    messageRevision: identity.messageRevision,
-    schemaVersion: 3,
-    sourceHash: identity.sourceHash,
-    targets,
+    blocks: narrationSourceBlocks(markdown),
+    offsetEncoding: 'utf16CodeUnit',
+    schemaVersion: 1,
   };
 }
 
@@ -1263,11 +1252,15 @@ function markdownParseOptions(options: MarkdownRenderOptions = {}): MarkdownPars
 }
 
 function parseMarkdownBlocks(markdown: string, options: MarkdownParseOptions): RawMarkdownBlock[] {
+  const key = `${options.richFileLinks ? 'richFiles' : 'plainFiles'}\0${markdown}`;
+  const cached = rawDocumentCache.get(key);
+  if (cached) return cached;
   const blocks = rootContentToRawBlocks(fromMarkdown(markdown, {
     extensions: [gfmTable()],
     mdastExtensions: [gfmTableFromMarkdown()],
   }).children, options);
   assignNarrationIds(blocks, '');
+  remember(rawDocumentCache, key, blocks, maxRawDocumentCacheEntries);
   return blocks;
 }
 
@@ -1288,17 +1281,16 @@ function assignNarrationIds(blocks: RawMarkdownBlock[], parentPath: string) {
 function collectNarrationSourceBlocks(
   blocks: RawMarkdownBlock[],
   output: CodexNarrationSourceBlock[],
-  targets: CodexNarrationSourceTarget[],
   containerKind?: 'blockquote' | 'listItem',
 ) {
   for (const block of blocks) {
     if (block.type === 'blockquote') {
-      collectNarrationSourceBlocks(block.children, output, targets, 'blockquote');
+      collectNarrationSourceBlocks(block.children, output, 'blockquote');
       continue;
     }
     if (block.type === 'list') {
       for (const item of block.items) {
-        collectNarrationSourceBlocks(item.blocks, output, targets, 'listItem');
+        collectNarrationSourceBlocks(item.blocks, output, 'listItem');
       }
       continue;
     }
@@ -1306,8 +1298,8 @@ function collectNarrationSourceBlocks(
       continue;
     }
 
-    const source = narrationSourceForBlock(block, targets, containerKind);
-    if (source.displayText.trim()) {
+    const source = narrationSourceForBlock(block, containerKind);
+    if (source.text.trim()) {
       output.push(source);
     }
   }
@@ -1315,127 +1307,59 @@ function collectNarrationSourceBlocks(
 
 function narrationSourceForBlock(
   block: Exclude<RawMarkdownBlock, { type: 'blockquote' | 'list' | 'rule' }>,
-  targets: CodexNarrationSourceTarget[],
   containerKind?: 'blockquote' | 'listItem',
 ): CodexNarrationSourceBlock {
-  let displayText = '';
-  let inlineRanges: CodexNarrationInlineRange[] = [];
+  let text = '';
   let kind: CodexNarrationBlockKind;
 
   switch (block.type) {
     case 'paragraph': {
-      const inline = narrationInlineText(block.lines);
-      displayText = inline.text;
-      inlineRanges = inline.ranges;
+      text = narrationInlineText(block.lines);
       kind = containerKind ?? 'paragraph';
       break;
     }
     case 'heading': {
-      const inline = narrationInlineText(block.lines);
-      displayText = inline.text;
-      inlineRanges = inline.ranges;
+      text = narrationInlineText(block.lines);
       kind = 'heading';
       break;
     }
     case 'code':
-      displayText = stripSingleTrailingNewline(block.text);
+      text = stripSingleTrailingNewline(block.text);
       kind = block.language === 'mermaid' ? 'diagram' : 'code';
       break;
     case 'table':
-      displayText = block.rows
-        .map((row) => row.cells.map((cell) => narrationInlineText(cell.lines).text).join(' | '))
+      text = block.rows
+        .map((row) => row.cells.map((cell) => narrationInlineText(cell.lines)).join(' | '))
         .join('\n');
       kind = 'table';
       break;
   }
 
-  const targetIds: string[] = [];
-  const blockTargetId = `${block.narrationId}/target/block`;
-  targets.push({ blockId: block.narrationId, id: blockTargetId, kind: 'block' });
-  targetIds.push(blockTargetId);
-
-  if (kind !== 'code' && kind !== 'diagram' && kind !== 'table') {
-    for (const match of displayText.matchAll(/[\p{L}\p{N}]+(?:['’._-][\p{L}\p{N}]+)*/gu)) {
-      const displayStart = match.index;
-      const displayEnd = displayStart + match[0].length;
-      const id = `${block.narrationId}/target/word/${displayStart}-${displayEnd}`;
-      targets.push({ blockId: block.narrationId, displayEnd, displayStart, id, kind: 'textRange', role: 'word' });
-      targetIds.push(id);
-    }
-
-    inlineRanges.forEach((range, index) => {
-      if (range.kind === 'text') return;
-      const id = `${block.narrationId}/target/${range.kind}/${index}`;
-      targets.push({
-        blockId: block.narrationId,
-        displayEnd: range.displayEnd,
-        displayStart: range.displayStart,
-        id,
-        kind: 'textRange',
-        role: range.kind,
-      });
-      targetIds.push(id);
-    });
-
-    // The acronym alternative must stay case-sensitive and outside the
-    // case-insensitive pass: under the `i` flag, `\b[A-Z]{2,}\b` matched any
-    // letter run between boundaries, minting bogus expression targets like
-    // the "rs" inside `live_transcript.rs` that then out-competed the full
-    // span during narration alignment.
-    const expressionPatterns = [
-      /https?:\/\/\S+|[$€£¥]\s?\d+(?:[.,]\d+)*|\b\w+(?:<[^>]+>|::\w+|\/\w+)\b/giu,
-      /\b[A-Z]{2,}\b/gu,
-    ];
-    for (const pattern of expressionPatterns) {
-      for (const match of displayText.matchAll(pattern)) {
-        const displayStart = match.index;
-        const displayEnd = displayStart + match[0].length;
-        if (targets.some((target) => target.kind === 'textRange' && target.blockId === block.narrationId && target.displayStart === displayStart && target.displayEnd === displayEnd)) continue;
-        const id = `${block.narrationId}/target/expression/${displayStart}-${displayEnd}`;
-        targets.push({ blockId: block.narrationId, displayEnd, displayStart, id, kind: 'textRange', role: 'expression' });
-        targetIds.push(id);
-      }
-    }
-  }
-
   return {
-    displayText,
+    highlightMode: kind === 'code' || kind === 'diagram' || kind === 'table' ? 'block' : 'text',
     id: block.narrationId,
-    inlineRanges,
     kind,
-    path: block.narrationId.slice('md:'.length),
-    targetIds,
+    text,
   };
 }
 
 function narrationInlineText(lines: MarkdownInline[][]) {
-  const ranges: CodexNarrationInlineRange[] = [];
   let text = '';
 
-  const append = (value: string, kind: CodexNarrationInlineRange['kind']) => {
-    if (!value) return;
-    const displayStart = text.length;
-    text += value;
-    ranges.push({ displayEnd: text.length, displayStart, kind });
-  };
-  const walk = (inlines: MarkdownInline[], inheritedKind: CodexNarrationInlineRange['kind'] = 'text') => {
+  const walk = (inlines: MarkdownInline[]) => {
     for (const inline of inlines) {
       switch (inline.type) {
         case 'text':
-          append(inline.text, inheritedKind);
-          break;
         case 'code':
-          append(inline.text, 'inlineCode');
+          text += inline.text;
           break;
         case 'fileLink':
-          append(inline.file.displayName, 'link');
+          text += inline.file.displayName;
           break;
         case 'link':
-          walk(inline.children, 'link');
-          break;
         case 'strong':
         case 'emphasis':
-          walk(inline.children, inheritedKind);
+          walk(inline.children);
           break;
       }
     }
@@ -1446,20 +1370,7 @@ function narrationInlineText(lines: MarkdownInline[][]) {
     walk(line);
   });
 
-  return { ranges: mergeNarrationRanges(ranges), text };
-}
-
-function mergeNarrationRanges(ranges: CodexNarrationInlineRange[]) {
-  const merged: CodexNarrationInlineRange[] = [];
-  for (const range of ranges) {
-    const previous = merged.at(-1);
-    if (previous && previous.kind === range.kind && previous.displayEnd === range.displayStart) {
-      previous.displayEnd = range.displayEnd;
-    } else {
-      merged.push({ ...range });
-    }
-  }
-  return merged;
+  return text;
 }
 
 function sanitizeHref(href: string) {

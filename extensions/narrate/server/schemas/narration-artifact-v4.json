@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://remux.dev/schemas/narrate/narration-artifact-v4.json",
+  "title": "NarrationArtifactV4",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion", "artifactKey", "documentHash", "pronunciationPlanSha256",
+    "structuralTranscriptPlanSha256", "offsetEncoding", "audio", "blocks", "sentences",
+    "wordCues", "profile"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 4 },
+    "artifactKey": { "$ref": "#/$defs/sha256" },
+    "documentHash": { "$ref": "#/$defs/sha256" },
+    "pronunciationPlanSha256": { "$ref": "#/$defs/sha256" },
+    "structuralTranscriptPlanSha256": { "$ref": "#/$defs/sha256" },
+    "offsetEncoding": { "const": "utf16CodeUnit" },
+    "audio": { "$ref": "#/$defs/audio" },
+    "blocks": { "type": "array", "items": { "$ref": "#/$defs/blockTiming" } },
+    "sentences": { "type": "array", "items": { "$ref": "#/$defs/sentence" } },
+    "wordCues": { "type": "array", "items": { "$ref": "#/$defs/wordCue" } },
+    "profile": { "$ref": "#/$defs/profile" }
+  },
+  "$defs": {
+    "nonnegativeInteger": { "type": "integer", "minimum": 0 },
+    "positiveInteger": { "type": "integer", "minimum": 1 },
+    "sha256": { "type": "string", "pattern": "^sha256-[0-9a-f]{64}$" },
+    "audio": {
+      "type": "object", "additionalProperties": false,
+      "required": ["url", "mimeType", "sampleRate", "channels", "totalSamples", "sizeBytes", "sha256"],
+      "properties": {
+        "url": { "type": "string", "pattern": "^/remux/media/sha256/[0-9a-f]{64}$" },
+        "mimeType": { "const": "audio/wav" }, "sampleRate": { "const": 24000 },
+        "channels": { "const": 1 }, "totalSamples": { "$ref": "#/$defs/positiveInteger" },
+        "sizeBytes": { "$ref": "#/$defs/positiveInteger" }, "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "blockTiming": {
+      "type": "object", "additionalProperties": false,
+      "required": ["blockId", "startSample", "endSample"],
+      "properties": {
+        "blockId": { "type": "string", "minLength": 1 },
+        "startSample": { "$ref": "#/$defs/nonnegativeInteger" },
+        "endSample": { "$ref": "#/$defs/positiveInteger" }
+      }
+    },
+    "sentence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "blockId", "textStart", "textEnd", "startSample", "endSample"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 }, "blockId": { "type": "string", "minLength": 1 },
+        "textStart": { "$ref": "#/$defs/nonnegativeInteger" }, "textEnd": { "$ref": "#/$defs/positiveInteger" },
+        "startSample": { "$ref": "#/$defs/nonnegativeInteger" }, "endSample": { "$ref": "#/$defs/positiveInteger" }
+      }
+    },
+    "wordCue": {
+      "type": "object", "additionalProperties": false,
+      "required": ["sentenceId", "blockId", "textStart", "textEnd", "startSample", "endSample"],
+      "properties": {
+        "sentenceId": { "type": "string", "minLength": 1 }, "blockId": { "type": "string", "minLength": 1 },
+        "textStart": { "$ref": "#/$defs/nonnegativeInteger" }, "textEnd": { "$ref": "#/$defs/positiveInteger" },
+        "startSample": { "$ref": "#/$defs/nonnegativeInteger" }, "endSample": { "$ref": "#/$defs/positiveInteger" }
+      }
+    },
+    "reviewer": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "model", "serviceTier", "effort", "profileDigest", "promptVersion",
+        "outputSchemaVersion", "windowPlannerVersion",
+        "phoneAlphabetVersion", "phoneAlphabetSha256", "kokoroVocabularySha256",
+        "directPhoneValidatorVersion"
+      ],
+      "properties": {
+        "model": { "const": "gpt-5.6-sol" }, "serviceTier": { "const": "priority" },
+        "effort": { "const": "low" }, "profileDigest": { "$ref": "#/$defs/sha256" },
+        "promptVersion": { "const": 4 }, "outputSchemaVersion": { "const": 4 },
+        "windowPlannerVersion": { "const": 3 },
+        "phoneAlphabetVersion": { "const": 1 }, "phoneAlphabetSha256": { "$ref": "#/$defs/sha256" },
+        "kokoroVocabularySha256": { "$ref": "#/$defs/sha256" }, "directPhoneValidatorVersion": { "const": 1 }
+      }
+    },
+    "structuralTranscript": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "model", "serviceTier", "effort", "profileDigest", "promptVersion",
+        "outputSchemaVersion", "windowPlannerVersion"
+      ],
+      "properties": {
+        "model": { "const": "gpt-5.6-sol" }, "serviceTier": { "const": "priority" },
+        "effort": { "const": "low" }, "profileDigest": { "$ref": "#/$defs/sha256" },
+        "promptVersion": { "const": 2 }, "outputSchemaVersion": { "const": 2 },
+        "windowPlannerVersion": { "const": 1 }
+      }
+    },
+    "profile": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "phonemizer", "pronunciationReviewer", "structuralTranscript", "sourceMapperVersion",
+        "wordSegmenterVersion", "sentenceVersion", "plannerVersion", "timingVersion", "synthesizerHash"
+      ],
+      "properties": {
+        "phonemizer": { "type": "string", "minLength": 1 },
+        "pronunciationReviewer": { "$ref": "#/$defs/reviewer" },
+        "structuralTranscript": { "$ref": "#/$defs/structuralTranscript" },
+        "sourceMapperVersion": { "$ref": "#/$defs/positiveInteger" },
+        "wordSegmenterVersion": { "$ref": "#/$defs/positiveInteger" },
+        "sentenceVersion": { "$ref": "#/$defs/positiveInteger" },
+        "plannerVersion": { "$ref": "#/$defs/positiveInteger" }, "timingVersion": { "const": 2 },
+        "synthesizerHash": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}

@@ -1,26 +1,56 @@
-import type { CodexNarrationAudioChunk, CodexNarrationTimeline } from '../../shared/narration';
-import { readNarrationAudio } from '../ipc/narration';
+import type { CodexNarrationArtifact } from '../../shared/narration';
 
 export type NarrationAudioCallbacks = {
   onBuffering: () => void;
   onEnded: () => void;
   onError: (message: string) => void;
+  onPaused: () => void;
   onPlaying: () => void;
-  onTime: (globalTime: number) => void;
+  onSample: (sample: number) => void;
 };
 
+export type NarrationAudioSnapshot = {
+  artifactKey: string | null;
+  clockRunning: boolean;
+  currentTime: number | null;
+  duration: number | null;
+  ended: boolean | null;
+  hasAudio: boolean;
+  hasPendingAudio: boolean;
+  lastMediaEvent: string | null;
+  lastMediaEventAt: number | null;
+  lastSampleChangedAt: number | null;
+  loadEpoch: number;
+  networkState: number | null;
+  paused: boolean | null;
+  playIntent: boolean;
+  playbackRate: number;
+  readyState: number | null;
+};
+
+const audioMetadataTimeoutMs = 15_000;
+
 export class NarrationAudioEngine {
+  private artifact: CodexNarrationArtifact | null = null;
   private artifactKey: string | null = null;
   private audio: HTMLAudioElement | null = null;
   private callbacks: NarrationAudioCallbacks;
-  private chunkIndex = 0;
-  private complete = false;
   private loadEpoch = 0;
-  private objectUrls = new Map<string, string>();
+  private pendingLoad: {
+    abort: AbortController;
+    audio: HTMLAudioElement;
+  } | null = null;
+  private pendingPrepare: {
+    artifactKey: string;
+    promise: Promise<boolean>;
+  } | null = null;
+  private lastMediaEvent: string | null = null;
+  private lastMediaEventAt: number | null = null;
+  private lastPublishedSample: number | null = null;
+  private lastSampleChangedAt: number | null = null;
   private playIntent = false;
   private playbackRate = 1;
   private raf = 0;
-  private timeline: CodexNarrationTimeline | null = null;
 
   constructor(callbacks: NarrationAudioCallbacks) {
     this.callbacks = callbacks;
@@ -30,73 +60,134 @@ export class NarrationAudioEngine {
     this.callbacks = callbacks;
   }
 
-  async update(artifactKey: string, timeline: CodexNarrationTimeline) {
-    if (this.artifactKey !== artifactKey) {
-      const playIntent = this.playIntent;
-      this.close();
-      this.playIntent = playIntent;
-      this.artifactKey = artifactKey;
-    } else if (this.timeline && !isImmutablePrefix(this.timeline, timeline)) {
-      throw new Error('Narration segment prefix changed after publication');
+  async prepare(artifactKey: string, artifact: CodexNarrationArtifact): Promise<boolean> {
+    if (this.audio && this.artifactKey === artifactKey) return true;
+    if (this.pendingPrepare?.artifactKey === artifactKey) return this.pendingPrepare.promise;
+    const epoch = this.resetForLoad(artifactKey, artifact);
+    this.callbacks.onBuffering();
+    const promise = this.prepareUrl(epoch, artifact);
+    this.pendingPrepare = { artifactKey, promise };
+    try {
+      return await promise;
+    } finally {
+      if (this.pendingPrepare?.promise === promise) this.pendingPrepare = null;
     }
-    const previousLength = this.timeline?.chunks.length ?? 0;
-    this.timeline = timeline;
-    this.complete = timeline.complete;
-
-    if (!this.audio && timeline.chunks.length > 0 && (this.chunkIndex === 0 || previousLength === 0)) {
-      await this.loadChunk(this.chunkIndex);
-      if (this.playIntent) await this.resumeLoadedAudio();
-    } else if (
-      this.audio?.ended &&
-      this.playIntent &&
-      this.chunkIndex + 1 < timeline.chunks.length
-    ) {
-      await this.loadChunk(this.chunkIndex + 1);
-      await this.resumeLoadedAudio();
-    }
-    void this.preloadChunk(this.chunkIndex + 1);
   }
 
-  async prepare(artifactKey: string, timeline: CodexNarrationTimeline) {
-    await this.update(artifactKey, timeline);
-    if (!this.audio && timeline.chunks[this.chunkIndex]) await this.loadChunk(this.chunkIndex);
-  }
-
-  async play(artifactKey: string, timeline: CodexNarrationTimeline) {
-    this.playIntent = true;
-    await this.prepare(artifactKey, timeline);
-    if (!this.playIntent) return;
-    if (!this.audio) {
+  private async prepareUrl(epoch: number, artifact: CodexNarrationArtifact): Promise<boolean> {
+    const audio = new Audio(resolveAudioUrl(artifact));
+    const pendingLoad = { abort: new AbortController(), audio };
+    this.pendingLoad = pendingLoad;
+    audio.preload = 'auto';
+    audio.playbackRate = this.playbackRate;
+    audio.preservesPitch = true;
+    try {
+      await waitForAudioReady(audio, pendingLoad.abort.signal);
+    } catch (error) {
+      if (this.pendingLoad === pendingLoad) this.pendingLoad = null;
+      audio.removeAttribute('src');
+      audio.load();
+      throw error;
+    }
+    if (this.pendingLoad === pendingLoad) this.pendingLoad = null;
+    if (epoch !== this.loadEpoch) {
+      audio.removeAttribute('src');
+      audio.load();
+      return false;
+    }
+    audio.onplaying = () => {
+      if (audio !== this.audio || !this.playIntent) return;
+      this.recordMediaEvent('playing');
+      this.callbacks.onPlaying();
+      this.startClock();
+    };
+    audio.onpause = () => {
+      if (audio !== this.audio) return;
+      this.recordMediaEvent('pause');
+      this.playIntent = false;
+      this.stopClock();
+      this.publishSample();
+      if (!audio.ended) this.callbacks.onPaused();
+    };
+    audio.onwaiting = () => {
+      if (audio !== this.audio || !this.playIntent) return;
+      this.recordMediaEvent('waiting');
+      this.stopClock();
       this.callbacks.onBuffering();
-      return;
+    };
+    audio.onstalled = () => {
+      if (audio !== this.audio || !this.playIntent) return;
+      this.recordMediaEvent('stalled');
+      this.stopClock();
+      this.callbacks.onBuffering();
+    };
+    audio.onended = () => {
+      if (audio !== this.audio) return;
+      this.recordMediaEvent('ended');
+      this.playIntent = false;
+      this.stopClock();
+      this.publishSample();
+      this.callbacks.onEnded();
+    };
+    audio.onerror = () => {
+      if (audio !== this.audio) return;
+      this.recordMediaEvent('error');
+      this.playIntent = false;
+      this.stopClock();
+      this.callbacks.onError('Narration audio could not be loaded');
+    };
+    this.audio = audio;
+    this.recordMediaEvent('loadedmetadata');
+    this.publishSample();
+    return true;
+  }
+
+  async play(artifactKey: string, artifact: CodexNarrationArtifact) {
+    this.playIntent = true;
+    const prepared = await this.prepare(artifactKey, artifact);
+    if (!prepared || this.artifactKey !== artifactKey || !this.playIntent || !this.audio) return;
+    const audio = this.audio;
+    if (audio.ended) audio.currentTime = 0;
+    audio.playbackRate = this.playbackRate;
+    audio.preservesPitch = true;
+    await audio.play();
+    // Some WebViews resolve play() just before dispatching `playing`. Reconcile
+    // from the media element without treating the user's intent as evidence.
+    if (audio === this.audio && this.playIntent && !audio.paused) {
+      this.callbacks.onPlaying();
+      this.startClock();
     }
-    if (this.audio.ended && this.chunkIndex + 1 >= timeline.chunks.length) {
-      this.audio.currentTime = 0;
-    }
-    await this.resumeLoadedAudio();
   }
 
   pause() {
     this.playIntent = false;
     this.audio?.pause();
     this.stopClock();
-    this.publishTime();
+    this.publishSample();
+    this.callbacks.onPaused();
   }
 
-  async seek(globalTime: number, keepPlaying: boolean) {
-    const timeline = this.timeline;
-    if (!timeline || !this.artifactKey || timeline.chunks.length === 0) return;
+  async seek(artifactKey: string, sample: number, keepPlaying: boolean): Promise<boolean> {
+    const artifact = this.artifact;
+    const audio = this.audio;
+    if (this.artifactKey !== artifactKey || !artifact || !audio) return false;
     this.playIntent = keepPlaying;
-    const bounded = Math.max(0, Math.min(globalTime, timeline.durationSeconds));
-    const found = timeline.chunks.findIndex((chunk, index) =>
-      bounded >= chunk.start && (bounded < chunk.end || index === timeline.chunks.length - 1));
-    const chunkIndex = Math.max(0, found);
-    const audio = await this.loadChunk(chunkIndex);
-    if (!audio || this.audio !== audio) return;
-    const chunk = timeline.chunks[chunkIndex];
-    audio.currentTime = Math.max(0, Math.min(bounded - chunk.start, chunk.end - chunk.start));
-    this.publishTime();
-    if (keepPlaying) await this.resumeLoadedAudio();
+    const bounded = Math.max(0, Math.min(sample, artifact.audio.totalSamples));
+    audio.currentTime = bounded / artifact.audio.sampleRate;
+    this.publishSample();
+    if (keepPlaying) {
+      audio.playbackRate = this.playbackRate;
+      await audio.play();
+      if (audio === this.audio && this.playIntent && !audio.paused) {
+        this.callbacks.onPlaying();
+        this.startClock();
+      }
+    } else {
+      audio.pause();
+      this.stopClock();
+      this.callbacks.onPaused();
+    }
+    return audio === this.audio && this.artifactKey === artifactKey;
   }
 
   setPlaybackRate(rate: number) {
@@ -108,156 +199,134 @@ export class NarrationAudioEngine {
     this.playIntent = false;
     this.loadEpoch += 1;
     this.stopClock();
+    this.pendingPrepare = null;
+    if (this.pendingLoad) {
+      const { abort, audio } = this.pendingLoad;
+      this.pendingLoad = null;
+      abort.abort();
+      audio.removeAttribute('src');
+      audio.load();
+    }
     if (this.audio) {
+      this.audio.onplaying = null;
+      this.audio.onpause = null;
+      this.audio.onwaiting = null;
+      this.audio.onstalled = null;
+      this.audio.onended = null;
+      this.audio.onerror = null;
       this.audio.pause();
       this.audio.removeAttribute('src');
       this.audio.load();
     }
-    for (const url of this.objectUrls.values()) URL.revokeObjectURL(url);
-    this.objectUrls.clear();
-    this.audio = null;
+    this.artifact = null;
     this.artifactKey = null;
-    this.chunkIndex = 0;
-    this.complete = false;
-    this.timeline = null;
+    this.audio = null;
+    this.lastPublishedSample = null;
   }
 
-  private async resumeLoadedAudio() {
-    if (!this.audio || !this.playIntent) return;
-    this.audio.playbackRate = this.playbackRate;
-    this.audio.preservesPitch = true;
-    await this.audio.play();
-    this.callbacks.onPlaying();
-    this.startClock();
+  snapshot(): NarrationAudioSnapshot {
+    const audio = this.audio;
+    return {
+      artifactKey: this.artifactKey,
+      clockRunning: this.raf !== 0,
+      currentTime: finiteOrNull(audio?.currentTime),
+      duration: finiteOrNull(audio?.duration),
+      ended: audio?.ended ?? null,
+      hasAudio: audio !== null,
+      hasPendingAudio: this.pendingLoad !== null,
+      lastMediaEvent: this.lastMediaEvent,
+      lastMediaEventAt: this.lastMediaEventAt,
+      lastSampleChangedAt: this.lastSampleChangedAt,
+      loadEpoch: this.loadEpoch,
+      networkState: audio?.networkState ?? null,
+      paused: audio?.paused ?? null,
+      playIntent: this.playIntent,
+      playbackRate: this.playbackRate,
+      readyState: audio?.readyState ?? null,
+    };
   }
 
-  private async loadChunk(index: number) {
-    const chunk = this.timeline?.chunks[index];
-    const artifactKey = this.artifactKey;
-    if (!artifactKey || !chunk) return;
-    const epoch = ++this.loadEpoch;
-    const url = await this.chunkUrl(artifactKey, chunk);
-    if (epoch !== this.loadEpoch) return null;
-    const audio = new Audio(url);
-    audio.preload = 'auto';
-    audio.playbackRate = this.playbackRate;
-    audio.preservesPitch = true;
-    await waitForAudioReady(audio);
-    if (epoch !== this.loadEpoch) {
-      audio.pause();
-      audio.removeAttribute('src');
-      audio.load();
-      return null;
-    }
-    if (this.audio) {
-      this.audio.pause();
-      this.audio.onended = null;
-      this.audio.onerror = null;
-    }
-    audio.onended = () => void this.advanceChunk();
-    audio.onerror = () => this.callbacks.onError('Narration audio could not be loaded');
-    this.audio = audio;
-    this.chunkIndex = index;
-    this.releaseDistantChunks(index);
-    void this.preloadChunk(index + 1);
-    return audio;
-  }
-
-  private async advanceChunk() {
-    if (!this.timeline || !this.artifactKey) return;
-    if (this.chunkIndex + 1 >= this.timeline.chunks.length) {
-      this.stopClock();
-      if (this.complete) {
-        this.playIntent = false;
-        this.callbacks.onEnded();
-      } else {
-        this.callbacks.onBuffering();
-      }
-      return;
-    }
-    try {
-      await this.loadChunk(this.chunkIndex + 1);
-      if (this.playIntent) await this.resumeLoadedAudio();
-    } catch (error) {
-      this.callbacks.onError(error instanceof Error ? error.message : 'Narration audio could not continue');
-    }
-  }
-
-  private async preloadChunk(index: number) {
-    const chunk = this.timeline?.chunks[index];
-    if (this.artifactKey && chunk) {
-      try { await this.chunkUrl(this.artifactKey, chunk); } catch { /* Foreground loading reports errors. */ }
-    }
-  }
-
-  private async chunkUrl(artifactKey: string, chunk: CodexNarrationAudioChunk) {
-    const cached = this.objectUrls.get(chunk.id);
-    if (cached) return cached;
-    const response = await readNarrationAudio({ artifactKey, chunkId: chunk.id });
-    const bytes = decodeBase64(response.dataBase64);
-    const url = URL.createObjectURL(new Blob([bytes], { type: response.mimeType }));
-    this.objectUrls.set(chunk.id, url);
-    return url;
-  }
-
-  private releaseDistantChunks(index: number) {
-    const keep = new Set([
-      this.timeline?.chunks[index]?.id,
-      this.timeline?.chunks[index + 1]?.id,
-    ].filter((id): id is string => Boolean(id)));
-    for (const [chunkId, url] of this.objectUrls) {
-      if (!keep.has(chunkId)) {
-        URL.revokeObjectURL(url);
-        this.objectUrls.delete(chunkId);
-      }
-    }
+  private resetForLoad(artifactKey: string, artifact: CodexNarrationArtifact) {
+    const playIntent = this.playIntent;
+    this.close();
+    this.playIntent = playIntent;
+    this.artifactKey = artifactKey;
+    this.artifact = artifact;
+    return this.loadEpoch;
   }
 
   private startClock() {
     if (this.raf !== 0) return;
     const tick = () => {
       this.raf = 0;
-      this.publishTime();
-      if (this.audio && !this.audio.paused && !this.audio.ended) this.raf = requestAnimationFrame(tick);
+      this.publishSample();
+      if (this.audio && !this.audio.paused && !this.audio.ended) {
+        this.raf = window.requestAnimationFrame(tick);
+      }
     };
-    this.raf = requestAnimationFrame(tick);
+    this.raf = window.requestAnimationFrame(tick);
   }
 
   private stopClock() {
-    if (this.raf !== 0) cancelAnimationFrame(this.raf);
+    if (this.raf !== 0) window.cancelAnimationFrame(this.raf);
     this.raf = 0;
   }
 
-  private publishTime() {
-    const chunk = this.timeline?.chunks[this.chunkIndex];
-    this.callbacks.onTime((chunk?.start ?? 0) + (this.audio?.currentTime ?? 0));
+  private publishSample() {
+    const artifact = this.artifact;
+    if (!artifact) return;
+    const sample = Math.floor((this.audio?.currentTime ?? 0) * artifact.audio.sampleRate);
+    const bounded = Math.max(0, Math.min(sample, artifact.audio.totalSamples));
+    if (bounded !== this.lastPublishedSample) {
+      this.lastPublishedSample = bounded;
+      this.lastSampleChangedAt = Date.now();
+    }
+    this.callbacks.onSample(bounded);
+  }
+
+  private recordMediaEvent(event: string) {
+    this.lastMediaEvent = event;
+    this.lastMediaEventAt = Date.now();
   }
 }
 
-function isImmutablePrefix(previous: CodexNarrationTimeline, next: CodexNarrationTimeline) {
-  if (next.chunks.length < previous.chunks.length) return false;
-  return previous.segments.every((segment, index) =>
-    JSON.stringify(segment) === JSON.stringify(next.segments[index]));
+function resolveAudioUrl(artifact: CodexNarrationArtifact) {
+  const { sha256, url } = artifact.audio;
+  const hash = sha256.startsWith('sha256-') ? sha256.slice('sha256-'.length) : '';
+  const expectedPath = `/remux/media/sha256/${hash}`;
+  if (!/^[0-9a-f]{64}$/.test(hash) || url !== expectedPath) {
+    throw new Error('Narration audio URL does not match its manifest');
+  }
+  const resolved = new URL(url, window.location.origin);
+  if (resolved.origin !== window.location.origin || resolved.search || resolved.hash) {
+    throw new Error('Narration audio URL is not a same-origin media resource');
+  }
+  return resolved.href;
 }
 
-function decodeBase64(value: string) {
-  const binary = atob(value);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
-  return bytes;
-}
-
-function waitForAudioReady(audio: HTMLAudioElement) {
+function waitForAudioReady(audio: HTMLAudioElement, signal: AbortSignal) {
   if (audio.readyState >= HTMLMediaElement.HAVE_METADATA) return Promise.resolve();
   return new Promise<void>((resolve, reject) => {
     const cleanup = () => {
+      window.clearTimeout(timeout);
+      signal.removeEventListener('abort', aborted);
       audio.removeEventListener('loadedmetadata', loaded);
       audio.removeEventListener('error', failed);
     };
     const loaded = () => { cleanup(); resolve(); };
     const failed = () => { cleanup(); reject(new Error('Narration audio could not be decoded')); };
+    const aborted = () => { cleanup(); reject(new Error('Narration audio load was cancelled')); };
+    const timeout = window.setTimeout(() => {
+      cleanup();
+      reject(new Error('Narration audio metadata timed out'));
+    }, audioMetadataTimeoutMs);
+    signal.addEventListener('abort', aborted, { once: true });
     audio.addEventListener('loadedmetadata', loaded, { once: true });
     audio.addEventListener('error', failed, { once: true });
     audio.load();
   });
+}
+
+function finiteOrNull(value: number | undefined) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }

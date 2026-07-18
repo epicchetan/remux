@@ -301,9 +301,39 @@ mod tests {
     #[ignore = "requires installed Kokoro model assets"]
     fn installed_model_runs_with_duration_output() {
         let model = installed_model();
-        let output = model.infer("həlˈO wˈɜɹld").unwrap();
-        assert!(!output.waveform.is_empty());
-        assert!(output.duration.len() > 2);
+        for phonemes in ["həlˈO", "həlˈO wˈɜɹld", "həlˈO, wˈɜɹld."] {
+            let output = model.infer(phonemes).unwrap();
+            let frame_rms = output
+                .waveform
+                .chunks_exact(600)
+                .map(|frame| {
+                    (frame.iter().map(|sample| sample * sample).sum::<f32>() / frame.len() as f32)
+                        .sqrt()
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "phonemes={phonemes:?} symbols={} waveform={} durations={:?} frame_rms={:?}",
+                phonemes.chars().count(),
+                output.waveform.len(),
+                output.duration,
+                frame_rms,
+            );
+            assert_eq!(output.duration.len(), phonemes.chars().count() + 2);
+            assert!(!output.waveform.is_empty());
+            assert!(output.duration.iter().all(|duration| *duration > 0));
+            let duration_samples = output.duration.iter().sum::<i64>() as usize * 600;
+            assert_eq!(output.waveform.len(), duration_samples);
+            let trim_start = (output.duration[0] - 3).max(0) as usize * 600;
+            let trim_end = output.duration[..output.duration.len() - 1]
+                .iter()
+                .sum::<i64>() as usize
+                * 600;
+            assert!(trim_start < trim_end && trim_end <= output.waveform.len());
+            assert_eq!(
+                frame_rms.iter().position(|rms| *rms >= 0.001),
+                Some(trim_start / 600),
+            );
+        }
     }
 
     #[test]

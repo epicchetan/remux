@@ -32,19 +32,29 @@ export function NarrationBar() {
     );
   }
 
-  const percent = progress?.totalBlocks
-    ? ` ${Math.round((progress.committedBlocks / progress.totalBlocks) * 100)}%`
+  const percent = progress?.chunksTotal
+    ? ` ${Math.round((progress.chunksCompleted / progress.chunksTotal) * 100)}%`
     : '';
-  const label = status === 'finalizing'
-    ? 'Finishing audio'
-    : status === 'streaming'
-      ? `Streaming audio${percent}`
-      : 'Writing the first spoken group';
+  const label = (() => {
+    switch (progress?.stage) {
+      case 'languagePlanning': {
+        const completed = progress.auditWindowsCompleted + progress.transcriptWindowsCompleted;
+        const total = progress.auditWindowsTotal + progress.transcriptWindowsTotal;
+        return total ? `Preparing speech ${completed} of ${total}` : 'Preparing speech';
+      }
+      case 'planning': return 'Planning natural speech chunks';
+      case 'loadingModel': return 'Loading the voice model';
+      case 'synthesizing': return `Synthesizing audio${percent}`;
+      case 'finalizing': return 'Finishing audio';
+      case 'baseline':
+      default: return 'Building pronunciation baseline';
+    }
+  })();
 
   return (
     <div className="remux-composer-context-row remux-narration-bar" data-remux-no-composer-focus>
       <span className="remux-narration-label">
-        {status === 'planning' ? <AudioLines className="size-3.5" /> : <Loader2 className="size-3.5 animate-spin" />}
+        {status === 'preparing' ? <AudioLines className="size-3.5" /> : <Loader2 className="size-3.5 animate-spin" />}
         <span>Preparing narration · {label}</span>
       </span>
       <button

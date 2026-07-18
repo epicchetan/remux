@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://remux.dev/schemas/narrate/narration-document-v1.json",
+  "title": "NarrationDocumentV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "offsetEncoding", "blocks"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "offsetEncoding": { "const": "utf16CodeUnit" },
+    "blocks": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 512,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "text", "highlightMode"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "kind": {
+            "enum": ["paragraph", "heading", "listItem", "blockquote", "code", "table", "diagram"]
+          },
+          "text": { "type": "string", "minLength": 1, "maxLength": 65536 },
+          "highlightMode": { "enum": ["text", "block"] }
+        }
+      }
+    }
+  }
+}
