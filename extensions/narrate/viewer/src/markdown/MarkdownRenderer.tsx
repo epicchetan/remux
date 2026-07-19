@@ -1,44 +1,100 @@
 import ReactMarkdown, { type Components } from 'react-markdown';
-import rehypeKatex from 'rehype-katex';
-import rehypeRaw from 'rehype-raw';
-import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
-import remarkGfm from 'remark-gfm';
-import remarkMath from 'remark-math';
-import { createElement, type ComponentPropsWithoutRef, type MouseEvent, type ReactNode } from 'react';
+import {
+  createElement,
+  memo,
+  useLayoutEffect,
+  useRef,
+  type ComponentPropsWithoutRef,
+  type MouseEvent,
+  type ReactNode,
+} from 'react';
+import type { Pluggable, PluggableList } from 'unified';
 
 import { openHostHref } from '@remux/viewer-kit/links';
 
 import { MarkdownCodeBlock } from './MarkdownCodeBlock';
 import { MarkdownImage } from './MarkdownImage';
+import { markdownRehypePlugins, markdownRemarkPlugins } from './markdownPipeline';
+import { rehypeNarrationBindings } from './narrationBindings';
+import type { MarkdownNarrationModel } from './narrationModel';
+import { useNarrationStore } from '../narration/client';
+import { registerNarrationDom } from '../narration/domIndex';
 
 type MarkdownRendererProps = {
   content: string;
   filePath: string;
+  narrationModel: MarkdownNarrationModel | null;
 };
 
-export function MarkdownRenderer({ content, filePath }: MarkdownRendererProps) {
+export const MarkdownRenderer = memo(function MarkdownRenderer({
+  content,
+  filePath,
+  narrationModel,
+}: MarkdownRendererProps) {
+  const articleRef = useRef<HTMLElement | null>(null);
   const components = markdownComponents(filePath);
+  const narrationBinding: Pluggable | null = narrationModel
+    ? [rehypeNarrationBindings, { model: narrationModel }]
+    : null;
+  const rehypePlugins: PluggableList = narrationBinding
+    ? [...markdownRehypePlugins, narrationBinding]
+    : markdownRehypePlugins;
+
+  useLayoutEffect(() => {
+    if (!articleRef.current || !narrationModel) {
+      return undefined;
+    }
+    return registerNarrationDom(articleRef.current, narrationModel);
+  }, [narrationModel]);
+
+  const seekFromClick = (event: MouseEvent<HTMLElement>) => {
+    const narration = useNarrationStore.getState();
+    const narrationSeekable = Boolean(
+      narrationModel
+      && narration.target?.sourceHash === narrationModel.sourceHash
+      && (narration.phase === 'ready'
+        || narration.phase === 'buffering'
+        || narration.phase === 'playing'
+        || narration.phase === 'paused'),
+    );
+    if (!narrationSeekable || !(event.target instanceof Element)) {
+      return;
+    }
+    if (event.target.closest('a, button, input, [data-remux-no-narration-seek]')) {
+      return;
+    }
+    const selection = window.getSelection();
+    if (selection && !selection.isCollapsed) {
+      return;
+    }
+    const blockId = event.target.closest<HTMLElement>('[data-narration-block-id]')
+      ?.dataset.narrationBlockId;
+    if (!blockId) {
+      return;
+    }
+    if (narration.followSuspendedByUser) {
+      narration.toggleFollow();
+    }
+    void narration.seekToBlock(blockId);
+  };
 
   return (
-    <article className="remux-markdown-document" data-file-path={filePath}>
+    <article
+      className="remux-markdown-document"
+      data-file-path={filePath}
+      onClick={seekFromClick}
+      ref={articleRef}
+    >
       <ReactMarkdown
         components={components}
-        rehypePlugins={[
-          rehypeRaw,
-          [rehypeSanitize, remuxMarkdownSanitizeSchema],
-          rehypeKatex,
-        ]}
-        remarkPlugins={[
-          remarkGfm,
-          remarkGitHubAlerts,
-          remarkMath,
-        ]}
+        rehypePlugins={rehypePlugins}
+        remarkPlugins={markdownRemarkPlugins}
       >
         {content}
       </ReactMarkdown>
     </article>
   );
-}
+});
 
 function markdownComponents(filePath: string): Components {
   const headingSlugCounts = new Map<string, number>();
@@ -76,6 +132,20 @@ function markdownComponents(filePath: string): Components {
     code(props) {
       return <MarkdownCodeBlock {...props} />;
     },
+    div({ children, className, node: _node, ...props }) {
+      const data = props as typeof props & Record<string, unknown>;
+      const displayMathSurface = data['data-narration-surface'] === 'block'
+        && isDisplayMathClassName(className);
+      return (
+        <div
+          {...props}
+          className={className}
+          data-narration-render-surface={displayMathSurface ? 'code' : undefined}
+        >
+          {children}
+        </div>
+      );
+    },
     h1({ children, node: _node, ...props }) {
       return <MarkdownHeading counts={headingSlugCounts} level={1} {...props}>{children}</MarkdownHeading>;
     },
@@ -101,16 +171,39 @@ function markdownComponents(filePath: string): Components {
         </span>
       );
     },
-    pre({ children }) {
+    pre({ children, node: _node, ...props }) {
+      const data = props as typeof props & Record<string, unknown>;
       return (
-        <div className="remux-markdown-pre-block">
+        <div
+          className="remux-markdown-pre-block"
+          data-narration-binding-error={data['data-narration-binding-error'] as string | undefined}
+          data-narration-block-id={data['data-narration-block-id'] as string | undefined}
+          data-narration-surface={data['data-narration-surface'] as string | undefined}
+        >
           {children}
         </div>
       );
     },
+    span({ children, className, node: _node, ...props }) {
+      const data = props as typeof props & Record<string, unknown>;
+      const displayMathSurface = data['data-narration-surface'] === 'block'
+        && isDisplayMathClassName(className);
+      return (
+        <span
+          {...props}
+          className={className}
+          data-narration-render-surface={displayMathSurface ? 'code' : undefined}
+        >
+          {children}
+        </span>
+      );
+    },
     table({ children, node: _node, ...props }) {
       return (
-        <div className="remux-markdown-table-scroll">
+        <div
+          className="remux-markdown-table-scroll"
+          data-narration-render-surface="table"
+        >
           <table {...props}>{children}</table>
         </div>
       );
@@ -221,137 +314,7 @@ function alertKindFromClassName(className: string | undefined) {
   return match?.[1]?.toUpperCase() ?? null;
 }
 
-function remarkGitHubAlerts() {
-  return (tree: MarkdownAstNode) => {
-    visitMarkdownAst(tree, (node) => {
-      if (node.type !== 'blockquote') {
-        return;
-      }
-
-      const firstChild = node.children?.[0];
-      const firstInline = firstChild?.children?.[0];
-      if (firstChild?.type !== 'paragraph' || firstInline?.type !== 'text' || typeof firstInline.value !== 'string') {
-        return;
-      }
-
-      const match = /^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\][ \t]*(?:\n)?/iu.exec(firstInline.value);
-      if (!match) {
-        return;
-      }
-
-      const kind = match[1].toLowerCase();
-      firstInline.value = firstInline.value.slice(match[0].length).replace(/^[ \t]*\n?/u, '');
-      if (!firstInline.value && firstChild.children) {
-        firstChild.children.shift();
-      }
-      if (firstChild.children?.length === 0) {
-        node.children?.shift();
-      }
-
-      node.data = {
-        ...(node.data ?? {}),
-        hProperties: {
-          ...(node.data?.hProperties ?? {}),
-          className: [
-            'remux-markdown-alert',
-            `remux-markdown-alert-${kind}`,
-          ],
-        },
-      };
-    });
-  };
+function isDisplayMathClassName(className: string | undefined) {
+  const names = className?.split(/\s+/u) ?? [];
+  return names.includes('math-display') || names.includes('katex-display');
 }
-
-type MarkdownAstNode = {
-  children?: MarkdownAstNode[];
-  data?: {
-    hProperties?: Record<string, unknown>;
-  };
-  type?: string;
-  value?: string;
-};
-
-function visitMarkdownAst(node: MarkdownAstNode, visitor: (node: MarkdownAstNode) => void) {
-  visitor(node);
-  for (const child of node.children ?? []) {
-    visitMarkdownAst(child, visitor);
-  }
-}
-
-const remuxMarkdownSanitizeSchema = {
-  ...defaultSchema,
-  protocols: {
-    ...defaultSchema.protocols,
-    href: ['http', 'https', 'file'],
-  },
-  attributes: {
-    ...defaultSchema.attributes,
-    a: [
-      ...(defaultSchema.attributes?.a ?? []),
-      ['dataFootnoteBackref'],
-      ['dataFootnoteRef'],
-      ['ariaDescribedBy'],
-    ],
-    blockquote: [
-      ...(defaultSchema.attributes?.blockquote ?? []),
-      ['className', 'remux-markdown-alert', /^remux-markdown-alert-(?:note|tip|important|warning|caution)$/u],
-    ],
-    code: [
-      ...(defaultSchema.attributes?.code ?? []),
-      ['className', /^language-[\w-]+$/u, 'math-inline', 'math-display'],
-    ],
-    div: [
-      ...(defaultSchema.attributes?.div ?? []),
-      ['className', 'math', 'math-display'],
-    ],
-    h1: [
-      ...(defaultSchema.attributes?.h1 ?? []),
-      ['id'],
-    ],
-    h2: [
-      ...(defaultSchema.attributes?.h2 ?? []),
-      ['id'],
-    ],
-    h3: [
-      ...(defaultSchema.attributes?.h3 ?? []),
-      ['id'],
-    ],
-    h4: [
-      ...(defaultSchema.attributes?.h4 ?? []),
-      ['id'],
-    ],
-    h5: [
-      ...(defaultSchema.attributes?.h5 ?? []),
-      ['id'],
-    ],
-    h6: [
-      ...(defaultSchema.attributes?.h6 ?? []),
-      ['id'],
-    ],
-    li: [
-      ...(defaultSchema.attributes?.li ?? []),
-      ['className', 'task-list-item'],
-    ],
-    ol: [
-      ...(defaultSchema.attributes?.ol ?? []),
-      ['className', 'contains-task-list'],
-    ],
-    section: [
-      ...(defaultSchema.attributes?.section ?? []),
-      ['className', 'footnotes'],
-      ['dataFootnotes'],
-    ],
-    span: [
-      ...(defaultSchema.attributes?.span ?? []),
-      ['className', 'math', 'math-inline'],
-    ],
-    sup: [
-      ...(defaultSchema.attributes?.sup ?? []),
-      ['id'],
-    ],
-    ul: [
-      ...(defaultSchema.attributes?.ul ?? []),
-      ['className', 'contains-task-list'],
-    ],
-  },
-};

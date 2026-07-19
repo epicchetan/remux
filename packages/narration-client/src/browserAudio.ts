@@ -1,13 +1,8 @@
-import type { CodexNarrationArtifact } from '../../shared/narration';
-
-export type NarrationAudioCallbacks = {
-  onBuffering: () => void;
-  onEnded: () => void;
-  onError: (message: string) => void;
-  onPaused: () => void;
-  onPlaying: () => void;
-  onSample: (sample: number) => void;
-};
+import {
+  type NarrationAudioCallbacks,
+  type NarrationAudioDriver,
+} from './audio';
+import type { NarrationArtifact, NarrationPlaybackRate } from './protocol';
 
 export type NarrationAudioSnapshot = {
   artifactKey: string | null;
@@ -28,39 +23,49 @@ export type NarrationAudioSnapshot = {
   readyState: number | null;
 };
 
-const audioMetadataTimeoutMs = 15_000;
+export type NarrationMediaElementFactory = (url: string) => HTMLAudioElement;
 
-export class NarrationAudioEngine {
-  private artifact: CodexNarrationArtifact | null = null;
+const audioMetadataTimeoutMs = 15_000;
+const noopCallbacks: NarrationAudioCallbacks = {
+  onBuffering: () => undefined,
+  onEnded: () => undefined,
+  onError: () => undefined,
+  onPaused: () => undefined,
+  onPlaying: () => undefined,
+  onSample: () => undefined,
+};
+
+export function createBrowserNarrationAudio(options: {
+  createMediaElement?: NarrationMediaElementFactory;
+} = {}): NarrationAudioDriver {
+  return new BrowserNarrationAudio(
+    options.createMediaElement ?? ((url) => new Audio(url)),
+  );
+}
+
+class BrowserNarrationAudio implements NarrationAudioDriver {
+  private artifact: NarrationArtifact | null = null;
   private artifactKey: string | null = null;
   private audio: HTMLAudioElement | null = null;
-  private callbacks: NarrationAudioCallbacks;
+  private callbacks = noopCallbacks;
   private loadEpoch = 0;
-  private pendingLoad: {
-    abort: AbortController;
-    audio: HTMLAudioElement;
-  } | null = null;
-  private pendingPrepare: {
-    artifactKey: string;
-    promise: Promise<boolean>;
-  } | null = null;
+  private pendingLoad: { abort: AbortController; audio: HTMLAudioElement } | null = null;
+  private pendingPrepare: { artifactKey: string; promise: Promise<boolean> } | null = null;
   private lastMediaEvent: string | null = null;
   private lastMediaEventAt: number | null = null;
   private lastPublishedSample: number | null = null;
   private lastSampleChangedAt: number | null = null;
   private playIntent = false;
-  private playbackRate = 1;
+  private playbackRate: NarrationPlaybackRate = 1;
   private raf = 0;
 
-  constructor(callbacks: NarrationAudioCallbacks) {
-    this.callbacks = callbacks;
-  }
+  constructor(private readonly createMediaElement: NarrationMediaElementFactory) {}
 
   setCallbacks(callbacks: NarrationAudioCallbacks) {
     this.callbacks = callbacks;
   }
 
-  async prepare(artifactKey: string, artifact: CodexNarrationArtifact): Promise<boolean> {
+  async prepare(artifactKey: string, artifact: NarrationArtifact): Promise<boolean> {
     if (this.audio && this.artifactKey === artifactKey) return true;
     if (this.pendingPrepare?.artifactKey === artifactKey) return this.pendingPrepare.promise;
     const epoch = this.resetForLoad(artifactKey, artifact);
@@ -74,8 +79,8 @@ export class NarrationAudioEngine {
     }
   }
 
-  private async prepareUrl(epoch: number, artifact: CodexNarrationArtifact): Promise<boolean> {
-    const audio = new Audio(resolveAudioUrl(artifact));
+  private async prepareUrl(epoch: number, artifact: NarrationArtifact): Promise<boolean> {
+    const audio = this.createMediaElement(resolveNarrationAudioUrl(artifact));
     const pendingLoad = { abort: new AbortController(), audio };
     this.pendingLoad = pendingLoad;
     audio.preload = 'auto';
@@ -85,14 +90,12 @@ export class NarrationAudioEngine {
       await waitForAudioReady(audio, pendingLoad.abort.signal);
     } catch (error) {
       if (this.pendingLoad === pendingLoad) this.pendingLoad = null;
-      audio.removeAttribute('src');
-      audio.load();
+      disposeAudio(audio);
       throw error;
     }
     if (this.pendingLoad === pendingLoad) this.pendingLoad = null;
     if (epoch !== this.loadEpoch) {
-      audio.removeAttribute('src');
-      audio.load();
+      disposeAudio(audio);
       return false;
     }
     audio.onplaying = () => {
@@ -121,6 +124,10 @@ export class NarrationAudioEngine {
       this.stopClock();
       this.callbacks.onBuffering();
     };
+    audio.ontimeupdate = () => {
+      if (audio !== this.audio) return;
+      this.publishSample();
+    };
     audio.onended = () => {
       if (audio !== this.audio) return;
       this.recordMediaEvent('ended');
@@ -142,7 +149,7 @@ export class NarrationAudioEngine {
     return true;
   }
 
-  async play(artifactKey: string, artifact: CodexNarrationArtifact) {
+  async play(artifactKey: string, artifact: NarrationArtifact) {
     this.playIntent = true;
     const prepared = await this.prepare(artifactKey, artifact);
     if (!prepared || this.artifactKey !== artifactKey || !this.playIntent || !this.audio) return;
@@ -151,8 +158,6 @@ export class NarrationAudioEngine {
     audio.playbackRate = this.playbackRate;
     audio.preservesPitch = true;
     await audio.play();
-    // Some WebViews resolve play() just before dispatching `playing`. Reconcile
-    // from the media element without treating the user's intent as evidence.
     if (audio === this.audio && this.playIntent && !audio.paused) {
       this.callbacks.onPlaying();
       this.startClock();
@@ -190,7 +195,7 @@ export class NarrationAudioEngine {
     return audio === this.audio && this.artifactKey === artifactKey;
   }
 
-  setPlaybackRate(rate: number) {
+  setPlaybackRate(rate: NarrationPlaybackRate) {
     this.playbackRate = rate;
     if (this.audio) this.audio.playbackRate = rate;
   }
@@ -204,19 +209,18 @@ export class NarrationAudioEngine {
       const { abort, audio } = this.pendingLoad;
       this.pendingLoad = null;
       abort.abort();
-      audio.removeAttribute('src');
-      audio.load();
+      disposeAudio(audio);
     }
     if (this.audio) {
       this.audio.onplaying = null;
       this.audio.onpause = null;
       this.audio.onwaiting = null;
       this.audio.onstalled = null;
+      this.audio.ontimeupdate = null;
       this.audio.onended = null;
       this.audio.onerror = null;
       this.audio.pause();
-      this.audio.removeAttribute('src');
-      this.audio.load();
+      disposeAudio(this.audio);
     }
     this.artifact = null;
     this.artifactKey = null;
@@ -246,7 +250,7 @@ export class NarrationAudioEngine {
     };
   }
 
-  private resetForLoad(artifactKey: string, artifact: CodexNarrationArtifact) {
+  private resetForLoad(artifactKey: string, artifact: NarrationArtifact) {
     const playIntent = this.playIntent;
     this.close();
     this.playIntent = playIntent;
@@ -290,7 +294,7 @@ export class NarrationAudioEngine {
   }
 }
 
-function resolveAudioUrl(artifact: CodexNarrationArtifact) {
+export function resolveNarrationAudioUrl(artifact: NarrationArtifact) {
   const { sha256, url } = artifact.audio;
   const hash = sha256.startsWith('sha256-') ? sha256.slice('sha256-'.length) : '';
   const expectedPath = `/remux/media/sha256/${hash}`;
@@ -325,6 +329,11 @@ function waitForAudioReady(audio: HTMLAudioElement, signal: AbortSignal) {
     audio.addEventListener('error', failed, { once: true });
     audio.load();
   });
+}
+
+function disposeAudio(audio: HTMLAudioElement) {
+  audio.removeAttribute('src');
+  audio.load();
 }
 
 function finiteOrNull(value: number | undefined) {

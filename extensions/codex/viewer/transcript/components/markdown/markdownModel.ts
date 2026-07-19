@@ -22,10 +22,10 @@ import { hostFileHrefInfoFromHref, webUrlFromHref } from '@remux/viewer-kit/link
 
 import { mentionPathFromHref } from '../../model/userMessageMarkdown';
 import type {
-  CodexNarrationBlockKind,
-  CodexNarrationSourceDocument,
-  CodexNarrationSourceBlock,
-} from '../../../../shared/narration';
+  NarrationBlockKind,
+  NarrationSourceDocument,
+  NarrationSourceBlock,
+} from '@remux/narration-client/protocol';
 
 export type MarkdownDensity = 'default' | 'user' | 'work';
 
@@ -450,14 +450,14 @@ export function parseMarkdownDocument(markdown: string, options: MarkdownRenderO
   return parseMarkdownBlocks(markdown, markdownParseOptions(options));
 }
 
-export function narrationSourceBlocks(markdown: string): CodexNarrationSourceBlock[] {
+export function narrationSourceBlocks(markdown: string): NarrationSourceBlock[] {
   const blocks = parseMarkdownBlocks(markdown, markdownParseOptions({ richFileLinks: true }));
-  const output: CodexNarrationSourceBlock[] = [];
+  const output: NarrationSourceBlock[] = [];
   collectNarrationSourceBlocks(blocks, output);
   return output;
 }
 
-export function narrationSourceDocument(markdown: string): CodexNarrationSourceDocument {
+export function narrationSourceDocument(markdown: string): NarrationSourceDocument {
   return {
     blocks: narrationSourceBlocks(markdown),
     offsetEncoding: 'utf16CodeUnit',
@@ -1280,7 +1280,7 @@ function assignNarrationIds(blocks: RawMarkdownBlock[], parentPath: string) {
 
 function collectNarrationSourceBlocks(
   blocks: RawMarkdownBlock[],
-  output: CodexNarrationSourceBlock[],
+  output: NarrationSourceBlock[],
   containerKind?: 'blockquote' | 'listItem',
 ) {
   for (const block of blocks) {
@@ -1308,9 +1308,9 @@ function collectNarrationSourceBlocks(
 function narrationSourceForBlock(
   block: Exclude<RawMarkdownBlock, { type: 'blockquote' | 'list' | 'rule' }>,
   containerKind?: 'blockquote' | 'listItem',
-): CodexNarrationSourceBlock {
+): NarrationSourceBlock {
   let text = '';
-  let kind: CodexNarrationBlockKind;
+  let kind: NarrationBlockKind;
 
   switch (block.type) {
     case 'paragraph': {

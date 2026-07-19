@@ -1,0 +1,21 @@
+{
+  "name": "@remux/narration-client",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./protocol": "./src/protocol.ts",
+    "./react": "./src/react.ts",
+    "./remux": "./src/remux.ts"
+  },
+  "scripts": {
+    "test": "playwright test -c playwright.config.ts"
+  },
+  "dependencies": {
+    "@remux/viewer-kit": "*",
+    "zustand": "^5.0.13"
+  },
+  "peerDependencies": {
+    "react": "^19.2.0"
+  }
+}

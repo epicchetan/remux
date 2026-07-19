@@ -42,6 +42,8 @@ Canonical code: ...
 
 | Spec | Status | Notes |
 | --- | --- | --- |
+| [narrate-viewer-playback.md](narrate-viewer-playback.md) | Active Spec | Narrate Markdown viewer integration: authoritative logical Markdown blocks and DOM offsets, document-scoped playback states and controls, sentence/word/structural paint, seeking/follow behavior, revision fencing, and realistic verification. |
+| [narration-client-package.md](narration-client-package.md) | Implemented | The generic transport, lifecycle, browser audio, cue resolution, strict decoding, and controller now live in `@remux/narration-client`; Codex is the sole v1 dogfood consumer and Narrate-viewer playback remains explicitly deferred. |
 | [narrate-structural-transcripts.md](narrate-structural-transcripts.md) | Implemented | v5 text-only structural projection: Sol authors plain transcripts for code/table/diagram blocks, then every generated word flows through the shared Misaki baseline and pronunciation review. |
 | [narrate-pronunciation-audit.md](narrate-pronunciation-audit.md) | Implemented | v4 post-transcript review: one complete projected speech document, contextual Misaki baseline, raw unresolved-phone evidence, explicit Kokoro lexical vocabulary, and sparse Sol corrections before synthesis. |
 | [narrate-batch-alignment.md](narrate-batch-alignment.md) | Implemented | Current exact-source word/sentence alignment, NLP-aware acoustic planning, Kokoro duration projection, final-WAV artifact, and Codex-owned playback/highlighting contract. |

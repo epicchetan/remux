@@ -1,21 +1,21 @@
 import type {
-  CodexNarrationArtifact,
-  CodexNarrationBlockTiming,
-  CodexNarrationSentence,
-  CodexNarrationWordCue,
-} from '../../shared/narration';
+  NarrationArtifact,
+  NarrationBlockTiming,
+  NarrationSentence,
+  NarrationWordCue,
+} from './protocol';
 
 export type NarrationResolvedPosition = {
-  block: CodexNarrationBlockTiming | null;
+  block: NarrationBlockTiming | null;
   blockIndex: number;
-  sentence: CodexNarrationSentence | null;
+  sentence: NarrationSentence | null;
   sentenceIndex: number;
-  wordCue: CodexNarrationWordCue | null;
+  wordCue: NarrationWordCue | null;
   wordCueIndex: number;
 };
 
 export function resolveNarrationPosition(
-  artifact: CodexNarrationArtifact,
+  artifact: NarrationArtifact,
   sample: number,
 ): NarrationResolvedPosition {
   const blockIndex = findHalfOpenSampleRange(artifact.blocks, sample);
@@ -40,13 +40,9 @@ function findHalfOpenSampleRange<T extends { endSample: number; startSample: num
   while (low <= high) {
     const middle = (low + high) >> 1;
     const item = items[middle];
-    if (sample < item.startSample) {
-      high = middle - 1;
-    } else if (sample >= item.endSample) {
-      low = middle + 1;
-    } else {
-      return middle;
-    }
+    if (sample < item.startSample) high = middle - 1;
+    else if (sample >= item.endSample) low = middle + 1;
+    else return middle;
   }
   return -1;
 }

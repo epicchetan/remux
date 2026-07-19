@@ -3,12 +3,25 @@ import type { RemuxViewerRoute } from '@remux/viewer-kit/route';
 import {
   ActionBar,
   ActionButton,
+  ActionMenu,
+  ActionMenuItem,
 } from '@remux/viewer-kit/ui';
-import { Copy, PanelRightOpen, RefreshCw, X } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { Copy, Menu, PanelRightOpen, RefreshCw, X } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 
 import { MarkdownRenderer } from './MarkdownRenderer';
+import {
+  buildMarkdownNarrationModel,
+  type MarkdownNarrationModel,
+} from './narrationModel';
 import { useMarkdownStore } from './store';
+import { NarrationActions } from '../narration/NarrationActions';
+import { useNarrationStore } from '../narration/client';
+import {
+  getNarrationDomSnapshot,
+  subscribeNarrationDom,
+} from '../narration/domIndex';
+import { narrationStatusText } from '../narration/narrationStatus';
 
 type MarkdownSurfaceProps = {
   route: RemuxViewerRoute;
@@ -19,8 +32,44 @@ export function MarkdownSurface({ route }: MarkdownSurfaceProps) {
   const activeFile = useMarkdownStore((state) => state.activeFile);
   const loadFile = useMarkdownStore((state) => state.loadFile);
   const fileInfo = fileInfoText({ activeFile, filePath });
+  const narrationModelResult = useMemo(() => {
+    if (activeFile.status !== 'ready') {
+      return { error: null, model: null };
+    }
+    try {
+      return {
+        error: null,
+        model: buildMarkdownNarrationModel(activeFile.content),
+      };
+    } catch (error) {
+      return {
+        error: error instanceof Error ? error.message : String(error),
+        model: null,
+      };
+    }
+  }, [activeFile]);
   const copiedTimeoutRef = useRef<number | null>(null);
   const [copied, setCopied] = useState(false);
+  const narrationState = useNarrationStore((state) => state);
+  const closeNarration = useNarrationStore((state) => state.close);
+  const narrationDom = useSyncExternalStore(
+    subscribeNarrationDom,
+    getNarrationDomSnapshot,
+    getNarrationDomSnapshot,
+  );
+  const bindingReady = Boolean(
+    narrationModelResult.model
+    && narrationDom.status === 'ready'
+    && narrationDom.sourceHash === narrationModelResult.model.sourceHash,
+  );
+  const bindingError = narrationModelResult.model
+    && narrationDom.sourceHash === narrationModelResult.model.sourceHash
+    ? narrationDom.error
+    : null;
+  const actionStatus = narrationStatusText(
+    narrationState,
+    narrationModelResult.error ?? bindingError ?? (copied ? 'Copied' : fileInfo),
+  );
 
   useEffect(() => {
     if (!filePath) {
@@ -32,9 +81,12 @@ export function MarkdownSurface({ route }: MarkdownSurfaceProps) {
 
   useEffect(() => subscribeHostNavigate((navigation) => {
     if (navigation.resourceKind === 'file' && navigation.resourceId) {
+      if (navigation.resourceId !== filePath) {
+        closeNarration();
+      }
       setFilePath(navigation.resourceId);
     }
-  }), []);
+  }), [closeNarration, filePath]);
 
   useEffect(() => () => {
     if (copiedTimeoutRef.current !== null) {
@@ -45,6 +97,45 @@ export function MarkdownSurface({ route }: MarkdownSurfaceProps) {
   useEffect(() => {
     void updateHostTab(fileTabMetadata({ activeFile, filePath })).catch(() => undefined);
   }, [activeFile, filePath]);
+
+  useEffect(() => {
+    if (narrationState.phase === 'idle') {
+      return;
+    }
+    const model = narrationModelResult.model;
+    const target = narrationState.target;
+    const targetMatches = activeFile.status === 'ready'
+      && model
+      && target
+      && filePath === activeFile.path
+      && target.filePath === activeFile.path
+      && target.modifiedAtMs === activeFile.modifiedAtMs
+      && target.sourceHash === model.sourceHash;
+    const modelBlockIds = new Set(model?.blocks.map((block) => block.id) ?? []);
+    const artifactMatches = !narrationState.artifact || (
+      narrationState.artifact.blocks.every((block) => modelBlockIds.has(block.blockId))
+      && narrationState.artifact.sentences.every((sentence) => modelBlockIds.has(sentence.blockId))
+      && narrationState.artifact.wordCues.every((cue) => modelBlockIds.has(cue.blockId))
+    );
+    const bindingInvalid = Boolean(
+      targetMatches
+      && narrationDom.sourceHash === model?.sourceHash
+      && narrationDom.status === 'invalid',
+    );
+    if (!targetMatches || !artifactMatches || bindingInvalid) {
+      closeNarration();
+    }
+  }, [
+    activeFile,
+    closeNarration,
+    filePath,
+    narrationDom.sourceHash,
+    narrationDom.status,
+    narrationModelResult.model,
+    narrationState.artifact,
+    narrationState.phase,
+    narrationState.target,
+  ]);
 
   const copyMarkdown = () => {
     if (activeFile.status !== 'ready') {
@@ -64,7 +155,11 @@ export function MarkdownSurface({ route }: MarkdownSurfaceProps) {
 
   return (
     <main className="remux-markdown-shell">
-      <MarkdownBody activeFile={activeFile} filePath={filePath} />
+      <MarkdownBody
+        activeFile={activeFile}
+        filePath={filePath}
+        narrationModel={narrationModelResult.model}
+      />
       <ActionBar
         left={(
           <>
@@ -75,31 +170,44 @@ export function MarkdownSurface({ route }: MarkdownSurfaceProps) {
                 void openHostOverview();
               }}
             />
-            <ActionButton
-              icon={<RefreshCw aria-hidden="true" />}
-              label="Reload viewer"
-              onClick={() => {
-                void reloadHostView();
-              }}
-            />
-            <ActionButton
-              disabled={activeFile.status !== 'ready'}
-              icon={copied ? <CheckIcon /> : <Copy aria-hidden="true" />}
-              label={copied ? 'Copied markdown' : 'Copy markdown'}
-              onClick={copyMarkdown}
-            />
+            <ActionMenu
+              align="start"
+              icon={<Menu aria-hidden="true" />}
+              label="Narrate menu"
+            >
+              <ActionMenuItem
+                icon={<RefreshCw />}
+                label="Reload viewer"
+                onSelect={() => {
+                  closeNarration();
+                  void reloadHostView();
+                }}
+              />
+              <ActionMenuItem
+                disabled={activeFile.status !== 'ready'}
+                icon={copied ? <CheckIcon /> : <Copy />}
+                label={copied ? 'Copied markdown' : 'Copy markdown'}
+                onSelect={copyMarkdown}
+              />
+              <ActionMenuItem
+                icon={<X />}
+                label="Close tab"
+                onSelect={() => {
+                  closeNarration();
+                  void closeHostTab();
+                }}
+              />
+            </ActionMenu>
           </>
         )}
         right={(
-          <ActionButton
-            icon={<X aria-hidden="true" />}
-            label="Close tab"
-            onClick={() => {
-              void closeHostTab();
-            }}
+          <NarrationActions
+            bindingReady={bindingReady}
+            file={activeFile.status === 'ready' ? activeFile : null}
+            model={narrationModelResult.model}
           />
         )}
-        status={copied ? 'Copied' : fileInfo}
+        status={actionStatus}
       />
     </main>
   );
@@ -108,9 +216,11 @@ export function MarkdownSurface({ route }: MarkdownSurfaceProps) {
 function MarkdownBody({
   activeFile,
   filePath,
+  narrationModel,
 }: {
   activeFile: ReturnType<typeof useMarkdownStore.getState>['activeFile'];
   filePath: string | null;
+  narrationModel: MarkdownNarrationModel | null;
 }) {
   if (!filePath || activeFile.status === 'idle') {
     return (
@@ -162,7 +272,11 @@ function MarkdownBody({
 
   return (
     <section className="remux-markdown-content-shell">
-      <MarkdownRenderer content={activeFile.content} filePath={activeFile.path} />
+      <MarkdownRenderer
+        content={activeFile.content}
+        filePath={activeFile.path}
+        narrationModel={narrationModel}
+      />
     </section>
   );
 }

@@ -6,7 +6,7 @@ import { useComposerStore } from '../../composer/store';
 import { MarkdownBlock } from './markdown/MarkdownBlock';
 import { useOperationQueueStore } from '../../threads/operationQueueStore';
 import { narrationSourceDocument } from './markdown/markdownModel';
-import { narrationSourceHash, useNarrationStore } from '../../narration/store';
+import { narrationSourceHash, useNarrationStore } from '../../narration/client';
 
 export function AssistantMessage({
   segment,

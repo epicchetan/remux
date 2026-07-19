@@ -8,7 +8,7 @@ import { ComposerAttachmentButton } from '../attachments/AttachmentButton';
 import { ComposerConfigButton } from '../config/ConfigButton';
 import { useComposerTurnAction } from './turnAction';
 import { NarrationPlaybackActions } from '../../narration/PlaybackActions';
-import { useNarrationStore } from '../../narration/store';
+import { useNarrationStore } from '../../narration/client';
 import { ComposerActionKey, type ComposerAction } from './ActionKey';
 
 export function ComposerActionButtons() {

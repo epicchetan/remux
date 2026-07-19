@@ -20,7 +20,7 @@ import { CodexSidebar } from './threads/Sidebar';
 import { shortenPath, threadTitle } from './threads/threadFormat';
 import { CodexTranscript } from './transcript';
 import { requestTranscriptTurnScroll } from './transcript/viewportStore';
-import { subscribeNarrationUpdates, useNarrationStore } from './narration/store';
+import { attachNarrationClient, useNarrationStore } from './narration/client';
 import { installNarrationPaintController } from './narration/paintController';
 
 export function App() {
@@ -323,7 +323,7 @@ export function App() {
     void loadThreadHistory();
   }, [loadThreadHistory]);
 
-  useEffect(() => subscribeNarrationUpdates(), []);
+  useEffect(() => attachNarrationClient(), []);
   useEffect(() => installNarrationPaintController(), []);
 
   useEffect(() => {

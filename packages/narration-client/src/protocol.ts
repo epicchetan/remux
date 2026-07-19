@@ -1,4 +1,4 @@
-export type CodexNarrationBlockKind =
+export type NarrationBlockKind =
   | 'paragraph'
   | 'heading'
   | 'listItem'
@@ -7,54 +7,39 @@ export type CodexNarrationBlockKind =
   | 'table'
   | 'diagram';
 
-export type CodexNarrationHighlightMode = 'block' | 'text';
+export type NarrationHighlightMode = 'block' | 'text';
 
-export type CodexNarrationSourceBlock = {
-  highlightMode: CodexNarrationHighlightMode;
+export type NarrationSourceBlock = {
+  highlightMode: NarrationHighlightMode;
   id: string;
-  kind: CodexNarrationBlockKind;
+  kind: NarrationBlockKind;
   text: string;
 };
 
-export type CodexNarrationSourceDocument = {
-  blocks: CodexNarrationSourceBlock[];
+export type NarrationSourceDocument = {
+  blocks: NarrationSourceBlock[];
   offsetEncoding: 'utf16CodeUnit';
   schemaVersion: 1;
 };
 
-// This identity stays local to the Codex viewer. It is deliberately absent
-// from the Narrate API and the cacheable artifact.
-export type CodexNarrationTarget = {
-  assistantMessageId: string;
-  messageRevision: string;
-  sourceHash: string;
-  threadId: string;
-  turnId: string;
-};
-
-export type CodexNarrationStartParams = {
-  document: CodexNarrationSourceDocument;
-};
-
-export type CodexNarrationStartResponse = {
+export type NarrationStartParams = { document: NarrationSourceDocument };
+export type NarrationStartResponse = {
   artifactKey: string;
-  resource: CodexNarrationResource;
+  resource: NarrationResource;
   status: 'accepted';
 };
-
-export type CodexNarrationReadParams = {
+export type NarrationReadParams = {
   artifactKey: string;
   knownRevision?: string | null;
 };
-
-export type CodexNarrationReadResponse = {
-  resource: CodexNarrationResource | null;
+export type NarrationReadResponse = {
+  resource: NarrationResource | null;
   status: 'missing' | 'notModified' | 'ok';
 };
+export type NarrationCancelParams = { artifactKey: string };
+export type NarrationCancelResponse = { artifactKey: string; status: 'accepted' };
 
-export type CodexNarrationCancelParams = { artifactKey: string };
-export type CodexNarrationCancelResponse = { artifactKey: string; status: 'accepted' };
-export type CodexNarrationStage =
+export type NarrationStage =
   | 'baseline'
   | 'languagePlanning'
   | 'planning'
@@ -62,7 +47,8 @@ export type CodexNarrationStage =
   | 'synthesizing'
   | 'finalizing'
   | 'ready';
-export type CodexNarrationProgress = {
+
+export type NarrationProgress = {
   auditWindowsCompleted: number;
   auditWindowsTotal: number;
   transcriptWindowsCompleted: number;
@@ -70,37 +56,45 @@ export type CodexNarrationProgress = {
   chunksCompleted: number;
   chunksTotal: number;
   sentences: number;
-  stage: CodexNarrationStage;
+  stage: NarrationStage;
   words: number;
 };
 
-export type CodexNarrationResource = {
+export type NarrationResourceStatus =
+  | 'preparing'
+  | 'synthesizing'
+  | 'finalizing'
+  | 'ready'
+  | 'failed'
+  | 'cancelled';
+
+export type NarrationResource = {
   artifactKey: string;
   complete: boolean;
   error: string | null;
-  manifest: CodexNarrationArtifact | null;
-  progress: CodexNarrationProgress;
+  manifest: NarrationArtifact | null;
+  progress: NarrationProgress;
   revision: string;
-  status: 'preparing' | 'synthesizing' | 'finalizing' | 'ready' | 'failed' | 'cancelled';
+  status: NarrationResourceStatus;
 };
 
-export type CodexNarrationUpdatedNotification = { artifactKey: string };
+export type NarrationUpdatedNotification = { artifactKey: string };
 
-export type CodexNarrationArtifact = {
+export type NarrationArtifact = {
   artifactKey: string;
-  audio: CodexNarrationAudio;
-  blocks: CodexNarrationBlockTiming[];
+  audio: NarrationAudio;
+  blocks: NarrationBlockTiming[];
   documentHash: string;
   offsetEncoding: 'utf16CodeUnit';
   pronunciationPlanSha256: string;
   structuralTranscriptPlanSha256: string;
-  profile: CodexNarrationProfile;
+  profile: NarrationProfile;
   schemaVersion: 4;
-  sentences: CodexNarrationSentence[];
-  wordCues: CodexNarrationWordCue[];
+  sentences: NarrationSentence[];
+  wordCues: NarrationWordCue[];
 };
 
-export type CodexNarrationAudio = {
+export type NarrationAudio = {
   channels: 1;
   mimeType: 'audio/wav';
   sampleRate: 24000;
@@ -110,13 +104,13 @@ export type CodexNarrationAudio = {
   url: `/remux/media/sha256/${string}`;
 };
 
-export type CodexNarrationBlockTiming = {
+export type NarrationBlockTiming = {
   blockId: string;
   endSample: number;
   startSample: number;
 };
 
-export type CodexNarrationSentence = {
+export type NarrationSentence = {
   blockId: string;
   endSample: number;
   id: string;
@@ -125,7 +119,7 @@ export type CodexNarrationSentence = {
   textStart: number;
 };
 
-export type CodexNarrationWordCue = {
+export type NarrationWordCue = {
   blockId: string;
   endSample: number;
   sentenceId: string;
@@ -134,11 +128,13 @@ export type CodexNarrationWordCue = {
   textStart: number;
 };
 
-export type CodexNarrationProfile = {
+export type NarrationPlaybackRate = 0.75 | 1 | 1.25 | 1.5 | 2;
+
+export type NarrationProfile = {
   phonemizer: string;
   plannerVersion: number;
-  pronunciationReviewer: CodexPronunciationReviewerProfile;
-  structuralTranscript: CodexStructuralTranscriptProfile;
+  pronunciationReviewer: NarrationPronunciationReviewerProfile;
+  structuralTranscript: NarrationStructuralTranscriptProfile;
   sentenceVersion: number;
   sourceMapperVersion: number;
   synthesizerHash: string;
@@ -146,7 +142,7 @@ export type CodexNarrationProfile = {
   wordSegmenterVersion: number;
 };
 
-export type CodexPronunciationReviewerProfile = {
+export type NarrationPronunciationReviewerProfile = {
   directPhoneValidatorVersion: number;
   effort: 'low';
   kokoroVocabularySha256: string;
@@ -160,7 +156,7 @@ export type CodexPronunciationReviewerProfile = {
   windowPlannerVersion: number;
 };
 
-export type CodexStructuralTranscriptProfile = {
+export type NarrationStructuralTranscriptProfile = {
   effort: 'low';
   model: 'gpt-5.6-sol';
   outputSchemaVersion: number;

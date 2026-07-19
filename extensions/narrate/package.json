@@ -11,9 +11,11 @@
   },
   "scripts": {
     "build": "vite build --config viewer/vite.config.ts",
+    "test": "playwright test -c playwright.config.ts",
     "watch": "vite build --watch --config viewer/vite.config.ts"
   },
   "dependencies": {
+    "@remux/narration-client": "*",
     "@remux/viewer-kit": "*",
     "katex": "^0.17.0",
     "lucide-react": "^1.21.0",
@@ -26,7 +28,10 @@
     "rehype-sanitize": "^6.0.0",
     "remark-gfm": "^4.0.1",
     "remark-math": "^6.0.0",
+    "remark-parse": "^11.0.0",
+    "remark-rehype": "^11.1.2",
     "shiki": "^4.2.0",
+    "unified": "^11.0.5",
     "zustand": "^5.0.14"
   }
 }

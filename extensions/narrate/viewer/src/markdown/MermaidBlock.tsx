@@ -64,7 +64,10 @@ export function MermaidBlock({ source }: MermaidBlockProps) {
 
   if (state.status === 'loading') {
     return (
-      <div className="remux-markdown-mermaid-card">
+      <div
+        className="remux-markdown-mermaid-card"
+        data-narration-render-surface="diagram"
+      >
         <div className="remux-markdown-spinner" aria-hidden="true" />
         <div className="remux-markdown-mermaid-muted">Rendering diagram</div>
       </div>
@@ -73,7 +76,10 @@ export function MermaidBlock({ source }: MermaidBlockProps) {
 
   if (state.status === 'error') {
     return (
-      <div className="remux-markdown-mermaid-card remux-markdown-mermaid-error">
+      <div
+        className="remux-markdown-mermaid-card remux-markdown-mermaid-error"
+        data-narration-render-surface="diagram"
+      >
         <div className="remux-markdown-mermaid-title">Could not render Mermaid</div>
         <div className="remux-markdown-mermaid-muted">{state.message}</div>
         <pre><code>{source}</code></pre>
@@ -82,7 +88,10 @@ export function MermaidBlock({ source }: MermaidBlockProps) {
   }
 
   return (
-    <div className="remux-markdown-mermaid-card">
+    <div
+      className="remux-markdown-mermaid-card"
+      data-narration-render-surface="diagram"
+    >
       <div
         className="remux-markdown-mermaid-diagram"
         dangerouslySetInnerHTML={{ __html: state.svg }}

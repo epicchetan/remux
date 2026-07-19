@@ -16,13 +16,22 @@ const markdownShikiThemes = {
 export function MarkdownCodeBlock({
   children,
   className,
+  node: _node,
   ...props
 }: MarkdownCodeBlockProps) {
   const source = String(children ?? '').replace(/\n$/u, '');
   const language = languageFromClassName(className);
 
   if (!language) {
-    return <code className={className} {...props}>{children}</code>;
+    return (
+      <code
+        {...props}
+        className={className}
+        data-narration-render-surface="code"
+      >
+        {children}
+      </code>
+    );
   }
 
   if (language === 'mermaid') {
@@ -86,13 +95,17 @@ function HighlightedCodeBlock({
     return (
       <div
         className="remux-markdown-code-highlight"
+        data-narration-render-surface="code"
         dangerouslySetInnerHTML={{ __html: html }}
       />
     );
   }
 
   return (
-    <div className="remux-markdown-code-highlight remux-markdown-code-highlight-pending">
+    <div
+      className="remux-markdown-code-highlight remux-markdown-code-highlight-pending"
+      data-narration-render-surface="code"
+    >
       <pre>
         <code className={className ?? undefined}>{source}</code>
       </pre>

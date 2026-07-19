@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { ArrowDown, ArrowUp, Check, LoaderCircle, LocateFixed, Pause, Play, X } from 'lucide-react';
 
 import { ComposerActionKey, type ComposerAction } from '../composer/actions/ActionKey';
-import { useNarrationStore } from './store';
+import { useNarrationStore } from './client';
 
 const rates = [0.75, 1, 1.25, 1.5, 2] as const;
 

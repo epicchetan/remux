@@ -27,6 +27,8 @@
       "@remux/codex/config/*": ["./extensions/codex/viewer/config/*"],
       "@remux/codex/protocol/*": ["./extensions/codex/shared/protocol/*"],
       "@remux/codex/styles.css": ["./extensions/codex/viewer/styles.css"],
+      "@remux/narration-client": ["./packages/narration-client/src/index.ts"],
+      "@remux/narration-client/*": ["./packages/narration-client/src/*"],
       "@remux/viewer-kit": ["./packages/viewer-kit/src/index.ts"],
       "@remux/viewer-kit/shadcn": ["./packages/viewer-kit/src/shadcn/index.ts"],
       "@remux/viewer-kit/tokens.native": ["./packages/viewer-kit/src/tokens/tokens.native.ts"],

@@ -1,6 +1,6 @@
 import { AlertTriangle, AudioLines, Loader2, RotateCcw, X } from 'lucide-react';
 
-import { useNarrationStore } from './store';
+import { useNarrationStore } from './client';
 
 export function NarrationBar() {
   const cancel = useNarrationStore((state) => state.cancel);

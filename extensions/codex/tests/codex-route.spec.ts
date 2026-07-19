@@ -849,7 +849,7 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
               };
             };
             const blocks = params.document?.blocks ?? [];
-            const artifactKey = `mock-narration-${blocks.length}`;
+            const artifactKey = `sha256-${'1'.repeat(56)}${blocks.length.toString(16).padStart(8, '0')}`;
             const blockTimings = blocks.map((block, index) => ({
               blockId: block.id ?? `md:${index}`,
               endSample: (index + 1) * 24_000,
@@ -890,22 +890,22 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
                 url: `/remux/media/sha256/${audioHash}`,
               },
               blocks: blockTimings,
-              documentHash: 'sha256-mock-document',
+              documentHash: `sha256-${'2'.repeat(64)}`,
               offsetEncoding: 'utf16CodeUnit',
-              pronunciationPlanSha256: 'sha256-mock-plan',
-              structuralTranscriptPlanSha256: 'sha256-mock-structural-plan',
+              pronunciationPlanSha256: `sha256-${'3'.repeat(64)}`,
+              structuralTranscriptPlanSha256: `sha256-${'4'.repeat(64)}`,
               profile: {
                 phonemizer: 'misaki-rs-0.3.0-us-no-default-features',
                 plannerVersion: 1,
                 pronunciationReviewer: {
                   directPhoneValidatorVersion: 1,
                   effort: 'low',
-                  kokoroVocabularySha256: 'sha256-mock-vocabulary',
+                  kokoroVocabularySha256: `sha256-${'5'.repeat(64)}`,
                   model: 'gpt-5.6-sol',
                   outputSchemaVersion: 4,
-                  phoneAlphabetSha256: 'sha256-mock-alphabet',
+                  phoneAlphabetSha256: `sha256-${'6'.repeat(64)}`,
                   phoneAlphabetVersion: 1,
-                  profileDigest: 'sha256-mock-profile',
+                  profileDigest: `sha256-${'7'.repeat(64)}`,
                   promptVersion: 4,
                   serviceTier: 'priority',
                   windowPlannerVersion: 3,
@@ -914,14 +914,14 @@ async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
                   effort: 'low',
                   model: 'gpt-5.6-sol',
                   outputSchemaVersion: 2,
-                  profileDigest: 'sha256-mock-profile',
+                  profileDigest: `sha256-${'7'.repeat(64)}`,
                   promptVersion: 2,
                   serviceTier: 'priority',
                   windowPlannerVersion: 1,
                 },
                 sentenceVersion: 1,
                 sourceMapperVersion: 1,
-                synthesizerHash: 'sha256-mock-synthesizer',
+                synthesizerHash: `sha256-${'8'.repeat(64)}`,
                 timingVersion: 2,
                 wordSegmenterVersion: 1,
               },
@@ -1167,6 +1167,17 @@ async function capturedHostMethods(page: Page) {
       .map((message) => message.method ?? message.type)
       .filter(Boolean),
   );
+}
+
+async function structuralNarrationStyle(locator: import('@playwright/test').Locator) {
+  return locator.evaluate((element) => {
+    const style = getComputedStyle(element);
+    return {
+      borderRadius: style.borderRadius,
+      boxShadow: style.boxShadow,
+      outlineStyle: style.outlineStyle,
+    };
+  });
 }
 
 async function capturedHostRequests(page: Page) {
@@ -3137,6 +3148,11 @@ test.describe('codex viewer route', () => {
     ]);
     await expect(markdown.locator('.codex-md-table')).toHaveClass(/codex-md-structural-target-narrating/);
     await expect(markdown.locator('.codex-md-table-scroll')).not.toHaveClass(/codex-md-structural-target-narrating/);
+    await expect.poll(() => structuralNarrationStyle(markdown.locator('.codex-md-table'))).toMatchObject({
+      borderRadius: '8px',
+      outlineStyle: 'none',
+    });
+    expect((await structuralNarrationStyle(markdown.locator('.codex-md-table'))).boxShadow).not.toBe('none');
     await page.locator('[data-remux-composer-root]').getByRole('button', { name: 'Play narration' }).click();
     await expect(page.locator('[data-remux-composer-root]').getByRole('button', { name: 'Pause narration' })).toBeVisible();
     // Cell-level cues keep painting at the element level: the table frame
@@ -3160,6 +3176,11 @@ test.describe('codex viewer route', () => {
 
     await expect(markdown.locator('.codex-md-code-block')).toHaveClass(/codex-md-structural-target-narrating/);
     await expect(markdown.locator('[data-narration-block-id="md:0"]')).not.toHaveClass(/codex-md-structural-target-narrating/);
+    await expect.poll(() => structuralNarrationStyle(markdown.locator('.codex-md-code-block'))).toMatchObject({
+      borderRadius: '12px',
+      outlineStyle: 'none',
+    });
+    expect((await structuralNarrationStyle(markdown.locator('.codex-md-code-block'))).boxShadow).not.toBe('none');
     await page.locator('[data-remux-composer-root]').getByRole('button', { name: 'Play narration' }).click();
     await expect(page.locator('[data-remux-composer-root]').getByRole('button', { name: 'Pause narration' })).toBeVisible();
     // Line-level cues keep painting at the element level: the code frame
@@ -3230,24 +3251,51 @@ test.describe('codex viewer route', () => {
         ].join('\n\n'),
       })],
     });
+    await page.addInitScript(() => {
+      const NativeAudio = window.Audio;
+      const elements: HTMLAudioElement[] = [];
+      const TrackingAudio = function TrackingAudio(source?: string) {
+        const audio = new NativeAudio(source);
+        elements.push(audio);
+        return audio;
+      } as unknown as typeof Audio;
+      TrackingAudio.prototype = NativeAudio.prototype;
+      Object.defineProperty(window, 'Audio', { configurable: true, value: TrackingAudio });
+      Object.defineProperty(window, '__mockNarrationAudioElements', {
+        configurable: true,
+        value: elements,
+      });
+    });
 
     await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
     await page.getByRole('button', { name: 'Narrate response' }).click();
     await page.locator('[data-remux-composer-root]').getByRole('button', { name: 'Play narration' }).click();
     const markdown = page.locator('[data-row-kind="assistantMessage"] .codex-markdown');
+    await expect.poll(() => page.evaluate(() => (
+      window as typeof window & { __mockNarrationAudioElements?: HTMLAudioElement[] }
+    ).__mockNarrationAudioElements?.length ?? 0)).toBeGreaterThan(0);
+    await page.evaluate(() => {
+      const audio = (window as typeof window & {
+        __mockNarrationAudioElements?: HTMLAudioElement[];
+      }).__mockNarrationAudioElements?.at(-1);
+      if (!audio) throw new Error('Narration audio element was not created');
+      audio.currentTime = 1.25;
+      audio.dispatchEvent(new Event('timeupdate'));
+    });
+    await page.locator('[data-remux-composer-root]').getByRole('button', { name: 'Pause narration' }).click();
     const second = markdown.locator('[data-narration-block-id="md:1"]');
-    await expect(second.locator('.codex-narration-word-rect')).toBeVisible({ timeout: 3_000 });
+    await expect(second.locator('.codex-narration-word-rect')).toBeVisible();
     const firstLayer = markdown.locator('[data-narration-block-id="md:0"] .codex-narration-paint-layer');
     await expect(firstLayer).toHaveAttribute('hidden', '');
     await expect(firstLayer.locator('div')).toHaveCount(0);
-    const readingPosition = () => page.evaluate(() => {
+    const readingPosition = () => page.evaluate((blockId) => {
       const viewport = document.querySelector<HTMLElement>('.remux-transcript-viewport')!;
       const composerRoot = document.querySelector<HTMLElement>('[data-remux-composer-root]')!;
-      const block = document.querySelector<HTMLElement>('[data-narration-block-id="md:1"]')!;
+      const block = document.querySelector<HTMLElement>(`[data-narration-block-id="${blockId}"]`)!;
       const viewportBounds = viewport.getBoundingClientRect();
       const usableBottom = Math.min(viewportBounds.bottom, composerRoot.getBoundingClientRect().top);
       return (block.getBoundingClientRect().top - viewportBounds.top) / (usableBottom - viewportBounds.top);
-    });
+    }, 'md:1');
     await expect.poll(readingPosition).toBeLessThan(0.38);
     expect(await readingPosition()).toBeGreaterThan(0.22);
   });

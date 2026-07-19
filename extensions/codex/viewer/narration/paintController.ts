@@ -1,5 +1,5 @@
 import { focusTranscriptNarration } from '../transcript/viewportStore';
-import { useNarrationStore, type NarrationFocusReason } from './store';
+import { useNarrationStore, type NarrationFocusReason } from './client';
 import {
   resolveNarrationBlockElements,
   subscribeNarrationBlocks,

@@ -16,6 +16,7 @@
     "watch": "vite build --watch --config viewer/vite.config.ts"
   },
   "dependencies": {
+    "@remux/narration-client": "*",
     "@chenglou/pretext": "^0.0.7",
     "@iconify/icons-vscode-icons": "^1.2.29",
     "@lexical/react": "^0.44.0",
