@@ -56,6 +56,7 @@ export function App() {
     Boolean(state.activeDraftId && state.draft?.id === state.activeDraftId));
   const loadThreadHistory = useThreadHistoryStore((state) => state.loadThreadHistory);
   const applyServerComposerConfig = useComposerStore((state) => state.applyServerConfig);
+  const loadComposerModels = useComposerStore((state) => state.loadModels);
   const loadComposerConfig = useComposerStore((state) => state.loadServerConfig);
   const saveActiveDraftSnapshot = useThreadsStore((state) => state.saveActiveDraftSnapshot);
   const setDefaultCwd = useThreadsStore((state) => state.setDefaultCwd);
@@ -360,6 +361,10 @@ export function App() {
       setDefaultCwd(newChatDefaultCwd);
     }
   }, [newChatDefaultCwd, setDefaultCwd]);
+
+  useEffect(() => {
+    void loadComposerModels(activeDraftVisible ? activeDraftCwd : null);
+  }, [activeDraftCwd, activeDraftVisible, loadComposerModels]);
 
   useEffect(() => {
     void setRuntimeThreadId(activeThreadId);

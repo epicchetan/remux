@@ -38,7 +38,8 @@ export type UserMessageLayoutModel = {
   railItems: UserMessageRailItem[];
 };
 
-type UserMessageItem = Extract<ThreadItem, { type: 'userMessage' }>;
+type AppServerUserMessageItem = Extract<ThreadItem, { type: 'userMessage' }>;
+type UserMessageItem = Pick<AppServerUserMessageItem, 'content' | 'id' | 'type'>;
 type UserInput = UserMessageItem['content'][number];
 type UserTextPart = Extract<UserInput, { type: 'text' }>;
 

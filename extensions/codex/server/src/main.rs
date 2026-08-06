@@ -150,7 +150,9 @@ fn handle_request(server: &CodexExtensionServer, request: JsonRpcRequest) -> Jso
         COMPOSER_CONFIG_WRITE_METHOD => server
             .composer_config
             .write_config(request.params.unwrap_or(Value::Null)),
-        MODELS_READ_METHOD => server.models.read_models(),
+        MODELS_READ_METHOD => server
+            .models
+            .read_models(request.params.unwrap_or(Value::Null)),
         APP_SERVER_STATUS_READ_METHOD => Ok(server.app_server_status()),
         APP_SERVER_START_METHOD => server.app_server_start(),
         APP_SERVER_STOP_METHOD => server.app_server_stop(),

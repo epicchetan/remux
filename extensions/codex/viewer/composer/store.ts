@@ -81,15 +81,17 @@ type ComposerStoreState = {
   intelligence: ComposerIntelligence;
   isSubmitting: boolean;
   failSubmission: (id: number, message: string) => void;
-  loadModels: () => Promise<void>;
+  loadModels: (cwd?: string | null) => Promise<void>;
   loadServerConfig: () => Promise<void>;
   mentionSession: ComposerMentionSession | null;
   model: string | null;
   models: CodexModelOption[] | null;
+  modelsContextCwd: string | null;
   modelsStatus: ComposerModelsStatus;
   openAttachmentPicker: (kind?: ComposerAttachmentPickerKind) => void;
   preEditSnapshot: ComposerSnapshot | null;
   reviewMode: ComposerReviewMode;
+  resolvedDefaultModel: string | null;
   snapshot: ComposerSnapshot;
   speed: ComposerSpeed;
   startEdit: (target: ComposerEditTarget, document: ComposerDocument, resources?: ComposerAttachmentResource[]) => void;
@@ -135,6 +137,7 @@ const defaultComposerConfig: CodexComposerConfig = {
 };
 
 let latestConfigRequestId = 0;
+let latestModelsRequestId = 0;
 type ComposerStoreSet = (
   partial:
     | Partial<ComposerStoreState>
@@ -225,22 +228,36 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
   forkTarget: null,
   intelligence: defaultComposerConfig.intelligence,
   isSubmitting: false,
-  loadModels: async () => {
-    const status = get().modelsStatus;
-    if (status === 'ready' || status === 'loading') {
+  loadModels: async (cwd = null) => {
+    const contextCwd = cwd?.trim() || null;
+    const state = get();
+    if (
+      state.modelsContextCwd === contextCwd &&
+      (state.modelsStatus === 'ready' || state.modelsStatus === 'loading')
+    ) {
       return;
     }
 
-    set({ modelsStatus: 'loading' });
+    const requestId = ++latestModelsRequestId;
+    set({
+      modelsContextCwd: contextCwd,
+      modelsStatus: 'loading',
+      resolvedDefaultModel: null,
+    });
 
     try {
-      const response = await readModels();
-      set({
-        models: response.models,
-        modelsStatus: 'ready',
-      });
+      const response = await readModels({ cwd: contextCwd });
+      if (requestId === latestModelsRequestId) {
+        set({
+          models: response.models,
+          modelsStatus: 'ready',
+          resolvedDefaultModel: response.resolvedDefaultModel,
+        });
+      }
     } catch {
-      set({ modelsStatus: 'failed' });
+      if (requestId === latestModelsRequestId) {
+        set({ modelsStatus: 'failed' });
+      }
     }
   },
   loadServerConfig: async () => {
@@ -261,10 +278,12 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
   mentionSession: null,
   model: defaultComposerConfig.model,
   models: null,
+  modelsContextCwd: null,
   modelsStatus: 'idle',
   openAttachmentPicker: noopOpenAttachmentPicker,
   preEditSnapshot: null,
   reviewMode: defaultComposerConfig.reviewMode,
+  resolvedDefaultModel: null,
   snapshot: createEmptyComposerSnapshot(),
   speed: defaultComposerConfig.speed,
   submission: null,

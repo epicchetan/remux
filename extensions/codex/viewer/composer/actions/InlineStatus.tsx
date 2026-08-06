@@ -1,15 +1,26 @@
 import type { ThreadTokenUsage } from '../../../shared/protocol/v2/ThreadTokenUsage';
 import { useThreadComposerStateStore } from '../../threads/composerStateStore';
+import { useThreadsStore } from '../../threads/store';
+import { modelDisplayLabel, resolveModelValue } from '../config/modelSelection';
 import { useComposerStore } from '../store';
 import type { ComposerIntelligence } from '../config/types';
 
 export function ComposerInlineStatus() {
+  const activeThreadId = useThreadsStore((state) => state.activeThreadId);
   const intelligence = useComposerStore((state) => state.intelligence);
+  const configuredModel = useComposerStore((state) => state.model);
+  const models = useComposerStore((state) => state.models);
+  const modelsStatus = useComposerStore((state) => state.modelsStatus);
+  const resolvedDefaultModel = useComposerStore((state) => state.resolvedDefaultModel);
   const speed = useComposerStore((state) => state.speed);
-  const model = useThreadComposerStateStore((state) => state.effective?.model ?? null);
+  const threadModel = useThreadComposerStateStore((state) => state.effective?.model ?? null);
   const tokenUsage = useThreadComposerStateStore((state) => state.tokenUsage);
+  const draftModel = configuredModel || modelsStatus === 'ready'
+    ? resolveModelValue(models, configuredModel, resolvedDefaultModel)
+    : null;
+  const model = activeThreadId ? threadModel : draftModel;
   const left = [
-    modelLabel(model),
+    modelDisplayLabel(models, model),
     thinkingLabel(intelligence),
     ...(speed === 'fast' ? ['Fast'] : []),
   ];
@@ -44,17 +55,6 @@ function StatusSegment({ children, index }: { children: string; index: number })
       <span className="truncate">{children}</span>
     </>
   );
-}
-
-function modelLabel(model: string | null) {
-  if (!model) {
-    return 'GPT 5.5';
-  }
-
-  return model
-    .replace(/^gpt-/i, 'GPT ')
-    .replace(/^codex-/i, 'Codex ')
-    .replace(/-/g, ' ');
 }
 
 function thinkingLabel(effort: ComposerIntelligence) {

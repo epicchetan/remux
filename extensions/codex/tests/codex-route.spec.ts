@@ -2524,6 +2524,8 @@ test.describe('codex viewer route', () => {
 
     await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
 
+    const inlineStatus = page.locator('.remux-composer-inline-status');
+    await expect(inlineStatus).toContainText('GPT 5.1 codex');
     const usageStatus = page.locator('.remux-composer-status-group-right');
     await expect(usageStatus).toContainText('50% context');
     await expect(usageStatus).not.toContainText('est.');
@@ -3611,6 +3613,7 @@ function mockTokenUsage({
   return {
     last: {
       cachedInputTokens: 100,
+      cacheWriteInputTokens: 0,
       inputTokens,
       outputTokens: 25,
       reasoningOutputTokens: 5,
@@ -3619,6 +3622,7 @@ function mockTokenUsage({
     modelContextWindow,
     total: {
       cachedInputTokens: 100,
+      cacheWriteInputTokens: 0,
       inputTokens,
       outputTokens: 25,
       reasoningOutputTokens: 5,

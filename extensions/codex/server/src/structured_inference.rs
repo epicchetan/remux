@@ -513,7 +513,6 @@ fn thread_start_params(params: &GenerateParams, context_dir: &std::path::Path) -
         "environments": [],
         "ephemeral": true,
         "experimentalRawEvents": false,
-        "persistExtendedHistory": false,
         "sandbox": "read-only",
         "serviceName": "remux-structured-inference"
     })

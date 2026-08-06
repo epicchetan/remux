@@ -7,8 +7,12 @@ type HostRequest = {
   type?: string;
 };
 
-async function installMockRemuxHost(page: Page) {
-  await page.addInitScript(() => {
+type MockHostOptions = {
+  resolvedDefaultModel?: string;
+};
+
+async function installMockRemuxHost(page: Page, options: MockHostOptions = {}) {
+  await page.addInitScript(({ resolvedDefaultModel }) => {
     const capturedMessages: HostRequest[] = [];
     let revision = 1;
     let config = {
@@ -63,8 +67,8 @@ async function installMockRemuxHost(page: Page) {
                 defaultServiceTier: 'default',
                 description: 'Balanced default Codex model',
                 displayName: 'GPT-5.5',
-                id: 'gpt-5.5',
-                isDefault: true,
+                id: 'gpt-5.5-picker',
+                isDefault: resolvedDefaultModel === 'gpt-5.5',
                 model: 'gpt-5.5',
                 serviceTiers: [
                   { description: 'Normal usage', id: 'default', name: 'Default' },
@@ -81,8 +85,8 @@ async function installMockRemuxHost(page: Page) {
                 defaultServiceTier: 'default',
                 description: 'Balanced next-gen model',
                 displayName: 'GPT-5.6 Terra',
-                id: 'gpt-5.6-terra',
-                isDefault: false,
+                id: 'gpt-5.6-terra-picker',
+                isDefault: resolvedDefaultModel === 'gpt-5.6-terra',
                 model: 'gpt-5.6-terra',
                 serviceTiers: [
                   { description: 'Normal usage', id: 'default', name: 'Default' },
@@ -95,6 +99,7 @@ async function installMockRemuxHost(page: Page) {
                 ],
               },
             ],
+            resolvedDefaultModel,
           };
         case 'remux/codex/thread/resources/read': {
           const params =
@@ -178,7 +183,7 @@ async function installMockRemuxHost(page: Page) {
         },
       },
     });
-  });
+  }, { resolvedDefaultModel: options.resolvedDefaultModel ?? 'gpt-5.5' });
 }
 
 async function capturedHostRequests(page: Page) {
@@ -216,4 +221,26 @@ test('selects composer model from catalog and updates reasoning options', async 
 
   await panel.getByRole('button', { name: 'High' }).click();
   await expect(panel.getByRole('button', { name: /Max/ })).toBeVisible();
+});
+
+test('shows the resolved app-server model for a new chat before preferences open', async ({ page }) => {
+  await installMockRemuxHost(page, { resolvedDefaultModel: 'gpt-5.6-terra' });
+
+  await page.goto('/viewers/codex/?remuxResourceKind=draft&remuxResourceId=codex%3Adraft%3Amodel');
+  await page.getByRole('button', { name: 'Select directory' }).click();
+
+  await expect(page.locator('.remux-composer-inline-status')).toContainText('GPT-5.6 Terra');
+  await expect(page.locator('[data-remux-composer-config-panel]')).toHaveCount(0);
+
+  await expect
+    .poll(async () => {
+      const requests = await capturedHostRequests(page);
+      return requests.some((request) => (
+        request.method === 'remux/codex/models/read' &&
+        request.params &&
+        typeof request.params === 'object' &&
+        (request.params as { cwd?: unknown }).cwd === '/tmp/remux'
+      ));
+    })
+    .toBe(true);
 });

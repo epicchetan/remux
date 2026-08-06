@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
@@ -15,12 +15,50 @@ const SOCKET_RELATIVE_PATH: &[&str] = &["app-server-control", "app-server-contro
 const APP_SERVER_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const APP_SERVER_MANAGEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 const CODEX_UPDATE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const APP_SERVER_OVERLOADED_ERROR_CODE: i64 = -32001;
+const APP_SERVER_OVERLOAD_RETRIES: usize = 1;
 const DIAGNOSTIC_MAX_JSON_CHARS: usize = 6000;
 const DIAGNOSTIC_MAX_STRING_CHARS: usize = 500;
 const DIAGNOSTIC_MAX_ARRAY_ITEMS: usize = 20;
 const DIAGNOSTIC_MAX_DEPTH: usize = 8;
 
-type PendingResponses = Arc<Mutex<HashMap<u64, mpsc::Sender<Result<Value, String>>>>>;
+type PendingResponses =
+    Arc<Mutex<HashMap<u64, mpsc::Sender<Result<Value, AppServerRequestFailure>>>>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AppServerRequestFailure {
+    Response { code: Option<i64>, message: String },
+    Transport(String),
+}
+
+impl AppServerRequestFailure {
+    fn response(error: &Value, fallback: &str) -> Self {
+        Self::Response {
+            code: error.get("code").and_then(Value::as_i64),
+            message: error_message(error, fallback),
+        }
+    }
+
+    fn is_overloaded(&self) -> bool {
+        matches!(
+            self,
+            Self::Response {
+                code: Some(APP_SERVER_OVERLOADED_ERROR_CODE),
+                ..
+            }
+        )
+    }
+}
+
+impl std::fmt::Display for AppServerRequestFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Response { message, .. } | Self::Transport(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct AppServerRuntime {
@@ -277,16 +315,43 @@ impl AppServerRuntime {
     pub(crate) fn request(&self, method: &str, params: Value) -> Result<Value, String> {
         let timeout = app_server_request_timeout(method)
             .ok_or_else(|| format!("unregistered app-server RPC policy: {method}"))?;
+        let deadline = Instant::now() + timeout;
+        let mut overload_retries = 0;
         debug_log(format_args!(
             "[codex:app-server] request begin method={method} timeout_ms={}",
             timeout.as_millis()
         ));
-        let value = self.request_once(method, params, timeout)?;
-        debug_log(format_args!(
-            "[codex:app-server] request ok method={method} summary={}",
-            summarize_app_server_value(&value)
-        ));
-        Ok(value)
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!("{method} timed out"));
+            }
+            match self.request_once(method, params.clone(), remaining) {
+                Ok(value) => {
+                    debug_log(format_args!(
+                        "[codex:app-server] request ok method={method} summary={}",
+                        summarize_app_server_value(&value)
+                    ));
+                    return Ok(value);
+                }
+                Err(error)
+                    if error.is_overloaded() && overload_retries < APP_SERVER_OVERLOAD_RETRIES =>
+                {
+                    let delay = overload_retry_delay(overload_retries)
+                        .min(deadline.saturating_duration_since(Instant::now()));
+                    overload_retries += 1;
+                    debug_log(format_args!(
+                        "[codex:app-server] retrying rejected request method={method} attempt={} delay_ms={}",
+                        overload_retries + 1,
+                        delay.as_millis()
+                    ));
+                    if !delay.is_zero() {
+                        thread::sleep(delay);
+                    }
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
     }
 
     pub(crate) fn reconnect(&self) -> Result<(), String> {
@@ -298,10 +363,14 @@ impl AppServerRuntime {
         method: &str,
         params: Value,
         timeout: Duration,
-    ) -> Result<Value, String> {
-        let connection = self.ensure_connected()?;
+    ) -> Result<Value, AppServerRequestFailure> {
+        let connection = self
+            .ensure_connected()
+            .map_err(AppServerRequestFailure::Transport)?;
         if !connection.alive.load(Ordering::SeqCst) {
-            return Err("app-server connection is closed".to_string());
+            return Err(AppServerRequestFailure::Transport(
+                "app-server connection is closed".to_string(),
+            ));
         }
 
         let id = self.next_request_id();
@@ -315,12 +384,15 @@ impl AppServerRuntime {
             "method": method,
             "params": params,
         });
-        let request = serde_json::to_string(&request).map_err(|error| error.to_string())?;
+        let request = serde_json::to_string(&request)
+            .map_err(|error| AppServerRequestFailure::Transport(error.to_string()))?;
         let (response_tx, response_rx) = mpsc::channel();
         connection
             .pending
             .lock()
-            .map_err(|_| "app-server pending map poisoned".to_string())?
+            .map_err(|_| {
+                AppServerRequestFailure::Transport("app-server pending map poisoned".to_string())
+            })?
             .insert(id, response_tx);
 
         if let Err(error) = connection.writer_tx.send(request) {
@@ -329,7 +401,9 @@ impl AppServerRuntime {
                 .lock()
                 .map(|mut pending| pending.remove(&id));
             connection.alive.store(false, Ordering::SeqCst);
-            return Err(format!("failed to send app-server request: {error}"));
+            return Err(AppServerRequestFailure::Transport(format!(
+                "failed to send app-server request: {error}"
+            )));
         }
 
         match response_rx.recv_timeout(timeout) {
@@ -340,14 +414,18 @@ impl AppServerRuntime {
                     .lock()
                     .map(|mut pending| pending.remove(&id));
                 eprintln!("[codex:app-server] timeout id={id} method={method}");
-                Err(format!("{method} timed out"))
+                Err(AppServerRequestFailure::Transport(format!(
+                    "{method} timed out"
+                )))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = connection
                     .pending
                     .lock()
                     .map(|mut pending| pending.remove(&id));
-                Err("app-server response channel closed".to_string())
+                Err(AppServerRequestFailure::Transport(
+                    "app-server response channel closed".to_string(),
+                ))
             }
         }
     }
@@ -469,7 +547,8 @@ impl AppServerRuntime {
             "method": "initialize",
             "params": {
                 "capabilities": {
-                    "experimentalApi": true
+                    "experimentalApi": true,
+                    "requestAttestation": false
                 },
                 "clientInfo": {
                     "name": "remux_codex_extension",
@@ -621,8 +700,8 @@ impl AppServerRuntime {
 
 fn app_server_request_timeout(method: &str) -> Option<Duration> {
     let seconds = match method {
-        "model/list" | "thread/list" | "thread/read" | "thread/resume" | "thread/rollback"
-        | "turn/steer" | "turn/interrupt" => 10,
+        "config/read" | "model/list" | "thread/list" | "thread/read" | "thread/resume"
+        | "thread/rollback" | "turn/steer" | "turn/interrupt" => 10,
         "thread/turns/list" => 5,
         "thread/start" | "thread/fork" | "turn/start" | "thread/compact/start" => 15,
         _ => return None,
@@ -749,10 +828,10 @@ fn route_app_server_message(
     events: &AppServerEventSink,
     writer_tx: Option<&mpsc::Sender<String>>,
 ) {
-    if let Some(id) = value.get("id").and_then(Value::as_u64) {
+    if let Some(id_value) = value.get("id").filter(|id| !id.is_null()) {
         if value.get("method").and_then(Value::as_str).is_some() {
             eprintln!(
-                "[codex:app-server] server-request id={id} summary={}",
+                "[codex:app-server] server-request id={id_value} summary={}",
                 summarize_app_server_value(&value)
             );
             debug_log(format_args!(
@@ -763,7 +842,7 @@ fn route_app_server_message(
             if let Some(writer_tx) = writer_tx {
                 let response = json!({
                     "jsonrpc": "2.0",
-                    "id": id,
+                    "id": id_value,
                     "error": {
                         "code": -32601,
                         "message": "server requests are not supported by remux-codex-server yet"
@@ -774,6 +853,12 @@ fn route_app_server_message(
             return;
         }
 
+        let Some(id) = id_value.as_u64() else {
+            debug_log(format_args!(
+                "[codex:app-server] ignoring response with unmatched non-integer id={id_value}"
+            ));
+            return;
+        };
         let sender = pending
             .lock()
             .ok()
@@ -788,7 +873,10 @@ fn route_app_server_message(
                     "[codex:app-server] response error payload={}",
                     diagnostic_json(error)
                 ));
-                Err(error_message(error, "app-server request failed"))
+                Err(AppServerRequestFailure::response(
+                    error,
+                    "app-server request failed",
+                ))
             } else {
                 debug_log(format_args!(
                     "[codex:app-server] response ok id={id} summary={}",
@@ -969,8 +1057,18 @@ fn drain_pending(pending: &PendingResponses, reason: String) {
     };
 
     for (_, sender) in pending {
-        let _ = sender.send(Err(reason.clone()));
+        let _ = sender.send(Err(AppServerRequestFailure::Transport(reason.clone())));
     }
+}
+
+fn overload_retry_delay(attempt: usize) -> Duration {
+    let exponent = attempt.min(3) as u32;
+    let base_ms = 25u64.saturating_mul(1u64 << exponent);
+    let jitter_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::from(duration.subsec_nanos()) % 26)
+        .unwrap_or(0);
+    Duration::from_millis(base_ms + jitter_ms)
 }
 
 fn error_message(error: &Value, fallback: &str) -> String {
@@ -1439,6 +1537,7 @@ mod tests {
     #[test]
     fn every_used_business_method_has_a_bounded_policy() {
         for method in [
+            "config/read",
             "model/list",
             "thread/list",
             "thread/read",
@@ -1668,8 +1767,31 @@ mod tests {
             None,
         );
 
-        assert_eq!(receiver.recv().unwrap().unwrap_err(), "boom");
+        assert_eq!(receiver.recv().unwrap().unwrap_err().to_string(), "boom");
         assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn preserves_overload_error_code_for_bounded_retry_policy() {
+        let (pending, receiver) = pending_map_with_request(12);
+        let events = AppServerEventSink::default();
+
+        route_app_server_message(
+            json!({
+                "id": 12,
+                "error": {
+                    "code": APP_SERVER_OVERLOADED_ERROR_CODE,
+                    "message": "Server overloaded; retry later."
+                }
+            }),
+            &pending,
+            &events,
+            None,
+        );
+
+        let error = receiver.recv().unwrap().unwrap_err();
+        assert!(error.is_overloaded());
+        assert_eq!(error.to_string(), "Server overloaded; retry later.");
     }
 
     #[test]
@@ -1696,6 +1818,29 @@ mod tests {
     }
 
     #[test]
+    fn routes_string_id_server_request_and_echoes_its_id() {
+        let (events, receiver) = AppServerEventSink::channel();
+        let pending = pending_map_with_request(3).0;
+        let (writer_tx, writer_rx) = mpsc::channel();
+
+        route_app_server_message(
+            json!({ "id": "approval-1", "method": "item/commandExecution/requestApproval", "params": {} }),
+            &pending,
+            &events,
+            Some(&writer_tx),
+        );
+
+        let AppServerEvent::ServerRequest(request) = receiver.recv().unwrap() else {
+            panic!("expected server request event");
+        };
+        assert_eq!(request["id"], "approval-1");
+        let response: Value = serde_json::from_str(&writer_rx.recv().unwrap()).unwrap();
+        assert_eq!(response["id"], "approval-1");
+        assert_eq!(response["error"]["code"], -32601);
+        assert!(pending.lock().unwrap().contains_key(&3));
+    }
+
+    #[test]
     fn drain_pending_resolves_all_waiters_with_error() {
         let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
         let (left_tx, left_rx) = mpsc::channel();
@@ -1705,8 +1850,8 @@ mod tests {
 
         drain_pending(&pending, "gone".to_string());
 
-        assert_eq!(left_rx.recv().unwrap().unwrap_err(), "gone");
-        assert_eq!(right_rx.recv().unwrap().unwrap_err(), "gone");
+        assert_eq!(left_rx.recv().unwrap().unwrap_err().to_string(), "gone");
+        assert_eq!(right_rx.recv().unwrap().unwrap_err().to_string(), "gone");
         assert!(pending.lock().unwrap().is_empty());
     }
 
@@ -1724,7 +1869,10 @@ mod tests {
 
     fn pending_map_with_request(
         id: u64,
-    ) -> (PendingResponses, mpsc::Receiver<Result<Value, String>>) {
+    ) -> (
+        PendingResponses,
+        mpsc::Receiver<Result<Value, AppServerRequestFailure>>,
+    ) {
         let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
         let (sender, receiver) = mpsc::channel();
         pending.lock().unwrap().insert(id, sender);

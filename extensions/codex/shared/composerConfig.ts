@@ -43,4 +43,11 @@ export type CodexModelOption = {
   defaultServiceTier?: string | null;
 };
 
-export type CodexModelsReadResponse = { models: CodexModelOption[] };
+export type CodexModelsReadParams = {
+  cwd?: string | null;
+};
+
+export type CodexModelsReadResponse = {
+  models: CodexModelOption[];
+  resolvedDefaultModel: string | null;
+};

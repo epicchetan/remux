@@ -7,6 +7,7 @@ import { compactThread } from '../../ipc/threadCommands';
 import { reloadHostView } from '@remux/viewer-kit/host';
 import { useThreadsStore } from '../../threads/store';
 import { useComposerStore } from '../store';
+import { resolveModelOption, resolveModelValue } from './modelSelection';
 import type { CodexModelOption, ComposerIntelligence, ComposerReviewMode, ComposerSpeed } from './types';
 
 type ConfigSection = 'model' | 'intelligence' | 'speed' | 'review';
@@ -42,10 +43,14 @@ const reviewOptions: Array<{ label: string; value: ComposerReviewMode }> = [
 
 export function ComposerConfigButton({ disabled = false }: { disabled?: boolean }) {
   const activeThreadId = useThreadsStore((state) => state.activeThreadId);
+  const activeDraftCwd = useThreadsStore((state) => (
+    state.activeDraftId && state.draft?.id === state.activeDraftId ? state.draft.cwd : null
+  ));
   const intelligence = useComposerStore((state) => state.intelligence);
   const model = useComposerStore((state) => state.model);
   const models = useComposerStore((state) => state.models);
   const reviewMode = useComposerStore((state) => state.reviewMode);
+  const resolvedDefaultModel = useComposerStore((state) => state.resolvedDefaultModel);
   const speed = useComposerStore((state) => state.speed);
   const loadModels = useComposerStore((state) => state.loadModels);
   const setIntelligence = useComposerStore((state) => state.setIntelligence);
@@ -140,8 +145,8 @@ export function ComposerConfigButton({ disabled = false }: { disabled?: boolean 
   }, [compactPending, open]);
 
   const panelBlocked = compactPending;
-  const selectedModel = selectedModelOption(models, model);
-  const selectedModelId = selectedModelIdValue(models, model);
+  const selectedModel = resolveModelOption(models, model, resolvedDefaultModel);
+  const selectedModelValue = resolveModelValue(models, model, resolvedDefaultModel) ?? '';
   const intelligenceOptions = intelligenceOptionsForModel(selectedModel);
 
   return (
@@ -160,7 +165,7 @@ export function ComposerConfigButton({ disabled = false }: { disabled?: boolean 
           setOpen((current) => {
             const next = !current;
             if (next) {
-              void loadModels();
+              void loadModels(activeThreadId ? null : activeDraftCwd);
             }
             return next;
           });
@@ -201,7 +206,7 @@ export function ComposerConfigButton({ disabled = false }: { disabled?: boolean 
               disabled={panelBlocked}
               expanded={expanded === 'model'}
               icon={<Boxes className="size-4" />}
-              label={selectedModel?.displayName ?? model ?? selectedModelId}
+              label={selectedModel?.displayName ?? model ?? selectedModelValue}
               onToggle={() => setExpanded((current) => (current === 'model' ? null : 'model'))}
             >
               <ConfigOptionList
@@ -214,9 +219,9 @@ export function ComposerConfigButton({ disabled = false }: { disabled?: boolean 
                 options={models.map((model) => ({
                   detail: model.description,
                   label: model.displayName,
-                  value: model.id,
+                  value: model.model,
                 }))}
-                value={selectedModelId}
+                value={selectedModelValue}
               />
             </ConfigRow>
           ) : null}
@@ -386,26 +391,6 @@ function ConfigOptionList<Value extends string>({
       ))}
     </div>
   );
-}
-
-function selectedModelOption(models: CodexModelOption[] | null, model: string | null) {
-  if (!models || models.length === 0) {
-    return null;
-  }
-
-  if (model) {
-    return models.find((option) => option.id === model) ?? null;
-  }
-
-  return models.find((option) => option.isDefault) ?? models[0] ?? null;
-}
-
-function selectedModelIdValue(models: CodexModelOption[] | null, model: string | null) {
-  if (model) {
-    return model;
-  }
-
-  return selectedModelOption(models, null)?.id ?? '';
 }
 
 function intelligenceOptionsForModel(model: CodexModelOption | null) {

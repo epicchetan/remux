@@ -38,6 +38,11 @@ sourceKinds?: Array<ThreadSourceKind> | null,
  */
 archived?: boolean | null,
 /**
+ * Omit to include every section, set to `null` for unsectioned threads,
+ * or provide a section ID to return only threads in that section.
+ */
+sectionId?: string | null,
+/**
  * Optional cwd filter or filters; when set, only threads whose session cwd
  * exactly matches one of these paths are returned.
  */
@@ -51,4 +56,13 @@ useStateDbOnly?: boolean,
 /**
  * Optional substring filter for the extracted thread title.
  */
-searchTerm?: string | null, };
+searchTerm?: string | null,
+/**
+ * Optional direct parent thread filter. Mutually exclusive with `ancestorThreadId`.
+ */
+parentThreadId?: string | null,
+/**
+ * Optional ancestor thread filter. Returns spawned descendants at any depth, excluding the
+ * ancestor itself. Mutually exclusive with `parentThreadId`.
+ */
+ancestorThreadId?: string | null, };

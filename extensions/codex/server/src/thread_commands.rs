@@ -377,7 +377,6 @@ impl CodexThreadCommandServer {
                 "threadId": source_thread_id,
                 "lastTurnId": turn_id,
                 "excludeTurns": true,
-                "persistExtendedHistory": false,
             }),
         )?;
         let fork_thread_id = fork_response
@@ -439,7 +438,6 @@ impl CodexThreadCommandServer {
         };
         start_params.insert("cwd".to_string(), json!(cwd));
         start_params.insert("experimentalRawEvents".to_string(), json!(false));
-        start_params.insert("persistExtendedHistory".to_string(), json!(false));
         let response = self
             .app_server
             .request("thread/start", Value::Object(start_params))?;
@@ -918,7 +916,7 @@ mod tests {
         assert_eq!(calls[0].1["effort"], "high");
         assert_eq!(calls[0].1["approvalsReviewer"], "auto_review");
         assert_eq!(calls[0].1["experimentalRawEvents"], false);
-        assert_eq!(calls[0].1["persistExtendedHistory"], false);
+        assert_eq!(calls[0].1.get("persistExtendedHistory"), None);
         assert_eq!(calls[1].0, "turn/start");
         assert_eq!(calls[1].1["threadId"], "thread-new");
         assert_eq!(calls[1].1["clientUserMessageId"], "client-new");
@@ -1079,7 +1077,7 @@ mod tests {
         assert_eq!(calls[1].1["threadId"], "thread-1");
         assert_eq!(calls[1].1["lastTurnId"], "turn-target");
         assert_eq!(calls[1].1["excludeTurns"], true);
-        assert_eq!(calls[1].1["persistExtendedHistory"], false);
+        assert_eq!(calls[1].1.get("persistExtendedHistory"), None);
         assert_eq!(calls[2].0, "turn/start");
         assert_eq!(calls[2].1["threadId"], "thread-fork");
         assert_eq!(calls[2].1["clientUserMessageId"], "client-fork");
@@ -1482,7 +1480,7 @@ mod tests {
     #[test]
     fn does_not_retry_resume_after_application_error() {
         let app_server = FakeAppServer::new(vec![Err(
-            "thread/resume failed: missing field `persistExtendedHistory`".to_string(),
+            "thread/resume failed: invalid approval policy".to_string(),
         )]);
         let server = CodexThreadCommandServer::with_requester(app_server.clone());
 
@@ -1497,7 +1495,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "thread/resume");
         assert_eq!(calls[0].1.get("persistExtendedHistory"), None);
-        assert!(error.contains("persistExtendedHistory"));
+        assert!(error.contains("invalid approval policy"));
     }
 
     #[test]

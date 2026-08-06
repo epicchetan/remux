@@ -1,7 +1,7 @@
 # Remux Codex Extension
 
 Status: Current
-Last verified: 2026-06-28
+Last verified: 2026-08-06
 
 The Codex extension lets Remux host a mobile Codex transcript and composer experience. It is implemented as a static React viewer plus a Rust stdio JSON-RPC server.
 
@@ -12,6 +12,10 @@ The Codex extension lets Remux host a mobile Codex transcript and composer exper
 - `server/`: Rust server that reads Codex history, talks to Codex app-server, projects transcript resources, and emits invalidations.
 - `shared/`: shared TypeScript contracts, generated Codex protocol bindings, and schemas.
 - `tests/`: Playwright viewer tests.
+
+The generated bindings and schemas under `shared/protocol/` and `shared/schema/`
+track the experimental app-server export from `openai/codex` commit
+`0a0ebb85355113610dd3f7a3d8b36f68c33465fc`.
 
 ## Data Flow
 

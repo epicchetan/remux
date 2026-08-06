@@ -498,7 +498,6 @@ The narration thread should set the behavior it depends on explicitly:
   environments: [],
   ephemeral: true,
   experimentalRawEvents: false,
-  persistExtendedHistory: false,
   sandbox: 'read-only',
   serviceName: 'remux-narration'
 }
