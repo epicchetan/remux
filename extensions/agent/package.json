@@ -6,7 +6,7 @@
     "build": "npm run build:server && npm run build:viewer",
     "build:server": "vite build --config server/vite.config.ts",
     "build:viewer": "vite build --config viewer/vite.config.ts",
-    "test": "node --test --experimental-strip-types tests/*.test.ts && playwright test -c playwright.config.ts",
+    "test": "npm run test:server && npm run test:unit && npm run test:viewer",
     "test:server": "node --test --experimental-strip-types tests/*.test.ts",
     "test:unit": "playwright test -c playwright.unit.config.ts",
     "test:viewer": "playwright test -c playwright.config.ts",

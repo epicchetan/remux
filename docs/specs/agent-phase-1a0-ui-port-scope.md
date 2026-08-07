@@ -1,6 +1,6 @@
 Status: Active Spec
 Last verified: 2026-08-07
-Canonical code: Phase 1A.0a–1A.0c and the automated 1A.0d gates are implemented in `extensions/agent/`; live desktop/physical-phone comparison and owner acceptance remain open
+Canonical code: Phase 1A.0a–1A.0d are implemented and owner-accepted in `extensions/agent/`; checkpoint `8e96512f06ea354bd54f84f5e783161b786e1696`
 
 # Agent Phase 1A.0 UI port foundation scope
 
@@ -996,16 +996,16 @@ Implementation status: complete for owner review on 2026-08-07.
 
 ### 1A.0d — hardening and acceptance
 
-Implementation status: automated hardening complete on 2026-08-07. The live
-desktop/physical-phone comparison and explicit owner decision remain pending;
-therefore Phase 1A.0 is not yet accepted and Phase 1A.1 is not authorized.
+Implementation status: complete and owner-accepted on 2026-08-07 after the
+live desktop/physical-phone comparison. Later checkpoints retain their own
+scope and authorization boundaries.
 
 - finish Playwright parity scenarios and static boundary audit;
 - run Agent and unchanged Codex suites;
 - run live desktop/phone side-by-side review; and
 - record deviations, source commit, test results, and owner decision.
 
-The implementation evidence and open owner gate are recorded in
+The implementation evidence and closed owner gate are recorded in
 [`agent-phase-1a0-implementation-report.md`](agent-phase-1a0-implementation-report.md).
 
 The owner may pause for Q&A after any internal step. Failure does not authorize

@@ -1,29 +1,30 @@
 Status: Active Spec
 Last verified: 2026-08-07
-Canonical code: Phase 1A.0 implementation is in `extensions/agent/`; this report records the automated-complete, owner-acceptance-pending state
+Canonical code: Phase 1A.0 is owner-accepted in `extensions/agent/` and checkpointed at `8e96512f06ea354bd54f84f5e783161b786e1696`
 
 # Agent Phase 1A.0 implementation report
 
 ## Decision state
 
-Phase 1A.0a–1A.0c and the automated portion of 1A.0d are complete. The
-checkpoint is not accepted yet: the owner still needs to run the specified
-live desktop/physical-phone comparison and record an explicit decision. Phase
-1A.1 is not authorized by this report.
+Phase 1A.0a–1A.0d are complete. The owner completed the live
+desktop/physical-phone comparison and explicitly accepted the checkpoint on
+2026-08-07. Phase 1A.1 is separate and is not authorized by this report.
 
 ## Source identity
 
 - Frozen Codex source and implementation base:
   `47703785ea70d43e24ac575baa6693017cc948c0`.
+- Phase 1A.0 implementation checkpoint:
+  `8e96512f06ea354bd54f84f5e783161b786e1696`.
 - Selected later Codex fixes: none.
 - `extensions/codex/` worktree changes: none.
 - Agent protocol/projection: version `1`, projection
   `agent-turn-render-v1`.
 - Pi: `0.84.0`, single `openai-codex` provider.
 
-The implementation is currently a working-tree change based on the frozen
-commit. A later commit operation should record the resulting implementation
-commit without changing this source-baseline identity.
+The implementation checkpoint is based on the frozen Codex source identity
+above. The checkpoint hash records the Agent implementation; it does not
+change the source-baseline identity used for the port.
 
 ## Implemented closure
 
@@ -65,9 +66,9 @@ or later Agent interaction feature was added.
    a manually positioned viewport preserves its window. This makes foreground
    catch-up and manual-scroll ownership explicit.
 5. Live OAuth/model traffic is intentionally absent from deterministic tests.
-   The new shell's live desktop/physical-phone OAuth, read, stream, interrupt,
-   reconnect, restart, light/dark, keyboard, and safe-area comparison remains
-   the owner-run acceptance gate.
+   The owner completed the separate live desktop/physical-phone OAuth, read,
+   stream, interrupt, reconnect, restart, light/dark, keyboard, and safe-area
+   acceptance gate.
 
 ## Automated evidence
 
@@ -76,6 +77,7 @@ Recorded on 2026-08-07 from the frozen source commit:
 | Command | Result |
 | --- | --- |
 | `npm --workspace @remux/agent run build` | Pass; server and viewer production bundles built. The existing large Shiki chunk warning remains non-blocking. |
+| `npm run test:agent` | Pass; aggregate command runs server (13/13), unit (23/23), and viewer (43 pass, one mobile-only desktop skip) suites. |
 | `npm --workspace @remux/agent run test:server` | Pass: 13/13. |
 | `npm --workspace @remux/agent run test:unit` | Pass: 23/23. |
 | `npm --workspace @remux/agent run test:viewer` | Pass: desktop/mobile parity matrix; 43 pass and one desktop skip for the mobile-only keyboard case. |
@@ -95,18 +97,10 @@ excluded-control surface. The static audit also
 rejects Codex/narration imports, App Server protocol, forbidden composer
 directories, and excluded dependency/feature names.
 
-## Open owner acceptance record
+## Owner acceptance record
 
-Pending. Run Codex and Agent side-by-side from the same repository state on
-desktop and the physical Remux phone using the prepared matrix in the scope
-spec. Record:
-
-- date and devices;
-- live OAuth/model/read/stream/interrupt/reconnect/restart results;
-- shell density, typography, work disclosure, navigation, focus, keyboard,
-  safe-area, responsive, and light/dark observations;
-- any accepted visual differences or blocking parity findings; and
-- an explicit `accepted` or `rejected` decision.
-
-Until that record says `accepted`, Phase 1A.0 remains open and no Phase 1A.1
-implementation should begin.
+Accepted on 2026-08-07. The owner reported the prepared live desktop and
+physical-phone comparison complete after exercising the Phase 1A.0 shell and
+runtime flows. No blocking parity finding or required deviation was reported.
+This closes Phase 1A.0; it does not by itself authorize a later implementation
+scope.

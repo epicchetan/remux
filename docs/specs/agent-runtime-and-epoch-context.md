@@ -1,6 +1,6 @@
 Status: Active Spec
 Last verified: 2026-08-07
-Canonical code: Owner-accepted Phase 0 and the automated Phase 1A.0 UI foundation are in `extensions/agent/`; Phase 1A.0 live owner acceptance, durable journal, epochs, coding tools, and process runtime remain open
+Canonical code: Owner-accepted Phase 0 and Phase 1A.0 UI foundation are in `extensions/agent/`; durable journal, epochs, coding tools, and process runtime remain open
 
 # Agent runtime and epoch context
 
@@ -800,7 +800,7 @@ companion specs are normative where this overview is conceptual.
 0A. **Acceptance seal (completed 2026-08-07)** — the owner exercised the live
    OAuth/model/read/interrupt/reconnect/restart/signout flow through the real
    Remux supervisor and completed the credential/process audit.
-1A.0. **UI port foundation (implemented; owner acceptance pending)** — copy the proven Codex transcript, renderer,
+1A.0. **UI port foundation (implemented and owner-accepted 2026-08-07)** — copy the proven Codex transcript, renderer,
    composer, lifecycle, responsive-layout, and fixture-test foundation into
    Agent; adapt it to the existing ephemeral protocol; remove narration and
    other excluded product surfaces. No durable schema is added in this

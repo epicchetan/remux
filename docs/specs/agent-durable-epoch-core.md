@@ -1,6 +1,6 @@
 Status: Active Spec
 Last verified: 2026-08-07
-Canonical code: Phase 0 and the automated Phase 1A.0 UI foundation live in `extensions/agent/`; Phase 1A.0 owner acceptance and the durable core described here remain open
+Canonical code: Phase 0 and the owner-accepted Phase 1A.0 UI foundation live in `extensions/agent/`; the durable core described here remains open
 
 # Agent durable epoch core
 
@@ -49,7 +49,7 @@ model-written summary on the hot path.
 Phase 0A       Phase 1A.0          Phase 1A.1–1A.3       Phase 1B
 live seal  ->  UI foundation  ->   journal + replay  ->  active epochs
   complete      code complete       + shadow compiler    + forced rollover
-                owner gate open
+                owner accepted
                                                                |
                                                                v
 Phase 1D       Phase 1C.4          Phase 1C.1–1C.3
@@ -1071,7 +1071,7 @@ tests never need network or the owner's credential store.
 | Gate | Must be true before |
 | --- | --- |
 | Phase 0A live acceptance — completed 2026-08-07 | starting the 1A.0 UI foundation port |
-| Phase 1A.0 UI parity foundation | creating the durable schema |
+| Phase 1A.0 UI parity foundation — accepted 2026-08-07 | creating the durable schema |
 | Phase 1A.1–1A.3 replay + shadow determinism | activating rollover |
 | Phase 1B context and transport reset | adding effectful tools |
 | Phase 1C.1–1C.4 idempotency, recovery, and interaction parity | adding persistent processes |

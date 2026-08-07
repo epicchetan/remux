@@ -1,18 +1,25 @@
-# Remux Agent preview
+# Remux Agent
 
-This extension is the owner-accepted Phase 0 integration spine described in
+This extension contains the owner-accepted Phase 0 integration spine and
+Phase 1A.0 UI foundation described in
 `docs/specs/agent-runtime-and-epoch-context.md`. It runs beside the existing
-`codex` extension and intentionally provides only an ephemeral conversation,
-OpenAI Codex subscription auth, model/reasoning selection, streaming,
-interrupt, and the bounded `workspace_read` tool. The phased UI port and
-parity boundary are defined in
+`codex` extension and combines OpenAI Codex subscription auth, one ephemeral
+Pi conversation, model/reasoning selection, streaming, interruption, and the
+bounded `workspace_read` tool with the ported transcript, Markdown, work,
+composer, virtualization, lifecycle, and responsive UI foundation. The phased
+parity boundary is defined in
 `docs/specs/agent-ui-parity-and-phased-delivery.md`.
+
+Durable conversations, history, epoch context management, coding tools beyond
+bounded reads, and persistent processes are not implemented yet.
 
 ## Local verification
 
 ```sh
+npm run test:agent
 npm --workspace @remux/agent run build
 npm --workspace @remux/agent run test:server
+npm --workspace @remux/agent run test:unit
 npm --workspace @remux/agent run test:viewer
 ```
 
@@ -32,6 +39,11 @@ The owner reported this interactive smoke test complete on 2026-08-07:
 This records owner confirmation without storing credential, provider payload,
 or transport-secret output. Fixture success remains separate evidence and
 must not replace the live gate on a future clean deployment.
+
+The owner also completed and accepted the Phase 1A.0 desktop/physical-phone UI
+comparison on 2026-08-07 with no blocking parity findings reported. The
+accepted checkpoint remains intentionally ephemeral: an Agent extension
+restart makes its current conversation unavailable.
 
 ## Pi 0.84.0 seam report
 

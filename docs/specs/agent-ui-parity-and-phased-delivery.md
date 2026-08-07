@@ -1,6 +1,6 @@
 Status: Active Spec
 Last verified: 2026-08-07
-Canonical code: The stable comparison UI remains in `extensions/codex/viewer/`; the Agent-owned Phase 1A.0 foundation and automated parity gates are implemented in `extensions/agent/`, with owner live acceptance pending
+Canonical code: The stable comparison UI remains in `extensions/codex/viewer/`; the Agent-owned Phase 1A.0 foundation is implemented and owner-accepted in `extensions/agent/`
 
 # Agent UI parity and phased delivery alignment
 
@@ -15,10 +15,11 @@ and process semantics. This document is normative for delivery checkpoints,
 UI reuse, parity, owner review, and cutover. Where an older section describes
 UI parity as one late bulk phase, this document supersedes that timing.
 
-Phase 0A live acceptance was owner-completed on 2026-08-07. Phase 1A.0 has
-since implemented the bounded Agent transcript/composer foundation and its
-automated gates. The live side-by-side owner gate remains open, so no later
-checkpoint is authorized by this status.
+Phase 0A live acceptance and the Phase 1A.0 desktop/physical-phone comparison
+were owner-completed on 2026-08-07. The bounded Agent transcript/composer
+foundation and its automated gates are checkpointed at
+`8e96512f06ea354bd54f84f5e783161b786e1696`. Later implementation scopes still
+require their own explicit alignment.
 
 ## Resolved decisions
 
@@ -575,11 +576,11 @@ The Phase 1A.0 scope note is
 [`agent-phase-1a0-ui-port-scope.md`](agent-phase-1a0-ui-port-scope.md). It fixes
 the exact source/test list, Agent turn-frame resource contract,
 narration-removal checklist, implementation substeps, and side-by-side fixture
-scenarios. Its implementation and automated hardening are complete; the
-desktop/physical-phone comparison and explicit owner acceptance remain. No
-database migration or Phase 1A.1 work is part of this checkpoint.
+scenarios. Its implementation, automated hardening, desktop/physical-phone
+comparison, and explicit owner acceptance are complete. No database migration
+or Phase 1A.1 work is part of this checkpoint.
 
 The proposed next checkpoint is
 [`agent-phase-1a1-durable-history-scope.md`](agent-phase-1a1-durable-history-scope.md).
-It may be reviewed now, but it does not authorize implementation while the
-Phase 1A.0 owner gate remains open.
+It may be reviewed now, but implementation still requires explicit acceptance
+of that next scope.

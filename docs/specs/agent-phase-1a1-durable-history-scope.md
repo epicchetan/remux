@@ -1,6 +1,6 @@
 Status: Proposed Spec
 Last verified: 2026-08-07
-Canonical code: Phase 1A.0 remains in `extensions/agent/`; this document proposes the next checkpoint and does not authorize implementation until the Phase 1A.0 owner gate and this scope are explicitly accepted
+Canonical code: Phase 1A.0 is owner-accepted at `8e96512f06ea354bd54f84f5e783161b786e1696`; this document proposes the next checkpoint and does not authorize implementation until this scope is explicitly accepted
 
 # Agent Phase 1A.1 durable conversations and history scope
 
