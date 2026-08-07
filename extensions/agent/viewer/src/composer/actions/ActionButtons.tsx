@@ -1,0 +1,78 @@
+import { ArrowDown, ArrowLeft, ArrowUp, Check, Loader2, LogOut, PanelRightOpen, Send, Square } from 'lucide-react';
+import { openHostOverview } from '@remux/viewer-kit/host';
+
+import { parentDirectory } from '../../conversation/format.ts';
+import { useConversationStore } from '../../conversation/store.ts';
+import { useTranscriptViewportControls } from '../../transcript/index.ts';
+import { ComposerConfigButton } from '../config/ConfigButton.tsx';
+import { ComposerActionKey, type ComposerAction } from './ActionKey.tsx';
+import { useComposerTurnAction } from './turnAction.ts';
+
+export function ComposerActionButtons({
+  canStart,
+  conversationExists,
+  isWorking,
+  onInterrupt,
+  onSend,
+  onSignOut,
+}: {
+  canStart: boolean;
+  conversationExists: boolean;
+  isWorking: boolean;
+  onInterrupt: () => Promise<void>;
+  onSend: (text: string, setPhase: (phase: 'sending' | 'updating-transcript') => void) => Promise<void>;
+  onSignOut: () => void;
+}) {
+  const { canScrollDown, canScrollUp, scrollDown, scrollUp } = useTranscriptViewportControls();
+  const pickerOpen = useConversationStore((state) => state.directoryPickerOpen);
+  const pickerPath = useConversationStore((state) => state.directoryPickerPath);
+  const setPickerPath = useConversationStore((state) => state.setDirectoryPickerPath);
+  const selectPickerPath = useConversationStore((state) => state.selectDirectoryPickerPath);
+  const turn = useComposerTurnAction({ canStart, conversationExists, isWorking, onInterrupt, onSend });
+  const parent = parentDirectory(pickerPath);
+
+  const left: ComposerAction[] = [{
+    className: 'remux-composer-overview-button',
+    icon: <PanelRightOpen className="size-4" />,
+    label: 'Open tabs',
+    onClick: () => void openHostOverview({ section: 'tabs' }),
+  }, {
+    icon: <LogOut className="size-4" />,
+    label: 'Sign out',
+    onClick: onSignOut,
+  }];
+  const navigation: ComposerAction[] = pickerOpen ? [
+    { disabled: !parent, icon: <ArrowLeft className="size-4" />, label: 'Parent directory', onClick: () => parent && setPickerPath(parent), preserveFocus: true },
+    { disabled: !pickerPath, icon: <Check className="size-4" />, label: 'Select directory', onClick: selectPickerPath, preserveFocus: true, tone: 'send' },
+  ] : [
+    { disabled: !canScrollUp, icon: <ArrowUp className="size-4" />, label: 'Previous turn', onClick: scrollUp },
+    { disabled: !canScrollDown, icon: <ArrowDown className="size-4" />, label: 'Next turn or bottom', onClick: scrollDown },
+  ];
+
+  return (
+    <div className="remux-composer-actions">
+      <div className="remux-composer-action-group">
+        {left.map((action) => <ComposerActionKey action={action} key={action.label} />)}
+        <ComposerConfigButton disabled={pickerOpen} locked={conversationExists} />
+      </div>
+      <div className="remux-composer-action-group remux-composer-action-group-right">
+        {navigation.map((action) => <ComposerActionKey action={action} key={action.label} />)}
+        {!pickerOpen && isWorking ? <ComposerActionKey action={{
+          busy: turn.isStopping,
+          disabled: turn.isStopping,
+          icon: turn.isStopping ? <Loader2 className="size-4 animate-spin" /> : <Square className="size-4 fill-current" />,
+          label: turn.isStopping ? 'Stopping turn' : 'Stop turn',
+          onClick: turn.handleInterrupt,
+        }} /> : null}
+        {!pickerOpen && !isWorking ? <ComposerActionKey action={{
+          busy: turn.isSubmitting,
+          disabled: turn.sendDisabled,
+          icon: turn.isSubmitting ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />,
+          label: turn.isSubmitting ? 'Sending message' : 'Send message',
+          onClick: turn.handleSend,
+          tone: 'send',
+        }} /> : null}
+      </div>
+    </div>
+  );
+}

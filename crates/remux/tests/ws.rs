@@ -758,6 +758,61 @@ async fn extension_origins_are_opaque_stable_and_target_one_downstream_context()
         Value::from(origin.clone())
     );
 
+    first
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 43,
+                "method": "remux/terminal/session/attach",
+                "remuxContract": { "kind": "subscription" },
+                "params": {},
+                "remuxContext": { "tabId": "tab-a", "resourceKey": "replay-b" }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let retargeted = next_text(&mut first).await;
+    assert_eq!(
+        retargeted["result"]["params"]["_remuxOrigin"],
+        Value::from(origin.clone()),
+        "changing a tab's mutable resource must not change its delivery origin"
+    );
+    let viewer_key: Value = serde_json::from_str(
+        retargeted["result"]["params"]["_remuxViewerKey"]
+            .as_str()
+            .expect("viewer key injected into extension params"),
+    )
+    .unwrap();
+    assert_eq!(
+        viewer_key,
+        json!({ "tabId": "tab-a", "resourceKey": "replay-b" }),
+        "request provenance must retain the current full context"
+    );
+
+    first
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 44,
+                "method": "remux/terminal/session/attach",
+                "remuxContract": { "kind": "subscription" },
+                "params": {},
+                "remuxContext": { "tabId": "tab-b", "resourceKey": "replay-b" }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let other_tab = next_text(&mut first).await;
+    assert_ne!(
+        other_tab["result"]["params"]["_remuxOrigin"],
+        Value::from(origin.clone()),
+        "different tabs on one connection must remain isolated"
+    );
+
     assert!(fixture.server.send_to_origin(
         &origin,
         json!({ "method": "remux/terminal/projections/frame", "params": { "seq": 1 } })

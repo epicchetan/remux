@@ -269,9 +269,7 @@ impl WsClient {
     }
 
     fn origin_for_context(&self, context: Option<&Value>) -> String {
-        let context_key = context
-            .and_then(|value| serde_json::to_string(value).ok())
-            .unwrap_or_else(|| "null".to_string());
+        let context_key = origin_context_key(context);
         let mut origins = self.origins.lock().unwrap();
         origins
             .entry(context_key)
@@ -332,6 +330,26 @@ impl WsClient {
             None => false,
         }
     }
+}
+
+// A delivery origin identifies the viewer that owns a subscription for the
+// lifetime of this downstream connection. `resourceKey` is deliberately not
+// part of that identity: a tab can retarget its current resource in place, and
+// extension streams established before the retarget must remain controllable
+// by that same viewer. The full context is still forwarded separately as
+// `_remuxViewerKey` for request/notification provenance.
+fn origin_context_key(context: Option<&Value>) -> String {
+    if let Some(tab_id) = context
+        .and_then(|value| value.get("tabId"))
+        .and_then(Value::as_str)
+        .filter(|tab_id| !tab_id.is_empty())
+    {
+        return format!("tab:{tab_id}");
+    }
+
+    context
+        .and_then(|value| serde_json::to_string(value).ok())
+        .unwrap_or_else(|| "null".to_string())
 }
 
 fn request_key(id: &Value) -> String {
@@ -1632,5 +1650,27 @@ mod tests {
         assert_eq!(params["_remuxOrigin"], "origin");
         assert_eq!(params["_remuxViewerKey"], "viewer");
         assert!(params.get("_remuxExecutionTimeoutMs").is_none());
+    }
+
+    #[test]
+    fn extension_origin_context_uses_stable_tab_identity() {
+        assert_eq!(
+            origin_context_key(Some(&serde_json::json!({
+                "tabId": "tab-a",
+                "resourceKey": "replay-a",
+            }))),
+            "tab:tab-a"
+        );
+        assert_eq!(
+            origin_context_key(Some(&serde_json::json!({
+                "tabId": "tab-a",
+                "resourceKey": "replay-b",
+            }))),
+            "tab:tab-a"
+        );
+        assert_ne!(
+            origin_context_key(Some(&serde_json::json!({ "tabId": "tab-a" }))),
+            origin_context_key(Some(&serde_json::json!({ "tabId": "tab-b" })))
+        );
     }
 }

@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "id": "agent",
+  "name": "Agent",
+  "display": {
+    "title": "Agent"
+  },
+  "server": {
+    "transport": "stdio",
+    "build": {
+      "command": "npm",
+      "args": ["run", "build:server"],
+      "cwd": "."
+    },
+    "command": "node",
+    "args": ["server/dist/main.mjs"],
+    "cwd": "."
+  },
+  "views": {
+    "main": {
+      "route": "/viewers/agent",
+      "entry": "viewer/dist/index.html",
+      "cache": "immutable",
+      "build": {
+        "command": "npm",
+        "args": ["run", "build:viewer"],
+        "cwd": "."
+      },
+      "watch": {
+        "command": "npm",
+        "args": ["run", "watch"],
+        "cwd": "."
+      }
+    }
+  },
+  "launchers": [
+    {
+      "id": "new-chat",
+      "view": "main",
+      "label": "Agent Preview",
+      "route": {
+        "kind": "launch",
+        "launch": "new-chat",
+        "resourceKind": "draft"
+      }
+    }
+  ],
+  "fileHandlers": []
+}

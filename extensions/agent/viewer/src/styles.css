@@ -1,0 +1,373 @@
+.agent-app {
+  display: flex;
+  width: 100%;
+  height: 100dvh;
+  min-height: 100svh;
+  overflow: hidden;
+  background: var(--background);
+  color: var(--foreground);
+}
+
+.agent-center { align-items: center; justify-content: center; color: var(--muted-foreground); padding: 20px; }
+.agent-auth-card { width: min(100%, 520px); border: 1px solid var(--border); border-radius: 16px; background: var(--card); padding: 24px; }
+.agent-auth-card h1 { margin: 4px 0 10px; color: var(--foreground); font-size: 21px; letter-spacing: -.02em; }
+.agent-auth-card p { color: var(--muted-foreground); line-height: 1.55; }
+.agent-auth-kicker { color: var(--muted-foreground); font-size: 11px; font-weight: 650; letter-spacing: .08em; text-transform: uppercase; }
+.agent-device-code { display: block; width: fit-content; margin: 20px 0; border-radius: 9px; background: var(--background); color: var(--foreground); font-size: 18px; letter-spacing: .12em; padding: 10px 14px; }
+.agent-auth-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+.agent-auth-actions button { border: 1px solid var(--border); border-radius: 9px; background: var(--primary); color: var(--primary-foreground); font-weight: 650; padding: 9px 13px; }
+.agent-auth-actions .agent-secondary { background: var(--secondary); color: var(--secondary-foreground); }
+.agent-error { color: var(--destructive) !important; }
+.agent-muted { color: var(--muted-foreground); }
+
+.remux-main-pane { position: relative; display: flex; min-width: 0; min-height: 0; flex: 1; flex-direction: column; overflow: hidden; }
+.remux-transcript-slot { display: flex; min-width: 0; min-height: 0; flex: 1; overflow: hidden; }
+.remux-bottom-bar-slot { min-width: 0; flex-shrink: 0; margin-bottom: var(--remux-composer-lift, 0px); }
+.remux-new-chat-empty { display: grid; width: 100%; min-width: 0; min-height: 100%; place-items: end center; padding: max(var(--remux-block-gap), env(safe-area-inset-top)) var(--remux-feed-pad-x) var(--remux-block-gap); }
+.remux-new-chat-empty-card { display: grid; width: 100%; max-width: var(--remux-feed-max-width); gap: 4px; border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent); color: var(--muted-foreground); padding-top: 12px; }
+.remux-new-chat-empty-title { color: var(--foreground); font-size: 18px; font-weight: 650; line-height: 24px; }
+.remux-new-chat-empty-path { overflow: hidden; font: 13px/18px var(--remux-font-mono); text-overflow: ellipsis; white-space: nowrap; }
+
+.agent-transcript-state { margin: auto; display: flex; align-items: center; gap: 8px; color: var(--muted-foreground); }
+.agent-transcript-failed, .codex-turn-error, .codex-work-error { color: var(--destructive); }
+
+.codex-transcript-scroll {
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  overflow-anchor: none;
+  scrollbar-gutter: stable;
+  -webkit-overflow-scrolling: touch;
+}
+
+.codex-transcript-lane {
+  width: 100%;
+  max-width: var(--remux-feed-max-width);
+  min-height: 100%;
+  margin-inline: auto;
+  padding: var(--remux-block-gap) var(--remux-feed-pad-x);
+}
+
+.codex-transcript-turn { min-width: 0; }
+.codex-transcript-row { min-width: 0; }
+.codex-transcript-row-userMessage,
+.codex-transcript-row-assistantMessage { padding-bottom: var(--remux-block-gap); }
+.codex-transcript-row-work { padding-bottom: var(--remux-work-boundary-gap); }
+.codex-transcript-page {
+  display: block;
+  width: fit-content;
+  margin: 0 auto 16px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+.codex-turn-error {
+  margin: 0 0 var(--remux-block-gap);
+  border: 1px solid color-mix(in srgb, var(--destructive) 45%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--destructive) 8%, transparent);
+  padding: 10px 12px;
+  font-size: 13px;
+}
+
+.codex-user-message { display: grid; width: 100%; min-width: 0; justify-items: end; }
+.codex-user-message-work { width: 100%; }
+.codex-user-bubble {
+  box-sizing: border-box;
+  display: flex;
+  width: fit-content;
+  max-width: 100%;
+  min-width: 0;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--secondary) 92%, transparent);
+  color: var(--foreground);
+  padding: 10px 16px;
+}
+.codex-user-message-work .codex-user-bubble { max-width: 86%; }
+.codex-user-actions, .codex-assistant-actions {
+  display: flex;
+  height: 28px;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.codex-user-actions { justify-content: flex-end; }
+.codex-assistant-actions { justify-content: flex-start; }
+.codex-user-action-button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted-foreground);
+  padding: 0;
+}
+.codex-user-action-button:hover { color: var(--foreground); }
+.codex-user-disclosure-button {
+  display: inline-flex;
+  height: 22px;
+  align-items: center;
+  align-self: flex-end;
+  gap: 4px;
+  border: 0;
+  background: transparent;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 0;
+}
+
+.codex-work-section { min-width: 0; }
+.codex-work-header {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  height: 24px;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  background: transparent;
+  color: var(--muted-foreground);
+  font-size: var(--remux-font-work-title-size);
+  font-weight: 600;
+  line-height: var(--remux-font-work-title-line);
+  padding: 0;
+  text-align: left;
+}
+.codex-work-header-chevron { display: grid; place-items: center; }
+.codex-work-header-title { min-width: 0; flex: 1; }
+.codex-work-header-status { font-size: 11px; font-weight: 500; text-transform: capitalize; }
+.codex-work-separator { margin-top: 4px; }
+.codex-work-content { display: grid; gap: var(--remux-work-gap); padding-top: var(--remux-work-gap); }
+.codex-work-group { display: grid; min-width: 0; gap: var(--remux-row-gap); }
+.codex-work-group-heading { display: flex; justify-content: space-between; color: var(--muted-foreground); font-size: 12px; }
+.codex-work-group-heading strong { color: var(--foreground); font-weight: 600; }
+.codex-work-loading { display: flex; align-items: center; gap: 6px; color: var(--muted-foreground); font-size: 12px; }
+.codex-work-error { font-size: 12px; }
+.codex-work-row-frame { min-width: 0; }
+.codex-work-row {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  min-height: 32px;
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted-foreground);
+  padding: 4px 6px;
+  text-align: left;
+}
+.codex-work-row:not(:disabled):hover { background: color-mix(in srgb, var(--muted) 70%, transparent); }
+.codex-work-row:disabled { cursor: default; }
+.codex-work-row-icon { display: grid; flex: 0 0 auto; place-items: center; }
+.codex-work-row-copy { display: grid; min-width: 0; flex: 1; }
+.codex-work-row-title, .codex-work-row-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.codex-work-row-title { color: var(--foreground); font-size: 13px; }
+.codex-work-row-meta { font-size: 11px; }
+.codex-work-row-detail { min-width: 0; padding: 6px 6px 8px 31px; }
+.codex-work-detail-copy { display: grid; min-width: 0; gap: 8px; }
+.codex-work-output {
+  max-width: 100%;
+  max-height: 280px;
+  margin: 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--card);
+  color: var(--muted-foreground);
+  font: 12px/18px var(--remux-font-mono);
+  padding: 10px 12px;
+  white-space: pre;
+}
+.codex-work-load-more { width: fit-content; background: transparent; color: var(--link); font-size: 12px; padding: 4px 6px; }
+
+.codex-markdown {
+  max-width: 100%;
+  min-width: 0;
+  color: color-mix(in srgb, var(--foreground) 88%, var(--muted-foreground));
+  font-size: 13px;
+  line-height: 18px;
+}
+.codex-markdown-clipped { overflow: hidden; }
+.codex-md-block { max-width: 100%; min-width: 0; margin: 0; }
+.codex-md-block-frame { position: relative; max-width: 100%; min-width: 0; overflow: visible; }
+.codex-md-paragraph { font-size: 13px; line-height: 18px; }
+.codex-md-heading { color: var(--foreground); font-weight: 700; }
+.codex-md-heading[data-depth="1"] { font-size: 16px; line-height: 22px; }
+.codex-md-heading[data-depth="2"] { font-size: 15px; line-height: 21px; }
+.codex-md-heading[data-depth="3"] { font-size: 14px; line-height: 20px; }
+.codex-md-text-line, .codex-md-line-fragment { min-width: 0; white-space: pre; }
+.codex-md-inline-strong { font-weight: 700; }
+.codex-md-inline-emphasis { font-style: italic; }
+.codex-md-line-link, .codex-markdown a { color: var(--link); text-decoration: none; }
+.codex-md-line-link:hover, .codex-markdown a:hover { text-decoration: underline; }
+.codex-md-blockquote { border-left: 3px solid var(--border); color: var(--muted-foreground); padding-left: 16px; }
+.codex-md-list-item { display: grid; min-width: 0; grid-template-columns: 24px minmax(0, 1fr); column-gap: 8px; }
+.codex-md-list-marker { color: var(--muted-foreground); font: 12px/18px var(--remux-font-mono); text-align: right; }
+.codex-md-list-content { min-width: 0; }
+.codex-md-rule { height: 17px; border: 0; border-top: 1px solid var(--border); }
+
+.codex-md-file-link {
+  display: inline-flex;
+  min-width: 0;
+  max-width: min(100%, var(--codex-md-file-link-max-width));
+  height: var(--codex-md-file-link-height);
+  align-items: center;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--muted);
+  padding: 0 var(--codex-md-file-link-padding-x);
+  white-space: nowrap;
+  vertical-align: text-bottom;
+}
+.codex-md-file-icon-frame {
+  display: inline-flex;
+  width: var(--codex-md-file-icon-size);
+  height: var(--codex-md-file-icon-size);
+  flex: 0 0 var(--codex-md-file-icon-size);
+  align-items: center;
+  justify-content: center;
+  margin-right: var(--codex-md-file-icon-gap);
+  transform: translateY(var(--codex-md-file-icon-baseline-shift));
+}
+.codex-md-file-icon { display: block; width: var(--codex-md-file-icon-size); height: var(--codex-md-file-icon-size); }
+.codex-md-file-link-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.codex-md-code-block {
+  box-sizing: border-box;
+  max-width: 100%;
+  overflow: auto;
+  border: 1px solid var(--rmx-code-border);
+  border-radius: 12px;
+  background: var(--rmx-code-bg);
+  color: var(--rmx-code-text);
+  font: 12px/18px var(--remux-font-mono);
+  padding: 12px 14px;
+  white-space: pre;
+}
+.codex-md-code-block code { display: block; width: max-content; min-width: 100%; background: transparent; color: inherit; font: inherit; padding: 0; white-space: inherit; }
+.codex-md-code-line { display: block; min-width: 100%; height: var(--codex-md-code-line-height); line-height: var(--codex-md-code-line-height); white-space: pre; }
+.codex-md-code-token { white-space: pre; }
+:root[data-remux-theme="light"] .codex-md-code-token { color: var(--shiki-light, var(--rmx-code-text)) !important; }
+.codex-md-inline-code { border: 1px solid var(--rmx-code-border); background: var(--rmx-code-bg); color: var(--rmx-code-text); font: 12px/18px var(--remux-font-mono); padding: 0 4px; }
+
+.codex-md-table-scroll { max-width: 100%; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+.codex-md-table-scroll::-webkit-scrollbar { display: none; }
+.codex-md-table { overflow: hidden; border: 1px solid var(--border); border-radius: 8px; }
+.codex-md-table-row { display: grid; min-width: 0; }
+.codex-md-table-cell { min-width: 0; height: 100%; overflow: hidden; padding: 7px 10px; }
+.codex-md-table-cell:not(:last-child) { border-right: 1px solid var(--border); }
+.codex-md-table-row:not(:last-child) .codex-md-table-cell { border-bottom: 1px solid var(--border); }
+.codex-md-table-row[data-header="true"] .codex-md-table-cell { background: var(--muted); color: var(--foreground); }
+.codex-md-table-cell[data-align="center"] { text-align: center; }
+.codex-md-table-cell[data-align="right"] { text-align: right; }
+
+.codex-diff-block {
+  max-width: 100%;
+  max-height: 360px;
+  margin: 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--card);
+  color: var(--muted-foreground);
+  font: 13px/22px var(--remux-font-mono);
+  padding: 8px 0;
+  white-space: pre;
+}
+.codex-diff-line { width: max-content; min-width: 100%; min-height: 22px; padding: 0 16px; }
+.codex-diff-line-added { background: color-mix(in srgb, var(--success) 10%, transparent); color: var(--success); }
+.codex-diff-line-removed { background: color-mix(in srgb, var(--destructive) 10%, transparent); color: var(--destructive); }
+.codex-diff-line-hunk { background: color-mix(in srgb, var(--link) 10%, transparent); color: var(--link); }
+
+.remux-bottom-bar {
+  --remux-composer-bottom-pad: max(12px, env(safe-area-inset-bottom));
+  position: relative;
+  flex-shrink: 0;
+  background: linear-gradient(to bottom, var(--composer) 0%, var(--background) 100%);
+  padding: 10px var(--remux-feed-pad-x) var(--remux-composer-bottom-pad);
+}
+.remux-composer-panel { display: grid; width: 100%; max-width: var(--remux-feed-max-width); min-width: 0; gap: 8px; margin-inline: auto; }
+.remux-composer-editor { position: relative; display: grid; min-width: 0; gap: 8px; }
+.remux-composer-input-shell { position: relative; min-width: 0; }
+.remux-composer-contenteditable { width: 100%; min-height: 38px; max-height: 126px; overflow-y: auto; border: 0; background: transparent; color: var(--foreground); font-size: 16px; line-height: var(--remux-font-body-line); outline: none; padding: 8px 10px; white-space: pre-wrap; word-break: break-word; }
+.remux-composer-contenteditable > p { margin: 0; }
+.remux-composer-contenteditable:focus-visible { outline: none; }
+.remux-composer-placeholder { position: absolute; top: 8px; right: 10px; left: 10px; color: var(--muted-foreground); font-size: 16px; line-height: var(--remux-font-body-line); pointer-events: none; }
+
+.remux-new-chat-bar { display: flex; min-width: 0; align-items: center; gap: 8px; border: 1px solid color-mix(in srgb, var(--border) 78%, transparent); border-radius: 12px; background: color-mix(in srgb, var(--card) 76%, transparent); color: var(--muted-foreground); font-size: 13px; line-height: 18px; padding: 6px 8px; }
+.remux-new-chat-cwd-button { display: inline-flex; min-width: 0; flex: 1; align-items: center; gap: 8px; border: 0; border-radius: 8px; background: transparent; color: var(--foreground); padding: 2px 4px; text-align: left; }
+.remux-new-chat-cwd-button:hover:not(:disabled) { background: color-mix(in srgb, var(--foreground) 8%, transparent); }
+.remux-new-chat-cwd-button:disabled { color: var(--foreground); opacity: 1; }
+.remux-new-chat-action { display: grid; width: 28px; height: 28px; flex: 0 0 28px; place-items: center; border: 0; border-radius: 8px; background: transparent; color: var(--muted-foreground); padding: 0; }
+.remux-new-chat-action:hover { background: color-mix(in srgb, var(--foreground) 8%, transparent); color: var(--foreground); }
+
+.remux-composer-actions { display: flex; width: 100%; min-width: 0; align-items: center; justify-content: space-between; gap: 10px; }
+.remux-composer-action-group { display: flex; min-width: 0; align-items: center; gap: 7px; }
+.remux-composer-action-group-right { flex-shrink: 0; }
+.remux-composer-action-button { position: relative; display: inline-grid; width: 39px; height: 36px; place-items: center; border: 1px solid color-mix(in srgb, var(--border) 88%, transparent); border-radius: 8px; background: linear-gradient(to bottom, color-mix(in srgb, var(--rmx-surface-hover) 96%, var(--rmx-text) 4%), color-mix(in srgb, var(--rmx-surface-raised) 88%, var(--rmx-surface) 12%)); color: color-mix(in srgb, var(--muted-foreground) 86%, var(--foreground) 14%); box-shadow: var(--rmx-shadow-raised); cursor: default; outline: 0; padding: 0; transition: transform 80ms ease, box-shadow 80ms ease, color 120ms ease; }
+.remux-composer-action-button:active:not(:disabled) { box-shadow: var(--rmx-shadow-pressed); transform: translateY(1px); }
+.remux-composer-action-button:disabled { opacity: .34; }
+.remux-composer-action-button.is-busy:disabled { opacity: 1; }
+.remux-composer-action-button:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.remux-composer-send-button { border-color: color-mix(in srgb, var(--rmx-primary-border) 74%, var(--border)); background: linear-gradient(to bottom, color-mix(in srgb, var(--rmx-accent-strong) 86%, var(--rmx-accent) 14%), color-mix(in srgb, var(--rmx-primary-edge) 88%, var(--rmx-primary-shadow) 12%)); color: var(--rmx-accent-foreground); box-shadow: inset 0 1px 0 var(--rmx-primary-highlight), inset 0 -2px 0 var(--rmx-primary-shadow-inset), 0 2px 0 var(--rmx-primary-shadow-drop); }
+
+.remux-composer-inline-status { position: absolute; right: var(--remux-feed-pad-x); bottom: max(1px, calc((var(--remux-composer-bottom-pad) - 10px) / 2)); left: var(--remux-feed-pad-x); display: flex; min-width: 0; max-width: var(--remux-feed-max-width); height: 10px; margin-inline: auto; align-items: center; gap: 8px; color: color-mix(in srgb, var(--muted-foreground) 78%, transparent); font-size: 9px; line-height: 10px; pointer-events: none; user-select: none; }
+.remux-composer-status-group { display: flex; min-width: 0; align-items: center; gap: 5px; overflow: hidden; white-space: nowrap; }
+.remux-composer-status-separator { flex: 0 0 auto; color: color-mix(in srgb, var(--muted-foreground) 45%, transparent); }
+.remux-composer-message-status-row { display: flex; width: 100%; max-width: var(--remux-feed-max-width); min-width: 0; margin: 6px auto 0; align-items: center; color: color-mix(in srgb, var(--muted-foreground) 82%, transparent); font-size: 11px; line-height: 14px; padding: 0 3px; pointer-events: none; }
+.remux-composer-message-status-row[data-tone="error"] { color: color-mix(in srgb, var(--destructive) 82%, var(--foreground) 18%); }
+.remux-composer-message-status-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.remux-composer-config { --remux-composer-menu-edge-offset: 46px; position: relative; display: inline-grid; }
+.remux-composer-config-panel { position: absolute; bottom: calc(100% + 10px); left: calc(-1 * var(--remux-composer-menu-edge-offset)); z-index: 40; display: grid; width: min(252px, calc(100vw - 28px)); gap: 2px; border: 1px solid color-mix(in srgb, var(--border) 82%, transparent); border-radius: 10px; background: linear-gradient(to bottom, color-mix(in srgb, var(--rmx-surface-hover) 70%, var(--rmx-surface) 30%), color-mix(in srgb, var(--rmx-surface-raised) 88%, var(--rmx-surface) 12%)); box-shadow: var(--rmx-shadow-menu); padding: 3px; }
+.remux-composer-config-section { display: grid; gap: 2px; }
+.remux-composer-config-row, .remux-composer-config-option { display: flex; width: 100%; min-width: 0; align-items: center; border: 1px solid transparent; color: var(--foreground); outline: 0; }
+.remux-composer-config-row { min-height: 34px; gap: 8px; border-radius: 8px; background: color-mix(in srgb, var(--background) 42%, transparent); box-shadow: inset 0 1px 0 color-mix(in srgb, var(--foreground) 6%, transparent), inset 0 -1px 0 var(--rmx-border-subtle); font-size: 14px; line-height: 18px; padding: 3px 6px; text-align: left; }
+.remux-composer-config-row:hover:not(:disabled), .remux-composer-config-row.is-open, .remux-composer-config-option:hover { background: color-mix(in srgb, var(--rmx-surface-hover) 80%, var(--rmx-text) 4%); }
+.remux-composer-config-row:disabled { opacity: .42; }
+.remux-composer-config-icon { display: grid; width: 26px; height: 26px; flex: 0 0 auto; place-items: center; border-radius: 7px; color: color-mix(in srgb, var(--muted-foreground) 86%, var(--foreground) 14%); }
+.remux-composer-config-label { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.remux-composer-config-chevron { width: 16px; height: 16px; flex: 0 0 auto; color: var(--muted-foreground); transition: transform 120ms ease; }
+.remux-composer-config-chevron.is-open { transform: rotate(180deg); }
+.remux-composer-config-options { overflow: hidden; border-radius: 8px; }
+.remux-composer-config-option-list { display: grid; gap: 1px; overflow: hidden; border-radius: 8px; background: color-mix(in srgb, var(--background) 44%, transparent); }
+.remux-composer-config-option { min-height: 32px; gap: 7px; border-radius: 0; background: transparent; padding: 3px 7px; text-align: left; }
+.remux-composer-config-option + .remux-composer-config-option { border-top-color: color-mix(in srgb, var(--border) 52%, transparent); }
+.remux-composer-config-option-text { display: grid; min-width: 0; flex: 1; }
+.remux-composer-config-option-label { overflow: hidden; color: var(--foreground); font-size: 13px; line-height: 17px; text-overflow: ellipsis; white-space: nowrap; }
+.remux-composer-config-check { display: grid; width: 16px; height: 16px; flex: 0 0 auto; place-items: center; color: var(--muted-foreground); }
+.remux-composer-config-note { color: var(--muted-foreground); font-size: 11px; line-height: 15px; padding: 5px 8px; }
+
+.remux-file-mention-overlay { position: absolute; top: 0; right: 0; left: 0; z-index: 30; display: flex; min-width: 0; min-height: 0; overflow: hidden; }
+.remux-file-mention-picker { display: flex; width: 100%; min-width: 0; min-height: 0; flex: 1; overflow: hidden; background: linear-gradient(to bottom, color-mix(in srgb, var(--composer) 88%, var(--card) 12%), color-mix(in srgb, var(--composer) 60%, var(--background) 40%)); }
+.remux-file-mention-lane { display: flex; width: 100%; min-width: 0; min-height: 0; flex-direction: column; padding-top: max(8px, calc(env(safe-area-inset-top) + 8px)); }
+.remux-directory-picker-header { display: grid; width: 100%; max-width: var(--remux-feed-max-width); flex-shrink: 0; gap: 4px; margin-inline: auto; padding: 4px 12px 10px; }
+.remux-file-mention-title { display: flex; min-width: 0; align-items: center; gap: 8px; color: var(--foreground); font-size: 15px; font-weight: 600; line-height: 20px; }
+.remux-directory-picker-description { overflow: hidden; color: var(--muted-foreground); font: 12px/16px var(--remux-font-mono); text-overflow: ellipsis; white-space: nowrap; }
+.remux-directory-picker-search { display: flex; width: calc(100% - 16px); max-width: calc(var(--remux-feed-max-width) - 16px); min-width: 0; align-items: center; gap: 8px; margin: 0 auto 8px; border: 1px solid color-mix(in srgb, var(--border) 78%, transparent); border-radius: 8px; background: color-mix(in srgb, var(--background) 72%, transparent); color: var(--muted-foreground); padding: 7px 8px; }
+.remux-directory-picker-search-input { min-width: 0; flex: 1; border: 0; background: transparent; color: var(--foreground); font-size: 16px; line-height: 20px; outline: 0; }
+.remux-file-mention-list { display: grid; min-height: 0; flex: 1; align-content: start; gap: 6px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; padding-bottom: 8px; }
+.remux-file-mention-row { display: flex; width: calc(100% - 16px); max-width: calc(var(--remux-feed-max-width) - 16px); min-width: 0; min-height: 42px; align-items: center; gap: 8px; margin-inline: auto; border: 0; border-radius: 10px; background: transparent; color: var(--foreground); cursor: default; padding: 7px 10px; touch-action: pan-y; user-select: none; }
+.remux-file-mention-row[aria-selected="true"] { background: color-mix(in srgb, var(--foreground) 10%, transparent); }
+.remux-file-mention-icon { display: grid; width: 26px; height: 26px; flex: 0 0 26px; place-items: center; color: color-mix(in srgb, var(--composer-accent) 82%, var(--foreground) 18%); }
+.remux-directory-picker-row-content { display: grid; min-width: 0; flex: 1; }
+.remux-directory-picker-row-name { overflow: hidden; color: var(--foreground); font-size: 15px; font-weight: 600; line-height: 20px; text-overflow: ellipsis; white-space: nowrap; }
+.remux-file-mention-status { display: flex; align-items: center; gap: 8px; color: var(--muted-foreground); font-size: 14px; line-height: 20px; padding: 10px 12px; }
+.remux-file-mention-error { color: var(--destructive); }
+
+@media (min-width: 768px) { .remux-composer-overview-button { display: none; } }
+@media (hover: hover) and (pointer: fine) { .remux-composer-action-button:hover:not(:disabled) { color: var(--foreground); } }

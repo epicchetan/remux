@@ -1,0 +1,57 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "@remux/viewer-kit/tokens.css";
+@import "@remux/viewer-kit/theme.css";
+
+@source "./src/**/*.{ts,tsx}";
+@source "../../../packages/viewer-kit/src/shadcn/**/*.{ts,tsx}";
+
+:root {
+  --composer: var(--card);
+  --composer-accent: var(--rmx-accent);
+  --remux-font-body-size: 15px;
+  --remux-font-body-line: 22px;
+  --remux-font-work-size: 13px;
+  --remux-font-work-line: 18px;
+  --remux-font-work-title-size: var(--remux-font-body-size);
+  --remux-font-work-title-line: var(--remux-font-body-line);
+  --remux-feed-max-width: 900px;
+  --remux-feed-pad-x: 16px;
+  --remux-turn-gap: 20px;
+  --remux-block-gap: 20px;
+  --remux-work-gap: 8px;
+  --remux-work-boundary-gap: 14px;
+  --remux-work-group-gap: 8px;
+  --remux-row-gap: 6px;
+  --remux-font-sans: Arial, "Helvetica Neue", sans-serif;
+  --remux-font-mono: Menlo, Consolas, "Liberation Mono", monospace;
+  font-family: var(--remux-font-sans);
+}
+
+@layer base {
+  * {
+    box-sizing: border-box;
+    border-color: var(--border);
+  }
+
+  html,
+  body,
+  #root {
+    min-height: 100%;
+    margin: 0;
+  }
+
+  body {
+    background: var(--background);
+    color: var(--foreground);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+  }
+}
