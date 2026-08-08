@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 
 import {
@@ -11,6 +11,7 @@ import {
   MAX_TRANSCRIPT_RESPONSE_BYTES,
   MAX_TRANSCRIPT_WINDOW_TURNS,
   MAX_TURN_FRAME_BYTES,
+  MAX_VISIBLE_TEXT_BYTES,
   MAX_WORK_ENTRY_DETAIL_BYTES,
   MAX_WORK_GROUP_ROWS,
   WORK_GROUP_ROW_LIMITS,
@@ -18,6 +19,7 @@ import {
   workGroupResourceKey,
   type AgentAssistantMessageSegment,
   type AgentResourceInvalidation,
+  type AgentTextContentReference,
   type AgentTranscriptResourceRequest,
   type AgentTranscriptResourceResult,
   type AgentTranscriptResourcesReadParams,
@@ -53,12 +55,15 @@ type ProjectorOptions = {
 
 type MutableTurn = {
   id: string;
+  durableIdentity: boolean;
+  assistantItemId: string | null;
   status: AgentTurnStatus;
   startedAt: number;
   startedMonotonicAt: number;
   completedAt: number | null;
   durationMs: number | null;
   error: AgentTurnError | null;
+  interruptionReason: 'restart' | 'user' | null;
   renderRevision: string;
   layoutRevision: string;
   user: AgentUserMessageSegment;
@@ -93,12 +98,22 @@ type MutableActivityDetail = {
   detail: string | null;
   output: string | null;
   originalBytes: number;
+  detailContent?: AgentTextContentReference;
+  outputContent?: AgentTextContentReference;
 };
 
 type WindowSelection = {
   startIndex: number;
   endIndexExclusive: number;
   turns: MutableTurn[];
+};
+
+type ProjectionMutation = {
+  sequence?: number;
+  basisSequence?: number;
+  createdAt?: number;
+  itemId?: string | null;
+  content?: AgentTextContentReference;
 };
 
 export class TranscriptProtocolError extends Error {
@@ -141,6 +156,11 @@ export class EphemeralTranscriptProjector {
     turnId: string;
     clientMessageId: string;
     text: string;
+    sequence?: number;
+    basisSequence?: number;
+    createdAt?: number;
+    userItemId?: string;
+    content?: AgentTextContentReference;
   }) {
     if (this.activeTurnId) {
       throw new TranscriptProtocolError(-32013, 'A projected turn is already running.');
@@ -149,25 +169,29 @@ export class EphemeralTranscriptProjector {
       throw new TranscriptProtocolError(-32602, 'turnId was already used.');
     }
 
-    const startedAt = this.wallNow();
+    const startedAt = input.createdAt ?? this.wallNow();
     const startedMonotonicAt = this.monotonicNow();
-    const revision = this.advanceRevision();
+    const revision = this.advanceRevision(input.sequence, `turn:${input.turnId}:user`);
     const turn: MutableTurn = {
       id: input.turnId,
+      durableIdentity: input.userItemId !== undefined,
+      assistantItemId: null,
       status: 'inProgress',
       startedAt,
       startedMonotonicAt,
       completedAt: null,
       durationMs: null,
       error: null,
+      interruptionReason: null,
       renderRevision: revision,
       layoutRevision: revision,
       user: {
-        id: this.createId(),
+        id: input.userItemId ?? this.createId(),
         type: 'userMessage',
         clientMessageId: input.clientMessageId,
         revision,
         text: input.text,
+        ...(input.content ? { content: input.content } : {}),
       },
       work: null,
       assistant: null,
@@ -178,6 +202,7 @@ export class EphemeralTranscriptProjector {
     this.turns.push(turn);
     this.turnsById.set(turn.id, turn);
     this.activeTurnId = turn.id;
+    if (input.basisSequence !== undefined) this.fenceBasis(input.basisSequence);
     this.publishTurnMutation(turn, 'sendAccepted', true, true);
   }
 
@@ -185,42 +210,66 @@ export class EphemeralTranscriptProjector {
     return this.activeTurn(turnId) !== null;
   }
 
-  appendAssistantText(turnId: string, delta: string) {
+  appendAssistantText(
+    turnId: string,
+    delta: string,
+    mutation: ProjectionMutation = {},
+  ) {
     const turn = this.activeTurn(turnId);
     if (!turn || !delta) return false;
 
-    const revision = this.advanceRevision();
+    const itemId = this.acceptAssistantItemId(turn, mutation.itemId);
+    const revision = this.advanceRevision(
+      mutation.sequence,
+      `turn:${turnId}:assistant-text`,
+    );
     turn.assistant ??= {
-      id: this.createId(),
+      id: itemId ?? this.createId(),
       type: 'assistantMessage',
       revision,
       text: '',
     };
     turn.assistant.text += delta;
     turn.assistant.revision = revision;
+    if (mutation.content) turn.assistant.content = mutation.content;
+    if (mutation.basisSequence !== undefined) this.fenceBasis(mutation.basisSequence);
     this.touchTurn(turn, revision, true);
     this.publishTurnMutation(turn, 'runtimeEvent', false, true);
     return true;
   }
 
-  appendReasoning(turnId: string, delta: string) {
+  appendReasoning(
+    turnId: string,
+    delta: string,
+    mutation: ProjectionMutation = {},
+  ) {
     const turn = this.activeTurn(turnId);
     if (!turn || !delta) return false;
 
-    const revision = this.advanceRevision();
+    const itemId = this.acceptAssistantItemId(turn, mutation.itemId);
+    const revision = this.advanceRevision(
+      mutation.sequence,
+      `turn:${turnId}:assistant-reasoning`,
+    );
     const work = this.ensureWork(turn, revision);
     const previous = work.timeline.at(-1);
     if (previous?.type === 'text') {
       previous.text += delta;
       previous.revision = revision;
+      if (mutation.content) previous.content = mutation.content;
     } else {
+      const runOrdinal = work.timeline.filter((entry) => entry.type === 'text').length;
       work.timeline.push({
-        id: this.createId(),
+        id: itemId
+          ? projectionUuid(`${itemId}:reasoning:${runOrdinal}`)
+          : this.createId(),
         type: 'text',
         revision,
         text: delta,
+        ...(mutation.content ? { content: mutation.content } : {}),
       } satisfies AgentWorkTextTimelineEntry);
     }
+    if (mutation.basisSequence !== undefined) this.fenceBasis(mutation.basisSequence);
     this.touchWork(turn, work, revision, true);
     this.publishTurnMutation(turn, 'runtimeEvent', false, true);
     return true;
@@ -230,17 +279,28 @@ export class EphemeralTranscriptProjector {
     callId: string;
     name: string;
     args: unknown;
+    detailText?: string;
+    detailContent?: AgentTextContentReference;
+    sequence?: number;
+    basisSequence?: number;
+    createdAt?: number;
+    itemId?: string | null;
   }) {
     const turn = this.activeTurn(turnId);
     if (!turn || turn.toolRowsByCallId.has(input.callId)) return false;
 
-    const revision = this.advanceRevision();
+    const revision = this.advanceRevision(input.sequence, `turn:${turnId}:tool-start:${input.callId}`);
     const work = this.ensureWork(turn, revision);
     const group = this.ensureActivityGroup(turn, work, revision);
     const path = toolPath(input.args);
-    const detailText = boundedSerializedValue(input.args);
+    const detailText = input.detailText === undefined
+      ? boundedSerializedValue(input.args)
+      : {
+          text: input.detailText,
+          originalBytes: input.detailContent?.byteLength ?? byteLength(input.detailText),
+        };
     const row: AgentWorkActivityRow = {
-      id: this.createId(),
+      id: input.itemId ?? this.createId(),
       type: 'activity',
       revision,
       kind: 'read',
@@ -258,15 +318,19 @@ export class EphemeralTranscriptProjector {
       detail: detailText.text,
       output: null,
       originalBytes: detailText.originalBytes,
+      ...(input.detailContent ? { detailContent: input.detailContent } : {}),
     };
     group.rows.push(row);
     group.detailsByRowId.set(row.id, detail);
+    group.revision = revision;
+    group.layoutRevision = revision;
     turn.toolRowsByCallId.set(input.callId, {
       group,
       row,
       detail,
       startedMonotonicAt: this.monotonicNow(),
     });
+    if (input.basisSequence !== undefined) this.fenceBasis(input.basisSequence);
     this.refreshGroupTimeline(work, group, revision);
     this.touchWork(turn, work, revision, true);
     this.publishTurnMutation(turn, 'runtimeEvent', false, true, group, row.id);
@@ -281,10 +345,12 @@ export class EphemeralTranscriptProjector {
     const tool = turn?.toolRowsByCallId.get(input.callId);
     if (!turn || !tool) return false;
 
-    const revision = this.advanceRevision();
+    const revision = this.advanceRevision(undefined, `turn:${turnId}:tool-update:${input.callId}`);
     const output = boundedSerializedValue(input.result);
     tool.detail.output = output.text;
-    tool.detail.originalBytes = byteLength(tool.detail.detail) + output.originalBytes;
+    tool.detail.originalBytes =
+      (tool.detail.detailContent?.byteLength ?? byteLength(tool.detail.detail)) +
+      output.originalBytes;
     tool.detail.revision = revision;
     tool.detail.layoutRevision = revision;
     tool.row.revision = revision;
@@ -305,18 +371,35 @@ export class EphemeralTranscriptProjector {
     callId: string;
     result: unknown;
     isError: boolean;
+    outputText?: string;
+    outputContent?: AgentTextContentReference;
+    sequence?: number;
+    basisSequence?: number;
+    createdAt?: number;
+    itemId?: string | null;
   }) {
     const turn = this.activeTurn(turnId);
     const tool = turn?.toolRowsByCallId.get(input.callId);
     if (!turn || !tool) return false;
 
-    const revision = this.advanceRevision();
-    const output = boundedSerializedValue(input.result);
+    if (input.itemId && input.itemId !== tool.row.id) {
+      throw new TranscriptProtocolError(-32603, 'Durable tool identity changed during projection.');
+    }
+    const revision = this.advanceRevision(input.sequence, `turn:${turnId}:tool-end:${input.callId}`);
+    const output = input.outputText === undefined
+      ? boundedSerializedValue(input.result)
+      : {
+          text: input.outputText,
+          originalBytes: input.outputContent?.byteLength ?? byteLength(input.outputText),
+        };
     tool.row.status = input.isError ? 'failed' : 'completed';
     tool.row.durationMs = Math.max(0, this.monotonicNow() - tool.startedMonotonicAt);
     tool.row.revision = revision;
     tool.detail.output = output.text;
-    tool.detail.originalBytes = byteLength(tool.detail.detail) + output.originalBytes;
+    tool.detail.originalBytes =
+      (tool.detail.detailContent?.byteLength ?? byteLength(tool.detail.detail)) +
+      output.originalBytes;
+    if (input.outputContent) tool.detail.outputContent = input.outputContent;
     tool.detail.revision = revision;
     tool.detail.layoutRevision = revision;
     tool.group.revision = revision;
@@ -328,38 +411,50 @@ export class EphemeralTranscriptProjector {
     } else {
       this.touchTurn(turn, revision, true);
     }
+    if (input.basisSequence !== undefined) this.fenceBasis(input.basisSequence);
     this.publishTurnMutation(turn, 'runtimeEvent', false, true, tool.group, tool.row.id);
     return true;
   }
 
   finishTurn(turnId: string, input: {
-    status: 'completed' | 'failed' | 'interrupted';
+    status: 'completed' | 'failed' | 'interrupted' | 'interrupted_by_restart';
     error?: AgentTurnError | null;
+    sequence?: number;
+    basisSequence?: number;
+    createdAt?: number;
+    durationMs?: number;
   }) {
     const turn = this.activeTurn(turnId);
     if (!turn) return false;
 
-    const completedAt = this.wallNow();
-    const revision = this.advanceRevision();
-    turn.status = input.status;
+    const completedAt = input.createdAt ?? this.wallNow();
+    const revision = this.advanceRevision(input.sequence, `turn:${turnId}:terminal:${input.status}`);
+    const terminalStatus = input.status === 'interrupted_by_restart' ? 'interrupted' : input.status;
+    turn.status = terminalStatus;
+    turn.interruptionReason = input.status === 'interrupted_by_restart'
+      ? 'restart'
+      : input.status === 'interrupted'
+        ? 'user'
+        : null;
     turn.completedAt = completedAt;
-    turn.durationMs = Math.max(0, this.monotonicNow() - turn.startedMonotonicAt);
+    turn.durationMs = input.durationMs ?? Math.max(0, this.monotonicNow() - turn.startedMonotonicAt);
     turn.error = input.status === 'failed' ? input.error ?? {
       code: 'runtime_error',
       message: 'The turn failed.',
     } : null;
     this.activeTurnId = null;
+    if (input.basisSequence !== undefined) this.fenceBasis(input.basisSequence);
 
     const invalidations: AgentResourceInvalidation[] = [];
     if (turn.work) {
-      turn.work.state = input.status === 'completed' ? 'completed' : input.status;
+      turn.work.state = terminalStatus;
       turn.work.durationMs = turn.durationMs;
       turn.work.revision = revision;
       turn.work.layoutRevision = revision;
       for (const group of turn.groups.values()) {
         for (const row of group.rows) {
           if (row.status === 'running') {
-            row.status = input.status === 'completed' ? 'completed' : input.status;
+            row.status = terminalStatus;
             row.durationMs = turn.durationMs;
             row.revision = revision;
             const detail = group.detailsByRowId.get(row.id);
@@ -387,6 +482,17 @@ export class EphemeralTranscriptProjector {
   activeElapsedMs() {
     const turn = this.activeTurnId ? this.turnsById.get(this.activeTurnId) : null;
     return turn ? Math.max(0, this.monotonicNow() - turn.startedMonotonicAt) : null;
+  }
+
+  fenceBasis(basisSequence: number) {
+    if (!Number.isSafeInteger(basisSequence) || basisSequence < 0) {
+      throw new TranscriptProtocolError(-32603, 'Transcript basis must be a non-negative safe integer.');
+    }
+    if (basisSequence < this.basisSequence) {
+      throw new TranscriptProtocolError(-32603, 'Transcript basis cannot move backward.');
+    }
+    this.basisSequence = basisSequence;
+    this.conversationRevision = `conversation:${basisSequence}`;
   }
 
   hasClientMessageId(clientMessageId: string) {
@@ -450,8 +556,10 @@ export class EphemeralTranscriptProjector {
           return {
             status: 'error',
             turnId: turn.id,
+            renderRevision: turn.renderRevision,
             code: 'frameTooLarge',
             message: 'Turn frame exceeds the 1 MiB limit.',
+            frame: this.errorFrame(turn, 'Turn content is too large to render in one frame.'),
           };
         }
         return {
@@ -464,8 +572,10 @@ export class EphemeralTranscriptProjector {
         return {
           status: 'error',
           turnId: turn.id,
+          renderRevision: turn.renderRevision,
           code: 'projectionFailed',
           message: 'Turn projection failed.',
+          frame: this.errorFrame(turn, 'Turn projection failed. Retry the transcript read.'),
         };
       }
     });
@@ -516,7 +626,18 @@ export class EphemeralTranscriptProjector {
       return { requestIndex, key, status: 'notModified', revision: group.revision };
     }
 
-    const start = request.cursor ? Number.parseInt(request.cursor, 10) : 0;
+    const cursor = request.cursor ? decodeWorkGroupCursor(request.cursor) : null;
+    if (cursor && cursor.groupRevision !== group.revision) {
+      return {
+        requestIndex,
+        key,
+        status: 'error',
+        code: 'staleCursor',
+        reason: 'The work group changed before the next page was read.',
+        revision: group.revision,
+      };
+    }
+    const start = cursor?.offset ?? 0;
     const limit = request.limit ?? DEFAULT_WORK_GROUP_ROWS;
     const end = Math.min(group.rows.length, start + limit);
     const value: AgentWorkGroupResource = {
@@ -529,7 +650,9 @@ export class EphemeralTranscriptProjector {
       revision: group.revision,
       layoutRevision: group.layoutRevision,
       rows: structuredClone(group.rows.slice(start, end)),
-      nextCursor: end < group.rows.length ? String(end) : null,
+      nextCursor: end < group.rows.length
+        ? encodeWorkGroupCursor(group.revision, end)
+        : null,
     };
     return { requestIndex, key, status: 'ok', revision: group.revision, value };
   }
@@ -570,6 +693,7 @@ export class EphemeralTranscriptProjector {
         output: bounded.output,
       },
       truncation: bounded.truncation,
+      ...(bounded.content ? { content: bounded.content } : {}),
     };
     return { requestIndex, key, status: 'ok', revision: detail.revision, value };
   }
@@ -618,13 +742,14 @@ export class EphemeralTranscriptProjector {
   }
 
   private renderFrame(turn: MutableTurn): AgentTurnRenderFrame {
-    return structuredClone({
+    const frame = structuredClone({
       id: turn.id,
       status: turn.status,
       startedAt: turn.startedAt,
       completedAt: turn.completedAt,
       durationMs: turn.durationMs,
       error: turn.error,
+      interruptionReason: turn.interruptionReason,
       renderRevision: turn.renderRevision,
       layoutRevision: turn.layoutRevision,
       segments: [
@@ -633,11 +758,56 @@ export class EphemeralTranscriptProjector {
         ...(turn.assistant && turn.assistant.text ? [turn.assistant] : []),
       ],
     } satisfies AgentTurnRenderFrame);
+    let remainingBytes = MAX_TURN_FRAME_BYTES - 128 * 1024;
+    for (const segment of frame.segments) {
+      if (segment.type === 'userMessage' || segment.type === 'assistantMessage') {
+        const bounded = boundVisibleText(
+          segment.text,
+          Math.min(MAX_VISIBLE_TEXT_BYTES, remainingBytes),
+          segment.content,
+          segment.type === 'userMessage' || turn.status !== 'inProgress',
+        );
+        segment.text = bounded.text;
+        if (bounded.content) segment.content = bounded.content;
+        remainingBytes = Math.max(0, remainingBytes - bounded.returnedBytes);
+      } else {
+        for (const entry of segment.timeline) {
+          if (entry.type !== 'text') continue;
+          const bounded = boundVisibleText(
+            entry.text,
+            Math.min(MAX_VISIBLE_TEXT_BYTES, remainingBytes),
+            entry.content,
+            turn.status !== 'inProgress',
+          );
+          entry.text = bounded.text;
+          if (bounded.content) entry.content = bounded.content;
+          remainingBytes = Math.max(0, remainingBytes - bounded.returnedBytes);
+        }
+      }
+    }
+    return frame;
+  }
+
+  private errorFrame(turn: MutableTurn, message: string): AgentTurnRenderFrame {
+    return {
+      id: turn.id,
+      status: turn.status,
+      startedAt: turn.startedAt,
+      completedAt: turn.completedAt,
+      durationMs: turn.durationMs,
+      error: { code: 'runtime_error', message },
+      interruptionReason: turn.interruptionReason,
+      renderRevision: turn.renderRevision,
+      layoutRevision: turn.layoutRevision,
+      segments: [],
+    };
   }
 
   private ensureWork(turn: MutableTurn, revision: string) {
     turn.work ??= {
-      id: this.createId(),
+      id: turn.durableIdentity
+        ? projectionUuid(`${AGENT_TRANSCRIPT_PROJECTION_VERSION}:work:${turn.id}`)
+        : this.createId(),
       type: 'work',
       state: 'running',
       revision,
@@ -657,7 +827,9 @@ export class EphemeralTranscriptProjector {
     if (existing) return existing;
 
     const group: MutableGroup = {
-      id: this.createId(),
+      id: turn.durableIdentity
+        ? projectionUuid(`${AGENT_TRANSCRIPT_PROJECTION_VERSION}:group:${turn.id}:activity:0`)
+        : this.createId(),
       type: 'activity',
       title: 'Workspace reads',
       revision,
@@ -706,11 +878,33 @@ export class EphemeralTranscriptProjector {
     return turn?.status === 'inProgress' ? turn : null;
   }
 
-  private advanceRevision() {
-    this.basisSequence += 1;
-    const revision = `revision:${this.basisSequence}`;
-    this.conversationRevision = `conversation:${this.basisSequence}`;
-    return revision;
+  private advanceRevision(sequence: number | undefined, discriminator: string) {
+    if (sequence === undefined) {
+      this.fenceBasis(this.basisSequence + 1);
+      return `revision:${this.basisSequence}`;
+    }
+    if (!Number.isSafeInteger(sequence) || sequence < 1) {
+      throw new TranscriptProtocolError(-32603, 'Transcript mutation sequence is invalid.');
+    }
+    this.fenceBasis(Math.max(this.basisSequence, sequence));
+    return `revision:${createHash('sha256')
+      .update(AGENT_TRANSCRIPT_PROJECTION_VERSION)
+      .update('\0')
+      .update(this.conversationId)
+      .update('\0')
+      .update(String(sequence))
+      .update('\0')
+      .update(discriminator)
+      .digest('hex')}`;
+  }
+
+  private acceptAssistantItemId(turn: MutableTurn, itemId: string | null | undefined) {
+    if (!itemId) return turn.assistantItemId;
+    if (turn.assistantItemId && turn.assistantItemId !== itemId) {
+      throw new TranscriptProtocolError(-32603, 'Durable assistant identity changed during projection.');
+    }
+    turn.assistantItemId = itemId;
+    return itemId;
   }
 
   private publishTurnMutation(
@@ -752,6 +946,7 @@ export class EphemeralTranscriptProjector {
       reason,
       affectsOrder,
       affectsLayout,
+      basisSequence: this.basisSequence,
     };
   }
 
@@ -769,6 +964,7 @@ export class EphemeralTranscriptProjector {
       groupId: group.id,
       reason,
       affectsLayout: true,
+      basisSequence: this.basisSequence,
     };
   }
 
@@ -794,6 +990,7 @@ export class EphemeralTranscriptProjector {
       rowId,
       reason,
       affectsLayout: true,
+      basisSequence: this.basisSequence,
     };
   }
 }
@@ -802,16 +999,20 @@ export function parseTranscriptResourcesReadParams(
   params: unknown,
 ): AgentTranscriptResourcesReadParams {
   const value = objectValue(params);
-  const conversationId = requiredString(value.conversationId, 'conversationId');
+  const conversationId = requiredUuidV4(value.conversationId, 'conversationId');
   if (!Array.isArray(value.requests)) {
     throw invalidParams('requests must be an array.');
   }
   if (value.requests.length > MAX_TRANSCRIPT_REQUESTS) {
     throw invalidParams(`requests exceeds the ${MAX_TRANSCRIPT_REQUESTS} item limit.`);
   }
+  const requests = value.requests.map(parseTranscriptRequest);
+  if (requests.filter((request) => request.type === 'transcriptSync').length > 1) {
+    throw invalidParams('A transcript resource batch may contain at most one transcriptSync request.');
+  }
   return {
     conversationId,
-    requests: value.requests.map(parseTranscriptRequest),
+    requests,
   };
 }
 
@@ -856,7 +1057,7 @@ function parseKnownTurns(value: unknown) {
   const seen = new Set<string>();
   return value.map((entry) => {
     const known = objectValue(entry);
-    const turnId = requiredString(known.turnId, 'knownTurns.turnId');
+    const turnId = requiredUuidV4(known.turnId, 'knownTurns.turnId');
     if (seen.has(turnId)) throw invalidParams('knownTurns contains a duplicate turnId.');
     seen.add(turnId);
     return {
@@ -883,7 +1084,7 @@ function parseWindow(value: unknown): AgentTranscriptSyncRequest['window'] {
     }
     return {
       kind: 'around',
-      turnId: requiredString(window.turnId, 'window.turnId'),
+      turnId: requiredUuidV4(window.turnId, 'window.turnId'),
       before,
       after,
     };
@@ -891,8 +1092,8 @@ function parseWindow(value: unknown): AgentTranscriptSyncRequest['window'] {
   if (kind === 'range') {
     return {
       kind: 'range',
-      startTurnId: requiredString(window.startTurnId, 'window.startTurnId'),
-      endTurnId: requiredString(window.endTurnId, 'window.endTurnId'),
+      startTurnId: requiredUuidV4(window.startTurnId, 'window.startTurnId'),
+      endTurnId: requiredUuidV4(window.endTurnId, 'window.endTurnId'),
     };
   }
   throw invalidParams('Unknown transcript window kind.');
@@ -907,17 +1108,53 @@ function parseWorkGroupRequest(request: Record<string, unknown>): AgentWorkGroup
     throw invalidParams(`limit must be one of ${WORK_GROUP_ROW_LIMITS.join(', ')}.`);
   }
   const cursor = optionalString(request.cursor, 'cursor');
-  if (cursor && !/^\d+$/u.test(cursor)) throw invalidParams('cursor must be a non-negative row offset.');
+  if (cursor && (cursor.length > 2_048 || !/^[A-Za-z0-9_-]+$/u.test(cursor))) {
+    throw invalidParams('cursor must be an opaque Agent work-group cursor.');
+  }
   const knownRevision = optionalString(request.knownRevision, 'knownRevision');
+  if (cursor && knownRevision) {
+    throw invalidParams('knownRevision cannot be combined with a continuation cursor.');
+  }
   return {
     type: 'workGroup',
     protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
-    turnId: requiredString(request.turnId, 'turnId'),
-    segmentId: requiredString(request.segmentId, 'segmentId'),
-    groupId: requiredString(request.groupId, 'groupId'),
+    turnId: requiredUuidV4(request.turnId, 'turnId'),
+    segmentId: requiredUuidV4(request.segmentId, 'segmentId'),
+    groupId: requiredUuidV4(request.groupId, 'groupId'),
     ...(cursor ? { cursor } : {}),
     ...(limit === undefined ? {} : { limit }),
     ...(knownRevision ? { knownRevision } : {}),
+  };
+}
+
+function encodeWorkGroupCursor(groupRevision: string, offset: number) {
+  return Buffer.from(JSON.stringify({
+    groupRevision,
+    offset,
+    projectionVersion: AGENT_TRANSCRIPT_PROJECTION_VERSION,
+    version: 1,
+  }), 'utf8').toString('base64url');
+}
+
+function decodeWorkGroupCursor(cursor: string) {
+  let value: unknown;
+  try {
+    const bytes = Buffer.from(cursor, 'base64url');
+    if (bytes.toString('base64url') !== cursor) throw new Error('non-canonical cursor');
+    value = JSON.parse(bytes.toString('utf8')) as unknown;
+  } catch {
+    throw invalidParams('cursor is not a valid Agent work-group cursor.');
+  }
+  const record = objectValue(value);
+  if (
+    record.version !== 1 ||
+    record.projectionVersion !== AGENT_TRANSCRIPT_PROJECTION_VERSION
+  ) {
+    throw invalidParams('cursor uses an unsupported work-group projection version.');
+  }
+  return {
+    groupRevision: requiredString(record.groupRevision, 'cursor.groupRevision'),
+    offset: boundedInteger(record.offset, 'cursor.offset', 0, Number.MAX_SAFE_INTEGER),
   };
 }
 
@@ -929,10 +1166,10 @@ function parseWorkEntryDetailRequest(
   return {
     type: 'workEntryDetail',
     protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
-    turnId: requiredString(request.turnId, 'turnId'),
-    segmentId: requiredString(request.segmentId, 'segmentId'),
-    groupId: requiredString(request.groupId, 'groupId'),
-    rowId: requiredString(request.rowId, 'rowId'),
+    turnId: requiredUuidV4(request.turnId, 'turnId'),
+    segmentId: requiredUuidV4(request.segmentId, 'segmentId'),
+    groupId: requiredUuidV4(request.groupId, 'groupId'),
+    rowId: requiredUuidV4(request.rowId, 'rowId'),
     ...(knownRevision ? { knownRevision } : {}),
   };
 }
@@ -986,6 +1223,16 @@ function boundedActivityDetail(detail: MutableActivityDetail) {
       returnedBytes,
       truncated: detail.originalBytes > returnedBytes,
     },
+    ...(
+      detail.detailContent || detail.outputContent
+        ? {
+            content: {
+              ...(detail.detailContent ? { detail: detail.detailContent } : {}),
+              ...(detail.outputContent ? { output: detail.outputContent } : {}),
+            },
+          }
+        : {}
+    ),
   };
 }
 
@@ -1022,6 +1269,37 @@ function sanitizeText(text: string) {
     .replace(/\beyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2}\b/gu, '[redacted]');
 }
 
+function boundVisibleText(
+  value: string,
+  maxBytes: number,
+  existing: AgentTextContentReference | undefined,
+  artifactAvailable: boolean,
+) {
+  const text = truncateUtf8(value, maxBytes);
+  const returnedBytes = byteLength(text);
+  const byteLengthValue = existing?.byteLength ?? byteLength(value);
+  if (byteLengthValue <= returnedBytes && !existing) {
+    return { text, returnedBytes, content: undefined };
+  }
+  const sha256 = existing?.sha256 ?? createHash('sha256').update(value, 'utf8').digest('hex');
+  const artifactHash = existing?.artifactHash ?? (artifactAvailable ? sha256 : null);
+  const content: AgentTextContentReference = {
+    sha256,
+    byteLength: byteLengthValue,
+    returnedBytes,
+    truncated: true,
+    artifactHash,
+    nextRange: artifactHash && returnedBytes < byteLengthValue
+      ? {
+          kind: 'utf8',
+          offset: returnedBytes,
+          byteLength: MAX_VISIBLE_TEXT_BYTES,
+        }
+      : null,
+  };
+  return { text, returnedBytes, content };
+}
+
 function truncateUtf8(value: string, maxBytes: number) {
   if (maxBytes <= 0) return '';
   const bytes = Buffer.from(value);
@@ -1031,6 +1309,14 @@ function truncateUtf8(value: string, maxBytes: number) {
 
 function byteLength(value: string | null) {
   return value ? Buffer.byteLength(value) : 0;
+}
+
+function projectionUuid(seed: string) {
+  const bytes = createHash('sha256').update(seed).digest().subarray(0, 16);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 function serializedByteLength(value: unknown) {
@@ -1049,6 +1335,14 @@ function requiredString(value: unknown, name: string) {
     throw invalidParams(`${name} must be a non-empty string.`);
   }
   return value;
+}
+
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+function requiredUuidV4(value: unknown, name: string) {
+  const id = requiredString(value, name);
+  if (!UUID_V4.test(id)) throw invalidParams(`${name} must be a lowercase UUID v4.`);
+  return id;
 }
 
 function optionalString(value: unknown, name: string) {

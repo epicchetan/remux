@@ -1,4 +1,4 @@
-import { Loader2 } from 'lucide-react';
+import { Loader2, RotateCcw, X } from 'lucide-react';
 import {
   useCallback,
   useEffect,
@@ -24,6 +24,7 @@ import {
 } from './virtualizerRange';
 import {
   anchorUserMessageScrollTop,
+  anchorTurnUserMessageScrollTop,
   autoScrollModeAfterNativeScrollSettles,
   autoScrollModeForStreamingTurn,
   resolveSentMessageScroll,
@@ -44,6 +45,9 @@ export function VirtualizedTranscript({
   const windowState = useTranscriptResourceStore((state) => state.window);
   const loadEarlier = useTranscriptResourceStore((state) => state.loadEarlierTranscriptResources);
   const loadLater = useTranscriptResourceStore((state) => state.loadLaterTranscriptResources);
+  const focusTranscriptTurn = useTranscriptResourceStore((state) => state.focusTranscriptTurn);
+  const refreshTranscript = useTranscriptResourceStore((state) => state.refreshActiveTranscriptResources);
+  const turnResourcesById = useTranscriptResourceStore((state) => state.turnResourcesById);
   const workingTurnId = useTranscriptResourceStore((state) => state.workingTurnId);
   const turns = useTranscriptLayoutStore(
     (state) => state.turnOrder.flatMap((turnId) =>
@@ -59,12 +63,19 @@ export function VirtualizedTranscript({
   const setAutoScrollMode = useTranscriptViewportStore((state) => state.setAutoScrollMode);
   const setScrollAvailability = useTranscriptViewportStore((state) => state.setScrollAvailability);
   const setScrollNavigationController = useTranscriptViewportStore((state) => state.setScrollNavigationController);
+  const requestedTurnScroll = useTranscriptViewportStore((state) => state.requestedTurnScroll);
+  const turnScrollError = useTranscriptViewportStore((state) => state.turnScrollError);
+  const clearTurnScroll = useTranscriptViewportStore((state) => state.clearTurnScroll);
+  const failTurnScroll = useTranscriptViewportStore((state) => state.failTurnScroll);
+  const requestTurnScroll = useTranscriptViewportStore((state) => state.requestTurnScroll);
+  const resolveTurnScroll = useTranscriptViewportStore((state) => state.resolveTurnScroll);
   const scrollerRef = useRef<HTMLDivElement | null>(null);
-  const laneRef = useRef<HTMLDivElement | null>(null);
+  const measureRef = useRef<HTMLDivElement | null>(null);
   const programmaticScroll = useRef(false);
   const previousTotalHeight = useRef(0);
   const sentAnchorRunway = useRef(0);
   const sentAnchorPinned = useRef(false);
+  const focusLoadRequestId = useRef<number | null>(null);
   const [scrollMetrics, setScrollMetrics] = useState({ scrollTop: 0, viewportHeight: 1 });
 
   useEffect(() => {
@@ -75,12 +86,12 @@ export function VirtualizedTranscript({
   }, [conversationId, setActiveConversationId]);
 
   useLayoutEffect(() => {
-    const lane = laneRef.current;
-    if (!lane) return;
-    const publish = () => void setWidth(lane.getBoundingClientRect().width);
+    const content = measureRef.current;
+    if (!content) return;
+    const publish = () => void setWidth(content.getBoundingClientRect().width);
     publish();
     const observer = new ResizeObserver(publish);
-    observer.observe(lane);
+    observer.observe(content);
     return () => observer.disconnect();
   }, [setWidth]);
 
@@ -176,6 +187,35 @@ export function VirtualizedTranscript({
     return () => setScrollNavigationController(null);
   }, [scrollDown, scrollUp, setScrollNavigationController]);
 
+  useEffect(() => {
+    if (
+      !requestedTurnScroll ||
+      requestedTurnScroll.conversationId !== conversationId ||
+      turnScrollError?.requestId === requestedTurnScroll.id ||
+      status !== 'ready' ||
+      turns.some((turn) => turn.turnId === requestedTurnScroll.turnId) ||
+      focusLoadRequestId.current === requestedTurnScroll.id
+    ) return;
+    focusLoadRequestId.current = requestedTurnScroll.id;
+    void focusTranscriptTurn(requestedTurnScroll.turnId).then((found) => {
+      if (!found) {
+        failTurnScroll(requestedTurnScroll.id, 'The requested turn could not be loaded.');
+      }
+    }).catch(() => {
+      failTurnScroll(requestedTurnScroll.id, 'The requested turn could not be loaded.');
+    }).finally(() => {
+      if (focusLoadRequestId.current === requestedTurnScroll.id) focusLoadRequestId.current = null;
+    });
+  }, [
+    conversationId,
+    failTurnScroll,
+    focusTranscriptTurn,
+    requestedTurnScroll,
+    status,
+    turns,
+    turnScrollError,
+  ]);
+
   useLayoutEffect(() => {
     const scroller = scrollerRef.current;
     if (!scroller || status !== 'ready' || turns.length === 0) return;
@@ -240,6 +280,33 @@ export function VirtualizedTranscript({
     workingTurnId,
   ]);
 
+  useLayoutEffect(() => {
+    if (
+      !requestedTurnScroll ||
+      requestedTurnScroll.conversationId !== conversationId ||
+      status !== 'ready'
+    ) return;
+    const target = anchorTurnUserMessageScrollTop({
+      expandedRows,
+      topPadding: transcriptLayout.viewport.padY,
+      turnId: requestedTurnScroll.turnId,
+      turns,
+    });
+    if (target === null) return;
+    setActiveTurnIds([requestedTurnScroll.turnId]);
+    scrollTo(target, { type: 'off' });
+    resolveTurnScroll(requestedTurnScroll.id);
+  }, [
+    conversationId,
+    expandedRows,
+    requestedTurnScroll,
+    resolveTurnScroll,
+    scrollTo,
+    setActiveTurnIds,
+    status,
+    turns,
+  ]);
+
   useEffect(() => {
     const scroller = scrollerRef.current;
     if (!scroller) return;
@@ -252,20 +319,29 @@ export function VirtualizedTranscript({
   if (activeConversationId !== conversationId || status === 'idle' || status === 'loading' || width === null) {
     return (
       <div className="codex-transcript-scroll" ref={scrollerRef}>
-        <div className="codex-transcript-lane" ref={laneRef}>
-          <div className="agent-transcript-state"><Loader2 className="size-4 animate-spin" /> Loading transcript…</div>
+        <div className="codex-transcript-lane">
+          <div className="codex-transcript-content" ref={measureRef}>
+            <div className="agent-transcript-state"><Loader2 className="size-4 animate-spin" /> Loading transcript…</div>
+          </div>
         </div>
       </div>
     );
   }
   if (status === 'failed') {
-    return <div className="agent-transcript-state agent-transcript-failed">{error ?? 'Transcript unavailable.'}</div>;
+    return (
+      <div className="agent-transcript-state agent-transcript-failed" role="alert">
+        <span>{error ?? 'Transcript unavailable.'}</span>
+        <button onClick={() => void refreshTranscript({ forceFullMeasure: true })} type="button">
+          <RotateCcw className="size-3.5" /> Retry
+        </button>
+      </div>
+    );
   }
   if (turns.length === 0) {
     return (
       <div className="agent-empty">
         <h2>Start with the work, not the ceremony.</h2>
-        <p>This conversation is ephemeral and exposes only bounded workspace reads.</p>
+        <p>Send a message to continue this durable conversation.</p>
       </div>
     );
   }
@@ -285,34 +361,63 @@ export function VirtualizedTranscript({
       }}
       ref={scrollerRef}
     >
-      <div className="codex-transcript-lane" ref={laneRef}>
-        {windowState?.hasEarlier ? (
-          <button className="codex-transcript-page" onClick={() => void loadEarlier()} type="button">
-            Load earlier turns
-          </button>
-        ) : null}
-        <div aria-hidden="true" style={{ height: range.topSpacerHeight }} />
-        {turns.filter((turn) => active.has(turn.turnId)).map((turn) => (
-          <article className="codex-transcript-turn" data-turn-id={turn.turnId} key={turn.turnId}>
-            {turn.rows.map((row) => (
-              <TranscriptRow
-                conversationId={conversationId}
-                key={row.id}
-                laneWidth={width}
-                row={row}
-              />
-            ))}
-            {turn.turn.error ? (
-              <div className="codex-turn-error" role="alert">{turn.turn.error.message}</div>
-            ) : null}
-          </article>
-        ))}
-        <div aria-hidden="true" style={{ height: range.bottomSpacerHeight + sentAnchorRunway.current }} />
-        {windowState?.hasLater ? (
-          <button className="codex-transcript-page" onClick={() => void loadLater()} type="button">
-            Load later turns
-          </button>
-        ) : null}
+      <div className="codex-transcript-lane">
+        <div className="codex-transcript-content" data-testid="agent-transcript-content" ref={measureRef}>
+          {turnScrollError && requestedTurnScroll ? (
+            <div className="agent-transcript-focus-error" role="alert">
+              <span>{turnScrollError.message}</span>
+              <button
+                onClick={() => requestTurnScroll(conversationId, requestedTurnScroll.turnId)}
+                type="button"
+              >
+                <RotateCcw className="size-3" /> Retry
+              </button>
+              <button
+                aria-label="Dismiss turn focus error"
+                onClick={() => clearTurnScroll(requestedTurnScroll.id)}
+                type="button"
+              >
+                <X className="size-3.5" />
+              </button>
+            </div>
+          ) : null}
+          {windowState?.hasEarlier ? (
+            <button className="codex-transcript-page" onClick={() => void loadEarlier()} type="button">
+              Load earlier turns
+            </button>
+          ) : null}
+          <div aria-hidden="true" style={{ height: range.topSpacerHeight }} />
+          {turns.filter((turn) => active.has(turn.turnId)).map((turn) => (
+            <article className="codex-transcript-turn" data-turn-id={turn.turnId} key={turn.turnId}>
+              {turn.rows.map((row) => (
+                <TranscriptRow
+                  conversationId={conversationId}
+                  key={row.id}
+                  laneWidth={width}
+                  row={row}
+                />
+              ))}
+              {turn.turn.error ? (
+                <div className="codex-turn-error" role="alert">{turn.turn.error.message}</div>
+              ) : null}
+              {turnResourcesById[turn.turnId]?.projectionError ? (
+                <button
+                  className="agent-transcript-retry"
+                  onClick={() => void refreshTranscript({ preserveReady: true, windowPolicy: 'preserve' })}
+                  type="button"
+                >
+                  <RotateCcw className="size-3" /> Retry turn projection
+                </button>
+              ) : null}
+            </article>
+          ))}
+          <div aria-hidden="true" style={{ height: range.bottomSpacerHeight + sentAnchorRunway.current }} />
+          {windowState?.hasLater ? (
+            <button className="codex-transcript-page" onClick={() => void loadLater()} type="button">
+              Load later turns
+            </button>
+          ) : null}
+        </div>
       </div>
     </div>
   );

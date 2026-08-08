@@ -9,6 +9,7 @@ import { useComposerStore } from './store.ts';
 
 export function ComposerContent({
   conversation,
+  conversationSelected,
   onInterrupt,
   onNewChat,
   onSend,
@@ -16,6 +17,7 @@ export function ComposerContent({
   runtimeError,
 }: {
   conversation: ConversationValue | null;
+  conversationSelected: boolean;
   onInterrupt: () => Promise<void>;
   onNewChat: () => void;
   onSend: (text: string, setPhase: (phase: 'sending' | 'updating-transcript') => void) => Promise<void>;
@@ -28,15 +30,17 @@ export function ComposerContent({
   const modelId = useComposerStore((state) => state.modelId);
   const submission = useComposerStore((state) => state.submission);
   const working = conversation?.status === 'running' || conversation?.status === 'interrupting';
+  const loading = conversation?.status === 'loading';
+  const waitingForConversation = conversationSelected && !conversation;
 
   return (
     <div className="remux-bottom-bar border-t border-border" data-remux-composer-root>
       <div className="remux-composer-panel">
-        {!pickerOpen ? <NewChatBar cwd={conversation?.cwd ?? cwd} locked={Boolean(conversation)} onNewChat={onNewChat} onOpenDirectory={openPicker} /> : null}
-        {!pickerOpen ? <ComposerLexicalInput readOnly={Boolean(submission || working)} /> : null}
+        {!pickerOpen ? <NewChatBar cwd={conversation?.cwd ?? cwd} locked={conversationSelected} onNewChat={onNewChat} onOpenDirectory={openPicker} /> : null}
+        {!pickerOpen ? <ComposerLexicalInput readOnly={Boolean(submission || working || loading || waitingForConversation)} /> : null}
         <ComposerActionButtons
-          canStart={Boolean(cwd && modelId)}
-          conversationExists={Boolean(conversation)}
+          canStart={Boolean((conversation || (!conversationSelected && cwd && modelId)) && !loading)}
+          conversationExists={conversationSelected}
           isWorking={working}
           onInterrupt={onInterrupt}
           onSend={onSend}

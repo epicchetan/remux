@@ -316,7 +316,9 @@ function measureUserMessage({
   const layout = buildUserMessageLayout(segment, 'topLevel');
   const bubbleHeight = measureUserMessageBubble(layout, contentWidth, 'topLevel', userMessageDisclosure);
 
-  return bubbleHeight;
+  return bubbleHeight + (segment.content
+    ? transcriptLayout.user.bubbleGap + transcriptLayout.exactContentHeight
+    : 0);
 }
 
 function measureUserMessageBubble(
@@ -420,5 +422,6 @@ function measureAssistantMessage({
     return 0;
   }
 
-  return measureMarkdownDocumentHeight(segment.text, 'default', contentWidth, { richFileLinks: !streaming });
+  return measureMarkdownDocumentHeight(segment.text, 'default', contentWidth, { richFileLinks: !streaming }) +
+    (segment.content ? transcriptLayout.exactContentHeight : 0);
 }

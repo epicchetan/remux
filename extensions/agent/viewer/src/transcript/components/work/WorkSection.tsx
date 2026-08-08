@@ -5,6 +5,7 @@ import {
   FileDiff,
   FileText,
   Loader2,
+  RotateCcw,
   Wrench,
 } from 'lucide-react';
 
@@ -18,6 +19,7 @@ import {
 } from '../../../../../shared/transcript';
 import { DiffBlock } from '../diff/DiffBlock';
 import { MarkdownBlock } from '../markdown/MarkdownBlock';
+import { ExactContent } from '../ExactContent';
 import {
   transcriptWorkDisclosureKey,
   useTranscriptLayoutStore,
@@ -88,9 +90,12 @@ export function WorkSection({
       {isOpen ? (
         <div className="codex-work-content" ref={contentRef}>
           {segment.timeline.map((entry) => entry.type === 'text' ? (
-            <MarkdownBlock density="work" key={entry.id} width={laneWidth}>
-              {entry.text}
-            </MarkdownBlock>
+            <div key={entry.id}>
+              <MarkdownBlock density="work" width={laneWidth}>
+                {entry.text}
+              </MarkdownBlock>
+              <ExactContent content={entry.content} preview={entry.text} title="reasoning" />
+            </div>
           ) : (
             <WorkGroup
               conversationId={conversationId}
@@ -129,8 +134,8 @@ function WorkGroup({
   const loadMore = useTranscriptResourceStore((state) => state.loadMoreWorkGroup);
 
   useEffect(() => {
-    void ensureGroup({ groupId: group.id, segmentId, turnId });
-  }, [ensureGroup, group.id, segmentId, turnId]);
+    if (!entry) void ensureGroup({ groupId: group.id, segmentId, turnId });
+  }, [ensureGroup, entry, group.id, segmentId, turnId]);
 
   return (
     <section className="codex-work-group" data-group-type={group.groupType}>
@@ -142,7 +147,17 @@ function WorkGroup({
         <div className="codex-work-loading"><Loader2 className="size-3.5 animate-spin" /> Loading…</div>
       ) : null}
       {entry?.status === 'error' || entry?.status === 'missing' ? (
-        <div className="codex-work-error">Work details are unavailable.</div>
+        <div className="codex-work-error" role="alert">
+          <span>{entry.errorCode === 'staleCursor'
+            ? 'Work changed while the next page was loading.'
+            : 'Work details are unavailable.'}</span>
+          <button
+            onClick={() => void ensureGroup({ groupId: group.id, segmentId, turnId })}
+            type="button"
+          >
+            <RotateCcw className="size-3" /> Retry
+          </button>
+        </div>
       ) : null}
       {entry?.resource?.rows.map((row) => (
         <WorkRow
@@ -212,6 +227,11 @@ function WorkRow({
   }, sameStrings);
 
   const canOpen = row.hasDetail;
+  useEffect(() => {
+    if (open && !detail) {
+      void ensureDetail({ groupId, rowId: row.id, segmentId, turnId });
+    }
+  }, [detail, ensureDetail, groupId, open, row.id, segmentId, turnId]);
   return (
     <div className={cn('codex-work-row-frame', open && 'is-open')}>
       <button
@@ -240,10 +260,22 @@ function WorkRow({
             <div className="codex-work-loading"><Loader2 className="size-3.5 animate-spin" /> Loading detail…</div>
           ) : null}
           {detail?.status === 'error' || detail?.status === 'missing' ? (
-            <div className="codex-work-error">Detail is unavailable.</div>
+            <div className="codex-work-error" role="alert">
+              <span>Detail is unavailable.</span>
+              <button
+                onClick={() => void ensureDetail({ groupId, rowId: row.id, segmentId, turnId })}
+                type="button"
+              >
+                <RotateCcw className="size-3" /> Retry
+              </button>
+            </div>
           ) : null}
           {detail?.resource ? (
-            <WorkDetail detail={detail.resource.detail} laneWidth={laneWidth} />
+            <WorkDetail
+              content={detail.resource.content}
+              detail={detail.resource.detail}
+              laneWidth={laneWidth}
+            />
           ) : null}
         </div>
       ) : null}
@@ -252,9 +284,11 @@ function WorkRow({
 }
 
 function WorkDetail({
+  content,
   detail,
   laneWidth,
 }: {
+  content?: import('../../../../../shared/transcript').AgentWorkEntryDetailResource['content'];
   detail: NonNullable<import('../../../../../shared/transcript').AgentWorkEntryDetailResource['detail']>;
   laneWidth: number;
 }) {
@@ -264,7 +298,9 @@ function WorkDetail({
   return (
     <div className="codex-work-detail-copy">
       {primary ? <MarkdownBlock density="work" width={laneWidth}>{primary}</MarkdownBlock> : null}
+      <ExactContent content={content?.detail} preview={primary ?? ''} title="tool input" />
       {output ? <pre className="codex-work-output">{output}</pre> : null}
+      <ExactContent content={content?.output} preview={output ?? ''} title="tool output" />
     </div>
   );
 }

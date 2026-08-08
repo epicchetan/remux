@@ -32,10 +32,18 @@ export function useComposerTurnAction({
     const next = beginSubmission(conversationExists ? 'sending' : 'starting-conversation');
     void onSend(projection.text, (phase) => setSubmissionPhase(next.id, phase))
       .then(() => {
-        clearComposer();
+        if (useComposerStore.getState().snapshot.contentKey === next.snapshot.contentKey) {
+          clearComposer();
+        }
         clearSubmission(next.id);
       })
-      .catch((error) => failSubmission(next.id, error instanceof Error ? error.message : String(error)));
+      .catch((error) => {
+        if (useComposerStore.getState().snapshot.contentKey === next.snapshot.contentKey) {
+          failSubmission(next.id, error instanceof Error ? error.message : String(error));
+        } else {
+          clearSubmission(next.id);
+        }
+      });
   };
 
   const handleInterrupt = () => {

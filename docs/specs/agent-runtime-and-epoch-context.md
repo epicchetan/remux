@@ -1,6 +1,6 @@
 Status: Active Spec
-Last verified: 2026-08-07
-Canonical code: Owner-accepted Phase 0 and Phase 1A.0 UI foundation are in `extensions/agent/`; durable journal, epochs, coding tools, and process runtime remain open
+Last verified: 2026-08-08
+Canonical code: Owner-accepted Phase 0 through Phase 1A.2 are in `extensions/agent/`; shadow context compilation, active epoch rollover, coding tools, and process runtime remain open
 
 # Agent runtime and epoch context
 
@@ -443,7 +443,7 @@ removed-but-referenced artifact leaves a tombstone.
 **Resources** — materialized current-state views over the journal, uniformly
 addressable (`command:<id>`, `process:<id>`, `workspace:<ws>/<path>@<hash>`,
 `changeset:<id>`, `turn:<conv>/<n>`, `record:<id>@<rev>`,
-`epoch:<strand>/<n>`, `artifact:<hash>`, `inference:<id>`), each carrying
+`scope:<id>`, `epoch:<scope>/<n>`, `artifact:<hash>`, `inference:<id>`), each carrying
 `state`, `basisEventSequence`, data, and typed relations (`produced`,
 `modified`, `validated`, `depends-on`, `supersedes`, …). Snapshot queries and
 `runtime` tool calls read these; graph edges beat embedding similarity for

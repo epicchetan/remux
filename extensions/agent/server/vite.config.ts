@@ -13,6 +13,6 @@ export default defineConfig({
       },
     },
     ssr: 'src/main.ts',
-    target: 'node22',
+    target: 'node24',
   },
 });

@@ -8,6 +8,7 @@ import type { TranscriptUserMessageDisclosure } from '../layout/types';
 import { buildUserMessageLayout } from '../model/userMessageContent';
 import { userBubbleContentWidth } from '../layout/constants';
 import { MarkdownBlock } from './markdown/MarkdownBlock';
+import { ExactContent } from './ExactContent';
 
 export function UserMessage({
   disclosure,
@@ -58,6 +59,7 @@ export function UserMessage({
                 : <ChevronDown className="size-3.5" />}
             </button>
           ) : null}
+          <ExactContent content={segment.content} preview={segment.text} title="message" />
         </div>
       ) : null}
       {showActions ? <CopyAction label="message" text={segment.text} /> : null}

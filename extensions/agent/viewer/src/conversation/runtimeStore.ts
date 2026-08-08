@@ -1,4 +1,4 @@
-import type { ConversationValue } from '../../../shared/protocol';
+import type { AgentRuntimeValue } from '../../../shared/protocol';
 import { createExternalStore } from '../transcript/externalStore';
 
 type ConversationRuntimeStoreState = {
@@ -6,7 +6,7 @@ type ConversationRuntimeStoreState = {
   activeTurnElapsedMs: number | null;
   activeTurnId: string | null;
   error: string | null;
-  status: ConversationValue['status'] | 'unavailable';
+  status: AgentRuntimeValue['state'] | 'unavailable';
 };
 
 const runtimeStore = createExternalStore<ConversationRuntimeStoreState>({
@@ -23,13 +23,13 @@ export function getConversationRuntimeState() {
   return runtimeStore.getState();
 }
 
-export function setConversationRuntime(conversation: ConversationValue | null) {
-  runtimeStore.setState(conversation ? {
-    activeConversationId: conversation.id,
-    activeTurnElapsedMs: conversation.activeTurnElapsedMs,
-    activeTurnId: conversation.activeTurnId,
-    error: conversation.error,
-    status: conversation.status,
+export function setConversationRuntime(runtime: AgentRuntimeValue | null) {
+  runtimeStore.setState(runtime ? {
+    activeConversationId: runtime.conversationId,
+    activeTurnElapsedMs: runtime.activeTurnElapsedMs,
+    activeTurnId: runtime.activeTurnId,
+    error: runtime.error,
+    status: runtime.state,
   } : {
     activeConversationId: null,
     activeTurnElapsedMs: null,

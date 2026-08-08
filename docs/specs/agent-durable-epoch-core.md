@@ -1,6 +1,6 @@
 Status: Active Spec
-Last verified: 2026-08-07
-Canonical code: Phase 0 and the owner-accepted Phase 1A.0 UI foundation live in `extensions/agent/`; the durable core described here remains open
+Last verified: 2026-08-08
+Canonical code: Phase 0 through Phase 1A.2 are implemented and owner-accepted in `extensions/agent/`; Phase 1A.3 shadow context compilation is the next planning boundary and remains unimplemented
 
 # Agent durable epoch core
 
@@ -123,6 +123,9 @@ order.
 The exact proposed 1A.1 storage, replay, recovery, protocol, history UI, and
 acceptance boundary is in
 [`agent-phase-1a1-durable-history-scope.md`](agent-phase-1a1-durable-history-scope.md).
+The audited 1A.2 transcript, protocol, scale, and recovery-hardening boundary
+is in
+[`agent-phase-1a2-transcript-hardening-scope.md`](agent-phase-1a2-transcript-hardening-scope.md).
 
 Required behavior:
 
@@ -322,8 +325,37 @@ meta(
   key PRIMARY KEY, value_json
 )
 
+projects(
+  project_id PRIMARY KEY, root_path UNIQUE, title, root_space_id,
+  revision, state, created_sequence, updated_sequence, created_at, updated_at
+)
+
+context_spaces(
+  space_id PRIMARY KEY, project_id, parent_space_id NULL, key,
+  descriptor_json, created_revision, created_sequence
+)
+
+project_primaries(
+  primary_id PRIMARY KEY, project_id, home_space_id, key, kind,
+  descriptor_json, body_json, authority, provenance_json, lifecycle,
+  superseded_by NULL, version, created_revision, updated_revision,
+  created_sequence, updated_sequence
+)
+
+context_bindings(
+  space_id, primary_id, project_id, mode, provenance_json, version,
+  created_revision, updated_revision, created_sequence, updated_sequence,
+  PRIMARY KEY(space_id, primary_id)
+)
+
+project_relations(
+  relation_id PRIMARY KEY, project_id, from_type, from_id, predicate,
+  to_type, to_id, attributes_json, provenance_json, version,
+  created_revision, created_sequence
+)
+
 conversations(
-  conversation_id PRIMARY KEY, title, cwd, model_id, reasoning,
+  conversation_id PRIMARY KEY, project_id, title, cwd, model_id, reasoning,
   head_strand_id, state, created_at, updated_at
 )
 
@@ -332,11 +364,23 @@ strands(
   forked_from_sequence NULL, state, created_at
 )
 
+turns(
+  turn_id PRIMARY KEY, project_id, conversation_id, strand_id,
+  client_message_id, root_scope_id, mode NULL, state, accepted_sequence,
+  terminal_sequence NULL, created_at, updated_at
+)
+
+execution_scopes(
+  scope_id PRIMARY KEY, project_id, conversation_id, strand_id, turn_id,
+  parent_scope_id NULL, kind, objective_json, state, created_sequence,
+  terminal_sequence NULL, result_artifact_hash NULL, created_at, updated_at
+)
+
 events(
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-  event_id UNIQUE, conversation_id, strand_id, turn_id NULL,
-  type, actor, visibility, causal_event_id NULL, operation_id NULL,
-  payload_json NULL, artifact_hash NULL, created_at
+  event_id UNIQUE, project_id, conversation_id, strand_id, turn_id NULL,
+  scope_id NULL, type, actor, visibility, causal_event_id NULL,
+  operation_id NULL, payload_json NULL, artifact_hash NULL, created_at
 )
 
 transcript_items(
@@ -349,8 +393,8 @@ resources(
 )
 
 operations(
-  operation_id PRIMARY KEY, conversation_id, strand_id, turn_id,
-  kind, arguments_hash, state, accepted_sequence,
+  operation_id PRIMARY KEY, project_id, conversation_id, strand_id,
+  turn_id NULL, scope_id NULL, kind, arguments_hash, state, accepted_sequence,
   terminal_sequence NULL, result_artifact_hash NULL, value_json
 )
 
@@ -360,9 +404,10 @@ artifacts(
 )
 
 epochs(
-  epoch_id PRIMARY KEY, conversation_id, strand_id, ordinal,
-  state, policy_version, opened_sequence, closed_sequence NULL,
-  close_reason NULL, bootstrap_artifact_hash, basis_sequence
+  epoch_id PRIMARY KEY, project_id, conversation_id, strand_id, turn_id,
+  scope_id, ordinal, state, policy_version, opened_sequence,
+  closed_sequence NULL, close_reason NULL, bootstrap_artifact_hash,
+  basis_sequence
 )
 
 epoch_blocks(
@@ -371,16 +416,19 @@ epoch_blocks(
 )
 
 inferences(
-  inference_id PRIMARY KEY, conversation_id, strand_id, turn_id,
-  epoch_id, ordinal, basis_sequence, state, request_mode,
+  inference_id PRIMARY KEY, project_id, conversation_id, strand_id, turn_id,
+  scope_id, epoch_id, ordinal, basis_sequence, state, request_mode,
   manifest_artifact_hash, input_hash, estimated_input_tokens,
   reported_input_tokens NULL, reported_output_tokens NULL,
   started_sequence, terminal_sequence NULL
 )
 ```
 
-`strands` exists now so event and epoch identity will not change when fork/edit
-arrives later. Phase 1 creates exactly one root strand and exposes no fork API.
+`strands` exists now so event identity will not change when fork/edit arrives
+later. Every turn owns a root `execution_scope`; optional child scopes are the
+future work-unit primitive. Epochs and inferences belong to one scope rather
+than to the strand as a whole. Phase 1A.1 creates only the root scope and
+exposes no fork or child-work API.
 
 `sequence` is the single committed ordering cursor. Resource revisions are
 their `basis_sequence`, not an in-memory counter. `serverGeneration` remains a
@@ -390,22 +438,38 @@ separate random boot identity used to fence stale browser state.
 
 The event log is append-only. The initial event taxonomy is also fixed:
 
+- `project.created`, `project.state.updated`;
 - `conversation.created`, `conversation.updated`;
 - `turn.accepted`, `turn.started`, `turn.completed`, `turn.interrupted`,
   `turn.failed`;
+- `execution_scope.created`, `execution_scope.yielded`,
+  `execution_scope.resumed`, `execution_scope.completed`,
+  `execution_scope.abandoned`, `execution_scope.interrupted`,
+  `execution_scope.failed`;
 - `message.user`, `message.assistant.started`,
-  `message.assistant.delta`, `message.assistant.completed`;
-- `tool.called`, `tool.updated`, `tool.completed`;
+  `message.assistant.content.checkpoint`, `message.assistant.completed`;
+- `tool.called`, `tool.completed`;
 - `operation.accepted`, `operation.started`, `operation.succeeded`,
   `operation.failed`, `operation.interrupted`, `operation.unknown`;
 - `epoch.opened`, `epoch.closed`;
 - `inference.started`, `inference.completed`, `inference.failed`; and
 - `recovery.observed`, `runtime.changed`, `context.pinned`.
 
-Assistant streaming deltas are coalesced before commit at the earlier of
-50 milliseconds or 8 KiB. A completed message has a terminal event even when
-its last delta is empty. The viewer consumes materialized transcript items; it
+The journal records semantic state transitions and bounded recovery
+checkpoints, not provider frames, individual tokens, UI invalidations, or
+incidental progress animation. Assistant streaming deltas accumulate in
+memory and become newly appended content checkpoints at the current durability
+policy's earlier time/size boundary (initially 50 milliseconds or 8 KiB).
+That cadence is tunable policy rather than event semantics. A completed
+message records its final content hash and terminal state even when the last
+checkpoint is empty. The viewer consumes materialized transcript items; it
 does not infer terminal state from a quiet stream.
+
+`workspace.read` has no intermediate durable tool state: `tool.called` is
+followed by one terminal `tool.completed`, artifact-backed when necessary. A
+future streaming effect may define `tool.output.checkpoint` only for output
+that must survive restart or enter context; transport-only progress remains
+ephemeral.
 
 An event payload is at most 32 KiB of canonical JSON. Larger exact bytes are
 installed as an artifact and referenced by hash. Secret redaction occurs
@@ -940,6 +1004,13 @@ available when needed, not injected into every turn.
 
 The release decision is not “use it for two weeks and see.” Owner dogfooding is
 valuable after deterministic gates, but it is not the only evidence.
+
+The first historical replay corpus, exact Codex/Claude session identifiers,
+commit associations, parsing hazards, sanitized-fixture requirements, and
+work-unit experiment arm are recorded in
+[`agent-ledger-benchmark-corpus.md`](agent-ledger-benchmark-corpus.md). That
+document is R&D evidence; this section continues to own the normative release
+gates.
 
 ### Deterministic fixture corpus
 

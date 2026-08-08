@@ -16,10 +16,12 @@ export function subscribeAgentResourceInvalidations(
     const envelopes = events
       .filter((event) => event.method === AGENT_METHODS.resourcesInvalidated)
       .map((event) => parseAgentInvalidationEnvelope(event.params));
-    const invalidations = dedupeInvalidations(envelopes.flatMap((value) => value.invalidations));
-    if (invalidations.length === 0) return;
-    onGenericInvalidation(invalidations.filter((value) => value.type === 'resource'));
-    void invalidateTranscriptResources(invalidations);
+    for (const envelope of envelopes) {
+      const invalidations = dedupeInvalidations(envelope.invalidations);
+      if (invalidations.length === 0) continue;
+      onGenericInvalidation(invalidations.filter((value) => value.type === 'resource'));
+      void invalidateTranscriptResources(invalidations, envelope.serverGeneration);
+    }
   });
 }
 
@@ -41,7 +43,15 @@ export function parseAgentInvalidationEnvelope(params: unknown): AgentInvalidati
 function dedupeInvalidations(invalidations: AgentResourceInvalidation[]) {
   const byKey = new Map<string, AgentResourceInvalidation>();
   for (const invalidation of invalidations) {
-    byKey.set(`${invalidation.type}:${invalidation.key}`, invalidation);
+    const key = `${invalidation.type}:${invalidation.key}`;
+    const previous = byKey.get(key);
+    if (
+      previous &&
+      previous.type !== 'resource' &&
+      invalidation.type !== 'resource' &&
+      previous.basisSequence > invalidation.basisSequence
+    ) continue;
+    byKey.set(key, invalidation);
   }
   return [...byKey.values()];
 }
@@ -56,7 +66,11 @@ function isAgentResourceInvalidation(value: unknown): value is AgentResourceInva
       invalidation.reason === 'deleted';
   }
   const scoped = invalidation as Partial<Exclude<AgentResourceInvalidation, { type: 'resource' }>>;
-  if (typeof scoped.conversationId !== 'string') return false;
+  if (
+    typeof scoped.conversationId !== 'string' ||
+    !Number.isSafeInteger(scoped.basisSequence) ||
+    Number(scoped.basisSequence) < 0
+  ) return false;
   if (invalidation.type === 'transcript') {
     return (invalidation.reason === 'sendAccepted' ||
       invalidation.reason === 'runtimeEvent' ||

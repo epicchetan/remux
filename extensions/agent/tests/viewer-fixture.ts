@@ -1,6 +1,7 @@
 import type { Page } from '@playwright/test';
 
 export const FIXTURE_CONVERSATION_ID = '11111111-1111-4111-8111-111111111111';
+export const FIXTURE_SECOND_CONVERSATION_ID = '22222222-2222-4222-8222-222222222222';
 
 export async function installAgentHost(page: Page) {
   await page.addInitScript(() => {
@@ -32,6 +33,11 @@ export async function installAgentHost(page: Page) {
       && route.get('remuxResourceId') === conversationId;
     const longTranscript = route.get('fixtureLong') === '1';
     const markdownTranscript = route.get('fixtureMarkdown') === '1';
+    const overflowTranscript = route.get('fixtureOverflow') === '1';
+    const exactTranscript = route.get('fixtureExact') === '1';
+    const exactArtifactHash = 'a'.repeat(64);
+    const exactPreview = 'Exact preview. ';
+    const exactFullText = `${exactPreview}The remaining response is fetched only when requested.`;
     const resources = new Map<string, Resource>([
       ['auth', { revision: 1, value: {
         state: signedOut ? 'signed-out' : 'signed-in', operationId: null,
@@ -45,6 +51,7 @@ export async function installAgentHost(page: Page) {
           contextWindow: 400000, supportedReasoning: ['low', 'medium', 'high', 'xhigh'],
         }],
       } }],
+      ['runtime', { revision: 1, value: runtimeValue('unloaded') }],
     ]);
     const turns: Turn[] = [];
     const workGroups = new Map<string, any>();
@@ -54,6 +61,8 @@ export async function installAgentHost(page: Page) {
     let turnCounter = 0;
     let lifecycleEpoch = 1;
     let nextTranscriptDelayMs = 0;
+    let nextMessageError: string | null = null;
+    let staleNextWorkPage = false;
     let viewportMetrics = {
       keyboardHeight: 0,
       keyboardVisible: false,
@@ -66,14 +75,49 @@ export async function installAgentHost(page: Page) {
     if (routedConversation) {
       resources.set(conversationKey, {
         revision: 3,
-        value: conversationValue('/tmp/remux-fixture', 'idle'),
+        value: conversationSummary('/tmp/remux-fixture', 'idle'),
       });
+      resources.set('runtime', { revision: 2, value: runtimeValue('idle') });
       if (longTranscript) {
         for (let index = 1; index <= 72; index += 1) {
           turns.push(completedTurn(`turn-${index}`, `Historical request ${index}`, `Historical answer ${index}.`));
         }
         sequence = 72;
         turnCounter = 72;
+      } else if (exactTranscript) {
+        const exact = completedTurn('exact-turn', 'Show the bounded response', exactPreview);
+        const assistant = exact.segments.find((segment) => segment.type === 'assistantMessage');
+        if (assistant) {
+          const returnedBytes = new TextEncoder().encode(exactPreview).byteLength;
+          assistant.content = {
+            sha256: exactArtifactHash,
+            byteLength: new TextEncoder().encode(exactFullText).byteLength,
+            returnedBytes,
+            truncated: true,
+            artifactHash: exactArtifactHash,
+            nextRange: { kind: 'utf8', offset: returnedBytes, byteLength: 13 },
+          };
+        }
+        turns.push(exact);
+      } else if (overflowTranscript) {
+        turns.push(completedTurn(
+          'overflow-turn',
+          'Automated recovery retry: finish the extension walkthrough requested in the prior turn using the durable context already available. Do not call tools. Keep the answer concise and end with REMUX_REPLAY_OK.',
+          [
+            'Yep—here’s the extension model end-to-end:',
+            '',
+            '1. **What an extension is**',
+            '',
+            '   - A folder (often under `extensions/`) with `remux-extension.json`.',
+            '   - It can define:',
+            '     - static **viewer assets** (HTML/JS bundle),',
+            '     - optional **stdio JSON-RPC server** (mandatory for richer extension actions),',
+            '     - optional **build/watch commands** for viewer bundles,',
+            '     - optional **child workloads** (`version: 2` only).',
+            '',
+            '2. **Discovery**',
+          ].join('\n'),
+        ));
       } else if (markdownTranscript) {
         turns.push(completedTurn(
           'markdown-turn',
@@ -103,19 +147,35 @@ export async function installAgentHost(page: Page) {
         ));
       }
     }
+    resources.set('conversation-list', {
+      revision: 1,
+      value: { conversations: conversationSummaries(), truncated: false },
+    });
 
-    function conversationValue(cwd: string, status: string) {
+    function conversationSummary(cwd: string, status: string) {
       return {
         id: conversationId,
+        title: 'Resume this conversation',
+        preview: 'Recovered from authoritative resources.',
         cwd,
         modelId: 'gpt-5.4-fixture',
         reasoning: 'high',
         status,
+        latestTurnId: turns.at(-1)?.id ?? null,
+        createdAt: 1_700_000_000_000,
+        updatedAt: Date.now(),
+      };
+    }
+
+    function runtimeValue(state: string) {
+      return {
+        conversationId: state === 'unloaded' ? null : conversationId,
+        state,
         activeTurnId: null,
         activeTurnElapsedMs: null,
         error: null,
         contextProbe: {
-          hookVersion: 'phase0-v1', modelCallCount: routedConversation ? 1 : 0,
+          hookVersion: 'agent-durable-v1', modelCallCount: routedConversation ? 1 : 0,
           messageCount: routedConversation ? 2 : 0,
           messageHash: routedConversation ? 'fixture-hash' : null,
           orderedMessageHashes: routedConversation ? ['one', 'two'] : [],
@@ -143,6 +203,21 @@ export async function installAgentHost(page: Page) {
       };
     }
 
+    function conversationSummaries() {
+      return [...resources.entries()]
+        .filter(([key]) => key.startsWith('conversation:'))
+        .map(([, resource]) => resource.value)
+        .sort((left, right) => right.updatedAt - left.updatedAt || right.id.localeCompare(left.id));
+    }
+
+    function syncConversationList() {
+      const existing = resources.get('conversation-list');
+      if (!existing) return;
+      existing.value = { conversations: conversationSummaries(), truncated: false };
+      existing.revision += 1;
+      invalidateResource('conversation-list');
+    }
+
     function dispatch(message: unknown) {
       const event = new MessageEvent('message', { data: JSON.stringify(message) });
       window.dispatchEvent(event);
@@ -160,7 +235,7 @@ export async function installAgentHost(page: Page) {
     ) {
       dispatchInvalidations([{
         type: 'transcript', key: `transcript:${conversationId}`, conversationId,
-        turnId, reason, affectsOrder, affectsLayout: true,
+        turnId, reason, affectsOrder, affectsLayout: true, basisSequence: sequence,
       }]);
     }
 
@@ -180,6 +255,7 @@ export async function installAgentHost(page: Page) {
       mutate(entry.value);
       entry.revision += 1;
       invalidateResource(key);
+      if (key.startsWith('conversation:')) syncConversationList();
     }
 
     function touchTurn(turn: Turn) {
@@ -307,11 +383,16 @@ export async function installAgentHost(page: Page) {
         turn.error = { code: 'provider_error', message: 'Fixture provider failure.' };
       }
       touchTurn(turn);
-      updateResource(conversationKey, (conversation) => {
-        conversation.status = outcome === 'failed' ? 'error' : 'idle';
-        conversation.activeTurnId = null;
-        conversation.activeTurnElapsedMs = null;
-        conversation.error = outcome === 'failed' ? 'Fixture provider failure.' : null;
+      updateResource(conversationKey, (summary) => {
+        summary.status = outcome === 'failed' ? 'error' : 'idle';
+        summary.latestTurnId = turn.id;
+        summary.updatedAt = Date.now();
+      });
+      updateResource('runtime', (runtime) => {
+        runtime.state = outcome === 'failed' ? 'error' : 'idle';
+        runtime.activeTurnId = null;
+        runtime.activeTurnElapsedMs = null;
+        runtime.error = outcome === 'failed' ? 'Fixture provider failure.' : null;
       });
       invalidateTranscript(turn.id, 'terminal', false);
       if (work) {
@@ -321,14 +402,14 @@ export async function installAgentHost(page: Page) {
             type: 'workGroup',
             key: groupKey(turn.id, work.id, group.id),
             conversationId, turnId: turn.id, segmentId: work.id, groupId: group.id,
-            reason: 'terminal', affectsLayout: true,
+            reason: 'terminal', affectsLayout: true, basisSequence: sequence,
           }]);
         }
       }
     }
 
-    function transcriptSync(request: any) {
-      const allIds = turns.map((turn) => turn.id);
+    function transcriptSync(request: any, targetConversationId: string, targetTurns: Turn[]) {
+      const allIds = targetTurns.map((turn) => turn.id);
       let start = 0;
       let end = allIds.length;
       if (request.window.kind === 'tail') {
@@ -347,15 +428,17 @@ export async function installAgentHost(page: Page) {
           end = Math.min(allIds.length, last + 1);
         }
       }
-      const selected = turns.slice(start, end);
+      const selected = targetTurns.slice(start, end);
       const known = new Map((request.knownTurns ?? []).map((entry: any) => [entry.turnId, entry.renderRevision]));
       return {
-        protocolVersion: 1,
-        projectionVersion: 'agent-turn-render-v1',
-        conversationId,
+        protocolVersion: 2,
+        projectionVersion: 'agent-turn-render-v2',
+        conversationId: targetConversationId,
         conversationRevision: `conversation:${sequence}`,
         basisSequence: sequence,
-        activeTurnId: resources.get(conversationKey)?.value.activeTurnId ?? null,
+        activeTurnId: resources.get('runtime')?.value.conversationId === targetConversationId
+          ? resources.get('runtime')?.value.activeTurnId ?? null
+          : null,
         turnOrder: selected.map((turn) => turn.id),
         turns: selected.map((turn) => known.get(turn.id) === turn.renderRevision
           ? { status: 'notModified', turnId: turn.id, renderRevision: turn.renderRevision }
@@ -365,24 +448,29 @@ export async function installAgentHost(page: Page) {
           startIndex: start,
           endIndexExclusive: end,
           hasEarlier: start > 0,
-          hasLater: end < turns.length,
+          hasLater: end < targetTurns.length,
           turnIds: selected.map((turn) => turn.id),
         },
       };
     }
 
     function transcriptResult(params: any) {
-      if (!resources.has(conversationKey)) {
-        return { conversationId, serverGeneration: generation, resources: params.requests.map((_: any, requestIndex: number) => ({ requestIndex, key: `transcript:${conversationId}`, status: 'missing' })) };
+      const targetConversationId = String(params.conversationId);
+      if (!resources.has(`conversation:${targetConversationId}`)) {
+        return { conversationId: targetConversationId, serverGeneration: generation, resources: params.requests.map((_: any, requestIndex: number) => ({ requestIndex, key: `transcript:${targetConversationId}`, status: 'missing' })) };
       }
       return {
-        conversationId,
+        conversationId: targetConversationId,
         serverGeneration: generation,
         resources: params.requests.map((request: any, requestIndex: number) => {
           if (request.type === 'transcriptSync') {
-            const value = transcriptSync(request);
+            const value = transcriptSync(
+              request,
+              targetConversationId,
+              targetConversationId === conversationId ? turns : [],
+            );
             return {
-              requestIndex, key: `transcript:${conversationId}`, status: 'ok',
+              requestIndex, key: `transcript:${targetConversationId}`, status: 'ok',
               revision: value.conversationRevision, value,
             };
           }
@@ -390,8 +478,29 @@ export async function installAgentHost(page: Page) {
             const key = groupKey(request.turnId, request.segmentId, request.groupId);
             const value = workGroups.get(key);
             if (!value) return { requestIndex, key, status: 'missing' };
-            if (request.knownRevision === value.revision) return { requestIndex, key, status: 'notModified', revision: value.revision };
-            return { requestIndex, key, status: 'ok', revision: value.revision, value };
+            if (!request.cursor && request.knownRevision === value.revision) {
+              return { requestIndex, key, status: 'notModified', revision: value.revision };
+            }
+            const cursor = request.cursor ? decodeWorkCursor(String(request.cursor)) : null;
+            if (cursor && staleNextWorkPage) {
+              staleNextWorkPage = false;
+              value.revision = `${value.revision}:changed`;
+              value.layoutRevision = value.revision;
+            }
+            if (cursor && cursor.revision !== value.revision) {
+              return {
+                requestIndex, key, status: 'error', code: 'staleCursor',
+                reason: 'The fixture work group changed.', revision: value.revision,
+              };
+            }
+            const start = cursor?.offset ?? 0;
+            const end = Math.min(value.rows.length, start + Number(request.limit ?? 200));
+            const page = {
+              ...value,
+              rows: value.rows.slice(start, end),
+              nextCursor: end < value.rows.length ? encodeWorkCursor(value.revision, end) : null,
+            };
+            return { requestIndex, key, status: 'ok', revision: value.revision, value: page };
           }
           const key = detailKey(request.turnId, request.segmentId, request.groupId, request.rowId);
           const value = workDetails.get(key);
@@ -410,6 +519,17 @@ export async function installAgentHost(page: Page) {
       return `workEntryDetail:${conversationId}:${turnId}:${segmentId}:${groupId}:${rowId}`;
     }
 
+    function encodeWorkCursor(revision: string, offset: number) {
+      return btoa(JSON.stringify({ offset, revision, version: 1 }))
+        .replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+    }
+
+    function decodeWorkCursor(cursor: string) {
+      const base64 = cursor.replaceAll('-', '+').replaceAll('_', '/');
+      const value = JSON.parse(atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, '=')));
+      return { offset: Number(value.offset), revision: String(value.revision) };
+    }
+
     function resultFor(request: HostRequest) {
       const params = request.params ?? {};
       requestLog.push({
@@ -424,32 +544,76 @@ export async function installAgentHost(page: Page) {
             const entry = resources.get(item.key);
             if (!entry) return { key: item.key, status: 'missing', serverGeneration: generation };
             if (item.ifNoneMatch === entry.revision) {
-              return { key: item.key, status: 'notModified', revision: entry.revision, serverGeneration: generation };
+              return {
+                key: item.key, status: 'notModified', revision: entry.revision,
+                basisSequence: entry.revision, serverGeneration: generation,
+              };
             }
             return {
               key: item.key, status: 'ok', revision: entry.revision,
-              serverGeneration: generation, value: entry.value,
+              basisSequence: entry.revision, serverGeneration: generation, value: entry.value,
             };
           }),
         };
       }
       if (request.method === 'remux/agent/transcript/resources/read') return transcriptResult(params);
-      if (request.method === 'remux/agent/conversation/start') {
+      if (request.method === 'remux/agent/artifact/read') {
+        if (params.hash !== exactArtifactHash || params.range.kind !== 'utf8') {
+          throw new Error('Fixture artifact range was not found.');
+        }
+        const bytes = new TextEncoder().encode(exactFullText);
+        const start = Math.min(Number(params.range.offset), bytes.byteLength);
+        const end = Math.min(bytes.byteLength, start + Number(params.range.byteLength));
+        const nextRange = end < bytes.byteLength
+          ? { kind: 'utf8', offset: end, byteLength: Number(params.range.byteLength) }
+          : null;
+        return {
+          hash: exactArtifactHash,
+          mediaType: 'text/plain; charset=utf-8',
+          totalByteLength: bytes.byteLength,
+          totalLineCount: null,
+          range: { kind: 'utf8', offset: start, byteLength: end - start },
+          encoding: 'utf8',
+          content: new TextDecoder().decode(bytes.slice(start, end)),
+          truncated: nextRange !== null,
+          nextRange,
+        };
+      }
+      if (request.method === 'remux/agent/conversation/create') {
         resources.set(conversationKey, {
           revision: 1,
-          value: { ...conversationValue(params.cwd, 'idle'), modelId: params.modelId, reasoning: params.reasoning },
+          value: { ...conversationSummary(params.cwd, 'idle'), modelId: params.modelId, reasoning: params.reasoning },
+        });
+        resources.set('runtime', {
+          revision: (resources.get('runtime')?.revision ?? 0) + 1,
+          value: { ...runtimeValue('idle'), contextProbe: { ...runtimeValue('idle').contextProbe, modelId: params.modelId } },
         });
         invalidateResource(conversationKey, 'created');
+        syncConversationList();
+        invalidateResource('runtime');
         return { conversationId };
       }
       if (request.method === 'remux/agent/conversation/message/send') {
+        if (nextMessageError) {
+          const message = nextMessageError;
+          nextMessageError = null;
+          throw new Error(message);
+        }
         const turn = createRunningTurn(String(params.text), String(params.clientMessageId));
-        updateResource(conversationKey, (conversation) => {
-          conversation.status = 'running';
-          conversation.activeTurnId = turn.id;
-          conversation.activeTurnElapsedMs = 0;
-          conversation.contextProbe = {
-            ...conversation.contextProbe,
+        updateResource(conversationKey, (summary) => {
+          summary.status = 'running';
+          summary.title = String(params.text);
+          summary.preview = String(params.text);
+          summary.latestTurnId = turn.id;
+          summary.updatedAt = Date.now();
+        });
+        updateResource('runtime', (runtime) => {
+          runtime.conversationId = conversationId;
+          runtime.state = 'running';
+          runtime.activeTurnId = turn.id;
+          runtime.activeTurnElapsedMs = 0;
+          runtime.contextProbe = {
+            ...runtime.contextProbe,
             modelCallCount: 1,
             messageCount: 1,
             messageHash: 'fixture-hash',
@@ -469,7 +633,7 @@ export async function installAgentHost(page: Page) {
             }
           }, 80);
         }
-        return { accepted: true, turnId: turn.id };
+        return { accepted: true, operationId: params.operationId, turnId: turn.id };
       }
       if (request.method === 'remux/agent/conversation/turn/interrupt') {
         const turn = turns.find((candidate) => candidate.id === params.turnId);
@@ -545,14 +709,26 @@ export async function installAgentHost(page: Page) {
             return;
           }
           if (request.id !== undefined && request.method) {
-            if (request.method === 'remux/agent/transcript/resources/read' && nextTranscriptDelayMs > 0) {
-              const result = resultFor(request);
-              const delay = nextTranscriptDelayMs;
-              nextTranscriptDelayMs = 0;
-              setTimeout(() => dispatch({ type: 'remux/response', id: request.id, result }), delay);
-              return;
+            try {
+              if (request.method === 'remux/agent/transcript/resources/read' && nextTranscriptDelayMs > 0) {
+                const result = resultFor(request);
+                const delay = nextTranscriptDelayMs;
+                nextTranscriptDelayMs = 0;
+                setTimeout(() => dispatch({ type: 'remux/response', id: request.id, result }), delay);
+                return;
+              }
+              dispatch({ type: 'remux/response', id: request.id, result: resultFor(request) });
+            } catch (error) {
+              dispatch({
+                type: 'remux/error',
+                id: request.id,
+                error: {
+                  code: -32019,
+                  data: { kind: 'active_runtime_busy' },
+                  message: error instanceof Error ? error.message : String(error),
+                },
+              });
             }
-            dispatch({ type: 'remux/response', id: request.id, result: resultFor(request) });
           }
         },
       },
@@ -570,10 +746,77 @@ export async function installAgentHost(page: Page) {
           sequence += 1;
           invalidateTranscript(turn.id, 'terminal', true);
         },
+        addConversation(input: { cwd?: string; id: string; preview?: string; title: string }) {
+          const key = `conversation:${input.id}`;
+          resources.set(key, {
+            revision: 1,
+            value: {
+              ...conversationSummary(input.cwd ?? '/tmp/remux-fixture', 'idle'),
+              id: input.id,
+              latestTurnId: null,
+              preview: input.preview ?? '',
+              title: input.title,
+              updatedAt: Date.now() + 1,
+            },
+          });
+          invalidateResource(key, 'created');
+          syncConversationList();
+        },
         delayNextTranscript(delayMs: number) {
           nextTranscriptDelayMs = Math.max(0, delayMs);
         },
+        populateLatestWorkGroup(rowCount: number) {
+          const turn = turns.at(-1);
+          const work = turn?.segments.find((segment) => segment.type === 'work');
+          const group = work?.timeline.find((entry: any) => entry.type === 'group');
+          if (!turn || !work || !group) throw new Error('No fixture work group is available.');
+          const key = groupKey(turn.id, work.id, group.id);
+          const value = workGroups.get(key);
+          if (!value) throw new Error('No fixture work resource is available.');
+          const first = value.rows[0];
+          value.rows = Array.from({ length: Math.max(1, rowCount) }, (_, index) => index === 0
+            ? first
+            : {
+                id: `${turn.id}:generated-${index}`,
+                type: 'activity',
+                revision: `generated-${index}`,
+                kind: 'read',
+                status: 'completed',
+                text: `Read generated-${index}.md`,
+                path: `generated-${index}.md`,
+                durationMs: 10,
+                hasDetail: false,
+              });
+          value.revision = `${turn.id}:paged:${sequence + 1}`;
+          value.layoutRevision = value.revision;
+          group.rowCount = value.rows.length;
+          group.revision = value.revision;
+          touchTurn(turn);
+          invalidateTranscript(turn.id, 'runtimeEvent', false);
+        },
+        staleNextWorkPage() {
+          staleNextWorkPage = true;
+        },
+        rejectNextMessage(message = 'Another conversation has an active turn.') {
+          nextMessageError = message;
+        },
         lifecycle: dispatchLifecycle,
+        navigate(resourceKind: string, resourceId: string, focusKind?: string, focusId?: string) {
+          dispatch({
+            type: 'remux/event',
+            message: {
+              jsonrpc: '2.0',
+              method: 'host/navigate',
+              params: {
+                focusId: focusId ?? null,
+                focusKind: focusKind ?? null,
+                nonce: `fixture-navigation-${Date.now()}`,
+                resourceId,
+                resourceKind,
+              },
+            },
+          });
+        },
         reconnect() {
           dispatchStatus('reconnecting');
           setTimeout(() => {
@@ -583,10 +826,18 @@ export async function installAgentHost(page: Page) {
         },
         resetGeneration() {
           generation = `fixture-generation-${Date.now()}`;
-          resources.delete(conversationKey);
           const auth = resources.get('auth');
           if (auth) auth.revision += 1;
-          invalidateResource('auth');
+          const runtime = resources.get('runtime');
+          if (runtime) {
+            runtime.revision += 1;
+            runtime.value = runtimeValue('unloaded');
+          }
+          dispatchInvalidations([
+            { type: 'resource', key: 'auth', reason: 'updated' },
+            { type: 'resource', key: 'runtime', reason: 'updated' },
+            { type: 'resource', key: conversationKey, reason: 'updated' },
+          ]);
         },
         setViewportMetrics(metrics: Partial<typeof viewportMetrics>) {
           viewportMetrics = { ...viewportMetrics, ...metrics };

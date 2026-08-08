@@ -1,5 +1,5 @@
-export const AGENT_TRANSCRIPT_PROTOCOL_VERSION = 1 as const;
-export const AGENT_TRANSCRIPT_PROJECTION_VERSION = 'agent-turn-render-v1' as const;
+export const AGENT_TRANSCRIPT_PROTOCOL_VERSION = 2 as const;
+export const AGENT_TRANSCRIPT_PROJECTION_VERSION = 'agent-turn-render-v2' as const;
 
 export const DEFAULT_TRANSCRIPT_TAIL_TURNS = 24;
 export const DEFAULT_TRANSCRIPT_PREPEND_TURNS = 16;
@@ -8,6 +8,7 @@ export const MAX_TRANSCRIPT_KNOWN_TURNS = 80;
 export const MAX_TRANSCRIPT_REQUESTS = 64;
 export const MAX_TRANSCRIPT_RESPONSE_BYTES = 8 * 1024 * 1024;
 export const MAX_TURN_FRAME_BYTES = 1024 * 1024;
+export const MAX_VISIBLE_TEXT_BYTES = 48 * 1024;
 export const DEFAULT_WORK_GROUP_ROWS = 200;
 export const MAX_WORK_GROUP_ROWS = 256;
 export const WORK_GROUP_ROW_LIMITS = [50, 100, 200] as const;
@@ -21,8 +22,21 @@ export type AgentTurnStatus =
   | 'interrupted';
 
 export type AgentTurnError = {
-  code: 'provider_error' | 'runtime_error';
+  code: 'provider_error' | 'runtime_error' | 'storage_error';
   message: string;
+};
+
+export type AgentTextContentReference = {
+  sha256: string;
+  byteLength: number;
+  returnedBytes: number;
+  truncated: true;
+  artifactHash: string | null;
+  nextRange: {
+    kind: 'utf8';
+    offset: number;
+    byteLength: number;
+  } | null;
 };
 
 export type AgentUserMessageSegment = {
@@ -31,6 +45,7 @@ export type AgentUserMessageSegment = {
   clientMessageId: string | null;
   revision: string;
   text: string;
+  content?: AgentTextContentReference;
 };
 
 export type AgentAssistantMessageSegment = {
@@ -38,6 +53,7 @@ export type AgentAssistantMessageSegment = {
   type: 'assistantMessage';
   revision: string;
   text: string;
+  content?: AgentTextContentReference;
 };
 
 export type AgentWorkTextTimelineEntry = {
@@ -45,6 +61,7 @@ export type AgentWorkTextTimelineEntry = {
   type: 'text';
   revision: string;
   text: string;
+  content?: AgentTextContentReference;
 };
 
 export type AgentWorkGroupTimelineEntry = {
@@ -84,6 +101,7 @@ export type AgentTurnRenderFrame = {
   completedAt: number | null;
   durationMs: number | null;
   error: AgentTurnError | null;
+  interruptionReason?: 'restart' | 'user' | null;
   renderRevision: string;
   layoutRevision: string;
   segments: AgentTurnSegment[];
@@ -150,8 +168,10 @@ export type AgentTurnRenderResult =
   | {
       status: 'error';
       turnId: string;
+      renderRevision: string;
       code: 'frameTooLarge' | 'projectionFailed';
       message: string;
+      frame: AgentTurnRenderFrame;
     };
 
 export type AgentWorkGroupRequest = {
@@ -265,6 +285,10 @@ export type AgentWorkEntryDetailResource = {
     returnedBytes: number;
     truncated: boolean;
   };
+  content?: {
+    detail?: AgentTextContentReference;
+    output?: AgentTextContentReference;
+  };
 };
 
 export type AgentTranscriptResourceRequest =
@@ -281,6 +305,7 @@ export type AgentTranscriptResourceResult = {
   requestIndex: number;
   key: string;
   status: 'ok' | 'notModified' | 'missing' | 'error';
+  code?: 'staleCursor' | 'resourceUnavailable';
   revision?: string;
   reason?: string;
   value?: AgentTranscriptSyncResource | AgentWorkGroupResource | AgentWorkEntryDetailResource;
@@ -295,7 +320,7 @@ export type AgentTranscriptResourcesReadResult = {
 export type AgentResourceInvalidation =
   | {
       type: 'resource';
-      key: 'auth' | 'models' | `conversation:${string}`;
+      key: 'auth' | 'models' | 'conversation-list' | 'runtime' | `conversation:${string}`;
       reason: 'created' | 'updated' | 'deleted';
     }
   | {
@@ -306,6 +331,7 @@ export type AgentResourceInvalidation =
       reason: 'sendAccepted' | 'runtimeEvent' | 'terminal';
       affectsOrder: boolean;
       affectsLayout: boolean;
+      basisSequence: number;
     }
   | {
       type: 'workGroup';
@@ -316,6 +342,7 @@ export type AgentResourceInvalidation =
       groupId: string;
       reason: 'runtimeEvent' | 'terminal';
       affectsLayout: boolean;
+      basisSequence: number;
     }
   | {
       type: 'workEntryDetail';
@@ -327,6 +354,7 @@ export type AgentResourceInvalidation =
       rowId: string;
       reason: 'runtimeEvent' | 'terminal';
       affectsLayout: boolean;
+      basisSequence: number;
     };
 
 export function workGroupResourceKey(

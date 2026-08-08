@@ -3,6 +3,7 @@ import { create } from 'zustand';
 import type { ModelsValue, ReasoningLevel } from '../../../shared/protocol.ts';
 import { preferredReasoning, resolveModel } from './config/modelSelection.ts';
 import {
+  createComposerSnapshot,
   createEmptyComposerSnapshot,
   type ComposerDocument,
   type ComposerSnapshot,
@@ -32,6 +33,7 @@ type ComposerStoreState = {
   models: ModelsValue | null;
   reasoning: ReasoningLevel;
   setEditorController: (controller: ComposerEditorController | null) => void;
+  setDocument: (document: ComposerDocument) => void;
   setModelId: (modelId: string) => void;
   setModels: (models: ModelsValue) => void;
   setReasoning: (reasoning: ReasoningLevel) => void;
@@ -63,6 +65,11 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
   reasoning: 'high',
   setEditorController: (next) => {
     controller = next;
+    if (next) next.setDocument(useComposerStore.getState().snapshot.document);
+  },
+  setDocument: (document) => {
+    controller?.setDocument(document);
+    if (!controller) set({ snapshot: createComposerSnapshot(document), submissionError: null });
   },
   setModelId: (modelId) => set((state) => {
     const selected = resolveModel(state.models, modelId);

@@ -30,6 +30,7 @@ export type TranscriptStatus = 'idle' | 'loading' | 'ready' | 'failed';
 
 export type TranscriptTurnResourceEntry = {
   layoutRevision: string;
+  projectionError: { code: 'frameTooLarge' | 'projectionFailed'; message: string } | null;
   revision: string;
   status: 'ready';
   turn: AgentTurnRenderFrame;
@@ -41,6 +42,7 @@ export type TranscriptWorkGroupEntry =
       resource: AgentWorkGroupResource | null;
       revision: string | null;
       status: 'error' | 'loading' | 'missing';
+      errorCode?: 'staleCursor' | 'resourceUnavailable';
     };
 
 export type TranscriptWorkEntryDetailEntry =
@@ -49,10 +51,12 @@ export type TranscriptWorkEntryDetailEntry =
       resource: AgentWorkEntryDetailResource | null;
       revision: string | null;
       status: 'error' | 'loading' | 'missing';
+      errorCode?: 'resourceUnavailable';
     };
 
 type TranscriptResourceStoreState = {
   activeConversationId: string | null;
+  basisSequence: number | null;
   conversationRevision: string | null;
   error: string | null;
   isWorking: boolean;
@@ -67,7 +71,11 @@ type TranscriptResourceStoreState = {
   ensureWorkEntryDetail: (input: WorkEntryInput) => Promise<void>;
   ensureWorkGroup: (input: WorkGroupInput) => Promise<void>;
   ensureWorkResources: (input: { segmentId: string; turnId: string }) => Promise<void>;
-  invalidateTranscriptResources: (invalidations: AgentResourceInvalidation[]) => Promise<void>;
+  focusTranscriptTurn: (turnId: string) => Promise<boolean>;
+  invalidateTranscriptResources: (
+    invalidations: AgentResourceInvalidation[],
+    serverGeneration?: string | null,
+  ) => Promise<void>;
   loadEarlierTranscriptResources: () => Promise<void>;
   loadLaterTranscriptResources: () => Promise<void>;
   loadMoreWorkGroup: (input: WorkGroupInput) => Promise<void>;
@@ -91,6 +99,7 @@ export type TranscriptRefreshOptions = {
 };
 
 let syncGeneration = 0;
+let transcriptGenerationEpoch = 0;
 let lifecycleState: 'active' | 'background' | 'inactive' = 'active';
 let dirtyWhileInactive = false;
 const groupRequests = new Map<string, Promise<void>>();
@@ -101,6 +110,7 @@ const actions: Pick<
   | 'ensureWorkEntryDetail'
   | 'ensureWorkGroup'
   | 'ensureWorkResources'
+  | 'focusTranscriptTurn'
   | 'invalidateTranscriptResources'
   | 'loadEarlierTranscriptResources'
   | 'loadLaterTranscriptResources'
@@ -111,6 +121,7 @@ const actions: Pick<
   ensureWorkEntryDetail,
   ensureWorkGroup,
   ensureWorkResources,
+  focusTranscriptTurn,
   invalidateTranscriptResources,
   loadEarlierTranscriptResources,
   loadLaterTranscriptResources,
@@ -121,6 +132,7 @@ const actions: Pick<
     if (state.activeConversationId === conversationId) return;
 
     syncGeneration += 1;
+    transcriptGenerationEpoch += 1;
     streamingRefreshScheduler.cancelPending();
     groupRequests.clear();
     detailRequests.clear();
@@ -165,11 +177,21 @@ export async function refreshActiveTranscriptResources(options: TranscriptRefres
   await loadTranscript(conversationId, generation, options);
 }
 
-export async function invalidateTranscriptResources(invalidations: AgentResourceInvalidation[]) {
-  const conversationId = resourceStore.getState().activeConversationId;
+export async function invalidateTranscriptResources(
+  invalidations: AgentResourceInvalidation[],
+  serverGeneration?: string | null,
+) {
+  const current = resourceStore.getState();
+  const conversationId = current.activeConversationId;
   if (!conversationId) return;
+  if (
+    !serverGeneration ||
+    (current.serverGeneration !== null && current.serverGeneration !== serverGeneration)
+  ) return;
   const relevant = invalidations.filter((invalidation) =>
-    'conversationId' in invalidation && invalidation.conversationId === conversationId);
+    'conversationId' in invalidation &&
+    invalidation.conversationId === conversationId &&
+    (current.basisSequence === null || invalidation.basisSequence > current.basisSequence));
   if (relevant.length === 0) return;
 
   if (lifecycleState !== 'active') {
@@ -276,6 +298,17 @@ async function loadLaterTranscriptResources() {
   });
 }
 
+async function focusTranscriptTurn(turnId: string) {
+  const state = resourceStore.getState();
+  if (!state.activeConversationId) return false;
+  if (state.turnResourcesById[turnId]) return true;
+  const outcome = await loadTranscript(state.activeConversationId, ++syncGeneration, {
+    preserveReady: true,
+    targetTurnId: turnId,
+  });
+  return outcome === 'applied' && Boolean(resourceStore.getState().turnResourcesById[turnId]);
+}
+
 async function ensureWorkResources({ segmentId, turnId }: { segmentId: string; turnId: string }) {
   const turn = resourceStore.getState().turnResourcesById[turnId]?.turn;
   const work = turn?.segments.find((segment): segment is AgentWorkRenderSegment =>
@@ -310,8 +343,10 @@ async function ensureWorkGroup(input: WorkGroupInput, force = false) {
       },
     },
   });
-  const request = readWorkGroup(conversationId, input, existing?.revision ?? undefined)
-    .finally(() => groupRequests.delete(key));
+  const request: Promise<void> = readWorkGroup(conversationId, input, existing?.revision ?? undefined)
+    .finally(() => {
+      if (groupRequests.get(key) === request) groupRequests.delete(key);
+    });
   groupRequests.set(key, request);
   return request;
 }
@@ -327,13 +362,15 @@ async function loadMoreWorkGroup(input: WorkGroupInput) {
   );
   const existing = resourceStore.getState().workGroupsByKey[key];
   if (existing?.status !== 'ready' || !existing.resource.nextCursor || groupRequests.has(key)) return;
-  const request = readWorkGroup(
+  const request: Promise<void> = readWorkGroup(
     conversationId,
     input,
     undefined,
     existing.resource.nextCursor,
     existing.resource,
-  ).finally(() => groupRequests.delete(key));
+  ).finally(() => {
+    if (groupRequests.get(key) === request) groupRequests.delete(key);
+  });
   groupRequests.set(key, request);
   return request;
 }
@@ -346,6 +383,7 @@ async function readWorkGroup(
   previous?: AgentWorkGroupResource,
 ) {
   const key = workGroupResourceKey(conversationId, input.turnId, input.segmentId, input.groupId);
+  const requestEpoch = transcriptGenerationEpoch;
   try {
     const response = await readTranscriptResources(conversationId, [{
       type: 'workGroup',
@@ -357,8 +395,11 @@ async function readWorkGroup(
       ...(knownRevision ? { knownRevision } : {}),
       ...(cursor ? { cursor } : {}),
     }]);
-    if (resourceStore.getState().activeConversationId !== conversationId) return;
-    if (!acceptTranscriptResponseGeneration(response.serverGeneration)) return;
+    if (
+      resourceStore.getState().activeConversationId !== conversationId ||
+      requestEpoch !== transcriptGenerationEpoch ||
+      !acceptScopedResponseGeneration(response.serverGeneration)
+    ) return;
     const result = response.resources[0];
     if (result?.status === 'notModified') {
       if (previous) setWorkGroup(key, previous);
@@ -370,15 +411,18 @@ async function readWorkGroup(
     }
     const value = result?.status === 'ok' ? result.value as AgentWorkGroupResource : null;
     if (!value) {
-      setWorkGroupFailure(key, result?.status === 'missing' ? 'missing' : 'error');
+      setWorkGroupFailure(
+        key,
+        result?.status === 'missing' ? 'missing' : 'error',
+        result?.code === 'staleCursor' ? 'staleCursor' : 'resourceUnavailable',
+      );
       return;
     }
-    setWorkGroup(key, previous ? {
-      ...value,
-      rows: [...previous.rows, ...value.rows],
-    } : value);
+    setWorkGroup(key, previous ? mergeWorkGroupPage(previous, value) : value);
   } catch {
-    setWorkGroupFailure(key, 'error');
+    if (requestEpoch === transcriptGenerationEpoch) {
+      setWorkGroupFailure(key, 'error', 'resourceUnavailable');
+    }
   }
 }
 
@@ -407,11 +451,13 @@ async function ensureWorkEntryDetail(input: WorkEntryInput, force = false) {
       },
     },
   });
-  const request = readWorkEntryDetail(
+  const request: Promise<void> = readWorkEntryDetail(
     conversationId,
     input,
     existing?.revision ?? undefined,
-  ).finally(() => detailRequests.delete(key));
+  ).finally(() => {
+    if (detailRequests.get(key) === request) detailRequests.delete(key);
+  });
   detailRequests.set(key, request);
   return request;
 }
@@ -428,6 +474,7 @@ async function readWorkEntryDetail(
     input.groupId,
     input.rowId,
   );
+  const requestEpoch = transcriptGenerationEpoch;
   try {
     const response = await readTranscriptResources(conversationId, [{
       type: 'workEntryDetail',
@@ -438,8 +485,11 @@ async function readWorkEntryDetail(
       rowId: input.rowId,
       ...(knownRevision ? { knownRevision } : {}),
     }]);
-    if (resourceStore.getState().activeConversationId !== conversationId) return;
-    if (!acceptTranscriptResponseGeneration(response.serverGeneration)) return;
+    if (
+      resourceStore.getState().activeConversationId !== conversationId ||
+      requestEpoch !== transcriptGenerationEpoch ||
+      !acceptScopedResponseGeneration(response.serverGeneration)
+    ) return;
     const result = response.resources[0];
     if (result?.status === 'notModified') {
       const current = resourceStore.getState().workEntryDetailsByKey[key];
@@ -450,16 +500,24 @@ async function readWorkEntryDetail(
       ? result.value as AgentWorkEntryDetailResource
       : null;
     if (!value) {
-      setWorkEntryDetailFailure(key, result?.status === 'missing' ? 'missing' : 'error');
+      setWorkEntryDetailFailure(
+        key,
+        result?.status === 'missing' ? 'missing' : 'error',
+        'resourceUnavailable',
+      );
       return;
     }
     setWorkEntryDetail(key, value);
   } catch {
-    setWorkEntryDetailFailure(key, 'error');
+    if (requestEpoch === transcriptGenerationEpoch) {
+      setWorkEntryDetailFailure(key, 'error', 'resourceUnavailable');
+    }
   }
 }
 
 type InternalLoadOptions = TranscriptRefreshOptions & {
+  forceFresh?: boolean;
+  generationRetry?: number;
   window?: AgentTranscriptSyncRequest['window'];
 };
 
@@ -469,11 +527,12 @@ async function loadTranscript(
   options: InternalLoadOptions,
 ) {
   const state = resourceStore.getState();
+  const expectedServerGeneration = state.serverGeneration;
   if (!options.preserveReady || state.status !== 'ready') {
     resourceStore.setState({ status: 'loading', error: null });
   }
   const window = options.window ?? transcriptWindow(state, options);
-  const knownTurns = state.turnOrder.slice(-80).flatMap((turnId) => {
+  const knownTurns = options.forceFresh ? [] : state.turnOrder.slice(-80).flatMap((turnId) => {
     const entry = state.turnResourcesById[turnId];
     return entry ? [{ turnId, renderRevision: entry.revision }] : [];
   });
@@ -484,28 +543,44 @@ async function loadTranscript(
       protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
       projectionVersion: AGENT_TRANSCRIPT_PROJECTION_VERSION,
       window,
-      ...(state.conversationRevision
+      ...(!options.forceFresh && state.conversationRevision
         ? { knownConversationRevision: state.conversationRevision }
         : {}),
       ...(knownTurns.length > 0 ? { knownTurns } : {}),
     }]);
     if (isStaleSync(conversationId, generation)) return;
-    if (state.serverGeneration && state.serverGeneration !== response.serverGeneration) {
-      markTranscriptUnavailable('The ephemeral Agent conversation ended when the extension restarted.');
-      return;
+    if (
+      expectedServerGeneration !== null &&
+      expectedServerGeneration !== response.serverGeneration
+    ) {
+      transitionTranscriptGeneration(response.serverGeneration);
+      if ((options.generationRetry ?? 0) >= 1) {
+        markTranscriptUnavailable('The Agent server generation changed repeatedly during transcript recovery.');
+        return 'unavailable' as const;
+      }
+      return loadTranscript(conversationId, ++syncGeneration, {
+        ...options,
+        forceFresh: true,
+        generationRetry: (options.generationRetry ?? 0) + 1,
+        preserveReady: true,
+      });
     }
     const result = response.resources[0];
     const sync = result?.status === 'ok' ? result.value as AgentTranscriptSyncResource : null;
     if (!sync) {
       markTranscriptUnavailable(result?.reason ?? 'The Agent transcript could not be loaded.');
-      return;
+      return 'unavailable' as const;
     }
     applySync(sync, response.serverGeneration, options);
+    return 'applied' as const;
   } catch (error) {
     if (!isStaleSync(conversationId, generation)) {
-      if (options.preserveReady && resourceStore.getState().status === 'ready') return;
+      if (options.preserveReady && resourceStore.getState().status === 'ready') {
+        return 'unavailable' as const;
+      }
       markTranscriptUnavailable(messageOf(error));
     }
+    return 'unavailable' as const;
   }
 }
 
@@ -515,12 +590,18 @@ function applySync(
   options: InternalLoadOptions,
 ) {
   const previous = resourceStore.getState();
+  if (
+    previous.serverGeneration === serverGeneration &&
+    previous.basisSequence !== null &&
+    sync.basisSequence < previous.basisSequence
+  ) return;
   const nextById: Record<string, TranscriptTurnResourceEntry> = {};
   const dirtyTurnIds = new Set<string>();
   for (const result of sync.turns) {
     if (result.status === 'ok') {
       nextById[result.turnId] = {
         layoutRevision: result.frame.layoutRevision,
+        projectionError: null,
         revision: result.renderRevision,
         status: 'ready',
         turn: result.frame,
@@ -531,11 +612,21 @@ function applySync(
     } else if (result.status === 'notModified') {
       const known = previous.turnResourcesById[result.turnId];
       if (known) nextById[result.turnId] = known;
+    } else if (result.status === 'error') {
+      nextById[result.turnId] = {
+        layoutRevision: result.frame.layoutRevision,
+        projectionError: { code: result.code, message: result.message },
+        revision: result.renderRevision,
+        status: 'ready',
+        turn: result.frame,
+      };
+      dirtyTurnIds.add(result.turnId);
     }
   }
   const turnOrder = sync.turnOrder.filter((turnId) => Boolean(nextById[turnId]));
   batchExternalStoreUpdates(() => {
     resourceStore.setState({
+      basisSequence: sync.basisSequence,
       conversationRevision: sync.conversationRevision,
       error: null,
       isWorking: sync.activeTurnId !== null,
@@ -598,7 +689,11 @@ function setWorkGroup(key: string, resource: AgentWorkGroupResource) {
   });
 }
 
-function setWorkGroupFailure(key: string, status: 'error' | 'missing') {
+function setWorkGroupFailure(
+  key: string,
+  status: 'error' | 'missing',
+  errorCode: 'staleCursor' | 'resourceUnavailable',
+) {
   const existing = resourceStore.getState().workGroupsByKey[key];
   resourceStore.setState({
     workGroupsByKey: {
@@ -607,6 +702,7 @@ function setWorkGroupFailure(key: string, status: 'error' | 'missing') {
         resource: existing?.resource ?? null,
         revision: existing?.revision ?? null,
         status,
+        errorCode,
       },
     },
   });
@@ -621,7 +717,11 @@ function setWorkEntryDetail(key: string, resource: AgentWorkEntryDetailResource)
   });
 }
 
-function setWorkEntryDetailFailure(key: string, status: 'error' | 'missing') {
+function setWorkEntryDetailFailure(
+  key: string,
+  status: 'error' | 'missing',
+  errorCode: 'resourceUnavailable',
+) {
   const existing = resourceStore.getState().workEntryDetailsByKey[key];
   resourceStore.setState({
     workEntryDetailsByKey: {
@@ -630,6 +730,7 @@ function setWorkEntryDetailFailure(key: string, status: 'error' | 'missing') {
         resource: existing?.resource ?? null,
         revision: existing?.revision ?? null,
         status,
+        errorCode,
       },
     },
   });
@@ -644,11 +745,60 @@ function markTranscriptUnavailable(error: string) {
   });
 }
 
-function acceptTranscriptResponseGeneration(serverGeneration: string) {
+function acceptScopedResponseGeneration(serverGeneration: string) {
   const knownGeneration = resourceStore.getState().serverGeneration;
-  if (!knownGeneration || knownGeneration === serverGeneration) return true;
-  markTranscriptUnavailable('The ephemeral Agent conversation ended when the extension restarted.');
-  return false;
+  return knownGeneration === null || knownGeneration === serverGeneration;
+}
+
+function mergeWorkGroupPage(
+  previous: AgentWorkGroupResource,
+  page: AgentWorkGroupResource,
+) {
+  if (
+    previous.conversationId !== page.conversationId ||
+    previous.turnId !== page.turnId ||
+    previous.segmentId !== page.segmentId ||
+    previous.groupId !== page.groupId ||
+    previous.revision !== page.revision
+  ) return page;
+  const rows = new Map(previous.rows.map((row) => [row.id, row]));
+  for (const row of page.rows) rows.set(row.id, row);
+  return { ...page, rows: [...rows.values()] };
+}
+
+function transitionTranscriptGeneration(serverGeneration: string) {
+  const state = resourceStore.getState();
+  if (state.serverGeneration === serverGeneration) return false;
+  transcriptGenerationEpoch += 1;
+  streamingRefreshScheduler.cancelPending();
+  groupRequests.clear();
+  detailRequests.clear();
+  resourceStore.setState({
+    basisSequence: null,
+    conversationRevision: null,
+    error: null,
+    serverGeneration,
+    workEntryDetailsByKey: {},
+    workGroupsByKey: {},
+  });
+  return true;
+}
+
+export function observeTranscriptServerGeneration(serverGeneration: string | null) {
+  if (!serverGeneration) return;
+  const state = resourceStore.getState();
+  if (state.serverGeneration === null) {
+    resourceStore.setState({ serverGeneration });
+    return;
+  }
+  if (!transitionTranscriptGeneration(serverGeneration) || !state.activeConversationId) return;
+  syncGeneration += 1;
+  void loadTranscript(state.activeConversationId, syncGeneration, {
+    forceFresh: true,
+    forceFullMeasure: true,
+    preserveReady: true,
+    windowPolicy: 'preserve',
+  });
 }
 
 function resetTranscriptResourceState(): Omit<
@@ -657,6 +807,7 @@ function resetTranscriptResourceState(): Omit<
 > {
   return {
     activeConversationId: null,
+    basisSequence: null,
     conversationRevision: null,
     error: null,
     isWorking: false,

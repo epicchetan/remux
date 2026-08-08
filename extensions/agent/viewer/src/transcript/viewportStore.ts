@@ -27,7 +27,11 @@ type TranscriptViewportStoreState = {
   lifecycleState: 'active' | 'background' | 'inactive';
   pendingUserMessageIds: string[];
   requestedTurnScroll: TranscriptTurnScrollRequest | null;
+  turnScrollError: { message: string; requestId: number } | null;
+  clearTurnScroll: (requestId: number) => void;
+  failTurnScroll: (requestId: number, message: string) => void;
   requestTurnScroll: (conversationId: string, turnId: string) => void;
+  resolveTurnScroll: (requestId: number) => void;
   trackUserMessage: (conversationId: string, messageId: string, turnId?: string | null) => void;
   scrollDown: () => void;
   scrollUp: () => void;
@@ -50,7 +54,10 @@ let turnScrollRequestId = 0;
 
 const actions: Pick<
   TranscriptViewportStoreState,
+  | 'clearTurnScroll'
+  | 'failTurnScroll'
   | 'requestTurnScroll'
+  | 'resolveTurnScroll'
   | 'setActiveTurnIds'
   | 'setAutoScrollMode'
   | 'setScrollAvailability'
@@ -58,6 +65,16 @@ const actions: Pick<
   | 'setLifecycleState'
   | 'trackUserMessage'
 > = {
+  clearTurnScroll(requestId) {
+    const state = viewportStore.getState();
+    if (state.requestedTurnScroll?.id !== requestId) return;
+    viewportStore.setState({ requestedTurnScroll: null, turnScrollError: null });
+  },
+  failTurnScroll(requestId, message) {
+    const state = viewportStore.getState();
+    if (state.requestedTurnScroll?.id !== requestId) return;
+    viewportStore.setState({ turnScrollError: { message, requestId } });
+  },
   requestTurnScroll(conversationId, turnId) {
     const normalizedConversationId = conversationId.trim();
     const normalizedTurnId = turnId.trim();
@@ -72,7 +89,13 @@ const actions: Pick<
         conversationId: normalizedConversationId,
         turnId: normalizedTurnId,
       },
+      turnScrollError: null,
     });
+  },
+  resolveTurnScroll(requestId) {
+    const state = viewportStore.getState();
+    if (state.requestedTurnScroll?.id !== requestId) return;
+    viewportStore.setState({ requestedTurnScroll: null, turnScrollError: null });
   },
   trackUserMessage(conversationId, messageId, turnId) {
     const normalizedConversationId = conversationId.trim();
@@ -151,6 +174,7 @@ const viewportStore = createExternalStore<TranscriptViewportStoreState>({
   lifecycleState: 'active',
   pendingUserMessageIds: [],
   requestedTurnScroll: null,
+  turnScrollError: null,
   scrollDown: noopScrollNavigation,
   scrollUp: noopScrollNavigation,
   conversationId: null,
@@ -188,6 +212,10 @@ export function resetTranscriptViewportForConversation(conversationId?: string |
       normalizedConversationId && requestedTurnScroll?.conversationId === normalizedConversationId
         ? requestedTurnScroll
         : null,
+    turnScrollError:
+      normalizedConversationId && requestedTurnScroll?.conversationId === normalizedConversationId
+        ? state.turnScrollError
+        : null,
     conversationId: normalizedConversationId,
   });
 }
@@ -202,6 +230,22 @@ export function trackTranscriptUserMessage(
   turnId?: string | null,
 ) {
   viewportStore.getState().trackUserMessage(conversationId, messageId, turnId);
+}
+
+export function discardTranscriptUserMessage(messageId: string) {
+  const normalized = messageId.trim();
+  if (!normalized) return;
+  const state = viewportStore.getState();
+  const pendingUserMessageIds = state.pendingUserMessageIds.filter((id) => id !== normalized);
+  const autoScrollMode = state.autoScrollMode.type === 'sent-message-anchor' &&
+    state.autoScrollMode.segmentId === normalized
+    ? { type: 'off' as const }
+    : state.autoScrollMode;
+  if (
+    sameStrings(state.pendingUserMessageIds, pendingUserMessageIds) &&
+    sameAutoScrollMode(state.autoScrollMode, autoScrollMode)
+  ) return;
+  viewportStore.setState({ autoScrollMode, pendingUserMessageIds });
 }
 
 export function setTranscriptViewportLifecycleState(

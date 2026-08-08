@@ -20,6 +20,14 @@ export function parentDirectory(path: string | null) {
   return separator <= 0 ? '/' : normalized.slice(0, separator);
 }
 
+export function formatRelativeTime(timestampMs: number) {
+  const elapsedSeconds = Math.max(0, Math.floor((Date.now() - timestampMs) / 1_000));
+  if (elapsedSeconds < 60) return 'now';
+  if (elapsedSeconds < 3_600) return `${Math.floor(elapsedSeconds / 60)}m`;
+  if (elapsedSeconds < 86_400) return `${Math.floor(elapsedSeconds / 3_600)}h`;
+  return `${Math.floor(elapsedSeconds / 86_400)}d`;
+}
+
 function homeDirectory() {
   const cwd = document.documentElement.dataset.remuxHome;
   return cwd?.replace(/\\/gu, '/').replace(/\/+$/u, '') || null;

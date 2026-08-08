@@ -1,8 +1,80 @@
-Status: Proposed Spec
-Last verified: 2026-08-07
-Canonical code: Phase 1A.0 is owner-accepted at `8e96512f06ea354bd54f84f5e783161b786e1696`; this document proposes the next checkpoint and does not authorize implementation until this scope is explicitly accepted
+Status: Active Spec
+Last verified: 2026-08-08
+Canonical code: Phase 1A.1 implementation, automated closeout, and owner live acceptance are complete; Phase 1A.2 supersedes its schema/protocol versions and closes the combined durable-transcript checkpoint
 
 # Agent Phase 1A.1 durable conversations and history scope
+
+## Current implementation checkpoint
+
+The live durable-turn slice is implemented as of 2026-08-07. Conversation
+creation and message admission now commit project/conversation/strand and
+turn/root-scope/epoch identity before the Pi runtime is invoked. The final
+transformed provider payload is installed as an immutable artifact and its
+`inference.started` row is committed by the awaited provider preflight before
+dispatch. `workspace.read` similarly commits its call before touching the
+workspace and commits its result before returning to Pi. Assistant output is
+coalesced into committed checkpoints before it reaches the existing turn-frame
+projector.
+
+The same slice includes exact inline-or-artifact user content, idempotent
+`clientMessageId` replay/conflict handling, terminal turn/scope/epoch and
+inference state, artifact hash/length validation on startup, transcript
+rehydration into the existing viewer protocol, and fail-closed startup
+recovery to `interrupted_by_restart`. Direct repository and live-server tests
+cover large messages, boundary ordering, replay, duplicate admission, and
+restart recovery.
+
+The live Pi cutover now also compiles a provider-neutral logical replay from a
+stable journal basis before every inference. The context hook semantically
+aligns Pi's exact in-memory suffix with that replay, prepends only a missing
+durable prefix, and issues a one-use context fence consumed by provider
+preflight. This preserves warm response signatures for continuation while a
+fresh runtime receives full history without duplication. Provider preflight
+records the journal basis/logical/rendered hashes with the inference, rejects
+stale bases, and enforces the pinned full-replay budget before provider I/O.
+Visible reasoning summaries receive a deterministic assistant-text replay
+encoding; opaque reasoning and response IDs remain excluded.
+
+The first Phase 1A.1c history slice is also implemented. Conversation-list and
+per-conversation summaries are durable projections, live runtime state is a
+separate singleton resource, and transcript reads route either to the loaded
+live projector or to a bounded frozen projector rebuilt from the journal. An
+unloaded conversation can therefore be viewed by route without creating a Pi
+session, and its frozen and hydrated transcript projections are byte-for-byte
+equivalent. Child work scopes and active epoch compilation remain deliberately
+inactive.
+
+The second Phase 1A.1c slice adds lazy execution activation. Viewing history
+still never creates Pi; sending in an unloaded conversation reconciles an
+existing client-message identity, refuses a busy runtime owner without journal
+mutation, or disposes the idle owner and hydrates the target from its durable
+descriptor. Hydration publishes explicit loading/error state and a new turn is
+admitted only after hydration succeeds. Exact retries return their original
+turn identity even while that turn is active.
+
+The third Phase 1A.1c slice activates durable history in the viewer. Desktop
+uses the shared history sidebar, phone uses the matching safe-area sheet and
+composer action, and both render the Agent-owned conversation-list projection.
+Selecting history remains cold, retargets the host tab, restores the locked
+durable configuration, and delegates late-response fencing to the existing
+conversation-aware transcript store. Host navigation uses the same selection
+path. New-chat and per-conversation plain-text composer snapshots are isolated
+by target in tab `sessionStorage`; switching does not leak or clear another
+target's draft, and successful send removes the admitted target snapshot.
+
+The proposed standalone `navigationStore.ts` was not added: selection has no
+server authority of its own, and keeping its small target transition in
+`App.tsx` avoids duplicating the transcript store's established generation and
+conversation fences. Phase 1A.1c implementation is feature-complete.
+
+Phase 1A.1d automated closeout is also complete. It adds the bounded
+hash-addressed artifact-read API, startup orphan diagnostics, a canonical
+`agent-projection-v1` digest, three abrupt Pi crash fixtures, a snapshot-based
+real-subscription replay check, the cumulative Agent matrix, and the unchanged
+Codex baseline. The exact adaptations and verification evidence are recorded
+in [`agent-phase-1a1-implementation-report.md`](agent-phase-1a1-implementation-report.md).
+Explicit desktop/physical-phone owner acceptance and the checkpoint commit
+remain.
 
 ## Purpose and authorization boundary
 
@@ -21,7 +93,8 @@ the complete long-transcript/work-detail pass in 1A.2, the shadow compiler in
 1A.3, active epochs in 1B, new coding effects, queue/edit/fork behavior,
 attachments, mentions, or durable processes.
 
-Implementation may start only after:
+The owner satisfied the implementation gate and authorized this checkpoint on
+2026-08-07 after:
 
 1. the Phase 1A.0 implementation is committed and its commit is recorded in
    the 1A.0 report;
@@ -83,18 +156,39 @@ conversation summaries are disposable projections or live caches.
 There is no second Pi JSONL history and no dual-write recovery policy.
 `SessionManager.inMemory()` remains mandatory.
 
-### Conversation, strand, and epoch identity
+### Project, conversation, strand, turn, execution-scope, and epoch identity
 
-Every conversation creates exactly one root strand. The strand is durable now
-so later edit/fork support does not change event identity, but no strand or
-fork UI/API is exposed in 1A.1.
+The pre-release schema-v1 spike is intentionally rebooted rather than migrated.
+No owner data exists at the default Agent data root, the only current databases
+are temporary fixtures, and the old uncommitted schema must not constrain the
+causal model. The server still refuses unexpected or malformed databases; it
+never deletes them automatically.
 
-Schema v1 also creates the durable-core epoch and inference tables. Each root
-strand begins with one ordinal-zero `full_replay` epoch. It has no bootstrap or
-epoch blocks and never rolls in Phase 1A.1. This is bookkeeping for inference
-identity, not active context compilation. Phase 1A.3 may attach shadow
-candidates; Phase 1B is the first checkpoint allowed to close it for budget
-rollover.
+The canonical workspace root owns one durable project. Conversations started
+at the same canonical root share that project and its root context space. Every
+conversation creates exactly one root strand. The strand is durable now so
+later edit/fork support does not change event identity, but no project switch,
+strand, or fork UI/API is exposed in 1A.1.
+
+Every accepted user turn creates an authoritative turn row and exactly one
+root `execution_scope` with `kind=turn`. Ordinary Phase 1A.1 execution stays in
+that root scope. The schema supports child `kind=work_unit` scopes and nested
+parent identity, but creating or executing them is deferred until the
+turn/work-unit design is separately activated. This is Agent-owned execution
+identity, not Codex collaboration-protocol compatibility.
+
+An epoch belongs to exactly one execution scope. Message acceptance opens the
+root scope's ordinal-zero `full_replay` epoch; conversation creation does not
+open an ownerless epoch. The epoch has no bootstrap or epoch blocks and never
+rolls in Phase 1A.1. This is bookkeeping for inference identity, not active
+context compilation. Phase 1A.3 may attach shadow candidates; Phase 1B is the
+first checkpoint allowed to close it for budget rollover.
+
+The hierarchy is therefore:
+
+```text
+project -> conversation -> strand -> turn -> execution scope -> epoch -> inference
+```
 
 ### Drafts versus conversations
 
@@ -215,8 +309,15 @@ Create the full minimum table set already fixed by the durable-core spec:
 
 ```text
 meta
+projects
+context_spaces
+project_primaries
+context_bindings
+project_relations
 conversations
 strands
+turns
+execution_scopes
 events
 transcript_items
 resources
@@ -227,9 +328,19 @@ epoch_blocks
 inferences
 ```
 
-The durable-core column names are normative. Phase 1A.1 actively uses all
-tables except `epoch_blocks`, which remains empty. Later checkpoints may add
-indexes and non-semantic metadata but do not rename these identities.
+Project context tables are materialized projections of journaled, canonical
+project-state operations. `descriptor`, `body`, attributes, and provenance use
+canonical JSON; large exact bytes become immutable artifact references rather
+than SQL sentence fragments. The model eventually changes this state through
+the typed create/update/supersede/relate/bind/mask/unbind operations already
+defined by the project-state kernel.
+
+Phase 1A.1 actively uses the project/root-space, conversation, strand, turn,
+root-execution-scope, journal, transcript, operation, epoch, and inference
+identities. `epoch_blocks` remains empty. Child execution scopes and non-root
+project context are schema/replay foundations until their later behavior is
+explicitly activated. Later checkpoints may add indexes and non-semantic
+metadata but do not rename these identities.
 
 `events.sequence` is the one committed ordering cursor. Every materialized
 resource revision is its maximum contributing `basis_sequence`, not an
@@ -240,23 +351,29 @@ substitutes for a revision.
 
 The journal accepts this subset of the already-fixed taxonomy:
 
+- `project.created`, `project.state.updated`;
 - `conversation.created`, `conversation.updated`;
 - `turn.accepted`, `turn.started`, `turn.completed`, `turn.interrupted`,
   `turn.failed`;
+- `execution_scope.created`, `execution_scope.completed`,
+  `execution_scope.interrupted`, `execution_scope.failed` for the root scope;
 - `message.user`, `message.assistant.started`,
-  `message.assistant.delta`, `message.assistant.completed`;
-- `tool.called`, `tool.updated`, `tool.completed`;
+  `message.assistant.content.checkpoint`, `message.assistant.completed`;
+- `tool.called`, `tool.completed`;
 - `operation.accepted`, `operation.started`, `operation.succeeded`,
   `operation.failed`, `operation.interrupted`;
 - `epoch.opened` for the one full-replay epoch;
 - `inference.started`, `inference.completed`, `inference.failed`; and
 - `recovery.observed`.
 
-No `epoch.closed`, `context.pinned`, mutation-effect, shell, process, edit, or
-fork event is emitted yet.
+No child-work-unit, `epoch.closed`, `context.pinned`, mutation-effect, shell,
+process, edit, or fork event is emitted yet.
 
-Assistant deltas are coalesced before commit at the earlier of 50 ms or 8 KiB.
-The final assistant event is committed even if its last delta is empty.
+Raw assistant deltas remain transport state. Newly appended content is
+coalesced into semantic recovery checkpoints at the current policy's earlier
+time/size boundary (initially 50 ms or 8 KiB); the cadence is not part of the
+event contract. The final assistant event records the completed content hash
+and terminal state. `workspace.read` has no intermediate durable tool update.
 Event payloads are canonical JSON capped at 32 KiB. Larger exact content is an
 artifact reference.
 
@@ -265,18 +382,25 @@ artifact reference.
 Conversation creation commits, in one transaction:
 
 1. caller operation acceptance;
-2. conversation/root-strand/full-replay-epoch creation events and rows;
-3. initial conversation/list/transcript projections;
-4. operation success with the stable conversation ID; and
-5. affected resource basis sequences.
+2. project/root-context-space creation when the canonical workspace has no
+   project yet, otherwise exact reuse of the existing project;
+3. conversation/root-strand creation events and rows;
+4. initial conversation/list/transcript projections;
+5. operation success with the stable project/conversation IDs; and
+6. affected resource basis sequences.
+
+Conversation creation does not open an epoch. There is no model execution
+scope until a user turn is accepted.
 
 Message acceptance commits, in one transaction:
 
 1. caller operation acceptance;
-2. `turn.accepted`, `message.user`, and `turn.started`;
-3. conversation, transcript, title/preview, and list projections;
-4. operation success with the stable turn ID; and
-5. affected resource basis sequences.
+2. `turn.accepted` and the authoritative turn row;
+3. root `execution_scope.created` and ordinal-zero `epoch.opened`;
+4. `message.user` and `turn.started`;
+5. conversation, transcript, title/preview, and list projections;
+6. operation success with stable turn/root-scope/epoch IDs; and
+7. affected resource basis sequences.
 
 Only after this commit may `session.prompt()` begin. Each provider inference
 commits `inference.started` before network I/O. Runtime assistant/tool events
@@ -304,8 +428,9 @@ The required order is:
    deltas and commits `tool.called` before reading the workspace;
 5. that wrapper installs any artifact and commits the terminal tool result
    before returning it to Pi; and
-6. assistant deltas flush before tool start/result, inference start, message
-   terminal state, interruption, runtime disposal, and restart recovery.
+6. assistant content checkpoints flush before tool start/result, inference
+   start, message terminal state, interruption, runtime disposal, and restart
+   recovery.
 
 Pi 0.84.0 awaits `context`, `before_provider_request`, tool lifecycle, and
 agent-event handlers in the relevant order. Its extension runner, however,
@@ -349,7 +474,8 @@ into empty projection tables must reproduce the live projection hash at `N`.
 
 The canonical hash includes, in primary-key order:
 
-- conversations and strands;
+- projects, context spaces, primaries, bindings, and relations;
+- conversations, strands, turns, and execution scopes;
 - transcript items;
 - materialized resource keys, basis sequences, and canonical values;
 - operation state;
@@ -515,6 +641,7 @@ Add:
 ```text
 conversation-list
 conversation:<conversationId>
+runtime
 operation:<operationId>
 ```
 
@@ -528,7 +655,7 @@ type AgentConversationSummary = {
   cwd: string;
   modelId: string;
   reasoning: ReasoningLevel;
-  status: 'idle' | 'running' | 'interrupting' | 'error';
+  status: 'idle' | 'running' | 'error';
   latestTurnId: string | null;
   createdAt: number;
   updatedAt: number;
@@ -538,7 +665,20 @@ type AgentConversationListValue = {
   conversations: AgentConversationSummary[];
   truncated: boolean;
 };
+
+type AgentRuntimeValue = {
+  conversationId: string | null;
+  state: 'unloaded' | 'loading' | 'idle' | 'running' | 'interrupting' | 'error';
+  activeTurnId: string | null;
+  activeTurnElapsedMs: number | null;
+  contextProbe: ContextProbe | null;
+  error: string | null;
+};
 ```
+
+Conversation summaries never carry process-local fields. The singleton
+`runtime` resource describes the one loaded Pi session; the viewer combines it
+with a matching durable summary only as a local presentation projection.
 
 Every durable resource result carries `basisSequence`, `serverGeneration`, and
 `notModified` support. The request's existing `ifNoneMatch` compares against

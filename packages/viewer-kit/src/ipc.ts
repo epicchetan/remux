@@ -15,6 +15,18 @@ export type JsonRpcMessage = {
   result?: unknown;
 };
 
+export class RemuxRpcError extends Error {
+  readonly code: number | null;
+  readonly data: unknown;
+
+  constructor(error: { code?: number; data?: unknown; message: string }) {
+    super(error.message);
+    this.name = 'RemuxRpcError';
+    this.code = typeof error.code === 'number' ? error.code : null;
+    this.data = error.data;
+  }
+}
+
 type WebViewReady = { type: 'remux/ready' };
 
 type WebViewRequest =
@@ -428,7 +440,7 @@ function handleNativeMessage(event: MessageEvent) {
   pending.abort?.();
 
   if (message.type === 'remux/error') {
-    pending.reject(new Error(message.error.message));
+    pending.reject(new RemuxRpcError(message.error));
     return;
   }
 

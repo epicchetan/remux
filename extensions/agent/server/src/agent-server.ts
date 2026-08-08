@@ -1,28 +1,45 @@
 import { randomUUID } from 'node:crypto';
 import { realpath, stat } from 'node:fs/promises';
+import { performance } from 'node:perf_hooks';
 
 import {
   AGENT_METHODS,
   AGENT_RESOURCE_KEYS,
   conversationResourceKey,
+  type AgentCommandErrorData,
+  type ArtifactReadParams,
+  type ArtifactReadRange,
+  type ArtifactReadResult,
+  type AgentRuntimeValue,
   type AuthValue,
-  type ConversationStartParams,
-  type ConversationValue,
+  type ConversationSummary,
+  type ConversationCreateParams,
   type LoginCancelParams,
   type MessageSendParams,
   type ModelsValue,
   type ReasoningLevel,
   type ResourceReadParams,
+  type ResourceReadResult,
   type TurnInterruptParams,
 } from '../../shared/protocol.ts';
 import type { AgentResourceInvalidation } from '../../shared/transcript.ts';
+import type { AgentConversationJournal } from './conversation-journal.ts';
 import type { AgentEngine, ConversationRuntime, RuntimeEvent } from './engine.ts';
+import type { DurableTranscriptMutation, DurableTurnHandle } from './storage/repository.ts';
+import { ArtifactIntegrityError } from './storage/artifact-store.ts';
 import { ResourceStore } from './resources.ts';
+import { createReplayedTranscriptProjector } from './transcript-replay.ts';
+import { TranscriptProjectionRouter } from './transcript-router.ts';
 import {
   EphemeralTranscriptProjector,
   parseTranscriptResourcesReadParams,
   TranscriptProtocolError,
 } from './transcript-projector.ts';
+
+const MAX_ARTIFACT_READ_BYTES = 48 * 1024;
+const MAX_ARTIFACT_READ_LINES = 400;
+const MAX_RESOURCE_READ_REQUESTS = 64;
+const SHA256 = /^[0-9a-f]{64}$/u;
 
 export class RpcFault extends Error {
   readonly code: number;
@@ -39,19 +56,43 @@ export class RpcFault extends Error {
 export class AgentServer {
   readonly resources: ResourceStore;
   private readonly engine: AgentEngine;
+  private readonly journal: AgentConversationJournal;
+  private readonly transcriptRouter: TranscriptProjectionRouter;
   private runtime: ConversationRuntime | null = null;
   private projector: EphemeralTranscriptProjector | null = null;
   private loginController: AbortController | null = null;
   private conversationId: string | null = null;
+  private conversationOperationId: string | null = null;
   private readonly notify: (method: string, params: unknown) => void;
+  private readonly monotonicNow: () => number;
+  private conversationCommandTail: Promise<void> = Promise.resolve();
+  private turnWriteTail: Promise<void> = Promise.resolve();
+  private turnWriteError: unknown = null;
+  private activeDurableTurn: DurableTurnHandle | null = null;
+  private activeTurnStartedMonotonicAt: number | null = null;
+  private pendingAssistantText = '';
+  private pendingAssistantReasoning = '';
+  private inferenceAssistantText = '';
+  private inferenceAssistantReasoning = '';
+  private assistantFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private turnCompletion: Promise<void> | null = null;
+  private durabilityFailure: Promise<void> | null = null;
+  private closePromise: Promise<void> | null = null;
 
-  constructor(
-    engine: AgentEngine,
-    notify: (method: string, params: unknown) => void,
-  ) {
-    this.engine = engine;
-    this.notify = notify;
-    this.resources = new ResourceStore((params) => notify(AGENT_METHODS.resourcesInvalidated, params));
+  constructor(options: {
+    engine: AgentEngine;
+    journal: AgentConversationJournal;
+    notify: (method: string, params: unknown) => void;
+    monotonicNow?: () => number;
+  }) {
+    this.engine = options.engine;
+    this.journal = options.journal;
+    this.notify = options.notify;
+    this.monotonicNow = options.monotonicNow ?? (() => performance.now());
+    this.resources = new ResourceStore(
+      (params) => options.notify(AGENT_METHODS.resourcesInvalidated, params),
+    );
+    this.transcriptRouter = new TranscriptProjectionRouter({ journal: options.journal });
   }
 
   async initialize() {
@@ -61,6 +102,7 @@ export class AgentServer {
       error: safeMessage(error),
     }));
     this.resources.set(AGENT_RESOURCE_KEYS.auth, sanitizeAuth(auth), false);
+    this.resources.set(AGENT_RESOURCE_KEYS.runtime, unloadedRuntime(), false);
     await this.refreshModels(false);
   }
 
@@ -72,16 +114,22 @@ export class AgentServer {
         return this.readTranscriptResources(params);
       case AGENT_METHODS.modelsRead:
         return this.refreshModels();
+      case AGENT_METHODS.artifactRead:
+        return this.readArtifact(parseArtifactRead(params));
       case AGENT_METHODS.authLoginStart:
         return this.startLogin();
       case AGENT_METHODS.authLoginCancel:
         return this.cancelLogin(parseLoginCancel(params));
       case AGENT_METHODS.authLogout:
-        return this.logout();
-      case AGENT_METHODS.conversationStart:
-        return this.startConversation(parseConversationStart(params));
+        return this.enqueueConversationCommand(() => this.logout());
+      case AGENT_METHODS.conversationCreate:
+        return this.enqueueConversationCommand(
+          () => this.createConversation(parseConversationCreate(params)),
+        );
       case AGENT_METHODS.messageSend:
-        return this.sendMessage(parseMessageSend(params));
+        return this.enqueueConversationCommand(
+          () => this.sendMessage(parseMessageSend(params)),
+        );
       case AGENT_METHODS.turnInterrupt:
         return this.interrupt(parseTurnInterrupt(params));
       default:
@@ -104,6 +152,126 @@ export class AgentServer {
     }
     this.resources.set(AGENT_RESOURCE_KEYS.models, value, notify);
     return value;
+  }
+
+  private async readArtifact(params: ArtifactReadParams): Promise<ArtifactReadResult> {
+    const requestedRange = params.range.kind === 'lines'
+      ? undefined
+      : {
+          offset: params.range.offset,
+          byteLength: params.range.byteLength + (params.range.kind === 'utf8' ? 3 : 0),
+        };
+    let artifact: Awaited<ReturnType<AgentConversationJournal['readArtifact']>>;
+    try {
+      artifact = await this.journal.readArtifact(params.hash, requestedRange);
+    } catch (error) {
+      if (error instanceof ArtifactIntegrityError) {
+        throw new RpcFault(-32023, 'Durable artifact failed integrity verification.', {
+          kind: 'durable_corruption',
+        });
+      }
+      throw error;
+    }
+    if (!artifact) throw new RpcFault(-32015, 'Artifact not found.');
+    if (params.range.kind === 'bytes') {
+      const start = Math.min(params.range.offset, artifact.byteLength);
+      const end = Math.min(artifact.byteLength, start + params.range.byteLength);
+      const nextRange: ArtifactReadRange | null = end < artifact.byteLength
+        ? { kind: 'bytes', offset: end, byteLength: params.range.byteLength }
+        : null;
+      return {
+        hash: artifact.hash,
+        mediaType: artifact.mediaType,
+        totalByteLength: artifact.byteLength,
+        totalLineCount: null,
+        range: { kind: 'bytes', offset: start, byteLength: end - start },
+        encoding: 'base64',
+        content: artifact.bytes.subarray(0, end - start).toString('base64'),
+        truncated: nextRange !== null,
+        nextRange,
+      };
+    }
+
+    if (params.range.kind === 'utf8') {
+      const start = Math.min(params.range.offset, artifact.byteLength);
+      if (start < artifact.byteLength && isUtf8ContinuationByte(artifact.bytes[0]!)) {
+        throw new RpcFault(-32602, 'UTF-8 range offset must start on a code-point boundary.');
+      }
+      let end = Math.min(artifact.byteLength, start + params.range.byteLength);
+      while (
+        end > start &&
+        end < artifact.byteLength &&
+        isUtf8ContinuationByte(artifact.bytes[end - artifact.offset]!)
+      ) {
+        end -= 1;
+      }
+      if (end === start && start < artifact.byteLength) {
+        end = Math.min(artifact.byteLength, start + params.range.byteLength);
+        while (
+          end < artifact.byteLength &&
+          isUtf8ContinuationByte(artifact.bytes[end - artifact.offset]!)
+        ) {
+          end += 1;
+        }
+      }
+      let content: string;
+      try {
+        content = new TextDecoder('utf-8', { fatal: true }).decode(
+          artifact.bytes.subarray(0, end - start),
+        );
+      } catch {
+        throw new RpcFault(-32016, 'Artifact does not contain valid UTF-8 text.');
+      }
+      const nextRange: ArtifactReadRange | null = end < artifact.byteLength
+        ? { kind: 'utf8', offset: end, byteLength: params.range.byteLength }
+        : null;
+      return {
+        hash: artifact.hash,
+        mediaType: artifact.mediaType,
+        totalByteLength: artifact.byteLength,
+        totalLineCount: null,
+        range: { kind: 'utf8', offset: start, byteLength: end - start },
+        encoding: 'utf8',
+        content,
+        truncated: nextRange !== null,
+        nextRange,
+      };
+    }
+
+    let text: string;
+    try {
+      text = new TextDecoder('utf-8', { fatal: true }).decode(artifact.bytes);
+    } catch {
+      throw new RpcFault(-32016, 'Artifact does not contain valid UTF-8 text.');
+    }
+    const lines = text.split('\n');
+    const startIndex = Math.min(params.range.startLine - 1, lines.length);
+    const endIndex = Math.min(lines.length, startIndex + params.range.lineCount);
+    const content = lines.slice(startIndex, endIndex).join('\n');
+    if (Buffer.byteLength(content, 'utf8') > MAX_ARTIFACT_READ_BYTES) {
+      throw new RpcFault(
+        -32602,
+        `Requested line range exceeds ${MAX_ARTIFACT_READ_BYTES} UTF-8 bytes; use a byte range.`,
+      );
+    }
+    const nextRange: ArtifactReadRange | null = endIndex < lines.length
+      ? { kind: 'lines', startLine: endIndex + 1, lineCount: params.range.lineCount }
+      : null;
+    return {
+      hash: artifact.hash,
+      mediaType: artifact.mediaType,
+      totalByteLength: artifact.byteLength,
+      totalLineCount: lines.length,
+      range: {
+        kind: 'lines',
+        startLine: params.range.startLine,
+        endLine: endIndex,
+      },
+      encoding: 'utf8',
+      content,
+      truncated: nextRange !== null,
+      nextRange,
+    };
   }
 
   private startLogin() {
@@ -160,7 +328,12 @@ export class AgentServer {
     return { ok: true as const };
   }
 
-  private async startConversation(params: ConversationStartParams) {
+  close() {
+    this.closePromise ??= this.closeOnce();
+    return this.closePromise;
+  }
+
+  private async createConversation(params: ConversationCreateParams) {
     const auth = this.resources.get<AuthValue>(AGENT_RESOURCE_KEYS.auth);
     if (auth?.state !== 'signed-in') throw new RpcFault(-32011, 'Sign in before starting a conversation.');
     const models = this.resources.get<ModelsValue>(AGENT_RESOURCE_KEYS.models);
@@ -170,205 +343,761 @@ export class AgentServer {
       throw new RpcFault(-32602, 'The selected reasoning level is unavailable for this model.');
     }
     if (this.conversationId) {
-      const current = this.resources.get<ConversationValue>(conversationResourceKey(this.conversationId));
-      if (current?.status === 'running' || current?.status === 'interrupting') {
-        throw new RpcFault(-32013, 'Interrupt the active turn before replacing the conversation.');
+      const current = this.resources.get<AgentRuntimeValue>(AGENT_RESOURCE_KEYS.runtime);
+      if (
+        (current?.state === 'running' || current?.state === 'interrupting') &&
+        this.conversationOperationId !== params.operationId
+      ) {
+        throw activeRuntimeBusyFault(current);
       }
     }
 
     const cwd = await canonicalDirectory(params.cwd);
-    await this.disposeConversation();
-    const conversationId = randomUUID();
-    const conversation: ConversationValue = {
-      id: conversationId,
-      cwd,
-      modelId: params.modelId,
-      reasoning: params.reasoning,
-      status: 'idle',
-      activeTurnId: null,
-      activeTurnElapsedMs: null,
-      contextProbe: {
-        hookVersion: 'phase0-v1',
-        modelCallCount: 0,
-        messageCount: 0,
-        messageHash: null,
-        orderedMessageHashes: [],
-        estimatedBytes: 0,
-        provider: 'openai-codex',
+    let durable: Awaited<ReturnType<AgentConversationJournal['createConversation']>>;
+    try {
+      durable = await this.journal.createConversation({
+        operationId: params.operationId,
+        cwd,
         modelId: params.modelId,
-        providerRequestMode: 'none',
-      },
-      error: null,
-    };
-    this.runtime = await this.engine.createConversation({
+        reasoning: params.reasoning,
+      });
+    } catch (error) {
+      if (isOperationConflict(error, params.operationId)) {
+        throw new RpcFault(-32018, 'Conversation creation operation conflicts with an earlier request.', {
+          kind: 'operation_conflict',
+          operationId: params.operationId,
+        });
+      }
+      throw error;
+    }
+    if (!durable.replayed) {
+      this.resources.invalidateKey(conversationResourceKey(durable.conversationId), 'created');
+      this.resources.invalidateKey(AGENT_RESOURCE_KEYS.conversationList, 'updated');
+    }
+
+    await this.loadConversationRuntime({
+      id: durable.conversationId,
       cwd,
       modelId: params.modelId,
       reasoning: params.reasoning,
-      onEvent: (event) => this.applyRuntimeEvent(conversationId, event),
-    });
-    this.projector = new EphemeralTranscriptProjector({
-      conversationId,
-      invalidate: (invalidations) => this.publishProjectorInvalidations(invalidations),
-    });
-    this.conversationId = conversationId;
-    this.resources.set(conversationResourceKey(conversationId), conversation);
-    return { conversationId };
+    }, params.operationId);
+    return { conversationId: durable.conversationId };
   }
 
-  private sendMessage(params: MessageSendParams) {
-    const conversation = this.requiredConversation(params.conversationId);
+  private async sendMessage(params: MessageSendParams) {
+    if (!params.text.trim()) throw new RpcFault(-32602, 'Message text cannot be empty.');
+    let replay: Awaited<ReturnType<AgentConversationJournal['reconcileTurn']>>;
+    try {
+      replay = await this.journal.reconcileTurn(params);
+    } catch (error) {
+      if (isOperationConflict(error, params.operationId)) {
+        throw new RpcFault(-32018, 'Message operation conflicts with an earlier request.', {
+          kind: 'operation_conflict',
+          operationId: params.operationId,
+        });
+      }
+      if (isClientMessageConflict(error)) {
+        throw new RpcFault(-32017, 'clientMessageId was already used with different message content.', {
+          kind: 'client_message_conflict',
+          clientMessageId: params.clientMessageId,
+        } satisfies AgentCommandErrorData);
+      }
+      throw error;
+    }
+    if (replay) return {
+      accepted: true as const,
+      operationId: replay.operationId,
+      turnId: replay.turnId,
+    };
+
+    const runtimeValue = await this.ensureConversationRuntime(params.conversationId);
     if (!this.runtime) throw new RpcFault(-32012, 'The conversation runtime is unavailable.');
-    if (conversation.status === 'running' || conversation.status === 'interrupting') {
-      throw new RpcFault(-32013, 'A turn is already running.');
+    let durable: Awaited<ReturnType<AgentConversationJournal['acceptTurn']>>;
+    try {
+      durable = await this.journal.acceptTurn(params);
+    } catch (error) {
+      if (isOperationConflict(error, params.operationId)) {
+        throw new RpcFault(-32018, 'Message operation conflicts with an earlier request.', {
+          kind: 'operation_conflict',
+          operationId: params.operationId,
+        });
+      }
+      if (isClientMessageConflict(error)) {
+        throw new RpcFault(-32017, 'clientMessageId was already used with different message content.', {
+          kind: 'client_message_conflict',
+          clientMessageId: params.clientMessageId,
+        } satisfies AgentCommandErrorData);
+      }
+      throw error;
     }
-    const text = params.text.trim();
-    if (!text) throw new RpcFault(-32602, 'Message text cannot be empty.');
-    if (Buffer.byteLength(text) > 64 * 1024) throw new RpcFault(-32602, 'Message text exceeds the 64 KiB Phase 0 limit.');
-    if (this.projector?.hasClientMessageId(params.clientMessageId)) {
-      throw new RpcFault(-32017, 'clientMessageId was already used in this conversation.');
+    if (durable.replayed) return {
+      accepted: true as const,
+      operationId: durable.operationId,
+      turnId: durable.turnId,
+    };
+    this.resources.invalidateKey(conversationResourceKey(params.conversationId));
+    this.resources.invalidateKey(AGENT_RESOURCE_KEYS.conversationList);
+
+    const turnId = durable.turnId;
+    this.activeDurableTurn = durable;
+    this.activeTurnStartedMonotonicAt = this.monotonicNow();
+    this.turnWriteTail = Promise.resolve();
+    this.turnWriteError = null;
+    this.turnCompletion = null;
+    this.durabilityFailure = null;
+    this.inferenceAssistantText = '';
+    this.inferenceAssistantReasoning = '';
+    runtimeValue.state = 'running';
+    runtimeValue.activeTurnId = turnId;
+    runtimeValue.activeTurnElapsedMs = 0;
+    runtimeValue.error = null;
+    this.resources.set(AGENT_RESOURCE_KEYS.runtime, runtimeValue);
+    try {
+      this.projector?.beginTurn({
+        turnId,
+        clientMessageId: params.clientMessageId,
+        text: params.text,
+        sequence: durable.transcriptSequence,
+        basisSequence: durable.basisSequence,
+        createdAt: durable.transcriptCreatedAt,
+        userItemId: durable.userItemId,
+        ...(durable.userContent ? { content: durable.userContent } : {}),
+      });
+    } catch (error) {
+      const message = safeMessage(error);
+      await this.journal.finishTurn(durable, {
+        status: 'failed',
+        error: message,
+        errorCode: 'runtime_error',
+        durationMs: this.activeTurnDurationMs(),
+      });
+      this.resources.invalidateKey(conversationResourceKey(params.conversationId));
+      this.resources.invalidateKey(AGENT_RESOURCE_KEYS.conversationList);
+      this.activeDurableTurn = null;
+      this.activeTurnStartedMonotonicAt = null;
+      runtimeValue.state = 'error';
+      runtimeValue.activeTurnId = null;
+      runtimeValue.activeTurnElapsedMs = null;
+      runtimeValue.error = message;
+      this.resources.set(AGENT_RESOURCE_KEYS.runtime, runtimeValue);
+      throw error;
     }
-    const turnId = randomUUID();
-    conversation.status = 'running';
-    conversation.activeTurnId = turnId;
-    conversation.activeTurnElapsedMs = 0;
-    conversation.error = null;
-    this.resources.set(conversationResourceKey(conversation.id), conversation);
-    this.projector?.beginTurn({
-      turnId,
-      clientMessageId: params.clientMessageId,
-      text,
-    });
 
     const runtime = this.runtime;
-    void runtime.prompt(text).then(() => {
-      this.finishTurn(conversation.id, false);
+    void Promise.resolve().then(() => runtime.prompt(params.text)).then(() => {
+      return this.completeTurn(params.conversationId, false);
     }).catch((error) => {
-      this.finishTurn(conversation.id, false, safeMessage(error));
-    });
-    return { accepted: true as const, turnId };
+      return this.completeTurn(params.conversationId, false, safeMessage(error));
+    }).catch((error) => this.failDurability(params.conversationId, error));
+    return { accepted: true as const, operationId: durable.operationId, turnId };
+  }
+
+  private async ensureConversationRuntime(conversationId: string) {
+    const current = this.resources.get<AgentRuntimeValue>(AGENT_RESOURCE_KEYS.runtime);
+    if (
+      this.conversationId === conversationId &&
+      this.runtime &&
+      this.projector &&
+      current?.conversationId === conversationId
+    ) {
+      if (current.state === 'running' || current.state === 'interrupting') {
+        throw turnActiveFault(current);
+      }
+      return current;
+    }
+    this.assertRuntimeSwitchAvailable(conversationId);
+    const summary = await this.readConversationSummary(conversationId);
+    return this.loadConversationRuntime(summary, null);
+  }
+
+  private async readConversationSummary(conversationId: string) {
+    const [projection] = await this.journal.readResourceProjections([
+      conversationResourceKey(conversationId),
+    ]);
+    if (!projection || projection.key === AGENT_RESOURCE_KEYS.conversationList) {
+      throw new RpcFault(-32015, 'Conversation not found.');
+    }
+    return projection.value as ConversationSummary;
+  }
+
+  private assertRuntimeSwitchAvailable(targetConversationId: string) {
+    const current = this.resources.get<AgentRuntimeValue>(AGENT_RESOURCE_KEYS.runtime);
+    if (current?.state !== 'running' && current?.state !== 'interrupting') return;
+    if (current.conversationId === targetConversationId) throw turnActiveFault(current);
+    throw activeRuntimeBusyFault(current);
+  }
+
+  private async loadConversationRuntime(
+    conversation: Pick<ConversationSummary, 'id' | 'cwd' | 'modelId' | 'reasoning'>,
+    operationId: string | null,
+  ) {
+    const current = this.resources.get<AgentRuntimeValue>(AGENT_RESOURCE_KEYS.runtime);
+    if (
+      this.conversationId === conversation.id &&
+      this.runtime &&
+      this.projector &&
+      current?.conversationId === conversation.id
+    ) return current;
+
+    this.assertRuntimeSwitchAvailable(conversation.id);
+    const auth = this.resources.get<AuthValue>(AGENT_RESOURCE_KEYS.auth);
+    if (auth?.state !== 'signed-in') throw new RpcFault(-32011, 'Sign in before continuing a conversation.');
+    const models = this.resources.get<ModelsValue>(AGENT_RESOURCE_KEYS.models);
+    const model = models?.models.find(({ id }) => id === conversation.modelId);
+    if (!model || !model.supportedReasoning.includes(conversation.reasoning)) {
+      const data: AgentCommandErrorData = {
+        kind: 'model_unavailable',
+        conversationId: conversation.id,
+        modelId: conversation.modelId,
+      };
+      throw new RpcFault(-32020, 'The conversation model is no longer available.', data);
+    }
+    let cwd: string;
+    try {
+      cwd = await canonicalDirectory(conversation.cwd);
+      if (cwd !== conversation.cwd) throw new Error('The canonical workspace identity changed.');
+    } catch {
+      const data: AgentCommandErrorData = {
+        kind: 'workspace_unavailable',
+        conversationId: conversation.id,
+        cwd: conversation.cwd,
+      };
+      throw new RpcFault(-32021, 'The conversation workspace is no longer available.', data);
+    }
+
+    await this.disposeConversation();
+    const loading = runtimeValue(conversation.id, conversation.modelId, 'loading');
+    this.resources.set(AGENT_RESOURCE_KEYS.runtime, loading);
+    try {
+      const transcript = await this.journal.readTranscriptProjection(conversation.id);
+      if (!transcript) throw new Error(`Conversation ${conversation.id} does not exist.`);
+      const projector = createReplayedTranscriptProjector({
+        conversationId: conversation.id,
+        actions: transcript.actions,
+        basisSequence: transcript.basisSequence,
+        live: true,
+        invalidate: (invalidations) => this.publishProjectorInvalidations(invalidations),
+      });
+      const runtime = await this.engine.createConversation({
+        cwd,
+        modelId: conversation.modelId,
+        reasoning: conversation.reasoning,
+        onEvent: (event) => this.applyRuntimeEvent(conversation.id, event),
+        durability: {
+          compileContext: () => this.compileContext(conversation.id),
+          beforeAssistantMessageEnd: (input) => this.beforeAssistantMessageEnd(conversation.id, input),
+          beforeProviderCall: (input) => this.beforeProviderCall(conversation.id, input),
+          beforeTool: (input) => this.beforeTool(conversation.id, input),
+          afterTool: (input) => this.afterTool(conversation.id, input),
+        },
+      });
+      this.runtime = runtime;
+      this.projector = projector;
+      this.conversationId = conversation.id;
+      this.conversationOperationId = operationId;
+      const loaded = { ...loading, state: 'idle' as const };
+      this.resources.set(AGENT_RESOURCE_KEYS.runtime, loaded);
+      return loaded;
+    } catch (error) {
+      this.runtime = null;
+      this.projector = null;
+      this.conversationId = null;
+      this.conversationOperationId = null;
+      const message = `Unable to load conversation runtime: ${safeMessage(error)}`;
+      this.resources.set(AGENT_RESOURCE_KEYS.runtime, {
+        ...loading,
+        state: 'error',
+        error: message,
+      });
+      const data: AgentCommandErrorData = {
+        kind: 'runtime_hydration_failed',
+        conversationId: conversation.id,
+      };
+      throw new RpcFault(-32022, message, data);
+    }
   }
 
   private interrupt(params: TurnInterruptParams) {
-    const conversation = this.requiredConversation(params.conversationId);
-    if (conversation.activeTurnId !== params.turnId || conversation.status === 'idle') {
+    const runtimeValue = this.requiredConversation(params.conversationId);
+    if (runtimeValue.activeTurnId !== params.turnId || runtimeValue.state === 'idle') {
       throw new RpcFault(-32014, 'The requested turn is no longer active.');
     }
-    conversation.status = 'interrupting';
-    this.resources.set(conversationResourceKey(conversation.id), conversation);
+    if (runtimeValue.state === 'interrupting') {
+      return { accepted: true as const };
+    }
+    runtimeValue.state = 'interrupting';
+    this.resources.set(AGENT_RESOURCE_KEYS.runtime, runtimeValue);
     const runtime = this.runtime;
     if (runtime) {
-      void runtime.interrupt().catch((error) => this.finishTurn(conversation.id, true, safeMessage(error)));
+      void runtime.interrupt()
+        .catch((error) => this.completeTurn(params.conversationId, true, safeMessage(error)))
+        .catch((error) => this.failDurability(params.conversationId, error));
     }
     return { accepted: true as const };
   }
 
   private applyRuntimeEvent(conversationId: string, event: RuntimeEvent) {
-    const conversation = this.resources.get<ConversationValue>(conversationResourceKey(conversationId));
-    if (!conversation || conversation.id !== conversationId) return;
-    const turnId = conversation.activeTurnId;
-    let conversationChanged = false;
+    const runtimeValue = this.resources.get<AgentRuntimeValue>(AGENT_RESOURCE_KEYS.runtime);
+    if (!runtimeValue || runtimeValue.conversationId !== conversationId) return;
+    const turnId = runtimeValue.activeTurnId;
+    let runtimeChanged = false;
     switch (event.type) {
       case 'assistant-start':
         if (turnId) this.projector?.assistantStarted(turnId);
         break;
       case 'assistant-text':
-        if (turnId) this.projector?.appendAssistantText(turnId, event.delta);
+        if (turnId) this.bufferAssistantCheckpoint(event.delta, '');
         break;
       case 'assistant-reasoning':
-        if (turnId) this.projector?.appendReasoning(turnId, event.delta);
+        if (turnId) this.bufferAssistantCheckpoint('', event.delta);
+        break;
+      case 'inference-end':
+        void this.finishInferenceBoundary(conversationId, event.state)
+          .catch((error) => this.failDurability(conversationId, error));
         break;
       case 'assistant-complete':
-        this.finishTurn(conversationId, event.interrupted, event.error);
+        void this.completeTurn(conversationId, event.interrupted, event.error)
+          .catch((error) => this.failDurability(conversationId, error));
         return;
       case 'tool-start':
-        if (turnId) {
-          this.projector?.startTool(turnId, {
-            callId: event.callId,
-            name: event.name,
-            args: event.args,
-          });
-        }
+        if (turnId) void this.beforeTool(conversationId, event)
+          .catch((error) => this.failDurability(conversationId, error));
         break;
       case 'tool-update': {
-        if (turnId) this.projector?.updateTool(turnId, { callId: event.callId, result: event.result });
+        // Partial tool output is presentation-only. The authoritative result is
+        // published after the tool wrapper commits its terminal boundary.
         break;
       }
       case 'tool-end': {
-        if (turnId) {
-          this.projector?.endTool(turnId, {
-            callId: event.callId,
-            result: event.result,
-            isError: event.isError,
-          });
-        }
+        if (turnId) void this.afterTool(conversationId, event)
+          .catch((error) => this.failDurability(conversationId, error));
         break;
       }
       case 'context-probe':
-        conversation.contextProbe = event.probe;
-        conversationChanged = true;
+        runtimeValue.contextProbe = event.probe;
+        runtimeChanged = true;
         break;
     }
-    if (conversationChanged) {
-      this.resources.set(conversationResourceKey(conversationId), conversation);
+    if (runtimeChanged) {
+      this.resources.set(AGENT_RESOURCE_KEYS.runtime, runtimeValue);
     }
   }
 
-  private finishTurn(conversationId: string, interrupted: boolean, error?: string) {
-    const conversation = this.resources.get<ConversationValue>(conversationResourceKey(conversationId));
-    if (!conversation || conversation.id !== conversationId || !conversation.activeTurnId) return;
-    const turnId = conversation.activeTurnId;
-    conversation.status = error ? 'error' : 'idle';
-    conversation.activeTurnId = null;
-    conversation.activeTurnElapsedMs = null;
-    conversation.error = error ?? null;
-    this.resources.set(conversationResourceKey(conversationId), conversation);
-    this.projector?.finishTurn(turnId, {
-      status: error ? 'failed' : interrupted ? 'interrupted' : 'completed',
-      error: error ? { code: 'provider_error', message: error } : null,
+  private async beforeProviderCall(
+    conversationId: string,
+    input: {
+      payload: unknown;
+      requestMode: 'full' | 'continuation';
+      estimatedInputTokens: number;
+      context?: {
+        basisSequence: number;
+        logicalHash: string;
+        renderedHash: string;
+        messageCount: number;
+      };
+    },
+  ) {
+    const handle = this.requiredActiveDurableTurn(conversationId);
+    const context = input.context ?? await this.compileContext(conversationId).then((snapshot) => ({
+      basisSequence: snapshot.basisSequence,
+      logicalHash: snapshot.logicalHash,
+      renderedHash: snapshot.logicalHash,
+      messageCount: snapshot.messages.length,
+    }));
+    await this.enqueueTurnWrite(() => this.journal.startInference(handle, { ...input, context }));
+    this.inferenceAssistantText = '';
+    this.inferenceAssistantReasoning = '';
+  }
+
+  private async compileContext(conversationId: string) {
+    this.requiredActiveDurableTurn(conversationId);
+    await this.flushAssistantCheckpoint();
+    await this.turnWriteTail;
+    if (this.turnWriteError) throw this.turnWriteError;
+    return this.journal.compileContext(conversationId);
+  }
+
+  private async finishInferenceBoundary(
+    conversationId: string,
+    state: 'completed' | 'failed' | 'interrupted',
+  ) {
+    const handle = this.activeDurableTurn;
+    if (!handle || handle.conversationId !== conversationId) return;
+    await this.flushAssistantCheckpoint();
+    await this.enqueueTurnWrite(() => this.journal.finishInference(handle, { state }));
+  }
+
+  private async beforeAssistantMessageEnd(
+    conversationId: string,
+    input: {
+      inferenceState: 'completed' | 'failed' | 'interrupted';
+      text: string;
+      reasoning: string;
+      calls: Array<{ callId: string; name: string; args: unknown }>;
+    },
+  ) {
+    const handle = this.requiredActiveDurableTurn(conversationId);
+    await this.flushAssistantCheckpoint();
+    const textDelta = finalizedSuffix(
+      this.inferenceAssistantText,
+      input.text,
+      'assistant text',
+    );
+    const reasoningDelta = finalizedSuffix(
+      this.inferenceAssistantReasoning,
+      input.reasoning,
+      'assistant reasoning',
+    );
+    if (textDelta || reasoningDelta) {
+      await this.enqueueTurnWrite(async () => {
+        const mutation = await this.journal.appendAssistantCheckpoint(
+          handle,
+          { textDelta, reasoningDelta },
+        );
+        if (!mutation) return;
+        this.resources.invalidateKey(conversationResourceKey(handle.conversationId));
+        this.resources.invalidateKey(AGENT_RESOURCE_KEYS.conversationList);
+        const projection = transcriptMutation(mutation);
+        if (reasoningDelta) this.projector?.appendReasoning(handle.turnId, reasoningDelta, projection);
+        if (textDelta) this.projector?.appendAssistantText(handle.turnId, textDelta, projection);
+      });
+    }
+    this.inferenceAssistantText = input.text;
+    this.inferenceAssistantReasoning = input.reasoning;
+    await this.enqueueTurnWrite(() => this.journal.finishInference(handle, {
+      state: input.inferenceState,
+    }));
+    for (const call of input.calls) {
+      const inserted = await this.enqueueTurnWrite(() => this.journal.recordToolStarted(handle, call));
+      if (inserted) {
+        this.projector?.startTool(handle.turnId, {
+          callId: call.callId,
+          name: call.name,
+          args: call.args,
+          ...(inserted.detailText === undefined ? {} : { detailText: inserted.detailText }),
+          ...(inserted.detailContent ? { detailContent: inserted.detailContent } : {}),
+          ...transcriptMutation(inserted),
+        });
+      }
+    }
+  }
+
+  private async beforeTool(
+    conversationId: string,
+    input: { callId: string; name: string; args: unknown },
+  ) {
+    const handle = this.requiredActiveDurableTurn(conversationId);
+    await this.flushAssistantCheckpoint();
+    const inserted = await this.enqueueTurnWrite(() => this.journal.recordToolStarted(handle, input));
+    if (inserted) {
+      this.projector?.startTool(handle.turnId, {
+        callId: input.callId,
+        name: input.name,
+        args: input.args,
+        ...(inserted.detailText === undefined ? {} : { detailText: inserted.detailText }),
+        ...(inserted.detailContent ? { detailContent: inserted.detailContent } : {}),
+        ...transcriptMutation(inserted),
+      });
+    }
+  }
+
+  private async afterTool(
+    conversationId: string,
+    input: { callId: string; name: string; result: unknown; isError: boolean },
+  ) {
+    const handle = this.requiredActiveDurableTurn(conversationId);
+    await this.flushAssistantCheckpoint();
+    const inserted = await this.enqueueTurnWrite(() => this.journal.recordToolFinished(handle, input));
+    if (inserted) {
+      this.projector?.endTool(handle.turnId, {
+        callId: input.callId,
+        result: input.result,
+        isError: input.isError,
+        ...(inserted.outputText === undefined ? {} : { outputText: inserted.outputText }),
+        ...(inserted.outputContent ? { outputContent: inserted.outputContent } : {}),
+        ...transcriptMutation(inserted),
+      });
+    }
+  }
+
+  private bufferAssistantCheckpoint(textDelta: string, reasoningDelta: string) {
+    this.inferenceAssistantText += textDelta;
+    this.inferenceAssistantReasoning += reasoningDelta;
+    this.pendingAssistantText += textDelta;
+    this.pendingAssistantReasoning += reasoningDelta;
+    const pendingBytes = Buffer.byteLength(this.pendingAssistantText, 'utf8') +
+      Buffer.byteLength(this.pendingAssistantReasoning, 'utf8');
+    if (pendingBytes >= 8 * 1024) {
+      void this.flushAssistantCheckpoint().catch((error) => {
+        if (this.conversationId) this.failDurability(this.conversationId, error);
+      });
+      return;
+    }
+    if (!this.assistantFlushTimer) {
+      this.assistantFlushTimer = setTimeout(() => {
+        this.assistantFlushTimer = null;
+        void this.flushAssistantCheckpoint().catch((error) => {
+          if (this.conversationId) this.failDurability(this.conversationId, error);
+        });
+      }, 50);
+    }
+  }
+
+  private flushAssistantCheckpoint() {
+    if (this.assistantFlushTimer) clearTimeout(this.assistantFlushTimer);
+    this.assistantFlushTimer = null;
+    const textDelta = this.pendingAssistantText;
+    const reasoningDelta = this.pendingAssistantReasoning;
+    this.pendingAssistantText = '';
+    this.pendingAssistantReasoning = '';
+    const handle = this.activeDurableTurn;
+    if (!handle || (!textDelta && !reasoningDelta)) return this.turnWriteTail;
+    return this.enqueueTurnWrite(async () => {
+      const mutation = await this.journal.appendAssistantCheckpoint(
+        handle,
+        { textDelta, reasoningDelta },
+      );
+      if (!mutation) return;
+      this.resources.invalidateKey(conversationResourceKey(handle.conversationId));
+      this.resources.invalidateKey(AGENT_RESOURCE_KEYS.conversationList);
+      const projection = transcriptMutation(mutation);
+      if (reasoningDelta) this.projector?.appendReasoning(handle.turnId, reasoningDelta, projection);
+      if (textDelta) this.projector?.appendAssistantText(handle.turnId, textDelta, projection);
     });
+  }
+
+  private enqueueTurnWrite<T>(work: () => Promise<T>): Promise<T> {
+    const next = this.turnWriteTail.then(() => {
+      if (this.turnWriteError) throw this.turnWriteError;
+      return work();
+    });
+    this.turnWriteTail = next.then(
+      () => undefined,
+      (error) => {
+        this.turnWriteError ??= error;
+      },
+    );
+    return next;
+  }
+
+  private requiredActiveDurableTurn(conversationId: string) {
+    const handle = this.activeDurableTurn;
+    if (!handle || handle.conversationId !== conversationId) {
+      throw new Error('No durable turn is active for this runtime effect.');
+    }
+    return handle;
+  }
+
+  private failDurability(conversationId: string, error: unknown) {
+    this.durabilityFailure ??= this.failDurabilityOnce(conversationId, error);
+  }
+
+  private async failDurabilityOnce(conversationId: string, error: unknown) {
+    const message = `Durable journal failure: ${safeMessage(error)}`;
+    const runtimeValue = this.resources.get<AgentRuntimeValue>(AGENT_RESOURCE_KEYS.runtime);
+    if (runtimeValue?.conversationId === conversationId) {
+      runtimeValue.state = 'error';
+      runtimeValue.error = message;
+      this.resources.set(AGENT_RESOURCE_KEYS.runtime, runtimeValue);
+    }
+    await this.runtime?.interrupt().catch(() => undefined);
+    const handle = this.activeDurableTurn;
+    if (!handle || handle.conversationId !== conversationId) return;
+    const durationMs = this.activeTurnDurationMs();
+    let mutation: DurableTranscriptMutation | null;
+    try {
+      mutation = await this.journal.finishTurn(handle, {
+        status: 'failed',
+        error: message,
+        errorCode: 'storage_error',
+        durationMs,
+      });
+      this.turnWriteError = null;
+      this.turnWriteTail = Promise.resolve();
+      this.resources.invalidateKey(conversationResourceKey(conversationId));
+      this.resources.invalidateKey(AGENT_RESOURCE_KEYS.conversationList);
+    } catch {
+      // The journal remains the authority. Startup recovery will terminate the
+      // still-running row if storage cannot accept the failure transition now.
+      return;
+    }
+    if (runtimeValue?.activeTurnId === handle.turnId) {
+      runtimeValue.activeTurnId = null;
+      runtimeValue.activeTurnElapsedMs = null;
+      this.resources.set(AGENT_RESOURCE_KEYS.runtime, runtimeValue);
+    }
+    this.projector?.finishTurn(handle.turnId, {
+      status: 'failed',
+      error: { code: 'storage_error', message },
+      durationMs,
+      ...(mutation ? transcriptTerminalMutation(mutation) : {}),
+    });
+    this.activeDurableTurn = null;
+    this.activeTurnStartedMonotonicAt = null;
+  }
+
+  private completeTurn(conversationId: string, interrupted: boolean, error?: string) {
+    this.turnCompletion ??= this.completeTurnOnce(conversationId, interrupted, error);
+    return this.turnCompletion;
+  }
+
+  private async completeTurnOnce(conversationId: string, interrupted: boolean, error?: string) {
+    const runtimeValue = this.resources.get<AgentRuntimeValue>(AGENT_RESOURCE_KEYS.runtime);
+    const handle = this.activeDurableTurn;
+    if (
+      !runtimeValue ||
+      runtimeValue.conversationId !== conversationId ||
+      !runtimeValue.activeTurnId ||
+      !handle
+    ) return;
+    const turnId = runtimeValue.activeTurnId;
+    await this.flushAssistantCheckpoint();
+    await this.turnWriteTail;
+    if (this.turnWriteError) throw this.turnWriteError;
+    const status = error ? 'failed' : interrupted ? 'interrupted' : 'completed';
+    const durationMs = this.activeTurnDurationMs();
+    const mutation = await this.journal.finishTurn(handle, {
+      status,
+      error: error ?? null,
+      errorCode: error ? 'provider_error' : null,
+      durationMs,
+    });
+    this.resources.invalidateKey(conversationResourceKey(conversationId));
+    this.resources.invalidateKey(AGENT_RESOURCE_KEYS.conversationList);
+    runtimeValue.state = error ? 'error' : 'idle';
+    runtimeValue.activeTurnId = null;
+    runtimeValue.activeTurnElapsedMs = null;
+    runtimeValue.error = error ?? null;
+    this.resources.set(AGENT_RESOURCE_KEYS.runtime, runtimeValue);
+    this.projector?.finishTurn(turnId, {
+      status,
+      error: error ? { code: 'provider_error', message: error } : null,
+      durationMs,
+      ...(mutation ? transcriptTerminalMutation(mutation) : {}),
+    });
+    this.activeDurableTurn = null;
+    this.activeTurnStartedMonotonicAt = null;
   }
 
   private requiredConversation(id: string) {
     if (this.conversationId !== id) throw new RpcFault(-32015, 'Conversation not found.');
-    const conversation = this.resources.get<ConversationValue>(conversationResourceKey(id));
-    if (!conversation) throw new RpcFault(-32015, 'Conversation not found.');
-    return conversation;
+    const runtimeValue = this.resources.get<AgentRuntimeValue>(AGENT_RESOURCE_KEYS.runtime);
+    if (runtimeValue?.conversationId !== id) throw new RpcFault(-32015, 'Conversation not found.');
+    return runtimeValue;
   }
 
   private async disposeConversation() {
     const previous = this.runtime;
+    if (previous && this.activeDurableTurn && this.conversationId) {
+      await previous.interrupt().catch(() => undefined);
+      await this.completeTurn(this.conversationId, true).catch((error) => {
+        this.failDurability(this.conversationId!, error);
+      });
+      await this.durabilityFailure;
+    }
+    if (this.assistantFlushTimer) clearTimeout(this.assistantFlushTimer);
+    this.assistantFlushTimer = null;
+    await this.turnWriteTail;
     this.runtime = null;
     this.projector = null;
     if (previous) await previous.dispose();
     if (this.conversationId) {
-      this.resources.delete(conversationResourceKey(this.conversationId));
       this.conversationId = null;
     }
+    this.resources.set(AGENT_RESOURCE_KEYS.runtime, unloadedRuntime());
+    this.conversationOperationId = null;
+    this.activeDurableTurn = null;
+    this.activeTurnStartedMonotonicAt = null;
+    this.turnCompletion = null;
+    this.durabilityFailure = null;
   }
 
-  private readResources(params: ResourceReadParams) {
-    return this.resources.read(params, (key, value) => {
-      if (
-        key.startsWith('conversation:') &&
-        this.projector &&
-        value &&
-        typeof value === 'object' &&
-        'activeTurnElapsedMs' in value
-      ) {
+  private async closeOnce() {
+    this.loginController?.abort(new DOMException('Agent server closed', 'AbortError'));
+    this.loginController = null;
+    await this.conversationCommandTail;
+    await this.disposeConversation();
+    this.transcriptRouter.clear();
+  }
+
+  private activeTurnDurationMs() {
+    return this.activeTurnStartedMonotonicAt === null
+      ? 0
+      : Math.round(Math.max(0, this.monotonicNow() - this.activeTurnStartedMonotonicAt));
+  }
+
+  private enqueueConversationCommand<T>(work: () => T | Promise<T>) {
+    const next = this.conversationCommandTail.then(work, work);
+    this.conversationCommandTail = next.then(() => undefined, () => undefined);
+    return next;
+  }
+
+  private async readResources(params: ResourceReadParams): Promise<ResourceReadResult> {
+    const durableRequests = params.requests
+      .map((request, index) => ({ index, key: request.key }))
+      .filter(({ key }) => key === AGENT_RESOURCE_KEYS.conversationList || key.startsWith('conversation:'));
+    const durableProjections = durableRequests.length > 0
+      ? await this.journal.readResourceProjections(durableRequests.map(({ key }) => key))
+      : [];
+    const durableByRequest = new Map(
+      durableRequests.map(({ index }, durableIndex) => [index, durableProjections[durableIndex] ?? null]),
+    );
+    return {
+      resources: params.requests.map((request, index) => {
+        if (
+          request.key === AGENT_RESOURCE_KEYS.auth ||
+          request.key === AGENT_RESOURCE_KEYS.models ||
+          request.key === AGENT_RESOURCE_KEYS.runtime
+        ) {
+          return this.resources.read({ requests: [request] }, (key, value) => {
+            if (key === AGENT_RESOURCE_KEYS.runtime && this.projector) {
+              return {
+                ...value as AgentRuntimeValue,
+                activeTurnElapsedMs: this.projector.activeElapsedMs(),
+              };
+            }
+            return value;
+          }).resources[0]!;
+        }
+        const projection = durableByRequest.get(index) ?? null;
+        if (!projection) {
+          return {
+            key: request.key,
+            status: 'missing' as const,
+            serverGeneration: this.resources.serverGeneration,
+          };
+        }
+        if (request.ifNoneMatch === projection.basisSequence) {
+          return {
+            key: request.key,
+            status: 'notModified' as const,
+            revision: projection.basisSequence,
+            basisSequence: projection.basisSequence,
+            serverGeneration: this.resources.serverGeneration,
+          };
+        }
         return {
-          ...value,
-          activeTurnElapsedMs: this.projector.activeElapsedMs(),
-        } as ConversationValue;
-      }
-      return value;
-    });
+          key: request.key,
+          status: 'ok' as const,
+          revision: projection.basisSequence,
+          basisSequence: projection.basisSequence,
+          serverGeneration: this.resources.serverGeneration,
+          value: projection.value,
+        };
+      }),
+    };
   }
 
-  private readTranscriptResources(params: unknown) {
-    if (!this.projector) throw new RpcFault(-32015, 'Conversation not found.');
+  private async readTranscriptResources(params: unknown) {
     try {
       const parsed = parseTranscriptResourcesReadParams(params);
-      return this.projector.read(parsed, this.resources.serverGeneration);
+      await this.turnWriteTail;
+      if (this.turnWriteError) throw this.turnWriteError;
+      return await this.transcriptRouter.read({
+        params: parsed,
+        serverGeneration: this.resources.serverGeneration,
+        liveProjector: this.projector,
+      });
     } catch (error) {
       if (error instanceof TranscriptProtocolError) {
         throw new RpcFault(error.code, error.message);
@@ -385,15 +1114,47 @@ export class AgentServer {
   }
 }
 
+function finalizedSuffix(observed: string, finalized: string, label: string) {
+  if (!finalized.startsWith(observed)) {
+    throw new Error(`Pi finalized ${label} by rewriting already journaled content.`);
+  }
+  return finalized.slice(observed.length);
+}
+
+function transcriptMutation(mutation: DurableTranscriptMutation) {
+  return {
+    sequence: mutation.basisSequence,
+    basisSequence: mutation.basisSequence,
+    createdAt: mutation.createdAt,
+    itemId: mutation.itemId,
+  };
+}
+
+function transcriptTerminalMutation(mutation: DurableTranscriptMutation) {
+  return {
+    sequence: mutation.basisSequence,
+    basisSequence: mutation.basisSequence,
+    createdAt: mutation.createdAt,
+  };
+}
+
 function parseResourceRead(params: unknown): ResourceReadParams {
   const value = objectValue(params);
   if (!Array.isArray(value.requests)) throw new RpcFault(-32602, 'requests must be an array.');
+  if (value.requests.length > MAX_RESOURCE_READ_REQUESTS) {
+    throw new RpcFault(-32602, `requests exceeds the ${MAX_RESOURCE_READ_REQUESTS} item limit.`);
+  }
+  const seen = new Set<string>();
   return {
     requests: value.requests.map((request) => {
       const item = objectValue(request);
       if (typeof item.key !== 'string' || !isResourceKey(item.key)) {
         throw new RpcFault(-32602, 'Unknown resource key.');
       }
+      if (seen.has(item.key)) {
+        throw new RpcFault(-32602, 'requests contains a duplicate resource key.');
+      }
+      seen.add(item.key);
       if (item.ifNoneMatch !== undefined && (!Number.isInteger(item.ifNoneMatch) || Number(item.ifNoneMatch) < 0)) {
         throw new RpcFault(-32602, 'ifNoneMatch must be a non-negative integer.');
       }
@@ -405,34 +1166,114 @@ function parseResourceRead(params: unknown): ResourceReadParams {
   };
 }
 
-function parseConversationStart(params: unknown): ConversationStartParams {
+function parseConversationCreate(params: unknown): ConversationCreateParams {
   const value = objectValue(params);
   return {
+    operationId: requiredUuidV4(value.operationId, 'operationId'),
     cwd: requiredString(value.cwd, 'cwd'),
     modelId: requiredString(value.modelId, 'modelId'),
     reasoning: reasoningLevel(value.reasoning),
   };
 }
 
+function parseArtifactRead(params: unknown): ArtifactReadParams {
+  const value = objectValue(params);
+  const hash = requiredString(value.hash, 'hash');
+  if (!SHA256.test(hash)) throw new RpcFault(-32602, 'hash must be a lowercase SHA-256 digest.');
+  const range = objectValue(value.range);
+  if (range.kind === 'bytes') {
+    return {
+      hash,
+      range: {
+        kind: 'bytes',
+        offset: boundedInteger(range.offset, 'range.offset', 0, Number.MAX_SAFE_INTEGER),
+        byteLength: boundedInteger(
+          range.byteLength,
+          'range.byteLength',
+          1,
+          MAX_ARTIFACT_READ_BYTES,
+        ),
+      },
+    };
+  }
+  if (range.kind === 'utf8') {
+    return {
+      hash,
+      range: {
+        kind: 'utf8',
+        offset: boundedInteger(range.offset, 'range.offset', 0, Number.MAX_SAFE_INTEGER),
+        byteLength: boundedInteger(
+          range.byteLength,
+          'range.byteLength',
+          1,
+          MAX_ARTIFACT_READ_BYTES,
+        ),
+      },
+    };
+  }
+  if (range.kind === 'lines') {
+    return {
+      hash,
+      range: {
+        kind: 'lines',
+        startLine: boundedInteger(range.startLine, 'range.startLine', 1, Number.MAX_SAFE_INTEGER),
+        lineCount: boundedInteger(range.lineCount, 'range.lineCount', 1, MAX_ARTIFACT_READ_LINES),
+      },
+    };
+  }
+  throw new RpcFault(-32602, 'range.kind must be bytes, utf8, or lines.');
+}
+
+function isUtf8ContinuationByte(value: number) {
+  return (value & 0xc0) === 0x80;
+}
+
+function boundedInteger(value: unknown, name: string, minimum: number, maximum: number) {
+  if (!Number.isSafeInteger(value) || Number(value) < minimum || Number(value) > maximum) {
+    throw new RpcFault(-32602, `${name} must be an integer from ${minimum} through ${maximum}.`);
+  }
+  return Number(value);
+}
+
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+function requiredUuidV4(value: unknown, name: string) {
+  const id = requiredString(value, name);
+  if (!UUID_V4.test(id)) throw new RpcFault(-32602, `${name} must be a lowercase UUID v4.`);
+  return id;
+}
+
+function isOperationConflict(error: unknown, operationId: string) {
+  return error instanceof Error &&
+    error.name === 'OperationConflictError' &&
+    'operationId' in error &&
+    error.operationId === operationId;
+}
+
+function isClientMessageConflict(error: unknown) {
+  return error instanceof Error && error.name === 'ClientMessageConflictError';
+}
+
 function parseMessageSend(params: unknown): MessageSendParams {
   const value = objectValue(params);
   return {
-    conversationId: requiredString(value.conversationId, 'conversationId'),
-    clientMessageId: requiredString(value.clientMessageId, 'clientMessageId'),
+    operationId: requiredUuidV4(value.operationId, 'operationId'),
+    conversationId: requiredUuidV4(value.conversationId, 'conversationId'),
+    clientMessageId: requiredUuidV4(value.clientMessageId, 'clientMessageId'),
     text: requiredString(value.text, 'text'),
   };
 }
 
 function parseLoginCancel(params: unknown): LoginCancelParams {
   const value = objectValue(params);
-  return { operationId: requiredString(value.operationId, 'operationId') };
+  return { operationId: requiredUuidV4(value.operationId, 'operationId') };
 }
 
 function parseTurnInterrupt(params: unknown): TurnInterruptParams {
   const value = objectValue(params);
   return {
-    conversationId: requiredString(value.conversationId, 'conversationId'),
-    turnId: requiredString(value.turnId, 'turnId'),
+    conversationId: requiredUuidV4(value.conversationId, 'conversationId'),
+    turnId: requiredUuidV4(value.turnId, 'turnId'),
   };
 }
 
@@ -466,7 +1307,9 @@ async function canonicalDirectory(path: string) {
 }
 
 function isResourceKey(value: string): value is ResourceReadParams['requests'][number]['key'] {
-  return value === 'auth' || value === 'models' || /^conversation:[0-9a-f-]{36}$/u.test(value);
+  return value === 'auth' || value === 'models' || value === 'conversation-list' ||
+    value === 'runtime' ||
+    (value.startsWith('conversation:') && UUID_V4.test(value.slice('conversation:'.length)));
 }
 
 function sanitizeAuth(value: AuthValue): AuthValue {
@@ -489,6 +1332,66 @@ function signedOutAuth(): AuthValue {
     progress: null,
     error: null,
   };
+}
+
+function unloadedRuntime(): AgentRuntimeValue {
+  return {
+    conversationId: null,
+    state: 'unloaded',
+    activeTurnId: null,
+    activeTurnElapsedMs: null,
+    contextProbe: null,
+    error: null,
+  };
+}
+
+function runtimeValue(
+  conversationId: string,
+  modelId: string,
+  state: 'loading' | 'idle',
+): AgentRuntimeValue {
+  return {
+    conversationId,
+    state,
+    activeTurnId: null,
+    activeTurnElapsedMs: null,
+    contextProbe: {
+      hookVersion: 'agent-durable-v1',
+      modelCallCount: 0,
+      messageCount: 0,
+      messageHash: null,
+      orderedMessageHashes: [],
+      estimatedBytes: 0,
+      provider: 'openai-codex',
+      modelId,
+      providerRequestMode: 'none',
+    },
+    error: null,
+  };
+}
+
+function activeRuntimeBusyFault(runtime: AgentRuntimeValue) {
+  const conversationId = runtime.conversationId;
+  const turnId = runtime.activeTurnId;
+  if (!conversationId || !turnId) return new RpcFault(-32603, 'The active runtime state is invalid.');
+  const data: AgentCommandErrorData = {
+    kind: 'active_runtime_busy',
+    conversationId,
+    turnId,
+  };
+  return new RpcFault(-32019, 'Another conversation has an active turn.', data);
+}
+
+function turnActiveFault(runtime: AgentRuntimeValue) {
+  const conversationId = runtime.conversationId;
+  const turnId = runtime.activeTurnId;
+  if (!conversationId || !turnId) return new RpcFault(-32603, 'The active runtime state is invalid.');
+  const data: AgentCommandErrorData = {
+    kind: 'turn_active',
+    conversationId,
+    turnId,
+  };
+  return new RpcFault(-32013, 'A turn is already running in this conversation.', data);
 }
 
 function publicAuthError(error: unknown) {

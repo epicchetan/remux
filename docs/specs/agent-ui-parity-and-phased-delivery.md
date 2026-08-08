@@ -1,6 +1,6 @@
 Status: Active Spec
-Last verified: 2026-08-07
-Canonical code: The stable comparison UI remains in `extensions/codex/viewer/`; the Agent-owned Phase 1A.0 foundation is implemented and owner-accepted in `extensions/agent/`
+Last verified: 2026-08-08
+Canonical code: The stable comparison UI remains in `extensions/codex/viewer/`; Agent Phase 1A.0 through Phase 1A.2 are implemented and owner-accepted in `extensions/agent/`, including durable history and hardened transcript delivery
 
 # Agent UI parity and phased delivery alignment
 
@@ -338,6 +338,9 @@ Owner review: new/list/open behavior, titles, routes, restart, draft retention,
 and whether conversation switching feels equivalent to current Codex.
 
 ### Phase 1A.2 — authoritative transcript windows and work details
+
+The audited implementation scope and exit gates are fixed in
+[`agent-phase-1a2-transcript-hardening-scope.md`](agent-phase-1a2-transcript-hardening-scope.md).
 
 Implement the complete durable transcript projection:
 

@@ -10,6 +10,7 @@ import {
 export type AgentResourceReadUpdate = {
   generationChanged: boolean;
   missing: AgentResourceKey[];
+  serverGeneration: string | null;
   values: Map<AgentResourceKey, AgentResourceValue>;
 };
 
@@ -28,14 +29,26 @@ export class AgentResourceReader {
         ...(this.revisions.has(key) ? { ifNoneMatch: this.revisions.get(key) } : {}),
       })),
     });
+    const responseGeneration = result.resources[0]?.serverGeneration ?? null;
+    if (this.generation && responseGeneration && this.generation !== responseGeneration) {
+      this.revisions.clear();
+      this.generation = responseGeneration;
+      const fresh = await rpc.query<ResourceReadResult>(AGENT_METHODS.resourcesRead, {
+        requests: keys.map((key) => ({ key })),
+      });
+      return this.apply(fresh, true);
+    }
+    return this.apply(result, false);
+  }
+
+  private apply(result: ResourceReadResult, generationChanged: boolean): AgentResourceReadUpdate {
     const values = new Map<AgentResourceKey, AgentResourceValue>();
     const missing: AgentResourceKey[] = [];
-    let generationChanged = false;
+    const serverGeneration = result.resources[0]?.serverGeneration ?? null;
 
     for (const resource of result.resources) {
-      if (this.generation && this.generation !== resource.serverGeneration) {
-        generationChanged = true;
-        this.revisions.clear();
+      if (serverGeneration !== null && resource.serverGeneration !== serverGeneration) {
+        throw new Error('Agent resource batch mixed server generations.');
       }
       this.generation = resource.serverGeneration;
       if (resource.status === 'missing') {
@@ -47,6 +60,6 @@ export class AgentResourceReader {
       if (resource.status === 'ok') values.set(resource.key, resource.value);
     }
 
-    return { generationChanged, missing, values };
+    return { generationChanged, missing, serverGeneration, values };
   }
 }

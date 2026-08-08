@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from '@playwright/test';
 
 import type { AgentResourceInvalidation } from '../../shared/transcript.ts';
+import { parseAgentInvalidationEnvelope } from '../../viewer/src/ipc/resourceInvalidations.ts';
 import { partitionStreamingTranscriptInvalidations } from '../../viewer/src/transcript/streamingRefreshPolicy.ts';
 import {
   StreamingRefreshScheduler,
@@ -20,6 +21,7 @@ test('partitions structural and cadence-limited transcript invalidations', () =>
     groupId: 'group',
     reason: 'runtimeEvent',
     affectsLayout: true,
+    basisSequence: 1,
   };
 
   assert.deepEqual(
@@ -29,6 +31,22 @@ test('partitions structural and cadence-limited transcript invalidations', () =>
       streamingInvalidations: [streaming],
     },
   );
+});
+
+test('accepts only basis-fenced transcript invalidations', () => {
+  const invalidation = transcriptInvalidation('runtimeEvent', false);
+  assert.deepEqual(parseAgentInvalidationEnvelope({
+    invalidations: [invalidation],
+    serverGeneration: 'generation-v2',
+  }), {
+    invalidations: [invalidation],
+    serverGeneration: 'generation-v2',
+  });
+  const { basisSequence: _basisSequence, ...unfenced } = invalidation;
+  assert.deepEqual(parseAgentInvalidationEnvelope({
+    invalidations: [unfenced],
+    serverGeneration: 'generation-v2',
+  }).invalidations, []);
 });
 
 test('publishes the leading refresh immediately and coalesces latest revisions', async () => {
@@ -118,7 +136,7 @@ class ManualClock implements StreamingRefreshSchedulerClock {
 function transcriptInvalidation(
   reason: 'runtimeEvent' | 'sendAccepted',
   affectsOrder: boolean,
-): AgentResourceInvalidation {
+): Extract<AgentResourceInvalidation, { type: 'transcript' }> {
   return {
     type: 'transcript',
     key: 'transcript:conversation',
@@ -127,6 +145,7 @@ function transcriptInvalidation(
     reason,
     affectsOrder,
     affectsLayout: true,
+    basisSequence: 1,
   };
 }
 

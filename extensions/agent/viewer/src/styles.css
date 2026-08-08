@@ -29,6 +29,10 @@
 .remux-new-chat-empty-path { overflow: hidden; font: 13px/18px var(--remux-font-mono); text-overflow: ellipsis; white-space: nowrap; }
 
 .agent-transcript-state { margin: auto; display: flex; align-items: center; gap: 8px; color: var(--muted-foreground); }
+.agent-transcript-state button, .agent-transcript-focus-error button, .agent-transcript-retry, .codex-work-error button { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--border); border-radius: 7px; background: var(--rmx-surface-raised); color: inherit; padding: 4px 7px; }
+.agent-transcript-focus-error { display: flex; align-items: center; gap: 8px; margin: 4px 0 12px; border: 1px solid color-mix(in srgb, var(--destructive) 55%, var(--border)); border-radius: 9px; color: var(--destructive); padding: 8px 10px; }
+.agent-transcript-focus-error span { min-width: 0; flex: 1; }
+.agent-transcript-retry { margin-top: 8px; color: var(--destructive); }
 .agent-transcript-failed, .codex-turn-error, .codex-work-error { color: var(--destructive); }
 
 .codex-transcript-scroll {
@@ -51,6 +55,7 @@
   margin-inline: auto;
   padding: var(--remux-block-gap) var(--remux-feed-pad-x);
 }
+.codex-transcript-content { width: 100%; min-width: 0; }
 
 .codex-transcript-turn { min-width: 0; }
 .codex-transcript-row { min-width: 0; }
@@ -153,7 +158,7 @@
 .codex-work-group-heading { display: flex; justify-content: space-between; color: var(--muted-foreground); font-size: 12px; }
 .codex-work-group-heading strong { color: var(--foreground); font-weight: 600; }
 .codex-work-loading { display: flex; align-items: center; gap: 6px; color: var(--muted-foreground); font-size: 12px; }
-.codex-work-error { font-size: 12px; }
+.codex-work-error { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; }
 .codex-work-row-frame { min-width: 0; }
 .codex-work-row {
   display: flex;
@@ -192,6 +197,18 @@
   white-space: pre;
 }
 .codex-work-load-more { width: fit-content; background: transparent; color: var(--link); font-size: 12px; padding: 4px 6px; }
+.agent-exact-content-open { width: fit-content; border: 0; background: transparent; color: var(--link); font-size: 12px; padding: 5px 0; }
+.agent-exact-content-open:disabled { color: var(--muted-foreground); cursor: default; }
+.agent-exact-content-backdrop { position: fixed; z-index: 80; inset: 0; display: grid; place-items: center; background: rgb(0 0 0 / .62); padding: 20px; }
+.agent-exact-content-dialog { display: grid; width: min(820px, 100%); max-height: min(760px, calc(100dvh - 40px)); grid-template-rows: auto minmax(0, 1fr) auto; overflow: hidden; border: 1px solid var(--border); border-radius: 14px; background: var(--background); box-shadow: 0 24px 80px rgb(0 0 0 / .38); }
+.agent-exact-content-dialog header,
+.agent-exact-content-dialog footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; }
+.agent-exact-content-dialog header { border-bottom: 1px solid var(--border); }
+.agent-exact-content-dialog footer { border-top: 1px solid var(--border); color: var(--muted-foreground); font-size: 12px; }
+.agent-exact-content-dialog header button,
+.agent-exact-content-dialog footer button { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: 8px; background: var(--secondary); color: var(--foreground); padding: 6px 9px; }
+.agent-exact-content-dialog footer > div { display: flex; gap: 8px; }
+.agent-exact-content-dialog pre { min-width: 0; min-height: 0; overflow: auto; margin: 0; padding: 16px; color: var(--foreground); font: 13px/1.55 var(--font-mono, ui-monospace, monospace); white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .codex-markdown {
   max-width: 100%;
@@ -369,5 +386,5 @@
 .remux-file-mention-status { display: flex; align-items: center; gap: 8px; color: var(--muted-foreground); font-size: 14px; line-height: 20px; padding: 10px 12px; }
 .remux-file-mention-error { color: var(--destructive); }
 
-@media (min-width: 768px) { .remux-composer-overview-button { display: none; } }
+@media (min-width: 768px) { .remux-composer-overview-button, .remux-composer-sidebar-button { display: none; } }
 @media (hover: hover) and (pointer: fine) { .remux-composer-action-button:hover:not(:disabled) { color: var(--foreground); } }

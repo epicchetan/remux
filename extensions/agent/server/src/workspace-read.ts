@@ -8,10 +8,16 @@ import { Type } from '@earendil-works/pi-ai';
 import { defineTool, type ToolDefinition } from '@earendil-works/pi-coding-agent';
 
 import type { WorkspaceReadParams, WorkspaceReadResult } from '../../shared/protocol.ts';
+import type { RuntimeDurabilityHooks } from './engine.ts';
 
 const MAX_VISIBLE_BYTES = 32 * 1024;
 const DEFAULT_LINE_COUNT = 200;
 const MAX_LINE_COUNT = 1_000;
+
+export type WorkspaceReadExecutor = (
+  workspaceRoot: string,
+  params: WorkspaceReadParams,
+) => Promise<WorkspaceReadResult>;
 
 export async function readWorkspaceFile(
   workspaceRoot: string,
@@ -96,7 +102,11 @@ function utf8Prefix(value: string, maxBytes: number) {
   return '';
 }
 
-export function createWorkspaceReadTool(workspaceRoot: string): ToolDefinition {
+export function createWorkspaceReadTool(
+  workspaceRoot: string,
+  durability?: Pick<RuntimeDurabilityHooks, 'beforeTool' | 'afterTool'>,
+  executeRead: WorkspaceReadExecutor = readWorkspaceFile,
+): ToolDefinition {
   return defineTool({
     name: 'workspace_read',
     label: 'Read workspace file',
@@ -107,8 +117,23 @@ export function createWorkspaceReadTool(workspaceRoot: string): ToolDefinition {
       startLine: Type.Optional(Type.Integer({ minimum: 1 })),
       lineCount: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_LINE_COUNT })),
     }),
-    async execute(_toolCallId, params) {
-      const result = await readWorkspaceFile(workspaceRoot, params);
+    async execute(toolCallId, params) {
+      const name = 'workspace.read';
+      await durability?.beforeTool({ callId: toolCallId, name, args: params });
+      let result: WorkspaceReadResult;
+      try {
+        result = await executeRead(workspaceRoot, params);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await durability?.afterTool({
+          callId: toolCallId,
+          name,
+          result: { error: message },
+          isError: true,
+        });
+        throw error;
+      }
+      await durability?.afterTool({ callId: toolCallId, name, result, isError: false });
       return {
         content: [{ type: 'text', text: JSON.stringify(result) }],
         details: result,

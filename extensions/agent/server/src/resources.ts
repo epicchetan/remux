@@ -65,6 +65,7 @@ export class ResourceStore {
             key: request.key,
             status: 'notModified' as const,
             revision: entry.revision,
+            basisSequence: entry.revision,
             serverGeneration: this.serverGeneration,
           };
         }
@@ -73,11 +74,19 @@ export class ResourceStore {
           key: request.key,
           status: 'ok' as const,
           revision: entry.revision,
+          basisSequence: entry.revision,
           serverGeneration: this.serverGeneration,
           value: projectValue ? projectValue(request.key, cloned) : cloned,
         };
       }),
     };
+  }
+
+  invalidateKey(
+    key: AgentResourceKey,
+    reason: 'created' | 'updated' | 'deleted' = 'updated',
+  ) {
+    this.scheduleInvalidation(key, reason);
   }
 
   private scheduleInvalidation(
@@ -108,7 +117,13 @@ function resourceInvalidation(
   key: AgentResourceKey,
   reason: 'created' | 'updated' | 'deleted',
 ): AgentResourceInvalidation {
-  if (key === 'auth' || key === 'models' || key.startsWith('conversation:')) {
+  if (
+    key === 'auth' ||
+    key === 'models' ||
+    key === 'conversation-list' ||
+    key === 'runtime' ||
+    key.startsWith('conversation:')
+  ) {
     return {
       type: 'resource',
       key: key as Extract<AgentResourceInvalidation, { type: 'resource' }>['key'],

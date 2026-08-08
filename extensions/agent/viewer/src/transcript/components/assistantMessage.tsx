@@ -6,6 +6,7 @@ import type {
   AgentTurnRenderFrame,
 } from '../../../../shared/transcript';
 import { MarkdownBlock } from './markdown/MarkdownBlock';
+import { ExactContent } from './ExactContent';
 
 export function AssistantMessage({
   segment,
@@ -24,6 +25,7 @@ export function AssistantMessage({
       <MarkdownBlock streaming={turnStatus === 'inProgress'} width={width}>
         {segment.text}
       </MarkdownBlock>
+      <ExactContent content={segment.content} preview={segment.text} title="response" />
       {showActions ? <AssistantCopyAction text={segment.text} /> : null}
     </div>
   );

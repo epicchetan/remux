@@ -1,0 +1,165 @@
+import type {
+  AgentTranscriptResourcesReadParams,
+  AgentTranscriptResourcesReadResult,
+  AgentTranscriptSyncRequest,
+  AgentTranscriptSyncResource,
+} from '../../shared/transcript.ts';
+import type { AgentConversationJournal } from './conversation-journal.ts';
+import { createReplayedTranscriptProjector } from './transcript-replay.ts';
+import {
+  EphemeralTranscriptProjector,
+  TranscriptProtocolError,
+} from './transcript-projector.ts';
+import type {
+  DurableTranscriptWindow,
+} from './storage/repository.ts';
+import { DurableTranscriptSelectionError } from './storage/repository.ts';
+
+type FrozenProjection = {
+  bytes: number;
+  projector: EphemeralTranscriptProjector;
+  windows: DurableTranscriptWindow[];
+};
+
+export class TranscriptProjectionRouter {
+  private readonly journal: AgentConversationJournal;
+  private readonly maxFrozenBytes: number;
+  private readonly frozen = new Map<string, FrozenProjection>();
+  private frozenBytes = 0;
+
+  constructor(options: {
+    journal: AgentConversationJournal;
+    maxFrozenBytes?: number;
+  }) {
+    this.journal = options.journal;
+    this.maxFrozenBytes = options.maxFrozenBytes ?? 16 * 1024 * 1024;
+  }
+
+  async read(options: {
+    params: AgentTranscriptResourcesReadParams;
+    serverGeneration: string;
+    liveProjector: EphemeralTranscriptProjector | null;
+  }): Promise<AgentTranscriptResourcesReadResult> {
+    if (options.liveProjector?.conversationId === options.params.conversationId) {
+      const basisSequence = await this.journal.readTranscriptBasis(options.params.conversationId);
+      if (basisSequence === null) throw new TranscriptProtocolError(-32015, 'Conversation not found.');
+      options.liveProjector.fenceBasis(basisSequence);
+      return options.liveProjector.read(options.params, options.serverGeneration);
+    }
+
+    const basisSequence = await this.journal.readTranscriptBasis(options.params.conversationId);
+    if (basisSequence === null) throw new TranscriptProtocolError(-32015, 'Conversation not found.');
+    const key = projectionCacheKey(options.params, basisSequence);
+    let entry = this.frozen.get(key);
+    if (!entry) {
+      let projection: Awaited<ReturnType<AgentConversationJournal['readTranscriptWindowProjection']>>;
+      try {
+        projection = await this.journal.readTranscriptWindowProjection(options.params);
+      } catch (error) {
+        if (error instanceof DurableTranscriptSelectionError) {
+          throw new TranscriptProtocolError(error.code, error.message);
+        }
+        throw error;
+      }
+      if (!projection) throw new TranscriptProtocolError(-32015, 'Conversation not found.');
+      entry = {
+        bytes: Math.max(1024, projection.estimatedBytes),
+        projector: createReplayedTranscriptProjector({
+          conversationId: options.params.conversationId,
+          actions: projection.actions,
+          basisSequence: projection.basisSequence,
+          live: false,
+        }),
+        windows: projection.windows,
+      };
+      if (entry.bytes <= this.maxFrozenBytes) {
+        this.frozen.set(key, entry);
+        this.frozenBytes += entry.bytes;
+        this.trim();
+      }
+    } else {
+      this.frozen.delete(key);
+      this.frozen.set(key, entry);
+    }
+    const normalized = normalizeTranscriptWindows(options.params, entry.windows);
+    const response = entry.projector.read(normalized, options.serverGeneration);
+    applyDurableWindows(response, entry.windows);
+    return response;
+  }
+
+  clear() {
+    this.frozen.clear();
+    this.frozenBytes = 0;
+  }
+
+  private trim() {
+    while (this.frozenBytes > this.maxFrozenBytes && this.frozen.size > 0) {
+      const oldest = this.frozen.entries().next().value as
+        | [string, FrozenProjection]
+        | undefined;
+      if (!oldest) return;
+      this.frozen.delete(oldest[0]);
+      this.frozenBytes -= oldest[1].bytes;
+    }
+  }
+}
+
+function projectionCacheKey(
+  params: AgentTranscriptResourcesReadParams,
+  basisSequence: number,
+) {
+  const selection = params.requests.map((request) => {
+    if (request.type === 'transcriptSync') return { type: request.type, window: request.window };
+    if (request.type === 'workGroup') return { type: request.type, turnId: request.turnId };
+    return { type: request.type, turnId: request.turnId, rowId: request.rowId };
+  });
+  return [
+    params.conversationId,
+    basisSequence,
+    JSON.stringify(selection),
+  ].join('\0');
+}
+
+function normalizeTranscriptWindows(
+  params: AgentTranscriptResourcesReadParams,
+  windows: DurableTranscriptWindow[],
+): AgentTranscriptResourcesReadParams {
+  const byIndex = new Map(windows.map((window) => [window.requestIndex, window]));
+  return {
+    ...params,
+    requests: params.requests.map((request, requestIndex) => {
+      if (request.type !== 'transcriptSync') return request;
+      const window = byIndex.get(requestIndex);
+      if (!window || window.turnIds.length === 0) {
+        return { ...request, window: { kind: 'tail', count: 1 } };
+      }
+      return {
+        ...request,
+        window: {
+          kind: 'range',
+          startTurnId: window.turnIds[0]!,
+          endTurnId: window.turnIds.at(-1)!,
+        },
+      } satisfies AgentTranscriptSyncRequest;
+    }),
+  };
+}
+
+function applyDurableWindows(
+  response: AgentTranscriptResourcesReadResult,
+  windows: DurableTranscriptWindow[],
+) {
+  for (const window of windows) {
+    const result = response.resources[window.requestIndex];
+    if (result?.status !== 'ok' || !result.value || !('turnOrder' in result.value)) continue;
+    const value = result.value as AgentTranscriptSyncResource;
+    value.turnOrder = [...window.turnIds];
+    value.window = {
+      startIndex: window.startIndex,
+      endIndexExclusive: window.endIndexExclusive,
+      hasEarlier: window.hasEarlier,
+      hasLater: window.hasLater,
+      turnIds: [...window.turnIds],
+    };
+  }
+}

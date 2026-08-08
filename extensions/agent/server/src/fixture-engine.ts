@@ -44,15 +44,27 @@ export class FixtureEngine implements AgentEngine {
       async prompt(text) {
         controller = new AbortController();
         const signal = controller.signal;
+        const context = await options.durability.compileContext();
+        await options.durability.beforeProviderCall({
+          payload: { messages: [{ role: 'user', content: text }] },
+          requestMode: 'full',
+          estimatedInputTokens: Math.ceil(context.estimatedBytes / 4),
+          context: {
+            basisSequence: context.basisSequence,
+            logicalHash: context.logicalHash,
+            renderedHash: context.logicalHash,
+            messageCount: context.messages.length,
+          },
+        });
         options.onEvent({
           type: 'context-probe',
           probe: {
-            hookVersion: 'phase0-v1',
+            hookVersion: 'agent-durable-v1',
             modelCallCount: 1,
-            messageCount: 1,
-            messageHash: 'fixture-context-hash',
-            orderedMessageHashes: ['fixture-message-hash'],
-            estimatedBytes: text.length,
+            messageCount: context.messages.length,
+            messageHash: context.logicalHash,
+            orderedMessageHashes: context.orderedMessageHashes,
+            estimatedBytes: context.estimatedBytes,
             provider: 'openai-codex',
             modelId: options.modelId,
             providerRequestMode: 'full',
@@ -60,13 +72,31 @@ export class FixtureEngine implements AgentEngine {
         });
         options.onEvent({ type: 'assistant-start' });
         try {
+          let response = '';
           for (const delta of ['Fixture ', 'response ', `for “${text}”.`]) {
             await delay(25, signal);
+            response += delta;
             options.onEvent({ type: 'assistant-text', delta });
           }
-          options.onEvent({ type: 'tool-start', callId: 'fixture-read', name: 'workspace.read', args: { path: 'README.md' } });
+          await options.durability.beforeAssistantMessageEnd({
+            inferenceState: 'completed',
+            text: response,
+            reasoning: '',
+            calls: [],
+          });
+          options.onEvent({ type: 'inference-end', state: 'completed' });
+          await options.durability.beforeTool({
+            callId: 'fixture-read',
+            name: 'workspace.read',
+            args: { path: 'README.md' },
+          });
           await delay(20, signal);
-          options.onEvent({ type: 'tool-end', callId: 'fixture-read', name: 'workspace.read', result: { path: 'README.md' }, isError: false });
+          await options.durability.afterTool({
+            callId: 'fixture-read',
+            name: 'workspace.read',
+            result: { path: 'README.md' },
+            isError: false,
+          });
           options.onEvent({ type: 'assistant-complete', interrupted: false });
         } catch (error) {
           if (signal.aborted) {
@@ -103,6 +133,10 @@ function authValue(state: AuthValue['state']): AuthValue {
 
 function delay(milliseconds: number, signal: AbortSignal) {
   return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason ?? new DOMException('Aborted', 'AbortError'));
+      return;
+    }
     const timeout = setTimeout(resolve, milliseconds);
     signal.addEventListener('abort', () => {
       clearTimeout(timeout);

@@ -1,7 +1,8 @@
-import { ArrowDown, ArrowLeft, ArrowUp, Check, Loader2, LogOut, PanelRightOpen, Send, Square } from 'lucide-react';
+import { ArrowDown, ArrowLeft, ArrowUp, Check, History, Loader2, LogOut, PanelRightOpen, Send, Square } from 'lucide-react';
 import { openHostOverview } from '@remux/viewer-kit/host';
 
 import { parentDirectory } from '../../conversation/format.ts';
+import { useAgentSidebarStore } from '../../conversation/sidebarStore.ts';
 import { useConversationStore } from '../../conversation/store.ts';
 import { useTranscriptViewportControls } from '../../transcript/index.ts';
 import { ComposerConfigButton } from '../config/ConfigButton.tsx';
@@ -24,6 +25,7 @@ export function ComposerActionButtons({
   onSignOut: () => void;
 }) {
   const { canScrollDown, canScrollUp, scrollDown, scrollUp } = useTranscriptViewportControls();
+  const openMobileSidebar = useAgentSidebarStore((state) => state.openMobile);
   const pickerOpen = useConversationStore((state) => state.directoryPickerOpen);
   const pickerPath = useConversationStore((state) => state.directoryPickerPath);
   const setPickerPath = useConversationStore((state) => state.setDirectoryPickerPath);
@@ -36,6 +38,11 @@ export function ComposerActionButtons({
     icon: <PanelRightOpen className="size-4" />,
     label: 'Open tabs',
     onClick: () => void openHostOverview({ section: 'tabs' }),
+  }, {
+    className: 'remux-composer-sidebar-button',
+    icon: <History className="size-4" />,
+    label: 'Open history',
+    onClick: openMobileSidebar,
   }, {
     icon: <LogOut className="size-4" />,
     label: 'Sign out',

@@ -1,6 +1,10 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
-import { FIXTURE_CONVERSATION_ID, installAgentHost } from './viewer-fixture';
+import {
+  FIXTURE_CONVERSATION_ID,
+  FIXTURE_SECOND_CONVERSATION_ID,
+  installAgentHost,
+} from './viewer-fixture';
 
 test.beforeEach(async ({ page }) => {
   await installAgentHost(page);
@@ -14,9 +18,10 @@ test('starts with the authoritative model and sends the first message once', asy
 
   await expect(page.getByText('The fixture stream completed.')).toBeVisible();
   await expect(page.locator('.codex-work-header-status')).toHaveText('completed');
-  await expect(page.getByText('Inspect the workspace', { exact: true })).toHaveCount(1);
-  await expect.poll(() => commandCount(page, 'remux/agent/conversation/start')).toBe(1);
+  await expect(transcript(page).getByText('Inspect the workspace', { exact: true })).toHaveCount(1);
+  await expect.poll(() => commandCount(page, 'remux/agent/conversation/create')).toBe(1);
   await expect.poll(() => commandCount(page, 'remux/agent/conversation/message/send')).toBe(1);
+  await expect.poll(() => lastConversationOperationId(page)).toMatch(UUID_V4);
 });
 
 test('sends with a portable UUID when crypto.randomUUID is unavailable', async ({ page }) => {
@@ -31,11 +36,30 @@ test('sends with a portable UUID when crypto.randomUUID is unavailable', async (
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
 
   await expect(page.getByText('The fixture stream completed.')).toBeVisible();
-  await expect.poll(() => commandCount(page, 'remux/agent/conversation/start')).toBe(1);
+  await expect.poll(() => commandCount(page, 'remux/agent/conversation/create')).toBe(1);
   await expect.poll(() => commandCount(page, 'remux/agent/conversation/message/send')).toBe(1);
   await expect.poll(() => lastClientMessageId(page)).toMatch(
-    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+    UUID_V4,
   );
+  await expect.poll(() => lastConversationOperationId(page)).toMatch(UUID_V4);
+});
+
+test('keeps one conversation operation identity across a draft reload', async ({ page }) => {
+  const beforeReload = await page.evaluate(() =>
+    window.sessionStorage.getItem('remux.agent.draft-operation.v1'));
+  expect(beforeReload).toMatch(UUID_V4);
+
+  await messageBox(page).fill('Unsaved text survives this reload');
+  await page.reload();
+  await expect.poll(() => messageBox(page).evaluate((element) => (element as HTMLElement).innerText))
+    .toBe('Unsaved text survives this reload');
+  await messageBox(page).fill('Send the reloaded draft');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+
+  await expect(page.getByText('The fixture stream completed.')).toBeVisible();
+  await expect.poll(() => lastConversationOperationId(page)).toBe(beforeReload);
+  await expect.poll(() => page.evaluate(() =>
+    window.sessionStorage.getItem('remux.agent.draft-operation.v1'))).toBeNull();
 });
 
 test('interrupts an active turn through the server command', async ({ page }) => {
@@ -64,9 +88,91 @@ test('preserves sign-out in the compact action shell', async ({ page }) => {
 test('reconstructs a conversation from route-addressed turn frames', async ({ page }) => {
   await page.goto(conversationUrl());
 
-  await expect(page.getByText('Recovered from authoritative resources.')).toBeVisible();
+  await expect(transcript(page).getByText('Recovered from authoritative resources.')).toBeVisible();
   await expect(page.getByText('GPT-5.4 Fixture')).toBeVisible();
-  await expect(page.getByRole('button', { name: 'New chat' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'New chat', exact: true })).toBeVisible();
+});
+
+test('selects history through the desktop sidebar or mobile sheet and restores target drafts', async ({ page, isMobile }) => {
+  await page.goto(conversationUrl());
+  await expect(transcript(page).getByText('Recovered from authoritative resources.')).toBeVisible();
+
+  await page.getByRole('button', { name: 'New chat', exact: true }).click();
+  const textbox = messageBox(page);
+  await textbox.fill('Keep this exact new-chat draft');
+
+  let history = await openHistory(page, isMobile);
+  await history.getByRole('button', { name: /^Resume this conversation/u }).click();
+  await expect.poll(() => currentResourceId(page)).toBe(FIXTURE_CONVERSATION_ID);
+  await expect(transcript(page).getByText('Recovered from authoritative resources.')).toBeVisible();
+
+  history = await openHistory(page, isMobile);
+  await history.getByRole('button', { name: /New chat Draft/u }).click();
+  await expect.poll(() => textbox.evaluate((element) => (element as HTMLElement).innerText))
+    .toBe('Keep this exact new-chat draft');
+  await expect.poll(() => currentResourceKind(page)).toBe('agentDraft');
+
+  history = await openHistory(page, isMobile);
+  await history.getByRole('button', { name: /^Resume this conversation/u }).click();
+  await textbox.fill('Keep this conversation-specific draft');
+  history = await openHistory(page, isMobile);
+  await history.getByRole('button', { name: /New chat Draft/u }).click();
+  await expect.poll(() => textbox.evaluate((element) => (element as HTMLElement).innerText))
+    .toBe('Keep this exact new-chat draft');
+  history = await openHistory(page, isMobile);
+  await history.getByRole('button', { name: /^Resume this conversation/u }).click();
+  await expect.poll(() => textbox.evaluate((element) => (element as HTMLElement).innerText))
+    .toBe('Keep this conversation-specific draft');
+});
+
+test('fences a delayed conversation read during rapid history selection', async ({ page, isMobile }) => {
+  await page.goto(conversationUrl());
+  await expect(transcript(page).getByText('Recovered from authoritative resources.')).toBeVisible();
+  await page.evaluate((id) => (window as any).__agentFixture.addConversation({
+    id,
+    preview: 'A separate empty work stream.',
+    title: 'Parallel ledger work',
+  }), FIXTURE_SECOND_CONVERSATION_ID);
+
+  let history = await openHistory(page, isMobile);
+  await expect(history.getByRole('button', { name: /^Parallel ledger work/u })).toBeVisible();
+  await page.evaluate(() => (window as any).__agentFixture.delayNextTranscript(220));
+  await history.getByRole('button', { name: /^Parallel ledger work/u }).click();
+  await expect.poll(() => currentResourceId(page)).toBe(FIXTURE_SECOND_CONVERSATION_ID);
+
+  history = await openHistory(page, isMobile);
+  await history.getByRole('button', { name: /^Resume this conversation/u }).click();
+  await expect.poll(() => currentResourceId(page)).toBe(FIXTURE_CONVERSATION_ID);
+  await page.waitForTimeout(260);
+  await expect(transcript(page).getByText('Recovered from authoritative resources.')).toBeVisible();
+});
+
+test('honors host navigation to another durable conversation', async ({ page }) => {
+  await page.goto(conversationUrl());
+  await page.evaluate((id) => {
+    const fixture = (window as any).__agentFixture;
+    fixture.addConversation({ id, title: 'Host-selected work' });
+    fixture.navigate('agentConversation', id);
+  }, FIXTURE_SECOND_CONVERSATION_ID);
+
+  await expect.poll(() => currentResourceId(page)).toBe(FIXTURE_SECOND_CONVERSATION_ID);
+  await expect(page.getByText('Start with the work, not the ceremony.')).toBeVisible();
+});
+
+test('preserves an unloaded conversation draft when lazy activation is rejected', async ({ page }) => {
+  await page.goto(conversationUrl());
+  await page.evaluate(() => (window as any).__agentFixture.resetGeneration());
+  await expect.poll(() => page.evaluate(() =>
+    (window as any).__agentFixture.resources.get('runtime')?.value.state)).toBe('unloaded');
+  await page.evaluate(() => (window as any).__agentFixture.rejectNextMessage());
+  const textbox = messageBox(page);
+  await textbox.fill('Keep this exact draft after a busy rejection');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+
+  await expect(page.getByRole('alert')).toContainText('Another conversation has an active turn.');
+  await expect.poll(() => textbox.evaluate((element) => (element as HTMLElement).innerText))
+    .toBe('Keep this exact draft after a busy rejection');
+  await expect(textbox).toBeEditable();
 });
 
 test('renders terminal turn errors from the authoritative frame', async ({ page }) => {
@@ -89,7 +195,7 @@ test('selects a workspace through the bounded directory picker', async ({ page }
   await expect.poll(async () => {
     return page.evaluate(() => {
       const log = (window as any).__agentFixture.requestLog as Array<{ method: string; summary: string }>;
-      const request = log.find((entry) => entry.method === 'remux/agent/conversation/start');
+      const request = log.find((entry) => entry.method === 'remux/agent/conversation/create');
       return request ? JSON.parse(request.summary).cwd : null;
     });
   }).toBe('/tmp/remux-fixture/packages');
@@ -103,13 +209,13 @@ test('locks model settings to an active conversation and unlocks a new chat', as
 
   await messageBox(page).fill('Start a locked conversation');
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
-  await expect(page.getByRole('button', { name: 'New chat' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'New chat', exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Preferences' }).click();
   await expect(page.getByRole('button', { name: 'GPT-5.4 Fixture' })).toBeDisabled();
   await expect(page.getByText('Start a new chat to change model settings.')).toBeVisible();
   await page.keyboard.press('Escape');
 
-  await page.getByRole('button', { name: 'New chat' }).click();
+  await page.getByRole('button', { name: 'New chat', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Choose workspace' })).toBeEnabled();
 });
 
@@ -152,6 +258,26 @@ function messageBox(page: Page) {
   return page.getByRole('textbox', { name: 'Message', exact: true });
 }
 
+function transcript(page: Page) {
+  return page.getByTestId('agent-transcript-scroll');
+}
+
+async function openHistory(page: Page, isMobile: boolean) {
+  if (isMobile) {
+    await page.getByRole('button', { name: 'Open history' }).click();
+    return page.getByRole('dialog');
+  }
+  return page.getByLabel('Agent history');
+}
+
+async function currentResourceId(page: Page) {
+  return page.evaluate(() => new URL(window.location.href).searchParams.get('remuxResourceId'));
+}
+
+async function currentResourceKind(page: Page) {
+  return page.evaluate(() => new URL(window.location.href).searchParams.get('remuxResourceKind'));
+}
+
 async function commandCount(page: Page, method: string) {
   return page.evaluate((value) => (window as any).__agentFixture.requestLog
     .filter((entry: { method: string }) => entry.method === value).length, method);
@@ -165,6 +291,16 @@ async function lastClientMessageId(page: Page) {
   });
 }
 
+async function lastConversationOperationId(page: Page) {
+  return page.evaluate(() => {
+    const log = (window as any).__agentFixture.requestLog as Array<{ method: string; summary: string }>;
+    const request = log.findLast((entry) => entry.method === 'remux/agent/conversation/create');
+    return request ? JSON.parse(request.summary).operationId as string : null;
+  });
+}
+
 async function computedBackgroundImage(locator: Locator) {
   return locator.evaluate((element) => getComputedStyle(element).backgroundImage);
 }
+
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;

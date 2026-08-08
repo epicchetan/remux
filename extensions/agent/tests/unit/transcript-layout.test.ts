@@ -8,6 +8,12 @@ import { measureCollapsedTranscript } from '../../viewer/src/transcript/layout/m
 import { reconcileMeasuredTranscript } from '../../viewer/src/transcript/layout/reconcileMeasured.ts';
 import { autoScrollModeForStreamingTurn, userMessageRowMatchesId } from '../../viewer/src/transcript/virtualizerScroll.ts';
 import { computeTranscriptVirtualRange } from '../../viewer/src/transcript/virtualizerRange.ts';
+import {
+  discardTranscriptUserMessage,
+  getTranscriptViewportState,
+  resetTranscriptViewportForConversation,
+  trackTranscriptUserMessage,
+} from '../../viewer/src/transcript/viewportStore.ts';
 
 if (typeof globalThis.OffscreenCanvas === 'undefined') {
   globalThis.OffscreenCanvas = class {
@@ -83,6 +89,16 @@ test('preserves sent-message identity and never steals manual scroll during stre
     nearBottom: true,
     streamingTurnId: 'turn',
   }), { type: 'bottom' });
+});
+
+test('discards a rejected message anchor without disturbing the draft conversation', () => {
+  resetTranscriptViewportForConversation('conversation');
+  trackTranscriptUserMessage('conversation', 'rejected-client-message');
+  assert.deepEqual(getTranscriptViewportState().pendingUserMessageIds, ['rejected-client-message']);
+
+  discardTranscriptUserMessage('rejected-client-message');
+  assert.deepEqual(getTranscriptViewportState().pendingUserMessageIds, []);
+  assert.equal(getTranscriptViewportState().conversationId, 'conversation');
 });
 
 function frame(id: string, segments: AgentTurnSegment[]): AgentTurnRenderFrame {

@@ -33,11 +33,23 @@ export class JsonRpcOutput {
   }
 }
 
-export function serveStdio(handle: (method: string, params: unknown) => Promise<unknown>, output: JsonRpcOutput) {
-  const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
+export async function serveStdio(
+  handle: (method: string, params: unknown) => Promise<unknown>,
+  output: JsonRpcOutput,
+  source: NodeJS.ReadableStream = process.stdin,
+) {
+  const input = createInterface({ input: source, crlfDelay: Infinity });
+  const pending = new Set<Promise<void>>();
   input.on('line', (line) => {
-    void handleJsonRpcLine(line, handle, output);
+    const request = handleJsonRpcLine(line, handle, output);
+    pending.add(request);
+    void request.then(
+      () => pending.delete(request),
+      () => pending.delete(request),
+    );
   });
+  await new Promise<void>((resolve) => input.once('close', resolve));
+  await Promise.all(pending);
 }
 
 export async function handleJsonRpcLine(

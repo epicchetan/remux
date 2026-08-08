@@ -8,7 +8,7 @@ test.beforeEach(async ({ page }) => {
 
 test('ignores a delayed stale transcript response after a newer terminal frame', async ({ page }) => {
   await page.goto(conversationUrl());
-  await expect(page.getByText('Recovered from authoritative resources.')).toBeVisible();
+  await expect(transcript(page).getByText('Recovered from authoritative resources.')).toBeVisible();
   await page.evaluate(() => (window as any).__agentFixture.delayNextTranscript(220));
 
   await messageBox(page).fill('Exercise the streaming race');
@@ -21,7 +21,7 @@ test('ignores a delayed stale transcript response after a newer terminal frame',
 
 test('defers background transcript work and catches up on resume', async ({ page }) => {
   await page.goto(conversationUrl());
-  await expect(page.getByText('Recovered from authoritative resources.')).toBeVisible();
+  await expect(transcript(page).getByText('Recovered from authoritative resources.')).toBeVisible();
   await page.evaluate(() => {
     const fixture = (window as any).__agentFixture;
     fixture.lifecycle('background');
@@ -36,21 +36,93 @@ test('defers background transcript work and catches up on resume', async ({ page
 
 test('re-reads resources after reconnect without losing the visible conversation', async ({ page }) => {
   await page.goto(conversationUrl());
-  await expect(page.getByText('Recovered from authoritative resources.')).toBeVisible();
+  await expect(transcript(page).getByText('Recovered from authoritative resources.')).toBeVisible();
   const before = await resourceReadCount(page);
   await page.evaluate(() => (window as any).__agentFixture.reconnect());
 
   await expect.poll(() => resourceReadCount(page)).toBeGreaterThan(before);
-  await expect(page.getByText('Recovered from authoritative resources.')).toBeVisible();
+  await expect(transcript(page).getByText('Recovered from authoritative resources.')).toBeVisible();
 });
 
-test('invalidates an ephemeral conversation across a server generation reset', async ({ page }) => {
+test('reconstructs and lazily continues a durable conversation across a server generation reset', async ({ page }) => {
   await page.goto(conversationUrl());
-  await expect(page.getByText('Recovered from authoritative resources.')).toBeVisible();
+  await expect(transcript(page).getByText('Recovered from authoritative resources.')).toBeVisible();
   await page.evaluate(() => (window as any).__agentFixture.resetGeneration());
 
-  await expect(page.getByText('Conversation unavailable')).toBeVisible();
-  await expect(page.getByText(/runtime restarted/u)).toBeVisible();
+  await expect(messageBox(page)).toBeEditable();
+  await expect(transcript(page).getByText('Recovered from authoritative resources.')).toBeVisible();
+  await expect(page.getByText('Conversation unavailable')).toHaveCount(0);
+  await messageBox(page).fill('Continue after the runtime reset');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect(page.getByText('The fixture stream completed.')).toBeVisible();
+});
+
+test('preserves open work and reloads its lazy detail across a server generation reset', async ({ page }) => {
+  await page.goto('/viewers/agent/');
+  await messageBox(page).fill('Inspect durable work across restart');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect(page.getByText('The fixture stream completed.')).toBeVisible();
+
+  const workHeader = page.locator('.codex-work-header');
+  await workHeader.click();
+  const readRow = page.getByRole('button', { name: /Read README\.md/u });
+  await readRow.click();
+  await expect(page.getByText('Read the workspace overview before editing.')).toBeVisible();
+
+  const detailReadsBeforeReset = await transcriptRequestCount(page, 'workEntryDetail');
+  await page.evaluate(() => (window as any).__agentFixture.resetGeneration());
+
+  await expect(workHeader).toHaveAttribute('aria-expanded', 'true');
+  await expect(readRow).toHaveAttribute('aria-expanded', 'true');
+  await expect(page.getByText('Read the workspace overview before editing.')).toBeVisible();
+  await expect.poll(() => transcriptRequestCount(page, 'workEntryDetail'))
+    .toBeGreaterThan(detailReadsBeforeReset);
+});
+
+test('fences a delayed old-generation transcript after fresh recovery', async ({ page }) => {
+  await page.goto(conversationUrl());
+  await expect(transcript(page).getByText('Recovered from authoritative resources.')).toBeVisible();
+  await page.evaluate(() => {
+    const fixture = (window as any).__agentFixture;
+    fixture.delayNextTranscript(220);
+    fixture.appendCompletedTurn('Old generation request', 'Old generation answer.');
+    fixture.resetGeneration();
+    fixture.appendCompletedTurn('New generation request', 'New generation answer.');
+  });
+
+  await expect(transcript(page).getByText('New generation answer.')).toBeVisible();
+  await page.waitForTimeout(260);
+  await expect(transcript(page).getByText('New generation answer.')).toBeVisible();
+  await expect(transcript(page).getByText('Old generation answer.')).toBeVisible();
+});
+
+test('loads an old focused turn before measuring and scrolling to it', async ({ page }) => {
+  await page.goto(conversationUrl(
+    '&fixtureLong=1&remuxFocusKind=turn&remuxFocusId=turn-10',
+  ));
+
+  await expect(transcript(page).getByText('Historical answer 10.')).toBeVisible();
+  await expect.poll(() => page.evaluate(() => (window as any).__agentFixture.requestLog
+    .filter((entry: { method: string }) => entry.method === 'remux/agent/transcript/resources/read')
+    .flatMap((entry: { summary: string }) => JSON.parse(entry.summary))
+    .some((request: any) => request.type === 'transcriptSync' &&
+      request.window?.kind === 'around' && request.window.turnId === 'turn-10'))).toBe(true);
+});
+
+test('offers retry and dismiss when a requested turn cannot be focused', async ({ page }) => {
+  await page.goto(conversationUrl(
+    '&fixtureLong=1&remuxFocusKind=turn&remuxFocusId=missing-turn',
+  ));
+
+  const failure = page.getByRole('alert').filter({ hasText: 'The requested turn could not be loaded.' });
+  await expect(failure).toBeVisible();
+  const aroundReadsBeforeRetry = await focusedTurnRequestCount(page, 'missing-turn');
+  await failure.getByRole('button', { name: 'Retry' }).click();
+  await expect.poll(() => focusedTurnRequestCount(page, 'missing-turn'))
+    .toBeGreaterThan(aroundReadsBeforeRetry);
+  await expect(failure).toBeVisible();
+  await failure.getByRole('button', { name: 'Dismiss' }).click();
+  await expect(failure).toHaveCount(0);
 });
 
 test('provides previous and next transcript navigation without forcing bottom mode', async ({ page }) => {
@@ -70,7 +142,7 @@ test('provides previous and next transcript navigation without forcing bottom mo
 test('keeps excluded Codex surfaces out of the Agent shell', async ({ page }) => {
   await page.goto('/viewers/agent/');
   await page.getByRole('button', { name: 'Preferences' }).click();
-  for (const name of ['History', 'Attach', 'Compact', 'Review', 'Speed', 'Narration', 'Queue']) {
+  for (const name of ['Attach', 'Compact', 'Review', 'Speed', 'Narration', 'Queue']) {
     await expect(page.getByText(name, { exact: false })).toHaveCount(0);
   }
 });
@@ -109,7 +181,26 @@ function messageBox(page: Page) {
   return page.getByRole('textbox', { name: 'Message', exact: true });
 }
 
+function transcript(page: Page) {
+  return page.getByTestId('agent-transcript-scroll');
+}
+
 async function resourceReadCount(page: Page) {
   return page.evaluate(() => (window as any).__agentFixture.requestLog
     .filter((entry: { method: string }) => entry.method === 'remux/agent/resources/read').length);
+}
+
+async function transcriptRequestCount(page: Page, type: string) {
+  return page.evaluate((requestType) => (window as any).__agentFixture.requestLog
+    .filter((entry: { method: string }) => entry.method === 'remux/agent/transcript/resources/read')
+    .flatMap((entry: { summary: string }) => JSON.parse(entry.summary))
+    .filter((request: { type: string }) => request.type === requestType).length, type);
+}
+
+async function focusedTurnRequestCount(page: Page, turnId: string) {
+  return page.evaluate((focusedTurnId) => (window as any).__agentFixture.requestLog
+    .filter((entry: { method: string }) => entry.method === 'remux/agent/transcript/resources/read')
+    .flatMap((entry: { summary: string }) => JSON.parse(entry.summary))
+    .filter((request: any) => request.type === 'transcriptSync' &&
+      request.window?.kind === 'around' && request.window.turnId === focusedTurnId).length, turnId);
 }
