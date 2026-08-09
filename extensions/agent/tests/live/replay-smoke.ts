@@ -8,7 +8,9 @@ import { backup, DatabaseSync } from 'node:sqlite';
 import {
   AGENT_METHODS,
   AGENT_RESOURCE_KEYS,
+  contextResourceKey,
   type AgentRuntimeValue,
+  type ContextInspectorValue,
   type ResourceReadResult,
 } from '../../shared/protocol.ts';
 import { AgentServer } from '../../server/src/agent-server.ts';
@@ -69,16 +71,62 @@ async function run() {
         `The live replay response did not contain the expected sentinel ${JSON.stringify(options.expect)}.`,
       );
     }
+    const contextRead = await server.handle(AGENT_METHODS.resourcesRead, {
+      requests: [{ key: contextResourceKey(conversationId) }],
+    }) as ResourceReadResult;
+    const contextResource = contextRead.resources[0];
+    if (contextResource?.status !== 'ok') {
+      throw new Error('The live replay did not publish its durable shadow context resource.');
+    }
+    const inspector = contextResource.value as ContextInspectorValue;
+    if (inspector.decision.kind === 'block') {
+      throw new Error('The live replay shadow compiler unexpectedly produced a blocking candidate.');
+    }
+    if (inspector.version !== 2 || !inspector.actual) {
+      throw new Error('The live replay did not publish the inference-scoped context truth projection.');
+    }
+    const dispatchArtifact = await repository.readArtifact(inspector.actual.dispatchArtifact.hash);
+    if (!dispatchArtifact?.bytes.toString('utf8').includes(options.prompt)) {
+      throw new Error('The captured provider dispatch does not contain the replay prompt.');
+    }
     const database = new DatabaseSync(repository.databasePath, { readOnly: true });
     const inferences = database.prepare(`
       SELECT ordinal, state, request_mode, estimated_input_tokens,
-             reported_input_tokens, reported_output_tokens
+             reported_input_tokens, reported_output_tokens, manifest_version
       FROM inferences WHERE turn_id = ? ORDER BY ordinal
+    `).all(accepted.turnId).map((row) => ({ ...row }));
+    const compilations = database.prepare(`
+      SELECT mode, compiler_version, policy_version, decision,
+             manifest_artifact_hash, bootstrap_artifact_hash, semantic_hash,
+             active_estimated_input_tokens, candidate_estimated_input_tokens,
+             build_duration_ms
+      FROM context_compilations WHERE turn_id = ? ORDER BY created_sequence
     `).all(accepted.turnId).map((row) => ({ ...row }));
     const conversation = database.prepare(`
       SELECT model_id, reasoning FROM conversations WHERE conversation_id = ?
     `).get(conversationId) as { model_id: string; reasoning: string };
     database.close();
+    if (compilations.length === 0) {
+      throw new Error('The live replay committed no durable shadow context compilation.');
+    }
+    if (inferences.some((row) =>
+      row.manifest_version !== 'agent-prompt-manifest-v1' &&
+      row.manifest_version !== 'agent-prompt-manifest-v2' &&
+      row.manifest_version !== 'agent-prompt-manifest-v3')) {
+      throw new Error('The live replay did not use the versioned prompt manifest.');
+    }
+    const latestCompilation = compilations.at(-1) as {
+      semantic_hash: string;
+      manifest_artifact_hash: string;
+      bootstrap_artifact_hash: string;
+    };
+    if (
+      latestCompilation.semantic_hash !== inspector.semanticHash ||
+      latestCompilation.manifest_artifact_hash !== inspector.manifestArtifact.hash ||
+      latestCompilation.bootstrap_artifact_hash !== inspector.bootstrapArtifact.hash
+    ) {
+      throw new Error('The live replay context inspector does not match its durable compilation row.');
+    }
     console.log(JSON.stringify({
       ok: true,
       mode: options.inPlace ? 'in-place' : 'snapshot',
@@ -90,6 +138,20 @@ async function run() {
       responseBytes: Buffer.byteLength(response, 'utf8'),
       expectedSentinel: options.expect,
       inferences,
+      shadowContext: {
+        compilations: compilations.length,
+        decision: inspector.decision.kind,
+        activeEstimatedInputTokens: inspector.activeEstimatedInputTokens,
+        candidateEstimatedInputTokens: inspector.candidateEstimatedInputTokens,
+        buildDurationMs: inspector.buildDurationMs,
+        semanticHash: inspector.semanticHash,
+        manifestArtifactHash: inspector.manifestArtifact.hash,
+        bootstrapArtifactHash: inspector.bootstrapArtifact.hash,
+        dispatchArtifactHash: inspector.actual.dispatchArtifact.hash,
+        transportMode: inspector.actual.transportMode,
+        messageCount: inspector.actual.messageCount,
+        turnCount: inspector.actual.turnCount,
+      },
       ...(snapshotRoot && options.keepSnapshot ? { snapshotRoot } : {}),
     }, null, 2));
   } finally {

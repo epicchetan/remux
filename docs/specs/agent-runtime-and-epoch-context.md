@@ -1,6 +1,6 @@
 Status: Active Spec
 Last verified: 2026-08-08
-Canonical code: Owner-accepted Phase 0 through Phase 1A.2 are in `extensions/agent/`; shadow context compilation, active epoch rollover, coding tools, and process runtime remain open
+Canonical code: The Phase 0–1A foundation and authoritative stateful context workspace are implemented in `extensions/agent/`; provider-context details are governed by `agent-context-workspace-v1.md`; child work scopes and a first-class process registry remain open
 
 # Agent runtime and epoch context
 
@@ -12,6 +12,12 @@ This is a single-provider product. It uses the owner's ChatGPT/Codex
 subscription through Pi's `openai-codex` provider. It does not use Codex
 app-server, `codex exec`, the OpenAI API-key surface, Anthropic, or an
 automatic provider/model fallback.
+
+Direction update (2026-08-08): the diagnostic shadow phase was superseded by
+the model-managed workspace and authoritative frame compiler in
+[`agent-context-workspace-v1.md`](agent-context-workspace-v1.md). E0 now
+measures both the existing Codex path and this stateful Agent path on the same
+sanitized multi-turn Ledger task.
 
 The whole design answers one question:
 

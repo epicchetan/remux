@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-import type { AssistantMessage, Message, Model, TextContent } from '@earendil-works/pi-ai';
+import type { AssistantMessage, Message, Model } from '@earendil-works/pi-ai';
 import { estimateTokens } from '@earendil-works/pi-coding-agent';
 
 import { canonicalJson, canonicalJsonHash, type CanonicalJsonValue } from './storage/canonical-json.ts';
@@ -18,6 +18,7 @@ export type LogicalContextMessage =
       role: 'user';
       turnId: string;
       text: string;
+      images?: LogicalContextImage[];
       timestamp: number;
     }
   | {
@@ -48,7 +49,14 @@ export type DurableContextSnapshot = {
 };
 
 export type LogicalReplayEvent =
-  | { type: 'user'; sequence: number; turnId: string; timestamp: number; text: string }
+  | {
+      type: 'user';
+      sequence: number;
+      turnId: string;
+      timestamp: number;
+      text: string;
+      images?: LogicalContextImage[];
+    }
   | {
       type: 'assistant-checkpoint';
       sequence: number;
@@ -100,6 +108,12 @@ export type LogicalReplayEvent =
 
 type PendingToolCall = LogicalToolCall & {
   result?: { value: unknown; isError: boolean; timestamp: number };
+};
+
+export type LogicalContextImage = {
+  data: string;
+  mimeType: string;
+  sha256: string;
 };
 
 type AssistantBuilder = {
@@ -156,6 +170,7 @@ export function reduceLogicalReplay(events: LogicalReplayEvent[]): LogicalContex
           role: 'user',
           turnId: event.turnId,
           text: event.text,
+          ...(event.images && event.images.length > 0 ? { images: event.images } : {}),
           timestamp: event.timestamp,
         });
         break;
@@ -268,7 +283,21 @@ export function renderDurablePiPrefix(
 ): Message[] {
   return messages.map((message): Message => {
     if (message.role === 'user') {
-      return { role: 'user', content: message.text, timestamp: message.timestamp };
+      const images = message.images ?? [];
+      return {
+        role: 'user',
+        content: images.length === 0
+          ? message.text
+          : [
+              { type: 'text' as const, text: message.text },
+              ...images.map((image) => ({
+                type: 'image' as const,
+                data: image.data,
+                mimeType: image.mimeType,
+              })),
+            ],
+        timestamp: message.timestamp,
+      };
     }
     if (message.role === 'tool') {
       return {
@@ -282,13 +311,6 @@ export function renderDurablePiPrefix(
       };
     }
     const content: AssistantMessage['content'] = [];
-    if (message.reasoning) {
-      content.push({
-        type: 'text',
-        text: `${VISIBLE_REASONING_LABEL}${message.reasoning}`,
-        remuxKind: 'visible-reasoning-summary',
-      } as TextContent & { remuxKind: 'visible-reasoning-summary' });
-    }
     if (message.text) content.push({ type: 'text', text: message.text });
     content.push(...message.toolCalls.map((call) => ({
       type: 'toolCall' as const,
@@ -324,12 +346,97 @@ export function alignDurableContextWithPi(
     offset < 0 ||
     !piHashes.every((hash, index) => snapshot.orderedMessageHashes[offset + index] === hash)
   ) {
-    throw new Error('Durable context does not match Pi runtime suffix.');
+    const mismatchIndex = offset < 0
+      ? 0
+      : piHashes.findIndex((hash, index) => snapshot.orderedMessageHashes[offset + index] !== hash);
+    const durableIndex = offset + Math.max(0, mismatchIndex);
+    const durable = snapshot.messages[durableIndex];
+    const pi = piMessages[Math.max(0, mismatchIndex)];
+    throw new Error(
+      'Durable context does not match Pi runtime suffix' +
+      ` at Pi index ${Math.max(0, mismatchIndex)} ` +
+      `(${messageMismatchSummary(durable, pi)}).`,
+    );
   }
   return [
     ...renderDurablePiPrefix(snapshot.messages.slice(0, offset), model),
     ...piMessages.map(requiredPiMessage),
   ];
+}
+
+function messageMismatchSummary(
+  durable: LogicalContextMessage | undefined,
+  pi: unknown,
+) {
+  if (!durable) return `durable missing, Pi ${piMessageIdentity(pi)}`;
+  try {
+    const expected = logicalMessageSemanticValue(durable) as Record<string, CanonicalJsonValue>;
+    const actual = piMessageSemanticValue(pi) as Record<string, CanonicalJsonValue>;
+    if (expected.role !== actual.role) return `role ${String(expected.role)}/${String(actual.role)}`;
+    if (expected.role === 'assistant') {
+      const expectedCalls = Array.isArray(expected.toolCalls) ? expected.toolCalls : [];
+      const actualCalls = Array.isArray(actual.toolCalls) ? actual.toolCalls : [];
+      const mismatch = Math.max(expectedCalls.length, actualCalls.length) === 0
+        ? -1
+        : Array.from({ length: Math.max(expectedCalls.length, actualCalls.length) }, (_, index) => index)
+          .find((index) => canonicalJson(expectedCalls[index] ?? null) !== canonicalJson(actualCalls[index] ?? null)) ?? -1;
+      return 'assistant ' +
+        `text=${expected.text === actual.text ? 'same' : 'different'} ` +
+        `reasoning=${expected.reasoning === actual.reasoning ? 'same' : 'different'} ` +
+        `tools=${expectedCalls.length}/${actualCalls.length}` +
+        (mismatch < 0 ? '' : ` firstToolDiff=${mismatch} ` +
+          `${toolCallIdentity(expectedCalls[mismatch])}/${toolCallIdentity(actualCalls[mismatch])}`);
+    }
+    if (expected.role === 'tool') {
+      return `tool ${String(expected.name)}/${String(actual.name)} ` +
+        `call=${String(expected.callId) === String(actual.callId) ? 'same' : 'different'} ` +
+        `error=${String(expected.isError)}/${String(actual.isError)} ` +
+        `result=${canonicalJson(expected.result ?? null) === canonicalJson(actual.result ?? null) ? 'same' : 'different'}`;
+    }
+    return `user text=${expected.text === actual.text ? 'same' : 'different'}`;
+  } catch {
+    return `durable ${logicalMessageIdentity(durable)}, Pi ${piMessageIdentity(pi)}`;
+  }
+}
+
+function toolCallIdentity(value: CanonicalJsonValue | undefined) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return 'missing';
+  const call = value as Record<string, CanonicalJsonValue>;
+  return `${String(call.name)}:${String(call.callId)}:${canonicalJsonHash(call.args ?? null)}`;
+}
+
+function logicalMessageIdentity(message: LogicalContextMessage | undefined) {
+  if (!message) return 'missing';
+  return semanticMessageIdentity(logicalMessageSemanticValue(message));
+}
+
+function piMessageIdentity(value: unknown) {
+  try {
+    return semanticMessageIdentity(piMessageSemanticValue(value));
+  } catch {
+    return 'invalid';
+  }
+}
+
+function semanticMessageIdentity(value: CanonicalJsonValue) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return 'invalid';
+  const semantic = value as Record<string, CanonicalJsonValue>;
+  if (semantic.role === 'tool') {
+    return `tool ${String(semantic.name)} ${String(semantic.callId)} result=${canonicalJsonHash(semantic.result ?? null)}`;
+  }
+  if (semantic.role === 'assistant') {
+    const calls = Array.isArray(semantic.toolCalls) ? semantic.toolCalls : [];
+    const callSummary = calls.map((entry) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return 'invalid';
+      const call = entry as Record<string, CanonicalJsonValue>;
+      return `${String(call.name)}:${String(call.callId)}:${canonicalJsonHash(call.args ?? null)}`;
+    }).join(',');
+    return 'assistant ' +
+      `text=${canonicalJsonHash(semantic.text ?? '')} ` +
+      `reasoning=${canonicalJsonHash(semantic.reasoning ?? '')} ` +
+      `tools=${callSummary}`;
+  }
+  return `user text=${canonicalJsonHash(semantic.text ?? '')}`;
 }
 
 export function hashRenderedMessages(messages: Message[]) {
@@ -354,7 +461,7 @@ export function estimatePiContextTokens(messages: Message[], fixedPrompt: string
 }
 
 export function assertContextBudget(estimatedInputTokens: number, contextWindow: number) {
-  const hardInputLimit = Math.min(150_000, Math.max(0, contextWindow - 25_000));
+  const hardInputLimit = Math.max(0, contextWindow - 25_000);
   const safetyMargin = 5_000;
   if (estimatedInputTokens + safetyMargin > hardInputLimit) {
     throw new ContextRolloverRequiredError(estimatedInputTokens, hardInputLimit, safetyMargin);
@@ -373,7 +480,7 @@ export class ContextRolloverRequiredError extends Error {
     super(
       `Context requires an estimated ${estimatedInputTokens} input tokens plus a ` +
       `${safetyMargin}-token safety margin; the effective admission limit is ` +
-      `${admissionLimit} tokens (${hardInputLimit} hard), and epoch rollover is not enabled.`,
+      `${admissionLimit} tokens (${hardInputLimit} hard); an emergency epoch rollover is required.`,
     );
     this.name = 'ContextRolloverRequiredError';
     this.estimatedInputTokens = estimatedInputTokens;
@@ -401,11 +508,17 @@ function providerVisiblePiMessage(message: Message) {
 }
 
 export function logicalMessageSemanticValue(message: LogicalContextMessage): CanonicalJsonValue {
-  if (message.role === 'user') return { role: 'user', text: message.text };
+  if (message.role === 'user') return {
+    role: 'user',
+    text: message.text,
+    ...((message.images?.length ?? 0) > 0
+      ? { images: message.images!.map((image) => ({ mimeType: image.mimeType, sha256: image.sha256 })) }
+      : {}),
+  };
   if (message.role === 'assistant') {
     return {
       role: 'assistant',
-      reasoning: message.reasoning,
+      reasoning: '',
       text: message.text,
       toolCalls: message.toolCalls.map((call) => ({
         args: jsonValue(call.args),
@@ -426,7 +539,7 @@ export function logicalMessageSemanticValue(message: LogicalContextMessage): Can
 function piMessageSemanticValue(value: unknown): CanonicalJsonValue {
   const message = requiredObject(value, 'Pi message');
   if (message.role === 'user') {
-    return { role: 'user', text: textContent(message.content, 'user') };
+    return userContentSemanticValue(message.content);
   }
   if (message.role === 'assistant') {
     if (!Array.isArray(message.content)) throw new Error('Pi assistant content is invalid.');
@@ -451,15 +564,13 @@ function piMessageSemanticValue(value: unknown): CanonicalJsonValue {
         });
       }
     }
-    return { role: 'assistant', reasoning, text, toolCalls };
+    return { role: 'assistant', reasoning: '', text, toolCalls };
   }
   if (message.role === 'toolResult') {
     const content = textContent(message.content, 'tool result');
     const result = message.isError === true
       ? { error: content }
-      : message.details === undefined
-        ? parseToolResultText(content)
-        : jsonValue(message.details);
+      : parseProviderToolResultText(content);
     return {
       role: 'tool',
       callId: requiredString(message.toolCallId, 'Pi tool result call id'),
@@ -483,7 +594,31 @@ function textContent(value: unknown, label: string) {
   return text;
 }
 
-function parseToolResultText(value: string): CanonicalJsonValue {
+function userContentSemanticValue(value: unknown): CanonicalJsonValue {
+  if (typeof value === 'string') return { role: 'user', text: value };
+  if (!Array.isArray(value)) throw new Error('Pi user content is invalid.');
+  let text = '';
+  const images: CanonicalJsonValue[] = [];
+  for (const entry of value) {
+    const block = requiredObject(entry, 'Pi user content block');
+    if (block.type === 'text') {
+      text += requiredString(block.text, 'Pi user text');
+      continue;
+    }
+    if (block.type === 'image') {
+      const data = requiredString(block.data, 'Pi user image data');
+      images.push({
+        mimeType: requiredString(block.mimeType, 'Pi user image mime type'),
+        sha256: createHash('sha256').update(Buffer.from(data, 'base64')).digest('hex'),
+      });
+      continue;
+    }
+    throw new Error('Pi user content contains an unsupported block.');
+  }
+  return { role: 'user', text, ...(images.length > 0 ? { images } : {}) };
+}
+
+export function parseProviderToolResultText(value: string): CanonicalJsonValue {
   try {
     return jsonValue(JSON.parse(value));
   } catch {

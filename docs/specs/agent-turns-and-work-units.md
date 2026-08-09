@@ -1,6 +1,6 @@
 Status: Active Spec
-Last verified: 2026-08-08
-Canonical code: schema-v1 root execution-scope and epoch identity are implemented in `extensions/agent/server/src/storage/`; child work-unit execution remains inactive
+Last verified: 2026-08-09
+Canonical code: schema-v1 execution scopes and H4 sequential work-unit execution are implemented in `extensions/agent/server/src/storage/` and `extensions/agent/server/src/pi-runtime.ts`; work units remain opt-in and absent from the default model contract
 
 # Agent turns and internal work units
 
@@ -15,8 +15,9 @@ The core finding is that a user-visible turn and a model context lifetime are
 different things. A turn may remain one fluid unit of collaboration while the
 harness executes it through several bounded, inspectable **work units**. Epoch
 rollover remains the hard safety mechanism when any one active context grows
-too large; work units are the preferred semantic mechanism for preventing
-unrelated scratch work from sharing that context in the first place.
+too large. Work units are an experimental semantic mechanism for preventing
+unrelated scratch work from sharing that context; the first measured run
+reduced carried context but regressed task quality, so they remain opt-in.
 
 This refinement is not a rigid workflow, task manager, or mandatory planner.
 Short conversational and coding turns continue directly. The additional
@@ -460,3 +461,42 @@ relations later does not require interpreting display transcript rows.
    child objective?
 7. Which semantic promotions can be deterministically derived, and which must
    remain model-proposed or owner-accepted?
+
+## H4 sequential work-unit contract
+
+H4 resolves the v1 questions narrowly. It activates the existing
+`execution_scopes(kind='work_unit')` storage without adding task boards,
+subagents, alternate models, worktrees, concurrency, or nested units.
+
+- **W1 — one tool:** `work_unit` has `enter` and `return` actions. `enter`
+  accepts an objective plus optional exact refs and expected evidence. `return`
+  accepts status (`completed`, `failed`, or `abandoned`), evidence-backed
+  findings, change refs, validation refs, and unresolved items.
+- **W2 — root children only:** one root turn may have one active child at a
+  time. The same Sol process and mutable working tree continue to execute it.
+- **W3 — bounded capsule:** entering writes a child scope, child context space,
+  base git observation, and deterministic capsule. The next inference is a
+  full child frame containing objective, current-user and preceding/accepted
+  proposal refs, applicable primaries, explicit refs, runtime observation, and
+  inherited authority. Parent scratch and raw tool trace are absent.
+- **W4 — local state:** state written while a child is active defaults to its
+  context space. A child cannot directly promote project state; its result may
+  propose promotions for the parent to accept explicitly.
+- **W5 — bounded result:** return writes a content-addressed result artifact
+  containing objective and basis, base/final workspace observations, findings,
+  change and validation refs, unresolved items, proposed promotions, and a
+  trace reference. The parent receives this bounded result, not the child raw
+  trace.
+- **W6 — safe implicit return:** if Sol emits terminal assistant text while a
+  child remains active, the harness stores it as a provisional result,
+  completes the child implicitly, restores the parent, and runs a parent
+  integration inference. Only the parent response is terminal transcript
+  output.
+- **W7 — restart:** active scope and capsule are derived from the journal. An
+  unfinished child resumes from its capsule in a fresh full frame; recovery
+  does not replay parent scratch into it.
+
+The normal path is explicit completion. Work units are optional semantic
+boundaries, not a call-count threshold or mandatory process. A child result
+must contain openable evidence; merely moving a long trace behind an opaque
+summary does not satisfy the design.

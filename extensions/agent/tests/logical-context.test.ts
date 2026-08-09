@@ -183,6 +183,37 @@ test('context estimation excludes tool details that providers never receive', ()
     estimatePiContextTokens([inflatedInternalDetails], 'fixture prompt'),
     estimatePiContextTokens([base], 'fixture prompt'),
   );
+  assert.deepEqual(
+    piMessageSemanticHashes([inflatedInternalDetails]),
+    piMessageSemanticHashes([base]),
+  );
+});
+
+test('tool-result semantics preserve provider-visible unsafe JSON as exact text', () => {
+  const visible = '{"created_at_ns":9007199254740992}';
+  const piMessage: Message = {
+    role: 'toolResult',
+    toolCallId: 'call-unsafe-number',
+    toolName: 'bash',
+    content: [{ type: 'text', text: visible }],
+    details: { created_at_ns: 9_007_199_254_740_992 },
+    isError: false,
+    timestamp: 123,
+  };
+  const durable: LogicalContextMessage = {
+    role: 'tool',
+    turnId: 'turn',
+    callId: 'call-unsafe-number',
+    name: 'bash',
+    result: visible,
+    isError: false,
+    timestamp: 123,
+  };
+
+  assert.deepEqual(
+    piMessageSemanticHashes([piMessage]),
+    createDurableContextSnapshot(1, [durable]).orderedMessageHashes,
+  );
 });
 
 test('context budget fails with an explicit rollover-required error', () => {

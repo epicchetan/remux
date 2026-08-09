@@ -39,12 +39,33 @@ export type AgentTextContentReference = {
   } | null;
 };
 
+export type AgentUserMessagePart =
+  | {
+      text: string;
+      type: 'text';
+    }
+  | {
+      kind: 'directory' | 'file';
+      name: string;
+      path: string;
+      type: 'mention';
+    }
+  | {
+      artifactHash: string;
+      dataUrl?: string;
+      mimeType: string;
+      name: string;
+      sizeBytes: number;
+      type: 'image';
+    };
+
 export type AgentUserMessageSegment = {
   id: string;
   type: 'userMessage';
   clientMessageId: string | null;
   revision: string;
   text: string;
+  parts?: AgentUserMessagePart[];
   content?: AgentTextContentReference;
 };
 
@@ -320,7 +341,7 @@ export type AgentTranscriptResourcesReadResult = {
 export type AgentResourceInvalidation =
   | {
       type: 'resource';
-      key: 'auth' | 'models' | 'conversation-list' | 'runtime' | `conversation:${string}`;
+      key: 'auth' | 'models' | 'conversation-list' | 'runtime' | `conversation:${string}` | `context:${string}` | `queue:${string}`;
       reason: 'created' | 'updated' | 'deleted';
     }
   | {

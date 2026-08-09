@@ -9,6 +9,8 @@
 :root {
   --composer: var(--card);
   --composer-accent: var(--rmx-accent);
+  --chrome: #1f232b;
+  --chrome-hover: #272b34;
   --remux-font-body-size: 15px;
   --remux-font-body-line: 22px;
   --remux-font-work-size: 13px;
@@ -28,17 +30,30 @@
   font-family: var(--remux-font-sans);
 }
 
+:root[data-remux-theme="light"] {
+  --chrome: var(--rmx-surface-raised);
+  --chrome-hover: var(--rmx-surface-hover);
+}
+
+@theme inline {
+  --color-chrome: var(--chrome);
+  --color-chrome-hover: var(--chrome-hover);
+}
+
 @layer base {
   * {
     box-sizing: border-box;
     border-color: var(--border);
+    outline-color: color-mix(in srgb, var(--ring) 50%, transparent);
   }
 
   html,
   body,
   #root {
+    height: 100%;
     min-height: 100%;
     margin: 0;
+    overflow: hidden;
   }
 
   body {
@@ -49,9 +64,15 @@
   }
 
   button,
-  input,
-  select,
   textarea {
     font: inherit;
+  }
+
+  code {
+    border-radius: 0.375rem;
+    background: var(--muted);
+    color: var(--foreground);
+    font-family: var(--remux-font-mono);
+    padding: 0.08em 0.28em;
   }
 }

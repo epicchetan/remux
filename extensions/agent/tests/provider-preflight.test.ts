@@ -110,7 +110,7 @@ test('the context rollover guard rejects before provider I/O', async (t) => {
   assert.equal(fixture.providerCalls(), 0);
   const assistant = lastAssistant(fixture.events);
   assert.equal(assistant?.stopReason, 'error');
-  assert.match(assistant?.errorMessage ?? '', /epoch rollover is not enabled/u);
+  assert.match(assistant?.errorMessage ?? '', /emergency epoch rollover is required/u);
 });
 
 async function createPreflightFixture(

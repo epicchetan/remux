@@ -9,6 +9,8 @@ import { DatabaseSync } from 'node:sqlite';
 
 import {
   conversationResourceKey,
+  contextResourceKey,
+  type ContextInspectorValue,
   type ConversationListValue,
   type ConversationSummary,
 } from '../shared/protocol.ts';
@@ -25,6 +27,7 @@ import {
   OperationConflictError,
 } from '../server/src/storage/repository.ts';
 import { AGENT_JOURNAL_TABLES, AgentSchemaError } from '../server/src/storage/schema.ts';
+import { compileShadowContext } from '../server/src/context/compiler.ts';
 
 const RECORDED_AT = 1_700_000_000_000;
 
@@ -47,7 +50,7 @@ test('Agent data-root resolution follows explicit, environment, XDG, and home pr
   );
 });
 
-test('clean storage creates and validates schema v2, pragmas, and private modes', async (t) => {
+test('clean storage creates and validates schema v3, pragmas, and private modes', async (t) => {
   const fixture = await storageFixture(t, 'create');
   await mkdir(fixture.dataRoot, { recursive: true, mode: 0o777 });
   await chmod(fixture.dataRoot, 0o777);
@@ -57,7 +60,7 @@ test('clean storage creates and validates schema v2, pragmas, and private modes'
 
   const storage = await openAgentDatabase({ dataRoot: fixture.dataRoot });
   assert.deepEqual(storage.diagnostics(), {
-    userVersion: 2,
+    userVersion: 3,
     journalMode: 'wal',
     foreignKeys: 1,
     synchronous: 2,
@@ -72,7 +75,7 @@ test('clean storage creates and validates schema v2, pragmas, and private modes'
   storage.close();
 
   const reopened = await openAgentDatabase({ dataRoot: fixture.dataRoot });
-  assert.equal(reopened.diagnostics().userVersion, 2);
+  assert.equal(reopened.diagnostics().userVersion, 3);
   assert.deepEqual(userTables(reopened.database), [...AGENT_JOURNAL_TABLES].sort());
   reopened.close();
 });
@@ -86,7 +89,7 @@ test('a newer schema is refused before WAL or schema mutation', async (t) => {
     PRAGMA journal_mode = DELETE;
     CREATE TABLE sentinel (value TEXT NOT NULL);
     INSERT INTO sentinel (value) VALUES ('preserve-me');
-    PRAGMA user_version = 3;
+    PRAGMA user_version = 4;
   `);
   newer.close();
 
@@ -95,7 +98,7 @@ test('a newer schema is refused before WAL or schema mutation', async (t) => {
     AgentSchemaVersionError,
   );
   const inspector = new DatabaseSync(databasePath);
-  assert.equal(pragmaNumber(inspector, 'user_version'), 3);
+  assert.equal(pragmaNumber(inspector, 'user_version'), 4);
   assert.equal(pragmaString(inspector, 'journal_mode'), 'delete');
   assert.equal(
     (inspector.prepare('SELECT value FROM sentinel').get() as { value: string }).value,
@@ -123,7 +126,7 @@ test('an unversioned partial schema and a malformed v1 schema fail closed', asyn
   await assert.rejects(() => openAgentDatabase({ dataRoot: malformed.dataRoot }), AgentSchemaError);
 });
 
-test('schema v2 refuses a lookalike with altered indexes', async (t) => {
+test('schema v3 refuses a lookalike with altered indexes', async (t) => {
   const fixture = await storageFixture(t, 'lookalike');
   const storage = await openAgentDatabase({ dataRoot: fixture.dataRoot });
   storage.close();
@@ -137,7 +140,7 @@ test('schema v2 refuses a lookalike with altered indexes', async (t) => {
 
   await assert.rejects(
     () => openAgentDatabase({ dataRoot: fixture.dataRoot }),
-    /schema structure does not match version 2/u,
+    /schema structure does not match version 3/u,
   );
 });
 
@@ -154,7 +157,14 @@ test('an exact schema v1 database migrates in place without losing conversations
 
   const databasePath = join(fixture.dataRoot, 'agent.sqlite3');
   const versionOne = new DatabaseSync(databasePath);
-  versionOne.exec('DROP INDEX transcript_items_by_turn_sequence');
+  versionOne.exec(`
+    DELETE FROM strand_context_spaces;
+    DELETE FROM context_spaces WHERE parent_space_id IS NOT NULL AND key LIKE 'strand:%';
+    DROP TABLE context_compilations;
+    DROP TABLE strand_context_spaces;
+    ALTER TABLE inferences DROP COLUMN manifest_version;
+    DROP INDEX transcript_items_by_turn_sequence;
+  `);
   versionOne.prepare('UPDATE meta SET value_json = ? WHERE key = ?').run(
     canonicalJson('agent-journal-v1'),
     'journal_schema',
@@ -163,7 +173,7 @@ test('an exact schema v1 database migrates in place without losing conversations
   versionOne.close();
 
   const migrated = await AgentJournalRepository.open({ dataRoot: fixture.dataRoot });
-  assert.equal(migrated.diagnostics().userVersion, 2);
+  assert.equal(migrated.diagnostics().userVersion, 3);
   const inspector = new DatabaseSync(migrated.databasePath, { readOnly: true });
   assert.equal(
     indexNames(inspector).includes('transcript_items_by_turn_sequence'),
@@ -248,6 +258,8 @@ test('conversation creation commits one replayable semantic event group', async 
   });
   assert.deepEqual(events[2]?.payload, {
     conversationId: created.conversationId,
+    contextSpaceId: created.contextSpaceId,
+    contextMode: 'stateful',
     cwd: fixture.workspace,
     forkedFromSequence: null,
     headStrandId: created.rootStrandId,
@@ -256,6 +268,7 @@ test('conversation creation commits one replayable semantic event group', async 
     projectId: created.projectId,
     reasoning: 'high',
     rootSpaceId: created.rootSpaceId,
+    workUnits: false,
     state: 'idle',
     strandState: 'active',
     title: 'New conversation',
@@ -263,7 +276,8 @@ test('conversation creation commits one replayable semantic event group', async 
   const inspector = new DatabaseSync(repository.databasePath);
   assert.deepEqual(rowCounts(inspector), {
     projects: 1,
-    context_spaces: 1,
+    context_spaces: 2,
+    strand_context_spaces: 1,
     project_primaries: 0,
     context_bindings: 0,
     project_relations: 0,
@@ -279,6 +293,7 @@ test('conversation creation commits one replayable semantic event group', async 
     artifacts: 0,
     epoch_blocks: 0,
     inferences: 0,
+    context_compilations: 0,
   });
   const operation = inspector.prepare(`
     SELECT state, accepted_sequence, terminal_sequence, value_json
@@ -295,6 +310,7 @@ test('conversation creation commits one replayable semantic event group', async 
   assert.equal(operation.value_json, canonicalJson({
     accepted: true,
     conversationId: created.conversationId,
+    contextSpaceId: created.contextSpaceId,
     operationId,
     projectId: created.projectId,
     rootSpaceId: created.rootSpaceId,
@@ -315,8 +331,8 @@ test('conversation creation commits one replayable semantic event group', async 
   assert.deepEqual({ ...inspector.prepare(`
     SELECT space_id, project_id, parent_space_id, key, descriptor_json,
            created_revision, created_sequence
-    FROM context_spaces
-  `).get() }, {
+    FROM context_spaces WHERE space_id = ?
+  `).get(created.rootSpaceId) }, {
     space_id: created.rootSpaceId,
     project_id: created.projectId,
     parent_space_id: null,
@@ -574,7 +590,7 @@ test('conversations at one canonical workspace share one durable project root', 
   ]);
   const database = new DatabaseSync(repository.databasePath);
   assert.equal((database.prepare('SELECT COUNT(*) AS count FROM projects').get() as { count: number }).count, 1);
-  assert.equal((database.prepare('SELECT COUNT(*) AS count FROM context_spaces').get() as { count: number }).count, 1);
+  assert.equal((database.prepare('SELECT COUNT(*) AS count FROM context_spaces').get() as { count: number }).count, 3);
   assert.equal((database.prepare('SELECT COUNT(*) AS count FROM conversations').get() as { count: number }).count, 2);
   database.close();
   await repository.close();
@@ -735,16 +751,24 @@ test('a live turn journals admission, inference, tool, transcript, and terminal 
 
   const dispatchContext = await repository.compileContext(conversation.conversationId);
   await repository.startInference(accepted, {
-    payload: { messages: [{ content: 'Preserve this exact message.\n', role: 'user' }] },
+    modelId: 'gpt-5.4',
     requestMode: 'full',
     estimatedInputTokens: 9,
-    context: {
-      basisSequence: dispatchContext.basisSequence,
-      logicalHash: dispatchContext.logicalHash,
-      renderedHash: 'rendered-context-fixture',
-      messageCount: dispatchContext.messages.length,
+    payload: {
+      headers: { authorization: 'Bearer must-not-persist' },
+      input: 'Preserve this exact message.\n',
+      prompt_cache_key: 'private-cache-key',
     },
+    context: inferenceContext(dispatchContext, 9),
   });
+  assert.equal(await repository.recordInferenceTransport(accepted, {
+    plannedRequestMode: 'full',
+    actualRequestMode: 'full',
+  }), true);
+  assert.equal(await repository.recordInferenceTransport(accepted, {
+    plannedRequestMode: 'full',
+    actualRequestMode: 'full',
+  }), false);
   await repository.appendAssistantCheckpoint(accepted, {
     reasoningDelta: 'Inspect the workspace. ',
     textDelta: 'I will check. ',
@@ -830,9 +854,17 @@ test('a live turn journals admission, inference, tool, transcript, and terminal 
     {
       contextLogicalHash: dispatchContext.logicalHash,
       contextMessageCount: 1,
-      contextRenderedHash: 'rendered-context-fixture',
+      contextMode: 'full-history',
+      contextRenderedHash: dispatchContext.logicalHash,
     },
   );
+  const inferenceTransport = (await repository.readEvents({ conversationId: conversation.conversationId }))
+    .find((event) => event.type === 'inference.transport');
+  assert.deepEqual(inferenceTransport?.payload, {
+    actualRequestMode: 'full',
+    inferenceId: (inferenceStarted?.payload as { inferenceId: string }).inferenceId,
+    plannedRequestMode: 'full',
+  });
 
   const replay = await repository.acceptTurn({
     operationId: messageOperationId,
@@ -877,11 +909,74 @@ test('a live turn journals admission, inference, tool, transcript, and terminal 
     inference_state: 'completed',
     conversation_state: 'idle',
   });
+  const compilation = database.prepare(`
+    SELECT i.manifest_version, i.manifest_artifact_hash, c.mode, c.decision,
+           c.semantic_hash, c.bootstrap_artifact_hash,
+           c.active_estimated_input_tokens, c.candidate_estimated_input_tokens
+    FROM inferences i
+    JOIN context_compilations c ON c.inference_id = i.inference_id
+    WHERE i.turn_id = ?
+  `).get(accepted.turnId) as {
+    manifest_version: string;
+    manifest_artifact_hash: string;
+    mode: string;
+    decision: string;
+    semantic_hash: string;
+    bootstrap_artifact_hash: string;
+    active_estimated_input_tokens: number;
+    candidate_estimated_input_tokens: number;
+  };
+  assert.equal(compilation.manifest_version, 'agent-prompt-manifest-v3');
+  assert.equal(compilation.mode, 'shadow');
+  assert.equal(compilation.decision, 'append');
+  assert.match(compilation.semantic_hash, /^[0-9a-f]{64}$/u);
+  assert.match(compilation.bootstrap_artifact_hash, /^[0-9a-f]{64}$/u);
+  assert.equal(compilation.active_estimated_input_tokens, 9);
+  assert.ok(compilation.candidate_estimated_input_tokens > 0);
   database.close();
+
+  const [contextProjection] = await repository.readResourceProjections([
+    contextResourceKey(conversation.conversationId),
+  ]);
+  assert.ok(contextProjection?.value);
+  const inspector = contextProjection.value as ContextInspectorValue;
+  assert.equal(inspector.version, 2);
+  assert.equal(inspector.inferenceId.length > 0, true);
+  assert.equal(inspector.semanticHash, compilation.semantic_hash);
+  assert.equal(inspector.manifestArtifact.hash, compilation.manifest_artifact_hash);
+  assert.equal(inspector.actual?.transportMode, 'full');
+  assert.equal(inspector.actual?.messageCount, dispatchContext.messages.length);
+  assert.equal(inspector.actual?.groups.length, 1);
+  const manifestArtifact = await repository.readArtifact(compilation.manifest_artifact_hash);
+  assert.ok(manifestArtifact);
+  const manifest = JSON.parse(manifestArtifact.bytes.toString('utf8')) as {
+    version: string;
+    active: { mode: string };
+    candidate: { mode: string; blocks: unknown[] };
+    transport: { dispatchArtifact: { hash: string } };
+  };
+  assert.equal(manifest.version, 'agent-prompt-manifest-v3');
+  assert.equal(manifest.active.mode, 'full-history');
+  assert.equal(manifest.candidate.mode, 'diagnostic');
+  assert.equal(manifest.candidate.blocks.length, 8);
+  assert.equal(manifest.transport.dispatchArtifact.hash, inspector.actual?.dispatchArtifact.hash);
+  const dispatchArtifact = await repository.readArtifact(manifest.transport.dispatchArtifact.hash);
+  const capturedDispatch = dispatchArtifact?.bytes.toString('utf8') ?? '';
+  assert.match(capturedDispatch, /Preserve this exact message/u);
+  assert.match(capturedDispatch, /\[redacted\]/u);
+  assert.doesNotMatch(capturedDispatch, /must-not-persist|private-cache-key/u);
   await repository.close();
 
   const reopened = await AgentJournalRepository.open({ dataRoot: fixture.dataRoot });
-  assert.deepEqual(await reopened.compileContext(conversation.conversationId), context);
+  const reopenedContext = await reopened.compileContext(conversation.conversationId);
+  const { observedAt: beforeObservedAt, ...beforeRuntime } = context.shadowSource.observedRuntime as Record<string, unknown>;
+  const { observedAt: afterObservedAt, ...afterRuntime } = reopenedContext.shadowSource.observedRuntime as Record<string, unknown>;
+  assert.deepEqual(afterRuntime, beforeRuntime);
+  assert.ok(Number(afterObservedAt) >= Number(beforeObservedAt));
+  assert.deepEqual(
+    { ...reopenedContext, shadowSource: { ...reopenedContext.shadowSource, observedRuntime: beforeRuntime } },
+    { ...context, shadowSource: { ...context.shadowSource, observedRuntime: beforeRuntime } },
+  );
   await reopened.close();
 });
 
@@ -912,15 +1007,11 @@ test('provider preflight refuses a context compiled from a stale journal basis',
   });
 
   await assert.rejects(() => repository.startInference(accepted, {
-    payload: { input: 'must not dispatch' },
+    modelId: 'gpt-5.4',
     requestMode: 'full',
     estimatedInputTokens: 10,
-    context: {
-      basisSequence: stale.basisSequence,
-      logicalHash: stale.logicalHash,
-      renderedHash: stale.logicalHash,
-      messageCount: stale.messages.length,
-    },
+    payload: { input: 'stale context' },
+    context: inferenceContext(stale, 10),
   }), /context basis .* is stale/u);
   assert.equal(
     (await repository.readEvents({ conversationId: conversation.conversationId }))
@@ -1235,10 +1326,13 @@ test('startup closes nonterminal work as interrupted without replaying effects',
     clientMessageId: testUuid(10_008),
     text: 'Do not replay this provider call.',
   });
+  const dispatch = await repository.compileContext(conversation.conversationId);
   await repository.startInference(accepted, {
-    payload: { request: 'already dispatched before crash' },
+    modelId: 'gpt-5.4',
     requestMode: 'full',
     estimatedInputTokens: 8,
+    payload: { input: 'Do not replay this provider call.' },
+    context: inferenceContext(dispatch, 8),
   });
   await repository.close();
 
@@ -1351,6 +1445,7 @@ test('failed terminal insertion rolls the entire creation transaction back', asy
   assert.deepEqual(rowCounts(afterFailure), {
     projects: 0,
     context_spaces: 0,
+    strand_context_spaces: 0,
     project_primaries: 0,
     context_bindings: 0,
     project_relations: 0,
@@ -1366,6 +1461,7 @@ test('failed terminal insertion rolls the entire creation transaction back', asy
     artifacts: 0,
     epoch_blocks: 0,
     inferences: 0,
+    context_compilations: 0,
   });
   afterFailure.exec('DROP TRIGGER reject_operation_success');
   afterFailure.close();
@@ -1429,10 +1525,13 @@ test('the canonical durable projection hash survives resource rebuild and reopen
     clientMessageId: testUuid(10_010),
     text: 'Inspect the durable projection.',
   });
+  const dispatch = await repository.compileContext(created.conversationId);
   await repository.startInference(turn, {
-    payload: { messages: [{ role: 'user', content: 'Inspect the durable projection.' }] },
+    modelId: 'gpt-5.4',
     requestMode: 'full',
     estimatedInputTokens: 12,
+    payload: { input: 'Inspect the durable projection.' },
+    context: inferenceContext(dispatch, 12),
   });
   await repository.appendAssistantCheckpoint(turn, {
     textDelta: 'Projection checkpoint.',
@@ -1453,7 +1552,7 @@ test('the canonical durable projection hash survives resource rebuild and reopen
 
   const before = await repository.projectionDigest();
   assert.match(before.hash, /^[0-9a-f]{64}$/u);
-  assert.equal(before.projectionVersion, 'agent-projection-v1');
+  assert.equal(before.projectionVersion, 'agent-projection-v2');
   await repository.rebuildConversationResources();
   assert.deepEqual(await repository.projectionDigest(), before);
   await repository.close();
@@ -1605,6 +1704,29 @@ function deterministicIds() {
   };
 }
 
+function inferenceContext(
+  context: Awaited<ReturnType<AgentJournalRepository['compileContext']>>,
+  activeEstimatedInputTokens: number,
+) {
+  const fixedContractsHash = '0'.repeat(64);
+  return {
+    basisSequence: context.basisSequence,
+    logicalHash: context.logicalHash,
+    renderedHash: context.logicalHash,
+    orderedMessageHashes: context.orderedMessageHashes,
+    messageCount: context.messages.length,
+    fixedContractsHash,
+    shadow: compileShadowContext(context.shadowSource, {
+      modelId: 'gpt-5.4',
+      contextWindow: 400_000,
+      fixedContractsHash,
+      activeEstimatedInputTokens,
+    }),
+    shadowBuildDurationMs: 0,
+    activeMessages: context.messages,
+  };
+}
+
 function testUuid(value: number) {
   return `f0000000-0000-4000-8000-${value.toString(16).padStart(12, '0')}`;
 }
@@ -1629,9 +1751,9 @@ function indexNames(database: DatabaseSync) {
 function rowCounts(database: DatabaseSync) {
   const tables = [
     'projects', 'context_spaces', 'project_primaries', 'context_bindings',
-    'project_relations', 'conversations', 'strands', 'turns',
+    'project_relations', 'conversations', 'strands', 'strand_context_spaces', 'turns',
     'execution_scopes', 'events', 'operations', 'epochs', 'transcript_items',
-    'resources', 'artifacts', 'epoch_blocks', 'inferences',
+    'resources', 'artifacts', 'epoch_blocks', 'inferences', 'context_compilations',
   ];
   return Object.fromEntries(tables.map((table) => {
     const row = database.prepare(`SELECT COUNT(*) AS count FROM "${table}"`).get() as { count: number };

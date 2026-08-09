@@ -10,6 +10,11 @@ export const AGENT_METHODS = {
   artifactRead: 'remux/agent/artifact/read',
   conversationCreate: 'remux/agent/conversation/create',
   messageSend: 'remux/agent/conversation/message/send',
+  messageQueueRemove: 'remux/agent/conversation/message/queue/remove',
+  messageQueueRunNow: 'remux/agent/conversation/message/queue/run-now',
+  messageEdit: 'remux/agent/conversation/message/edit',
+  messageFork: 'remux/agent/conversation/message/fork',
+  filesSearch: 'remux/agent/files/search',
   turnInterrupt: 'remux/agent/conversation/turn/interrupt',
   resourcesInvalidated: 'remux/agent/resources/invalidated',
 } as const;
@@ -23,13 +28,44 @@ export const AGENT_RESOURCE_KEYS = {
 
 export type AgentResourceKey =
   | typeof AGENT_RESOURCE_KEYS[keyof typeof AGENT_RESOURCE_KEYS]
-  | `conversation:${string}`;
+  | `conversation:${string}`
+  | `context:${string}`
+  | `queue:${string}`;
 
 export function conversationResourceKey(conversationId: string): `conversation:${string}` {
   return `conversation:${conversationId}`;
 }
 
+export function contextResourceKey(conversationId: string): `context:${string}` {
+  return `context:${conversationId}`;
+}
+
+export function queueResourceKey(conversationId: string): `queue:${string}` {
+  return `queue:${conversationId}`;
+}
+
 export type ReasoningLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+export type AgentContextMode = 'full-history' | 'stateful';
+
+export type AgentFileSearchResult = {
+  absolutePath: string;
+  id: string;
+  kind: 'directory' | 'file';
+  name: string;
+  parentPath: string;
+  path: string;
+  score: number;
+};
+
+export type AgentFileSearchParams = {
+  cwd: string;
+  limit?: number;
+  query: string;
+};
+
+export type AgentFileSearchResponse = {
+  results: AgentFileSearchResult[];
+};
 
 export type AuthValue = {
   state: 'signed-out' | 'signing-in' | 'signed-in' | 'error';
@@ -86,6 +122,69 @@ export type ConversationListValue = {
   truncated: boolean;
 };
 
+export type ContextInspectorArtifact = {
+  hash: string;
+  byteLength: number;
+  mediaType: string;
+};
+
+export type ContextInspectorValue = {
+  version: 1 | 2;
+  conversationId: string;
+  inferenceId: string;
+  epochId: string;
+  basisSequence: number;
+  projectRevision: number;
+  targetContextSpaceId: string;
+  compilerVersion: string;
+  policyVersion: string;
+  decision:
+    | { kind: 'append'; pressurePermille: number }
+    | { kind: 'roll'; pressurePermille: number; reason: string }
+    | { kind: 'block'; pressurePermille: number; reason: string };
+  activeEstimatedInputTokens: number;
+  candidateEstimatedInputTokens: number;
+  semanticHash: string;
+  bootstrapHash: string;
+  buildDurationMs: number;
+  manifestArtifact: ContextInspectorArtifact;
+  bootstrapArtifact: ContextInspectorArtifact;
+  actual?: {
+    mode: 'full-history' | 'stateful-frame';
+    frameOrdinal: number | null;
+    transportMode: 'full' | 'continuation';
+    messageCount: number;
+    turnCount: number;
+    logicalHash: string;
+    renderedHash: string;
+    fixedContractsHash: string;
+    dispatchArtifact: ContextInspectorArtifact;
+    groups: ReadonlyArray<{
+      turnId: string;
+      source: string;
+      messageCount: number;
+      estimatedTokens: number;
+      roles: { user: number; assistant: number; tool: number };
+    }>;
+    groupsTruncated: boolean;
+  };
+  blocks: ReadonlyArray<{
+    kind: 'context_hud' | 'continuation' | 'working_state' | 'open_work' | 'workspace' | 'runtime' | 'raw_tail' | 'retrieval_map';
+    hash: string;
+    estimatedTokens: number;
+    sources: readonly string[];
+    sourceCount: number;
+    sourcesTruncated: boolean;
+  }>;
+  omissions: ReadonlyArray<{
+    source: string;
+    reason: string;
+    retrieval: string;
+    count: number;
+  }>;
+  omissionsTruncated: boolean;
+};
+
 export type AgentRuntimeValue = {
   conversationId: string | null;
   state: 'unloaded' | 'loading' | 'idle' | 'running' | 'interrupting' | 'error';
@@ -93,6 +192,19 @@ export type AgentRuntimeValue = {
   activeTurnElapsedMs: number | null;
   contextProbe: ContextProbe | null;
   error: string | null;
+};
+
+export type AgentPendingQueueEntry = {
+  attachmentCount: number;
+  createdAt: number;
+  id: string;
+  mentionCount: number;
+  text: string;
+};
+
+export type AgentPendingQueueValue = {
+  conversationId: string;
+  entries: AgentPendingQueueEntry[];
 };
 
 /** Viewer-level projection combining one durable conversation with the singleton runtime. */
@@ -109,7 +221,9 @@ export type AgentResourceValue =
   | ModelsValue
   | AgentRuntimeValue
   | ConversationSummary
-  | ConversationListValue;
+  | ConversationListValue
+  | ContextInspectorValue
+  | AgentPendingQueueValue;
 
 export type ResourceReadRequest = {
   key: AgentResourceKey;
@@ -186,22 +300,65 @@ export type ConversationCreateParams = {
   cwd: string;
   modelId: string;
   reasoning: ReasoningLevel;
+  contextMode?: AgentContextMode;
+  workUnits?: boolean;
 };
 
 export type ConversationCreateResult = {
   conversationId: string;
 };
 
+export type AgentComposerMessagePart =
+  | {
+      text: string;
+      type: 'text';
+    }
+  | {
+      dataUrl: string;
+      mimeType?: string | null;
+      name?: string | null;
+      type: 'image';
+    }
+  | {
+      kind?: 'directory' | 'file';
+      name?: string | null;
+      path: string;
+      type: 'mention';
+    };
+
 export type MessageSendParams = {
   operationId: string;
   conversationId: string;
   clientMessageId: string;
+  parts?: AgentComposerMessagePart[];
   text: string;
 };
 
-export type MessageSendResult = {
-  accepted: true;
+export type MessageSendResult =
+  | { accepted: true; operationId: string; turnId: string; delivery?: 'sent' }
+  | { accepted: true; operationId: string; turnId: null; delivery: 'queued' };
+
+export type MessageQueueMutationParams = {
+  conversationId: string;
   operationId: string;
+};
+
+export type MessageQueueMutationResult = {
+  status: 'removed' | 'running' | 'retained';
+};
+
+export type MessageBranchParams = {
+  clientMessageId: string;
+  operationId: string;
+  parts?: AgentComposerMessagePart[];
+  sourceConversationId: string;
+  sourceMessageId: string;
+  sourceTurnId: string;
+  text: string;
+};
+
+export type MessageBranchResult = {
+  conversationId: string;
   turnId: string;
 };
 

@@ -11,11 +11,14 @@ import {
   AGENT_METHODS,
   AGENT_RESOURCE_KEYS,
   conversationResourceKey,
+  contextResourceKey,
   type AgentRuntimeValue,
   type ArtifactReadResult,
   type ConversationListValue,
   type ConversationSummary,
   type ConversationValue,
+  type ContextInspectorValue,
+  type MessageBranchResult,
   type ResourceReadResult,
 } from '../shared/protocol.ts';
 import {
@@ -32,11 +35,12 @@ import {
 } from '../shared/transcript.ts';
 import { AgentServer, RpcFault } from '../server/src/agent-server.ts';
 import type { AgentConversationJournal } from '../server/src/conversation-journal.ts';
-import type { AgentEngine } from '../server/src/engine.ts';
+import type { AgentEngine, RuntimeDurabilityHooks } from '../server/src/engine.ts';
 import { FixtureEngine } from '../server/src/fixture-engine.ts';
 import {
   createDurableContextSnapshot,
   reduceLogicalReplay,
+  type LogicalContextMessage,
   type LogicalReplayEvent,
 } from '../server/src/logical-context.ts';
 import { handleJsonRpcLine, JsonRpcOutput, serveStdio } from '../server/src/json-rpc.ts';
@@ -48,6 +52,7 @@ import {
 import { readWorkspaceFile } from '../server/src/workspace-read.ts';
 import { AgentJournalRepository } from '../server/src/storage/repository.ts';
 import { ArtifactIntegrityError } from '../server/src/storage/artifact-store.ts';
+import { compileShadowContext } from '../server/src/context/compiler.ts';
 
 test('resource reads support revisions and reconnect generations', async () => {
   const server = testServer();
@@ -672,9 +677,9 @@ test('sending lazily switches idle runtimes, rejects a busy owner, and reconcile
       const runtime = await super.createConversation(options);
       if (ordinal !== 1) return runtime;
       return {
-        async prompt(text: string) {
+        async prompt(input: Parameters<typeof runtime.prompt>[0]) {
           await firstPromptGate;
-          return runtime.prompt(text);
+          return runtime.prompt(input);
         },
         interrupt: () => runtime.interrupt(),
         dispose: () => runtime.dispose(),
@@ -986,13 +991,14 @@ test('send admission and provider/tool effects cross committed durable boundarie
     listModels: () => fixture.listModels(),
     async createConversation(options) {
       return {
-        async prompt(text) {
-          assert.equal(text, '  exact provider input\n');
+        async prompt(input) {
+          assert.equal(input.text, '  exact provider input\n');
           assert.ok((await repository.readEvents()).some(({ type }) => type === 'turn.started'));
           await options.durability.beforeProviderCall({
-            payload: { messages: [{ role: 'user', content: text }] },
+            payload: { messages: [{ role: 'user', content: input.text }] },
             requestMode: 'full',
             estimatedInputTokens: 6,
+            context: await testInferenceContext(options.durability, 6),
           });
           assert.ok((await repository.readEvents()).some(({ type }) => type === 'inference.started'));
           options.onEvent({ type: 'assistant-start' });
@@ -1070,7 +1076,17 @@ test('a fresh runtime after restart receives the same durable logical history wi
               basisSequence: context.basisSequence,
               logicalHash: context.logicalHash,
               renderedHash: context.logicalHash,
+              orderedMessageHashes: context.orderedMessageHashes,
               messageCount: context.messages.length,
+              fixedContractsHash: '0'.repeat(64),
+              shadow: compileShadowContext(context.shadowSource, {
+                modelId: 'gpt-5.4-fixture',
+                contextWindow: 400_000,
+                fixedContractsHash: '0'.repeat(64),
+                activeEstimatedInputTokens: Math.max(1, Math.ceil(context.estimatedBytes / 4)),
+              }),
+              shadowBuildDurationMs: 0,
+              activeMessages: context.messages,
             },
           });
           options.onEvent({ type: 'assistant-start' });
@@ -1163,12 +1179,13 @@ test('a failed inference journal gate makes zero provider calls and one durable 
     listModels: () => fixture.listModels(),
     async createConversation(options) {
       return {
-        async prompt(text) {
+        async prompt(input) {
           try {
             await options.durability.beforeProviderCall({
-              payload: { messages: [{ role: 'user', content: text }] },
+              payload: { messages: [{ role: 'user', content: input.text }] },
               requestMode: 'full',
               estimatedInputTokens: 3,
+              context: await testInferenceContext(options.durability, 3),
             });
             providerCalls += 1;
           } catch (error) {
@@ -1318,12 +1335,16 @@ test('auth resources redact credential-shaped diagnostics and cancel only the ma
   );
 });
 
-test('fixture conversation streams projected transcript and tool rows', async () => {
+test('fixture conversation streams projected transcript, tool rows, and shadow context', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'remux-agent-test-'));
+  t.after(() => rm(root, { force: true, recursive: true }));
   const notifications: Array<{ method: string; params: unknown }> = [];
+  const repository = await AgentJournalRepository.open({ dataRoot: join(root, 'data') });
+  t.after(() => repository.close());
   const server = testServer(
     new FixtureEngine(),
     (method, params) => notifications.push({ method, params }),
+    repository,
   );
   await server.initialize();
   const models = await server.handle(AGENT_METHODS.modelsRead, {}) as {
@@ -1380,10 +1401,27 @@ test('fixture conversation streams projected transcript and tool rows', async ()
   assert.equal(detail.detail.type, 'activity');
   assert.match(detail.detail.type === 'activity' ? detail.detail.output ?? '' : '', /README\.md/u);
   assert.equal(conversation.contextProbe.providerRequestMode, 'full');
+  const contextRead = await server.handle(AGENT_METHODS.resourcesRead, {
+    requests: [{ key: contextResourceKey(started.conversationId) }],
+  }) as ResourceReadResult;
+  const contextResource = contextRead.resources[0];
+  assert.ok(contextResource?.status === 'ok');
+  const contextInspector = contextResource.value as ContextInspectorValue;
+  assert.equal(contextInspector.version, 2);
+  assert.equal(contextInspector.conversationId, started.conversationId);
+  assert.equal(contextInspector.decision.kind, 'append');
+  assert.equal(contextInspector.blocks.length, 8);
+  assert.equal(contextInspector.actual?.transportMode, 'full');
+  assert.equal(contextInspector.actual?.turnCount, 1);
+  assert.equal(contextInspector.actual?.groups[0]?.roles.user, 1);
+  assert.match(contextInspector.semanticHash, /^[0-9a-f]{64}$/u);
   assert.ok(notifications.some((notification) => notification.method === AGENT_METHODS.resourcesInvalidated));
+  assert.ok(notifications.some((notification) =>
+    JSON.stringify(notification.params).includes(contextResourceKey(started.conversationId))));
   assert.ok(notifications.some((notification) =>
     JSON.stringify(notification.params).includes('"type":"transcript"')));
   assert.doesNotMatch(JSON.stringify(sync), /fixture-read/u);
+  await server.close();
 });
 
 test('interrupt is immediate and leaves the durable conversation runtime reusable', async () => {
@@ -1432,9 +1470,9 @@ test('the command lane reconciles concurrent sends, idempotent interrupt, and se
     override async createConversation(options: Parameters<AgentEngine['createConversation']>[0]) {
       const runtime = await super.createConversation(options);
       return {
-        prompt: async (text: string) => {
+        prompt: async (input: Parameters<typeof runtime.prompt>[0]) => {
           this.promptCount += 1;
-          await runtime.prompt(text);
+          await runtime.prompt(input);
         },
         interrupt: async () => {
           this.interruptCount += 1;
@@ -1563,7 +1601,7 @@ test('server close waits for runtime hydration and disposes the admitted runtime
       await hydrationGate;
       const runtime = await fixture.createConversation(options);
       return {
-        prompt: (text) => runtime.prompt(text),
+        prompt: (input) => runtime.prompt(input),
         interrupt: () => runtime.interrupt(),
         async dispose() {
           disposeCount += 1;
@@ -1654,19 +1692,27 @@ test('client, conversation, turn, transcript, and item identities remain distinc
 test('provider failure reaches one terminal error state even when prompt resolves after agent_end', async () => {
   const root = await mkdtemp(join(tmpdir(), 'remux-agent-error-'));
   const fixture = new FixtureEngine();
+  let conversationCreations = 0;
+  let disposals = 0;
   const engine: AgentEngine = {
     authStatus: () => fixture.authStatus(),
     login: (operationId, signal, update) => fixture.login(operationId, signal, update),
     logout: () => fixture.logout(),
     listModels: () => fixture.listModels(),
     async createConversation(options) {
+      const creation = ++conversationCreations;
       return {
         async prompt() {
           options.onEvent({ type: 'assistant-start' });
-          options.onEvent({ type: 'assistant-complete', interrupted: false, error: 'Fixture model failed.' });
+          if (creation === 1) {
+            options.onEvent({ type: 'assistant-complete', interrupted: false, error: 'Fixture model failed.' });
+          } else {
+            options.onEvent({ type: 'assistant-text', delta: 'Recovered with a fresh runtime.' });
+            options.onEvent({ type: 'assistant-complete', interrupted: false });
+          }
         },
         async interrupt() {},
-        async dispose() {},
+        async dispose() { disposals += 1; },
       };
     },
   };
@@ -1697,6 +1743,19 @@ test('provider failure reaches one terminal error state even when prompt resolve
   const frame = requiredFrame(sync.turns[0]);
   assert.equal(frame.status, 'failed');
   assert.deepEqual(frame.error, { code: 'provider_error', message: 'Fixture model failed.' });
+
+  await server.handle(AGENT_METHODS.messageSend, {
+    operationId: randomUUID(),
+    conversationId: started.conversationId,
+    clientMessageId: randomUUID(),
+    text: 'retry from durable history',
+  });
+  await waitForConversation(server, started.conversationId, (value) => value.status === 'idle');
+  assert.equal(conversationCreations, 2);
+  assert.equal(disposals, 1);
+  const recovered = await readTranscriptSync(server, started.conversationId);
+  assert.equal(recovered.turns.length, 2);
+  assert.match(JSON.stringify(recovered.turns[1]), /Recovered with a fresh runtime/u);
 });
 
 test('projector windows and known revisions stay bounded and deterministic', () => {
@@ -2126,6 +2185,230 @@ function testServer(
   return new AgentServer({ engine, journal, notify });
 }
 
+async function testInferenceContext(
+  durability: RuntimeDurabilityHooks,
+  activeEstimatedInputTokens: number,
+) {
+  const context = await durability.compileContext();
+  const fixedContractsHash = '0'.repeat(64);
+  return {
+    basisSequence: context.basisSequence,
+    logicalHash: context.logicalHash,
+    renderedHash: context.logicalHash,
+    orderedMessageHashes: context.orderedMessageHashes,
+    messageCount: context.messages.length,
+    fixedContractsHash,
+    shadow: compileShadowContext(context.shadowSource, {
+      modelId: 'gpt-5.4-fixture',
+      contextWindow: 400_000,
+      fixedContractsHash,
+      activeEstimatedInputTokens,
+    }),
+    shadowBuildDurationMs: 0,
+    activeMessages: context.messages,
+  };
+}
+
+test('structured image input is artifact-backed and survives cold transcript replay', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'remux-agent-image-input-'));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const dataRoot = join(root, 'data');
+  const repository = await AgentJournalRepository.open({ dataRoot });
+  const server = new AgentServer({ engine: new FixtureEngine(), journal: repository, notify: () => {} });
+  await server.initialize();
+  const model = await server.handle(AGENT_METHODS.modelsRead, {}) as { defaultModelId: string };
+  const created = await server.handle(AGENT_METHODS.conversationCreate, {
+    operationId: randomUUID(), cwd: root, modelId: model.defaultModelId, reasoning: 'high',
+  }) as { conversationId: string };
+  await server.handle(AGENT_METHODS.messageSend, {
+    operationId: randomUUID(), conversationId: created.conversationId, clientMessageId: randomUUID(),
+    parts: [
+      { text: 'Inspect this ', type: 'text' },
+      { kind: 'file', name: 'README.md', path: 'README.md', type: 'mention' },
+      {
+        dataUrl: `data:image/png;base64,${Buffer.from('durable-image').toString('base64')}`,
+        mimeType: 'image/png', name: 'sample.png', type: 'image',
+      },
+    ],
+    text: 'ignored browser display text',
+  });
+  await waitForConversation(server, created.conversationId, (value) => value.status === 'idle');
+  const live = requiredFrame((await readTranscriptSync(server, created.conversationId)).turns[0]);
+  const user = live.segments.find((segment) => segment.type === 'userMessage');
+  assert.ok(user?.type === 'userMessage');
+  assert.equal(user.text, 'Inspect this @README.md');
+  assert.deepEqual(user.parts?.map((part) => part.type), ['text', 'mention', 'image']);
+  const image = user.parts?.find((part) => part.type === 'image');
+  assert.ok(image?.type === 'image');
+  assert.equal((await repository.readArtifact(image.artifactHash))?.bytes.toString(), 'durable-image');
+  await server.close();
+  await repository.close();
+
+  const reopened = await AgentJournalRepository.open({ dataRoot });
+  t.after(() => reopened.close());
+  const replayedUser = (await reopened.readTranscriptProjection(created.conversationId))?.actions
+    .find((action) => action.type === 'turn');
+  assert.equal(replayedUser?.type === 'turn' ? replayedUser.parts?.[2]?.type : null, 'image');
+  const logicalUser = (await reopened.compileContext(created.conversationId)).messages
+    .find((message) => message.role === 'user');
+  assert.equal(logicalUser?.role === 'user' ? logicalUser.images?.[0]?.sha256 : null, image.artifactHash);
+});
+
+test('large structured text stays outside the bounded event payload and replays exactly', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'remux-agent-large-structured-input-'));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const repository = await AgentJournalRepository.open({ dataRoot: join(root, 'data') });
+  const server = new AgentServer({ engine: new FixtureEngine(), journal: repository, notify: () => {} });
+  t.after(async () => {
+    await server.close();
+    await repository.close();
+  });
+  await server.initialize();
+  const model = await server.handle(AGENT_METHODS.modelsRead, {}) as { defaultModelId: string };
+  const created = await server.handle(AGENT_METHODS.conversationCreate, {
+    operationId: randomUUID(), cwd: root, modelId: model.defaultModelId, reasoning: 'high',
+  }) as { conversationId: string };
+  const text = `large structured input\n${'0123456789abcdef'.repeat(3_000)}`;
+  await server.handle(AGENT_METHODS.messageSend, {
+    operationId: randomUUID(), conversationId: created.conversationId, clientMessageId: randomUUID(),
+    parts: [{ text, type: 'text' }], text,
+  });
+  await waitForConversation(server, created.conversationId, (value) => value.status === 'idle');
+  const action = (await repository.readTranscriptProjection(created.conversationId))?.actions
+    .find((candidate) => candidate.type === 'turn');
+  assert.equal(action?.type === 'turn' ? action.text : null, text);
+  assert.equal(action?.type === 'turn' ? action.parts?.[0]?.type : null, 'text');
+  const logical = (await repository.compileContext(created.conversationId)).messages
+    .find((message) => message.role === 'user');
+  assert.equal(logical?.role === 'user' ? logical.text : null, text);
+});
+
+test('running sends queue durably and dispatch in order after the active turn', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'remux-agent-queue-'));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const repository = await AgentJournalRepository.open({ dataRoot: join(root, 'data') });
+  const server = new AgentServer({ engine: new FixtureEngine(), journal: repository, notify: () => {} });
+  t.after(async () => server.close());
+  await server.initialize();
+  const model = await server.handle(AGENT_METHODS.modelsRead, {}) as { defaultModelId: string };
+  const created = await server.handle(AGENT_METHODS.conversationCreate, {
+    operationId: randomUUID(), cwd: root, modelId: model.defaultModelId, reasoning: 'high',
+  }) as { conversationId: string };
+  await server.handle(AGENT_METHODS.messageSend, {
+    operationId: randomUUID(), conversationId: created.conversationId,
+    clientMessageId: randomUUID(), text: 'first',
+  });
+  const queued = await server.handle(AGENT_METHODS.messageSend, {
+    operationId: randomUUID(), conversationId: created.conversationId,
+    clientMessageId: randomUUID(), text: 'second',
+  }) as { delivery: string; turnId: string | null };
+  assert.deepEqual({ delivery: queued.delivery, turnId: queued.turnId }, { delivery: 'queued', turnId: null });
+  const [during] = await repository.readResourceProjections([`queue:${created.conversationId}`]);
+  assert.equal(during?.value && 'entries' in during.value ? during.value.entries.length : 0, 1);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const actions = await repository.readTranscriptActions(created.conversationId);
+    if (actions.filter((action) => action.type === 'terminal').length === 2) break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  const actions = await repository.readTranscriptActions(created.conversationId);
+  assert.deepEqual(actions.filter((action) => action.type === 'turn').map((action) =>
+    action.type === 'turn' ? action.text : ''), ['first', 'second']);
+  const [after] = await repository.readResourceProjections([`queue:${created.conversationId}`]);
+  assert.equal(after?.value && 'entries' in after.value ? after.value.entries.length : -1, 0);
+});
+
+test('the oldest durable queued follow-up resumes after a server restart', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'remux-agent-queue-restart-'));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const dataRoot = join(root, 'data');
+  const firstRepository = await AgentJournalRepository.open({ dataRoot });
+  const firstServer = new AgentServer({
+    engine: new FixtureEngine(), journal: firstRepository, notify: () => {},
+  });
+  await firstServer.initialize();
+  const model = await firstServer.handle(AGENT_METHODS.modelsRead, {}) as { defaultModelId: string };
+  const created = await firstServer.handle(AGENT_METHODS.conversationCreate, {
+    operationId: randomUUID(), cwd: root, modelId: model.defaultModelId, reasoning: 'high',
+  }) as { conversationId: string };
+  await firstServer.handle(AGENT_METHODS.messageSend, {
+    operationId: randomUUID(), conversationId: created.conversationId,
+    clientMessageId: randomUUID(), text: 'before restart',
+  });
+  const queued = await firstServer.handle(AGENT_METHODS.messageSend, {
+    operationId: randomUUID(), conversationId: created.conversationId,
+    clientMessageId: randomUUID(), text: 'resume after restart',
+  }) as { delivery: string };
+  assert.equal(queued.delivery, 'queued');
+  await firstServer.close();
+  await firstRepository.close();
+
+  const reopened = await AgentJournalRepository.open({ dataRoot });
+  const restarted = new AgentServer({ engine: new FixtureEngine(), journal: reopened, notify: () => {} });
+  t.after(async () => {
+    await restarted.close();
+    await reopened.close();
+  });
+  await restarted.initialize();
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const actions = await reopened.readTranscriptActions(created.conversationId);
+    if (actions.some((action) => action.type === 'turn' && action.text === 'resume after restart') &&
+        actions.filter((action) => action.type === 'terminal').length >= 2) break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  const actions = await reopened.readTranscriptActions(created.conversationId);
+  assert.deepEqual(actions.filter((action) => action.type === 'turn').map((action) =>
+    action.type === 'turn' ? action.text : ''), ['before restart', 'resume after restart']);
+  const [queue] = await reopened.readResourceProjections([`queue:${created.conversationId}`]);
+  assert.equal(queue?.value && 'entries' in queue.value ? queue.value.entries.length : -1, 0);
+});
+
+test('edit and fork create immutable replayed-prefix conversations', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'remux-agent-branches-'));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const repository = await AgentJournalRepository.open({ dataRoot: join(root, 'data') });
+  const server = new AgentServer({ engine: new FixtureEngine(), journal: repository, notify: () => {} });
+  t.after(async () => server.close());
+  await server.initialize();
+  const model = await server.handle(AGENT_METHODS.modelsRead, {}) as { defaultModelId: string };
+  const source = await server.handle(AGENT_METHODS.conversationCreate, {
+    operationId: randomUUID(), cwd: root, modelId: model.defaultModelId, reasoning: 'high',
+  }) as { conversationId: string };
+  await server.handle(AGENT_METHODS.messageSend, {
+    operationId: randomUUID(), conversationId: source.conversationId,
+    clientMessageId: randomUUID(), text: 'source prompt',
+  });
+  await waitForConversation(server, source.conversationId, (value) => value.status === 'idle');
+  const sourceFrame = requiredFrame((await readTranscriptSync(server, source.conversationId)).turns[0]);
+  const sourceUser = sourceFrame.segments.find((segment) => segment.type === 'userMessage');
+  const sourceAssistant = sourceFrame.segments.find((segment) => segment.type === 'assistantMessage');
+  assert.ok(sourceUser?.type === 'userMessage' && sourceAssistant?.type === 'assistantMessage');
+
+  const fork = await server.handle(AGENT_METHODS.messageFork, {
+    operationId: randomUUID(), clientMessageId: randomUUID(),
+    sourceConversationId: source.conversationId, sourceTurnId: sourceFrame.id,
+    sourceMessageId: sourceAssistant.id,
+    parts: [{ text: 'fork follow-up', type: 'text' }], text: 'fork follow-up',
+  }) as MessageBranchResult;
+  await waitForConversation(server, fork.conversationId, (value) => value.status === 'idle');
+  assert.deepEqual((await repository.readTranscriptActions(fork.conversationId))
+    .filter((action) => action.type === 'turn')
+    .map((action) => action.type === 'turn' ? action.text : ''), ['source prompt', 'fork follow-up']);
+
+  const edit = await server.handle(AGENT_METHODS.messageEdit, {
+    operationId: randomUUID(), clientMessageId: randomUUID(),
+    sourceConversationId: source.conversationId, sourceTurnId: sourceFrame.id,
+    sourceMessageId: sourceUser.id,
+    parts: [{ text: 'replacement prompt', type: 'text' }], text: 'replacement prompt',
+  }) as MessageBranchResult;
+  await waitForConversation(server, edit.conversationId, (value) => value.status === 'idle');
+  assert.deepEqual((await repository.readTranscriptActions(edit.conversationId))
+    .filter((action) => action.type === 'turn')
+    .map((action) => action.type === 'turn' ? action.text : ''), ['replacement prompt']);
+  assert.deepEqual((await repository.readTranscriptActions(source.conversationId))
+    .filter((action) => action.type === 'turn')
+    .map((action) => action.type === 'turn' ? action.text : ''), ['source prompt']);
+});
+
 class TestConversationJournal implements AgentConversationJournal {
   private readonly operations = new Map<string, {
     arguments: string;
@@ -2134,6 +2417,7 @@ class TestConversationJournal implements AgentConversationJournal {
   private readonly conversations = new Map<string, {
     projectId: string;
     strandId: string;
+    contextSpaceId: string;
     cwd: string;
     modelId: string;
     reasoning: Parameters<AgentConversationJournal['createConversation']>[0]['reasoning'];
@@ -2174,6 +2458,7 @@ class TestConversationJournal implements AgentConversationJournal {
       rootSpaceId: randomUUID(),
       conversationId: randomUUID(),
       rootStrandId: randomUUID(),
+      contextSpaceId: randomUUID(),
       basisSequence: 4,
       replayed: false,
     };
@@ -2181,6 +2466,7 @@ class TestConversationJournal implements AgentConversationJournal {
     this.conversations.set(result.conversationId, {
       projectId: result.projectId,
       strandId: result.rootStrandId,
+      contextSpaceId: result.contextSpaceId,
       cwd: params.cwd,
       modelId: params.modelId,
       reasoning: params.reasoning,
@@ -2275,6 +2561,32 @@ class TestConversationJournal implements AgentConversationJournal {
       throw conflict;
     }
     return null;
+  }
+
+  async reconcileQueuedTurn() {
+    return null;
+  }
+
+  async enqueueTurn(params: Parameters<AgentConversationJournal['enqueueTurn']>[0]) {
+    return {
+      accepted: true as const,
+      delivery: 'queued' as const,
+      operationId: params.operationId,
+      replayed: false,
+      turnId: null,
+    };
+  }
+
+  async readQueuedTurn() {
+    return null;
+  }
+
+  async finishQueuedTurn() {
+    return false;
+  }
+
+  async removeQueuedTurn() {
+    return false;
   }
 
   async appendAssistantCheckpoint(
@@ -2379,7 +2691,42 @@ class TestConversationJournal implements AgentConversationJournal {
         });
       }
     }
-    return createDurableContextSnapshot(sequence, reduceLogicalReplay(replay));
+    const snapshot = createDurableContextSnapshot(sequence, reduceLogicalReplay(replay));
+    const conversation = this.conversations.get(conversationId);
+    const activeTurn = [...this.turns.values()]
+      .map(({ result }) => result)
+      .filter((turn) => turn.conversationId === conversationId)
+      .at(-1);
+    if (!conversation || !activeTurn) throw new Error('Conversation has no active shadow context source.');
+    const currentUser = [...snapshot.messages].reverse().find((message): message is Extract<LogicalContextMessage, { role: 'user' }> =>
+      message.role === 'user' && message.turnId === activeTurn.turnId);
+    if (!currentUser) throw new Error('Conversation has no current user message.');
+    return {
+      ...snapshot,
+      shadowSource: {
+        basisSequence: snapshot.basisSequence,
+        projectId: conversation.projectId,
+        projectRevision: 0,
+        conversationId,
+        strandId: conversation.strandId,
+        turnId: activeTurn.turnId,
+        scopeId: activeTurn.scopeId,
+        epochId: activeTurn.epochId,
+        targetContextSpaceId: conversation.contextSpaceId,
+        workspaceRoot: conversation.cwd,
+        reasoning: conversation.reasoning,
+        messages: snapshot.messages,
+        authority: [],
+        turnAnchor: {
+          currentUser: { ref: `journal://turn/${encodeURIComponent(activeTurn.turnId)}#user`, body: currentUser.text },
+          precedingAssistantRef: null,
+          acceptedProposalRef: null,
+          steeringRefs: [],
+        },
+        observedRuntime: { cwd: conversation.cwd },
+        executionScope: { kind: 'turn' as const, parentScopeId: null, objective: {}, capsuleRef: null },
+      },
+    };
   }
 
   async readTranscriptActions(conversationId: string) {
@@ -2534,6 +2881,11 @@ function repositoryJournal(repository: AgentJournalRepository): Omit<AgentConver
   return {
     reconcileTurn: (params) => repository.reconcileTurn(params),
     acceptTurn: (params) => repository.acceptTurn(params),
+    reconcileQueuedTurn: (params) => repository.reconcileQueuedTurn(params),
+    enqueueTurn: (params) => repository.enqueueTurn(params),
+    readQueuedTurn: (conversationId, operationId) => repository.readQueuedTurn(conversationId, operationId),
+    finishQueuedTurn: (operationId, turnId) => repository.finishQueuedTurn(operationId, turnId),
+    removeQueuedTurn: (conversationId, operationId) => repository.removeQueuedTurn(conversationId, operationId),
     appendAssistantCheckpoint: (handle, checkpoint) =>
       repository.appendAssistantCheckpoint(handle, checkpoint),
     recordToolStarted: (handle, input) => repository.recordToolStarted(handle, input),

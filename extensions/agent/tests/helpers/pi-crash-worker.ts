@@ -79,6 +79,7 @@ async function main() {
     cwd: config.workspace,
     modelId: SCRIPTED_CODEX_MODEL_ID,
     reasoning: 'high',
+    contextMode: 'full-history',
   }) as { conversationId: string };
   const accepted = await server.handle(AGENT_METHODS.messageSend, {
     operationId: randomUUID(),

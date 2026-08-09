@@ -50,6 +50,7 @@ web-build/
 
 .codex-mobile/
 .remux/
+.remux-benchmarks/
 extensions/codex/dev/fixtures/captures/*.json
 
 # typescript

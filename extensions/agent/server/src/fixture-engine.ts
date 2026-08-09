@@ -1,5 +1,12 @@
 import type { AuthValue, ModelInfo } from '../../shared/protocol.ts';
 import type { AgentEngine, ConversationRuntime } from './engine.ts';
+import { compileShadowContext } from './context/compiler.ts';
+import { canonicalJsonHash } from './storage/canonical-json.ts';
+
+const FIXTURE_CONTRACTS_HASH = canonicalJsonHash({
+  engine: 'fixture',
+  tools: ['workspace_read@1'],
+});
 
 const fixtureModels: ModelInfo[] = [
   {
@@ -41,19 +48,33 @@ export class FixtureEngine implements AgentEngine {
   async createConversation(options: Parameters<AgentEngine['createConversation']>[0]): Promise<ConversationRuntime> {
     let controller: AbortController | null = null;
     return {
-      async prompt(text) {
+      async prompt(input) {
+        const text = input.text;
         controller = new AbortController();
         const signal = controller.signal;
         const context = await options.durability.compileContext();
+        const estimatedInputTokens = Math.max(1, Math.ceil(context.estimatedBytes / 4));
+        const compileStartedAt = performance.now();
+        const shadow = compileShadowContext(context.shadowSource, {
+          modelId: options.modelId,
+          contextWindow: fixtureModels[0]!.contextWindow,
+          fixedContractsHash: FIXTURE_CONTRACTS_HASH,
+          activeEstimatedInputTokens: estimatedInputTokens,
+        });
         await options.durability.beforeProviderCall({
           payload: { messages: [{ role: 'user', content: text }] },
           requestMode: 'full',
-          estimatedInputTokens: Math.ceil(context.estimatedBytes / 4),
+          estimatedInputTokens,
           context: {
             basisSequence: context.basisSequence,
             logicalHash: context.logicalHash,
             renderedHash: context.logicalHash,
+            orderedMessageHashes: context.orderedMessageHashes,
             messageCount: context.messages.length,
+            fixedContractsHash: FIXTURE_CONTRACTS_HASH,
+            shadow,
+            shadowBuildDurationMs: Math.max(0, Math.round(performance.now() - compileStartedAt)),
+            activeMessages: context.messages,
           },
         });
         options.onEvent({

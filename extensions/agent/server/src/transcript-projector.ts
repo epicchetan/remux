@@ -156,6 +156,7 @@ export class EphemeralTranscriptProjector {
     turnId: string;
     clientMessageId: string;
     text: string;
+    parts?: AgentUserMessageSegment['parts'];
     sequence?: number;
     basisSequence?: number;
     createdAt?: number;
@@ -191,6 +192,7 @@ export class EphemeralTranscriptProjector {
         clientMessageId: input.clientMessageId,
         revision,
         text: input.text,
+        ...(input.parts ? { parts: input.parts } : {}),
         ...(input.content ? { content: input.content } : {}),
       },
       work: null,

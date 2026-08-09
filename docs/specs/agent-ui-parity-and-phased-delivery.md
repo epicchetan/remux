@@ -1,6 +1,6 @@
 Status: Active Spec
 Last verified: 2026-08-08
-Canonical code: The stable comparison UI remains in `extensions/codex/viewer/`; Agent Phase 1A.0 through Phase 1A.2 are implemented and owner-accepted in `extensions/agent/`, including durable history and hardened transcript delivery
+Canonical code: The stable comparison UI remains in `extensions/codex/viewer/`; the Agent transcript/history/context foundation and applicable interaction-parity port are implemented and automated/live-validated, with native owner review and the durable-process phase still outstanding
 
 # Agent UI parity and phased delivery alignment
 
@@ -361,6 +361,13 @@ background/resume, and route-focused turns.
 
 ### Phase 1A.3 — shadow compiler and context inspector
 
+Implementation state: code and automated/live validation completed on
+2026-08-08. The existing composer now exposes a quiet, expandable,
+inference-scoped inspector separating the active full replay and sanitized
+provider dispatch from the exact next-epoch bootstrap; active provider input
+remains exact full replay. Owner snapshot review is still required before
+Phase 1B.
+
 Implement deterministic shadow epoch candidates without changing provider
 input. Add an inspector—not a transcript compaction row—showing:
 
@@ -415,6 +422,13 @@ Owner review: real build/test workflows, large output, interruption, failure
 visibility, and output retrieval.
 
 ### Phase 1C.4 — interaction parity
+
+Implementation state: completed and automated/live-validated on 2026-08-09.
+The Agent now owns structured file mentions and image attachments, a durable
+follow-up queue with run-now/remove behavior, and immutable edit/fork branches.
+The source conversation remains unchanged, queued work resumes after an Agent
+restart, and the viewer exercises these Agent RPCs on desktop and mobile. A
+native owner feel review remains part of the acceptance gate.
 
 Implement and activate the remaining included interaction surfaces only after
 their durable semantics exist:
@@ -575,15 +589,11 @@ both a stable product surface and fast context experimentation.
 
 ## Current gate
 
-The Phase 1A.0 scope note is
-[`agent-phase-1a0-ui-port-scope.md`](agent-phase-1a0-ui-port-scope.md). It fixes
-the exact source/test list, Agent turn-frame resource contract,
-narration-removal checklist, implementation substeps, and side-by-side fixture
-scenarios. Its implementation, automated hardening, desktop/physical-phone
-comparison, and explicit owner acceptance are complete. No database migration
-or Phase 1A.1 work is part of this checkpoint.
-
-The proposed next checkpoint is
-[`agent-phase-1a1-durable-history-scope.md`](agent-phase-1a1-durable-history-scope.md).
-It may be reviewed now, but implementation still requires explicit acceptance
-of that next scope.
+The applicable interaction-parity port is the current review gate. The
+provider-neutral Codex styling contract, desktop/mobile viewer suite,
+production build, deployed viewer geometry/error check, restart behavior, and
+real-subscription replay smoke are green. Narration, manual compaction, review,
+speed/service tier, quota UI, App Server approvals, Codex history import,
+collaboration/subagent UI, and first-class web/research UI remain intentional
+exclusions. Durable processes and the paired evaluation release remain the
+next architectural checkpoint after owner acceptance.

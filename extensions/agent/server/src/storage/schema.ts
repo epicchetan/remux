@@ -2,9 +2,10 @@ import type { DatabaseSync } from 'node:sqlite';
 
 import { canonicalJson, canonicalJsonHash } from './canonical-json.ts';
 
-export const AGENT_JOURNAL_SCHEMA_VERSION = 2;
-export const AGENT_JOURNAL_SCHEMA_ID = 'agent-journal-v2';
+export const AGENT_JOURNAL_SCHEMA_VERSION = 3;
+export const AGENT_JOURNAL_SCHEMA_ID = 'agent-journal-v3';
 export const AGENT_JOURNAL_SCHEMA_V1_ID = 'agent-journal-v1';
+export const AGENT_JOURNAL_SCHEMA_V2_ID = 'agent-journal-v2';
 
 export const AGENT_JOURNAL_TABLES = [
   'meta',
@@ -15,6 +16,7 @@ export const AGENT_JOURNAL_TABLES = [
   'project_relations',
   'conversations',
   'strands',
+  'strand_context_spaces',
   'turns',
   'execution_scopes',
   'events',
@@ -25,7 +27,12 @@ export const AGENT_JOURNAL_TABLES = [
   'epochs',
   'epoch_blocks',
   'inferences',
+  'context_compilations',
 ] as const;
+
+const AGENT_JOURNAL_V2_TABLES = AGENT_JOURNAL_TABLES.filter(
+  (table) => table !== 'strand_context_spaces' && table !== 'context_compilations',
+);
 
 const EXPECTED_COLUMNS: Record<typeof AGENT_JOURNAL_TABLES[number], string[]> = {
   meta: ['key', 'value_json'],
@@ -59,6 +66,9 @@ const EXPECTED_COLUMNS: Record<typeof AGENT_JOURNAL_TABLES[number], string[]> = 
   strands: [
     'strand_id', 'conversation_id', 'parent_strand_id', 'forked_from_sequence',
     'state', 'created_at',
+  ],
+  strand_context_spaces: [
+    'strand_id', 'conversation_id', 'project_id', 'space_id', 'created_sequence',
   ],
   turns: [
     'turn_id', 'project_id', 'conversation_id', 'strand_id', 'client_message_id',
@@ -103,8 +113,21 @@ const EXPECTED_COLUMNS: Record<typeof AGENT_JOURNAL_TABLES[number], string[]> = 
     'scope_id', 'epoch_id', 'ordinal', 'basis_sequence', 'state', 'request_mode',
     'manifest_artifact_hash', 'input_hash', 'estimated_input_tokens',
     'reported_input_tokens', 'reported_output_tokens', 'started_sequence',
-    'terminal_sequence',
+    'terminal_sequence', 'manifest_version',
   ],
+  context_compilations: [
+    'compilation_id', 'inference_id', 'project_id', 'conversation_id',
+    'strand_id', 'turn_id', 'scope_id', 'epoch_id', 'basis_sequence',
+    'project_revision', 'target_space_id', 'mode', 'compiler_version',
+    'policy_version', 'decision', 'manifest_artifact_hash',
+    'bootstrap_artifact_hash', 'semantic_hash', 'active_estimated_input_tokens',
+    'candidate_estimated_input_tokens', 'build_duration_ms', 'created_sequence',
+  ],
+};
+
+const EXPECTED_COLUMNS_V2: Record<string, string[]> = {
+  ...EXPECTED_COLUMNS,
+  inferences: EXPECTED_COLUMNS.inferences.filter((column) => column !== 'manifest_version'),
 };
 
 const SCHEMA_V1_SQL = `
@@ -615,6 +638,69 @@ CREATE UNIQUE INDEX execution_scopes_one_root
   ON execution_scopes(turn_id) WHERE parent_scope_id IS NULL;
 `;
 
+const SCHEMA_V3_SQL = `
+CREATE TABLE strand_context_spaces (
+  strand_id TEXT PRIMARY KEY NOT NULL,
+  conversation_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  space_id TEXT NOT NULL UNIQUE,
+  created_sequence INTEGER NOT NULL,
+  UNIQUE (conversation_id, strand_id),
+  UNIQUE (project_id, space_id),
+  FOREIGN KEY (conversation_id, strand_id)
+    REFERENCES strands(conversation_id, strand_id)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (project_id, space_id)
+    REFERENCES context_spaces(project_id, space_id)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (created_sequence, project_id)
+    REFERENCES events(sequence, project_id)
+    DEFERRABLE INITIALLY DEFERRED
+) STRICT;
+
+CREATE TABLE context_compilations (
+  compilation_id TEXT PRIMARY KEY NOT NULL,
+  inference_id TEXT NOT NULL UNIQUE,
+  project_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  strand_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  scope_id TEXT NOT NULL,
+  epoch_id TEXT NOT NULL,
+  basis_sequence INTEGER NOT NULL,
+  project_revision INTEGER NOT NULL CHECK (project_revision >= 0),
+  target_space_id TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK (mode IN ('shadow', 'active')),
+  compiler_version TEXT NOT NULL,
+  policy_version TEXT NOT NULL,
+  decision TEXT NOT NULL CHECK (decision IN ('append', 'roll', 'block')),
+  manifest_artifact_hash TEXT NOT NULL,
+  bootstrap_artifact_hash TEXT NOT NULL,
+  semantic_hash TEXT NOT NULL
+    CHECK (length(semantic_hash) = 64 AND semantic_hash NOT GLOB '*[^0-9a-f]*'),
+  active_estimated_input_tokens INTEGER NOT NULL CHECK (active_estimated_input_tokens >= 0),
+  candidate_estimated_input_tokens INTEGER NOT NULL CHECK (candidate_estimated_input_tokens >= 0),
+  build_duration_ms INTEGER NOT NULL CHECK (build_duration_ms >= 0),
+  created_sequence INTEGER NOT NULL UNIQUE,
+  CHECK (basis_sequence <= created_sequence),
+  FOREIGN KEY (inference_id) REFERENCES inferences(inference_id)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (project_id, target_space_id)
+    REFERENCES context_spaces(project_id, space_id)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (manifest_artifact_hash) REFERENCES artifacts(hash)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (bootstrap_artifact_hash) REFERENCES artifacts(hash)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (created_sequence, project_id, conversation_id, strand_id)
+    REFERENCES events(sequence, project_id, conversation_id, strand_id)
+    DEFERRABLE INITIALLY DEFERRED
+) STRICT;
+
+CREATE INDEX context_compilations_by_conversation
+  ON context_compilations(conversation_id, created_sequence DESC);
+`;
+
 export function listAgentDatabaseTables(database: DatabaseSync) {
   const rows = database.prepare(`
     SELECT name
@@ -642,9 +728,14 @@ export function createAgentSchemaV2(database: DatabaseSync) {
   `);
   database.prepare('INSERT INTO meta (key, value_json) VALUES (?, ?)').run(
     'journal_schema',
-    canonicalJson(AGENT_JOURNAL_SCHEMA_ID),
+    canonicalJson(AGENT_JOURNAL_SCHEMA_V2_ID),
   );
-  database.exec(`PRAGMA user_version = ${AGENT_JOURNAL_SCHEMA_VERSION}`);
+  database.exec('PRAGMA user_version = 2');
+}
+
+export function createAgentSchemaV3(database: DatabaseSync) {
+  createAgentSchemaV2(database);
+  migrateAgentSchemaV2ToV3(database);
 }
 
 export function migrateAgentSchemaV1ToV2(database: DatabaseSync) {
@@ -653,10 +744,97 @@ export function migrateAgentSchemaV1ToV2(database: DatabaseSync) {
       ON transcript_items(conversation_id, turn_id, first_sequence);
   `);
   database.prepare('UPDATE meta SET value_json = ? WHERE key = ?').run(
+    canonicalJson(AGENT_JOURNAL_SCHEMA_V2_ID),
+    'journal_schema',
+  );
+  database.exec('PRAGMA user_version = 2');
+}
+
+export function migrateAgentSchemaV2ToV3(database: DatabaseSync) {
+  database.exec(SCHEMA_V3_SQL);
+  database.exec(`
+    ALTER TABLE inferences
+      ADD COLUMN manifest_version TEXT NOT NULL DEFAULT 'agent-provider-payload-v1';
+  `);
+  backfillStrandContextSpaces(database);
+  database.prepare('UPDATE meta SET value_json = ? WHERE key = ?').run(
     canonicalJson(AGENT_JOURNAL_SCHEMA_ID),
     'journal_schema',
   );
   database.exec(`PRAGMA user_version = ${AGENT_JOURNAL_SCHEMA_VERSION}`);
+}
+
+function backfillStrandContextSpaces(database: DatabaseSync) {
+  const rows = database.prepare(`
+    SELECT s.strand_id, s.conversation_id, s.parent_strand_id,
+           c.project_id, p.root_space_id, p.revision,
+           (
+             SELECT MIN(e.sequence)
+             FROM events e
+             WHERE e.conversation_id = s.conversation_id
+               AND e.type = 'conversation.created'
+           ) AS created_sequence
+    FROM strands s
+    JOIN conversations c ON c.conversation_id = s.conversation_id
+    JOIN projects p ON p.project_id = c.project_id
+    ORDER BY s.created_at, s.strand_id
+  `).all() as Array<{
+    strand_id: string;
+    conversation_id: string;
+    parent_strand_id: string | null;
+    project_id: string;
+    root_space_id: string;
+    revision: number;
+    created_sequence: number | null;
+  }>;
+  const pending = new Map(rows.map((row) => [row.strand_id, row]));
+  const targetByStrand = new Map<string, string>();
+  while (pending.size > 0) {
+    let progressed = false;
+    for (const [strandId, row] of pending) {
+      const parentSpaceId = row.parent_strand_id === null
+        ? row.root_space_id
+        : targetByStrand.get(row.parent_strand_id);
+      if (!parentSpaceId) continue;
+      if (row.created_sequence === null) {
+        throw new AgentSchemaError(`Strand ${strandId} has no durable conversation creation sequence.`);
+      }
+      const spaceId = migratedStrandContextSpaceId(strandId);
+      database.prepare(`
+        INSERT INTO context_spaces (
+          space_id, project_id, parent_space_id, key, descriptor_json,
+          created_revision, created_sequence
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        spaceId,
+        row.project_id,
+        parentSpaceId,
+        `strand:${strandId}`,
+        canonicalJson({
+          conversationId: row.conversation_id,
+          kind: 'strand',
+          strandId,
+        }),
+        row.revision,
+        row.created_sequence,
+      );
+      database.prepare(`
+        INSERT INTO strand_context_spaces (
+          strand_id, conversation_id, project_id, space_id, created_sequence
+        ) VALUES (?, ?, ?, ?, ?)
+      `).run(strandId, row.conversation_id, row.project_id, spaceId, row.created_sequence);
+      targetByStrand.set(strandId, spaceId);
+      pending.delete(strandId);
+      progressed = true;
+    }
+    if (!progressed) {
+      throw new AgentSchemaError('Strand context-space migration encountered missing or cyclic ancestry.');
+    }
+  }
+}
+
+export function migratedStrandContextSpaceId(strandId: string) {
+  return `strand-context:${strandId}`;
 }
 
 export function agentSchemaFingerprint(database: DatabaseSync) {
@@ -681,15 +859,35 @@ export function agentSchemaFingerprint(database: DatabaseSync) {
 }
 
 export function validateAgentSchemaV1(database: DatabaseSync, expectedFingerprint: string) {
-  validateAgentSchema(database, expectedFingerprint, 1, AGENT_JOURNAL_SCHEMA_V1_ID);
+  validateAgentSchema(
+    database,
+    expectedFingerprint,
+    1,
+    AGENT_JOURNAL_SCHEMA_V1_ID,
+    AGENT_JOURNAL_V2_TABLES,
+    EXPECTED_COLUMNS_V2,
+  );
 }
 
 export function validateAgentSchemaV2(database: DatabaseSync, expectedFingerprint: string) {
   validateAgentSchema(
     database,
     expectedFingerprint,
+    2,
+    AGENT_JOURNAL_SCHEMA_V2_ID,
+    AGENT_JOURNAL_V2_TABLES,
+    EXPECTED_COLUMNS_V2,
+  );
+}
+
+export function validateAgentSchemaV3(database: DatabaseSync, expectedFingerprint: string) {
+  validateAgentSchema(
+    database,
+    expectedFingerprint,
     AGENT_JOURNAL_SCHEMA_VERSION,
     AGENT_JOURNAL_SCHEMA_ID,
+    AGENT_JOURNAL_TABLES,
+    EXPECTED_COLUMNS,
   );
 }
 
@@ -698,18 +896,20 @@ function validateAgentSchema(
   expectedFingerprint: string,
   version: number,
   schemaId: string,
+  expectedTableNames: readonly string[],
+  expectedColumns: Record<string, string[]>,
 ) {
   const actualTables = listAgentDatabaseTables(database);
-  const expectedTables = [...AGENT_JOURNAL_TABLES].sort();
+  const expectedTables = [...expectedTableNames].sort();
   if (!sameStrings(actualTables, expectedTables)) {
     throw new AgentSchemaError(
       `Agent schema tables do not match version ${version} (expected ${expectedTables.join(', ')}; found ${actualTables.join(', ')}).`,
     );
   }
-  for (const table of AGENT_JOURNAL_TABLES) {
+  for (const table of expectedTableNames) {
     const rows = database.prepare(`PRAGMA table_info("${table}")`).all() as Array<{ name: string }>;
     const actualColumns = rows.map((row) => row.name);
-    if (!sameStrings(actualColumns, EXPECTED_COLUMNS[table])) {
+    if (!sameStrings(actualColumns, expectedColumns[table] ?? [])) {
       throw new AgentSchemaError(`Agent schema columns do not match version ${version} for ${table}.`);
     }
   }

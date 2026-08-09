@@ -80,24 +80,51 @@ test('renders signed-out device-code login and cancel state', async ({ page }) =
   await expect(page.getByRole('button', { name: 'Sign in with device code' })).toBeVisible();
 });
 
-test('preserves sign-out in the compact action shell', async ({ page }) => {
+test('keeps sign-out inside the preferences menu', async ({ page }) => {
+  await expect(page.getByRole('button', { name: 'Sign out' })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Preferences' }).click();
   await page.getByRole('button', { name: 'Sign out' }).click();
   await expect(page.getByRole('button', { name: 'Sign in with device code' })).toBeVisible();
 });
 
-test('reconstructs a conversation from route-addressed turn frames', async ({ page }) => {
+test('reconstructs a conversation from route-addressed turn frames', async ({ page, isMobile }) => {
   await page.goto(conversationUrl());
 
   await expect(transcript(page).getByText('Recovered from authoritative resources.')).toBeVisible();
   await expect(page.getByText('GPT-5.4 Fixture')).toBeVisible();
-  await expect(page.getByRole('button', { name: 'New chat', exact: true })).toBeVisible();
+  const history = await openHistory(page, isMobile);
+  await expect(history.getByRole('button', { name: 'Start new chat', exact: true })).toBeVisible();
+});
+
+test('shows actual dispatch and compiled-frame evidence for a durable inference', async ({ page }) => {
+  await page.goto(conversationUrl());
+
+  const inspector = page.getByTestId('context-inspector');
+  await expect(inspector.locator('summary')).toContainText('history 12k · next frame 3.2k · continue');
+  await inspector.locator('summary').click();
+  const panel = page.getByRole('region', { name: 'Inference context inspector' });
+  await expect(panel).toContainText('Actual last request');
+  await expect(panel).toContainText('continuation transport');
+  await expect(panel).toContainText('Compiled context frame');
+  await expect(panel).toContainText('diagnostic control');
+  await expect(panel).toContainText('retrieval_map');
+  await expect(panel).toContainText('retrievable omissions');
+
+  await panel.getByRole('button', { name: /Open captured request context/u }).click();
+  const dispatch = page.getByRole('dialog', { name: 'Captured harness-visible request context' });
+  await expect(dispatch).toContainText('Fixture provider input');
+  await dispatch.getByRole('button', { name: 'Close Captured harness-visible request context' }).click();
+
+  await panel.getByRole('button', { name: /Open exact candidate bootstrap/u }).click();
+  const bootstrap = page.getByRole('dialog', { name: 'Exact context-frame bootstrap' });
+  await expect(bootstrap).toContainText('<remux_epoch version="1">');
 });
 
 test('selects history through the desktop sidebar or mobile sheet and restores target drafts', async ({ page, isMobile }) => {
   await page.goto(conversationUrl());
   await expect(transcript(page).getByText('Recovered from authoritative resources.')).toBeVisible();
 
-  await page.getByRole('button', { name: 'New chat', exact: true }).click();
+  await startNewChat(page, isMobile);
   const textbox = messageBox(page);
   await textbox.fill('Keep this exact new-chat draft');
 
@@ -156,7 +183,7 @@ test('honors host navigation to another durable conversation', async ({ page }) 
   }, FIXTURE_SECOND_CONVERSATION_ID);
 
   await expect.poll(() => currentResourceId(page)).toBe(FIXTURE_SECOND_CONVERSATION_ID);
-  await expect(page.getByText('Start with the work, not the ceremony.')).toBeVisible();
+  await expect(page.getByText('No transcript yet')).toBeVisible();
 });
 
 test('preserves an unloaded conversation draft when lazy activation is rejected', async ({ page }) => {
@@ -201,7 +228,7 @@ test('selects a workspace through the bounded directory picker', async ({ page }
   }).toBe('/tmp/remux-fixture/packages');
 });
 
-test('locks model settings to an active conversation and unlocks a new chat', async ({ page }) => {
+test('locks model settings to an active conversation and unlocks a new chat', async ({ page, isMobile }) => {
   await page.getByRole('button', { name: 'Preferences' }).click();
   await expect(page.getByRole('button', { name: 'Reload' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'GPT-5.4 Fixture' })).toBeEnabled();
@@ -209,13 +236,15 @@ test('locks model settings to an active conversation and unlocks a new chat', as
 
   await messageBox(page).fill('Start a locked conversation');
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
-  await expect(page.getByRole('button', { name: 'New chat', exact: true })).toBeVisible();
+  if (!isMobile) {
+    await expect(page.getByRole('button', { name: 'Start new chat', exact: true })).toBeVisible();
+  }
   await page.getByRole('button', { name: 'Preferences' }).click();
   await expect(page.getByRole('button', { name: 'GPT-5.4 Fixture' })).toBeDisabled();
   await expect(page.getByText('Start a new chat to change model settings.')).toBeVisible();
   await page.keyboard.press('Escape');
 
-  await page.getByRole('button', { name: 'New chat', exact: true }).click();
+  await startNewChat(page, isMobile);
   await expect(page.getByRole('button', { name: 'Choose workspace' })).toBeEnabled();
 });
 
@@ -250,6 +279,77 @@ test('keeps Enter multiline and sends only from the action', async ({ page }) =>
   await expect.poll(() => commandCount(page, 'remux/agent/conversation/message/send')).toBe(1);
 });
 
+test('searches and sends workspace file mentions as structured input', async ({ page }) => {
+  const textbox = messageBox(page);
+  await textbox.fill('Please inspect @read');
+  await expect(page.getByText('Workspace files', { exact: true })).toBeVisible();
+  await page.locator('.remux-file-mention-row').filter({ hasText: 'README.md' }).click();
+  await textbox.press('End');
+  await textbox.type(' now');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+
+  await expect(page.getByText('The fixture stream completed.')).toBeVisible();
+  const params = await lastCommandParams(page, 'remux/agent/conversation/message/send');
+  expect(params.parts.some((part: { path?: string; type: string }) =>
+    part.type === 'mention' && part.path === 'README.md')).toBe(true);
+  await expect(transcript(page).locator('.codex-user-rail-title').getByText('README.md', { exact: true })).toBeVisible();
+});
+
+test('picks, sends, and renders native image attachments', async ({ page }) => {
+  await messageBox(page).fill('Use this image');
+  await page.getByRole('button', { name: 'Attach', exact: true }).click();
+  await page.getByText('Photo Library', { exact: true }).click();
+  await expect(page.locator('.remux-composer-attachment-card').getByText('picked.png')).toBeVisible();
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+
+  const params = await lastCommandParams(page, 'remux/agent/conversation/message/send');
+  expect(params.parts.some((part: { dataUrl?: string; type: string }) =>
+    part.type === 'image' && part.dataUrl?.startsWith('data:image/png;base64,'))).toBe(true);
+  await expect(transcript(page).getByText('picked.png', { exact: true })).toBeVisible();
+  await expect(transcript(page).getByRole('img', { name: 'picked.png' })).toBeVisible();
+  await expect.poll(() => commandCount(page, 'host/attachments/pick')).toBe(1);
+});
+
+test('queues a follow-up during active work and dispatches it after stop', async ({ page }) => {
+  await messageBox(page).fill('Please interrupt this turn');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Stop turn', exact: true })).toBeVisible();
+
+  await messageBox(page).fill('Continue after the stop');
+  await page.getByRole('button', { name: 'Queue message', exact: true }).click();
+  await expect(page.getByText('Queued 1', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Stop turn', exact: true }).click();
+
+  await expect(transcript(page).getByText('Continue after the stop', { exact: true })).toBeVisible();
+  await expect(page.getByText('Queued 1', { exact: true })).toHaveCount(0);
+  await expect.poll(() => commandCount(page, 'remux/agent/conversation/message/send')).toBe(2);
+});
+
+test('edits a completed user message into an immutable branch', async ({ page }) => {
+  await page.goto(conversationUrl());
+  await page.getByRole('button', { name: 'Edit message', exact: true }).click();
+  await expect(page.getByText('Editing message', { exact: true })).toBeVisible();
+  await messageBox(page).fill('Replacement prompt');
+  await page.getByRole('button', { name: 'Save edited message', exact: true }).click();
+
+  await expect.poll(() => currentResourceId(page)).not.toBe(FIXTURE_CONVERSATION_ID);
+  await expect(transcript(page).getByText('Replacement prompt', { exact: true })).toBeVisible();
+  await expect.poll(() => commandCount(page, 'remux/agent/conversation/message/edit')).toBe(1);
+});
+
+test('forks a completed response with its visible prefix intact', async ({ page }) => {
+  await page.goto(conversationUrl());
+  await page.getByRole('button', { name: 'Fork from response', exact: true }).click();
+  await expect(page.getByText('Forking from response', { exact: true })).toBeVisible();
+  await messageBox(page).fill('Fork follow-up');
+  await page.getByRole('button', { name: 'Send forked message', exact: true }).click();
+
+  await expect.poll(() => currentResourceId(page)).not.toBe(FIXTURE_CONVERSATION_ID);
+  await expect(transcript(page).getByText('Resume this conversation', { exact: true })).toBeVisible();
+  await expect(transcript(page).getByText('Fork follow-up', { exact: true })).toBeVisible();
+  await expect.poll(() => commandCount(page, 'remux/agent/conversation/message/fork')).toBe(1);
+});
+
 function conversationUrl(extra = '') {
   return `/viewers/agent/?remuxResourceKind=agentConversation&remuxResourceId=${FIXTURE_CONVERSATION_ID}${extra}`;
 }
@@ -270,6 +370,11 @@ async function openHistory(page: Page, isMobile: boolean) {
   return page.getByLabel('Agent history');
 }
 
+async function startNewChat(page: Page, isMobile: boolean) {
+  const history = await openHistory(page, isMobile);
+  await history.getByRole('button', { name: 'Start new chat', exact: true }).click();
+}
+
 async function currentResourceId(page: Page) {
   return page.evaluate(() => new URL(window.location.href).searchParams.get('remuxResourceId'));
 }
@@ -281,6 +386,14 @@ async function currentResourceKind(page: Page) {
 async function commandCount(page: Page, method: string) {
   return page.evaluate((value) => (window as any).__agentFixture.requestLog
     .filter((entry: { method: string }) => entry.method === value).length, method);
+}
+
+async function lastCommandParams(page: Page, method: string) {
+  return page.evaluate((value) => {
+    const log = (window as any).__agentFixture.requestLog as Array<{ method: string; summary: string }>;
+    const request = log.findLast((entry) => entry.method === value);
+    return request ? JSON.parse(request.summary) : null;
+  }, method);
 }
 
 async function lastClientMessageId(page: Page) {

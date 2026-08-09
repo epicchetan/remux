@@ -6,8 +6,22 @@ import { transcriptLayout } from '../../viewer/src/transcript/layout/constants.t
 import { TranscriptMeasureCache } from '../../viewer/src/transcript/layout/measureCache.ts';
 import { measureCollapsedTranscript } from '../../viewer/src/transcript/layout/measureCollapsed.ts';
 import { reconcileMeasuredTranscript } from '../../viewer/src/transcript/layout/reconcileMeasured.ts';
-import { autoScrollModeForStreamingTurn, userMessageRowMatchesId } from '../../viewer/src/transcript/virtualizerScroll.ts';
-import { computeTranscriptVirtualRange } from '../../viewer/src/transcript/virtualizerRange.ts';
+import { resolveTranscriptContentWidth } from '../../viewer/src/transcript/measureWidth.ts';
+import {
+  autoScrollModeAfterNativeScrollSettles,
+  autoScrollModeForStreamingTurn,
+  initialTranscriptScrollTarget,
+  nativeScrollOwnsTranscriptViewport,
+  resolveInitialTranscriptScrollTarget,
+  resolveSentMessageScroll,
+  transcriptMessageAnchorTopOffset,
+  transcriptNativeScrollPhaseAfterEvent,
+  userMessageRowMatchesId,
+} from '../../viewer/src/transcript/virtualizerScroll.ts';
+import {
+  computeTranscriptSpacerRange,
+  computeTranscriptVirtualRange,
+} from '../../viewer/src/transcript/virtualizerRange.ts';
 import {
   discardTranscriptUserMessage,
   getTranscriptViewportState,
@@ -99,6 +113,134 @@ test('discards a rejected message anchor without disturbing the draft conversati
   discardTranscriptUserMessage('rejected-client-message');
   assert.deepEqual(getTranscriptViewportState().pendingUserMessageIds, []);
   assert.equal(getTranscriptViewportState().conversationId, 'conversation');
+});
+
+test('rejects collapsed WebView samples and recovers width from the transcript lane', () => {
+  assert.equal(resolveTranscriptContentWidth({
+    contentWidth: 1,
+    laneBorderWidth: 375,
+    lanePaddingLeft: 16,
+    lanePaddingRight: 16,
+    viewportWidth: 390,
+  }), 343);
+  assert.equal(resolveTranscriptContentWidth({
+    contentWidth: 1,
+    laneBorderWidth: 1,
+    lanePaddingLeft: 0,
+    lanePaddingRight: 0,
+    viewportWidth: 390,
+  }), null);
+  assert.equal(resolveTranscriptContentWidth({
+    contentWidth: 868,
+    laneBorderWidth: 900,
+    lanePaddingLeft: 16,
+    lanePaddingRight: 16,
+    viewportWidth: 1_280,
+  }), 868);
+});
+
+test('keeps native scroll ownership from touch through momentum settlement', () => {
+  let phase = transcriptNativeScrollPhaseAfterEvent('idle', 'touch-start');
+  assert.equal(phase, 'touch');
+  assert.equal(nativeScrollOwnsTranscriptViewport(phase), true);
+
+  phase = transcriptNativeScrollPhaseAfterEvent(phase, 'touch-end');
+  assert.equal(phase, 'momentum');
+  assert.equal(nativeScrollOwnsTranscriptViewport(phase), true);
+
+  phase = transcriptNativeScrollPhaseAfterEvent(phase, 'settle');
+  assert.equal(phase, 'idle');
+  assert.equal(nativeScrollOwnsTranscriptViewport(phase), false);
+});
+
+test('restores bottom stickiness only after native scrolling settles at the bottom', () => {
+  assert.deepEqual(autoScrollModeAfterNativeScrollSettles({
+    currentMode: { type: 'off' },
+    nearBottom: true,
+    userInitiated: true,
+  }), { type: 'bottom' });
+  assert.deepEqual(autoScrollModeAfterNativeScrollSettles({
+    currentMode: { type: 'bottom' },
+    nearBottom: false,
+    userInitiated: true,
+  }), { type: 'off' });
+  assert.deepEqual(autoScrollModeAfterNativeScrollSettles({
+    currentMode: { type: 'bottom' },
+    nearBottom: false,
+    userInitiated: false,
+  }), { type: 'bottom' });
+});
+
+test('holds a pinned sent-message anchor with runway after content collapses', () => {
+  assert.deepEqual(resolveSentMessageScroll({
+    currentScrollTop: 500,
+    desiredScrollTop: 500,
+    naturalMaxScrollTop: 420,
+    phase: 'anchored',
+    runwayHeight: 0,
+    viewportGrew: false,
+    wasPinned: true,
+  }), {
+    phase: 'anchored',
+    runwayHeight: 80,
+    scrollTop: 500,
+  });
+});
+
+test('releases a premature sent-message anchor when the viewport grows', () => {
+  assert.deepEqual(resolveSentMessageScroll({
+    currentScrollTop: 500,
+    desiredScrollTop: 500,
+    naturalMaxScrollTop: 420,
+    phase: 'anchored',
+    runwayHeight: 80,
+    viewportGrew: true,
+    wasPinned: true,
+  }), {
+    phase: 'catching-up',
+    runwayHeight: 0,
+    scrollTop: 420,
+  });
+});
+
+test('resolves initial transcript placement to an exact message anchor or sticky bottom', () => {
+  const anchors = [
+    { segmentId: 'user-1', scrollTop: 120, turnId: 'turn-1' },
+    { segmentId: 'user-2', scrollTop: 640, turnId: 'turn-2' },
+  ];
+  assert.deepEqual(initialTranscriptScrollTarget({ anchors, streamingTurnId: 'turn-1' }), {
+    mode: { type: 'off' },
+    scrollTop: 120,
+  });
+  assert.deepEqual(resolveInitialTranscriptScrollTarget({
+    maxScrollTop: 500,
+    target: initialTranscriptScrollTarget({ anchors, streamingTurnId: null }),
+  }), {
+    mode: { type: 'bottom' },
+    scrollTop: 500,
+  });
+  assert.deepEqual(resolveInitialTranscriptScrollTarget({ maxScrollTop: 500, target: null }), {
+    mode: { type: 'bottom' },
+    scrollTop: 500,
+  });
+});
+
+test('uses a safe-area-aware offset and accounts for expanded rows outside the render range', () => {
+  assert.equal(transcriptMessageAnchorTopOffset(8), 24);
+  assert.equal(transcriptMessageAnchorTopOffset(44), 44);
+
+  const turns = Array.from({ length: 30 }, (_, index) =>
+    frame(`turn-${index}`, [user(`user-${index}`, `Request ${index}`)]));
+  const layout = measureCollapsedTranscript({ turns, width: 600 });
+  const activeTurnIds = layout.turns.slice(20, 25).map((turn) => turn.turnId);
+  const withoutExpansion = computeTranscriptSpacerRange({ activeTurnIds, turns: layout.turns });
+  const withExpansion = computeTranscriptSpacerRange({
+    activeTurnIds,
+    expandedRows: [{ additionalHeight: 240, rowId: 'turn-3:user-3', turnId: 'turn-3' }],
+    turns: layout.turns,
+  });
+  assert.equal(withExpansion.topSpacerHeight, withoutExpansion.topSpacerHeight + 240);
+  assert.equal(withExpansion.bottomSpacerHeight, withoutExpansion.bottomSpacerHeight);
 });
 
 function frame(id: string, segments: AgentTurnSegment[]): AgentTurnRenderFrame {

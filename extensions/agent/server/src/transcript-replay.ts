@@ -48,6 +48,7 @@ export function replayTranscriptActions(
           turnId: action.turnId,
           clientMessageId: action.clientMessageId,
           text: action.text,
+          ...('parts' in action && action.parts ? { parts: action.parts } : {}),
           ...('content' in action && action.content ? { content: action.content } : {}),
           ...('sequence' in action
             ? {

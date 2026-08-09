@@ -42,6 +42,7 @@ test('keeps long user and assistant content inside the mobile transcript rail', 
     ].join(',')));
     return {
       content: { left: contentRect.left, right: contentRect.right, width: contentRect.width },
+      layoutWidth: Number(content.dataset.layoutWidth),
       offenders: candidates.flatMap((element) => {
         const rect = element.getBoundingClientRect();
         const exceedsRail = rect.left < contentRect.left - 1 || rect.right > contentRect.right + 1;
@@ -61,6 +62,7 @@ test('keeps long user and assistant content inside the mobile transcript rail', 
   });
 
   expect(containment.content.width).toBeGreaterThan(0);
+  expect(containment.layoutWidth).toBeGreaterThanOrEqual(containment.content.width - 1);
   expect(containment.offenders).toEqual([]);
   expect(containment.scroller.scrollWidth).toBeLessThanOrEqual(containment.scroller.clientWidth + 1);
 });
@@ -90,6 +92,12 @@ test('loads work summaries and entry details only after disclosure', async ({ pa
   await expect(workHeader).toHaveAttribute('aria-expanded', 'false');
   expect(await transcriptRequestTypes(page)).not.toContain('workGroup');
   await workHeader.click();
+  const reasoning = page.locator('.agent-reasoning-disclosure');
+  await expect(reasoning.locator('> summary')).toContainText('Reasoning');
+  await expect(reasoning.locator('> summary')).toContainText('1 update');
+  await expect(page.getByText('Checking context.', { exact: true })).toBeHidden();
+  await reasoning.locator('> summary').click();
+  await expect(page.getByText('Checking context.', { exact: true })).toBeVisible();
   await expect(page.getByText('Workspace reads')).toBeVisible();
   expect(await transcriptRequestTypes(page)).toContain('workGroup');
   expect(await transcriptRequestTypes(page)).not.toContain('workEntryDetail');
@@ -137,22 +145,43 @@ test('recovers stale work pagination without mixing group revisions', async ({ p
     !/^\d+$/.test(request.cursor) && request.knownRevision === undefined)).toBe(true);
 });
 
-test('keeps the DOM bounded and can request an earlier transcript window', async ({ page }) => {
+test('pages only after a user scroll and preserves the mounted row anchor', async ({ page }) => {
   await page.goto(conversationUrl('&fixtureLong=1'));
   await expect(page.getByText('Historical answer 72.')).toBeVisible();
 
-  const mountedBefore = await page.locator('[data-turn-id]').count();
+  const mountedBefore = await page.locator('.codex-transcript-turn').count();
   expect(mountedBefore).toBeGreaterThan(0);
   expect(mountedBefore).toBeLessThan(24);
 
-  await page.getByTestId('agent-transcript-scroll').evaluate((element) => {
-    element.scrollTop = 0;
-    element.dispatchEvent(new Event('scroll'));
+  const syncCount = () => transcriptSyncCount(page);
+  await expect.poll(syncCount).toBe(1);
+
+  const viewport = page.getByTestId('agent-transcript-scroll');
+  await viewport.evaluate((node) => {
+    node.scrollTop = 0;
+    node.dispatchEvent(new Event('scrollend'));
   });
-  await page.getByRole('button', { name: 'Load earlier turns' }).click();
-  await expect(page.getByText('Historical request 33')).toBeVisible();
-  const mountedAfter = await page.locator('[data-turn-id]').count();
-  expect(mountedAfter).toBeLessThan(24);
+  await page.waitForTimeout(250);
+  expect(await syncCount()).toBe(1);
+
+  const anchor = page.locator('[data-transcript-row-id^="turn-49:"]').first();
+  await expect(anchor).toBeVisible();
+  const beforeTop = await anchor.evaluate((node) => node.getBoundingClientRect().top);
+  await viewport.evaluate((node) => {
+    node.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -12 }));
+    node.dispatchEvent(new Event('scrollend'));
+  });
+  await expect.poll(syncCount).toBe(2);
+  expect(await latestTranscriptSyncWindow(page)).toMatchObject({
+    before: 16,
+    kind: 'around',
+    turnId: 'turn-49',
+  });
+  const afterTop = await anchor.evaluate((node) => node.getBoundingClientRect().top);
+  expect(Math.abs(afterTop - beforeTop)).toBeLessThanOrEqual(1);
+
+  const mountedAfter = await page.locator('.codex-transcript-turn').count();
+  expect(mountedAfter).toBeLessThanOrEqual(32);
 });
 
 test('keeps a sent message visible while work and assistant output settle', async ({ page }) => {
@@ -179,4 +208,21 @@ async function transcriptRequestTypes(page: import('@playwright/test').Page) {
 async function artifactRequestCount(page: import('@playwright/test').Page) {
   return page.evaluate(() => (window as any).__agentFixture.requestLog
     .filter((entry: { method: string }) => entry.method === 'remux/agent/artifact/read').length);
+}
+
+async function transcriptSyncCount(page: import('@playwright/test').Page) {
+  return page.evaluate(() => (window as any).__agentFixture.requestLog
+    .filter((entry: { method: string; summary: string }) => {
+      if (entry.method !== 'remux/agent/transcript/resources/read') return false;
+      return JSON.parse(entry.summary).some((request: { type?: string }) => request.type === 'transcriptSync');
+    }).length);
+}
+
+async function latestTranscriptSyncWindow(page: import('@playwright/test').Page) {
+  return page.evaluate(() => {
+    const entries = (window as any).__agentFixture.requestLog
+      .filter((entry: { method: string }) => entry.method === 'remux/agent/transcript/resources/read');
+    const requests = JSON.parse(entries.at(-1)?.summary ?? '[]');
+    return requests.find((request: { type?: string }) => request.type === 'transcriptSync')?.window;
+  });
 }

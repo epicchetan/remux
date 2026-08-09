@@ -24,7 +24,7 @@ test('the temporary flat transcript resource model stays removed', () => {
   assert.doesNotMatch(server, /flatTranscript|legacyTranscript|transcriptItems/u);
 });
 
-test('the Agent composer contains only the approved plain-text dependency surface', () => {
+test('the Agent composer owns the applicable interaction surface without Codex-only modes', () => {
   const root = new URL('../../', import.meta.url);
   const packageJson = JSON.parse(readFileSync(new URL('package.json', root), 'utf8')) as {
     dependencies: Record<string, string>;
@@ -38,14 +38,14 @@ test('the Agent composer contains only the approved plain-text dependency surfac
 
   const composerRoot = new URL('viewer/src/composer/', root);
   for (const name of ['attachments', 'edit', 'mentions', 'queue']) {
-    assert.equal(existsSync(new URL(`${name}/`, composerRoot)), false, `${name} must stay excluded`);
+    assert.equal(existsSync(new URL(`${name}/`, composerRoot)), true, `${name} must be Agent-owned`);
   }
   for (const name of ['editor/commands.ts', 'editor/nodes.tsx']) {
-    assert.equal(existsSync(new URL(name, composerRoot)), false, `${name} must stay excluded`);
+    assert.equal(existsSync(new URL(name, composerRoot)), true, `${name} must support structured input`);
   }
 
   const source = sourceText([new URL('viewer/src/', root)]);
-  assert.doesNotMatch(source, /operationQueue|reviewMode|auto-review|attachmentPicker|mentionSession|compactThread/u);
+  assert.doesNotMatch(source, /reviewMode|auto-review|compactThread|NarrationBar|NarrationPlayback/u);
 });
 
 function sourceText(roots: URL[]) {

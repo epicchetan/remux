@@ -1,6 +1,6 @@
 Status: Active Spec
 Last verified: 2026-08-08
-Canonical code: Phase 0 through Phase 1A.2 are implemented and owner-accepted in `extensions/agent/`; Phase 1A.3 shadow context compilation is the next planning boundary and remains unimplemented
+Canonical code: Phase 0 through Phase 1A.3 storage, replay, manifest, and inspector foundations are implemented in `extensions/agent/`; the authoritative provider-context mechanism is now defined by `agent-context-workspace-v1.md`
 
 # Agent durable epoch core
 
@@ -11,6 +11,12 @@ This document turns its former all-at-once “core loop” into independently
 testable checkpoints. UI delivery and owner-review timing are further defined
 by
 [`agent-ui-parity-and-phased-delivery.md`](agent-ui-parity-and-phased-delivery.md).
+
+Direction update (2026-08-08): this document's diagnostic shadow sequence was
+superseded by the context workspace and active frame design in
+[`agent-context-workspace-v1.md`](agent-context-workspace-v1.md). The E0 Ledger
+benchmark in `extensions/agent/tests/benchmark/` is the common Codex/Agent
+replay and evaluation path; its first stateful comparison is complete.
 
 The outcome is an operationally unbounded conversation: the complete useful
 history remains durable and inspectable while every provider inference sees a
@@ -115,6 +121,10 @@ approves proceeding to durable state.
 
 ### Phase 1A.1–1A.3 — durable journal, replay, and shadow compiler
 
+**Gate state: Phase 1A.3 implementation and automated/live validation completed
+on 2026-08-08; owner inspection of representative snapshots remains the stop/go
+gate for Phase 1B.**
+
 These checkpoints change persistence but deliberately do not activate
 rollover. They land durable conversations/history, authoritative transcript
 windows/work details, and then the shadow compiler/context inspector in that
@@ -156,6 +166,23 @@ phase.
 Exit gate: deterministic replay, crash injection, resource revision, and
 shadow-manifest tests pass. A live short conversation survives an extension
 restart and can be continued in a fresh provider chain.
+
+The implemented 1A.3 boundary keeps Pi's exact full replay authoritative. Its
+pure compiler synchronously produces a deterministic candidate at every Pi
+context hook; provider preflight then commits a versioned manifest and
+bootstrap artifact before network I/O. Schema v3 adds strand-to-context-space
+ownership and durable compilation rows. A bounded `context:<conversation>`
+resource exposes the latest candidate in the existing composer without
+placing manifest bodies in ordinary transcript resources.
+
+The read-only historical pressure check in
+`extensions/agent/tests/benchmark/context-corpus.ts` sampled 151 boundaries
+across five retained Codex rollouts, including 873- and 1,186-tool-call
+sessions. Candidates stayed at or below 17,901 estimated tokens with no blocked
+candidate. A normal 106-call bounded run compiled at 2.62 ms p95; the
+compaction-unaware 2.48M-token retained-history upper bound reached 53.70 ms
+p95. The latter is deliberately not described as historical provider usage
+and would be precluded by active rollover at the 120k threshold.
 
 ### Phase 1B — active epoch rollover
 
@@ -709,7 +736,7 @@ patch. Phase 1C does not proceed while mode is `unknown` at rollover.
 Every inference stores one immutable manifest artifact containing:
 
 ```ts
-type PromptManifestV1 = {
+type PromptManifestV2 = {
   inferenceId: string;
   epochId: string;
   basisSequence: number;
@@ -717,7 +744,7 @@ type PromptManifestV1 = {
   piVersion: '0.84.0';
   provider: 'openai-codex';
   modelId: string;
-  requestMode: 'full' | 'continuation' | 'unknown';
+  requestMode: 'full' | 'continuation';
   fixedContractsHash: string;
   orderedMessageHashes: string[];
   orderedBlocks: Array<{
@@ -733,13 +760,22 @@ type PromptManifestV1 = {
   }>;
   inputHash: string;
   estimatedInputTokens: number;
+  dispatchArtifact: {
+    hash: string;
+    byteLength: number;
+    mediaType: string;
+  };
 };
 ```
 
 The manifest reproduces the exact **logical** input owned by Remux. Exact
-provider request bytes, credentials, response IDs, headers, and raw payloads
-are neither claimed nor stored. Until Pi provides normalized cache telemetry,
-missing cache fields remain absent rather than inferred.
+provider request bytes are not claimed. Version 2 additionally points to a
+local, bounded-read inspection artifact captured from Pi's final request
+object. It preserves harness-visible instructions, messages, and tool contracts
+while replacing credentials, headers, cache keys, response IDs, and opaque
+encrypted content with explicit presence/redaction markers. Until Pi provides
+normalized cache telemetry, missing cache fields remain absent rather than
+inferred.
 
 The context hook creates a manifest draft. The async
 `before_provider_request` hook derives sanitized request mode from the final

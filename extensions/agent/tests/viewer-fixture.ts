@@ -26,6 +26,7 @@ export async function installAgentHost(page: Page) {
 
     const conversationId = '11111111-1111-4111-8111-111111111111';
     const conversationKey = `conversation:${conversationId}`;
+    const contextKey = `context:${conversationId}`;
     let generation = 'fixture-generation';
     const route = new URL(window.location.href).searchParams;
     const signedOut = route.get('fixtureSignedOut') === '1';
@@ -36,8 +37,28 @@ export async function installAgentHost(page: Page) {
     const overflowTranscript = route.get('fixtureOverflow') === '1';
     const exactTranscript = route.get('fixtureExact') === '1';
     const exactArtifactHash = 'a'.repeat(64);
+    const pickedImageHash = 'b'.repeat(64);
+    const pickedImageDataUrl = 'data:image/png;base64,iVBORw0KGgo=';
+    const pickedImageBytes = Uint8Array.from(atob(pickedImageDataUrl.split(',')[1]!), (value) => value.charCodeAt(0));
     const exactPreview = 'Exact preview. ';
     const exactFullText = `${exactPreview}The remaining response is fetched only when requested.`;
+    const contextBootstrapHash = 'd'.repeat(64);
+    const contextDispatchHash = 'f'.repeat(64);
+    const contextBootstrapText = '<remux_epoch version="1">\n<continuation>Fixture context</continuation>\n</remux_epoch>';
+    const contextDispatchText = JSON.stringify({
+      input: [{ role: 'user', content: 'Fixture provider input' }],
+      model: 'gpt-5.4-fixture',
+      tools: [{ name: 'workspace_read' }],
+    }, null, 2);
+    const artifactTexts = new Map([
+      [exactArtifactHash, exactFullText],
+      [contextBootstrapHash, contextBootstrapText],
+      [contextDispatchHash, contextDispatchText],
+    ]);
+    const artifactBytes = new Map([[pickedImageHash, {
+      bytes: pickedImageBytes,
+      mediaType: 'image/png',
+    }]]);
     const resources = new Map<string, Resource>([
       ['auth', { revision: 1, value: {
         state: signedOut ? 'signed-out' : 'signed-in', operationId: null,
@@ -54,6 +75,8 @@ export async function installAgentHost(page: Page) {
       ['runtime', { revision: 1, value: runtimeValue('unloaded') }],
     ]);
     const turns: Turn[] = [];
+    const turnsByConversation = new Map<string, Turn[]>([[conversationId, turns]]);
+    const pendingQueue: Array<{ clientMessageId: string; operationId: string; parts?: any[]; text: string }> = [];
     const workGroups = new Map<string, any>();
     const workDetails = new Map<string, any>();
     const requestLog: Array<{ method: string; summary: string }> = [];
@@ -78,6 +101,7 @@ export async function installAgentHost(page: Page) {
         value: conversationSummary('/tmp/remux-fixture', 'idle'),
       });
       resources.set('runtime', { revision: 2, value: runtimeValue('idle') });
+      resources.set(contextKey, { revision: 1, value: contextValue('append') });
       if (longTranscript) {
         for (let index = 1; index <= 72; index += 1) {
           turns.push(completedTurn(`turn-${index}`, `Historical request ${index}`, `Historical answer ${index}.`));
@@ -152,16 +176,17 @@ export async function installAgentHost(page: Page) {
       value: { conversations: conversationSummaries(), truncated: false },
     });
 
-    function conversationSummary(cwd: string, status: string) {
+    function conversationSummary(cwd: string, status: string, id = conversationId) {
+      const targetTurns = turnsByConversation.get(id) ?? [];
       return {
-        id: conversationId,
+        id,
         title: 'Resume this conversation',
         preview: 'Recovered from authoritative resources.',
         cwd,
         modelId: 'gpt-5.4-fixture',
         reasoning: 'high',
         status,
-        latestTurnId: turns.at(-1)?.id ?? null,
+        latestTurnId: targetTurns.at(-1)?.id ?? null,
         createdAt: 1_700_000_000_000,
         updatedAt: Date.now(),
       };
@@ -183,6 +208,73 @@ export async function installAgentHost(page: Page) {
           provider: 'openai-codex', modelId: 'gpt-5.4-fixture',
           providerRequestMode: routedConversation ? 'continuation' : 'none',
         },
+      };
+    }
+
+    function contextValue(decision: 'append' | 'roll') {
+      const hash = decision === 'append' ? 'b'.repeat(64) : 'c'.repeat(64);
+      return {
+        version: 2,
+        conversationId,
+        inferenceId: 'fixture-inference',
+        epochId: 'fixture-epoch',
+        basisSequence: sequence,
+        projectRevision: 0,
+        targetContextSpaceId: 'fixture-context-space',
+        compilerVersion: 'agent-context-compiler-v2',
+        policyVersion: 'agent-context-policy-v1',
+        decision: decision === 'append'
+          ? { kind: 'append', pressurePermille: 120 }
+          : { kind: 'roll', pressurePermille: 1_020, reason: 'Fixture rollover threshold reached.' },
+        activeEstimatedInputTokens: 12_400,
+        candidateEstimatedInputTokens: 3_200,
+        semanticHash: hash,
+        bootstrapHash: contextBootstrapHash,
+        buildDurationMs: 2,
+        manifestArtifact: { hash: 'e'.repeat(64), byteLength: 1_200, mediaType: 'application/json' },
+        bootstrapArtifact: {
+          hash: contextBootstrapHash,
+          byteLength: new TextEncoder().encode(contextBootstrapText).byteLength,
+          mediaType: 'text/plain; charset=utf-8',
+        },
+        actual: {
+          mode: 'full-replay',
+          transportMode: 'continuation',
+          messageCount: 2,
+          turnCount: 1,
+          logicalHash: '8'.repeat(64),
+          renderedHash: '9'.repeat(64),
+          fixedContractsHash: '0'.repeat(64),
+          dispatchArtifact: {
+            hash: contextDispatchHash,
+            byteLength: new TextEncoder().encode(contextDispatchText).byteLength,
+            mediaType: 'text/plain; charset=utf-8',
+          },
+          groups: [{
+            turnId: 'fixture-turn',
+            source: 'agent://conversation/fixture/turn/fixture-turn',
+            messageCount: 2,
+            estimatedTokens: 310,
+            roles: { user: 1, assistant: 1, tool: 0 },
+          }],
+          groupsTruncated: false,
+        },
+        blocks: ['continuation', 'working_state', 'open_work', 'workspace', 'runtime', 'raw_tail', 'retrieval_map']
+          .map((kind, index) => ({
+            kind,
+            hash: String(index + 1).repeat(64).slice(0, 64),
+            estimatedTokens: 100 + index,
+            sources: [`agent://fixture/${kind}`],
+            sourceCount: 1,
+            sourcesTruncated: false,
+          })),
+        omissions: [{
+          source: 'agent://conversation/fixture/turns',
+          reason: 'raw-tail-budget',
+          retrieval: 'agent://conversation/fixture/turns?before=latest',
+          count: 4,
+        }],
+        omissionsTruncated: false,
       };
     }
 
@@ -232,9 +324,10 @@ export async function installAgentHost(page: Page) {
       turnId: string,
       reason: 'sendAccepted' | 'runtimeEvent' | 'terminal',
       affectsOrder: boolean,
+      targetConversationId = conversationId,
     ) {
       dispatchInvalidations([{
-        type: 'transcript', key: `transcript:${conversationId}`, conversationId,
+        type: 'transcript', key: `transcript:${targetConversationId}`, conversationId: targetConversationId,
         turnId, reason, affectsOrder, affectsLayout: true, basisSequence: sequence,
       }]);
     }
@@ -268,7 +361,7 @@ export async function installAgentHost(page: Page) {
       }
     }
 
-    function createRunningTurn(text: string, clientMessageId: string) {
+    function createRunningTurn(text: string, clientMessageId: string, parts?: any[]) {
       turnCounter += 1;
       const id = `fixture-turn-${turnCounter}`;
       const workId = `${id}:work`;
@@ -286,7 +379,10 @@ export async function installAgentHost(page: Page) {
         renderRevision: `${id}:1`,
         layoutRevision: `${id}:1`,
         segments: [
-          { id: `${id}:user`, type: 'userMessage', clientMessageId, revision: '1', text },
+          {
+            id: `${id}:user`, type: 'userMessage', clientMessageId, revision: '1', text,
+            ...(parts ? { parts: storedFixtureParts(parts) } : {}),
+          },
           {
             id: workId, type: 'work', state: 'running', revision: '1',
             layoutRevision: '1', durationMs: null,
@@ -347,7 +443,30 @@ export async function installAgentHost(page: Page) {
       return turn;
     }
 
-    function finishTurn(turn: Turn, outcome: 'completed' | 'failed' | 'interrupted') {
+    function storedFixtureParts(parts: any[]) {
+      return parts.map((part) => {
+        if (part.type !== 'image') return part;
+        const encoded = String(part.dataUrl).split(',')[1] ?? '';
+        const bytes = Uint8Array.from(atob(encoded), (value) => value.charCodeAt(0));
+        artifactBytes.set(pickedImageHash, {
+          bytes,
+          mediaType: String(part.mimeType ?? 'image/png'),
+        });
+        return {
+          artifactHash: pickedImageHash,
+          mimeType: String(part.mimeType ?? 'image/png'),
+          name: String(part.name ?? 'Image'),
+          sizeBytes: bytes.byteLength,
+          type: 'image',
+        };
+      });
+    }
+
+    function finishTurn(
+      turn: Turn,
+      outcome: 'completed' | 'failed' | 'interrupted',
+      dispatchQueued = true,
+    ) {
       turn.status = outcome;
       turn.completedAt = Date.now();
       turn.durationMs = Math.max(1_000, turn.completedAt - turn.startedAt);
@@ -406,6 +525,62 @@ export async function installAgentHost(page: Page) {
           }]);
         }
       }
+      if (dispatchQueued && pendingQueue.length > 0) {
+        const next = pendingQueue.shift()!;
+        syncFixtureQueue();
+        window.setTimeout(() => startFixtureMessage(next), 0);
+      }
+    }
+
+    function syncFixtureQueue() {
+      const key = `queue:${conversationId}`;
+      const entry = resources.get(key);
+      const value = {
+        conversationId,
+        entries: pendingQueue.map((item) => ({
+          attachmentCount: item.parts?.filter((part) => part.type === 'image').length ?? 0,
+          createdAt: Date.now(),
+          id: item.operationId,
+          mentionCount: item.parts?.filter((part) => part.type === 'mention').length ?? 0,
+          text: item.text,
+        })),
+      };
+      if (entry) {
+        entry.revision += 1;
+        entry.value = value;
+      } else {
+        resources.set(key, { revision: 1, value });
+      }
+      invalidateResource(key, entry ? 'updated' : 'created');
+    }
+
+    function startFixtureMessage(params: { clientMessageId: string; parts?: any[]; text: string }) {
+      const turn = createRunningTurn(String(params.text), String(params.clientMessageId), params.parts);
+      updateResource(conversationKey, (summary) => {
+        summary.status = 'running';
+        summary.title = String(params.text);
+        summary.preview = String(params.text);
+        summary.latestTurnId = turn.id;
+        summary.updatedAt = Date.now();
+      });
+      updateResource('runtime', (runtime) => {
+        runtime.conversationId = conversationId;
+        runtime.state = 'running';
+        runtime.activeTurnId = turn.id;
+        runtime.activeTurnElapsedMs = 0;
+      });
+      invalidateTranscript(turn.id, 'sendAccepted', true);
+      const text = String(params.text);
+      if (!text.includes('interrupt')) {
+        setTimeout(() => {
+          try {
+            finishTurn(turn, text.includes('error') ? 'failed' : 'completed');
+          } catch (error) {
+            console.error('Agent viewer fixture failed to finish a turn.', error);
+          }
+        }, 80);
+      }
+      return turn;
     }
 
     function transcriptSync(request: any, targetConversationId: string, targetTurns: Turn[]) {
@@ -467,7 +642,7 @@ export async function installAgentHost(page: Page) {
             const value = transcriptSync(
               request,
               targetConversationId,
-              targetConversationId === conversationId ? turns : [],
+              turnsByConversation.get(targetConversationId) ?? [],
             );
             return {
               requestIndex, key: `transcript:${targetConversationId}`, status: 'ok',
@@ -558,10 +733,31 @@ export async function installAgentHost(page: Page) {
       }
       if (request.method === 'remux/agent/transcript/resources/read') return transcriptResult(params);
       if (request.method === 'remux/agent/artifact/read') {
-        if (params.hash !== exactArtifactHash || params.range.kind !== 'utf8') {
+        const binary = artifactBytes.get(params.hash);
+        if (binary && params.range.kind === 'bytes') {
+          const start = Math.min(Number(params.range.offset), binary.bytes.byteLength);
+          const end = Math.min(binary.bytes.byteLength, start + Number(params.range.byteLength));
+          const selected = binary.bytes.slice(start, end);
+          const content = btoa(String.fromCharCode(...selected));
+          return {
+            hash: params.hash,
+            mediaType: binary.mediaType,
+            totalByteLength: binary.bytes.byteLength,
+            totalLineCount: null,
+            range: { kind: 'bytes', offset: start, byteLength: end - start },
+            encoding: 'base64',
+            content,
+            truncated: end < binary.bytes.byteLength,
+            nextRange: end < binary.bytes.byteLength
+              ? { kind: 'bytes', offset: end, byteLength: Number(params.range.byteLength) }
+              : null,
+          };
+        }
+        const artifactText = artifactTexts.get(params.hash);
+        if (artifactText === undefined || params.range.kind !== 'utf8') {
           throw new Error('Fixture artifact range was not found.');
         }
-        const bytes = new TextEncoder().encode(exactFullText);
+        const bytes = new TextEncoder().encode(artifactText);
         const start = Math.min(Number(params.range.offset), bytes.byteLength);
         const end = Math.min(bytes.byteLength, start + Number(params.range.byteLength));
         const nextRange = end < bytes.byteLength
@@ -599,21 +795,27 @@ export async function installAgentHost(page: Page) {
           nextMessageError = null;
           throw new Error(message);
         }
-        const turn = createRunningTurn(String(params.text), String(params.clientMessageId));
-        updateResource(conversationKey, (summary) => {
-          summary.status = 'running';
-          summary.title = String(params.text);
-          summary.preview = String(params.text);
-          summary.latestTurnId = turn.id;
-          summary.updatedAt = Date.now();
+        const runtime = resources.get('runtime')?.value;
+        if (runtime?.state === 'running' || runtime?.state === 'interrupting') {
+          pendingQueue.push({
+            clientMessageId: String(params.clientMessageId),
+            operationId: String(params.operationId),
+            ...(Array.isArray(params.parts) ? { parts: params.parts } : {}),
+            text: String(params.text),
+          });
+          syncFixtureQueue();
+          return {
+            accepted: true, delivery: 'queued', operationId: params.operationId, turnId: null,
+          };
+        }
+        const turn = startFixtureMessage({
+          clientMessageId: String(params.clientMessageId),
+          ...(Array.isArray(params.parts) ? { parts: params.parts } : {}),
+          text: String(params.text),
         });
-        updateResource('runtime', (runtime) => {
-          runtime.conversationId = conversationId;
-          runtime.state = 'running';
-          runtime.activeTurnId = turn.id;
-          runtime.activeTurnElapsedMs = 0;
-          runtime.contextProbe = {
-            ...runtime.contextProbe,
+        updateResource('runtime', (value) => {
+          value.contextProbe = {
+            ...value.contextProbe,
             modelCallCount: 1,
             messageCount: 1,
             messageHash: 'fixture-hash',
@@ -622,18 +824,84 @@ export async function installAgentHost(page: Page) {
             providerRequestMode: 'full',
           };
         });
-        invalidateTranscript(turn.id, 'sendAccepted', true);
-        const text = String(params.text);
-        if (!text.includes('interrupt')) {
-          setTimeout(() => {
-            try {
-              finishTurn(turn, text.includes('error') ? 'failed' : 'completed');
-            } catch (error) {
-              console.error('Agent viewer fixture failed to finish a turn.', error);
-            }
-          }, 80);
-        }
+        resources.set(contextKey, {
+          revision: (resources.get(contextKey)?.revision ?? 0) + 1,
+          value: contextValue('append'),
+        });
+        invalidateResource(contextKey);
         return { accepted: true, operationId: params.operationId, turnId: turn.id };
+      }
+      if (request.method === 'remux/agent/conversation/message/queue/remove') {
+        const index = pendingQueue.findIndex((entry) => entry.operationId === params.operationId);
+        if (index < 0) return { status: 'retained' };
+        pendingQueue.splice(index, 1);
+        syncFixtureQueue();
+        return { status: 'removed' };
+      }
+      if (request.method === 'remux/agent/conversation/message/queue/run-now') {
+        const index = pendingQueue.findIndex((entry) => entry.operationId === params.operationId);
+        if (index < 0) return { status: 'retained' };
+        const [selected] = pendingQueue.splice(index, 1);
+        pendingQueue.unshift(selected!);
+        const active = turns.find((candidate) => candidate.status === 'inProgress');
+        if (active) finishTurn(active, 'interrupted', false);
+        const next = pendingQueue.shift();
+        syncFixtureQueue();
+        if (next) window.setTimeout(() => startFixtureMessage(next), 0);
+        return { status: 'running' };
+      }
+      if (request.method === 'remux/agent/conversation/message/edit' ||
+          request.method === 'remux/agent/conversation/message/fork') {
+        const branchId = `33333333-3333-4333-8333-${String(turnCounter + 1).padStart(12, '0')}`;
+        const isFork = request.method.endsWith('/fork');
+        const sourceTurns = turnsByConversation.get(String(params.sourceConversationId)) ?? [];
+        const targetIndex = sourceTurns.findIndex((turn) => turn.id === params.sourceTurnId);
+        const prefix = isFork && targetIndex >= 0 ? sourceTurns.slice(0, targetIndex + 1) : sourceTurns.slice(0, Math.max(0, targetIndex));
+        const replacement = completedTurn(
+          `branch-turn-${turnCounter + 1}`,
+          String(params.text),
+          'The fixture branch completed.',
+        );
+        const replacementUser = replacement.segments.find((segment) => segment.type === 'userMessage');
+        if (replacementUser) replacementUser.clientMessageId = String(params.clientMessageId);
+        const branchTurns = [...prefix.map((turn) => structuredClone(turn)), replacement];
+        turnsByConversation.set(branchId, branchTurns);
+        resources.set(`conversation:${branchId}`, {
+          revision: 1,
+          value: {
+            ...conversationSummary('/tmp/remux-fixture', 'idle', branchId),
+            latestTurnId: replacement.id,
+            preview: String(params.text),
+            title: String(params.text),
+          },
+        });
+        resources.set('runtime', {
+          revision: (resources.get('runtime')?.revision ?? 0) + 1,
+          value: { ...runtimeValue('idle'), conversationId: branchId, activeTurnId: null },
+        });
+        syncConversationList();
+        invalidateResource(`conversation:${branchId}`, 'created');
+        invalidateResource('runtime');
+        invalidateTranscript(replacement.id, 'terminal', true, branchId);
+        return { conversationId: branchId, turnId: replacement.id };
+      }
+      if (request.method === 'remux/agent/files/search') {
+        const query = String(params.query ?? '').toLowerCase();
+        const files = [
+          {
+            absolutePath: '/tmp/remux-fixture/README.md', id: 'fixture-readme', kind: 'file',
+            name: 'README.md', parentPath: '.', path: 'README.md', score: 100,
+          },
+          {
+            absolutePath: '/tmp/remux-fixture/src/index.ts', id: 'fixture-index', kind: 'file',
+            name: 'index.ts', parentPath: 'src', path: 'src/index.ts', score: 90,
+          },
+          {
+            absolutePath: '/tmp/remux-fixture/extensions/agent', id: 'fixture-agent', kind: 'directory',
+            name: 'agent', parentPath: 'extensions', path: 'extensions/agent/', score: 80,
+          },
+        ];
+        return { results: files.filter((entry) => entry.path.toLowerCase().includes(query)) };
       }
       if (request.method === 'remux/agent/conversation/turn/interrupt') {
         const turn = turns.find((candidate) => candidate.id === params.turnId);
@@ -673,6 +941,17 @@ export async function installAgentHost(page: Page) {
         };
       }
       if (request.method === 'host/viewport/get') return viewportMetrics;
+      if (request.method === 'host/attachments/pick') {
+        return {
+          assets: [{
+            dataUrl: pickedImageDataUrl,
+            mimeType: 'image/png',
+            name: 'picked.png',
+            sizeBytes: pickedImageBytes.byteLength,
+          }],
+          canceled: false,
+        };
+      }
       if (request.method === 'host/link/open') return { ok: true };
       return { ok: true };
     }

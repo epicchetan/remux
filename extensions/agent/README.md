@@ -1,25 +1,32 @@
 # Remux Agent
 
-This extension contains the owner-accepted Phase 0 integration spine and
-Phase 1A.0 UI foundation plus the implemented Phase 1A.1 durable-history and
-Phase 1A.2a–1A.2d transcript-hardening checkpoints described in
-`docs/specs/agent-runtime-and-epoch-context.md`. It
-runs beside the existing `codex` extension and combines OpenAI Codex
-subscription auth, model/reasoning selection, streaming, interruption, and the
-bounded `workspace_read` tool with an Agent-owned SQLite journal, restart-safe
-conversation history, deterministic full-replay provider hydration, bounded
-selected-row UI projection, explicit oversized-content retrieval,
-revision-scoped work pagination, generation-safe recovery, load-before-scroll
-turn focus, typed terminal fidelity, metadata-fast startup, explicit artifact
-scrubbing, and the ported transcript, Markdown, work, composer,
-virtualization, lifecycle, and responsive UI foundation. The phased parity boundary is defined in
+This extension contains the owner-accepted Phase 0 integration spine, Phase
+1A UI and durable-history foundation, transcript hardening, and the first
+authoritative context workspace described in
+`docs/specs/agent-context-workspace-v1.md`. It runs beside the existing
+`codex` extension and combines OpenAI Codex subscription auth,
+model/reasoning selection, streaming, interruption, Pi read/bash/edit/write
+tools, an Agent-owned SQLite journal, restart-safe conversation history,
+bounded UI projection, exact artifact retrieval, atomic model-managed context
+state through the model-facing `context_update` set/remove/pin/unpin tool,
+journal search/open tools, deterministic provider context frames,
+pressure rollover without compaction, and an inspectable full-versus-
+continuation transport trail. The ported transcript, Markdown, work, composer,
+virtualization, lifecycle, and responsive UI foundation now also includes
+structured file mentions, artifact-backed image attachments, durable queued
+follow-ups, and immutable edit/fork branches. Its provider-neutral styling and
+interaction behavior stay aligned with the established Codex experience. The
+phased parity boundary is defined in
 `docs/specs/agent-ui-parity-and-phased-delivery.md`.
 
 Phase 1A.1 and Phase 1A.2 owner acceptance are complete, including the
 fault/scale closeout, clean-state restart smoke, and desktop/physical-phone
-review. Shadow context compilation, active epoch rollover, child work scopes,
-coding effects beyond bounded reads, and persistent processes are not
-implemented yet.
+review. The context workspace and active frame compiler have also completed
+their first real-subscription E0 comparison. Full-history remains an evaluation
+control; stateful frames are the product default. Bounded child work scopes are
+implemented behind an opt-in benchmark/runtime flag and are not part of the
+default prompt or tool surface. A first-class persistent-process registry
+remains future work.
 
 ## Local verification
 
@@ -30,7 +37,52 @@ npm --workspace @remux/agent run test:server
 npm --workspace @remux/agent run test:unit
 npm --workspace @remux/agent run test:viewer
 npm --workspace @remux/agent run test:hardening
+npm --workspace @remux/agent run test:context-corpus
+npm --workspace @remux/agent run benchmark -- list
 ```
+
+`test:context-corpus` is a read-only structural pressure check over the local
+historical rollout paths documented in
+`docs/specs/agent-ledger-benchmark-corpus.md`. It prints hashes and aggregate
+measurements only; it neither imports transcript content into product state nor
+claims semantic task-quality coverage.
+
+## Production-path benchmark
+
+The E0 benchmark controller drives the same authenticated Codex or Agent RPC
+commands used by the UI. Its first fixture replays the historical Ledger
+feed/session workflow as four owner-style turns: read-only audit, implementation
+authorization, focused FIFO correction, and final audit. Fixture workers get a
+fresh repository containing only the historical base tree; the source rollout,
+target commit, fixture manifest, and hidden reference tests remain outside the
+worker workspace.
+
+```sh
+# Inspect entitled model IDs, then prepare or run the fixture.
+npm --workspace @remux/agent run benchmark -- models --target codex
+npm --workspace @remux/agent run benchmark -- prepare
+npm --workspace @remux/agent run benchmark -- run \
+  --target codex --model <model-id> --reasoning high
+
+# Run the same scenario through the stateful Agent/Pi path.
+npm --workspace @remux/agent run benchmark -- run \
+  --target agent --context-mode managed-v1.1 --model <model-id> --reasoning high
+
+# The run command stops after the collaboration turns so the working tree can
+# be inspected. Evaluation is a separate, deterministic step.
+npm --workspace @remux/agent run benchmark -- finalize --run <run-id>
+```
+
+`start`, `send`, and `status` expose the same flow one turn at a time. `replay`
+copies only a prior run's recorded owner messages into a fresh fixture and a
+different target. `resume --run <run-id>` continues an interrupted Agent run
+in its original workspace and conversation without replaying completed owner
+turns. Finalization captures the visible transcript, rollout hash
+and tool metrics when available, complete patch (including untracked files),
+scope and permission gates, formatting, and a managed full-workspace test run
+with hidden historical reference tests overlaid. Generated workspaces and
+evidence live under ignored `.remux-benchmarks/`; the Ledger source repository
+is read-only and checked for mutation.
 
 Set `REMUX_AGENT_FIXTURE=1` when launching `server/dist/main.mjs` to use the
 deterministic fixture engine without auth or model traffic.

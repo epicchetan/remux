@@ -4,7 +4,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { AGENT_JOURNAL_SCHEMA_VERSION } from './schema.ts';
 import { canonicalJson, type CanonicalJsonValue } from './canonical-json.ts';
 
-const PROJECTION_VERSION = 'agent-projection-v1';
+const PROJECTION_VERSION = 'agent-projection-v2';
 
 const projectionTables = [
   { name: 'projects', order: ['project_id'] },
@@ -14,6 +14,7 @@ const projectionTables = [
   { name: 'project_relations', order: ['relation_id'] },
   { name: 'conversations', order: ['conversation_id'] },
   { name: 'strands', order: ['strand_id'] },
+  { name: 'strand_context_spaces', order: ['strand_id'] },
   { name: 'turns', order: ['turn_id'] },
   { name: 'execution_scopes', order: ['scope_id'] },
   { name: 'transcript_items', order: ['item_id'] },
@@ -23,6 +24,7 @@ const projectionTables = [
   { name: 'epochs', order: ['epoch_id'] },
   { name: 'epoch_blocks', order: ['epoch_id', 'ordinal'] },
   { name: 'inferences', order: ['inference_id'] },
+  { name: 'context_compilations', order: ['compilation_id'] },
 ] as const;
 
 export function durableProjectionSnapshot(database: DatabaseSync): CanonicalJsonValue {

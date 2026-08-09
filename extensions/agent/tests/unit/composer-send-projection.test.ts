@@ -7,13 +7,17 @@ import { buildComposerSendProjection } from '../../viewer/src/composer/model/sen
 test('projects only trimmed plain text', () => {
   assert.deepEqual(
     buildComposerSendProjection(createComposerSnapshot(createTextComposerDocument('  line one\nline two  '))),
-    { displayText: 'line one\nline two', text: 'line one\nline two', type: 'ok' },
+    {
+      displayText: 'line one\nline two',
+      parts: [{ text: 'line one\nline two', type: 'text' }],
+      type: 'ok',
+    },
   );
 });
 
 test('rejects an empty projection', () => {
   assert.deepEqual(
     buildComposerSendProjection(createComposerSnapshot(createTextComposerDocument(' \n '))),
-    { message: 'Enter a message.', type: 'error' },
+    { message: 'Enter a message or attach an image.', type: 'error' },
   );
 });

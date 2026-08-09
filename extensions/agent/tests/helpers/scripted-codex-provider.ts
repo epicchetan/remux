@@ -18,6 +18,7 @@ export type ScriptedCodexStep =
       kind: 'answer';
       text: string;
       reasoning?: string;
+      streamedReasoning?: string;
       responseId: string;
     }
   | {
@@ -25,6 +26,19 @@ export type ScriptedCodexStep =
       callId: string;
       name: string;
       args: Record<string, unknown>;
+      reasoning?: string;
+      streamedReasoning?: string;
+      responseId: string;
+    }
+  | {
+      kind: 'tool-calls';
+      calls: Array<{
+        callId: string;
+        name: string;
+        args: Record<string, unknown>;
+      }>;
+      reasoning?: string;
+      streamedReasoning?: string;
       responseId: string;
     };
 
@@ -159,25 +173,30 @@ async function emitScriptedResponse(
 ) {
   stream.push({ type: 'start', partial });
 
-  if (step.kind === 'answer') {
-    if (step.reasoning) {
-      const reasoning: ThinkingContent = { type: 'thinking', thinking: '' };
-      partial.content.push(reasoning);
+  if (step.reasoning) {
+    const reasoning: ThinkingContent = { type: 'thinking', thinking: '' };
+    partial.content.push(reasoning);
+    const contentIndex = partial.content.length - 1;
+    stream.push({ type: 'thinking_start', contentIndex, partial });
+    if (step.streamedReasoning) {
+      reasoning.thinking = step.streamedReasoning;
       stream.push({
-        type: 'thinking_start',
-        contentIndex: partial.content.length - 1,
-        partial,
-      });
-      // Intentionally publish no thinking_delta. The real Codex websocket can
-      // reveal the complete summary only when the reasoning item is finalized.
-      reasoning.thinking = step.reasoning;
-      stream.push({
-        type: 'thinking_end',
-        contentIndex: partial.content.length - 1,
-        content: step.reasoning,
+        type: 'thinking_delta',
+        contentIndex,
+        delta: step.streamedReasoning,
         partial,
       });
     }
+    reasoning.thinking = step.reasoning;
+    stream.push({
+      type: 'thinking_end',
+      contentIndex,
+      content: step.reasoning,
+      partial,
+    });
+  }
+
+  if (step.kind === 'answer') {
     const text: TextContent = { type: 'text', text: '' };
     partial.content.push(text);
     const contentIndex = partial.content.length - 1;
@@ -187,16 +206,21 @@ async function emitScriptedResponse(
     await onStreamBoundary?.({ type: 'after-text-delta', ordinal });
     stream.push({ type: 'text_end', contentIndex, content: step.text, partial });
   } else {
-    const toolCall: ToolCall = {
-      type: 'toolCall',
-      id: step.callId,
-      name: step.name,
-      arguments: step.args,
-    };
-    partial.content.push(toolCall);
-    const contentIndex = partial.content.length - 1;
-    stream.push({ type: 'toolcall_start', contentIndex, partial });
-    stream.push({ type: 'toolcall_end', contentIndex, toolCall, partial });
+    const calls = step.kind === 'tool-call'
+      ? [{ callId: step.callId, name: step.name, args: step.args }]
+      : step.calls;
+    for (const call of calls) {
+      const toolCall: ToolCall = {
+        type: 'toolCall',
+        id: call.callId,
+        name: call.name,
+        arguments: call.args,
+      };
+      partial.content.push(toolCall);
+      const contentIndex = partial.content.length - 1;
+      stream.push({ type: 'toolcall_start', contentIndex, partial });
+      stream.push({ type: 'toolcall_end', contentIndex, toolCall, partial });
+    }
   }
 
   stream.push({
@@ -207,17 +231,26 @@ async function emitScriptedResponse(
 }
 
 function assistantMessage(model: Model<string>, step: ScriptedCodexStep): AssistantMessage {
+  const reasoning = step.reasoning
+    ? [{ type: 'thinking' as const, thinking: step.reasoning }]
+    : [];
   const content: AssistantMessage['content'] = step.kind === 'answer'
     ? [
-        ...(step.reasoning ? [{ type: 'thinking' as const, thinking: step.reasoning }] : []),
+        ...reasoning,
         { type: 'text', text: step.text },
       ]
-    : [{
-        type: 'toolCall',
-        id: step.callId,
-        name: step.name,
-        arguments: step.args,
-      }];
+    : [
+        ...reasoning,
+        ...(step.kind === 'tool-call'
+          ? [{ callId: step.callId, name: step.name, args: step.args }]
+          : step.calls)
+          .map((call) => ({
+            type: 'toolCall' as const,
+            id: call.callId,
+            name: call.name,
+            arguments: call.args,
+          })),
+      ];
   return {
     role: 'assistant',
     content,
@@ -238,7 +271,7 @@ function assistantMessage(model: Model<string>, step: ScriptedCodexStep): Assist
         total: 0.000183,
       },
     },
-    stopReason: step.kind === 'tool-call' ? 'toolUse' : 'stop',
+    stopReason: step.kind === 'answer' ? 'stop' : 'toolUse',
     responseId: step.responseId,
     timestamp: Date.now(),
   };

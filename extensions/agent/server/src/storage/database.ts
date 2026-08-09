@@ -13,10 +13,13 @@ import {
   agentSchemaFingerprint,
   createAgentSchemaV1,
   createAgentSchemaV2,
+  createAgentSchemaV3,
   listAgentDatabaseTables,
   migrateAgentSchemaV1ToV2,
+  migrateAgentSchemaV2ToV3,
   validateAgentSchemaV1,
   validateAgentSchemaV2,
+  validateAgentSchemaV3,
 } from './schema.ts';
 
 export type AgentDatabaseDiagnostics = {
@@ -100,7 +103,7 @@ export async function openAgentDatabase(options: AgentDataRootOptions = {}) {
           `Refusing to initialize an unversioned Agent database containing tables: ${tables.join(', ')}.`,
         );
       }
-    } else if (version !== 1 && version !== AGENT_JOURNAL_SCHEMA_VERSION) {
+    } else if (version !== 1 && version !== 2 && version !== AGENT_JOURNAL_SCHEMA_VERSION) {
       throw new AgentSchemaVersionError(`Unsupported Agent journal schema version ${version}.`);
     }
 
@@ -108,7 +111,7 @@ export async function openAgentDatabase(options: AgentDataRootOptions = {}) {
     applyConnectionPragmas(database);
     await secureDatabaseSidecars(paths.database);
     if (version === 0) {
-      runTransaction(database, () => createAgentSchemaV2(database));
+      runTransaction(database, () => createAgentSchemaV3(database));
     } else if (version === 1) {
       const versionOneReference = new sqlite.DatabaseSync(':memory:');
       try {
@@ -118,16 +121,26 @@ export async function openAgentDatabase(options: AgentDataRootOptions = {}) {
         versionOneReference.close();
       }
       runTransaction(database, () => migrateAgentSchemaV1ToV2(database));
+      runTransaction(database, () => migrateAgentSchemaV2ToV3(database));
+    } else if (version === 2) {
+      const versionTwoReference = new sqlite.DatabaseSync(':memory:');
+      try {
+        createAgentSchemaV2(versionTwoReference);
+        validateAgentSchemaV2(database, agentSchemaFingerprint(versionTwoReference));
+      } finally {
+        versionTwoReference.close();
+      }
+      runTransaction(database, () => migrateAgentSchemaV2ToV3(database));
     }
     const reference = new sqlite.DatabaseSync(':memory:');
     let expectedFingerprint: string;
     try {
-      createAgentSchemaV2(reference);
+      createAgentSchemaV3(reference);
       expectedFingerprint = agentSchemaFingerprint(reference);
     } finally {
       reference.close();
     }
-    validateAgentSchemaV2(database, expectedFingerprint);
+    validateAgentSchemaV3(database, expectedFingerprint);
     runQuickCheck(database);
     return new AgentDatabase(database, paths);
   } catch (error) {

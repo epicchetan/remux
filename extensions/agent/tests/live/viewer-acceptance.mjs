@@ -39,9 +39,14 @@ try {
     url.searchParams.set('remuxResourceId', options.conversationId);
     await page.goto(url.toString(), { waitUntil: 'domcontentloaded' });
     const transcript = page.getByTestId('agent-transcript-content');
-    await transcript.getByText('REMUX_CLEAN_FIRST_OK', { exact: true }).waitFor({ timeout: 20_000 });
-    await transcript.getByText('REMUX_CONTEXT_8AUG26 REMUX_CLEAN_SECOND_OK', { exact: true })
-      .waitFor({ timeout: 20_000 });
+    if (options.generic) {
+      await transcript.locator('[data-turn-id]').last().waitFor({ timeout: 20_000 });
+      await transcript.locator('.codex-assistant-message').last().waitFor({ timeout: 20_000 });
+    } else {
+      await transcript.getByText('REMUX_CLEAN_FIRST_OK', { exact: true }).waitFor({ timeout: 20_000 });
+      await transcript.getByText('REMUX_CONTEXT_8AUG26 REMUX_CLEAN_SECOND_OK', { exact: true })
+        .waitFor({ timeout: 20_000 });
+    }
     await page.getByRole('button', { name: 'Send message', exact: true }).waitFor();
 
     if (target.name === 'desktop') {
@@ -62,10 +67,22 @@ try {
         throw new Error('The live transcript geometry roots are missing.');
       }
       const contentRect = content.getBoundingClientRect();
+      const rect = (selector) => {
+        const element = document.querySelector(selector);
+        if (!(element instanceof HTMLElement)) return null;
+        const bounds = element.getBoundingClientRect();
+        return { left: bounds.left, right: bounds.right, width: bounds.width };
+      };
       return {
         contentLeft: contentRect.left,
         contentRight: contentRect.right,
+        contentWidth: contentRect.width,
         documentOverflow: document.documentElement.scrollWidth - window.innerWidth,
+        lastAssistant: rect('.codex-assistant-message:last-of-type'),
+        lastMarkdown: rect('.codex-assistant-message:last-of-type .codex-markdown'),
+        mainPane: rect('.remux-main-pane'),
+        transcriptLane: rect('.codex-transcript-lane'),
+        transcriptSlot: rect('.remux-transcript-slot'),
         transcriptOverflow: transcript.scrollWidth - transcript.clientWidth,
         viewportWidth: window.innerWidth,
       };
@@ -74,6 +91,16 @@ try {
     assert.ok(geometry.transcriptOverflow <= 1, `${target.name} transcript overflowed by ${geometry.transcriptOverflow}px.`);
     assert.ok(geometry.contentLeft >= -1, `${target.name} transcript escaped the left edge.`);
     assert.ok(geometry.contentRight <= geometry.viewportWidth + 1, `${target.name} transcript escaped the right edge.`);
+    assert.ok(
+      geometry.contentWidth >= Math.min(96, geometry.viewportWidth * 0.5),
+      `${target.name} transcript collapsed to ${geometry.contentWidth}px.`,
+    );
+    assert.ok(
+      !geometry.lastMarkdown || geometry.lastMarkdown.width >= Math.min(96, geometry.viewportWidth * 0.5),
+      `${target.name} Markdown collapsed to ${geometry.lastMarkdown?.width}px.`,
+    );
+    const visibleErrors = await page.getByRole('alert').allTextContents();
+    assert.deepEqual(visibleErrors, [], `${target.name} viewer exposed an error status.`);
     assert.deepEqual(pageErrors, []);
 
     const screenshot = resolve(options.outputDir, `${target.name}.png`);
@@ -93,8 +120,13 @@ process.stdout.write(`${JSON.stringify({
 
 function parseOptions(args) {
   const values = new Map();
+  const flags = new Set();
   for (let index = 0; index < args.length; index += 1) {
     const key = args[index];
+    if (key === '--generic') {
+      flags.add(key);
+      continue;
+    }
     const value = args[index + 1];
     if (!key?.startsWith('--') || !value || value.startsWith('--')) {
       throw new Error(`Expected --name value arguments; received ${key ?? '<end>'}.`);
@@ -108,6 +140,7 @@ function parseOptions(args) {
   return {
     conversationId,
     cwd: resolve(values.get('--cwd') ?? repositoryRoot),
+    generic: flags.has('--generic'),
     httpBase: values.get('--http-base') ?? 'http://127.0.0.1:48123',
     outputDir: resolve(values.get('--output-dir') ?? '/tmp/remux-agent-live-viewer'),
     tokenFile: resolve(values.get('--token-file') ?? resolve(repositoryRoot, '.remux/auth-token')),

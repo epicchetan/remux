@@ -11,17 +11,27 @@ import {
 import {
   AGENT_METHODS,
   AGENT_RESOURCE_KEYS,
+  contextResourceKey,
+  queueResourceKey,
+  type AgentComposerMessagePart,
   type AgentResourceKey,
   type AgentRuntimeValue,
+  type AgentPendingQueueValue,
   type AuthValue,
   type ConversationSummary,
   type ConversationValue,
+  type ContextInspectorValue,
   type ModelsValue,
   type MessageSendResult,
+  type MessageBranchResult,
 } from '../../shared/protocol.ts';
 import { ComposerContent } from './composer/content.tsx';
 import { createEmptyComposerSnapshot } from './composer/model/composerModel.ts';
+import { composerResourcesFromSnapshot } from './composer/model/userInputInterop.ts';
+import { ComposerMentionPicker } from './composer/mentions/MentionPicker.tsx';
+import { parseComposerMentionQuery } from './composer/mentions/mentionSearch.ts';
 import { useComposerStore } from './composer/store.ts';
+import type { ComposerEditTarget, ComposerForkTarget } from './composer/store.ts';
 import { AgentDirectoryPicker } from './conversation/DirectoryPicker.tsx';
 import {
   loadConversationDraft,
@@ -90,6 +100,8 @@ export function App() {
   const loadHistory = useConversationHistoryStore((state) => state.load);
   const resetHistoryReader = useConversationHistoryStore((state) => state.resetReader);
   const [runtime, setRuntime] = useState<AgentRuntimeValue | null>(null);
+  const [contextInspector, setContextInspector] = useState<ContextInspectorValue | null>(null);
+  const [queue, setQueue] = useState<AgentPendingQueueValue | null>(null);
   const conversation = useMemo(
     () => conversationSummary ? projectConversation(conversationSummary, runtime) : null,
     [conversationSummary, runtime],
@@ -107,7 +119,12 @@ export function App() {
   const modelId = useComposerStore((state) => state.modelId);
   const reasoning = useComposerStore((state) => state.reasoning);
   const composerSnapshot = useComposerStore((state) => state.snapshot);
-  const setComposerDocument = useComposerStore((state) => state.setDocument);
+  const composerPresentationRequest = useComposerStore((state) => state.composerPresentationRequest);
+  const editTarget = useComposerStore((state) => state.editTarget);
+  const focusComposer = useComposerStore((state) => state.focusComposer);
+  const forkTarget = useComposerStore((state) => state.forkTarget);
+  const mentionSession = useComposerStore((state) => state.mentionSession);
+  const setComposerDocument = useComposerStore((state) => state.setComposerDocument);
   const setModelId = useComposerStore((state) => state.setModelId);
   const setModels = useComposerStore((state) => state.setModels);
   const setReasoning = useComposerStore((state) => state.setReasoning);
@@ -123,7 +140,13 @@ export function App() {
   const [composerDomFocused, setComposerDomFocused] = useState(false);
   const [composerLiftPx, setComposerLiftPx] = useState(0);
   const [pickerOverlayStyle, setPickerOverlayStyle] = useState<CSSProperties | null>(null);
-  const composerShouldLift = directoryPickerOpen || composerDomFocused;
+  const mentionQuery = mentionSession
+    ? parseComposerMentionQuery(mentionSession.query).normalizedQuery
+    : '';
+  const mentionPickerVisible = mentionQuery.length > 0;
+  const pickerOverlayVisible = mentionPickerVisible || directoryPickerOpen;
+  const composerPresentationActive = Boolean(editTarget || forkTarget || mentionSession);
+  const composerShouldLift = composerPresentationActive || directoryPickerOpen || composerDomFocused;
   const mainPaneStyle = { '--remux-composer-lift': `${composerLiftPx}px` } as CSSProperties;
 
   const refresh = useCallback(async (keys?: AgentResourceKey[]) => {
@@ -133,14 +156,20 @@ export function App() {
       observeTranscriptServerGeneration(update.serverGeneration);
       if (update.generationChanged) {
         setRuntime(null);
+        setContextInspector(null);
+        setQueue(null);
       }
       for (const key of update.missing) {
         if (key === AGENT_RESOURCE_KEYS.runtime) setRuntime(null);
+        if (key.startsWith('context:')) setContextInspector(null);
+        if (key.startsWith('queue:')) setQueue(null);
       }
       for (const [key, value] of update.values) {
         if (key === AGENT_RESOURCE_KEYS.auth) setAuth(value as AuthValue);
         if (key === AGENT_RESOURCE_KEYS.models) setModels(value as ModelsValue);
         if (key === AGENT_RESOURCE_KEYS.runtime) setRuntime(value as AgentRuntimeValue);
+        if (key.startsWith('context:')) setContextInspector(value as ContextInspectorValue);
+        if (key.startsWith('queue:')) setQueue(value as AgentPendingQueueValue);
       }
       setError(null);
     } catch (refreshError) {
@@ -176,7 +205,9 @@ export function App() {
       const keys = resources
         .map((invalidation) => invalidation.key as AgentResourceKey)
         .filter((key) => key === AGENT_RESOURCE_KEYS.auth ||
-          key === AGENT_RESOURCE_KEYS.models || key === AGENT_RESOURCE_KEYS.runtime);
+          key === AGENT_RESOURCE_KEYS.models || key === AGENT_RESOURCE_KEYS.runtime ||
+          key === contextResourceKey(activeConversationIdRef.current ?? '') ||
+          key === queueResourceKey(activeConversationIdRef.current ?? ''));
       if (keys.length > 0) scheduleRefresh(keys);
     });
     const unsubscribeStatus = subscribeHostStatus((status) => {
@@ -211,21 +242,34 @@ export function App() {
     draftRef.current = draft;
   }, [activeConversationId, activeDraftId, draft]);
 
+  useEffect(() => {
+    setContextInspector(null);
+    setQueue(null);
+    if (activeConversationId) void refresh([
+      contextResourceKey(activeConversationId),
+      queueResourceKey(activeConversationId),
+    ]);
+  }, [activeConversationId, refresh]);
+
   const restoreComposerSnapshot = useCallback((snapshot: ReturnType<typeof createEmptyComposerSnapshot>) => {
     composerRestorePendingRef.current = snapshot.contentKey;
-    setComposerDocument(snapshot.document);
+    setComposerDocument(snapshot.document, composerResourcesFromSnapshot(snapshot));
   }, [setComposerDocument]);
 
   useEffect(() => {
-    if (activeDraftId && draft?.id === activeDraftId) {
-      if (draft.cwd) setCwd(draft.cwd);
-      if (draft.modelId) setModelId(draft.modelId);
-      setReasoning(draft.reasoning);
-      restoreComposerSnapshot(draft.snapshot);
+    if (activeDraftId) {
+      const currentDraft = draftRef.current?.id === activeDraftId
+        ? draftRef.current
+        : loadNewChatDraft(activeDraftId);
+      if (!currentDraft) return;
+      if (currentDraft.cwd) setCwd(currentDraft.cwd);
+      if (currentDraft.modelId) setModelId(currentDraft.modelId);
+      setReasoning(currentDraft.reasoning);
+      restoreComposerSnapshot(currentDraft.snapshot);
     } else if (activeConversationId) {
       restoreComposerSnapshot(loadConversationDraft(activeConversationId) ?? createEmptyComposerSnapshot());
     }
-  }, []);
+  }, [activeConversationId, activeDraftId, restoreComposerSnapshot, setCwd, setModelId, setReasoning]);
 
   useEffect(() => {
     const pendingRestore = composerRestorePendingRef.current;
@@ -369,7 +413,7 @@ export function App() {
   }), [selectConversation, startNewChat]);
 
   const updatePickerGeometry = useCallback(() => {
-    if (!directoryPickerOpen) {
+    if (!pickerOverlayVisible) {
       setPickerOverlayStyle(null);
       return;
     }
@@ -383,7 +427,7 @@ export function App() {
         .then((metrics) => setPickerOverlayStyle(measurePickerOverlay(mainRect, bottomBarRect, metrics)))
         .catch(() => setPickerOverlayStyle(measurePickerOverlay(mainRect, bottomBarRect, null)));
     }));
-  }, [directoryPickerOpen, getHostViewportMetrics]);
+  }, [getHostViewportMetrics, pickerOverlayVisible]);
 
   const updateComposerLiftGeometry = useCallback(() => {
     window.requestAnimationFrame(() => {
@@ -455,7 +499,32 @@ export function App() {
   }, [composerShouldLift, updateComposerLiftGeometry]);
 
   useEffect(() => {
-    if (!directoryPickerOpen) {
+    if (composerPresentationRequest.id === 0) return;
+    let cancelled = false;
+    const frames: number[] = [];
+    const timers: number[] = [];
+    const present = () => {
+      if (cancelled) return;
+      updateComposerLiftGeometry();
+      const first = window.requestAnimationFrame(() => {
+        const second = window.requestAnimationFrame(() => {
+          if (!cancelled) focusComposer();
+        });
+        frames.push(second);
+      });
+      frames.push(first);
+    };
+    present();
+    for (const delay of [50, 150, 300]) timers.push(window.setTimeout(present, delay));
+    return () => {
+      cancelled = true;
+      frames.forEach((frame) => window.cancelAnimationFrame(frame));
+      timers.forEach((timer) => window.clearTimeout(timer));
+    };
+  }, [composerPresentationRequest.id, focusComposer, updateComposerLiftGeometry]);
+
+  useEffect(() => {
+    if (!pickerOverlayVisible) {
       setPickerOverlayStyle(null);
       return;
     }
@@ -473,11 +542,11 @@ export function App() {
       viewport?.removeEventListener('resize', updatePickerGeometry);
       viewport?.removeEventListener('scroll', updatePickerGeometry);
     };
-  }, [directoryPickerOpen, updatePickerGeometry]);
+  }, [pickerOverlayVisible, updatePickerGeometry]);
 
   useEffect(() => {
-    if (directoryPickerOpen) updatePickerGeometry();
-  }, [composerLiftPx, directoryPickerOpen, hostViewportMetrics, updatePickerGeometry]);
+    if (pickerOverlayVisible) updatePickerGeometry();
+  }, [composerLiftPx, hostViewportMetrics, pickerOverlayVisible, updatePickerGeometry]);
 
   const runAuth = useCallback(async (action: () => Promise<unknown>) => {
     setAuthBusy(true);
@@ -522,7 +591,7 @@ export function App() {
   }, [cwd, ensureConversation, modelId, reasoning]);
 
   const send = useCallback(async (
-    text: string,
+    input: { displayText: string; parts: AgentComposerMessagePart[] },
     setPhase: (phase: 'sending' | 'updating-transcript') => void,
   ) => {
     setError(null);
@@ -537,23 +606,63 @@ export function App() {
         operationId,
         conversationId: activeId,
         clientMessageId,
-        text,
+        parts: input.parts,
+        text: input.displayText,
       });
     } catch (reason) {
       discardTranscriptUserMessage(clientMessageId);
       throw reason;
     }
-    trackTranscriptUserMessage(activeId, clientMessageId, sent.turnId);
+    if (sent.turnId) {
+      trackTranscriptUserMessage(activeId, clientMessageId, sent.turnId);
+    } else {
+      discardTranscriptUserMessage(clientMessageId);
+    }
     setPhase('updating-transcript');
     removeConversationDraft(activeId);
     await Promise.all([
-      refresh([AGENT_RESOURCE_KEYS.runtime]),
+      refresh([AGENT_RESOURCE_KEYS.runtime, queueResourceKey(activeId)]),
       ensureConversation(activeId, true),
       ...(activeConversationIdRef.current === activeId
         ? [refreshActiveTranscriptResources({ forceFullMeasure: false, preserveReady: true, windowPolicy: 'tail' })]
         : []),
     ]);
   }, [conversation?.id, createConversation, ensureConversation, refresh]);
+
+  const branchMessage = useCallback(async (
+    mode: 'edit' | 'fork',
+    target: ComposerEditTarget | ComposerForkTarget,
+    input: { displayText: string; parts: AgentComposerMessagePart[] },
+    setPhase: (phase: 'sending' | 'updating-transcript') => void,
+  ) => {
+    setError(null);
+    setPhase('sending');
+    const clientMessageId = createViewerUuid();
+    const result = await rpc.command<MessageBranchResult>(
+      mode === 'edit' ? AGENT_METHODS.messageEdit : AGENT_METHODS.messageFork,
+      {
+        operationId: createViewerUuid(),
+        clientMessageId,
+        parts: input.parts,
+        text: input.displayText,
+        sourceConversationId: target.conversationId,
+        sourceMessageId: mode === 'edit'
+          ? (target as ComposerEditTarget).userMessageId
+          : (target as ComposerForkTarget).assistantMessageId,
+        sourceTurnId: target.turnId,
+      },
+    );
+    removeConversationDraft(target.conversationId);
+    trackTranscriptUserMessage(result.conversationId, clientMessageId, result.turnId);
+    setPhase('updating-transcript');
+    await ensureConversation(result.conversationId, true);
+    selectConversation(result.conversationId, result.turnId);
+    await getTranscriptResourceState().setActiveConversationId(result.conversationId);
+    await Promise.all([
+      refresh([AGENT_RESOURCE_KEYS.runtime, queueResourceKey(result.conversationId)]),
+      refreshActiveTranscriptResources({ forceFullMeasure: true, preserveReady: false, windowPolicy: 'tail' }),
+    ]);
+  }, [ensureConversation, refresh, selectConversation]);
 
   const interrupt = useCallback(async () => {
     if (!conversation?.activeTurnId) return;
@@ -659,17 +768,25 @@ export function App() {
         <div className="remux-bottom-bar-slot" ref={bottomBarSlotRef}>
           <ComposerContent
             conversation={conversation}
+            contextInspector={contextInspector}
             conversationSelected={Boolean(activeConversationId)}
             onInterrupt={interrupt}
-            onNewChat={() => startNewChat()}
+            onEdit={(target, input, setPhase) => branchMessage('edit', target, input, setPhase)}
+            onFork={(target, input, setPhase) => branchMessage('fork', target, input, setPhase)}
+            onQueueChanged={() => activeConversationId
+              ? refresh([queueResourceKey(activeConversationId)])
+              : Promise.resolve()}
             onSend={send}
             onSignOut={() => void runAuth(() => rpc.command(AGENT_METHODS.authLogout))}
             runtimeError={error ?? conversation?.error ?? null}
+            queue={queue}
           />
         </div>
-        {directoryPickerOpen ? (
+        {pickerOverlayVisible ? (
           <div className="remux-file-mention-overlay" data-remux-no-composer-focus style={pickerOverlayStyle ?? undefined}>
-            <AgentDirectoryPicker />
+            {mentionPickerVisible && mentionSession
+              ? <ComposerMentionPicker session={mentionSession} />
+              : directoryPickerOpen ? <AgentDirectoryPicker /> : null}
           </div>
         ) : null}
       </section>

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { Boxes, Check, ChevronDown, Play, RefreshCw, Sparkles, Wrench } from 'lucide-react';
+import { Boxes, Check, ChevronDown, LogOut, Play, RefreshCw, Sparkles, Wrench } from 'lucide-react';
 import { reloadHostView } from '@remux/viewer-kit/host';
 
 import { reasoningLabel, resolveModel } from './modelSelection.ts';
@@ -7,7 +7,15 @@ import { useComposerStore } from '../store.ts';
 
 type ConfigSection = 'model' | 'reasoning';
 
-export function ComposerConfigButton({ disabled = false, locked = false }: { disabled?: boolean; locked?: boolean }) {
+export function ComposerConfigButton({
+  disabled = false,
+  locked = false,
+  onSignOut,
+}: {
+  disabled?: boolean;
+  locked?: boolean;
+  onSignOut: () => void;
+}) {
   const modelId = useComposerStore((state) => state.modelId);
   const models = useComposerStore((state) => state.models);
   const reasoning = useComposerStore((state) => state.reasoning);
@@ -71,6 +79,14 @@ export function ComposerConfigButton({ disabled = false, locked = false }: { dis
             onClick={() => {
               setOpen(false);
               void reloadHostView();
+            }}
+          />
+          <ConfigAction
+            icon={<LogOut className="size-4" />}
+            label="Sign out"
+            onClick={() => {
+              setOpen(false);
+              onSignOut();
             }}
           />
           {models?.models.length ? (

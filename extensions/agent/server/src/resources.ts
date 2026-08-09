@@ -123,6 +123,8 @@ function resourceInvalidation(
     key === 'conversation-list' ||
     key === 'runtime' ||
     key.startsWith('conversation:')
+    || key.startsWith('context:')
+    || key.startsWith('queue:')
   ) {
     return {
       type: 'resource',

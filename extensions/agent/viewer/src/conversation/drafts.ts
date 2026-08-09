@@ -1,7 +1,9 @@
 import type { ReasoningLevel } from '../../../shared/protocol.ts';
 import {
   createComposerSnapshot,
+  type ComposerAttachmentResource,
   type ComposerDocument,
+  type ComposerDocumentPart,
   type ComposerSnapshot,
 } from '../composer/model/composerModel.ts';
 
@@ -66,27 +68,95 @@ export function removeConversationDraft(conversationId: string) {
 }
 
 function persistedSnapshot(snapshot: ComposerSnapshot) {
-  return { document: snapshot.document };
+  return {
+    ...snapshot,
+    attachments: snapshot.attachments.map((attachment) => ({
+      ...attachment,
+      previewUrl: attachment.dataUrl,
+    })),
+  };
 }
 
 function parseSnapshot(value: unknown): ComposerSnapshot | null {
   if (!value || typeof value !== 'object') return null;
   const document = parseDocument((value as { document?: unknown }).document);
-  return document ? createComposerSnapshot(document) : null;
+  if (!document) return null;
+  const attachments = Array.isArray((value as { attachments?: unknown }).attachments)
+    ? (value as { attachments: unknown[] }).attachments.flatMap(parseAttachment)
+    : [];
+  const resources = new Map(attachments.map((resource) => [resource.id, resource]));
+  return createComposerSnapshot(document, resources);
 }
 
 function parseDocument(value: unknown): ComposerDocument | null {
   if (!value || typeof value !== 'object' || !Array.isArray((value as ComposerDocument).parts)) return null;
   const parts = (value as { parts: unknown[] }).parts;
-  if (parts.length > 1) return null;
-  const parsed = parts.flatMap((part) => {
-    if (!part || typeof part !== 'object') return [];
-    const candidate = part as { id?: unknown; text?: unknown; type?: unknown };
-    return candidate.type === 'text' && typeof candidate.id === 'string' && typeof candidate.text === 'string'
-      ? [{ id: candidate.id, text: candidate.text, type: 'text' as const }]
-      : [];
-  });
+  const parsed: ComposerDocumentPart[] = [];
+  for (const part of parts) {
+    if (!part || typeof part !== 'object') return null;
+    const candidate = part as Record<string, unknown>;
+    if (candidate.type === 'text' && typeof candidate.text === 'string') {
+      parsed.push({ text: candidate.text, type: 'text' });
+      continue;
+    }
+    if (
+      candidate.type === 'mention' &&
+      typeof candidate.id === 'string' &&
+      (candidate.kind === 'directory' || candidate.kind === 'file') &&
+      typeof candidate.name === 'string' &&
+      typeof candidate.path === 'string'
+    ) {
+      parsed.push({
+        id: candidate.id,
+        kind: candidate.kind,
+        name: candidate.name,
+        path: candidate.path,
+        type: 'mention',
+      });
+      continue;
+    }
+    if (
+      candidate.type === 'attachment' &&
+      typeof candidate.id === 'string' &&
+      (typeof candidate.mimeType === 'string' || candidate.mimeType === null) &&
+      typeof candidate.name === 'string'
+    ) {
+      parsed.push({
+        id: candidate.id,
+        mimeType: candidate.mimeType,
+        name: candidate.name,
+        type: 'attachment',
+      });
+      continue;
+    }
+    return null;
+  }
   return parsed.length === parts.length ? { parts: parsed } : null;
+}
+
+function parseAttachment(value: unknown): ComposerAttachmentResource[] {
+  if (!value || typeof value !== 'object') return [];
+  const candidate = value as Record<string, unknown>;
+  if (
+    typeof candidate.id !== 'string' ||
+    typeof candidate.name !== 'string' ||
+    typeof candidate.mimeType !== 'string' ||
+    typeof candidate.dataUrl !== 'string' ||
+    !candidate.dataUrl.startsWith('data:image/') ||
+    typeof candidate.digest !== 'string' ||
+    typeof candidate.sizeBytes !== 'number'
+  ) return [];
+  return [{
+    dataUrl: candidate.dataUrl,
+    digest: candidate.digest,
+    error: typeof candidate.error === 'string' ? candidate.error : null,
+    file: null,
+    id: candidate.id,
+    mimeType: candidate.mimeType,
+    name: candidate.name,
+    previewUrl: candidate.dataUrl,
+    sizeBytes: candidate.sizeBytes,
+  }];
 }
 
 function isReasoningLevel(value: unknown): value is ReasoningLevel {

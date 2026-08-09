@@ -64,6 +64,8 @@ export function WorkSection({
   }, [isOpen, rowId, setAdditionalHeight, workKey]);
 
   const completed = segment.state !== 'running';
+  const reasoning = segment.timeline.filter((entry) => entry.type === 'text');
+  const workGroups = segment.timeline.filter((entry) => entry.type === 'group');
   return (
     <section className="codex-work-section" data-state={segment.state}>
       <button
@@ -89,14 +91,12 @@ export function WorkSection({
       <Separator className="codex-work-separator" />
       {isOpen ? (
         <div className="codex-work-content" ref={contentRef}>
-          {segment.timeline.map((entry) => entry.type === 'text' ? (
-            <div key={entry.id}>
-              <MarkdownBlock density="work" width={laneWidth}>
-                {entry.text}
-              </MarkdownBlock>
-              <ExactContent content={entry.content} preview={entry.text} title="reasoning" />
-            </div>
-          ) : (
+          <ReasoningDisclosure
+            entries={reasoning}
+            laneWidth={laneWidth}
+            running={segment.state === 'running'}
+          />
+          {workGroups.map((entry) => (
             <WorkGroup
               conversationId={conversationId}
               group={entry}
@@ -111,6 +111,48 @@ export function WorkSection({
       ) : null}
     </section>
   );
+}
+
+function ReasoningDisclosure({
+  entries,
+  laneWidth,
+  running,
+}: {
+  entries: Extract<AgentWorkRenderSegment['timeline'][number], { type: 'text' }>[];
+  laneWidth: number;
+  running: boolean;
+}) {
+  if (entries.length === 0) return null;
+  const latest = reasoningPreview(entries.at(-1)?.text ?? '');
+  return (
+    <details className="agent-reasoning-disclosure">
+      <summary>
+        <span className="agent-reasoning-label">Reasoning</span>
+        <span className="agent-reasoning-count">
+          {entries.length} {entries.length === 1 ? 'update' : 'updates'}
+        </span>
+        {running && latest ? <span className="agent-reasoning-preview">{latest}</span> : null}
+        <ChevronRight aria-hidden="true" className="agent-reasoning-chevron size-3.5" />
+      </summary>
+      <div className="agent-reasoning-content">
+        {entries.map((entry) => (
+          <div className="agent-reasoning-entry" key={entry.id}>
+            <MarkdownBlock density="work" width={laneWidth}>
+              {entry.text}
+            </MarkdownBlock>
+            <ExactContent content={entry.content} preview={entry.text} title="reasoning" />
+          </div>
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function reasoningPreview(value: string) {
+  return value
+    .replace(/[*_`#>]/gu, '')
+    .replace(/\s+/gu, ' ')
+    .trim();
 }
 
 function WorkGroup({

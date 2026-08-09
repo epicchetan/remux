@@ -10,13 +10,13 @@ import {
 test('normalizes text into one stable document part', () => {
   const normalized = normalizeComposerDocument({
     parts: [
-      { id: 'stable', text: 'one', type: 'text' },
-      { id: 'discarded', text: '\ntwo', type: 'text' },
+      { text: 'one', type: 'text' },
+      { text: '\ntwo', type: 'text' },
     ],
   });
 
-  assert.deepEqual(normalized, { parts: [{ id: 'stable', text: 'one\ntwo', type: 'text' }] });
-  assert.equal(createComposerSnapshot(normalized).contentKey, 'stable:one\ntwo');
+  assert.deepEqual(normalized, { parts: [{ text: 'one\ntwo', type: 'text' }] });
+  assert.equal(createComposerSnapshot(normalized).contentKey, 'text:one\ntwo');
 });
 
 test('distinguishes whitespace-only and sendable text', () => {

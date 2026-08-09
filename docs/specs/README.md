@@ -22,6 +22,9 @@ Last verified: YYYY-MM-DD
 Canonical code: ...
 ```
 
+The active Agent context implementation contract is
+[agent-context-workspace-v1.md](agent-context-workspace-v1.md).
+
 ## Codex Specs
 
 | Spec | Status | Notes |
@@ -67,10 +70,10 @@ Canonical code: ...
 
 | Spec | Status | Notes |
 | --- | --- | --- |
-| [agent-runtime-and-epoch-context.md](agent-runtime-and-epoch-context.md) | Active Spec | Single-provider Remux agent built on embedded Pi + the owner's `openai-codex` subscription, with a purpose-built Remux UI and OAuth. Phase 0 is an owner-accepted ephemeral integration spine; the final harness adds lossless journal/artifact storage, deterministic epoch rollover, and a ~150k hard input budget. No native/manual compaction, app-server/API-key/Anthropic fallback, narration, research, subagents, review mode, or old-history import. |
-| [agent-durable-epoch-core.md](agent-durable-epoch-core.md) | Active Spec | Implementation-ready Phase 0A–1D plan: completed live integration seal, early UI foundation port, SQLite journal and shadow compiler, mid-turn active epoch rollover, idempotent coding tools, reconnectable persistent processes, and deterministic plus paired real-work evaluation gates. |
+| [agent-runtime-and-epoch-context.md](agent-runtime-and-epoch-context.md) | Active Spec | Single-provider Remux agent built on embedded Pi + the owner's `openai-codex` subscription, with a purpose-built Remux UI and OAuth. Phase 0–1A.3 foundation is implemented; provider-context behavior is now governed by `agent-context-workspace-v1.md`. No native/manual compaction, app-server/API-key/Anthropic fallback, narration, research, subagents, review mode, or old-history import. |
+| [agent-durable-epoch-core.md](agent-durable-epoch-core.md) | Active Spec | Phase 0A–1D durable schema, replay, prompt-manifest, and inspector reference. Its diagnostic shadow design has been superseded by the model-managed workspace and active context-frame compiler in `agent-context-workspace-v1.md`. |
 | [agent-turns-and-work-units.md](agent-turns-and-work-units.md) | Active Spec | Empirically grounded refinement separating the user-visible turn from internal context lifetimes: schema v1 gives every direct turn a root execution scope and reserves optional child work scopes for bounded tool traces, resumable execution, evidence-backed handoffs, and local epochs while the parent retains intent, steering, permissions, and integration. Child execution remains inactive. |
-| [agent-ledger-benchmark-corpus.md](agent-ledger-benchmark-corpus.md) | R&D evidence | Detailed Ledger/Remux research corpus: Codex and Claude transcript/session IDs, commit associations, parsing caveats, clean and monster-turn fixtures, sanitized replay setup, experiment arms, and scoring guidance for the future Agent-versus-App-Server benchmark. |
+| [agent-ledger-benchmark-corpus.md](agent-ledger-benchmark-corpus.md) | R&D evidence + E0 | Detailed Ledger/Remux research corpus plus the implemented sanitized production-path E0 fixture, shared Codex/Agent controller, hidden reference validation, and first GPT-5.6 Sol baseline. |
 | [agent-ui-parity-and-phased-delivery.md](agent-ui-parity-and-phased-delivery.md) | Active Spec | Normative alignment for continuously porting the stable Codex UI into Agent, activating behavior only with Agent-owned server semantics, preserving owner review at each checkpoint, excluding narration/App Server-only features, and cutting over without a late bulk parity phase. |
 | [agent-phase-1a0-ui-port-scope.md](agent-phase-1a0-ui-port-scope.md) | Active Spec | Owner-approval contract for the first implementation checkpoint: exact Codex-to-Agent source/test closure, in-memory Agent turn-frame protocol, narration/exclusion removal audit, phased port sequence, and desktop/phone side-by-side acceptance. No durable journal or later Agent capability is authorized. |
 | [agent-phase-1a0-implementation-report.md](agent-phase-1a0-implementation-report.md) | Active Spec | Phase 1A.0 source/deviation/test record. Implementation, automated hardening, live desktop/physical-phone comparison, and explicit owner acceptance are complete. |
