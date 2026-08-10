@@ -1,6 +1,5 @@
 import type { AuthValue, ModelInfo } from '../../shared/protocol.ts';
 import type { AgentEngine, ConversationRuntime } from './engine.ts';
-import { compileShadowContext } from './context/compiler.ts';
 import { canonicalJsonHash } from './storage/canonical-json.ts';
 
 const FIXTURE_CONTRACTS_HASH = canonicalJsonHash({
@@ -53,14 +52,7 @@ export class FixtureEngine implements AgentEngine {
         controller = new AbortController();
         const signal = controller.signal;
         const context = await options.durability.compileContext();
-        const estimatedInputTokens = Math.max(1, Math.ceil(context.estimatedBytes / 4));
-        const compileStartedAt = performance.now();
-        const shadow = compileShadowContext(context.shadowSource, {
-          modelId: options.modelId,
-          contextWindow: fixtureModels[0]!.contextWindow,
-          fixedContractsHash: FIXTURE_CONTRACTS_HASH,
-          activeEstimatedInputTokens: estimatedInputTokens,
-        });
+        const estimatedInputTokens = context.frame.estimatedInputTokens;
         await options.durability.beforeProviderCall({
           payload: { messages: [{ role: 'user', content: text }] },
           requestMode: 'full',
@@ -72,8 +64,8 @@ export class FixtureEngine implements AgentEngine {
             orderedMessageHashes: context.orderedMessageHashes,
             messageCount: context.messages.length,
             fixedContractsHash: FIXTURE_CONTRACTS_HASH,
-            shadow,
-            shadowBuildDurationMs: Math.max(0, Math.round(performance.now() - compileStartedAt)),
+            frame: context.frame,
+            frameBuildDurationMs: 0,
             activeMessages: context.messages,
           },
         });
@@ -104,6 +96,23 @@ export class FixtureEngine implements AgentEngine {
             text: response,
             reasoning: '',
             calls: [],
+            providerMessage: {
+              role: 'assistant',
+              content: [{ type: 'text', text: response }],
+              api: 'openai-responses',
+              provider: 'openai-codex',
+              model: options.modelId,
+              usage: {
+                input: estimatedInputTokens,
+                output: Math.max(1, Math.ceil(response.length / 4)),
+                cacheRead: 0,
+                cacheWrite: 0,
+                totalTokens: estimatedInputTokens + Math.max(1, Math.ceil(response.length / 4)),
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+              },
+              stopReason: 'stop',
+              timestamp: Date.now(),
+            },
           });
           options.onEvent({ type: 'inference-end', state: 'completed' });
           await options.durability.beforeTool({

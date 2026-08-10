@@ -216,12 +216,12 @@ test('tool-result semantics preserve provider-visible unsafe JSON as exact text'
   );
 });
 
-test('context budget fails with an explicit rollover-required error', () => {
+test('context budget fails with an explicit execution-scope limit', () => {
   assert.doesNotThrow(() => assertContextBudget(4_999, 35_000));
   assert.throws(
     () => assertContextBudget(5_001, 35_000),
     (error) => error instanceof ContextRolloverRequiredError &&
-      error.kind === 'context_rollover_not_enabled' &&
+      error.kind === 'context_scope_limit' &&
       error.hardInputLimit === 10_000 &&
       error.safetyMargin === 5_000 &&
       error.admissionLimit === 5_000,

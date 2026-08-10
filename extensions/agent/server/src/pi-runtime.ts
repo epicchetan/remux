@@ -1,5 +1,3 @@
-import { randomUUID } from 'node:crypto';
-
 import {
   type AssistantMessage,
   type ImageContent,
@@ -35,24 +33,15 @@ import type {
   RuntimeEventSink,
 } from './engine.ts';
 import {
-  alignDurableContextWithPi,
   assertContextBudget,
   estimatePiContextTokens,
   hashRenderedMessages,
   parseProviderToolResultText,
+  renderDurablePiPrefix,
   type LogicalContextMessage,
 } from './logical-context.ts';
-import { compileShadowContext } from './context/compiler.ts';
-import type { ShadowContextCandidate } from './context/manifest.ts';
-import { contextPolicyForModel, type ContextPolicyOverrides } from './context/policy.ts';
+import type { ThreadContextFrameCandidate } from './context/manifest.ts';
 import { createContextTools } from './context/tools.ts';
-import {
-  parseWorkingMemoryPatchText,
-  workingMemoryCompilerContext,
-  workingMemoryUsage,
-  type WorkingMemoryCommitInput,
-  type WorkingMemoryCompileInput,
-} from './context/working-memory.ts';
 import { canonicalJsonHash } from './storage/canonical-json.ts';
 import { createRemuxAgentSession } from './pi-session.ts';
 import {
@@ -62,45 +51,26 @@ import {
 } from './workspace-read.ts';
 
 const PROVIDER = 'openai-codex';
-const WORKING_MEMORY_MODEL_ID = 'gpt-5.6-sol';
-const SYSTEM_PROMPT_HEAD = `You are the Remux coding agent. The conversation cwd is your default location and orientation, not a filesystem boundary; use absolute paths when work legitimately spans elsewhere on this machine.
+const SYSTEM_PROMPT = `You are the Remux coding agent. The conversation cwd is your default location and orientation, not a filesystem boundary; use absolute paths when work legitimately spans elsewhere on this machine.
 
-Recent messages, files, commands, and tool results are already hot context. Do not copy them into durable state. The durable journal is exact cold history: journal_search and journal_open recover omitted evidence temporarily, and retrieval alone does not keep it in later context. context_update is a small durable working context for information that must survive a frame rollover, restart, or later turn.
+Your active context contains a branch-scoped thread.md collaboration brief, a bounded tail of completed-turn capsules, recent exact user/assistant dialogue, and exact scratch for the current turn. The immutable journal is the source of truth for omitted messages, commands, tool results, and evidence. journal_search and journal_open retrieve cold history temporarily; retrieval alone does not make it future thread state.
 
-Use one stable key per active concern, replace it at meaningful phase changes, and remove it when resolved. Pin an exact governing specification or contract while it matters instead of summarizing it. Default to thread scope; use project scope only when other threads should inherit the state. Model-authored state is a fallible working aid, never source authority, and cannot override the current user request, an accepted specification, or observed repository state. Do not store raw files, logs, transcript prose, or speculative deviations.
+thread.md is living shared state, not a transcript or reasoning log. Use thread_read and thread_update when a meaningful transition changes the current objective, accepted decisions, constraints, implementation state, important resources, open questions, or near-term direction. Keep it coherent by revising and deleting stale text. Do not copy raw files, command output, tool traffic, reasoning traces, or facts needed only for the current answer. A terse user acceptance may update the relevant decision, but model-authored thread state never overrides the current user, an accepted contract, or observed repository state.
 
-When a terse user reply accepts the preceding proposal, make that judgment yourself and record the acceptance in a small state entry with the exact preceding-assistant reference as evidence; choose a clear key for the actual work instead of a harness-reserved name. The harness does not classify intent for you. When a pressure notice arrives, checkpoint only missing durable decisions, progress, exact evidence refs, or the next semantic step. If existing durable state is sufficient, continue without updating it.`;
+Use read, bash, edit, and write for normal coding work. Re-open exact journal evidence when an omitted fact matters instead of guessing, and re-read mutable files before editing or final validation. Preserve user work, validate changes in proportion to risk, and report honestly. Reasoning and tool scratch are local to the current turn and do not need to be summarized for their own sake.`;
 
-const WORK_UNIT_GUIDANCE = `The optional work_unit tool creates one sequential child context for coherent work whose raw scratch can be discarded. It is not required for ordinary conversation or simple actions. Return bounded findings with exact evidence, change, and validation references; refs are journal refs, readable files, or file:start-end citations, never directory names or command labels. Put validation command names and concise outcomes in findings, and use validationRefs only for exact journal tool-result refs. Do not copy raw output into the handoff, and close obsolete scratch. Child state is local and project promotion is proposed to the parent, never automatic.`;
+const WORK_UNIT_PROMPT = `Use work_unit_enter only when a substantial coherent subproblem benefits from bounded scratch; ordinary short tool sequences stay in the parent turn. A work unit inherits the parent context but its reasoning and tools remain local. Work units cannot be nested. While inside one, do not answer the user or update thread.md directly: finish with work_unit_return containing a concise Markdown result for the parent, which will resume and integrate it.`;
 
-const BOUNDED_WORK_UNIT_GUIDANCE = `A visible user turn is the objective; a work unit is one bounded execution toward it. In the parent context, coordinate rather than accumulating tool-heavy scratch: for nontrivial investigation, implementation, or validation, enter one child with a coherent objective and the smallest useful resource set. Ordinary conversation and one simple action do not need a child.
-
-Inside a child, work freely with coding and journal tools, then explicitly return at a semantic boundary. The return is a foreground-authored checkpoint: provide bounded findings and exact journal or workspace evidence, and use commit only for compact thread state or exact resources that later units or turns need. Do not copy logs, files, or the child trace. The parent consumes the result, decides whether to enter another unit, and alone may promote project state. When a work-unit checkpoint notice appears, finish the current atomic action and return before taking on more work. No nested or concurrent units are available.`;
-
-const SYSTEM_PROMPT_TAIL = `Context frames may replace old raw history under input pressure. Use journal retrieval when an omitted fact matters instead of guessing. User constraints and commit or push permission are authoritative and cannot be weakened by model state.
-
-Use read, bash, edit, and write for normal coding work. Treat explicit scope boundaries and public API shapes in an accepted spec as contracts unless the user approves a deviation. Re-read the exact governing resource before implementation and final audit rather than trusting a model-authored summary. Preserve user work, validate changes in proportion to risk, and report honestly.`;
-
-const WORKING_MEMORY_PROMPT_HEAD = `You are the Remux coding agent. The conversation cwd is your default location and orientation, not a filesystem boundary; use absolute paths when work legitimately spans elsewhere on this machine.
-
-You have four context layers: the immutable journal is exact truth; a background Sol compiler maintains fallible working-memory cache entries; the current frame is a frozen KV-cache-friendly prefix; and messages plus tool results after it are an exact hot tail. Let ordinary reads flow into the hot tail and background cache automatically. Use the memory tool only to remember a small stable value or hold an exact governing resource that must survive cache eviction, and release it when resolved. A held resource may be a workspace-relative or absolute file path, or an exact journal:// reference. Default to thread scope; use project scope only when sibling threads should inherit the information.
-
-Cached memory is an orientation aid, never authority over the current user request, an accepted specification, or observed repository state. Re-open cited journal evidence when precision matters and re-read mutable files before editing or final validation. Do not copy raw files, logs, transcript prose, or speculative deviations into memory.`;
-
-function runtimeContract(workUnits: boolean, workingMemory: boolean, boundedWorkUnits: boolean) {
-  const systemPrompt = [
-    workingMemory ? WORKING_MEMORY_PROMPT_HEAD : SYSTEM_PROMPT_HEAD,
-    ...(workUnits ? [boundedWorkUnits ? BOUNDED_WORK_UNIT_GUIDANCE : WORK_UNIT_GUIDANCE] : []),
-    SYSTEM_PROMPT_TAIL,
-  ].join('\n\n');
+function runtimeContract() {
+  const systemPrompt = `${SYSTEM_PROMPT}\n\n${WORK_UNIT_PROMPT}`;
   const tools = [
     'read@pi-0.84',
     'bash@pi-0.84',
     'edit@pi-0.84',
     'write@pi-0.84',
-    'journal@2',
-    workingMemory ? 'memory@2' : 'context_update@3',
-    ...(workUnits ? [boundedWorkUnits ? 'work_unit@2' : 'work_unit@1'] : []),
+    'journal@3',
+    'thread@1',
+    'work-unit@1',
   ];
   return {
     systemPrompt,
@@ -111,39 +81,18 @@ function runtimeContract(workUnits: boolean, workingMemory: boolean, boundedWork
 export class PiEngine implements AgentEngine {
   private readonly modelRuntime: ModelRuntime;
   private readonly workspaceRead: WorkspaceReadExecutor;
-  private readonly contextPolicy: ContextPolicyOverrides;
-  private readonly workingMemoryModelId: string;
-  private readonly workingMemoryCompiler?: (
-    input: WorkingMemoryCompileInput,
-    signal: AbortSignal,
-  ) => Promise<WorkingMemoryCommitInput>;
 
   private constructor(
     modelRuntime: ModelRuntime,
     workspaceRead: WorkspaceReadExecutor,
-    contextPolicy: ContextPolicyOverrides,
-    workingMemoryModelId: string,
-    workingMemoryCompiler?: (
-      input: WorkingMemoryCompileInput,
-      signal: AbortSignal,
-    ) => Promise<WorkingMemoryCommitInput>,
   ) {
     this.modelRuntime = modelRuntime;
     this.workspaceRead = workspaceRead;
-    this.contextPolicy = { ...contextPolicy };
-    this.workingMemoryModelId = workingMemoryModelId;
-    this.workingMemoryCompiler = workingMemoryCompiler;
   }
 
   static async create(options: {
-    contextPolicy?: ContextPolicyOverrides;
     modelRuntime?: ModelRuntime;
     workspaceRead?: WorkspaceReadExecutor;
-    workingMemoryModelId?: string;
-    workingMemoryCompiler?: (
-      input: WorkingMemoryCompileInput,
-      signal: AbortSignal,
-    ) => Promise<WorkingMemoryCommitInput>;
   } = {}) {
     const modelRuntime = options.modelRuntime ?? await ModelRuntime.create({
       allowModelNetwork: false,
@@ -151,9 +100,6 @@ export class PiEngine implements AgentEngine {
     return new PiEngine(
       modelRuntime,
       options.workspaceRead ?? readWorkspaceFile,
-      options.contextPolicy ?? {},
-      options.workingMemoryModelId ?? WORKING_MEMORY_MODEL_ID,
-      options.workingMemoryCompiler,
     );
   }
 
@@ -202,14 +148,7 @@ export class PiEngine implements AgentEngine {
   ): Promise<ConversationRuntime> {
     const model = this.modelRuntime.getModel(PROVIDER, options.modelId);
     if (!model) throw new Error(`Unknown OpenAI Codex model: ${options.modelId}`);
-    const boundedWorkUnitMode = options.contextMode === 'work-units';
-    const workUnits = boundedWorkUnitMode || (options.workUnits ?? false);
-    const workingMemoryMode = options.contextMode === 'working-memory';
-    const { systemPrompt, fixedContractsHash } = runtimeContract(
-      workUnits,
-      workingMemoryMode,
-      boundedWorkUnitMode,
-    );
+    const { systemPrompt, fixedContractsHash } = runtimeContract();
 
     let probe: ContextProbe = {
       hookVersion: 'agent-durable-v1',
@@ -223,24 +162,12 @@ export class PiEngine implements AgentEngine {
       providerRequestMode: 'none',
     };
     let providerCallCount = 0;
-    let lastProviderFrameOrdinal: number | null | undefined;
     let pendingTransport: {
       plannedRequestMode: 'full' | 'continuation';
       fullContextRequests: number;
       deltaRequests: number;
     } | null = null;
-    let frameOrdinal = -1;
-    let frameOrdinalInitialized = false;
-    let activeFrame: {
-      ordinal: number;
-      basisSequence: number;
-      baseMessageCount: number;
-      bootstrapHash: string;
-      prefix: Message;
-      scopeId: string;
-      scopeKind: 'turn' | 'work_unit';
-      pressureNoticeAtMessageCount: number | null;
-    } | null = null;
+    let lastRenderedHashes: readonly string[] | null = null;
     let pendingContext: {
       basisSequence: number;
       logicalHash: string;
@@ -249,175 +176,41 @@ export class PiEngine implements AgentEngine {
       messageCount: number;
       estimatedInputTokens: number;
       fixedContractsHash: string;
-      shadow: ShadowContextCandidate;
-      shadowBuildDurationMs: number;
+      frame: ThreadContextFrameCandidate;
+      frameBuildDurationMs: number;
       activeMessages: readonly LogicalContextMessage[];
-      contextMode: 'full-history' | 'stateful' | 'working-memory' | 'work-units';
-      frameOrdinal: number | null;
-      pressureNotice: boolean;
-      workUnitRecovery: boolean;
     } | null = null;
     let pendingContextError: unknown = null;
-    let activeScopeKind: 'turn' | 'work_unit' = 'turn';
-    let pendingParentIntegration: string | null = null;
-    const memorySessionId = `remux-memory-${randomUUID()}`;
-    let memoryRequested = false;
-    let memoryLoop: Promise<void> | null = null;
-    let memoryDisposed = false;
-    let memoryAbort: AbortController | null = null;
-    const compileWorkingMemory = this.workingMemoryCompiler ?? (async (
-      input: WorkingMemoryCompileInput,
-      signal: AbortSignal,
-    ): Promise<WorkingMemoryCommitInput> => {
-      const compilerModel = this.modelRuntime.getModel(PROVIDER, this.workingMemoryModelId);
-      if (!compilerModel) {
-        throw new Error(`Background working-memory model ${this.workingMemoryModelId} is unavailable.`);
-      }
-      const prompt = workingMemoryCompilerContext(input);
-      const startedAt = performance.now();
-      const response = await this.modelRuntime.completeSimple(compilerModel, {
-        systemPrompt: prompt.systemPrompt,
-        messages: [{ role: 'user', content: prompt.userPrompt, timestamp: Date.now() }],
-      }, {
-        reasoning: 'low',
-        maxTokens: 6_000,
-        transport: 'websocket-cached',
-        cacheRetention: 'short',
-        sessionId: memorySessionId,
-        signal,
-        maxRetries: 0,
-      });
-      if (response.stopReason === 'error' || response.stopReason === 'aborted') {
-        throw new Error(response.errorMessage ?? `Background working-memory call ${response.stopReason}.`);
-      }
-      return {
-        compile: input,
-        patch: parseWorkingMemoryPatchText(assistantText(response), input.allowedRefs),
-        compiler: workingMemoryUsage(
-          compilerModel.id,
-          Math.max(0, Math.round(performance.now() - startedAt)),
-          response.usage,
-        ),
-      };
-    });
-    const runMemoryLoop = async () => {
-      while (memoryRequested && !memoryDisposed) {
-        memoryRequested = false;
-        const input = await options.durability.prepareWorkingMemory?.() ?? null;
-        if (!input || memoryDisposed) continue;
-        memoryAbort = new AbortController();
-        const startedAt = performance.now();
-        try {
-          const compiled = await compileWorkingMemory(input, memoryAbort.signal);
-          if (compiled.compile !== input) {
-            throw new Error('Working-memory compiler returned a mismatched compile input.');
-          }
-          await options.durability.commitWorkingMemory?.(compiled);
-        } catch (error) {
-          if (!memoryDisposed) {
-            await options.durability.recordWorkingMemoryFailure?.({
-              compile: input,
-              modelId: this.workingMemoryModelId,
-              durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
-              error: safeMessage(error),
-            }).catch(() => undefined);
-          }
-        } finally {
-          memoryAbort = null;
-        }
-      }
-    };
-    const scheduleWorkingMemory = () => {
-      if (!workingMemoryMode || memoryDisposed) return;
-      memoryRequested = true;
-      if (memoryLoop) return;
-      memoryLoop = runMemoryLoop().finally(() => {
-        memoryLoop = null;
-        if (memoryRequested && !memoryDisposed) scheduleWorkingMemory();
-      });
+    let providerDurabilityTail: Promise<void> = Promise.resolve();
+    let providerDurabilityError: unknown = null;
+    const awaitProviderDurability = async () => {
+      await providerDurabilityTail;
+      if (providerDurabilityError) throw providerDurabilityError;
     };
     const probeExtension: ExtensionFactory = (pi) => {
-      pi.on('context', async (event) => {
+      pi.on('context', async () => {
         // Extension failures are intentionally swallowed by Pi. Clearing the
         // one-use fence first ensures provider preflight still fails closed.
         pendingContext = null;
         pendingContextError = null;
         try {
-          const snapshot = await options.durability.compileContext();
-          activeScopeKind = snapshot.shadowSource.executionScope.kind;
-          if (!frameOrdinalInitialized) {
-            frameOrdinal = (snapshot.nextFrameOrdinal ?? 0) - 1;
-            frameOrdinalInitialized = true;
-          }
-          const fullMessages = alignDurableContextWithPi(snapshot, event.messages, model);
-          const fullEstimatedInputTokens = estimatePiContextTokens(fullMessages, systemPrompt);
-          const statefulMode = (options.contextMode ?? 'stateful') !== 'full-history';
-          let workUnitRecovery = false;
-          if (
-            activeFrame && activeFrame.scopeId !== snapshot.shadowSource.scopeId &&
-            (activeFrame.scopeKind === 'work_unit' || snapshot.shadowSource.executionScope.kind === 'work_unit')
-          ) activeFrame = null;
-          const activeFrameEstimate = statefulMode
-            ? activeFrame
-              ? estimatePiContextTokens(
-                  frameMessages(activeFrame, fullMessages, boundedWorkUnitMode),
-                  systemPrompt,
-                )
-              : 0
-            : fullEstimatedInputTokens;
+          // Pi does not wait for asynchronous message_end extension handlers
+          // before it begins the following tool/model cycle. The exact
+          // provider item and terminal inference boundary must reach the
+          // journal before compiling the next frame, both to prevent two
+          // running inferences in one scope and to compile from the real head.
+          await awaitProviderDurability();
           const compileStartedAt = performance.now();
-          const shadow = compileShadowContext(snapshot.shadowSource, {
-            modelId: model.id,
-            contextWindow: model.contextWindow,
-            fixedContractsHash,
-            activeEstimatedInputTokens: activeFrameEstimate,
-            policy: this.contextPolicy,
-            pressureNoticeSent: Boolean(activeFrame && activeFrame.pressureNoticeAtMessageCount !== null),
-          });
-          const shadowBuildDurationMs = Math.max(0, Math.round(performance.now() - compileStartedAt));
-          let messages = fullMessages;
-          if (statefulMode) {
-            const policy = contextPolicyForModel(model.contextWindow, this.contextPolicy);
-            if (activeFrame) {
-              messages = frameMessages(activeFrame, fullMessages, boundedWorkUnitMode);
-              const activeEstimate = estimatePiContextTokens(messages, systemPrompt);
-              const boundedChild = boundedWorkUnitMode && activeFrame.scopeKind === 'work_unit';
-              const softNoticeTokens = boundedChild
-                ? policy.workUnitSoftNoticeTokens
-                : policy.softNoticeTokens;
-              const recoveryTokens = boundedChild
-                ? policy.workUnitRecoveryTokens
-                : policy.rollThresholdTokens;
-              if (
-                activeEstimate >= policy.admissionLimitTokens ||
-                activeEstimate >= recoveryTokens &&
-                  activeFrame.pressureNoticeAtMessageCount !== null
-              ) {
-                workUnitRecovery = boundedChild;
-                activeFrame = null;
-              } else if (
-                activeEstimate >= softNoticeTokens &&
-                activeFrame.pressureNoticeAtMessageCount === null
-              ) {
-                activeFrame.pressureNoticeAtMessageCount = fullMessages.length;
-                messages = frameMessages(activeFrame, fullMessages, boundedWorkUnitMode);
-              }
-            }
-            if (!activeFrame) {
-              frameOrdinal += 1;
-              activeFrame = {
-                ordinal: frameOrdinal,
-                basisSequence: snapshot.basisSequence,
-                baseMessageCount: snapshot.messages.length,
-                bootstrapHash: shadow.bootstrapHash,
-                prefix: contextFrameMessage(shadow, snapshot.messages.at(-1)?.timestamp ?? Date.now()),
-                scopeId: snapshot.shadowSource.scopeId,
-                scopeKind: snapshot.shadowSource.executionScope.kind,
-                pressureNoticeAtMessageCount: null,
-              };
-              messages = frameMessages(activeFrame, fullMessages, boundedWorkUnitMode);
-            }
-          }
+          const snapshot = await options.durability.compileContext();
+          const messages: Message[] = [
+            contextFrameMessage(
+              snapshot.frame,
+              snapshot.scopeKind,
+              snapshot.messages.at(-1)?.timestamp ?? Date.now(),
+            ),
+            ...renderDurablePiPrefix(snapshot.messages, model),
+          ];
+          const frameBuildDurationMs = Math.max(0, Math.round(performance.now() - compileStartedAt));
           const rendered = hashRenderedMessages(messages);
           const estimatedInputTokens = estimatePiContextTokens(messages, systemPrompt);
           pendingContext = {
@@ -428,17 +221,9 @@ export class PiEngine implements AgentEngine {
             messageCount: messages.length,
             estimatedInputTokens,
             fixedContractsHash,
-            shadow,
-            shadowBuildDurationMs,
-            activeMessages: statefulMode && activeFrame
-              ? snapshot.messages.slice(activeFrame.baseMessageCount)
-              : snapshot.messages,
-            contextMode: options.contextMode ?? 'stateful',
-            frameOrdinal: (options.contextMode ?? 'stateful') !== 'full-history'
-              ? activeFrame?.ordinal ?? null
-              : null,
-            pressureNotice: Boolean(activeFrame && activeFrame.pressureNoticeAtMessageCount !== null),
-            workUnitRecovery,
+            frame: snapshot.frame,
+            frameBuildDurationMs,
+            activeMessages: snapshot.messages,
           };
           probe = {
             ...probe,
@@ -457,44 +242,54 @@ export class PiEngine implements AgentEngine {
       });
       pi.on('message_end', async (event) => {
         if (event.message.role !== 'assistant') return;
-        if (pendingTransport) {
-          const actualRequestMode = observedTransportMode(sessionId, pendingTransport);
-          await options.durability.afterProviderCall?.({
-            plannedRequestMode: pendingTransport.plannedRequestMode,
-            actualRequestMode,
+        const message = event.message;
+        const durability = (async () => {
+          if (pendingTransport) {
+            const actualRequestMode = observedTransportMode(sessionId, pendingTransport);
+            await options.durability.afterProviderCall?.({
+              plannedRequestMode: pendingTransport.plannedRequestMode,
+              actualRequestMode,
+            });
+            pendingTransport = null;
+          }
+          const content = durableAssistantContent(message.content);
+          const calls = message.content.flatMap((block) => block.type === 'toolCall'
+            ? [{
+                callId: block.id,
+                name: durableToolName(block.name),
+                args: block.arguments,
+              }]
+            : []);
+          await options.durability.beforeAssistantMessageEnd({
+            inferenceState: assistantInferenceState(message.stopReason),
+            text: content.text,
+            reasoning: content.reasoning,
+            calls,
+            providerMessage: message,
           });
-          pendingTransport = null;
-        }
-        const content = durableAssistantContent(event.message.content);
-        const calls = event.message.content.flatMap((block) => block.type === 'toolCall'
-          ? [{
-              callId: block.id,
-              name: durableToolName(block.name),
-              args: block.arguments,
-            }]
-          : []);
-        const transition = await options.durability.beforeAssistantMessageEnd({
-          inferenceState: assistantInferenceState(event.message.stopReason),
-          text: content.text,
-          reasoning: content.reasoning,
-          calls,
+        })();
+        const settled = durability.catch((error) => {
+          providerDurabilityError ??= error;
         });
-        if (transition?.parentIntegrationPrompt) {
-          pendingParentIntegration = transition.parentIntegrationPrompt;
-        }
+        providerDurabilityTail = Promise.all([providerDurabilityTail, settled]).then(() => undefined);
+        await durability;
       });
-      pi.on('tool_execution_start', async (event) => {
+      // tool_call/tool_result are Pi's awaited execution gates. The similarly
+      // named tool_execution_* events are observational notifications and Pi
+      // does not wait for asynchronous extension handlers there.
+      pi.on('tool_call', async (event) => {
+        await awaitProviderDurability();
         await options.durability.beforeTool({
           callId: event.toolCallId,
           name: durableToolName(event.toolName),
-          args: event.args,
+          args: event.input,
         });
       });
-      pi.on('tool_execution_end', async (event) => {
+      pi.on('tool_result', async (event) => {
         await options.durability.afterTool({
           callId: event.toolCallId,
           name: durableToolName(event.toolName),
-          result: durableToolResult(event.result, event.isError),
+          result: durableToolResult({ content: event.content }, event.isError),
           isError: event.isError,
         });
       });
@@ -532,19 +327,20 @@ export class PiEngine implements AgentEngine {
       modelRuntime: this.modelRuntime,
       model,
       thinkingLevel: options.reasoning,
-      customTools: [createWorkspaceReadTool(
-        options.cwd,
-        options.durability,
-        this.workspaceRead,
-      ), ...createContextTools(options.durability, {
-        workUnits,
-        workingMemory: workingMemoryMode,
-        boundedWorkUnits: boundedWorkUnitMode,
-      })],
+      customTools: [
+        // The awaited tool_call/tool_result gates above own durability for all
+        // tools. Avoid a second direct durability wrapper on workspace_read.
+        createWorkspaceReadTool(options.cwd, undefined, this.workspaceRead),
+        ...createContextTools(options.durability),
+      ],
       resourceLoader,
       sessionManager,
       settingsManager,
       providerPreflight: async (payload) => {
+        // Keep the provider fence defensive even if Pi changes its context
+        // hook ordering: no request may overtake the preceding provider
+        // item's durable terminal boundary.
+        await awaitProviderDurability();
         const context = pendingContext;
         pendingContext = null;
         if (!context) {
@@ -556,7 +352,9 @@ export class PiEngine implements AgentEngine {
           }
           throw new Error('Provider dispatch has no committed durable context fence.');
         }
-        const requestMode = providerCallCount > 0 && context.frameOrdinal === lastProviderFrameOrdinal
+        const requestMode = providerCallCount > 0 && lastRenderedHashes !== null &&
+            lastRenderedHashes.length <= context.orderedMessageHashes.length &&
+            lastRenderedHashes.every((hash, index) => context.orderedMessageHashes[index] === hash)
           ? 'continuation'
           : 'full';
         if (providerCallCount === 0 && requestMode !== 'full') {
@@ -577,13 +375,9 @@ export class PiEngine implements AgentEngine {
             orderedMessageHashes: context.orderedMessageHashes,
             messageCount: context.messageCount,
             fixedContractsHash: context.fixedContractsHash,
-            shadow: context.shadow,
-            shadowBuildDurationMs: context.shadowBuildDurationMs,
+            frame: context.frame,
+            frameBuildDurationMs: context.frameBuildDurationMs,
             activeMessages: context.activeMessages,
-            contextMode: context.contextMode,
-            frameOrdinal: context.frameOrdinal,
-            pressureNotice: context.pressureNotice,
-            workUnitRecovery: context.workUnitRecovery,
           },
         });
         // The rejected inference is now itself durable. Throwing here still
@@ -596,7 +390,7 @@ export class PiEngine implements AgentEngine {
           deltaRequests: transportStats?.deltaRequests ?? 0,
         };
         providerCallCount += 1;
-        lastProviderFrameOrdinal = context.frameOrdinal;
+        lastRenderedHashes = context.orderedMessageHashes;
         probe = {
           ...probe,
           providerRequestMode: requestMode,
@@ -605,42 +399,35 @@ export class PiEngine implements AgentEngine {
       },
     });
     const unsubscribe = session.subscribe((event) => {
-      if (
-        activeScopeKind === 'work_unit' &&
-        (event.type === 'message_start' || event.type === 'message_update' || event.type === 'message_end') &&
-        event.message.role === 'assistant'
-      ) return;
-      if (event.type === 'agent_end' && pendingParentIntegration) return;
+      if (event.type === 'agent_end') {
+        void providerDurabilityTail.then(() => {
+          if (!providerDurabilityError) projectPiEvent(event, options.onEvent);
+        });
+        return;
+      }
       projectPiEvent(event, options.onEvent);
     });
 
     return {
       async prompt(input) {
+        providerDurabilityError = null;
         await session.prompt(input.text, {
           expandPromptTemplates: false,
           images: input.images?.map((image): ImageContent => ({ type: 'image', ...image })),
         });
-        while (pendingParentIntegration) {
-          const prompt = pendingParentIntegration;
-          pendingParentIntegration = null;
-          await session.prompt(prompt, { expandPromptTemplates: false });
-        }
+        await providerDurabilityTail;
+        if (providerDurabilityError) throw providerDurabilityError;
       },
       async interrupt() {
         await session.abort();
       },
-      scheduleWorkingMemory,
       async dispose() {
-        memoryDisposed = true;
-        memoryRequested = false;
-        memoryAbort?.abort();
         unsubscribe();
         try {
           await session.abort();
         } finally {
           session.dispose();
           closeOpenAICodexWebSocketSessions(sessionId);
-          closeOpenAICodexWebSocketSessions(memorySessionId);
           resetOpenAICodexWebSocketDebugStats(sessionId);
         }
       },
@@ -663,49 +450,26 @@ function observedTransportMode(
   return pending.plannedRequestMode;
 }
 
-function contextFrameMessage(candidate: ShadowContextCandidate, timestamp: number): Message {
+function contextFrameMessage(
+  candidate: ThreadContextFrameCandidate,
+  scopeKind: 'turn' | 'work_unit',
+  _timestamp: number,
+): Message {
+  const scopeBoundary = scopeKind === 'work_unit'
+    ? 'Active execution scope: bounded work unit. Keep scratch local and finish with work_unit_return.'
+    : 'Active execution scope: parent turn. work_unit_return is invalid unless work_unit_enter has opened a child scope.';
   return {
     role: 'user',
     content: [
-      'The following is the authoritative Remux context frame. Treat its continuation request as the current user request. Omitted evidence remains available through journal tools.',
+      'The following is the active Remux thread context. The exact user message after it is the current request. Omitted evidence remains available through journal tools.',
+      scopeBoundary,
       candidate.bootstrap,
     ].join('\n\n'),
-    timestamp,
+    // This synthetic control message is stable while its content is stable.
+    // Event timestamps belong to the durable messages below; changing this
+    // timestamp on every inference would invalidate the provider prefix cache.
+    timestamp: 0,
   };
-}
-
-function frameMessages(
-  frame: {
-    baseMessageCount: number;
-    prefix: Message;
-    scopeKind: 'turn' | 'work_unit';
-    pressureNoticeAtMessageCount: number | null;
-  },
-  alignedMessages: readonly Message[],
-  boundedWorkUnits = false,
-) {
-  if (alignedMessages.length < frame.baseMessageCount) {
-    throw new Error('Durable context moved behind the active context frame.');
-  }
-  const tail = alignedMessages.slice(frame.baseMessageCount);
-  if (frame.pressureNoticeAtMessageCount === null) return [frame.prefix, ...tail];
-  const noticeIndex = Math.max(
-    0,
-    Math.min(tail.length, frame.pressureNoticeAtMessageCount - frame.baseMessageCount),
-  );
-  const timestamp = alignedMessages[Math.max(0, frame.pressureNoticeAtMessageCount - 1)]?.timestamp ?? Date.now();
-  return [
-    frame.prefix,
-    ...tail.slice(0, noticeIndex),
-    {
-      role: 'user' as const,
-      content: boundedWorkUnits && frame.scopeKind === 'work_unit'
-        ? 'This bounded work unit is approaching its context budget. Finish the current atomic action, then call work_unit return with a compact evidence-backed result and only the shared state later units need. Do not begin another investigation or summarize raw logs.'
-        : 'Context pressure is elevated. At the next meaningful action, checkpoint only durable decisions or progress that must survive a frame rollover; do not summarize raw logs.',
-      timestamp,
-    },
-    ...tail.slice(noticeIndex),
-  ];
 }
 
 function projectPiEvent(event: AgentSessionEvent, sink: RuntimeEventSink) {
@@ -721,16 +485,9 @@ function projectPiEvent(event: AgentSessionEvent, sink: RuntimeEventSink) {
       }
       return;
     case 'message_end':
-      if (event.message.role === 'assistant') {
-        sink({
-          type: 'inference-end',
-          state: event.message.stopReason === 'error'
-            ? 'failed'
-            : event.message.stopReason === 'aborted'
-              ? 'interrupted'
-              : 'completed',
-        });
-      }
+      // The awaited Pi extension hook owns the durable provider/inference
+      // boundary. Emitting a second asynchronous boundary here races the exact
+      // provider item and can terminalize an inference before it is recorded.
       return;
     case 'agent_end': {
       const finalAssistant = [...event.messages].reverse().find((message) => message.role === 'assistant');
@@ -758,12 +515,15 @@ function durableAssistantContent(
   content: Array<{ type: string; text?: string; thinking?: string }>,
 ) {
   let text = '';
-  let reasoning = '';
+  const reasoning: string[] = [];
   for (const block of content) {
     if (block.type === 'text') text += block.text ?? '';
-    else if (block.type === 'thinking') reasoning += block.thinking ?? '';
+    else if (block.type === 'thinking') reasoning.push(block.thinking ?? '');
   }
-  return { text, reasoning };
+  // OpenAI may finalize one streamed reasoning trace as several signed
+  // thinking blocks. Pi renders those summaries as Markdown paragraphs, so
+  // preserve the same paragraph boundary when reconciling the final message.
+  return { text, reasoning: reasoning.join('\n\n') };
 }
 
 function assistantText(message: AssistantMessage) {

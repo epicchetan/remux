@@ -44,7 +44,12 @@ export async function installAgentHost(page: Page) {
     const exactFullText = `${exactPreview}The remaining response is fetched only when requested.`;
     const contextBootstrapHash = 'd'.repeat(64);
     const contextDispatchHash = 'f'.repeat(64);
-    const contextBootstrapText = '<remux_epoch version="1">\n<continuation>Fixture context</continuation>\n</remux_epoch>';
+    const contextBootstrapText = [
+      '<thread_context version="1">',
+      '<thread_document># Thread\\n\\nFixture context</thread_document>',
+      '<turn_capsules />',
+      '</thread_context>',
+    ].join('\n');
     const contextDispatchText = JSON.stringify({
       input: [{ role: 'user', content: 'Fixture provider input' }],
       model: 'gpt-5.4-fixture',
@@ -211,55 +216,46 @@ export async function installAgentHost(page: Page) {
       };
     }
 
-    function contextValue(decision: 'append' | 'roll') {
-      const hash = decision === 'append' ? 'b'.repeat(64) : 'c'.repeat(64);
+    function contextValue(_decision: 'append' | 'roll') {
       return {
-        version: 2,
+        version: 3,
         conversationId,
         inferenceId: 'fixture-inference',
-        epochId: 'fixture-epoch',
+        frameId: 'fixture-frame',
         basisSequence: sequence,
-        projectRevision: 0,
-        targetContextSpaceId: 'fixture-context-space',
-        compilerVersion: 'agent-context-compiler-v2',
-        policyVersion: 'agent-context-policy-v1',
-        decision: decision === 'append'
-          ? { kind: 'append', pressurePermille: 120 }
-          : { kind: 'roll', pressurePermille: 1_020, reason: 'Fixture rollover threshold reached.' },
-        activeEstimatedInputTokens: 12_400,
-        candidateEstimatedInputTokens: 3_200,
-        semanticHash: hash,
+        threadVersionId: 'fixture-thread-version',
+        compilerVersion: 'agent-thread-compiler-v1',
+        policyVersion: 'agent-thread-policy-v1',
+        estimatedInputTokens: 3_200,
+        semanticHash: 'b'.repeat(64),
         bootstrapHash: contextBootstrapHash,
         buildDurationMs: 2,
+        transportMode: 'continuation',
+        messageCount: 2,
+        turnCount: 1,
+        logicalHash: '8'.repeat(64),
+        renderedHash: '9'.repeat(64),
+        fixedContractsHash: '0'.repeat(64),
         manifestArtifact: { hash: 'e'.repeat(64), byteLength: 1_200, mediaType: 'application/json' },
         bootstrapArtifact: {
           hash: contextBootstrapHash,
           byteLength: new TextEncoder().encode(contextBootstrapText).byteLength,
           mediaType: 'text/plain; charset=utf-8',
         },
-        actual: {
-          mode: 'full-replay',
-          transportMode: 'continuation',
-          messageCount: 2,
-          turnCount: 1,
-          logicalHash: '8'.repeat(64),
-          renderedHash: '9'.repeat(64),
-          fixedContractsHash: '0'.repeat(64),
-          dispatchArtifact: {
-            hash: contextDispatchHash,
-            byteLength: new TextEncoder().encode(contextDispatchText).byteLength,
-            mediaType: 'text/plain; charset=utf-8',
-          },
-          groups: [{
-            turnId: 'fixture-turn',
-            source: 'agent://conversation/fixture/turn/fixture-turn',
-            messageCount: 2,
-            estimatedTokens: 310,
-            roles: { user: 1, assistant: 1, tool: 0 },
-          }],
-          groupsTruncated: false,
+        dispatchArtifact: {
+          hash: contextDispatchHash,
+          byteLength: new TextEncoder().encode(contextDispatchText).byteLength,
+          mediaType: 'text/plain; charset=utf-8',
         },
-        blocks: ['continuation', 'working_state', 'open_work', 'workspace', 'runtime', 'raw_tail', 'retrieval_map']
+        groups: [{
+          turnId: 'fixture-turn',
+          source: 'agent://conversation/fixture/turn/fixture-turn',
+          messageCount: 2,
+          estimatedTokens: 310,
+          roles: { user: 1, assistant: 1, tool: 0 },
+        }],
+        groupsTruncated: false,
+        layers: ['thread_document', 'capsule_tail', 'dialogue_tail', 'active_turn']
           .map((kind, index) => ({
             kind,
             hash: String(index + 1).repeat(64).slice(0, 64),
@@ -270,8 +266,8 @@ export async function installAgentHost(page: Page) {
           })),
         omissions: [{
           source: 'agent://conversation/fixture/turns',
-          reason: 'raw-tail-budget',
-          retrieval: 'agent://conversation/fixture/turns?before=latest',
+          reason: 'dialogue-tail-budget',
+          retrieval: 'journal://conversation/fixture/turns?before=latest',
           count: 4,
         }],
         omissionsTruncated: false,

@@ -11,15 +11,9 @@ import {
   AGENT_JOURNAL_SCHEMA_VERSION,
   AgentSchemaError,
   agentSchemaFingerprint,
-  createAgentSchemaV1,
-  createAgentSchemaV2,
-  createAgentSchemaV3,
+  createAgentSchema,
   listAgentDatabaseTables,
-  migrateAgentSchemaV1ToV2,
-  migrateAgentSchemaV2ToV3,
-  validateAgentSchemaV1,
-  validateAgentSchemaV2,
-  validateAgentSchemaV3,
+  validateAgentSchema,
 } from './schema.ts';
 
 export type AgentDatabaseDiagnostics = {
@@ -91,11 +85,6 @@ export async function openAgentDatabase(options: AgentDataRootOptions = {}) {
   const database = new sqlite.DatabaseSync(paths.database, { timeout: 5_000 });
   try {
     const version = pragmaNumber(database, 'user_version');
-    if (version > AGENT_JOURNAL_SCHEMA_VERSION) {
-      throw new AgentSchemaVersionError(
-        `Agent journal schema ${version} is newer than supported version ${AGENT_JOURNAL_SCHEMA_VERSION}.`,
-      );
-    }
     if (version === 0) {
       const tables = listAgentDatabaseTables(database);
       if (tables.length > 0) {
@@ -103,44 +92,28 @@ export async function openAgentDatabase(options: AgentDataRootOptions = {}) {
           `Refusing to initialize an unversioned Agent database containing tables: ${tables.join(', ')}.`,
         );
       }
-    } else if (version !== 1 && version !== 2 && version !== AGENT_JOURNAL_SCHEMA_VERSION) {
-      throw new AgentSchemaVersionError(`Unsupported Agent journal schema version ${version}.`);
+    } else if (version !== AGENT_JOURNAL_SCHEMA_VERSION) {
+      throw new AgentSchemaVersionError(
+        `Agent journal schema ${version} is not ${AGENT_JOURNAL_SCHEMA_VERSION}; ` +
+        'Thread Runtime v1 requires a fresh Agent data root.',
+      );
     }
 
     await secureDatabaseFile(paths.database);
     applyConnectionPragmas(database);
     await secureDatabaseSidecars(paths.database);
     if (version === 0) {
-      runTransaction(database, () => createAgentSchemaV3(database));
-    } else if (version === 1) {
-      const versionOneReference = new sqlite.DatabaseSync(':memory:');
-      try {
-        createAgentSchemaV1(versionOneReference);
-        validateAgentSchemaV1(database, agentSchemaFingerprint(versionOneReference));
-      } finally {
-        versionOneReference.close();
-      }
-      runTransaction(database, () => migrateAgentSchemaV1ToV2(database));
-      runTransaction(database, () => migrateAgentSchemaV2ToV3(database));
-    } else if (version === 2) {
-      const versionTwoReference = new sqlite.DatabaseSync(':memory:');
-      try {
-        createAgentSchemaV2(versionTwoReference);
-        validateAgentSchemaV2(database, agentSchemaFingerprint(versionTwoReference));
-      } finally {
-        versionTwoReference.close();
-      }
-      runTransaction(database, () => migrateAgentSchemaV2ToV3(database));
+      runTransaction(database, () => createAgentSchema(database));
     }
     const reference = new sqlite.DatabaseSync(':memory:');
     let expectedFingerprint: string;
     try {
-      createAgentSchemaV3(reference);
+      createAgentSchema(reference);
       expectedFingerprint = agentSchemaFingerprint(reference);
     } finally {
       reference.close();
     }
-    validateAgentSchemaV3(database, expectedFingerprint);
+    validateAgentSchema(database, expectedFingerprint);
     runQuickCheck(database);
     return new AgentDatabase(database, paths);
   } catch (error) {

@@ -1,16 +1,21 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
 import process from 'node:process';
+import { DatabaseSync } from 'node:sqlite';
 
 import WebSocket from 'ws';
 
 const TRANSCRIPT_PROTOCOL_VERSION = 2;
 const TRANSCRIPT_PROJECTION_VERSION = 'agent-turn-render-v2';
-const FIRST_SENTINEL = 'REMUX_CLEAN_FIRST_OK';
+const FIRST_SENTINEL = 'REMUX_THREAD_FIRST_OK';
 const CONTEXT_NONCE = 'REMUX_CONTEXT_8AUG26';
-const SECOND_SENTINEL = `${CONTEXT_NONCE} REMUX_CLEAN_SECOND_OK`;
+const SECOND_SENTINEL = `${CONTEXT_NONCE} REMUX_THREAD_SECOND_OK`;
+const CHILD_SECRET = 'REMUX_CHILD_TRACE_MUST_STAY_PRIVATE';
+const WORK_UNIT_RESULT = 'REMUX_WORK_UNIT_RESULT_OK';
+const THIRD_SENTINEL = 'REMUX_WORK_UNIT_PARENT_OK';
 
 async function main() {
   const options = parseOptions(process.argv.slice(2));
@@ -39,11 +44,18 @@ async function main() {
   assert.match(conversation.conversationId, UUID_V4);
 
   const first = await sendAndWait(client, conversation.conversationId, [
-    `This is a clean-state acceptance test. Remember the exact nonce ${CONTEXT_NONCE}.`,
-    `Do not call tools. Reply with exactly ${FIRST_SENTINEL} and nothing else.`,
+    'This is a Thread Runtime v1 acceptance test.',
+    'Use thread_read, then replace thread.md with a concise Markdown briefing that includes',
+    `the exact durable nonce ${CONTEXT_NONCE} by calling thread_update.`,
+    `After the update succeeds, reply with exactly ${FIRST_SENTINEL} and nothing else.`,
   ].join(' '), options.timeoutMs);
   const firstTranscript = await readTranscript(client, conversation.conversationId);
   assert.equal(assistantText(firstTranscript, first.turnId).trim(), FIRST_SENTINEL);
+  const firstContext = await readContext(client, conversation.conversationId);
+  assert.equal(firstContext.version, 3);
+  assert.deepEqual(firstContext.layers.map(({ kind }) => kind), [
+    'thread_document', 'capsule_tail', 'dialogue_tail', 'active_turn',
+  ]);
 
   const generationBeforeRestart = firstTranscript.serverGeneration;
   const restart = await restartAgent(client, generationBeforeRestart, options.timeoutMs);
@@ -57,7 +69,7 @@ async function main() {
   assert.equal(assistantText(coldTranscript, first.turnId).trim(), FIRST_SENTINEL);
 
   const second = await sendAndWait(client, conversation.conversationId, [
-    'Without calling tools, recover the exact nonce from the user message before the Agent restart.',
+    'Without calling tools, recover the exact durable nonce from the compiled thread context after the Agent restart.',
     `Reply with exactly "${SECOND_SENTINEL}" and nothing else.`,
   ].join(' '), options.timeoutMs);
   const finalTranscript = await readTranscript(client, conversation.conversationId);
@@ -71,12 +83,62 @@ async function main() {
   assert.equal(final.runtime.conversationId, conversation.conversationId);
   assert.equal(final.runtime.contextProbe.provider, 'openai-codex');
   assert.equal(final.runtime.contextProbe.providerRequestMode, 'full');
+  const secondContext = await readContext(client, conversation.conversationId);
+  assert.equal(secondContext.version, 3);
+  assert.equal(secondContext.transportMode, 'full');
+  assert.equal(
+    secondContext.groups.reduce((count, group) => count + group.roles.tool, 0),
+    0,
+    'Prior-turn tool traffic leaked into the next provider frame.',
+  );
+
+  const third = await sendAndWait(client, conversation.conversationId, [
+    'Exercise the bounded work-unit runtime exactly once.',
+    'First call work_unit_enter with the objective "Validate the live child-context boundary."',
+    `Inside that work unit, call bash with command "printf ${CHILD_SECRET}",`,
+    `then call work_unit_return with a concise Markdown result containing exactly the marker ${WORK_UNIT_RESULT}`,
+    `but not the child-only marker ${CHILD_SECRET}.`,
+    `After the parent context resumes, reply with exactly ${THIRD_SENTINEL} and nothing else.`,
+  ].join(' '), options.timeoutMs);
+  const workUnitTranscript = await readTranscript(client, conversation.conversationId);
+  assert.equal(assistantText(workUnitTranscript, third.turnId).trim(), THIRD_SENTINEL);
+  assert.deepEqual(workUnitTranscript.value.turnOrder, [first.turnId, second.turnId, third.turnId]);
+
+  const durability = await inspectDurability(options.dataRoot, conversation.conversationId);
+  assert.equal(durability.schemaId, 'agent-thread-runtime-v1');
+  assert.equal(durability.contextFrames, durability.inferences);
+  assert.equal(durability.providerItems, durability.inferences);
+  assert.equal(durability.runningTurns, 0);
+  assert.equal(durability.runningInferences, 0);
+  assert.ok((durability.requestModes.continuation ?? 0) >= 2);
+  assert.equal(durability.readyCapsules, 3);
+  assert.ok(durability.threadUpdates >= 1);
+  assert.match(durability.threadContent, new RegExp(CONTEXT_NONCE));
+  assert.equal(durability.workUnits.length, 1);
+  assert.equal(durability.workUnits[0].state, 'completed');
+  assert.match(durability.workUnits[0].result, new RegExp(WORK_UNIT_RESULT));
+  assert.doesNotMatch(durability.workUnits[0].result, new RegExp(CHILD_SECRET));
+  assert.deepEqual(durability.childToolNames, ['bash', 'work_unit_return']);
+  assert.ok(durability.visibleToolNames.includes('thread_read'));
+  assert.ok(durability.visibleToolNames.includes('thread_update'));
+  assert.equal(durability.visibleToolNames.filter((name) => name === 'work_unit_enter').length, 1);
+  assert.equal(durability.visibleToolNames.includes('bash'), false);
+  assert.equal(durability.visibleToolNames.includes('work_unit_return'), false);
+  assert.equal(durability.childProviderCalls >= 2, true);
+  assert.equal(durability.finalScopeKind, 'turn');
+  const workUnitTurn = workUnitTranscript.value.turns.find(({ turnId }) => turnId === third.turnId);
+  assert.ok(workUnitTurn?.frame, 'The bounded work-unit turn is missing from the transcript.');
+  assert.doesNotMatch(
+    JSON.stringify(workUnitTurn.frame.segments.filter(({ type }) => type !== 'userMessage')),
+    new RegExp(CHILD_SECRET),
+  );
 
   process.stdout.write(`${JSON.stringify({
     ok: true,
     conversationId: conversation.conversationId,
     firstTurnId: first.turnId,
     secondTurnId: second.turnId,
+    thirdTurnId: third.turnId,
     modelId,
     reasoning: options.reasoning,
     generations: {
@@ -84,8 +146,9 @@ async function main() {
       afterRestart: finalTranscript.serverGeneration,
     },
     providerRequestModeAfterRestart: final.runtime.contextProbe.providerRequestMode,
+    durability,
     restartPid: restart.pid,
-    sentinels: [FIRST_SENTINEL, SECOND_SENTINEL],
+    sentinels: [FIRST_SENTINEL, SECOND_SENTINEL, THIRD_SENTINEL],
   }, null, 2)}\n`);
   } finally {
     client.close();
@@ -182,6 +245,90 @@ async function readTranscript(client, conversationId) {
   return { serverGeneration: response.serverGeneration, value: resource.value };
 }
 
+async function readContext(client, conversationId) {
+  const response = await client.query('remux/agent/resources/read', {
+    requests: [{ key: `context:${conversationId}` }],
+  }, `agent-context:${conversationId}`);
+  const resource = response.resources[0];
+  assert.equal(resource?.status, 'ok', 'The actual inference context resource is missing.');
+  return resource.value;
+}
+
+async function inspectDurability(dataRoot, conversationId) {
+  const database = new DatabaseSync(join(dataRoot, 'agent.sqlite3'), { readOnly: true });
+  try {
+    const scalar = (sql, ...params) => database.prepare(sql).get(...params).value;
+    const thread = database.prepare(`
+      SELECT a.storage_path
+      FROM conversations c
+      JOIN state_documents d
+        ON d.conversation_id = c.conversation_id AND d.strand_id = c.head_strand_id
+       AND d.scope_kind = 'strand' AND d.key = 'thread.md'
+      JOIN document_versions v ON v.version_id = d.head_version_id
+      JOIN artifacts a ON a.hash = v.content_artifact_hash
+      WHERE c.conversation_id = ?
+    `).get(conversationId);
+    assert.ok(thread?.storage_path, 'The live thread.md artifact is missing.');
+    const workUnitRows = database.prepare(`
+      SELECT s.scope_id, s.state, a.storage_path
+      FROM execution_scopes s
+      LEFT JOIN artifacts a ON a.hash = s.result_artifact_hash
+      WHERE s.conversation_id = ? AND s.kind = 'work_unit'
+      ORDER BY s.created_sequence
+    `).all(conversationId);
+    const workUnits = await Promise.all(workUnitRows.map(async (row) => ({
+      scopeId: row.scope_id,
+      state: row.state,
+      result: row.storage_path
+        ? await readFile(join(dataRoot, 'artifacts', row.storage_path), 'utf8')
+        : '',
+    })));
+    const childToolNames = database.prepare(`
+      SELECT json_extract(e.payload_json, '$.name') AS name
+      FROM events e
+      JOIN execution_scopes s ON s.scope_id = e.scope_id
+      WHERE e.conversation_id = ? AND s.kind = 'work_unit' AND e.type = 'tool.called'
+      ORDER BY e.sequence
+    `).all(conversationId).map(({ name }) => name);
+    const visibleToolNames = database.prepare(`
+      SELECT json_extract(value_json, '$.name') AS name
+      FROM transcript_items
+      WHERE conversation_id = ? AND kind = 'tool'
+      ORDER BY first_sequence
+    `).all(conversationId).map(({ name }) => name);
+    return {
+      schemaId: JSON.parse(scalar("SELECT value_json AS value FROM meta WHERE key = 'journal_schema'")),
+      inferences: scalar('SELECT COUNT(*) AS value FROM inferences WHERE conversation_id = ?', conversationId),
+      contextFrames: scalar('SELECT COUNT(*) AS value FROM context_frames WHERE conversation_id = ?', conversationId),
+      providerItems: scalar('SELECT COUNT(*) AS value FROM provider_items WHERE conversation_id = ?', conversationId),
+      runningTurns: scalar("SELECT COUNT(*) AS value FROM turns WHERE conversation_id = ? AND state = 'running'", conversationId),
+      runningInferences: scalar("SELECT COUNT(*) AS value FROM inferences WHERE conversation_id = ? AND state = 'running'", conversationId),
+      requestModes: Object.fromEntries(database.prepare(`
+        SELECT request_mode, COUNT(*) AS count
+        FROM inferences WHERE conversation_id = ? GROUP BY request_mode
+      `).all(conversationId).map(({ request_mode, count }) => [request_mode, count])),
+      readyCapsules: scalar("SELECT COUNT(*) AS value FROM turn_capsules WHERE conversation_id = ? AND state = 'ready'", conversationId),
+      threadUpdates: scalar("SELECT COUNT(*) AS value FROM events WHERE conversation_id = ? AND type = 'thread.document.updated'", conversationId),
+      threadContent: await readFile(join(dataRoot, 'artifacts', thread.storage_path), 'utf8'),
+      workUnits,
+      childToolNames,
+      visibleToolNames,
+      childProviderCalls: scalar(`
+        SELECT COUNT(*) AS value
+        FROM inferences i JOIN execution_scopes s ON s.scope_id = i.scope_id
+        WHERE i.conversation_id = ? AND s.kind = 'work_unit'
+      `, conversationId),
+      finalScopeKind: scalar(`
+        SELECT s.kind AS value
+        FROM context_frames f JOIN execution_scopes s ON s.scope_id = f.scope_id
+        WHERE f.conversation_id = ? ORDER BY f.created_sequence DESC LIMIT 1
+      `, conversationId),
+    };
+  } finally {
+    database.close();
+  }
+}
+
 function assistantText(transcript, turnId) {
   const result = transcript.value.turns.find((turn) => turn.turnId === turnId);
   assert.ok(result && (result.status === 'ok' || result.status === 'error'));
@@ -211,10 +358,17 @@ function parseOptions(args) {
     cwd: resolve(values.get('--cwd') ?? repositoryRoot),
     endpoint: values.get('--endpoint') ?? 'ws://127.0.0.1:48123/ws',
     modelId: values.get('--model-id') ?? null,
+    dataRoot: resolve(values.get('--data-root') ?? defaultDataRoot()),
     reasoning: values.get('--reasoning') ?? 'high',
     timeoutMs,
     tokenFile: resolve(values.get('--token-file') ?? resolve(repositoryRoot, '.remux/auth-token')),
   };
+}
+
+function defaultDataRoot() {
+  if (process.env.REMUX_AGENT_DATA_DIR?.trim()) return process.env.REMUX_AGENT_DATA_DIR;
+  const base = process.env.XDG_DATA_HOME?.trim() || join(homedir(), '.local', 'share');
+  return join(base, 'remux', 'agent');
 }
 
 function delay(ms) {

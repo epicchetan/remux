@@ -3,18 +3,12 @@ import type {
   ContextProbe,
   ModelInfo,
   ReasoningLevel,
-  AgentContextMode,
 } from '../../shared/protocol.ts';
+import type { AssistantMessage } from '@earendil-works/pi-ai';
 import type {
   DurableContextBoundarySnapshot,
   DurableInferenceContext,
 } from './storage/repository.ts';
-import type {
-  WorkingMemoryCommitInput,
-  WorkingMemoryCommitResult,
-  WorkingMemoryCompileInput,
-  WorkingMemoryFailureInput,
-} from './context/working-memory.ts';
 
 export type RuntimeEvent =
   | { type: 'assistant-start' }
@@ -36,7 +30,8 @@ export type RuntimeDurabilityHooks = {
     text: string;
     reasoning: string;
     calls: Array<{ callId: string; name: string; args: unknown }>;
-  }): Promise<void | { parentIntegrationPrompt: string }>;
+    providerMessage: AssistantMessage;
+  }): Promise<void>;
   beforeProviderCall(input: {
     payload: unknown;
     requestMode: 'full' | 'continuation';
@@ -56,11 +51,44 @@ export type RuntimeDurabilityHooks = {
   }): Promise<void>;
   journalSearch(input: JournalSearchInput): Promise<JournalSearchResult>;
   journalOpen(input: JournalOpenInput): Promise<JournalOpenResult>;
-  updateContext(input: ContextUpdateInput): Promise<ContextWorkspaceView>;
-  workUnit(input: WorkUnitInput): Promise<WorkUnitResult>;
-  prepareWorkingMemory?(): Promise<WorkingMemoryCompileInput | null>;
-  commitWorkingMemory?(input: WorkingMemoryCommitInput): Promise<WorkingMemoryCommitResult>;
-  recordWorkingMemoryFailure?(input: WorkingMemoryFailureInput): Promise<void>;
+  threadRead(): Promise<ThreadDocumentView>;
+  threadUpdate(input: ThreadUpdateInput): Promise<ThreadDocumentView>;
+  workUnitEnter(callId: string, input: WorkUnitEnterInput): Promise<WorkUnitView>;
+  workUnitReturn(callId: string, input: WorkUnitReturnInput): Promise<WorkUnitReturnPending>;
+};
+
+export type ThreadDocumentView = {
+  documentId: string;
+  versionId: string;
+  content: string;
+  ref: string;
+};
+
+export type ThreadUpdateInput = {
+  baseVersionId: string;
+  content: string;
+};
+
+export type WorkUnitEnterInput = {
+  objective: string;
+  evidenceRefs?: string[];
+};
+
+export type WorkUnitReturnInput = {
+  result: string;
+};
+
+export type WorkUnitView = {
+  scopeId: string;
+  parentScopeId: string;
+  objective: string;
+  evidenceRefs: string[];
+  state: 'running';
+};
+
+export type WorkUnitReturnPending = {
+  scopeId: string;
+  state: 'returning';
 };
 
 export type JournalSearchInput = {
@@ -101,66 +129,10 @@ export type JournalOpenResult = {
   retention: 'ephemeral';
 };
 
-export type ContextScope = 'thread' | 'project';
-export type ContextUpdateInput = {
-  set?: Array<{
-    key: string;
-    scope?: ContextScope;
-    value: unknown;
-    evidence?: string[];
-  }>;
-  remove?: Array<{ key: string; scope?: ContextScope }>;
-  pin?: Array<{ ref: string; label?: string; scope?: ContextScope }>;
-  unpin?: Array<{ ref: string; scope?: ContextScope }>;
-};
-export type WorkUnitCommitInput = {
-  remember?: Array<{ key: string; value: unknown; evidence?: string[] }>;
-  forget?: string[];
-  hold?: Array<{ resource: string; label?: string }>;
-  release?: string[];
-};
-export type WorkUnitInput =
-  | { action: 'enter'; objective: string; refs?: string[]; expectedEvidence?: string[] }
-  | {
-      action: 'return';
-      status: 'completed' | 'failed' | 'abandoned';
-      findings: Array<{ text: string; evidence: string[] }>;
-      changeRefs?: string[];
-      validationRefs?: string[];
-      unresolved?: string[];
-      proposedPromotions?: Array<{ key: string; value: unknown }>;
-      commit?: WorkUnitCommitInput;
-    };
-export type WorkUnitResult = {
-  action: 'entered' | 'returned';
-  scopeId: string;
-  parentScopeId: string;
-  epochId?: string;
-  capsuleRef?: string;
-  resultRef?: string;
-  traceRef: string;
-  status: 'running' | 'completed' | 'failed' | 'abandoned';
-  committed?: ContextWorkspaceView;
-};
-export type ContextWorkspaceView = {
-  revision: number;
-  state: Array<{ key: string; scope: ContextScope; version: number }>;
-  pinned: Array<{
-    ref: string;
-    label: string;
-    scope: ContextScope;
-    state: 'pinned' | 'unpinned';
-    version: number;
-  }>;
-  estimatedBytes: number;
-  warnings: string[];
-};
-
 export interface ConversationRuntime {
   prompt(input: { text: string; images?: Array<{ data: string; mimeType: string }> }): Promise<void>;
   interrupt(): Promise<void>;
   dispose(): Promise<void>;
-  scheduleWorkingMemory?(): void;
 }
 
 export interface AgentEngine {
@@ -172,8 +144,6 @@ export interface AgentEngine {
     cwd: string;
     modelId: string;
     reasoning: ReasoningLevel;
-    contextMode?: AgentContextMode;
-    workUnits?: boolean;
     onEvent: RuntimeEventSink;
     durability: RuntimeDurabilityHooks;
   }): Promise<ConversationRuntime>;

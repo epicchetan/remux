@@ -14,26 +14,20 @@ import type {
   DurableContextBoundarySnapshot,
   DurableInferenceContext,
   DurableQueuedTurn,
-  DurableWorkUnitTransition,
   QueueTurnResult,
 } from './storage/repository.ts';
 import type { AgentResourceKey } from '../../shared/protocol.ts';
+import type { AssistantMessage } from '@earendil-works/pi-ai';
 import type {
-  ContextUpdateInput,
-  ContextWorkspaceView,
   JournalOpenInput,
   JournalOpenResult,
   JournalSearchInput,
   JournalSearchResult,
-  WorkUnitInput,
+  ThreadDocumentView,
+  ThreadUpdateInput,
+  WorkUnitEnterInput,
 } from './engine.ts';
 import type { AgentTranscriptResourcesReadParams } from '../../shared/transcript.ts';
-import type {
-  WorkingMemoryCommitInput,
-  WorkingMemoryCommitResult,
-  WorkingMemoryCompileInput,
-  WorkingMemoryFailureInput,
-} from './context/working-memory.ts';
 
 export interface AgentConversationJournal {
   createConversation(params: CreateConversationParams): Promise<CreateConversationResult>;
@@ -74,6 +68,7 @@ export interface AgentConversationJournal {
       actualRequestMode: 'full' | 'continuation';
     },
   ): Promise<boolean>;
+  recordProviderItem?(handle: DurableTurnHandle, message: AssistantMessage): Promise<unknown>;
   finishInference(
     handle: DurableTurnHandle,
     input: { state: 'completed' | 'failed' | 'interrupted' },
@@ -88,6 +83,11 @@ export interface AgentConversationJournal {
     },
   ): Promise<DurableTranscriptMutation | null>;
   compileContext(conversationId: string): Promise<DurableContextBoundarySnapshot>;
+  resumeActiveTurn?(conversationId: string): Promise<{
+    handle: DurableTurnHandle;
+    rootHandle: DurableTurnHandle;
+    prompt: string;
+  } | null>;
   readTranscriptActions(conversationId: string): Promise<DurableTranscriptAction[]>;
   readTranscriptBasis(conversationId: string): Promise<number | null>;
   readTranscriptProjection(conversationId: string): Promise<DurableTranscriptProjection | null>;
@@ -101,21 +101,20 @@ export interface AgentConversationJournal {
     hash: string,
     range?: { offset: number; byteLength: number },
   ): Promise<DurableArtifact | null>;
-  readContextMode?(conversationId: string): Promise<'full-history' | 'stateful' | 'working-memory' | 'work-units'>;
-  readWorkUnitMode?(conversationId: string): Promise<boolean>;
   searchJournal?(conversationId: string, input: JournalSearchInput): Promise<JournalSearchResult>;
   openJournal?(conversationId: string, input: JournalOpenInput): Promise<JournalOpenResult>;
-  updateContext?(handle: DurableTurnHandle, input: ContextUpdateInput): Promise<ContextWorkspaceView>;
-  workUnit?(handle: DurableTurnHandle, input: WorkUnitInput): Promise<DurableWorkUnitTransition>;
-  completeWorkUnitImplicit?(
-    handle: DurableTurnHandle,
-    input: { text: string; reasoning: string; state?: 'completed' | 'failed' | 'interrupted' },
-  ): Promise<DurableWorkUnitTransition & { parentIntegrationPrompt: string }>;
-  resumeActiveWorkUnit?(conversationId: string): Promise<{
+  readThread?(conversationId: string): Promise<ThreadDocumentView>;
+  updateThread?(handle: DurableTurnHandle, input: ThreadUpdateInput): Promise<ThreadDocumentView>;
+  enterWorkUnit?(handle: DurableTurnHandle, input: WorkUnitEnterInput): Promise<{
     handle: DurableTurnHandle;
-    prompt: string;
-  } | null>;
-  prepareWorkingMemory?(conversationId: string): Promise<WorkingMemoryCompileInput | null>;
-  commitWorkingMemory?(input: WorkingMemoryCommitInput): Promise<WorkingMemoryCommitResult>;
-  recordWorkingMemoryFailure?(input: WorkingMemoryFailureInput): Promise<void>;
+    parentScopeId: string;
+    objective: string;
+    evidenceRefs: string[];
+  }>;
+  returnWorkUnit?(handle: DurableTurnHandle, input: { result: string }): Promise<{
+    parentHandle: DurableTurnHandle;
+    result: string;
+    resultRef: string;
+    scopeId: string;
+  }>;
 }

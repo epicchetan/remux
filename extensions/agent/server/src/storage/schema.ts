@@ -2,62 +2,35 @@ import type { DatabaseSync } from 'node:sqlite';
 
 import { canonicalJson, canonicalJsonHash } from './canonical-json.ts';
 
-export const AGENT_JOURNAL_SCHEMA_VERSION = 3;
-export const AGENT_JOURNAL_SCHEMA_ID = 'agent-journal-v3';
-export const AGENT_JOURNAL_SCHEMA_V1_ID = 'agent-journal-v1';
-export const AGENT_JOURNAL_SCHEMA_V2_ID = 'agent-journal-v2';
+export const AGENT_JOURNAL_SCHEMA_VERSION = 1;
+export const AGENT_JOURNAL_SCHEMA_ID = 'agent-thread-runtime-v1';
 
 export const AGENT_JOURNAL_TABLES = [
   'meta',
   'projects',
-  'context_spaces',
-  'project_primaries',
-  'context_bindings',
-  'project_relations',
   'conversations',
   'strands',
-  'strand_context_spaces',
   'turns',
   'execution_scopes',
   'events',
+  'messages',
   'transcript_items',
   'resources',
   'operations',
   'artifacts',
-  'epochs',
-  'epoch_blocks',
+  'state_documents',
+  'document_versions',
+  'turn_capsules',
+  'context_frames',
   'inferences',
-  'context_compilations',
+  'provider_items',
 ] as const;
-
-const AGENT_JOURNAL_V2_TABLES = AGENT_JOURNAL_TABLES.filter(
-  (table) => table !== 'strand_context_spaces' && table !== 'context_compilations',
-);
 
 const EXPECTED_COLUMNS: Record<typeof AGENT_JOURNAL_TABLES[number], string[]> = {
   meta: ['key', 'value_json'],
   projects: [
-    'project_id', 'root_path', 'title', 'root_space_id', 'revision', 'state',
-    'created_sequence', 'updated_sequence', 'created_at', 'updated_at',
-  ],
-  context_spaces: [
-    'space_id', 'project_id', 'parent_space_id', 'key', 'descriptor_json',
-    'created_revision', 'created_sequence',
-  ],
-  project_primaries: [
-    'primary_id', 'project_id', 'home_space_id', 'key', 'kind',
-    'descriptor_json', 'body_json', 'authority', 'provenance_json', 'lifecycle',
-    'superseded_by', 'version', 'created_revision', 'updated_revision',
-    'created_sequence', 'updated_sequence',
-  ],
-  context_bindings: [
-    'space_id', 'primary_id', 'project_id', 'mode', 'provenance_json', 'version',
-    'created_revision', 'updated_revision', 'created_sequence', 'updated_sequence',
-  ],
-  project_relations: [
-    'relation_id', 'project_id', 'from_type', 'from_id', 'predicate', 'to_type',
-    'to_id', 'attributes_json', 'provenance_json', 'version', 'created_revision',
-    'created_sequence',
+    'project_id', 'root_path', 'title', 'state', 'created_sequence',
+    'updated_sequence', 'created_at', 'updated_at',
   ],
   conversations: [
     'conversation_id', 'project_id', 'title', 'cwd', 'model_id', 'reasoning',
@@ -67,13 +40,11 @@ const EXPECTED_COLUMNS: Record<typeof AGENT_JOURNAL_TABLES[number], string[]> = 
     'strand_id', 'conversation_id', 'parent_strand_id', 'forked_from_sequence',
     'state', 'created_at',
   ],
-  strand_context_spaces: [
-    'strand_id', 'conversation_id', 'project_id', 'space_id', 'created_sequence',
-  ],
   turns: [
     'turn_id', 'project_id', 'conversation_id', 'strand_id', 'client_message_id',
-    'root_scope_id', 'mode', 'state', 'accepted_sequence', 'terminal_sequence',
-    'created_at', 'updated_at',
+    'root_scope_id', 'state', 'accepted_sequence', 'terminal_sequence',
+    'thread_version_before', 'thread_version_after', 'capsule_id', 'created_at',
+    'updated_at',
   ],
   execution_scopes: [
     'scope_id', 'project_id', 'conversation_id', 'strand_id', 'turn_id',
@@ -84,6 +55,11 @@ const EXPECTED_COLUMNS: Record<typeof AGENT_JOURNAL_TABLES[number], string[]> = 
     'sequence', 'event_id', 'project_id', 'conversation_id', 'strand_id',
     'turn_id', 'scope_id', 'type', 'actor', 'visibility', 'causal_event_id',
     'operation_id', 'payload_json', 'artifact_hash', 'created_at',
+  ],
+  messages: [
+    'message_id', 'project_id', 'conversation_id', 'strand_id', 'turn_id',
+    'scope_id', 'ordinal', 'role', 'visibility', 'state',
+    'content_artifact_hash', 'provider_item_id', 'created_sequence', 'created_at',
   ],
   transcript_items: [
     'item_id', 'conversation_id', 'strand_id', 'turn_id', 'first_sequence',
@@ -97,40 +73,46 @@ const EXPECTED_COLUMNS: Record<typeof AGENT_JOURNAL_TABLES[number], string[]> = 
   ],
   artifacts: [
     'hash', 'byte_length', 'media_type', 'created_sequence', 'storage_path',
-    'redaction_state',
+    'sensitivity',
   ],
-  epochs: [
-    'epoch_id', 'project_id', 'conversation_id', 'strand_id', 'turn_id',
-    'scope_id', 'ordinal', 'state', 'policy_version', 'opened_sequence',
-    'closed_sequence', 'close_reason', 'bootstrap_artifact_hash', 'basis_sequence',
+  state_documents: [
+    'document_id', 'project_id', 'conversation_id', 'strand_id', 'scope_kind',
+    'key', 'head_version_id', 'created_sequence', 'updated_sequence',
+    'created_at', 'updated_at',
   ],
-  epoch_blocks: [
-    'epoch_id', 'ordinal', 'block_hash', 'kind', 'source_json',
-    'estimated_tokens', 'artifact_hash',
+  document_versions: [
+    'version_id', 'document_id', 'ordinal', 'parent_version_id',
+    'content_artifact_hash', 'based_on_turn_id', 'created_sequence', 'created_at',
+  ],
+  turn_capsules: [
+    'capsule_id', 'project_id', 'conversation_id', 'strand_id', 'turn_id',
+    'state', 'summary_artifact_hash', 'user_message_id', 'assistant_message_id',
+    'thread_version_before', 'thread_version_after', 'trace_first_sequence',
+    'trace_last_sequence', 'created_sequence', 'created_at',
+  ],
+  context_frames: [
+    'frame_id', 'project_id', 'conversation_id', 'strand_id', 'turn_id',
+    'scope_id', 'ordinal', 'basis_sequence', 'compiler_version',
+    'thread_version_id', 'manifest_artifact_hash', 'bootstrap_artifact_hash',
+    'input_hash', 'ordered_item_hashes_json', 'estimated_input_tokens',
+    'created_sequence', 'created_at',
   ],
   inferences: [
     'inference_id', 'project_id', 'conversation_id', 'strand_id', 'turn_id',
-    'scope_id', 'epoch_id', 'ordinal', 'basis_sequence', 'state', 'request_mode',
-    'manifest_artifact_hash', 'input_hash', 'estimated_input_tokens',
-    'reported_input_tokens', 'reported_output_tokens', 'started_sequence',
-    'terminal_sequence', 'manifest_version',
+    'scope_id', 'frame_id', 'ordinal', 'basis_sequence', 'state',
+    'request_mode', 'dispatch_artifact_hash', 'input_hash',
+    'estimated_input_tokens', 'reported_input_tokens', 'reported_output_tokens',
+    'reported_cache_read_tokens', 'started_sequence', 'terminal_sequence',
   ],
-  context_compilations: [
-    'compilation_id', 'inference_id', 'project_id', 'conversation_id',
-    'strand_id', 'turn_id', 'scope_id', 'epoch_id', 'basis_sequence',
-    'project_revision', 'target_space_id', 'mode', 'compiler_version',
-    'policy_version', 'decision', 'manifest_artifact_hash',
-    'bootstrap_artifact_hash', 'semantic_hash', 'active_estimated_input_tokens',
-    'candidate_estimated_input_tokens', 'build_duration_ms', 'created_sequence',
+  provider_items: [
+    'provider_item_id', 'inference_id', 'project_id', 'conversation_id',
+    'strand_id', 'turn_id', 'scope_id', 'ordinal', 'item_type',
+    'upstream_item_id', 'raw_artifact_hash', 'inspectable_artifact_hash',
+    'created_sequence', 'created_at',
   ],
 };
 
-const EXPECTED_COLUMNS_V2: Record<string, string[]> = {
-  ...EXPECTED_COLUMNS,
-  inferences: EXPECTED_COLUMNS.inferences.filter((column) => column !== 'manifest_version'),
-};
-
-const SCHEMA_V1_SQL = `
+const SCHEMA_SQL = `
 CREATE TABLE meta (
   key TEXT PRIMARY KEY NOT NULL,
   value_json TEXT NOT NULL CHECK (json_valid(value_json))
@@ -140,135 +122,18 @@ CREATE TABLE projects (
   project_id TEXT PRIMARY KEY NOT NULL,
   root_path TEXT NOT NULL UNIQUE,
   title TEXT NOT NULL,
-  root_space_id TEXT NOT NULL,
-  revision INTEGER NOT NULL CHECK (revision >= 0),
-  state TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('active', 'archived')),
   created_sequence INTEGER NOT NULL,
   updated_sequence INTEGER NOT NULL,
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
-  UNIQUE (project_id, root_space_id),
+  UNIQUE (created_sequence, project_id),
+  UNIQUE (updated_sequence, project_id),
   CHECK (updated_sequence >= created_sequence),
-  FOREIGN KEY (project_id, root_space_id)
-    REFERENCES context_spaces(project_id, space_id)
-    DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (created_sequence, project_id)
-    REFERENCES events(sequence, project_id)
-    DEFERRABLE INITIALLY DEFERRED,
+    REFERENCES events(sequence, project_id) DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (updated_sequence, project_id)
-    REFERENCES events(sequence, project_id)
-    DEFERRABLE INITIALLY DEFERRED
-) STRICT;
-
-CREATE TABLE context_spaces (
-  space_id TEXT PRIMARY KEY NOT NULL,
-  project_id TEXT NOT NULL,
-  parent_space_id TEXT,
-  key TEXT NOT NULL,
-  descriptor_json TEXT NOT NULL CHECK (json_valid(descriptor_json)),
-  created_revision INTEGER NOT NULL CHECK (created_revision >= 0),
-  created_sequence INTEGER NOT NULL,
-  UNIQUE (project_id, space_id),
-  UNIQUE (project_id, parent_space_id, key),
-  FOREIGN KEY (project_id) REFERENCES projects(project_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (project_id, parent_space_id)
-    REFERENCES context_spaces(project_id, space_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (created_sequence, project_id)
-    REFERENCES events(sequence, project_id)
-    DEFERRABLE INITIALLY DEFERRED
-) STRICT;
-
-CREATE TABLE project_primaries (
-  primary_id TEXT PRIMARY KEY NOT NULL,
-  project_id TEXT NOT NULL,
-  home_space_id TEXT NOT NULL,
-  key TEXT NOT NULL,
-  kind TEXT NOT NULL,
-  descriptor_json TEXT NOT NULL CHECK (json_valid(descriptor_json)),
-  body_json TEXT NOT NULL CHECK (json_valid(body_json)),
-  authority TEXT NOT NULL,
-  provenance_json TEXT NOT NULL CHECK (json_valid(provenance_json)),
-  lifecycle TEXT NOT NULL,
-  superseded_by TEXT,
-  version INTEGER NOT NULL CHECK (version >= 1),
-  created_revision INTEGER NOT NULL CHECK (created_revision >= 0),
-  updated_revision INTEGER NOT NULL CHECK (updated_revision >= created_revision),
-  created_sequence INTEGER NOT NULL,
-  updated_sequence INTEGER NOT NULL,
-  UNIQUE (project_id, primary_id),
-  UNIQUE (project_id, home_space_id, key),
-  CHECK (authority IN ('user', 'observed', 'model')),
-  CHECK (lifecycle IN ('active', 'superseded', 'tombstoned')),
-  CHECK ((lifecycle = 'superseded') = (superseded_by IS NOT NULL)),
-  CHECK (updated_sequence >= created_sequence),
-  FOREIGN KEY (project_id) REFERENCES projects(project_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (project_id, home_space_id)
-    REFERENCES context_spaces(project_id, space_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (project_id, superseded_by)
-    REFERENCES project_primaries(project_id, primary_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (created_sequence, project_id)
-    REFERENCES events(sequence, project_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (updated_sequence, project_id)
-    REFERENCES events(sequence, project_id)
-    DEFERRABLE INITIALLY DEFERRED
-) STRICT;
-
-CREATE TABLE context_bindings (
-  space_id TEXT NOT NULL,
-  primary_id TEXT NOT NULL,
-  project_id TEXT NOT NULL,
-  mode TEXT NOT NULL,
-  provenance_json TEXT NOT NULL CHECK (json_valid(provenance_json)),
-  version INTEGER NOT NULL CHECK (version >= 1),
-  created_revision INTEGER NOT NULL CHECK (created_revision >= 0),
-  updated_revision INTEGER NOT NULL CHECK (updated_revision >= created_revision),
-  created_sequence INTEGER NOT NULL,
-  updated_sequence INTEGER NOT NULL,
-  PRIMARY KEY (space_id, primary_id),
-  UNIQUE (project_id, space_id, primary_id),
-  CHECK (mode IN ('inline', 'index', 'available', 'masked')),
-  CHECK (updated_sequence >= created_sequence),
-  FOREIGN KEY (project_id, space_id)
-    REFERENCES context_spaces(project_id, space_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (project_id, primary_id)
-    REFERENCES project_primaries(project_id, primary_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (created_sequence, project_id)
-    REFERENCES events(sequence, project_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (updated_sequence, project_id)
-    REFERENCES events(sequence, project_id)
-    DEFERRABLE INITIALLY DEFERRED
-) STRICT;
-
-CREATE TABLE project_relations (
-  relation_id TEXT PRIMARY KEY NOT NULL,
-  project_id TEXT NOT NULL,
-  from_type TEXT NOT NULL,
-  from_id TEXT NOT NULL,
-  predicate TEXT NOT NULL,
-  to_type TEXT NOT NULL,
-  to_id TEXT NOT NULL,
-  attributes_json TEXT NOT NULL CHECK (json_valid(attributes_json)),
-  provenance_json TEXT NOT NULL CHECK (json_valid(provenance_json)),
-  version INTEGER NOT NULL CHECK (version >= 1),
-  created_revision INTEGER NOT NULL CHECK (created_revision >= 0),
-  created_sequence INTEGER NOT NULL,
-  UNIQUE (project_id, relation_id),
-  CHECK (from_type IN ('primary', 'space')),
-  CHECK (to_type IN ('primary', 'space')),
-  FOREIGN KEY (project_id) REFERENCES projects(project_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (created_sequence, project_id)
-    REFERENCES events(sequence, project_id)
-    DEFERRABLE INITIALLY DEFERRED
+    REFERENCES events(sequence, project_id) DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
 
 CREATE TABLE conversations (
@@ -279,15 +144,14 @@ CREATE TABLE conversations (
   model_id TEXT NOT NULL,
   reasoning TEXT NOT NULL,
   head_strand_id TEXT NOT NULL,
-  state TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('idle', 'running', 'archived')),
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
   UNIQUE (project_id, conversation_id),
   FOREIGN KEY (project_id) REFERENCES projects(project_id)
     DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (conversation_id, head_strand_id)
-    REFERENCES strands(conversation_id, strand_id)
-    DEFERRABLE INITIALLY DEFERRED
+    REFERENCES strands(conversation_id, strand_id) DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
 
 CREATE TABLE strands (
@@ -295,15 +159,14 @@ CREATE TABLE strands (
   conversation_id TEXT NOT NULL,
   parent_strand_id TEXT,
   forked_from_sequence INTEGER,
-  state TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('active', 'archived')),
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   UNIQUE (conversation_id, strand_id),
   CHECK ((parent_strand_id IS NULL) = (forked_from_sequence IS NULL)),
   FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
     DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (conversation_id, parent_strand_id)
-    REFERENCES strands(conversation_id, strand_id)
-    DEFERRABLE INITIALLY DEFERRED,
+    REFERENCES strands(conversation_id, strand_id) DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (forked_from_sequence, conversation_id, parent_strand_id)
     REFERENCES events(sequence, conversation_id, strand_id)
     DEFERRABLE INITIALLY DEFERRED
@@ -316,10 +179,12 @@ CREATE TABLE turns (
   strand_id TEXT NOT NULL,
   client_message_id TEXT NOT NULL,
   root_scope_id TEXT NOT NULL,
-  mode TEXT,
-  state TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('running', 'completed', 'failed', 'interrupted', 'interrupted_by_restart')),
   accepted_sequence INTEGER NOT NULL UNIQUE,
   terminal_sequence INTEGER UNIQUE,
+  thread_version_before TEXT,
+  thread_version_after TEXT,
+  capsule_id TEXT,
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
   UNIQUE (conversation_id, turn_id),
@@ -328,11 +193,9 @@ CREATE TABLE turns (
   UNIQUE (project_id, conversation_id, strand_id, turn_id),
   CHECK (terminal_sequence IS NULL OR terminal_sequence >= accepted_sequence),
   FOREIGN KEY (project_id, conversation_id)
-    REFERENCES conversations(project_id, conversation_id)
-    DEFERRABLE INITIALLY DEFERRED,
+    REFERENCES conversations(project_id, conversation_id) DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (conversation_id, strand_id)
-    REFERENCES strands(conversation_id, strand_id)
-    DEFERRABLE INITIALLY DEFERRED,
+    REFERENCES strands(conversation_id, strand_id) DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (project_id, conversation_id, strand_id, turn_id, root_scope_id)
     REFERENCES execution_scopes(project_id, conversation_id, strand_id, turn_id, scope_id)
     DEFERRABLE INITIALLY DEFERRED,
@@ -341,6 +204,12 @@ CREATE TABLE turns (
     DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (terminal_sequence, project_id, conversation_id, strand_id)
     REFERENCES events(sequence, project_id, conversation_id, strand_id)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (thread_version_before) REFERENCES document_versions(version_id)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (thread_version_after) REFERENCES document_versions(version_id)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (capsule_id) REFERENCES turn_capsules(capsule_id)
     DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
 
@@ -351,9 +220,9 @@ CREATE TABLE execution_scopes (
   strand_id TEXT NOT NULL,
   turn_id TEXT NOT NULL,
   parent_scope_id TEXT,
-  kind TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('turn', 'work_unit')),
   objective_json TEXT NOT NULL CHECK (json_valid(objective_json)),
-  state TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('running', 'completed', 'failed', 'abandoned', 'interrupted')),
   created_sequence INTEGER NOT NULL UNIQUE,
   terminal_sequence INTEGER UNIQUE,
   result_artifact_hash TEXT,
@@ -362,7 +231,6 @@ CREATE TABLE execution_scopes (
   UNIQUE (conversation_id, scope_id),
   UNIQUE (conversation_id, strand_id, turn_id, scope_id),
   UNIQUE (project_id, conversation_id, strand_id, turn_id, scope_id),
-  CHECK (kind IN ('turn', 'work_unit')),
   CHECK ((kind = 'turn' AND parent_scope_id IS NULL) OR
          (kind = 'work_unit' AND parent_scope_id IS NOT NULL)),
   CHECK (terminal_sequence IS NULL OR terminal_sequence >= created_sequence),
@@ -392,10 +260,10 @@ CREATE TABLE events (
   scope_id TEXT,
   type TEXT NOT NULL,
   actor TEXT NOT NULL,
-  visibility TEXT NOT NULL,
+  visibility TEXT NOT NULL CHECK (visibility IN ('transcript', 'internal')),
   causal_event_id TEXT,
   operation_id TEXT,
-  payload_json TEXT,
+  payload_json TEXT CHECK (payload_json IS NULL OR json_valid(payload_json)),
   artifact_hash TEXT,
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   UNIQUE (sequence, project_id),
@@ -404,16 +272,12 @@ CREATE TABLE events (
   UNIQUE (sequence, project_id, conversation_id, strand_id),
   UNIQUE (event_id, conversation_id),
   CHECK (scope_id IS NULL OR turn_id IS NOT NULL),
-  CHECK (payload_json IS NULL OR json_valid(payload_json)),
   FOREIGN KEY (project_id, conversation_id)
-    REFERENCES conversations(project_id, conversation_id)
-    DEFERRABLE INITIALLY DEFERRED,
+    REFERENCES conversations(project_id, conversation_id) DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (conversation_id, strand_id)
-    REFERENCES strands(conversation_id, strand_id)
-    DEFERRABLE INITIALLY DEFERRED,
+    REFERENCES strands(conversation_id, strand_id) DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (causal_event_id, conversation_id)
-    REFERENCES events(event_id, conversation_id)
-    DEFERRABLE INITIALLY DEFERRED,
+    REFERENCES events(event_id, conversation_id) DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (project_id, conversation_id, strand_id, turn_id)
     REFERENCES turns(project_id, conversation_id, strand_id, turn_id)
     DEFERRABLE INITIALLY DEFERRED,
@@ -423,7 +287,35 @@ CREATE TABLE events (
   FOREIGN KEY (operation_id, project_id, conversation_id, strand_id)
     REFERENCES operations(operation_id, project_id, conversation_id, strand_id)
     DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (artifact_hash) REFERENCES artifacts(hash)
+  FOREIGN KEY (artifact_hash) REFERENCES artifacts(hash) DEFERRABLE INITIALLY DEFERRED
+) STRICT;
+
+CREATE TABLE messages (
+  message_id TEXT PRIMARY KEY NOT NULL,
+  project_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  strand_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  scope_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'internal')),
+  visibility TEXT NOT NULL CHECK (visibility IN ('transcript', 'internal')),
+  state TEXT NOT NULL CHECK (state IN ('completed', 'failed', 'interrupted')),
+  content_artifact_hash TEXT NOT NULL,
+  provider_item_id TEXT,
+  created_sequence INTEGER NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  UNIQUE (scope_id, ordinal),
+  UNIQUE (conversation_id, message_id),
+  FOREIGN KEY (project_id, conversation_id, strand_id, turn_id, scope_id)
+    REFERENCES execution_scopes(project_id, conversation_id, strand_id, turn_id, scope_id)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (content_artifact_hash) REFERENCES artifacts(hash)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (provider_item_id) REFERENCES provider_items(provider_item_id)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (created_sequence, project_id, conversation_id, strand_id)
+    REFERENCES events(sequence, project_id, conversation_id, strand_id)
     DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
 
@@ -439,17 +331,13 @@ CREATE TABLE transcript_items (
   value_json TEXT NOT NULL CHECK (json_valid(value_json)),
   CHECK (last_sequence >= first_sequence),
   FOREIGN KEY (conversation_id, strand_id)
-    REFERENCES strands(conversation_id, strand_id)
-    DEFERRABLE INITIALLY DEFERRED,
+    REFERENCES strands(conversation_id, strand_id) DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (conversation_id, strand_id, turn_id)
-    REFERENCES turns(conversation_id, strand_id, turn_id)
-    DEFERRABLE INITIALLY DEFERRED,
+    REFERENCES turns(conversation_id, strand_id, turn_id) DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (first_sequence, conversation_id, strand_id)
-    REFERENCES events(sequence, conversation_id, strand_id)
-    DEFERRABLE INITIALLY DEFERRED,
+    REFERENCES events(sequence, conversation_id, strand_id) DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (last_sequence, conversation_id, strand_id)
-    REFERENCES events(sequence, conversation_id, strand_id)
-    DEFERRABLE INITIALLY DEFERRED
+    REFERENCES events(sequence, conversation_id, strand_id) DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
 
 CREATE TABLE resources (
@@ -457,8 +345,7 @@ CREATE TABLE resources (
   basis_sequence INTEGER NOT NULL,
   value_json TEXT NOT NULL CHECK (json_valid(value_json)),
   updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
-  FOREIGN KEY (basis_sequence) REFERENCES events(sequence)
-    DEFERRABLE INITIALLY DEFERRED
+  FOREIGN KEY (basis_sequence) REFERENCES events(sequence) DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
 
 CREATE TABLE operations (
@@ -469,8 +356,7 @@ CREATE TABLE operations (
   turn_id TEXT,
   scope_id TEXT,
   kind TEXT NOT NULL,
-  arguments_hash TEXT NOT NULL
-    CHECK (length(arguments_hash) = 64 AND arguments_hash NOT GLOB '*[^0-9a-f]*'),
+  arguments_hash TEXT NOT NULL CHECK (length(arguments_hash) = 64 AND arguments_hash NOT GLOB '*[^0-9a-f]*'),
   state TEXT NOT NULL,
   accepted_sequence INTEGER NOT NULL UNIQUE,
   terminal_sequence INTEGER UNIQUE,
@@ -480,11 +366,9 @@ CREATE TABLE operations (
   CHECK (scope_id IS NULL OR turn_id IS NOT NULL),
   CHECK (terminal_sequence IS NULL OR terminal_sequence > accepted_sequence),
   FOREIGN KEY (project_id, conversation_id)
-    REFERENCES conversations(project_id, conversation_id)
-    DEFERRABLE INITIALLY DEFERRED,
+    REFERENCES conversations(project_id, conversation_id) DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (conversation_id, strand_id)
-    REFERENCES strands(conversation_id, strand_id)
-    DEFERRABLE INITIALLY DEFERRED,
+    REFERENCES strands(conversation_id, strand_id) DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (project_id, conversation_id, strand_id, turn_id)
     REFERENCES turns(project_id, conversation_id, strand_id, turn_id)
     DEFERRABLE INITIALLY DEFERRED,
@@ -502,191 +386,132 @@ CREATE TABLE operations (
 ) STRICT;
 
 CREATE TABLE artifacts (
-  hash TEXT PRIMARY KEY NOT NULL
-    CHECK (length(hash) = 64 AND hash NOT GLOB '*[^0-9a-f]*'),
+  hash TEXT PRIMARY KEY NOT NULL CHECK (length(hash) = 64 AND hash NOT GLOB '*[^0-9a-f]*'),
   byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
   media_type TEXT NOT NULL,
   created_sequence INTEGER NOT NULL,
   storage_path TEXT NOT NULL,
-  redaction_state TEXT NOT NULL,
-  FOREIGN KEY (created_sequence) REFERENCES events(sequence)
+  sensitivity TEXT NOT NULL CHECK (sensitivity IN ('content', 'inspectable', 'private')),
+  FOREIGN KEY (created_sequence) REFERENCES events(sequence) DEFERRABLE INITIALLY DEFERRED
+) STRICT;
+
+CREATE TABLE state_documents (
+  document_id TEXT PRIMARY KEY NOT NULL,
+  project_id TEXT NOT NULL,
+  conversation_id TEXT,
+  strand_id TEXT,
+  scope_kind TEXT NOT NULL CHECK (scope_kind IN ('project', 'strand')),
+  key TEXT NOT NULL,
+  head_version_id TEXT,
+  created_sequence INTEGER NOT NULL,
+  updated_sequence INTEGER NOT NULL,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+  UNIQUE (document_id, head_version_id),
+  CHECK ((scope_kind = 'project' AND conversation_id IS NULL AND strand_id IS NULL) OR
+         (scope_kind = 'strand' AND conversation_id IS NOT NULL AND strand_id IS NOT NULL)),
+  CHECK (updated_sequence >= created_sequence),
+  FOREIGN KEY (project_id) REFERENCES projects(project_id) DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (conversation_id, strand_id)
+    REFERENCES strands(conversation_id, strand_id) DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (document_id, head_version_id)
+    REFERENCES document_versions(document_id, version_id) DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (created_sequence, project_id)
+    REFERENCES events(sequence, project_id) DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (updated_sequence, project_id)
+    REFERENCES events(sequence, project_id) DEFERRABLE INITIALLY DEFERRED
+) STRICT;
+
+CREATE TABLE document_versions (
+  version_id TEXT PRIMARY KEY NOT NULL,
+  document_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  parent_version_id TEXT,
+  content_artifact_hash TEXT NOT NULL,
+  based_on_turn_id TEXT,
+  created_sequence INTEGER NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  UNIQUE (document_id, version_id),
+  UNIQUE (document_id, ordinal),
+  CHECK ((ordinal = 0 AND parent_version_id IS NULL) OR
+         (ordinal > 0 AND parent_version_id IS NOT NULL)),
+  FOREIGN KEY (document_id) REFERENCES state_documents(document_id)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (document_id, parent_version_id)
+    REFERENCES document_versions(document_id, version_id) DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (content_artifact_hash) REFERENCES artifacts(hash)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (based_on_turn_id) REFERENCES turns(turn_id) DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (created_sequence) REFERENCES events(sequence) DEFERRABLE INITIALLY DEFERRED
+) STRICT;
+
+CREATE TABLE turn_capsules (
+  capsule_id TEXT PRIMARY KEY NOT NULL,
+  project_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  strand_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL CHECK (state IN ('ready', 'pending', 'failed')),
+  summary_artifact_hash TEXT NOT NULL,
+  user_message_id TEXT NOT NULL,
+  assistant_message_id TEXT,
+  thread_version_before TEXT,
+  thread_version_after TEXT,
+  trace_first_sequence INTEGER NOT NULL,
+  trace_last_sequence INTEGER NOT NULL,
+  created_sequence INTEGER NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  CHECK (trace_last_sequence >= trace_first_sequence),
+  FOREIGN KEY (project_id, conversation_id, strand_id, turn_id)
+    REFERENCES turns(project_id, conversation_id, strand_id, turn_id)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (conversation_id, user_message_id)
+    REFERENCES messages(conversation_id, message_id) DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (conversation_id, assistant_message_id)
+    REFERENCES messages(conversation_id, message_id) DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (thread_version_before) REFERENCES document_versions(version_id)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (thread_version_after) REFERENCES document_versions(version_id)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (summary_artifact_hash) REFERENCES artifacts(hash)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (trace_first_sequence, conversation_id, strand_id)
+    REFERENCES events(sequence, conversation_id, strand_id) DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (trace_last_sequence, conversation_id, strand_id)
+    REFERENCES events(sequence, conversation_id, strand_id) DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (created_sequence, project_id, conversation_id, strand_id)
+    REFERENCES events(sequence, project_id, conversation_id, strand_id)
     DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
 
-CREATE TABLE epochs (
-  epoch_id TEXT PRIMARY KEY NOT NULL,
+CREATE TABLE context_frames (
+  frame_id TEXT PRIMARY KEY NOT NULL,
   project_id TEXT NOT NULL,
   conversation_id TEXT NOT NULL,
   strand_id TEXT NOT NULL,
   turn_id TEXT NOT NULL,
   scope_id TEXT NOT NULL,
   ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-  state TEXT NOT NULL,
-  policy_version TEXT NOT NULL,
-  opened_sequence INTEGER NOT NULL UNIQUE,
-  closed_sequence INTEGER UNIQUE,
-  close_reason TEXT,
-  bootstrap_artifact_hash TEXT,
   basis_sequence INTEGER NOT NULL,
+  compiler_version TEXT NOT NULL,
+  thread_version_id TEXT,
+  manifest_artifact_hash TEXT NOT NULL,
+  bootstrap_artifact_hash TEXT NOT NULL,
+  input_hash TEXT NOT NULL CHECK (length(input_hash) = 64 AND input_hash NOT GLOB '*[^0-9a-f]*'),
+  ordered_item_hashes_json TEXT NOT NULL CHECK (json_valid(ordered_item_hashes_json)),
+  estimated_input_tokens INTEGER NOT NULL CHECK (estimated_input_tokens >= 0),
+  created_sequence INTEGER NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
   UNIQUE (scope_id, ordinal),
-  UNIQUE (epoch_id, project_id, conversation_id, strand_id, turn_id, scope_id),
-  CHECK (closed_sequence IS NULL OR closed_sequence >= opened_sequence),
-  CHECK (basis_sequence <= opened_sequence),
+  UNIQUE (frame_id, project_id, conversation_id, strand_id, turn_id, scope_id),
+  CHECK (basis_sequence <= created_sequence),
   FOREIGN KEY (project_id, conversation_id, strand_id, turn_id, scope_id)
     REFERENCES execution_scopes(project_id, conversation_id, strand_id, turn_id, scope_id)
     DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (opened_sequence, project_id, conversation_id, strand_id)
-    REFERENCES events(sequence, project_id, conversation_id, strand_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (closed_sequence, project_id, conversation_id, strand_id)
-    REFERENCES events(sequence, project_id, conversation_id, strand_id)
-    DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (basis_sequence, project_id, conversation_id, strand_id)
     REFERENCES events(sequence, project_id, conversation_id, strand_id)
     DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (bootstrap_artifact_hash) REFERENCES artifacts(hash)
-    DEFERRABLE INITIALLY DEFERRED
-) STRICT;
-
-CREATE TABLE epoch_blocks (
-  epoch_id TEXT NOT NULL,
-  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-  block_hash TEXT NOT NULL
-    CHECK (length(block_hash) = 64 AND block_hash NOT GLOB '*[^0-9a-f]*'),
-  kind TEXT NOT NULL,
-  source_json TEXT NOT NULL CHECK (json_valid(source_json)),
-  estimated_tokens INTEGER NOT NULL CHECK (estimated_tokens >= 0),
-  artifact_hash TEXT NOT NULL,
-  PRIMARY KEY (epoch_id, ordinal),
-  FOREIGN KEY (epoch_id) REFERENCES epochs(epoch_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (artifact_hash) REFERENCES artifacts(hash)
-    DEFERRABLE INITIALLY DEFERRED
-) STRICT;
-
-CREATE TABLE inferences (
-  inference_id TEXT PRIMARY KEY NOT NULL,
-  project_id TEXT NOT NULL,
-  conversation_id TEXT NOT NULL,
-  strand_id TEXT NOT NULL,
-  turn_id TEXT NOT NULL,
-  scope_id TEXT NOT NULL,
-  epoch_id TEXT NOT NULL,
-  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-  basis_sequence INTEGER NOT NULL,
-  state TEXT NOT NULL,
-  request_mode TEXT NOT NULL,
-  manifest_artifact_hash TEXT NOT NULL,
-  input_hash TEXT NOT NULL
-    CHECK (length(input_hash) = 64 AND input_hash NOT GLOB '*[^0-9a-f]*'),
-  estimated_input_tokens INTEGER NOT NULL CHECK (estimated_input_tokens >= 0),
-  reported_input_tokens INTEGER CHECK (reported_input_tokens >= 0),
-  reported_output_tokens INTEGER CHECK (reported_output_tokens >= 0),
-  started_sequence INTEGER NOT NULL UNIQUE,
-  terminal_sequence INTEGER UNIQUE,
-  CHECK (terminal_sequence IS NULL OR terminal_sequence >= started_sequence),
-  UNIQUE (epoch_id, ordinal),
-  FOREIGN KEY (epoch_id, project_id, conversation_id, strand_id, turn_id, scope_id)
-    REFERENCES epochs(epoch_id, project_id, conversation_id, strand_id, turn_id, scope_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (basis_sequence, project_id, conversation_id, strand_id)
-    REFERENCES events(sequence, project_id, conversation_id, strand_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (manifest_artifact_hash) REFERENCES artifacts(hash)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (started_sequence, project_id, conversation_id, strand_id)
-    REFERENCES events(sequence, project_id, conversation_id, strand_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (terminal_sequence, project_id, conversation_id, strand_id)
-    REFERENCES events(sequence, project_id, conversation_id, strand_id)
-    DEFERRABLE INITIALLY DEFERRED
-) STRICT;
-
-CREATE INDEX projects_by_recent
-  ON projects(updated_at DESC, project_id DESC);
-CREATE INDEX context_spaces_by_parent
-  ON context_spaces(project_id, parent_space_id, key);
-CREATE UNIQUE INDEX context_spaces_one_root
-  ON context_spaces(project_id) WHERE parent_space_id IS NULL;
-CREATE INDEX project_primaries_by_home
-  ON project_primaries(project_id, home_space_id, key);
-CREATE INDEX project_relations_by_from
-  ON project_relations(project_id, from_type, from_id, predicate);
-CREATE INDEX project_relations_by_to
-  ON project_relations(project_id, to_type, to_id, predicate);
-CREATE INDEX conversations_by_recent
-  ON conversations(updated_at DESC, conversation_id DESC);
-CREATE INDEX strands_by_parent
-  ON strands(conversation_id, parent_strand_id) WHERE parent_strand_id IS NOT NULL;
-CREATE INDEX events_by_strand_sequence
-  ON events(conversation_id, strand_id, sequence);
-CREATE INDEX events_by_turn_sequence
-  ON events(conversation_id, turn_id, sequence) WHERE turn_id IS NOT NULL;
-CREATE INDEX events_by_scope_sequence
-  ON events(scope_id, sequence) WHERE scope_id IS NOT NULL;
-CREATE INDEX events_by_operation_sequence
-  ON events(operation_id, sequence) WHERE operation_id IS NOT NULL;
-CREATE INDEX transcript_items_by_strand_sequence
-  ON transcript_items(conversation_id, strand_id, first_sequence);
-CREATE INDEX operations_nonterminal
-  ON operations(state) WHERE terminal_sequence IS NULL;
-CREATE INDEX turns_by_strand_sequence
-  ON turns(conversation_id, strand_id, accepted_sequence);
-CREATE INDEX execution_scopes_by_parent
-  ON execution_scopes(turn_id, parent_scope_id, created_sequence);
-CREATE UNIQUE INDEX execution_scopes_one_root
-  ON execution_scopes(turn_id) WHERE parent_scope_id IS NULL;
-`;
-
-const SCHEMA_V3_SQL = `
-CREATE TABLE strand_context_spaces (
-  strand_id TEXT PRIMARY KEY NOT NULL,
-  conversation_id TEXT NOT NULL,
-  project_id TEXT NOT NULL,
-  space_id TEXT NOT NULL UNIQUE,
-  created_sequence INTEGER NOT NULL,
-  UNIQUE (conversation_id, strand_id),
-  UNIQUE (project_id, space_id),
-  FOREIGN KEY (conversation_id, strand_id)
-    REFERENCES strands(conversation_id, strand_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (project_id, space_id)
-    REFERENCES context_spaces(project_id, space_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (created_sequence, project_id)
-    REFERENCES events(sequence, project_id)
-    DEFERRABLE INITIALLY DEFERRED
-) STRICT;
-
-CREATE TABLE context_compilations (
-  compilation_id TEXT PRIMARY KEY NOT NULL,
-  inference_id TEXT NOT NULL UNIQUE,
-  project_id TEXT NOT NULL,
-  conversation_id TEXT NOT NULL,
-  strand_id TEXT NOT NULL,
-  turn_id TEXT NOT NULL,
-  scope_id TEXT NOT NULL,
-  epoch_id TEXT NOT NULL,
-  basis_sequence INTEGER NOT NULL,
-  project_revision INTEGER NOT NULL CHECK (project_revision >= 0),
-  target_space_id TEXT NOT NULL,
-  mode TEXT NOT NULL CHECK (mode IN ('shadow', 'active')),
-  compiler_version TEXT NOT NULL,
-  policy_version TEXT NOT NULL,
-  decision TEXT NOT NULL CHECK (decision IN ('append', 'roll', 'block')),
-  manifest_artifact_hash TEXT NOT NULL,
-  bootstrap_artifact_hash TEXT NOT NULL,
-  semantic_hash TEXT NOT NULL
-    CHECK (length(semantic_hash) = 64 AND semantic_hash NOT GLOB '*[^0-9a-f]*'),
-  active_estimated_input_tokens INTEGER NOT NULL CHECK (active_estimated_input_tokens >= 0),
-  candidate_estimated_input_tokens INTEGER NOT NULL CHECK (candidate_estimated_input_tokens >= 0),
-  build_duration_ms INTEGER NOT NULL CHECK (build_duration_ms >= 0),
-  created_sequence INTEGER NOT NULL UNIQUE,
-  CHECK (basis_sequence <= created_sequence),
-  FOREIGN KEY (inference_id) REFERENCES inferences(inference_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (project_id, target_space_id)
-    REFERENCES context_spaces(project_id, space_id)
+  FOREIGN KEY (thread_version_id) REFERENCES document_versions(version_id)
     DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (manifest_artifact_hash) REFERENCES artifacts(hash)
     DEFERRABLE INITIALLY DEFERRED,
@@ -697,230 +522,155 @@ CREATE TABLE context_compilations (
     DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
 
-CREATE INDEX context_compilations_by_conversation
-  ON context_compilations(conversation_id, created_sequence DESC);
+CREATE TABLE inferences (
+  inference_id TEXT PRIMARY KEY NOT NULL,
+  project_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  strand_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  scope_id TEXT NOT NULL,
+  frame_id TEXT NOT NULL UNIQUE,
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  basis_sequence INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('running', 'completed', 'failed', 'interrupted')),
+  request_mode TEXT NOT NULL CHECK (request_mode IN ('full', 'continuation')),
+  dispatch_artifact_hash TEXT NOT NULL,
+  input_hash TEXT NOT NULL CHECK (length(input_hash) = 64 AND input_hash NOT GLOB '*[^0-9a-f]*'),
+  estimated_input_tokens INTEGER NOT NULL CHECK (estimated_input_tokens >= 0),
+  reported_input_tokens INTEGER CHECK (reported_input_tokens >= 0),
+  reported_output_tokens INTEGER CHECK (reported_output_tokens >= 0),
+  reported_cache_read_tokens INTEGER CHECK (reported_cache_read_tokens >= 0),
+  started_sequence INTEGER NOT NULL UNIQUE,
+  terminal_sequence INTEGER UNIQUE,
+  UNIQUE (scope_id, ordinal),
+  CHECK (terminal_sequence IS NULL OR terminal_sequence >= started_sequence),
+  FOREIGN KEY (frame_id, project_id, conversation_id, strand_id, turn_id, scope_id)
+    REFERENCES context_frames(frame_id, project_id, conversation_id, strand_id, turn_id, scope_id)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (basis_sequence, project_id, conversation_id, strand_id)
+    REFERENCES events(sequence, project_id, conversation_id, strand_id)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (dispatch_artifact_hash) REFERENCES artifacts(hash)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (started_sequence, project_id, conversation_id, strand_id)
+    REFERENCES events(sequence, project_id, conversation_id, strand_id)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (terminal_sequence, project_id, conversation_id, strand_id)
+    REFERENCES events(sequence, project_id, conversation_id, strand_id)
+    DEFERRABLE INITIALLY DEFERRED
+) STRICT;
+
+CREATE TABLE provider_items (
+  provider_item_id TEXT PRIMARY KEY NOT NULL,
+  inference_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  strand_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  scope_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  item_type TEXT NOT NULL,
+  upstream_item_id TEXT,
+  raw_artifact_hash TEXT NOT NULL,
+  inspectable_artifact_hash TEXT NOT NULL,
+  created_sequence INTEGER NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  UNIQUE (inference_id, ordinal),
+  UNIQUE (provider_item_id, conversation_id),
+  FOREIGN KEY (inference_id) REFERENCES inferences(inference_id)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (project_id, conversation_id, strand_id, turn_id, scope_id)
+    REFERENCES execution_scopes(project_id, conversation_id, strand_id, turn_id, scope_id)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (raw_artifact_hash) REFERENCES artifacts(hash)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (inspectable_artifact_hash) REFERENCES artifacts(hash)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (created_sequence, project_id, conversation_id, strand_id)
+    REFERENCES events(sequence, project_id, conversation_id, strand_id)
+    DEFERRABLE INITIALLY DEFERRED
+) STRICT;
+
+CREATE INDEX projects_by_recent ON projects(updated_at DESC, project_id DESC);
+CREATE INDEX conversations_by_recent ON conversations(updated_at DESC, conversation_id DESC);
+CREATE INDEX strands_by_parent ON strands(conversation_id, parent_strand_id) WHERE parent_strand_id IS NOT NULL;
+CREATE INDEX turns_by_strand_sequence ON turns(conversation_id, strand_id, accepted_sequence);
+CREATE INDEX execution_scopes_by_parent ON execution_scopes(turn_id, parent_scope_id, created_sequence);
+CREATE UNIQUE INDEX execution_scopes_one_root ON execution_scopes(turn_id) WHERE parent_scope_id IS NULL;
+CREATE INDEX events_by_strand_sequence ON events(conversation_id, strand_id, sequence);
+CREATE INDEX events_by_turn_sequence ON events(conversation_id, turn_id, sequence) WHERE turn_id IS NOT NULL;
+CREATE INDEX events_by_scope_sequence ON events(scope_id, sequence) WHERE scope_id IS NOT NULL;
+CREATE INDEX events_by_operation_sequence ON events(operation_id, sequence) WHERE operation_id IS NOT NULL;
+CREATE INDEX messages_by_strand_sequence ON messages(conversation_id, strand_id, created_sequence);
+CREATE INDEX transcript_items_by_strand_sequence ON transcript_items(conversation_id, strand_id, first_sequence);
+CREATE INDEX transcript_items_by_turn_sequence ON transcript_items(conversation_id, turn_id, first_sequence);
+CREATE INDEX operations_nonterminal ON operations(state) WHERE terminal_sequence IS NULL;
+CREATE UNIQUE INDEX state_documents_project_key
+  ON state_documents(project_id, key) WHERE scope_kind = 'project';
+CREATE UNIQUE INDEX state_documents_strand_key
+  ON state_documents(conversation_id, strand_id, key) WHERE scope_kind = 'strand';
+CREATE INDEX document_versions_by_document ON document_versions(document_id, ordinal);
+CREATE INDEX capsules_by_strand ON turn_capsules(conversation_id, strand_id, trace_last_sequence);
+CREATE INDEX frames_by_scope ON context_frames(scope_id, ordinal);
+CREATE INDEX provider_items_by_scope ON provider_items(scope_id, created_sequence);
 `;
 
 export function listAgentDatabaseTables(database: DatabaseSync) {
   const rows = database.prepare(`
-    SELECT name
-    FROM sqlite_master
+    SELECT name FROM sqlite_master
     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
     ORDER BY name
   `).all() as Array<{ name: string }>;
   return rows.map((row) => row.name);
 }
 
-export function createAgentSchemaV1(database: DatabaseSync) {
-  database.exec(SCHEMA_V1_SQL);
+export function createAgentSchema(database: DatabaseSync) {
+  database.exec(SCHEMA_SQL);
   database.prepare('INSERT INTO meta (key, value_json) VALUES (?, ?)').run(
     'journal_schema',
-    canonicalJson(AGENT_JOURNAL_SCHEMA_V1_ID),
-  );
-  database.exec('PRAGMA user_version = 1');
-}
-
-export function createAgentSchemaV2(database: DatabaseSync) {
-  database.exec(SCHEMA_V1_SQL);
-  database.exec(`
-    CREATE INDEX transcript_items_by_turn_sequence
-      ON transcript_items(conversation_id, turn_id, first_sequence);
-  `);
-  database.prepare('INSERT INTO meta (key, value_json) VALUES (?, ?)').run(
-    'journal_schema',
-    canonicalJson(AGENT_JOURNAL_SCHEMA_V2_ID),
-  );
-  database.exec('PRAGMA user_version = 2');
-}
-
-export function createAgentSchemaV3(database: DatabaseSync) {
-  createAgentSchemaV2(database);
-  migrateAgentSchemaV2ToV3(database);
-}
-
-export function migrateAgentSchemaV1ToV2(database: DatabaseSync) {
-  database.exec(`
-    CREATE INDEX transcript_items_by_turn_sequence
-      ON transcript_items(conversation_id, turn_id, first_sequence);
-  `);
-  database.prepare('UPDATE meta SET value_json = ? WHERE key = ?').run(
-    canonicalJson(AGENT_JOURNAL_SCHEMA_V2_ID),
-    'journal_schema',
-  );
-  database.exec('PRAGMA user_version = 2');
-}
-
-export function migrateAgentSchemaV2ToV3(database: DatabaseSync) {
-  database.exec(SCHEMA_V3_SQL);
-  database.exec(`
-    ALTER TABLE inferences
-      ADD COLUMN manifest_version TEXT NOT NULL DEFAULT 'agent-provider-payload-v1';
-  `);
-  backfillStrandContextSpaces(database);
-  database.prepare('UPDATE meta SET value_json = ? WHERE key = ?').run(
     canonicalJson(AGENT_JOURNAL_SCHEMA_ID),
-    'journal_schema',
   );
   database.exec(`PRAGMA user_version = ${AGENT_JOURNAL_SCHEMA_VERSION}`);
-}
-
-function backfillStrandContextSpaces(database: DatabaseSync) {
-  const rows = database.prepare(`
-    SELECT s.strand_id, s.conversation_id, s.parent_strand_id,
-           c.project_id, p.root_space_id, p.revision,
-           (
-             SELECT MIN(e.sequence)
-             FROM events e
-             WHERE e.conversation_id = s.conversation_id
-               AND e.type = 'conversation.created'
-           ) AS created_sequence
-    FROM strands s
-    JOIN conversations c ON c.conversation_id = s.conversation_id
-    JOIN projects p ON p.project_id = c.project_id
-    ORDER BY s.created_at, s.strand_id
-  `).all() as Array<{
-    strand_id: string;
-    conversation_id: string;
-    parent_strand_id: string | null;
-    project_id: string;
-    root_space_id: string;
-    revision: number;
-    created_sequence: number | null;
-  }>;
-  const pending = new Map(rows.map((row) => [row.strand_id, row]));
-  const targetByStrand = new Map<string, string>();
-  while (pending.size > 0) {
-    let progressed = false;
-    for (const [strandId, row] of pending) {
-      const parentSpaceId = row.parent_strand_id === null
-        ? row.root_space_id
-        : targetByStrand.get(row.parent_strand_id);
-      if (!parentSpaceId) continue;
-      if (row.created_sequence === null) {
-        throw new AgentSchemaError(`Strand ${strandId} has no durable conversation creation sequence.`);
-      }
-      const spaceId = migratedStrandContextSpaceId(strandId);
-      database.prepare(`
-        INSERT INTO context_spaces (
-          space_id, project_id, parent_space_id, key, descriptor_json,
-          created_revision, created_sequence
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        spaceId,
-        row.project_id,
-        parentSpaceId,
-        `strand:${strandId}`,
-        canonicalJson({
-          conversationId: row.conversation_id,
-          kind: 'strand',
-          strandId,
-        }),
-        row.revision,
-        row.created_sequence,
-      );
-      database.prepare(`
-        INSERT INTO strand_context_spaces (
-          strand_id, conversation_id, project_id, space_id, created_sequence
-        ) VALUES (?, ?, ?, ?, ?)
-      `).run(strandId, row.conversation_id, row.project_id, spaceId, row.created_sequence);
-      targetByStrand.set(strandId, spaceId);
-      pending.delete(strandId);
-      progressed = true;
-    }
-    if (!progressed) {
-      throw new AgentSchemaError('Strand context-space migration encountered missing or cyclic ancestry.');
-    }
-  }
-}
-
-export function migratedStrandContextSpaceId(strandId: string) {
-  return `strand-context:${strandId}`;
 }
 
 export function agentSchemaFingerprint(database: DatabaseSync) {
   const rows = database.prepare(`
     SELECT type, name, tbl_name, sql
-    FROM sqlite_schema
-    WHERE name NOT LIKE 'sqlite_%'
-      AND type IN ('table', 'index', 'trigger', 'view')
+    FROM sqlite_master
+    WHERE name NOT LIKE 'sqlite_%' AND type IN ('table', 'index', 'trigger', 'view')
     ORDER BY type, name
-  `).all() as Array<{
-    type: string;
-    name: string;
-    tbl_name: string;
-    sql: string | null;
-  }>;
+  `).all() as Array<Record<string, unknown>>;
   return canonicalJsonHash(rows.map((row) => ({
-    name: row.name,
-    sql: row.sql === null ? null : normalizeSchemaSql(row.sql),
-    table: row.tbl_name,
-    type: row.type,
+    type: String(row.type),
+    name: String(row.name),
+    table: String(row.tbl_name),
+    sql: String(row.sql ?? ''),
   })));
 }
 
-export function validateAgentSchemaV1(database: DatabaseSync, expectedFingerprint: string) {
-  validateAgentSchema(
-    database,
-    expectedFingerprint,
-    1,
-    AGENT_JOURNAL_SCHEMA_V1_ID,
-    AGENT_JOURNAL_V2_TABLES,
-    EXPECTED_COLUMNS_V2,
-  );
-}
-
-export function validateAgentSchemaV2(database: DatabaseSync, expectedFingerprint: string) {
-  validateAgentSchema(
-    database,
-    expectedFingerprint,
-    2,
-    AGENT_JOURNAL_SCHEMA_V2_ID,
-    AGENT_JOURNAL_V2_TABLES,
-    EXPECTED_COLUMNS_V2,
-  );
-}
-
-export function validateAgentSchemaV3(database: DatabaseSync, expectedFingerprint: string) {
-  validateAgentSchema(
-    database,
-    expectedFingerprint,
-    AGENT_JOURNAL_SCHEMA_VERSION,
-    AGENT_JOURNAL_SCHEMA_ID,
-    AGENT_JOURNAL_TABLES,
-    EXPECTED_COLUMNS,
-  );
-}
-
-function validateAgentSchema(
-  database: DatabaseSync,
-  expectedFingerprint: string,
-  version: number,
-  schemaId: string,
-  expectedTableNames: readonly string[],
-  expectedColumns: Record<string, string[]>,
-) {
+export function validateAgentSchema(database: DatabaseSync, expectedFingerprint: string) {
   const actualTables = listAgentDatabaseTables(database);
-  const expectedTables = [...expectedTableNames].sort();
+  const expectedTables = [...AGENT_JOURNAL_TABLES].sort();
   if (!sameStrings(actualTables, expectedTables)) {
     throw new AgentSchemaError(
-      `Agent schema tables do not match version ${version} (expected ${expectedTables.join(', ')}; found ${actualTables.join(', ')}).`,
+      `Agent schema tables do not match ${AGENT_JOURNAL_SCHEMA_ID} ` +
+      `(expected ${expectedTables.join(', ')}; found ${actualTables.join(', ')}).`,
     );
   }
-  for (const table of expectedTableNames) {
+  for (const table of AGENT_JOURNAL_TABLES) {
     const rows = database.prepare(`PRAGMA table_info("${table}")`).all() as Array<{ name: string }>;
     const actualColumns = rows.map((row) => row.name);
-    if (!sameStrings(actualColumns, expectedColumns[table] ?? [])) {
-      throw new AgentSchemaError(`Agent schema columns do not match version ${version} for ${table}.`);
+    if (!sameStrings(actualColumns, EXPECTED_COLUMNS[table])) {
+      throw new AgentSchemaError(`Agent schema columns do not match for ${table}.`);
     }
   }
-  const actualFingerprint = agentSchemaFingerprint(database);
-  if (actualFingerprint !== expectedFingerprint) {
-    throw new AgentSchemaError(`Agent schema structure does not match version ${version}.`);
+  if (agentSchemaFingerprint(database) !== expectedFingerprint) {
+    throw new AgentSchemaError('Agent schema structure does not match the thread-runtime reference.');
   }
   const schema = database.prepare('SELECT value_json FROM meta WHERE key = ?').get('journal_schema') as
     | { value_json: string }
     | undefined;
-  if (!schema || schema.value_json !== canonicalJson(schemaId)) {
+  if (!schema || schema.value_json !== canonicalJson(AGENT_JOURNAL_SCHEMA_ID)) {
     throw new AgentSchemaError('Agent journal schema identity is missing or invalid.');
   }
   const foreignKeyFailures = database.prepare('PRAGMA foreign_key_check').all();
@@ -928,6 +678,34 @@ function validateAgentSchema(
     throw new AgentSchemaError(`Agent journal contains ${foreignKeyFailures.length} foreign-key violation(s).`);
   }
   validateCanonicalData(database);
+}
+
+function validateCanonicalData(database: DatabaseSync) {
+  const jsonColumns: Array<[string, string]> = [
+    ['meta', 'value_json'],
+    ['execution_scopes', 'objective_json'],
+    ['events', 'payload_json'],
+    ['transcript_items', 'value_json'],
+    ['resources', 'value_json'],
+    ['operations', 'value_json'],
+    ['context_frames', 'ordered_item_hashes_json'],
+  ];
+  for (const [table, column] of jsonColumns) {
+    const rows = database.prepare(`SELECT rowid AS row_id, ${column} AS value FROM ${table}`).all() as
+      Array<{ row_id: number; value: string | null }>;
+    for (const row of rows) {
+      if (row.value === null) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(row.value);
+      } catch (error) {
+        throw new AgentSchemaError(`Agent journal contains invalid JSON in ${table}.${column}.`, { cause: error });
+      }
+      if (canonicalJson(parsed) !== row.value) {
+        throw new AgentSchemaError(`Agent journal contains non-canonical JSON in ${table}.${column}.`);
+      }
+    }
+  }
 }
 
 export class AgentSchemaError extends Error {
@@ -939,57 +717,4 @@ export class AgentSchemaError extends Error {
 
 function sameStrings(left: string[], right: string[]) {
   return left.length === right.length && left.every((value, index) => value === right[index]);
-}
-
-const CANONICAL_JSON_COLUMNS = [
-  ['meta', 'value_json'],
-  ['context_spaces', 'descriptor_json'],
-  ['project_primaries', 'descriptor_json'],
-  ['project_primaries', 'body_json'],
-  ['project_primaries', 'provenance_json'],
-  ['context_bindings', 'provenance_json'],
-  ['project_relations', 'attributes_json'],
-  ['project_relations', 'provenance_json'],
-  ['execution_scopes', 'objective_json'],
-  ['events', 'payload_json'],
-  ['transcript_items', 'value_json'],
-  ['resources', 'value_json'],
-  ['operations', 'value_json'],
-  ['epoch_blocks', 'source_json'],
-] as const;
-
-function validateCanonicalData(database: DatabaseSync) {
-  for (const [table, column] of CANONICAL_JSON_COLUMNS) {
-    const rows = database.prepare(`
-      SELECT rowid AS storage_row_id, "${column}" AS value
-      FROM "${table}"
-      WHERE "${column}" IS NOT NULL
-    `).all() as Array<{ storage_row_id: number; value: unknown }>;
-    for (const row of rows) {
-      if (typeof row.value !== 'string') {
-        throw new AgentSchemaError(`Agent journal ${table}.${column} contains a non-text value.`);
-      }
-      if (
-        table === 'events' &&
-        column === 'payload_json' &&
-        Buffer.byteLength(row.value, 'utf8') > 32 * 1024
-      ) {
-        throw new AgentSchemaError(`Agent journal event ${row.storage_row_id} payload exceeds 32 KiB.`);
-      }
-      try {
-        if (canonicalJson(JSON.parse(row.value)) !== row.value) {
-          throw new Error('noncanonical JSON');
-        }
-      } catch (error) {
-        throw new AgentSchemaError(
-          `Agent journal ${table}.${column} row ${row.storage_row_id} is not canonical JSON.`,
-          { cause: error },
-        );
-      }
-    }
-  }
-}
-
-function normalizeSchemaSql(sql: string) {
-  return sql.trim().replace(/\s+/gu, ' ');
 }

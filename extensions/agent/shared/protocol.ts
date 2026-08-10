@@ -45,7 +45,6 @@ export function queueResourceKey(conversationId: string): `queue:${string}` {
 }
 
 export type ReasoningLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
-export type AgentContextMode = 'full-history' | 'stateful' | 'working-memory' | 'work-units';
 
 export type AgentFileSearchResult = {
   absolutePath: string;
@@ -129,47 +128,37 @@ export type ContextInspectorArtifact = {
 };
 
 export type ContextInspectorValue = {
-  version: 1 | 2;
+  version: 3;
   conversationId: string;
   inferenceId: string;
-  epochId: string;
+  frameId: string;
   basisSequence: number;
-  projectRevision: number;
-  targetContextSpaceId: string;
+  threadVersionId: string;
   compilerVersion: string;
   policyVersion: string;
-  decision:
-    | { kind: 'append'; pressurePermille: number }
-    | { kind: 'roll'; pressurePermille: number; reason: string }
-    | { kind: 'block'; pressurePermille: number; reason: string };
-  activeEstimatedInputTokens: number;
-  candidateEstimatedInputTokens: number;
+  estimatedInputTokens: number;
   semanticHash: string;
   bootstrapHash: string;
   buildDurationMs: number;
+  transportMode: 'full' | 'continuation';
+  messageCount: number;
+  turnCount: number;
+  logicalHash: string;
+  renderedHash: string;
+  fixedContractsHash: string;
   manifestArtifact: ContextInspectorArtifact;
   bootstrapArtifact: ContextInspectorArtifact;
-  actual?: {
-    mode: 'full-history' | 'stateful-frame';
-    frameOrdinal: number | null;
-    transportMode: 'full' | 'continuation';
+  dispatchArtifact: ContextInspectorArtifact;
+  groups: ReadonlyArray<{
+    turnId: string;
+    source: string;
     messageCount: number;
-    turnCount: number;
-    logicalHash: string;
-    renderedHash: string;
-    fixedContractsHash: string;
-    dispatchArtifact: ContextInspectorArtifact;
-    groups: ReadonlyArray<{
-      turnId: string;
-      source: string;
-      messageCount: number;
-      estimatedTokens: number;
-      roles: { user: number; assistant: number; tool: number };
-    }>;
-    groupsTruncated: boolean;
-  };
-  blocks: ReadonlyArray<{
-    kind: 'context_hud' | 'continuation' | 'working_state' | 'working_memory' | 'open_work' | 'workspace' | 'runtime' | 'raw_tail' | 'retrieval_map';
+    estimatedTokens: number;
+    roles: { user: number; assistant: number; tool: number };
+  }>;
+  groupsTruncated: boolean;
+  layers: ReadonlyArray<{
+    kind: 'thread_document' | 'capsule_tail' | 'dialogue_tail' | 'active_turn';
     hash: string;
     estimatedTokens: number;
     sources: readonly string[];
@@ -300,8 +289,6 @@ export type ConversationCreateParams = {
   cwd: string;
   modelId: string;
   reasoning: ReasoningLevel;
-  contextMode?: AgentContextMode;
-  workUnits?: boolean;
 };
 
 export type ConversationCreateResult = {

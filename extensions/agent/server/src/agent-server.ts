@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { realpath, stat } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
+import type { AssistantMessage } from '@earendil-works/pi-ai';
 
 import {
   AGENT_METHODS,
@@ -13,7 +14,6 @@ import {
   type ArtifactReadRange,
   type ArtifactReadResult,
   type AgentRuntimeValue,
-  type AgentContextMode,
   type AgentFileSearchParams,
   type AuthValue,
   type ConversationSummary,
@@ -31,7 +31,13 @@ import {
 } from '../../shared/protocol.ts';
 import type { AgentResourceInvalidation } from '../../shared/transcript.ts';
 import type { AgentConversationJournal } from './conversation-journal.ts';
-import type { AgentEngine, ConversationRuntime, RuntimeEvent } from './engine.ts';
+import type {
+  AgentEngine,
+  ConversationRuntime,
+  RuntimeEvent,
+  WorkUnitEnterInput,
+  WorkUnitReturnInput,
+} from './engine.ts';
 import type {
   DurableInferenceContext,
   DurableTranscriptAction,
@@ -84,7 +90,12 @@ export class AgentServer {
   private turnWriteTail: Promise<void> = Promise.resolve();
   private turnWriteError: unknown = null;
   private activeDurableTurn: DurableTurnHandle | null = null;
-  private activeWorkUnitScopeId: string | null = null;
+  private activeDurableScope: DurableTurnHandle | null = null;
+  private readonly toolScopes = new Map<string, DurableTurnHandle>();
+  private readonly pendingWorkUnitReturns = new Map<string, {
+    handle: DurableTurnHandle;
+    input: WorkUnitReturnInput;
+  }>();
   private activeTurnStartedMonotonicAt: number | null = null;
   private pendingAssistantText = '';
   private pendingAssistantReasoning = '';
@@ -403,8 +414,6 @@ export class AgentServer {
         cwd,
         modelId: params.modelId,
         reasoning: params.reasoning,
-        contextMode: params.contextMode ?? 'stateful',
-        workUnits: params.contextMode === 'work-units' || (params.workUnits ?? false),
       });
     } catch (error) {
       if (isOperationConflict(error, params.operationId)) {
@@ -425,8 +434,6 @@ export class AgentServer {
       cwd,
       modelId: params.modelId,
       reasoning: params.reasoning,
-      contextMode: params.contextMode ?? 'stateful',
-      workUnits: params.contextMode === 'work-units' || (params.workUnits ?? false),
     }, params.operationId);
     return { conversationId: durable.conversationId };
   }
@@ -519,7 +526,7 @@ export class AgentServer {
 
     const turnId = durable.turnId;
     this.activeDurableTurn = durable;
-    this.activeWorkUnitScopeId = null;
+    this.activeDurableScope = durable;
     this.activeTurnStartedMonotonicAt = this.monotonicNow();
     this.turnWriteTail = Promise.resolve();
     this.turnWriteError = null;
@@ -555,7 +562,7 @@ export class AgentServer {
       this.resources.invalidateKey(conversationResourceKey(params.conversationId));
       this.resources.invalidateKey(AGENT_RESOURCE_KEYS.conversationList);
       this.activeDurableTurn = null;
-      this.activeWorkUnitScopeId = null;
+      this.activeDurableScope = null;
       this.activeTurnStartedMonotonicAt = null;
       runtimeValue.state = 'error';
       runtimeValue.activeTurnId = null;
@@ -637,15 +644,16 @@ export class AgentServer {
     const projection = await this.journal.readTranscriptProjection(params.sourceConversationId);
     if (!projection) throw new RpcFault(-32015, 'Source conversation transcript was not found.');
     const prefix = branchPrefix(projection.actions, params, mode);
-    const contextMode = await this.journal.readContextMode?.(params.sourceConversationId) ?? 'stateful';
-    const workUnits = await this.journal.readWorkUnitMode?.(params.sourceConversationId) ?? false;
     const branch = await this.journal.createConversation({
       operationId: params.operationId,
       cwd: source.cwd,
       modelId: source.modelId,
       reasoning: source.reasoning,
-      contextMode,
-      workUnits,
+      inheritThreadFrom: {
+        conversationId: params.sourceConversationId,
+        turnId: params.sourceTurnId,
+        position: mode === 'edit' ? 'before' : 'after',
+      },
     });
     await this.cloneTranscriptPrefix(branch.conversationId, prefix, params.operationId);
     this.resources.invalidateKey(AGENT_RESOURCE_KEYS.conversationList, 'created');
@@ -787,10 +795,7 @@ export class AgentServer {
   }
 
   private async loadConversationRuntime(
-    conversation: Pick<ConversationSummary, 'id' | 'cwd' | 'modelId' | 'reasoning'> & {
-      contextMode?: AgentContextMode;
-      workUnits?: boolean;
-    },
+    conversation: Pick<ConversationSummary, 'id' | 'cwd' | 'modelId' | 'reasoning'>,
     operationId: string | null,
   ) {
     const current = this.resources.get<AgentRuntimeValue>(AGENT_RESOURCE_KEYS.runtime);
@@ -840,18 +845,10 @@ export class AgentServer {
         live: true,
         invalidate: (invalidations) => this.publishProjectorInvalidations(invalidations),
       });
-      const contextMode = conversation.contextMode
-        ?? await this.journal.readContextMode?.(conversation.id)
-        ?? 'stateful';
-      const workUnits = conversation.workUnits
-        ?? await this.journal.readWorkUnitMode?.(conversation.id)
-        ?? false;
       const runtime = await this.engine.createConversation({
         cwd,
         modelId: conversation.modelId,
         reasoning: conversation.reasoning,
-        contextMode,
-        workUnits,
         onEvent: (event) => this.applyRuntimeEvent(conversation.id, event),
         durability: {
           compileContext: () => this.compileContext(conversation.id),
@@ -868,59 +865,39 @@ export class AgentServer {
             if (!this.journal.openJournal) throw new Error('Durable journal open is unavailable.');
             return this.journal.openJournal(conversation.id, input);
           },
-          updateContext: (input) => {
-            if (!this.journal.updateContext) throw new Error('Durable context updates are unavailable.');
-            return this.journal.updateContext(this.requiredActiveDurableTurn(conversation.id), input);
+          threadRead: () => {
+            if (!this.journal.readThread) throw new Error('Durable thread state is unavailable.');
+            return this.journal.readThread(conversation.id);
           },
-          prepareWorkingMemory: () => {
-            if (!this.journal.prepareWorkingMemory) throw new Error('Background working memory is unavailable.');
-            return this.journal.prepareWorkingMemory(conversation.id);
+          threadUpdate: (input) => {
+            if (!this.journal.updateThread) throw new Error('Durable thread updates are unavailable.');
+            return this.journal.updateThread(this.requiredActiveDurableScope(conversation.id), input);
           },
-          commitWorkingMemory: (input) => {
-            if (!this.journal.commitWorkingMemory) throw new Error('Background working memory is unavailable.');
-            return this.journal.commitWorkingMemory(input);
-          },
-          recordWorkingMemoryFailure: (input) => {
-            if (!this.journal.recordWorkingMemoryFailure) throw new Error('Background working memory is unavailable.');
-            return this.journal.recordWorkingMemoryFailure(input);
-          },
-          workUnit: async (input) => {
-            if (!this.journal.workUnit) throw new Error('Durable work units are unavailable.');
-            const transition = await this.journal.workUnit(
-              this.requiredActiveDurableTurn(conversation.id),
-              input,
-            );
-            this.activeDurableTurn = transition.handle;
-            this.activeWorkUnitScopeId = transition.result.action === 'entered'
-              ? transition.result.scopeId
-              : null;
-            this.resources.invalidateKey(contextResourceKey(conversation.id), 'updated');
-            return transition.result;
-          },
+          workUnitEnter: (callId, input) => this.enterWorkUnit(conversation.id, callId, input),
+          workUnitReturn: (callId, input) =>
+            this.requestWorkUnitReturn(conversation.id, callId, input),
         },
       });
       this.runtime = runtime;
       this.projector = projector;
       this.conversationId = conversation.id;
       this.conversationOperationId = operationId;
-      const resumed = await this.journal.resumeActiveWorkUnit?.(conversation.id) ?? null;
+      const resumed = await this.journal.resumeActiveTurn?.(conversation.id) ?? null;
       if (resumed) {
-        this.activeDurableTurn = resumed.handle;
-        this.activeWorkUnitScopeId = resumed.handle.scopeId;
+        this.activeDurableTurn = resumed.rootHandle;
+        this.activeDurableScope = resumed.handle;
         this.activeTurnStartedMonotonicAt = this.monotonicNow();
         this.turnWriteTail = Promise.resolve();
         this.turnWriteError = null;
         this.turnCompletion = null;
         this.durabilityFailure = null;
       }
-      const loaded = resumed
-        ? {
-            ...loading,
-            state: 'running' as const,
-            activeTurnId: resumed.handle.turnId,
-            activeTurnElapsedMs: 0,
-          }
-        : { ...loading, state: 'idle' as const };
+      const loaded = resumed ? {
+        ...loading,
+        state: 'running' as const,
+        activeTurnId: resumed.handle.turnId,
+        activeTurnElapsedMs: 0,
+      } : { ...loading, state: 'idle' as const };
       this.resources.set(AGENT_RESOURCE_KEYS.runtime, loaded);
       if (resumed) {
         void runtime.prompt({ text: resumed.prompt })
@@ -973,7 +950,9 @@ export class AgentServer {
     let runtimeChanged = false;
     switch (event.type) {
       case 'assistant-start':
-        if (turnId) this.projector?.assistantStarted(turnId);
+        if (turnId && this.activeDurableScope && this.isRootScope(this.activeDurableScope)) {
+          this.projector?.assistantStarted(turnId);
+        }
         break;
       case 'assistant-text':
         if (turnId) this.bufferAssistantCheckpoint(event.delta, '');
@@ -986,7 +965,15 @@ export class AgentServer {
           .catch((error) => this.failDurability(conversationId, error));
         break;
       case 'assistant-complete':
-        void this.completeTurn(conversationId, event.interrupted, event.error)
+        void this.completeTurn(
+          conversationId,
+          event.interrupted,
+          event.error ?? (
+            this.activeDurableScope && !this.isRootScope(this.activeDurableScope)
+              ? 'A work unit ended without calling work_unit_return.'
+              : undefined
+          ),
+        )
           .catch((error) => this.failDurability(conversationId, error));
         return;
       case 'tool-start':
@@ -1022,7 +1009,7 @@ export class AgentServer {
       context: DurableInferenceContext;
     },
   ) {
-    const handle = this.requiredActiveDurableTurn(conversationId);
+    const handle = this.requiredActiveDurableScope(conversationId);
     const runtime = this.resources.get<AgentRuntimeValue>(AGENT_RESOURCE_KEYS.runtime);
     const modelId = runtime?.contextProbe?.modelId;
     if (!modelId) throw new Error('Provider dispatch has no durable model identity.');
@@ -1039,7 +1026,7 @@ export class AgentServer {
   }
 
   private async compileContext(conversationId: string) {
-    this.requiredActiveDurableTurn(conversationId);
+    this.requiredActiveDurableScope(conversationId);
     await this.flushAssistantCheckpoint();
     await this.turnWriteTail;
     if (this.turnWriteError) throw this.turnWriteError;
@@ -1053,7 +1040,7 @@ export class AgentServer {
       actualRequestMode: 'full' | 'continuation';
     },
   ) {
-    const handle = this.requiredActiveDurableTurn(conversationId);
+    const handle = this.requiredActiveDurableScope(conversationId);
     if (!this.journal.recordInferenceTransport) return;
     const recorded = await this.enqueueTurnWrite(() =>
       this.journal.recordInferenceTransport!(handle, input));
@@ -1064,7 +1051,7 @@ export class AgentServer {
     conversationId: string,
     state: 'completed' | 'failed' | 'interrupted',
   ) {
-    const handle = this.activeDurableTurn;
+    const handle = this.activeDurableScope;
     if (!handle || handle.conversationId !== conversationId) return;
     await this.flushAssistantCheckpoint();
     await this.enqueueTurnWrite(() => this.journal.finishInference(handle, { state }));
@@ -1077,46 +1064,15 @@ export class AgentServer {
       text: string;
       reasoning: string;
       calls: Array<{ callId: string; name: string; args: unknown }>;
+      providerMessage: AssistantMessage;
     },
   ) {
-    const handle = this.requiredActiveDurableTurn(conversationId);
-    if (this.activeWorkUnitScopeId === handle.scopeId) {
-      await this.turnWriteTail;
-      if (this.turnWriteError) throw this.turnWriteError;
-      if (input.calls.length > 0) {
-        if (input.text || input.reasoning) {
-          await this.enqueueTurnWrite(() => this.journal.appendAssistantCheckpoint(handle, {
-            textDelta: input.text,
-            reasoningDelta: input.reasoning,
-          }));
-        }
-        await this.enqueueTurnWrite(() => this.journal.finishInference(handle, {
-          state: input.inferenceState,
-        }));
-        for (const call of input.calls) {
-          await this.enqueueTurnWrite(() => this.journal.recordToolStarted(handle, call));
-        }
-        this.inferenceAssistantText = input.text;
-        this.inferenceAssistantReasoning = input.reasoning;
-        return;
-      }
-      if (!this.journal.completeWorkUnitImplicit) {
-        throw new Error('Implicit work-unit completion is unavailable.');
-      }
-      const transition = await this.journal.completeWorkUnitImplicit(handle, {
-        text: input.text,
-        reasoning: input.reasoning,
-        state: input.inferenceState,
-      });
-      this.activeDurableTurn = transition.handle;
-      this.activeWorkUnitScopeId = null;
-      this.inferenceAssistantText = '';
-      this.inferenceAssistantReasoning = '';
-      this.resources.invalidateKey(contextResourceKey(conversationId), 'updated');
-      if (input.inferenceState === 'interrupted') return;
-      return { parentIntegrationPrompt: transition.parentIntegrationPrompt };
-    }
+    const handle = this.requiredActiveDurableScope(conversationId);
     await this.flushAssistantCheckpoint();
+    if (!this.journal.recordProviderItem) {
+      throw new Error('Exact provider item durability is unavailable.');
+    }
+    await this.enqueueTurnWrite(() => this.journal.recordProviderItem!(handle, input.providerMessage));
     const textDelta = finalizedSuffix(
       this.inferenceAssistantText,
       input.text,
@@ -1134,11 +1090,13 @@ export class AgentServer {
           { textDelta, reasoningDelta },
         );
         if (!mutation) return;
-        this.resources.invalidateKey(conversationResourceKey(handle.conversationId));
-        this.resources.invalidateKey(AGENT_RESOURCE_KEYS.conversationList);
-        const projection = transcriptMutation(mutation);
-        if (reasoningDelta) this.projector?.appendReasoning(handle.turnId, reasoningDelta, projection);
-        if (textDelta) this.projector?.appendAssistantText(handle.turnId, textDelta, projection);
+        if (this.isRootScope(handle)) {
+          this.resources.invalidateKey(conversationResourceKey(handle.conversationId));
+          this.resources.invalidateKey(AGENT_RESOURCE_KEYS.conversationList);
+          const projection = transcriptMutation(mutation);
+          if (reasoningDelta) this.projector?.appendReasoning(handle.turnId, reasoningDelta, projection);
+          if (textDelta) this.projector?.appendAssistantText(handle.turnId, textDelta, projection);
+        }
       });
     }
     this.inferenceAssistantText = input.text;
@@ -1147,8 +1105,9 @@ export class AgentServer {
       state: input.inferenceState,
     }));
     for (const call of input.calls) {
+      this.toolScopes.set(call.callId, handle);
       const inserted = await this.enqueueTurnWrite(() => this.journal.recordToolStarted(handle, call));
-      if (inserted) {
+      if (inserted && this.isRootScope(handle)) {
         this.projector?.startTool(handle.turnId, {
           callId: call.callId,
           name: call.name,
@@ -1165,10 +1124,11 @@ export class AgentServer {
     conversationId: string,
     input: { callId: string; name: string; args: unknown },
   ) {
-    const handle = this.requiredActiveDurableTurn(conversationId);
+    const handle = this.toolScopes.get(input.callId) ?? this.requiredActiveDurableScope(conversationId);
+    this.toolScopes.set(input.callId, handle);
     await this.flushAssistantCheckpoint();
     const inserted = await this.enqueueTurnWrite(() => this.journal.recordToolStarted(handle, input));
-    if (inserted) {
+    if (inserted && this.isRootScope(handle)) {
       this.projector?.startTool(handle.turnId, {
         callId: input.callId,
         name: input.name,
@@ -1184,10 +1144,10 @@ export class AgentServer {
     conversationId: string,
     input: { callId: string; name: string; result: unknown; isError: boolean },
   ) {
-    const handle = this.requiredActiveDurableTurn(conversationId);
+    const handle = this.toolScopes.get(input.callId) ?? this.requiredActiveDurableScope(conversationId);
     await this.flushAssistantCheckpoint();
     const inserted = await this.enqueueTurnWrite(() => this.journal.recordToolFinished(handle, input));
-    if (inserted) {
+    if (inserted && this.isRootScope(handle)) {
       this.projector?.endTool(handle.turnId, {
         callId: input.callId,
         result: input.result,
@@ -1197,6 +1157,51 @@ export class AgentServer {
         ...transcriptMutation(inserted),
       });
     }
+    const pendingReturn = this.pendingWorkUnitReturns.get(input.callId);
+    if (input.name === 'work_unit_return' && !input.isError) {
+      if (!pendingReturn || pendingReturn.handle.scopeId !== handle.scopeId) {
+        throw new Error('The work unit return boundary was not prepared.');
+      }
+      if (!this.journal.returnWorkUnit) throw new Error('Durable work unit return is unavailable.');
+      const returned = await this.enqueueTurnWrite(() =>
+        this.journal.returnWorkUnit!(handle, pendingReturn.input));
+      this.activeDurableScope = returned.parentHandle;
+    }
+    this.pendingWorkUnitReturns.delete(input.callId);
+    this.toolScopes.delete(input.callId);
+  }
+
+  private async enterWorkUnit(
+    conversationId: string,
+    callId: string,
+    input: WorkUnitEnterInput,
+  ) {
+    const parent = this.requiredActiveDurableScope(conversationId);
+    if (!this.isRootScope(parent)) throw new Error('Work units cannot be nested.');
+    if (!this.journal.enterWorkUnit) throw new Error('Durable work unit entry is unavailable.');
+    await this.flushAssistantCheckpoint();
+    const entered = await this.enqueueTurnWrite(() => this.journal.enterWorkUnit!(parent, input));
+    this.toolScopes.set(callId, parent);
+    this.activeDurableScope = entered.handle;
+    return {
+      scopeId: entered.handle.scopeId,
+      parentScopeId: entered.parentScopeId,
+      objective: entered.objective,
+      evidenceRefs: entered.evidenceRefs,
+      state: 'running' as const,
+    };
+  }
+
+  private async requestWorkUnitReturn(
+    conversationId: string,
+    callId: string,
+    input: WorkUnitReturnInput,
+  ) {
+    const handle = this.requiredActiveDurableScope(conversationId);
+    if (this.isRootScope(handle)) throw new Error('No work unit is active.');
+    this.toolScopes.set(callId, handle);
+    this.pendingWorkUnitReturns.set(callId, { handle, input });
+    return { scopeId: handle.scopeId, state: 'returning' as const };
   }
 
   private bufferAssistantCheckpoint(textDelta: string, reasoningDelta: string) {
@@ -1229,7 +1234,7 @@ export class AgentServer {
     const reasoningDelta = this.pendingAssistantReasoning;
     this.pendingAssistantText = '';
     this.pendingAssistantReasoning = '';
-    const handle = this.activeDurableTurn;
+    const handle = this.activeDurableScope;
     if (!handle || (!textDelta && !reasoningDelta)) return this.turnWriteTail;
     return this.enqueueTurnWrite(async () => {
       const mutation = await this.journal.appendAssistantCheckpoint(
@@ -1237,11 +1242,13 @@ export class AgentServer {
         { textDelta, reasoningDelta },
       );
       if (!mutation) return;
-      this.resources.invalidateKey(conversationResourceKey(handle.conversationId));
-      this.resources.invalidateKey(AGENT_RESOURCE_KEYS.conversationList);
-      const projection = transcriptMutation(mutation);
-      if (reasoningDelta) this.projector?.appendReasoning(handle.turnId, reasoningDelta, projection);
-      if (textDelta) this.projector?.appendAssistantText(handle.turnId, textDelta, projection);
+      if (this.isRootScope(handle)) {
+        this.resources.invalidateKey(conversationResourceKey(handle.conversationId));
+        this.resources.invalidateKey(AGENT_RESOURCE_KEYS.conversationList);
+        const projection = transcriptMutation(mutation);
+        if (reasoningDelta) this.projector?.appendReasoning(handle.turnId, reasoningDelta, projection);
+        if (textDelta) this.projector?.appendAssistantText(handle.turnId, textDelta, projection);
+      }
     });
   }
 
@@ -1265,6 +1272,18 @@ export class AgentServer {
       throw new Error('No durable turn is active for this runtime effect.');
     }
     return handle;
+  }
+
+  private requiredActiveDurableScope(conversationId: string) {
+    const handle = this.activeDurableScope;
+    if (!handle || handle.conversationId !== conversationId) {
+      throw new Error('No durable execution scope is active for this runtime effect.');
+    }
+    return handle;
+  }
+
+  private isRootScope(handle: DurableTurnHandle) {
+    return this.activeDurableTurn?.scopeId === handle.scopeId;
   }
 
   private failDurability(conversationId: string, error: unknown) {
@@ -1312,9 +1331,10 @@ export class AgentServer {
       ...(mutation ? transcriptTerminalMutation(mutation) : {}),
     });
     this.activeDurableTurn = null;
-    this.activeWorkUnitScopeId = null;
+    this.activeDurableScope = null;
+    this.toolScopes.clear();
+    this.pendingWorkUnitReturns.clear();
     this.activeTurnStartedMonotonicAt = null;
-    this.runtime?.scheduleWorkingMemory?.();
     if (!this.closePromise) {
       void this.enqueueConversationCommand(() => this.dispatchNextQueuedMessage(conversationId));
     }
@@ -1360,9 +1380,10 @@ export class AgentServer {
       ...(mutation ? transcriptTerminalMutation(mutation) : {}),
     });
     this.activeDurableTurn = null;
-    this.activeWorkUnitScopeId = null;
+    this.activeDurableScope = null;
+    this.toolScopes.clear();
+    this.pendingWorkUnitReturns.clear();
     this.activeTurnStartedMonotonicAt = null;
-    this.runtime?.scheduleWorkingMemory?.();
     if (!this.closePromise) {
       void this.enqueueConversationCommand(() => this.dispatchNextQueuedMessage(conversationId));
     }
@@ -1396,7 +1417,9 @@ export class AgentServer {
     this.resources.set(AGENT_RESOURCE_KEYS.runtime, unloadedRuntime());
     this.conversationOperationId = null;
     this.activeDurableTurn = null;
-    this.activeWorkUnitScopeId = null;
+    this.activeDurableScope = null;
+    this.toolScopes.clear();
+    this.pendingWorkUnitReturns.clear();
     this.activeTurnStartedMonotonicAt = null;
     this.turnCompletion = null;
     this.durabilityFailure = null;
@@ -1510,6 +1533,13 @@ export class AgentServer {
 
 function finalizedSuffix(observed: string, finalized: string, label: string) {
   if (!finalized.startsWith(observed)) {
+    // Pi streams formatting whitespace around reasoning summaries that the
+    // finalized provider message may omit. The exact provider item is already
+    // durable and authoritative for replay; an invisible provisional suffix
+    // must not turn a successful inference into a provider failure.
+    if (observed.startsWith(finalized) && observed.slice(finalized.length).trim() === '') {
+      return '';
+    }
     throw new Error(`Pi finalized ${label} by rewriting already journaled content.`);
   }
   return finalized.slice(observed.length);
@@ -1567,24 +1597,7 @@ function parseConversationCreate(params: unknown): ConversationCreateParams {
     cwd: requiredString(value.cwd, 'cwd'),
     modelId: requiredString(value.modelId, 'modelId'),
     reasoning: reasoningLevel(value.reasoning),
-    contextMode: contextMode(value.contextMode),
-    workUnits: optionalBoolean(value.workUnits, 'workUnits') ?? false,
   };
-}
-
-function contextMode(value: unknown): AgentContextMode {
-  if (value === undefined || value === null) return 'stateful';
-  if (
-    value === 'full-history' || value === 'stateful' || value === 'working-memory' ||
-    value === 'work-units'
-  ) return value;
-  throw new RpcFault(-32602, 'contextMode must be full-history, stateful, working-memory, or work-units.');
-}
-
-function optionalBoolean(value: unknown, label: string) {
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== 'boolean') throw new RpcFault(-32602, `${label} must be a boolean.`);
-  return value;
 }
 
 function parseArtifactRead(params: unknown): ArtifactReadParams {

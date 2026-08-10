@@ -30,7 +30,6 @@ class CodexBenchmarkTarget implements BenchmarkConversationTarget {
     reasoning: string;
     reviewMode: string;
     speed: string;
-    contextMode?: import('./contracts.ts').BenchmarkContextMode;
     text: string;
   }) {
     const models = objectValue(await this.client.query(
@@ -156,7 +155,6 @@ class AgentBenchmarkTarget implements BenchmarkConversationTarget {
     reasoning: string;
     reviewMode: string;
     speed: string;
-    contextMode?: import('./contracts.ts').BenchmarkContextMode;
     text: string;
   }) {
     const resources = objectValue(await this.client.query('remux/agent/resources/read', {
@@ -182,17 +180,6 @@ class AgentBenchmarkTarget implements BenchmarkConversationTarget {
       cwd: input.cwd,
       modelId: input.modelId,
       reasoning: input.reasoning,
-      contextMode: input.contextMode === 'full-history'
-        ? 'full-history'
-        : input.contextMode === 'working-memory-v1'
-          ? 'working-memory'
-          : input.contextMode === 'bounded-work-units-v2'
-            ? 'work-units'
-            : 'stateful',
-      workUnits: input.contextMode === 'managed-v1.1' || input.contextMode === 'full-history' ||
-          input.contextMode === 'working-memory-v1'
-        ? false
-        : true,
     }));
     const conversationId = requiredString(created.conversationId, 'Agent create response conversationId');
     const sent = await this.send({ conversationId, text: input.text });

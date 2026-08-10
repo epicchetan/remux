@@ -189,7 +189,7 @@ test('Agent adapter waits for a successful turn to settle durably after runtime 
   assert.equal(transcriptReads, 2);
 });
 
-test('Agent benchmark profiles isolate compiler and work-unit capability', async () => {
+test('Agent benchmark always enters the single production context architecture', async () => {
   const creates: Array<Record<string, unknown>> = [];
   const fake = {
     async query() {
@@ -206,26 +206,20 @@ test('Agent benchmark profiles isolate compiler and work-unit capability', async
       return { accepted: true, turnId: `turn-${creates.length}` };
     },
   };
-  for (const contextMode of [
-    'full-history',
-    'managed-v1.1',
-    'managed-v1.1-work-units',
-    'working-memory-v1',
-    'bounded-work-units-v2',
-  ] as const) {
-    const target = createBenchmarkTarget('agent', fake as unknown as RemuxBenchmarkClient);
-    await target.start({
-      cwd: '/fixture', modelId: 'gpt-test', reasoning: 'high', reviewMode: 'full-access',
-      speed: 'default', contextMode, text: 'audit',
-    });
-  }
-  assert.deepEqual(creates.map(({ contextMode, workUnits }) => ({ contextMode, workUnits })), [
-    { contextMode: 'full-history', workUnits: false },
-    { contextMode: 'stateful', workUnits: false },
-    { contextMode: 'stateful', workUnits: true },
-    { contextMode: 'working-memory', workUnits: false },
-    { contextMode: 'work-units', workUnits: true },
-  ]);
+  const target = createBenchmarkTarget('agent', fake as unknown as RemuxBenchmarkClient);
+  await target.start({
+    cwd: '/fixture', modelId: 'gpt-test', reasoning: 'high', reviewMode: 'full-access',
+    speed: 'default', text: 'audit',
+  });
+  assert.equal(creates.length, 1);
+  assert.deepEqual(creates[0], {
+    operationId: creates[0]?.operationId,
+    cwd: '/fixture',
+    modelId: 'gpt-test',
+    reasoning: 'high',
+  });
+  assert.equal('contextMode' in creates[0]!, false);
+  assert.equal('workUnits' in creates[0]!, false);
 });
 
 test('rollout evidence reports token, compaction, tool, and leakage signals', async (context) => {

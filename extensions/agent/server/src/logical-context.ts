@@ -27,6 +27,8 @@ export type LogicalContextMessage =
       text: string;
       reasoning: string;
       toolCalls: LogicalToolCall[];
+      /** Exact private Pi/provider message for active-scope continuation. */
+      providerMessage?: AssistantMessage;
       state: 'completed' | 'failed' | 'interrupted';
       timestamp: number;
     }
@@ -310,6 +312,7 @@ export function renderDurablePiPrefix(
         timestamp: message.timestamp,
       };
     }
+    if (message.providerMessage) return message.providerMessage;
     const content: AssistantMessage['content'] = [];
     if (message.text) content.push({ type: 'text', text: message.text });
     content.push(...message.toolCalls.map((call) => ({
@@ -469,7 +472,7 @@ export function assertContextBudget(estimatedInputTokens: number, contextWindow:
 }
 
 export class ContextRolloverRequiredError extends Error {
-  readonly kind = 'context_rollover_not_enabled';
+  readonly kind = 'context_scope_limit';
   readonly estimatedInputTokens: number;
   readonly hardInputLimit: number;
   readonly safetyMargin: number;
@@ -480,9 +483,10 @@ export class ContextRolloverRequiredError extends Error {
     super(
       `Context requires an estimated ${estimatedInputTokens} input tokens plus a ` +
       `${safetyMargin}-token safety margin; the effective admission limit is ` +
-      `${admissionLimit} tokens (${hardInputLimit} hard); an emergency epoch rollover is required.`,
+      `${admissionLimit} tokens (${hardInputLimit} hard). End this execution scope and continue ` +
+      'in a smaller work unit.',
     );
-    this.name = 'ContextRolloverRequiredError';
+    this.name = 'ContextScopeLimitError';
     this.estimatedInputTokens = estimatedInputTokens;
     this.hardInputLimit = hardInputLimit;
     this.safetyMargin = safetyMargin;
@@ -660,6 +664,10 @@ function jsonRoundTrip(value: unknown): CanonicalJsonValue {
   const encoded = JSON.stringify(value);
   if (encoded === undefined) throw new Error('Provider context is not JSON serializable.');
   return JSON.parse(encoded) as CanonicalJsonValue;
+}
+
+export function canonicalProviderJson(value: unknown) {
+  return canonicalTransportJson(jsonRoundTrip(value));
 }
 
 /**

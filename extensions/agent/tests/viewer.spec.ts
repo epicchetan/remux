@@ -100,14 +100,14 @@ test('shows actual dispatch and compiled-frame evidence for a durable inference'
   await page.goto(conversationUrl());
 
   const inspector = page.getByTestId('context-inspector');
-  await expect(inspector.locator('summary')).toContainText('history 12k · next frame 3.2k · continue');
+  await expect(inspector.locator('summary')).toContainText('context 3.2k · 1 turn');
   await inspector.locator('summary').click();
   const panel = page.getByRole('region', { name: 'Inference context inspector' });
-  await expect(panel).toContainText('Actual last request');
+  await expect(panel).toContainText('Actual inference context');
   await expect(panel).toContainText('continuation transport');
-  await expect(panel).toContainText('Compiled context frame');
-  await expect(panel).toContainText('diagnostic control');
-  await expect(panel).toContainText('retrieval_map');
+  await expect(panel).toContainText('Thread frame');
+  await expect(panel).toContainText('thread document');
+  await expect(panel).toContainText('active turn');
   await expect(panel).toContainText('retrievable omissions');
 
   await panel.getByRole('button', { name: /Open captured request context/u }).click();
@@ -115,9 +115,9 @@ test('shows actual dispatch and compiled-frame evidence for a durable inference'
   await expect(dispatch).toContainText('Fixture provider input');
   await dispatch.getByRole('button', { name: 'Close Captured harness-visible request context' }).click();
 
-  await panel.getByRole('button', { name: /Open exact candidate bootstrap/u }).click();
-  const bootstrap = page.getByRole('dialog', { name: 'Exact context-frame bootstrap' });
-  await expect(bootstrap).toContainText('<remux_epoch version="1">');
+  await panel.getByRole('button', { name: /Open compiled thread bootstrap/u }).click();
+  const bootstrap = page.getByRole('dialog', { name: 'Exact dispatched thread bootstrap' });
+  await expect(bootstrap).toContainText('<thread_context version="1">');
 });
 
 test('selects history through the desktop sidebar or mobile sheet and restores target drafts', async ({ page, isMobile }) => {

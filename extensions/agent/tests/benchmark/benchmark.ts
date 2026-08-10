@@ -199,7 +199,6 @@ async function commandSentinel(options: Options, client: RemuxBenchmarkClient) {
     reasoning: options.reasoning,
     reviewMode: options.reviewMode,
     speed: options.speed,
-    contextMode: options.contextMode,
     text: 'This is a production-path adapter sentinel. Do not call tools or change files. Reply exactly: BENCHMARK_SENTINEL_ONE',
   });
   await target.waitForTerminal({ conversationId: first.conversationId, turnId: first.turnId, timeoutMs: options.timeoutMs });
@@ -237,7 +236,6 @@ async function startScenarioRun(options: Options, client: RemuxBenchmarkClient, 
     reasoning: options.reasoning,
     reviewMode: options.reviewMode,
     speed: options.speed,
-    contextMode: options.contextMode,
     text,
   });
   const runRecord: BenchmarkRun = {
@@ -254,7 +252,7 @@ async function startScenarioRun(options: Options, client: RemuxBenchmarkClient, 
     reasoning: options.reasoning,
     reviewMode: options.reviewMode,
     speed: options.speed,
-    contextMode: options.contextMode,
+    contextArchitecture: options.target === 'agent' ? 'thread-runtime-v1' : 'codex-app-server',
     stageIndex: 0,
     startedAt: turnStartedAt,
     updatedAt: turnStartedAt,
@@ -391,13 +389,8 @@ function parseOptions(args: string[]): Options {
   }
   const target = values.get('--target') ?? 'codex';
   if (target !== 'codex' && target !== 'agent') throw new Error('--target must be codex or agent.');
-  const contextMode = values.get('--context-mode') ?? 'managed-v1.1';
-  if (
-    contextMode !== 'full-history' && contextMode !== 'stateful' &&
-    contextMode !== 'managed-v1.1' && contextMode !== 'managed-v1.1-work-units' &&
-    contextMode !== 'working-memory-v1' && contextMode !== 'bounded-work-units-v2'
-  ) {
-    throw new Error('--context-mode must be full-history, stateful, managed-v1.1, managed-v1.1-work-units, working-memory-v1, or bounded-work-units-v2.');
+  if (values.has('--context-mode')) {
+    throw new Error('--context-mode was removed; the Agent benchmark always uses Thread Runtime v1.');
   }
   const timeoutMs = Number(values.get('--timeout-ms') ?? 45 * 60_000);
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000) throw new Error('--timeout-ms must be a safe integer of at least 1000.');
@@ -412,7 +405,6 @@ function parseOptions(args: string[]): Options {
     reasoning: values.get('--reasoning') ?? 'high',
     reviewMode: values.get('--review-mode') ?? 'full-access',
     speed: values.get('--speed') ?? 'default',
-    contextMode,
     timeoutMs,
     runId: values.get('--run') ?? null,
     sourceRun: values.get('--source-run') ?? null,
@@ -431,7 +423,6 @@ type Options = {
   reasoning: string;
   reviewMode: string;
   speed: string;
-  contextMode: import('./contracts.ts').BenchmarkContextMode;
   timeoutMs: number;
   runId: string | null;
   sourceRun: string | null;
@@ -461,7 +452,7 @@ function printHelp() {
     `  benchmark resume --run id\n` +
     `  benchmark status --run id\n` +
     `  benchmark finalize --run id\n` +
-    `  benchmark run --target codex|agent --model id [--context-mode full-history|managed-v1.1|managed-v1.1-work-units|working-memory-v1|bounded-work-units-v2]\n` +
+    `  benchmark run --target codex|agent --model id\n` +
     `  benchmark replay --source-run id --target codex|agent --model id\n` +
     `  benchmark sentinel --target agent --model id\n`);
 }

@@ -1,13 +1,6 @@
 export const BENCHMARK_FORMAT_VERSION = 1 as const;
 
 export type BenchmarkTarget = 'agent' | 'codex';
-export type BenchmarkContextMode =
-  | 'full-history'
-  | 'managed-v1.1'
-  | 'managed-v1.1-work-units'
-  | 'stateful'
-  | 'working-memory-v1'
-  | 'bounded-work-units-v2';
 
 export type BenchmarkStage = {
   id: string;
@@ -90,7 +83,7 @@ export type BenchmarkRun = {
   reasoning: string;
   reviewMode: string;
   speed: string;
-  contextMode: BenchmarkContextMode;
+  contextArchitecture: 'thread-runtime-v1' | 'codex-app-server';
   stageIndex: number;
   startedAt: string;
   updatedAt: string;
@@ -137,22 +130,29 @@ export type BenchmarkReport = {
     cacheReadRatio: number | null;
     modelContextWindow: number | null;
     providerCalls: number | null;
+    rootProviderCalls: number | null;
+    childProviderCalls: number | null;
     estimatedInputTokens: number | null;
     peakEstimatedInputTokens: number | null;
+    peakRootEstimatedInputTokens: number | null;
+    peakChildEstimatedInputTokens: number | null;
     reportedInputTokens: number | null;
     reportedOutputTokens: number | null;
     fullRequests: number | null;
     continuationRequests: number | null;
     contextFrames: number | null;
-    contextRollovers: number | null;
-    pressureNotices: number | null;
-    workUnitCheckpointNotices: number | null;
-    emergencyWorkUnitRollovers: number | null;
-    rolloversWithoutPriorNotice: number | null;
+    providerItems: number | null;
+    turnCapsules: number | null;
+    threadUpdates: number | null;
+    workUnitsEntered: number | null;
+    workUnitsReturned: number | null;
+    workUnitsAbandoned: number | null;
+    rootToolCalls: number | null;
+    childToolCalls: number | null;
+    workUnitResultBytes: number | null;
     contextLimitErrors: number | null;
-    contextBlockEstimatedTokens: Record<string, number> | null;
+    contextLayerEstimatedTokens: Record<string, number> | null;
     contextOmissions: number | null;
-    contextUpdates: number | null;
     journalRetrievalCalls: number | null;
     journalSearchCalls: number | null;
     journalOpenCalls: number | null;
@@ -160,12 +160,6 @@ export type BenchmarkReport = {
     invalidContextCalls: number | null;
     selfReferentialSearchHits: number | null;
     duplicateRetrievalHits: number | null;
-    primaryCreates: number | null;
-    primaryRevisions: number | null;
-    primaryCloses: number | null;
-    primaryProvenanceSources: number | null;
-    activePrimaryBytes: number | null;
-    acceptedProposalEntries: number | null;
     readCalls: number | null;
     repeatedReadCalls: number | null;
     acceptedSpecReads: number | null;
@@ -174,32 +168,6 @@ export type BenchmarkReport = {
     writeCalls: number | null;
     testCalls: number | null;
     parentVisibleToolResultBytes: number | null;
-    workUnitsEntered: number | null;
-    workUnitsReturned: number | null;
-    explicitWorkUnitReturns: number | null;
-    implicitWorkUnitReturns: number | null;
-    childProviderCalls: number | null;
-    childToolCalls: number | null;
-    childEstimatedInputTokens: number | null;
-    childContextFrames: number | null;
-    maxWorkUnitEstimatedInputTokens: number | null;
-    workUnitStateCommits: number | null;
-    workUnitResultBytes: number | null;
-    workUnitTraceBytes: number | null;
-    parentTraceReopens: number | null;
-    localPrimaryLeaks: number | null;
-    abandonedUnitPromotions: number | null;
-    finalProjectRevision: number | null;
-    memoryAttempts: number | null;
-    memoryCommits: number | null;
-    memoryFailures: number | null;
-    memoryStaleCommits: number | null;
-    memoryInputTokens: number | null;
-    memoryOutputTokens: number | null;
-    memoryCacheReadTokens: number | null;
-    memoryDurationMs: number | null;
-    finalMemoryEntries: number | null;
-    finalMemoryBytes: number | null;
   };
   artifacts: {
     run: string;
@@ -233,7 +201,6 @@ export interface BenchmarkConversationTarget {
     reasoning: string;
     reviewMode: string;
     speed: string;
-    contextMode?: BenchmarkContextMode;
     text: string;
   }): Promise<StartedBenchmarkTurn>;
   send(input: { conversationId: string; text: string }): Promise<{ turnId: string }>;

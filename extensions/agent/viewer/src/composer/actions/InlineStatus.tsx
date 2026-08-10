@@ -30,43 +30,63 @@ export function ComposerInlineStatus({
 }
 
 function ContextInspector({ value }: { value: ContextInspectorValue }) {
-  const stateful = value.actual?.mode === 'stateful-frame';
   return (
     <details className="agent-context-inspector" data-testid="context-inspector">
       <summary>
-        {stateful ? 'frame' : 'history'} {formatTokens(value.activeEstimatedInputTokens)} · next frame {formatTokens(value.candidateEstimatedInputTokens)} · {decisionLabel(value.decision.kind)}
+        context {formatTokens(value.estimatedInputTokens)} · {value.turnCount} turn{value.turnCount === 1 ? '' : 's'}
       </summary>
       <section className="agent-context-inspector-panel" aria-label="Inference context inspector">
         <header>
-          <strong>Inference context</strong>
+          <strong>Actual inference context</strong>
           <span>{value.buildDurationMs} ms</span>
         </header>
-        <ContextActual value={value} />
         <section className="agent-context-inspector-section">
           <div className="agent-context-inspector-heading">
-            <strong>Compiled context frame</strong>
-            <span>{stateful ? 'authoritative on rollover' : 'diagnostic control'}</span>
+            <strong>Thread frame</strong>
+            <span>{value.transportMode} transport</span>
           </div>
           <div className="agent-context-inspector-metrics">
-            <span>{formatTokens(value.candidateEstimatedInputTokens)} estimated</span>
-            <span>{decisionLabel(value.decision.kind)}</span>
+            <span>{formatTokens(value.estimatedInputTokens)} estimated</span>
+            <span>{value.messageCount} messages / {value.turnCount} turns</span>
           </div>
           <ContextArtifactButton
             artifact={value.bootstrapArtifact}
-            label="Open exact candidate bootstrap"
-            title="Exact context-frame bootstrap"
+            label="Open compiled thread bootstrap"
+            title="Exact dispatched thread bootstrap"
           />
         </section>
-        {'reason' in value.decision ? <p>{value.decision.reason}</p> : null}
         <div className="agent-context-inspector-blocks">
-          {value.blocks.map((block) => (
-            <div key={`${block.kind}:${block.hash}`} title={block.sources.join('\n')}>
-              <span>{block.kind}</span>
-              <span>{formatTokens(block.estimatedTokens)}</span>
-              <span>{block.sourceCount} source{block.sourceCount === 1 ? '' : 's'}</span>
+          {value.layers.map((layer) => (
+            <div key={`${layer.kind}:${layer.hash}`} title={layer.sources.join('\n')}>
+              <span>{layerLabel(layer.kind)}</span>
+              <span>{formatTokens(layer.estimatedTokens)}</span>
+              <span>{layer.sourceCount} source{layer.sourceCount === 1 ? '' : 's'}</span>
             </div>
           ))}
         </div>
+        <section className="agent-context-inspector-section">
+          <div className="agent-context-inspector-heading">
+            <strong>Selected dialogue</strong>
+            <span>{value.groupsTruncated ? 'newest 64 turns' : 'all selected turns'}</span>
+          </div>
+          <div className="agent-context-actual-groups">
+            <div>
+              <span>system + tool contracts</span>
+              <code>{shortHash(value.fixedContractsHash)}</code>
+            </div>
+            {value.groups.map((group) => (
+              <div key={group.turnId} title={group.source}>
+                <span>turn {shortHash(group.turnId)}</span>
+                <span>{formatRoles(group.roles)} · {formatTokens(group.estimatedTokens)}</span>
+              </div>
+            ))}
+          </div>
+          <ContextArtifactButton
+            artifact={value.dispatchArtifact}
+            label="Open captured request context"
+            title="Captured harness-visible request context"
+          />
+        </section>
         <section className="agent-context-inspector-section">
           <div className="agent-context-inspector-heading">
             <strong>Disposition</strong>
@@ -81,52 +101,14 @@ function ContextInspector({ value }: { value: ContextInspectorValue }) {
                 </div>
               ))}
             </div>
-          ) : <p>Everything selected by the candidate policy is represented.</p>}
+          ) : <p>No completed-turn material was omitted from this frame.</p>}
         </section>
         <footer>
-          <span>inference <code>{shortHash(value.inferenceId)}</code> · basis {value.basisSequence}</span>
+          <span>frame <code>{shortHash(value.frameId)}</code> · basis {value.basisSequence}</span>
           <span>manifest <code>{shortHash(value.manifestArtifact.hash)}</code></span>
         </footer>
       </section>
     </details>
-  );
-}
-
-function ContextActual({ value }: { value: ContextInspectorValue }) {
-  const actual = value.actual;
-  return (
-    <section className="agent-context-inspector-section">
-      <div className="agent-context-inspector-heading">
-        <strong>Actual last request</strong>
-        <span>{actual ? `${actual.transportMode} transport` : 'legacy snapshot'}</span>
-      </div>
-      <div className="agent-context-inspector-metrics">
-        <span>{actual?.mode === 'stateful-frame' ? `stateful frame ${actual.frameOrdinal ?? 0}` : 'full history'} · {formatTokens(value.activeEstimatedInputTokens)} estimated</span>
-        <span>{actual ? `${actual.messageCount} messages / ${actual.turnCount} turns` : 'dispatch not captured'}</span>
-      </div>
-      {actual ? (
-        <>
-          <div className="agent-context-actual-groups">
-            <div>
-              <span>system + tool contracts</span>
-              <code>{shortHash(actual.fixedContractsHash)}</code>
-            </div>
-            {actual.groups.map((group) => (
-              <div key={group.turnId} title={group.source}>
-                <span>turn {shortHash(group.turnId)}</span>
-                <span>{formatRoles(group.roles)} · {formatTokens(group.estimatedTokens)}</span>
-              </div>
-            ))}
-          </div>
-          {actual.groupsTruncated ? <p>Showing the newest 64 durable turns.</p> : null}
-          <ContextArtifactButton
-            artifact={actual.dispatchArtifact}
-            label="Open captured request context"
-            title="Captured harness-visible request context"
-          />
-        </>
-      ) : <p>Send another message to capture the exact provider dispatch with the v2 inspector.</p>}
-    </section>
   );
 }
 
@@ -150,6 +132,6 @@ function compactSource(source: string) {
   return source.length > 38 ? `…${source.slice(-37)}` : source;
 }
 
-function decisionLabel(kind: ContextInspectorValue['decision']['kind']) {
-  return kind === 'append' ? 'continue' : kind === 'block' ? 'blocked' : 'roll';
+function layerLabel(kind: ContextInspectorValue['layers'][number]['kind']) {
+  return kind.replaceAll('_', ' ');
 }
