@@ -45,7 +45,7 @@ export function queueResourceKey(conversationId: string): `queue:${string}` {
 }
 
 export type ReasoningLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
-export type AgentContextMode = 'full-history' | 'stateful';
+export type AgentContextMode = 'full-history' | 'stateful' | 'working-memory' | 'work-units';
 
 export type AgentFileSearchResult = {
   absolutePath: string;
@@ -169,7 +169,7 @@ export type ContextInspectorValue = {
     groupsTruncated: boolean;
   };
   blocks: ReadonlyArray<{
-    kind: 'context_hud' | 'continuation' | 'working_state' | 'open_work' | 'workspace' | 'runtime' | 'raw_tail' | 'retrieval_map';
+    kind: 'context_hud' | 'continuation' | 'working_state' | 'working_memory' | 'open_work' | 'workspace' | 'runtime' | 'raw_tail' | 'retrieval_map';
     hash: string;
     estimatedTokens: number;
     sources: readonly string[];

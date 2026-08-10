@@ -404,7 +404,7 @@ export class AgentServer {
         modelId: params.modelId,
         reasoning: params.reasoning,
         contextMode: params.contextMode ?? 'stateful',
-        workUnits: params.workUnits ?? false,
+        workUnits: params.contextMode === 'work-units' || (params.workUnits ?? false),
       });
     } catch (error) {
       if (isOperationConflict(error, params.operationId)) {
@@ -426,7 +426,7 @@ export class AgentServer {
       modelId: params.modelId,
       reasoning: params.reasoning,
       contextMode: params.contextMode ?? 'stateful',
-      workUnits: params.workUnits ?? false,
+      workUnits: params.contextMode === 'work-units' || (params.workUnits ?? false),
     }, params.operationId);
     return { conversationId: durable.conversationId };
   }
@@ -872,6 +872,18 @@ export class AgentServer {
             if (!this.journal.updateContext) throw new Error('Durable context updates are unavailable.');
             return this.journal.updateContext(this.requiredActiveDurableTurn(conversation.id), input);
           },
+          prepareWorkingMemory: () => {
+            if (!this.journal.prepareWorkingMemory) throw new Error('Background working memory is unavailable.');
+            return this.journal.prepareWorkingMemory(conversation.id);
+          },
+          commitWorkingMemory: (input) => {
+            if (!this.journal.commitWorkingMemory) throw new Error('Background working memory is unavailable.');
+            return this.journal.commitWorkingMemory(input);
+          },
+          recordWorkingMemoryFailure: (input) => {
+            if (!this.journal.recordWorkingMemoryFailure) throw new Error('Background working memory is unavailable.');
+            return this.journal.recordWorkingMemoryFailure(input);
+          },
           workUnit: async (input) => {
             if (!this.journal.workUnit) throw new Error('Durable work units are unavailable.');
             const transition = await this.journal.workUnit(
@@ -1302,6 +1314,7 @@ export class AgentServer {
     this.activeDurableTurn = null;
     this.activeWorkUnitScopeId = null;
     this.activeTurnStartedMonotonicAt = null;
+    this.runtime?.scheduleWorkingMemory?.();
     if (!this.closePromise) {
       void this.enqueueConversationCommand(() => this.dispatchNextQueuedMessage(conversationId));
     }
@@ -1349,6 +1362,7 @@ export class AgentServer {
     this.activeDurableTurn = null;
     this.activeWorkUnitScopeId = null;
     this.activeTurnStartedMonotonicAt = null;
+    this.runtime?.scheduleWorkingMemory?.();
     if (!this.closePromise) {
       void this.enqueueConversationCommand(() => this.dispatchNextQueuedMessage(conversationId));
     }
@@ -1560,8 +1574,11 @@ function parseConversationCreate(params: unknown): ConversationCreateParams {
 
 function contextMode(value: unknown): AgentContextMode {
   if (value === undefined || value === null) return 'stateful';
-  if (value === 'full-history' || value === 'stateful') return value;
-  throw new RpcFault(-32602, 'contextMode must be full-history or stateful.');
+  if (
+    value === 'full-history' || value === 'stateful' || value === 'working-memory' ||
+    value === 'work-units'
+  ) return value;
+  throw new RpcFault(-32602, 'contextMode must be full-history, stateful, working-memory, or work-units.');
 }
 
 function optionalBoolean(value: unknown, label: string) {

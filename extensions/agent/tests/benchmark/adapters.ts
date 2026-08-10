@@ -182,8 +182,15 @@ class AgentBenchmarkTarget implements BenchmarkConversationTarget {
       cwd: input.cwd,
       modelId: input.modelId,
       reasoning: input.reasoning,
-      contextMode: input.contextMode === 'full-history' ? 'full-history' : 'stateful',
-      workUnits: input.contextMode === 'managed-v1.1' || input.contextMode === 'full-history'
+      contextMode: input.contextMode === 'full-history'
+        ? 'full-history'
+        : input.contextMode === 'working-memory-v1'
+          ? 'working-memory'
+          : input.contextMode === 'bounded-work-units-v2'
+            ? 'work-units'
+            : 'stateful',
+      workUnits: input.contextMode === 'managed-v1.1' || input.contextMode === 'full-history' ||
+          input.contextMode === 'working-memory-v1'
         ? false
         : true,
     }));
@@ -213,7 +220,10 @@ class AgentBenchmarkTarget implements BenchmarkConversationTarget {
       const resource = objectValue(arrayValue(response.resources)[0]);
       if (resource.status === 'ok') {
         const runtime = objectValue(resource.value);
-        if (runtime.conversationId === input.conversationId && runtime.state === 'idle') return;
+        if (runtime.conversationId === input.conversationId && runtime.state === 'idle') {
+          const transcript = await this.readTranscript(input.conversationId);
+          if (transcript.activeTurnId !== input.turnId && transcript.turnIds.includes(input.turnId)) return;
+        }
         if (runtime.conversationId === input.conversationId && runtime.state === 'error') {
           observedError = String(runtime.error ?? 'unknown error');
           const transcript = await this.readTranscript(input.conversationId);

@@ -8,6 +8,7 @@ export type ContextBlockKind =
   | 'context_hud'
   | 'continuation'
   | 'working_state'
+  | 'working_memory'
   | 'open_work'
   | 'workspace'
   | 'runtime'
@@ -72,6 +73,7 @@ export type PromptManifest = {
     mode: 'full-history' | 'stateful-frame';
     frameOrdinal: number | null;
     pressureNotice: boolean;
+    workUnitRecovery: boolean;
     logicalHash: string;
     renderedHash: string;
     orderedMessageHashes: readonly string[];

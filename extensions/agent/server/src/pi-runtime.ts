@@ -1,4 +1,7 @@
+import { randomUUID } from 'node:crypto';
+
 import {
+  type AssistantMessage,
   type ImageContent,
   type AuthEvent,
   getSupportedThinkingLevels,
@@ -43,6 +46,13 @@ import { compileShadowContext } from './context/compiler.ts';
 import type { ShadowContextCandidate } from './context/manifest.ts';
 import { contextPolicyForModel, type ContextPolicyOverrides } from './context/policy.ts';
 import { createContextTools } from './context/tools.ts';
+import {
+  parseWorkingMemoryPatchText,
+  workingMemoryCompilerContext,
+  workingMemoryUsage,
+  type WorkingMemoryCommitInput,
+  type WorkingMemoryCompileInput,
+} from './context/working-memory.ts';
 import { canonicalJsonHash } from './storage/canonical-json.ts';
 import { createRemuxAgentSession } from './pi-session.ts';
 import {
@@ -52,6 +62,7 @@ import {
 } from './workspace-read.ts';
 
 const PROVIDER = 'openai-codex';
+const WORKING_MEMORY_MODEL_ID = 'gpt-5.6-sol';
 const SYSTEM_PROMPT_HEAD = `You are the Remux coding agent. The conversation cwd is your default location and orientation, not a filesystem boundary; use absolute paths when work legitimately spans elsewhere on this machine.
 
 Recent messages, files, commands, and tool results are already hot context. Do not copy them into durable state. The durable journal is exact cold history: journal_search and journal_open recover omitted evidence temporarily, and retrieval alone does not keep it in later context. context_update is a small durable working context for information that must survive a frame rollover, restart, or later turn.
@@ -60,16 +71,26 @@ Use one stable key per active concern, replace it at meaningful phase changes, a
 
 When a terse user reply accepts the preceding proposal, make that judgment yourself and record the acceptance in a small state entry with the exact preceding-assistant reference as evidence; choose a clear key for the actual work instead of a harness-reserved name. The harness does not classify intent for you. When a pressure notice arrives, checkpoint only missing durable decisions, progress, exact evidence refs, or the next semantic step. If existing durable state is sufficient, continue without updating it.`;
 
-const WORK_UNIT_GUIDANCE = `The optional work_unit tool creates one sequential child context for coherent work whose raw scratch can be discarded. It is not required for ordinary conversation or simple actions. Return bounded findings with exact evidence, change, and validation references; do not copy raw output into the handoff, and close obsolete scratch. Child state is local and project promotion is proposed to the parent, never automatic.`;
+const WORK_UNIT_GUIDANCE = `The optional work_unit tool creates one sequential child context for coherent work whose raw scratch can be discarded. It is not required for ordinary conversation or simple actions. Return bounded findings with exact evidence, change, and validation references; refs are journal refs, readable files, or file:start-end citations, never directory names or command labels. Put validation command names and concise outcomes in findings, and use validationRefs only for exact journal tool-result refs. Do not copy raw output into the handoff, and close obsolete scratch. Child state is local and project promotion is proposed to the parent, never automatic.`;
+
+const BOUNDED_WORK_UNIT_GUIDANCE = `A visible user turn is the objective; a work unit is one bounded execution toward it. In the parent context, coordinate rather than accumulating tool-heavy scratch: for nontrivial investigation, implementation, or validation, enter one child with a coherent objective and the smallest useful resource set. Ordinary conversation and one simple action do not need a child.
+
+Inside a child, work freely with coding and journal tools, then explicitly return at a semantic boundary. The return is a foreground-authored checkpoint: provide bounded findings and exact journal or workspace evidence, and use commit only for compact thread state or exact resources that later units or turns need. Do not copy logs, files, or the child trace. The parent consumes the result, decides whether to enter another unit, and alone may promote project state. When a work-unit checkpoint notice appears, finish the current atomic action and return before taking on more work. No nested or concurrent units are available.`;
 
 const SYSTEM_PROMPT_TAIL = `Context frames may replace old raw history under input pressure. Use journal retrieval when an omitted fact matters instead of guessing. User constraints and commit or push permission are authoritative and cannot be weakened by model state.
 
 Use read, bash, edit, and write for normal coding work. Treat explicit scope boundaries and public API shapes in an accepted spec as contracts unless the user approves a deviation. Re-read the exact governing resource before implementation and final audit rather than trusting a model-authored summary. Preserve user work, validate changes in proportion to risk, and report honestly.`;
 
-function runtimeContract(workUnits: boolean) {
+const WORKING_MEMORY_PROMPT_HEAD = `You are the Remux coding agent. The conversation cwd is your default location and orientation, not a filesystem boundary; use absolute paths when work legitimately spans elsewhere on this machine.
+
+You have four context layers: the immutable journal is exact truth; a background Sol compiler maintains fallible working-memory cache entries; the current frame is a frozen KV-cache-friendly prefix; and messages plus tool results after it are an exact hot tail. Let ordinary reads flow into the hot tail and background cache automatically. Use the memory tool only to remember a small stable value or hold an exact governing resource that must survive cache eviction, and release it when resolved. A held resource may be a workspace-relative or absolute file path, or an exact journal:// reference. Default to thread scope; use project scope only when sibling threads should inherit the information.
+
+Cached memory is an orientation aid, never authority over the current user request, an accepted specification, or observed repository state. Re-open cited journal evidence when precision matters and re-read mutable files before editing or final validation. Do not copy raw files, logs, transcript prose, or speculative deviations into memory.`;
+
+function runtimeContract(workUnits: boolean, workingMemory: boolean, boundedWorkUnits: boolean) {
   const systemPrompt = [
-    SYSTEM_PROMPT_HEAD,
-    ...(workUnits ? [WORK_UNIT_GUIDANCE] : []),
+    workingMemory ? WORKING_MEMORY_PROMPT_HEAD : SYSTEM_PROMPT_HEAD,
+    ...(workUnits ? [boundedWorkUnits ? BOUNDED_WORK_UNIT_GUIDANCE : WORK_UNIT_GUIDANCE] : []),
     SYSTEM_PROMPT_TAIL,
   ].join('\n\n');
   const tools = [
@@ -78,8 +99,8 @@ function runtimeContract(workUnits: boolean) {
     'edit@pi-0.84',
     'write@pi-0.84',
     'journal@2',
-    'context_update@3',
-    ...(workUnits ? ['work_unit@1'] : []),
+    workingMemory ? 'memory@2' : 'context_update@3',
+    ...(workUnits ? [boundedWorkUnits ? 'work_unit@2' : 'work_unit@1'] : []),
   ];
   return {
     systemPrompt,
@@ -91,21 +112,38 @@ export class PiEngine implements AgentEngine {
   private readonly modelRuntime: ModelRuntime;
   private readonly workspaceRead: WorkspaceReadExecutor;
   private readonly contextPolicy: ContextPolicyOverrides;
+  private readonly workingMemoryModelId: string;
+  private readonly workingMemoryCompiler?: (
+    input: WorkingMemoryCompileInput,
+    signal: AbortSignal,
+  ) => Promise<WorkingMemoryCommitInput>;
 
   private constructor(
     modelRuntime: ModelRuntime,
     workspaceRead: WorkspaceReadExecutor,
     contextPolicy: ContextPolicyOverrides,
+    workingMemoryModelId: string,
+    workingMemoryCompiler?: (
+      input: WorkingMemoryCompileInput,
+      signal: AbortSignal,
+    ) => Promise<WorkingMemoryCommitInput>,
   ) {
     this.modelRuntime = modelRuntime;
     this.workspaceRead = workspaceRead;
     this.contextPolicy = { ...contextPolicy };
+    this.workingMemoryModelId = workingMemoryModelId;
+    this.workingMemoryCompiler = workingMemoryCompiler;
   }
 
   static async create(options: {
     contextPolicy?: ContextPolicyOverrides;
     modelRuntime?: ModelRuntime;
     workspaceRead?: WorkspaceReadExecutor;
+    workingMemoryModelId?: string;
+    workingMemoryCompiler?: (
+      input: WorkingMemoryCompileInput,
+      signal: AbortSignal,
+    ) => Promise<WorkingMemoryCommitInput>;
   } = {}) {
     const modelRuntime = options.modelRuntime ?? await ModelRuntime.create({
       allowModelNetwork: false,
@@ -114,6 +152,8 @@ export class PiEngine implements AgentEngine {
       modelRuntime,
       options.workspaceRead ?? readWorkspaceFile,
       options.contextPolicy ?? {},
+      options.workingMemoryModelId ?? WORKING_MEMORY_MODEL_ID,
+      options.workingMemoryCompiler,
     );
   }
 
@@ -162,8 +202,14 @@ export class PiEngine implements AgentEngine {
   ): Promise<ConversationRuntime> {
     const model = this.modelRuntime.getModel(PROVIDER, options.modelId);
     if (!model) throw new Error(`Unknown OpenAI Codex model: ${options.modelId}`);
-    const workUnits = options.workUnits ?? false;
-    const { systemPrompt, fixedContractsHash } = runtimeContract(workUnits);
+    const boundedWorkUnitMode = options.contextMode === 'work-units';
+    const workUnits = boundedWorkUnitMode || (options.workUnits ?? false);
+    const workingMemoryMode = options.contextMode === 'working-memory';
+    const { systemPrompt, fixedContractsHash } = runtimeContract(
+      workUnits,
+      workingMemoryMode,
+      boundedWorkUnitMode,
+    );
 
     let probe: ContextProbe = {
       hookVersion: 'agent-durable-v1',
@@ -206,13 +252,90 @@ export class PiEngine implements AgentEngine {
       shadow: ShadowContextCandidate;
       shadowBuildDurationMs: number;
       activeMessages: readonly LogicalContextMessage[];
-      contextMode: 'full-history' | 'stateful';
+      contextMode: 'full-history' | 'stateful' | 'working-memory' | 'work-units';
       frameOrdinal: number | null;
       pressureNotice: boolean;
+      workUnitRecovery: boolean;
     } | null = null;
     let pendingContextError: unknown = null;
     let activeScopeKind: 'turn' | 'work_unit' = 'turn';
     let pendingParentIntegration: string | null = null;
+    const memorySessionId = `remux-memory-${randomUUID()}`;
+    let memoryRequested = false;
+    let memoryLoop: Promise<void> | null = null;
+    let memoryDisposed = false;
+    let memoryAbort: AbortController | null = null;
+    const compileWorkingMemory = this.workingMemoryCompiler ?? (async (
+      input: WorkingMemoryCompileInput,
+      signal: AbortSignal,
+    ): Promise<WorkingMemoryCommitInput> => {
+      const compilerModel = this.modelRuntime.getModel(PROVIDER, this.workingMemoryModelId);
+      if (!compilerModel) {
+        throw new Error(`Background working-memory model ${this.workingMemoryModelId} is unavailable.`);
+      }
+      const prompt = workingMemoryCompilerContext(input);
+      const startedAt = performance.now();
+      const response = await this.modelRuntime.completeSimple(compilerModel, {
+        systemPrompt: prompt.systemPrompt,
+        messages: [{ role: 'user', content: prompt.userPrompt, timestamp: Date.now() }],
+      }, {
+        reasoning: 'low',
+        maxTokens: 6_000,
+        transport: 'websocket-cached',
+        cacheRetention: 'short',
+        sessionId: memorySessionId,
+        signal,
+        maxRetries: 0,
+      });
+      if (response.stopReason === 'error' || response.stopReason === 'aborted') {
+        throw new Error(response.errorMessage ?? `Background working-memory call ${response.stopReason}.`);
+      }
+      return {
+        compile: input,
+        patch: parseWorkingMemoryPatchText(assistantText(response), input.allowedRefs),
+        compiler: workingMemoryUsage(
+          compilerModel.id,
+          Math.max(0, Math.round(performance.now() - startedAt)),
+          response.usage,
+        ),
+      };
+    });
+    const runMemoryLoop = async () => {
+      while (memoryRequested && !memoryDisposed) {
+        memoryRequested = false;
+        const input = await options.durability.prepareWorkingMemory?.() ?? null;
+        if (!input || memoryDisposed) continue;
+        memoryAbort = new AbortController();
+        const startedAt = performance.now();
+        try {
+          const compiled = await compileWorkingMemory(input, memoryAbort.signal);
+          if (compiled.compile !== input) {
+            throw new Error('Working-memory compiler returned a mismatched compile input.');
+          }
+          await options.durability.commitWorkingMemory?.(compiled);
+        } catch (error) {
+          if (!memoryDisposed) {
+            await options.durability.recordWorkingMemoryFailure?.({
+              compile: input,
+              modelId: this.workingMemoryModelId,
+              durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+              error: safeMessage(error),
+            }).catch(() => undefined);
+          }
+        } finally {
+          memoryAbort = null;
+        }
+      }
+    };
+    const scheduleWorkingMemory = () => {
+      if (!workingMemoryMode || memoryDisposed) return;
+      memoryRequested = true;
+      if (memoryLoop) return;
+      memoryLoop = runMemoryLoop().finally(() => {
+        memoryLoop = null;
+        if (memoryRequested && !memoryDisposed) scheduleWorkingMemory();
+      });
+    };
     const probeExtension: ExtensionFactory = (pi) => {
       pi.on('context', async (event) => {
         // Extension failures are intentionally swallowed by Pi. Clearing the
@@ -228,14 +351,18 @@ export class PiEngine implements AgentEngine {
           }
           const fullMessages = alignDurableContextWithPi(snapshot, event.messages, model);
           const fullEstimatedInputTokens = estimatePiContextTokens(fullMessages, systemPrompt);
-          const statefulMode = (options.contextMode ?? 'stateful') === 'stateful';
+          const statefulMode = (options.contextMode ?? 'stateful') !== 'full-history';
+          let workUnitRecovery = false;
           if (
             activeFrame && activeFrame.scopeId !== snapshot.shadowSource.scopeId &&
             (activeFrame.scopeKind === 'work_unit' || snapshot.shadowSource.executionScope.kind === 'work_unit')
           ) activeFrame = null;
           const activeFrameEstimate = statefulMode
             ? activeFrame
-              ? estimatePiContextTokens(frameMessages(activeFrame, fullMessages), systemPrompt)
+              ? estimatePiContextTokens(
+                  frameMessages(activeFrame, fullMessages, boundedWorkUnitMode),
+                  systemPrompt,
+                )
               : 0
             : fullEstimatedInputTokens;
           const compileStartedAt = performance.now();
@@ -252,20 +379,28 @@ export class PiEngine implements AgentEngine {
           if (statefulMode) {
             const policy = contextPolicyForModel(model.contextWindow, this.contextPolicy);
             if (activeFrame) {
-              messages = frameMessages(activeFrame, fullMessages);
+              messages = frameMessages(activeFrame, fullMessages, boundedWorkUnitMode);
               const activeEstimate = estimatePiContextTokens(messages, systemPrompt);
+              const boundedChild = boundedWorkUnitMode && activeFrame.scopeKind === 'work_unit';
+              const softNoticeTokens = boundedChild
+                ? policy.workUnitSoftNoticeTokens
+                : policy.softNoticeTokens;
+              const recoveryTokens = boundedChild
+                ? policy.workUnitRecoveryTokens
+                : policy.rollThresholdTokens;
               if (
                 activeEstimate >= policy.admissionLimitTokens ||
-                activeEstimate >= policy.rollThresholdTokens &&
+                activeEstimate >= recoveryTokens &&
                   activeFrame.pressureNoticeAtMessageCount !== null
               ) {
+                workUnitRecovery = boundedChild;
                 activeFrame = null;
               } else if (
-                activeEstimate >= policy.softNoticeTokens &&
+                activeEstimate >= softNoticeTokens &&
                 activeFrame.pressureNoticeAtMessageCount === null
               ) {
                 activeFrame.pressureNoticeAtMessageCount = fullMessages.length;
-                messages = frameMessages(activeFrame, fullMessages);
+                messages = frameMessages(activeFrame, fullMessages, boundedWorkUnitMode);
               }
             }
             if (!activeFrame) {
@@ -280,7 +415,7 @@ export class PiEngine implements AgentEngine {
                 scopeKind: snapshot.shadowSource.executionScope.kind,
                 pressureNoticeAtMessageCount: null,
               };
-              messages = frameMessages(activeFrame, fullMessages);
+              messages = frameMessages(activeFrame, fullMessages, boundedWorkUnitMode);
             }
           }
           const rendered = hashRenderedMessages(messages);
@@ -299,10 +434,11 @@ export class PiEngine implements AgentEngine {
               ? snapshot.messages.slice(activeFrame.baseMessageCount)
               : snapshot.messages,
             contextMode: options.contextMode ?? 'stateful',
-            frameOrdinal: (options.contextMode ?? 'stateful') === 'stateful'
+            frameOrdinal: (options.contextMode ?? 'stateful') !== 'full-history'
               ? activeFrame?.ordinal ?? null
               : null,
             pressureNotice: Boolean(activeFrame && activeFrame.pressureNoticeAtMessageCount !== null),
+            workUnitRecovery,
           };
           probe = {
             ...probe,
@@ -400,7 +536,11 @@ export class PiEngine implements AgentEngine {
         options.cwd,
         options.durability,
         this.workspaceRead,
-      ), ...createContextTools(options.durability, { workUnits })],
+      ), ...createContextTools(options.durability, {
+        workUnits,
+        workingMemory: workingMemoryMode,
+        boundedWorkUnits: boundedWorkUnitMode,
+      })],
       resourceLoader,
       sessionManager,
       settingsManager,
@@ -443,6 +583,7 @@ export class PiEngine implements AgentEngine {
             contextMode: context.contextMode,
             frameOrdinal: context.frameOrdinal,
             pressureNotice: context.pressureNotice,
+            workUnitRecovery: context.workUnitRecovery,
           },
         });
         // The rejected inference is now itself durable. Throwing here still
@@ -488,13 +629,18 @@ export class PiEngine implements AgentEngine {
       async interrupt() {
         await session.abort();
       },
+      scheduleWorkingMemory,
       async dispose() {
+        memoryDisposed = true;
+        memoryRequested = false;
+        memoryAbort?.abort();
         unsubscribe();
         try {
           await session.abort();
         } finally {
           session.dispose();
           closeOpenAICodexWebSocketSessions(sessionId);
+          closeOpenAICodexWebSocketSessions(memorySessionId);
           resetOpenAICodexWebSocketDebugStats(sessionId);
         }
       },
@@ -532,9 +678,11 @@ function frameMessages(
   frame: {
     baseMessageCount: number;
     prefix: Message;
+    scopeKind: 'turn' | 'work_unit';
     pressureNoticeAtMessageCount: number | null;
   },
   alignedMessages: readonly Message[],
+  boundedWorkUnits = false,
 ) {
   if (alignedMessages.length < frame.baseMessageCount) {
     throw new Error('Durable context moved behind the active context frame.');
@@ -551,7 +699,9 @@ function frameMessages(
     ...tail.slice(0, noticeIndex),
     {
       role: 'user' as const,
-      content: 'Context pressure is elevated. At the next meaningful action, checkpoint only durable decisions or progress that must survive a frame rollover; do not summarize raw logs.',
+      content: boundedWorkUnits && frame.scopeKind === 'work_unit'
+        ? 'This bounded work unit is approaching its context budget. Finish the current atomic action, then call work_unit return with a compact evidence-backed result and only the shared state later units need. Do not begin another investigation or summarize raw logs.'
+        : 'Context pressure is elevated. At the next meaningful action, checkpoint only durable decisions or progress that must survive a frame rollover; do not summarize raw logs.',
       timestamp,
     },
     ...tail.slice(noticeIndex),
@@ -614,6 +764,10 @@ function durableAssistantContent(
     else if (block.type === 'thinking') reasoning += block.thinking ?? '';
   }
   return { text, reasoning };
+}
+
+function assistantText(message: AssistantMessage) {
+  return message.content.flatMap((block) => block.type === 'text' ? [block.text] : []).join('');
 }
 
 function durableToolResult(value: unknown, isError: boolean): unknown {

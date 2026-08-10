@@ -606,6 +606,13 @@ test('Pi switches through an explicit bounded work unit and restores the parent 
       },
       {
         kind: 'tool-call',
+        callId: 'call-unit-search|item-unit-search',
+        name: 'journal_search',
+        args: { query: 'bounded implementation concern' },
+        responseId: 'unit-search-response',
+      },
+      {
+        kind: 'tool-call',
         callId: 'call-unit-return|item-unit-return',
         name: 'work_unit',
         args: {
@@ -613,10 +620,14 @@ test('Pi switches through an explicit bounded work unit and restores the parent 
           status: 'completed',
           findings: [{ text: 'The bounded concern is validated.', evidence: [] }],
           validationRefs: [],
+          commit: {
+            remember: [{ key: 'bounded-result', value: { status: 'validated' } }],
+          },
         },
         responseId: 'unit-return-response',
       },
       { kind: 'answer', text: 'Parent integrated the bounded result.', responseId: 'unit-parent-response' },
+      { kind: 'answer', text: 'The bounded result remains available.', responseId: 'unit-followup-response' },
     ],
   });
   const modelRuntime = await ModelRuntime.create({
@@ -627,23 +638,39 @@ test('Pi switches through an explicit bounded work unit and restores the parent 
   await modelRuntime.refresh({ allowNetwork: false, providers: ['openai-codex'] });
   const repository = await AgentJournalRepository.open({ dataRoot });
   const server = new AgentServer({
-    engine: await PiEngine.create({ modelRuntime }), journal: repository, notify: () => {},
+    engine: await PiEngine.create({
+      modelRuntime,
+      contextPolicy: { workUnitSoftNoticeTokens: 1_000, workUnitRecoveryTokens: 300_000 },
+    }),
+    journal: repository,
+    notify: () => {},
   });
   registerClose(t, server, repository);
   await server.initialize();
   const started = await server.handle(AGENT_METHODS.conversationCreate, {
     operationId: randomUUID(), cwd: workspace, modelId: SCRIPTED_CODEX_MODEL_ID,
-    reasoning: 'high', contextMode: 'stateful', workUnits: true,
+    reasoning: 'high', contextMode: 'work-units',
   }) as { conversationId: string };
   await sendAndWait(server, started.conversationId, 'Use one bounded work unit, then integrate it.');
-  assert.deepEqual(scripted.requests.map(requestMode), ['full', 'full', 'full']);
+  await sendAndWait(server, started.conversationId, 'Was the bounded result retained?');
+  assert.deepEqual(scripted.requests.map(requestMode), [
+    'full',
+    'full',
+    'continuation:unit-search-response',
+    'full',
+    'continuation:unit-parent-response',
+  ]);
   assert.match(
-    JSON.stringify(scripted.requests[2]?.context.messages),
+    JSON.stringify(scripted.requests[3]?.context.messages),
     /Integrate the completed child result/u,
   );
   assert.match(
-    JSON.stringify(scripted.requests[2]?.context.messages),
+    JSON.stringify(scripted.requests[3]?.context.messages),
     /journal:\/\/artifact\/[0-9a-f]{64}/u,
+  );
+  assert.match(
+    JSON.stringify(scripted.requests[2]?.context.messages),
+    /bounded work unit is approaching its context budget/u,
   );
   const database = new DatabaseSync(repository.databasePath, { readOnly: true });
   const scope = database.prepare(`
@@ -652,8 +679,10 @@ test('Pi switches through an explicit bounded work unit and restores the parent 
   database.close();
   assert.equal(scope.state, 'completed');
   assert.match(scope.result_artifact_hash ?? '', /^[0-9a-f]{64}$/u);
+  assert.match(JSON.stringify(scripted.requests[3]?.context.messages), /bounded-result/u);
   const transcript = await repository.readTranscriptActions(started.conversationId);
   assert.match(JSON.stringify(transcript), /Parent integrated the bounded result/u);
+  assert.match(JSON.stringify(transcript), /bounded result remains available/u);
 });
 
 test('terminal child text becomes an implicit result and only the parent answer is visible', async (t) => {

@@ -258,7 +258,7 @@ test('H4 references, search, provenance, anchors, runtime, and work units compos
   const entered = await repository.workUnit(second, {
     action: 'enter',
     objective: 'Inspect and validate the exact-reference implementation.',
-    refs: [proposalRef],
+    refs: [proposalRef, 'tracked.txt:1'],
     expectedEvidence: ['openable proposal and validation refs'],
   });
   assert.equal(entered.result.action, 'entered');
@@ -277,14 +277,30 @@ test('H4 references, search, provenance, anchors, runtime, and work units compos
     set: [{ key: 'child-progress', value: { status: 'validated' }, evidence: [proposalRef] }],
   });
   assert.equal(local.state.some(({ key }) => key === 'child-progress'), true);
+  await assert.rejects(() => repository.workUnit(entered.handle, {
+    action: 'return', status: 'completed', findings: [], commit: {},
+  }), /between 1 and 16 total changes/u);
+  assert.equal(
+    (await repository.compileContext(conversation.conversationId)).shadowSource.executionScope.kind,
+    'work_unit',
+  );
   const returned = await repository.workUnit(entered.handle, {
     action: 'return',
     status: 'completed',
-    findings: [{ text: 'The proposal is openable.', evidence: [proposalRef] }],
+    findings: [{ text: 'The proposal is openable.', evidence: [proposalRef, 'tracked.txt:1'] }],
     validationRefs: ['journal://tool/search-fixture-call'],
+    commit: {
+      remember: [{
+        key: 'unit-handoff',
+        value: { status: 'validated', next: 'integrate' },
+        evidence: ['tracked.txt:1'],
+      }],
+    },
   });
   const result = await repository.openJournal(conversation.conversationId, { ref: returned.result.resultRef! });
   assert.match(result.content, /The proposal is openable/u);
+  assert.match(result.content, /journal:\/\/artifact\/[0-9a-f]{64}/u);
+  assert.equal(returned.result.committed?.state.some(({ key }) => key === 'unit-handoff'), true);
   assert.match((await repository.openJournal(conversation.conversationId, {
     ref: returned.result.traceRef,
     maxBytes: 32 * 1024,
@@ -292,8 +308,19 @@ test('H4 references, search, provenance, anchors, runtime, and work units compos
   const parentContext = await repository.compileContext(conversation.conversationId);
   assert.equal(parentContext.shadowSource.executionScope.kind, 'turn');
   assert.equal(parentContext.shadowSource.authority.some(({ key }) => key === 'child-progress'), false);
+  assert.equal(parentContext.shadowSource.authority.some(({ key }) => key === 'unit-handoff'), true);
   assert.match(JSON.stringify(parentContext.shadowSource.observedRuntime), /recentWorkUnits/u);
-  await repository.finishTurn(returned.handle, { status: 'completed' });
+  const next = await repository.workUnit(returned.handle, {
+    action: 'enter', objective: 'Consume only the bounded shared handoff.',
+  });
+  const nextContext = await repository.compileContext(conversation.conversationId);
+  assert.equal(nextContext.shadowSource.authority.some(({ key }) => key === 'unit-handoff'), true);
+  assert.doesNotMatch(JSON.stringify(nextContext.shadowSource.messages), /The proposal is openable/u);
+  const finished = await repository.workUnit(next.handle, {
+    action: 'return', status: 'completed', findings: [],
+    commit: { forget: ['unit-handoff'] },
+  });
+  await repository.finishTurn(finished.handle, { status: 'completed' });
 });
 
 test('an active work unit survives repository restart from its capsule', async (t) => {
@@ -327,6 +354,54 @@ test('an active work unit survives repository restart from its capsule', async (
     action: 'return', status: 'completed', findings: [],
   });
   await repository.finishTurn(returned.handle, { status: 'completed' });
+});
+
+test('work-unit line ranges remain openable when identical evidence is reused by another project', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'remux-context-work-unit-evidence-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const dataRoot = join(root, 'data');
+  const ids = deterministicIds();
+  const repository = await AgentJournalRepository.open({ dataRoot, idFactory: ids.next });
+  t.after(() => repository.close());
+
+  const evidenceRefs: string[] = [];
+  for (const [index, workspaceName] of ['workspace-a', 'workspace-b'].entries()) {
+    const workspace = join(root, workspaceName);
+    await mkdir(workspace);
+    await writeFile(join(workspace, 'shared.txt'), 'zero\none\ntwo\nthree\n');
+    const conversation = await repository.createConversation({
+      operationId: uuid(40 + index * 3),
+      cwd: workspace,
+      modelId: 'gpt-5.6-sol',
+      reasoning: 'high',
+    });
+    const turn = await repository.acceptTurn({
+      operationId: uuid(41 + index * 3),
+      conversationId: conversation.conversationId,
+      clientMessageId: uuid(42 + index * 3),
+      text: 'Inspect the shared evidence range.',
+    });
+    const entered = await repository.workUnit(turn, {
+      action: 'enter',
+      objective: 'Inspect only the cited evidence range.',
+      refs: ['shared.txt:2-3'],
+    });
+    const capsule = JSON.parse((await repository.openJournal(conversation.conversationId, {
+      ref: entered.result.capsuleRef!,
+    })).content) as { refs: Array<{ source: string; ref: string }> };
+    const evidenceRef = capsule.refs.find(({ source }) => source === 'shared.txt:2-3')?.ref;
+    assert.match(evidenceRef ?? '', /^journal:\/\/artifact\/[0-9a-f]{64}$/u);
+    const evidence = await repository.openJournal(conversation.conversationId, { ref: evidenceRef! });
+    assert.equal(evidence.content, 'shared.txt:2-3\none\ntwo\n');
+    evidenceRefs.push(evidenceRef!);
+    const returned = await repository.workUnit(entered.handle, {
+      action: 'return',
+      status: 'completed',
+      findings: [{ text: 'The cited range is exact.', evidence: ['shared.txt:2-3'] }],
+    });
+    await repository.finishTurn(returned.handle, { status: 'completed' });
+  }
+  assert.equal(evidenceRefs[0], evidenceRefs[1]);
 });
 
 function deterministicIds() {

@@ -9,6 +9,12 @@ import type {
   DurableContextBoundarySnapshot,
   DurableInferenceContext,
 } from './storage/repository.ts';
+import type {
+  WorkingMemoryCommitInput,
+  WorkingMemoryCommitResult,
+  WorkingMemoryCompileInput,
+  WorkingMemoryFailureInput,
+} from './context/working-memory.ts';
 
 export type RuntimeEvent =
   | { type: 'assistant-start' }
@@ -52,6 +58,9 @@ export type RuntimeDurabilityHooks = {
   journalOpen(input: JournalOpenInput): Promise<JournalOpenResult>;
   updateContext(input: ContextUpdateInput): Promise<ContextWorkspaceView>;
   workUnit(input: WorkUnitInput): Promise<WorkUnitResult>;
+  prepareWorkingMemory?(): Promise<WorkingMemoryCompileInput | null>;
+  commitWorkingMemory?(input: WorkingMemoryCommitInput): Promise<WorkingMemoryCommitResult>;
+  recordWorkingMemoryFailure?(input: WorkingMemoryFailureInput): Promise<void>;
 };
 
 export type JournalSearchInput = {
@@ -104,6 +113,12 @@ export type ContextUpdateInput = {
   pin?: Array<{ ref: string; label?: string; scope?: ContextScope }>;
   unpin?: Array<{ ref: string; scope?: ContextScope }>;
 };
+export type WorkUnitCommitInput = {
+  remember?: Array<{ key: string; value: unknown; evidence?: string[] }>;
+  forget?: string[];
+  hold?: Array<{ resource: string; label?: string }>;
+  release?: string[];
+};
 export type WorkUnitInput =
   | { action: 'enter'; objective: string; refs?: string[]; expectedEvidence?: string[] }
   | {
@@ -114,6 +129,7 @@ export type WorkUnitInput =
       validationRefs?: string[];
       unresolved?: string[];
       proposedPromotions?: Array<{ key: string; value: unknown }>;
+      commit?: WorkUnitCommitInput;
     };
 export type WorkUnitResult = {
   action: 'entered' | 'returned';
@@ -124,6 +140,7 @@ export type WorkUnitResult = {
   resultRef?: string;
   traceRef: string;
   status: 'running' | 'completed' | 'failed' | 'abandoned';
+  committed?: ContextWorkspaceView;
 };
 export type ContextWorkspaceView = {
   revision: number;
@@ -143,6 +160,7 @@ export interface ConversationRuntime {
   prompt(input: { text: string; images?: Array<{ data: string; mimeType: string }> }): Promise<void>;
   interrupt(): Promise<void>;
   dispose(): Promise<void>;
+  scheduleWorkingMemory?(): void;
 }
 
 export interface AgentEngine {

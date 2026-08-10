@@ -161,6 +161,34 @@ test('Agent adapter waits for a failed turn to settle durably before returning t
   assert.equal(transcriptReads, 2);
 });
 
+test('Agent adapter waits for a successful turn to settle durably after runtime idle', async () => {
+  let transcriptReads = 0;
+  const fake = {
+    async query(method: string) {
+      if (method === 'remux/agent/resources/read') {
+        return { resources: [{ status: 'ok', value: {
+          conversationId: 'conversation-completed', state: 'idle', activeTurnId: null,
+        } }] };
+      }
+      transcriptReads += 1;
+      return { resources: [{ status: 'ok', value: {
+        turnOrder: ['turn-completed'],
+        activeTurnId: transcriptReads === 1 ? 'turn-completed' : null,
+        turns: [{ status: 'ok', turnId: 'turn-completed', frame: { segments: [] } }],
+      } }] };
+    },
+    async command() {
+      throw new Error('not used');
+    },
+  };
+  const target = createBenchmarkTarget('agent', fake as unknown as RemuxBenchmarkClient);
+
+  await target.waitForTerminal({
+    conversationId: 'conversation-completed', turnId: 'turn-completed', timeoutMs: 2_000,
+  });
+  assert.equal(transcriptReads, 2);
+});
+
 test('Agent benchmark profiles isolate compiler and work-unit capability', async () => {
   const creates: Array<Record<string, unknown>> = [];
   const fake = {
@@ -178,7 +206,13 @@ test('Agent benchmark profiles isolate compiler and work-unit capability', async
       return { accepted: true, turnId: `turn-${creates.length}` };
     },
   };
-  for (const contextMode of ['full-history', 'managed-v1.1', 'managed-v1.1-work-units'] as const) {
+  for (const contextMode of [
+    'full-history',
+    'managed-v1.1',
+    'managed-v1.1-work-units',
+    'working-memory-v1',
+    'bounded-work-units-v2',
+  ] as const) {
     const target = createBenchmarkTarget('agent', fake as unknown as RemuxBenchmarkClient);
     await target.start({
       cwd: '/fixture', modelId: 'gpt-test', reasoning: 'high', reviewMode: 'full-access',
@@ -189,6 +223,8 @@ test('Agent benchmark profiles isolate compiler and work-unit capability', async
     { contextMode: 'full-history', workUnits: false },
     { contextMode: 'stateful', workUnits: false },
     { contextMode: 'stateful', workUnits: true },
+    { contextMode: 'working-memory', workUnits: false },
+    { contextMode: 'work-units', workUnits: true },
   ]);
 });
 

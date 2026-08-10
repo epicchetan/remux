@@ -5,7 +5,9 @@ export type BenchmarkContextMode =
   | 'full-history'
   | 'managed-v1.1'
   | 'managed-v1.1-work-units'
-  | 'stateful';
+  | 'stateful'
+  | 'working-memory-v1'
+  | 'bounded-work-units-v2';
 
 export type BenchmarkStage = {
   id: string;
@@ -144,6 +146,8 @@ export type BenchmarkReport = {
     contextFrames: number | null;
     contextRollovers: number | null;
     pressureNotices: number | null;
+    workUnitCheckpointNotices: number | null;
+    emergencyWorkUnitRollovers: number | null;
     rolloversWithoutPriorNotice: number | null;
     contextLimitErrors: number | null;
     contextBlockEstimatedTokens: Record<string, number> | null;
@@ -178,12 +182,24 @@ export type BenchmarkReport = {
     childToolCalls: number | null;
     childEstimatedInputTokens: number | null;
     childContextFrames: number | null;
+    maxWorkUnitEstimatedInputTokens: number | null;
+    workUnitStateCommits: number | null;
     workUnitResultBytes: number | null;
     workUnitTraceBytes: number | null;
     parentTraceReopens: number | null;
     localPrimaryLeaks: number | null;
     abandonedUnitPromotions: number | null;
     finalProjectRevision: number | null;
+    memoryAttempts: number | null;
+    memoryCommits: number | null;
+    memoryFailures: number | null;
+    memoryStaleCommits: number | null;
+    memoryInputTokens: number | null;
+    memoryOutputTokens: number | null;
+    memoryCacheReadTokens: number | null;
+    memoryDurationMs: number | null;
+    finalMemoryEntries: number | null;
+    finalMemoryBytes: number | null;
   };
   artifacts: {
     run: string;

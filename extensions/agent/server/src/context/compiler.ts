@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { canonicalJson, canonicalJsonHash, type CanonicalJsonValue } from '../storage/canonical-json.ts';
 import { logicalMessageSemanticValue, type LogicalContextMessage } from '../logical-context.ts';
 import type { PrimaryAuthority, BindingMode } from '../project-state/model.ts';
+import type { WorkingMemorySnapshotRecord } from './working-memory.ts';
 import {
   CONTEXT_COMPILER_VERSION,
   type ContextBlockKind,
@@ -38,6 +39,7 @@ export type ShadowContextSource = {
   workspaceRoot: string;
   reasoning: string;
   messages: readonly LogicalContextMessage[];
+  workingMemory?: WorkingMemorySnapshotRecord | null;
   authority: readonly ContextAuthorityEntry[];
   turnAnchor: {
     currentUser: { ref: string; body: string };
@@ -127,7 +129,9 @@ export function compileShadowContext(
   const contextHudValue = {
     basisSequence: source.basisSequence,
     cwd: source.workspaceRoot,
-    ephemeral: 'Journal retrieval and ordinary tool results remain hot only in this frame unless explicitly set or pinned.',
+    ephemeral: source.workingMemory
+      ? 'Journal retrieval and tool results remain exact in the hot tail; the background snapshot is a disposable cache and explicit state remains protected.'
+      : 'Journal retrieval and ordinary tool results remain hot only in this frame unless explicitly set or pinned.',
     frame: 'Stable append-only prefix; rebuilt only under input pressure or runtime restart.',
     projectId: source.projectId,
     revision: source.projectRevision,
@@ -147,6 +151,13 @@ export function compileShadowContext(
 
   const mandatory = [
     createBlock('context_hud', canonicalJson(contextHudValue), []),
+    ...(source.workingMemory ? [createBlock('working_memory', canonicalJson({
+      cacheSemantics: 'Fallible derived working memory. Re-open cited truth when precision or freshness matters.',
+      coveredThroughSequence: source.workingMemory.snapshot.coveredThroughSequence,
+      orientation: source.workingMemory.snapshot.orientation,
+      entries: source.workingMemory.snapshot.entries,
+      snapshotSequence: source.workingMemory.sequence,
+    }), [`journal://event/${source.workingMemory.sequence}`])] : []),
     createBlock(
       'working_state',
       canonicalJson(authorityValue),

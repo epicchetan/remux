@@ -10,6 +10,8 @@ export type ContextPolicy = {
   rollThresholdTokens: number;
   snapshotTargetTokens: number;
   snapshotHardMaxTokens: number;
+  workUnitSoftNoticeTokens: number;
+  workUnitRecoveryTokens: number;
   oversizedValueBytes: number;
 };
 
@@ -57,6 +59,14 @@ export function contextPolicyForModel(
     overrides.snapshotTargetTokens ?? Math.min(18_000, snapshotHardMaxTokens),
     'snapshotTargetTokens',
   );
+  const workUnitSoftNoticeTokens = positiveInteger(
+    overrides.workUnitSoftNoticeTokens ?? Math.min(96_000, Math.max(1, Math.floor(admissionLimit * 0.48))),
+    'workUnitSoftNoticeTokens',
+  );
+  const workUnitRecoveryTokens = positiveInteger(
+    overrides.workUnitRecoveryTokens ?? Math.min(128_000, Math.max(1, Math.floor(admissionLimit * 0.64))),
+    'workUnitRecoveryTokens',
+  );
   if (rollThresholdTokens > admissionLimit) {
     throw new TypeError('rollThresholdTokens must not exceed the effective admission limit.');
   }
@@ -69,6 +79,12 @@ export function contextPolicyForModel(
   if (snapshotHardMaxTokens > admissionLimit) {
     throw new TypeError('snapshotHardMaxTokens must not exceed the effective admission limit.');
   }
+  if (workUnitSoftNoticeTokens > workUnitRecoveryTokens) {
+    throw new TypeError('workUnitSoftNoticeTokens must not exceed workUnitRecoveryTokens.');
+  }
+  if (workUnitRecoveryTokens > admissionLimit) {
+    throw new TypeError('workUnitRecoveryTokens must not exceed the effective admission limit.');
+  }
   return {
     version: overrides.version ?? CONTEXT_POLICY_VERSION,
     outputReserveTokens,
@@ -79,6 +95,8 @@ export function contextPolicyForModel(
     rollThresholdTokens,
     snapshotTargetTokens,
     snapshotHardMaxTokens,
+    workUnitSoftNoticeTokens,
+    workUnitRecoveryTokens,
     oversizedValueBytes: positiveInteger(overrides.oversizedValueBytes ?? 8 * 1024, 'oversizedValueBytes'),
   };
 }

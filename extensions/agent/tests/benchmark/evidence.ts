@@ -45,6 +45,8 @@ type AgentJournalSummary = {
   contextFrames: number;
   contextRollovers: number;
   pressureNotices: number;
+  workUnitCheckpointNotices: number;
+  emergencyWorkUnitRollovers: number;
   rolloversWithoutPriorNotice: number;
   contextLimitErrors: number;
   contextBlockEstimatedTokens: Record<string, number>;
@@ -79,12 +81,24 @@ type AgentJournalSummary = {
   childToolCalls: number;
   childEstimatedInputTokens: number;
   childContextFrames: number;
+  maxWorkUnitEstimatedInputTokens: number;
+  workUnitStateCommits: number;
   workUnitResultBytes: number;
   workUnitTraceBytes: number;
   parentTraceReopens: number;
   localPrimaryLeaks: number;
   abandonedUnitPromotions: number;
   finalProjectRevision: number;
+  memoryAttempts: number;
+  memoryCommits: number;
+  memoryFailures: number;
+  memoryStaleCommits: number;
+  memoryInputTokens: number;
+  memoryOutputTokens: number;
+  memoryCacheReadTokens: number;
+  memoryDurationMs: number;
+  finalMemoryEntries: number;
+  finalMemoryBytes: number;
   toolNames: Record<string, number>;
   leakageFindings: string[];
 };
@@ -268,7 +282,9 @@ export async function evaluateRun(input: {
   if (agentJournal) {
     const managed = runRecord.contextMode === 'managed-v1.1'
       || runRecord.contextMode === 'managed-v1.1-work-units'
-      || runRecord.contextMode === 'stateful';
+      || runRecord.contextMode === 'stateful'
+      || runRecord.contextMode === 'working-memory-v1'
+      || runRecord.contextMode === 'bounded-work-units-v2';
     gates.push(gate(
       'contract',
       'context-mechanics',
@@ -277,7 +293,7 @@ export async function evaluateRun(input: {
         && agentJournal.selfReferentialSearchHits === 0
         && agentJournal.contextLimitErrors === 0
         && (!managed || agentJournal.rolloversWithoutPriorNotice === 0)
-        && (!managed || agentJournal.acceptedProposalEntries > 0),
+        && (!managed || agentJournal.acceptedProposalEntries > 0 || agentJournal.memoryCommits > 0),
       [
         `compactions=${agentJournal.compactionEvents}`,
         `invalidContextCalls=${agentJournal.invalidContextCalls}`,
@@ -285,9 +301,13 @@ export async function evaluateRun(input: {
         `contextLimitErrors=${agentJournal.contextLimitErrors}`,
         `unannouncedRollovers=${agentJournal.rolloversWithoutPriorNotice}`,
         `acceptedProposalEntries=${agentJournal.acceptedProposalEntries}`,
+        `memoryCommits=${agentJournal.memoryCommits}`,
       ].join(', '),
     ));
-    if (runRecord.contextMode === 'managed-v1.1-work-units') {
+    if (
+      runRecord.contextMode === 'managed-v1.1-work-units' ||
+      runRecord.contextMode === 'bounded-work-units-v2'
+    ) {
       gates.push(gate(
         'contract',
         'work-unit-lifecycle',
@@ -295,7 +315,9 @@ export async function evaluateRun(input: {
           && agentJournal.workUnitsEntered === agentJournal.workUnitsReturned
           && agentJournal.explicitWorkUnitReturns > 0
           && agentJournal.localPrimaryLeaks === 0
-          && agentJournal.abandonedUnitPromotions === 0,
+          && agentJournal.abandonedUnitPromotions === 0
+          && (runRecord.contextMode !== 'bounded-work-units-v2' ||
+            agentJournal.emergencyWorkUnitRollovers === 0),
         [
           `entered=${agentJournal.workUnitsEntered}`,
           `returned=${agentJournal.workUnitsReturned}`,
@@ -303,6 +325,9 @@ export async function evaluateRun(input: {
           `implicit=${agentJournal.implicitWorkUnitReturns}`,
           `localLeaks=${agentJournal.localPrimaryLeaks}`,
           `abandonedPromotions=${agentJournal.abandonedUnitPromotions}`,
+          `checkpointNotices=${agentJournal.workUnitCheckpointNotices}`,
+          `emergencyRollovers=${agentJournal.emergencyWorkUnitRollovers}`,
+          `stateCommits=${agentJournal.workUnitStateCommits}`,
         ].join(', '),
       ));
     }
@@ -382,6 +407,8 @@ export async function evaluateRun(input: {
       contextFrames: agentJournal?.contextFrames ?? null,
       contextRollovers: agentJournal?.contextRollovers ?? null,
       pressureNotices: agentJournal?.pressureNotices ?? null,
+      workUnitCheckpointNotices: agentJournal?.workUnitCheckpointNotices ?? null,
+      emergencyWorkUnitRollovers: agentJournal?.emergencyWorkUnitRollovers ?? null,
       rolloversWithoutPriorNotice: agentJournal?.rolloversWithoutPriorNotice ?? null,
       contextLimitErrors: agentJournal?.contextLimitErrors ?? null,
       contextBlockEstimatedTokens: agentJournal?.contextBlockEstimatedTokens ?? null,
@@ -416,12 +443,24 @@ export async function evaluateRun(input: {
       childToolCalls: agentJournal?.childToolCalls ?? null,
       childEstimatedInputTokens: agentJournal?.childEstimatedInputTokens ?? null,
       childContextFrames: agentJournal?.childContextFrames ?? null,
+      maxWorkUnitEstimatedInputTokens: agentJournal?.maxWorkUnitEstimatedInputTokens ?? null,
+      workUnitStateCommits: agentJournal?.workUnitStateCommits ?? null,
       workUnitResultBytes: agentJournal?.workUnitResultBytes ?? null,
       workUnitTraceBytes: agentJournal?.workUnitTraceBytes ?? null,
       parentTraceReopens: agentJournal?.parentTraceReopens ?? null,
       localPrimaryLeaks: agentJournal?.localPrimaryLeaks ?? null,
       abandonedUnitPromotions: agentJournal?.abandonedUnitPromotions ?? null,
       finalProjectRevision: agentJournal?.finalProjectRevision ?? null,
+      memoryAttempts: agentJournal?.memoryAttempts ?? null,
+      memoryCommits: agentJournal?.memoryCommits ?? null,
+      memoryFailures: agentJournal?.memoryFailures ?? null,
+      memoryStaleCommits: agentJournal?.memoryStaleCommits ?? null,
+      memoryInputTokens: agentJournal?.memoryInputTokens ?? null,
+      memoryOutputTokens: agentJournal?.memoryOutputTokens ?? null,
+      memoryCacheReadTokens: agentJournal?.memoryCacheReadTokens ?? null,
+      memoryDurationMs: agentJournal?.memoryDurationMs ?? null,
+      finalMemoryEntries: agentJournal?.finalMemoryEntries ?? null,
+      finalMemoryBytes: agentJournal?.finalMemoryBytes ?? null,
     },
     artifacts: {
       run: join(runPath, 'run.json'),
@@ -641,7 +680,7 @@ function summarizeAgentJournal(
         parentVisibleToolResultBytes += numberValue(resultWrapper.byteLength) ?? 0;
       }
       const isError = payload.isError === true;
-      if (isError && ['journal_search', 'journal_open', 'context_update', 'work_unit'].includes(call.name)) {
+      if (isError && ['journal_search', 'journal_open', 'context_update', 'memory', 'work_unit'].includes(call.name)) {
         invalidContextCalls += 1;
       }
       if (isError) continue;
@@ -666,8 +705,11 @@ function summarizeAgentJournal(
     const frameKeys = new Set<string>();
     const childFrameKeys = new Set<string>();
     const pressureFrameKeys = new Set<string>();
+    const workUnitPressureFrameKeys = new Set<string>();
     const pressureByScope = new Map<string, boolean>();
     let pressureNotices = 0;
+    let workUnitCheckpointNotices = 0;
+    let emergencyWorkUnitRollovers = 0;
     let contextRollovers = 0;
     let rolloversWithoutPriorNotice = 0;
     let contextOmissions = 0;
@@ -690,7 +732,14 @@ function summarizeAgentJournal(
           pressureFrameKeys.add(pressureFrameKey);
           pressureNotices += 1;
         }
+        if (row.scope_kind === 'work_unit' && !workUnitPressureFrameKeys.has(pressureFrameKey)) {
+          workUnitPressureFrameKeys.add(pressureFrameKey);
+          workUnitCheckpointNotices += 1;
+        }
         pressureByScope.set(row.scope_id, true);
+      }
+      if (row.scope_kind === 'work_unit' && active.workUnitRecovery === true) {
+        emergencyWorkUnitRollovers += 1;
       }
       if (row.mode === 'active' && row.decision === 'roll') {
         contextRollovers += 1;
@@ -716,10 +765,13 @@ function summarizeAgentJournal(
     let explicitWorkUnitReturns = 0;
     let implicitWorkUnitReturns = 0;
     let workUnitResultBytes = 0;
+    let workUnitStateCommits = 0;
     for (const row of returnedRows) {
       const payload = objectValue(row.payload_json ? JSON.parse(row.payload_json) : null);
       if (payload.returnMode === 'implicit') implicitWorkUnitReturns += 1;
       else explicitWorkUnitReturns += 1;
+      workUnitStateCommits += arrayValue(payload.committedKeys).length +
+        arrayValue(payload.committedResources).length;
       if (row.artifact_hash) {
         const artifact = database.prepare('SELECT byte_length FROM artifacts WHERE hash = ?')
           .get(row.artifact_hash) as { byte_length: number } | undefined;
@@ -760,6 +812,26 @@ function summarizeAgentJournal(
       .reduce((total, row) => total
         + Buffer.byteLength(row.body_json, 'utf8')
         + Buffer.byteLength(row.descriptor_json, 'utf8'), 0);
+    const memoryRows = eventRows.filter(({ type }) =>
+      type === 'memory.snapshot.committed' ||
+      type === 'memory.compilation.failed' ||
+      type === 'memory.compilation.stale');
+    const memoryCommits = memoryRows.filter(({ type }) => type === 'memory.snapshot.committed');
+    const memoryFailures = memoryRows.filter(({ type }) => type === 'memory.compilation.failed');
+    const memoryStale = memoryRows.filter(({ type }) => type === 'memory.compilation.stale');
+    const memoryPayloads = memoryCommits.map((row) => objectValue(row.payload_json ? JSON.parse(row.payload_json) : null));
+    const finalMemory = memoryPayloads.at(-1) ?? {};
+    const memoryInputTokens = memoryPayloads.reduce((sum, payload) =>
+      sum + (numberValue(objectValue(payload.compiler).inputTokens) ?? 0), 0);
+    const memoryOutputTokens = memoryPayloads.reduce((sum, payload) =>
+      sum + (numberValue(objectValue(payload.compiler).outputTokens) ?? 0), 0);
+    const memoryCacheReadTokens = memoryPayloads.reduce((sum, payload) =>
+      sum + (numberValue(objectValue(payload.compiler).cacheReadTokens) ?? 0), 0);
+    const memoryDurationMs = memoryRows.reduce((sum, row) => {
+      const payload = objectValue(row.payload_json ? JSON.parse(row.payload_json) : null);
+      const compiler = objectValue(payload.compiler);
+      return sum + (numberValue(compiler.durationMs) ?? numberValue(payload.durationMs) ?? 0);
+    }, 0);
     return {
       databasePath,
       providerCalls: inferenceRows.length,
@@ -774,6 +846,8 @@ function summarizeAgentJournal(
       contextFrames: frameKeys.size,
       contextRollovers,
       pressureNotices,
+      workUnitCheckpointNotices,
+      emergencyWorkUnitRollovers,
       rolloversWithoutPriorNotice,
       contextLimitErrors,
       contextBlockEstimatedTokens,
@@ -815,12 +889,31 @@ function summarizeAgentJournal(
         .filter(({ scope_kind }) => scope_kind === 'work_unit')
         .reduce((sum, row) => sum + row.estimated_input_tokens, 0),
       childContextFrames: childFrameKeys.size,
+      maxWorkUnitEstimatedInputTokens: Math.max(
+        0,
+        ...inferenceRows
+          .filter(({ scope_kind }) => scope_kind === 'work_unit')
+          .map((row) => row.estimated_input_tokens),
+      ),
+      workUnitStateCommits,
       workUnitResultBytes,
       workUnitTraceBytes,
       parentTraceReopens,
       localPrimaryLeaks,
       abandonedUnitPromotions,
       finalProjectRevision,
+      memoryAttempts: memoryRows.length,
+      memoryCommits: memoryCommits.length,
+      memoryFailures: memoryFailures.length,
+      memoryStaleCommits: memoryStale.length,
+      memoryInputTokens,
+      memoryOutputTokens,
+      memoryCacheReadTokens,
+      memoryDurationMs,
+      finalMemoryEntries: arrayValue(finalMemory.entries).length,
+      finalMemoryBytes: Object.keys(finalMemory).length === 0
+        ? 0
+        : Buffer.byteLength(JSON.stringify(finalMemory), 'utf8'),
       toolNames,
       leakageFindings: unique(leakageFindings),
     };

@@ -28,6 +28,12 @@ import type {
   WorkUnitInput,
 } from './engine.ts';
 import type { AgentTranscriptResourcesReadParams } from '../../shared/transcript.ts';
+import type {
+  WorkingMemoryCommitInput,
+  WorkingMemoryCommitResult,
+  WorkingMemoryCompileInput,
+  WorkingMemoryFailureInput,
+} from './context/working-memory.ts';
 
 export interface AgentConversationJournal {
   createConversation(params: CreateConversationParams): Promise<CreateConversationResult>;
@@ -95,7 +101,7 @@ export interface AgentConversationJournal {
     hash: string,
     range?: { offset: number; byteLength: number },
   ): Promise<DurableArtifact | null>;
-  readContextMode?(conversationId: string): Promise<'full-history' | 'stateful'>;
+  readContextMode?(conversationId: string): Promise<'full-history' | 'stateful' | 'working-memory' | 'work-units'>;
   readWorkUnitMode?(conversationId: string): Promise<boolean>;
   searchJournal?(conversationId: string, input: JournalSearchInput): Promise<JournalSearchResult>;
   openJournal?(conversationId: string, input: JournalOpenInput): Promise<JournalOpenResult>;
@@ -109,4 +115,7 @@ export interface AgentConversationJournal {
     handle: DurableTurnHandle;
     prompt: string;
   } | null>;
+  prepareWorkingMemory?(conversationId: string): Promise<WorkingMemoryCompileInput | null>;
+  commitWorkingMemory?(input: WorkingMemoryCommitInput): Promise<WorkingMemoryCommitResult>;
+  recordWorkingMemoryFailure?(input: WorkingMemoryFailureInput): Promise<void>;
 }

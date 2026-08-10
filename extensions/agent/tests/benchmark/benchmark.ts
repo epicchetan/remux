@@ -394,9 +394,10 @@ function parseOptions(args: string[]): Options {
   const contextMode = values.get('--context-mode') ?? 'managed-v1.1';
   if (
     contextMode !== 'full-history' && contextMode !== 'stateful' &&
-    contextMode !== 'managed-v1.1' && contextMode !== 'managed-v1.1-work-units'
+    contextMode !== 'managed-v1.1' && contextMode !== 'managed-v1.1-work-units' &&
+    contextMode !== 'working-memory-v1' && contextMode !== 'bounded-work-units-v2'
   ) {
-    throw new Error('--context-mode must be full-history, managed-v1.1, or managed-v1.1-work-units.');
+    throw new Error('--context-mode must be full-history, stateful, managed-v1.1, managed-v1.1-work-units, working-memory-v1, or bounded-work-units-v2.');
   }
   const timeoutMs = Number(values.get('--timeout-ms') ?? 45 * 60_000);
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000) throw new Error('--timeout-ms must be a safe integer of at least 1000.');
@@ -460,7 +461,7 @@ function printHelp() {
     `  benchmark resume --run id\n` +
     `  benchmark status --run id\n` +
     `  benchmark finalize --run id\n` +
-    `  benchmark run --target codex|agent --model id [--context-mode full-history|managed-v1.1|managed-v1.1-work-units]\n` +
+    `  benchmark run --target codex|agent --model id [--context-mode full-history|managed-v1.1|managed-v1.1-work-units|working-memory-v1|bounded-work-units-v2]\n` +
     `  benchmark replay --source-run id --target codex|agent --model id\n` +
     `  benchmark sentinel --target agent --model id\n`);
 }

@@ -33,6 +33,19 @@ import {
   type LogicalReplayEvent,
 } from '../logical-context.ts';
 import type { ShadowContextSource } from '../context/compiler.ts';
+import {
+  WORKING_MEMORY_MAX_DELTA_BYTES,
+  WORKING_MEMORY_VERSION,
+  applyWorkingMemoryPatch,
+  compactWorkingMemoryValue,
+  type WorkingMemoryCommitInput,
+  type WorkingMemoryCommitResult,
+  type WorkingMemoryCompileInput,
+  type WorkingMemoryDeltaItem,
+  type WorkingMemoryFailureInput,
+  type WorkingMemorySnapshot,
+  type WorkingMemorySnapshotRecord,
+} from '../context/working-memory.ts';
 import type {
   ContextScope,
   ContextUpdateInput,
@@ -41,6 +54,7 @@ import type {
   JournalOpenResult,
   JournalSearchInput,
   JournalSearchResult,
+  WorkUnitCommitInput,
   WorkUnitInput,
   WorkUnitResult,
 } from '../engine.ts';
@@ -87,12 +101,19 @@ const INITIAL_TITLE = 'New conversation';
 const EVENT_PAYLOAD_LIMIT_BYTES = 32 * 1024;
 const INLINE_CONTENT_LIMIT_BYTES = 16 * 1024;
 const MAX_EXACT_WORKING_RESOURCE_BYTES = 64 * 1024;
+const MAX_WORK_UNIT_EVIDENCE_BYTES = 2 * 1024 * 1024;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const execFileAsync = promisify(execFile);
 
 type PreparedWorkingResource = {
   body: CanonicalJsonValue;
   descriptor: CanonicalJsonValue;
+  artifact?: StagedArtifact;
+};
+
+type PreparedWorkUnitReference = {
+  source: string;
+  ref: string;
   artifact?: StagedArtifact;
 };
 
@@ -141,7 +162,7 @@ export type CreateConversationParams = {
   cwd: string;
   modelId: string;
   reasoning: ReasoningLevel;
-  contextMode?: 'full-history' | 'stateful';
+  contextMode?: 'full-history' | 'stateful' | 'working-memory' | 'work-units';
   workUnits?: boolean;
 };
 
@@ -345,9 +366,10 @@ export type DurableInferenceContext = {
   shadow: ShadowContextCandidate;
   shadowBuildDurationMs: number;
   activeMessages: readonly LogicalContextMessage[];
-  contextMode?: 'full-history' | 'stateful';
+  contextMode?: 'full-history' | 'stateful' | 'working-memory' | 'work-units';
   frameOrdinal?: number | null;
   pressureNotice?: boolean;
+  workUnitRecovery?: boolean;
 };
 
 export type DurableWorkUnitTransition = {
@@ -791,9 +813,13 @@ export class AgentJournalRepository {
       projectRevision: input.context.shadow.projectRevision,
       targetContextSpaceId: input.context.shadow.targetContextSpaceId,
       active: {
-        mode: input.context.contextMode === 'stateful' ? 'stateful-frame' : 'full-history',
+        mode: input.context.contextMode === 'stateful' || input.context.contextMode === 'working-memory' ||
+            input.context.contextMode === 'work-units'
+          ? 'stateful-frame'
+          : 'full-history',
         frameOrdinal: input.context.frameOrdinal ?? null,
         pressureNotice: input.context.pressureNotice ?? false,
+        workUnitRecovery: input.context.workUnitRecovery ?? false,
         logicalHash: input.context.logicalHash,
         renderedHash: input.context.renderedHash,
         orderedMessageHashes: input.context.orderedMessageHashes,
@@ -801,7 +827,10 @@ export class AgentJournalRepository {
         estimatedInputTokens: input.estimatedInputTokens,
       },
       candidate: {
-        mode: input.context.contextMode === 'stateful' ? 'authoritative' : 'diagnostic',
+        mode: input.context.contextMode === 'stateful' || input.context.contextMode === 'working-memory' ||
+            input.context.contextMode === 'work-units'
+          ? 'authoritative'
+          : 'diagnostic',
         semanticHash: input.context.shadow.semanticHash,
         bootstrapHash: input.context.shadow.bootstrapHash,
         estimatedInputTokens: input.context.shadow.estimatedInputTokens,
@@ -873,6 +902,7 @@ export class AgentJournalRepository {
           contextMode: input.context.contextMode ?? 'full-history',
           frameOrdinal: input.context.frameOrdinal ?? null,
           pressureNotice: input.context.pressureNotice ?? false,
+          workUnitRecovery: input.context.workUnitRecovery ?? false,
           shadowBootstrapHash: bootstrapArtifact.hash,
           shadowDecision: input.context.shadow.decision.kind,
           shadowSemanticHash: input.context.shadow.semanticHash,
@@ -933,7 +963,10 @@ export class AgentJournalRepository {
         basisSequence,
         input.context.shadow.projectRevision,
         input.context.shadow.targetContextSpaceId,
-        input.context.contextMode === 'stateful' ? 'active' : 'shadow',
+        input.context.contextMode === 'stateful' || input.context.contextMode === 'working-memory' ||
+          input.context.contextMode === 'work-units'
+          ? 'active'
+          : 'shadow',
         input.context.shadow.compilerVersion,
         input.context.shadow.policyVersion,
         input.context.shadow.decision.kind,
@@ -1680,6 +1713,168 @@ export class AgentJournalRepository {
     };
   }
 
+  async prepareWorkingMemory(conversationId: string): Promise<WorkingMemoryCompileInput | null> {
+    this.assertOpen();
+    await this.writerTail;
+    if (this.readContextModeValue(conversationId) !== 'working-memory') return null;
+    const identity = this.contextIdentity(conversationId);
+    const terminal = this.storage.database.prepare(`
+      SELECT turn_id, root_scope_id, terminal_sequence
+      FROM turns
+      WHERE conversation_id = ? AND strand_id = ? AND terminal_sequence IS NOT NULL
+      ORDER BY terminal_sequence DESC LIMIT 1
+    `).get(conversationId, identity.strandId) as {
+      turn_id: string;
+      root_scope_id: string;
+      terminal_sequence: number;
+    } | undefined;
+    if (!terminal) return null;
+    const coveredThroughSequence = safeInteger(terminal.terminal_sequence, 'working-memory terminal sequence');
+    const baseSnapshot = this.readLatestWorkingMemoryRecord(conversationId, identity.strandId);
+    const previousBasis = baseSnapshot?.snapshot.coveredThroughSequence ?? 0;
+    if (coveredThroughSequence <= previousBasis) return null;
+
+    const events = (await this.readEvents({ conversationId, throughSequence: coveredThroughSequence }))
+      .filter((event) => event.strandId === identity.strandId && event.sequence > previousBasis);
+    const messages = reduceLogicalReplay(await this.logicalReplayEvents(events));
+    const candidates: WorkingMemoryDeltaItem[] = messages.map((message) => {
+      const ref = message.role === 'tool'
+        ? `journal://tool/${encodeURIComponent(message.callId)}`
+        : `journal://turn/${encodeURIComponent(message.turnId)}${message.role === 'assistant' ? '#assistant' : ''}`;
+      return {
+        ref,
+        turnId: message.turnId,
+        value: compactWorkingMemoryValue(logicalMessageSemanticValue(message), 5_000),
+      };
+    });
+    const selected: WorkingMemoryDeltaItem[] = [];
+    let selectedBytes = 0;
+    let deltaOmittedBytes = 0;
+    for (const item of [...candidates].reverse()) {
+      const itemBytes = Buffer.byteLength(canonicalJson(item as unknown as CanonicalJsonValue), 'utf8');
+      if (selectedBytes + itemBytes > WORKING_MEMORY_MAX_DELTA_BYTES) {
+        deltaOmittedBytes += itemBytes;
+        continue;
+      }
+      selected.push(item);
+      selectedBytes += itemBytes;
+    }
+    selected.reverse();
+
+    const state = this.readProjectState(identity.projectId, identity.rootSpaceId);
+    const compiled = compileProjectContext(state, identity.targetSpaceId);
+    const protectedState = compiled.effective.flatMap((entry) => {
+      const primary = state.primaries.get(entry.primaryId);
+      return primary ? [{
+        key: primary.key,
+        kind: primary.kind,
+        body: primary.body,
+        descriptor: primary.descriptor,
+        mode: entry.mode,
+        provenance: primary.provenance,
+      }] : [];
+    }) as unknown as CanonicalJsonValue;
+    return {
+      conversationId,
+      strandId: identity.strandId,
+      projectId: identity.projectId,
+      baseSnapshot,
+      coveredThroughSequence,
+      delta: selected,
+      deltaOmittedBytes,
+      protectedState,
+      allowedRefs: [...new Set([
+        ...selected.map(({ ref }) => ref),
+        ...(baseSnapshot?.snapshot.entries.flatMap(({ refs }) => refs) ?? []),
+      ])].sort(),
+    };
+  }
+
+  async commitWorkingMemory(input: WorkingMemoryCommitInput): Promise<WorkingMemoryCommitResult> {
+    this.assertOpen();
+    const snapshot = applyWorkingMemoryPatch(input.compile, input.patch, input.compiler);
+    return this.enqueueWrite(() => this.storage.transaction(() => {
+      const latest = this.readLatestWorkingMemoryRecord(input.compile.conversationId, input.compile.strandId);
+      const expected = input.compile.baseSnapshot?.sequence ?? null;
+      const actual = latest?.sequence ?? null;
+      const terminal = this.workingMemoryTerminalIdentity(
+        input.compile.conversationId,
+        input.compile.strandId,
+        input.compile.coveredThroughSequence,
+      );
+      if (actual !== expected) {
+        this.insertEvent({
+          eventId: this.nextId('event'),
+          projectId: input.compile.projectId,
+          conversationId: input.compile.conversationId,
+          strandId: input.compile.strandId,
+          turnId: terminal.turnId,
+          scopeId: terminal.scopeId,
+          type: 'memory.compilation.stale',
+          actor: 'memory-compiler',
+          payload: {
+            baseSnapshotSequence: expected,
+            latestSnapshotSequence: actual,
+            coveredThroughSequence: input.compile.coveredThroughSequence,
+            modelId: input.compiler.modelId,
+            durationMs: input.compiler.durationMs,
+          },
+          createdAt: safeTimestamp(this.now()),
+        });
+        return { state: 'stale' as const, sequence: null, snapshot: null };
+      }
+      const sequence = this.insertEvent({
+        eventId: this.nextId('event'),
+        projectId: input.compile.projectId,
+        conversationId: input.compile.conversationId,
+        strandId: input.compile.strandId,
+        turnId: terminal.turnId,
+        scopeId: terminal.scopeId,
+        type: 'memory.snapshot.committed',
+        actor: 'memory-compiler',
+        payload: snapshot as unknown as CanonicalJsonValue,
+        createdAt: safeTimestamp(this.now()),
+      });
+      return { state: 'committed' as const, sequence, snapshot };
+    }));
+  }
+
+  async recordWorkingMemoryFailure(input: WorkingMemoryFailureInput): Promise<void> {
+    this.assertOpen();
+    await this.enqueueWrite(() => this.storage.transaction(() => {
+      const terminal = this.workingMemoryTerminalIdentity(
+        input.compile.conversationId,
+        input.compile.strandId,
+        input.compile.coveredThroughSequence,
+      );
+      this.insertEvent({
+        eventId: this.nextId('event'),
+        projectId: input.compile.projectId,
+        conversationId: input.compile.conversationId,
+        strandId: input.compile.strandId,
+        turnId: terminal.turnId,
+        scopeId: terminal.scopeId,
+        type: 'memory.compilation.failed',
+        actor: 'memory-compiler',
+        payload: {
+          baseSnapshotSequence: input.compile.baseSnapshot?.sequence ?? null,
+          coveredThroughSequence: input.compile.coveredThroughSequence,
+          modelId: input.modelId,
+          durationMs: safeNonnegativeInteger(Math.round(input.durationMs), 'working-memory failure duration'),
+          error: input.error.slice(0, 1_000),
+        },
+        createdAt: safeTimestamp(this.now()),
+      });
+    }));
+  }
+
+  async readLatestWorkingMemory(conversationId: string): Promise<WorkingMemorySnapshotRecord | null> {
+    this.assertOpen();
+    await this.writerTail;
+    const identity = this.contextIdentity(conversationId);
+    return this.readLatestWorkingMemoryRecord(conversationId, identity.strandId);
+  }
+
   private async logicalReplayEvents(events: readonly AgentJournalEvent[]) {
     const replay: LogicalReplayEvent[] = [];
     for (const event of events) {
@@ -2238,8 +2433,19 @@ export class AgentJournalRepository {
     const row = this.storage.database.prepare(`
       SELECT a.byte_length, a.media_type, a.storage_path
       FROM artifacts a
-      JOIN events e ON e.sequence = a.created_sequence
-      WHERE a.hash = ? AND e.project_id = ?
+      WHERE a.hash = ?
+        AND EXISTS (
+          SELECT 1 FROM events e
+          WHERE e.project_id = ?
+            AND (
+              e.artifact_hash = a.hash
+              OR EXISTS (
+                SELECT 1 FROM json_tree(e.payload_json) linked
+                WHERE linked.value = a.hash
+                   OR linked.value = 'journal://artifact/' || a.hash
+              )
+            )
+        )
     `).get(hash, projectId) as {
       byte_length: number; media_type: string; storage_path: string;
     } | undefined;
@@ -2466,7 +2672,12 @@ export class AgentJournalRepository {
     if (!objective) throw new TypeError('A work-unit objective is required.');
     const refs = [...new Set(input.refs ?? [])];
     if (refs.length > 16) throw new TypeError('A work unit may receive at most 16 explicit refs.');
-    for (const ref of refs) await this.resolveOpenableContent(handle.conversationId, ref);
+    const preparedRefs = await this.prepareWorkUnitReferences(
+      handle.conversationId,
+      active.cwd,
+      refs,
+      'work-unit input reference',
+    );
     this.dirtyRuntime.add(handle.conversationId);
     const baseWorkspace = await this.observeRuntimeState(handle.conversationId, active.cwd);
     const context = await this.compileContext(handle.conversationId);
@@ -2485,7 +2696,7 @@ export class AgentJournalRepository {
         ref: `journal://primary/${encodeURIComponent(entry.primaryId)}`,
         version: entry.version,
       })),
-      refs,
+      refs: preparedRefs.map(({ source, ref }) => ({ source, ref })),
       expectedEvidence: input.expectedEvidence ?? [],
       baseWorkspace,
       authority: {
@@ -2522,13 +2733,14 @@ export class AgentJournalRepository {
           expectedEvidence: input.expectedEvidence ?? [],
           objective,
           parentScopeId: handle.scopeId,
-          refs,
+          refs: preparedRefs.map(({ source, ref }) => ({ source, ref })),
           scopeId: childScopeId,
         },
         artifactHash: capsule.artifact!.hash,
         createdAt: recordedAt,
       });
       this.insertArtifact(capsule.artifact!, scopeSequence);
+      for (const prepared of preparedRefs) this.insertArtifact(prepared.artifact, scopeSequence);
       const epochSequence = this.insertEvent({
         ...childHandle,
         eventId: this.nextId('event'),
@@ -2558,7 +2770,7 @@ export class AgentJournalRepository {
         handle.scopeId,
         canonicalJson({
           objective,
-          refs,
+          refs: preparedRefs.map(({ source, ref }) => ({ source, ref })),
           expectedEvidence: input.expectedEvidence ?? [],
           capsuleRef,
           baseWorkspace,
@@ -2632,12 +2844,41 @@ export class AgentJournalRepository {
     if (active.kind !== 'work_unit' || active.scopeId !== handle.scopeId || !active.parentScopeId) {
       throw new Error('No work unit is active to return.');
     }
+    if (input.status === 'abandoned' && input.commit) {
+      throw new Error('An abandoned work unit cannot commit shared state.');
+    }
+    const identity = this.contextIdentity(handle.conversationId);
+    const commitInput = workUnitCommitContext(input.commit);
     const citedRefs = [...new Set([
       ...input.findings.flatMap(({ evidence }) => evidence),
       ...(input.changeRefs ?? []),
       ...(input.validationRefs ?? []),
+      ...(commitInput?.set?.flatMap(({ evidence }) => evidence ?? []) ?? []),
     ])];
-    for (const ref of citedRefs) await this.resolveOpenableContent(handle.conversationId, ref);
+    const preparedRefs = await this.prepareWorkUnitReferences(
+      handle.conversationId,
+      active.cwd,
+      citedRefs,
+      'work-unit evidence',
+    );
+    const resolvedRef = new Map(preparedRefs.map(({ source, ref }) => [source, ref]));
+    const normalizeRefs = (refs: readonly string[] | undefined) =>
+      (refs ?? []).map((ref) => resolvedRef.get(ref) ?? ref);
+    const findings = input.findings.map((finding) => ({
+      ...finding,
+      evidence: normalizeRefs(finding.evidence),
+    }));
+    const normalizedCommit: ContextUpdateInput | null = commitInput ? {
+      ...commitInput,
+      set: commitInput.set?.map((entry) => ({
+        ...entry,
+        evidence: normalizeRefs(entry.evidence),
+      })),
+    } : null;
+    const commitActions = normalizedCommit ? contextStorageActions(normalizedCommit) : [];
+    const workingResources = normalizedCommit
+      ? await this.prepareWorkingResources(handle.conversationId, active.cwd, commitActions)
+      : new Map<string, PreparedWorkingResource>();
     this.dirtyRuntime.add(handle.conversationId);
     const finalWorkspace = await this.observeRuntimeState(handle.conversationId, active.cwd);
     const objective = active.objective && typeof active.objective === 'object' && !Array.isArray(active.objective)
@@ -2654,11 +2895,13 @@ export class AgentJournalRepository {
       baseWorkspace: objective.baseWorkspace ?? null,
       finalWorkspace,
       status: input.status,
-      findings: input.findings,
-      changeRefs: input.changeRefs ?? [],
-      validationRefs: input.validationRefs ?? [],
+      findings,
+      changeRefs: normalizeRefs(input.changeRefs),
+      validationRefs: normalizeRefs(input.validationRefs),
       unresolved: input.unresolved ?? [],
       proposedPromotions: input.proposedPromotions ?? [],
+      commit: normalizedCommit,
+      referenceMap: preparedRefs.map(({ source, ref }) => ({ source, ref })),
       traceRef,
     }, 'work-unit result');
     const resultArtifact = await this.prepareJson(resultValue, true);
@@ -2680,20 +2923,54 @@ export class AgentJournalRepository {
       scopeId: active.parentScopeId,
       epochId: parentRow.epoch_id,
     };
-    await this.enqueueWrite(() => this.storage.transaction(() => {
+    const committed = await this.enqueueWrite(() => this.storage.transaction(() => {
       this.assertRunningHandle(handle);
       const recordedAt = safeTimestamp(this.now());
+      const returnEventId = this.nextId('event');
+      const before = this.readProjectState(identity.projectId, identity.rootSpaceId);
+      const operations = this.contextOperations(
+        before,
+        identity.targetSpaceId,
+        commitActions,
+        `journal://event-id/${returnEventId}`,
+        workingResources,
+        'turn',
+      );
+      const after = operations.length > 0
+        ? applyProjectTransaction(before, {
+            operationId: `work-unit-commit:${returnEventId}`,
+            projectId: before.projectId,
+            basisRevision: before.revision,
+            operations,
+          })
+        : before;
       const terminalSequence = this.insertEvent({
         ...handle,
-        eventId: this.nextId('event'),
+        eventId: returnEventId,
         type: 'work_unit.returned',
         actor: 'model',
         visibility: 'internal',
-        payload: { resultRef, returnMode, status: input.status, traceRef },
+        payload: {
+          resultRef,
+          returnMode,
+          status: input.status,
+          traceRef,
+          committedKeys: commitActions.flatMap((action) =>
+            action.op === 'set' || action.op === 'remove' ? [action.key] : []),
+          committedResources: commitActions.flatMap((action) =>
+            action.op === 'pin' || action.op === 'unpin' ? [action.ref] : []),
+          basisRevision: before.revision,
+          revision: after.revision,
+        },
         artifactHash: resultArtifact.artifact!.hash,
         createdAt: recordedAt,
       });
       this.insertArtifact(resultArtifact.artifact!, terminalSequence);
+      for (const prepared of preparedRefs) this.insertArtifact(prepared.artifact, terminalSequence);
+      for (const prepared of workingResources.values()) {
+        this.insertArtifact(prepared.artifact, terminalSequence);
+      }
+      if (after !== before) this.persistProjectStateDelta(before, after, terminalSequence, recordedAt);
       this.storage.database.prepare(`
         UPDATE epochs SET state = 'closed', closed_sequence = ?, close_reason = ?
         WHERE epoch_id = ? AND state = 'open'
@@ -2728,10 +3005,18 @@ export class AgentJournalRepository {
           scopeId: handle.scopeId,
           status: input.status,
           traceRef,
+          committedRevision: after.revision,
         },
         artifactHash: resultArtifact.artifact!.hash,
         createdAt: recordedAt,
       });
+      return normalizedCommit
+        ? this.contextWorkspaceView(
+            after,
+            identity.targetSpaceId,
+            operations.length === 0 ? ['The work-unit state commit required no durable change.'] : [],
+          )
+        : undefined;
     }));
     this.dirtyRuntime.add(handle.conversationId);
     return {
@@ -2743,6 +3028,7 @@ export class AgentJournalRepository {
         resultRef,
         traceRef,
         status: input.status,
+        ...(committed ? { committed } : {}),
       },
     };
   }
@@ -2771,6 +3057,66 @@ export class AgentJournalRepository {
       targetSpaceId: row.target_space_id,
       cwd: row.cwd,
     };
+  }
+
+  private readContextModeValue(
+    conversationId: string,
+  ): 'full-history' | 'stateful' | 'working-memory' | 'work-units' {
+    const row = this.storage.database.prepare(`
+      SELECT json_extract(payload_json, '$.contextMode') AS context_mode
+      FROM events
+      WHERE conversation_id = ? AND type = 'conversation.created'
+      ORDER BY sequence LIMIT 1
+    `).get(conversationId) as { context_mode: unknown } | undefined;
+    if (!row) throw new Error(`Conversation ${conversationId} does not exist.`);
+    return row.context_mode === 'full-history'
+      ? 'full-history'
+      : row.context_mode === 'working-memory'
+        ? 'working-memory'
+        : row.context_mode === 'work-units'
+          ? 'work-units'
+          : 'stateful';
+  }
+
+  private readLatestWorkingMemoryRecord(
+    conversationId: string,
+    strandId: string,
+  ): WorkingMemorySnapshotRecord | null {
+    const row = this.storage.database.prepare(`
+      SELECT sequence, payload_json
+      FROM events
+      WHERE conversation_id = ? AND strand_id = ? AND type = 'memory.snapshot.committed'
+      ORDER BY sequence DESC LIMIT 1
+    `).get(conversationId, strandId) as { sequence: number; payload_json: string } | undefined;
+    if (!row) return null;
+    const snapshot = JSON.parse(row.payload_json) as WorkingMemorySnapshot;
+    if (snapshot.version !== WORKING_MEMORY_VERSION) {
+      throw new Error(`Unsupported working-memory snapshot version ${String(snapshot.version)}.`);
+    }
+    if (!Array.isArray(snapshot.entries) || typeof snapshot.orientation !== 'string') {
+      throw new Error('Stored working-memory snapshot has an invalid shape.');
+    }
+    return {
+      sequence: safeInteger(row.sequence, 'working-memory snapshot sequence'),
+      snapshot,
+    };
+  }
+
+  private workingMemoryTerminalIdentity(
+    conversationId: string,
+    strandId: string,
+    terminalSequence: number,
+  ) {
+    const row = this.storage.database.prepare(`
+      SELECT turn_id, root_scope_id
+      FROM turns
+      WHERE conversation_id = ? AND strand_id = ? AND terminal_sequence = ?
+    `).get(conversationId, strandId, terminalSequence) as {
+      turn_id: string;
+      root_scope_id: string;
+    } | undefined;
+    if (!row) throw new Error(`Working-memory basis ${terminalSequence} is not a terminal turn.`);
+    return { turnId: row.turn_id, scopeId: row.root_scope_id };
   }
 
   private activeScopeIdentity(conversationId: string) {
@@ -3342,6 +3688,76 @@ export class AgentJournalRepository {
     return prepared;
   }
 
+  private async prepareWorkUnitReferences(
+    conversationId: string,
+    cwd: string,
+    values: readonly string[],
+    label: string,
+  ): Promise<PreparedWorkUnitReference[]> {
+    const prepared: PreparedWorkUnitReference[] = [];
+    for (const raw of values) {
+      const source = requiredContextResource(raw);
+      if (source.includes('://')) {
+        await this.resolveOpenableContent(conversationId, source);
+        prepared.push({ source, ref: source });
+        continue;
+      }
+      const citation = /^(.*?):(\d+)(?:-(\d+))?(?::\d+)?$/u.exec(source);
+      const candidates = citation?.[1] ? [citation[1]] : [source];
+      let resolvedPath = '';
+      let bytes: Buffer | null = null;
+      let readError: unknown = null;
+      for (const candidate of [...new Set(candidates)]) {
+        const path = isAbsolute(candidate) ? candidate : resolve(cwd, candidate);
+        try {
+          bytes = await readFile(path);
+          resolvedPath = path;
+          break;
+        } catch (error) {
+          readError = error;
+        }
+      }
+      if (!bytes) {
+        throw new Error(`${label} ${source} is neither an openable journal reference nor a readable file.`, {
+          cause: readError,
+        });
+      }
+      if (citation) {
+        if (bytes.includes(0)) {
+          throw new Error(`${label} ${source} cannot select lines from a binary file.`);
+        }
+        const startLine = Number(citation[2]);
+        const endLine = Number(citation[3] ?? citation[2]);
+        const lines = bytes.toString('utf8').split('\n');
+        if (
+          !Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine) ||
+          startLine < 1 || endLine < startLine || startLine > lines.length
+        ) {
+          throw new Error(`${label} ${source} has an invalid or out-of-range line citation.`);
+        }
+        const selected = lines.slice(startLine - 1, Math.min(endLine, lines.length)).join('\n');
+        bytes = Buffer.from(`${source}\n${selected}${selected.endsWith('\n') ? '' : '\n'}`, 'utf8');
+      }
+      if (bytes.byteLength > MAX_WORK_UNIT_EVIDENCE_BYTES) {
+        throw new Error(
+          `${label} ${source} is ${bytes.byteLength} bytes; the evidence limit is ` +
+          `${MAX_WORK_UNIT_EVIDENCE_BYTES} bytes. Cite a narrower immutable journal artifact instead.`,
+        );
+      }
+      const artifact = await this.artifacts.put(
+        bytes,
+        bytes.includes(0) ? 'application/octet-stream' : 'text/plain; charset=utf-8',
+      );
+      prepared.push({
+        source,
+        ref: `journal://artifact/${artifact.hash}`,
+        artifact,
+      });
+      if (!resolvedPath) throw new Error(`${label} ${source} did not resolve to a file.`);
+    }
+    return prepared;
+  }
+
   private persistProjectStateDelta(
     before: ProjectState,
     after: ProjectState,
@@ -3485,6 +3901,23 @@ export class AgentJournalRepository {
       root_space_id: active.rootSpaceId,
       target_space_id: active.targetSpaceId,
     };
+    const workingMemory = this.readContextModeValue(conversationId) === 'working-memory'
+      ? this.readLatestWorkingMemoryRecord(conversationId, identity.strand_id)
+      : null;
+    const hotTurnIds = workingMemory
+      ? new Set((this.storage.database.prepare(`
+          SELECT turn_id FROM turns
+          WHERE conversation_id = ? AND strand_id = ? AND accepted_sequence > ?
+          ORDER BY accepted_sequence
+        `).all(
+          conversationId,
+          identity.strand_id,
+          workingMemory.snapshot.coveredThroughSequence,
+        ) as Array<{ turn_id: string }>).map(({ turn_id }) => turn_id))
+      : null;
+    const sourceMessages = hotTurnIds
+      ? snapshot.messages.filter((message) => hotTurnIds.has(message.turnId))
+      : snapshot.messages;
 
     const spaces = new Map<string, ContextSpace>();
     for (const row of this.storage.database.prepare(`
@@ -3593,7 +4026,7 @@ export class AgentJournalRepository {
       WHERE conversation_id = ? AND turn_id = ? AND type = 'message.user'
       ORDER BY sequence DESC LIMIT 1
     `).get(conversationId, identity.turn_id) as { sequence: number } | undefined;
-    const currentUser = snapshot.messages.find(
+    const currentUser = sourceMessages.find(
       (message): message is Extract<LogicalContextMessage, { role: 'user' }> =>
         message.role === 'user' && message.turnId === identity.turn_id,
     );
@@ -3643,7 +4076,8 @@ export class AgentJournalRepository {
       targetContextSpaceId: identity.target_space_id,
       workspaceRoot: identity.cwd,
       reasoning: identity.reasoning,
-      messages: snapshot.messages,
+      messages: sourceMessages,
+      workingMemory,
       turnAnchor: {
         currentUser: {
           ref: `journal://event/${safeInteger(currentUserRow.sequence, 'current user sequence')}`,
@@ -3708,17 +4142,12 @@ export class AgentJournalRepository {
     return rows.map(decodeEventRow);
   }
 
-  async readContextMode(conversationId: string): Promise<'full-history' | 'stateful'> {
+  async readContextMode(
+    conversationId: string,
+  ): Promise<'full-history' | 'stateful' | 'working-memory' | 'work-units'> {
     this.assertOpen();
     await this.writerTail;
-    const row = this.storage.database.prepare(`
-      SELECT json_extract(payload_json, '$.contextMode') AS context_mode
-      FROM events
-      WHERE conversation_id = ? AND type = 'conversation.created'
-      ORDER BY sequence LIMIT 1
-    `).get(conversationId) as { context_mode: unknown } | undefined;
-    if (!row) throw new Error(`Conversation ${conversationId} does not exist.`);
-    return row.context_mode === 'full-history' ? 'full-history' : 'stateful';
+    return this.readContextModeValue(conversationId);
   }
 
   async readWorkUnitMode(conversationId: string): Promise<boolean> {
@@ -5204,6 +5633,52 @@ export class AgentJournalRepository {
     ) {
       throw new Error(`Artifact ${artifact.hash} conflicts with its durable metadata.`);
     }
+    const linked = this.storage.database.prepare(`
+      SELECT 1
+      FROM events source
+      WHERE source.sequence = ?
+        AND (
+          source.artifact_hash = ?
+          OR EXISTS (
+            SELECT 1 FROM json_tree(source.payload_json) linked
+            WHERE linked.value = ?
+               OR linked.value = 'journal://artifact/' || ?
+          )
+        )
+      LIMIT 1
+    `).get(sequence, artifact.hash, artifact.hash, artifact.hash);
+    if (linked) return;
+    const source = this.storage.database.prepare(`
+      SELECT project_id, conversation_id, strand_id, turn_id, scope_id,
+             event_id, created_at
+      FROM events WHERE sequence = ?
+    `).get(sequence) as {
+      project_id: string;
+      conversation_id: string;
+      strand_id: string;
+      turn_id: string | null;
+      scope_id: string | null;
+      event_id: string;
+      created_at: number;
+    } | undefined;
+    if (!source) throw new Error(`Artifact ${artifact.hash} has no durable source event.`);
+    this.insertEvent({
+      eventId: this.nextId('event'),
+      projectId: source.project_id,
+      conversationId: source.conversation_id,
+      strandId: source.strand_id,
+      ...(source.turn_id ? { turnId: source.turn_id } : {}),
+      ...(source.scope_id ? { scopeId: source.scope_id } : {}),
+      type: 'artifact.linked',
+      actor: 'harness',
+      visibility: 'internal',
+      payload: {
+        artifactRef: `journal://artifact/${artifact.hash}`,
+        sourceEventRef: `journal://event-id/${source.event_id}`,
+      },
+      artifactHash: artifact.hash,
+      createdAt: source.created_at,
+    });
   }
 
   private async readTextRef(value: CanonicalJsonValue | undefined) {
@@ -5995,6 +6470,42 @@ function contextStorageActions(input: ContextUpdateInput): ContextStorageAction[
     throw new TypeError('context_update must contain between 1 and 16 total changes.');
   }
   return actions;
+}
+
+function workUnitCommitContext(input: WorkUnitCommitInput | undefined): ContextUpdateInput | null {
+  if (input === undefined) return null;
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new TypeError('work_unit commit must be an object.');
+  }
+  const remember = input.remember ?? [];
+  const forget = input.forget ?? [];
+  const hold = input.hold ?? [];
+  const release = input.release ?? [];
+  if (!Array.isArray(remember) || !Array.isArray(forget) || !Array.isArray(hold) || !Array.isArray(release)) {
+    throw new TypeError('work_unit commit fields must be arrays.');
+  }
+  const changeCount = remember.length + forget.length + hold.length + release.length;
+  if (changeCount === 0 || changeCount > 16) {
+    throw new TypeError('work_unit commit must contain between 1 and 16 total changes.');
+  }
+  return {
+    ...(remember.length > 0 ? {
+      set: remember.map((entry) => ({ ...entry, scope: 'thread' as const })),
+    } : {}),
+    ...(forget.length > 0 ? {
+      remove: forget.map((key) => ({ key, scope: 'thread' as const })),
+    } : {}),
+    ...(hold.length > 0 ? {
+      pin: hold.map(({ resource, label }) => ({
+        ref: resource,
+        ...(label ? { label } : {}),
+        scope: 'thread' as const,
+      })),
+    } : {}),
+    ...(release.length > 0 ? {
+      unpin: release.map((ref) => ({ ref, scope: 'thread' as const })),
+    } : {}),
+  };
 }
 
 function contextKey(value: string) {

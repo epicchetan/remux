@@ -1,5 +1,5 @@
-Status: R&D evidence with H4 qualification completed
-Last verified: 2026-08-09
+Status: R&D evidence with bounded-work-unit qualification completed
+Last verified: 2026-08-10
 Canonical code: historical repositories and local transcripts listed below; E0 controller and fixture code lives under `extensions/agent/tests/benchmark/`
 
 # Ledger workflow transcript and benchmark corpus
@@ -1021,6 +1021,84 @@ Dogfooding for one or two weeks remains valuable after these fixtures pass. It
 measures comfort, creativity, and unexpected workflow friction. It should not
 replace controlled replay, and controlled replay should not pretend to measure
 all of subjective collaboration quality.
+
+## First working-memory comparison
+
+The first clean `working-memory-v1` E0 run is
+`2026-08-09T23-41-19-231Z-agent-0b0db7`; its retained stateful control is
+`2026-08-09T21-00-03-940Z-agent-eab4b1`, and the Codex baseline is
+`2026-08-08T20-23-11-730Z-codex-8e6618`.
+
+Working memory completed the same four-turn collaborative envelope with no
+compaction, context-limit error, invalid memory call, self-search, unauthorized
+write, commit, or source-repository mutation. It used 78 foreground provider
+calls, 9.604M estimated foreground input tokens, and 163 tool calls versus the
+stateful control's 95, 12.798M, and 192. Task wall time was effectively flat
+(26m26s versus 25m47s). Four concurrent background compiles added 133,596 input
+and 5,040 output tokens and committed four snapshots without failure.
+
+The quality result is diagnostic rather than a release win. Working memory and
+the stateful control failed the same hidden historical API-shape and dual-error
+gates; Codex failed only the API-shape gate. The working-memory run did pass the
+FIFO clock re-read invariant and all visible workspace tests. This supports the
+hypothesis that a derived cache can reduce foreground context cost without
+degrading the existing Agent control, but it does not yet establish parity with
+Codex task correctness.
+
+The run preserved exact benchmark artifacts under
+`.remux-benchmarks/runs/2026-08-09T23-41-19-231Z-agent-0b0db7/`. A prior
+diagnostic run, `2026-08-09T22-56-57-317Z-agent-6272be`, exercised crash resume
+but is excluded from causal efficiency comparison because its conversation
+contains an interrupted duplicate audit.
+
+## Bounded work-units v2 comparison
+
+The first clean bounded-unit E0 run is
+`2026-08-10T01-57-25-702Z-agent-087182`. A final run after line-range,
+artifact-ownership, and tool-contract hardening is
+`2026-08-10T02-36-33-818Z-agent-e2be23`. Its final-audit provider request first
+failed with a transient WebSocket error and then completed through the public
+benchmark resume path on the same durable conversation and workspace. It is
+therefore retained as recovery and post-hardening evidence, while the first
+run remains the cleaner runtime sample.
+
+| Profile | Wall | Calls | Context mechanics | Quality |
+| --- | ---: | ---: | --- | --- |
+| Codex/App Server | 22m40s | 117 functions | one App Server compaction | failed hidden historical API shape only |
+| Agent working-memory v1 | 26m26s | 78 providers / 163 tools | 9.604M estimated input, 225,897 peak, one rollover | failed hidden API shape and dual-error preservation |
+| bounded v2, clean | 30m31s | 97 providers / 175 tools | 4.607M estimated input, 116,587 peak, five explicit units, two notices, no rollover, seven invalid refs | failed hidden API shape and dual-error preservation |
+| bounded v2, hardened/recovered | 33m31s | 130 providers / 207 tools | 6.967M estimated input, 112,579 peak, six explicit units, three notices, no rollover, one invalid ref | failed hidden API shape, dual-error preservation, and stale-clock reread |
+
+The clean bounded run cut estimated input by 52%, peak input by 48%, repeated
+reads by 50%, and parent-visible tool-result bytes by 83% relative to
+working-memory v1. Neither bounded run compacted, reached the provider limit,
+opened an emergency unit recovery frame, reopened a parent trace, leaked
+child-local state, or promoted abandoned work. Those are meaningful mechanism
+wins.
+
+They are not an overall harness win. Both samples were slower than the Agent
+control and Codex, tool volume remained above Codex, and correctness was worse
+than Codex. The hardened run also committed twelve shared-state changes and
+ended with 61,001 active primary bytes, mostly five sticky full-file snapshots.
+That demonstrates the pollution risk predicted by the design discussion: a
+model will use a permissive `hold` primitive as a workspace cache unless the
+handoff layer makes exact refs easier and whole-resource retention temporary.
+
+The seven invalid calls in the first run were six work-unit reference errors
+and one cross-project artifact-open failure. Four used natural
+`file:start-end` citations, one used a directory as an input ref, two used
+command labels as validation refs, and an identical content hash had been
+owned only by an older benchmark project. Exact line-range snapshots,
+project-local artifact linking, and evidence-only schema descriptions reduced
+the hardened run to one invalid call. That remaining call fabricated a
+`journal://tool/...` validation ref, exposing that ordinary coding-tool results
+do not tell the model their own durable journal identity.
+
+The bounded experiment should remain available but not become the default.
+The next causal iteration should preserve fresh sequential child frames while
+making state handoffs reference-first, exposing exact tool-result refs, and
+evicting or demoting whole-file holds unless renewed. E0 should be rerun before
+expanding the benchmark suite or adding a separate context-manager agent.
 
 ## Corpus limitations
 
