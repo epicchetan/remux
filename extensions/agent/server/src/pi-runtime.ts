@@ -53,9 +53,9 @@ import {
 const PROVIDER = 'openai-codex';
 const SYSTEM_PROMPT = `You are the Remux coding agent. The conversation cwd is your default location and orientation, not a filesystem boundary; use absolute paths when work legitimately spans elsewhere on this machine.
 
-Your active context contains a branch-scoped thread.md collaboration brief, a bounded tail of completed-turn capsules, recent exact user/assistant dialogue, and exact scratch for the current turn. The immutable journal is the source of truth for omitted messages, commands, tool results, and evidence. journal_search and journal_open retrieve cold history temporarily; retrieval alone does not make it future thread state.
+Your active context contains exact recent completed user/assistant dialogue, the nearer branch-scoped thread.md collaboration brief, and exact scratch for the current execution scope. Recent dialogue may contain superseded statements; thread.md is the current shared understanding. The immutable journal is the source of truth for omitted messages, commands, tool results, and evidence. journal_search and journal_open retrieve cold history temporarily; retrieval alone does not make it future thread state.
 
-thread.md is living shared state, not a transcript or reasoning log. Use thread_read and thread_update when a meaningful transition changes the current objective, accepted decisions, constraints, implementation state, important resources, open questions, or near-term direction. Keep it coherent by revising and deleting stale text. Do not copy raw files, command output, tool traffic, reasoning traces, or facts needed only for the current answer. A terse user acceptance may update the relevant decision, but model-authored thread state never overrides the current user, an accepted contract, or observed repository state.
+thread.md is living shared state, not a transcript or reasoning log. Use thread_read and thread_update when a meaningful transition changes the current objective, accepted decisions, constraints, implementation state, important resources, open questions, or near-term direction. Keep it coherent by revising and deleting stale text. Do not copy raw files, command output, tool traffic, reasoning traces, or facts needed only for the current answer. A terse user acceptance may update the relevant decision, but model-authored thread state never overrides the current user, an accepted contract, or observed repository state. Before implementing or auditing against an active governing file named in thread state, reopen that exact file unless its exact contents are already in the current scope.
 
 Use read, bash, edit, and write for normal coding work. Re-open exact journal evidence when an omitted fact matters instead of guessing, and re-read mutable files before editing or final validation. Preserve user work, validate changes in proportion to risk, and report honestly. Reasoning and tool scratch are local to the current turn and do not need to be summarized for their own sake.`;
 
@@ -183,9 +183,49 @@ export class PiEngine implements AgentEngine {
     let pendingContextError: unknown = null;
     let providerDurabilityTail: Promise<void> = Promise.resolve();
     let providerDurabilityError: unknown = null;
+    let providerBoundaryRegistered = false;
+    let pendingAgentEnd: Extract<AgentSessionEvent, { type: 'agent_end' }> | null = null;
+    const assistantDurability = new WeakMap<AssistantMessage, Promise<void>>();
     const awaitProviderDurability = async () => {
       await providerDurabilityTail;
       if (providerDurabilityError) throw providerDurabilityError;
+    };
+    const ensureAssistantDurable = (message: AssistantMessage) => {
+      const existing = assistantDurability.get(message);
+      if (existing) return existing;
+      providerBoundaryRegistered = true;
+      const transport = pendingTransport;
+      pendingTransport = null;
+      const durability = (async () => {
+        if (transport) {
+          const actualRequestMode = observedTransportMode(sessionId, transport);
+          await options.durability.afterProviderCall?.({
+            plannedRequestMode: transport.plannedRequestMode,
+            actualRequestMode,
+          });
+        }
+        const content = durableAssistantContent(message.content);
+        const calls = message.content.flatMap((block) => block.type === 'toolCall'
+          ? [{
+              callId: block.id,
+              name: durableToolName(block.name),
+              args: block.arguments,
+            }]
+          : []);
+        await options.durability.beforeAssistantMessageEnd({
+          inferenceState: assistantInferenceState(message.stopReason),
+          text: content.text,
+          reasoning: content.reasoning,
+          calls,
+          providerMessage: message,
+        });
+      })();
+      assistantDurability.set(message, durability);
+      const settled = durability.catch((error) => {
+        providerDurabilityError ??= error;
+      });
+      providerDurabilityTail = Promise.all([providerDurabilityTail, settled]).then(() => undefined);
+      return durability;
     };
     const probeExtension: ExtensionFactory = (pi) => {
       pi.on('context', async () => {
@@ -201,18 +241,39 @@ export class PiEngine implements AgentEngine {
           // running inferences in one scope and to compile from the real head.
           await awaitProviderDurability();
           const compileStartedAt = performance.now();
-          const snapshot = await options.durability.compileContext();
-          const messages: Message[] = [
-            contextFrameMessage(
-              snapshot.frame,
-              snapshot.scopeKind,
-              snapshot.messages.at(-1)?.timestamp ?? Date.now(),
-            ),
-            ...renderDurablePiPrefix(snapshot.messages, model),
-          ];
+          const compileFrame = async () => {
+            const snapshot = await options.durability.compileContext(model.contextWindow);
+            const dialogueTurnIds = new Set(snapshot.frame.dialogueTurnIds);
+            const recentDialogue = snapshot.messages.filter((message) =>
+              dialogueTurnIds.has(message.turnId));
+            const activeScope = snapshot.messages.filter((message) =>
+              !dialogueTurnIds.has(message.turnId));
+            const messages: Message[] = [
+              ...renderDurablePiPrefix(recentDialogue, model),
+              contextFrameMessage(snapshot.frame, snapshot.scopeKind),
+              ...renderDurablePiPrefix(activeScope, model),
+            ];
+            return {
+              snapshot,
+              messages,
+              estimatedInputTokens: estimatePiContextTokens(messages, systemPrompt),
+            };
+          };
+          let compiled = await compileFrame();
+          if (
+            compiled.estimatedInputTokens >= compiled.snapshot.frame.softContextLimit &&
+            !compiled.snapshot.frame.pressureNoticed
+          ) {
+            const recorded = await options.durability.noticeContextPressure({
+              estimatedInputTokens: compiled.estimatedInputTokens,
+              softContextLimit: compiled.snapshot.frame.softContextLimit,
+              hardContextLimit: compiled.snapshot.frame.hardContextLimit,
+            });
+            if (recorded) compiled = await compileFrame();
+          }
+          const { snapshot, messages, estimatedInputTokens } = compiled;
           const frameBuildDurationMs = Math.max(0, Math.round(performance.now() - compileStartedAt));
           const rendered = hashRenderedMessages(messages);
-          const estimatedInputTokens = estimatePiContextTokens(messages, systemPrompt);
           pendingContext = {
             basisSequence: snapshot.basisSequence,
             logicalHash: snapshot.logicalHash,
@@ -242,37 +303,7 @@ export class PiEngine implements AgentEngine {
       });
       pi.on('message_end', async (event) => {
         if (event.message.role !== 'assistant') return;
-        const message = event.message;
-        const durability = (async () => {
-          if (pendingTransport) {
-            const actualRequestMode = observedTransportMode(sessionId, pendingTransport);
-            await options.durability.afterProviderCall?.({
-              plannedRequestMode: pendingTransport.plannedRequestMode,
-              actualRequestMode,
-            });
-            pendingTransport = null;
-          }
-          const content = durableAssistantContent(message.content);
-          const calls = message.content.flatMap((block) => block.type === 'toolCall'
-            ? [{
-                callId: block.id,
-                name: durableToolName(block.name),
-                args: block.arguments,
-              }]
-            : []);
-          await options.durability.beforeAssistantMessageEnd({
-            inferenceState: assistantInferenceState(message.stopReason),
-            text: content.text,
-            reasoning: content.reasoning,
-            calls,
-            providerMessage: message,
-          });
-        })();
-        const settled = durability.catch((error) => {
-          providerDurabilityError ??= error;
-        });
-        providerDurabilityTail = Promise.all([providerDurabilityTail, settled]).then(() => undefined);
-        await durability;
+        await ensureAssistantDurable(event.message);
       });
       // tool_call/tool_result are Pi's awaited execution gates. The similarly
       // named tool_execution_* events are observational notifications and Pi
@@ -389,6 +420,7 @@ export class PiEngine implements AgentEngine {
           fullContextRequests: transportStats?.fullContextRequests ?? 0,
           deltaRequests: transportStats?.deltaRequests ?? 0,
         };
+        providerBoundaryRegistered = false;
         providerCallCount += 1;
         lastRenderedHashes = context.orderedMessageHashes;
         probe = {
@@ -400,9 +432,7 @@ export class PiEngine implements AgentEngine {
     });
     const unsubscribe = session.subscribe((event) => {
       if (event.type === 'agent_end') {
-        void providerDurabilityTail.then(() => {
-          if (!providerDurabilityError) projectPiEvent(event, options.onEvent);
-        });
+        pendingAgentEnd = event;
         return;
       }
       projectPiEvent(event, options.onEvent);
@@ -411,12 +441,26 @@ export class PiEngine implements AgentEngine {
     return {
       async prompt(input) {
         providerDurabilityError = null;
+        pendingAgentEnd = null;
         await session.prompt(input.text, {
           expandPromptTemplates: false,
           images: input.images?.map((image): ImageContent => ({ type: 'image', ...image })),
         });
+        const agentEnd = pendingAgentEnd as Extract<AgentSessionEvent, { type: 'agent_end' }> | null;
+        if (!agentEnd) throw new Error('Pi completed a prompt without an agent_end boundary.');
+        const finalAssistant = [...agentEnd.messages]
+          .reverse()
+          .find((message): message is AssistantMessage => message.role === 'assistant');
+        // Pi extension callbacks are not guaranteed to settle before the
+        // session-level agent_end notification. If the final message_end hook
+        // has not registered its durable boundary, close it from the exact
+        // final AssistantMessage before the server can publish runtime idle.
+        if (!providerBoundaryRegistered && finalAssistant) {
+          await ensureAssistantDurable(finalAssistant);
+        }
         await providerDurabilityTail;
         if (providerDurabilityError) throw providerDurabilityError;
+        projectPiEvent(agentEnd, options.onEvent);
       },
       async interrupt() {
         await session.abort();
@@ -453,7 +497,6 @@ function observedTransportMode(
 function contextFrameMessage(
   candidate: ThreadContextFrameCandidate,
   scopeKind: 'turn' | 'work_unit',
-  _timestamp: number,
 ): Message {
   const scopeBoundary = scopeKind === 'work_unit'
     ? 'Active execution scope: bounded work unit. Keep scratch local and finish with work_unit_return.'

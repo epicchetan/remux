@@ -24,7 +24,12 @@ export type RuntimeEvent =
 export type RuntimeEventSink = (event: RuntimeEvent) => void;
 
 export type RuntimeDurabilityHooks = {
-  compileContext(): Promise<DurableContextBoundarySnapshot>;
+  compileContext(contextWindow: number): Promise<DurableContextBoundarySnapshot>;
+  noticeContextPressure(input: {
+    estimatedInputTokens: number;
+    softContextLimit: number;
+    hardContextLimit: number;
+  }): Promise<boolean>;
   beforeAssistantMessageEnd(input: {
     inferenceState: 'completed' | 'failed' | 'interrupted';
     text: string;

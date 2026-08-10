@@ -128,7 +128,7 @@ export type ContextInspectorArtifact = {
 };
 
 export type ContextInspectorValue = {
-  version: 3;
+  version: 4;
   conversationId: string;
   inferenceId: string;
   frameId: string;
@@ -157,8 +157,15 @@ export type ContextInspectorValue = {
     roles: { user: number; assistant: number; tool: number };
   }>;
   groupsTruncated: boolean;
+  dialogueTurnIds: readonly string[];
+  omittedDialogueTurns: number;
+  threadDocumentBytes: number;
+  scopeKind: 'turn' | 'work_unit';
+  softContextLimit: number;
+  hardContextLimit: number;
+  pressureNoticed: boolean;
   layers: ReadonlyArray<{
-    kind: 'thread_document' | 'capsule_tail' | 'dialogue_tail' | 'active_turn';
+    kind: 'thread_document' | 'recent_dialogue' | 'active_scope';
     hash: string;
     estimatedTokens: number;
     sources: readonly string[];

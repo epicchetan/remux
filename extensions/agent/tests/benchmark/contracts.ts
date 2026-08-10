@@ -83,7 +83,7 @@ export type BenchmarkRun = {
   reasoning: string;
   reviewMode: string;
   speed: string;
-  contextArchitecture: 'thread-runtime-v1' | 'codex-app-server';
+  contextArchitecture: 'thread-runtime-v2' | 'codex-app-server';
   stageIndex: number;
   startedAt: string;
   updatedAt: string;
@@ -142,7 +142,12 @@ export type BenchmarkReport = {
     continuationRequests: number | null;
     contextFrames: number | null;
     providerItems: number | null;
-    turnCapsules: number | null;
+    runningInferences: number | null;
+    runningTurns: number | null;
+    peakSelectedDialogueTurns: number | null;
+    peakOmittedDialogueTurns: number | null;
+    peakThreadDocumentBytes: number | null;
+    pressureNotices: number | null;
     threadUpdates: number | null;
     workUnitsEntered: number | null;
     workUnitsReturned: number | null;

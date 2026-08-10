@@ -13,12 +13,6 @@ import {
   type ThreadContextLayer,
 } from './manifest.ts';
 
-export type ThreadCapsuleSource = {
-  turnId: string;
-  ref: string;
-  markdown: string;
-};
-
 export type ThreadContextSource = {
   basisSequence: number;
   projectId: string;
@@ -26,17 +20,16 @@ export type ThreadContextSource = {
   strandId: string;
   turnId: string;
   scopeId: string;
+  scopeKind: 'turn' | 'work_unit';
   threadVersionId: string;
   threadMarkdown: string;
   messages: readonly LogicalContextMessage[];
-  capsules: readonly ThreadCapsuleSource[];
+  pressureNoticed: boolean;
 };
 
 export type ThreadContextProfile = {
   contextWindow: number;
-  threadDocumentTokens?: number;
-  capsuleTailTokens?: number;
-  dialogueTailTokens?: number;
+  recentDialogueTokens?: number;
 };
 
 export type CompiledThreadContext = {
@@ -45,30 +38,20 @@ export type CompiledThreadContext = {
 };
 
 /**
- * Selects the active context in whole-turn units. Current-turn scratch stays
- * exact. Completed turns contribute only their user/assistant dialogue; old
- * tools and reasoning remain cold in the journal. Older outcomes are carried
- * by the independent capsule tail.
+ * Completed turns contribute only exact user/visible-assistant pairs. Active
+ * scope scratch stays exact, while all omitted internals remain cold in the
+ * journal. The mutable thread document is rendered between recent dialogue
+ * and the active turn by the provider adapter.
  */
 export function compileThreadContext(
   source: ThreadContextSource,
   profile: ThreadContextProfile,
 ): CompiledThreadContext {
   assertPositiveInteger(profile.contextWindow, 'contextWindow');
-  const threadBudget = boundedBudget(
-    profile.threadDocumentTokens,
-    Math.min(20_000, Math.max(4_000, Math.floor(profile.contextWindow * 0.08))),
-    'threadDocumentTokens',
-  );
-  const capsuleBudget = boundedBudget(
-    profile.capsuleTailTokens,
-    Math.min(24_000, Math.max(4_000, Math.floor(profile.contextWindow * 0.08))),
-    'capsuleTailTokens',
-  );
   const dialogueBudget = boundedBudget(
-    profile.dialogueTailTokens,
-    Math.min(48_000, Math.max(8_000, Math.floor(profile.contextWindow * 0.18))),
-    'dialogueTailTokens',
+    profile.recentDialogueTokens,
+    Math.min(64_000, Math.max(16_000, Math.floor(profile.contextWindow * 0.2))),
+    'recentDialogueTokens',
   );
 
   const active = source.messages.filter((message) => message.turnId === source.turnId);
@@ -82,27 +65,17 @@ export function compileThreadContext(
   const selectedDialogueGroups = selectNewestWholeGroups(priorGroups, dialogueBudget);
   const selectedDialogue = selectedDialogueGroups.flatMap((group) => group.messages);
   const selectedDialogueIds = selectedDialogueGroups.map((group) => group.turnId);
-  const omittedDialogue = priorGroups.length - selectedDialogueGroups.length;
-
-  const selectedCapsules = selectNewestCapsules(source.capsules, capsuleBudget);
-  const omittedCapsules = source.capsules.length - selectedCapsules.length;
-  const threadMarkdown = truncateUtf8ByTokenBudget(source.threadMarkdown, threadBudget);
-  const bootstrap = renderBootstrap(source, threadMarkdown, selectedCapsules);
+  const omittedDialogueTurns = priorGroups.length - selectedDialogueGroups.length;
+  const control = renderThreadControl(source, omittedDialogueTurns);
   const messages = [...selectedDialogue, ...active];
   const orderedMessageHashes = messages.map((message) =>
     canonicalJsonHash(logicalMessageSemanticValue(message)));
   const omissions: ContextOmission[] = [
-    ...(omittedCapsules > 0 ? [{
-      source: `agent://conversation/${encodeURIComponent(source.conversationId)}/capsules`,
-      reason: 'capsule-budget' as const,
-      retrieval: `journal://conversation/${encodeURIComponent(source.conversationId)}`,
-      count: omittedCapsules,
-    }] : []),
-    ...(omittedDialogue > 0 ? [{
+    ...(omittedDialogueTurns > 0 ? [{
       source: `agent://conversation/${encodeURIComponent(source.conversationId)}/dialogue`,
-      reason: 'dialogue-budget' as const,
+      reason: 'recent-dialogue-budget' as const,
       retrieval: `journal://conversation/${encodeURIComponent(source.conversationId)}`,
-      count: omittedDialogue,
+      count: omittedDialogueTurns,
     }] : []),
     ...(priorGroups.length > 0 ? [{
       source: `agent://conversation/${encodeURIComponent(source.conversationId)}/turn-scratch`,
@@ -116,48 +89,42 @@ export function compileThreadContext(
       count: priorGroups.length,
     }] : []),
   ];
-  const threadHash = sha256(threadMarkdown);
-  const capsuleHash = canonicalJsonHash(selectedCapsules.map(({ turnId, ref, markdown }) => ({
-    markdown,
-    ref,
-    turnId,
-  })));
-  const dialogueHash = canonicalJsonHash(selectedDialogue.map(logicalMessageSemanticValue));
-  const activeHash = canonicalJsonHash(active.map(logicalMessageSemanticValue));
+  const threadTokens = estimateTextTokens(source.threadMarkdown);
+  const dialogueTokens = estimateMessagesTokens(selectedDialogue);
+  const activeTokens = estimateMessagesTokens(active);
   const layers: ThreadContextLayer[] = [
     {
-      kind: 'thread_document',
-      estimatedTokens: estimateTextTokens(threadMarkdown),
-      hash: threadHash,
-      sources: [`journal://document-version/${encodeURIComponent(source.threadVersionId)}`],
-    },
-    {
-      kind: 'capsule_tail',
-      estimatedTokens: selectedCapsules.reduce((total, capsule) =>
-        total + estimateTextTokens(capsule.markdown), 0),
-      hash: capsuleHash,
-      sources: selectedCapsules.map(({ ref }) => ref),
-    },
-    {
-      kind: 'dialogue_tail',
-      estimatedTokens: estimateMessagesTokens(selectedDialogue),
-      hash: dialogueHash,
+      kind: 'recent_dialogue',
+      estimatedTokens: dialogueTokens,
+      hash: canonicalJsonHash(selectedDialogue.map(logicalMessageSemanticValue)),
       sources: selectedDialogueIds.map((turnId) => `journal://turn/${encodeURIComponent(turnId)}`),
     },
     {
-      kind: 'active_turn',
-      estimatedTokens: estimateMessagesTokens(active),
-      hash: activeHash,
-      sources: [`journal://turn/${encodeURIComponent(source.turnId)}`],
+      kind: 'thread_document',
+      estimatedTokens: threadTokens,
+      hash: sha256(source.threadMarkdown),
+      sources: [`journal://document-version/${encodeURIComponent(source.threadVersionId)}`],
+    },
+    {
+      kind: 'active_scope',
+      estimatedTokens: activeTokens,
+      hash: canonicalJsonHash(active.map(logicalMessageSemanticValue)),
+      sources: [
+        `journal://turn/${encodeURIComponent(source.turnId)}`,
+        `journal://scope/${encodeURIComponent(source.scopeId)}`,
+      ],
     },
   ];
-  const bootstrapHash = sha256(bootstrap);
+  const controlHash = sha256(control);
+  const softContextLimit = contextSoftLimit(profile.contextWindow);
+  const hardContextLimit = contextHardLimit(profile.contextWindow);
   const semanticHash = canonicalJsonHash({
     basisSequence: source.basisSequence,
-    bootstrapHash,
     compilerVersion: CONTEXT_COMPILER_VERSION,
+    controlHash,
     orderedMessageHashes,
     policyVersion: CONTEXT_POLICY_VERSION,
+    pressureNoticed: source.pressureNoticed,
     threadVersionId: source.threadVersionId,
   });
   return {
@@ -167,14 +134,19 @@ export function compileThreadContext(
       policyVersion: CONTEXT_POLICY_VERSION,
       basisSequence: source.basisSequence,
       threadVersionId: source.threadVersionId,
-      bootstrap,
-      bootstrapHash,
+      bootstrap: control,
+      bootstrapHash: controlHash,
       semanticHash,
-      estimatedInputTokens: estimateTextTokens(bootstrap) + estimateMessagesTokens(messages),
+      estimatedInputTokens: estimateTextTokens(control) + dialogueTokens + activeTokens,
       orderedMessageHashes,
       selectedTurnIds: [...selectedDialogueIds, source.turnId],
       dialogueTurnIds: selectedDialogueIds,
-      capsuleTurnIds: selectedCapsules.map(({ turnId }) => turnId),
+      omittedDialogueTurns,
+      threadDocumentBytes: Buffer.byteLength(source.threadMarkdown, 'utf8'),
+      scopeKind: source.scopeKind,
+      softContextLimit,
+      hardContextLimit,
+      pressureNoticed: source.pressureNoticed,
       layers,
       omissions,
     },
@@ -197,8 +169,7 @@ function groupCompletedTurns(messages: readonly LogicalContextMessage[]): Dialog
     const group = groups.get(turnId)!;
     const user = group.find((message) => message.role === 'user');
     const assistant = [...group].reverse().find((message) =>
-      message.role === 'assistant' && message.text.trim().length > 0) ??
-      [...group].reverse().find((message) => message.role === 'assistant');
+      message.role === 'assistant' && message.state === 'completed' && message.text.trim().length > 0);
     if (!user || !assistant || assistant.role !== 'assistant') return [];
     const dialogue: LogicalContextMessage[] = [
       user,
@@ -206,6 +177,7 @@ function groupCompletedTurns(messages: readonly LogicalContextMessage[]): Dialog
         ...assistant,
         reasoning: '',
         toolCalls: [],
+        providerMessage: undefined,
       },
     ];
     return [{ turnId, messages: dialogue, estimatedTokens: estimateMessagesTokens(dialogue) }];
@@ -216,47 +188,27 @@ function selectNewestWholeGroups(groups: readonly DialogueGroup[], budget: numbe
   const selected: DialogueGroup[] = [];
   let used = 0;
   for (const group of [...groups].reverse()) {
-    if (selected.length > 0 && used + group.estimatedTokens > budget) break;
-    if (group.estimatedTokens > budget && selected.length === 0) continue;
+    if (used + group.estimatedTokens > budget) break;
     selected.push(group);
     used += group.estimatedTokens;
   }
   return selected.reverse();
 }
 
-function selectNewestCapsules(capsules: readonly ThreadCapsuleSource[], budget: number) {
-  const selected: ThreadCapsuleSource[] = [];
-  let used = 0;
-  for (const capsule of [...capsules].reverse()) {
-    const tokens = estimateTextTokens(capsule.markdown);
-    if (selected.length > 0 && used + tokens > budget) break;
-    if (tokens > budget && selected.length === 0) continue;
-    selected.push(capsule);
-    used += tokens;
-  }
-  return selected.reverse();
-}
-
-function renderBootstrap(
-  source: ThreadContextSource,
-  threadMarkdown: string,
-  capsules: readonly ThreadCapsuleSource[],
-) {
+function renderThreadControl(source: ThreadContextSource, omittedDialogueTurns: number) {
+  const history = omittedDialogueTurns > 0
+    ? `${omittedDialogueTurns} older completed dialogue turn(s) are omitted from active context.`
+    : 'No eligible completed dialogue turns are omitted from active context.';
   const sections = [
-    '<remux_thread_context version="1">',
-    '<thread_document>',
-    threadMarkdown,
+    '<remux_thread_context version="2">',
+    `<thread_document ref=${JSON.stringify(`journal://document-version/${source.threadVersionId}`)}>`,
+    source.threadMarkdown,
     '</thread_document>',
-    '<turn_capsules>',
-    ...capsules.flatMap((capsule) => [
-      `<turn_capsule turn_id=${JSON.stringify(capsule.turnId)} ref=${JSON.stringify(capsule.ref)}>`,
-      capsule.markdown,
-      '</turn_capsule>',
-    ]),
-    '</turn_capsules>',
-    '<retrieval>',
-    'Exact omitted messages, tool operations, and evidence remain available through journal_search and journal_open.',
-    '</retrieval>',
+    '<cold_history>',
+    history,
+    `Exact history: journal://conversation/${encodeURIComponent(source.conversationId)}`,
+    'Use journal_search and journal_open when an omitted fact matters. Retrieval is ephemeral.',
+    '</cold_history>',
     '</remux_thread_context>',
   ];
   return `${sections.join('\n')}\n`;
@@ -268,15 +220,6 @@ function estimateMessagesTokens(messages: readonly LogicalContextMessage[]) {
 
 function estimateTextTokens(text: string) {
   return Math.max(1, Math.ceil(Buffer.byteLength(text, 'utf8') / 4));
-}
-
-function truncateUtf8ByTokenBudget(text: string, tokens: number) {
-  const maxBytes = tokens * 4;
-  const bytes = Buffer.from(text, 'utf8');
-  if (bytes.byteLength <= maxBytes) return text;
-  let truncated = bytes.subarray(0, maxBytes).toString('utf8').replace(/\uFFFD$/u, '');
-  truncated += '\n\n[thread.md truncated; open its journal document version for the exact remainder]\n';
-  return truncated;
 }
 
 function boundedBudget(value: number | undefined, fallback: number, label: string) {
@@ -293,4 +236,12 @@ function assertPositiveInteger(value: number, label: string) {
 
 function sha256(text: string) {
   return createHash('sha256').update(text).digest('hex');
+}
+
+export function contextSoftLimit(contextWindow: number) {
+  return Math.max(1, Math.min(200_000, contextWindow - 60_000));
+}
+
+export function contextHardLimit(contextWindow: number) {
+  return Math.max(0, contextWindow - 30_000);
 }

@@ -2,8 +2,8 @@ import type { DatabaseSync } from 'node:sqlite';
 
 import { canonicalJson, canonicalJsonHash } from './canonical-json.ts';
 
-export const AGENT_JOURNAL_SCHEMA_VERSION = 1;
-export const AGENT_JOURNAL_SCHEMA_ID = 'agent-thread-runtime-v1';
+export const AGENT_JOURNAL_SCHEMA_VERSION = 2;
+export const AGENT_JOURNAL_SCHEMA_ID = 'agent-thread-runtime-v2';
 
 export const AGENT_JOURNAL_TABLES = [
   'meta',
@@ -20,7 +20,7 @@ export const AGENT_JOURNAL_TABLES = [
   'artifacts',
   'state_documents',
   'document_versions',
-  'turn_capsules',
+  'journal_search_index',
   'context_frames',
   'inferences',
   'provider_items',
@@ -43,8 +43,7 @@ const EXPECTED_COLUMNS: Record<typeof AGENT_JOURNAL_TABLES[number], string[]> = 
   turns: [
     'turn_id', 'project_id', 'conversation_id', 'strand_id', 'client_message_id',
     'root_scope_id', 'state', 'accepted_sequence', 'terminal_sequence',
-    'thread_version_before', 'thread_version_after', 'capsule_id', 'created_at',
-    'updated_at',
+    'thread_version_before', 'thread_version_after', 'created_at', 'updated_at',
   ],
   execution_scopes: [
     'scope_id', 'project_id', 'conversation_id', 'strand_id', 'turn_id',
@@ -84,11 +83,9 @@ const EXPECTED_COLUMNS: Record<typeof AGENT_JOURNAL_TABLES[number], string[]> = 
     'version_id', 'document_id', 'ordinal', 'parent_version_id',
     'content_artifact_hash', 'based_on_turn_id', 'created_sequence', 'created_at',
   ],
-  turn_capsules: [
-    'capsule_id', 'project_id', 'conversation_id', 'strand_id', 'turn_id',
-    'state', 'summary_artifact_hash', 'user_message_id', 'assistant_message_id',
-    'thread_version_before', 'thread_version_after', 'trace_first_sequence',
-    'trace_last_sequence', 'created_sequence', 'created_at',
+  journal_search_index: [
+    'ref', 'project_id', 'conversation_id', 'strand_id', 'turn_id', 'kind',
+    'sequence', 'text',
   ],
   context_frames: [
     'frame_id', 'project_id', 'conversation_id', 'strand_id', 'turn_id',
@@ -184,7 +181,6 @@ CREATE TABLE turns (
   terminal_sequence INTEGER UNIQUE,
   thread_version_before TEXT,
   thread_version_after TEXT,
-  capsule_id TEXT,
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
   UNIQUE (conversation_id, turn_id),
@@ -208,8 +204,6 @@ CREATE TABLE turns (
   FOREIGN KEY (thread_version_before) REFERENCES document_versions(version_id)
     DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (thread_version_after) REFERENCES document_versions(version_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (capsule_id) REFERENCES turn_capsules(capsule_id)
     DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
 
@@ -445,45 +439,6 @@ CREATE TABLE document_versions (
   FOREIGN KEY (created_sequence) REFERENCES events(sequence) DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
 
-CREATE TABLE turn_capsules (
-  capsule_id TEXT PRIMARY KEY NOT NULL,
-  project_id TEXT NOT NULL,
-  conversation_id TEXT NOT NULL,
-  strand_id TEXT NOT NULL,
-  turn_id TEXT NOT NULL UNIQUE,
-  state TEXT NOT NULL CHECK (state IN ('ready', 'pending', 'failed')),
-  summary_artifact_hash TEXT NOT NULL,
-  user_message_id TEXT NOT NULL,
-  assistant_message_id TEXT,
-  thread_version_before TEXT,
-  thread_version_after TEXT,
-  trace_first_sequence INTEGER NOT NULL,
-  trace_last_sequence INTEGER NOT NULL,
-  created_sequence INTEGER NOT NULL UNIQUE,
-  created_at INTEGER NOT NULL CHECK (created_at >= 0),
-  CHECK (trace_last_sequence >= trace_first_sequence),
-  FOREIGN KEY (project_id, conversation_id, strand_id, turn_id)
-    REFERENCES turns(project_id, conversation_id, strand_id, turn_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (conversation_id, user_message_id)
-    REFERENCES messages(conversation_id, message_id) DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (conversation_id, assistant_message_id)
-    REFERENCES messages(conversation_id, message_id) DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (thread_version_before) REFERENCES document_versions(version_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (thread_version_after) REFERENCES document_versions(version_id)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (summary_artifact_hash) REFERENCES artifacts(hash)
-    DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (trace_first_sequence, conversation_id, strand_id)
-    REFERENCES events(sequence, conversation_id, strand_id) DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (trace_last_sequence, conversation_id, strand_id)
-    REFERENCES events(sequence, conversation_id, strand_id) DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (created_sequence, project_id, conversation_id, strand_id)
-    REFERENCES events(sequence, project_id, conversation_id, strand_id)
-    DEFERRABLE INITIALLY DEFERRED
-) STRICT;
-
 CREATE TABLE context_frames (
   frame_id TEXT PRIMARY KEY NOT NULL,
   project_id TEXT NOT NULL,
@@ -591,6 +546,18 @@ CREATE TABLE provider_items (
     DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
 
+CREATE VIRTUAL TABLE journal_search_index USING fts5(
+  ref UNINDEXED,
+  project_id UNINDEXED,
+  conversation_id UNINDEXED,
+  strand_id UNINDEXED,
+  turn_id UNINDEXED,
+  kind UNINDEXED,
+  sequence UNINDEXED,
+  text,
+  tokenize = 'unicode61'
+);
+
 CREATE INDEX projects_by_recent ON projects(updated_at DESC, project_id DESC);
 CREATE INDEX conversations_by_recent ON conversations(updated_at DESC, conversation_id DESC);
 CREATE INDEX strands_by_parent ON strands(conversation_id, parent_strand_id) WHERE parent_strand_id IS NOT NULL;
@@ -610,7 +577,6 @@ CREATE UNIQUE INDEX state_documents_project_key
 CREATE UNIQUE INDEX state_documents_strand_key
   ON state_documents(conversation_id, strand_id, key) WHERE scope_kind = 'strand';
 CREATE INDEX document_versions_by_document ON document_versions(document_id, ordinal);
-CREATE INDEX capsules_by_strand ON turn_capsules(conversation_id, strand_id, trace_last_sequence);
 CREATE INDEX frames_by_scope ON context_frames(scope_id, ordinal);
 CREATE INDEX provider_items_by_scope ON provider_items(scope_id, created_sequence);
 `;
@@ -619,6 +585,7 @@ export function listAgentDatabaseTables(database: DatabaseSync) {
   const rows = database.prepare(`
     SELECT name FROM sqlite_master
     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+      AND (name = 'journal_search_index' OR name NOT GLOB 'journal_search_index_*')
     ORDER BY name
   `).all() as Array<{ name: string }>;
   return rows.map((row) => row.name);

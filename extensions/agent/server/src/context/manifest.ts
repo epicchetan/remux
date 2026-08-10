@@ -1,14 +1,13 @@
 import type { CanonicalJsonValue } from '../storage/canonical-json.ts';
 
-export const CONTEXT_COMPILER_VERSION = 'agent-thread-compiler-v1' as const;
-export const CONTEXT_POLICY_VERSION = 'agent-thread-policy-v1' as const;
-export const PROMPT_MANIFEST_VERSION = 'agent-thread-prompt-v1' as const;
+export const CONTEXT_COMPILER_VERSION = 'agent-thread-compiler-v2' as const;
+export const CONTEXT_POLICY_VERSION = 'agent-thread-policy-v2' as const;
+export const PROMPT_MANIFEST_VERSION = 'agent-thread-prompt-v2' as const;
 
 export type ThreadContextLayerKind =
   | 'thread_document'
-  | 'capsule_tail'
-  | 'dialogue_tail'
-  | 'active_turn';
+  | 'recent_dialogue'
+  | 'active_scope';
 
 export type ThreadContextLayer = {
   kind: ThreadContextLayerKind;
@@ -19,7 +18,7 @@ export type ThreadContextLayer = {
 
 export type ContextOmission = {
   source: string;
-  reason: 'capsule-budget' | 'dialogue-budget' | 'prior-turn-scratch' | 'prior-turn-reasoning';
+  reason: 'recent-dialogue-budget' | 'prior-turn-scratch' | 'prior-turn-reasoning';
   retrieval: string;
   count: number;
 };
@@ -41,7 +40,12 @@ export type ThreadContextFrameCandidate = {
   orderedMessageHashes: readonly string[];
   selectedTurnIds: readonly string[];
   dialogueTurnIds: readonly string[];
-  capsuleTurnIds: readonly string[];
+  omittedDialogueTurns: number;
+  threadDocumentBytes: number;
+  scopeKind: 'turn' | 'work_unit';
+  softContextLimit: number;
+  hardContextLimit: number;
+  pressureNoticed: boolean;
   layers: readonly ThreadContextLayer[];
   omissions: readonly ContextOmission[];
 };
@@ -72,7 +76,12 @@ export type PromptManifest = {
     estimatedInputTokens: number;
     selectedTurnIds: readonly string[];
     dialogueTurnIds: readonly string[];
-    capsuleTurnIds: readonly string[];
+    omittedDialogueTurns: number;
+    threadDocumentBytes: number;
+    scopeKind: 'turn' | 'work_unit';
+    softContextLimit: number;
+    hardContextLimit: number;
+    pressureNoticed: boolean;
     layers: readonly ThreadContextLayer[];
     omissions: readonly ContextOmission[];
   };

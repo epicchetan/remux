@@ -45,10 +45,10 @@ export async function installAgentHost(page: Page) {
     const contextBootstrapHash = 'd'.repeat(64);
     const contextDispatchHash = 'f'.repeat(64);
     const contextBootstrapText = [
-      '<thread_context version="1">',
-      '<thread_document># Thread\\n\\nFixture context</thread_document>',
-      '<turn_capsules />',
-      '</thread_context>',
+      '<remux_thread_context version="2">',
+      '<thread_document ref="journal://document-version/fixture-thread-version"># Thread\\n\\nFixture context</thread_document>',
+      '<cold_history>No eligible completed dialogue turns are omitted from active context.</cold_history>',
+      '</remux_thread_context>',
     ].join('\n');
     const contextDispatchText = JSON.stringify({
       input: [{ role: 'user', content: 'Fixture provider input' }],
@@ -218,14 +218,14 @@ export async function installAgentHost(page: Page) {
 
     function contextValue(_decision: 'append' | 'roll') {
       return {
-        version: 3,
+        version: 4,
         conversationId,
         inferenceId: 'fixture-inference',
         frameId: 'fixture-frame',
         basisSequence: sequence,
         threadVersionId: 'fixture-thread-version',
-        compilerVersion: 'agent-thread-compiler-v1',
-        policyVersion: 'agent-thread-policy-v1',
+        compilerVersion: 'agent-thread-compiler-v2',
+        policyVersion: 'agent-thread-policy-v2',
         estimatedInputTokens: 3_200,
         semanticHash: 'b'.repeat(64),
         bootstrapHash: contextBootstrapHash,
@@ -255,7 +255,14 @@ export async function installAgentHost(page: Page) {
           roles: { user: 1, assistant: 1, tool: 0 },
         }],
         groupsTruncated: false,
-        layers: ['thread_document', 'capsule_tail', 'dialogue_tail', 'active_turn']
+        dialogueTurnIds: ['fixture-turn'],
+        omittedDialogueTurns: 4,
+        threadDocumentBytes: 128,
+        scopeKind: 'turn',
+        softContextLimit: 200_000,
+        hardContextLimit: 370_000,
+        pressureNoticed: false,
+        layers: ['recent_dialogue', 'thread_document', 'active_scope']
           .map((kind, index) => ({
             kind,
             hash: String(index + 1).repeat(64).slice(0, 64),

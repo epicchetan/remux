@@ -44,7 +44,7 @@ async function main() {
   assert.match(conversation.conversationId, UUID_V4);
 
   const first = await sendAndWait(client, conversation.conversationId, [
-    'This is a Thread Runtime v1 acceptance test.',
+    'This is a Thread Runtime v2 acceptance test.',
     'Use thread_read, then replace thread.md with a concise Markdown briefing that includes',
     `the exact durable nonce ${CONTEXT_NONCE} by calling thread_update.`,
     `After the update succeeds, reply with exactly ${FIRST_SENTINEL} and nothing else.`,
@@ -52,9 +52,9 @@ async function main() {
   const firstTranscript = await readTranscript(client, conversation.conversationId);
   assert.equal(assistantText(firstTranscript, first.turnId).trim(), FIRST_SENTINEL);
   const firstContext = await readContext(client, conversation.conversationId);
-  assert.equal(firstContext.version, 3);
+  assert.equal(firstContext.version, 4);
   assert.deepEqual(firstContext.layers.map(({ kind }) => kind), [
-    'thread_document', 'capsule_tail', 'dialogue_tail', 'active_turn',
+    'recent_dialogue', 'thread_document', 'active_scope',
   ]);
 
   const generationBeforeRestart = firstTranscript.serverGeneration;
@@ -84,7 +84,7 @@ async function main() {
   assert.equal(final.runtime.contextProbe.provider, 'openai-codex');
   assert.equal(final.runtime.contextProbe.providerRequestMode, 'full');
   const secondContext = await readContext(client, conversation.conversationId);
-  assert.equal(secondContext.version, 3);
+  assert.equal(secondContext.version, 4);
   assert.equal(secondContext.transportMode, 'full');
   assert.equal(
     secondContext.groups.reduce((count, group) => count + group.roles.tool, 0),
@@ -105,13 +105,14 @@ async function main() {
   assert.deepEqual(workUnitTranscript.value.turnOrder, [first.turnId, second.turnId, third.turnId]);
 
   const durability = await inspectDurability(options.dataRoot, conversation.conversationId);
-  assert.equal(durability.schemaId, 'agent-thread-runtime-v1');
+  assert.equal(durability.schemaId, 'agent-thread-runtime-v2');
   assert.equal(durability.contextFrames, durability.inferences);
   assert.equal(durability.providerItems, durability.inferences);
   assert.equal(durability.runningTurns, 0);
   assert.equal(durability.runningInferences, 0);
   assert.ok((durability.requestModes.continuation ?? 0) >= 2);
-  assert.equal(durability.readyCapsules, 3);
+  assert.equal(durability.completedAssistantMessages, 3);
+  assert.ok(durability.searchRows >= 7);
   assert.ok(durability.threadUpdates >= 1);
   assert.match(durability.threadContent, new RegExp(CONTEXT_NONCE));
   assert.equal(durability.workUnits.length, 1);
@@ -307,7 +308,9 @@ async function inspectDurability(dataRoot, conversationId) {
         SELECT request_mode, COUNT(*) AS count
         FROM inferences WHERE conversation_id = ? GROUP BY request_mode
       `).all(conversationId).map(({ request_mode, count }) => [request_mode, count])),
-      readyCapsules: scalar("SELECT COUNT(*) AS value FROM turn_capsules WHERE conversation_id = ? AND state = 'ready'", conversationId),
+      completedAssistantMessages: scalar("SELECT COUNT(*) AS value FROM messages WHERE conversation_id = ? AND role = 'assistant' AND state = 'completed'", conversationId),
+      searchRows: scalar('SELECT COUNT(*) AS value FROM journal_search_index WHERE conversation_id = ?', conversationId),
+      pressureNotices: scalar("SELECT COUNT(*) AS value FROM events WHERE conversation_id = ? AND type = 'context.pressure'", conversationId),
       threadUpdates: scalar("SELECT COUNT(*) AS value FROM events WHERE conversation_id = ? AND type = 'thread.document.updated'", conversationId),
       threadContent: await readFile(join(dataRoot, 'artifacts', thread.storage_path), 'utf8'),
       workUnits,

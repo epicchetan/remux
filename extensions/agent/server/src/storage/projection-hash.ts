@@ -4,7 +4,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { AGENT_JOURNAL_SCHEMA_VERSION } from './schema.ts';
 import { canonicalJson, type CanonicalJsonValue } from './canonical-json.ts';
 
-const PROJECTION_VERSION = 'agent-thread-projection-v1';
+const PROJECTION_VERSION = 'agent-thread-projection-v2';
 
 const projectionTables = [
   { name: 'projects', order: ['project_id'] },
@@ -19,7 +19,6 @@ const projectionTables = [
   { name: 'artifacts', order: ['hash'], omit: ['storage_path'] },
   { name: 'state_documents', order: ['document_id'] },
   { name: 'document_versions', order: ['version_id'] },
-  { name: 'turn_capsules', order: ['capsule_id'] },
   { name: 'context_frames', order: ['frame_id'] },
   { name: 'inferences', order: ['inference_id'] },
   { name: 'provider_items', order: ['provider_item_id'] },

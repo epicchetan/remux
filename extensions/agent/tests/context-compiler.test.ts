@@ -9,9 +9,8 @@ test('thread context compilation is deterministic and preserves exact active-tur
   const left = compileThreadContext(source, { contextWindow: 400_000 });
   const right = compileThreadContext(source, { contextWindow: 400_000 });
   assert.deepEqual(left, right);
-  assert.equal(left.frame.compilerVersion, 'agent-thread-compiler-v1');
+  assert.equal(left.frame.compilerVersion, 'agent-thread-compiler-v2');
   assert.deepEqual(left.frame.dialogueTurnIds, ['turn:prior']);
-  assert.deepEqual(left.frame.capsuleTurnIds, ['turn:prior']);
   assert.deepEqual(left.messages.map(({ role }) => role), [
     'user', 'assistant', 'user', 'assistant', 'tool',
   ]);
@@ -28,29 +27,25 @@ test('thread context compilation is deterministic and preserves exact active-tur
     assert.equal(activeAssistant.toolCalls.length, 1);
   }
   assert.match(left.frame.bootstrap, /Current objective/u);
-  assert.match(left.frame.bootstrap, /Prior outcome/u);
+  assert.doesNotMatch(left.frame.bootstrap, /Prior outcome/u);
+  assert.equal(left.frame.scopeKind, 'turn');
+  assert.equal(left.frame.pressureNoticed, false);
 });
 
-test('dialogue and capsule tails evict oldest whole turns independently', () => {
+test('recent dialogue evicts oldest exact turns as whole user/assistant groups', () => {
   const source = fixtureSource();
   source.messages = [
     ...completedDialogue('turn:old', 'old '.repeat(400)),
     ...completedDialogue('turn:new', 'new compact'),
     ...source.messages.filter(({ turnId }) => turnId === source.turnId),
   ];
-  source.capsules = [
-    { turnId: 'turn:old', ref: 'journal://capsule/old', markdown: 'old capsule '.repeat(400) },
-    { turnId: 'turn:new', ref: 'journal://capsule/new', markdown: 'new capsule' },
-  ];
   const compiled = compileThreadContext(source, {
     contextWindow: 400_000,
-    dialogueTailTokens: 100,
-    capsuleTailTokens: 100,
+    recentDialogueTokens: 100,
   });
   assert.deepEqual(compiled.frame.dialogueTurnIds, ['turn:new']);
-  assert.deepEqual(compiled.frame.capsuleTurnIds, ['turn:new']);
-  assert.ok(compiled.frame.omissions.some(({ reason }) => reason === 'dialogue-budget'));
-  assert.ok(compiled.frame.omissions.some(({ reason }) => reason === 'capsule-budget'));
+  assert.equal(compiled.frame.omittedDialogueTurns, 1);
+  assert.ok(compiled.frame.omissions.some(({ reason }) => reason === 'recent-dialogue-budget'));
   assert.ok(compiled.messages.every(({ turnId }) => turnId !== 'turn:old'));
 });
 
@@ -84,14 +79,11 @@ function fixtureSource(): ThreadContextSource {
     strandId: 'strand:1',
     turnId: 'turn:active',
     scopeId: 'scope:active',
+    scopeKind: 'turn',
     threadVersionId: 'thread-version:2',
     threadMarkdown: '# Thread\n\nCurrent objective: implement the runtime.\n',
     messages,
-    capsules: [{
-      turnId: 'turn:prior',
-      ref: 'journal://capsule/prior',
-      markdown: '# Prior outcome\n\nThe storage foundation is complete.\n',
-    }],
+    pressureNoticed: false,
   };
 }
 

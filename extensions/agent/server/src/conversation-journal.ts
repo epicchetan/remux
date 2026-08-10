@@ -82,7 +82,18 @@ export interface AgentConversationJournal {
       durationMs?: number;
     },
   ): Promise<DurableTranscriptMutation | null>;
-  compileContext(conversationId: string): Promise<DurableContextBoundarySnapshot>;
+  compileContext(
+    conversationId: string,
+    contextWindow?: number,
+  ): Promise<DurableContextBoundarySnapshot>;
+  recordContextPressure?(
+    handle: DurableTurnHandle,
+    input: {
+      estimatedInputTokens: number;
+      softContextLimit: number;
+      hardContextLimit: number;
+    },
+  ): Promise<boolean>;
   resumeActiveTurn?(conversationId: string): Promise<{
     handle: DurableTurnHandle;
     rootHandle: DurableTurnHandle;

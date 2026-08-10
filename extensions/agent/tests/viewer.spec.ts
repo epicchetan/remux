@@ -100,14 +100,15 @@ test('shows actual dispatch and compiled-frame evidence for a durable inference'
   await page.goto(conversationUrl());
 
   const inspector = page.getByTestId('context-inspector');
-  await expect(inspector.locator('summary')).toContainText('context 3.2k · 1 turn');
+  await expect(inspector.locator('summary')).toContainText('thread 101 · recent 100 · active 102 · turn');
   await inspector.locator('summary').click();
   const panel = page.getByRole('region', { name: 'Inference context inspector' });
   await expect(panel).toContainText('Actual inference context');
   await expect(panel).toContainText('continuation transport');
   await expect(panel).toContainText('Thread frame');
   await expect(panel).toContainText('thread document');
-  await expect(panel).toContainText('active turn');
+  await expect(panel).toContainText('active scope');
+  await expect(panel).toContainText('1 exact · 4 cold');
   await expect(panel).toContainText('retrievable omissions');
 
   await panel.getByRole('button', { name: /Open captured request context/u }).click();
@@ -117,7 +118,7 @@ test('shows actual dispatch and compiled-frame evidence for a durable inference'
 
   await panel.getByRole('button', { name: /Open compiled thread bootstrap/u }).click();
   const bootstrap = page.getByRole('dialog', { name: 'Exact dispatched thread bootstrap' });
-  await expect(bootstrap).toContainText('<thread_context version="1">');
+  await expect(bootstrap).toContainText('<remux_thread_context version="2">');
 });
 
 test('selects history through the desktop sidebar or mobile sheet and restores target drafts', async ({ page, isMobile }) => {

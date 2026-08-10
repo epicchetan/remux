@@ -851,7 +851,8 @@ export class AgentServer {
         reasoning: conversation.reasoning,
         onEvent: (event) => this.applyRuntimeEvent(conversation.id, event),
         durability: {
-          compileContext: () => this.compileContext(conversation.id),
+          compileContext: (contextWindow) => this.compileContext(conversation.id, contextWindow),
+          noticeContextPressure: (input) => this.noticeContextPressure(conversation.id, input),
           beforeAssistantMessageEnd: (input) => this.beforeAssistantMessageEnd(conversation.id, input),
           beforeProviderCall: (input) => this.beforeProviderCall(conversation.id, input),
           afterProviderCall: (input) => this.afterProviderCall(conversation.id, input),
@@ -1025,12 +1026,30 @@ export class AgentServer {
     this.inferenceAssistantReasoning = '';
   }
 
-  private async compileContext(conversationId: string) {
+  private async compileContext(conversationId: string, contextWindow: number) {
     this.requiredActiveDurableScope(conversationId);
     await this.flushAssistantCheckpoint();
     await this.turnWriteTail;
     if (this.turnWriteError) throw this.turnWriteError;
-    return this.journal.compileContext(conversationId);
+    return this.journal.compileContext(conversationId, contextWindow);
+  }
+
+  private async noticeContextPressure(
+    conversationId: string,
+    input: {
+      estimatedInputTokens: number;
+      softContextLimit: number;
+      hardContextLimit: number;
+    },
+  ) {
+    if (!this.journal.recordContextPressure) {
+      throw new Error('Durable context pressure notices are unavailable.');
+    }
+    const handle = this.requiredActiveDurableScope(conversationId);
+    const recorded = await this.enqueueTurnWrite(() =>
+      this.journal.recordContextPressure!(handle, input));
+    if (recorded) this.resources.invalidateKey(contextResourceKey(conversationId), 'updated');
+    return recorded;
   }
 
   private async afterProviderCall(

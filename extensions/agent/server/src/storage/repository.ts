@@ -91,8 +91,7 @@ type IdKind =
   | 'frame'
   | 'provider-item'
   | 'document'
-  | 'document-version'
-  | 'capsule';
+  | 'document-version';
 
 export type AgentJournalRepositoryOptions = AgentDataRootOptions & {
   now?: () => number;
@@ -366,6 +365,7 @@ export class AgentJournalRepository {
       repository.orphanArtifactPaths = await repository.findArtifactOrphans();
       await repository.recoverInterruptedTurns();
       await repository.upgradeLegacyAssistantProjections();
+      await repository.rebuildJournalSearchIndex();
       await repository.rebuildConversationResources();
       return repository;
     } catch (error) {
@@ -426,14 +426,16 @@ export class AgentJournalRepository {
     const inheritedThread = normalized.inheritThreadFrom
       ? await this.readInheritedThread(normalized.inheritThreadFrom)
       : null;
+    const initialThreadContent = inheritedThread?.content ?? '# Thread\n';
     const initialThread = await this.artifacts.put(
-      Buffer.from(inheritedThread?.content ?? '# Thread\n', 'utf8'),
+      Buffer.from(initialThreadContent, 'utf8'),
       'text/markdown; charset=utf-8',
     );
     return this.enqueueWrite(() => this.createConversationTransaction(
       normalized,
       argumentsHash,
       initialThread,
+      initialThreadContent,
       inheritedThread?.versionId ?? null,
     ));
   }
@@ -654,6 +656,16 @@ export class AgentJournalRepository {
         createdAt: recordedAt,
       });
       this.insertArtifact(args.artifact, sequence);
+      this.indexJournalText({
+        ref: `journal://tool/${encodeURIComponent(input.callId)}`,
+        projectId: handle.projectId,
+        conversationId: handle.conversationId,
+        strandId: handle.strandId,
+        turnId: handle.turnId,
+        kind: `operation:${input.name}`,
+        sequence,
+        text: `${input.name}\n${args.text}`,
+      });
       if (scope.kind === 'work_unit') return null;
       const itemId = this.nextId('item');
       this.storage.database.prepare(`
@@ -797,7 +809,12 @@ export class AgentJournalRepository {
         estimatedInputTokens: input.estimatedInputTokens,
         selectedTurnIds: input.context.frame.selectedTurnIds,
         dialogueTurnIds: input.context.frame.dialogueTurnIds,
-        capsuleTurnIds: input.context.frame.capsuleTurnIds,
+        omittedDialogueTurns: input.context.frame.omittedDialogueTurns,
+        threadDocumentBytes: input.context.frame.threadDocumentBytes,
+        scopeKind: input.context.frame.scopeKind,
+        softContextLimit: input.context.frame.softContextLimit,
+        hardContextLimit: input.context.frame.hardContextLimit,
+        pressureNoticed: input.context.frame.pressureNoticed,
         layers: input.context.frame.layers,
         omissions: input.context.frame.omissions,
       },
@@ -1701,7 +1718,10 @@ export class AgentJournalRepository {
     return { value: {}, text: projected.text, content: projected.content };
   }
 
-  async compileContext(conversationId: string): Promise<DurableContextBoundarySnapshot> {
+  async compileContext(
+    conversationId: string,
+    contextWindow = 400_000,
+  ): Promise<DurableContextBoundarySnapshot> {
     this.assertOpen();
     await this.writerTail;
     const activeScope = this.activeScopeIdentity(conversationId);
@@ -1741,26 +1761,6 @@ export class AgentJournalRepository {
     } | undefined;
     if (!thread) throw new Error('The active strand has no thread.md document.');
     const threadMarkdown = await this.readArtifactTextByHash(thread.content_artifact_hash);
-    const capsuleRows = this.storage.database.prepare(`
-      SELECT tc.turn_id, tc.capsule_id, tc.summary_artifact_hash
-      FROM turn_capsules tc
-      JOIN turns t ON t.turn_id = tc.turn_id
-      WHERE tc.conversation_id = ? AND tc.strand_id = ?
-        AND tc.state = 'ready' AND t.terminal_sequence IS NOT NULL
-        AND t.accepted_sequence < (
-          SELECT accepted_sequence FROM turns WHERE turn_id = ?
-        )
-      ORDER BY t.accepted_sequence
-    `).all(conversationId, activeScope.strandId, activeScope.turnId) as Array<{
-      turn_id: string;
-      capsule_id: string;
-      summary_artifact_hash: string;
-    }>;
-    const capsules = await Promise.all(capsuleRows.map(async (row) => ({
-      turnId: row.turn_id,
-      ref: `journal://capsule/${encodeURIComponent(row.capsule_id)}`,
-      markdown: await this.readArtifactTextByHash(row.summary_artifact_hash),
-    })));
     const basisSequence = allEvents.at(-1)!.sequence;
     const source: ThreadContextSource = {
       basisSequence,
@@ -1769,12 +1769,14 @@ export class AgentJournalRepository {
       strandId: activeScope.strandId,
       turnId: activeScope.turnId,
       scopeId: activeScope.scopeId,
+      scopeKind: activeScope.kind,
       threadVersionId: thread.head_version_id,
       threadMarkdown,
       messages: logicalMessages,
-      capsules,
+      pressureNoticed: allEvents.some((event) =>
+        event.scopeId === activeScope.scopeId && event.type === 'context.pressure'),
     };
-    const compiled = compileThreadContext(source, { contextWindow: 400_000 });
+    const compiled = compileThreadContext(source, { contextWindow });
     const snapshot = createDurableContextSnapshot(basisSequence, compiled.messages);
     const frameRow = this.storage.database.prepare(`
       SELECT MAX(ordinal) AS frame_ordinal
@@ -1790,6 +1792,80 @@ export class AgentJournalRepository {
       scopeKind: activeScope.kind,
       nextFrameOrdinal,
     };
+  }
+
+  async recordContextPressure(
+    handle: DurableTurnHandle,
+    input: {
+      estimatedInputTokens: number;
+      softContextLimit: number;
+      hardContextLimit: number;
+    },
+  ) {
+    this.assertOpen();
+    const estimatedInputTokens = safeNonnegativeInteger(
+      input.estimatedInputTokens,
+      'estimated input tokens',
+    );
+    const softContextLimit = safeNonnegativeInteger(
+      input.softContextLimit,
+      'soft context limit',
+    );
+    const hardContextLimit = safeNonnegativeInteger(
+      input.hardContextLimit,
+      'hard context limit',
+    );
+    const scope = this.scopeIdentity(handle.scopeId);
+    const notice = await this.prepareText(scope.kind === 'work_unit'
+      ? [
+          'Context pressure notice: this bounded work unit is approaching its healthy context boundary.',
+          'Finish the current coherent checkpoint, perform the most important remaining validation, then call work_unit_return with the bounded result the parent needs.',
+          'Do not claim unperformed work or validation. Exact evidence remains available through the journal.',
+        ].join('\n\n')
+      : [
+          'Context pressure notice: this parent turn is approaching its healthy context boundary.',
+          'Integrate completed work, update thread.md if future shared state changed, and complete the user turn honestly.',
+          'Do not claim unperformed work or validation. Exact evidence remains available through the journal.',
+        ].join('\n\n'));
+    return this.enqueueWrite(() => this.storage.transaction(() => {
+      this.assertRunningHandle(handle);
+      const existing = this.storage.database.prepare(`
+        SELECT 1 FROM events WHERE scope_id = ? AND type = 'context.pressure'
+      `).get(handle.scopeId);
+      if (existing) return false;
+      const recordedAt = safeTimestamp(this.now());
+      const pressureEventId = this.nextId('event');
+      const pressureSequence = this.insertEvent({
+        ...handle,
+        eventId: pressureEventId,
+        type: 'context.pressure',
+        actor: 'harness',
+        visibility: 'internal',
+        payload: {
+          estimatedInputTokens,
+          hardContextLimit,
+          scopeKind: scope.kind,
+          softContextLimit,
+        },
+        createdAt: recordedAt,
+      });
+      const messageSequence = this.insertEvent({
+        ...handle,
+        eventId: this.nextId('event'),
+        type: 'message.internal',
+        actor: 'harness',
+        visibility: 'internal',
+        payload: {
+          content: notice.ref,
+          kind: 'context_pressure',
+          pressureSequence,
+        },
+        artifactHash: artifactHash(notice.ref),
+        createdAt: recordedAt,
+      });
+      this.insertArtifact(notice.artifact, messageSequence);
+      return true;
+    }));
   }
 
   async resumeActiveTurn(conversationId: string): Promise<{
@@ -1975,197 +2051,57 @@ export class AgentJournalRepository {
     const limit = boundedSafeInteger(input.limit ?? 10, 1, 20, 'journal search limit');
     const scope = input.scope ?? 'project';
     const identity = this.contextIdentity(conversationId);
-    const terms = query.toLocaleLowerCase().split(/\s+/u).filter(Boolean);
-    type Candidate = JournalSearchResult['hits'][number] & { rank: number; text: string };
-    const candidates: Candidate[] = [];
-    const documentRows = this.storage.database.prepare(`
-      SELECT d.document_id, d.conversation_id, d.strand_id, d.head_version_id,
-             d.updated_sequence, v.content_artifact_hash
-      FROM state_documents d
-      JOIN document_versions v ON v.version_id = d.head_version_id
-      WHERE d.project_id = ? AND (? = 'project' OR d.conversation_id = ?)
-      ORDER BY d.updated_sequence DESC
-    `).all(identity.projectId, scope, conversationId) as Array<{
-      document_id: string; conversation_id: string | null; strand_id: string | null;
-      head_version_id: string; updated_sequence: number; content_artifact_hash: string;
-    }>;
-    for (const row of documentRows) {
-      candidates.push({
-        ref: `journal://document-version/${encodeURIComponent(row.head_version_id)}`,
-        kind: 'thread-document',
-        excerpt: '',
-        ...(row.conversation_id ? { conversationId: row.conversation_id } : {}),
-        sequence: safeInteger(row.updated_sequence, 'document updated sequence'),
-        historical: row.conversation_id !== conversationId || row.strand_id !== identity.strandId,
-        rank: row.strand_id === identity.strandId ? 0 : 4,
-        text: await this.openArtifactText(identity.projectId, row.content_artifact_hash),
-      });
-    }
-    const capsuleRows = this.storage.database.prepare(`
-      SELECT capsule_id, conversation_id, turn_id, summary_artifact_hash, created_sequence
-      FROM turn_capsules
-      WHERE project_id = ? AND state = 'ready'
+    const terms = journalSearchTerms(query);
+    if (terms.length === 0) throw new TypeError('Journal search query must contain searchable text.');
+    const ftsQuery = terms.map((term) => `"${term.replaceAll('"', '""')}"`).join(' AND ');
+    const rows = this.storage.database.prepare(`
+      SELECT ref, conversation_id, strand_id, turn_id, kind, sequence, text,
+             bm25(journal_search_index) AS relevance
+      FROM journal_search_index
+      WHERE journal_search_index MATCH ?
+        AND project_id = ?
         AND (? = 'project' OR conversation_id = ?)
-      ORDER BY created_sequence DESC
-    `).all(identity.projectId, scope, conversationId) as Array<{
-      capsule_id: string; conversation_id: string; turn_id: string;
-      summary_artifact_hash: string; created_sequence: number;
+        AND (? = 'operations' OR kind NOT LIKE 'operation:%')
+      ORDER BY
+        CASE WHEN strand_id = ? THEN 0 WHEN conversation_id = ? THEN 1 ELSE 2 END,
+        relevance,
+        CAST(sequence AS INTEGER) DESC,
+        ref
+      LIMIT ?
+    `).all(
+      ftsQuery,
+      identity.projectId,
+      scope,
+      conversationId,
+      input.include ?? '',
+      identity.strandId,
+      conversationId,
+      limit + 1,
+    ) as Array<{
+      ref: string;
+      conversation_id: string;
+      strand_id: string;
+      turn_id: string;
+      kind: string;
+      sequence: number;
+      text: string;
+      relevance: number;
     }>;
-    for (const row of capsuleRows) {
-      candidates.push({
-        ref: `journal://capsule/${encodeURIComponent(row.capsule_id)}`,
-        kind: 'turn-capsule',
-        excerpt: '',
-        conversationId: row.conversation_id,
-        turnId: row.turn_id,
-        sequence: safeInteger(row.created_sequence, 'capsule sequence'),
-        historical: row.conversation_id !== conversationId,
-        rank: 1,
-        text: await this.openArtifactText(identity.projectId, row.summary_artifact_hash),
-      });
-    }
-    const userRows = this.storage.database.prepare(`
-      SELECT sequence, event_id, project_id, conversation_id, strand_id,
-             turn_id, scope_id, type, actor, visibility, causal_event_id,
-             operation_id, payload_json, artifact_hash, created_at
-      FROM events
-      WHERE project_id = ? AND type = 'message.user'
-        AND (? = 'project' OR conversation_id = ?)
-      ORDER BY sequence DESC
-    `).all(identity.projectId, scope, conversationId) as EventRow[];
-    for (const row of userRows) {
-      const event = decodeEventRow(row);
-      const payload = await this.expandEventPayload(event);
-      candidates.push({
-        ref: `journal://event/${event.sequence}`,
-        kind: 'user-message',
-        excerpt: '',
-        conversationId: event.conversationId,
-        ...(event.turnId ? { turnId: event.turnId } : {}),
-        sequence: event.sequence,
-        historical: event.conversationId !== conversationId,
-        rank: 1,
-        text: canonicalJson(payload),
-      });
-    }
-    const assistantRows = this.storage.database.prepare(`
-      SELECT ti.item_id, ti.turn_id, ti.first_sequence, ti.last_sequence,
-             ti.status, t.conversation_id
-      FROM transcript_items ti
-      JOIN turns t ON t.turn_id = ti.turn_id
-      WHERE t.project_id = ? AND ti.kind = 'assistant'
-        AND (? = 'project' OR t.conversation_id = ?)
-      ORDER BY ti.last_sequence DESC, ti.item_id
-    `).all(identity.projectId, scope, conversationId) as Array<{
-      item_id: string; turn_id: string; first_sequence: number; last_sequence: number;
-      status: string; conversation_id: string;
-    }>;
-    for (const row of assistantRows) {
-      const text = await this.assistantVisibleText(row.turn_id);
-      if (!text) continue;
-      candidates.push({
-        ref: `journal://turn/${encodeURIComponent(row.turn_id)}#assistant`,
-        kind: row.status === 'completed' ? 'assistant-outcome' : 'assistant-proposal',
-        excerpt: '',
-        conversationId: row.conversation_id,
-        turnId: row.turn_id,
-        sequence: safeInteger(row.last_sequence, 'assistant search sequence'),
-        historical: row.conversation_id !== conversationId,
-        rank: 2,
-        text,
-      });
-    }
-    const completedRows = this.storage.database.prepare(`
-      SELECT turn_id, conversation_id, state, terminal_sequence
-      FROM turns WHERE project_id = ? AND terminal_sequence IS NOT NULL
-        AND (? = 'project' OR conversation_id = ?)
-      ORDER BY terminal_sequence DESC
-    `).all(identity.projectId, scope, conversationId) as Array<{
-      turn_id: string; conversation_id: string; state: string; terminal_sequence: number;
-    }>;
-    for (const row of completedRows) {
-      candidates.push({
-        ref: `journal://turn/${encodeURIComponent(row.turn_id)}`,
-        kind: 'turn-outcome',
-        excerpt: '',
-        conversationId: row.conversation_id,
-        turnId: row.turn_id,
-        sequence: safeInteger(row.terminal_sequence, 'turn terminal sequence'),
-        historical: row.conversation_id !== conversationId,
-        rank: 3,
-        text: `turn ${row.turn_id} ${row.state} ${await this.assistantVisibleText(row.turn_id)}`,
-      });
-    }
-    const workRows = this.storage.database.prepare(`
-      SELECT scope_id, conversation_id, turn_id, objective_json, state,
-             terminal_sequence, result_artifact_hash
-      FROM execution_scopes
-      WHERE project_id = ? AND kind = 'work_unit' AND result_artifact_hash IS NOT NULL
-        AND (? = 'project' OR conversation_id = ?)
-      ORDER BY terminal_sequence DESC, scope_id
-    `).all(identity.projectId, scope, conversationId) as Array<{
-      scope_id: string; conversation_id: string; turn_id: string; objective_json: string;
-      state: string; terminal_sequence: number; result_artifact_hash: string;
-    }>;
-    for (const row of workRows) {
-      const resultRef = `journal://artifact/${row.result_artifact_hash}`;
-      candidates.push({
-        ref: resultRef,
-        kind: 'work-unit-result',
-        excerpt: '',
-        conversationId: row.conversation_id,
-        turnId: row.turn_id,
-        sequence: safeInteger(row.terminal_sequence, 'work unit terminal sequence'),
-        historical: row.conversation_id !== conversationId,
-        rank: 3,
-        text: `${row.objective_json}\n${await this.openArtifactText(identity.projectId, row.result_artifact_hash)}`,
-      });
-    }
-    if (input.include === 'operations') {
-      const operationRows = this.storage.database.prepare(`
-        SELECT sequence, event_id, project_id, conversation_id, strand_id,
-               turn_id, scope_id, type, actor, visibility, causal_event_id,
-               operation_id, payload_json, artifact_hash, created_at
-        FROM events
-        WHERE project_id = ? AND type = 'tool.called'
-          AND json_extract(payload_json, '$.name') <> 'journal_search'
-          AND (? = 'project' OR conversation_id = ?)
-        ORDER BY sequence DESC
-      `).all(identity.projectId, scope, conversationId) as EventRow[];
-      for (const row of operationRows) {
-        const event = decodeEventRow(row);
-        const payload = await this.expandEventPayload(event) as Record<string, CanonicalJsonValue>;
-        const callId = requiredString(payload.callId, 'search operation callId');
-        candidates.push({
-          ref: `journal://tool/${encodeURIComponent(callId)}`,
-          kind: `operation:${requiredString(payload.name, 'search operation name')}`,
-          excerpt: '',
-          conversationId: event.conversationId,
-          ...(event.turnId ? { turnId: event.turnId } : {}),
-          sequence: event.sequence,
-          historical: event.conversationId !== conversationId,
-          rank: 5,
-          text: canonicalJson(payload),
-        });
-      }
-    }
-    const matches = candidates
-      .filter((candidate) => {
-        const folded = candidate.text.toLocaleLowerCase();
-        return terms.every((term) => folded.includes(term));
-      })
-      .sort((left, right) => left.rank - right.rank ||
-        (right.sequence ?? 0) - (left.sequence ?? 0) || left.ref.localeCompare(right.ref));
-    const deduped = [...new Map(matches.map((candidate) => [candidate.ref, candidate])).values()];
-    const hits = deduped.slice(0, limit).map(({ rank: _rank, text, ...hit }) => ({
-      ...hit,
-      excerpt: matchingExcerpt(text, terms, 480),
+    const selected = rows.slice(0, limit);
+    const hits = selected.map((row) => ({
+      ref: row.ref,
+      kind: row.kind,
+      excerpt: matchingExcerpt(row.text, terms, 480),
+      ...(row.conversation_id ? { conversationId: row.conversation_id } : {}),
+      ...(row.turn_id ? { turnId: row.turn_id } : {}),
+      sequence: safeInteger(Number(row.sequence), 'journal search sequence'),
+      historical: row.conversation_id !== conversationId || row.strand_id !== identity.strandId,
     }));
     return {
       query,
       scope,
       hits,
-      truncated: deduped.length > hits.length,
+      truncated: rows.length > selected.length,
       retention: 'ephemeral',
     };
   }
@@ -2242,23 +2178,6 @@ export class AgentJournalRepository {
         basedOnTurnId: row.based_on_turn_id,
         createdSequence: row.created_sequence,
         content: await this.openArtifactText(identity.projectId, row.content_artifact_hash),
-      });
-    }
-
-    const capsuleMatch = /^journal:\/\/capsule\/([^/?#]+)$/u.exec(ref);
-    if (capsuleMatch) {
-      const capsuleId = decodeURIComponent(capsuleMatch[1]!);
-      const row = this.storage.database.prepare(`
-        SELECT capsule_id, turn_id, state, summary_artifact_hash,
-               user_message_id, assistant_message_id, thread_version_before,
-               thread_version_after, trace_first_sequence, trace_last_sequence
-        FROM turn_capsules WHERE project_id = ? AND capsule_id = ?
-      `).get(identity.projectId, capsuleId) as Record<string, unknown> | undefined;
-      if (!row) throw new Error(`Turn capsule ${capsuleId} does not exist in this project.`);
-      const hash = requiredString(row.summary_artifact_hash as CanonicalJsonValue, 'capsule artifact hash');
-      return canonicalJson({
-        ...normalizeJson(row) as Record<string, CanonicalJsonValue>,
-        markdown: await this.openArtifactText(identity.projectId, hash),
       });
     }
 
@@ -2578,6 +2497,16 @@ export class AgentJournalRepository {
         WHERE document_id = ? AND head_version_id = ?
       `).run(versionId, sequence, recordedAt, document.document_id, input.baseVersionId);
       if (updated.changes !== 1) throw new Error('thread.md compare-and-swap failed.');
+      this.indexJournalText({
+        ref: `journal://document-version/${encodeURIComponent(versionId)}`,
+        projectId: handle.projectId,
+        conversationId: handle.conversationId,
+        strandId: handle.strandId,
+        turnId: handle.turnId,
+        kind: 'thread-document',
+        sequence,
+        text: input.content,
+      });
       return {
         documentId: document.document_id,
         versionId,
@@ -2650,6 +2579,16 @@ export class AgentJournalRepository {
         recordedAt,
         recordedAt,
       );
+      this.indexJournalText({
+        ref: `journal://scope/${encodeURIComponent(child.scopeId)}`,
+        projectId: child.projectId,
+        conversationId: child.conversationId,
+        strandId: child.strandId,
+        turnId: child.turnId,
+        kind: 'work-unit-objective',
+        sequence,
+        text: objective,
+      });
       const orientationSequence = this.insertEvent({
         ...child,
         eventId: this.nextId('event'),
@@ -2721,6 +2660,16 @@ export class AgentJournalRepository {
         SET state = 'completed', terminal_sequence = ?, result_artifact_hash = ?, updated_at = ?
         WHERE scope_id = ? AND state = 'running' AND terminal_sequence IS NULL
       `).run(terminalSequence, resultArtifact.hash, recordedAt, handle.scopeId);
+      this.indexJournalText({
+        ref: `journal://artifact/${resultArtifact.hash}`,
+        projectId: handle.projectId,
+        conversationId: handle.conversationId,
+        strandId: handle.strandId,
+        turnId: handle.turnId,
+        kind: 'work-unit-result',
+        sequence: terminalSequence,
+        text: result,
+      });
       const foldedSequence = this.insertEvent({
         ...parentHandle,
         eventId: this.nextId('event'),
@@ -3298,9 +3247,9 @@ export class AgentJournalRepository {
         INSERT INTO turns (
           turn_id, project_id, conversation_id, strand_id, client_message_id,
           root_scope_id, state, accepted_sequence, terminal_sequence,
-          thread_version_before, thread_version_after, capsule_id,
+          thread_version_before, thread_version_after,
           created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, NULL, ?, NULL, NULL, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, NULL, ?, NULL, ?, ?)
       `).run(
         handle.turnId,
         handle.projectId,
@@ -3349,6 +3298,16 @@ export class AgentJournalRepository {
         messageSequence,
         recordedAt,
       );
+      this.indexJournalText({
+        ref: `journal://message/${encodeURIComponent(userMessageId)}`,
+        projectId: handle.projectId,
+        conversationId: handle.conversationId,
+        strandId: handle.strandId,
+        turnId: handle.turnId,
+        kind: 'user-message',
+        sequence: messageSequence,
+        text: input.content.text,
+      });
       this.storage.database.prepare(`
         INSERT INTO transcript_items (
           item_id, conversation_id, strand_id, turn_id, first_sequence,
@@ -3525,6 +3484,7 @@ export class AgentJournalRepository {
     params: CreateConversationParams,
     argumentsHash: string,
     initialThread: StagedArtifact,
+    initialThreadContent: string,
     inheritedThreadVersionId: string | null,
   ): CreateConversationResult {
     const replay = this.readCreateReplay(params.operationId, argumentsHash);
@@ -3689,6 +3649,15 @@ export class AgentJournalRepository {
       this.storage.database.prepare(`
         UPDATE state_documents SET head_version_id = ? WHERE document_id = ?
       `).run(threadVersionId, threadDocumentId);
+      this.indexJournalText({
+        ref: `journal://document-version/${encodeURIComponent(threadVersionId)}`,
+        projectId,
+        conversationId,
+        strandId: rootStrandId,
+        kind: 'thread-document',
+        sequence: conversationSequence,
+        text: initialThreadContent,
+      });
       this.storage.database.prepare(`
         INSERT INTO operations (
           operation_id, project_id, conversation_id, strand_id, turn_id,
@@ -3829,62 +3798,7 @@ export class AgentJournalRepository {
           'application/vnd.remux.message+json',
         )
       : null;
-    const user = this.storage.database.prepare(`
-      SELECT message_id FROM messages
-      WHERE turn_id = ? AND role = 'user'
-      ORDER BY ordinal LIMIT 1
-    `).get(handle.turnId) as { message_id: string } | undefined;
-    if (!user) throw new Error(`Turn ${handle.turnId} has no exact user message.`);
-    const workUnits = this.storage.database.prepare(`
-      SELECT scope_id, objective_json, result_artifact_hash
-      FROM execution_scopes
-      WHERE turn_id = ? AND kind = 'work_unit'
-        AND state = 'completed' AND result_artifact_hash IS NOT NULL
-      ORDER BY created_sequence
-    `).all(handle.turnId) as Array<{
-      scope_id: string;
-      objective_json: string;
-      result_artifact_hash: string;
-    }>;
-    const workUnitSections = await Promise.all(workUnits.map(async (workUnit) => {
-      const objective = JSON.parse(workUnit.objective_json) as { objective?: unknown };
-      return [
-        `### ${workUnit.scope_id}`,
-        '',
-        `Objective: ${typeof objective.objective === 'string' ? objective.objective : '_unspecified_'}`,
-        '',
-        truncateUtf8Text(await this.readArtifactTextByHash(workUnit.result_artifact_hash), 4 * 1024),
-        '',
-        `Exact result: journal://artifact/${workUnit.result_artifact_hash}`,
-      ].join('\n');
-    }));
-    const capsuleId = this.nextId('capsule');
-    const capsuleMarkdown = [
-      `# Turn ${handle.turnId}`,
-      '',
-      '## User',
-      '',
-      `journal://message/${user.message_id}`,
-      '',
-      '## Assistant',
-      '',
-      assistantMessageId ? `journal://message/${assistantMessageId}` : '_No assistant message._',
-      '',
-      '## Outcome',
-      '',
-      truncateUtf8Text(assistant?.text ?? error ?? status, 4 * 1024),
-      '',
-      ...(workUnitSections.length > 0 ? [
-        '## Work units',
-        '',
-        ...workUnitSections.flatMap((section) => [section, '']),
-      ] : []),
-    ].join('\n');
-    const capsuleArtifact = await this.artifacts.put(
-      Buffer.from(capsuleMarkdown, 'utf8'),
-      'text/markdown; charset=utf-8',
-    );
-    return { assistantMessageArtifact, assistantMessageId, capsuleArtifact, capsuleId };
+    return { assistantMessageArtifact, assistantMessageId };
   }
 
   private async prepareAssistantProjection(
@@ -4079,13 +3993,6 @@ export class AgentJournalRepository {
         `).run(assistant.valueJson, assistant.itemId, handle.turnId);
       }
       this.insertArtifact(finalization.assistantMessageArtifact, sequence, 'content');
-      this.insertArtifact(finalization.capsuleArtifact, sequence, 'content');
-      const user = this.storage.database.prepare(`
-        SELECT message_id FROM messages
-        WHERE turn_id = ? AND role = 'user'
-        ORDER BY ordinal LIMIT 1
-      `).get(handle.turnId) as { message_id: string } | undefined;
-      if (!user) throw new Error(`Turn ${handle.turnId} has no exact user message.`);
       if (finalization.assistantMessageArtifact && finalization.assistantMessageId) {
         const providerItem = this.storage.database.prepare(`
           SELECT provider_item_id FROM provider_items
@@ -4115,6 +4022,18 @@ export class AgentJournalRepository {
           sequence,
           recordedAt,
         );
+        if (assistant?.text) {
+          this.indexJournalText({
+            ref: `journal://turn/${encodeURIComponent(handle.turnId)}#assistant`,
+            projectId: handle.projectId,
+            conversationId: handle.conversationId,
+            strandId: handle.strandId,
+            turnId: handle.turnId,
+            kind: status === 'completed' ? 'assistant-outcome' : 'assistant-response',
+            sequence,
+            text: assistant.text,
+          });
+        }
       }
       const thread = this.storage.database.prepare(`
         SELECT d.head_version_id
@@ -4123,35 +4042,6 @@ export class AgentJournalRepository {
           AND d.scope_kind = 'strand' AND d.key = 'thread.md'
       `).get(handle.conversationId, handle.strandId) as { head_version_id: string } | undefined;
       if (!thread?.head_version_id) throw new Error('The active strand has no thread.md version.');
-      const turn = this.storage.database.prepare(`
-        SELECT accepted_sequence, thread_version_before FROM turns WHERE turn_id = ?
-      `).get(handle.turnId) as {
-        accepted_sequence: number;
-        thread_version_before: string | null;
-      };
-      this.storage.database.prepare(`
-        INSERT INTO turn_capsules (
-          capsule_id, project_id, conversation_id, strand_id, turn_id, state,
-          summary_artifact_hash, user_message_id, assistant_message_id,
-          thread_version_before, thread_version_after, trace_first_sequence,
-          trace_last_sequence, created_sequence, created_at
-        ) VALUES (?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        finalization.capsuleId,
-        handle.projectId,
-        handle.conversationId,
-        handle.strandId,
-        handle.turnId,
-        finalization.capsuleArtifact.hash,
-        user.message_id,
-        finalization.assistantMessageId,
-        turn.thread_version_before,
-        thread.head_version_id,
-        turn.accepted_sequence,
-        sequence,
-        sequence,
-        recordedAt,
-      );
       this.storage.database.prepare(`
         UPDATE inferences
         SET state = ?, terminal_sequence = ?
@@ -4187,13 +4077,12 @@ export class AgentJournalRepository {
       this.storage.database.prepare(`
         UPDATE turns
         SET state = ?, terminal_sequence = ?, thread_version_after = ?,
-            capsule_id = ?, updated_at = ?
+            updated_at = ?
         WHERE turn_id = ? AND terminal_sequence IS NULL
       `).run(
         status,
         sequence,
         thread.head_version_id,
-        finalization.capsuleId,
         recordedAt,
         handle.turnId,
       );
@@ -4609,6 +4498,158 @@ export class AgentJournalRepository {
     });
   }
 
+  private indexJournalText(input: {
+    ref: string;
+    projectId: string;
+    conversationId?: string | null;
+    strandId?: string | null;
+    turnId?: string | null;
+    kind: string;
+    sequence: number;
+    text: string;
+  }) {
+    this.storage.database.prepare(`
+      DELETE FROM journal_search_index
+      WHERE ref = ? AND kind = ? AND project_id = ? AND conversation_id = ?
+    `).run(input.ref, input.kind, input.projectId, input.conversationId ?? '');
+    this.storage.database.prepare(`
+      INSERT INTO journal_search_index (
+        ref, project_id, conversation_id, strand_id, turn_id, kind, sequence, text
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.ref,
+      input.projectId,
+      input.conversationId ?? '',
+      input.strandId ?? '',
+      input.turnId ?? '',
+      input.kind,
+      input.sequence,
+      input.text,
+    );
+  }
+
+  private async rebuildJournalSearchIndex() {
+    type SearchEntry = Parameters<AgentJournalRepository['indexJournalText']>[0];
+    const entries: SearchEntry[] = [];
+    const messageRows = this.storage.database.prepare(`
+      SELECT message_id, project_id, conversation_id, strand_id, turn_id,
+             role, state, content_artifact_hash, created_sequence
+      FROM messages
+      WHERE visibility = 'transcript' AND role IN ('user', 'assistant')
+      ORDER BY created_sequence
+    `).all() as Array<{
+      message_id: string; project_id: string; conversation_id: string; strand_id: string;
+      turn_id: string; role: 'user' | 'assistant'; state: string;
+      content_artifact_hash: string; created_sequence: number;
+    }>;
+    for (const row of messageRows) {
+      const value = JSON.parse(await this.readArtifactTextByHash(row.content_artifact_hash)) as {
+        text?: unknown;
+      };
+      if (typeof value.text !== 'string' || value.text.length === 0) continue;
+      entries.push({
+        ref: row.role === 'assistant'
+          ? `journal://turn/${encodeURIComponent(row.turn_id)}#assistant`
+          : `journal://message/${encodeURIComponent(row.message_id)}`,
+        projectId: row.project_id,
+        conversationId: row.conversation_id,
+        strandId: row.strand_id,
+        turnId: row.turn_id,
+        kind: row.role === 'assistant'
+          ? row.state === 'completed' ? 'assistant-outcome' : 'assistant-response'
+          : 'user-message',
+        sequence: safeInteger(row.created_sequence, 'journal message sequence'),
+        text: value.text,
+      });
+    }
+
+    const documentRows = this.storage.database.prepare(`
+      SELECT v.version_id, d.project_id, d.conversation_id, d.strand_id,
+             v.based_on_turn_id, v.content_artifact_hash, v.created_sequence
+      FROM document_versions v
+      JOIN state_documents d ON d.document_id = v.document_id
+      ORDER BY v.created_sequence, v.version_id
+    `).all() as Array<{
+      version_id: string; project_id: string; conversation_id: string; strand_id: string;
+      based_on_turn_id: string | null; content_artifact_hash: string; created_sequence: number;
+    }>;
+    for (const row of documentRows) {
+      entries.push({
+        ref: `journal://document-version/${encodeURIComponent(row.version_id)}`,
+        projectId: row.project_id,
+        conversationId: row.conversation_id,
+        strandId: row.strand_id,
+        turnId: row.based_on_turn_id,
+        kind: 'thread-document',
+        sequence: safeInteger(row.created_sequence, 'journal document sequence'),
+        text: await this.readArtifactTextByHash(row.content_artifact_hash),
+      });
+    }
+
+    const scopeRows = this.storage.database.prepare(`
+      SELECT scope_id, project_id, conversation_id, strand_id, turn_id,
+             objective_json, created_sequence, terminal_sequence, result_artifact_hash
+      FROM execution_scopes WHERE kind = 'work_unit'
+      ORDER BY created_sequence, scope_id
+    `).all() as Array<{
+      scope_id: string; project_id: string; conversation_id: string; strand_id: string;
+      turn_id: string; objective_json: string; created_sequence: number;
+      terminal_sequence: number | null; result_artifact_hash: string | null;
+    }>;
+    for (const row of scopeRows) {
+      const objective = JSON.parse(row.objective_json) as { objective?: unknown };
+      if (typeof objective.objective === 'string' && objective.objective.length > 0) {
+        entries.push({
+          ref: `journal://artifact/${row.result_artifact_hash}`,
+          projectId: row.project_id,
+          conversationId: row.conversation_id,
+          strandId: row.strand_id,
+          turnId: row.turn_id,
+          kind: 'work-unit-objective',
+          sequence: safeInteger(row.created_sequence, 'journal work-unit sequence'),
+          text: objective.objective,
+        });
+      }
+      if (row.result_artifact_hash && row.terminal_sequence !== null) {
+        entries.push({
+          ref: `journal://scope/${encodeURIComponent(row.scope_id)}`,
+          projectId: row.project_id,
+          conversationId: row.conversation_id,
+          strandId: row.strand_id,
+          turnId: row.turn_id,
+          kind: 'work-unit-result',
+          sequence: safeInteger(row.terminal_sequence, 'journal work-unit result sequence'),
+          text: await this.readArtifactTextByHash(row.result_artifact_hash),
+        });
+      }
+    }
+
+    const toolEvents = (await this.readEvents({})).filter((event) => event.type === 'tool.called');
+    for (const event of toolEvents) {
+      if (!event.turnId || !event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
+        continue;
+      }
+      const payload = event.payload as Record<string, CanonicalJsonValue>;
+      const callId = requiredString(payload.callId, 'journal tool call id');
+      const name = requiredString(payload.name, 'journal tool name');
+      entries.push({
+        ref: `journal://tool/${encodeURIComponent(callId)}`,
+        projectId: event.projectId,
+        conversationId: event.conversationId,
+        strandId: event.strandId,
+        turnId: event.turnId,
+        kind: `operation:${name}`,
+        sequence: event.sequence,
+        text: `${name}\n${canonicalJson(await this.readJsonRef(payload.args))}`,
+      });
+    }
+
+    this.storage.transaction(() => {
+      this.storage.database.exec('DELETE FROM journal_search_index');
+      for (const entry of entries) this.indexJournalText(entry);
+    });
+  }
+
   private async readTextRef(value: CanonicalJsonValue | undefined) {
     const ref = parseReference(value);
     if (ref.kind === 'inline') return ref.text;
@@ -4836,8 +4877,6 @@ type PreparedAssistantProjection = {
 type PreparedTurnFinalization = {
   assistantMessageArtifact: StagedArtifact | null;
   assistantMessageId: string | null;
-  capsuleArtifact: StagedArtifact;
-  capsuleId: string;
 };
 
 type ConversationProjectionRow = {
@@ -5052,12 +5091,19 @@ function contextInspectorValue(input: {
   }
   const orderedGroups = [...groups.values()];
   return {
-    version: 3,
+    version: 4,
     conversationId: input.manifest.conversationId,
     inferenceId: input.manifest.inferenceId,
     frameId: input.frameId,
     basisSequence: input.manifest.basisSequence,
     threadVersionId: input.manifest.threadVersionId,
+    dialogueTurnIds: [...input.manifest.context.dialogueTurnIds],
+    omittedDialogueTurns: input.manifest.context.omittedDialogueTurns,
+    threadDocumentBytes: input.manifest.context.threadDocumentBytes,
+    scopeKind: input.manifest.context.scopeKind,
+    softContextLimit: input.manifest.context.softContextLimit,
+    hardContextLimit: input.manifest.context.hardContextLimit,
+    pressureNoticed: input.manifest.context.pressureNoticed,
     compilerVersion: input.manifest.compilerVersion,
     policyVersion: input.manifest.policyVersion,
     estimatedInputTokens: input.manifest.context.estimatedInputTokens,
@@ -5392,6 +5438,13 @@ function matchingExcerpt(value: string, terms: readonly string[], maxCodePoints:
   const start = Math.max(0, center - Math.floor(maxCodePoints / 4));
   const text = codePoints.slice(start, start + maxCodePoints).join('');
   return `${start > 0 ? '…' : ''}${text}${start + maxCodePoints < codePoints.length ? '…' : ''}`;
+}
+
+function journalSearchTerms(value: string) {
+  return [...new Set(
+    (value.toLocaleLowerCase().match(/[\p{L}\p{N}_./:@+-]+/gu) ?? [])
+      .filter((term) => /[\p{L}\p{N}_]/u.test(term)),
+  )];
 }
 
 function boundedUtf8Slice(bytes: Buffer, requestedOffset: number, maxBytes: number) {

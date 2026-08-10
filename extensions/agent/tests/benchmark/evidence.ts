@@ -37,7 +37,12 @@ type AgentJournalSummary = {
   rootProviderCalls: number;
   childProviderCalls: number;
   providerItems: number;
-  turnCapsules: number;
+  runningInferences: number;
+  runningTurns: number;
+  peakSelectedDialogueTurns: number;
+  peakOmittedDialogueTurns: number;
+  peakThreadDocumentBytes: number;
+  pressureNotices: number;
   threadUpdates: number;
   workUnitsEntered: number;
   workUnitsReturned: number;
@@ -264,10 +269,11 @@ export async function evaluateRun(input: {
         && agentJournal.selfReferentialSearchHits === 0
         && agentJournal.contextLimitErrors === 0
         && agentJournal.contextFrames === agentJournal.providerCalls
-        && agentJournal.providerItems >= agentJournal.providerCalls
+        && agentJournal.providerItems === agentJournal.providerCalls
+        && agentJournal.runningInferences === 0
+        && agentJournal.runningTurns === 0
         && agentJournal.workUnitsEntered === agentJournal.workUnitsReturned
         && agentJournal.workUnitsAbandoned === 0
-        && agentJournal.turnCapsules >= runRecord.turns.length
         && agentJournal.threadUpdates > 0,
       [
         `compactions=${agentJournal.compactionEvents}`,
@@ -276,9 +282,12 @@ export async function evaluateRun(input: {
         `contextLimitErrors=${agentJournal.contextLimitErrors}`,
         `frames=${agentJournal.contextFrames}/${agentJournal.providerCalls}`,
         `providerItems=${agentJournal.providerItems}`,
+        `running=${agentJournal.runningInferences} inferences/${agentJournal.runningTurns} turns`,
         `workUnits=${agentJournal.workUnitsReturned}/${agentJournal.workUnitsEntered}`,
         `abandonedWorkUnits=${agentJournal.workUnitsAbandoned}`,
-        `capsules=${agentJournal.turnCapsules}/${runRecord.turns.length}`,
+        `recent=${agentJournal.peakSelectedDialogueTurns} selected/${agentJournal.peakOmittedDialogueTurns} omitted`,
+        `threadBytes=${agentJournal.peakThreadDocumentBytes}`,
+        `pressureNotices=${agentJournal.pressureNotices}`,
         `threadUpdates=${agentJournal.threadUpdates}`,
       ].join(', '),
     ));
@@ -364,7 +373,12 @@ export async function evaluateRun(input: {
       continuationRequests: agentJournal?.requestModes.continuation ?? null,
       contextFrames: agentJournal?.contextFrames ?? null,
       providerItems: agentJournal?.providerItems ?? null,
-      turnCapsules: agentJournal?.turnCapsules ?? null,
+      runningInferences: agentJournal?.runningInferences ?? null,
+      runningTurns: agentJournal?.runningTurns ?? null,
+      peakSelectedDialogueTurns: agentJournal?.peakSelectedDialogueTurns ?? null,
+      peakOmittedDialogueTurns: agentJournal?.peakOmittedDialogueTurns ?? null,
+      peakThreadDocumentBytes: agentJournal?.peakThreadDocumentBytes ?? null,
+      pressureNotices: agentJournal?.pressureNotices ?? null,
       threadUpdates: agentJournal?.threadUpdates ?? null,
       workUnitsEntered: agentJournal?.workUnitsEntered ?? null,
       workUnitsReturned: agentJournal?.workUnitsReturned ?? null,
@@ -595,9 +609,24 @@ function summarizeAgentJournal(
     }
 
     let contextOmissions = 0;
+    let peakSelectedDialogueTurns = 0;
+    let peakOmittedDialogueTurns = 0;
+    let peakThreadDocumentBytes = 0;
     for (const row of frameRows) {
       const manifest = readArtifactJson(dataRoot, row.storage_path);
       const context = objectValue(manifest.context);
+      peakSelectedDialogueTurns = Math.max(
+        peakSelectedDialogueTurns,
+        arrayValue(context.dialogueTurnIds).length,
+      );
+      peakOmittedDialogueTurns = Math.max(
+        peakOmittedDialogueTurns,
+        numberValue(context.omittedDialogueTurns) ?? 0,
+      );
+      peakThreadDocumentBytes = Math.max(
+        peakThreadDocumentBytes,
+        numberValue(context.threadDocumentBytes) ?? 0,
+      );
       for (const layerValue of arrayValue(context.layers)) {
         const layer = objectValue(layerValue);
         const kind = stringValue(layer.kind) ?? 'unknown';
@@ -625,7 +654,12 @@ function summarizeAgentJournal(
       rootProviderCalls: rootInferences.length,
       childProviderCalls: childInferences.length,
       providerItems: scalar('SELECT COUNT(*) AS count FROM provider_items WHERE conversation_id = ?'),
-      turnCapsules: scalar("SELECT COUNT(*) AS count FROM turn_capsules WHERE conversation_id = ? AND state = 'ready'"),
+      runningInferences: scalar("SELECT COUNT(*) AS count FROM inferences WHERE conversation_id = ? AND state = 'running'"),
+      runningTurns: scalar("SELECT COUNT(*) AS count FROM turns WHERE conversation_id = ? AND state = 'running'"),
+      peakSelectedDialogueTurns,
+      peakOmittedDialogueTurns,
+      peakThreadDocumentBytes,
+      pressureNotices: eventRows.filter(({ type }) => type === 'context.pressure').length,
       threadUpdates: eventRows.filter(({ type }) => type === 'thread.document.updated').length,
       workUnitsEntered: workUnitRows.length,
       workUnitsReturned: workUnitRows.filter(({ state }) => state === 'completed').length,

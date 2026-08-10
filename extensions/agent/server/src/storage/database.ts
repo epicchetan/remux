@@ -95,7 +95,7 @@ export async function openAgentDatabase(options: AgentDataRootOptions = {}) {
     } else if (version !== AGENT_JOURNAL_SCHEMA_VERSION) {
       throw new AgentSchemaVersionError(
         `Agent journal schema ${version} is not ${AGENT_JOURNAL_SCHEMA_VERSION}; ` +
-        'Thread Runtime v1 requires a fresh Agent data root.',
+        'Thread Runtime v2 requires a fresh Agent data root.',
       );
     }
 

@@ -12,7 +12,7 @@ import { FixtureEngine } from '../server/src/fixture-engine.ts';
 import { AgentJournalRepository, type DurableTurnHandle } from '../server/src/storage/repository.ts';
 import { AGENT_JOURNAL_TABLES } from '../server/src/storage/schema.ts';
 
-test('Thread Runtime v1 owns one clean schema and compiles the accepted user turn', async (t) => {
+test('Thread Runtime v2 owns one clean schema and compiles the accepted user turn', async (t) => {
   const fixture = await repositoryFixture(t);
   const conversation = await fixture.repository.createConversation({
     operationId: crypto.randomUUID(),
@@ -33,7 +33,9 @@ test('Thread Runtime v1 owns one clean schema and compiles the accepted user tur
   t.after(() => database.close());
   const tables: string[] = (database.prepare(`
     SELECT name FROM sqlite_master
-    WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name
+    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+      AND (name = 'journal_search_index' OR name NOT GLOB 'journal_search_index_*')
+    ORDER BY name
   `).all() as Array<{ name: string }>).map(({ name }) => name);
   const tableNames = new Set<string>(tables);
   assert.deepEqual(tables, [...AGENT_JOURNAL_TABLES].sort());
@@ -116,7 +118,7 @@ test('actual frames, exact provider reasoning, restart recovery, and next-turn e
     assert.equal(priorAssistant.providerMessage, undefined);
     assert.deepEqual(priorAssistant.toolCalls, []);
   }
-  assert.deepEqual(next.frame.capsuleTurnIds, [turn.turnId]);
+  assert.deepEqual(next.frame.dialogueTurnIds, [turn.turnId]);
   assert.ok(next.messages.every((message) =>
     message.turnId !== turn.turnId || message.role !== 'tool'));
   await fixture.repository.finishTurn(followup, { status: 'interrupted' });
@@ -131,7 +133,7 @@ test('thread.md updates are CAS-versioned and historical edit/fork inheritance i
   const turn = await accept(fixture.repository, source.conversationId, 'Choose the design.');
   const updated = await fixture.repository.updateThread(turn, {
     baseVersionId: source.threadVersionId,
-    content: '# Thread\n\nDecision: use immutable capsules.\n',
+    content: '# Thread\n\nDecision: use exact dialogue and living thread state.\n',
   });
   await assert.rejects(
     fixture.repository.updateThread(turn, {
@@ -241,23 +243,23 @@ test('bounded work units inherit the parent and fold back only their explicit re
 
   await fixture.repository.appendAssistantCheckpoint(root, { textDelta: 'Parent complete.', reasoningDelta: '' });
   await fixture.repository.finishTurn(root, { status: 'completed' });
-  const capsuleSearch = await fixture.repository.searchJournal(conversation.conversationId, {
+  const resultSearch = await fixture.repository.searchJournal(conversation.conversationId, {
     query: 'seam sound', scope: 'conversation',
   });
-  const capsule = capsuleSearch.hits.find(({ kind }) => kind === 'turn-capsule');
-  assert.ok(capsule);
-  const opened = await fixture.repository.openJournal(conversation.conversationId, { ref: capsule!.ref });
-  assert.match(opened.content, /## Work units[\s\S]*The seam is sound/u);
+  const result = resultSearch.hits.find(({ kind }) => kind === 'work-unit-result');
+  assert.ok(result);
+  const opened = await fixture.repository.openJournal(conversation.conversationId, { ref: result!.ref });
+  assert.match(opened.content, /The seam is sound/u);
 });
 
-test('journal retrieval exposes thread documents and capsules but not private provider artifacts', async (t) => {
+test('journal retrieval exposes thread documents and exact visible outcomes but not private provider artifacts', async (t) => {
   const fixture = await repositoryFixture(t);
   const conversation = await fixture.repository.createConversation({
     operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'model', reasoning: 'high',
   });
   const turn = await accept(fixture.repository, conversation.conversationId, 'Remember cobalt behavior.');
   await fixture.repository.appendAssistantCheckpoint(turn, {
-    textDelta: 'Cobalt behavior is retained in the capsule.', reasoningDelta: '',
+    textDelta: 'Cobalt behavior is retained in exact history.', reasoningDelta: '',
   });
   await fixture.repository.updateThread(turn, {
     baseVersionId: conversation.threadVersionId,
@@ -268,13 +270,74 @@ test('journal retrieval exposes thread documents and capsules but not private pr
     query: 'cobalt', scope: 'conversation',
   });
   assert.ok(search.hits.some(({ kind }) => kind === 'thread-document'));
-  const capsule = search.hits.find(({ kind }) => kind === 'turn-capsule');
-  assert.ok(capsule);
-  const opened = await fixture.repository.openJournal(conversation.conversationId, { ref: capsule!.ref });
+  const outcome = search.hits.find(({ kind }) => kind === 'assistant-outcome');
+  assert.ok(outcome);
+  const opened = await fixture.repository.openJournal(conversation.conversationId, { ref: outcome!.ref });
   assert.match(opened.content, /Cobalt behavior/u);
+
+  const safelyTokenized = await fixture.repository.searchJournal(conversation.conversationId, {
+    query: 'cobalt (behavior):', scope: 'conversation',
+  });
+  assert.ok(safelyTokenized.hits.length >= 2);
+  assert.deepEqual(
+    safelyTokenized.hits.map(({ ref, kind }) => ({ ref, kind })),
+    (await fixture.repository.searchJournal(conversation.conversationId, {
+      query: 'cobalt (behavior):', scope: 'conversation',
+    })).hits.map(({ ref, kind }) => ({ ref, kind })),
+  );
+
+  await fixture.repository.close();
+  fixture.repository = await AgentJournalRepository.open({ dataRoot: fixture.dataRoot });
+  const rebuilt = await fixture.repository.searchJournal(conversation.conversationId, {
+    query: 'cobalt behavior', scope: 'conversation',
+  });
+  assert.ok(rebuilt.hits.some(({ kind }) => kind === 'thread-document'));
+  assert.ok(rebuilt.hits.some(({ kind }) => kind === 'assistant-outcome'));
 });
 
-test('the public fixture runtime commits a v3 frame and completes through normal server hooks', async (t) => {
+test('context pressure is durable, scope-specific, and emitted at most once across restart', async (t) => {
+  const fixture = await repositoryFixture(t);
+  const conversation = await fixture.repository.createConversation({
+    operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'model', reasoning: 'high',
+  });
+  const turn = await accept(
+    fixture.repository,
+    conversation.conversationId,
+    `Perform a coherent task with enough active text to cross a test boundary. ${'pressure '.repeat(80)}`,
+  );
+  const before = await fixture.repository.compileContext(conversation.conversationId, 120);
+  assert.equal(before.frame.pressureNoticed, false);
+  assert.ok(before.frame.estimatedInputTokens >= before.frame.softContextLimit);
+  assert.equal(await fixture.repository.recordContextPressure(turn, {
+    estimatedInputTokens: before.frame.estimatedInputTokens,
+    softContextLimit: before.frame.softContextLimit,
+    hardContextLimit: before.frame.hardContextLimit,
+  }), true);
+  assert.equal(await fixture.repository.recordContextPressure(turn, {
+    estimatedInputTokens: before.frame.estimatedInputTokens + 1,
+    softContextLimit: before.frame.softContextLimit,
+    hardContextLimit: before.frame.hardContextLimit,
+  }), false);
+  const noticed = await fixture.repository.compileContext(conversation.conversationId, 120);
+  assert.equal(noticed.frame.pressureNoticed, true);
+  assert.ok(noticed.messages.some((message) =>
+    message.role === 'user' && message.text.includes('Context pressure notice')));
+
+  await fixture.repository.close();
+  fixture.repository = await AgentJournalRepository.open({ dataRoot: fixture.dataRoot });
+  const recovery = await fixture.repository.resumeActiveTurn(conversation.conversationId);
+  assert.equal(recovery?.handle.turnId, turn.turnId);
+  assert.equal(await fixture.repository.recordContextPressure(turn, {
+    estimatedInputTokens: noticed.frame.estimatedInputTokens,
+    softContextLimit: noticed.frame.softContextLimit,
+    hardContextLimit: noticed.frame.hardContextLimit,
+  }), false);
+  const events = await fixture.repository.readEvents({ conversationId: conversation.conversationId });
+  assert.equal(events.filter(({ type }) => type === 'context.pressure').length, 1);
+  await fixture.repository.finishTurn(turn, { status: 'interrupted' });
+});
+
+test('the public fixture runtime commits a v4 frame and completes through normal server hooks', async (t) => {
   const fixture = await repositoryFixture(t);
   const server = new AgentServer({
     engine: new FixtureEngine(),
@@ -305,9 +368,9 @@ test('the public fixture runtime commits a v3 frame and completes through normal
     `context:${created.conversationId}`,
   ]);
   const inspector = projections[0]?.value as { version?: number; frameId?: string; layers?: unknown[] };
-  assert.equal(inspector.version, 3);
+  assert.equal(inspector.version, 4);
   assert.equal(typeof inspector.frameId, 'string');
-  assert.equal(inspector.layers?.length, 4);
+  assert.equal(inspector.layers?.length, 3);
   const events = await fixture.repository.readEvents({ conversationId: created.conversationId });
   assert.ok(events.some(({ type }) => type === 'provider.item.recorded'));
   assert.ok(events.some(({ type }) => type === 'turn.terminal'));
