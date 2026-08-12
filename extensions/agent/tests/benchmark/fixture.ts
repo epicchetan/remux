@@ -21,7 +21,8 @@ export async function prepareFixture(
   const sourceHeadBefore = await gitOutput(scenario.sourceRepository, ['rev-parse', 'HEAD']);
   const sourceStatusBefore = await gitOutput(scenario.sourceRepository, ['status', '--porcelain=v1', '--untracked-files=all']);
   const baseTree = await gitOutput(scenario.sourceRepository, ['rev-parse', `${scenario.baseCommit}^{tree}`]);
-  const hiddenTargetTree = await gitOutput(scenario.sourceRepository, ['rev-parse', `${scenario.hiddenTargetCommit}^{tree}`]);
+  const referenceCommit = await gitOutput(scenario.sourceRepository, ['rev-parse', `${scenario.referenceCommit}^{commit}`]);
+  const referenceTree = await gitOutput(scenario.sourceRepository, ['rev-parse', `${referenceCommit}^{tree}`]);
   const fixtureRoot = join(dataRoot, 'fixtures', scenario.fixtureId, baseTree);
   const templatePath = join(fixtureRoot, 'workspace');
   const manifestPath = join(fixtureRoot, 'fixture-manifest.json');
@@ -45,6 +46,16 @@ export async function prepareFixture(
     await mustRun('tar', ['-xf', archivePath, '-C', temporaryWorkspace]);
     await rm(archivePath, { force: true });
 
+    const visibleInputs = await Promise.all(scenario.visibleInputs.map(async (input) => {
+      const bytes = await gitBytes(scenario.sourceRepository, [
+        'show', `${input.sourceRef}:${input.sourcePath}`,
+      ]);
+      const destination = join(temporaryWorkspace, input.path);
+      await mkdir(dirname(destination), { recursive: true });
+      await writeFile(destination, bytes);
+      return { ...input, sha256: sha256(bytes) };
+    }));
+
     await mustRun('git', ['init', '--quiet', '--initial-branch=main'], { cwd: temporaryWorkspace });
     await mustRun('git', ['config', 'commit.gpgsign', 'false'], { cwd: temporaryWorkspace });
     await mustRun('git', ['add', '--all'], { cwd: temporaryWorkspace });
@@ -53,23 +64,19 @@ export async function prepareFixture(
       env: { ...process.env, ...FIXED_GIT_ENV },
     });
     const templateTree = await gitOutput(temporaryWorkspace, ['rev-parse', 'HEAD^{tree}']);
-    if (templateTree !== baseTree) {
-      throw new Error(`Sanitized fixture tree mismatch: expected ${baseTree}, received ${templateTree}.`);
-    }
     const remotes = await gitOutput(temporaryWorkspace, ['remote']);
     if (remotes) throw new Error(`Sanitized fixture unexpectedly contains remotes: ${remotes}`);
-    const targetPresence = await run('git', ['cat-file', '-e', `${scenario.hiddenTargetCommit}^{commit}`], { cwd: temporaryWorkspace });
+    const targetPresence = await run('git', ['cat-file', '-e', `${referenceCommit}^{commit}`], { cwd: temporaryWorkspace });
     if (targetPresence.code === 0) throw new Error('Hidden target commit leaked into the sanitized fixture object database.');
-    await assertNoIdentifiers(temporaryWorkspace, [scenario.hiddenTargetCommit, ...scenario.sourceTurnIds]);
+    await assertNoIdentifiers(temporaryWorkspace, [referenceCommit, ...scenario.sourceTurnIds]);
 
-    const acceptedSpec = await gitBytes(scenario.sourceRepository, ['show', `${scenario.baseCommit}:${scenario.acceptedSpecPath}`]);
     const transcriptFiles = await Promise.all(scenario.sourceRollouts.map(async (path) => {
       const bytes = await readFile(path);
       return { path, sha256: sha256(bytes), bytes: bytes.length };
     }));
     const templateHead = await gitOutput(temporaryWorkspace, ['rev-parse', 'HEAD']);
     const manifest: PreparedFixtureManifest = {
-      version: 1,
+      version: 3,
       fixtureId: scenario.fixtureId,
       createdAt: new Date().toISOString(),
       source: {
@@ -78,17 +85,19 @@ export async function prepareFixture(
         statusBefore: sourceStatusBefore,
         baseCommit: scenario.baseCommit,
         baseTree,
-        acceptedSpecPath: scenario.acceptedSpecPath,
-        acceptedSpecSha256: sha256(acceptedSpec),
+        referenceCommit,
+        referenceTree,
+        visibleInputs,
         transcriptFiles,
         sourceTurnIds: scenario.sourceTurnIds,
       },
       template: { path: templatePath, headCommit: templateHead, tree: templateTree },
       evaluation: {
-        hiddenTargetCommit: scenario.hiddenTargetCommit,
-        hiddenTargetTree,
         forbiddenPaths: scenario.forbiddenPaths,
-        requiredCommands: scenario.requiredCommands,
+        overlayPaths: scenario.evaluator.overlayPaths,
+        overlayRewrites: scenario.evaluator.overlayRewrites,
+        formatCommand: scenario.evaluator.formatCommand,
+        behavioralCommand: scenario.evaluator.behavioralCommand,
       },
     };
     await writeFile(join(temporaryRoot, 'fixture-manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
@@ -130,7 +139,21 @@ async function isValidTemplate(
   scenario: BenchmarkScenario,
   expectedTree: string,
 ) {
-  if (manifest.version !== 1 || manifest.fixtureId !== scenario.fixtureId || manifest.template.tree !== expectedTree) return false;
+  if (
+    manifest.version !== 3 ||
+    manifest.fixtureId !== scenario.fixtureId ||
+    manifest.source.baseTree !== expectedTree ||
+    manifest.source.referenceCommit !== await gitOutput(
+      scenario.sourceRepository,
+      ['rev-parse', `${scenario.referenceCommit}^{commit}`],
+    ) ||
+    JSON.stringify(manifest.source.visibleInputs.map(({ path, sourceRef, sourcePath }) => ({ path, sourceRef, sourcePath }))) !==
+      JSON.stringify(scenario.visibleInputs) ||
+    JSON.stringify(manifest.evaluation.overlayPaths) !==
+      JSON.stringify(scenario.evaluator.overlayPaths) ||
+    JSON.stringify(manifest.evaluation.overlayRewrites ?? []) !==
+      JSON.stringify(scenario.evaluator.overlayRewrites)
+  ) return false;
   try {
     const [head, tree, status, remotes] = await Promise.all([
       gitOutput(manifest.template.path, ['rev-parse', 'HEAD']),
@@ -138,7 +161,7 @@ async function isValidTemplate(
       gitOutput(manifest.template.path, ['status', '--porcelain=v1', '--untracked-files=all']),
       gitOutput(manifest.template.path, ['remote']),
     ]);
-    return head === manifest.template.headCommit && tree === expectedTree && status === '' && remotes === '';
+    return head === manifest.template.headCommit && tree === manifest.template.tree && status === '' && remotes === '';
   } catch {
     return false;
   }

@@ -1,8 +1,8 @@
 import type { CanonicalJsonValue } from '../storage/canonical-json.ts';
 
-export const CONTEXT_COMPILER_VERSION = 'agent-thread-compiler-v2' as const;
-export const CONTEXT_POLICY_VERSION = 'agent-thread-policy-v2' as const;
-export const PROMPT_MANIFEST_VERSION = 'agent-thread-prompt-v2' as const;
+export const CONTEXT_COMPILER_VERSION = 'agent-thread-compiler-v3' as const;
+export const CONTEXT_POLICY_VERSION = 'agent-thread-policy-v4' as const;
+export const PROMPT_MANIFEST_VERSION = 'agent-thread-prompt-v4' as const;
 
 export type ThreadContextLayerKind =
   | 'thread_document'

@@ -41,9 +41,14 @@ import {
   type LogicalContextMessage,
 } from './logical-context.ts';
 import type { ThreadContextFrameCandidate } from './context/manifest.ts';
-import { createContextTools } from './context/tools.ts';
+import {
+  createContextTools,
+  PARENT_CONTEXT_TOOL_NAMES,
+  WORK_UNIT_CONTEXT_TOOL_NAMES,
+} from './context/tools.ts';
 import { canonicalJsonHash } from './storage/canonical-json.ts';
 import { createRemuxAgentSession } from './pi-session.ts';
+import { REMUX_SYSTEM_PROMPT } from './prompts.ts';
 import {
   createWorkspaceReadTool,
   readWorkspaceFile,
@@ -51,30 +56,32 @@ import {
 } from './workspace-read.ts';
 
 const PROVIDER = 'openai-codex';
-const SYSTEM_PROMPT = `You are the Remux coding agent. The conversation cwd is your default location and orientation, not a filesystem boundary; use absolute paths when work legitimately spans elsewhere on this machine.
-
-Your active context contains exact recent completed user/assistant dialogue, the nearer branch-scoped thread.md collaboration brief, and exact scratch for the current execution scope. Recent dialogue may contain superseded statements; thread.md is the current shared understanding. The immutable journal is the source of truth for omitted messages, commands, tool results, and evidence. journal_search and journal_open retrieve cold history temporarily; retrieval alone does not make it future thread state.
-
-thread.md is living shared state, not a transcript or reasoning log. Use thread_read and thread_update when a meaningful transition changes the current objective, accepted decisions, constraints, implementation state, important resources, open questions, or near-term direction. Keep it coherent by revising and deleting stale text. Do not copy raw files, command output, tool traffic, reasoning traces, or facts needed only for the current answer. A terse user acceptance may update the relevant decision, but model-authored thread state never overrides the current user, an accepted contract, or observed repository state. Before implementing or auditing against an active governing file named in thread state, reopen that exact file unless its exact contents are already in the current scope.
-
-Use read, bash, edit, and write for normal coding work. Re-open exact journal evidence when an omitted fact matters instead of guessing, and re-read mutable files before editing or final validation. Preserve user work, validate changes in proportion to risk, and report honestly. Reasoning and tool scratch are local to the current turn and do not need to be summarized for their own sake.`;
-
-const WORK_UNIT_PROMPT = `Use work_unit_enter only when a substantial coherent subproblem benefits from bounded scratch; ordinary short tool sequences stay in the parent turn. A work unit inherits the parent context but its reasoning and tools remain local. Work units cannot be nested. While inside one, do not answer the user or update thread.md directly: finish with work_unit_return containing a concise Markdown result for the parent, which will resume and integrate it.`;
+const BASE_TOOL_NAMES = ['read', 'bash', 'edit', 'write', 'workspace_read'] as const;
+const PARENT_ACTIVE_TOOL_NAMES = [...BASE_TOOL_NAMES, ...PARENT_CONTEXT_TOOL_NAMES];
+const WORK_UNIT_ACTIVE_TOOL_NAMES = [...BASE_TOOL_NAMES, ...WORK_UNIT_CONTEXT_TOOL_NAMES];
 
 function runtimeContract() {
-  const systemPrompt = `${SYSTEM_PROMPT}\n\n${WORK_UNIT_PROMPT}`;
+  const systemPrompt = REMUX_SYSTEM_PROMPT;
   const tools = [
     'read@pi-0.84',
     'bash@pi-0.84',
     'edit@pi-0.84',
     'write@pi-0.84',
-    'journal@3',
-    'thread@1',
-    'work-unit@1',
+    'history@1',
+    'thread@3',
+    'work-unit@2',
   ];
   return {
     systemPrompt,
-    fixedContractsHash: canonicalJsonHash({ piVersion: '0.84.0', systemPrompt, tools }),
+    fixedContractsHash: canonicalJsonHash({
+      piVersion: '0.84.0',
+      systemPrompt,
+      tools,
+      activeToolProfiles: {
+        parent: PARENT_ACTIVE_TOOL_NAMES,
+        workUnit: WORK_UNIT_ACTIVE_TOOL_NAMES,
+      },
+    }),
   };
 }
 
@@ -323,6 +330,11 @@ export class PiEngine implements AgentEngine {
           result: durableToolResult({ content: event.content }, event.isError),
           isError: event.isError,
         });
+        if (!event.isError && event.toolName === 'work_unit_start') {
+          pi.setActiveTools(WORK_UNIT_ACTIVE_TOOL_NAMES);
+        } else if (!event.isError && event.toolName === 'work_unit_finish') {
+          pi.setActiveTools(PARENT_ACTIVE_TOOL_NAMES);
+        }
       });
     };
 
@@ -430,6 +442,7 @@ export class PiEngine implements AgentEngine {
         options.onEvent({ type: 'context-probe', probe });
       },
     });
+    session.setActiveToolsByName(PARENT_ACTIVE_TOOL_NAMES);
     const unsubscribe = session.subscribe((event) => {
       if (event.type === 'agent_end') {
         pendingAgentEnd = event;
@@ -499,12 +512,12 @@ function contextFrameMessage(
   scopeKind: 'turn' | 'work_unit',
 ): Message {
   const scopeBoundary = scopeKind === 'work_unit'
-    ? 'Active execution scope: bounded work unit. Keep scratch local and finish with work_unit_return.'
-    : 'Active execution scope: parent turn. work_unit_return is invalid unless work_unit_enter has opened a child scope.';
+    ? 'Current work: focused work unit. Keep scratch local and finish with work_unit_finish.'
+    : 'Current work: parent conversation. work_unit_finish is valid only after work_unit_start has opened a work unit.';
   return {
     role: 'user',
     content: [
-      'The following is the active Remux thread context. The exact user message after it is the current request. Omitted evidence remains available through journal tools.',
+      'The following is the living Thread for this conversation. The exact user message after it is the current request. Exact earlier activity remains available through History tools.',
       scopeBoundary,
       candidate.bootstrap,
     ].join('\n\n'),

@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "build": "npm run build:server && npm run build:viewer",
-    "build:server": "vite build --config server/vite.config.ts",
+    "build:server": "vite build --config server/vite.config.ts && node scripts/verify-built-prompts.mjs",
     "build:viewer": "vite build --config viewer/vite.config.ts",
     "test": "npm run test:server && npm run test:unit && npm run test:viewer",
     "test:server": "node --test --experimental-strip-types tests/*.test.ts",

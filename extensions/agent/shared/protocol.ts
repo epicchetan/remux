@@ -8,6 +8,8 @@ export const AGENT_METHODS = {
   authLogout: 'remux/agent/auth/logout',
   modelsRead: 'remux/agent/models/read',
   artifactRead: 'remux/agent/artifact/read',
+  threadRead: 'remux/agent/thread/read',
+  turnRead: 'remux/agent/turn/read',
   conversationCreate: 'remux/agent/conversation/create',
   messageSend: 'remux/agent/conversation/message/send',
   messageQueueRemove: 'remux/agent/conversation/message/queue/remove',
@@ -179,6 +181,45 @@ export type ContextInspectorValue = {
     count: number;
   }>;
   omissionsTruncated: boolean;
+};
+
+export type ThreadCanvasVersion = {
+  versionId: string;
+  ordinal: number;
+  basedOnTurnId: string | null;
+  createdAt: number;
+  content: string;
+  byteLength: number;
+};
+
+export type ThreadCanvasValue = {
+  conversationId: string;
+  documentId: string;
+  current: ThreadCanvasVersion;
+  previous: ThreadCanvasVersion | null;
+};
+
+export type ThreadReadParams = {
+  conversationId: string;
+};
+
+export type TurnReadParams = {
+  conversationId: string;
+  turnId: string;
+};
+
+export type TurnReadValue = {
+  conversationId: string;
+  turnId: string;
+  state: 'running' | 'completed' | 'failed' | 'interrupted' | 'interrupted_by_restart';
+  terminal: boolean;
+  terminalSequence: number | null;
+  error: string | null;
+  errorCode: 'provider_error' | 'runtime_error' | 'storage_error' | null;
+  threadVersionBefore: string;
+  threadVersionAfter: string | null;
+  createdAt: number;
+  updatedAt: number;
 };
 
 export type AgentRuntimeValue = {

@@ -6,20 +6,24 @@ import test from 'node:test';
 
 import { createBenchmarkTarget } from './benchmark/adapters.ts';
 import type { BenchmarkScenario } from './benchmark/contracts.ts';
-import { evaluateLifecycleRegressions, summarizeCodexRollout } from './benchmark/evidence.ts';
+import { summarizeCodexRollout } from './benchmark/evidence.ts';
 import { prepareFixture } from './benchmark/fixture.ts';
 import { run } from './benchmark/process.ts';
-import { LEDGER_FEED_SESSION_SCENARIO } from './benchmark/scenarios.ts';
+import { LEDGER_PROJECTION_TIME_BARS_SCENARIO } from './benchmark/scenarios.ts';
 import type { RemuxBenchmarkClient } from './benchmark/remux-client.ts';
 
-test('ledger benchmark stages preserve the collaborative permission envelope', () => {
-  const scenario = LEDGER_FEED_SESSION_SCENARIO;
-  assert.deepEqual(scenario.stages.map(({ id }) => id), ['audit', 'implement', 'fifo-correction', 'final-audit']);
-  assert.equal(scenario.stages[0].permissions.mayWrite, false);
-  assert.ok(scenario.stages.slice(1).every(({ permissions }) => permissions.mayCommit === false && permissions.mayPush === false));
-  assert.ok(scenario.stages.every(({ defaultPrompt }) => !defaultPrompt.includes(scenario.hiddenTargetCommit)));
-  assert.ok(scenario.stages.length <= scenario.maxUserTurns);
-  assert.ok(scenario.hiddenValidationPaths.length > 0);
+test('ledger parity benchmark exposes a fixed authoritative implementation contract', () => {
+  const scenario = LEDGER_PROJECTION_TIME_BARS_SCENARIO;
+  assert.equal(scenario.version, 3);
+  assert.equal(scenario.suite, 'parity');
+  assert.equal(scenario.driverBrief.defaultAuthority.mayWrite, true);
+  assert.equal(scenario.driverBrief.defaultAuthority.mayCommit, false);
+  assert.equal(scenario.driverBrief.defaultAuthority.mayPush, false);
+  assert.equal(scenario.maxUserTurns, 1);
+  assert.match(scenario.fixedPrompt ?? '', /final and authoritative/u);
+  assert.ok(scenario.visibleInputs.length > 0);
+  assert.ok(scenario.evaluator.overlayPaths.length > 0);
+  assert.ok(!JSON.stringify(scenario.driverBrief).includes(scenario.referenceCommit));
 });
 
 test('fixture preparation creates deterministic, isolated Git history', async (context) => {
@@ -90,7 +94,7 @@ test('Codex adapter uses public start/send/runtime/transcript contracts', async 
   assert.ok(calls.some(({ method }) => method === 'remux/codex/transcript/resources/read'));
 });
 
-test('Agent adapter uses public create/send/runtime/transcript contracts', async () => {
+test('Agent adapter uses public create/send/durable-turn/transcript contracts', async () => {
   const calls: string[] = [];
   const fake = {
     async query(method: string) {
@@ -101,12 +105,14 @@ test('Agent adapter uses public create/send/runtime/transcript contracts', async
           { key: 'models', status: 'ok', value: { models: [{ id: 'gpt-test', supportedReasoning: ['high'] }] } },
         ] };
       }
-      if (method === 'remux/agent/resources/read') {
-        return { resources: [{ status: 'ok', value: { conversationId: 'conversation-1', state: 'idle' } }] };
+      if (method === 'remux/agent/turn/read') {
+        return {
+          conversationId: 'conversation-1', turnId: 'turn-1', state: 'completed', terminal: true,
+        };
       }
       return { resources: [{ status: 'ok', value: {
         turnOrder: ['turn-1'], activeTurnId: null,
-        turns: [{ status: 'ok', turnId: 'turn-1', frame: { segments: [{ type: 'assistantMessage', text: 'agent done' }] } }],
+        turns: [{ status: 'ok', turnId: 'turn-1', frame: { status: 'completed', segments: [{ type: 'assistantMessage', text: 'agent done' }] } }],
       } }] };
     },
     async command(method: string) {
@@ -123,28 +129,27 @@ test('Agent adapter uses public create/send/runtime/transcript contracts', async
   assert.equal(transcript.assistantTextByTurn['turn-1'], 'agent done');
   assert.ok(calls.includes('remux/agent/conversation/create'));
   assert.ok(calls.includes('remux/agent/conversation/message/send'));
+  assert.ok(calls.includes('remux/agent/turn/read'));
   assert.ok(calls.includes('remux/agent/transcript/resources/read'));
 });
 
 test('Agent adapter waits for a failed turn to settle durably before returning the error', async () => {
-  let transcriptReads = 0;
+  let durableReads = 0;
   const fake = {
     async query(method: string) {
-      if (method === 'remux/agent/resources/read') {
-        return { resources: [{ status: 'ok', value: {
-          conversationId: 'conversation-failed', state: 'error', error: 'provider failed',
-        } }] };
+      if (method === 'remux/agent/turn/read') {
+        durableReads += 1;
+        return durableReads === 1
+          ? {
+              conversationId: 'conversation-failed', turnId: 'turn-failed',
+              state: 'running', terminal: false,
+            }
+          : {
+              conversationId: 'conversation-failed', turnId: 'turn-failed',
+              state: 'failed', terminal: true, error: 'provider failed',
+            };
       }
-      transcriptReads += 1;
-      return { resources: [{ status: 'ok', value: {
-        turnOrder: ['turn-failed'],
-        activeTurnId: transcriptReads === 1 ? 'turn-failed' : null,
-        turns: [{
-          status: transcriptReads === 1 ? 'ok' : 'error',
-          turnId: 'turn-failed',
-          frame: { segments: [] },
-        }],
-      } }] };
+      throw new Error(`unexpected query ${method}`);
     },
     async command() {
       throw new Error('not used');
@@ -158,23 +163,30 @@ test('Agent adapter waits for a failed turn to settle durably before returning t
     }),
     /Agent turn failed: provider failed/u,
   );
-  assert.equal(transcriptReads, 2);
+  assert.equal(durableReads, 2);
 });
 
-test('Agent adapter waits for a successful turn to settle durably after runtime idle', async () => {
+test('Agent adapter waits for durable completion before reading the terminal transcript', async () => {
+  let durableReads = 0;
   let transcriptReads = 0;
   const fake = {
     async query(method: string) {
-      if (method === 'remux/agent/resources/read') {
-        return { resources: [{ status: 'ok', value: {
-          conversationId: 'conversation-completed', state: 'idle', activeTurnId: null,
-        } }] };
+      if (method === 'remux/agent/turn/read') {
+        durableReads += 1;
+        return {
+          conversationId: 'conversation-completed', turnId: 'turn-completed',
+          state: durableReads === 1 ? 'running' : 'completed',
+          terminal: durableReads !== 1,
+        };
       }
       transcriptReads += 1;
       return { resources: [{ status: 'ok', value: {
         turnOrder: ['turn-completed'],
-        activeTurnId: transcriptReads === 1 ? 'turn-completed' : null,
-        turns: [{ status: 'ok', turnId: 'turn-completed', frame: { segments: [] } }],
+        activeTurnId: null,
+        turns: [{
+          status: 'ok', turnId: 'turn-completed',
+          frame: { status: 'completed', segments: [] },
+        }],
       } }] };
     },
     async command() {
@@ -186,7 +198,8 @@ test('Agent adapter waits for a successful turn to settle durably after runtime 
   await target.waitForTerminal({
     conversationId: 'conversation-completed', turnId: 'turn-completed', timeoutMs: 2_000,
   });
-  assert.equal(transcriptReads, 2);
+  assert.equal(durableReads, 2);
+  assert.equal(transcriptReads, 1);
 });
 
 test('Agent benchmark always enters the single production context architecture', async () => {
@@ -228,7 +241,7 @@ test('rollout evidence reports token, compaction, tool, and leakage signals', as
   const source = join(root, 'source');
   const workspace = join(root, '.remux-benchmarks', 'runs', 'run', 'workspace');
   const path = join(root, 'rollout.jsonl');
-  const scenario = { ...LEDGER_FEED_SESSION_SCENARIO, sourceRepository: source };
+  const scenario = { ...LEDGER_PROJECTION_TIME_BARS_SCENARIO, sourceRepository: source };
   await writeFile(path, [
     JSON.stringify({ type: 'response_item', payload: { type: 'function_call', name: 'exec_command', arguments: JSON.stringify({ cmd: `git -C ${source} show HEAD` }) } }),
     JSON.stringify({ type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', input: `await tools.exec_command({cmd: 'git status', workdir: '${workspace}'})` } }),
@@ -249,58 +262,36 @@ test('rollout evidence reports token, compaction, tool, and leakage signals', as
   assert.ok(summary.leakageFindings.some((finding) => finding.includes(source)));
 });
 
-test('frozen lifecycle checks catch stale-clock and discarded-shutdown regressions', async (context) => {
-  const root = await mkdtemp(join(tmpdir(), 'remux-benchmark-lifecycle-'));
-  context.after(() => rm(root, { recursive: true, force: true }));
-  const feedPath = join(root, 'crates/ledger/src/feed/es_replay');
-  const cliPath = join(root, 'crates/cli/src');
-  await Promise.all([mkdir(feedPath, { recursive: true }), mkdir(cliPath, { recursive: true })]);
-  await writeFile(join(feedPath, 'feed.rs'), `
-    write.replace_array(&cells.batches, kept);
-    ctx.submit(write).await?;
-    continue;
-    while batch_idx < total_batches {}
-  `);
-  await writeFile(join(cliPath, 'main.rs'), `
-    let run_result = drive().await;
-    let shutdown_result = session.shutdown().await;
-    match (run_result, shutdown_result) {
-      (Err(error), Err(shutdown_error)) => return Err(error.context(format!("session shutdown also failed: \${shutdown_error}"))),
-      _ => todo!(),
-    }
-  `);
-  assert.deepEqual(await evaluateLifecycleRegressions(root), {
-    feedRereadsClock: true,
-    dualErrorsPreserved: true,
-  });
-
-  await writeFile(join(feedPath, 'feed.rs'), 'write.replace_array(&cells.batches, kept); ctx.submit(write).await?; while due {}');
-  await writeFile(join(cliPath, 'main.rs'), 'let run_result = drive().await; let shutdown_result = session.shutdown().await; run_result?; shutdown_result?;');
-  assert.deepEqual(await evaluateLifecycleRegressions(root), {
-    feedRereadsClock: false,
-    dualErrorsPreserved: false,
-  });
-});
-
 function testScenario(source: string, baseCommit: string, targetCommit: string, rollout: string): BenchmarkScenario {
   return {
-    version: 1,
+    version: 3,
+    suite: 'parity',
     fixtureId: 'fixture-test',
     title: 'fixture test',
     sourceRepository: source,
     baseCommit,
-    acceptedSpecPath: 'docs/spec.md',
-    hiddenTargetCommit: targetCommit,
+    referenceCommit: targetCommit,
     sourceRollouts: [rollout],
     sourceTurnIds: ['turn-source-only'],
+    visibleInputs: [{ path: 'docs/spec.md', sourceRef: baseCommit, sourcePath: 'docs/spec.md' }],
+    governingPaths: ['docs/spec.md'],
+    fixedPrompt: 'Implement the spec.',
+    driverCardPath: null,
+    driverBrief: {
+      goal: 'test the fixture',
+      background: [],
+      constraints: [],
+      defaultAuthority: { mayWrite: false, mayCommit: false, mayPush: false },
+    },
     maxUserTurns: 1,
-    stages: [{
-      id: 'audit', title: 'audit', ownerIntent: ['audit'], defaultPrompt: 'audit',
-      permissions: { mayWrite: false, mayCommit: false, mayPush: false },
-    }],
+    maxDurationMs: 60_000,
     forbiddenPaths: [],
-    hiddenValidationPaths: [],
-    requiredCommands: [],
+    evaluator: {
+      overlayPaths: [],
+      overlayRewrites: [],
+      formatCommand: { id: 'format', file: 'true', args: [] },
+      behavioralCommand: { id: 'behavior', file: 'true', args: [] },
+    },
   };
 }
 

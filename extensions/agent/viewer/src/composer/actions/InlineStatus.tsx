@@ -2,6 +2,7 @@ import type { ContextInspectorValue, ConversationValue } from '../../../../share
 import { reasoningLabel, resolveModel } from '../config/modelSelection.ts';
 import { useComposerStore } from '../store.ts';
 import { ContextArtifactButton } from './ContextArtifactButton.tsx';
+import { ThreadCanvasButton } from './ThreadCanvasButton.tsx';
 
 export function ComposerInlineStatus({
   conversation,
@@ -24,7 +25,16 @@ export function ComposerInlineStatus({
         <span className="remux-composer-status-separator" aria-hidden="true">/</span>
         <span className="truncate">{reasoningLabel(reasoning)} reasoning</span>
       </div>
-      {contextInspector ? <ContextInspector value={contextInspector} /> : null}
+      {conversation ? (
+        <div className="remux-composer-status-actions">
+          <ThreadCanvasButton
+            conversationId={conversation.id}
+            latestTurnId={conversation.latestTurnId}
+            versionHint={contextInspector?.threadVersionId ?? null}
+          />
+          {contextInspector ? <ContextInspector value={contextInspector} /> : null}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -35,7 +45,7 @@ function ContextInspector({ value }: { value: ContextInspectorValue }) {
   return (
     <details className="agent-context-inspector" data-testid="context-inspector">
       <summary>
-        thread {formatTokens(tokens('thread_document'))} · recent {formatTokens(tokens('recent_dialogue'))} · active {formatTokens(tokens('active_scope'))} · {value.scopeKind === 'work_unit' ? 'work unit' : 'turn'}
+        Thread {formatTokens(tokens('thread_document'))} · recent {formatTokens(tokens('recent_dialogue'))} · active {formatTokens(tokens('active_scope'))} · {value.scopeKind === 'work_unit' ? 'work unit' : 'turn'}
       </summary>
       <section className="agent-context-inspector-panel" aria-label="Inference context inspector">
         <header>
@@ -44,20 +54,20 @@ function ContextInspector({ value }: { value: ContextInspectorValue }) {
         </header>
         <section className="agent-context-inspector-section">
           <div className="agent-context-inspector-heading">
-            <strong>Thread frame</strong>
+            <strong>Thread context</strong>
             <span>{value.transportMode} transport</span>
           </div>
           <div className="agent-context-inspector-metrics">
             <span>{formatTokens(value.estimatedInputTokens)} estimated</span>
             <span>{value.messageCount} messages / {value.turnCount} turns</span>
-            <span>{formatBytes(value.threadDocumentBytes)} thread.md</span>
+            <span>{formatBytes(value.threadDocumentBytes)} Thread</span>
             <span>{formatTokens(value.softContextLimit)} soft / {formatTokens(value.hardContextLimit)} hard</span>
             <span>{value.pressureNoticed ? 'pressure noticed' : 'healthy'}</span>
           </div>
           <ContextArtifactButton
             artifact={value.bootstrapArtifact}
-            label="Open compiled thread bootstrap"
-            title="Exact dispatched thread bootstrap"
+            label="Open compiled Thread context"
+            title="Exact dispatched Thread context"
           />
         </section>
         <div className="agent-context-inspector-blocks">
@@ -72,7 +82,7 @@ function ContextInspector({ value }: { value: ContextInspectorValue }) {
         <section className="agent-context-inspector-section">
           <div className="agent-context-inspector-heading">
             <strong>Selected dialogue</strong>
-            <span>{value.dialogueTurnIds.length} exact · {value.omittedDialogueTurns} cold</span>
+            <span>{value.dialogueTurnIds.length} shown · {value.omittedDialogueTurns} in History</span>
           </div>
           <div className="agent-context-actual-groups">
             <div>
@@ -142,5 +152,12 @@ function compactSource(source: string) {
 }
 
 function layerLabel(kind: ContextInspectorValue['layers'][number]['kind']) {
-  return kind.replaceAll('_', ' ');
+  switch (kind) {
+    case 'thread_document':
+      return 'Thread';
+    case 'recent_dialogue':
+      return 'recent conversation';
+    case 'active_scope':
+      return 'current work';
+  }
 }

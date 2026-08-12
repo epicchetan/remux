@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { basename, isAbsolute } from 'node:path';
+import { readFile } from 'node:fs/promises';
+import { basename, isAbsolute, resolve } from 'node:path';
 
 import type { AssistantMessage } from '@earendil-works/pi-ai';
 
@@ -14,6 +15,8 @@ import {
   type ContextInspectorValue,
   type MessageSendParams,
   type ReasoningLevel,
+  type ThreadCanvasValue,
+  type TurnReadValue,
 } from '../../../shared/protocol.ts';
 import {
   DEFAULT_TRANSCRIPT_TAIL_TURNS,
@@ -42,8 +45,13 @@ import type {
   JournalSearchInput,
   JournalSearchResult,
   ThreadDocumentView,
-  ThreadUpdateInput,
+  ThreadPatchInput,
+  ThreadReplaceInput,
   WorkUnitEnterInput,
+  WorkUnitResourceRef,
+  WorkUnitResourceView,
+  WorkUnitReturnInput,
+  WorkUnitReturnStatus,
 } from '../engine.ts';
 import {
   PROMPT_MANIFEST_VERSION,
@@ -69,6 +77,11 @@ import type { AgentDataRootOptions } from './data-root.ts';
 import { AgentArtifactStore, type StagedArtifact } from './artifact-store.ts';
 import { durableProjectionDigest } from './projection-hash.ts';
 import { agentComposerPartsHashValue, decodeAgentImageDataUrl } from '../user-input.ts';
+import {
+  renderMaterializedResourceSection,
+  renderWorkUnitPrompt,
+  type MaterializedPromptResource,
+} from '../prompts.ts';
 
 const CREATE_CONVERSATION_KIND = 'conversation.create';
 const SEND_MESSAGE_KIND = 'message.send';
@@ -1267,6 +1280,11 @@ export class AgentJournalRepository {
     const actions: DurableTranscriptProjectionAction[] = [];
     const startedAtByTurn = new Map<string, number>();
     for (const event of events) {
+      // Work-unit events share the parent turn id so they remain searchable and
+      // auditable, but they are intentionally not top-level transcript rows.
+      // Project only the public transcript boundary; otherwise a child tool
+      // event is mistaken for a missing durable transcript item on reload.
+      if (event.visibility !== 'transcript') continue;
       if (!event.turnId || !event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) continue;
       const payload = event.payload as Record<string, CanonicalJsonValue>;
       if (event.type === 'message.user') {
@@ -1412,6 +1430,7 @@ export class AgentJournalRepository {
              operation_id, payload_json, artifact_hash, created_at
       FROM events
       WHERE conversation_id = ? AND turn_id IN (${placeholders})
+        AND visibility = 'transcript'
         AND type IN (
           'message.user', 'assistant.checkpoint', 'tool.called',
           'tool.completed', 'turn.terminal'
@@ -1486,6 +1505,7 @@ export class AgentJournalRepository {
     }
 
     for (const event of events) {
+      if (event.visibility !== 'transcript') continue;
       if (!event.turnId || !event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
         continue;
       }
@@ -1819,13 +1839,13 @@ export class AgentJournalRepository {
     const notice = await this.prepareText(scope.kind === 'work_unit'
       ? [
           'Context pressure notice: this bounded work unit is approaching its healthy context boundary.',
-          'Finish the current coherent checkpoint, perform the most important remaining validation, then call work_unit_return with the bounded result the parent needs.',
-          'Do not claim unperformed work or validation. Exact evidence remains available through the journal.',
+          'Return at the current coherent checkpoint, perform the most important remaining validation, then call work_unit_finish with completed, partial, or blocked status and what the parent needs.',
+          'Do not claim unperformed work or validation. Exact evidence remains available through History.',
         ].join('\n\n')
       : [
           'Context pressure notice: this parent turn is approaching its healthy context boundary.',
-          'Integrate completed work, update thread.md if future shared state changed, and complete the user turn honestly.',
-          'Do not claim unperformed work or validation. Exact evidence remains available through the journal.',
+          'Integrate completed work, update the Thread if future shared state changed, and complete the user turn honestly.',
+          'Do not claim unperformed work or validation. Exact evidence remains available through History.',
         ].join('\n\n'));
     return this.enqueueWrite(() => this.storage.transaction(() => {
       this.assertRunningHandle(handle);
@@ -1903,7 +1923,7 @@ export class AgentJournalRepository {
       ? [
           'The runtime restarted inside this bounded work unit.',
           'Continue its objective from the exact child context and durable tool results.',
-          'Do not answer the user directly; finish by calling work_unit_return.',
+          'Do not answer the user directly; finish by calling work_unit_finish.',
         ].join(' ')
       : [
           'The runtime restarted during this active turn.',
@@ -2421,22 +2441,173 @@ export class AgentJournalRepository {
     };
   }
 
-  async updateThread(
+  async readThreadHistory(conversationId: string): Promise<ThreadCanvasValue> {
+    this.assertOpen();
+    await this.writerTail;
+    const row = this.storage.database.prepare(`
+      SELECT d.document_id,
+             current.version_id AS current_version_id,
+             current.ordinal AS current_ordinal,
+             current.based_on_turn_id AS current_turn_id,
+             current.created_at AS current_created_at,
+             current.content_artifact_hash AS current_artifact_hash,
+             previous.version_id AS previous_version_id,
+             previous.ordinal AS previous_ordinal,
+             previous.based_on_turn_id AS previous_turn_id,
+             previous.created_at AS previous_created_at,
+             previous.content_artifact_hash AS previous_artifact_hash
+      FROM conversations c
+      JOIN state_documents d
+        ON d.conversation_id = c.conversation_id AND d.strand_id = c.head_strand_id
+       AND d.scope_kind = 'strand' AND d.key = 'thread.md'
+      JOIN document_versions current ON current.version_id = d.head_version_id
+      LEFT JOIN document_versions previous ON previous.version_id = current.parent_version_id
+      WHERE c.conversation_id = ?
+    `).get(conversationId) as {
+      document_id: string;
+      current_version_id: string;
+      current_ordinal: number;
+      current_turn_id: string | null;
+      current_created_at: number;
+      current_artifact_hash: string;
+      previous_version_id: string | null;
+      previous_ordinal: number | null;
+      previous_turn_id: string | null;
+      previous_created_at: number | null;
+      previous_artifact_hash: string | null;
+    } | undefined;
+    if (!row) throw new Error(`Conversation ${conversationId} has no thread.md document.`);
+    const currentContent = await this.readArtifactTextByHash(row.current_artifact_hash);
+    const previousContent = row.previous_artifact_hash
+      ? await this.readArtifactTextByHash(row.previous_artifact_hash)
+      : null;
+    return {
+      conversationId,
+      documentId: row.document_id,
+      current: {
+        versionId: row.current_version_id,
+        ordinal: safeInteger(row.current_ordinal, 'thread document ordinal'),
+        basedOnTurnId: row.current_turn_id,
+        createdAt: safeTimestamp(row.current_created_at),
+        content: currentContent,
+        byteLength: Buffer.byteLength(currentContent, 'utf8'),
+      },
+      previous: row.previous_version_id && row.previous_ordinal !== null &&
+          row.previous_created_at !== null && previousContent !== null
+        ? {
+            versionId: row.previous_version_id,
+            ordinal: safeInteger(row.previous_ordinal, 'previous thread document ordinal'),
+            basedOnTurnId: row.previous_turn_id,
+            createdAt: safeTimestamp(row.previous_created_at),
+            content: previousContent,
+            byteLength: Buffer.byteLength(previousContent, 'utf8'),
+          }
+        : null,
+    };
+  }
+
+  async readTurn(conversationId: string, turnId: string): Promise<TurnReadValue> {
+    this.assertOpen();
+    await this.writerTail;
+    const row = this.storage.database.prepare(`
+      SELECT t.state, t.terminal_sequence, t.thread_version_before, t.thread_version_after,
+             t.created_at, t.updated_at,
+             json_extract(e.payload_json, '$.error') AS error,
+             json_extract(e.payload_json, '$.errorCode') AS error_code
+      FROM turns t
+      LEFT JOIN events e ON e.sequence = t.terminal_sequence AND e.type = 'turn.terminal'
+      WHERE t.conversation_id = ? AND t.turn_id = ?
+    `).get(conversationId, turnId) as {
+      state: string;
+      terminal_sequence: number | null;
+      thread_version_before: string;
+      thread_version_after: string | null;
+      created_at: number;
+      updated_at: number;
+      error: string | null;
+      error_code: string | null;
+    } | undefined;
+    if (!row) throw new Error(`Turn ${turnId} does not exist in conversation ${conversationId}.`);
+    const state = durableTurnReadState(row.state);
+    return {
+      conversationId,
+      turnId,
+      state,
+      terminal: row.terminal_sequence !== null,
+      terminalSequence: row.terminal_sequence === null
+        ? null
+        : safeInteger(row.terminal_sequence, 'turn terminal sequence'),
+      error: row.error,
+      errorCode: durableTurnErrorCode(row.error_code),
+      threadVersionBefore: row.thread_version_before,
+      threadVersionAfter: row.thread_version_after,
+      createdAt: safeTimestamp(row.created_at),
+      updatedAt: safeTimestamp(row.updated_at),
+    };
+  }
+
+  async patchThread(
     handle: DurableTurnHandle,
-    input: ThreadUpdateInput,
+    input: ThreadPatchInput,
   ): Promise<ThreadDocumentView> {
     this.assertOpen();
     if (!input.baseVersionId.trim()) throw new TypeError('baseVersionId is required.');
-    const bytes = Buffer.from(input.content, 'utf8');
+    if (input.edits.length < 1 || input.edits.length > 32) {
+      throw new TypeError('Thread patches require between one and 32 exact edits.');
+    }
+    if (this.scopeIdentity(handle.scopeId).kind !== 'turn') {
+      throw new Error('The Thread is parent-owned; finish the work unit first.');
+    }
+    await this.writerTail;
+    this.assertRunningHandle(handle);
+    const row = this.storage.database.prepare(`
+      SELECT d.head_version_id, v.content_artifact_hash
+      FROM state_documents d
+      JOIN document_versions v ON v.version_id = d.head_version_id
+      WHERE d.conversation_id = ? AND d.strand_id = ?
+        AND d.scope_kind = 'strand' AND d.key = 'thread.md'
+    `).get(handle.conversationId, handle.strandId) as {
+      head_version_id: string;
+      content_artifact_hash: string;
+    } | undefined;
+    if (!row) throw new Error('The active strand has no thread.md document.');
+    if (row.head_version_id !== input.baseVersionId) {
+      throw new Error(
+        `The Thread changed from ${input.baseVersionId} to ${row.head_version_id}; read it and retry.`,
+      );
+    }
+    const content = applyExactThreadEdits(
+      await this.readArtifactTextByHash(row.content_artifact_hash),
+      input.edits,
+    );
+    return this.commitThreadContent(handle, input.baseVersionId, content, 'patch');
+  }
+
+  async replaceThread(
+    handle: DurableTurnHandle,
+    input: ThreadReplaceInput,
+  ): Promise<ThreadDocumentView> {
+    this.assertOpen();
+    if (!input.baseVersionId.trim()) throw new TypeError('baseVersionId is required.');
+    return this.commitThreadContent(handle, input.baseVersionId, input.content, 'replace');
+  }
+
+  private async commitThreadContent(
+    handle: DurableTurnHandle,
+    baseVersionId: string,
+    content: string,
+    method: 'patch' | 'replace',
+  ): Promise<ThreadDocumentView> {
+    const bytes = Buffer.from(content, 'utf8');
     if (bytes.byteLength > 96 * 1024) {
-      throw new TypeError('thread.md must not exceed 96 KiB.');
+      throw new TypeError('The Thread must not exceed 96 KiB.');
     }
     const artifact = await this.artifacts.put(bytes, 'text/markdown; charset=utf-8');
     const versionId = this.nextId('document-version');
     return this.enqueueWrite(() => this.storage.transaction(() => {
       this.assertRunningHandle(handle);
       if (this.scopeIdentity(handle.scopeId).kind !== 'turn') {
-        throw new Error('thread.md is parent-owned; return the work unit result first.');
+        throw new Error('The Thread is parent-owned; finish the work unit first.');
       }
       const document = this.storage.database.prepare(`
         SELECT document_id, head_version_id
@@ -2448,9 +2619,9 @@ export class AgentJournalRepository {
         head_version_id: string;
       } | undefined;
       if (!document) throw new Error('The active strand has no thread.md document.');
-      if (document.head_version_id !== input.baseVersionId) {
+      if (document.head_version_id !== baseVersionId) {
         throw new Error(
-          `thread.md changed from ${input.baseVersionId} to ${document.head_version_id}; read it and retry.`,
+          `The Thread changed from ${baseVersionId} to ${document.head_version_id}; read it and retry.`,
         );
       }
       const ordinalRow = this.storage.database.prepare(`
@@ -2466,9 +2637,10 @@ export class AgentJournalRepository {
         actor: 'model',
         visibility: 'internal',
         payload: {
-          baseVersionId: input.baseVersionId,
+          baseVersionId,
           contentArtifactHash: artifact.hash,
           documentId: document.document_id,
+          method,
           ordinal,
           versionId,
         },
@@ -2495,7 +2667,7 @@ export class AgentJournalRepository {
         UPDATE state_documents
         SET head_version_id = ?, updated_sequence = ?, updated_at = ?
         WHERE document_id = ? AND head_version_id = ?
-      `).run(versionId, sequence, recordedAt, document.document_id, input.baseVersionId);
+      `).run(versionId, sequence, recordedAt, document.document_id, baseVersionId);
       if (updated.changes !== 1) throw new Error('thread.md compare-and-swap failed.');
       this.indexJournalText({
         ref: `journal://document-version/${encodeURIComponent(versionId)}`,
@@ -2505,12 +2677,12 @@ export class AgentJournalRepository {
         turnId: handle.turnId,
         kind: 'thread-document',
         sequence,
-        text: input.content,
+        text: content,
       });
       return {
         documentId: document.document_id,
         versionId,
-        content: input.content,
+        content,
         ref: `journal://document-version/${encodeURIComponent(versionId)}`,
       };
     }));
@@ -2523,17 +2695,18 @@ export class AgentJournalRepository {
     if (Buffer.byteLength(objective, 'utf8') > 4 * 1024) {
       throw new TypeError('A work unit objective must not exceed 4 KiB.');
     }
-    const evidenceRefs = [...new Set(input.evidenceRefs ?? [])];
-    if (evidenceRefs.length > 8 || evidenceRefs.some((ref) => !ref.startsWith('journal://'))) {
-      throw new TypeError('Work unit evidence must contain at most eight journal:// references.');
-    }
-    const orientation = await this.prepareText([
-      'You are now inside a bounded Remux work unit.',
-      `Objective: ${objective}`,
-      evidenceRefs.length > 0 ? `Suggested evidence:\n${evidenceRefs.map((ref) => `- ${ref}`).join('\n')}` : '',
-      'Keep reasoning and tool scratch local. Do not answer the user or update thread.md directly.',
-      'When this objective is complete, call work_unit_return with the bounded result the parent needs.',
-    ].filter(Boolean).join('\n\n'));
+    const doneWhen = normalizeWorkUnitDoneWhen(input.doneWhen ?? []);
+    const resources = normalizeWorkUnitResources(input.resources ?? []);
+    const materializedResources = await this.prepareWorkUnitResources(
+      handle,
+      resources,
+      this.parentMaterializedResourceHashes(handle.turnId),
+    );
+    const orientation = await this.prepareText(renderWorkUnitPrompt({
+      objective,
+      doneWhen,
+      resources: materializedResources.map(modelPromptWorkUnitResource),
+    }));
     const child: DurableTurnHandle = { ...handle, scopeId: this.nextId('scope') };
     return this.enqueueWrite(() => this.storage.transaction(() => {
       this.assertRunningHandle(handle);
@@ -2554,9 +2727,10 @@ export class AgentJournalRepository {
         actor: 'model',
         visibility: 'internal',
         payload: {
-          evidenceRefs,
+          doneWhen,
           objective,
           parentScopeId: handle.scopeId,
+          resources: materializedResources.map(({ view }) => view),
           scopeId: child.scopeId,
         },
         createdAt: recordedAt,
@@ -2574,11 +2748,14 @@ export class AgentJournalRepository {
         child.strandId,
         child.turnId,
         handle.scopeId,
-        canonicalJson({ evidenceRefs, objective }),
+        canonicalJson({ doneWhen, objective, resources: materializedResources.map(({ view }) => view) }),
         sequence,
         recordedAt,
         recordedAt,
       );
+      for (const resource of materializedResources) {
+        this.insertArtifact(resource.artifact, sequence, 'content');
+      }
       this.indexJournalText({
         ref: `journal://scope/${encodeURIComponent(child.scopeId)}`,
         projectId: child.projectId,
@@ -2604,30 +2781,51 @@ export class AgentJournalRepository {
         handle: child,
         parentScopeId: handle.scopeId,
         objective,
-        evidenceRefs,
+        doneWhen,
+        resources: materializedResources.map(({ view }) => view),
       };
     }));
   }
 
-  async returnWorkUnit(handle: DurableTurnHandle, input: { result: string }) {
+  async prepareWorkUnitReturn(
+    handle: DurableTurnHandle,
+    input: WorkUnitReturnInput,
+  ): Promise<PreparedWorkUnitReturn> {
     this.assertOpen();
-    const result = input.result.trim();
-    if (!result) throw new TypeError('A work unit result is required.');
-    if (Buffer.byteLength(result, 'utf8') > 16 * 1024) {
-      throw new TypeError('A work unit result must not exceed 16 KiB.');
+    this.assertRunningHandle(handle);
+    const child = this.scopeIdentity(handle.scopeId);
+    if (child.kind !== 'work_unit' || child.parent_scope_id === null) {
+      throw new Error('No work unit is active.');
     }
+    const normalized = normalizeWorkUnitReturnInput(input);
+    const resources = await this.prepareWorkUnitResources(
+      handle,
+      normalized.resources,
+      this.parentMaterializedResourceHashes(handle.turnId),
+    );
+    const bundle = renderWorkUnitReturnBundle({
+      resources: resources.map(modelPromptWorkUnitResource),
+      result: normalized.result,
+      status: normalized.status,
+      threadUpdate: normalized.threadUpdate,
+    });
     const resultArtifact = await this.artifacts.put(
-      Buffer.from(result, 'utf8'),
+      Buffer.from(bundle, 'utf8'),
       'text/markdown; charset=utf-8',
     );
     const folded = await this.prepareText([
-      'Active execution scope: parent turn. The child work unit is closed; do not call work_unit_return again.',
-      `The bounded work unit returned from journal://scope/${encodeURIComponent(handle.scopeId)}.`,
+      'Current work: parent conversation. The focused work unit is closed; do not call work_unit_finish again.',
+      `The work unit returned from history://scope/${encodeURIComponent(handle.scopeId)}.`,
       '',
-      result,
+      bundle,
       '',
-      `Exact child evidence: journal://scope/${encodeURIComponent(handle.scopeId)}`,
+      `Exact work-unit History: history://scope/${encodeURIComponent(handle.scopeId)}`,
     ].join('\n'));
+    return { ...normalized, bundle, folded, resources, resultArtifact };
+  }
+
+  commitWorkUnitReturn(handle: DurableTurnHandle, prepared: PreparedWorkUnitReturn) {
+    this.assertOpen();
     return this.enqueueWrite(() => this.storage.transaction(() => {
       this.assertRunningHandle(handle);
       const child = this.scopeIdentity(handle.scopeId);
@@ -2647,28 +2845,33 @@ export class AgentJournalRepository {
         actor: 'model',
         visibility: 'internal',
         payload: {
+          resources: prepared.resources.map(({ view }) => view),
           parentScopeId: parentHandle.scopeId,
-          resultRef: `journal://artifact/${resultArtifact.hash}`,
+          resultRef: `journal://artifact/${prepared.resultArtifact.hash}`,
           scopeId: handle.scopeId,
+          status: prepared.status,
         },
-        artifactHash: resultArtifact.hash,
+        artifactHash: prepared.resultArtifact.hash,
         createdAt: recordedAt,
       });
-      this.insertArtifact(resultArtifact, terminalSequence, 'content');
+      this.insertArtifact(prepared.resultArtifact, terminalSequence, 'content');
+      for (const resource of prepared.resources) {
+        this.insertArtifact(resource.artifact, terminalSequence, 'content');
+      }
       this.storage.database.prepare(`
         UPDATE execution_scopes
         SET state = 'completed', terminal_sequence = ?, result_artifact_hash = ?, updated_at = ?
         WHERE scope_id = ? AND state = 'running' AND terminal_sequence IS NULL
-      `).run(terminalSequence, resultArtifact.hash, recordedAt, handle.scopeId);
+      `).run(terminalSequence, prepared.resultArtifact.hash, recordedAt, handle.scopeId);
       this.indexJournalText({
-        ref: `journal://artifact/${resultArtifact.hash}`,
+        ref: `journal://artifact/${prepared.resultArtifact.hash}`,
         projectId: handle.projectId,
         conversationId: handle.conversationId,
         strandId: handle.strandId,
         turnId: handle.turnId,
         kind: 'work-unit-result',
         sequence: terminalSequence,
-        text: result,
+        text: prepared.bundle,
       });
       const foldedSequence = this.insertEvent({
         ...parentHandle,
@@ -2678,21 +2881,98 @@ export class AgentJournalRepository {
         visibility: 'internal',
         payload: {
           childScopeId: handle.scopeId,
-          content: folded.ref,
+          content: prepared.folded.ref,
           kind: 'work_unit_result',
-          resultRef: `journal://artifact/${resultArtifact.hash}`,
+          resultRef: `journal://artifact/${prepared.resultArtifact.hash}`,
         },
-        artifactHash: artifactHash(folded.ref),
+        artifactHash: artifactHash(prepared.folded.ref),
         createdAt: recordedAt,
       });
-      this.insertArtifact(folded.artifact, foldedSequence);
+      this.insertArtifact(prepared.folded.artifact, foldedSequence);
       return {
         parentHandle,
-        result,
-        resultRef: `journal://artifact/${resultArtifact.hash}`,
+        status: prepared.status,
+        result: prepared.result,
+        ...(prepared.threadUpdate ? { threadUpdate: prepared.threadUpdate } : {}),
+        resources: prepared.resources.map(({ view }) => view),
+        resultRef: `journal://artifact/${prepared.resultArtifact.hash}`,
         scopeId: handle.scopeId,
       };
     }));
+  }
+
+  async returnWorkUnit(handle: DurableTurnHandle, input: WorkUnitReturnInput) {
+    return this.commitWorkUnitReturn(handle, await this.prepareWorkUnitReturn(handle, input));
+  }
+
+  private async prepareWorkUnitResources(
+    handle: DurableTurnHandle,
+    resources: readonly WorkUnitResourceRef[],
+    inheritedHashes: ReadonlySet<string>,
+  ): Promise<PreparedWorkUnitResource[]> {
+    const identity = this.contextIdentity(handle.conversationId);
+    const seen = new Set(inheritedHashes);
+    const prepared: PreparedWorkUnitResource[] = [];
+    for (const resource of resources) {
+      let content: string;
+      let source: 'file' | 'history';
+      if (resource.ref.startsWith('journal://')) {
+        content = await this.resolveOpenableContent(handle.conversationId, resource.ref);
+        source = 'history';
+      } else {
+        const path = isAbsolute(resource.ref) ? resource.ref : resolve(identity.cwd, resource.ref);
+        const bytes = await readFile(path);
+        try {
+          content = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+        } catch {
+          throw new TypeError(`Work unit resource ${resource.ref} is not UTF-8 text.`);
+        }
+        source = 'file';
+      }
+      const artifact = await this.artifacts.put(
+        Buffer.from(content, 'utf8'),
+        'text/plain; charset=utf-8',
+      );
+      const inclusion = seen.has(artifact.hash) ? 'inherited' : 'materialized';
+      seen.add(artifact.hash);
+      prepared.push({
+        artifact,
+        content,
+        view: {
+          ...resource,
+          inclusion,
+          snapshot: {
+            ref: `journal://artifact/${artifact.hash}`,
+            hash: artifact.hash,
+            byteLength: artifact.byteLength,
+            mediaType: artifact.mediaType,
+            source,
+          },
+        },
+      });
+    }
+    return prepared;
+  }
+
+  private parentMaterializedResourceHashes(turnId: string) {
+    const rows = this.storage.database.prepare(`
+      SELECT payload_json FROM events
+      WHERE turn_id = ? AND type = 'work_unit.returned'
+      ORDER BY sequence
+    `).all(turnId) as Array<{ payload_json: string }>;
+    const hashes = new Set<string>();
+    for (const row of rows) {
+      const payload = JSON.parse(row.payload_json) as { resources?: unknown };
+      if (!Array.isArray(payload.resources)) continue;
+      for (const value of payload.resources) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+        const snapshot = (value as { snapshot?: unknown }).snapshot;
+        if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) continue;
+        const hash = (snapshot as { hash?: unknown }).hash;
+        if (typeof hash === 'string' && /^[0-9a-f]{64}$/u.test(hash)) hashes.add(hash);
+      }
+    }
+    return hashes;
   }
 
   private contextIdentity(conversationId: string) {
@@ -3975,6 +4255,42 @@ export class AgentJournalRepository {
       const durableDurationMs = durationMs === undefined
         ? Math.max(0, recordedAt - safeTimestamp(row.created_at))
         : safeDuration(durationMs);
+      const abandonedScopes = this.storage.database.prepare(`
+        SELECT scope_id
+        FROM execution_scopes
+        WHERE turn_id = ? AND kind = 'work_unit' AND terminal_sequence IS NULL
+        ORDER BY created_sequence, scope_id
+      `).all(handle.turnId) as Array<{ scope_id: string }>;
+      for (const abandoned of abandonedScopes) {
+        const childHandle = { ...handle, scopeId: abandoned.scope_id };
+        const childSequence = this.insertEvent({
+          ...childHandle,
+          eventId: this.nextId('event'),
+          type: 'work_unit.abandoned',
+          actor: 'harness',
+          visibility: 'internal',
+          payload: {
+            parentScopeId: handle.scopeId,
+            reason: error ?? (
+              status === 'interrupted' || status === 'interrupted_by_restart'
+                ? status
+                : 'turn_completed_without_return'
+            ),
+            scopeId: abandoned.scope_id,
+          },
+          createdAt: recordedAt,
+        });
+        this.storage.database.prepare(`
+          UPDATE inferences
+          SET state = 'interrupted', terminal_sequence = ?
+          WHERE scope_id = ? AND terminal_sequence IS NULL
+        `).run(childSequence, abandoned.scope_id);
+        this.storage.database.prepare(`
+          UPDATE execution_scopes
+          SET state = 'abandoned', terminal_sequence = ?, updated_at = ?
+          WHERE scope_id = ? AND terminal_sequence IS NULL
+        `).run(childSequence, recordedAt, abandoned.scope_id);
+      }
       const sequence = this.insertEvent({
         ...handle,
         eventId: this.nextId('event'),
@@ -4051,19 +4367,6 @@ export class AgentJournalRepository {
         sequence,
         handle.scopeId,
       );
-      this.storage.database.prepare(`
-        UPDATE inferences
-        SET state = 'interrupted', terminal_sequence = ?
-        WHERE terminal_sequence IS NULL AND scope_id IN (
-          SELECT scope_id FROM execution_scopes
-          WHERE turn_id = ? AND kind = 'work_unit'
-        )
-      `).run(sequence, handle.turnId);
-      this.storage.database.prepare(`
-        UPDATE execution_scopes
-        SET state = 'abandoned', terminal_sequence = ?, updated_at = ?
-        WHERE turn_id = ? AND kind = 'work_unit' AND terminal_sequence IS NULL
-      `).run(sequence, recordedAt, handle.turnId);
       this.storage.database.prepare(`
         UPDATE execution_scopes
         SET state = ?, terminal_sequence = ?, updated_at = ?
@@ -4842,11 +5145,27 @@ export class DurableTranscriptSelectionError extends Error {
   }
 }
 
-type PreparedReference = {
+export type PreparedReference = {
   ref: DurableContentRef;
   artifact: StagedArtifact | null;
   sha256: string;
   text: string;
+};
+
+type PreparedWorkUnitResource = {
+  artifact: StagedArtifact;
+  content: string;
+  view: WorkUnitResourceView;
+};
+
+export type PreparedWorkUnitReturn = {
+  status: WorkUnitReturnStatus;
+  result: string;
+  threadUpdate?: string;
+  resources: PreparedWorkUnitResource[];
+  bundle: string;
+  resultArtifact: StagedArtifact;
+  folded: PreparedReference;
 };
 
 type PreparedUserInput = {
@@ -5489,6 +5808,150 @@ function sanitizeProviderPayload(value: unknown, key = ''): unknown {
   return value;
 }
 
+function applyExactThreadEdits(content: string, edits: ThreadPatchInput['edits']) {
+  let next = content;
+  for (const [index, edit] of edits.entries()) {
+    if (!edit.oldText) {
+      throw new TypeError(`Thread patch edit ${index + 1} requires non-empty oldText.`);
+    }
+    const match = next.indexOf(edit.oldText);
+    if (match < 0) {
+      throw new Error(`Thread patch edit ${index + 1} did not match the current document.`);
+    }
+    if (next.indexOf(edit.oldText, match + edit.oldText.length) >= 0) {
+      throw new Error(`Thread patch edit ${index + 1} is ambiguous in the current document.`);
+    }
+    next = `${next.slice(0, match)}${edit.newText}${next.slice(match + edit.oldText.length)}`;
+  }
+  if (next === content) throw new Error('Thread patch did not change the document.');
+  return next;
+}
+
+function modelHistoryRef(ref: string) {
+  return ref.replace(/^journal:\/\//u, 'history://');
+}
+
+function modelPromptWorkUnitResource(resource: PreparedWorkUnitResource): MaterializedPromptResource {
+  return {
+    ...resource.view,
+    ref: modelHistoryRef(resource.view.ref),
+    snapshot: {
+      ...resource.view.snapshot,
+      ref: modelHistoryRef(resource.view.snapshot.ref),
+    },
+    content: resource.content,
+  };
+}
+
+function normalizeWorkUnitDoneWhen(values: readonly string[]) {
+  if (values.length > 16) throw new TypeError('A work unit accepts at most sixteen done-when conditions.');
+  const normalized = values.map((value) =>
+    normalizeWorkUnitResourceText(value, 'done-when condition', 4 * 1024));
+  return [...new Set(normalized)];
+}
+
+function normalizeWorkUnitResources(resources: readonly WorkUnitResourceRef[]) {
+  if (resources.length > 16) {
+    throw new TypeError('A work unit accepts at most sixteen resource references.');
+  }
+  const normalized: WorkUnitResourceRef[] = [];
+  const seen = new Set<string>();
+  for (const resource of resources) {
+    const ref = normalizeWorkUnitResourceRef(resource.ref);
+    if (
+      resource.role !== 'authority' && resource.role !== 'deliverable' &&
+      resource.role !== 'evidence'
+    ) {
+      throw new TypeError('A work unit resource role must be authority, deliverable, or evidence.');
+    }
+    const description = resource.description === undefined
+      ? undefined
+      : normalizeWorkUnitResourceText(resource.description, 'resource description', 2 * 1024);
+    const identity = `${resource.role}\0${ref}`;
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    normalized.push({ ref, role: resource.role, ...(description ? { description } : {}) });
+  }
+  if (Buffer.byteLength(canonicalJson(normalized), 'utf8') > 16 * 1024) {
+    throw new TypeError('Work unit resource references must not exceed 16 KiB in total.');
+  }
+  return normalized;
+}
+
+export function normalizeWorkUnitReturnInput(input: WorkUnitReturnInput): {
+  status: WorkUnitReturnStatus;
+  result: string;
+  threadUpdate?: string;
+  resources: WorkUnitResourceRef[];
+} {
+  if (input.status !== 'completed' && input.status !== 'partial' && input.status !== 'blocked') {
+    throw new TypeError('A work unit status must be completed, partial, or blocked.');
+  }
+  if (typeof input.result !== 'string') {
+    throw new TypeError('A work unit result must be text.');
+  }
+  const result = input.result.trim();
+  if (!result) throw new TypeError('A work unit result is required.');
+  if (input.threadUpdate !== undefined && typeof input.threadUpdate !== 'string') {
+    throw new TypeError('A proposed Thread update must be text.');
+  }
+  const threadUpdate = input.threadUpdate?.trim() || undefined;
+  const resources = normalizeWorkUnitResources(input.resources ?? []);
+  return { status: input.status, result, ...(threadUpdate ? { threadUpdate } : {}), resources };
+}
+
+function normalizeWorkUnitResourceRef(value: unknown) {
+  if (typeof value !== 'string') throw new TypeError('A work unit resource reference must be text.');
+  const normalized = value.trim();
+  if (!normalized) throw new TypeError('A work unit resource reference is required.');
+  if (Buffer.byteLength(normalized, 'utf8') > 4 * 1024) {
+    throw new TypeError('A work unit resource reference is too large.');
+  }
+  return normalized;
+}
+
+function normalizeWorkUnitResourceText(value: unknown, label: string, maxBytes: number) {
+  if (typeof value !== 'string') throw new TypeError(`A work unit ${label} must be text.`);
+  const normalized = value.trim().replace(/\s+/gu, ' ');
+  if (!normalized) throw new TypeError(`A work unit ${label} is required.`);
+  if (Buffer.byteLength(normalized, 'utf8') > maxBytes) {
+    throw new TypeError(`A work unit ${label} is too large.`);
+  }
+  return normalized;
+}
+
+function renderWorkUnitReturnBundle(input: {
+  status: WorkUnitReturnStatus;
+  result: string;
+  threadUpdate?: string;
+  resources: readonly MaterializedPromptResource[];
+}) {
+  const sections = [
+    '# Completed work unit',
+    '',
+    '## Status',
+    '',
+    input.status,
+    '',
+    '## Result',
+    '',
+    input.result,
+  ];
+  if (input.threadUpdate) {
+    sections.push(
+      '',
+      '## Proposed Thread update',
+      '',
+      'The parent must deliberately merge this proposal; it has not been applied automatically.',
+      '',
+      input.threadUpdate,
+    );
+  }
+  const resourceSection = renderMaterializedResourceSection('Materialized resources', input.resources);
+  if (resourceSection) sections.push('', resourceSection);
+  return sections.join('\n').trim();
+}
+
 function requiredString(value: CanonicalJsonValue | undefined, label: string) {
   if (typeof value !== 'string') throw new Error(`Durable ${label} is invalid.`);
   return value;
@@ -5513,6 +5976,24 @@ function requiredTurnStatus(value: CanonicalJsonValue | undefined): DurableTurnS
     value !== 'interrupted_by_restart'
   ) {
     throw new Error('Durable turn status is invalid.');
+  }
+  return value;
+}
+
+function durableTurnReadState(value: string): TurnReadValue['state'] {
+  if (
+    value !== 'running' && value !== 'completed' && value !== 'failed' &&
+    value !== 'interrupted' && value !== 'interrupted_by_restart'
+  ) {
+    throw new Error('Durable turn state is invalid.');
+  }
+  return value;
+}
+
+function durableTurnErrorCode(value: string | null): TurnReadValue['errorCode'] {
+  if (value === null) return null;
+  if (value !== 'provider_error' && value !== 'runtime_error' && value !== 'storage_error') {
+    throw new Error('Durable turn error code is invalid.');
   }
   return value;
 }

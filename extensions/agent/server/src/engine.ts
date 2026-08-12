@@ -57,7 +57,8 @@ export type RuntimeDurabilityHooks = {
   journalSearch(input: JournalSearchInput): Promise<JournalSearchResult>;
   journalOpen(input: JournalOpenInput): Promise<JournalOpenResult>;
   threadRead(): Promise<ThreadDocumentView>;
-  threadUpdate(input: ThreadUpdateInput): Promise<ThreadDocumentView>;
+  threadPatch(input: ThreadPatchInput): Promise<ThreadDocumentView>;
+  threadReplace(input: ThreadReplaceInput): Promise<ThreadDocumentView>;
   workUnitEnter(callId: string, input: WorkUnitEnterInput): Promise<WorkUnitView>;
   workUnitReturn(callId: string, input: WorkUnitReturnInput): Promise<WorkUnitReturnPending>;
 };
@@ -69,25 +70,61 @@ export type ThreadDocumentView = {
   ref: string;
 };
 
-export type ThreadUpdateInput = {
+export type ThreadPatchEdit = {
+  oldText: string;
+  newText: string;
+};
+
+export type ThreadPatchInput = {
+  baseVersionId: string;
+  edits: ThreadPatchEdit[];
+};
+
+export type ThreadReplaceInput = {
   baseVersionId: string;
   content: string;
 };
 
 export type WorkUnitEnterInput = {
   objective: string;
-  evidenceRefs?: string[];
+  doneWhen?: string[];
+  resources?: WorkUnitResourceRef[];
 };
 
 export type WorkUnitReturnInput = {
+  status: WorkUnitReturnStatus;
   result: string;
+  threadUpdate?: string;
+  resources?: WorkUnitResourceRef[];
+};
+
+export type WorkUnitReturnStatus = 'completed' | 'partial' | 'blocked';
+
+export type WorkUnitResourceRole = 'authority' | 'deliverable' | 'evidence';
+
+export type WorkUnitResourceRef = {
+  ref: string;
+  role: WorkUnitResourceRole;
+  description?: string;
+};
+
+export type WorkUnitResourceView = WorkUnitResourceRef & {
+  snapshot: {
+    ref: string;
+    hash: string;
+    byteLength: number;
+    mediaType: string;
+    source: 'file' | 'history';
+  };
+  inclusion: 'materialized' | 'inherited';
 };
 
 export type WorkUnitView = {
   scopeId: string;
   parentScopeId: string;
   objective: string;
-  evidenceRefs: string[];
+  doneWhen: string[];
+  resources: WorkUnitResourceView[];
   state: 'running';
 };
 

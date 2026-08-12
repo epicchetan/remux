@@ -53,7 +53,7 @@ project primaries and context bindings already stored in the journal database.
 
 ### Ephemeral evidence
 
-`journal_search`, `journal_open`, ordinary file reads, and tool output enter the
+`history_search`, `history_read`, ordinary file reads, and tool output enter the
 current provider conversation. They are guaranteed to be available to the next
 inference in the active frame. They do not become durable semantic state merely
 because the model looked at them.
@@ -87,7 +87,7 @@ interpretive state value is not a substitute for the source.
 
 ## Model tools
 
-### `journal_search`
+### `history_search`
 
 Input:
 
@@ -99,12 +99,12 @@ The tool searches durable messages, tool operations, and context primaries. It
 returns bounded excerpts, stable references, kinds, and journal sequence or
 state revision. Results are ephemeral.
 
-### `journal_open`
+### `history_read`
 
 Input:
 
 ```json
-{"ref":"journal://event/123","offset":0,"maxBytes":24000}
+{"ref":"history://event/123","offset":0,"maxBytes":24000}
 ```
 
 The tool returns a bounded exact expansion, content hash, byte range, and
@@ -124,7 +124,7 @@ Input is one atomic, model-oriented update:
         "status": "editing",
         "next": ["finish session lifecycle", "run workspace tests"]
       },
-      "evidence": ["journal://message/example#assistant"]
+      "evidence": ["history://message/example#assistant"]
     }
   ],
   "pin": [
@@ -282,7 +282,7 @@ has a product reason.
 
 - enable Pi read, bash, edit, and write tools with absolute paths;
 - describe cwd as orientation;
-- add `journal_search` and `journal_open`;
+- add `history_search` and `history_read`;
 - preserve all calls and results in the durable journal;
 - add full-history/stateful selection to the production benchmark adapter.
 
@@ -342,10 +342,10 @@ by implementation tests and the next measured run.
 
 ### F1: one openable reference plane
 
-The model-facing surface remains `journal_search`, `journal_open`, and
+The model-facing surface remains `history_search`, `history_read`, and
 `context_update`. Every reference emitted by the compiler, search, context
 workspace, runtime snapshot, or work-unit result must be accepted by
-`journal_open` and support bounded byte continuation. The resolver covers
+`history_read` and support bounded byte continuation. The resolver covers
 journal events, messages, turns, tool calls and results, primaries, artifacts,
 context frames, omissions, execution scopes, work-unit traces, and exact file
 snapshots. A visible reference that cannot be opened is a contract failure.

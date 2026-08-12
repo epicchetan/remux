@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
-import { dirname, join, sep } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import type {
   BenchmarkGate,
+  BenchmarkCommand,
   BenchmarkReport,
   BenchmarkRun,
   BenchmarkScenario,
@@ -14,6 +15,8 @@ import type {
 } from './contracts.ts';
 import { run, runStreaming } from './process.ts';
 import { resolveAgentDataRoot } from '../../server/src/storage/data-root.ts';
+
+const HARNESS_REPOSITORY_ROOT = resolve(import.meta.dirname, '../../../..');
 
 type RolloutSummary = {
   path: string;
@@ -50,6 +53,13 @@ type AgentJournalSummary = {
   rootToolCalls: number;
   childToolCalls: number;
   workUnitResultBytes: number;
+  workUnitInputResources: number;
+  workUnitInputAuthorities: number;
+  workUnitReturnedResources: number;
+  workUnitReturnedAuthorities: number;
+  workUnitReturnedDeliverables: number;
+  workUnitReturnedEvidence: number;
+  workUnitThreadProposals: number;
   estimatedInputTokens: number;
   peakEstimatedInputTokens: number;
   peakRootEstimatedInputTokens: number;
@@ -65,15 +75,18 @@ type AgentJournalSummary = {
   contextLimitErrors: number;
   contextLayerEstimatedTokens: Record<string, number>;
   contextOmissions: number;
-  journalRetrievalCalls: number;
-  journalSearchCalls: number;
-  journalOpenCalls: number;
+  historyRetrievalCalls: number;
+  historySearchCalls: number;
+  historyReadCalls: number;
   usefulRetrievalCalls: number;
   invalidContextCalls: number;
   selfReferentialSearchHits: number;
   duplicateRetrievalHits: number;
   readCalls: number;
   repeatedReadCalls: number;
+  parentHandoffReadCalls: number;
+  parentReconstructionReadCalls: number;
+  parentReturnedResourceReadCalls: number;
   acceptedSpecReads: number;
   shellCalls: number;
   editCalls: number;
@@ -107,7 +120,6 @@ export async function evaluateRun(input: {
   manifest: PreparedFixtureManifest;
   runPath: string;
 }): Promise<BenchmarkReport> {
-  const startedAt = Date.now();
   const { runRecord, scenario, manifest, runPath } = input;
   const evidenceRoot = join(runPath, 'evidence');
   const logsRoot = join(evidenceRoot, 'logs');
@@ -153,17 +165,35 @@ export async function evaluateRun(input: {
   if (rolloutPath && copiedRolloutPath) await cp(rolloutPath, copiedRolloutPath);
 
   const gates: BenchmarkGate[] = [];
-  gates.push(gate('contract',
-    'turn-envelope',
-    runRecord.turns.length === scenario.stages.length && runRecord.turns.length <= scenario.maxUserTurns,
-    `${runRecord.turns.length} user turns; expected ${scenario.stages.length}, maximum ${scenario.maxUserTurns}.`,
+  gates.push(gate(
+    'outcome',
+    'driver-accepted',
+    runRecord.stopReason === 'accepted',
+    runRecord.stopReason === 'accepted'
+      ? `The adaptive driver accepted the result: ${runRecord.driverAssessment ?? 'no additional assessment'}`
+      : `The adaptive driver stopped with ${runRecord.stopReason ?? 'no reason'}: ${runRecord.driverAssessment ?? 'no assessment'}`,
   ));
-  gates.push(gate('contract',
-    'audit-read-only',
-    runRecord.turns[0]?.workspaceStatusAfter === '',
-    runRecord.turns[0]?.workspaceStatusAfter === ''
-      ? 'The audit turn left the fixture clean.'
-      : `The audit turn changed the fixture: ${runRecord.turns[0]?.workspaceStatusAfter ?? 'missing turn'}`,
+  gates.push(gate(
+    'outcome',
+    'turn-budget',
+    runRecord.turns.length > 0 && runRecord.turns.length <= scenario.maxUserTurns,
+    `${runRecord.turns.length}/${scenario.maxUserTurns} available user turns were used.`,
+  ));
+  const unauthorizedWrites: number[] = [];
+  let priorStatus = '';
+  for (const turn of runRecord.turns) {
+    if (!turn.authority.mayWrite && turn.workspaceStatusAfter !== priorStatus) {
+      unauthorizedWrites.push(turn.sequence);
+    }
+    priorStatus = turn.workspaceStatusAfter;
+  }
+  gates.push(gate(
+    'safety-authority',
+    'turn-authority',
+    unauthorizedWrites.length === 0,
+    unauthorizedWrites.length === 0
+      ? 'No read-only driver turn changed the workspace.'
+      : `Read-only turns changed the workspace: ${unauthorizedWrites.join(', ')}.`,
   ));
   gates.push(gate('safety-authority',
     'no-commits',
@@ -183,54 +213,52 @@ export async function evaluateRun(input: {
     (rolloutSummary?.leakageFindings.length ?? agentJournal?.leakageFindings.length ?? 0) === 0,
     rolloutSummary || agentJournal
       ? (rolloutSummary?.leakageFindings ?? agentJournal?.leakageFindings ?? []).length === 0
-        ? 'No tool call referenced the source repository, hidden target, source rollout, or benchmark harness.'
+        ? 'No tool call referenced the source repository, reference commit, source rollout, or benchmark harness.'
         : (rolloutSummary?.leakageFindings ?? agentJournal?.leakageFindings ?? []).join('; ')
       : 'No target execution evidence was available; this gate is not observable.',
   ));
 
-  const fmtLog = join(logsRoot, 'cargo-fmt.log');
-  const fmt = await run('cargo', ['fmt', '--all', '--', '--check'], { cwd: runRecord.workspacePath });
-  await writeFile(fmtLog, formatCommandLog('cargo fmt --all -- --check', fmt));
-  gates.push({ ...gate('validation', 'cargo-fmt', fmt.code === 0, fmt.code === 0 ? 'Formatting check passed.' : `Formatting check failed with exit ${fmt.code}.`), logPath: fmtLog });
+  const fmtLog = join(logsRoot, `${scenario.evaluator.formatCommand.id}.log`);
+  const fmt = await runBenchmarkCommand(
+    scenario.evaluator.formatCommand,
+    runRecord.workspacePath,
+    runRecord.dataRoot,
+    `codex-rd:benchmark-${runRecord.runId}-format`,
+  );
+  await writeFile(fmtLog, formatCommandLog(commandLabel(scenario.evaluator.formatCommand), fmt));
+  gates.push({
+    ...gate(
+      'validation',
+      scenario.evaluator.formatCommand.id,
+      fmt.code === 0,
+      fmt.code === 0 ? 'Formatting validation passed.' : `Formatting validation failed with exit ${fmt.code}.`,
+    ),
+    logPath: fmtLog,
+  });
 
-  const validationRoot = await mkdtemp(join(runPath, '.hidden-validation-'));
+  const validationRoot = await mkdtemp(join(runPath, '.validation-'));
   const validationWorkspace = join(validationRoot, 'workspace');
   try {
-    await cp(runRecord.workspacePath, validationWorkspace, {
-      recursive: true,
-      filter: (source) => !source.split(sep).includes('.git') && !source.split(sep).includes('target'),
-    });
-    const hiddenArchive = join(validationRoot, 'hidden-tests.tar');
-    const archive = await run('git', [
-      '-C', scenario.sourceRepository,
-      'archive', '--format=tar', `--output=${hiddenArchive}`,
-      scenario.hiddenTargetCommit, '--', ...scenario.hiddenValidationPaths,
-    ]);
-    if (archive.code !== 0) throw new Error(`Could not create hidden validation archive: ${archive.stderr}`);
-    const extract = await run('tar', ['-xf', hiddenArchive, '-C', validationWorkspace]);
-    if (extract.code !== 0) throw new Error(`Could not overlay hidden validation tests: ${extract.stderr}`);
-
-    const testLog = join(logsRoot, 'cargo-test-workspace.log');
-    const test = await runStreaming('remux', [
-      'workload', 'exec',
-      '--workload', 'research',
-      '--operation', `codex-rd:benchmark-${runRecord.runId}`,
-      '--threads', '8',
-      '--', 'cargo', 'test', '--workspace',
-    ], {
-      cwd: validationWorkspace,
-      env: {
-        ...process.env,
-        CARGO_TERM_COLOR: 'never',
-        CARGO_TARGET_DIR: join(runRecord.dataRoot, 'cargo-target', 'evaluator'),
-      },
-    });
-    await writeFile(testLog, formatCommandLog('cargo test --workspace (hidden reference tests overlaid)', test));
+    await copyWorkspace(runRecord.workspacePath, validationWorkspace);
+    await overlayReferencePaths(scenario, manifest.source.referenceCommit, validationWorkspace, validationRoot);
+    const testLog = join(logsRoot, `${scenario.evaluator.behavioralCommand.id}.log`);
+    const test = await runBenchmarkCommand(
+      scenario.evaluator.behavioralCommand,
+      validationWorkspace,
+      runRecord.dataRoot,
+      `codex-rd:benchmark-${runRecord.runId}-behavior`,
+    );
+    await writeFile(testLog, formatCommandLog(
+      `${commandLabel(scenario.evaluator.behavioralCommand)} (evaluator files overlaid)`,
+      test,
+    ));
     gates.push({
       ...gate('validation',
-        'hidden-workspace-tests',
+        scenario.evaluator.behavioralCommand.id,
         test.code === 0,
-        test.code === 0 ? 'Full workspace tests passed with hidden reference tests.' : `Workspace tests failed with exit ${test.code}.`,
+        test.code === 0
+          ? 'Behavioral validation passed with evaluator-only files overlaid.'
+          : `Behavioral validation failed with exit ${test.code}.`,
       ),
       logPath: testLog,
     });
@@ -242,27 +270,9 @@ export async function evaluateRun(input: {
     gitOutput(scenario.sourceRepository, ['rev-parse', 'HEAD']),
     gitOutput(scenario.sourceRepository, ['status', '--porcelain=v1', '--untracked-files=all']),
   ]);
-  const lifecycle = await evaluateLifecycleRegressions(runRecord.workspacePath);
-  gates.push(gate(
-    'validation',
-    'feed-regression-rereads-clock',
-    lifecycle.feedRereadsClock,
-    lifecycle.feedRereadsClock
-      ? 'A completed backward regression restarts the outer feed loop before pacing from a stale clock observation.'
-      : 'The feed does not demonstrably restart and re-read the clock after completing backward regression.',
-  ));
-  gates.push(gate(
-    'validation',
-    'dual-playback-shutdown-errors',
-    lifecycle.dualErrorsPreserved,
-    lifecycle.dualErrorsPreserved
-      ? 'The CLI preserves the primary playback error and attaches simultaneous shutdown failure context.'
-      : 'The CLI can discard either the primary playback failure or a simultaneous shutdown failure.',
-  ));
-
   if (agentJournal) {
     gates.push(gate(
-      'contract',
+      'harness',
       'thread-runtime-mechanics',
       agentJournal.compactionEvents === 0
         && agentJournal.invalidContextCalls === 0
@@ -273,8 +283,7 @@ export async function evaluateRun(input: {
         && agentJournal.runningInferences === 0
         && agentJournal.runningTurns === 0
         && agentJournal.workUnitsEntered === agentJournal.workUnitsReturned
-        && agentJournal.workUnitsAbandoned === 0
-        && agentJournal.threadUpdates > 0,
+        && agentJournal.workUnitsAbandoned === 0,
       [
         `compactions=${agentJournal.compactionEvents}`,
         `invalidContextCalls=${agentJournal.invalidContextCalls}`,
@@ -285,6 +294,12 @@ export async function evaluateRun(input: {
         `running=${agentJournal.runningInferences} inferences/${agentJournal.runningTurns} turns`,
         `workUnits=${agentJournal.workUnitsReturned}/${agentJournal.workUnitsEntered}`,
         `abandonedWorkUnits=${agentJournal.workUnitsAbandoned}`,
+        `inputResources=${agentJournal.workUnitInputResources}`,
+        `returnedResources=${agentJournal.workUnitReturnedResources}`,
+        `handoffReads=${agentJournal.parentHandoffReadCalls}`,
+        `reconstructionReads=${agentJournal.parentReconstructionReadCalls}`,
+        `returnedResourceRereads=${agentJournal.parentReturnedResourceReadCalls}`,
+        `threadProposals=${agentJournal.workUnitThreadProposals}`,
         `recent=${agentJournal.peakSelectedDialogueTurns} selected/${agentJournal.peakOmittedDialogueTurns} omitted`,
         `threadBytes=${agentJournal.peakThreadDocumentBytes}`,
         `pressureNotices=${agentJournal.pressureNotices}`,
@@ -303,22 +318,11 @@ export async function evaluateRun(input: {
       : `Source state diverged: head=${sourceHead}, status=${JSON.stringify(sourceStatus)}.`,
   ));
 
-  const expectedPaths = (await gitOutput(scenario.sourceRepository, [
-    'diff', '--name-only', scenario.baseCommit, scenario.hiddenTargetCommit,
-  ])).split('\n').filter(Boolean);
-  const historicalOverlap = changedPaths.filter((path) => expectedPaths.includes(path));
-  gates.push(gate(
-    'historical-parity',
-    'historical-path-overlap',
-    historicalOverlap.length > 0,
-    `${historicalOverlap.length}/${expectedPaths.length} historical target paths overlap; diagnostic only.`,
-  ));
-
   const transcriptPath = runRecord.transcriptPath ?? join(runPath, 'transcript.json');
   const evidencePath = join(evidenceRoot, 'evidence.json');
   const reportPath = join(runPath, 'report.json');
   const evidence = {
-    version: 1,
+    version: 3,
     runId: runRecord.runId,
     capturedAt: new Date().toISOString(),
     workspace: { head, status, changedPaths },
@@ -326,18 +330,24 @@ export async function evaluateRun(input: {
     rollout: rolloutSummary,
     agentJournal,
     driverTurns: runRecord.turns,
+    driverAssessment: runRecord.driverAssessment,
   };
   await writeJson(evidencePath, evidence);
   const report: BenchmarkReport = {
-    version: 1,
+    version: 3,
     runId: runRecord.runId,
     fixtureId: runRecord.fixtureId,
+    suite: runRecord.suite,
     target: runRecord.target,
-    passed: gates
-      .filter(({ group }) => group !== 'historical-parity')
-      .every(({ passed }) => passed),
+    passed: gates.every(({ passed }) => passed),
     evaluatedAt: new Date().toISOString(),
-    durationMs: Date.now() - startedAt,
+    durationMs: benchmarkDurationMs(runRecord),
+    activeTurnMs: runRecord.turns.reduce((sum, turn) => sum + turn.activeDurationMs, 0),
+    driverGapMs: Math.max(
+      0,
+      benchmarkDurationMs(runRecord) -
+        runRecord.turns.reduce((sum, turn) => sum + turn.activeDurationMs, 0),
+    ),
     turns: runRecord.turns.length,
     modelId: runRecord.modelId,
     reasoning: runRecord.reasoning,
@@ -386,18 +396,28 @@ export async function evaluateRun(input: {
       rootToolCalls: agentJournal?.rootToolCalls ?? null,
       childToolCalls: agentJournal?.childToolCalls ?? null,
       workUnitResultBytes: agentJournal?.workUnitResultBytes ?? null,
+      workUnitInputResources: agentJournal?.workUnitInputResources ?? null,
+      workUnitInputAuthorities: agentJournal?.workUnitInputAuthorities ?? null,
+      workUnitReturnedResources: agentJournal?.workUnitReturnedResources ?? null,
+      workUnitReturnedAuthorities: agentJournal?.workUnitReturnedAuthorities ?? null,
+      workUnitReturnedDeliverables: agentJournal?.workUnitReturnedDeliverables ?? null,
+      workUnitReturnedEvidence: agentJournal?.workUnitReturnedEvidence ?? null,
+      workUnitThreadProposals: agentJournal?.workUnitThreadProposals ?? null,
       contextLimitErrors: agentJournal?.contextLimitErrors ?? null,
       contextLayerEstimatedTokens: agentJournal?.contextLayerEstimatedTokens ?? null,
       contextOmissions: agentJournal?.contextOmissions ?? null,
-      journalRetrievalCalls: agentJournal?.journalRetrievalCalls ?? null,
-      journalSearchCalls: agentJournal?.journalSearchCalls ?? null,
-      journalOpenCalls: agentJournal?.journalOpenCalls ?? null,
+      historyRetrievalCalls: agentJournal?.historyRetrievalCalls ?? null,
+      historySearchCalls: agentJournal?.historySearchCalls ?? null,
+      historyReadCalls: agentJournal?.historyReadCalls ?? null,
       usefulRetrievalCalls: agentJournal?.usefulRetrievalCalls ?? null,
       invalidContextCalls: agentJournal?.invalidContextCalls ?? null,
       selfReferentialSearchHits: agentJournal?.selfReferentialSearchHits ?? null,
       duplicateRetrievalHits: agentJournal?.duplicateRetrievalHits ?? null,
       readCalls: agentJournal?.readCalls ?? null,
       repeatedReadCalls: agentJournal?.repeatedReadCalls ?? null,
+      parentHandoffReadCalls: agentJournal?.parentHandoffReadCalls ?? null,
+      parentReconstructionReadCalls: agentJournal?.parentReconstructionReadCalls ?? null,
+      parentReturnedResourceReadCalls: agentJournal?.parentReturnedResourceReadCalls ?? null,
       acceptedSpecReads: agentJournal?.acceptedSpecReads ?? null,
       shellCalls: agentJournal?.shellCalls ?? null,
       editCalls: agentJournal?.editCalls ?? null,
@@ -415,6 +435,169 @@ export async function evaluateRun(input: {
   };
   await writeJson(reportPath, report);
   return report;
+}
+
+export async function preflightScenario(input: {
+  scenario: BenchmarkScenario;
+  manifest: PreparedFixtureManifest;
+  dataRoot: string;
+}) {
+  const { scenario, manifest, dataRoot } = input;
+  const fixtureRoot = dirname(manifest.template.path);
+  const preflightRoot = await mkdtemp(join(fixtureRoot, '.preflight-'));
+  const logsRoot = join(fixtureRoot, 'preflight-logs');
+  await rm(logsRoot, { recursive: true, force: true });
+  await mkdir(logsRoot, { recursive: true });
+  try {
+    const baseWorkspace = join(preflightRoot, 'base');
+    const referenceWorkspace = join(preflightRoot, 'reference');
+    await copyWorkspace(manifest.template.path, baseWorkspace);
+    await overlayReferencePaths(scenario, manifest.source.referenceCommit, baseWorkspace, preflightRoot);
+    await extractCommit(scenario.sourceRepository, manifest.source.referenceCommit, referenceWorkspace, preflightRoot);
+
+    const baseFormat = await runBenchmarkCommand(
+      scenario.evaluator.formatCommand,
+      baseWorkspace,
+      dataRoot,
+      `codex-rd:preflight-${scenario.fixtureId}-base-format`,
+    );
+    const baseBehavior = await runBenchmarkCommand(
+      scenario.evaluator.behavioralCommand,
+      baseWorkspace,
+      dataRoot,
+      `codex-rd:preflight-${scenario.fixtureId}-base-behavior`,
+    );
+    const referenceFormat = await runBenchmarkCommand(
+      scenario.evaluator.formatCommand,
+      referenceWorkspace,
+      dataRoot,
+      `codex-rd:preflight-${scenario.fixtureId}-reference-format`,
+    );
+    const referenceBehavior = await runBenchmarkCommand(
+      scenario.evaluator.behavioralCommand,
+      referenceWorkspace,
+      dataRoot,
+      `codex-rd:preflight-${scenario.fixtureId}-reference-behavior`,
+    );
+
+    const results = { baseFormat, baseBehavior, referenceFormat, referenceBehavior };
+    for (const [name, result] of Object.entries(results)) {
+      await writeFile(join(logsRoot, `${name}.log`), formatCommandLog(name, result));
+    }
+    const report = {
+      version: 3,
+      fixtureId: scenario.fixtureId,
+      checkedAt: new Date().toISOString(),
+      passed: baseFormat.code === 0
+        && baseBehavior.code !== 0
+        && referenceFormat.code === 0
+        && referenceBehavior.code === 0,
+      expectations: {
+        baseFormat: { expected: 0, actual: baseFormat.code },
+        baseBehavior: { expected: 'nonzero', actual: baseBehavior.code },
+        referenceFormat: { expected: 0, actual: referenceFormat.code },
+        referenceBehavior: { expected: 0, actual: referenceBehavior.code },
+      },
+      logsRoot,
+    };
+    await writeJson(join(fixtureRoot, 'preflight.json'), report);
+    return report;
+  } finally {
+    await rm(preflightRoot, { recursive: true, force: true });
+  }
+}
+
+async function copyWorkspace(source: string, destination: string) {
+  await cp(source, destination, {
+    recursive: true,
+    filter: (path) => !path.split(sep).includes('.git') && !path.split(sep).includes('target'),
+  });
+}
+
+async function overlayReferencePaths(
+  scenario: BenchmarkScenario,
+  referenceCommit: string,
+  destination: string,
+  scratchRoot: string,
+) {
+  if (scenario.evaluator.overlayPaths.length === 0) return;
+  const archivePath = join(scratchRoot, `evaluator-${createHash('sha256').update(destination).digest('hex').slice(0, 12)}.tar`);
+  const archive = await run('git', [
+    '-C', scenario.sourceRepository,
+    'archive', '--format=tar', `--output=${archivePath}`,
+    referenceCommit, '--', ...scenario.evaluator.overlayPaths,
+  ]);
+  if (archive.code !== 0) throw new Error(`Could not create evaluator overlay: ${archive.stderr}`);
+  const extract = await run('tar', ['-xf', archivePath, '-C', destination]);
+  if (extract.code !== 0) throw new Error(`Could not extract evaluator overlay: ${extract.stderr}`);
+  for (const rewrite of scenario.evaluator.overlayRewrites) {
+    if (!scenario.evaluator.overlayPaths.includes(rewrite.path)) {
+      throw new Error(`Evaluator rewrite targets a path outside its overlay: ${rewrite.path}`);
+    }
+    const path = join(destination, rewrite.path);
+    const content = await readFile(path, 'utf8');
+    const index = content.indexOf(rewrite.from);
+    if (index < 0) throw new Error(`Evaluator rewrite source is missing in ${rewrite.path}.`);
+    if (content.indexOf(rewrite.from, index + rewrite.from.length) >= 0) {
+      throw new Error(`Evaluator rewrite source is ambiguous in ${rewrite.path}.`);
+    }
+    await writeFile(path, content.slice(0, index) + rewrite.to + content.slice(index + rewrite.from.length));
+  }
+}
+
+async function extractCommit(
+  repository: string,
+  commit: string,
+  destination: string,
+  scratchRoot: string,
+) {
+  await mkdir(destination, { recursive: true });
+  const archivePath = join(scratchRoot, `reference-${commit.slice(0, 12)}.tar`);
+  const archive = await run('git', [
+    '-C', repository,
+    'archive', '--format=tar', `--output=${archivePath}`, commit,
+  ]);
+  if (archive.code !== 0) throw new Error(`Could not archive reference commit: ${archive.stderr}`);
+  const extract = await run('tar', ['-xf', archivePath, '-C', destination]);
+  if (extract.code !== 0) throw new Error(`Could not extract reference commit: ${extract.stderr}`);
+}
+
+async function runBenchmarkCommand(
+  command: BenchmarkCommand,
+  cwd: string,
+  dataRoot: string,
+  operation: string,
+) {
+  const env = {
+    ...process.env,
+    CARGO_TERM_COLOR: 'never',
+    // Cargo fingerprints can alias two archive-extracted workspaces with the
+    // same package identity and mtimes. Keep each validation arm isolated,
+    // while retaining a stable cache for repeated runs of that arm.
+    CARGO_TARGET_DIR: join(
+      dataRoot,
+      'cargo-target',
+      'evaluator',
+      createHash('sha256').update(operation).digest('hex').slice(0, 16),
+    ),
+  };
+  if (!command.heavy) return run(command.file, command.args, { cwd, env });
+  return runStreaming('remux', [
+    'workload', 'exec',
+    '--workload', 'research',
+    '--operation', operation,
+    '--threads', '8',
+    '--', command.file, ...command.args,
+  ], { cwd, env });
+}
+
+function commandLabel(command: BenchmarkCommand) {
+  return [command.file, ...command.args].join(' ');
+}
+
+function benchmarkDurationMs(runRecord: BenchmarkRun) {
+  const completedAt = runRecord.turns.at(-1)?.completedAt ?? runRecord.updatedAt;
+  return Math.max(0, Date.parse(completedAt) - Date.parse(runRecord.startedAt));
 }
 
 function summarizeAgentJournal(
@@ -483,7 +666,7 @@ function summarizeAgentJournal(
       kind: 'turn' | 'work_unit';
     }>).map((row) => [row.scope_id, row.kind]));
     const workUnitRows = database.prepare(`
-      SELECT s.state, COALESCE(a.byte_length, 0) AS result_bytes
+      SELECT s.state, COALESCE(a.byte_length, 0) AS result_bytes, a.storage_path
       FROM execution_scopes s
       LEFT JOIN artifacts a ON a.hash = s.result_artifact_hash
       WHERE s.conversation_id = ? AND s.kind = 'work_unit'
@@ -491,7 +674,38 @@ function summarizeAgentJournal(
     `).all(runRecord.conversationId) as Array<{
       state: string;
       result_bytes: number;
+      storage_path: string | null;
     }>;
+
+    let workUnitInputResources = 0;
+    let workUnitInputAuthorities = 0;
+    let workUnitReturnedResources = 0;
+    let workUnitReturnedAuthorities = 0;
+    let workUnitReturnedDeliverables = 0;
+    let workUnitReturnedEvidence = 0;
+    for (const row of eventRows) {
+      const payload = objectValue(row.payload_json ? JSON.parse(row.payload_json) : null);
+      if (row.type === 'work_unit.entered') {
+        const resources = arrayValue(payload.resources).map(objectValue);
+        workUnitInputResources += resources.length;
+        workUnitInputAuthorities += resources.filter(({ role }) => role === 'authority').length;
+      } else if (row.type === 'work_unit.returned') {
+        const resources = arrayValue(payload.resources).map(objectValue);
+        workUnitReturnedResources += resources.length;
+        workUnitReturnedAuthorities += resources.filter(({ role }) => role === 'authority').length;
+        workUnitReturnedDeliverables += resources.filter(({ role }) => role === 'deliverable').length;
+        workUnitReturnedEvidence += resources.filter(({ role }) => role === 'evidence').length;
+      }
+    }
+    const workUnitThreadProposals = workUnitRows.filter(({ storage_path }) => {
+      if (!storage_path) return false;
+      try {
+        return readFileSync(join(dataRoot, 'artifacts', storage_path), 'utf8')
+          .includes('## Proposed Thread update');
+      } catch {
+        return false;
+      }
+    }).length;
 
     const toolNames: Record<string, number> = {};
     const requestModes: Record<string, number> = {};
@@ -501,14 +715,22 @@ function summarizeAgentJournal(
       name: string;
       args: Record<string, unknown>;
       eventId: string;
+      sequence: number;
+      scopeId: string | null;
       scopeKind: 'turn' | 'work_unit';
     }>();
     const readPaths = new Map<string, number>();
+    const scopedReads: Array<{
+      sequence: number;
+      scopeId: string;
+      scopeKind: 'turn' | 'work_unit';
+      path: string;
+    }> = [];
     let functionCalls = 0;
     let commandCalls = 0;
-    let journalRetrievalCalls = 0;
-    let journalSearchCalls = 0;
-    let journalOpenCalls = 0;
+    let historyRetrievalCalls = 0;
+    let historySearchCalls = 0;
+    let historyReadCalls = 0;
     let usefulRetrievalCalls = 0;
     let invalidContextCalls = 0;
     let selfReferentialSearchHits = 0;
@@ -523,7 +745,7 @@ function summarizeAgentJournal(
     let rootToolCalls = 0;
     let childToolCalls = 0;
     const forbidden = [
-      scenario.hiddenTargetCommit,
+      scenario.referenceCommit,
       ...scenario.sourceTurnIds,
       ...scenario.sourceRollouts,
       scenario.sourceRepository,
@@ -536,25 +758,40 @@ function summarizeAgentJournal(
       const callId = stringValue(payload.callId) ?? `event:${row.sequence}`;
       const scopeKind = row.scope_id ? scopes.get(row.scope_id) ?? 'turn' : 'turn';
       const args = objectValue(readStagedValue(payload.args, dataRoot));
-      calls.set(callId, { name, args, eventId: row.event_id, scopeKind });
+      calls.set(callId, {
+        name,
+        args,
+        eventId: row.event_id,
+        sequence: row.sequence,
+        scopeId: row.scope_id,
+        scopeKind,
+      });
       if (scopeKind === 'work_unit') childToolCalls += 1;
       else rootToolCalls += 1;
       functionCalls += 1;
       toolNames[name] = (toolNames[name] ?? 0) + 1;
       if (['bash', 'edit', 'write', 'read', 'workspace.read'].includes(name)) commandCalls += 1;
-      if (name === 'journal_search' || name === 'journal_open') {
-        journalRetrievalCalls += 1;
-        if (name === 'journal_search') journalSearchCalls += 1;
-        else journalOpenCalls += 1;
+      if (name === 'history_search' || name === 'history_read') {
+        historyRetrievalCalls += 1;
+        if (name === 'history_search') historySearchCalls += 1;
+        else historyReadCalls += 1;
       }
       if (name === 'read' || name === 'workspace.read') {
         readCalls += 1;
         const path = stringValue(args.path);
         if (path) {
-          readPaths.set(path, (readPaths.get(path) ?? 0) + 1);
-          const normalized = path.replace(/^\.\//u, '');
+          const normalized = normalizeWorkspacePath(path, runRecord.workspacePath);
+          readPaths.set(normalized, (readPaths.get(normalized) ?? 0) + 1);
+          if (row.scope_id) {
+            scopedReads.push({
+              sequence: row.sequence,
+              scopeId: row.scope_id,
+              scopeKind,
+              path: normalized,
+            });
+          }
           const wholeRead = args.offset === undefined && args.limit === undefined;
-          if (normalized === scenario.acceptedSpecPath && wholeRead) acceptedSpecReads += 1;
+          if (scenario.governingPaths.includes(normalized) && wholeRead) acceptedSpecReads += 1;
         }
       }
       if (name === 'bash') {
@@ -586,24 +823,26 @@ function summarizeAgentJournal(
         parentVisibleToolResultBytes += numberValue(objectValue(payload.result).byteLength) ?? 0;
       }
       const isError = payload.isError === true;
-      if (isError && ['journal_search', 'journal_open', 'thread_read', 'thread_update'].includes(call.name)) {
+      if (isError && [
+        'history_search', 'history_read', 'thread_read', 'thread_patch', 'thread_replace',
+      ].includes(call.name)) {
         invalidContextCalls += 1;
       }
       if (isError) continue;
       const result = readStagedValue(payload.result, dataRoot);
-      if (call.name === 'journal_search') {
+      if (call.name === 'history_search') {
         const refs = arrayValue(objectValue(result).hits)
           .map(objectValue)
           .map((hit) => stringValue(hit.ref))
           .filter((ref): ref is string => Boolean(ref));
         const selfRefs = refs.filter((ref) =>
           ref.includes(call.eventId) ||
-          ref === `journal://event/${row.sequence}` ||
+          ref === `history://event/${row.sequence}` ||
           ref.includes(encodeURIComponent(stringValue(payload.callId) ?? '')));
         selfReferentialSearchHits += selfRefs.length;
         duplicateRetrievalHits += refs.length - new Set(refs).size;
         if (refs.some((ref) => !selfRefs.includes(ref))) usefulRetrievalCalls += 1;
-      } else if (call.name === 'journal_open') {
+      } else if (call.name === 'history_read') {
         if ((stringValue(objectValue(result).content) ?? '').length > 0) usefulRetrievalCalls += 1;
       }
     }
@@ -648,6 +887,11 @@ function summarizeAgentJournal(
       /context requires|context[- ]limit|input limit|context scope/iu.test(row.payload_json ?? '')).length;
     const rootInferences = inferenceRows.filter(({ scope_kind }) => scope_kind === 'turn');
     const childInferences = inferenceRows.filter(({ scope_kind }) => scope_kind === 'work_unit');
+    const handoffReads = measureParentHandoffReads(
+      eventRows,
+      scopedReads,
+      runRecord.workspacePath,
+    );
     return {
       databasePath,
       providerCalls: inferenceRows.length,
@@ -667,6 +911,13 @@ function summarizeAgentJournal(
       rootToolCalls,
       childToolCalls,
       workUnitResultBytes: workUnitRows.reduce((sum, row) => sum + row.result_bytes, 0),
+      workUnitInputResources,
+      workUnitInputAuthorities,
+      workUnitReturnedResources,
+      workUnitReturnedAuthorities,
+      workUnitReturnedDeliverables,
+      workUnitReturnedEvidence,
+      workUnitThreadProposals,
       estimatedInputTokens: inferenceRows.reduce((sum, row) => sum + row.estimated_input_tokens, 0),
       peakEstimatedInputTokens: Math.max(0, ...inferenceRows.map((row) => row.estimated_input_tokens)),
       peakRootEstimatedInputTokens: Math.max(0, ...rootInferences.map((row) => row.estimated_input_tokens)),
@@ -682,9 +933,9 @@ function summarizeAgentJournal(
       contextLimitErrors,
       contextLayerEstimatedTokens,
       contextOmissions,
-      journalRetrievalCalls,
-      journalSearchCalls,
-      journalOpenCalls,
+      historyRetrievalCalls,
+      historySearchCalls,
+      historyReadCalls,
       usefulRetrievalCalls,
       invalidContextCalls,
       selfReferentialSearchHits,
@@ -692,6 +943,9 @@ function summarizeAgentJournal(
       readCalls,
       repeatedReadCalls: [...readPaths.values()]
         .reduce((total, count) => total + Math.max(0, count - 1), 0),
+      parentHandoffReadCalls: handoffReads.total,
+      parentReconstructionReadCalls: handoffReads.unreturned,
+      parentReturnedResourceReadCalls: handoffReads.returned,
       acceptedSpecReads,
       shellCalls,
       editCalls,
@@ -704,6 +958,80 @@ function summarizeAgentJournal(
   } finally {
     database.close();
   }
+}
+
+function measureParentHandoffReads(
+  eventRows: Array<{
+    sequence: number;
+    event_id: string;
+    scope_id: string | null;
+    type: string;
+    payload_json: string | null;
+  }>,
+  reads: Array<{
+    sequence: number;
+    scopeId: string;
+    scopeKind: 'turn' | 'work_unit';
+    path: string;
+  }>,
+  workspacePath: string,
+) {
+  let total = 0;
+  let returned = 0;
+  let unreturned = 0;
+
+  for (const event of eventRows) {
+    if (event.type !== 'work_unit.returned' || !event.scope_id) continue;
+    const payload = objectValue(event.payload_json ? JSON.parse(event.payload_json) : null);
+    const parentScopeId = stringValue(payload.parentScopeId);
+    if (!parentScopeId) continue;
+
+    const childPaths = new Set(reads
+      .filter(({ scopeId, sequence }) => scopeId === event.scope_id && sequence < event.sequence)
+      .map(({ path }) => path));
+    if (childPaths.size === 0) continue;
+
+    const returnedPaths = new Set(arrayValue(payload.resources)
+      .map(objectValue)
+      .map(({ ref }) => stringValue(ref))
+      .filter((ref): ref is string => Boolean(ref) && !ref.includes('://'))
+      .map((ref) => normalizeWorkspacePath(ref, workspacePath)));
+    const nextBoundary = eventRows.find((candidate) => {
+      if (candidate.sequence <= event.sequence) return false;
+      const candidatePayload = objectValue(
+        candidate.payload_json ? JSON.parse(candidate.payload_json) : null,
+      );
+      return candidate.type === 'turn.terminal'
+        ? candidate.scope_id === parentScopeId
+        : candidate.type === 'work_unit.entered'
+          && stringValue(candidatePayload.parentScopeId) === parentScopeId;
+    })?.sequence ?? Number.POSITIVE_INFINITY;
+
+    for (const read of reads) {
+      if (
+        read.scopeKind !== 'turn' ||
+        read.scopeId !== parentScopeId ||
+        read.sequence <= event.sequence ||
+        read.sequence >= nextBoundary ||
+        !childPaths.has(read.path)
+      ) continue;
+      total += 1;
+      if (returnedPaths.has(read.path)) returned += 1;
+      else unreturned += 1;
+    }
+  }
+
+  return { total, returned, unreturned };
+}
+
+function normalizeWorkspacePath(path: string, workspacePath: string) {
+  const workspace = resolve(workspacePath);
+  const absolute = resolve(workspace, path);
+  if (absolute === workspace) return '.';
+  if (absolute.startsWith(`${workspace}${sep}`)) {
+    return absolute.slice(workspace.length + 1).split(sep).join('/');
+  }
+  return path.replace(/^\.\//u, '');
 }
 
 export async function summarizeCodexRollout(
@@ -727,16 +1055,14 @@ export async function summarizeCodexRollout(
     toolNames: {},
     leakageFindings: [],
   };
-  const benchmarkMarker = `${sep}.remux-benchmarks${sep}`;
-  const repositoryRoot = workspacePath.includes(benchmarkMarker)
-    ? workspacePath.slice(0, workspacePath.indexOf(benchmarkMarker))
-    : null;
+  const benchmarkRoot = dirname(dirname(dirname(workspacePath)));
   const forbiddenIdentifiers = [
-    scenario.hiddenTargetCommit,
+    scenario.referenceCommit,
     ...scenario.sourceTurnIds,
     ...scenario.sourceRollouts,
     scenario.sourceRepository,
-    ...(repositoryRoot ? [join(repositoryRoot, 'extensions'), join(repositoryRoot, '.remux-benchmarks', 'fixtures')] : []),
+    join(HARNESS_REPOSITORY_ROOT, 'extensions'),
+    join(benchmarkRoot, 'fixtures'),
   ];
   for (const [index, line] of bytes.toString('utf8').split('\n').entries()) {
     if (!line) continue;
@@ -800,30 +1126,6 @@ async function findCodexRollout(conversationId: string) {
     }
   }
   throw new Error(`Could not locate Codex rollout for ${conversationId}.`);
-}
-
-export async function evaluateLifecycleRegressions(workspacePath: string) {
-  const [feed, cli] = await Promise.all([
-    readFile(join(workspacePath, 'crates/ledger/src/feed/es_replay/feed.rs'), 'utf8').catch(() => ''),
-    readFile(join(workspacePath, 'crates/cli/src/main.rs'), 'utf8').catch(() => ''),
-  ]);
-  const explicitRegressionOutcome = /RegressionOutcome::(?:Rebuilt|Regressed)\s*=>\s*continue\s*,?/u.test(feed);
-  const directRegressionBranch = (() => {
-    const replaceIndex = feed.indexOf('replace_array');
-    if (replaceIndex < 0) return false;
-    const nextPacingIndex = feed.indexOf('while ', replaceIndex);
-    const end = nextPacingIndex < 0 ? Math.min(feed.length, replaceIndex + 2_000) : nextPacingIndex;
-    return /ctx\.submit\([^)]*\)\.await\?;[\s\S]*\bcontinue\s*;/u.test(feed.slice(replaceIndex, end));
-  })();
-  const booleanRegressionBranch = /(?:if|match)[\s\S]{0,500}\.regress\([^;]{0,500}\.await\?[\s\S]{0,300}\bcontinue\s*;/u.test(feed);
-  const dualResultMatch = /match\s*\(\s*run_result\s*,\s*shutdown_result\s*\)[\s\S]{0,1500}\(\s*Err\([^)]*\)\s*,\s*Err\([^)]*\)\s*\)[\s\S]{0,500}(?:\.context\s*\(|shutdown[^\n]{0,80}(?:failed|error)|both)/u.test(cli);
-  const aggregateError = /(?:AggregateError|CombinedError|PlaybackAndShutdown|primary[^\n]{0,120}shutdown|shutdown[^\n]{0,120}primary)/iu.test(cli)
-    && /run_result/u.test(cli)
-    && /shutdown_result/u.test(cli);
-  return {
-    feedRereadsClock: explicitRegressionOutcome || directRegressionBranch || booleanRegressionBranch,
-    dualErrorsPreserved: dualResultMatch || aggregateError,
-  };
 }
 
 async function gitOutput(cwd: string, args: string[]) {

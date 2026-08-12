@@ -1,6 +1,6 @@
-Status: R&D evidence with bounded-work-unit qualification completed
-Last verified: 2026-08-10
-Canonical code: historical repositories and local transcripts listed below; E0 controller and fixture code lives under `extensions/agent/tests/benchmark/`
+Status: R&D evidence with strict parity and collaborative workflow benchmarks completed
+Last verified: 2026-08-11
+Canonical code: historical repositories and local transcripts listed below; the adaptive controller and fixture code lives under `extensions/agent/tests/benchmark/`
 
 # Ledger workflow transcript and benchmark corpus
 
@@ -10,6 +10,70 @@ reproducible starting point for a later Agent-versus-Codex benchmark. It maps
 Ledger and Remux commits to retained Codex and Claude transcripts, identifies
 high-value replay fixtures, documents parsing hazards, and defines an initial
 experiment protocol.
+
+## Benchmark v3: strict parity and collaborative workflow
+
+Benchmark v3 separates two questions that the earlier adaptive scenario mixed
+together. `ledger-projection-time-bars-strict-v1` is a one-turn implementation
+parity test with the same authoritative prompt, base tree, model, reasoning,
+and evaluator for Agent and Codex. `ledger-feed-session-workflow-v1` is an
+adaptive, multi-turn collaboration test whose next owner message is written
+after observing the prior response, Thread, and workspace. Driver events record
+intent, constraints, and decisions without pretending that natural dialogue is
+a fixed prompt script.
+
+Both scenarios keep accepted inputs visible and reference implementations and
+tests evaluator-only. The evaluator may rewrite its own imports when historical
+tests assume an API path not required by the governing spec; every permitted
+rewrite is declared in the fixture manifest and must match exactly once. This
+corrects an earlier false negative: the projection spec requires a public
+`projection::bars` module and public types within it, not duplicate parent-module
+re-exports. Preflight still proves that the untouched base fails behavior and
+the known-good reference passes it. Evaluation also checks authority, commits,
+path scope, source immutability, reference leakage, formatting, and durable
+Agent mechanics.
+
+The strict parity runs used GPT-5.6 Sol/high:
+
+| Arm | Run | Result | Active time | Context behavior |
+| --- | --- | --- | ---: | --- |
+| Agent | `2026-08-11T19-50-09-387Z-agent-965dc0` | Pass | 10m21.508s | 37 provider calls, one entered/returned work unit, 41,970-token peak root, 97,143-token peak child, zero compactions |
+| Codex/App Server | `2026-08-11T20-01-11-541Z-codex-c1702e` | Pass | 6m36.595s | 35 function calls, zero compactions |
+
+Both implementations pass formatting and the full overlaid behavioral suite,
+make no commits, stay within allowed paths, leak no hidden references, and
+leave the source Ledger repository unchanged. Agent is 1.57 times as slow in
+this single sample and uses 81 total tool calls, so the run establishes parity
+of outcome, not an efficiency win. Agent completed without compaction and
+returned a typed continuation bundle with one authority, two deliverables, one
+evidence resource, and one Thread proposal. Agent and Codex token totals are
+not directly comparable because their adapters expose different accounting
+semantics.
+
+The first collaborative workflow run,
+`2026-08-11T20-14-35-575Z-agent-7dc8f1`, failed honestly on its first read-only
+design-audit turn after 11m24s. Its child work unit reached a 167,650-token peak
+estimate and did call `work_unit_finish` with a complete repository-grounded
+audit, a proposed Thread update, and eight resource references (then named
+artifacts by the tool contract). The result was
+17,242 bytes—858 bytes above the former static 16 KiB result cap. Because that
+validation happened after the tool had appeared to succeed, Pi received `No
+result provided`; the next child continuation stopped empty and the turn was
+misreported as ending without a finish call. The audit findings therefore never
+reached the visible response or Thread.
+
+The workspace remained clean and the durable failed turn survived an Agent
+restart. The defect was in the return boundary, not a missing model handoff:
+the low result/Thread caps have been removed and deterministic return validation
+now occurs before tool success so the child can correct and retry. The benchmark
+controller still labels this recorded terminal error `infrastructure-failed`;
+that historical label is too broad. The workflow scenario should be rerun after
+the prompt-level parent scoping changes described by the Thread Runtime plan.
+
+An earlier Agent attempt,
+`2026-08-11T19-35-00-867Z-agent-550df3`, was excluded from parity scoring after
+the upstream model WebSocket closed with code 1012. It remains a transport
+reliability observation rather than a correctness result.
 
 ## Implemented E0 benchmark
 
@@ -736,7 +800,7 @@ real GPT-5.6 Sol provider run.
 
 | Contract | Status | Implementation and evidence |
 | --- | --- | --- |
-| F1 | Pass | `journal_open` resolves the compiler, journal, primary, artifact, omission, scope, work-result, and exact-file reference plane; the H4 context-workspace test opens emitted refs. |
+| F1 | Pass | `history_read` resolves the compiler, journal, primary, artifact, omission, scope, work-result, and exact-file reference plane; the H4 context-workspace test opens emitted refs. |
 | F2 | Pass | Journal search ranks/deduplicates high-signal records and exposes ordinary operations only through `include: "operations"`; search behavior is covered end to end. |
 | F3 | Pass | `context_update.set.evidence` validates all refs atomically and persists primary/binding provenance; invalid-evidence rollback and proposal lineage are tested. |
 | F4 | Pass | `context_update.pin` snapshots exact bounded files and journal resources; pins remain openable across rollover and restart. |

@@ -2211,7 +2211,8 @@
 .agent-exact-content-dialog pre { min-width: 0; min-height: 0; overflow: auto; margin: 0; padding: 16px; color: var(--foreground); font: 13px/1.55 var(--font-mono, ui-monospace, monospace); white-space: pre-wrap; overflow-wrap: anywhere; }
 .remux-new-chat-action { display: grid; width: 28px; height: 28px; flex: 0 0 28px; place-items: center; border: 0; border-radius: 8px; background: transparent; color: var(--muted-foreground); padding: 0; }
 .remux-new-chat-action:hover { background: color-mix(in srgb, var(--foreground) 8%, transparent); color: var(--foreground); }
-.agent-context-inspector { position: relative; margin-left: auto; pointer-events: auto; }
+.remux-composer-status-actions { display: flex; min-width: 0; align-items: center; gap: 10px; margin-left: auto; pointer-events: auto; }
+.agent-context-inspector { position: relative; pointer-events: auto; }
 .agent-context-inspector > summary { cursor: pointer; list-style: none; white-space: nowrap; }
 .agent-context-inspector > summary::-webkit-details-marker { display: none; }
 .agent-context-inspector[open] > summary { color: var(--foreground); }
@@ -2236,5 +2237,27 @@
 .agent-context-inspector-blocks { display: grid; gap: 4px; margin: 10px 0; }
 .agent-context-inspector-blocks > div { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 10px; border-top: 1px solid color-mix(in srgb, var(--border) 65%, transparent); padding-top: 4px; }
 .agent-context-inspector-blocks > div > span:not(:first-child) { color: var(--muted-foreground); }
+.agent-thread-canvas-open { display: inline-flex; align-items: center; gap: 5px; border: 0; background: transparent; color: var(--muted-foreground); font: inherit; white-space: nowrap; padding: 0; }
+.agent-thread-canvas-open:hover { color: var(--foreground); }
+.agent-thread-updated-dot { width: 5px; height: 5px; border-radius: 999px; background: var(--link); }
+.agent-thread-canvas-dialog { display: grid; width: min(900px, 100%); max-height: min(820px, calc(100dvh - 40px)); grid-template-rows: auto minmax(0, 1fr) auto; overflow: hidden; border: 1px solid var(--border); border-radius: 14px; background: var(--background); box-shadow: 0 24px 80px rgb(0 0 0 / .38); }
+.agent-thread-canvas-dialog > header, .agent-thread-canvas-dialog > footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; }
+.agent-thread-canvas-dialog > header { border-bottom: 1px solid var(--border); }
+.agent-thread-canvas-dialog > footer { border-top: 1px solid var(--border); color: var(--muted-foreground); font-size: 12px; }
+.agent-thread-canvas-dialog > header > div:first-child { display: grid; gap: 1px; }
+.agent-thread-canvas-dialog > header > div:first-child > span { color: var(--muted-foreground); font-size: 11px; }
+.agent-thread-canvas-actions { display: flex; align-items: center; gap: 6px; }
+.agent-thread-canvas-actions button { display: grid; min-height: 29px; place-items: center; border: 1px solid var(--border); border-radius: 8px; background: transparent; color: var(--muted-foreground); padding: 5px 9px; }
+.agent-thread-canvas-actions button.is-active { background: var(--secondary); color: var(--foreground); }
+.agent-thread-canvas-actions button:disabled { opacity: .45; }
+.agent-thread-canvas-body { min-width: 0; min-height: 0; overflow: auto; padding: 18px 16px 28px; color: var(--foreground); user-select: text; }
+.agent-thread-canvas-body > p { color: var(--muted-foreground); }
+@media (max-width: 560px) {
+  .agent-exact-content-backdrop { padding: 8px; }
+  .agent-thread-canvas-dialog { max-height: calc(100dvh - 16px); border-radius: 12px; }
+  .agent-thread-canvas-dialog > header, .agent-thread-canvas-dialog > footer { padding: 10px 11px; }
+  .agent-thread-canvas-dialog > footer { align-items: flex-start; flex-direction: column; gap: 2px; }
+  .agent-thread-canvas-body { padding: 15px 12px 24px; }
+}
 .remux-composer-config-note { color: var(--muted-foreground); font-size: 11px; line-height: 15px; padding: 5px 8px; }
 }

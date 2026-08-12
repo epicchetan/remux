@@ -1,19 +1,32 @@
 import { randomBytes } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
 import { createBenchmarkTarget } from './adapters.ts';
-import type { BenchmarkRun, BenchmarkTarget, PreparedFixtureManifest } from './contracts.ts';
-import { captureTranscript, evaluateRun, snapshotWorkspace } from './evidence.ts';
+import type {
+  BenchmarkDriverEvent,
+  BenchmarkReport,
+  BenchmarkRun,
+  BenchmarkTarget,
+  BenchmarkTurnRecord,
+  PreparedFixtureManifest,
+} from './contracts.ts';
+import {
+  captureTranscript,
+  evaluateRun,
+  preflightScenario,
+  snapshotWorkspace,
+} from './evidence.ts';
 import { createRunWorkspace, prepareFixture } from './fixture.ts';
 import { RemuxBenchmarkClient } from './remux-client.ts';
 import { benchmarkScenario, benchmarkScenarios } from './scenarios.ts';
 
 const REPOSITORY_ROOT = resolve(import.meta.dirname, '../../../..');
-const DEFAULT_DATA_ROOT = join(REPOSITORY_ROOT, '.remux-benchmarks');
+const DEFAULT_DATA_ROOT = join(homedir(), '.local', 'state', 'remux', 'benchmarks');
 const DEFAULT_ENDPOINT = 'ws://127.0.0.1:48123/ws';
 const DEFAULT_TOKEN_FILE = join(REPOSITORY_ROOT, '.remux', 'auth-token');
-const DEFAULT_SCENARIO = 'ledger-feed-session-collaboration-v1';
+const DEFAULT_SCENARIO = 'ledger-projection-time-bars-strict-v1';
 
 await main(process.argv.slice(2));
 
@@ -23,15 +36,20 @@ async function main(argv: string[]) {
   try {
     switch (command) {
       case 'list':
-        printJson(benchmarkScenarios().map(({ fixtureId, title, stages, maxUserTurns }) => ({
-          fixtureId,
-          title,
-          stages: stages.map(({ id, title: stageTitle }) => ({ id, title: stageTitle })),
-          maxUserTurns,
+        printJson(benchmarkScenarios().map((scenario) => ({
+          suite: scenario.suite,
+          fixtureId: scenario.fixtureId,
+          title: scenario.title,
+          goal: scenario.driverBrief.goal,
+          maxUserTurns: scenario.maxUserTurns,
+          maxDurationMs: scenario.maxDurationMs,
         })));
         return;
       case 'prepare':
         await commandPrepare(options);
+        return;
+      case 'preflight':
+        await commandPreflight(options);
         return;
       case 'models':
         await withClient(options, (client) => commandModels(options, client));
@@ -39,23 +57,23 @@ async function main(argv: string[]) {
       case 'start':
         await withClient(options, (client) => commandStart(options, client));
         return;
+      case 'observe':
+        await withClient(options, (client) => commandObserve(options, client));
+        return;
       case 'send':
         await withClient(options, (client) => commandSend(options, client));
         return;
-      case 'resume':
-        await withClient(options, (client) => commandResume(options, client));
+      case 'stop':
+        await commandStop(options);
         return;
       case 'status':
         await commandStatus(options);
         return;
-      case 'finalize':
-        await commandFinalize(options);
+      case 'evaluate':
+        await commandEvaluate(options);
         return;
-      case 'run':
-        await withClient(options, (client) => commandRun(options, client));
-        return;
-      case 'replay':
-        await withClient(options, (client) => commandReplay(options, client));
+      case 'compare':
+        await commandCompare(options);
         return;
       case 'sentinel':
         await withClient(options, (client) => commandSentinel(options, client));
@@ -80,6 +98,14 @@ async function commandPrepare(options: Options) {
   printJson({ fixtureId: scenario.fixtureId, manifestPath: prepared.manifestPath, template: prepared.manifest.template });
 }
 
+async function commandPreflight(options: Options) {
+  const scenario = benchmarkScenario(options.scenario);
+  const prepared = await prepareFixture(scenario, options.dataRoot);
+  const report = await preflightScenario({ scenario, manifest: prepared.manifest, dataRoot: options.dataRoot });
+  printJson(report);
+  if (!report.passed) process.exitCode = 1;
+}
+
 async function commandModels(options: Options, client: RemuxBenchmarkClient) {
   const cwd = options.cwd ?? REPOSITORY_ROOT;
   const result = options.target === 'codex'
@@ -89,40 +115,149 @@ async function commandModels(options: Options, client: RemuxBenchmarkClient) {
 }
 
 async function commandStart(options: Options, client: RemuxBenchmarkClient) {
-  const runRecord = await startScenarioRun(options, client);
+  const scenario = benchmarkScenario(options.scenario);
+  const text = await turnText(options, scenario.fixedPrompt);
+  const driverEvent = await readDriverEvent(options.driverEventPath);
+  const prepared = await prepareFixture(scenario, options.dataRoot);
+  const runId = newRunId(options.target);
+  const runPath = join(options.dataRoot, 'runs', runId);
+  const workspacePath = await createRunWorkspace(prepared.manifest, runPath);
+  const target = createBenchmarkTarget(options.target, client);
+  const modelId = requiredOption(options.modelId, '--model');
+  const startedAt = new Date().toISOString();
+  const sourceBefore = await snapshotWorkspace(scenario.sourceRepository);
+  const started = await target.start({
+    cwd: workspacePath,
+    modelId,
+    reasoning: options.reasoning,
+    reviewMode: options.reviewMode,
+    speed: options.speed,
+    text,
+  });
+  const runRecord: BenchmarkRun = {
+    version: 3,
+    runId,
+    fixtureId: scenario.fixtureId,
+    suite: scenario.suite,
+    target: options.target,
+    state: 'running',
+    dataRoot: options.dataRoot,
+    workspacePath,
+    fixtureManifestPath: prepared.manifestPath,
+    conversationId: started.conversationId,
+    modelId: started.modelId,
+    reasoning: options.reasoning,
+    reviewMode: options.reviewMode,
+    speed: options.speed,
+    contextArchitecture: options.target === 'agent' ? 'thread-runtime-v2' : 'codex-app-server',
+    stopReason: null,
+    driverAssessment: null,
+    startedAt,
+    updatedAt: startedAt,
+    sourceHeadBefore: sourceBefore.head,
+    sourceStatusBefore: sourceBefore.status,
+    turns: [],
+    transcriptPath: null,
+    evidencePath: null,
+    reportPath: null,
+    error: null,
+  };
+  await persistRun(runRecord, runPath);
+  try {
+    await finishTurn({
+      runRecord,
+      runPath,
+      text,
+      driverNote: options.driverNote,
+      driverEvent,
+      authority: turnAuthority(scenario.driverBrief.defaultAuthority, options),
+      turnId: started.turnId,
+      startedAt,
+      target,
+      timeoutMs: options.timeoutMs,
+    });
+  } catch (error) {
+    await markInfrastructureFailure(runRecord, runPath, error);
+    throw error;
+  }
   printRunProgress(runRecord);
+}
+
+async function commandObserve(options: Options, client: RemuxBenchmarkClient) {
+  const { runRecord } = await loadRequiredRun(options);
+  const target = createBenchmarkTarget(runRecord.target, client);
+  const [transcript, workspace, thread] = await Promise.all([
+    target.readTranscript(runRecord.conversationId),
+    snapshotWorkspace(runRecord.workspacePath),
+    runRecord.target === 'agent'
+      ? client.query(
+        'remux/agent/thread/read',
+        { conversationId: runRecord.conversationId },
+        `benchmark:observe:${runRecord.runId}`,
+      ).catch((error) => ({ error: error instanceof Error ? error.message : String(error) }))
+      : Promise.resolve(null),
+  ]);
+  const last = runRecord.turns.at(-1);
+  printJson({
+    runId: runRecord.runId,
+    state: runRecord.state,
+    stopReason: runRecord.stopReason,
+    turns: runRecord.turns.length,
+    latest: last ? {
+      sequence: last.sequence,
+      turnId: last.turnId,
+      user: last.text,
+      assistant: transcript.assistantTextByTurn[last.turnId] ?? '',
+      status: transcript.turnStatusByTurn[last.turnId] ?? null,
+    } : null,
+    workspace,
+    thread,
+  });
 }
 
 async function commandSend(options: Options, client: RemuxBenchmarkClient) {
   const { runRecord, runPath } = await loadRequiredRun(options);
   const scenario = benchmarkScenario(runRecord.fixtureId);
+  const text = await turnText(options, null);
+  const driverEvent = await readDriverEvent(options.driverEventPath);
   if (runRecord.state !== 'running') throw new Error(`Run ${runRecord.runId} is ${runRecord.state}, not running.`);
-  if (runRecord.stageIndex >= scenario.stages.length) throw new Error(`Run ${runRecord.runId} has no remaining scenario stage.`);
-  const stage = scenario.stages[runRecord.stageIndex];
-  const text = options.text ?? stage.defaultPrompt;
-  await executeTurn(runRecord, runPath, stage.id, text, client);
+  assertWithinBudget(runRecord, scenario);
+  const priorAuthority = runRecord.turns.at(-1)?.authority ?? scenario.driverBrief.defaultAuthority;
+  const target = createBenchmarkTarget(runRecord.target, client);
+  const startedAt = new Date().toISOString();
+  try {
+    const started = await target.send({ conversationId: runRecord.conversationId, text });
+    await finishTurn({
+      runRecord,
+      runPath,
+      text,
+      driverNote: options.driverNote,
+      driverEvent,
+      authority: turnAuthority(priorAuthority, options),
+      turnId: started.turnId,
+      startedAt,
+      target,
+      timeoutMs: options.timeoutMs,
+    });
+  } catch (error) {
+    await markInfrastructureFailure(runRecord, runPath, error);
+    throw error;
+  }
   printRunProgress(runRecord);
 }
 
-async function commandResume(options: Options, client: RemuxBenchmarkClient) {
+async function commandStop(options: Options) {
   const { runRecord, runPath } = await loadRequiredRun(options);
-  const scenario = benchmarkScenario(runRecord.fixtureId);
-  if (runRecord.state !== 'failed' && runRecord.state !== 'interrupted') {
-    throw new Error(`Run ${runRecord.runId} is ${runRecord.state}, not failed or interrupted.`);
+  if (runRecord.state !== 'running' && runRecord.state !== 'infrastructure-failed') {
+    throw new Error(`Run ${runRecord.runId} is ${runRecord.state}; only active runs can be stopped.`);
   }
-  if (runRecord.stageIndex >= scenario.stages.length) {
-    throw new Error(`Run ${runRecord.runId} has no remaining scenario stage.`);
-  }
-  runRecord.state = 'running';
-  runRecord.error = null;
+  const reason = stopReason(requiredOption(options.stopReason, '--reason'));
+  runRecord.state = 'stopped';
+  runRecord.stopReason = reason;
+  runRecord.driverAssessment = options.note;
   runRecord.updatedAt = new Date().toISOString();
   await persistRun(runRecord, runPath);
-  while (runRecord.stageIndex < scenario.stages.length) {
-    const stage = scenario.stages[runRecord.stageIndex];
-    await executeTurn(runRecord, runPath, stage.id, stage.defaultPrompt, client);
-  }
   printRunProgress(runRecord);
-  process.stdout.write(`Run ${runRecord.runId} is ready. Finalize it with npm --workspace @remux/agent run benchmark -- finalize --run ${runRecord.runId}\n`);
 }
 
 async function commandStatus(options: Options) {
@@ -130,10 +265,10 @@ async function commandStatus(options: Options) {
   printRunProgress(runRecord);
 }
 
-async function commandFinalize(options: Options) {
+async function commandEvaluate(options: Options) {
   const { runRecord, runPath } = await loadRequiredRun(options);
-  if (runRecord.state !== 'ready-for-evaluation' && runRecord.state !== 'failed') {
-    throw new Error(`Run ${runRecord.runId} is ${runRecord.state}; complete all stages before finalizing.`);
+  if (!['stopped', 'completed', 'failed'].includes(runRecord.state)) {
+    throw new Error(`Run ${runRecord.runId} is ${runRecord.state}; only terminal runs can be evaluated.`);
   }
   const scenario = benchmarkScenario(runRecord.fixtureId);
   const manifest = await readJson<PreparedFixtureManifest>(runRecord.fixtureManifestPath);
@@ -159,32 +294,63 @@ async function commandFinalize(options: Options) {
   }
 }
 
-async function commandRun(options: Options, client: RemuxBenchmarkClient) {
-  const runRecord = await startScenarioRun(options, client);
-  const runPath = dirname(runRecord.workspacePath);
-  const scenario = benchmarkScenario(runRecord.fixtureId);
-  while (runRecord.stageIndex < scenario.stages.length) {
-    const stage = scenario.stages[runRecord.stageIndex];
-    await executeTurn(runRecord, runPath, stage.id, stage.defaultPrompt, client);
+async function commandCompare(options: Options) {
+  const agentRunId = requiredOption(options.agentRunId, '--agent-run');
+  const codexRunId = requiredOption(options.codexRunId, '--codex-run');
+  const [agent, codex] = await Promise.all([
+    readJson<BenchmarkReport>(join(options.dataRoot, 'runs', agentRunId, 'report.json')),
+    readJson<BenchmarkReport>(join(options.dataRoot, 'runs', codexRunId, 'report.json')),
+  ]);
+  if (agent.target !== 'agent' || codex.target !== 'codex') {
+    throw new Error('Comparison requires --agent-run to target Agent and --codex-run to target Codex.');
   }
-  printRunProgress(runRecord);
-  process.stdout.write(`Run ${runRecord.runId} is ready. Finalize it with npm --workspace @remux/agent run benchmark -- finalize --run ${runRecord.runId}\n`);
-}
-
-async function commandReplay(options: Options, client: RemuxBenchmarkClient) {
-  if (!options.sourceRun) throw new Error('replay requires --source-run <run-id>.');
-  const source = await readJson<BenchmarkRun>(join(options.dataRoot, 'runs', options.sourceRun, 'run.json'));
-  const replayOptions = { ...options, scenario: source.fixtureId };
-  const prompts = source.turns.map(({ text }) => text);
-  if (prompts.length === 0) throw new Error(`Source run ${source.runId} has no turns to replay.`);
-  const runRecord = await startScenarioRun(replayOptions, client, prompts[0]);
-  const runPath = dirname(runRecord.workspacePath);
-  const scenario = benchmarkScenario(runRecord.fixtureId);
-  while (runRecord.stageIndex < prompts.length && runRecord.stageIndex < scenario.stages.length) {
-    const stage = scenario.stages[runRecord.stageIndex];
-    await executeTurn(runRecord, runPath, stage.id, prompts[runRecord.stageIndex], client);
+  if (agent.fixtureId !== codex.fixtureId || agent.suite !== 'parity' || codex.suite !== 'parity') {
+    throw new Error('Comparison arms must use the same parity fixture.');
   }
-  printRunProgress(runRecord);
+  const comparisonId = `${agentRunId}--${codexRunId}`;
+  const comparisonRoot = join(options.dataRoot, 'comparisons', comparisonId);
+  await mkdir(comparisonRoot, { recursive: true });
+  const value = {
+    version: 3,
+    comparisonId,
+    fixtureId: agent.fixtureId,
+    model: { agent: agent.modelId, codex: codex.modelId },
+    reasoning: { agent: agent.reasoning, codex: codex.reasoning },
+    correctness: {
+      agentPassed: agent.passed,
+      codexPassed: codex.passed,
+      agentFailedGates: agent.gates.filter((gate) => !gate.passed).map((gate) => gate.id),
+      codexFailedGates: codex.gates.filter((gate) => !gate.passed).map((gate) => gate.id),
+    },
+    runtime: {
+      agentActiveTurnMs: agent.activeTurnMs,
+      codexActiveTurnMs: codex.activeTurnMs,
+      deltaMs: agent.activeTurnMs - codex.activeTurnMs,
+      ratio: codex.activeTurnMs > 0 ? agent.activeTurnMs / codex.activeTurnMs : null,
+    },
+    context: {
+      agentProviderCalls: agent.metrics.providerCalls,
+      codexFunctionCalls: codex.metrics.functionCalls,
+      agentFunctionCalls: agent.metrics.functionCalls,
+      agentWorkUnits: agent.metrics.workUnitsEntered,
+      agentPeakRootTokens: agent.metrics.peakRootEstimatedInputTokens,
+      agentPeakChildTokens: agent.metrics.peakChildEstimatedInputTokens,
+      codexContextWindow: codex.metrics.modelContextWindow,
+      agentCompactions: agent.metrics.compactionEvents,
+      codexCompactions: codex.metrics.compactionEvents,
+      agentCacheReadRatio: agent.metrics.cacheReadRatio,
+      codexCacheReadRatio: codex.metrics.cacheReadRatio,
+    },
+    reports: {
+      agent: join(options.dataRoot, 'runs', agentRunId, 'report.json'),
+      codex: join(options.dataRoot, 'runs', codexRunId, 'report.json'),
+    },
+  };
+  const jsonPath = join(comparisonRoot, 'comparison.json');
+  const markdownPath = join(comparisonRoot, 'comparison.md');
+  await writeFile(jsonPath, `${JSON.stringify(value, null, 2)}\n`);
+  await writeFile(markdownPath, renderComparisonMarkdown(value));
+  printJson({ ...value, artifacts: { json: jsonPath, markdown: markdownPath } });
 }
 
 async function commandSentinel(options: Options, client: RemuxBenchmarkClient) {
@@ -211,123 +377,71 @@ async function commandSentinel(options: Options, client: RemuxBenchmarkClient) {
   const workspace = await snapshotWorkspace(cwd);
   const firstText = transcript.assistantTextByTurn[first.turnId] ?? '';
   const secondText = transcript.assistantTextByTurn[second.turnId] ?? '';
-  const passed = firstText.includes('BENCHMARK_SENTINEL_ONE')
-    && secondText.includes('BENCHMARK_SENTINEL_TWO')
-    && workspace.status === '';
+  const passed = firstText.includes('BENCHMARK_SENTINEL_ONE') &&
+    secondText.includes('BENCHMARK_SENTINEL_TWO') && workspace.status === '';
   printJson({ passed, target: options.target, conversationId: first.conversationId, turnIds: [first.turnId, second.turnId], firstText, secondText, workspace });
   if (!passed) process.exitCode = 1;
 }
 
-async function startScenarioRun(options: Options, client: RemuxBenchmarkClient, firstPrompt?: string) {
-  const scenario = benchmarkScenario(options.scenario);
-  const prepared = await prepareFixture(scenario, options.dataRoot);
-  const runId = newRunId(options.target);
-  const runPath = join(options.dataRoot, 'runs', runId);
-  const workspacePath = await createRunWorkspace(prepared.manifest, runPath);
-  const stage = scenario.stages[0];
-  const target = createBenchmarkTarget(options.target, client);
-  const modelId = requiredOption(options.modelId, '--model');
-  const text = firstPrompt ?? options.text ?? stage.defaultPrompt;
-  const turnStartedAt = new Date().toISOString();
-  const sourceBefore = await snapshotWorkspace(scenario.sourceRepository);
-  const started = await target.start({
-    cwd: workspacePath,
-    modelId,
-    reasoning: options.reasoning,
-    reviewMode: options.reviewMode,
-    speed: options.speed,
-    text,
-  });
-  const runRecord: BenchmarkRun = {
-    version: 1,
-    runId,
-    fixtureId: scenario.fixtureId,
-    target: options.target,
-    state: 'running',
-    dataRoot: options.dataRoot,
-    workspacePath,
-    fixtureManifestPath: prepared.manifestPath,
-    conversationId: started.conversationId,
-    modelId: started.modelId,
-    reasoning: options.reasoning,
-    reviewMode: options.reviewMode,
-    speed: options.speed,
-    contextArchitecture: options.target === 'agent' ? 'thread-runtime-v2' : 'codex-app-server',
-    stageIndex: 0,
-    startedAt: turnStartedAt,
-    updatedAt: turnStartedAt,
-    sourceHeadBefore: sourceBefore.head,
-    sourceStatusBefore: sourceBefore.status,
-    turns: [],
-    transcriptPath: null,
-    evidencePath: null,
-    reportPath: null,
-    error: null,
-  };
-  await persistRun(runRecord, runPath);
-  try {
-    await finishTurn(runRecord, runPath, stage.id, text, started.turnId, turnStartedAt, target, options.timeoutMs);
-  } catch (error) {
-    await markRunFailed(runRecord, runPath, error);
-    throw error;
-  }
-  return runRecord;
-}
-
-async function executeTurn(
-  runRecord: BenchmarkRun,
-  runPath: string,
-  stageId: string,
-  text: string,
-  client: RemuxBenchmarkClient,
-) {
-  const target = createBenchmarkTarget(runRecord.target, client);
-  const startedAt = new Date().toISOString();
-  try {
-    const started = await target.send({ conversationId: runRecord.conversationId, text });
-    await finishTurn(runRecord, runPath, stageId, text, started.turnId, startedAt, target, 45 * 60_000);
-  } catch (error) {
-    await markRunFailed(runRecord, runPath, error);
-    throw error;
-  }
-}
-
-async function finishTurn(
-  runRecord: BenchmarkRun,
-  runPath: string,
-  stageId: string,
-  text: string,
-  turnId: string,
-  startedAt: string,
-  target: ReturnType<typeof createBenchmarkTarget>,
-  timeoutMs: number,
-) {
-  await target.waitForTerminal({ conversationId: runRecord.conversationId, turnId, timeoutMs });
+async function finishTurn(input: {
+  runRecord: BenchmarkRun;
+  runPath: string;
+  text: string;
+  driverNote: string | null;
+  driverEvent: BenchmarkDriverEvent | null;
+  authority: BenchmarkTurnRecord['authority'];
+  turnId: string;
+  startedAt: string;
+  target: ReturnType<typeof createBenchmarkTarget>;
+  timeoutMs: number;
+}) {
+  const { runRecord, runPath, target } = input;
+  await target.waitForTerminal({ conversationId: runRecord.conversationId, turnId: input.turnId, timeoutMs: input.timeoutMs });
   const [transcript, workspace] = await Promise.all([
     target.readTranscript(runRecord.conversationId),
     snapshotWorkspace(runRecord.workspacePath),
   ]);
+  const threadSnapshot = target.readThread
+    ? await target.readThread(runRecord.conversationId)
+    : null;
+  const completedAt = new Date().toISOString();
   runRecord.turns.push({
-    stageId,
-    text,
-    turnId,
-    startedAt,
-    completedAt: new Date().toISOString(),
+    sequence: runRecord.turns.length + 1,
+    text: input.text,
+    driverNote: input.driverNote,
+    driverEvent: input.driverEvent,
+    authority: input.authority,
+    turnId: input.turnId,
+    startedAt: input.startedAt,
+    completedAt,
+    activeDurationMs: Math.max(0, Date.parse(completedAt) - Date.parse(input.startedAt)),
     workspaceHeadAfter: workspace.head,
     workspaceStatusAfter: workspace.status,
+    threadSnapshot,
   });
-  runRecord.stageIndex = runRecord.turns.length;
-  runRecord.state = runRecord.stageIndex >= benchmarkScenario(runRecord.fixtureId).stages.length
-    ? 'ready-for-evaluation'
-    : 'running';
+  await persistTurnEvidence({
+    runPath,
+    turn: runRecord.turns.at(-1)!,
+    assistant: transcript.assistantTextByTurn[input.turnId] ?? '',
+  });
+  const scenario = benchmarkScenario(runRecord.fixtureId);
+  const exhausted = runRecord.turns.length >= scenario.maxUserTurns ||
+    Date.now() - Date.parse(runRecord.startedAt) >= scenario.maxDurationMs;
+  if (exhausted) {
+    runRecord.state = 'stopped';
+    runRecord.stopReason = scenario.suite === 'parity' ? 'accepted' : 'budget-exhausted';
+    runRecord.driverAssessment = scenario.suite === 'parity'
+      ? 'The fixed parity prompt completed; the evaluator determines implementation correctness.'
+      : 'The adaptive run reached its configured turn or duration budget.';
+  }
   runRecord.updatedAt = new Date().toISOString();
   runRecord.transcriptPath = await captureTranscript(runRecord, transcript);
   await persistRun(runRecord, runPath);
-  process.stdout.write(`\n[${stageId}] ${turnId}\n${transcript.assistantTextByTurn[turnId] ?? '<no assistant text>'}\n`);
+  process.stdout.write(`\n[turn ${runRecord.turns.length}] ${input.turnId}\n${transcript.assistantTextByTurn[input.turnId] ?? '<no assistant text>'}\n`);
 }
 
-async function markRunFailed(runRecord: BenchmarkRun, runPath: string, error: unknown) {
-  runRecord.state = 'failed';
+async function markInfrastructureFailure(runRecord: BenchmarkRun, runPath: string, error: unknown) {
+  runRecord.state = 'infrastructure-failed';
   runRecord.error = error instanceof Error ? error.message : String(error);
   runRecord.updatedAt = new Date().toISOString();
   await persistRun(runRecord, runPath);
@@ -361,15 +475,32 @@ async function readJson<T>(path: string): Promise<T> {
   return JSON.parse(await readFile(path, 'utf8')) as T;
 }
 
+function assertWithinBudget(runRecord: BenchmarkRun, scenario: ReturnType<typeof benchmarkScenario>) {
+  if (runRecord.turns.length >= scenario.maxUserTurns) throw new Error('The adaptive run exhausted its user-turn budget.');
+  if (Date.now() - Date.parse(runRecord.startedAt) >= scenario.maxDurationMs) {
+    throw new Error('The adaptive run exhausted its duration budget.');
+  }
+}
+
+function turnAuthority(
+  prior: BenchmarkTurnRecord['authority'],
+  options: Options,
+): BenchmarkTurnRecord['authority'] {
+  return {
+    mayWrite: options.mayWrite ?? prior.mayWrite,
+    mayCommit: options.mayCommit ?? prior.mayCommit,
+    mayPush: options.mayPush ?? prior.mayPush,
+  };
+}
+
 function printRunProgress(runRecord: BenchmarkRun) {
-  const scenario = benchmarkScenario(runRecord.fixtureId);
   printJson({
     runId: runRecord.runId,
     state: runRecord.state,
+    stopReason: runRecord.stopReason,
     target: runRecord.target,
     conversationId: runRecord.conversationId,
-    completedStages: runRecord.turns.map(({ stageId, turnId }) => ({ stageId, turnId })),
-    nextStage: scenario.stages[runRecord.stageIndex]?.id ?? null,
+    turns: runRecord.turns.map(({ sequence, turnId, authority }) => ({ sequence, turnId, authority })),
     workspacePath: runRecord.workspacePath,
     reportPath: runRecord.reportPath,
     error: runRecord.error,
@@ -387,11 +518,8 @@ function parseOptions(args: string[]): Options {
     values.set(key, value);
     index += 1;
   }
-  const target = values.get('--target') ?? 'codex';
+  const target = values.get('--target') ?? 'agent';
   if (target !== 'codex' && target !== 'agent') throw new Error('--target must be codex or agent.');
-  if (values.has('--context-mode')) {
-    throw new Error('--context-mode was removed; the Agent benchmark always uses Thread Runtime v1.');
-  }
   const timeoutMs = Number(values.get('--timeout-ms') ?? 45 * 60_000);
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000) throw new Error('--timeout-ms must be a safe integer of at least 1000.');
   return {
@@ -407,8 +535,17 @@ function parseOptions(args: string[]): Options {
     speed: values.get('--speed') ?? 'default',
     timeoutMs,
     runId: values.get('--run') ?? null,
-    sourceRun: values.get('--source-run') ?? null,
     text: values.get('--text') ?? null,
+    textFile: values.has('--text-file') ? resolve(values.get('--text-file')!) : null,
+    driverNote: values.get('--driver-note') ?? null,
+    driverEventPath: values.has('--driver-event') ? resolve(values.get('--driver-event')!) : null,
+    agentRunId: values.get('--agent-run') ?? null,
+    codexRunId: values.get('--codex-run') ?? null,
+    note: values.get('--note') ?? null,
+    stopReason: values.get('--reason') ?? null,
+    mayWrite: optionalBoolean(values.get('--may-write'), '--may-write'),
+    mayCommit: optionalBoolean(values.get('--may-commit'), '--may-commit'),
+    mayPush: optionalBoolean(values.get('--may-push'), '--may-push'),
   };
 }
 
@@ -425,13 +562,110 @@ type Options = {
   speed: string;
   timeoutMs: number;
   runId: string | null;
-  sourceRun: string | null;
   text: string | null;
+  textFile: string | null;
+  driverNote: string | null;
+  driverEventPath: string | null;
+  agentRunId: string | null;
+  codexRunId: string | null;
+  note: string | null;
+  stopReason: string | null;
+  mayWrite: boolean | null;
+  mayCommit: boolean | null;
+  mayPush: boolean | null;
 };
+
+function optionalBoolean(value: string | undefined, name: string) {
+  if (value === undefined) return null;
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  throw new Error(`${name} must be true or false.`);
+}
+
+function stopReason(value: string): NonNullable<BenchmarkRun['stopReason']> {
+  if (value === 'accepted' || value === 'abandoned' || value === 'budget-exhausted') return value;
+  throw new Error('--reason must be accepted, abandoned, or budget-exhausted.');
+}
 
 function requiredOption(value: string | null, name: string) {
   if (!value) throw new Error(`${name} is required.`);
   return value;
+}
+
+async function turnText(options: Options, fallback: string | null) {
+  if (options.textFile) {
+    const value = (await readFile(options.textFile, 'utf8')).trim();
+    if (!value) throw new Error(`Benchmark text file is empty: ${options.textFile}`);
+    return value;
+  }
+  if (options.text?.trim()) return options.text.trim();
+  if (fallback) return fallback;
+  throw new Error('--text or --text-file is required for this scenario.');
+}
+
+async function readDriverEvent(path: string | null): Promise<BenchmarkDriverEvent | null> {
+  if (!path) return null;
+  const value = JSON.parse(await readFile(path, 'utf8')) as BenchmarkDriverEvent;
+  if (!value || typeof value !== 'object' || typeof value.stage !== 'string' || typeof value.intent !== 'string') {
+    throw new Error(`Invalid benchmark driver event: ${path}`);
+  }
+  if (!Array.isArray(value.introducedConstraints) || !Array.isArray(value.decisions)) {
+    throw new Error(`Invalid benchmark driver event arrays: ${path}`);
+  }
+  return value;
+}
+
+async function persistTurnEvidence(input: {
+  runPath: string;
+  turn: BenchmarkTurnRecord;
+  assistant: string;
+}) {
+  const root = join(input.runPath, 'turns', String(input.turn.sequence).padStart(2, '0'));
+  await mkdir(root, { recursive: true });
+  await Promise.all([
+    writeFile(join(root, 'user.md'), `${input.turn.text}\n`),
+    writeFile(join(root, 'assistant.md'), `${input.assistant}\n`),
+    writeFile(join(root, 'driver-event.json'), `${JSON.stringify(input.turn.driverEvent, null, 2)}\n`),
+    writeFile(join(root, 'workspace-status.txt'), `${input.turn.workspaceStatusAfter}\n`),
+    input.turn.threadSnapshot
+      ? writeFile(join(root, 'thread.md'), input.turn.threadSnapshot.content)
+      : Promise.resolve(),
+    input.turn.threadSnapshot
+      ? writeFile(join(root, 'thread-metadata.json'), `${JSON.stringify({
+          ...input.turn.threadSnapshot,
+          content: undefined,
+        }, null, 2)}\n`)
+      : Promise.resolve(),
+  ]);
+}
+
+function renderComparisonMarkdown(value: {
+  fixtureId: string;
+  correctness: { agentPassed: boolean; codexPassed: boolean; agentFailedGates: string[]; codexFailedGates: string[] };
+  runtime: { agentActiveTurnMs: number; codexActiveTurnMs: number; deltaMs: number; ratio: number | null };
+  context: Record<string, unknown>;
+}) {
+  const duration = (ms: number) => `${(ms / 60_000).toFixed(2)} min`;
+  return [
+    `# ${value.fixtureId} parity comparison`,
+    '',
+    '| | Agent | Codex |',
+    '| --- | ---: | ---: |',
+    `| Passed | ${value.correctness.agentPassed ? 'yes' : 'no'} | ${value.correctness.codexPassed ? 'yes' : 'no'} |`,
+    `| Active turn time | ${duration(value.runtime.agentActiveTurnMs)} | ${duration(value.runtime.codexActiveTurnMs)} |`,
+    '',
+    `Agent/Codex active-time ratio: ${value.runtime.ratio?.toFixed(2) ?? 'n/a'}.`,
+    '',
+    `Agent failed gates: ${value.correctness.agentFailedGates.join(', ') || 'none'}.`,
+    `Codex failed gates: ${value.correctness.codexFailedGates.join(', ') || 'none'}.`,
+    '',
+    '## Context evidence',
+    '',
+    '```json',
+    JSON.stringify(value.context, null, 2),
+    '```',
+    '',
+  ].join('\n');
 }
 
 function newRunId(target: BenchmarkTarget) {
@@ -443,16 +677,17 @@ function printJson(value: unknown) {
 }
 
 function printHelp() {
-  process.stdout.write(`Remux production-path benchmark\n\n` +
+  process.stdout.write(`Remux adaptive production-path benchmark\n\n` +
     `  benchmark list\n` +
     `  benchmark prepare [--scenario id]\n` +
+    `  benchmark preflight [--scenario id]\n` +
     `  benchmark models --target codex|agent [--cwd path]\n` +
-    `  benchmark start --target codex|agent --model id [--reasoning high]\n` +
-    `  benchmark send --run id [--text prompt]\n` +
-    `  benchmark resume --run id\n` +
+    `  benchmark start --target agent|codex --model id [--text prompt|--text-file path] [--driver-event path]\n` +
+    `  benchmark observe --run id\n` +
+    `  benchmark send --run id [--text prompt|--text-file path] [--driver-event path] [--may-write true]\n` +
+    `  benchmark stop --run id --reason accepted|abandoned|budget-exhausted [--note assessment]\n` +
     `  benchmark status --run id\n` +
-    `  benchmark finalize --run id\n` +
-    `  benchmark run --target codex|agent --model id\n` +
-    `  benchmark replay --source-run id --target codex|agent --model id\n` +
+    `  benchmark evaluate --run id\n` +
+    `  benchmark compare --agent-run id --codex-run id\n` +
     `  benchmark sentinel --target agent --model id\n`);
 }

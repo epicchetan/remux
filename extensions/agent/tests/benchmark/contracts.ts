@@ -1,38 +1,64 @@
-export const BENCHMARK_FORMAT_VERSION = 1 as const;
+export const BENCHMARK_FORMAT_VERSION = 3 as const;
 
 export type BenchmarkTarget = 'agent' | 'codex';
+export type BenchmarkSuite = 'parity' | 'workflow';
 
-export type BenchmarkStage = {
+export type BenchmarkVisibleInput = {
+  path: string;
+  sourceRef: string;
+  sourcePath: string;
+};
+
+export type BenchmarkCommand = {
   id: string;
-  title: string;
-  ownerIntent: string[];
-  defaultPrompt: string;
-  permissions: {
-    mayWrite: boolean;
-    mayCommit: boolean;
-    mayPush: boolean;
-  };
+  file: string;
+  args: string[];
+  heavy?: boolean;
+};
+
+export type BenchmarkOverlayRewrite = {
+  path: string;
+  from: string;
+  to: string;
 };
 
 export type BenchmarkScenario = {
-  version: 1;
+  version: 3;
+  suite: BenchmarkSuite;
   fixtureId: string;
   title: string;
   sourceRepository: string;
   baseCommit: string;
-  acceptedSpecPath: string;
-  hiddenTargetCommit: string;
+  referenceCommit: string;
   sourceRollouts: string[];
   sourceTurnIds: string[];
+  visibleInputs: BenchmarkVisibleInput[];
+  governingPaths: string[];
+  fixedPrompt: string | null;
+  driverCardPath: string | null;
+  driverBrief: {
+    goal: string;
+    background: string[];
+    constraints: string[];
+    defaultAuthority: {
+      mayWrite: boolean;
+      mayCommit: boolean;
+      mayPush: boolean;
+    };
+  };
   maxUserTurns: number;
-  stages: BenchmarkStage[];
+  maxDurationMs: number;
   forbiddenPaths: string[];
-  hiddenValidationPaths: string[];
-  requiredCommands: string[];
+  evaluator: {
+    overlayPaths: string[];
+    overlayRewrites: BenchmarkOverlayRewrite[];
+    formatCommand: BenchmarkCommand;
+    behavioralCommand: BenchmarkCommand;
+  };
 };
 
 export type PreparedFixtureManifest = {
-  version: 1;
+  version: 3;
   fixtureId: string;
   createdAt: string;
   source: {
@@ -41,8 +67,9 @@ export type PreparedFixtureManifest = {
     statusBefore: string;
     baseCommit: string;
     baseTree: string;
-    acceptedSpecPath: string;
-    acceptedSpecSha256: string;
+    referenceCommit: string;
+    referenceTree: string;
+    visibleInputs: Array<BenchmarkVisibleInput & { sha256: string }>;
     transcriptFiles: Array<{ path: string; sha256: string; bytes: number }>;
     sourceTurnIds: string[];
   };
@@ -52,29 +79,62 @@ export type PreparedFixtureManifest = {
     tree: string;
   };
   evaluation: {
-    hiddenTargetCommit: string;
-    hiddenTargetTree: string;
     forbiddenPaths: string[];
-    requiredCommands: string[];
+    overlayPaths: string[];
+    overlayRewrites: BenchmarkOverlayRewrite[];
+    formatCommand: BenchmarkCommand;
+    behavioralCommand: BenchmarkCommand;
   };
 };
 
+export type BenchmarkDriverDecision = {
+  id: string;
+  status: 'accepted' | 'rejected' | 'revised' | 'open';
+  value?: string;
+  rationale?: string;
+};
+
+export type BenchmarkDriverEvent = {
+  stage: 'explore' | 'decide' | 'revise' | 'implement' | 'review' | 'continuity' | 'strict';
+  intent: string;
+  introducedConstraints: string[];
+  decisions: BenchmarkDriverDecision[];
+};
+
+export type BenchmarkThreadSnapshot = {
+  versionId: string;
+  ordinal: number;
+  content: string;
+  byteLength: number;
+  previousVersionId: string | null;
+};
+
 export type BenchmarkTurnRecord = {
-  stageId: string;
+  sequence: number;
   text: string;
+  driverNote: string | null;
+  driverEvent: BenchmarkDriverEvent | null;
+  authority: {
+    mayWrite: boolean;
+    mayCommit: boolean;
+    mayPush: boolean;
+  };
   turnId: string;
   startedAt: string;
   completedAt: string;
+  activeDurationMs: number;
   workspaceHeadAfter: string;
   workspaceStatusAfter: string;
+  threadSnapshot: BenchmarkThreadSnapshot | null;
 };
 
 export type BenchmarkRun = {
-  version: 1;
+  version: 3;
   runId: string;
   fixtureId: string;
+  suite: BenchmarkSuite;
   target: BenchmarkTarget;
-  state: 'running' | 'ready-for-evaluation' | 'evaluating' | 'completed' | 'failed' | 'interrupted';
+  state: 'running' | 'stopped' | 'evaluating' | 'completed' | 'failed' | 'infrastructure-failed';
   dataRoot: string;
   workspacePath: string;
   fixtureManifestPath: string;
@@ -84,7 +144,8 @@ export type BenchmarkRun = {
   reviewMode: string;
   speed: string;
   contextArchitecture: 'thread-runtime-v2' | 'codex-app-server';
-  stageIndex: number;
+  stopReason: 'accepted' | 'abandoned' | 'budget-exhausted' | null;
+  driverAssessment: string | null;
   startedAt: string;
   updatedAt: string;
   sourceHeadBefore: string;
@@ -98,20 +159,23 @@ export type BenchmarkRun = {
 
 export type BenchmarkGate = {
   id: string;
-  group: 'contract' | 'safety-authority' | 'validation' | 'historical-parity';
+  group: 'outcome' | 'safety-authority' | 'validation' | 'harness';
   passed: boolean;
   detail: string;
   logPath?: string;
 };
 
 export type BenchmarkReport = {
-  version: 1;
+  version: 3;
   runId: string;
   fixtureId: string;
+  suite: BenchmarkSuite;
   target: BenchmarkTarget;
   passed: boolean;
   evaluatedAt: string;
   durationMs: number;
+  activeTurnMs: number;
+  driverGapMs: number;
   turns: number;
   modelId: string;
   reasoning: string;
@@ -155,18 +219,28 @@ export type BenchmarkReport = {
     rootToolCalls: number | null;
     childToolCalls: number | null;
     workUnitResultBytes: number | null;
+    workUnitInputResources: number | null;
+    workUnitInputAuthorities: number | null;
+    workUnitReturnedResources: number | null;
+    workUnitReturnedAuthorities: number | null;
+    workUnitReturnedDeliverables: number | null;
+    workUnitReturnedEvidence: number | null;
+    workUnitThreadProposals: number | null;
     contextLimitErrors: number | null;
     contextLayerEstimatedTokens: Record<string, number> | null;
     contextOmissions: number | null;
-    journalRetrievalCalls: number | null;
-    journalSearchCalls: number | null;
-    journalOpenCalls: number | null;
+    historyRetrievalCalls: number | null;
+    historySearchCalls: number | null;
+    historyReadCalls: number | null;
     usefulRetrievalCalls: number | null;
     invalidContextCalls: number | null;
     selfReferentialSearchHits: number | null;
     duplicateRetrievalHits: number | null;
     readCalls: number | null;
     repeatedReadCalls: number | null;
+    parentHandoffReadCalls: number | null;
+    parentReconstructionReadCalls: number | null;
+    parentReturnedResourceReadCalls: number | null;
     acceptedSpecReads: number | null;
     shellCalls: number | null;
     editCalls: number | null;
@@ -189,6 +263,7 @@ export type VisibleBenchmarkTranscript = {
   turnIds: string[];
   activeTurnId: string | null;
   assistantTextByTurn: Record<string, string>;
+  turnStatusByTurn: Record<string, string>;
   raw: unknown;
 };
 
@@ -215,5 +290,6 @@ export interface BenchmarkConversationTarget {
     timeoutMs: number;
   }): Promise<void>;
   readTranscript(conversationId: string): Promise<VisibleBenchmarkTranscript>;
+  readThread?(conversationId: string): Promise<BenchmarkThreadSnapshot>;
   interrupt(input: { conversationId: string; turnId?: string }): Promise<void>;
 }

@@ -1,7 +1,9 @@
 import { defineConfig } from 'vite';
+import { resolve } from 'node:path';
 
 export default defineConfig({
   root: __dirname,
+  publicDir: resolve(__dirname, 'prompts'),
   build: {
     emptyOutDir: true,
     minify: false,

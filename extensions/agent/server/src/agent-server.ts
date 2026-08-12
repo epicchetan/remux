@@ -28,6 +28,8 @@ import {
   type ResourceReadParams,
   type ResourceReadResult,
   type TurnInterruptParams,
+  type ThreadReadParams,
+  type TurnReadParams,
 } from '../../shared/protocol.ts';
 import type { AgentResourceInvalidation } from '../../shared/transcript.ts';
 import type { AgentConversationJournal } from './conversation-journal.ts';
@@ -38,12 +40,14 @@ import type {
   WorkUnitEnterInput,
   WorkUnitReturnInput,
 } from './engine.ts';
-import type {
-  DurableInferenceContext,
-  DurableTranscriptAction,
-  DurableTranscriptProjectionAction,
-  DurableTranscriptMutation,
-  DurableTurnHandle,
+import {
+  normalizeWorkUnitReturnInput,
+  type DurableInferenceContext,
+  type PreparedWorkUnitReturn,
+  type DurableTranscriptAction,
+  type DurableTranscriptProjectionAction,
+  type DurableTranscriptMutation,
+  type DurableTurnHandle,
 } from './storage/repository.ts';
 import { ArtifactIntegrityError } from './storage/artifact-store.ts';
 import { ResourceStore } from './resources.ts';
@@ -94,7 +98,7 @@ export class AgentServer {
   private readonly toolScopes = new Map<string, DurableTurnHandle>();
   private readonly pendingWorkUnitReturns = new Map<string, {
     handle: DurableTurnHandle;
-    input: WorkUnitReturnInput;
+    prepared: PreparedWorkUnitReturn;
   }>();
   private activeTurnStartedMonotonicAt: number | null = null;
   private pendingAssistantText = '';
@@ -152,6 +156,10 @@ export class AgentServer {
         return this.refreshModels();
       case AGENT_METHODS.artifactRead:
         return this.readArtifact(parseArtifactRead(params));
+      case AGENT_METHODS.threadRead:
+        return this.readThreadCanvas(parseThreadRead(params));
+      case AGENT_METHODS.turnRead:
+        return this.readDurableTurn(parseTurnRead(params));
       case AGENT_METHODS.filesSearch:
         return searchAgentFiles(parseFileSearch(params));
       case AGENT_METHODS.authLoginStart:
@@ -326,6 +334,24 @@ export class AgentServer {
       truncated: nextRange !== null,
       nextRange,
     };
+  }
+
+  private async readThreadCanvas(params: ThreadReadParams) {
+    await this.turnWriteTail;
+    if (this.turnWriteError) throw this.turnWriteError;
+    if (!this.journal.readThreadHistory) {
+      throw new RpcFault(-32030, 'Durable thread history is unavailable.');
+    }
+    return this.journal.readThreadHistory(params.conversationId);
+  }
+
+  private async readDurableTurn(params: TurnReadParams) {
+    await this.turnWriteTail;
+    if (this.turnWriteError) throw this.turnWriteError;
+    if (!this.journal.readTurn) {
+      throw new RpcFault(-32030, 'Durable turn status is unavailable.');
+    }
+    return this.journal.readTurn(params.conversationId, params.turnId);
   }
 
   private startLogin() {
@@ -870,9 +896,13 @@ export class AgentServer {
             if (!this.journal.readThread) throw new Error('Durable thread state is unavailable.');
             return this.journal.readThread(conversation.id);
           },
-          threadUpdate: (input) => {
-            if (!this.journal.updateThread) throw new Error('Durable thread updates are unavailable.');
-            return this.journal.updateThread(this.requiredActiveDurableScope(conversation.id), input);
+          threadPatch: (input) => {
+            if (!this.journal.patchThread) throw new Error('Durable thread patches are unavailable.');
+            return this.journal.patchThread(this.requiredActiveDurableScope(conversation.id), input);
+          },
+          threadReplace: (input) => {
+            if (!this.journal.replaceThread) throw new Error('Durable thread replacement is unavailable.');
+            return this.journal.replaceThread(this.requiredActiveDurableScope(conversation.id), input);
           },
           workUnitEnter: (callId, input) => this.enterWorkUnit(conversation.id, callId, input),
           workUnitReturn: (callId, input) =>
@@ -971,7 +1001,7 @@ export class AgentServer {
           event.interrupted,
           event.error ?? (
             this.activeDurableScope && !this.isRootScope(this.activeDurableScope)
-              ? 'A work unit ended without calling work_unit_return.'
+              ? 'A work unit ended without calling work_unit_finish.'
               : undefined
           ),
         )
@@ -1177,13 +1207,15 @@ export class AgentServer {
       });
     }
     const pendingReturn = this.pendingWorkUnitReturns.get(input.callId);
-    if (input.name === 'work_unit_return' && !input.isError) {
+    if (input.name === 'work_unit_finish' && !input.isError) {
       if (!pendingReturn || pendingReturn.handle.scopeId !== handle.scopeId) {
         throw new Error('The work unit return boundary was not prepared.');
       }
-      if (!this.journal.returnWorkUnit) throw new Error('Durable work unit return is unavailable.');
+      if (!this.journal.commitWorkUnitReturn) {
+        throw new Error('Durable work unit return commit is unavailable.');
+      }
       const returned = await this.enqueueTurnWrite(() =>
-        this.journal.returnWorkUnit!(handle, pendingReturn.input));
+        this.journal.commitWorkUnitReturn!(handle, pendingReturn.prepared));
       this.activeDurableScope = returned.parentHandle;
     }
     this.pendingWorkUnitReturns.delete(input.callId);
@@ -1206,7 +1238,8 @@ export class AgentServer {
       scopeId: entered.handle.scopeId,
       parentScopeId: entered.parentScopeId,
       objective: entered.objective,
-      evidenceRefs: entered.evidenceRefs,
+      doneWhen: entered.doneWhen,
+      resources: entered.resources,
       state: 'running' as const,
     };
   }
@@ -1218,8 +1251,17 @@ export class AgentServer {
   ) {
     const handle = this.requiredActiveDurableScope(conversationId);
     if (this.isRootScope(handle)) throw new Error('No work unit is active.');
+    // Prepare and materialize the complete handoff before the tool reports
+    // success. The durable scope transition intentionally waits for
+    // tool_result, but correctable model input or resource errors must remain
+    // tool errors so the child can fix them and retry.
+    normalizeWorkUnitReturnInput(input);
+    if (!this.journal.prepareWorkUnitReturn) {
+      throw new Error('Durable work unit return preparation is unavailable.');
+    }
+    const prepared = await this.journal.prepareWorkUnitReturn(handle, input);
     this.toolScopes.set(callId, handle);
-    this.pendingWorkUnitReturns.set(callId, { handle, input });
+    this.pendingWorkUnitReturns.set(callId, { handle, prepared });
     return { scopeId: handle.scopeId, state: 'returning' as const };
   }
 
@@ -1665,6 +1707,19 @@ function parseArtifactRead(params: unknown): ArtifactReadParams {
     };
   }
   throw new RpcFault(-32602, 'range.kind must be bytes, utf8, or lines.');
+}
+
+function parseThreadRead(params: unknown): ThreadReadParams {
+  const value = objectValue(params);
+  return { conversationId: requiredUuidV4(value.conversationId, 'conversationId') };
+}
+
+function parseTurnRead(params: unknown): TurnReadParams {
+  const value = objectValue(params);
+  return {
+    conversationId: requiredUuidV4(value.conversationId, 'conversationId'),
+    turnId: requiredUuidV4(value.turnId, 'turnId'),
+  };
 }
 
 function parseFileSearch(params: unknown): AgentFileSearchParams {

@@ -45,10 +45,8 @@ export async function installAgentHost(page: Page) {
     const contextBootstrapHash = 'd'.repeat(64);
     const contextDispatchHash = 'f'.repeat(64);
     const contextBootstrapText = [
-      '<remux_thread_context version="2">',
-      '<thread_document ref="journal://document-version/fixture-thread-version"># Thread\\n\\nFixture context</thread_document>',
-      '<cold_history>No eligible completed dialogue turns are omitted from active context.</cold_history>',
-      '</remux_thread_context>',
+      '<thread version="fixture-thread-version"># Thread\\n\\nFixture context</thread>',
+      '<history>All eligible completed conversation turns are currently shown.</history>',
     ].join('\n');
     const contextDispatchText = JSON.stringify({
       input: [{ role: 'user', content: 'Fixture provider input' }],
@@ -224,8 +222,8 @@ export async function installAgentHost(page: Page) {
         frameId: 'fixture-frame',
         basisSequence: sequence,
         threadVersionId: 'fixture-thread-version',
-        compilerVersion: 'agent-thread-compiler-v2',
-        policyVersion: 'agent-thread-policy-v2',
+        compilerVersion: 'agent-thread-compiler-v3',
+        policyVersion: 'agent-thread-policy-v3',
         estimatedInputTokens: 3_200,
         semanticHash: 'b'.repeat(64),
         bootstrapHash: contextBootstrapHash,
@@ -735,6 +733,38 @@ export async function installAgentHost(page: Page) {
         };
       }
       if (request.method === 'remux/agent/transcript/resources/read') return transcriptResult(params);
+      if (request.method === 'remux/agent/thread/read') {
+        const currentContent = [
+          '# Ledger — 0DTE heat maps',
+          '',
+          'The active canvas preserves the user intuition and the unresolved design space.',
+          '',
+          '## Candidate interpretations',
+          '',
+          '- Trade activity',
+          '- Open-interest positioning',
+          '- Modeled gamma exposure',
+          '',
+          '## Current conversational edge',
+          '',
+          'Inspect the existing Ledger data path before choosing the persisted representation.',
+        ].join('\n');
+        const previousContent = '# Ledger — 0DTE heat maps\n\n## Earlier canvas\n\nChoose the first metric.\n';
+        return {
+          conversationId: params.conversationId,
+          documentId: 'fixture-thread-document',
+          current: {
+            versionId: 'fixture-thread-version', ordinal: 3,
+            basedOnTurnId: turns.at(-1)?.id ?? null, createdAt: 1_700_000_003_000,
+            content: currentContent, byteLength: new TextEncoder().encode(currentContent).byteLength,
+          },
+          previous: {
+            versionId: 'fixture-thread-version-previous', ordinal: 2,
+            basedOnTurnId: turns.at(-2)?.id ?? null, createdAt: 1_700_000_002_000,
+            content: previousContent, byteLength: new TextEncoder().encode(previousContent).byteLength,
+          },
+        };
+      }
       if (request.method === 'remux/agent/artifact/read') {
         const binary = artifactBytes.get(params.hash);
         if (binary && params.range.kind === 'bytes') {

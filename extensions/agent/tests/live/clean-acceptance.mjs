@@ -45,9 +45,11 @@ async function main() {
 
   const first = await sendAndWait(client, conversation.conversationId, [
     'This is a Thread Runtime v2 acceptance test.',
-    'Use thread_read, then replace thread.md with a concise Markdown briefing that includes',
-    `the exact durable nonce ${CONTEXT_NONCE} by calling thread_update.`,
-    `After the update succeeds, reply with exactly ${FIRST_SENTINEL} and nothing else.`,
+    'Use thread_read, then call thread_replace to create a Markdown collaboration canvas containing',
+    `the exact unique line "Durable nonce: ${CONTEXT_NONCE}".`,
+    'After replacement succeeds, call thread_patch with its returned version and replace that exact line with',
+    `"Durable nonce: ${CONTEXT_NONCE}; canvas patch verified."`,
+    `After both edits succeed, reply with exactly ${FIRST_SENTINEL} and nothing else.`,
   ].join(' '), options.timeoutMs);
   const firstTranscript = await readTranscript(client, conversation.conversationId);
   assert.equal(assistantText(firstTranscript, first.turnId).trim(), FIRST_SENTINEL);
@@ -94,9 +96,9 @@ async function main() {
 
   const third = await sendAndWait(client, conversation.conversationId, [
     'Exercise the bounded work-unit runtime exactly once.',
-    'First call work_unit_enter with the objective "Validate the live child-context boundary."',
+    'First call work_unit_start with the objective "Validate the live child-context boundary."',
     `Inside that work unit, call bash with command "printf ${CHILD_SECRET}",`,
-    `then call work_unit_return with a concise Markdown result containing exactly the marker ${WORK_UNIT_RESULT}`,
+    `then call work_unit_finish with status completed and a concise Markdown result containing exactly the marker ${WORK_UNIT_RESULT}`,
     `but not the child-only marker ${CHILD_SECRET}.`,
     `After the parent context resumes, reply with exactly ${THIRD_SENTINEL} and nothing else.`,
   ].join(' '), options.timeoutMs);
@@ -113,18 +115,19 @@ async function main() {
   assert.ok((durability.requestModes.continuation ?? 0) >= 2);
   assert.equal(durability.completedAssistantMessages, 3);
   assert.ok(durability.searchRows >= 7);
-  assert.ok(durability.threadUpdates >= 1);
+  assert.ok(durability.threadUpdates >= 2);
   assert.match(durability.threadContent, new RegExp(CONTEXT_NONCE));
   assert.equal(durability.workUnits.length, 1);
   assert.equal(durability.workUnits[0].state, 'completed');
   assert.match(durability.workUnits[0].result, new RegExp(WORK_UNIT_RESULT));
   assert.doesNotMatch(durability.workUnits[0].result, new RegExp(CHILD_SECRET));
-  assert.deepEqual(durability.childToolNames, ['bash', 'work_unit_return']);
+  assert.deepEqual(durability.childToolNames, ['bash', 'work_unit_finish']);
   assert.ok(durability.visibleToolNames.includes('thread_read'));
-  assert.ok(durability.visibleToolNames.includes('thread_update'));
-  assert.equal(durability.visibleToolNames.filter((name) => name === 'work_unit_enter').length, 1);
+  assert.ok(durability.visibleToolNames.includes('thread_replace'));
+  assert.ok(durability.visibleToolNames.includes('thread_patch'));
+  assert.equal(durability.visibleToolNames.filter((name) => name === 'work_unit_start').length, 1);
   assert.equal(durability.visibleToolNames.includes('bash'), false);
-  assert.equal(durability.visibleToolNames.includes('work_unit_return'), false);
+  assert.equal(durability.visibleToolNames.includes('work_unit_finish'), false);
   assert.equal(durability.childProviderCalls >= 2, true);
   assert.equal(durability.finalScopeKind, 'turn');
   const workUnitTurn = workUnitTranscript.value.turns.find(({ turnId }) => turnId === third.turnId);

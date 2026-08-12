@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -28,6 +28,10 @@ test('Thread Runtime v2 owns one clean schema and compiles the accepted user tur
   assert.equal(context.messages[0]?.turnId, turn.turnId);
   assert.equal(context.frame.threadVersionId, conversation.threadVersionId);
   assert.deepEqual(context.frame.selectedTurnIds, [turn.turnId]);
+  assert.match(context.frame.bootstrap, /<thread version=/u);
+  assert.match(context.frame.bootstrap, /<history>/u);
+  assert.match(context.frame.bootstrap, /history_search and history_read/u);
+  assert.doesNotMatch(context.frame.bootstrap, /thread\.md|journal|cold_history|cold history/iu);
 
   const database = new DatabaseSync(fixture.repository.databasePath);
   t.after(() => database.close());
@@ -125,23 +129,41 @@ test('actual frames, exact provider reasoning, restart recovery, and next-turn e
   assert.ok(provider.providerItemId);
 });
 
-test('thread.md updates are CAS-versioned and historical edit/fork inheritance is exact', async (t) => {
+test('thread.md patches and replacements are CAS-versioned with exact fork inheritance', async (t) => {
   const fixture = await repositoryFixture(t);
   const source = await fixture.repository.createConversation({
     operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'model', reasoning: 'high',
   });
   const turn = await accept(fixture.repository, source.conversationId, 'Choose the design.');
-  const updated = await fixture.repository.updateThread(turn, {
+  const initialized = await fixture.repository.replaceThread(turn, {
     baseVersionId: source.threadVersionId,
-    content: '# Thread\n\nDecision: use exact dialogue and living thread state.\n',
+    content: '# Thread\n\n## Design space\n\nCandidate: exact dialogue.\n\n## Current edge\n\nChoose the state model.\n',
+  });
+  const updated = await fixture.repository.patchThread(turn, {
+    baseVersionId: initialized.versionId,
+    edits: [
+      {
+        oldText: 'Candidate: exact dialogue.',
+        newText: 'Accepted: exact dialogue with a living semantic canvas.',
+      },
+      {
+        oldText: 'Choose the state model.',
+        newText: 'Implement the accepted state model.',
+      },
+    ],
   });
   await assert.rejects(
-    fixture.repository.updateThread(turn, {
+    fixture.repository.replaceThread(turn, {
       baseVersionId: source.threadVersionId,
       content: '# Thread\n\nStale overwrite.\n',
     }),
     /changed from/u,
   );
+  const history = await fixture.repository.readThreadHistory(source.conversationId);
+  assert.equal(history.current.versionId, updated.versionId);
+  assert.equal(history.current.content, updated.content);
+  assert.equal(history.previous?.versionId, initialized.versionId);
+  assert.equal(history.previous?.content, initialized.content);
   await fixture.repository.appendAssistantCheckpoint(turn, { textDelta: 'Accepted.', reasoningDelta: '' });
   await fixture.repository.finishTurn(turn, { status: 'completed' });
 
@@ -157,7 +179,52 @@ test('thread.md updates are CAS-versioned and historical edit/fork inheritance i
   assert.equal((await fixture.repository.readThread(forked.conversationId)).content, updated.content);
 });
 
-test('bounded work units inherit the parent and fold back only their explicit result', async (t) => {
+test('thread.md patches reject missing, ambiguous, empty, and partially applicable edits atomically', async (t) => {
+  const fixture = await repositoryFixture(t);
+  const conversation = await fixture.repository.createConversation({
+    operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'model', reasoning: 'high',
+  });
+  const turn = await accept(fixture.repository, conversation.conversationId, 'Maintain the canvas.');
+  const initialized = await fixture.repository.replaceThread(turn, {
+    baseVersionId: conversation.threadVersionId,
+    content: '# Canvas\n\nCandidate\n\nCandidate\n\n## Edge\n\nExplore.\n',
+  });
+  await assert.rejects(
+    fixture.repository.patchThread(turn, {
+      baseVersionId: initialized.versionId,
+      edits: [{ oldText: 'Candidate', newText: 'Accepted' }],
+    }),
+    /ambiguous/u,
+  );
+  await assert.rejects(
+    fixture.repository.patchThread(turn, {
+      baseVersionId: initialized.versionId,
+      edits: [{ oldText: 'Missing', newText: 'Accepted' }],
+    }),
+    /did not match/u,
+  );
+  await assert.rejects(
+    fixture.repository.patchThread(turn, {
+      baseVersionId: initialized.versionId,
+      edits: [{ oldText: '', newText: 'Accepted' }],
+    }),
+    /non-empty/u,
+  );
+  await assert.rejects(
+    fixture.repository.patchThread(turn, {
+      baseVersionId: initialized.versionId,
+      edits: [
+        { oldText: 'Explore.', newText: 'Implement.' },
+        { oldText: 'Missing after first edit', newText: 'No partial write.' },
+      ],
+    }),
+    /did not match/u,
+  );
+  assert.equal((await fixture.repository.readThread(conversation.conversationId)).content, initialized.content);
+  await fixture.repository.finishTurn(turn, { status: 'interrupted' });
+});
+
+test('bounded work units inherit typed resources and fold back only their continuation bundle', async (t) => {
   const fixture = await repositoryFixture(t);
   const conversation = await fixture.repository.createConversation({
     operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'model', reasoning: 'high',
@@ -168,7 +235,7 @@ test('bounded work units inherit the parent and fold back only their explicit re
   await fixture.repository.recordProviderItem(root, assistantMessage({
     content: [
       { type: 'thinking', thinking: 'parent reasoning', thinkingSignature: 'parent-signature' },
-      { type: 'toolCall', id: 'call:enter', name: 'work_unit_enter', arguments: { objective: 'Inspect one seam.' } },
+      { type: 'toolCall', id: 'call:enter', name: 'work_unit_start', arguments: { objective: 'Inspect one seam.' } },
     ],
     stopReason: 'toolUse',
   }));
@@ -177,10 +244,15 @@ test('bounded work units inherit the parent and fold back only their explicit re
   });
   await fixture.repository.finishInference(root, { state: 'completed' });
   await fixture.repository.recordToolStarted(root, {
-    callId: 'call:enter', name: 'work_unit_enter', args: { objective: 'Inspect one seam.' },
+    callId: 'call:enter', name: 'work_unit_start', args: { objective: 'Inspect one seam.' },
   });
   const entered = await fixture.repository.enterWorkUnit(root, {
-    objective: 'Inspect one seam.', evidenceRefs: ['journal://turn/example'],
+    objective: 'Inspect one seam.',
+    doneWhen: ['The seam is verified against its exact contract.'],
+    resources: [
+      { ref: 'docs/seam-contract.md', role: 'authority', description: 'Exact seam contract.' },
+      { ref: `journal://turn/${root.turnId}`, role: 'evidence', description: 'Current request.' },
+    ],
   });
   await fixture.repository.recordToolFinished(root, {
     callId: 'call:enter', result: { scopeId: entered.handle.scopeId }, isError: false,
@@ -191,12 +263,38 @@ test('bounded work units inherit the parent and fold back only their explicit re
   assert.equal(childContext.scopeId, entered.handle.scopeId);
   assert.ok(childContext.messages.some((message) =>
     message.role === 'user' && message.text.includes('Inspect one seam.')));
+  assert.ok(childContext.messages.some((message) =>
+    message.role === 'user' && message.text.includes(`history://turn/${root.turnId}`)));
+  assert.ok(childContext.messages.some((message) =>
+    message.role === 'user' && message.text.includes('docs/seam-contract.md')));
+  assert.ok(childContext.messages.some((message) =>
+    message.role === 'user' && message.text.includes('The seam must be sound.')));
+  assert.ok(childContext.messages.some((message) =>
+    message.role === 'user' && message.text.includes('Solve the parent task.')));
+  assert.doesNotMatch(
+    JSON.stringify(childContext.messages),
+    /### evidence: `journal:\/\//u,
+  );
   const inherited = childContext.messages.find((message) => message.role === 'assistant');
   assert.equal(inherited?.role, 'assistant');
   if (inherited?.role === 'assistant') {
     const thinking = inherited.providerMessage?.content.find(({ type }) => type === 'thinking');
     assert.equal(thinking?.type === 'thinking' ? thinking.thinkingSignature : null, 'parent-signature');
   }
+  await assert.rejects(
+    fixture.repository.patchThread(entered.handle, {
+      baseVersionId: conversation.threadVersionId,
+      edits: [{ oldText: '# Thread', newText: '# Child mutation' }],
+    }),
+    /parent-owned/u,
+  );
+  await assert.rejects(
+    fixture.repository.replaceThread(entered.handle, {
+      baseVersionId: conversation.threadVersionId,
+      content: '# Child mutation\n',
+    }),
+    /parent-owned/u,
+  );
 
   await startInference(fixture.repository, entered.handle, childContext);
   await fixture.repository.recordProviderItem(entered.handle, assistantMessage({
@@ -217,22 +315,53 @@ test('bounded work units inherit the parent and fold back only their explicit re
     callId: 'call:child', result: { secret: 'CHILD_TOOL_RESULT' }, isError: false,
   });
   await fixture.repository.recordToolStarted(entered.handle, {
-    callId: 'call:return', name: 'work_unit_return', args: { result: 'The seam is sound.' },
+    callId: 'call:return', name: 'work_unit_finish', args: { result: 'The seam is sound.' },
   });
   await fixture.repository.recordToolFinished(entered.handle, {
     callId: 'call:return', result: { state: 'returning' }, isError: false,
   });
+  await assert.rejects(
+    fixture.repository.prepareWorkUnitReturn(entered.handle, {
+      status: 'completed',
+      result: 'This invalid boundary must remain correctable.',
+      resources: [{ ref: 'missing-resource.txt', role: 'evidence' }],
+    }),
+    /missing-resource\.txt|ENOENT/u,
+  );
+  assert.equal(
+    (await fixture.repository.compileContext(conversation.conversationId)).scopeId,
+    entered.handle.scopeId,
+  );
   const returned = await fixture.repository.returnWorkUnit(entered.handle, {
+    status: 'completed',
     result: '## Result\n\nThe seam is sound.',
+    threadUpdate: 'Record that the seam contract was verified.',
+    resources: [
+      { ref: 'docs/seam-contract.md', role: 'authority', description: 'Exact seam contract.' },
+      { ref: 'src/seam.ts', role: 'deliverable', description: 'Verified implementation.' },
+    ],
   });
+  assert.equal(returned.status, 'completed');
   assert.equal(returned.parentHandle.scopeId, root.scopeId);
+  assert.equal(returned.threadUpdate, 'Record that the seam contract was verified.');
+  assert.equal(returned.resources[1]?.ref, 'src/seam.ts');
+  assert.equal(returned.resources[1]?.inclusion, 'materialized');
+  const deliverableSnapshot = await fixture.repository.openJournal(
+    conversation.conversationId,
+    { ref: returned.resources[1]!.snapshot.ref },
+  );
+  assert.equal(deliverableSnapshot.content, 'export const seam = "sound";\n');
 
   const resumed = await fixture.repository.compileContext(conversation.conversationId);
   assert.equal(resumed.scopeKind, 'turn');
   assert.equal(resumed.scopeId, root.scopeId);
   const resumedText = JSON.stringify(resumed.messages);
   assert.match(resumedText, /The seam is sound/u);
-  assert.match(resumedText, /Active execution scope: parent turn/u);
+  assert.match(resumedText, /Proposed Thread update/u);
+  assert.match(resumedText, /Record that the seam contract was verified/u);
+  assert.match(resumedText, /docs\/seam-contract\.md|src\/seam\.ts/u);
+  assert.match(resumedText, /Current work: parent conversation/u);
+  assert.match(resumedText, /history:\/\/scope/u);
   assert.doesNotMatch(resumedText, /CHILD_PRIVATE_REASONING|CHILD_TOOL_RESULT|child-signature/u);
   const resumedAssistant = resumed.messages.find((message) => message.role === 'assistant');
   assert.equal(resumedAssistant?.role, 'assistant');
@@ -241,8 +370,57 @@ test('bounded work units inherit the parent and fold back only their explicit re
     assert.equal(thinking?.type === 'thinking' ? thinking.thinkingSignature : null, 'parent-signature');
   }
 
+  const inheritedUnit = await fixture.repository.enterWorkUnit(root, {
+    objective: 'Use the already-returned seam implementation.',
+    resources: [{ ref: 'src/seam.ts', role: 'authority' }],
+  });
+  assert.equal(inheritedUnit.resources[0]?.inclusion, 'inherited');
+  const inheritedContext = await fixture.repository.compileContext(conversation.conversationId);
+  const inheritedOrientation = inheritedContext.messages.at(-1);
+  assert.equal(inheritedOrientation?.role, 'user');
+  if (inheritedOrientation?.role === 'user') {
+    assert.match(inheritedOrientation.text, /already materialized earlier in the active parent context/u);
+    assert.doesNotMatch(inheritedOrientation.text, /export const seam = "sound"/u);
+  }
+  await fixture.repository.returnWorkUnit(inheritedUnit.handle, {
+    status: 'completed',
+    result: 'The inherited snapshot was sufficient.',
+  });
+
+  await writeFile(join(fixture.cwd, 'src/seam.ts'), 'export const seam = "revised";\n');
+  const revisedUnit = await fixture.repository.enterWorkUnit(root, {
+    objective: 'Inspect the revised seam implementation.',
+    resources: [{ ref: 'src/seam.ts', role: 'deliverable' }],
+  });
+  assert.equal(revisedUnit.resources[0]?.inclusion, 'materialized');
+  assert.notEqual(revisedUnit.resources[0]?.snapshot.hash, returned.resources[1]?.snapshot.hash);
+  const revisedContext = await fixture.repository.compileContext(conversation.conversationId);
+  const revisedOrientation = revisedContext.messages.at(-1);
+  assert.equal(revisedOrientation?.role, 'user');
+  if (revisedOrientation?.role === 'user') {
+    assert.match(revisedOrientation.text, /export const seam = "revised"/u);
+  }
+  await fixture.repository.returnWorkUnit(revisedUnit.handle, {
+    status: 'completed',
+    result: 'The revised snapshot was inspected.',
+  });
+
   await fixture.repository.appendAssistantCheckpoint(root, { textDelta: 'Parent complete.', reasoningDelta: '' });
   await fixture.repository.finishTurn(root, { status: 'completed' });
+  const transcript = await fixture.repository.readTranscriptActions(conversation.conversationId);
+  const transcriptText = JSON.stringify(transcript);
+  assert.match(transcriptText, /work_unit_start|Parent complete/u);
+  assert.doesNotMatch(transcriptText, /call:child|call:return|CHILD_PRIVATE_REASONING|CHILD_TOOL_RESULT/u);
+  const durableEvents = await fixture.repository.readEvents({ conversationId: conversation.conversationId });
+  const returnedEvent = durableEvents.find(({ type }) => type === 'work_unit.returned');
+  assert.deepEqual(
+    (returnedEvent?.payload.resources as Array<{ ref: string; role: string }> | undefined)
+      ?.map(({ ref, role }) => ({ ref, role })),
+    [
+      { ref: 'docs/seam-contract.md', role: 'authority' },
+      { ref: 'src/seam.ts', role: 'deliverable' },
+    ],
+  );
   const resultSearch = await fixture.repository.searchJournal(conversation.conversationId, {
     query: 'seam sound', scope: 'conversation',
   });
@@ -250,6 +428,73 @@ test('bounded work units inherit the parent and fold back only their explicit re
   assert.ok(result);
   const opened = await fixture.repository.openJournal(conversation.conversationId, { ref: result!.ref });
   assert.match(opened.content, /The seam is sound/u);
+  assert.match(opened.content, /Proposed Thread update/u);
+  assert.match(opened.content, /### authority: `docs\/seam-contract\.md`/u);
+  assert.equal((await fixture.repository.readThread(conversation.conversationId)).content, '# Thread\n');
+});
+
+test('work-unit handoffs may use the available parent context beyond the former static limit', async (t) => {
+  const fixture = await repositoryFixture(t);
+  const conversation = await fixture.repository.createConversation({
+    operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'model', reasoning: 'high',
+  });
+  const root = await accept(fixture.repository, conversation.conversationId, 'Audit the architecture.');
+  const entered = await fixture.repository.enterWorkUnit(root, {
+    objective: 'Return a repository-grounded architecture audit.',
+    resources: [{ ref: 'docs/architecture.md', role: 'authority' }],
+  });
+  const result = `## Audit result\n\n${'Detailed repository-grounded finding.\n'.repeat(520)}RESULT_END`;
+  const threadUpdate = `# Proposed Thread\n\n${'Durable architectural detail.\n'.repeat(650)}THREAD_END`;
+  assert.ok(Buffer.byteLength(result, 'utf8') > 16 * 1024);
+  assert.ok(Buffer.byteLength(threadUpdate, 'utf8') > 16 * 1024);
+
+  const returned = await fixture.repository.returnWorkUnit(entered.handle, {
+    status: 'partial',
+    result,
+    threadUpdate,
+    resources: [{ ref: 'docs/architecture.md', role: 'authority' }],
+  });
+  assert.equal(returned.result, result);
+  assert.equal(returned.threadUpdate, threadUpdate);
+  assert.equal(returned.parentHandle.scopeId, root.scopeId);
+
+  const resumed = await fixture.repository.compileContext(conversation.conversationId);
+  assert.equal(resumed.scopeKind, 'turn');
+  const resumedText = JSON.stringify(resumed.messages);
+  assert.match(resumedText, /RESULT_END/u);
+  assert.match(resumedText, /THREAD_END/u);
+  await fixture.repository.finishTurn(root, { status: 'interrupted' });
+});
+
+test('turn failure abandons an unreturned work unit with its own terminal event', async (t) => {
+  const fixture = await repositoryFixture(t);
+  const conversation = await fixture.repository.createConversation({
+    operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'model', reasoning: 'high',
+  });
+  const root = await accept(fixture.repository, conversation.conversationId, 'Run bounded work.');
+  const entered = await fixture.repository.enterWorkUnit(root, {
+    objective: 'Exercise abnormal child cleanup.', resources: [],
+  });
+  const childContext = await fixture.repository.compileContext(conversation.conversationId);
+  await startInference(fixture.repository, entered.handle, childContext);
+
+  await fixture.repository.finishTurn(root, {
+    status: 'failed', error: 'provider stopped before work_unit_finish', errorCode: 'provider_error',
+  });
+
+  const durable = await fixture.repository.readTurn(conversation.conversationId, root.turnId);
+  assert.equal(durable.state, 'failed');
+  assert.equal(durable.terminal, true);
+  assert.equal(durable.error, 'provider stopped before work_unit_finish');
+  const events = (await fixture.repository.readEvents({ conversationId: conversation.conversationId }))
+    .filter((event) => event.turnId === root.turnId);
+  const abandoned = events.find(({ type }) => type === 'work_unit.abandoned');
+  const terminal = events.find(({ type }) => type === 'turn.terminal');
+  assert.ok(abandoned);
+  assert.ok(terminal);
+  assert.ok(abandoned.sequence < terminal.sequence);
+  assert.notEqual(abandoned.sequence, terminal.sequence);
+  assert.equal(await fixture.repository.resumeActiveTurn(conversation.conversationId), null);
 });
 
 test('journal retrieval exposes thread documents and exact visible outcomes but not private provider artifacts', async (t) => {
@@ -261,7 +506,7 @@ test('journal retrieval exposes thread documents and exact visible outcomes but 
   await fixture.repository.appendAssistantCheckpoint(turn, {
     textDelta: 'Cobalt behavior is retained in exact history.', reasoningDelta: '',
   });
-  await fixture.repository.updateThread(turn, {
+  await fixture.repository.replaceThread(turn, {
     baseVersionId: conversation.threadVersionId,
     content: '# Thread\n\nConstraint: preserve cobalt behavior.\n',
   });
@@ -352,12 +597,12 @@ test('the public fixture runtime commits a v4 frame and completes through normal
     modelId: 'gpt-5.4-fixture',
     reasoning: 'high',
   }) as { conversationId: string };
-  await server.handle('remux/agent/conversation/message/send', {
+  const sent = await server.handle('remux/agent/conversation/message/send', {
     operationId: crypto.randomUUID(),
     conversationId: created.conversationId,
     clientMessageId: crypto.randomUUID(),
     text: 'Exercise the public path.',
-  });
+  }) as { turnId: string };
   await eventually(async () => {
     const response = await server.handle('remux/agent/resources/read', {
       requests: [{ key: 'runtime' }],
@@ -371,6 +616,19 @@ test('the public fixture runtime commits a v4 frame and completes through normal
   assert.equal(inspector.version, 4);
   assert.equal(typeof inspector.frameId, 'string');
   assert.equal(inspector.layers?.length, 3);
+  const thread = await server.handle('remux/agent/thread/read', {
+    conversationId: created.conversationId,
+  }) as { current?: { content?: string; ordinal?: number }; previous?: unknown };
+  assert.equal(thread.current?.content, '# Thread\n');
+  assert.equal(thread.current?.ordinal, 0);
+  assert.equal(thread.previous, null);
+  const durableTurn = await server.handle('remux/agent/turn/read', {
+    conversationId: created.conversationId,
+    turnId: sent.turnId,
+  }) as { state?: string; terminal?: boolean; terminalSequence?: number | null };
+  assert.equal(durableTurn.state, 'completed');
+  assert.equal(durableTurn.terminal, true);
+  assert.equal(typeof durableTurn.terminalSequence, 'number');
   const events = await fixture.repository.readEvents({ conversationId: created.conversationId });
   assert.ok(events.some(({ type }) => type === 'provider.item.recorded'));
   assert.ok(events.some(({ type }) => type === 'turn.terminal'));
@@ -378,7 +636,13 @@ test('the public fixture runtime commits a v4 frame and completes through normal
 
 async function repositoryFixture(t: TestContext) {
   const dataRoot = await mkdtemp(join(tmpdir(), 'remux-agent-thread-runtime-'));
-  const cwd = process.cwd();
+  const cwd = join(dataRoot, 'workspace');
+  await mkdir(join(cwd, 'docs'), { recursive: true });
+  await mkdir(join(cwd, 'src'), { recursive: true });
+  await writeFile(join(cwd, 'README.md'), '# Fixture workspace\n');
+  await writeFile(join(cwd, 'docs/seam-contract.md'), '# Seam contract\n\nThe seam must be sound.\n');
+  await writeFile(join(cwd, 'docs/architecture.md'), '# Architecture\n\nPreserve the boundary.\n');
+  await writeFile(join(cwd, 'src/seam.ts'), 'export const seam = "sound";\n');
   const fixture = {
     dataRoot,
     cwd,

@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type {
   BenchmarkConversationTarget,
   BenchmarkTarget,
+  BenchmarkThreadSnapshot,
   VisibleBenchmarkTranscript,
 } from './contracts.ts';
 import { RemuxBenchmarkClient } from './remux-client.ts';
@@ -113,15 +114,18 @@ class CodexBenchmarkTarget implements BenchmarkConversationTarget {
     }
     const value = objectValue(resource.value);
     const assistantTextByTurn: Record<string, string> = {};
+    const turnStatusByTurn: Record<string, string> = {};
     for (const resultValue of arrayValue(value.turns)) {
       const result = objectValue(resultValue);
       if (result.status !== 'ok') continue;
       const frame = objectValue(result.frame);
-      assistantTextByTurn[requiredString(result.turnId, 'Codex transcript turnId')] = arrayValue(frame.segments)
+      const turnId = requiredString(result.turnId, 'Codex transcript turnId');
+      assistantTextByTurn[turnId] = arrayValue(frame.segments)
         .map(objectValue)
         .filter((segment) => segment.type === 'assistantMessage')
         .map((segment) => stringValue(segment.text) ?? '')
         .join('');
+      if (typeof frame.status === 'string') turnStatusByTurn[turnId] = frame.status;
     }
     return {
       target: this.kind,
@@ -129,6 +133,7 @@ class CodexBenchmarkTarget implements BenchmarkConversationTarget {
       turnIds: arrayValue(value.turnOrder).map((turnId) => requiredString(turnId, 'Codex turn order id')),
       activeTurnId: nullableString(value.activeTurnId),
       assistantTextByTurn,
+      turnStatusByTurn,
       raw: response,
     };
   }
@@ -144,6 +149,7 @@ class CodexBenchmarkTarget implements BenchmarkConversationTarget {
 class AgentBenchmarkTarget implements BenchmarkConversationTarget {
   readonly kind = 'agent' as const;
   private readonly client: RemuxBenchmarkClient;
+  private readOrdinal = 0;
 
   constructor(client: RemuxBenchmarkClient) {
     this.client = client;
@@ -199,30 +205,38 @@ class AgentBenchmarkTarget implements BenchmarkConversationTarget {
 
   async waitForTerminal(input: { conversationId: string; turnId: string; timeoutMs: number }) {
     const deadline = Date.now() + input.timeoutMs;
-    let observedError: string | null = null;
+    let observedState = 'unknown';
     while (Date.now() < deadline) {
-      const response = objectValue(await this.client.query('remux/agent/resources/read', {
-        requests: [{ key: 'runtime' }],
-      }, 'benchmark:agent:runtime'));
-      const resource = objectValue(arrayValue(response.resources)[0]);
-      if (resource.status === 'ok') {
-        const runtime = objectValue(resource.value);
-        if (runtime.conversationId === input.conversationId && runtime.state === 'idle') {
-          const transcript = await this.readTranscript(input.conversationId);
-          if (transcript.activeTurnId !== input.turnId && transcript.turnIds.includes(input.turnId)) return;
+      const turn = objectValue(await this.client.query('remux/agent/turn/read', {
+        conversationId: input.conversationId,
+        turnId: input.turnId,
+      }, this.nextReadKey(`turn:${input.conversationId}:${input.turnId}`)));
+      if (
+        turn.conversationId !== input.conversationId ||
+        turn.turnId !== input.turnId
+      ) {
+        throw new Error('Agent durable turn read returned the wrong identity.');
+      }
+      observedState = String(turn.state ?? 'unknown');
+      if (turn.terminal === true) {
+        if (turn.state !== 'completed') {
+          const detail = typeof turn.error === 'string' && turn.error
+            ? `: ${turn.error}`
+            : '';
+          throw new Error(`Agent turn ${String(turn.state)}${detail}`);
         }
-        if (runtime.conversationId === input.conversationId && runtime.state === 'error') {
-          observedError = String(runtime.error ?? 'unknown error');
-          const transcript = await this.readTranscript(input.conversationId);
-          if (transcript.activeTurnId !== input.turnId) {
-            throw new Error(`Agent turn failed: ${observedError}`);
-          }
-        }
+        const transcript = await this.readTranscript(input.conversationId);
+        if (
+          transcript.activeTurnId !== input.turnId &&
+          transcript.turnIds.includes(input.turnId) &&
+          transcript.turnStatusByTurn[input.turnId] === 'completed'
+        ) return;
       }
       await delay(250);
     }
-    if (observedError) throw new Error(`Agent turn failed before durable settlement: ${observedError}`);
-    throw new Error(`Timed out after ${input.timeoutMs} ms waiting for Agent turn ${input.turnId}.`);
+    throw new Error(
+      `Timed out after ${input.timeoutMs} ms waiting for Agent turn ${input.turnId}; durable state was ${observedState}.`,
+    );
   }
 
   async readTranscript(conversationId: string): Promise<VisibleBenchmarkTranscript> {
@@ -234,22 +248,25 @@ class AgentBenchmarkTarget implements BenchmarkConversationTarget {
         projectionVersion: 'agent-turn-render-v2',
         window: { kind: 'tail', count: 40 },
       }],
-    }, `benchmark:agent:transcript:${conversationId}`));
+    }, this.nextReadKey(`transcript:${conversationId}`)));
     const resource = objectValue(arrayValue(response.resources)[0]);
     if (resource.status !== 'ok') {
       throw new Error(`Agent transcript read failed: ${String(resource.reason ?? resource.status)}`);
     }
     const value = objectValue(resource.value);
     const assistantTextByTurn: Record<string, string> = {};
+    const turnStatusByTurn: Record<string, string> = {};
     for (const resultValue of arrayValue(value.turns)) {
       const result = objectValue(resultValue);
       if (result.status !== 'ok' && result.status !== 'error') continue;
       const frame = objectValue(result.frame);
-      assistantTextByTurn[requiredString(result.turnId, 'Agent transcript turnId')] = arrayValue(frame.segments)
+      const turnId = requiredString(result.turnId, 'Agent transcript turnId');
+      assistantTextByTurn[turnId] = arrayValue(frame.segments)
         .map(objectValue)
         .filter((segment) => segment.type === 'assistantMessage')
         .map((segment) => stringValue(segment.text) ?? '')
         .join('');
+      if (typeof frame.status === 'string') turnStatusByTurn[turnId] = frame.status;
     }
     return {
       target: this.kind,
@@ -257,7 +274,23 @@ class AgentBenchmarkTarget implements BenchmarkConversationTarget {
       turnIds: arrayValue(value.turnOrder).map((turnId) => requiredString(turnId, 'Agent turn order id')),
       activeTurnId: nullableString(value.activeTurnId),
       assistantTextByTurn,
+      turnStatusByTurn,
       raw: response,
+    };
+  }
+
+  async readThread(conversationId: string): Promise<BenchmarkThreadSnapshot> {
+    const value = objectValue(await this.client.query('remux/agent/thread/read', {
+      conversationId,
+    }, this.nextReadKey(`thread:${conversationId}`)));
+    const current = objectValue(value.current);
+    const previous = objectValue(value.previous);
+    return {
+      versionId: requiredString(current.versionId, 'Agent Thread versionId'),
+      ordinal: requiredNumber(current.ordinal, 'Agent Thread ordinal'),
+      content: requiredString(current.content, 'Agent Thread content'),
+      byteLength: requiredNumber(current.byteLength, 'Agent Thread byteLength'),
+      previousVersionId: stringValue(previous.versionId),
     };
   }
 
@@ -267,6 +300,11 @@ class AgentBenchmarkTarget implements BenchmarkConversationTarget {
       conversationId: input.conversationId,
       turnId: input.turnId ?? null,
     });
+  }
+
+  private nextReadKey(kind: string) {
+    this.readOrdinal += 1;
+    return `benchmark:agent:${kind}:${this.readOrdinal}`;
   }
 }
 
@@ -286,10 +324,18 @@ function nullableString(value: unknown) {
   return value === null ? null : stringValue(value);
 }
 
+
 function requiredString(value: unknown, label: string) {
   const result = stringValue(value);
   if (!result) throw new Error(`${label} is missing.`);
   return result;
+}
+
+function requiredNumber(value: unknown, label: string) {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${label} is missing or invalid.`);
+  }
+  return value;
 }
 
 function delay(ms: number) {

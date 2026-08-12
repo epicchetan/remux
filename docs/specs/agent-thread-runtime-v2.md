@@ -1,9 +1,13 @@
 # Agent Thread Runtime v2: exact dialogue and living thread state
 
 Status: Implemented
-Last verified: 2026-08-10
+Last verified: 2026-08-11
 Canonical code: `extensions/agent/server/src/{context,storage,pi-runtime.ts,agent-server.ts}` and `extensions/agent/tests/`
 Replaces: the turn-capsule layer in `agent-thread-runtime-v1.md`
+
+The later `agent-living-thread-canvas-v1.md` checkpoint supersedes this
+document's thin-brief guidance and model-facing `thread_update` operation while
+retaining the v2 storage, compilation, journal, and work-unit foundation.
 
 ## Outcome
 
@@ -56,7 +60,10 @@ project
             ├── tool operations and artifacts
             └── optional work units
                 ├── exact private child trace
-                └── bounded Markdown return
+                └── bounded continuation bundle
+                    ├── result Markdown
+                    ├── proposed Thread update
+                    └── authority/deliverable/evidence snapshots
 ```
 
 The journal and content-addressed artifact store remain canonical. Transcript
@@ -97,9 +104,15 @@ and assistant messages remain in their original provider order. The harness
 rebuilds context only at a semantic boundary: new user turn, work-unit entry,
 work-unit return, pressure notice, or crash recovery.
 
-A work unit inherits the parent provider anchor and a focused orientation. Its
-trace remains private. `work_unit_return` closes it and contributes only its
-explicit Markdown result plus an exact journal reference to the parent.
+A work unit inherits the parent provider anchor and a focused orientation. The
+parent supplies one semantic objective, optional observable `doneWhen`
+conditions, and selected resources classified as authority, deliverable, or
+evidence. Each resource is resolved to an immutable content-addressed snapshot
+before the boundary succeeds and its exact UTF-8 contents are materialized into
+the child context. Its trace remains private. The model-facing
+`work_unit_finish` tool closes it with completed, partial, or blocked status and
+contributes only its explicit continuation bundle plus selected exact resource
+snapshots to the parent.
 
 ## Exact recent dialogue
 
@@ -155,10 +168,11 @@ It must not retain:
 - claims that model-written state outranks the current user, a governing
   contract, or observed repository state.
 
-The parent model uses the existing compare-and-swap `thread_read` and
-`thread_update` tools. `thread_update` remains a complete replacement, so stale
-state is revised or deleted rather than appended. A work unit cannot update the
-document directly; it returns to the parent first.
+The parent model uses the compare-and-swap `thread_read`, `thread_patch`, and
+`thread_replace` tools. A work unit cannot update the document directly; it may
+return a proposed Thread update, which the parent deliberately merges after
+accounting for user decisions and newer evidence. Recommendations therefore do
+not become accepted state merely because an audit child proposed them.
 
 The foreground model revises `thread.md` near the end of a meaningful turn when
 future context changed, then sends its user-facing response. A transient answer
@@ -187,20 +201,30 @@ version after the turn atomically. It does not create a summary artifact.
 > the current scope. Model-written thread state records the current
 > understanding; it does not substitute for the governing source.
 
-The initial implementation uses normal `read`/`bash` access. A dedicated hot
-resource attachment primitive is deferred until repeated exact-resource reads
-are measured as a material cost. Once read inside a scope, the resource remains
-in that scope's append-only provider context and benefits from normal prefix
-caching.
+Normal file and History tools remain available, but a work-unit boundary can
+carry selected exact text resources directly. A resource may be a working-
+directory-relative path, an absolute path, or an openable History reference.
+The harness reads it before reporting boundary success, rejects missing or
+non-UTF-8 content as a correctable tool error, stores the immutable snapshot in
+the journal, and renders its full contents into the receiving scope.
 
-## Journal retrieval
+Returned snapshots remain in the parent provider context for the rest of the
+turn, so later work units inherit them naturally. If the same content hash is
+selected again in that turn, the handoff emits metadata rather than a duplicate
+body. A changed file produces a new snapshot and body. Snapshot freshness is
+explicit: the snapshot is exact at capture time, while the source file may need
+to be re-read after later edits. At the next user turn, the full body leaves hot
+scope scratch but its History reference remains openable.
 
-Old dialogue and all omitted internals remain available through the existing
-two-tool surface:
+## History retrieval
 
-- `journal_search` finds exact durable messages, visible outcomes, thread
+Old dialogue and all omitted internals remain in the immutable internal
+journal, exposed through a plain two-tool model surface:
+
+- `history_search` finds exact durable messages, visible outcomes, Thread
   versions, work-unit objectives/results, artifacts, and optional operations;
-- `journal_open` opens a returned exact reference with byte continuation.
+- `history_read` reads a returned exact `history://` reference with byte
+  continuation.
 
 Retrieval is ephemeral. Opening an old turn does not update `thread.md` or make
 it part of later turns. If the retrieved information becomes active again, the
@@ -215,13 +239,14 @@ projection indexes:
 - exact user message text;
 - exact visible assistant response text;
 - every `thread.md` version;
-- work-unit objectives and returned Markdown;
+- work-unit objectives, returned bundles, and referenced artifacts;
 - artifact/file-path metadata; and
 - tool names and searchable operation text for `include: "operations"`.
 
 Search applies project/conversation scope filters before ranking, prefers the
 active strand and current conversation when relevance is otherwise equal, and
-returns stable exact `journal://` references. Query text is tokenized and safely
+returns stable exact model-facing `history://` references. The repository maps
+these to its internal journal identifiers. Query text is tokenized and safely
 quoted by the server rather than interpolated as raw FTS syntax. The index is
 rebuildable from canonical storage and is recreated with the v2 database.
 
@@ -249,7 +274,7 @@ notice is stable for subsequent calls and occurs at most once per scope.
 
 For a child work unit, the notice asks the model to finish the current coherent
 checkpoint, perform the most important remaining validation, and call
-`work_unit_return`. For a parent scope, it asks the model to integrate completed
+`work_unit_finish`. For a parent scope, it asks the model to integrate completed
 work, update retained thread state if necessary, and complete the user turn
 honestly. It does not claim that work is complete.
 
@@ -266,11 +291,37 @@ threshold remains model-aware and is recorded in context evidence.
 
 ## Parent coordination
 
-Returned work-unit Markdown accumulates in the active parent scope. V2 retains
-this behavior because the measured three-unit turn returned only 19.3 KiB and
-the parent remained well below pressure. Work-unit returns keep the current hard
-transport safety limit and a soft instruction to include only conclusions,
-changes, validation, unresolved issues, and exact evidence references.
+Returned work-unit bundles accumulate in the active parent scope. Each bundle
+has three focused parts:
+
+1. required result Markdown with the outcome, changes, validation, and
+   unresolved issues;
+2. optional proposed Thread Markdown for the parent to merge; and
+3. optional exact resources classified as authority, deliverable, or evidence.
+
+The primary result and Thread proposal have no fixed low byte cap: the child
+branch is discarded, so only the returned bundle consumes the parent scope's
+remaining context. Resource descriptors remain capped separately at 16 KiB and
+sixteen entries, but selected resource bodies are not truncated or replaced by
+pointers. They are copied exactly into the receiving context and retained as
+content-addressed snapshots. The complete rendered bundle is stored as the
+execution scope's immutable Markdown result artifact and folded into the
+parent. Structured resource metadata, including hash, byte length, source, and
+whether the body was newly materialized or already inherited, is retained on
+the return event.
+
+All deterministic return validation and normalization happens before
+`work_unit_finish` reports tool success. The durable scope transition still
+commits after the tool-result boundary, preserving replay order. A malformed
+handoff therefore remains a correctable child tool error rather than becoming a
+failed parent transition.
+
+This preserves the behavior measured in the three-unit turn, where bounded
+returns left the parent well below pressure, while making continuation-critical
+sources inspectable. A later work unit inherits returned resource bodies already
+present in the parent and may receive additional selected resources through
+`work_unit_start`; it does not inherit the prior child's private trace or every
+file the child touched.
 
 An internal parent checkpoint is explicitly deferred. It becomes eligible only
 if a controlled multi-unit task shows that concise sibling returns push the
@@ -340,6 +391,9 @@ manifest evidence remains available to tests and future diagnostics.
 
 ## System-prompt behavior
 
+The production prompts are repository-owned Markdown at
+`extensions/agent/server/prompts/system.md` and `work-unit.md`; they are copied
+into the server build and loaded at startup rather than hidden in TypeScript.
 The prompt remains descriptive rather than procedural. It teaches these
 invariants:
 
@@ -356,6 +410,9 @@ invariants:
 
 The prompt does not prescribe a brainstorm/spec/implement workflow, require a
 work unit, force a thread update, or classify the user's request into modes.
+The runtime also exposes scope-valid tools only: the parent receives Thread,
+History, and `work_unit_start`, while a child receives History and
+`work_unit_finish`. Both retain the normal file and shell tools.
 
 ## Implementation checkpoints
 
@@ -402,6 +459,20 @@ work unit, force a thread update, or classify the user's request into modes.
 - run a real subscription smoke covering update, eviction, retrieval, work-unit
   return, pressure, restart, edit, and fork; and
 - rerun the frozen Ledger Agent benchmark through the production API path.
+
+### V2.6 — auditable work-unit resource handoffs
+
+- give each child an explicit objective and optional observable `doneWhen`
+  conditions while the parent retains the turn plan and integration decisions;
+- replace pointer-only boundary artifacts with exact authority, deliverable, and
+  evidence snapshots materialized into the receiving context;
+- require completed, partial, or blocked return status and preserve the result
+  and optional Thread proposal without a fixed low byte cap;
+- keep child traces private while making selected file or History contents
+  directly inspectable by the parent;
+- deduplicate unchanged returned snapshots for the remainder of the turn and
+  materialize changed content as a new snapshot; and
+- validate all boundary input and resource reads before reporting tool success.
 
 ## Implementation evidence
 
@@ -455,8 +526,9 @@ The cutover is complete only when:
 8. a large coherent work unit can run normally, receives one durable early
    pressure notice when configured to cross the boundary, and returns without
    leaking its trace;
-9. repeated sibling work units keep explicit bounded handoffs and the parent
-   never receives child reasoning or raw operations;
+9. repeated sibling work units keep explicit bounded handoffs, selected exact
+   resources remain auditable and reusable, and the parent never receives child
+   reasoning or raw operations unless it deliberately retrieves that trace;
 10. active-scope restart preserves exact provider reasoning/signatures and does
     not duplicate a pressure notice;
 11. edit/fork before and after a historical turn inherit the correct exact

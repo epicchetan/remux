@@ -9,7 +9,7 @@ test('thread context compilation is deterministic and preserves exact active-tur
   const left = compileThreadContext(source, { contextWindow: 400_000 });
   const right = compileThreadContext(source, { contextWindow: 400_000 });
   assert.deepEqual(left, right);
-  assert.equal(left.frame.compilerVersion, 'agent-thread-compiler-v2');
+  assert.equal(left.frame.compilerVersion, 'agent-thread-compiler-v3');
   assert.deepEqual(left.frame.dialogueTurnIds, ['turn:prior']);
   assert.deepEqual(left.messages.map(({ role }) => role), [
     'user', 'assistant', 'user', 'assistant', 'tool',

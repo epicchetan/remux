@@ -197,19 +197,16 @@ function selectNewestWholeGroups(groups: readonly DialogueGroup[], budget: numbe
 
 function renderThreadControl(source: ThreadContextSource, omittedDialogueTurns: number) {
   const history = omittedDialogueTurns > 0
-    ? `${omittedDialogueTurns} older completed dialogue turn(s) are omitted from active context.`
-    : 'No eligible completed dialogue turns are omitted from active context.';
+    ? `${omittedDialogueTurns} older completed conversation turn(s) are not currently shown.`
+    : 'All eligible completed conversation turns are currently shown.';
   const sections = [
-    '<remux_thread_context version="2">',
-    `<thread_document ref=${JSON.stringify(`journal://document-version/${source.threadVersionId}`)}>`,
+    `<thread version=${JSON.stringify(source.threadVersionId)}>`,
     source.threadMarkdown,
-    '</thread_document>',
-    '<cold_history>',
+    '</thread>',
+    '<history>',
     history,
-    `Exact history: journal://conversation/${encodeURIComponent(source.conversationId)}`,
-    'Use journal_search and journal_open when an omitted fact matters. Retrieval is ephemeral.',
-    '</cold_history>',
-    '</remux_thread_context>',
+    'Use history_search and history_read when an exact earlier detail matters. Reading History does not change the Thread.',
+    '</history>',
   ];
   return `${sections.join('\n')}\n`;
 }

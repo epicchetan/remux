@@ -100,15 +100,15 @@ test('shows actual dispatch and compiled-frame evidence for a durable inference'
   await page.goto(conversationUrl());
 
   const inspector = page.getByTestId('context-inspector');
-  await expect(inspector.locator('summary')).toContainText('thread 101 · recent 100 · active 102 · turn');
+  await expect(inspector.locator('summary')).toContainText('Thread 101 · recent 100 · active 102 · turn');
   await inspector.locator('summary').click();
   const panel = page.getByRole('region', { name: 'Inference context inspector' });
   await expect(panel).toContainText('Actual inference context');
   await expect(panel).toContainText('continuation transport');
-  await expect(panel).toContainText('Thread frame');
-  await expect(panel).toContainText('thread document');
-  await expect(panel).toContainText('active scope');
-  await expect(panel).toContainText('1 exact · 4 cold');
+  await expect(panel).toContainText('Thread context');
+  await expect(panel).toContainText('Thread');
+  await expect(panel).toContainText('current work');
+  await expect(panel).toContainText('1 shown · 4 in History');
   await expect(panel).toContainText('retrievable omissions');
 
   await panel.getByRole('button', { name: /Open captured request context/u }).click();
@@ -116,9 +116,27 @@ test('shows actual dispatch and compiled-frame evidence for a durable inference'
   await expect(dispatch).toContainText('Fixture provider input');
   await dispatch.getByRole('button', { name: 'Close Captured harness-visible request context' }).click();
 
-  await panel.getByRole('button', { name: /Open compiled thread bootstrap/u }).click();
-  const bootstrap = page.getByRole('dialog', { name: 'Exact dispatched thread bootstrap' });
-  await expect(bootstrap).toContainText('<remux_thread_context version="2">');
+  await panel.getByRole('button', { name: /Open compiled Thread context/u }).click();
+  const bootstrap = page.getByRole('dialog', { name: 'Exact dispatched Thread context' });
+  await expect(bootstrap).toContainText('<thread version="fixture-thread-version">');
+});
+
+test('opens the current Thread and its previous durable version', async ({ page }) => {
+  await page.goto(conversationUrl());
+
+  await page.getByTestId('thread-canvas-open').click();
+  const canvas = page.getByRole('dialog', { name: 'Thread' });
+  await expect(canvas).toBeVisible();
+  await expect(canvas).toContainText('Ledger — 0DTE heat maps');
+  await expect(canvas).toContainText('Candidate interpretations');
+  await expect(canvas).toContainText('Current conversational edge');
+  await expect(canvas).toContainText('version 3');
+
+  await canvas.getByRole('button', { name: 'Previous' }).click();
+  await expect(canvas).toContainText('Earlier canvas');
+  await expect(canvas).toContainText('Choose the first metric.');
+  await canvas.getByRole('button', { name: 'Close Thread' }).click();
+  await expect(canvas).toHaveCount(0);
 });
 
 test('selects history through the desktop sidebar or mobile sheet and restores target drafts', async ({ page, isMobile }) => {

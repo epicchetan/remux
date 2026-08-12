@@ -3,29 +3,66 @@ import { defineTool, type ToolDefinition } from '@earendil-works/pi-coding-agent
 
 import type { RuntimeDurabilityHooks } from '../engine.ts';
 
+export const PARENT_CONTEXT_TOOL_NAMES = [
+  'history_search',
+  'history_read',
+  'thread_read',
+  'thread_patch',
+  'thread_replace',
+  'work_unit_start',
+] as const;
+
+export const WORK_UNIT_CONTEXT_TOOL_NAMES = [
+  'history_search',
+  'history_read',
+  'work_unit_finish',
+] as const;
+
 const searchSchema = Type.Object({
-  query: Type.String({ minLength: 1, description: 'Words or phrase to find in durable journal evidence.' }),
+  query: Type.String({ minLength: 1, description: 'Words or phrase to find in exact prior History.' }),
   limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
   scope: Type.Optional(Type.Union([Type.Literal('conversation'), Type.Literal('project')])),
   include: Type.Optional(Type.Literal('operations')),
 });
 
 const openSchema = Type.Object({
-  ref: Type.String({ minLength: 1, description: 'Stable journal:// reference returned by journal_search.' }),
+  ref: Type.String({ minLength: 1, description: 'Stable history:// reference returned by history_search.' }),
   offset: Type.Optional(Type.Integer({ minimum: 0 })),
   maxBytes: Type.Optional(Type.Integer({ minimum: 256, maximum: 32 * 1024 })),
 });
 
 const threadReadSchema = Type.Object({});
 
-const threadUpdateSchema = Type.Object({
+const threadPatchSchema = Type.Object({
   baseVersionId: Type.String({
     minLength: 1,
-    description: 'The exact versionId returned by thread_read or the prior successful update.',
+    description: 'The exact versionId from active context, thread_read, or the prior successful edit.',
+  }),
+  edits: Type.Array(Type.Object({
+    oldText: Type.String({
+      minLength: 1,
+      maxLength: 96 * 1024,
+      description: 'Exact non-empty text that occurs once in the current Thread.',
+    }),
+    newText: Type.String({
+      maxLength: 96 * 1024,
+      description: 'Replacement text. Use an empty string to delete the exact oldText.',
+    }),
+  }), {
+    minItems: 1,
+    maxItems: 32,
+    description: 'Atomic exact replacements applied in order.',
+  }),
+});
+
+const threadReplaceSchema = Type.Object({
+  baseVersionId: Type.String({
+    minLength: 1,
+    description: 'The exact versionId from active context, thread_read, or the prior successful edit.',
   }),
   content: Type.String({
     maxLength: 96 * 1024,
-    description: 'Complete replacement Markdown for the active branch thread.md.',
+    description: 'Deliberate complete replacement Markdown for the active Thread.',
   }),
 });
 
@@ -35,127 +72,250 @@ const workUnitEnterSchema = Type.Object({
     maxLength: 4 * 1024,
     description: 'One focused, coherent objective for the bounded child execution scope.',
   }),
-  evidenceRefs: Type.Optional(Type.Array(Type.String({ minLength: 1 }), {
-    maxItems: 8,
-    description: 'Optional journal:// references that orient the child without copying their contents.',
+  doneWhen: Type.Optional(Type.Array(Type.String({
+    minLength: 1,
+    maxLength: 4 * 1024,
+    description: 'One observable condition that tells the child it has enough to return.',
+  }), {
+    minItems: 1,
+    maxItems: 16,
+    description: 'Semantic completion criteria for this work unit.',
+  })),
+  resources: Type.Optional(Type.Array(workUnitResourceSchema(), {
+    maxItems: 16,
+    description: 'Durable authorities, deliverables, or evidence the work unit should consult.',
   })),
 });
 
 const workUnitReturnSchema = Type.Object({
+  status: Type.Union([
+    Type.Literal('completed'),
+    Type.Literal('partial'),
+    Type.Literal('blocked'),
+  ], {
+    description: 'Whether the objective completed, reached a useful partial boundary, or is blocked.',
+  }),
   result: Type.String({
     minLength: 1,
-    maxLength: 16 * 1024,
-    description: 'Bounded Markdown result containing conclusions, changes, validation, and unresolved issues.',
+    description: 'Decision-ready Markdown continuation that lets the parent proceed without reconstructing the work-unit trace.',
   }),
+  threadUpdate: Type.Optional(Type.String({
+    minLength: 1,
+    description: 'Proposed Markdown for the parent to merge into the Thread. It is not applied automatically.',
+  })),
+  resources: Type.Optional(Type.Array(workUnitResourceSchema(), {
+    maxItems: 16,
+    description: 'Selected exact authorities, deliverables, or evidence that prevent meaningful reconstruction or enable the next action.',
+  })),
 });
+
+function workUnitResourceSchema() {
+  return Type.Object({
+    ref: Type.String({
+      minLength: 1,
+      maxLength: 4 * 1024,
+      description: 'A history:// reference or an absolute or working-directory-relative filesystem path.',
+    }),
+    role: Type.Union([
+      Type.Literal('authority'),
+      Type.Literal('deliverable'),
+      Type.Literal('evidence'),
+    ]),
+    description: Type.Optional(Type.String({ minLength: 1, maxLength: 2 * 1024 })),
+  });
+}
 
 export function createContextTools(
   durability: Pick<
     RuntimeDurabilityHooks,
-    'journalSearch' | 'journalOpen' | 'threadRead' | 'threadUpdate' |
+    'journalSearch' | 'journalOpen' | 'threadRead' | 'threadPatch' | 'threadReplace' |
     'workUnitEnter' | 'workUnitReturn'
   >,
 ): ToolDefinition[] {
   return [
     defineTool({
-      name: 'journal_search',
-      label: 'Search journal',
+      name: 'history_search',
+      label: 'Search History',
       description: [
-        'Search exact durable project or conversation history that is not in the active frame.',
+        'Search exact prior messages, outcomes, and operations that are not currently shown.',
         'Ordinary operations are excluded unless include="operations" is requested.',
-        'Results are ephemeral: searching does not automatically add them to thread.md or later turns.',
+        'The result is temporary; search does not change the Thread or later context.',
       ].join(' '),
-      promptSnippet: 'Search durable messages, outcomes, artifacts, and prior operations',
+      promptSnippet: 'Search exact earlier conversation and execution History',
       parameters: searchSchema,
       executionMode: 'parallel',
       async execute(_callId, params) {
-        return jsonResult(await durability.journalSearch(params));
+        const result = await durability.journalSearch(params);
+        return jsonResult({
+          ...result,
+          hits: result.hits.map((hit) => ({ ...hit, ref: modelHistoryRef(hit.ref) })),
+        });
       },
     }),
     defineTool({
-      name: 'journal_open',
-      label: 'Open journal evidence',
+      name: 'history_read',
+      label: 'Read History',
       description: [
-        'Open a bounded exact journal reference returned by search or present in thread context.',
-        'The result is ephemeral and supports byte continuations.',
+        'Read bounded exact History from a reference returned by history_search or another tool.',
+        'The result is temporary and supports byte continuations for large results.',
       ].join(' '),
-      promptSnippet: 'Open exact durable evidence by journal reference',
+      promptSnippet: 'Read exact prior evidence from History',
       parameters: openSchema,
       executionMode: 'parallel',
       async execute(_callId, params) {
-        return jsonResult(await durability.journalOpen(params));
+        const result = await durability.journalOpen({
+          ...params,
+          ref: durableHistoryRef(params.ref),
+        });
+        return jsonResult({ ...result, ref: modelHistoryRef(result.ref) });
       },
     }),
     defineTool({
       name: 'thread_read',
-      label: 'Read thread state',
-      description: 'Read the current branch-scoped thread.md and its compare-and-swap version.',
-      promptSnippet: 'Read current collaborative thread state',
+      label: 'Read Thread',
+      description: 'Read the complete living Thread and the version required by the editing tools.',
+      promptSnippet: 'Read the living working document for this conversation',
       parameters: threadReadSchema,
       executionMode: 'parallel',
       async execute() {
-        return jsonResult(await durability.threadRead());
+        return jsonResult(modelThreadView(await durability.threadRead()));
       },
     }),
     defineTool({
-      name: 'thread_update',
-      label: 'Update thread state',
+      name: 'thread_patch',
+      label: 'Patch Thread',
       description: [
-        'Replace branch-scoped thread.md using its exact base version.',
-        'Keep current objectives, accepted decisions, constraints, progress, important resources, open questions, and next direction.',
-        'It is a bounded collaboration brief, not a transcript, log, scratchpad, or copy of files.',
+        'Update the living Thread when shared goals, decisions, design, contract, implementation state, evidence, or open questions materially change.',
+        'Revise existing content rather than appending a turn log.',
+        'Apply one or more atomic exact-text replacements.',
+        'Use the version from active context, thread_read, or the previous successful edit.',
+        'If the version changed or an old text is missing or ambiguous, nothing is modified.',
       ].join(' '),
-      promptSnippet: 'CAS-replace the current thread.md collaboration brief',
+      promptSnippet: 'Patch the living Thread with exact replacements',
       promptGuidelines: [
-        'Update only at a meaningful state transition or before completing a turn whose outcome changes future context.',
-        'Prefer revising or deleting stale text over appending another status block.',
-        'Do not store reasoning traces, raw command output, or facts that matter only to the current response.',
+        'Each oldText must occur exactly once at the point its edit is applied.',
+        'On conflict, read the current Thread and retry deliberately.',
       ],
-      parameters: threadUpdateSchema,
+      parameters: threadPatchSchema,
       executionMode: 'sequential',
       async execute(_callId, params) {
-        return jsonResult(await durability.threadUpdate(params));
+        return jsonResult(modelThreadView(await durability.threadPatch(params)));
       },
     }),
     defineTool({
-      name: 'work_unit_enter',
-      label: 'Enter work unit',
+      name: 'thread_replace',
+      label: 'Replace Thread',
       description: [
-        'Branch the current turn into one bounded child execution scope for a coherent subproblem.',
-        'The child inherits current parent context and may retrieve exact journal evidence.',
-        'Its reasoning and tool trace stay child-local; only an explicit bounded return reaches the parent.',
+        'Replace the complete living Thread using its exact current version.',
+        'Use only to initialize it, deliberately reorganize it, recover it, or fundamentally change the subject.',
+        'Ordinary maintenance belongs in thread_patch.',
       ].join(' '),
-      promptSnippet: 'Enter a bounded child context for one focused subproblem',
+      promptSnippet: 'Deliberately replace the complete living Thread',
+      parameters: threadReplaceSchema,
+      executionMode: 'sequential',
+      async execute(_callId, params) {
+        return jsonResult(modelThreadView(await durability.threadReplace(params)));
+      },
+    }),
+    defineTool({
+      name: 'work_unit_start',
+      label: 'Start work unit',
+      description: [
+        'Start a temporary child scope for one substantial, independently assessable research, implementation, or validation outcome.',
+        'It inherits the current request, Thread, and parent context at this point; its reasoning and tool trace stay local.',
+        'Resources are snapshotted and materialized into the child context.',
+        'The parent resumes from the work_unit_finish continuation rather than the child trace.',
+      ].join(' '),
+      promptSnippet: 'Start one coherent unit of substantial disposable work',
       promptGuidelines: [
-        'Use only when isolating substantial scratch or a coherent subproblem improves the work; ordinary short tool sequences stay in the parent.',
+        'Keep brainstorming, ordinary dialogue, small changes, short tool sequences, Thread maintenance, integration, and response drafting in the parent.',
+        'Keep the turn plan in the parent. State one outcome, observable doneWhen conditions, and the next decision or action this return should unlock.',
+        'Ask for only the exact resources this child should have directly in context.',
+        'Use the largest coherent unit the parent can independently assess while leaving room for the child to validate and return cleanly.',
         'Work units cannot be nested.',
-        'Once entered, finish by calling work_unit_return rather than answering the user directly.',
+        'Finish by calling work_unit_finish.',
       ],
       parameters: workUnitEnterSchema,
       executionMode: 'sequential',
       async execute(callId, params) {
-        return jsonResult(await durability.workUnitEnter(callId, params));
+        const result = await durability.workUnitEnter(callId, {
+          ...params,
+          resources: params.resources?.map(durableWorkUnitResource),
+        });
+        return jsonResult({
+          ...result,
+          resources: result.resources.map(modelWorkUnitResource),
+        });
       },
     }),
     defineTool({
-      name: 'work_unit_return',
-      label: 'Return work unit',
+      name: 'work_unit_finish',
+      label: 'Finish work unit',
       description: [
-        'Close the active work unit and return one bounded Markdown result to its parent turn.',
-        'The child trace remains in the journal and is not replayed into the parent.',
+        'Finish the active work unit with a continuation that enables the parent\'s next decision or action without reconstructing the child trace.',
+        'The status and result are required; a proposed Thread update and resources are optional.',
+        'Returned resources are snapshotted and materialized into the parent context.',
+        'Detailed scratch remains in History and is not replayed into the parent.',
       ].join(' '),
-      promptSnippet: 'Fold a bounded child result into the parent context',
+      promptSnippet: 'Finish the work unit and return what its parent needs',
       promptGuidelines: [
-        'Include conclusions, material changes, validation evidence, and unresolved issues needed by the parent.',
+        'Put the established outcome, changed state or findings, supporting validation, remaining uncertainty, and next useful parent edge in result.',
+        'Use partial or blocked to return honestly at a useful boundary instead of broadening the unit.',
+        'Use threadUpdate only for shared state the parent should deliberately merge; do not treat recommendations as accepted user decisions.',
+        'Return a resource when its exact contents prevent meaningful reconstruction or enable inspection, integration, audit, or later work; prefer the smallest useful surface.',
+        'Do not return every file touched or unchanged material already inherited.',
         'Do not paste reasoning traces or raw command output.',
       ],
       parameters: workUnitReturnSchema,
       executionMode: 'sequential',
       async execute(callId, params) {
-        return jsonResult(await durability.workUnitReturn(callId, params));
+        return jsonResult(await durability.workUnitReturn(callId, {
+          ...params,
+          resources: params.resources?.map(durableWorkUnitResource),
+        }));
       },
     }),
   ];
+}
+
+function modelThreadView<T extends { ref: string }>(view: T): T {
+  return { ...view, ref: modelHistoryRef(view.ref) };
+}
+
+function modelHistoryRef(ref: string) {
+  return ref.replace(/^journal:\/\//u, 'history://');
+}
+
+function durableHistoryRef(ref: string) {
+  if (!ref.startsWith('history://')) {
+    throw new TypeError('History references must start with history://.');
+  }
+  return ref.replace(/^history:\/\//u, 'journal://');
+}
+
+function modelWorkUnitResource<T extends { ref: string; snapshot?: { ref: string } }>(resource: T): T {
+  return {
+    ...resource,
+    ref: modelHistoryRef(resource.ref),
+    ...(resource.snapshot ? {
+      snapshot: { ...resource.snapshot, ref: modelHistoryRef(resource.snapshot.ref) },
+    } : {}),
+  };
+}
+
+function durableWorkUnitResource<T extends { ref: string; snapshot?: { ref: string } }>(resource: T): T {
+  return {
+    ...resource,
+    ref: resource.ref.startsWith('history://') ? durableHistoryRef(resource.ref) : resource.ref,
+    ...(resource.snapshot ? {
+      snapshot: {
+        ...resource.snapshot,
+        ref: resource.snapshot.ref.startsWith('history://')
+          ? durableHistoryRef(resource.snapshot.ref)
+          : resource.snapshot.ref,
+      },
+    } : {}),
+  };
 }
 
 function jsonResult(value: unknown) {

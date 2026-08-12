@@ -14,9 +14,12 @@ import type {
   DurableContextBoundarySnapshot,
   DurableInferenceContext,
   DurableQueuedTurn,
+  PreparedWorkUnitReturn,
   QueueTurnResult,
 } from './storage/repository.ts';
 import type { AgentResourceKey } from '../../shared/protocol.ts';
+import type { ThreadCanvasValue } from '../../shared/protocol.ts';
+import type { TurnReadValue } from '../../shared/protocol.ts';
 import type { AssistantMessage } from '@earendil-works/pi-ai';
 import type {
   JournalOpenInput,
@@ -24,8 +27,12 @@ import type {
   JournalSearchInput,
   JournalSearchResult,
   ThreadDocumentView,
-  ThreadUpdateInput,
+  ThreadPatchInput,
+  ThreadReplaceInput,
   WorkUnitEnterInput,
+  WorkUnitResourceView,
+  WorkUnitReturnInput,
+  WorkUnitReturnStatus,
 } from './engine.ts';
 import type { AgentTranscriptResourcesReadParams } from '../../shared/transcript.ts';
 
@@ -115,16 +122,39 @@ export interface AgentConversationJournal {
   searchJournal?(conversationId: string, input: JournalSearchInput): Promise<JournalSearchResult>;
   openJournal?(conversationId: string, input: JournalOpenInput): Promise<JournalOpenResult>;
   readThread?(conversationId: string): Promise<ThreadDocumentView>;
-  updateThread?(handle: DurableTurnHandle, input: ThreadUpdateInput): Promise<ThreadDocumentView>;
+  readThreadHistory?(conversationId: string): Promise<ThreadCanvasValue>;
+  readTurn?(conversationId: string, turnId: string): Promise<TurnReadValue>;
+  patchThread?(handle: DurableTurnHandle, input: ThreadPatchInput): Promise<ThreadDocumentView>;
+  replaceThread?(handle: DurableTurnHandle, input: ThreadReplaceInput): Promise<ThreadDocumentView>;
   enterWorkUnit?(handle: DurableTurnHandle, input: WorkUnitEnterInput): Promise<{
     handle: DurableTurnHandle;
     parentScopeId: string;
     objective: string;
-    evidenceRefs: string[];
+    doneWhen: string[];
+    resources: WorkUnitResourceView[];
   }>;
-  returnWorkUnit?(handle: DurableTurnHandle, input: { result: string }): Promise<{
+  prepareWorkUnitReturn?(
+    handle: DurableTurnHandle,
+    input: WorkUnitReturnInput,
+  ): Promise<PreparedWorkUnitReturn>;
+  commitWorkUnitReturn?(
+    handle: DurableTurnHandle,
+    prepared: PreparedWorkUnitReturn,
+  ): Promise<{
     parentHandle: DurableTurnHandle;
+    status: WorkUnitReturnStatus;
     result: string;
+    threadUpdate?: string;
+    resources: WorkUnitResourceView[];
+    resultRef: string;
+    scopeId: string;
+  }>;
+  returnWorkUnit?(handle: DurableTurnHandle, input: WorkUnitReturnInput): Promise<{
+    parentHandle: DurableTurnHandle;
+    status: WorkUnitReturnStatus;
+    result: string;
+    threadUpdate?: string;
+    resources: WorkUnitResourceView[];
     resultRef: string;
     scopeId: string;
   }>;
