@@ -1,6 +1,5 @@
-import { createHash, randomUUID } from 'node:crypto';
-import { readFile, stat } from 'node:fs/promises';
-import { basename, isAbsolute, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
+import { basename, isAbsolute } from 'node:path';
 
 import type { AssistantMessage } from '@earendil-works/pi-ai';
 
@@ -47,11 +46,6 @@ import type {
   ThreadDocumentView,
   ThreadPatchInput,
   ThreadReplaceInput,
-  WorkUnitEnterInput,
-  WorkUnitResourceRef,
-  WorkUnitResourceView,
-  WorkUnitReturnInput,
-  WorkUnitReturnStatus,
 } from '../domain/work.ts';
 import type {
   AcceptTurnParams,
@@ -76,9 +70,6 @@ import type {
   DurableTurnHandle,
   DurableTurnStatus,
   PreparedReference,
-  PreparedWorkUnitEntry,
-  PreparedWorkUnitResource,
-  PreparedWorkUnitReturn,
   QueueTurnResult,
 } from '../domain/state.ts';
 import {
@@ -98,44 +89,39 @@ import { canonicalJson, canonicalJsonHash, type CanonicalJsonValue } from './can
 import {
   openAgentDatabase,
   type AgentDatabase,
-  type AgentDatabaseDiagnostics,
 } from './database.ts';
 import type { AgentDataRootOptions } from './data-root.ts';
-import { AgentArtifactStore, type StagedArtifact } from './artifact-store.ts';
+import type { StagedArtifact } from './artifact-store.ts';
 import { durableProjectionDigest } from './projection-hash.ts';
-import { agentComposerPartsHashValue, decodeAgentImageDataUrl } from '../user-input.ts';
 import {
-  renderMaterializedResourceSection,
-  renderWorkUnitPrompt,
-  type MaterializedPromptResource,
-} from '../prompts.ts';
+  EVENT_PAYLOAD_LIMIT_BYTES,
+  type AgentStateCoreOptions,
+} from './state-core.ts';
+import { WorkUnitState } from './work-unit-state.ts';
+import {
+  artifactRef,
+  boundedSafeInteger,
+  boundedUtf8Slice,
+  normalizeJson,
+  parseReference,
+  requiredHash,
+  requiredNonnegativeInteger,
+  requiredString,
+  safeDuration,
+  safeInteger,
+  safeNonnegativeInteger,
+  safeTimestamp,
+  sqlPlaceholders,
+  truncateUtf8Text,
+} from './state-codec.ts';
+import { agentComposerPartsHashValue, decodeAgentImageDataUrl } from '../user-input.ts';
 
 const CREATE_CONVERSATION_KIND = 'conversation.create';
 const SEND_MESSAGE_KIND = 'message.send';
 const INITIAL_TITLE = 'New conversation';
-const EVENT_PAYLOAD_LIMIT_BYTES = 32 * 1024;
-const INLINE_CONTENT_LIMIT_BYTES = 16 * 1024;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
-type IdKind =
-  | 'project'
-  | 'conversation'
-  | 'turn'
-  | 'scope'
-  | 'event'
-  | 'operation'
-  | 'item'
-  | 'message'
-  | 'inference'
-  | 'frame'
-  | 'provider-item'
-  | 'document'
-  | 'document-version';
-
-export type AgentStateStoreOptions = AgentDataRootOptions & {
-  now?: () => number;
-  idFactory?: (kind: IdKind) => string;
-};
+export type AgentStateStoreOptions = AgentDataRootOptions & AgentStateCoreOptions;
 
 type StoredCreateOutcome = {
   accepted: true;
@@ -162,22 +148,9 @@ type ProjectRow = {
   project_id: string;
 };
 
-export class AgentStateStore implements AgentStore {
-  readonly databasePath: string;
-  private readonly storage: AgentDatabase;
-  private readonly now: () => number;
-  private readonly idFactory: (kind: IdKind) => string;
-  private readonly artifacts: AgentArtifactStore;
-  private orphanArtifactPaths: string[] = [];
-  private writerTail: Promise<void> = Promise.resolve();
-  private closePromise: Promise<void> | null = null;
-
+export class AgentStateStore extends WorkUnitState implements AgentStore {
   private constructor(storage: AgentDatabase, options: AgentStateStoreOptions) {
-    this.storage = storage;
-    this.databasePath = storage.paths.database;
-    this.now = options.now ?? Date.now;
-    this.idFactory = options.idFactory ?? (() => randomUUID());
-    this.artifacts = new AgentArtifactStore(storage.paths);
+    super(storage, options);
   }
 
   static async open(options: AgentStateStoreOptions = {}) {
@@ -194,16 +167,6 @@ export class AgentStateStore implements AgentStore {
       storage.close();
       throw error;
     }
-  }
-
-  diagnostics(): AgentDatabaseDiagnostics {
-    this.assertOpen();
-    return this.storage.diagnostics();
-  }
-
-  artifactDiagnostics() {
-    this.assertOpen();
-    return { orphanStoragePaths: [...this.orphanArtifactPaths] };
   }
 
   async scrubArtifacts(): Promise<ArtifactScrubReport> {
@@ -2090,7 +2053,7 @@ export class AgentStateStore implements AgentStore {
     };
   }
 
-  private async resolveOpenableContent(conversationId: string, ref: string): Promise<string> {
+  protected async resolveOpenableContent(conversationId: string, ref: string): Promise<string> {
     const identity = this.contextIdentity(conversationId);
     const eventMatch = /^history:\/\/event\/(\d+)$/u.exec(ref);
     const eventIdMatch = /^history:\/\/event-id\/([^/?#]+)$/u.exec(ref);
@@ -2629,363 +2592,6 @@ export class AgentStateStore implements AgentStore {
     }));
   }
 
-  async prepareWorkUnitEntry(
-    handle: DurableTurnHandle,
-    input: WorkUnitEnterInput,
-  ): Promise<PreparedWorkUnitEntry> {
-    this.assertOpen();
-    this.assertRunningHandle(handle);
-    const objective = input.objective.trim();
-    if (!objective) throw new TypeError('A work unit objective is required.');
-    if (Buffer.byteLength(objective, 'utf8') > 4 * 1024) {
-      throw new TypeError('A work unit objective must not exceed 4 KiB.');
-    }
-    const doneWhen = normalizeWorkUnitDoneWhen(input.doneWhen ?? []);
-    const resources = normalizeWorkUnitResources(input.resources ?? []);
-    const materializedResources = await this.prepareWorkUnitResources(
-      handle,
-      resources,
-      this.parentMaterializedResourceHashes(handle.turnId),
-    );
-    const orientation = await this.prepareText(renderWorkUnitPrompt({
-      objective,
-      doneWhen,
-      resources: materializedResources.map(modelPromptWorkUnitResource),
-    }));
-    const child: DurableTurnHandle = { ...handle, scopeId: this.nextId('scope') };
-    return { child, doneWhen, materializedResources, objective, orientation };
-  }
-
-  commitWorkUnitEntry(handle: DurableTurnHandle, prepared: PreparedWorkUnitEntry) {
-    const { child, doneWhen, materializedResources, objective, orientation } = prepared;
-    return this.enqueueWrite(() => this.storage.transaction(() => {
-      this.assertRunningHandle(handle);
-      const parent = this.scopeIdentity(handle.scopeId);
-      if (parent.kind !== 'turn' || parent.parent_scope_id !== null) {
-        throw new Error('Work units cannot be nested.');
-      }
-      const runningChild = this.storage.database.prepare(`
-        SELECT 1 FROM execution_scopes
-        WHERE parent_scope_id = ? AND kind = 'work_unit' AND terminal_sequence IS NULL
-      `).get(handle.scopeId);
-      if (runningChild) throw new Error('A work unit is already active for this turn.');
-      const recordedAt = safeTimestamp(this.now());
-      const sequence = this.insertEvent({
-        ...child,
-        eventId: this.nextId('event'),
-        type: 'work_unit.entered',
-        actor: 'model',
-        visibility: 'internal',
-        payload: {
-          doneWhen,
-          objective,
-          parentScopeId: handle.scopeId,
-          resources: materializedResources.map(({ view }) => view),
-          scopeId: child.scopeId,
-        },
-        createdAt: recordedAt,
-      });
-      this.storage.database.prepare(`
-        INSERT INTO execution_scopes (
-          scope_id, project_id, conversation_id, turn_id,
-          parent_scope_id, kind, objective_json, state, created_sequence,
-          terminal_sequence, result_artifact_hash, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, 'work_unit', ?, 'running', ?, NULL, NULL, ?, ?)
-      `).run(
-        child.scopeId,
-        child.projectId,
-        child.conversationId,
-        child.turnId,
-        handle.scopeId,
-        canonicalJson({ doneWhen, objective, resources: materializedResources.map(({ view }) => view) }),
-        sequence,
-        recordedAt,
-        recordedAt,
-      );
-      for (const resource of materializedResources) {
-        this.insertArtifact(resource.artifact, sequence, 'content');
-      }
-      this.indexHistoryText({
-        ref: `history://scope/${encodeURIComponent(child.scopeId)}`,
-        projectId: child.projectId,
-        conversationId: child.conversationId,
-        turnId: child.turnId,
-        kind: 'work-unit-objective',
-        sequence,
-        text: objective,
-      });
-      const orientationSequence = this.insertEvent({
-        ...child,
-        eventId: this.nextId('event'),
-        type: 'message.internal',
-        actor: 'harness',
-        visibility: 'internal',
-        payload: { content: orientation.ref, kind: 'work_unit_orientation' },
-        artifactHash: artifactHash(orientation.ref),
-        createdAt: recordedAt,
-      });
-      this.insertArtifact(orientation.artifact, orientationSequence);
-      return {
-        handle: child,
-        parentScopeId: handle.scopeId,
-        objective,
-        doneWhen,
-        resources: materializedResources.map(({ view }) => view),
-      };
-    }));
-  }
-
-  async enterWorkUnit(handle: DurableTurnHandle, input: WorkUnitEnterInput) {
-    return this.commitWorkUnitEntry(handle, await this.prepareWorkUnitEntry(handle, input));
-  }
-
-  async prepareWorkUnitReturn(
-    handle: DurableTurnHandle,
-    input: WorkUnitReturnInput,
-  ): Promise<PreparedWorkUnitReturn> {
-    this.assertOpen();
-    this.assertRunningHandle(handle);
-    const child = this.scopeIdentity(handle.scopeId);
-    if (child.kind !== 'work_unit' || child.parent_scope_id === null) {
-      throw new Error('No work unit is active.');
-    }
-    const normalized = normalizeWorkUnitReturnInput(input);
-    const resources = await this.prepareWorkUnitResources(
-      handle,
-      normalized.resources,
-      this.parentMaterializedResourceHashes(handle.turnId),
-    );
-    const bundle = renderWorkUnitReturnBundle({
-      resources: resources.map(modelPromptWorkUnitResource),
-      result: normalized.result,
-      status: normalized.status,
-      threadUpdate: normalized.threadUpdate,
-    });
-    const resultArtifact = await this.artifacts.put(
-      Buffer.from(bundle, 'utf8'),
-      'text/markdown; charset=utf-8',
-    );
-    const folded = await this.prepareText([
-      'Current work: parent conversation. The focused work unit is closed; do not call work_unit_finish again.',
-      `The work unit returned from history://scope/${encodeURIComponent(handle.scopeId)}.`,
-      '',
-      bundle,
-      '',
-      `Exact work-unit History: history://scope/${encodeURIComponent(handle.scopeId)}`,
-    ].join('\n'));
-    return { ...normalized, bundle, folded, resources, resultArtifact };
-  }
-
-  commitWorkUnitReturn(handle: DurableTurnHandle, prepared: PreparedWorkUnitReturn) {
-    this.assertOpen();
-    return this.enqueueWrite(() => this.storage.transaction(() => {
-      this.assertRunningHandle(handle);
-      const child = this.scopeIdentity(handle.scopeId);
-      if (child.kind !== 'work_unit' || child.parent_scope_id === null) {
-        throw new Error('No work unit is active.');
-      }
-      const parentHandle = { ...handle, scopeId: child.parent_scope_id };
-      const parent = this.scopeIdentity(parentHandle.scopeId);
-      if (parent.kind !== 'turn' || parent.state !== 'running') {
-        throw new Error('The work unit parent is no longer running.');
-      }
-      const recordedAt = safeTimestamp(this.now());
-      const terminalSequence = this.insertEvent({
-        ...handle,
-        eventId: this.nextId('event'),
-        type: 'work_unit.returned',
-        actor: 'model',
-        visibility: 'internal',
-        payload: {
-          resources: prepared.resources.map(({ view }) => view),
-          parentScopeId: parentHandle.scopeId,
-          resultRef: `history://artifact/${prepared.resultArtifact.hash}`,
-          scopeId: handle.scopeId,
-          status: prepared.status,
-        },
-        artifactHash: prepared.resultArtifact.hash,
-        createdAt: recordedAt,
-      });
-      this.insertArtifact(prepared.resultArtifact, terminalSequence, 'content');
-      for (const resource of prepared.resources) {
-        this.insertArtifact(resource.artifact, terminalSequence, 'content');
-      }
-      this.storage.database.prepare(`
-        UPDATE execution_scopes
-        SET state = 'completed', terminal_sequence = ?, result_artifact_hash = ?, updated_at = ?
-        WHERE scope_id = ? AND state = 'running' AND terminal_sequence IS NULL
-      `).run(terminalSequence, prepared.resultArtifact.hash, recordedAt, handle.scopeId);
-      this.indexHistoryText({
-        ref: `history://artifact/${prepared.resultArtifact.hash}`,
-        projectId: handle.projectId,
-        conversationId: handle.conversationId,
-        turnId: handle.turnId,
-        kind: 'work-unit-result',
-        sequence: terminalSequence,
-        text: prepared.bundle,
-      });
-      const foldedSequence = this.insertEvent({
-        ...parentHandle,
-        eventId: this.nextId('event'),
-        type: 'message.internal',
-        actor: 'harness',
-        visibility: 'internal',
-        payload: {
-          childScopeId: handle.scopeId,
-          content: prepared.folded.ref,
-          kind: 'work_unit_result',
-          resultRef: `history://artifact/${prepared.resultArtifact.hash}`,
-        },
-        artifactHash: artifactHash(prepared.folded.ref),
-        createdAt: recordedAt,
-      });
-      this.insertArtifact(prepared.folded.artifact, foldedSequence);
-      return {
-        parentHandle,
-        status: prepared.status,
-        result: prepared.result,
-        ...(prepared.threadUpdate ? { threadUpdate: prepared.threadUpdate } : {}),
-        resources: prepared.resources.map(({ view }) => view),
-        resultRef: `history://artifact/${prepared.resultArtifact.hash}`,
-        scopeId: handle.scopeId,
-      };
-    }));
-  }
-
-  async returnWorkUnit(handle: DurableTurnHandle, input: WorkUnitReturnInput) {
-    return this.commitWorkUnitReturn(handle, await this.prepareWorkUnitReturn(handle, input));
-  }
-
-  private async prepareWorkUnitResources(
-    handle: DurableTurnHandle,
-    resources: readonly WorkUnitResourceRef[],
-    inheritedHashes: ReadonlySet<string>,
-  ): Promise<PreparedWorkUnitResource[]> {
-    const identity = this.contextIdentity(handle.conversationId);
-    const seen = new Set(inheritedHashes);
-    const prepared: PreparedWorkUnitResource[] = [];
-    for (const resource of resources) {
-      let content: string;
-      let source: 'file' | 'history';
-      if (resource.ref.startsWith('history://')) {
-        content = await this.resolveOpenableContent(handle.conversationId, resource.ref);
-        source = 'history';
-      } else {
-        const path = isAbsolute(resource.ref) ? resource.ref : resolve(identity.cwd, resource.ref);
-        const metadata = await stat(path);
-        if (!metadata.isFile()) {
-          throw new TypeError(
-            `Work unit resource ${resource.ref} must be a UTF-8 text file; directories are not supported.`,
-          );
-        }
-        const bytes = await readFile(path);
-        try {
-          content = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-        } catch {
-          throw new TypeError(`Work unit resource ${resource.ref} is not UTF-8 text.`);
-        }
-        source = 'file';
-      }
-      const artifact = await this.artifacts.put(
-        Buffer.from(content, 'utf8'),
-        'text/plain; charset=utf-8',
-      );
-      const inclusion = seen.has(artifact.hash) ? 'inherited' : 'materialized';
-      seen.add(artifact.hash);
-      prepared.push({
-        artifact,
-        content,
-        view: {
-          ...resource,
-          inclusion,
-          snapshot: {
-            ref: `history://artifact/${artifact.hash}`,
-            hash: artifact.hash,
-            byteLength: artifact.byteLength,
-            mediaType: artifact.mediaType,
-            source,
-          },
-        },
-      });
-    }
-    return prepared;
-  }
-
-  private parentMaterializedResourceHashes(turnId: string) {
-    const rows = this.storage.database.prepare(`
-      SELECT payload_json FROM events
-      WHERE turn_id = ? AND type = 'work_unit.returned'
-      ORDER BY sequence
-    `).all(turnId) as Array<{ payload_json: string }>;
-    const hashes = new Set<string>();
-    for (const row of rows) {
-      const payload = JSON.parse(row.payload_json) as { resources?: unknown };
-      if (!Array.isArray(payload.resources)) continue;
-      for (const value of payload.resources) {
-        if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
-        const snapshot = (value as { snapshot?: unknown }).snapshot;
-        if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) continue;
-        const hash = (snapshot as { hash?: unknown }).hash;
-        if (typeof hash === 'string' && /^[0-9a-f]{64}$/u.test(hash)) hashes.add(hash);
-      }
-    }
-    return hashes;
-  }
-
-  private contextIdentity(conversationId: string) {
-    const row = this.storage.database.prepare(`
-      SELECT c.project_id, c.cwd
-      FROM conversations c
-      WHERE c.conversation_id = ?
-    `).get(conversationId) as {
-      project_id: string;
-      cwd: string;
-    } | undefined;
-    if (!row) throw new Error(`Conversation ${conversationId} has no context identity.`);
-    return {
-      projectId: row.project_id,
-      cwd: row.cwd,
-    };
-  }
-
-  private activeScopeIdentity(conversationId: string) {
-    const row = this.storage.database.prepare(`
-      SELECT c.project_id, c.cwd, c.reasoning, t.turn_id,
-             t.root_scope_id, s.scope_id, s.parent_scope_id, s.kind,
-             s.objective_json
-      FROM conversations c
-      JOIN turns t ON t.conversation_id = c.conversation_id
-      JOIN execution_scopes s ON s.turn_id = t.turn_id
-      WHERE c.conversation_id = ?
-      ORDER BY (t.state = 'running') DESC, t.accepted_sequence DESC,
-               (s.state = 'running') DESC,
-               (s.kind = 'work_unit' AND s.state = 'running') DESC,
-               (s.kind = 'turn') DESC, s.created_sequence DESC
-      LIMIT 1
-    `).get(conversationId) as {
-      project_id: string;
-      cwd: string;
-      reasoning: string;
-      turn_id: string;
-      root_scope_id: string;
-      scope_id: string;
-      parent_scope_id: string | null;
-      kind: 'turn' | 'work_unit';
-      objective_json: string;
-    } | undefined;
-    if (!row) throw new Error(`Conversation ${conversationId} has no active context boundary.`);
-    return {
-      projectId: row.project_id,
-      cwd: row.cwd,
-      reasoning: row.reasoning,
-      turnId: row.turn_id,
-      rootScopeId: row.root_scope_id,
-      scopeId: row.scope_id,
-      parentScopeId: row.parent_scope_id,
-      kind: row.kind,
-      objective: JSON.parse(row.objective_json) as CanonicalJsonValue,
-    };
-  }
 
   private async assistantVisibleText(turnId: string) {
     const rows = this.storage.database.prepare(`
@@ -3148,16 +2754,6 @@ export class AgentStateStore implements AgentStore {
       this.refreshConversationList();
       return rebuilt.length;
     }));
-  }
-
-  close() {
-    this.closePromise ??= this.drainAndClose();
-    return this.closePromise;
-  }
-
-  private async drainAndClose() {
-    await this.writerTail;
-    this.storage.close();
   }
 
   private enqueueTurnTransaction(
@@ -4342,7 +3938,7 @@ export class AgentStateStore implements AgentStore {
     });
   }
 
-  private assertRunningHandle(handle: DurableTurnHandle) {
+  protected assertRunningHandle(handle: DurableTurnHandle) {
     const row = this.storage.database.prepare(`
       SELECT 1 AS present
       FROM turns t
@@ -4359,7 +3955,7 @@ export class AgentStateStore implements AgentStore {
     if (!row) throw new Error(`Durable turn ${handle.turnId} is not running.`);
   }
 
-  private scopeIdentity(scopeId: string) {
+  protected scopeIdentity(scopeId: string) {
     const row = this.storage.database.prepare(`
       SELECT scope_id, parent_scope_id, kind, state
       FROM execution_scopes WHERE scope_id = ?
@@ -4487,42 +4083,6 @@ export class AgentStateStore implements AgentStore {
     );
   }
 
-  private upsertResource(
-    key: DurableResourceProjection['key'],
-    basisSequence: number,
-    value: DurableResourceProjection['value'],
-    updatedAt: number,
-  ) {
-    this.storage.database.prepare(`
-      INSERT INTO resources (resource_key, basis_sequence, value_json, updated_at)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(resource_key) DO UPDATE SET
-        basis_sequence = excluded.basis_sequence,
-        value_json = excluded.value_json,
-        updated_at = excluded.updated_at
-    `).run(key, basisSequence, canonicalJson(value), updatedAt);
-  }
-
-  private async prepareText(text: string, forceArtifact = false): Promise<PreparedReference> {
-    const bytes = Buffer.from(text, 'utf8');
-    const sha256 = createHash('sha256').update(bytes).digest('hex');
-    const inlineRef: DurableContentRef = { kind: 'inline', text, byteLength: bytes.byteLength, sha256 };
-    if (
-      !forceArtifact &&
-      bytes.byteLength <= INLINE_CONTENT_LIMIT_BYTES &&
-      Buffer.byteLength(canonicalJson(inlineRef), 'utf8') <= EVENT_PAYLOAD_LIMIT_BYTES - 8 * 1024
-    ) {
-      return {
-        ref: inlineRef,
-        artifact: null,
-        sha256,
-        text,
-      };
-    }
-    const artifact = await this.artifacts.put(bytes, 'text/plain; charset=utf-8');
-    return { ref: artifactRef(artifact), artifact, sha256, text };
-  }
-
   private async prepareUserInput(params: AcceptTurnParams): Promise<PreparedUserInput> {
     const content = await this.prepareText(params.text);
     const artifacts: StagedArtifact[] = content.artifact ? [content.artifact] : [];
@@ -4620,119 +4180,7 @@ export class AgentStateStore implements AgentStore {
     return hydrated;
   }
 
-  private async prepareJson(value: unknown, forceArtifact = false): Promise<PreparedReference> {
-    const normalized = normalizeJson(value);
-    const json = canonicalJson(normalized);
-    const bytes = Buffer.from(json, 'utf8');
-    const sha256 = createHash('sha256').update(bytes).digest('hex');
-    const inlineRef: DurableContentRef = { kind: 'inline', text: json, byteLength: bytes.byteLength, sha256 };
-    if (
-      !forceArtifact &&
-      bytes.byteLength <= INLINE_CONTENT_LIMIT_BYTES &&
-      Buffer.byteLength(canonicalJson(inlineRef), 'utf8') <= EVENT_PAYLOAD_LIMIT_BYTES - 8 * 1024
-    ) {
-      return {
-        ref: inlineRef,
-        artifact: null,
-        sha256,
-        text: json,
-      };
-    }
-    const artifact = await this.artifacts.put(bytes, 'application/json');
-    return { ref: artifactRef(artifact), artifact, sha256, text: json };
-  }
-
-  private async prepareProviderJson(value: unknown): Promise<PreparedReference> {
-    const json = canonicalProviderJson(value);
-    const bytes = Buffer.from(json, 'utf8');
-    const sha256 = createHash('sha256').update(bytes).digest('hex');
-    const artifact = await this.artifacts.put(bytes, 'application/json');
-    return { ref: artifactRef(artifact), artifact, sha256, text: json };
-  }
-
-  private insertArtifact(
-    artifact: StagedArtifact | null,
-    sequence: number,
-    sensitivity: 'content' | 'inspectable' | 'private' = 'content',
-  ) {
-    if (!artifact) return;
-    this.storage.database.prepare(`
-      INSERT OR IGNORE INTO artifacts (
-        hash, byte_length, media_type, created_sequence, storage_path, sensitivity
-      ) VALUES (?, ?, ?, ?, ?, ?)
-    `).run(
-      artifact.hash,
-      artifact.byteLength,
-      artifact.mediaType,
-      sequence,
-      artifact.storagePath,
-      sensitivity,
-    );
-    if (sensitivity === 'private') {
-      this.storage.database.prepare(`
-        UPDATE artifacts SET sensitivity = 'private' WHERE hash = ?
-      `).run(artifact.hash);
-    }
-    const row = this.storage.database.prepare(`
-      SELECT byte_length, media_type, storage_path FROM artifacts WHERE hash = ?
-    `).get(artifact.hash) as {
-      byte_length: number;
-      media_type: string;
-      storage_path: string;
-    };
-    if (
-      row.byte_length !== artifact.byteLength ||
-      row.storage_path !== artifact.storagePath
-    ) {
-      throw new Error(`Artifact ${artifact.hash} conflicts with its durable metadata.`);
-    }
-    const linked = this.storage.database.prepare(`
-      SELECT 1
-      FROM events source
-      WHERE source.sequence = ?
-        AND (
-          source.artifact_hash = ?
-          OR EXISTS (
-            SELECT 1 FROM json_tree(source.payload_json) linked
-            WHERE linked.value = ?
-               OR linked.value = 'history://artifact/' || ?
-          )
-        )
-      LIMIT 1
-    `).get(sequence, artifact.hash, artifact.hash, artifact.hash);
-    if (linked) return;
-    const source = this.storage.database.prepare(`
-      SELECT project_id, conversation_id, turn_id, scope_id,
-             event_id, created_at
-      FROM events WHERE sequence = ?
-    `).get(sequence) as {
-      project_id: string;
-      conversation_id: string;
-      turn_id: string | null;
-      scope_id: string | null;
-      event_id: string;
-      created_at: number;
-    } | undefined;
-    if (!source) throw new Error(`Artifact ${artifact.hash} has no durable source event.`);
-    this.insertEvent({
-      eventId: this.nextId('event'),
-      projectId: source.project_id,
-      conversationId: source.conversation_id,
-      ...(source.turn_id ? { turnId: source.turn_id } : {}),
-      ...(source.scope_id ? { scopeId: source.scope_id } : {}),
-      type: 'artifact.linked',
-      actor: 'harness',
-      visibility: 'internal',
-      payload: {
-        artifactRef: `history://artifact/${artifact.hash}`,
-        sourceEventRef: `history://event-id/${source.event_id}`,
-      },
-      artifactHash: artifact.hash,
-      createdAt: source.created_at,
-    });
-  }
-
-  private indexHistoryText(input: {
+  protected indexHistoryText(input: {
     ref: string;
     projectId: string;
     conversationId?: string | null;
@@ -4877,26 +4325,6 @@ export class AgentStateStore implements AgentStore {
     });
   }
 
-  private async readTextRef(value: CanonicalJsonValue | undefined) {
-    const ref = parseReference(value);
-    if (ref.kind === 'inline') return ref.text;
-    const bytes = await this.artifacts.read(ref);
-    return bytes.toString('utf8');
-  }
-
-  private async readArtifactTextByHash(hash: string) {
-    const row = this.storage.database.prepare(`
-      SELECT byte_length, storage_path FROM artifacts WHERE hash = ?
-    `).get(hash) as { byte_length: number; storage_path: string } | undefined;
-    if (!row) throw new Error(`Artifact ${hash} is missing.`);
-    const bytes = await this.artifacts.read({
-      hash,
-      byteLength: safeNonnegativeInteger(row.byte_length, 'artifact byte length'),
-      storagePath: row.storage_path,
-    });
-    return bytes.toString('utf8');
-  }
-
   private async attachActiveProviderMessages(
     messages: readonly LogicalContextMessage[],
     scopeIds: readonly string[],
@@ -4926,54 +4354,6 @@ export class AgentStateStore implements AgentStore {
     });
   }
 
-  private async readProjectedTextRef(
-    value: CanonicalJsonValue | undefined,
-    maxBytes = MAX_VISIBLE_TEXT_BYTES,
-  ) {
-    const ref = parseReference(value);
-    if (ref.kind === 'inline') {
-      const text = truncateUtf8Text(ref.text, maxBytes);
-      const returnedBytes = Buffer.byteLength(text, 'utf8');
-      return {
-        text,
-        content: ref.byteLength > returnedBytes
-          ? {
-              sha256: ref.sha256,
-              byteLength: ref.byteLength,
-              returnedBytes,
-              truncated: true as const,
-              artifactHash: null,
-              nextRange: null,
-            } satisfies AgentTextContentReference
-          : undefined,
-      };
-    }
-    const bytes = await this.artifacts.readRange(ref, 0, Math.min(ref.byteLength, maxBytes));
-    const text = bytes.toString('utf8').replace(/\uFFFD$/u, '');
-    const returnedBytes = Buffer.byteLength(text, 'utf8');
-    return {
-      text,
-      content: ref.byteLength > returnedBytes
-        ? {
-            sha256: ref.hash,
-            byteLength: ref.byteLength,
-            returnedBytes,
-            truncated: true as const,
-            artifactHash: ref.hash,
-            nextRange: {
-              kind: 'utf8' as const,
-              offset: returnedBytes,
-              byteLength: maxBytes,
-            },
-          } satisfies AgentTextContentReference
-        : undefined,
-    };
-  }
-
-  private async readJsonRef(value: CanonicalJsonValue | undefined) {
-    return JSON.parse(await this.readTextRef(value)) as unknown;
-  }
-
   private currentHead(handle: DurableTurnHandle) {
     const row = this.storage.database.prepare(`
       SELECT MAX(sequence) AS sequence
@@ -4984,63 +4364,6 @@ export class AgentStateStore implements AgentStore {
     return safeInteger(row.sequence, 'event head');
   }
 
-  private insertEvent(event: {
-    eventId: string;
-    projectId: string;
-    conversationId: string;
-    turnId?: string;
-    scopeId?: string;
-    operationId?: string;
-    type: string;
-    actor?: string;
-    visibility?: string;
-    payload: CanonicalJsonValue;
-    artifactHash?: string | null;
-    createdAt: number;
-  }) {
-    const payload = canonicalJson(event.payload);
-    if (Buffer.byteLength(payload, 'utf8') > EVENT_PAYLOAD_LIMIT_BYTES) {
-      throw new Error(`Agent event payload exceeds ${EVENT_PAYLOAD_LIMIT_BYTES} bytes.`);
-    }
-    const row = this.storage.database.prepare(`
-      INSERT INTO events (
-        event_id, project_id, conversation_id, turn_id, scope_id,
-        type, actor, visibility, causal_event_id, operation_id, payload_json,
-        artifact_hash, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
-      RETURNING sequence
-    `).get(
-      event.eventId,
-      event.projectId,
-      event.conversationId,
-      event.turnId ?? null,
-      event.scopeId ?? null,
-      event.type,
-      event.actor ?? 'harness',
-      event.visibility ?? 'internal',
-      event.operationId ?? null,
-      payload,
-      event.artifactHash ?? null,
-      event.createdAt,
-    ) as { sequence: number };
-    return safeInteger(row.sequence, 'event sequence');
-  }
-
-  private nextId(kind: IdKind) {
-    const id = this.idFactory(kind);
-    if (!UUID_V4.test(id)) throw new TypeError(`Agent ${kind} ID must be a lowercase UUID v4.`);
-    return id;
-  }
-
-  private enqueueWrite<T>(work: () => T | Promise<T>): Promise<T> {
-    const next = this.writerTail.then(work, work);
-    this.writerTail = next.then(() => undefined, () => undefined);
-    return next;
-  }
-
-  private assertOpen() {
-    if (this.closePromise) throw new Error('Agent state store is closed.');
-  }
 }
 
 export class OperationConflictError extends Error {
@@ -5192,11 +4515,6 @@ function requiredSequenceTimestamp(timestamps: Map<number, number>, sequence: nu
   const timestamp = timestamps.get(sequence);
   if (timestamp === undefined) throw new Error(`Transcript sequence ${sequence} has no timestamp.`);
   return timestamp;
-}
-
-function sqlPlaceholders(count: number) {
-  if (!Number.isSafeInteger(count) || count < 1) throw new Error('SQL placeholder count is invalid.');
-  return Array.from({ length: count }, () => '?').join(', ');
 }
 
 function stripTranscriptProjectionMetadata(
@@ -5450,13 +4768,6 @@ function preparedTextProjection(prepared: PreparedReference, maxBytes: number) {
   };
 }
 
-function truncateUtf8Text(value: string, maxBytes: number) {
-  if (maxBytes <= 0) return '';
-  const bytes = Buffer.from(value, 'utf8');
-  if (bytes.byteLength <= maxBytes) return value;
-  return bytes.subarray(0, maxBytes).toString('utf8').replace(/\uFFFD$/u, '');
-}
-
 function uniqueArtifacts(artifacts: StagedArtifact[]) {
   const byHash = new Map<string, StagedArtifact>();
   for (const artifact of artifacts) byHash.set(artifact.hash, artifact);
@@ -5549,16 +4860,6 @@ function parseQueuedOperationValue(json: string): QueuedOperationValue {
   };
 }
 
-function artifactRef(artifact: StagedArtifact): DurableContentRef {
-  return {
-    kind: 'artifact',
-    hash: artifact.hash,
-    byteLength: artifact.byteLength,
-    mediaType: artifact.mediaType,
-    storagePath: artifact.storagePath,
-  };
-}
-
 function artifactHash(ref: DurableContentRef) {
   return ref.kind === 'artifact' ? ref.hash : null;
 }
@@ -5598,46 +4899,6 @@ function parseStoredUserParts(value: CanonicalJsonValue | undefined): AgentUserM
   });
 }
 
-function parseReference(value: CanonicalJsonValue | undefined): DurableContentRef {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('Durable content reference is invalid.');
-  }
-  const ref = value as Record<string, CanonicalJsonValue>;
-  const kind = requiredString(ref.kind, 'kind');
-  const byteLength = requiredNonnegativeInteger(ref.byteLength, 'byteLength');
-  if (kind === 'inline') {
-    const text = requiredString(ref.text, 'text');
-    const sha256 = requiredHash(ref.sha256, 'sha256');
-    if (Buffer.byteLength(text, 'utf8') !== byteLength) throw new Error('Inline content byte length is invalid.');
-    if (createHash('sha256').update(text).digest('hex') !== sha256) {
-      throw new Error('Inline content hash is invalid.');
-    }
-    return { kind, text, byteLength, sha256 };
-  }
-  if (kind !== 'artifact') throw new Error('Durable content reference kind is invalid.');
-  return {
-    kind,
-    hash: requiredHash(ref.hash, 'hash'),
-    byteLength,
-    mediaType: requiredString(ref.mediaType, 'mediaType'),
-    storagePath: requiredString(ref.storagePath, 'storagePath'),
-  };
-}
-
-function normalizeJson(value: unknown): CanonicalJsonValue {
-  if (value === undefined) return null;
-  const serialized = JSON.stringify(value);
-  if (serialized === undefined) return null;
-  return JSON.parse(serialized) as CanonicalJsonValue;
-}
-
-function boundedSafeInteger(value: number, min: number, max: number, label: string) {
-  if (!Number.isSafeInteger(value) || value < min || value > max) {
-    throw new TypeError(`${label} must be an integer between ${min} and ${max}.`);
-  }
-  return value;
-}
-
 function matchingExcerpt(value: string, terms: readonly string[], maxCodePoints: number) {
   const normalized = value.replace(/\s+/gu, ' ').trim();
   const folded = normalized.toLocaleLowerCase();
@@ -5657,18 +4918,6 @@ function historySearchTerms(value: string) {
     (value.toLocaleLowerCase().match(/[\p{L}\p{N}_./:@+-]+/gu) ?? [])
       .filter((term) => /[\p{L}\p{N}_]/u.test(term)),
   )];
-}
-
-function boundedUtf8Slice(bytes: Buffer, requestedOffset: number, maxBytes: number) {
-  let offset = requestedOffset;
-  while (offset < bytes.byteLength && (bytes[offset]! & 0xc0) === 0x80) offset += 1;
-  let end = Math.min(bytes.byteLength, offset + maxBytes);
-  while (end > offset && end < bytes.byteLength && (bytes[end]! & 0xc0) === 0x80) end -= 1;
-  return {
-    offset,
-    byteLength: end - offset,
-    text: bytes.subarray(offset, end).toString('utf8'),
-  };
 }
 
 function renderInspectableProviderPayload(value: unknown) {
@@ -5720,139 +4969,6 @@ function applyExactThreadEdits(content: string, edits: ThreadPatchInput['edits']
   return next;
 }
 
-function modelPromptWorkUnitResource(resource: PreparedWorkUnitResource): MaterializedPromptResource {
-  return {
-    ...resource.view,
-    content: resource.content,
-  };
-}
-
-function normalizeWorkUnitDoneWhen(values: readonly string[]) {
-  if (values.length > 16) throw new TypeError('A work unit accepts at most sixteen done-when conditions.');
-  const normalized = values.map((value) =>
-    normalizeWorkUnitResourceText(value, 'done-when condition', 4 * 1024));
-  return [...new Set(normalized)];
-}
-
-function normalizeWorkUnitResources(resources: readonly WorkUnitResourceRef[]) {
-  if (resources.length > 16) {
-    throw new TypeError('A work unit accepts at most sixteen resource references.');
-  }
-  const normalized: WorkUnitResourceRef[] = [];
-  const seen = new Set<string>();
-  for (const resource of resources) {
-    const ref = normalizeWorkUnitResourceRef(resource.ref);
-    if (
-      resource.role !== 'authority' && resource.role !== 'deliverable' &&
-      resource.role !== 'evidence'
-    ) {
-      throw new TypeError('A work unit resource role must be authority, deliverable, or evidence.');
-    }
-    const description = resource.description === undefined
-      ? undefined
-      : normalizeWorkUnitResourceText(resource.description, 'resource description', 2 * 1024);
-    const identity = `${resource.role}\0${ref}`;
-    if (seen.has(identity)) continue;
-    seen.add(identity);
-    normalized.push({ ref, role: resource.role, ...(description ? { description } : {}) });
-  }
-  if (Buffer.byteLength(canonicalJson(normalized), 'utf8') > 16 * 1024) {
-    throw new TypeError('Work unit resource references must not exceed 16 KiB in total.');
-  }
-  return normalized;
-}
-
-function normalizeWorkUnitReturnInput(input: WorkUnitReturnInput): {
-  status: WorkUnitReturnStatus;
-  result: string;
-  threadUpdate?: string;
-  resources: WorkUnitResourceRef[];
-} {
-  if (input.status !== 'completed' && input.status !== 'partial' && input.status !== 'blocked') {
-    throw new TypeError('A work unit status must be completed, partial, or blocked.');
-  }
-  if (typeof input.result !== 'string') {
-    throw new TypeError('A work unit result must be text.');
-  }
-  const result = input.result.trim();
-  if (!result) throw new TypeError('A work unit result is required.');
-  if (input.threadUpdate !== undefined && typeof input.threadUpdate !== 'string') {
-    throw new TypeError('A proposed Thread update must be text.');
-  }
-  const threadUpdate = input.threadUpdate?.trim() || undefined;
-  const resources = normalizeWorkUnitResources(input.resources ?? []);
-  return { status: input.status, result, ...(threadUpdate ? { threadUpdate } : {}), resources };
-}
-
-function normalizeWorkUnitResourceRef(value: unknown) {
-  if (typeof value !== 'string') throw new TypeError('A work unit resource reference must be text.');
-  const normalized = value.trim();
-  if (!normalized) throw new TypeError('A work unit resource reference is required.');
-  if (Buffer.byteLength(normalized, 'utf8') > 4 * 1024) {
-    throw new TypeError('A work unit resource reference is too large.');
-  }
-  return normalized;
-}
-
-function normalizeWorkUnitResourceText(value: unknown, label: string, maxBytes: number) {
-  if (typeof value !== 'string') throw new TypeError(`A work unit ${label} must be text.`);
-  const normalized = value.trim().replace(/\s+/gu, ' ');
-  if (!normalized) throw new TypeError(`A work unit ${label} is required.`);
-  if (Buffer.byteLength(normalized, 'utf8') > maxBytes) {
-    throw new TypeError(`A work unit ${label} is too large.`);
-  }
-  return normalized;
-}
-
-function renderWorkUnitReturnBundle(input: {
-  status: WorkUnitReturnStatus;
-  result: string;
-  threadUpdate?: string;
-  resources: readonly MaterializedPromptResource[];
-}) {
-  const sections = [
-    '# Completed work unit',
-    '',
-    '## Status',
-    '',
-    input.status,
-    '',
-    '## Result',
-    '',
-    input.result,
-  ];
-  if (input.threadUpdate) {
-    sections.push(
-      '',
-      '## Proposed Thread update',
-      '',
-      'The parent must deliberately merge this proposal; it has not been applied automatically.',
-      '',
-      input.threadUpdate,
-    );
-  }
-  const resourceSection = renderMaterializedResourceSection('Materialized resources', input.resources);
-  if (resourceSection) sections.push('', resourceSection);
-  return sections.join('\n').trim();
-}
-
-function requiredString(value: CanonicalJsonValue | undefined, label: string) {
-  if (typeof value !== 'string') throw new Error(`Durable ${label} is invalid.`);
-  return value;
-}
-
-function requiredHash(value: CanonicalJsonValue | undefined, label: string) {
-  const hash = requiredString(value, label);
-  if (!/^[0-9a-f]{64}$/u.test(hash)) throw new Error(`Durable ${label} is invalid.`);
-  return hash;
-}
-
-function requiredNonnegativeInteger(value: CanonicalJsonValue | undefined, label: string) {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
-    throw new Error(`Durable ${label} is invalid.`);
-  }
-  return value;
-}
 
 function requiredTurnStatus(value: CanonicalJsonValue | undefined): DurableTurnStatus {
   if (
@@ -5926,24 +5042,4 @@ function requiredProjectionItemId(value: string | undefined, label: string) {
 function isReasoningLevel(value: string): value is ReasoningLevel {
   return value === 'off' || value === 'minimal' || value === 'low' || value === 'medium' ||
     value === 'high' || value === 'xhigh' || value === 'max';
-}
-
-function safeTimestamp(value: number) {
-  if (!Number.isSafeInteger(value) || value < 0) throw new TypeError('Recorded timestamp must be nonnegative.');
-  return value;
-}
-
-function safeDuration(value: number) {
-  if (!Number.isFinite(value) || value < 0) throw new TypeError('Turn duration must be nonnegative.');
-  return Math.round(value);
-}
-
-function safeInteger(value: number, label: string) {
-  if (!Number.isSafeInteger(value)) throw new Error(`Invalid ${label}.`);
-  return value;
-}
-
-function safeNonnegativeInteger(value: unknown, label: string) {
-  if (!Number.isSafeInteger(value) || Number(value) < 0) throw new Error(`Invalid ${label}.`);
-  return Number(value);
 }
