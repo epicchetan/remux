@@ -1,9 +1,9 @@
 import type { AuthValue, ModelInfo } from '../../shared/protocol.ts';
-import type { AgentEngine, ConversationRuntime } from './engine.ts';
+import type { ModelProvider, ModelSession } from './model-provider.ts';
 import { canonicalJsonHash } from './storage/canonical-json.ts';
 
 const FIXTURE_CONTRACTS_HASH = canonicalJsonHash({
-  engine: 'fixture',
+  provider: 'fixture',
   tools: ['workspace_read@1'],
 });
 
@@ -17,7 +17,7 @@ const fixtureModels: ModelInfo[] = [
   },
 ];
 
-export class FixtureEngine implements AgentEngine {
+export class FixtureProvider implements ModelProvider {
   private signedIn = process.env.REMUX_AGENT_FIXTURE_SIGNED_OUT !== '1';
 
   async authStatus(): Promise<AuthValue> {
@@ -44,7 +44,7 @@ export class FixtureEngine implements AgentEngine {
     return this.signedIn ? fixtureModels : [];
   }
 
-  async createConversation(options: Parameters<AgentEngine['createConversation']>[0]): Promise<ConversationRuntime> {
+  async createSession(options: Parameters<ModelProvider['createSession']>[0]): Promise<ModelSession> {
     let controller: AbortController | null = null;
     return {
       async prompt(input) {

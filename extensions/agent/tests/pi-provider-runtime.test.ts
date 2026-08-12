@@ -6,7 +6,7 @@ import test from 'node:test';
 import {
   invalidateProviderLane,
   planProviderLaneRequest,
-} from '../server/src/provider-lanes.ts';
+} from '../server/src/providers/openai-codex/provider-lanes.ts';
 
 const root = resolve(import.meta.dirname, '../../..');
 
@@ -51,7 +51,7 @@ test('the pinned Pi seam separates prompt caching from scope-local WebSocket lan
 });
 
 test('the Agent runtime owns bounded durable retries and selects one provider lane per scope', async () => {
-  const runtime = await readFile(resolve(root, 'extensions/agent/server/src/pi-runtime.ts'), 'utf8');
+  const runtime = await readFile(resolve(root, 'extensions/agent/server/src/providers/openai-codex/openai-codex-provider.ts'), 'utf8');
   assert.match(runtime, /enabled: true,\s+maxRetries: 2,\s+baseDelayMs: 500/u);
   assert.match(runtime, /supersedeProviderAttempt/u);
   assert.match(runtime, /providerSessionId: \(\) => activeProviderSessionId/u);

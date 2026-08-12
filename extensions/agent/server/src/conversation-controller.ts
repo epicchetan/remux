@@ -19,7 +19,7 @@ import {
 import type { AgentResourceInvalidation } from '../../shared/transcript.ts';
 import type { AgentStore } from './agent-store.ts';
 import { RpcFault } from './agent-rpc-router.ts';
-import type { AgentEngine, ConversationRuntime } from './engine.ts';
+import type { ModelProvider, ModelSession } from './model-provider.ts';
 import type {
   DurableTranscriptAction,
   DurableTranscriptProjectionAction,
@@ -31,7 +31,7 @@ import { agentPromptImages } from './user-input.ts';
 import { TurnCoordinator } from './turn-coordinator.ts';
 
 type ConversationControllerOptions = {
-  engine: AgentEngine;
+  provider: ModelProvider;
   store: AgentStore;
   resources: ResourceStore;
   monotonicNow?: () => number;
@@ -42,10 +42,10 @@ type ConversationControllerOptions = {
 export class ConversationController {
   readonly turns: TurnCoordinator;
   private readonly options: ConversationControllerOptions;
-  private readonly engine: AgentEngine;
+  private readonly provider: ModelProvider;
   private readonly store: AgentStore;
   private readonly resources: ResourceStore;
-  private runtimeValue: ConversationRuntime | null = null;
+  private sessionValue: ModelSession | null = null;
   private projectorValue: EphemeralTranscriptProjector | null = null;
   private conversationIdValue: string | null = null;
   private conversationOperationId: string | null = null;
@@ -55,14 +55,14 @@ export class ConversationController {
 
   constructor(options: ConversationControllerOptions) {
     this.options = options;
-    this.engine = options.engine;
+    this.provider = options.provider;
     this.store = options.store;
     this.resources = options.resources;
     this.turns = new TurnCoordinator({
       store: options.store,
       resources: options.resources,
       ...(options.monotonicNow ? { monotonicNow: options.monotonicNow } : {}),
-      runtime: () => this.runtimeValue,
+      session: () => this.sessionValue,
       projector: () => this.projectorValue,
       replaceProjector: (projector) => {
         this.projectorValue = projector;
@@ -77,8 +77,8 @@ export class ConversationController {
     });
   }
 
-  get runtime() {
-    return this.runtimeValue;
+  get session() {
+    return this.sessionValue;
   }
 
   get projector() {
@@ -139,7 +139,7 @@ export class ConversationController {
       this.resources.invalidateKey(conversationResourceKey(durable.conversationId), 'created');
       this.resources.invalidateKey(AGENT_RESOURCE_KEYS.conversationList, 'updated');
     }
-    await this.loadConversationRuntime({
+    await this.loadModelSession({
       id: durable.conversationId,
       cwd,
       modelId: params.modelId,
@@ -196,8 +196,8 @@ export class ConversationController {
         turnId: null,
       };
     }
-    const runtimeState = await this.ensureConversationRuntime(params.conversationId);
-    if (!this.runtimeValue) throw new RpcFault(-32012, 'The conversation runtime is unavailable.');
+    const runtimeState = await this.ensureModelSession(params.conversationId);
+    if (!this.sessionValue) throw new RpcFault(-32012, 'The conversation runtime is unavailable.');
     let durable: Awaited<ReturnType<AgentStore['acceptTurn']>>;
     try {
       durable = await this.store.acceptTurn(params);
@@ -218,8 +218,8 @@ export class ConversationController {
 
     const turnId = durable.turnId;
     await this.turns.beginTurn(durable, params, runtimeState);
-    const runtime = this.runtimeValue;
-    void Promise.resolve().then(() => runtime.prompt({
+    const session = this.sessionValue;
+    void Promise.resolve().then(() => session.prompt({
       text: params.text,
       images: agentPromptImages(params.parts ?? [{ text: params.text, type: 'text' }]),
     })).then(() => this.turns.completeTurn(params.conversationId, false))
@@ -292,9 +292,9 @@ export class ConversationController {
   }
 
   async disposeConversation() {
-    const previous = this.runtimeValue;
+    const previous = this.sessionValue;
     await this.turns.disposeConversation(previous, this.conversationIdValue);
-    this.runtimeValue = null;
+    this.sessionValue = null;
     this.projectorValue = null;
     if (previous) await previous.dispose();
     this.conversationIdValue = null;
@@ -415,11 +415,11 @@ export class ConversationController {
     return hydrated;
   }
 
-  private async ensureConversationRuntime(conversationId: string) {
+  private async ensureModelSession(conversationId: string) {
     const current = this.resources.get<AgentRuntimeValue>(AGENT_RESOURCE_KEYS.runtime);
     if (
       this.conversationIdValue === conversationId &&
-      this.runtimeValue &&
+      this.sessionValue &&
       this.projectorValue &&
       current?.conversationId === conversationId
     ) {
@@ -427,13 +427,13 @@ export class ConversationController {
       if (current.state === 'error') {
         const summary = await this.readConversationSummary(conversationId);
         await this.disposeConversation();
-        return this.loadConversationRuntime(summary, null);
+        return this.loadModelSession(summary, null);
       }
       return current;
     }
     this.assertRuntimeSwitchAvailable(conversationId);
     const summary = await this.readConversationSummary(conversationId);
-    return this.loadConversationRuntime(summary, null);
+    return this.loadModelSession(summary, null);
   }
 
   private async readConversationSummary(conversationId: string) {
@@ -451,14 +451,14 @@ export class ConversationController {
     throw activeRuntimeBusyFault(current);
   }
 
-  private async loadConversationRuntime(
+  private async loadModelSession(
     conversation: Pick<ConversationSummary, 'id' | 'cwd' | 'modelId' | 'reasoning'>,
     operationId: string | null,
   ) {
     const current = this.resources.get<AgentRuntimeValue>(AGENT_RESOURCE_KEYS.runtime);
     if (
       this.conversationIdValue === conversation.id &&
-      this.runtimeValue &&
+      this.sessionValue &&
       this.projectorValue &&
       current?.conversationId === conversation.id
     ) return current;
@@ -502,14 +502,14 @@ export class ConversationController {
         live: true,
         invalidate: this.options.publishProjectorInvalidations,
       });
-      const runtime = await this.engine.createConversation({
+      const session = await this.provider.createSession({
         cwd,
         modelId: conversation.modelId,
         reasoning: conversation.reasoning,
-        onEvent: (event) => this.turns.applyRuntimeEvent(conversation.id, event),
+        onEvent: (event) => this.turns.applySessionEvent(conversation.id, event),
         durability: this.turns.durabilityHooks(conversation.id),
       });
-      this.runtimeValue = runtime;
+      this.sessionValue = session;
       this.projectorValue = projector;
       this.conversationIdValue = conversation.id;
       this.conversationOperationId = operationId;
@@ -523,13 +523,13 @@ export class ConversationController {
       } : { ...loading, state: 'idle' as const };
       this.resources.set(AGENT_RESOURCE_KEYS.runtime, loaded);
       if (resumed) {
-        void runtime.prompt({ text: resumed.prompt })
+        void session.prompt({ text: resumed.prompt })
           .catch((error) => this.turns.completeTurn(conversation.id, false, safeMessage(error)))
           .catch((error) => this.turns.failDurability(conversation.id, error));
       }
       return loaded;
     } catch (error) {
-      this.runtimeValue = null;
+      this.sessionValue = null;
       this.projectorValue = null;
       this.conversationIdValue = null;
       this.conversationOperationId = null;

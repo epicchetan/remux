@@ -17,7 +17,7 @@ import {
 } from '../../shared/protocol.ts';
 import type { AgentResourceInvalidation } from '../../shared/transcript.ts';
 import type { AgentStore } from './agent-store.ts';
-import type { AgentEngine } from './engine.ts';
+import type { ModelProvider } from './model-provider.ts';
 import { ArtifactIntegrityError } from './domain/errors.ts';
 import { AgentRpcRouter, RpcFault } from './agent-rpc-router.ts';
 export { RpcFault } from './agent-rpc-router.ts';
@@ -34,7 +34,7 @@ const MAX_ARTIFACT_READ_BYTES = 48 * 1024;
 
 export class AgentServer {
   readonly resources: ResourceStore;
-  private readonly engine: AgentEngine;
+  private readonly provider: ModelProvider;
   private readonly store: AgentStore;
   private readonly transcriptRouter: TranscriptProjectionRouter;
   private readonly rpc: AgentRpcRouter;
@@ -44,12 +44,12 @@ export class AgentServer {
   private closePromise: Promise<void> | null = null;
 
   constructor(options: {
-    engine: AgentEngine;
+    provider: ModelProvider;
     store: AgentStore;
     notify: (method: string, params: unknown) => void;
     monotonicNow?: () => number;
   }) {
-    this.engine = options.engine;
+    this.provider = options.provider;
     this.store = options.store;
     this.notify = options.notify;
     this.resources = new ResourceStore(
@@ -57,7 +57,7 @@ export class AgentServer {
     );
     this.transcriptRouter = new TranscriptProjectionRouter({ store: options.store });
     this.conversations = new ConversationController({
-      engine: options.engine,
+      provider: options.provider,
       store: options.store,
       resources: this.resources,
       ...(options.monotonicNow ? { monotonicNow: options.monotonicNow } : {}),
@@ -94,7 +94,7 @@ export class AgentServer {
   }
 
   async initialize() {
-    const auth = await this.engine.authStatus().catch((error): AuthValue => ({
+    const auth = await this.provider.authStatus().catch((error): AuthValue => ({
       ...signedOutAuth(),
       state: 'error',
       error: safeMessage(error),
@@ -118,7 +118,7 @@ export class AgentServer {
       value = { models: [], defaultModelId: null, error: null };
     } else {
       try {
-        const models = await this.engine.listModels();
+        const models = await this.provider.listModels();
         value = { models, defaultModelId: models[0]?.id ?? null, error: null };
       } catch (error) {
         value = { models: [], defaultModelId: null, error: safeMessage(error) };
@@ -276,13 +276,13 @@ export class AgentServer {
       progress: 'Starting OpenAI device sign-in…',
     });
 
-    void this.engine.login(operationId, controller.signal, (value) => {
+    void this.provider.login(operationId, controller.signal, (value) => {
       if (this.loginController === controller) {
         this.resources.set(AGENT_RESOURCE_KEYS.auth, sanitizeAuth(value));
       }
     }).then(async () => {
       if (this.loginController !== controller) return;
-      const auth = await this.engine.authStatus();
+      const auth = await this.provider.authStatus();
       this.resources.set(AGENT_RESOURCE_KEYS.auth, sanitizeAuth(auth));
       await this.refreshModels();
     }).catch((error) => {
@@ -312,7 +312,7 @@ export class AgentServer {
     this.loginController?.abort(new DOMException('Sign-in canceled', 'AbortError'));
     this.loginController = null;
     await this.conversations.disposeConversation();
-    await this.engine.logout();
+    await this.provider.logout();
     this.resources.set(AGENT_RESOURCE_KEYS.auth, signedOutAuth());
     await this.refreshModels();
     return { ok: true as const };

@@ -21,7 +21,7 @@ import {
   type AgentWorkRenderSegment,
 } from '../../shared/transcript.ts';
 import { AgentServer } from '../../server/src/agent-server.ts';
-import { FixtureEngine } from '../../server/src/fixture-engine.ts';
+import { FixtureProvider } from '../../server/src/fixture-provider.ts';
 import { AgentStateStore } from '../../server/src/storage/agent-state-store.ts';
 import { EphemeralTranscriptProjector } from '../../server/src/transcript-projector.ts';
 
@@ -240,7 +240,7 @@ try {
   );
 
   server = new AgentServer({
-    engine: new FixtureEngine(),
+    provider: new FixtureProvider(),
     store: repository,
     notify: () => {},
   });

@@ -8,7 +8,7 @@ import { Type } from '@earendil-works/pi-ai';
 import { defineTool, type ToolDefinition } from '@earendil-works/pi-coding-agent';
 
 import type { WorkspaceReadParams, WorkspaceReadResult } from '../../shared/protocol.ts';
-import type { RuntimeDurabilityHooks } from './engine.ts';
+import type { ModelSessionDurabilityHooks } from './model-provider.ts';
 
 const MAX_VISIBLE_BYTES = 32 * 1024;
 const DEFAULT_LINE_COUNT = 200;
@@ -104,7 +104,7 @@ function utf8Prefix(value: string, maxBytes: number) {
 
 export function createWorkspaceReadTool(
   workspaceRoot: string,
-  durability?: Pick<RuntimeDurabilityHooks, 'beforeTool' | 'afterTool'>,
+  durability?: Pick<ModelSessionDurabilityHooks, 'beforeTool' | 'afterTool'>,
   executeRead: WorkspaceReadExecutor = readWorkspaceFile,
 ): ToolDefinition {
   return defineTool({

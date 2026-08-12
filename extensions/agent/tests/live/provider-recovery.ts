@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { AgentServer } from '../../server/src/agent-server.ts';
-import { PiEngine } from '../../server/src/pi-runtime.ts';
+import { OpenAICodexProvider } from '../../server/src/providers/openai-codex/openai-codex-provider.ts';
 import { AgentStateStore } from '../../server/src/storage/agent-state-store.ts';
 
 const FIRST_SENTINEL = 'REMUX_REAL_PROVIDER_RECOVERY_OK';
@@ -21,7 +21,7 @@ await mkdir(cwd, { recursive: true });
 await writeFile(join(cwd, 'README.md'), '# Real provider recovery smoke\n');
 
 let injectedDrops = 0;
-const engine = await PiEngine.create({
+const provider = await OpenAICodexProvider.create({
   providerWebSocketFaultAfterEvents() {
     if (injectedDrops > 0) return undefined;
     injectedDrops += 1;
@@ -29,13 +29,13 @@ const engine = await PiEngine.create({
   },
 });
 const repository = await AgentStateStore.open({ dataRoot });
-const server = new AgentServer({ engine, store: repository, notify() {} });
+const server = new AgentServer({ provider, store: repository, notify() {} });
 
 try {
   await server.initialize();
-  const auth = await engine.authStatus();
+  const auth = await provider.authStatus();
   assert.equal(auth.state, 'signed-in', 'The real-provider smoke requires an existing Codex sign-in.');
-  const models = await engine.listModels();
+  const models = await provider.listModels();
   const model = models.find(({ id }) => id === MODEL_ID);
   assert.ok(model, `The real-provider smoke model is unavailable: ${MODEL_ID}`);
   assert.ok(model.supportedReasoning.includes('high'));

@@ -21,12 +21,12 @@ import type {
   ContextProbe,
   ModelInfo,
   ReasoningLevel,
-} from '../../shared/protocol.ts';
+} from '../../../../shared/protocol.ts';
 import type {
-  AgentEngine,
-  ConversationRuntime,
-  RuntimeEventSink,
-} from './engine.ts';
+  ModelProvider,
+  ModelSession,
+  ModelSessionEventSink,
+} from '../../model-provider.ts';
 import {
   assertContextBudget,
   estimatePiContextTokens,
@@ -34,16 +34,16 @@ import {
   parseProviderToolResultText,
   renderDurablePiPrefix,
   type LogicalContextMessage,
-} from './logical-context.ts';
-import type { ThreadContextFrameCandidate } from './context/manifest.ts';
+} from '../../logical-context.ts';
+import type { ThreadContextFrameCandidate } from '../../context/manifest.ts';
 import {
   createContextTools,
   PARENT_CONTEXT_TOOL_NAMES,
   WORK_UNIT_CONTEXT_TOOL_NAMES,
-} from './context/tools.ts';
-import { canonicalJsonHash } from './storage/canonical-json.ts';
+} from '../../context/tools.ts';
+import { canonicalJsonHash } from '../../storage/canonical-json.ts';
 import { createRemuxAgentSession } from './pi-session.ts';
-import { REMUX_SYSTEM_PROMPT } from './prompts.ts';
+import { REMUX_SYSTEM_PROMPT } from '../../prompts.ts';
 import {
   invalidateProviderLane,
   planProviderLaneRequest,
@@ -53,7 +53,7 @@ import {
   createWorkspaceReadTool,
   readWorkspaceFile,
   type WorkspaceReadExecutor,
-} from './workspace-read.ts';
+} from '../../workspace-read.ts';
 
 const PROVIDER = 'openai-codex';
 const BASE_TOOL_NAMES = ['read', 'bash', 'edit', 'write', 'workspace_read'] as const;
@@ -76,7 +76,7 @@ type ProviderTransportControls = {
   resetStats(sessionId?: string): void;
 };
 
-function runtimeContract() {
+function providerContract() {
   const systemPrompt = REMUX_SYSTEM_PROMPT;
   const tools = [
     'read@pi-0.84',
@@ -103,7 +103,7 @@ function runtimeContract() {
   };
 }
 
-export class PiEngine implements AgentEngine {
+export class OpenAICodexProvider implements ModelProvider {
   private readonly modelRuntime: ModelRuntime;
   private readonly workspaceRead: WorkspaceReadExecutor;
   private readonly providerWebSocketFaultAfterEvents: (() => number | undefined) | undefined;
@@ -127,7 +127,7 @@ export class PiEngine implements AgentEngine {
     const modelRuntime = options.modelRuntime ?? await ModelRuntime.create({
       allowModelNetwork: false,
     });
-    return new PiEngine(
+    return new OpenAICodexProvider(
       modelRuntime,
       options.workspaceRead ?? readWorkspaceFile,
       options.providerWebSocketFaultAfterEvents,
@@ -174,12 +174,12 @@ export class PiEngine implements AgentEngine {
     return models.map(toModelInfo).sort((left, right) => left.name.localeCompare(right.name));
   }
 
-  async createConversation(
-    options: Parameters<AgentEngine['createConversation']>[0],
-  ): Promise<ConversationRuntime> {
+  async createSession(
+    options: Parameters<ModelProvider['createSession']>[0],
+  ): Promise<ModelSession> {
     const model = this.modelRuntime.getModel(PROVIDER, options.modelId);
     if (!model) throw new Error(`Unknown OpenAI Codex model: ${options.modelId}`);
-    const { systemPrompt, fixedContractsHash } = runtimeContract();
+    const { systemPrompt, fixedContractsHash } = providerContract();
 
     let probe: ContextProbe = {
       hookVersion: 'agent-durable-v1',
@@ -707,7 +707,7 @@ function contextFrameMessage(
   };
 }
 
-function projectPiEvent(event: AgentSessionEvent, sink: RuntimeEventSink) {
+function projectPiEvent(event: AgentSessionEvent, sink: ModelSessionEventSink) {
   switch (event.type) {
     case 'message_start':
       if (event.message.role === 'assistant') sink({ type: 'assistant-start' });

@@ -8,8 +8,8 @@ import test, { type TestContext } from 'node:test';
 import type { AssistantMessage } from '@earendil-works/pi-ai';
 
 import { AgentServer } from '../server/src/agent-server.ts';
-import { FixtureEngine } from '../server/src/fixture-engine.ts';
-import type { AgentEngine, ConversationRuntime } from '../server/src/engine.ts';
+import { FixtureProvider } from '../server/src/fixture-provider.ts';
+import type { ModelProvider, ModelSession } from '../server/src/model-provider.ts';
 import { AgentStateStore } from '../server/src/storage/agent-state-store.ts';
 import type { DurableTurnHandle } from '../server/src/domain/state.ts';
 import { AGENT_STATE_TABLES } from '../server/src/storage/schema.ts';
@@ -745,7 +745,7 @@ test('a provider attempt with a durable tool effect cannot be superseded', async
 test('the public fixture runtime commits a v5 frame and completes through normal server hooks', async (t) => {
   const fixture = await repositoryFixture(t);
   const server = new AgentServer({
-    engine: new FixtureEngine(),
+    provider: new FixtureProvider(),
     store: fixture.repository,
     notify() {},
   });
@@ -797,7 +797,7 @@ test('the public fixture runtime commits a v5 frame and completes through normal
 test('the public runtime recovers a response-started transport drop without duplicating partial output', async (t) => {
   const fixture = await repositoryFixture(t);
   const server = new AgentServer({
-    engine: new RecoveringTransportFixtureEngine(),
+    provider: new RecoveringTransportFixtureProvider(),
     store: fixture.repository,
     notify() {},
   });
@@ -952,7 +952,7 @@ async function eventually(check: () => Promise<boolean>, timeoutMs = 3_000) {
   assert.fail(`Condition was not met within ${timeoutMs} ms.`);
 }
 
-class RecoveringTransportFixtureEngine implements AgentEngine {
+class RecoveringTransportFixtureProvider implements ModelProvider {
   async authStatus() {
     return {
       state: 'signed-in' as const,
@@ -979,9 +979,9 @@ class RecoveringTransportFixtureEngine implements AgentEngine {
     }];
   }
 
-  async createConversation(
-    options: Parameters<AgentEngine['createConversation']>[0],
-  ): Promise<ConversationRuntime> {
+  async createSession(
+    options: Parameters<ModelProvider['createSession']>[0],
+  ): Promise<ModelSession> {
     let interrupted = false;
     return {
       async prompt() {

@@ -1,45 +1,24 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent } from 'react';
-import {
-  openHostLink,
-  parseRemuxViewerRoute,
-  rpc,
-  subscribeHostNavigate,
-  subscribeHostStatus,
-  updateHostTab,
-} from '@remux/viewer-kit';
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent } from 'react';
 
 import {
-  AGENT_METHODS,
-  AGENT_RESOURCE_KEYS,
-  contextResourceKey,
   queueResourceKey,
-  type AgentComposerMessagePart,
-  type AgentResourceKey,
   type AgentRuntimeValue,
-  type AgentPendingQueueValue,
-  type AuthValue,
   type ConversationSummary,
   type ConversationValue,
-  type ContextInspectorValue,
-  type ModelsValue,
-  type MessageSendResult,
-  type MessageBranchResult,
 } from '../../shared/protocol.ts';
 import { ComposerContent } from './composer/content.tsx';
+import { AgentAuthScreen } from './auth/AgentAuthScreen.tsx';
 import { createEmptyComposerSnapshot } from './composer/model/composerModel.ts';
 import { composerResourcesFromSnapshot } from './composer/model/userInputInterop.ts';
 import { ComposerMentionPicker } from './composer/mentions/MentionPicker.tsx';
 import { parseComposerMentionQuery } from './composer/mentions/mentionSearch.ts';
 import { useComposerStore } from './composer/store.ts';
-import type { ComposerEditTarget, ComposerForkTarget } from './composer/store.ts';
 import { AgentDirectoryPicker } from './conversation/DirectoryPicker.tsx';
 import {
   loadConversationDraft,
   loadNewChatDraft,
   persistConversationDraft,
   persistNewChatDraft,
-  removeConversationDraft,
-  removeNewChatDraft,
   type AgentNewChatDraft,
 } from './conversation/drafts.ts';
 import { shortenPath } from './conversation/format.ts';
@@ -48,33 +27,23 @@ import { AgentSidebar } from './conversation/Sidebar.tsx';
 import { useConversationStore } from './conversation/store.ts';
 import {
   activateDraftOperationId,
-  confirmDraftOperationId,
-  createViewerUuid,
   isViewerUuid,
-  loadOrCreateDraftOperationId,
   replaceDraftOperationId,
 } from './identity.ts';
-import { setConversationRuntime } from './conversation/runtimeStore.ts';
 import { useHostStore } from './ipc/hostStore.ts';
-import { subscribeAgentResourceInvalidations } from './ipc/resourceInvalidations.ts';
-import { AgentResourceReader } from './ipc/resources.ts';
-import type { RemuxHostViewportMetrics } from './ipc/types.ts';
-import { useAgentResumeSync } from './resumeSync.ts';
+import { agentCommands } from './ipc/agentCommands.ts';
+import { useComposerViewport } from './app/useComposerViewport.ts';
+import { useAgentResources } from './app/useAgentResources.ts';
+import { readInitialTarget, useAgentNavigation } from './app/useAgentNavigation.ts';
+import { useConversationActions } from './app/useConversationActions.ts';
 import { AgentTranscript } from './transcript/index.ts';
+import { getTranscriptResourceState } from './transcript/resourceStore.ts';
 import {
-  getTranscriptResourceState,
-  observeTranscriptServerGeneration,
-  refreshActiveTranscriptResources,
-} from './transcript/resourceStore.ts';
-import {
-  discardTranscriptUserMessage,
   requestTranscriptTurnScroll,
-  trackTranscriptUserMessage,
 } from './transcript/viewportStore.ts';
 
 export function App() {
   const [initialTarget] = useState(readInitialTarget);
-  const [auth, setAuth] = useState<AuthValue | null>(null);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(
     initialTarget.kind === 'conversation' ? initialTarget.id : null,
   );
@@ -96,25 +65,25 @@ export function App() {
   const conversationMissing = useConversationHistoryStore((state) =>
     activeConversationId ? Boolean(state.missingById[activeConversationId]) : false);
   const ensureConversation = useConversationHistoryStore((state) => state.ensureConversation);
-  const invalidateHistory = useConversationHistoryStore((state) => state.invalidate);
-  const loadHistory = useConversationHistoryStore((state) => state.load);
-  const resetHistoryReader = useConversationHistoryStore((state) => state.resetReader);
-  const [runtime, setRuntime] = useState<AgentRuntimeValue | null>(null);
-  const [contextInspector, setContextInspector] = useState<ContextInspectorValue | null>(null);
-  const [queue, setQueue] = useState<AgentPendingQueueValue | null>(null);
+  const {
+    auth,
+    connectionStatus,
+    contextInspector,
+    error,
+    queue,
+    refresh,
+    runtime,
+    setError,
+  } = useAgentResources(activeConversationId, activeConversationIdRef);
   const conversation = useMemo(
     () => conversationSummary ? projectConversation(conversationSummary, runtime) : null,
     [conversationSummary, runtime],
   );
   const [authBusy, setAuthBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const connectionStatus = useHostStore((state) => state.connectionStatus);
   const hostViewportMetrics = useHostStore((state) => state.hostViewportMetrics);
   const getHostViewportMetrics = useHostStore((state) => state.getHostViewportMetrics);
-  const initializeHost = useHostStore((state) => state.initialize);
   const cwd = useConversationStore((state) => state.cwd);
   const directoryPickerOpen = useConversationStore((state) => state.directoryPickerOpen);
-  const initializeCwd = useConversationStore((state) => state.initializeCwd);
   const setCwd = useConversationStore((state) => state.setCwd);
   const modelId = useComposerStore((state) => state.modelId);
   const reasoning = useComposerStore((state) => state.reasoning);
@@ -126,130 +95,36 @@ export function App() {
   const mentionSession = useComposerStore((state) => state.mentionSession);
   const setComposerDocument = useComposerStore((state) => state.setComposerDocument);
   const setModelId = useComposerStore((state) => state.setModelId);
-  const setModels = useComposerStore((state) => state.setModels);
   const setReasoning = useComposerStore((state) => state.setReasoning);
-  const resourceReader = useRef(new AgentResourceReader());
-  const conversationOperationId = useRef<string | null>(activeDraftId);
-  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pendingRefreshKeys = useRef(new Set<AgentResourceKey>());
   const composerRestorePendingRef = useRef<string | null>(null);
   const mainPaneRef = useRef<HTMLElement | null>(null);
   const bottomBarSlotRef = useRef<HTMLDivElement | null>(null);
-  const hostViewportMetricsRef = useRef<RemuxHostViewportMetrics | null>(hostViewportMetrics);
-  const composerPresentationActiveRef = useRef(false);
-  const [composerDomFocused, setComposerDomFocused] = useState(false);
-  const [composerLiftPx, setComposerLiftPx] = useState(0);
-  const [pickerOverlayStyle, setPickerOverlayStyle] = useState<CSSProperties | null>(null);
   const mentionQuery = mentionSession
     ? parseComposerMentionQuery(mentionSession.query).normalizedQuery
     : '';
   const mentionPickerVisible = mentionQuery.length > 0;
-  const pickerOverlayVisible = mentionPickerVisible || directoryPickerOpen;
   const composerPresentationActive = Boolean(editTarget || forkTarget || mentionSession);
-  const composerShouldLift = composerPresentationActive || directoryPickerOpen || composerDomFocused;
-  const mainPaneStyle = { '--remux-composer-lift': `${composerLiftPx}px` } as CSSProperties;
-
-  const refresh = useCallback(async (keys?: AgentResourceKey[]) => {
-    const requestedKeys = keys ?? baseResourceKeys();
-    try {
-      const update = await resourceReader.current.read(requestedKeys);
-      observeTranscriptServerGeneration(update.serverGeneration);
-      if (update.generationChanged) {
-        setRuntime(null);
-        setContextInspector(null);
-        setQueue(null);
-      }
-      for (const key of update.missing) {
-        if (key === AGENT_RESOURCE_KEYS.runtime) setRuntime(null);
-        if (key.startsWith('context:')) setContextInspector(null);
-        if (key.startsWith('queue:')) setQueue(null);
-      }
-      for (const [key, value] of update.values) {
-        if (key === AGENT_RESOURCE_KEYS.auth) setAuth(value as AuthValue);
-        if (key === AGENT_RESOURCE_KEYS.models) setModels(value as ModelsValue);
-        if (key === AGENT_RESOURCE_KEYS.runtime) setRuntime(value as AgentRuntimeValue);
-        if (key.startsWith('context:')) setContextInspector(value as ContextInspectorValue);
-        if (key.startsWith('queue:')) setQueue(value as AgentPendingQueueValue);
-      }
-      setError(null);
-    } catch (refreshError) {
-      setError(messageOf(refreshError));
-    }
-  }, [setModels]);
-
-  useEffect(() => setConversationRuntime(runtime), [runtime]);
-
-  const scheduleRefresh = useCallback((keys: AgentResourceKey[]) => {
-    for (const key of keys) pendingRefreshKeys.current.add(key);
-    if (refreshTimer.current) return;
-    refreshTimer.current = setTimeout(() => {
-      refreshTimer.current = null;
-      const pending = [...pendingRefreshKeys.current];
-      pendingRefreshKeys.current.clear();
-      void refresh(pending);
-    }, 16);
-  }, [refresh]);
-
-  useEffect(() => {
-    initializeHost();
-    void refresh();
-    void loadHistory().then(() => {
-      if (activeConversationIdRef.current) {
-        return ensureConversation(activeConversationIdRef.current);
-      }
-      return null;
-    });
-    const unsubscribeEvents = subscribeAgentResourceInvalidations((invalidations) => {
-      const resources = invalidations.filter((invalidation) => invalidation.type === 'resource');
-      void invalidateHistory(resources);
-      const keys = resources
-        .map((invalidation) => invalidation.key as AgentResourceKey)
-        .filter((key) => key === AGENT_RESOURCE_KEYS.auth ||
-          key === AGENT_RESOURCE_KEYS.models || key === AGENT_RESOURCE_KEYS.runtime ||
-          key === contextResourceKey(activeConversationIdRef.current ?? '') ||
-          key === queueResourceKey(activeConversationIdRef.current ?? ''));
-      if (keys.length > 0) scheduleRefresh(keys);
-    });
-    const unsubscribeStatus = subscribeHostStatus((status) => {
-      if (status.status.type === 'connected' && status.status.cwd) initializeCwd(status.status.cwd);
-    });
-    return () => {
-      unsubscribeEvents();
-      unsubscribeStatus();
-      if (refreshTimer.current) clearTimeout(refreshTimer.current);
-    };
-  }, [ensureConversation, initializeCwd, initializeHost, invalidateHistory, loadHistory, refresh, scheduleRefresh]);
-
-  useEffect(() => {
-    if (connectionStatus.type === 'connected' && connectionStatus.cwd) initializeCwd(connectionStatus.cwd);
-  }, [connectionStatus, initializeCwd]);
-
-  useAgentResumeSync(useCallback(async () => {
-    resourceReader.current.clear();
-    resetHistoryReader();
-    await Promise.all([
-      refresh(),
-      loadHistory({ preserveReady: true }),
-      ...(activeConversationIdRef.current
-        ? [ensureConversation(activeConversationIdRef.current, true)]
-        : []),
-    ]);
-  }, [ensureConversation, loadHistory, refresh, resetHistoryReader]));
+  const {
+    mainPaneStyle,
+    pickerOverlayStyle,
+    pickerOverlayVisible,
+  } = useComposerViewport({
+    bottomBarSlotRef,
+    composerPresentationRequestId: composerPresentationRequest.id,
+    directoryPickerOpen,
+    focusComposer,
+    getHostViewportMetrics,
+    hostViewportMetrics,
+    mainPaneRef,
+    mentionPickerVisible,
+    presentationActive: composerPresentationActive,
+  });
 
   useEffect(() => {
     activeConversationIdRef.current = activeConversationId;
     activeDraftIdRef.current = activeDraftId;
     draftRef.current = draft;
   }, [activeConversationId, activeDraftId, draft]);
-
-  useEffect(() => {
-    setContextInspector(null);
-    setQueue(null);
-    if (activeConversationId) void refresh([
-      contextResourceKey(activeConversationId),
-      queueResourceKey(activeConversationId),
-    ]);
-  }, [activeConversationId, refresh]);
 
   const restoreComposerSnapshot = useCallback((snapshot: ReturnType<typeof createEmptyComposerSnapshot>) => {
     composerRestorePendingRef.current = snapshot.contentKey;
@@ -335,7 +210,6 @@ export function App() {
     activeConversationIdRef.current = null;
     activeDraftIdRef.current = nextDraft.id;
     draftRef.current = nextDraft;
-    conversationOperationId.current = activateDraftOperationId(nextDraft.id);
     setActiveConversationId(null);
     setActiveDraftId(nextDraft.id);
     setDraft(nextDraft);
@@ -388,7 +262,6 @@ export function App() {
       saveCurrentTargetDraft();
       activeConversationIdRef.current = normalized;
       activeDraftIdRef.current = null;
-      conversationOperationId.current = null;
       setActiveConversationId(normalized);
       setActiveDraftId(null);
       restoreComposerSnapshot(loadConversationDraft(normalized) ?? createEmptyComposerSnapshot());
@@ -399,154 +272,15 @@ export function App() {
     if (focusTurnId) requestTranscriptTurnScroll(normalized, focusTurnId);
   }, [ensureConversation, restoreComposerSnapshot, saveCurrentTargetDraft]);
 
-  useEffect(() => subscribeHostNavigate((navigation) => {
-    if (navigation.resourceKind === 'agentConversation' && navigation.resourceId) {
-      selectConversation(
-        navigation.resourceId,
-        navigation.focusKind === 'turn' ? navigation.focusId : null,
-      );
-      return;
-    }
-    if (navigation.resourceKind === 'agentDraft' && navigation.resourceId) {
-      startNewChat(navigation.resourceId);
-    }
-  }), [selectConversation, startNewChat]);
-
-  const updatePickerGeometry = useCallback(() => {
-    if (!pickerOverlayVisible) {
-      setPickerOverlayStyle(null);
-      return;
-    }
-    window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
-      const mainPane = mainPaneRef.current;
-      const bottomBar = bottomBarSlotRef.current;
-      if (!mainPane || !bottomBar) return;
-      const mainRect = mainPane.getBoundingClientRect();
-      const bottomBarRect = bottomBar.getBoundingClientRect();
-      void getHostViewportMetrics()
-        .then((metrics) => setPickerOverlayStyle(measurePickerOverlay(mainRect, bottomBarRect, metrics)))
-        .catch(() => setPickerOverlayStyle(measurePickerOverlay(mainRect, bottomBarRect, null)));
-    }));
-  }, [getHostViewportMetrics, pickerOverlayVisible]);
-
-  const updateComposerLiftGeometry = useCallback(() => {
-    window.requestAnimationFrame(() => {
-      const mainPane = mainPaneRef.current;
-      if (!mainPane || !composerPresentationActiveRef.current) return;
-      const mainRect = mainPane.getBoundingClientRect();
-      const metrics = hostViewportMetricsRef.current;
-      if (metrics) {
-        setComposerLiftPx(measureComposerLift(mainRect, metrics));
-        return;
-      }
-      void getHostViewportMetrics()
-        .then((next) => {
-          if (composerPresentationActiveRef.current) setComposerLiftPx(measureComposerLift(mainRect, next));
-        })
-        .catch(() => {
-          if (composerPresentationActiveRef.current) setComposerLiftPx(measureVisualViewportComposerLift(mainRect));
-        });
-    });
-  }, [getHostViewportMetrics]);
-
-  useEffect(() => {
-    hostViewportMetricsRef.current = hostViewportMetrics;
-    composerPresentationActiveRef.current = composerShouldLift;
-    if (composerShouldLift) updateComposerLiftGeometry();
-  }, [composerShouldLift, hostViewportMetrics, updateComposerLiftGeometry]);
-
-  useEffect(() => {
-    let frame = 0;
-    const update = () => setComposerDomFocused(activeElementInComposer());
-    const schedule = () => {
-      if (frame) window.cancelAnimationFrame(frame);
-      frame = window.requestAnimationFrame(() => {
-        frame = 0;
-        update();
-      });
-    };
-    document.addEventListener('focusin', update);
-    document.addEventListener('focusout', schedule);
-    update();
-    return () => {
-      if (frame) window.cancelAnimationFrame(frame);
-      document.removeEventListener('focusin', update);
-      document.removeEventListener('focusout', schedule);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!composerShouldLift) {
-      setComposerLiftPx(0);
-      return;
-    }
-    updateComposerLiftGeometry();
-    const viewport = window.visualViewport;
-    const observer = new ResizeObserver(updateComposerLiftGeometry);
-    if (mainPaneRef.current) observer.observe(mainPaneRef.current);
-    if (bottomBarSlotRef.current) observer.observe(bottomBarSlotRef.current);
-    const timers = [50, 150, 300, 500].map((delay) => window.setTimeout(updateComposerLiftGeometry, delay));
-    window.addEventListener('resize', updateComposerLiftGeometry);
-    viewport?.addEventListener('resize', updateComposerLiftGeometry);
-    viewport?.addEventListener('scroll', updateComposerLiftGeometry);
-    return () => {
-      timers.forEach((timer) => window.clearTimeout(timer));
-      observer.disconnect();
-      window.removeEventListener('resize', updateComposerLiftGeometry);
-      viewport?.removeEventListener('resize', updateComposerLiftGeometry);
-      viewport?.removeEventListener('scroll', updateComposerLiftGeometry);
-    };
-  }, [composerShouldLift, updateComposerLiftGeometry]);
-
-  useEffect(() => {
-    if (composerPresentationRequest.id === 0) return;
-    let cancelled = false;
-    const frames: number[] = [];
-    const timers: number[] = [];
-    const present = () => {
-      if (cancelled) return;
-      updateComposerLiftGeometry();
-      const first = window.requestAnimationFrame(() => {
-        const second = window.requestAnimationFrame(() => {
-          if (!cancelled) focusComposer();
-        });
-        frames.push(second);
-      });
-      frames.push(first);
-    };
-    present();
-    for (const delay of [50, 150, 300]) timers.push(window.setTimeout(present, delay));
-    return () => {
-      cancelled = true;
-      frames.forEach((frame) => window.cancelAnimationFrame(frame));
-      timers.forEach((timer) => window.clearTimeout(timer));
-    };
-  }, [composerPresentationRequest.id, focusComposer, updateComposerLiftGeometry]);
-
-  useEffect(() => {
-    if (!pickerOverlayVisible) {
-      setPickerOverlayStyle(null);
-      return;
-    }
-    updatePickerGeometry();
-    const viewport = window.visualViewport;
-    const observer = new ResizeObserver(updatePickerGeometry);
-    if (mainPaneRef.current) observer.observe(mainPaneRef.current);
-    if (bottomBarSlotRef.current) observer.observe(bottomBarSlotRef.current);
-    window.addEventListener('resize', updatePickerGeometry);
-    viewport?.addEventListener('resize', updatePickerGeometry);
-    viewport?.addEventListener('scroll', updatePickerGeometry);
-    return () => {
-      observer.disconnect();
-      window.removeEventListener('resize', updatePickerGeometry);
-      viewport?.removeEventListener('resize', updatePickerGeometry);
-      viewport?.removeEventListener('scroll', updatePickerGeometry);
-    };
-  }, [pickerOverlayVisible, updatePickerGeometry]);
-
-  useEffect(() => {
-    if (pickerOverlayVisible) updatePickerGeometry();
-  }, [composerLiftPx, hostViewportMetrics, pickerOverlayVisible, updatePickerGeometry]);
+  useAgentNavigation({
+    activeConversationId,
+    activeDraftId,
+    conversation,
+    conversationMissing,
+    conversationSummary,
+    selectConversation,
+    startNewChat,
+  });
 
   const runAuth = useCallback(async (action: () => Promise<unknown>) => {
     setAuthBusy(true);
@@ -561,173 +295,28 @@ export function App() {
     }
   }, [refresh]);
 
-  const createConversation = useCallback(async () => {
-    if (!modelId || !cwd) throw new Error('Choose a workspace and model first.');
-    const operationId = conversationOperationId.current ?? loadOrCreateDraftOperationId();
-    const sourceDraftId = activeDraftIdRef.current;
-    conversationOperationId.current = operationId;
-    const result = await rpc.command<{ conversationId: string }>(AGENT_METHODS.conversationCreate, {
-      operationId,
-      cwd,
-      modelId,
-      reasoning,
-    });
-    conversationOperationId.current = null;
-    confirmDraftOperationId(operationId);
-    if (sourceDraftId) removeNewChatDraft(sourceDraftId);
-    if (draftRef.current?.id === sourceDraftId) {
-      draftRef.current = null;
-      setDraft(null);
-    }
-    await ensureConversation(result.conversationId, true);
-    if (activeDraftIdRef.current === sourceDraftId) {
-      activeDraftIdRef.current = null;
-      activeConversationIdRef.current = result.conversationId;
-      setActiveDraftId(null);
-      setActiveConversationId(result.conversationId);
-      await getTranscriptResourceState().setActiveConversationId(result.conversationId);
-    }
-    return result.conversationId;
-  }, [cwd, ensureConversation, modelId, reasoning]);
-
-  const send = useCallback(async (
-    input: { displayText: string; parts: AgentComposerMessagePart[] },
-    setPhase: (phase: 'sending' | 'updating-transcript') => void,
-  ) => {
-    setError(null);
-    const activeId = activeConversationIdRef.current ?? await createConversation();
-    setPhase('sending');
-    const clientMessageId = createViewerUuid();
-    const operationId = createViewerUuid();
-    trackTranscriptUserMessage(activeId, clientMessageId);
-    let sent: MessageSendResult;
-    try {
-      sent = await rpc.command<MessageSendResult>(AGENT_METHODS.messageSend, {
-        operationId,
-        conversationId: activeId,
-        clientMessageId,
-        parts: input.parts,
-        text: input.displayText,
-      });
-    } catch (reason) {
-      discardTranscriptUserMessage(clientMessageId);
-      throw reason;
-    }
-    if (sent.turnId) {
-      trackTranscriptUserMessage(activeId, clientMessageId, sent.turnId);
-    } else {
-      discardTranscriptUserMessage(clientMessageId);
-    }
-    setPhase('updating-transcript');
-    removeConversationDraft(activeId);
-    await Promise.all([
-      refresh([AGENT_RESOURCE_KEYS.runtime, queueResourceKey(activeId)]),
-      ensureConversation(activeId, true),
-      ...(activeConversationIdRef.current === activeId
-        ? [refreshActiveTranscriptResources({ forceFullMeasure: false, preserveReady: true, windowPolicy: 'tail' })]
-        : []),
-    ]);
-  }, [conversation?.id, createConversation, ensureConversation, refresh]);
-
-  const branchMessage = useCallback(async (
-    mode: 'edit' | 'fork',
-    target: ComposerEditTarget | ComposerForkTarget,
-    input: { displayText: string; parts: AgentComposerMessagePart[] },
-    setPhase: (phase: 'sending' | 'updating-transcript') => void,
-  ) => {
-    setError(null);
-    setPhase('sending');
-    const clientMessageId = createViewerUuid();
-    const result = await rpc.command<MessageBranchResult>(
-      mode === 'edit' ? AGENT_METHODS.messageEdit : AGENT_METHODS.messageFork,
-      {
-        operationId: createViewerUuid(),
-        clientMessageId,
-        parts: input.parts,
-        text: input.displayText,
-        sourceConversationId: target.conversationId,
-        sourceMessageId: mode === 'edit'
-          ? (target as ComposerEditTarget).userMessageId
-          : (target as ComposerForkTarget).assistantMessageId,
-        sourceTurnId: target.turnId,
-      },
-    );
-    removeConversationDraft(target.conversationId);
-    trackTranscriptUserMessage(result.conversationId, clientMessageId, result.turnId);
-    setPhase('updating-transcript');
-    await ensureConversation(result.conversationId, true);
-    selectConversation(result.conversationId, result.turnId);
-    await getTranscriptResourceState().setActiveConversationId(result.conversationId);
-    await Promise.all([
-      refresh([AGENT_RESOURCE_KEYS.runtime, queueResourceKey(result.conversationId)]),
-      refreshActiveTranscriptResources({ forceFullMeasure: true, preserveReady: false, windowPolicy: 'tail' }),
-    ]);
-  }, [ensureConversation, refresh, selectConversation]);
-
-  const interrupt = useCallback(async () => {
-    if (!conversation?.activeTurnId) return;
-    setError(null);
-    try {
-      await rpc.command(AGENT_METHODS.turnInterrupt, {
-        conversationId: conversation.id,
-        turnId: conversation.activeTurnId,
-      });
-      await refresh([AGENT_RESOURCE_KEYS.runtime]);
-    } catch (reason) {
-      setError(messageOf(reason));
-      throw reason;
-    }
-  }, [conversation?.activeTurnId, conversation?.id, refresh]);
-
-  useEffect(() => {
-    if (!activeDraftId) return;
-    void syncAgentTabLocation({
-      resourceId: activeDraftId,
-      resourceKind: 'agentDraft',
-      status: 'Draft',
-      title: 'New chat',
-    }).catch(() => undefined);
-  }, [activeDraftId]);
-
-  useEffect(() => {
-    if (!activeConversationId) return;
-    void syncAgentTabLocation({
-      resourceId: activeConversationId,
-      resourceKind: 'agentConversation',
-      status: conversation ? conversationStatusLabel(conversation.status) : null,
-      title: conversationSummary?.title || (conversationMissing ? 'Conversation unavailable' : 'Agent'),
-    }).catch(() => undefined);
-  }, [activeConversationId, conversation, conversationMissing, conversationSummary?.title]);
+  const { branchMessage, interrupt, send } = useConversationActions({
+    activeConversationIdRef,
+    activeDraftIdRef,
+    conversation,
+    cwd,
+    draftRef,
+    modelId,
+    reasoning,
+    refresh,
+    selectConversation,
+    setActiveConversationId,
+    setActiveDraftId,
+    setDraft,
+    setError,
+  });
 
   if (!auth) {
     return <main className="agent-app agent-center"><p>Connecting to agent runtime…</p></main>;
   }
 
   if (auth.state !== 'signed-in') {
-    return (
-      <main className="agent-app agent-center">
-        <section className="agent-auth-card">
-          <div className="agent-auth-kicker">Remux Agent</div>
-          <h1>Connect your OpenAI subscription</h1>
-          <p>This runtime reads Pi’s OpenAI Codex OAuth credential store. Tokens never enter the viewer.</p>
-          {auth.userCode ? <code className="agent-device-code">{auth.userCode}</code> : null}
-          {auth.progress ? <p className="agent-muted">{auth.progress}</p> : null}
-          {auth.error || error ? <p className="agent-error" role="alert">{auth.error ?? error}</p> : null}
-          <div className="agent-auth-actions">
-            {auth.verificationUri ? (
-              <button type="button" onClick={() => void openHostLink({ url: auth.verificationUri! })}>Open verification page</button>
-            ) : null}
-            {auth.state === 'signing-in' ? (
-              <button type="button" className="agent-secondary" onClick={() => {
-                if (auth.operationId) void runAuth(() => rpc.command(AGENT_METHODS.authLoginCancel, { operationId: auth.operationId }));
-              }}>Cancel</button>
-            ) : (
-              <button type="button" onClick={() => void runAuth(() => rpc.command(AGENT_METHODS.authLoginStart))} disabled={authBusy}>Sign in with device code</button>
-            )}
-          </div>
-        </section>
-      </main>
-    );
+    return <AgentAuthScreen auth={auth} busy={authBusy} error={error} run={(action) => void runAuth(action)} />;
   }
 
   return (
@@ -777,7 +366,7 @@ export function App() {
               ? refresh([queueResourceKey(activeConversationId)])
               : Promise.resolve()}
             onSend={send}
-            onSignOut={() => void runAuth(() => rpc.command(AGENT_METHODS.authLogout))}
+            onSignOut={() => void runAuth(() => agentCommands.logout())}
             runtimeError={error ?? conversation?.error ?? null}
             queue={queue}
           />
@@ -794,28 +383,6 @@ export function App() {
   );
 }
 
-type AgentInitialTarget =
-  | { focusTurnId: string | null; id: string; kind: 'conversation' }
-  | { id: string; kind: 'draft' };
-
-function readInitialTarget(): AgentInitialTarget {
-  const route = parseRemuxViewerRoute(window.location.href);
-  if (route.resourceKind === 'agentConversation' && route.resourceId) {
-    return {
-      focusTurnId: route.focusKind === 'turn' ? route.focusId : null,
-      id: route.resourceId,
-      kind: 'conversation',
-    };
-  }
-  if (route.resourceKind === 'agentDraft' && isViewerUuid(route.resourceId)) {
-    return { id: activateDraftOperationId(route.resourceId), kind: 'draft' };
-  }
-  if (route.launch === 'new-chat' && isViewerUuid(route.resourceId)) {
-    return { id: activateDraftOperationId(route.resourceId), kind: 'draft' };
-  }
-  return { id: loadOrCreateDraftOperationId(), kind: 'draft' };
-}
-
 function initialDraft(id: string): AgentNewChatDraft {
   return loadNewChatDraft(id) ?? {
     cwd: '',
@@ -825,14 +392,6 @@ function initialDraft(id: string): AgentNewChatDraft {
     snapshot: createEmptyComposerSnapshot(),
     updatedAt: Date.now(),
   };
-}
-
-function baseResourceKeys(): AgentResourceKey[] {
-  return [
-    AGENT_RESOURCE_KEYS.auth,
-    AGENT_RESOURCE_KEYS.models,
-    AGENT_RESOURCE_KEYS.runtime,
-  ];
 }
 
 function projectConversation(summary: ConversationSummary, runtime: AgentRuntimeValue | null): ConversationValue {
@@ -860,67 +419,6 @@ function emptyContextProbe(modelId: string): ConversationValue['contextProbe'] {
     modelId,
     providerRequestMode: 'none',
   };
-}
-
-type AgentTabLocation = {
-  resourceId: string;
-  resourceKind: 'agentConversation' | 'agentDraft';
-  status: string | null;
-  title: string;
-};
-
-async function syncAgentTabLocation(location: AgentTabLocation) {
-  replaceAgentLocation(location);
-  await updateHostTab({ ...location, launch: null });
-}
-
-function replaceAgentLocation(location: AgentTabLocation) {
-  const url = new URL(window.location.href);
-  url.searchParams.delete('remuxLaunch');
-  url.searchParams.delete('remuxFocusKind');
-  url.searchParams.delete('remuxFocusId');
-  url.searchParams.set('remuxResourceKind', location.resourceKind);
-  url.searchParams.set('remuxResourceId', location.resourceId);
-  window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`);
-}
-
-function conversationStatusLabel(status: ConversationValue['status']) {
-  if (status === 'running') return 'Working';
-  if (status === 'interrupting') return 'Stopping';
-  if (status === 'loading') return 'Loading';
-  if (status === 'error') return 'Failed';
-  return null;
-}
-
-function hostKeyboardActive(metrics: RemuxHostViewportMetrics | null) {
-  return Boolean(metrics && (metrics.keyboardVisible || metrics.keyboardHeight > 0 || metrics.visibleBottom < metrics.viewportHeight));
-}
-
-function measureComposerLift(mainRect: DOMRect, metrics: RemuxHostViewportMetrics | null) {
-  if (!hostKeyboardActive(metrics) || !metrics || metrics.viewportHeight <= 0) return measureVisualViewportComposerLift(mainRect);
-  const visibleBottom = Math.max(0, Math.min(metrics.viewportHeight, metrics.visibleBottom));
-  return visibleBottom > 0 ? Math.max(0, Math.ceil(mainRect.bottom - visibleBottom)) : measureVisualViewportComposerLift(mainRect);
-}
-
-function measureVisualViewportComposerLift(mainRect: DOMRect) {
-  const viewport = window.visualViewport;
-  return viewport ? Math.max(0, Math.ceil(mainRect.bottom - (viewport.offsetTop + viewport.height))) : 0;
-}
-
-function measurePickerOverlay(mainRect: DOMRect, bottomBarRect: DOMRect, metrics: RemuxHostViewportMetrics | null): CSSProperties {
-  const top = Math.max(0, -mainRect.top);
-  const fallbackBottom = Math.max(top, bottomBarRect.top - mainRect.top);
-  const maxBottom = Math.max(top, mainRect.height - bottomBarRect.height);
-  const hostBottom = metrics && metrics.viewportHeight > 0
-    ? metrics.visibleBottom - bottomBarRect.height - mainRect.top
-    : fallbackBottom;
-  const bottom = Math.max(top, Math.min(hostKeyboardActive(metrics) ? hostBottom : fallbackBottom, maxBottom));
-  return { height: Math.max(0, bottom - top), top };
-}
-
-function activeElementInComposer() {
-  const active = document.activeElement;
-  return active instanceof Element && Boolean(active.closest('[data-remux-composer-root]'));
 }
 
 function blurComposerOnOutsideTap(event: PointerEvent<HTMLElement>) {

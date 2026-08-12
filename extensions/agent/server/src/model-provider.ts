@@ -44,7 +44,7 @@ export type {
   WorkUnitView,
 } from './domain/work.ts';
 
-export type RuntimeEvent =
+export type ModelSessionEvent =
   | { type: 'assistant-start' }
   | { type: 'assistant-text'; delta: string }
   | { type: 'assistant-reasoning'; delta: string }
@@ -55,9 +55,9 @@ export type RuntimeEvent =
   | { type: 'tool-end'; callId: string; name: string; result: unknown; isError: boolean }
   | { type: 'context-probe'; probe: ContextProbe };
 
-export type RuntimeEventSink = (event: RuntimeEvent) => void;
+export type ModelSessionEventSink = (event: ModelSessionEvent) => void;
 
-export type RuntimeDurabilityHooks = {
+export type ModelSessionDurabilityHooks = {
   compileContext(contextWindow: number): Promise<DurableContextBoundarySnapshot>;
   noticeContextPressure(input: {
     estimatedInputTokens: number;
@@ -112,22 +112,22 @@ export type RuntimeDurabilityHooks = {
   workUnitReturn(callId: string, input: WorkUnitReturnInput): Promise<WorkUnitReturnPending>;
 };
 
-export interface ConversationRuntime {
+export interface ModelSession {
   prompt(input: { text: string; images?: Array<{ data: string; mimeType: string }> }): Promise<void>;
   interrupt(): Promise<void>;
   dispose(): Promise<void>;
 }
 
-export interface AgentEngine {
+export interface ModelProvider {
   authStatus(): Promise<AuthValue>;
   login(operationId: string, signal: AbortSignal, onUpdate: (value: AuthValue) => void): Promise<void>;
   logout(): Promise<void>;
   listModels(): Promise<ModelInfo[]>;
-  createConversation(options: {
+  createSession(options: {
     cwd: string;
     modelId: string;
     reasoning: ReasoningLevel;
-    onEvent: RuntimeEventSink;
-    durability: RuntimeDurabilityHooks;
-  }): Promise<ConversationRuntime>;
+    onEvent: ModelSessionEventSink;
+    durability: ModelSessionDurabilityHooks;
+  }): Promise<ModelSession>;
 }

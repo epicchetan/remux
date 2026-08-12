@@ -12,11 +12,11 @@ import {
 import type { AgentResourceInvalidation } from '../../shared/transcript.ts';
 import type { AgentStore } from './agent-store.ts';
 import type {
-  ConversationRuntime,
-  RuntimeEvent,
+  ModelSession,
+  ModelSessionEvent,
   WorkUnitEnterInput,
   WorkUnitReturnInput,
-} from './engine.ts';
+} from './model-provider.ts';
 import type {
   DurableInferenceContext,
   DurableTranscriptMutation,
@@ -32,7 +32,7 @@ type TurnCoordinatorOptions = {
   store: AgentStore;
   resources: ResourceStore;
   monotonicNow?: () => number;
-  runtime: () => ConversationRuntime | null;
+  session: () => ModelSession | null;
   projector: () => EphemeralTranscriptProjector | null;
   replaceProjector: (projector: EphemeralTranscriptProjector) => void;
   conversationId: () => string | null;
@@ -205,7 +205,7 @@ export class TurnCoordinator {
     };
   }
 
-  applyRuntimeEvent(conversationId: string, event: RuntimeEvent) {
+  applySessionEvent(conversationId: string, event: ModelSessionEvent) {
     const runtimeValue = this.resources.get<AgentRuntimeValue>(AGENT_RESOURCE_KEYS.runtime);
     if (!runtimeValue || runtimeValue.conversationId !== conversationId) return;
     const turnId = runtimeValue.activeTurnId;
@@ -263,9 +263,9 @@ export class TurnCoordinator {
     if (runtimeValue.state === 'interrupting') return { accepted: true as const };
     runtimeValue.state = 'interrupting';
     this.resources.set(AGENT_RESOURCE_KEYS.runtime, runtimeValue);
-    const runtime = this.options.runtime();
-    if (runtime) {
-      void runtime.interrupt()
+    const session = this.options.session();
+    if (session) {
+      void session.interrupt()
         .catch((error) => this.completeTurn(params.conversationId, true, safeMessage(error)))
         .catch((error) => this.failDurability(params.conversationId, error));
     }
@@ -286,7 +286,7 @@ export class TurnCoordinator {
     if (this.turnWriteError) throw this.turnWriteError;
   }
 
-  async disposeConversation(previous: ConversationRuntime | null, conversationId: string | null) {
+  async disposeConversation(previous: ModelSession | null, conversationId: string | null) {
     if (previous && this.activeDurableTurn && conversationId) {
       await previous.interrupt().catch(() => undefined);
       await this.completeTurn(conversationId, true).catch((error) => {
@@ -623,7 +623,7 @@ export class TurnCoordinator {
       runtimeValue.error = message;
       this.resources.set(AGENT_RESOURCE_KEYS.runtime, runtimeValue);
     }
-    await this.options.runtime()?.interrupt().catch(() => undefined);
+    await this.options.session()?.interrupt().catch(() => undefined);
     const handle = this.activeDurableTurn;
     if (!handle || handle.conversationId !== conversationId) return;
     const durationMs = this.activeTurnDurationMs();

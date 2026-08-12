@@ -1,7 +1,7 @@
 import { Type } from '@earendil-works/pi-ai';
 import { defineTool, type ToolDefinition } from '@earendil-works/pi-coding-agent';
 
-import type { RuntimeDurabilityHooks } from '../engine.ts';
+import type { ModelSessionDurabilityHooks } from '../model-provider.ts';
 
 export const PARENT_CONTEXT_TOOL_NAMES = [
   'history_search',
@@ -127,7 +127,7 @@ function workUnitResourceSchema() {
 
 export function createContextTools(
   durability: Pick<
-    RuntimeDurabilityHooks,
+    ModelSessionDurabilityHooks,
     'historySearch' | 'historyOpen' | 'threadRead' | 'threadPatch' | 'threadReplace' |
     'workUnitEnter' | 'workUnitReturn'
   >,
