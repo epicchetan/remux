@@ -9,7 +9,11 @@ import type { BenchmarkScenario } from './benchmark/contracts.ts';
 import { summarizeCodexRollout } from './benchmark/evidence.ts';
 import { prepareFixture } from './benchmark/fixture.ts';
 import { run } from './benchmark/process.ts';
-import { LEDGER_PROJECTION_TIME_BARS_SCENARIO } from './benchmark/scenarios.ts';
+import {
+  LEDGER_FEED_SESSION_WORKFLOW_SCENARIO,
+  LEDGER_PROJECTION_TIME_BARS_SCENARIO,
+  LEDGER_SESSION_TRANSPORT_WORKFLOW_SCENARIO,
+} from './benchmark/scenarios.ts';
 import type { RemuxBenchmarkClient } from './benchmark/remux-client.ts';
 
 test('ledger parity benchmark exposes a fixed authoritative implementation contract', () => {
@@ -23,6 +27,29 @@ test('ledger parity benchmark exposes a fixed authoritative implementation contr
   assert.match(scenario.fixedPrompt ?? '', /final and authoritative/u);
   assert.ok(scenario.visibleInputs.length > 0);
   assert.ok(scenario.evaluator.overlayPaths.length > 0);
+  assert.ok(!JSON.stringify(scenario.driverBrief).includes(scenario.referenceCommit));
+});
+
+test('feed workflow makes evaluator-required public compatibility visible', async () => {
+  const scenario = LEDGER_FEED_SESSION_WORKFLOW_SCENARIO;
+  const contract = scenario.visibleInputs.find(({ path }) =>
+    path === 'docs/benchmark_feed_public_compatibility.md');
+  assert.ok(contract?.fixturePath);
+  const content = await readFile(contract.fixturePath, 'utf8');
+  assert.match(content, /pub fn new\(store: Arc<Store<S>>\) -> Result<Self, LedgerError>/u);
+  assert.match(content, /pub fn es_replay/u);
+  assert.match(content, /pub async fn start\(self\) -> Result<LedgerSessionHandle, LedgerError>/u);
+  assert.ok(scenario.governingPaths.includes(contract.path));
+});
+
+test('session transport workflow has an independent hidden behavioral gate', () => {
+  const scenario = LEDGER_SESSION_TRANSPORT_WORKFLOW_SCENARIO;
+  assert.equal(scenario.suite, 'workflow');
+  assert.equal(scenario.fixedPrompt, null);
+  assert.ok(scenario.driverCardPath);
+  assert.equal(scenario.evaluator.behavioralCommand.file, 'node');
+  assert.match(scenario.evaluator.behavioralCommand.args[0] ?? '', /session-transport\/evaluate\.mjs$/u);
+  assert.ok(scenario.forbiddenPaths.includes('lens/'));
   assert.ok(!JSON.stringify(scenario.driverBrief).includes(scenario.referenceCommit));
 });
 

@@ -47,9 +47,7 @@ export async function prepareFixture(
     await rm(archivePath, { force: true });
 
     const visibleInputs = await Promise.all(scenario.visibleInputs.map(async (input) => {
-      const bytes = await gitBytes(scenario.sourceRepository, [
-        'show', `${input.sourceRef}:${input.sourcePath}`,
-      ]);
+      const bytes = await visibleInputBytes(scenario, input);
       const destination = join(temporaryWorkspace, input.path);
       await mkdir(dirname(destination), { recursive: true });
       await writeFile(destination, bytes);
@@ -139,6 +137,10 @@ async function isValidTemplate(
   scenario: BenchmarkScenario,
   expectedTree: string,
 ) {
+  const expectedVisibleInputs = await Promise.all(scenario.visibleInputs.map(async (input) => ({
+    ...input,
+    sha256: sha256(await visibleInputBytes(scenario, input)),
+  })));
   if (
     manifest.version !== 3 ||
     manifest.fixtureId !== scenario.fixtureId ||
@@ -147,8 +149,7 @@ async function isValidTemplate(
       scenario.sourceRepository,
       ['rev-parse', `${scenario.referenceCommit}^{commit}`],
     ) ||
-    JSON.stringify(manifest.source.visibleInputs.map(({ path, sourceRef, sourcePath }) => ({ path, sourceRef, sourcePath }))) !==
-      JSON.stringify(scenario.visibleInputs) ||
+    JSON.stringify(manifest.source.visibleInputs) !== JSON.stringify(expectedVisibleInputs) ||
     JSON.stringify(manifest.evaluation.overlayPaths) !==
       JSON.stringify(scenario.evaluator.overlayPaths) ||
     JSON.stringify(manifest.evaluation.overlayRewrites ?? []) !==
@@ -165,6 +166,14 @@ async function isValidTemplate(
   } catch {
     return false;
   }
+}
+
+async function visibleInputBytes(
+  scenario: BenchmarkScenario,
+  input: BenchmarkScenario['visibleInputs'][number],
+) {
+  if (input.fixturePath) return readFile(input.fixturePath);
+  return gitBytes(scenario.sourceRepository, ['show', `${input.sourceRef}:${input.sourcePath}`]);
 }
 
 async function assertNoIdentifiers(root: string, identifiers: string[]) {

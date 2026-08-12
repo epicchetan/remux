@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { basename, isAbsolute, resolve } from 'node:path';
 
 import type { AssistantMessage } from '@earendil-works/pi-ai';
@@ -43,6 +43,7 @@ import type {
   JournalOpenInput,
   JournalOpenResult,
   JournalSearchInput,
+  JournalSearchOptions,
   JournalSearchResult,
   ThreadDocumentView,
   ThreadPatchInput,
@@ -2063,6 +2064,7 @@ export class AgentJournalRepository {
   async searchJournal(
     conversationId: string,
     input: JournalSearchInput,
+    options: JournalSearchOptions = {},
   ): Promise<JournalSearchResult> {
     this.assertOpen();
     await this.writerTail;
@@ -2082,6 +2084,7 @@ export class AgentJournalRepository {
         AND project_id = ?
         AND (? = 'project' OR conversation_id = ?)
         AND (? = 'operations' OR kind NOT LIKE 'operation:%')
+        AND (? = '' OR ref <> ?)
       ORDER BY
         CASE WHEN strand_id = ? THEN 0 WHEN conversation_id = ? THEN 1 ELSE 2 END,
         relevance,
@@ -2094,6 +2097,8 @@ export class AgentJournalRepository {
       scope,
       conversationId,
       input.include ?? '',
+      options.excludeRef ?? '',
+      options.excludeRef ?? '',
       identity.strandId,
       conversationId,
       limit + 1,
@@ -2688,8 +2693,12 @@ export class AgentJournalRepository {
     }));
   }
 
-  async enterWorkUnit(handle: DurableTurnHandle, input: WorkUnitEnterInput) {
+  async prepareWorkUnitEntry(
+    handle: DurableTurnHandle,
+    input: WorkUnitEnterInput,
+  ): Promise<PreparedWorkUnitEntry> {
     this.assertOpen();
+    this.assertRunningHandle(handle);
     const objective = input.objective.trim();
     if (!objective) throw new TypeError('A work unit objective is required.');
     if (Buffer.byteLength(objective, 'utf8') > 4 * 1024) {
@@ -2708,6 +2717,11 @@ export class AgentJournalRepository {
       resources: materializedResources.map(modelPromptWorkUnitResource),
     }));
     const child: DurableTurnHandle = { ...handle, scopeId: this.nextId('scope') };
+    return { child, doneWhen, materializedResources, objective, orientation };
+  }
+
+  commitWorkUnitEntry(handle: DurableTurnHandle, prepared: PreparedWorkUnitEntry) {
+    const { child, doneWhen, materializedResources, objective, orientation } = prepared;
     return this.enqueueWrite(() => this.storage.transaction(() => {
       this.assertRunningHandle(handle);
       const parent = this.scopeIdentity(handle.scopeId);
@@ -2785,6 +2799,10 @@ export class AgentJournalRepository {
         resources: materializedResources.map(({ view }) => view),
       };
     }));
+  }
+
+  async enterWorkUnit(handle: DurableTurnHandle, input: WorkUnitEnterInput) {
+    return this.commitWorkUnitEntry(handle, await this.prepareWorkUnitEntry(handle, input));
   }
 
   async prepareWorkUnitReturn(
@@ -2921,6 +2939,12 @@ export class AgentJournalRepository {
         source = 'history';
       } else {
         const path = isAbsolute(resource.ref) ? resource.ref : resolve(identity.cwd, resource.ref);
+        const metadata = await stat(path);
+        if (!metadata.isFile()) {
+          throw new TypeError(
+            `Work unit resource ${resource.ref} must be a UTF-8 text file; directories are not supported.`,
+          );
+        }
         const bytes = await readFile(path);
         try {
           content = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
@@ -5156,6 +5180,14 @@ type PreparedWorkUnitResource = {
   artifact: StagedArtifact;
   content: string;
   view: WorkUnitResourceView;
+};
+
+export type PreparedWorkUnitEntry = {
+  child: DurableTurnHandle;
+  doneWhen: string[];
+  materializedResources: PreparedWorkUnitResource[];
+  objective: string;
+  orientation: PreparedReference;
 };
 
 export type PreparedWorkUnitReturn = {

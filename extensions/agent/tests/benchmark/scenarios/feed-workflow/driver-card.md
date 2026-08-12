@@ -12,9 +12,8 @@ ability to question and refine the design before code is written.
   shutdown are required.
 - The checked-in feed-system specification remains the governing authority.
 - Existing public compatibility expected by Ledger callers must be preserved:
-  the specified feed payload/helper and type re-exports, the documented
-  `EsReplayCells::register` signature, and the `es_replay` and `start` builder
-  entry points.
+  the exact contract in `docs/benchmark_feed_public_compatibility.md` is
+  acceptance-critical, not an evaluator-only assumption.
 - Cache and runtime internals are out of scope.
 - Do not commit or push.
 

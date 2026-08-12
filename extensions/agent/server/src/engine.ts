@@ -54,7 +54,7 @@ export type RuntimeDurabilityHooks = {
     result: unknown;
     isError: boolean;
   }): Promise<void>;
-  journalSearch(input: JournalSearchInput): Promise<JournalSearchResult>;
+  journalSearch(callId: string, input: JournalSearchInput): Promise<JournalSearchResult>;
   journalOpen(input: JournalOpenInput): Promise<JournalOpenResult>;
   threadRead(): Promise<ThreadDocumentView>;
   threadPatch(input: ThreadPatchInput): Promise<ThreadDocumentView>;
@@ -138,6 +138,10 @@ export type JournalSearchInput = {
   limit?: number;
   scope?: 'conversation' | 'project';
   include?: 'operations';
+};
+
+export type JournalSearchOptions = {
+  excludeRef?: string;
 };
 
 export type JournalSearchHit = {

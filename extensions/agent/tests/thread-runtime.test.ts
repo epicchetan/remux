@@ -466,6 +466,37 @@ test('work-unit handoffs may use the available parent context beyond the former 
   await fixture.repository.finishTurn(root, { status: 'interrupted' });
 });
 
+test('work-unit directory resources are correctable before the durable entry commit', async (t) => {
+  const fixture = await repositoryFixture(t);
+  const conversation = await fixture.repository.createConversation({
+    operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'model', reasoning: 'high',
+  });
+  const root = await accept(fixture.repository, conversation.conversationId, 'Implement the seam.');
+
+  await assert.rejects(
+    fixture.repository.prepareWorkUnitEntry(root, {
+      objective: 'Implement the source tree.',
+      resources: [{ ref: 'src', role: 'deliverable' }],
+    }),
+    /must be a UTF-8 text file; directories are not supported/u,
+  );
+  const eventsBeforeRetry = await fixture.repository.readEvents({
+    conversationId: conversation.conversationId,
+  });
+  assert.ok(eventsBeforeRetry.every(({ type }) => type !== 'work_unit.entered'));
+
+  const entered = await fixture.repository.enterWorkUnit(root, {
+    objective: 'Implement the seam file.',
+    resources: [{ ref: 'src/seam.ts', role: 'deliverable' }],
+  });
+  assert.equal(entered.resources[0]?.snapshot.source, 'file');
+  await fixture.repository.returnWorkUnit(entered.handle, {
+    status: 'completed',
+    result: 'The corrected file resource was accepted.',
+  });
+  await fixture.repository.finishTurn(root, { status: 'completed' });
+});
+
 test('turn failure abandons an unreturned work unit with its own terminal event', async (t) => {
   const fixture = await repositoryFixture(t);
   const conversation = await fixture.repository.createConversation({
@@ -538,6 +569,35 @@ test('journal retrieval exposes thread documents and exact visible outcomes but 
   });
   assert.ok(rebuilt.hits.some(({ kind }) => kind === 'thread-document'));
   assert.ok(rebuilt.hits.some(({ kind }) => kind === 'assistant-outcome'));
+});
+
+test('journal retrieval can exclude the active history search without hiding prior operations', async (t) => {
+  const fixture = await repositoryFixture(t);
+  const conversation = await fixture.repository.createConversation({
+    operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'model', reasoning: 'high',
+  });
+  const turn = await accept(fixture.repository, conversation.conversationId, 'Inspect prior validation.');
+  await fixture.repository.recordToolStarted(turn, {
+    callId: 'prior-validation',
+    name: 'bash',
+    args: { command: 'cargo test --workspace' },
+  });
+  await fixture.repository.recordToolStarted(turn, {
+    callId: 'active-search',
+    name: 'history_search',
+    args: { query: 'cargo test --workspace', include: 'operations' },
+  });
+
+  const search = await fixture.repository.searchJournal(conversation.conversationId, {
+    query: 'cargo test --workspace',
+    scope: 'conversation',
+    include: 'operations',
+  }, {
+    excludeRef: 'journal://tool/active-search',
+  });
+  assert.ok(search.hits.some(({ ref }) => ref === 'journal://tool/prior-validation'));
+  assert.ok(search.hits.every(({ ref }) => ref !== 'journal://tool/active-search'));
+  await fixture.repository.finishTurn(turn, { status: 'interrupted' });
 });
 
 test('context pressure is durable, scope-specific, and emitted at most once across restart', async (t) => {

@@ -15,6 +15,7 @@ import type {
   DurableInferenceContext,
   DurableQueuedTurn,
   PreparedWorkUnitReturn,
+  PreparedWorkUnitEntry,
   QueueTurnResult,
 } from './storage/repository.ts';
 import type { AgentResourceKey } from '../../shared/protocol.ts';
@@ -25,6 +26,7 @@ import type {
   JournalOpenInput,
   JournalOpenResult,
   JournalSearchInput,
+  JournalSearchOptions,
   JournalSearchResult,
   ThreadDocumentView,
   ThreadPatchInput,
@@ -119,7 +121,11 @@ export interface AgentConversationJournal {
     hash: string,
     range?: { offset: number; byteLength: number },
   ): Promise<DurableArtifact | null>;
-  searchJournal?(conversationId: string, input: JournalSearchInput): Promise<JournalSearchResult>;
+  searchJournal?(
+    conversationId: string,
+    input: JournalSearchInput,
+    options?: JournalSearchOptions,
+  ): Promise<JournalSearchResult>;
   openJournal?(conversationId: string, input: JournalOpenInput): Promise<JournalOpenResult>;
   readThread?(conversationId: string): Promise<ThreadDocumentView>;
   readThreadHistory?(conversationId: string): Promise<ThreadCanvasValue>;
@@ -127,6 +133,20 @@ export interface AgentConversationJournal {
   patchThread?(handle: DurableTurnHandle, input: ThreadPatchInput): Promise<ThreadDocumentView>;
   replaceThread?(handle: DurableTurnHandle, input: ThreadReplaceInput): Promise<ThreadDocumentView>;
   enterWorkUnit?(handle: DurableTurnHandle, input: WorkUnitEnterInput): Promise<{
+    handle: DurableTurnHandle;
+    parentScopeId: string;
+    objective: string;
+    doneWhen: string[];
+    resources: WorkUnitResourceView[];
+  }>;
+  prepareWorkUnitEntry?(
+    handle: DurableTurnHandle,
+    input: WorkUnitEnterInput,
+  ): Promise<PreparedWorkUnitEntry>;
+  commitWorkUnitEntry?(
+    handle: DurableTurnHandle,
+    prepared: PreparedWorkUnitEntry,
+  ): Promise<{
     handle: DurableTurnHandle;
     parentScopeId: string;
     objective: string;

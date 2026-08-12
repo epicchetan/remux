@@ -5,9 +5,15 @@ export type BenchmarkSuite = 'parity' | 'workflow';
 
 export type BenchmarkVisibleInput = {
   path: string;
+} & ({
   sourceRef: string;
   sourcePath: string;
-};
+  fixturePath?: never;
+} | {
+  fixturePath: string;
+  sourceRef?: never;
+  sourcePath?: never;
+});
 
 export type BenchmarkCommand = {
   id: string;

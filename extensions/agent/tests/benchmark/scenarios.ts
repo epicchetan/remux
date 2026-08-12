@@ -104,8 +104,14 @@ export const LEDGER_FEED_SESSION_WORKFLOW_SCENARIO: BenchmarkScenario = {
     path: 'docs/ledger_feed_system_implementation_spec.md',
     sourceRef: 'd92c6020b7729b22e709a31b2da9d7923cfc1923',
     sourcePath: 'docs/ledger_feed_system_implementation_spec.md',
+  }, {
+    path: 'docs/benchmark_feed_public_compatibility.md',
+    fixturePath: resolve(SCENARIO_ROOT, 'feed-workflow/public-compatibility.md'),
   }],
-  governingPaths: ['docs/ledger_feed_system_implementation_spec.md'],
+  governingPaths: [
+    'docs/ledger_feed_system_implementation_spec.md',
+    'docs/benchmark_feed_public_compatibility.md',
+  ],
   fixedPrompt: null,
   driverCardPath: resolve(SCENARIO_ROOT, 'feed-workflow/driver-card.md'),
   driverBrief: {
@@ -159,9 +165,70 @@ export const LEDGER_FEED_SESSION_WORKFLOW_SCENARIO: BenchmarkScenario = {
   },
 };
 
+export const LEDGER_SESSION_TRANSPORT_WORKFLOW_SCENARIO: BenchmarkScenario = {
+  version: 3,
+  suite: 'workflow',
+  fixtureId: 'ledger-session-transport-workflow-v1',
+  title: 'Collaborative Remux session-transport implementation workflow',
+  sourceRepository: '/home/ubuntu/ledger',
+  baseCommit: 'b8512c941438738d0cb9a27bf44f740c1f920b3e',
+  referenceCommit: '85c98dc62879195c6e5e1aa46d2c1a8cce421721',
+  sourceRollouts: [
+    '/home/ubuntu/.codex/sessions/2026/07/08/rollout-2026-07-08T03-10-48-019f3fb4-e7e1-77a0-b49a-b1cb7b6dbc73.jsonl',
+  ],
+  sourceTurnIds: ['019f3fb4-e818-7ab3-a0e8-631f82cd18c3'],
+  visibleInputs: [{
+    path: 'docs/ledger_session_transport_implementation_spec.md',
+    sourceRef: '85c98dc62879195c6e5e1aa46d2c1a8cce421721',
+    sourcePath: 'docs/ledger_session_transport_implementation_spec.md',
+  }],
+  governingPaths: ['docs/ledger_session_transport_implementation_spec.md'],
+  fixedPrompt: null,
+  driverCardPath: resolve(SCENARIO_ROOT, 'session-transport/driver-card.md'),
+  driverBrief: {
+    goal: 'Collaboratively audit, implement, and validate the Remux session transport and its watcher-backed push streams.',
+    background: [
+      'The checked-in session-transport specification is the governing authority.',
+      'The feed/session and projection layers already exist in the prepared repository and should be reused through their public surfaces.',
+      'The owner wants a repository-grounded design audit before authorizing implementation.',
+    ],
+    constraints: [
+      'Do not expose the historical reference implementation, source rollout, or evaluator tests.',
+      'Do not commit or push.',
+      'Lens, cache, runtime, store, and the existing CLI are out of scope.',
+    ],
+    defaultAuthority: { mayWrite: false, mayCommit: false, mayPush: false },
+  },
+  maxUserTurns: 5,
+  maxDurationMs: 90 * 60_000,
+  forbiddenPaths: [
+    'crates/cache/',
+    'crates/runtime/',
+    'crates/store/',
+    'crates/cli/',
+    'lens/',
+  ],
+  evaluator: {
+    overlayPaths: [],
+    overlayRewrites: [],
+    formatCommand: {
+      id: 'cargo-fmt',
+      file: 'cargo',
+      args: ['fmt', '--all', '--', '--check'],
+    },
+    behavioralCommand: {
+      id: 'session-transport-behavior',
+      file: 'node',
+      args: [resolve(SCENARIO_ROOT, 'session-transport/evaluate.mjs')],
+      heavy: true,
+    },
+  },
+};
+
 const SCENARIOS = new Map([
   [LEDGER_PROJECTION_TIME_BARS_SCENARIO.fixtureId, LEDGER_PROJECTION_TIME_BARS_SCENARIO],
   [LEDGER_FEED_SESSION_WORKFLOW_SCENARIO.fixtureId, LEDGER_FEED_SESSION_WORKFLOW_SCENARIO],
+  [LEDGER_SESSION_TRANSPORT_WORKFLOW_SCENARIO.fixtureId, LEDGER_SESSION_TRANSPORT_WORKFLOW_SCENARIO],
 ]);
 
 export function benchmarkScenario(fixtureId: string) {

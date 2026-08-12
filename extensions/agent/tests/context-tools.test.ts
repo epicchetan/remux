@@ -7,13 +7,15 @@ import { createContextTools } from '../server/src/context/tools.ts';
 
 test('model-facing context tools use Thread, History, and work-unit start/finish language', async () => {
   const seen: {
+    searchCallId?: string;
     openedRef?: string;
     resources?: Array<{ ref: string }>;
     returnedResources?: Array<{ ref: string }>;
     threadUpdate?: string;
   } = {};
   const tools = createContextTools({
-    async journalSearch(input) {
+    async journalSearch(callId, input) {
+      seen.searchCallId = callId;
       return {
         query: input.query,
         scope: input.scope ?? 'conversation',
@@ -100,6 +102,7 @@ test('model-facing context tools use Thread, History, and work-unit start/finish
     'search', { query: 'prior' }, undefined, undefined, context,
   );
   assert.equal((search.details as { hits: Array<{ ref: string }> }).hits[0]?.ref, 'history://turn/prior');
+  assert.equal(seen.searchCallId, 'search');
   const opened = await byName.get('history_read')!.execute(
     'read', { ref: 'history://turn/prior' }, undefined, undefined, context,
   );

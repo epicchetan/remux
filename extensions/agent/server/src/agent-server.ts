@@ -884,9 +884,11 @@ export class AgentServer {
           afterProviderCall: (input) => this.afterProviderCall(conversation.id, input),
           beforeTool: (input) => this.beforeTool(conversation.id, input),
           afterTool: (input) => this.afterTool(conversation.id, input),
-          journalSearch: (input) => {
+          journalSearch: (callId, input) => {
             if (!this.journal.searchJournal) throw new Error('Durable journal search is unavailable.');
-            return this.journal.searchJournal(conversation.id, input);
+            return this.journal.searchJournal(conversation.id, input, {
+              excludeRef: `journal://tool/${encodeURIComponent(callId)}`,
+            });
           },
           journalOpen: (input) => {
             if (!this.journal.openJournal) throw new Error('Durable journal open is unavailable.');
@@ -1229,9 +1231,16 @@ export class AgentServer {
   ) {
     const parent = this.requiredActiveDurableScope(conversationId);
     if (!this.isRootScope(parent)) throw new Error('Work units cannot be nested.');
-    if (!this.journal.enterWorkUnit) throw new Error('Durable work unit entry is unavailable.');
+    if (!this.journal.prepareWorkUnitEntry || !this.journal.commitWorkUnitEntry) {
+      throw new Error('Durable work unit entry is unavailable.');
+    }
     await this.flushAssistantCheckpoint();
-    const entered = await this.enqueueTurnWrite(() => this.journal.enterWorkUnit!(parent, input));
+    // Materialization and model-input validation happen before the durable
+    // write boundary. A missing, non-text, or directory resource is a
+    // correctable tool error, not a poisoned journal.
+    const prepared = await this.journal.prepareWorkUnitEntry(parent, input);
+    const entered = await this.enqueueTurnWrite(() =>
+      this.journal.commitWorkUnitEntry!(parent, prepared));
     this.toolScopes.set(callId, parent);
     this.activeDurableScope = entered.handle;
     return {

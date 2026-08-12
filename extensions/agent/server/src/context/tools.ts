@@ -114,7 +114,7 @@ function workUnitResourceSchema() {
     ref: Type.String({
       minLength: 1,
       maxLength: 4 * 1024,
-      description: 'A history:// reference or an absolute or working-directory-relative filesystem path.',
+      description: 'A history:// reference or an absolute or working-directory-relative UTF-8 text file. Directories are not resources; name specific files instead.',
     }),
     role: Type.Union([
       Type.Literal('authority'),
@@ -144,8 +144,8 @@ export function createContextTools(
       promptSnippet: 'Search exact earlier conversation and execution History',
       parameters: searchSchema,
       executionMode: 'parallel',
-      async execute(_callId, params) {
-        const result = await durability.journalSearch(params);
+      async execute(callId, params) {
+        const result = await durability.journalSearch(callId, params);
         return jsonResult({
           ...result,
           hits: result.hits.map((hit) => ({ ...hit, ref: modelHistoryRef(hit.ref) })),
