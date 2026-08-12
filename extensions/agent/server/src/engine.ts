@@ -41,11 +41,26 @@ export type RuntimeDurabilityHooks = {
     payload: unknown;
     requestMode: 'full' | 'continuation';
     estimatedInputTokens: number;
+    retryOfInferenceId?: string;
     context: DurableInferenceContext;
   }): Promise<void>;
+  supersedeProviderAttempt(input: {
+    attempt: number;
+    maxAttempts: number;
+    delayMs: number;
+    error: string;
+  }): Promise<{ inferenceId: string }>;
   afterProviderCall?(input: {
     plannedRequestMode: 'full' | 'continuation';
     actualRequestMode: 'full' | 'continuation';
+    carrier: 'websocket' | 'sse' | 'unknown';
+    websocketRequests: number;
+    connectionsCreated: number;
+    connectionsReused: number;
+    websocketFailures: number;
+    sseFallbacks: number;
+    dispatchToFirstEventMs: number | null;
+    durationMs: number;
   }): Promise<void>;
   beforeTool(input: { callId: string; name: string; args: unknown }): Promise<void>;
   afterTool(input: {

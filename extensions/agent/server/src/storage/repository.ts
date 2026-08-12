@@ -560,6 +560,17 @@ export class AgentJournalRepository {
     return this.enqueueWrite(() => this.storage.transaction(() => {
       this.assertRunningHandle(handle);
       const scope = this.scopeIdentity(handle.scopeId);
+      const inference = this.storage.database.prepare(`
+        SELECT inference_id FROM inferences
+        WHERE scope_id = ? AND state = 'running'
+        ORDER BY ordinal DESC LIMIT 1
+      `).get(handle.scopeId) as { inference_id: string } | undefined;
+      if (inference) {
+        payload = {
+          ...(payload as Record<string, CanonicalJsonValue>),
+          inferenceId: inference.inference_id,
+        };
+      }
       const recordedAt = safeTimestamp(this.now());
       const sequence = this.insertEvent({
         ...handle,
@@ -788,6 +799,7 @@ export class AgentJournalRepository {
       requestMode: 'full' | 'continuation';
       estimatedInputTokens: number;
       payload: unknown;
+      retryOfInferenceId?: string;
       context: DurableInferenceContext;
     },
   ) {
@@ -898,6 +910,9 @@ export class AgentJournalRepository {
           ordinal,
           requestMode: input.requestMode,
           dispatchArtifactHash: dispatchArtifact.hash,
+          ...(input.retryOfInferenceId
+            ? { retryOfInferenceId: input.retryOfInferenceId }
+            : {}),
         },
         artifactHash: manifestArtifact.hash,
         createdAt: recordedAt,
@@ -956,6 +971,19 @@ export class AgentJournalRepository {
         input.estimatedInputTokens,
         sequence,
       );
+      if (input.retryOfInferenceId) {
+        const prior = this.storage.database.prepare(`
+          SELECT inference_id FROM inferences
+          WHERE inference_id = ? AND scope_id = ? AND state = 'failed'
+        `).get(input.retryOfInferenceId, handle.scopeId) as { inference_id: string } | undefined;
+        if (!prior) throw new Error('A provider retry does not reference the superseded failed inference.');
+        const superseded = this.storage.database.prepare(`
+          SELECT 1 FROM events
+          WHERE scope_id = ? AND type = 'inference.superseded'
+            AND json_extract(payload_json, '$.inferenceId') = ?
+        `).get(handle.scopeId, input.retryOfInferenceId);
+        if (!superseded) throw new Error('A provider retry began before its failed attempt was superseded.');
+      }
       const inspector = contextInspectorValue({
         frameId,
         manifest: manifestValue,
@@ -975,6 +1003,14 @@ export class AgentJournalRepository {
     input: {
       plannedRequestMode: 'full' | 'continuation';
       actualRequestMode: 'full' | 'continuation';
+      carrier: 'websocket' | 'sse' | 'unknown';
+      websocketRequests: number;
+      connectionsCreated: number;
+      connectionsReused: number;
+      websocketFailures: number;
+      sseFallbacks: number;
+      dispatchToFirstEventMs: number | null;
+      durationMs: number;
     },
   ) {
     this.assertOpen();
@@ -1006,6 +1042,34 @@ export class AgentJournalRepository {
           inferenceId: inference.inference_id,
           plannedRequestMode: input.plannedRequestMode,
           actualRequestMode: input.actualRequestMode,
+          carrier: input.carrier,
+          websocketRequests: safeNonnegativeInteger(
+            input.websocketRequests,
+            'provider WebSocket request count',
+          ),
+          connectionsCreated: safeNonnegativeInteger(
+            input.connectionsCreated,
+            'provider connection-created count',
+          ),
+          connectionsReused: safeNonnegativeInteger(
+            input.connectionsReused,
+            'provider connection-reused count',
+          ),
+          websocketFailures: safeNonnegativeInteger(
+            input.websocketFailures,
+            'provider WebSocket failure count',
+          ),
+          sseFallbacks: safeNonnegativeInteger(
+            input.sseFallbacks,
+            'provider SSE fallback count',
+          ),
+          dispatchToFirstEventMs: input.dispatchToFirstEventMs === null
+            ? null
+            : safeNonnegativeInteger(
+                input.dispatchToFirstEventMs,
+                'provider dispatch-to-first-event duration',
+              ),
+          durationMs: safeNonnegativeInteger(input.durationMs, 'provider call duration'),
         },
         createdAt: recordedAt,
       });
@@ -1161,6 +1225,66 @@ export class AgentJournalRepository {
     }));
   }
 
+  async supersedeInference(
+    handle: DurableTurnHandle,
+    input: {
+      attempt: number;
+      maxAttempts: number;
+      delayMs: number;
+      error: string;
+    },
+  ) {
+    this.assertOpen();
+    const result = await this.enqueueWrite(() => this.storage.transaction(() => {
+      this.assertRunningHandle(handle);
+      const inference = this.storage.database.prepare(`
+        SELECT inference_id, started_sequence
+        FROM inferences
+        WHERE scope_id = ? AND state = 'failed'
+          AND NOT EXISTS (
+            SELECT 1 FROM events e
+            WHERE e.scope_id = inferences.scope_id
+              AND e.type = 'inference.superseded'
+              AND json_extract(e.payload_json, '$.inferenceId') = inferences.inference_id
+          )
+        ORDER BY ordinal DESC LIMIT 1
+      `).get(handle.scopeId) as {
+        inference_id: string;
+        started_sequence: number;
+      } | undefined;
+      if (!inference) throw new Error('No retryable failed inference is available to supersede.');
+      const toolEffect = this.storage.database.prepare(`
+        SELECT 1 FROM events
+        WHERE scope_id = ? AND sequence > ?
+          AND type IN ('tool.called', 'tool.completed')
+        LIMIT 1
+      `).get(handle.scopeId, inference.started_sequence);
+      if (toolEffect) {
+        throw new Error('A provider attempt with a durable tool effect cannot be superseded.');
+      }
+      const recordedAt = safeTimestamp(this.now());
+      const sequence = this.insertEvent({
+        ...handle,
+        eventId: this.nextId('event'),
+        type: 'inference.superseded',
+        actor: 'harness',
+        visibility: 'internal',
+        payload: {
+          attempt: safeNonnegativeInteger(input.attempt, 'provider retry attempt'),
+          delayMs: safeNonnegativeInteger(input.delayMs, 'provider retry delay'),
+          error: input.error.slice(0, 1_000),
+          inferenceId: inference.inference_id,
+          maxAttempts: safeNonnegativeInteger(input.maxAttempts, 'provider retry maximum'),
+          reason: 'retryable_provider_error',
+        },
+        createdAt: recordedAt,
+      });
+      return { inferenceId: inference.inference_id, sequence };
+    }));
+    await this.rebuildRunningAssistantAccumulator(handle.turnId);
+    return result;
+  }
+
   finishTurn(
     handle: DurableTurnHandle,
     input: {
@@ -1280,6 +1404,12 @@ export class AgentJournalRepository {
     }
     const actions: DurableTranscriptProjectionAction[] = [];
     const startedAtByTurn = new Map<string, number>();
+    const supersededInferenceIds = new Set(events.flatMap((event) => {
+      if (event.type !== 'inference.superseded' || !event.payload ||
+        typeof event.payload !== 'object' || Array.isArray(event.payload)) return [];
+      const inferenceId = (event.payload as Record<string, CanonicalJsonValue>).inferenceId;
+      return typeof inferenceId === 'string' ? [inferenceId] : [];
+    }));
     for (const event of events) {
       // Work-unit events share the parent turn id so they remain searchable and
       // auditable, but they are intentionally not top-level transcript rows.
@@ -1306,6 +1436,8 @@ export class AgentJournalRepository {
           ...(parts.length > 0 ? { parts } : {}),
         });
       } else if (event.type === 'assistant.checkpoint' && event.visibility === 'transcript') {
+        const inferenceId = payload.inferenceId;
+        if (typeof inferenceId === 'string' && supersededInferenceIds.has(inferenceId)) continue;
         actions.push({
           type: 'assistant',
           sequence: event.sequence,
@@ -2026,6 +2158,14 @@ export class AgentJournalRepository {
             : event.type === 'inference.failed'
               ? 'failed'
               : 'interrupted',
+        });
+      } else if (event.type === 'inference.superseded') {
+        replay.push({
+          type: 'inference-superseded',
+          sequence: event.sequence,
+          turnId: event.turnId,
+          timestamp: event.createdAt,
+          inferenceId: requiredString(payload.inferenceId, 'inferenceId'),
         });
       } else if (event.type === 'tool.called') {
         replay.push({
@@ -4105,6 +4245,56 @@ export class AgentJournalRepository {
     return { assistantMessageArtifact, assistantMessageId };
   }
 
+  private async rebuildRunningAssistantAccumulator(turnId: string) {
+    const item = this.storage.database.prepare(`
+      SELECT item_id FROM transcript_items
+      WHERE turn_id = ? AND kind = 'assistant'
+    `).get(turnId) as { item_id: string } | undefined;
+    if (!item) return;
+    const rows = this.storage.database.prepare(`
+      SELECT e.payload_json
+      FROM events e
+      WHERE e.turn_id = ? AND e.visibility = 'transcript'
+        AND e.type = 'assistant.checkpoint'
+        AND NOT EXISTS (
+          SELECT 1 FROM events superseded
+          WHERE superseded.scope_id = e.scope_id
+            AND superseded.type = 'inference.superseded'
+            AND json_extract(superseded.payload_json, '$.inferenceId') =
+                json_extract(e.payload_json, '$.inferenceId')
+        )
+      ORDER BY e.sequence
+    `).all(turnId) as Array<{ payload_json: string }>;
+    let summaryText = '';
+    let summaryPendingSpace = false;
+    let textByteLength = 0;
+    let reasoningByteLength = 0;
+    for (const row of rows) {
+      const payload = JSON.parse(row.payload_json) as Record<string, CanonicalJsonValue>;
+      const textDelta = payload.textDelta === undefined
+        ? await this.readTextRef(payload.text)
+        : requiredString(payload.textDelta, 'textDelta');
+      const reasoningDelta = payload.reasoningDelta === undefined
+        ? await this.readTextRef(payload.reasoning)
+        : requiredString(payload.reasoningDelta, 'reasoningDelta');
+      const summary = appendAssistantSummary({ summaryText, summaryPendingSpace }, textDelta);
+      summaryText = summary.text;
+      summaryPendingSpace = summary.pendingSpace;
+      textByteLength += Buffer.byteLength(textDelta, 'utf8');
+      reasoningByteLength += Buffer.byteLength(reasoningDelta, 'utf8');
+    }
+    await this.enqueueWrite(() => this.storage.database.prepare(`
+      UPDATE transcript_items SET value_json = ?
+      WHERE item_id = ? AND turn_id = ? AND kind = 'assistant'
+    `).run(canonicalJson({
+      reasoningByteLength,
+      summaryPendingSpace,
+      summaryText,
+      textByteLength,
+      version: 2,
+    }), item.item_id, turnId));
+  }
+
   private async prepareAssistantProjection(
     turnId: string,
   ): Promise<PreparedAssistantProjection | null> {
@@ -4115,10 +4305,19 @@ export class AgentJournalRepository {
     if (!item) return null;
     const rows = this.storage.database.prepare(`
       SELECT sequence, type, payload_json
-      FROM events
-      WHERE turn_id = ? AND visibility = 'transcript'
-        AND type IN ('assistant.checkpoint', 'tool.called')
-      ORDER BY sequence
+      FROM events e
+      WHERE e.turn_id = ? AND e.visibility = 'transcript'
+        AND e.type IN ('assistant.checkpoint', 'tool.called')
+        AND (
+          e.type <> 'assistant.checkpoint' OR NOT EXISTS (
+            SELECT 1 FROM events superseded
+            WHERE superseded.scope_id = e.scope_id
+              AND superseded.type = 'inference.superseded'
+              AND json_extract(superseded.payload_json, '$.inferenceId') =
+                  json_extract(e.payload_json, '$.inferenceId')
+          )
+        )
+      ORDER BY e.sequence
     `).all(turnId) as Array<{
       sequence: number;
       type: string;
@@ -4335,9 +4534,15 @@ export class AgentJournalRepository {
       this.insertArtifact(finalization.assistantMessageArtifact, sequence, 'content');
       if (finalization.assistantMessageArtifact && finalization.assistantMessageId) {
         const providerItem = this.storage.database.prepare(`
-          SELECT provider_item_id FROM provider_items
-          WHERE scope_id = ? AND item_type = 'assistant_message'
-          ORDER BY created_sequence DESC LIMIT 1
+          SELECT pi.provider_item_id FROM provider_items pi
+          WHERE pi.scope_id = ? AND pi.item_type = 'assistant_message'
+            AND NOT EXISTS (
+              SELECT 1 FROM events superseded
+              WHERE superseded.scope_id = pi.scope_id
+                AND superseded.type = 'inference.superseded'
+                AND json_extract(superseded.payload_json, '$.inferenceId') = pi.inference_id
+            )
+          ORDER BY pi.created_sequence DESC LIMIT 1
         `).get(handle.scopeId) as { provider_item_id: string } | undefined;
         const ordinal = this.storage.database.prepare(`
           SELECT COALESCE(MAX(ordinal), -1) + 1 AS ordinal FROM messages WHERE scope_id = ?
@@ -5004,11 +5209,16 @@ export class AgentJournalRepository {
   ): Promise<LogicalContextMessage[]> {
     if (scopeIds.length === 0) return [...messages];
     const rows = this.storage.database.prepare(`
-      SELECT raw_artifact_hash
-      FROM provider_items
-      WHERE scope_id IN (${sqlPlaceholders(scopeIds.length)})
-        AND turn_id = ? AND item_type = 'assistant_message'
-      ORDER BY created_sequence
+      SELECT pi.raw_artifact_hash
+      FROM provider_items pi
+      WHERE pi.scope_id IN (${sqlPlaceholders(scopeIds.length)})
+        AND pi.turn_id = ? AND pi.item_type = 'assistant_message'
+        AND NOT EXISTS (
+          SELECT 1 FROM events e
+          WHERE e.scope_id = pi.scope_id AND e.type = 'inference.superseded'
+            AND json_extract(e.payload_json, '$.inferenceId') = pi.inference_id
+        )
+      ORDER BY pi.created_sequence
     `).all(...scopeIds, turnId) as Array<{ raw_artifact_hash: string }>;
     if (rows.length === 0) return [...messages];
     const providerMessages = await Promise.all(rows.map(async ({ raw_artifact_hash }) =>

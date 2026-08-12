@@ -83,6 +83,13 @@ export type LogicalReplayEvent =
       state: 'completed' | 'failed' | 'interrupted';
     }
   | {
+      type: 'inference-superseded';
+      sequence: number;
+      turnId: string;
+      timestamp: number;
+      inferenceId: string;
+    }
+  | {
       type: 'tool-called';
       sequence: number;
       turnId: string;
@@ -125,7 +132,7 @@ type AssistantBuilder = {
   text: string;
   reasoning: string;
   toolCalls: PendingToolCall[];
-  state: 'running' | 'completed' | 'failed' | 'interrupted';
+  state: 'running' | 'completed' | 'failed' | 'interrupted' | 'superseded';
   timestamp: number;
 };
 
@@ -197,6 +204,14 @@ export function reduceLogicalReplay(events: LogicalReplayEvent[]): LogicalContex
         latestByTurn.set(event.turnId, assistant);
         break;
       }
+      case 'inference-superseded': {
+        const assistant = byInference.get(event.inferenceId);
+        if (!assistant) break;
+        assistant.state = 'superseded';
+        if (activeByTurn.get(event.turnId) === assistant) activeByTurn.delete(event.turnId);
+        if (latestByTurn.get(event.turnId) === assistant) latestByTurn.delete(event.turnId);
+        break;
+      }
       case 'tool-called': {
         const assistant = latestByTurn.get(event.turnId) ??
           activeByTurn.get(event.turnId) ??
@@ -235,6 +250,7 @@ export function reduceLogicalReplay(events: LogicalReplayEvent[]): LogicalContex
 
   return units.flatMap((unit): LogicalContextMessage[] => {
     if ('role' in unit) return [unit];
+    if (unit.state === 'superseded') return [];
     const completedCalls = unit.toolCalls.filter(
       (call): call is PendingToolCall & { result: NonNullable<PendingToolCall['result']> } =>
         call.result !== undefined,

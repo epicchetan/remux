@@ -994,7 +994,7 @@ function measureParentHandoffReads(
     const returnedPaths = new Set(arrayValue(payload.resources)
       .map(objectValue)
       .map(({ ref }) => stringValue(ref))
-      .filter((ref): ref is string => Boolean(ref) && !ref.includes('://'))
+      .filter((ref): ref is string => typeof ref === 'string' && !ref.includes('://'))
       .map((ref) => normalizeWorkspacePath(ref, workspacePath)));
     const nextBoundary = eventRows.find((candidate) => {
       if (candidate.sequence <= event.sequence) return false;

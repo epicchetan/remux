@@ -9,6 +9,7 @@ import type { AssistantMessage } from '@earendil-works/pi-ai';
 
 import { AgentServer } from '../server/src/agent-server.ts';
 import { FixtureEngine } from '../server/src/fixture-engine.ts';
+import type { AgentEngine, ConversationRuntime } from '../server/src/engine.ts';
 import { AgentJournalRepository, type DurableTurnHandle } from '../server/src/storage/repository.ts';
 import { AGENT_JOURNAL_TABLES } from '../server/src/storage/schema.ts';
 
@@ -413,8 +414,12 @@ test('bounded work units inherit typed resources and fold back only their contin
   assert.doesNotMatch(transcriptText, /call:child|call:return|CHILD_PRIVATE_REASONING|CHILD_TOOL_RESULT/u);
   const durableEvents = await fixture.repository.readEvents({ conversationId: conversation.conversationId });
   const returnedEvent = durableEvents.find(({ type }) => type === 'work_unit.returned');
+  const returnedPayload = returnedEvent?.payload;
+  if (!returnedPayload || typeof returnedPayload !== 'object' || Array.isArray(returnedPayload)) {
+    assert.fail('The work-unit return event is missing its object payload.');
+  }
   assert.deepEqual(
-    (returnedEvent?.payload.resources as Array<{ ref: string; role: string }> | undefined)
+    (returnedPayload.resources as Array<{ ref: string; role: string }> | undefined)
       ?.map(({ ref, role }) => ({ ref, role })),
     [
       { ref: 'docs/seam-contract.md', role: 'authority' },
@@ -642,6 +647,100 @@ test('context pressure is durable, scope-specific, and emitted at most once acro
   await fixture.repository.finishTurn(turn, { status: 'interrupted' });
 });
 
+test('retryable provider attempts stay auditable but disappear from active context and transcript', async (t) => {
+  const fixture = await repositoryFixture(t);
+  const conversation = await fixture.repository.createConversation({
+    operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'model', reasoning: 'high',
+  });
+  const turn = await accept(fixture.repository, conversation.conversationId, 'Recover this request.');
+  const initialContext = await fixture.repository.compileContext(conversation.conversationId);
+  const failed = await startInference(fixture.repository, turn, initialContext);
+  await fixture.repository.appendAssistantCheckpoint(turn, {
+    textDelta: 'Provisional output that must be replaced.',
+    reasoningDelta: 'Incomplete reasoning.',
+  });
+  await fixture.repository.recordProviderItem(turn, assistantMessage({
+    content: [{ type: 'text', text: 'Provisional output that must be replaced.' }],
+    stopReason: 'error',
+  }));
+  await fixture.repository.finishInference(turn, { state: 'failed' });
+  const superseded = await fixture.repository.supersedeInference(turn, {
+    attempt: 1,
+    maxAttempts: 2,
+    delayMs: 500,
+    error: 'WebSocket error',
+  });
+  assert.equal(superseded.inferenceId, failed.inferenceId);
+
+  const retryContext = await fixture.repository.compileContext(conversation.conversationId);
+  assert.deepEqual(retryContext.messages.map(({ role }) => role), ['user']);
+  assert.ok(retryContext.messages.every((message) =>
+    message.role !== 'assistant' || !message.text.includes('Provisional output')));
+  assert.ok((await fixture.repository.readTranscriptActions(conversation.conversationId))
+    .every((action) => action.type !== 'assistant' || !action.textDelta.includes('Provisional output')));
+
+  const retry = await startInference(
+    fixture.repository,
+    turn,
+    retryContext,
+    failed.inferenceId,
+  );
+  await fixture.repository.appendAssistantCheckpoint(turn, {
+    textDelta: 'Recovered output.',
+    reasoningDelta: 'Completed reasoning.',
+  });
+  await fixture.repository.recordProviderItem(turn, assistantMessage({
+    content: [{ type: 'text', text: 'Recovered output.' }],
+    stopReason: 'stop',
+  }));
+  await fixture.repository.finishInference(turn, { state: 'completed' });
+
+  const recovered = await fixture.repository.compileContext(conversation.conversationId);
+  const assistant = recovered.messages.find((message) => message.role === 'assistant');
+  assert.equal(assistant?.role, 'assistant');
+  if (assistant?.role === 'assistant') {
+    assert.equal(assistant.text, 'Recovered output.');
+    assert.equal(assistant.providerMessage?.stopReason, 'stop');
+  }
+  const actions = await fixture.repository.readTranscriptActions(conversation.conversationId);
+  assert.deepEqual(
+    actions.filter((action) => action.type === 'assistant').map((action) => action.textDelta),
+    ['Recovered output.'],
+  );
+  const events = await fixture.repository.readEvents({ conversationId: conversation.conversationId });
+  const supersededEvent = events.find(({ type }) => type === 'inference.superseded');
+  const retryStarted = events.find((event) =>
+    event.type === 'inference.started' && event.payload && typeof event.payload === 'object' &&
+    !Array.isArray(event.payload) && event.payload.inferenceId === retry.inferenceId);
+  assert.ok(supersededEvent);
+  assert.ok(retryStarted?.payload && typeof retryStarted.payload === 'object' && !Array.isArray(retryStarted.payload));
+  if (retryStarted?.payload && typeof retryStarted.payload === 'object' && !Array.isArray(retryStarted.payload)) {
+    assert.equal(retryStarted.payload.retryOfInferenceId, failed.inferenceId);
+  }
+  await fixture.repository.finishTurn(turn, { status: 'completed' });
+});
+
+test('a provider attempt with a durable tool effect cannot be superseded', async (t) => {
+  const fixture = await repositoryFixture(t);
+  const conversation = await fixture.repository.createConversation({
+    operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'model', reasoning: 'high',
+  });
+  const turn = await accept(fixture.repository, conversation.conversationId, 'Do not replay effects.');
+  const context = await fixture.repository.compileContext(conversation.conversationId);
+  await startInference(fixture.repository, turn, context);
+  await fixture.repository.finishInference(turn, { state: 'failed' });
+  await fixture.repository.recordToolStarted(turn, {
+    callId: 'durable-effect', name: 'bash', args: { command: 'touch sentinel' },
+  });
+  await assert.rejects(
+    fixture.repository.supersedeInference(turn, {
+      attempt: 1, maxAttempts: 2, delayMs: 500, error: 'WebSocket error',
+    }),
+    /durable tool effect/u,
+  );
+  await fixture.repository.finishTurn(turn, { status: 'failed', error: 'Transport failed.' });
+});
+
 test('the public fixture runtime commits a v4 frame and completes through normal server hooks', async (t) => {
   const fixture = await repositoryFixture(t);
   const server = new AgentServer({
@@ -694,6 +793,76 @@ test('the public fixture runtime commits a v4 frame and completes through normal
   assert.ok(events.some(({ type }) => type === 'turn.terminal'));
 });
 
+test('the public runtime recovers a response-started transport drop without duplicating partial output', async (t) => {
+  const fixture = await repositoryFixture(t);
+  const server = new AgentServer({
+    engine: new RecoveringTransportFixtureEngine(),
+    journal: fixture.repository,
+    notify() {},
+  });
+  t.after(() => server.close());
+  await server.initialize();
+  const created = await server.handle('remux/agent/conversation/create', {
+    operationId: crypto.randomUUID(),
+    cwd: fixture.cwd,
+    modelId: 'gpt-5.6-recovery-fixture',
+    reasoning: 'high',
+  }) as { conversationId: string };
+  const sent = await server.handle('remux/agent/conversation/message/send', {
+    operationId: crypto.randomUUID(),
+    conversationId: created.conversationId,
+    clientMessageId: crypto.randomUUID(),
+    text: 'Survive a dropped WebSocket.',
+  }) as { turnId: string };
+  await eventually(async () => {
+    const response = await server.handle('remux/agent/resources/read', {
+      requests: [{ key: 'runtime' }],
+    }) as { resources: Array<{ value?: { state?: string } }> };
+    return response.resources[0]?.value?.state === 'idle';
+  });
+
+  const turn = await fixture.repository.readTurn(created.conversationId, sent.turnId);
+  assert.equal(turn.state, 'completed');
+  const actions = await fixture.repository.readTranscriptActions(created.conversationId);
+  assert.deepEqual(
+    actions.filter((action) => action.type === 'assistant').map((action) => action.textDelta),
+    ['Recovered through a fresh provider frame.'],
+  );
+  const events = await fixture.repository.readEvents({ conversationId: created.conversationId });
+  assert.equal(events.filter(({ type }) => type === 'inference.failed').length, 1);
+  assert.equal(events.filter(({ type }) => type === 'inference.superseded').length, 1);
+  assert.equal(events.filter(({ type }) => type === 'inference.completed').length, 1);
+  const transports = events.filter(({ type }) => type === 'inference.transport');
+  assert.equal(transports.length, 2);
+  const failedTransport = transports[0]?.payload;
+  assert.ok(failedTransport && typeof failedTransport === 'object' && !Array.isArray(failedTransport));
+  if (failedTransport && typeof failedTransport === 'object' && !Array.isArray(failedTransport)) {
+    assert.equal(failedTransport.carrier, 'websocket');
+    assert.equal(failedTransport.websocketRequests, 1);
+    assert.equal(failedTransport.connectionsCreated, 1);
+    assert.equal(failedTransport.websocketFailures, 1);
+    assert.equal(failedTransport.dispatchToFirstEventMs, 40);
+    assert.equal(failedTransport.durationMs, 65);
+  }
+  const recoveredTransport = transports[1]?.payload;
+  assert.ok(recoveredTransport && typeof recoveredTransport === 'object' && !Array.isArray(recoveredTransport));
+  if (recoveredTransport && typeof recoveredTransport === 'object' && !Array.isArray(recoveredTransport)) {
+    assert.equal(recoveredTransport.carrier, 'sse');
+    assert.equal(recoveredTransport.websocketRequests, 0);
+    assert.equal(recoveredTransport.sseFallbacks, 1);
+    assert.equal(recoveredTransport.dispatchToFirstEventMs, 30);
+    assert.equal(recoveredTransport.durationMs, 55);
+  }
+  const starts = events.filter(({ type }) => type === 'inference.started');
+  assert.equal(starts.length, 2);
+  const retryPayload = starts[1]?.payload;
+  assert.ok(retryPayload && typeof retryPayload === 'object' && !Array.isArray(retryPayload));
+  if (retryPayload && typeof retryPayload === 'object' && !Array.isArray(retryPayload)) {
+    assert.equal(retryPayload.requestMode, 'full');
+    assert.equal(typeof retryPayload.retryOfInferenceId, 'string');
+  }
+});
+
 async function repositoryFixture(t: TestContext) {
   const dataRoot = await mkdtemp(join(tmpdir(), 'remux-agent-thread-runtime-'));
   const cwd = join(dataRoot, 'workspace');
@@ -728,12 +897,14 @@ async function startInference(
   repository: AgentJournalRepository,
   handle: DurableTurnHandle,
   context: Awaited<ReturnType<AgentJournalRepository['compileContext']>>,
+  retryOfInferenceId?: string,
 ) {
   return repository.startInference(handle, {
     modelId: 'gpt-5.6-codex',
     requestMode: 'full',
     estimatedInputTokens: 2_000,
     payload: { messages: [] },
+    ...(retryOfInferenceId ? { retryOfInferenceId } : {}),
     context: {
       basisSequence: context.basisSequence,
       logicalHash: context.logicalHash,
@@ -778,4 +949,140 @@ async function eventually(check: () => Promise<boolean>, timeoutMs = 3_000) {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   assert.fail(`Condition was not met within ${timeoutMs} ms.`);
+}
+
+class RecoveringTransportFixtureEngine implements AgentEngine {
+  async authStatus() {
+    return {
+      state: 'signed-in' as const,
+      operationId: null,
+      displayLabel: 'Recovery fixture',
+      verificationUri: null,
+      userCode: null,
+      expiresAt: null,
+      progress: null,
+      error: null,
+    };
+  }
+
+  async login() {}
+  async logout() {}
+
+  async listModels() {
+    return [{
+      id: 'gpt-5.6-recovery-fixture',
+      name: 'GPT-5.6 Recovery Fixture',
+      provider: 'openai-codex' as const,
+      contextWindow: 400_000,
+      supportedReasoning: ['high' as const],
+    }];
+  }
+
+  async createConversation(
+    options: Parameters<AgentEngine['createConversation']>[0],
+  ): Promise<ConversationRuntime> {
+    let interrupted = false;
+    return {
+      async prompt() {
+        const firstContext = await options.durability.compileContext(400_000);
+        await options.durability.beforeProviderCall({
+          payload: { input: 'first-attempt' },
+          requestMode: 'full',
+          estimatedInputTokens: firstContext.frame.estimatedInputTokens,
+          context: durableFixtureContext(firstContext),
+        });
+        options.onEvent({ type: 'assistant-start' });
+        options.onEvent({ type: 'assistant-text', delta: 'Partial transport output.' });
+        await options.durability.afterProviderCall?.({
+          plannedRequestMode: 'full',
+          actualRequestMode: 'full',
+          carrier: 'websocket',
+          websocketRequests: 1,
+          connectionsCreated: 1,
+          connectionsReused: 0,
+          websocketFailures: 1,
+          sseFallbacks: 0,
+          dispatchToFirstEventMs: 40,
+          durationMs: 65,
+        });
+        await options.durability.beforeAssistantMessageEnd({
+          inferenceState: 'failed',
+          text: 'Partial transport output.',
+          reasoning: '',
+          calls: [],
+          providerMessage: fixtureProviderMessage('Partial transport output.', 'error'),
+        });
+        const superseded = await options.durability.supersedeProviderAttempt({
+          attempt: 1,
+          maxAttempts: 2,
+          delayMs: 0,
+          error: 'WebSocket error',
+        });
+        const retryContext = await options.durability.compileContext(400_000);
+        await options.durability.beforeProviderCall({
+          payload: { input: 'fresh-full-retry' },
+          requestMode: 'full',
+          estimatedInputTokens: retryContext.frame.estimatedInputTokens,
+          retryOfInferenceId: superseded.inferenceId,
+          context: durableFixtureContext(retryContext),
+        });
+        const recovered = 'Recovered through a fresh provider frame.';
+        options.onEvent({ type: 'assistant-start' });
+        options.onEvent({ type: 'assistant-text', delta: recovered });
+        await options.durability.afterProviderCall?.({
+          plannedRequestMode: 'full',
+          actualRequestMode: 'full',
+          carrier: 'sse',
+          websocketRequests: 0,
+          connectionsCreated: 0,
+          connectionsReused: 0,
+          websocketFailures: 0,
+          sseFallbacks: 1,
+          dispatchToFirstEventMs: 30,
+          durationMs: 55,
+        });
+        await options.durability.beforeAssistantMessageEnd({
+          inferenceState: 'completed',
+          text: recovered,
+          reasoning: '',
+          calls: [],
+          providerMessage: fixtureProviderMessage(recovered, 'stop'),
+        });
+        options.onEvent({ type: 'assistant-complete', interrupted });
+      },
+      async interrupt() {
+        interrupted = true;
+      },
+      async dispose() {
+        interrupted = true;
+      },
+    };
+  }
+}
+
+function durableFixtureContext(
+  context: Awaited<ReturnType<AgentJournalRepository['compileContext']>>,
+) {
+  return {
+    basisSequence: context.basisSequence,
+    logicalHash: context.logicalHash,
+    renderedHash: context.logicalHash,
+    orderedMessageHashes: context.orderedMessageHashes,
+    messageCount: context.messages.length,
+    fixedContractsHash: 'c'.repeat(64),
+    frame: context.frame,
+    frameBuildDurationMs: 0,
+    activeMessages: context.messages,
+  };
+}
+
+function fixtureProviderMessage(
+  text: string,
+  stopReason: AssistantMessage['stopReason'],
+): AssistantMessage {
+  return {
+    ...assistantMessage({ content: [{ type: 'text', text }], stopReason }),
+    model: 'gpt-5.6-recovery-fixture',
+    ...(stopReason === 'error' ? { errorMessage: 'WebSocket error' } : {}),
+  };
 }

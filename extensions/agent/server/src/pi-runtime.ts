@@ -7,11 +7,6 @@ import {
   type Model,
 } from '@earendil-works/pi-ai';
 import {
-  closeOpenAICodexWebSocketSessions,
-  getOpenAICodexWebSocketDebugStats,
-  resetOpenAICodexWebSocketDebugStats,
-} from '@earendil-works/pi-ai/api/openai-codex-responses';
-import {
   DefaultResourceLoader,
   getAgentDir,
   ModelRuntime,
@@ -50,6 +45,11 @@ import { canonicalJsonHash } from './storage/canonical-json.ts';
 import { createRemuxAgentSession } from './pi-session.ts';
 import { REMUX_SYSTEM_PROMPT } from './prompts.ts';
 import {
+  invalidateProviderLane,
+  planProviderLaneRequest,
+  type ProviderLaneState,
+} from './provider-lanes.ts';
+import {
   createWorkspaceReadTool,
   readWorkspaceFile,
   type WorkspaceReadExecutor,
@@ -59,6 +59,22 @@ const PROVIDER = 'openai-codex';
 const BASE_TOOL_NAMES = ['read', 'bash', 'edit', 'write', 'workspace_read'] as const;
 const PARENT_ACTIVE_TOOL_NAMES = [...BASE_TOOL_NAMES, ...PARENT_CONTEXT_TOOL_NAMES];
 const WORK_UNIT_ACTIVE_TOOL_NAMES = [...BASE_TOOL_NAMES, ...WORK_UNIT_CONTEXT_TOOL_NAMES];
+
+type ProviderTransportStats = {
+  requests: number;
+  connectionsCreated: number;
+  connectionsReused: number;
+  fullContextRequests: number;
+  deltaRequests: number;
+  websocketFailures: number;
+  sseFallbacks: number;
+};
+
+type ProviderTransportControls = {
+  close(sessionId?: string): void;
+  getStats(sessionId: string): ProviderTransportStats | undefined;
+  resetStats(sessionId?: string): void;
+};
 
 function runtimeContract() {
   const systemPrompt = REMUX_SYSTEM_PROMPT;
@@ -70,6 +86,8 @@ function runtimeContract() {
     'history@1',
     'thread@3',
     'work-unit@2',
+    'provider-retry@1',
+    'provider-lanes@1',
   ];
   return {
     systemPrompt,
@@ -88,18 +106,23 @@ function runtimeContract() {
 export class PiEngine implements AgentEngine {
   private readonly modelRuntime: ModelRuntime;
   private readonly workspaceRead: WorkspaceReadExecutor;
+  private readonly providerWebSocketFaultAfterEvents: (() => number | undefined) | undefined;
 
   private constructor(
     modelRuntime: ModelRuntime,
     workspaceRead: WorkspaceReadExecutor,
+    providerWebSocketFaultAfterEvents: (() => number | undefined) | undefined,
   ) {
     this.modelRuntime = modelRuntime;
     this.workspaceRead = workspaceRead;
+    this.providerWebSocketFaultAfterEvents = providerWebSocketFaultAfterEvents;
   }
 
   static async create(options: {
     modelRuntime?: ModelRuntime;
     workspaceRead?: WorkspaceReadExecutor;
+    /** Test-only hook for deterministic response-started WebSocket failure coverage. */
+    providerWebSocketFaultAfterEvents?: () => number | undefined;
   } = {}) {
     const modelRuntime = options.modelRuntime ?? await ModelRuntime.create({
       allowModelNetwork: false,
@@ -107,6 +130,7 @@ export class PiEngine implements AgentEngine {
     return new PiEngine(
       modelRuntime,
       options.workspaceRead ?? readWorkspaceFile,
+      options.providerWebSocketFaultAfterEvents,
     );
   }
 
@@ -168,14 +192,27 @@ export class PiEngine implements AgentEngine {
       modelId: options.modelId,
       providerRequestMode: 'none',
     };
-    let providerCallCount = 0;
+    let pendingRetryOfInferenceId: string | null = null;
+    let parentProviderSessionId = '';
+    let activeProviderSessionId = '';
+    let providerTransportControls: ProviderTransportControls | null = null;
+    const providerSessionIds = new Set<string>();
+    const providerLanes = new Map<string, ProviderLaneState>();
     let pendingTransport: {
+      providerSessionId: string;
       plannedRequestMode: 'full' | 'continuation';
+      startedAt: number;
+      firstEventAt: number | null;
+      requests: number;
+      connectionsCreated: number;
+      connectionsReused: number;
       fullContextRequests: number;
       deltaRequests: number;
+      websocketFailures: number;
+      sseFallbacks: number;
     } | null = null;
-    let lastRenderedHashes: readonly string[] | null = null;
     let pendingContext: {
+      providerSessionId: string;
       basisSequence: number;
       logicalHash: string;
       renderedHash: string;
@@ -190,7 +227,6 @@ export class PiEngine implements AgentEngine {
     let pendingContextError: unknown = null;
     let providerDurabilityTail: Promise<void> = Promise.resolve();
     let providerDurabilityError: unknown = null;
-    let providerBoundaryRegistered = false;
     let pendingAgentEnd: Extract<AgentSessionEvent, { type: 'agent_end' }> | null = null;
     const assistantDurability = new WeakMap<AssistantMessage, Promise<void>>();
     const awaitProviderDurability = async () => {
@@ -200,15 +236,30 @@ export class PiEngine implements AgentEngine {
     const ensureAssistantDurable = (message: AssistantMessage) => {
       const existing = assistantDurability.get(message);
       if (existing) return existing;
-      providerBoundaryRegistered = true;
       const transport = pendingTransport;
       pendingTransport = null;
       const durability = (async () => {
         if (transport) {
-          const actualRequestMode = observedTransportMode(sessionId, transport);
+          const completedAt = performance.now();
+          const controls = requiredProviderTransportControls(providerTransportControls);
+          const observation = observeProviderTransport(
+            controls,
+            transport.providerSessionId,
+            transport,
+          );
+          const actualRequestMode = observedTransportMode(
+            controls,
+            transport.providerSessionId,
+            transport,
+          );
           await options.durability.afterProviderCall?.({
             plannedRequestMode: transport.plannedRequestMode,
             actualRequestMode,
+            ...observation,
+            dispatchToFirstEventMs: transport.firstEventAt === null
+              ? null
+              : Math.max(0, Math.round(transport.firstEventAt - transport.startedAt)),
+            durationMs: Math.max(0, Math.round(completedAt - transport.startedAt)),
           });
         }
         const content = durableAssistantContent(message.content);
@@ -250,6 +301,14 @@ export class PiEngine implements AgentEngine {
           const compileStartedAt = performance.now();
           const compileFrame = async () => {
             const snapshot = await options.durability.compileContext(model.contextWindow);
+            activeProviderSessionId = snapshot.scopeKind === 'work_unit'
+              ? snapshot.scopeId
+              : parentProviderSessionId;
+            if (!providerSessionIds.has(activeProviderSessionId)) {
+              providerSessionIds.add(activeProviderSessionId);
+              requiredProviderTransportControls(providerTransportControls)
+                .resetStats(activeProviderSessionId);
+            }
             const dialogueTurnIds = new Set(snapshot.frame.dialogueTurnIds);
             const recentDialogue = snapshot.messages.filter((message) =>
               dialogueTurnIds.has(message.turnId));
@@ -282,6 +341,7 @@ export class PiEngine implements AgentEngine {
           const frameBuildDurationMs = Math.max(0, Math.round(performance.now() - compileStartedAt));
           const rendered = hashRenderedMessages(messages);
           pendingContext = {
+            providerSessionId: activeProviderSessionId,
             basisSequence: snapshot.basisSequence,
             logicalHash: snapshot.logicalHash,
             renderedHash: rendered.hash,
@@ -333,6 +393,12 @@ export class PiEngine implements AgentEngine {
         if (!event.isError && event.toolName === 'work_unit_start') {
           pi.setActiveTools(WORK_UNIT_ACTIVE_TOOL_NAMES);
         } else if (!event.isError && event.toolName === 'work_unit_finish') {
+          const completedLaneId = activeProviderSessionId;
+          const controls = requiredProviderTransportControls(providerTransportControls);
+          controls.close(completedLaneId);
+          controls.resetStats(completedLaneId);
+          providerSessionIds.delete(completedLaneId);
+          providerLanes.delete(completedLaneId);
           pi.setActiveTools(PARENT_ACTIVE_TOOL_NAMES);
         }
       });
@@ -341,8 +407,9 @@ export class PiEngine implements AgentEngine {
     const settingsManager = SettingsManager.inMemory({
       compaction: { enabled: false },
       retry: {
-        enabled: false,
-        maxRetries: 0,
+        enabled: true,
+        maxRetries: 2,
+        baseDelayMs: 500,
         provider: { maxRetries: 0, maxRetryDelayMs: 0 },
       },
       transport: 'websocket-cached',
@@ -364,7 +431,8 @@ export class PiEngine implements AgentEngine {
     await resourceLoader.reload();
     const sessionManager = SessionManager.inMemory(options.cwd);
     const sessionId = sessionManager.getSessionId();
-    resetOpenAICodexWebSocketDebugStats(sessionId);
+    parentProviderSessionId = sessionId;
+    activeProviderSessionId = sessionId;
     const { session } = await createRemuxAgentSession({
       cwd: options.cwd,
       modelRuntime: this.modelRuntime,
@@ -379,6 +447,11 @@ export class PiEngine implements AgentEngine {
       resourceLoader,
       sessionManager,
       settingsManager,
+      providerSessionId: () => activeProviderSessionId,
+      providerWebSocketFaultAfterEvents: this.providerWebSocketFaultAfterEvents,
+      registerProviderTransportControls: (controls) => {
+        providerTransportControls = controls;
+      },
       providerPreflight: async (payload) => {
         // Keep the provider fence defensive even if Pi changes its context
         // hook ordering: no request may overtake the preceding provider
@@ -395,14 +468,11 @@ export class PiEngine implements AgentEngine {
           }
           throw new Error('Provider dispatch has no committed durable context fence.');
         }
-        const requestMode = providerCallCount > 0 && lastRenderedHashes !== null &&
-            lastRenderedHashes.length <= context.orderedMessageHashes.length &&
-            lastRenderedHashes.every((hash, index) => context.orderedMessageHashes[index] === hash)
-          ? 'continuation'
-          : 'full';
-        if (providerCallCount === 0 && requestMode !== 'full') {
-          throw new Error('A fresh Pi runtime must begin with a full provider request.');
-        }
+        const lanePlan = planProviderLaneRequest(
+          providerLanes.get(context.providerSessionId),
+          context.orderedMessageHashes,
+        );
+        const requestMode = lanePlan.requestMode;
         const estimatedInputTokens = Math.max(
           context.estimatedInputTokens,
           Math.ceil(Buffer.byteLength(JSON.stringify(payload), 'utf8') / 4),
@@ -411,6 +481,9 @@ export class PiEngine implements AgentEngine {
           payload,
           requestMode,
           estimatedInputTokens,
+          ...(pendingRetryOfInferenceId
+            ? { retryOfInferenceId: pendingRetryOfInferenceId }
+            : {}),
           context: {
             basisSequence: context.basisSequence,
             logicalHash: context.logicalHash,
@@ -423,18 +496,26 @@ export class PiEngine implements AgentEngine {
             activeMessages: context.activeMessages,
           },
         });
+        pendingRetryOfInferenceId = null;
         // The rejected inference is now itself durable. Throwing here still
         // precedes provider I/O; Pi emits its normal failed inference boundary.
         assertContextBudget(estimatedInputTokens, model.contextWindow);
-        const transportStats = getOpenAICodexWebSocketDebugStats(sessionId);
+        const transportStats = requiredProviderTransportControls(providerTransportControls)
+          .getStats(context.providerSessionId);
         pendingTransport = {
+          providerSessionId: context.providerSessionId,
           plannedRequestMode: requestMode,
+          startedAt: performance.now(),
+          firstEventAt: null,
+          requests: transportStats?.requests ?? 0,
+          connectionsCreated: transportStats?.connectionsCreated ?? 0,
+          connectionsReused: transportStats?.connectionsReused ?? 0,
           fullContextRequests: transportStats?.fullContextRequests ?? 0,
           deltaRequests: transportStats?.deltaRequests ?? 0,
+          websocketFailures: transportStats?.websocketFailures ?? 0,
+          sseFallbacks: transportStats?.sseFallbacks ?? 0,
         };
-        providerBoundaryRegistered = false;
-        providerCallCount += 1;
-        lastRenderedHashes = context.orderedMessageHashes;
+        providerLanes.set(context.providerSessionId, lanePlan.next);
         probe = {
           ...probe,
           providerRequestMode: requestMode,
@@ -444,6 +525,54 @@ export class PiEngine implements AgentEngine {
     });
     session.setActiveToolsByName(PARENT_ACTIVE_TOOL_NAMES);
     const unsubscribe = session.subscribe((event) => {
+      if (event.type === 'message_update' && pendingTransport?.firstEventAt === null) {
+        pendingTransport.firstEventAt = performance.now();
+      }
+      if (event.type === 'auto_retry_start') {
+        const priorDurability = providerDurabilityTail;
+        const durability = (async () => {
+          await priorDurability;
+          if (providerDurabilityError) throw providerDurabilityError;
+          const superseded = await options.durability.supersedeProviderAttempt({
+            attempt: event.attempt,
+            maxAttempts: event.maxAttempts,
+            delayMs: event.delayMs,
+            error: safeMessage(event.errorMessage),
+          });
+          pendingRetryOfInferenceId = superseded.inferenceId;
+          // The first recovery attempt gets a fresh WebSocket. If that also
+          // drops after streaming starts, Pi's per-session transport marker
+          // deliberately routes the final bounded attempt through SSE.
+          const controls = requiredProviderTransportControls(providerTransportControls);
+          controls.close(activeProviderSessionId);
+          if (event.attempt === 1) {
+            controls.resetStats(activeProviderSessionId);
+          }
+          pendingTransport = null;
+          providerLanes.set(
+            activeProviderSessionId,
+            invalidateProviderLane(providerLanes.get(activeProviderSessionId)),
+          );
+        })();
+        const settled = durability.catch((error) => {
+          providerDurabilityError ??= error;
+        });
+        providerDurabilityTail = Promise.all([priorDurability, settled]).then(() => undefined);
+        return;
+      }
+      if (event.type === 'auto_retry_end' && event.success && event.attempt >= 2) {
+        // The last bounded attempt may have succeeded through SSE. Clear Pi's
+        // sticky fallback marker so the following inference returns to a fresh
+        // scope-local WebSocket instead of degrading the rest of the thread.
+        const controls = requiredProviderTransportControls(providerTransportControls);
+        controls.close(activeProviderSessionId);
+        controls.resetStats(activeProviderSessionId);
+        providerLanes.set(
+          activeProviderSessionId,
+          invalidateProviderLane(providerLanes.get(activeProviderSessionId)),
+        );
+        return;
+      }
       if (event.type === 'agent_end') {
         pendingAgentEnd = event;
         return;
@@ -465,12 +594,13 @@ export class PiEngine implements AgentEngine {
           .reverse()
           .find((message): message is AssistantMessage => message.role === 'assistant');
         // Pi extension callbacks are not guaranteed to settle before the
-        // session-level agent_end notification. If the final message_end hook
-        // has not registered its durable boundary, close it from the exact
-        // final AssistantMessage before the server can publish runtime idle.
-        if (!providerBoundaryRegistered && finalAssistant) {
-          await ensureAssistantDurable(finalAssistant);
-        }
+        // session-level agent_end notification. Always seal the exact final
+        // AssistantMessage before the server can publish runtime idle. The
+        // WeakMap makes this idempotent when message_end already registered
+        // the same boundary; a conversation-wide boolean is unsafe because a
+        // late hook from an earlier model cycle can satisfy it for the wrong
+        // message.
+        if (finalAssistant) await ensureAssistantDurable(finalAssistant);
         await providerDurabilityTail;
         if (providerDurabilityError) throw providerDurabilityError;
         projectPiEvent(agentEnd, options.onEvent);
@@ -484,8 +614,10 @@ export class PiEngine implements AgentEngine {
           await session.abort();
         } finally {
           session.dispose();
-          closeOpenAICodexWebSocketSessions(sessionId);
-          resetOpenAICodexWebSocketDebugStats(sessionId);
+          for (const providerSessionId of providerSessionIds) {
+            providerTransportControls?.close(providerSessionId);
+            providerTransportControls?.resetStats(providerSessionId);
+          }
         }
       },
     };
@@ -493,6 +625,7 @@ export class PiEngine implements AgentEngine {
 }
 
 function observedTransportMode(
+  controls: ProviderTransportControls,
   sessionId: string,
   pending: {
     plannedRequestMode: 'full' | 'continuation';
@@ -500,11 +633,57 @@ function observedTransportMode(
     deltaRequests: number;
   },
 ): 'full' | 'continuation' {
-  const stats = getOpenAICodexWebSocketDebugStats(sessionId);
+  const stats = controls.getStats(sessionId);
   if (!stats) return pending.plannedRequestMode;
   if (stats.deltaRequests > pending.deltaRequests) return 'continuation';
   if (stats.fullContextRequests > pending.fullContextRequests) return 'full';
   return pending.plannedRequestMode;
+}
+
+function observeProviderTransport(
+  controls: ProviderTransportControls,
+  sessionId: string,
+  pending: {
+    requests: number;
+    connectionsCreated: number;
+    connectionsReused: number;
+    websocketFailures: number;
+    sseFallbacks: number;
+  },
+) {
+  const stats = controls.getStats(sessionId);
+  const websocketRequests = Math.max(0, (stats?.requests ?? 0) - pending.requests);
+  const sseFallbacks = Math.max(0, (stats?.sseFallbacks ?? 0) - pending.sseFallbacks);
+  return {
+    carrier: sseFallbacks > 0
+      ? 'sse' as const
+      : websocketRequests > 0
+        ? 'websocket' as const
+        : 'unknown' as const,
+    websocketRequests,
+    connectionsCreated: Math.max(
+      0,
+      (stats?.connectionsCreated ?? 0) - pending.connectionsCreated,
+    ),
+    connectionsReused: Math.max(
+      0,
+      (stats?.connectionsReused ?? 0) - pending.connectionsReused,
+    ),
+    websocketFailures: Math.max(
+      0,
+      (stats?.websocketFailures ?? 0) - pending.websocketFailures,
+    ),
+    sseFallbacks,
+  };
+}
+
+function requiredProviderTransportControls(
+  controls: ProviderTransportControls | null,
+): ProviderTransportControls {
+  if (!controls) {
+    throw new Error('Pi did not register provider transport controls from its active pi-ai runtime.');
+  }
+  return controls;
 }
 
 function contextFrameMessage(

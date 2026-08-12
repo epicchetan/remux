@@ -67,14 +67,32 @@ export interface AgentConversationJournal {
       requestMode: 'full' | 'continuation';
       estimatedInputTokens: number;
       payload: unknown;
+      retryOfInferenceId?: string;
       context: DurableInferenceContext;
     },
   ): Promise<{ inferenceId: string; ordinal: number; sequence: number }>;
+  supersedeInference(
+    handle: DurableTurnHandle,
+    input: {
+      attempt: number;
+      maxAttempts: number;
+      delayMs: number;
+      error: string;
+    },
+  ): Promise<{ inferenceId: string; sequence: number }>;
   recordInferenceTransport?(
     handle: DurableTurnHandle,
     input: {
       plannedRequestMode: 'full' | 'continuation';
       actualRequestMode: 'full' | 'continuation';
+      carrier: 'websocket' | 'sse' | 'unknown';
+      websocketRequests: number;
+      connectionsCreated: number;
+      connectionsReused: number;
+      websocketFailures: number;
+      sseFallbacks: number;
+      dispatchToFirstEventMs: number | null;
+      durationMs: number;
     },
   ): Promise<boolean>;
   recordProviderItem?(handle: DurableTurnHandle, message: AssistantMessage): Promise<unknown>;

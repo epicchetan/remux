@@ -882,6 +882,8 @@ export class AgentServer {
           beforeAssistantMessageEnd: (input) => this.beforeAssistantMessageEnd(conversation.id, input),
           beforeProviderCall: (input) => this.beforeProviderCall(conversation.id, input),
           afterProviderCall: (input) => this.afterProviderCall(conversation.id, input),
+          supersedeProviderAttempt: (input) =>
+            this.supersedeProviderAttempt(conversation.id, input),
           beforeTool: (input) => this.beforeTool(conversation.id, input),
           afterTool: (input) => this.afterTool(conversation.id, input),
           journalSearch: (callId, input) => {
@@ -1039,6 +1041,7 @@ export class AgentServer {
       payload: unknown;
       requestMode: 'full' | 'continuation';
       estimatedInputTokens: number;
+      retryOfInferenceId?: string;
       context: DurableInferenceContext;
     },
   ) {
@@ -1051,11 +1054,55 @@ export class AgentServer {
       requestMode: input.requestMode,
       estimatedInputTokens: input.estimatedInputTokens,
       payload: input.payload,
+      ...(input.retryOfInferenceId
+        ? { retryOfInferenceId: input.retryOfInferenceId }
+        : {}),
       context: input.context,
     }));
     this.resources.invalidateKey(contextResourceKey(conversationId), 'updated');
     this.inferenceAssistantText = '';
     this.inferenceAssistantReasoning = '';
+  }
+
+  private async supersedeProviderAttempt(
+    conversationId: string,
+    input: {
+      attempt: number;
+      maxAttempts: number;
+      delayMs: number;
+      error: string;
+    },
+  ) {
+    const handle = this.requiredActiveDurableScope(conversationId);
+    await this.flushAssistantCheckpoint();
+    const result = await this.enqueueTurnWrite(() => this.journal.supersedeInference(handle, input));
+    this.inferenceAssistantText = '';
+    this.inferenceAssistantReasoning = '';
+    this.pendingAssistantText = '';
+    this.pendingAssistantReasoning = '';
+    this.resources.invalidateKey(contextResourceKey(conversationId), 'updated');
+    if (this.isRootScope(handle)) {
+      const projection = await this.journal.readTranscriptProjection(conversationId);
+      if (!projection) throw new Error(`Conversation ${conversationId} disappeared during provider recovery.`);
+      this.projector = createReplayedTranscriptProjector({
+        conversationId,
+        actions: projection.actions,
+        basisSequence: projection.basisSequence,
+        live: true,
+        invalidate: (invalidations) => this.publishProjectorInvalidations(invalidations),
+      });
+      this.publishProjectorInvalidations([{
+        type: 'transcript',
+        key: `transcript:${conversationId}`,
+        conversationId,
+        turnId: handle.turnId,
+        reason: 'runtimeEvent',
+        affectsOrder: false,
+        affectsLayout: true,
+        basisSequence: projection.basisSequence,
+      }]);
+    }
+    return result;
   }
 
   private async compileContext(conversationId: string, contextWindow: number) {
@@ -1089,6 +1136,14 @@ export class AgentServer {
     input: {
       plannedRequestMode: 'full' | 'continuation';
       actualRequestMode: 'full' | 'continuation';
+      carrier: 'websocket' | 'sse' | 'unknown';
+      websocketRequests: number;
+      connectionsCreated: number;
+      connectionsReused: number;
+      websocketFailures: number;
+      sseFallbacks: number;
+      dispatchToFirstEventMs: number | null;
+      durationMs: number;
     },
   ) {
     const handle = this.requiredActiveDurableScope(conversationId);
