@@ -5,7 +5,7 @@ import type { AgentResourceInvalidation } from '../../shared/transcript.ts';
 import type {
   DurableTranscriptAction,
   DurableTranscriptProjectionAction,
-} from './storage/repository.ts';
+} from './domain/state.ts';
 import { EphemeralTranscriptProjector } from './transcript-projector.ts';
 
 type ReplayAction = DurableTranscriptAction | DurableTranscriptProjectionAction;

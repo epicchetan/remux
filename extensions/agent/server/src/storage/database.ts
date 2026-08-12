@@ -8,7 +8,7 @@ import {
   type AgentDataRootOptions,
 } from './data-root.ts';
 import {
-  AGENT_JOURNAL_SCHEMA_VERSION,
+  AGENT_STATE_SCHEMA_VERSION,
   AgentSchemaError,
   agentSchemaFingerprint,
   createAgentSchema,
@@ -92,10 +92,10 @@ export async function openAgentDatabase(options: AgentDataRootOptions = {}) {
           `Refusing to initialize an unversioned Agent database containing tables: ${tables.join(', ')}.`,
         );
       }
-    } else if (version !== AGENT_JOURNAL_SCHEMA_VERSION) {
+    } else if (version !== AGENT_STATE_SCHEMA_VERSION) {
       throw new AgentSchemaVersionError(
-        `Agent journal schema ${version} is not ${AGENT_JOURNAL_SCHEMA_VERSION}; ` +
-        'Thread Runtime v2 requires a fresh Agent data root.',
+        `Agent state schema ${version} is not ${AGENT_STATE_SCHEMA_VERSION}; ` +
+        'Agent state v3 requires a fresh Agent data root.',
       );
     }
 

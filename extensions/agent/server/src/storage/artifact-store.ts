@@ -3,6 +3,7 @@ import { constants } from 'node:fs';
 import { lstat, mkdir, open, readFile, readdir, rename, stat, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
+import { ArtifactIntegrityError } from '../domain/errors.ts';
 import type { AgentDataPaths } from './data-root.ts';
 
 export type StagedArtifact = {
@@ -13,17 +14,6 @@ export type StagedArtifact = {
 };
 
 type ArtifactReference = Pick<StagedArtifact, 'hash' | 'byteLength' | 'storagePath'>;
-
-export class ArtifactIntegrityError extends Error {
-  readonly code = 'durable_artifact_integrity';
-  readonly reason: 'hash' | 'length' | 'missing' | 'path' | 'type';
-
-  constructor(reason: 'hash' | 'length' | 'missing' | 'path' | 'type') {
-    super('Durable artifact failed integrity verification.');
-    this.name = 'ArtifactIntegrityError';
-    this.reason = reason;
-  }
-}
 
 /**
  * Immutable, content-addressed storage. Files are durable before a SQL row is

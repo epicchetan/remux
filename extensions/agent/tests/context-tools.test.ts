@@ -14,17 +14,17 @@ test('model-facing context tools use Thread, History, and work-unit start/finish
     threadUpdate?: string;
   } = {};
   const tools = createContextTools({
-    async journalSearch(callId, input) {
+    async historySearch(callId, input) {
       seen.searchCallId = callId;
       return {
         query: input.query,
         scope: input.scope ?? 'conversation',
-        hits: [{ ref: 'journal://turn/prior', kind: 'assistant-outcome', excerpt: 'Prior result.' }],
+        hits: [{ ref: 'history://turn/prior', kind: 'assistant-outcome', excerpt: 'Prior result.' }],
         truncated: false,
         retention: 'ephemeral',
       };
     },
-    async journalOpen(input) {
+    async historyOpen(input) {
       seen.openedRef = input.ref;
       return {
         ref: input.ref,
@@ -38,13 +38,13 @@ test('model-facing context tools use Thread, History, and work-unit start/finish
       };
     },
     async threadRead() {
-      return { documentId: 'thread', versionId: 'v1', content: '# Thread\n', ref: 'journal://document-version/v1' };
+      return { documentId: 'thread', versionId: 'v1', content: '# Thread\n', ref: 'history://document-version/v1' };
     },
     async threadPatch() {
-      return { documentId: 'thread', versionId: 'v2', content: '# Thread\n\nUpdated.\n', ref: 'journal://document-version/v2' };
+      return { documentId: 'thread', versionId: 'v2', content: '# Thread\n\nUpdated.\n', ref: 'history://document-version/v2' };
     },
     async threadReplace() {
-      return { documentId: 'thread', versionId: 'v3', content: '# Thread\n\nReplaced.\n', ref: 'journal://document-version/v3' };
+      return { documentId: 'thread', versionId: 'v3', content: '# Thread\n\nReplaced.\n', ref: 'history://document-version/v3' };
     },
     async workUnitEnter(_callId, input) {
       seen.resources = input.resources;
@@ -57,11 +57,11 @@ test('model-facing context tools use Thread, History, and work-unit start/finish
           ...resource,
           inclusion: 'materialized' as const,
           snapshot: {
-            ref: `journal://artifact/${'a'.repeat(64)}`,
+            ref: `history://artifact/${'a'.repeat(64)}`,
             hash: 'a'.repeat(64),
             byteLength: 13,
             mediaType: 'text/plain; charset=utf-8',
-            source: resource.ref.startsWith('journal://') ? 'history' as const : 'file' as const,
+            source: resource.ref.startsWith('history://') ? 'history' as const : 'file' as const,
           },
         })),
         state: 'running',
@@ -106,7 +106,7 @@ test('model-facing context tools use Thread, History, and work-unit start/finish
   const opened = await byName.get('history_read')!.execute(
     'read', { ref: 'history://turn/prior' }, undefined, undefined, context,
   );
-  assert.equal(seen.openedRef, 'journal://turn/prior');
+  assert.equal(seen.openedRef, 'history://turn/prior');
   assert.equal((opened.details as { ref: string }).ref, 'history://turn/prior');
   const thread = await byName.get('thread_read')!.execute(
     'thread', {}, undefined, undefined, context,
@@ -123,7 +123,7 @@ test('model-facing context tools use Thread, History, and work-unit start/finish
     },
     undefined, undefined, context,
   );
-  assert.deepEqual(seen.resources?.map(({ ref }) => ref), ['journal://turn/prior', 'docs/contract.md']);
+  assert.deepEqual(seen.resources?.map(({ ref }) => ref), ['history://turn/prior', 'docs/contract.md']);
   assert.deepEqual(
     (work.details as { resources: Array<{ ref: string }> }).resources.map(({ ref }) => ref),
     ['history://turn/prior', 'docs/contract.md'],
@@ -142,7 +142,7 @@ test('model-facing context tools use Thread, History, and work-unit start/finish
   );
   assert.equal(seen.threadUpdate, 'Mark the seam verified.');
   assert.deepEqual(seen.returnedResources?.map(({ ref }) => ref), [
-    'journal://turn/prior',
+    'history://turn/prior',
     'src/seam.ts',
   ]);
 

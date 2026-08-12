@@ -32,7 +32,7 @@ import {
   type TurnReadParams,
 } from '../../shared/protocol.ts';
 import type { AgentResourceInvalidation } from '../../shared/transcript.ts';
-import type { AgentConversationJournal } from './conversation-journal.ts';
+import type { AgentStore } from './agent-store.ts';
 import type {
   AgentEngine,
   ConversationRuntime,
@@ -40,16 +40,15 @@ import type {
   WorkUnitEnterInput,
   WorkUnitReturnInput,
 } from './engine.ts';
-import {
-  normalizeWorkUnitReturnInput,
-  type DurableInferenceContext,
-  type PreparedWorkUnitReturn,
-  type DurableTranscriptAction,
-  type DurableTranscriptProjectionAction,
-  type DurableTranscriptMutation,
-  type DurableTurnHandle,
-} from './storage/repository.ts';
-import { ArtifactIntegrityError } from './storage/artifact-store.ts';
+import type {
+  DurableInferenceContext,
+  PreparedWorkUnitReturn,
+  DurableTranscriptAction,
+  DurableTranscriptProjectionAction,
+  DurableTranscriptMutation,
+  DurableTurnHandle,
+} from './domain/state.ts';
+import { ArtifactIntegrityError } from './domain/errors.ts';
 import { ResourceStore } from './resources.ts';
 import { searchAgentFiles } from './file-search.ts';
 import { agentPromptImages, agentPromptText, parseAgentComposerParts } from './user-input.ts';
@@ -81,7 +80,7 @@ export class RpcFault extends Error {
 export class AgentServer {
   readonly resources: ResourceStore;
   private readonly engine: AgentEngine;
-  private readonly journal: AgentConversationJournal;
+  private readonly store: AgentStore;
   private readonly transcriptRouter: TranscriptProjectionRouter;
   private runtime: ConversationRuntime | null = null;
   private projector: EphemeralTranscriptProjector | null = null;
@@ -113,18 +112,18 @@ export class AgentServer {
 
   constructor(options: {
     engine: AgentEngine;
-    journal: AgentConversationJournal;
+    store: AgentStore;
     notify: (method: string, params: unknown) => void;
     monotonicNow?: () => number;
   }) {
     this.engine = options.engine;
-    this.journal = options.journal;
+    this.store = options.store;
     this.notify = options.notify;
     this.monotonicNow = options.monotonicNow ?? (() => performance.now());
     this.resources = new ResourceStore(
       (params) => options.notify(AGENT_METHODS.resourcesInvalidated, params),
     );
-    this.transcriptRouter = new TranscriptProjectionRouter({ journal: options.journal });
+    this.transcriptRouter = new TranscriptProjectionRouter({ store: options.store });
   }
 
   async initialize() {
@@ -137,7 +136,7 @@ export class AgentServer {
     this.resources.set(AGENT_RESOURCE_KEYS.runtime, unloadedRuntime(), false);
     await this.refreshModels(false);
     if (auth.state === 'signed-in') {
-      const queuedConversationId = await this.journal.readOldestQueuedConversationId?.();
+      const queuedConversationId = await this.store.readOldestQueuedConversationId();
       if (queuedConversationId) {
         void this.enqueueConversationCommand(
           () => this.dispatchNextQueuedMessage(queuedConversationId),
@@ -223,9 +222,9 @@ export class AgentServer {
           offset: params.range.offset,
           byteLength: params.range.byteLength + (params.range.kind === 'utf8' ? 3 : 0),
         };
-    let artifact: Awaited<ReturnType<AgentConversationJournal['readArtifact']>>;
+    let artifact: Awaited<ReturnType<AgentStore['readArtifact']>>;
     try {
-      artifact = await this.journal.readArtifact(params.hash, requestedRange);
+      artifact = await this.store.readArtifact(params.hash, requestedRange);
     } catch (error) {
       if (error instanceof ArtifactIntegrityError) {
         throw new RpcFault(-32023, 'Durable artifact failed integrity verification.', {
@@ -339,19 +338,19 @@ export class AgentServer {
   private async readThreadCanvas(params: ThreadReadParams) {
     await this.turnWriteTail;
     if (this.turnWriteError) throw this.turnWriteError;
-    if (!this.journal.readThreadHistory) {
+    if (!this.store.readThreadHistory) {
       throw new RpcFault(-32030, 'Durable thread history is unavailable.');
     }
-    return this.journal.readThreadHistory(params.conversationId);
+    return this.store.readThreadHistory(params.conversationId);
   }
 
   private async readDurableTurn(params: TurnReadParams) {
     await this.turnWriteTail;
     if (this.turnWriteError) throw this.turnWriteError;
-    if (!this.journal.readTurn) {
+    if (!this.store.readTurn) {
       throw new RpcFault(-32030, 'Durable turn status is unavailable.');
     }
-    return this.journal.readTurn(params.conversationId, params.turnId);
+    return this.store.readTurn(params.conversationId, params.turnId);
   }
 
   private startLogin() {
@@ -433,9 +432,9 @@ export class AgentServer {
     }
 
     const cwd = await canonicalDirectory(params.cwd);
-    let durable: Awaited<ReturnType<AgentConversationJournal['createConversation']>>;
+    let durable: Awaited<ReturnType<AgentStore['createConversation']>>;
     try {
-      durable = await this.journal.createConversation({
+      durable = await this.store.createConversation({
         operationId: params.operationId,
         cwd,
         modelId: params.modelId,
@@ -468,7 +467,7 @@ export class AgentServer {
     if (!params.text.trim()) throw new RpcFault(-32602, 'Message text cannot be empty.');
     let queuedReplay;
     try {
-      queuedReplay = await this.journal.reconcileQueuedTurn(params);
+      queuedReplay = await this.store.reconcileQueuedTurn(params);
     } catch (error) {
       if (isOperationConflict(error, params.operationId)) {
         throw new RpcFault(-32018, 'Message operation conflicts with an earlier request.', {
@@ -483,9 +482,9 @@ export class AgentServer {
       operationId: queuedReplay.operationId,
       turnId: queuedReplay.turnId,
     };
-    let replay: Awaited<ReturnType<AgentConversationJournal['reconcileTurn']>>;
+    let replay: Awaited<ReturnType<AgentStore['reconcileTurn']>>;
     try {
-      replay = await this.journal.reconcileTurn(params);
+      replay = await this.store.reconcileTurn(params);
     } catch (error) {
       if (isOperationConflict(error, params.operationId)) {
         throw new RpcFault(-32018, 'Message operation conflicts with an earlier request.', {
@@ -513,7 +512,7 @@ export class AgentServer {
       currentRuntime?.conversationId === params.conversationId &&
       (currentRuntime.state === 'running' || currentRuntime.state === 'interrupting')
     ) {
-      const queued = await this.journal.enqueueTurn(params);
+      const queued = await this.store.enqueueTurn(params);
       this.resources.invalidateKey(queueResourceKey(params.conversationId), 'updated');
       return {
         accepted: true as const,
@@ -524,9 +523,9 @@ export class AgentServer {
     }
     const runtimeValue = await this.ensureConversationRuntime(params.conversationId);
     if (!this.runtime) throw new RpcFault(-32012, 'The conversation runtime is unavailable.');
-    let durable: Awaited<ReturnType<AgentConversationJournal['acceptTurn']>>;
+    let durable: Awaited<ReturnType<AgentStore['acceptTurn']>>;
     try {
-      durable = await this.journal.acceptTurn(params);
+      durable = await this.store.acceptTurn(params);
     } catch (error) {
       if (isOperationConflict(error, params.operationId)) {
         throw new RpcFault(-32018, 'Message operation conflicts with an earlier request.', {
@@ -579,7 +578,7 @@ export class AgentServer {
       });
     } catch (error) {
       const message = safeMessage(error);
-      await this.journal.finishTurn(durable, {
+      await this.store.finishTurn(durable, {
         status: 'failed',
         error: message,
         errorCode: 'runtime_error',
@@ -611,13 +610,13 @@ export class AgentServer {
   }
 
   private async removeQueuedMessage(params: MessageQueueMutationParams) {
-    const removed = await this.journal.removeQueuedTurn(params.conversationId, params.operationId);
+    const removed = await this.store.removeQueuedTurn(params.conversationId, params.operationId);
     this.resources.invalidateKey(queueResourceKey(params.conversationId), 'updated');
     return { status: removed ? 'removed' as const : 'retained' as const };
   }
 
   private async runQueuedMessageNow(params: MessageQueueMutationParams) {
-    const queued = await this.journal.readQueuedTurn(params.conversationId, params.operationId);
+    const queued = await this.store.readQueuedTurn(params.conversationId, params.operationId);
     if (!queued) return { status: 'retained' as const };
     this.nextQueuedOperationId = params.operationId;
     const runtime = this.resources.get<AgentRuntimeValue>(AGENT_RESOURCE_KEYS.runtime);
@@ -640,13 +639,13 @@ export class AgentServer {
     if (this.closePromise) return;
     const requested = this.nextQueuedOperationId;
     this.nextQueuedOperationId = null;
-    const queued = await this.journal.readQueuedTurn(conversationId, requested ?? undefined)
-      ?? (requested ? await this.journal.readQueuedTurn(conversationId) : null);
+    const queued = await this.store.readQueuedTurn(conversationId, requested ?? undefined)
+      ?? (requested ? await this.store.readQueuedTurn(conversationId) : null);
     if (!queued) return;
     try {
       const sent = await this.sendMessage(queued);
       if (sent.turnId) {
-        await this.journal.finishQueuedTurn(queued.queueOperationId, sent.turnId);
+        await this.store.finishQueuedTurn(queued.queueOperationId, sent.turnId);
         this.resources.invalidateKey(queueResourceKey(conversationId), 'updated');
       }
     } catch (error) {
@@ -667,10 +666,10 @@ export class AgentServer {
       throw new RpcFault(-32013, 'Wait for the active turn to finish before editing or forking.');
     }
     const source = await this.readConversationSummary(params.sourceConversationId);
-    const projection = await this.journal.readTranscriptProjection(params.sourceConversationId);
+    const projection = await this.store.readTranscriptProjection(params.sourceConversationId);
     if (!projection) throw new RpcFault(-32015, 'Source conversation transcript was not found.');
     const prefix = branchPrefix(projection.actions, params, mode);
-    const branch = await this.journal.createConversation({
+    const branch = await this.store.createConversation({
       operationId: params.operationId,
       cwd: source.cwd,
       modelId: source.modelId,
@@ -705,14 +704,14 @@ export class AgentServer {
       const user = turn.find((action) => action.type === 'turn');
       if (!user || user.type !== 'turn') continue;
       const parts = user.parts ? await this.hydrateBranchParts(user.parts) : undefined;
-      const handle = await this.journal.acceptTurn({
+      const handle = await this.store.acceptTurn({
         operationId: derivedUuid(branchOperationId, `clone-operation:${user.turnId}`),
         conversationId,
         clientMessageId: derivedUuid(branchOperationId, `clone-message:${user.turnId}`),
         text: user.text,
         ...(parts ? { parts } : {}),
       });
-      const existing = (await this.journal.readTranscriptActions(conversationId))
+      const existing = (await this.store.readTranscriptActions(conversationId))
         .filter((action) => action.turnId === handle.turnId);
       if (existing.some((action) => action.type === 'terminal')) continue;
       const assistant = turn.filter((action) => action.type === 'assistant');
@@ -725,7 +724,7 @@ export class AgentServer {
         throw new Error(`Partially cloned turn ${user.turnId} does not match its source.`);
       }
       if (sourceText.length > existingText.length || sourceReasoning.length > existingReasoning.length) {
-        await this.journal.appendAssistantCheckpoint(handle, {
+        await this.store.appendAssistantCheckpoint(handle, {
           textDelta: sourceText.slice(existingText.length),
           reasoningDelta: sourceReasoning.slice(existingReasoning.length),
         });
@@ -734,14 +733,14 @@ export class AgentServer {
         action.type === 'tool-start' ? [action.callId] : []));
       for (const start of turn.filter((action) => action.type === 'tool-start')) {
         if (start.type !== 'tool-start' || existingCalls.has(start.callId)) continue;
-        await this.journal.recordToolStarted(handle, {
+        await this.store.recordToolStarted(handle, {
           callId: start.callId,
           name: start.name,
           args: start.args,
         });
         const end = turn.find((action) => action.type === 'tool-end' && action.callId === start.callId);
         if (end?.type === 'tool-end') {
-          await this.journal.recordToolFinished(handle, {
+          await this.store.recordToolFinished(handle, {
             callId: end.callId,
             result: end.result,
             isError: end.isError,
@@ -752,7 +751,7 @@ export class AgentServer {
       if (!terminal || terminal.type !== 'terminal') {
         throw new Error(`Source turn ${user.turnId} has no terminal boundary.`);
       }
-      await this.journal.finishTurn(handle, {
+      await this.store.finishTurn(handle, {
         status: terminal.status === 'interrupted_by_restart' ? 'interrupted' : terminal.status,
         error: terminal.error,
         errorCode: terminal.errorCode,
@@ -768,7 +767,7 @@ export class AgentServer {
         hydrated.push(part);
         continue;
       }
-      const artifact = await this.journal.readArtifact(part.artifactHash);
+      const artifact = await this.store.readArtifact(part.artifactHash);
       if (!artifact) throw new Error(`Branch image artifact ${part.artifactHash} is missing.`);
       hydrated.push({
         dataUrl: `data:${part.mimeType};base64,${artifact.bytes.toString('base64')}`,
@@ -804,7 +803,7 @@ export class AgentServer {
   }
 
   private async readConversationSummary(conversationId: string) {
-    const [projection] = await this.journal.readResourceProjections([
+    const [projection] = await this.store.readResourceProjections([
       conversationResourceKey(conversationId),
     ]);
     if (!projection || projection.key === AGENT_RESOURCE_KEYS.conversationList) {
@@ -862,7 +861,7 @@ export class AgentServer {
     const loading = runtimeValue(conversation.id, conversation.modelId, 'loading');
     this.resources.set(AGENT_RESOURCE_KEYS.runtime, loading);
     try {
-      const transcript = await this.journal.readTranscriptProjection(conversation.id);
+      const transcript = await this.store.readTranscriptProjection(conversation.id);
       if (!transcript) throw new Error(`Conversation ${conversation.id} does not exist.`);
       const projector = createReplayedTranscriptProjector({
         conversationId: conversation.id,
@@ -886,28 +885,17 @@ export class AgentServer {
             this.supersedeProviderAttempt(conversation.id, input),
           beforeTool: (input) => this.beforeTool(conversation.id, input),
           afterTool: (input) => this.afterTool(conversation.id, input),
-          journalSearch: (callId, input) => {
-            if (!this.journal.searchJournal) throw new Error('Durable journal search is unavailable.');
-            return this.journal.searchJournal(conversation.id, input, {
-              excludeRef: `journal://tool/${encodeURIComponent(callId)}`,
+          historySearch: (callId, input) => {
+            return this.store.searchHistory(conversation.id, input, {
+              excludeRef: `history://tool/${encodeURIComponent(callId)}`,
             });
           },
-          journalOpen: (input) => {
-            if (!this.journal.openJournal) throw new Error('Durable journal open is unavailable.');
-            return this.journal.openJournal(conversation.id, input);
-          },
-          threadRead: () => {
-            if (!this.journal.readThread) throw new Error('Durable thread state is unavailable.');
-            return this.journal.readThread(conversation.id);
-          },
-          threadPatch: (input) => {
-            if (!this.journal.patchThread) throw new Error('Durable thread patches are unavailable.');
-            return this.journal.patchThread(this.requiredActiveDurableScope(conversation.id), input);
-          },
-          threadReplace: (input) => {
-            if (!this.journal.replaceThread) throw new Error('Durable thread replacement is unavailable.');
-            return this.journal.replaceThread(this.requiredActiveDurableScope(conversation.id), input);
-          },
+          historyOpen: (input) => this.store.openHistory(conversation.id, input),
+          threadRead: () => this.store.readThread(conversation.id),
+          threadPatch: (input) => this.store.patchThread(
+            this.requiredActiveDurableScope(conversation.id), input),
+          threadReplace: (input) => this.store.replaceThread(
+            this.requiredActiveDurableScope(conversation.id), input),
           workUnitEnter: (callId, input) => this.enterWorkUnit(conversation.id, callId, input),
           workUnitReturn: (callId, input) =>
             this.requestWorkUnitReturn(conversation.id, callId, input),
@@ -917,7 +905,7 @@ export class AgentServer {
       this.projector = projector;
       this.conversationId = conversation.id;
       this.conversationOperationId = operationId;
-      const resumed = await this.journal.resumeActiveTurn?.(conversation.id) ?? null;
+      const resumed = await this.store.resumeActiveTurn(conversation.id);
       if (resumed) {
         this.activeDurableTurn = resumed.rootHandle;
         this.activeDurableScope = resumed.handle;
@@ -1049,7 +1037,7 @@ export class AgentServer {
     const runtime = this.resources.get<AgentRuntimeValue>(AGENT_RESOURCE_KEYS.runtime);
     const modelId = runtime?.contextProbe?.modelId;
     if (!modelId) throw new Error('Provider dispatch has no durable model identity.');
-    await this.enqueueTurnWrite(() => this.journal.startInference(handle, {
+    await this.enqueueTurnWrite(() => this.store.startInference(handle, {
       modelId,
       requestMode: input.requestMode,
       estimatedInputTokens: input.estimatedInputTokens,
@@ -1075,14 +1063,14 @@ export class AgentServer {
   ) {
     const handle = this.requiredActiveDurableScope(conversationId);
     await this.flushAssistantCheckpoint();
-    const result = await this.enqueueTurnWrite(() => this.journal.supersedeInference(handle, input));
+    const result = await this.enqueueTurnWrite(() => this.store.supersedeInference(handle, input));
     this.inferenceAssistantText = '';
     this.inferenceAssistantReasoning = '';
     this.pendingAssistantText = '';
     this.pendingAssistantReasoning = '';
     this.resources.invalidateKey(contextResourceKey(conversationId), 'updated');
     if (this.isRootScope(handle)) {
-      const projection = await this.journal.readTranscriptProjection(conversationId);
+      const projection = await this.store.readTranscriptProjection(conversationId);
       if (!projection) throw new Error(`Conversation ${conversationId} disappeared during provider recovery.`);
       this.projector = createReplayedTranscriptProjector({
         conversationId,
@@ -1110,7 +1098,7 @@ export class AgentServer {
     await this.flushAssistantCheckpoint();
     await this.turnWriteTail;
     if (this.turnWriteError) throw this.turnWriteError;
-    return this.journal.compileContext(conversationId, contextWindow);
+    return this.store.compileContext(conversationId, contextWindow);
   }
 
   private async noticeContextPressure(
@@ -1121,12 +1109,9 @@ export class AgentServer {
       hardContextLimit: number;
     },
   ) {
-    if (!this.journal.recordContextPressure) {
-      throw new Error('Durable context pressure notices are unavailable.');
-    }
     const handle = this.requiredActiveDurableScope(conversationId);
     const recorded = await this.enqueueTurnWrite(() =>
-      this.journal.recordContextPressure!(handle, input));
+      this.store.recordContextPressure(handle, input));
     if (recorded) this.resources.invalidateKey(contextResourceKey(conversationId), 'updated');
     return recorded;
   }
@@ -1147,9 +1132,8 @@ export class AgentServer {
     },
   ) {
     const handle = this.requiredActiveDurableScope(conversationId);
-    if (!this.journal.recordInferenceTransport) return;
     const recorded = await this.enqueueTurnWrite(() =>
-      this.journal.recordInferenceTransport!(handle, input));
+      this.store.recordInferenceTransport(handle, input));
     if (recorded) this.resources.invalidateKey(contextResourceKey(conversationId), 'updated');
   }
 
@@ -1160,7 +1144,7 @@ export class AgentServer {
     const handle = this.activeDurableScope;
     if (!handle || handle.conversationId !== conversationId) return;
     await this.flushAssistantCheckpoint();
-    await this.enqueueTurnWrite(() => this.journal.finishInference(handle, { state }));
+    await this.enqueueTurnWrite(() => this.store.finishInference(handle, { state }));
   }
 
   private async beforeAssistantMessageEnd(
@@ -1175,10 +1159,7 @@ export class AgentServer {
   ) {
     const handle = this.requiredActiveDurableScope(conversationId);
     await this.flushAssistantCheckpoint();
-    if (!this.journal.recordProviderItem) {
-      throw new Error('Exact provider item durability is unavailable.');
-    }
-    await this.enqueueTurnWrite(() => this.journal.recordProviderItem!(handle, input.providerMessage));
+    await this.enqueueTurnWrite(() => this.store.recordProviderItem(handle, input.providerMessage));
     const textDelta = finalizedSuffix(
       this.inferenceAssistantText,
       input.text,
@@ -1191,7 +1172,7 @@ export class AgentServer {
     );
     if (textDelta || reasoningDelta) {
       await this.enqueueTurnWrite(async () => {
-        const mutation = await this.journal.appendAssistantCheckpoint(
+        const mutation = await this.store.appendAssistantCheckpoint(
           handle,
           { textDelta, reasoningDelta },
         );
@@ -1207,12 +1188,12 @@ export class AgentServer {
     }
     this.inferenceAssistantText = input.text;
     this.inferenceAssistantReasoning = input.reasoning;
-    await this.enqueueTurnWrite(() => this.journal.finishInference(handle, {
+    await this.enqueueTurnWrite(() => this.store.finishInference(handle, {
       state: input.inferenceState,
     }));
     for (const call of input.calls) {
       this.toolScopes.set(call.callId, handle);
-      const inserted = await this.enqueueTurnWrite(() => this.journal.recordToolStarted(handle, call));
+      const inserted = await this.enqueueTurnWrite(() => this.store.recordToolStarted(handle, call));
       if (inserted && this.isRootScope(handle)) {
         this.projector?.startTool(handle.turnId, {
           callId: call.callId,
@@ -1233,7 +1214,7 @@ export class AgentServer {
     const handle = this.toolScopes.get(input.callId) ?? this.requiredActiveDurableScope(conversationId);
     this.toolScopes.set(input.callId, handle);
     await this.flushAssistantCheckpoint();
-    const inserted = await this.enqueueTurnWrite(() => this.journal.recordToolStarted(handle, input));
+    const inserted = await this.enqueueTurnWrite(() => this.store.recordToolStarted(handle, input));
     if (inserted && this.isRootScope(handle)) {
       this.projector?.startTool(handle.turnId, {
         callId: input.callId,
@@ -1252,7 +1233,7 @@ export class AgentServer {
   ) {
     const handle = this.toolScopes.get(input.callId) ?? this.requiredActiveDurableScope(conversationId);
     await this.flushAssistantCheckpoint();
-    const inserted = await this.enqueueTurnWrite(() => this.journal.recordToolFinished(handle, input));
+    const inserted = await this.enqueueTurnWrite(() => this.store.recordToolFinished(handle, input));
     if (inserted && this.isRootScope(handle)) {
       this.projector?.endTool(handle.turnId, {
         callId: input.callId,
@@ -1268,11 +1249,8 @@ export class AgentServer {
       if (!pendingReturn || pendingReturn.handle.scopeId !== handle.scopeId) {
         throw new Error('The work unit return boundary was not prepared.');
       }
-      if (!this.journal.commitWorkUnitReturn) {
-        throw new Error('Durable work unit return commit is unavailable.');
-      }
       const returned = await this.enqueueTurnWrite(() =>
-        this.journal.commitWorkUnitReturn!(handle, pendingReturn.prepared));
+        this.store.commitWorkUnitReturn(handle, pendingReturn.prepared));
       this.activeDurableScope = returned.parentHandle;
     }
     this.pendingWorkUnitReturns.delete(input.callId);
@@ -1286,16 +1264,13 @@ export class AgentServer {
   ) {
     const parent = this.requiredActiveDurableScope(conversationId);
     if (!this.isRootScope(parent)) throw new Error('Work units cannot be nested.');
-    if (!this.journal.prepareWorkUnitEntry || !this.journal.commitWorkUnitEntry) {
-      throw new Error('Durable work unit entry is unavailable.');
-    }
     await this.flushAssistantCheckpoint();
     // Materialization and model-input validation happen before the durable
     // write boundary. A missing, non-text, or directory resource is a
-    // correctable tool error, not a poisoned journal.
-    const prepared = await this.journal.prepareWorkUnitEntry(parent, input);
+    // correctable tool error, not poisoned durable state.
+    const prepared = await this.store.prepareWorkUnitEntry(parent, input);
     const entered = await this.enqueueTurnWrite(() =>
-      this.journal.commitWorkUnitEntry!(parent, prepared));
+      this.store.commitWorkUnitEntry(parent, prepared));
     this.toolScopes.set(callId, parent);
     this.activeDurableScope = entered.handle;
     return {
@@ -1319,11 +1294,7 @@ export class AgentServer {
     // success. The durable scope transition intentionally waits for
     // tool_result, but correctable model input or resource errors must remain
     // tool errors so the child can fix them and retry.
-    normalizeWorkUnitReturnInput(input);
-    if (!this.journal.prepareWorkUnitReturn) {
-      throw new Error('Durable work unit return preparation is unavailable.');
-    }
-    const prepared = await this.journal.prepareWorkUnitReturn(handle, input);
+    const prepared = await this.store.prepareWorkUnitReturn(handle, input);
     this.toolScopes.set(callId, handle);
     this.pendingWorkUnitReturns.set(callId, { handle, prepared });
     return { scopeId: handle.scopeId, state: 'returning' as const };
@@ -1362,7 +1333,7 @@ export class AgentServer {
     const handle = this.activeDurableScope;
     if (!handle || (!textDelta && !reasoningDelta)) return this.turnWriteTail;
     return this.enqueueTurnWrite(async () => {
-      const mutation = await this.journal.appendAssistantCheckpoint(
+      const mutation = await this.store.appendAssistantCheckpoint(
         handle,
         { textDelta, reasoningDelta },
       );
@@ -1416,7 +1387,7 @@ export class AgentServer {
   }
 
   private async failDurabilityOnce(conversationId: string, error: unknown) {
-    const message = `Durable journal failure: ${safeMessage(error)}`;
+    const message = `Durable state failure: ${safeMessage(error)}`;
     const runtimeValue = this.resources.get<AgentRuntimeValue>(AGENT_RESOURCE_KEYS.runtime);
     if (runtimeValue?.conversationId === conversationId) {
       runtimeValue.state = 'error';
@@ -1429,7 +1400,7 @@ export class AgentServer {
     const durationMs = this.activeTurnDurationMs();
     let mutation: DurableTranscriptMutation | null;
     try {
-      mutation = await this.journal.finishTurn(handle, {
+      mutation = await this.store.finishTurn(handle, {
         status: 'failed',
         error: message,
         errorCode: 'storage_error',
@@ -1440,7 +1411,7 @@ export class AgentServer {
       this.resources.invalidateKey(conversationResourceKey(conversationId));
       this.resources.invalidateKey(AGENT_RESOURCE_KEYS.conversationList);
     } catch {
-      // The journal remains the authority. Startup recovery will terminate the
+      // The state store remains the authority. Startup recovery will terminate the
       // still-running row if storage cannot accept the failure transition now.
       return;
     }
@@ -1485,7 +1456,7 @@ export class AgentServer {
     if (this.turnWriteError) throw this.turnWriteError;
     const status = error ? 'failed' : interrupted ? 'interrupted' : 'completed';
     const durationMs = this.activeTurnDurationMs();
-    const mutation = await this.journal.finishTurn(handle, {
+    const mutation = await this.store.finishTurn(handle, {
       status,
       error: error ?? null,
       errorCode: error ? 'provider_error' : null,
@@ -1579,7 +1550,7 @@ export class AgentServer {
         key.startsWith('context:') ||
         key.startsWith('queue:'));
     const durableProjections = durableRequests.length > 0
-      ? await this.journal.readResourceProjections(durableRequests.map(({ key }) => key))
+      ? await this.store.readResourceProjections(durableRequests.map(({ key }) => key))
       : [];
     const durableByRequest = new Map(
       durableRequests.map(({ index }, durableIndex) => [index, durableProjections[durableIndex] ?? null]),
@@ -1665,7 +1636,7 @@ function finalizedSuffix(observed: string, finalized: string, label: string) {
     if (observed.startsWith(finalized) && observed.slice(finalized.length).trim() === '') {
       return '';
     }
-    throw new Error(`Pi finalized ${label} by rewriting already journaled content.`);
+    throw new Error(`Pi finalized ${label} by rewriting already recorded content.`);
   }
   return finalized.slice(observed.length);
 }

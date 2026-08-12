@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 
-import type { WorkUnitResourceView } from './engine.ts';
+import type { WorkUnitResourceView } from './domain/work.ts';
 
 export const REMUX_SYSTEM_PROMPT = readPrompt('system.md');
 const WORK_UNIT_PROMPT = readPrompt('work-unit.md');

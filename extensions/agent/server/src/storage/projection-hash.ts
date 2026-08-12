@@ -1,15 +1,14 @@
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 
-import { AGENT_JOURNAL_SCHEMA_VERSION } from './schema.ts';
+import { AGENT_STATE_SCHEMA_VERSION } from './schema.ts';
 import { canonicalJson, type CanonicalJsonValue } from './canonical-json.ts';
 
-const PROJECTION_VERSION = 'agent-thread-projection-v2';
+const PROJECTION_VERSION = 'agent-state-projection-v3';
 
 const projectionTables = [
   { name: 'projects', order: ['project_id'] },
   { name: 'conversations', order: ['conversation_id'] },
-  { name: 'strands', order: ['strand_id'] },
   { name: 'turns', order: ['turn_id'] },
   { name: 'execution_scopes', order: ['scope_id'] },
   { name: 'messages', order: ['message_id'] },
@@ -42,7 +41,7 @@ export function durableProjectionSnapshot(database: DatabaseSync): CanonicalJson
     tables[table.name] = rows as CanonicalJsonValue;
   }
   return {
-    journalSchemaVersion: AGENT_JOURNAL_SCHEMA_VERSION,
+    stateSchemaVersion: AGENT_STATE_SCHEMA_VERSION,
     projectionVersion: PROJECTION_VERSION,
     tables,
   };

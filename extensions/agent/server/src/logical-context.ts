@@ -139,7 +139,7 @@ type AssistantBuilder = {
 type OrderedUnit = LogicalContextMessage & { role: 'user' } | AssistantBuilder;
 
 /**
- * Reduce immutable journal facts into the provider-neutral conversation that a
+ * Reduce immutable History facts into the provider-neutral conversation that a
  * model may see. Incomplete tool effects remain durable/auditable but are never
  * replayed as if they had completed.
  */
@@ -354,110 +354,6 @@ export function piMessageSemanticHashes(messages: unknown[]): string[] {
   return messages.map((message) => canonicalJsonHash(piMessageSemanticValue(message)));
 }
 
-export function alignDurableContextWithPi(
-  snapshot: DurableContextSnapshot,
-  piMessages: unknown[],
-  model: Model<string>,
-): Message[] {
-  const piHashes = piMessageSemanticHashes(piMessages);
-  const offset = snapshot.orderedMessageHashes.length - piHashes.length;
-  if (
-    offset < 0 ||
-    !piHashes.every((hash, index) => snapshot.orderedMessageHashes[offset + index] === hash)
-  ) {
-    const mismatchIndex = offset < 0
-      ? 0
-      : piHashes.findIndex((hash, index) => snapshot.orderedMessageHashes[offset + index] !== hash);
-    const durableIndex = offset + Math.max(0, mismatchIndex);
-    const durable = snapshot.messages[durableIndex];
-    const pi = piMessages[Math.max(0, mismatchIndex)];
-    throw new Error(
-      'Durable context does not match Pi runtime suffix' +
-      ` at Pi index ${Math.max(0, mismatchIndex)} ` +
-      `(${messageMismatchSummary(durable, pi)}).`,
-    );
-  }
-  return [
-    ...renderDurablePiPrefix(snapshot.messages.slice(0, offset), model),
-    ...piMessages.map(requiredPiMessage),
-  ];
-}
-
-function messageMismatchSummary(
-  durable: LogicalContextMessage | undefined,
-  pi: unknown,
-) {
-  if (!durable) return `durable missing, Pi ${piMessageIdentity(pi)}`;
-  try {
-    const expected = logicalMessageSemanticValue(durable) as Record<string, CanonicalJsonValue>;
-    const actual = piMessageSemanticValue(pi) as Record<string, CanonicalJsonValue>;
-    if (expected.role !== actual.role) return `role ${String(expected.role)}/${String(actual.role)}`;
-    if (expected.role === 'assistant') {
-      const expectedCalls = Array.isArray(expected.toolCalls) ? expected.toolCalls : [];
-      const actualCalls = Array.isArray(actual.toolCalls) ? actual.toolCalls : [];
-      const mismatch = Math.max(expectedCalls.length, actualCalls.length) === 0
-        ? -1
-        : Array.from({ length: Math.max(expectedCalls.length, actualCalls.length) }, (_, index) => index)
-          .find((index) => canonicalJson(expectedCalls[index] ?? null) !== canonicalJson(actualCalls[index] ?? null)) ?? -1;
-      return 'assistant ' +
-        `text=${expected.text === actual.text ? 'same' : 'different'} ` +
-        `reasoning=${expected.reasoning === actual.reasoning ? 'same' : 'different'} ` +
-        `tools=${expectedCalls.length}/${actualCalls.length}` +
-        (mismatch < 0 ? '' : ` firstToolDiff=${mismatch} ` +
-          `${toolCallIdentity(expectedCalls[mismatch])}/${toolCallIdentity(actualCalls[mismatch])}`);
-    }
-    if (expected.role === 'tool') {
-      return `tool ${String(expected.name)}/${String(actual.name)} ` +
-        `call=${String(expected.callId) === String(actual.callId) ? 'same' : 'different'} ` +
-        `error=${String(expected.isError)}/${String(actual.isError)} ` +
-        `result=${canonicalJson(expected.result ?? null) === canonicalJson(actual.result ?? null) ? 'same' : 'different'}`;
-    }
-    return `user text=${expected.text === actual.text ? 'same' : 'different'}`;
-  } catch {
-    return `durable ${logicalMessageIdentity(durable)}, Pi ${piMessageIdentity(pi)}`;
-  }
-}
-
-function toolCallIdentity(value: CanonicalJsonValue | undefined) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return 'missing';
-  const call = value as Record<string, CanonicalJsonValue>;
-  return `${String(call.name)}:${String(call.callId)}:${canonicalJsonHash(call.args ?? null)}`;
-}
-
-function logicalMessageIdentity(message: LogicalContextMessage | undefined) {
-  if (!message) return 'missing';
-  return semanticMessageIdentity(logicalMessageSemanticValue(message));
-}
-
-function piMessageIdentity(value: unknown) {
-  try {
-    return semanticMessageIdentity(piMessageSemanticValue(value));
-  } catch {
-    return 'invalid';
-  }
-}
-
-function semanticMessageIdentity(value: CanonicalJsonValue) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return 'invalid';
-  const semantic = value as Record<string, CanonicalJsonValue>;
-  if (semantic.role === 'tool') {
-    return `tool ${String(semantic.name)} ${String(semantic.callId)} result=${canonicalJsonHash(semantic.result ?? null)}`;
-  }
-  if (semantic.role === 'assistant') {
-    const calls = Array.isArray(semantic.toolCalls) ? semantic.toolCalls : [];
-    const callSummary = calls.map((entry) => {
-      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return 'invalid';
-      const call = entry as Record<string, CanonicalJsonValue>;
-      return `${String(call.name)}:${String(call.callId)}:${canonicalJsonHash(call.args ?? null)}`;
-    }).join(',');
-    return 'assistant ' +
-      `text=${canonicalJsonHash(semantic.text ?? '')} ` +
-      `reasoning=${canonicalJsonHash(semantic.reasoning ?? '')} ` +
-      `tools=${callSummary}`;
-  }
-  return `user text=${canonicalJsonHash(semantic.text ?? '')}`;
-}
-
 export function hashRenderedMessages(messages: Message[]) {
   const encoded = messages.map((message) => canonicalTransportJson(jsonRoundTrip(message)));
   return {
@@ -483,12 +379,12 @@ export function assertContextBudget(estimatedInputTokens: number, contextWindow:
   const hardInputLimit = Math.max(0, contextWindow - 25_000);
   const safetyMargin = 5_000;
   if (estimatedInputTokens + safetyMargin > hardInputLimit) {
-    throw new ContextRolloverRequiredError(estimatedInputTokens, hardInputLimit, safetyMargin);
+    throw new ContextBudgetExceededError(estimatedInputTokens, hardInputLimit, safetyMargin);
   }
 }
 
-export class ContextRolloverRequiredError extends Error {
-  readonly kind = 'context_scope_limit';
+export class ContextBudgetExceededError extends Error {
+  readonly kind = 'context_budget_exceeded';
   readonly estimatedInputTokens: number;
   readonly hardInputLimit: number;
   readonly safetyMargin: number;
@@ -502,7 +398,7 @@ export class ContextRolloverRequiredError extends Error {
       `${admissionLimit} tokens (${hardInputLimit} hard). End this execution scope and continue ` +
       'in a smaller work unit.',
     );
-    this.name = 'ContextScopeLimitError';
+    this.name = 'ContextBudgetExceededError';
     this.estimatedInputTokens = estimatedInputTokens;
     this.hardInputLimit = hardInputLimit;
     this.safetyMargin = safetyMargin;
@@ -646,11 +542,6 @@ export function parseProviderToolResultText(value: string): CanonicalJsonValue {
   }
 }
 
-function requiredPiMessage(value: unknown): Message {
-  piMessageSemanticValue(value);
-  return value as Message;
-}
-
 function providerToolName(name: string) {
   return name === 'workspace.read' ? 'workspace_read' : name;
 }
@@ -688,7 +579,7 @@ export function canonicalProviderJson(value: unknown) {
 
 /**
  * Provider-native messages contain finite decimal metadata such as token
- * costs. Keep that transport domain separate from the journal's deliberately
+ * costs. Keep that transport domain separate from the state store's deliberately
  * stricter integer-only canonical JSON contract.
  */
 function canonicalTransportJson(value: CanonicalJsonValue): string {

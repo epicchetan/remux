@@ -17,17 +17,17 @@ import type {
   PreparedWorkUnitReturn,
   PreparedWorkUnitEntry,
   QueueTurnResult,
-} from './storage/repository.ts';
+} from './domain/state.ts';
 import type { AgentResourceKey } from '../../shared/protocol.ts';
 import type { ThreadCanvasValue } from '../../shared/protocol.ts';
 import type { TurnReadValue } from '../../shared/protocol.ts';
 import type { AssistantMessage } from '@earendil-works/pi-ai';
 import type {
-  JournalOpenInput,
-  JournalOpenResult,
-  JournalSearchInput,
-  JournalSearchOptions,
-  JournalSearchResult,
+  HistoryOpenInput,
+  HistoryOpenResult,
+  HistorySearchInput,
+  HistorySearchOptions,
+  HistorySearchResult,
   ThreadDocumentView,
   ThreadPatchInput,
   ThreadReplaceInput,
@@ -35,17 +35,17 @@ import type {
   WorkUnitResourceView,
   WorkUnitReturnInput,
   WorkUnitReturnStatus,
-} from './engine.ts';
+} from './domain/work.ts';
 import type { AgentTranscriptResourcesReadParams } from '../../shared/transcript.ts';
 
-export interface AgentConversationJournal {
+export interface AgentStore {
   createConversation(params: CreateConversationParams): Promise<CreateConversationResult>;
   reconcileTurn(params: AcceptTurnParams): Promise<AcceptTurnResult | null>;
   acceptTurn(params: AcceptTurnParams): Promise<AcceptTurnResult>;
   reconcileQueuedTurn(params: AcceptTurnParams): Promise<QueueTurnResult | null>;
   enqueueTurn(params: AcceptTurnParams): Promise<QueueTurnResult>;
   readQueuedTurn(conversationId: string, operationId?: string): Promise<DurableQueuedTurn | null>;
-  readOldestQueuedConversationId?(): Promise<string | null>;
+  readOldestQueuedConversationId(): Promise<string | null>;
   finishQueuedTurn(operationId: string, turnId: string): Promise<boolean>;
   removeQueuedTurn(conversationId: string, operationId: string): Promise<boolean>;
   appendAssistantCheckpoint(
@@ -80,7 +80,7 @@ export interface AgentConversationJournal {
       error: string;
     },
   ): Promise<{ inferenceId: string; sequence: number }>;
-  recordInferenceTransport?(
+  recordInferenceTransport(
     handle: DurableTurnHandle,
     input: {
       plannedRequestMode: 'full' | 'continuation';
@@ -95,7 +95,7 @@ export interface AgentConversationJournal {
       durationMs: number;
     },
   ): Promise<boolean>;
-  recordProviderItem?(handle: DurableTurnHandle, message: AssistantMessage): Promise<unknown>;
+  recordProviderItem(handle: DurableTurnHandle, message: AssistantMessage): Promise<unknown>;
   finishInference(
     handle: DurableTurnHandle,
     input: { state: 'completed' | 'failed' | 'interrupted' },
@@ -113,7 +113,7 @@ export interface AgentConversationJournal {
     conversationId: string,
     contextWindow?: number,
   ): Promise<DurableContextBoundarySnapshot>;
-  recordContextPressure?(
+  recordContextPressure(
     handle: DurableTurnHandle,
     input: {
       estimatedInputTokens: number;
@@ -121,7 +121,7 @@ export interface AgentConversationJournal {
       hardContextLimit: number;
     },
   ): Promise<boolean>;
-  resumeActiveTurn?(conversationId: string): Promise<{
+  resumeActiveTurn(conversationId: string): Promise<{
     handle: DurableTurnHandle;
     rootHandle: DurableTurnHandle;
     prompt: string;
@@ -139,29 +139,29 @@ export interface AgentConversationJournal {
     hash: string,
     range?: { offset: number; byteLength: number },
   ): Promise<DurableArtifact | null>;
-  searchJournal?(
+  searchHistory(
     conversationId: string,
-    input: JournalSearchInput,
-    options?: JournalSearchOptions,
-  ): Promise<JournalSearchResult>;
-  openJournal?(conversationId: string, input: JournalOpenInput): Promise<JournalOpenResult>;
-  readThread?(conversationId: string): Promise<ThreadDocumentView>;
-  readThreadHistory?(conversationId: string): Promise<ThreadCanvasValue>;
-  readTurn?(conversationId: string, turnId: string): Promise<TurnReadValue>;
-  patchThread?(handle: DurableTurnHandle, input: ThreadPatchInput): Promise<ThreadDocumentView>;
-  replaceThread?(handle: DurableTurnHandle, input: ThreadReplaceInput): Promise<ThreadDocumentView>;
-  enterWorkUnit?(handle: DurableTurnHandle, input: WorkUnitEnterInput): Promise<{
+    input: HistorySearchInput,
+    options?: HistorySearchOptions,
+  ): Promise<HistorySearchResult>;
+  openHistory(conversationId: string, input: HistoryOpenInput): Promise<HistoryOpenResult>;
+  readThread(conversationId: string): Promise<ThreadDocumentView>;
+  readThreadHistory(conversationId: string): Promise<ThreadCanvasValue>;
+  readTurn(conversationId: string, turnId: string): Promise<TurnReadValue>;
+  patchThread(handle: DurableTurnHandle, input: ThreadPatchInput): Promise<ThreadDocumentView>;
+  replaceThread(handle: DurableTurnHandle, input: ThreadReplaceInput): Promise<ThreadDocumentView>;
+  enterWorkUnit(handle: DurableTurnHandle, input: WorkUnitEnterInput): Promise<{
     handle: DurableTurnHandle;
     parentScopeId: string;
     objective: string;
     doneWhen: string[];
     resources: WorkUnitResourceView[];
   }>;
-  prepareWorkUnitEntry?(
+  prepareWorkUnitEntry(
     handle: DurableTurnHandle,
     input: WorkUnitEnterInput,
   ): Promise<PreparedWorkUnitEntry>;
-  commitWorkUnitEntry?(
+  commitWorkUnitEntry(
     handle: DurableTurnHandle,
     prepared: PreparedWorkUnitEntry,
   ): Promise<{
@@ -171,11 +171,11 @@ export interface AgentConversationJournal {
     doneWhen: string[];
     resources: WorkUnitResourceView[];
   }>;
-  prepareWorkUnitReturn?(
+  prepareWorkUnitReturn(
     handle: DurableTurnHandle,
     input: WorkUnitReturnInput,
   ): Promise<PreparedWorkUnitReturn>;
-  commitWorkUnitReturn?(
+  commitWorkUnitReturn(
     handle: DurableTurnHandle,
     prepared: PreparedWorkUnitReturn,
   ): Promise<{
@@ -187,7 +187,7 @@ export interface AgentConversationJournal {
     resultRef: string;
     scopeId: string;
   }>;
-  returnWorkUnit?(handle: DurableTurnHandle, input: WorkUnitReturnInput): Promise<{
+  returnWorkUnit(handle: DurableTurnHandle, input: WorkUnitReturnInput): Promise<{
     parentHandle: DurableTurnHandle;
     status: WorkUnitReturnStatus;
     result: string;

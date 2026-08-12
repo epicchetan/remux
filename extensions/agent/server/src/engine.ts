@@ -8,7 +8,41 @@ import type { AssistantMessage } from '@earendil-works/pi-ai';
 import type {
   DurableContextBoundarySnapshot,
   DurableInferenceContext,
-} from './storage/repository.ts';
+} from './domain/state.ts';
+import type {
+  HistoryOpenInput,
+  HistoryOpenResult,
+  HistorySearchInput,
+  HistorySearchResult,
+  ThreadDocumentView,
+  ThreadPatchInput,
+  ThreadReplaceInput,
+  WorkUnitEnterInput,
+  WorkUnitReturnInput,
+  WorkUnitReturnPending,
+  WorkUnitView,
+} from './domain/work.ts';
+
+export type {
+  HistoryOpenInput,
+  HistoryOpenResult,
+  HistorySearchHit,
+  HistorySearchInput,
+  HistorySearchOptions,
+  HistorySearchResult,
+  ThreadDocumentView,
+  ThreadPatchEdit,
+  ThreadPatchInput,
+  ThreadReplaceInput,
+  WorkUnitEnterInput,
+  WorkUnitResourceRef,
+  WorkUnitResourceRole,
+  WorkUnitResourceView,
+  WorkUnitReturnInput,
+  WorkUnitReturnPending,
+  WorkUnitReturnStatus,
+  WorkUnitView,
+} from './domain/work.ts';
 
 export type RuntimeEvent =
   | { type: 'assistant-start' }
@@ -69,125 +103,13 @@ export type RuntimeDurabilityHooks = {
     result: unknown;
     isError: boolean;
   }): Promise<void>;
-  journalSearch(callId: string, input: JournalSearchInput): Promise<JournalSearchResult>;
-  journalOpen(input: JournalOpenInput): Promise<JournalOpenResult>;
+  historySearch(callId: string, input: HistorySearchInput): Promise<HistorySearchResult>;
+  historyOpen(input: HistoryOpenInput): Promise<HistoryOpenResult>;
   threadRead(): Promise<ThreadDocumentView>;
   threadPatch(input: ThreadPatchInput): Promise<ThreadDocumentView>;
   threadReplace(input: ThreadReplaceInput): Promise<ThreadDocumentView>;
   workUnitEnter(callId: string, input: WorkUnitEnterInput): Promise<WorkUnitView>;
   workUnitReturn(callId: string, input: WorkUnitReturnInput): Promise<WorkUnitReturnPending>;
-};
-
-export type ThreadDocumentView = {
-  documentId: string;
-  versionId: string;
-  content: string;
-  ref: string;
-};
-
-export type ThreadPatchEdit = {
-  oldText: string;
-  newText: string;
-};
-
-export type ThreadPatchInput = {
-  baseVersionId: string;
-  edits: ThreadPatchEdit[];
-};
-
-export type ThreadReplaceInput = {
-  baseVersionId: string;
-  content: string;
-};
-
-export type WorkUnitEnterInput = {
-  objective: string;
-  doneWhen?: string[];
-  resources?: WorkUnitResourceRef[];
-};
-
-export type WorkUnitReturnInput = {
-  status: WorkUnitReturnStatus;
-  result: string;
-  threadUpdate?: string;
-  resources?: WorkUnitResourceRef[];
-};
-
-export type WorkUnitReturnStatus = 'completed' | 'partial' | 'blocked';
-
-export type WorkUnitResourceRole = 'authority' | 'deliverable' | 'evidence';
-
-export type WorkUnitResourceRef = {
-  ref: string;
-  role: WorkUnitResourceRole;
-  description?: string;
-};
-
-export type WorkUnitResourceView = WorkUnitResourceRef & {
-  snapshot: {
-    ref: string;
-    hash: string;
-    byteLength: number;
-    mediaType: string;
-    source: 'file' | 'history';
-  };
-  inclusion: 'materialized' | 'inherited';
-};
-
-export type WorkUnitView = {
-  scopeId: string;
-  parentScopeId: string;
-  objective: string;
-  doneWhen: string[];
-  resources: WorkUnitResourceView[];
-  state: 'running';
-};
-
-export type WorkUnitReturnPending = {
-  scopeId: string;
-  state: 'returning';
-};
-
-export type JournalSearchInput = {
-  query: string;
-  limit?: number;
-  scope?: 'conversation' | 'project';
-  include?: 'operations';
-};
-
-export type JournalSearchOptions = {
-  excludeRef?: string;
-};
-
-export type JournalSearchHit = {
-  ref: string;
-  kind: string;
-  excerpt: string;
-  conversationId?: string;
-  turnId?: string;
-  sequence?: number;
-  revision?: number;
-  historical?: boolean;
-};
-
-export type JournalSearchResult = {
-  query: string;
-  scope: 'conversation' | 'project';
-  hits: JournalSearchHit[];
-  truncated: boolean;
-  retention: 'ephemeral';
-};
-
-export type JournalOpenInput = { ref: string; offset?: number; maxBytes?: number };
-export type JournalOpenResult = {
-  ref: string;
-  content: string;
-  contentHash: string;
-  offset: number;
-  byteLength: number;
-  totalByteLength: number;
-  nextOffset: number | null;
-  retention: 'ephemeral';
 };
 
 export interface ConversationRuntime {

@@ -4,16 +4,16 @@ import { basename, isAbsolute, resolve } from 'node:path';
 
 import type { AssistantMessage } from '@earendil-works/pi-ai';
 
+import type { AgentStore } from '../agent-store.ts';
+import { DurableTranscriptSelectionError } from '../domain/errors.ts';
+
 import {
   conversationResourceKey,
   queueResourceKey,
   type AgentComposerMessagePart,
-  type AgentPendingQueueValue,
   type AgentResourceKey,
-  type ConversationListValue,
   type ConversationSummary,
   type ContextInspectorValue,
-  type MessageSendParams,
   type ReasoningLevel,
   type ThreadCanvasValue,
   type TurnReadValue,
@@ -31,7 +31,6 @@ import {
   createDurableContextSnapshot,
   logicalMessageSemanticValue,
   reduceLogicalReplay,
-  type DurableContextSnapshot,
   type LogicalContextMessage,
   type LogicalReplayEvent,
 } from '../logical-context.ts';
@@ -40,11 +39,11 @@ import {
   type ThreadContextSource,
 } from '../context/compiler.ts';
 import type {
-  JournalOpenInput,
-  JournalOpenResult,
-  JournalSearchInput,
-  JournalSearchOptions,
-  JournalSearchResult,
+  HistoryOpenInput,
+  HistoryOpenResult,
+  HistorySearchInput,
+  HistorySearchOptions,
+  HistorySearchResult,
   ThreadDocumentView,
   ThreadPatchInput,
   ThreadReplaceInput,
@@ -53,12 +52,39 @@ import type {
   WorkUnitResourceView,
   WorkUnitReturnInput,
   WorkUnitReturnStatus,
-} from '../engine.ts';
+} from '../domain/work.ts';
+import type {
+  AcceptTurnParams,
+  AcceptTurnResult,
+  AgentStateEvent,
+  ArtifactScrubReport,
+  CreateConversationParams,
+  CreateConversationResult,
+  DurableArtifact,
+  DurableContentRef,
+  DurableContextBoundarySnapshot,
+  DurableInferenceContext,
+  DurableQueuedTurn,
+  DurableResourceProjection,
+  DurableTranscriptAction,
+  DurableTranscriptMutation,
+  DurableTranscriptProjection,
+  DurableTranscriptProjectionAction,
+  DurableTranscriptWindow,
+  DurableTranscriptWindowProjection,
+  DurableTurnErrorCode,
+  DurableTurnHandle,
+  DurableTurnStatus,
+  PreparedReference,
+  PreparedWorkUnitEntry,
+  PreparedWorkUnitResource,
+  PreparedWorkUnitReturn,
+  QueueTurnResult,
+} from '../domain/state.ts';
 import {
-  PROMPT_MANIFEST_VERSION,
-  promptManifestValue,
-  type PromptManifest,
-  type ThreadContextFrameCandidate,
+  INFERENCE_CONTEXT_MANIFEST_VERSION,
+  inferenceContextManifestValue,
+  type InferenceContextManifest,
 } from '../context/manifest.ts';
 import {
   CONVERSATION_PREVIEW_CODE_POINTS,
@@ -94,7 +120,6 @@ const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 type IdKind =
   | 'project'
   | 'conversation'
-  | 'strand'
   | 'turn'
   | 'scope'
   | 'event'
@@ -107,224 +132,9 @@ type IdKind =
   | 'document'
   | 'document-version';
 
-export type AgentJournalRepositoryOptions = AgentDataRootOptions & {
+export type AgentStateStoreOptions = AgentDataRootOptions & {
   now?: () => number;
   idFactory?: (kind: IdKind) => string;
-};
-
-export type CreateConversationParams = {
-  operationId: string;
-  cwd: string;
-  modelId: string;
-  reasoning: ReasoningLevel;
-  inheritThreadFrom?: {
-    conversationId: string;
-    turnId: string;
-    position: 'before' | 'after';
-  };
-};
-
-export type CreateConversationResult = {
-  accepted: true;
-  operationId: string;
-  projectId: string;
-  conversationId: string;
-  rootStrandId: string;
-  threadDocumentId: string;
-  threadVersionId: string;
-  basisSequence: number;
-  replayed: boolean;
-};
-
-export type DurableContentRef =
-  | { kind: 'inline'; text: string; byteLength: number; sha256: string }
-  | {
-      kind: 'artifact';
-      hash: string;
-      byteLength: number;
-      mediaType: string;
-      storagePath: string;
-    };
-
-export type DurableTurnHandle = {
-  projectId: string;
-  conversationId: string;
-  strandId: string;
-  turnId: string;
-  scopeId: string;
-};
-
-export type AcceptTurnParams = {
-  operationId: string;
-  conversationId: string;
-  clientMessageId: string;
-  parts?: AgentComposerMessagePart[];
-  text: string;
-};
-
-export type AcceptTurnResult = DurableTurnHandle & {
-  accepted: true;
-  operationId: string;
-  clientMessageId: string;
-  basisSequence: number;
-  transcriptSequence: number;
-  transcriptCreatedAt: number;
-  userItemId: string;
-  userContent?: AgentTextContentReference;
-  userParts?: AgentUserMessagePart[];
-  replayed: boolean;
-};
-
-export type DurableTranscriptMutation = {
-  basisSequence: number;
-  createdAt: number;
-  itemId: string | null;
-  detailText?: string;
-  detailContent?: AgentTextContentReference;
-  outputText?: string;
-  outputContent?: AgentTextContentReference;
-};
-
-export type DurableTurnStatus = 'completed' | 'failed' | 'interrupted' | 'interrupted_by_restart';
-export type DurableTurnErrorCode = 'provider_error' | 'runtime_error' | 'storage_error';
-
-export type DurableTranscriptAction =
-  | {
-      type: 'turn';
-      turnId: string;
-      clientMessageId: string;
-      text: string;
-      parts?: AgentUserMessagePart[];
-      content?: AgentTextContentReference;
-    }
-  | {
-      type: 'assistant';
-      turnId: string;
-      textDelta: string;
-      reasoningDelta: string;
-      textContent?: AgentTextContentReference;
-      reasoningContent?: AgentTextContentReference;
-    }
-  | {
-      type: 'tool-start';
-      turnId: string;
-      callId: string;
-      name: string;
-      args: unknown;
-      detailText?: string;
-      detailContent?: AgentTextContentReference;
-    }
-  | {
-      type: 'tool-end';
-      turnId: string;
-      callId: string;
-      result: unknown;
-      isError: boolean;
-      outputText?: string;
-      outputContent?: AgentTextContentReference;
-    }
-  | {
-      type: 'terminal';
-      turnId: string;
-      status: DurableTurnStatus;
-      error: string | null;
-      errorCode?: DurableTurnErrorCode | null;
-      durationMs?: number;
-    };
-
-export type DurableTranscriptProjectionAction = DurableTranscriptAction & {
-  sequence: number;
-  createdAt: number;
-  itemId: string | null;
-};
-
-export type DurableTranscriptProjection = {
-  basisSequence: number;
-  actions: DurableTranscriptProjectionAction[];
-};
-
-export type DurableTranscriptWindow = {
-  requestIndex: number;
-  startIndex: number;
-  endIndexExclusive: number;
-  hasEarlier: boolean;
-  hasLater: boolean;
-  turnIds: string[];
-};
-
-export type DurableTranscriptWindowProjection = DurableTranscriptProjection & {
-  selectedTurnIds: string[];
-  windows: DurableTranscriptWindow[];
-  estimatedBytes: number;
-};
-
-export type AgentJournalEvent = {
-  sequence: number;
-  eventId: string;
-  projectId: string;
-  conversationId: string;
-  strandId: string;
-  turnId: string | null;
-  scopeId: string | null;
-  type: string;
-  actor: string;
-  visibility: string;
-  causalEventId: string | null;
-  operationId: string | null;
-  payload: CanonicalJsonValue | null;
-  artifactHash: string | null;
-  createdAt: number;
-};
-
-export type DurableResourceProjection = {
-  key: 'conversation-list' | `conversation:${string}` | `context:${string}` | `queue:${string}`;
-  basisSequence: number;
-  value: ConversationListValue | ConversationSummary | ContextInspectorValue | AgentPendingQueueValue;
-};
-
-export type DurableQueuedTurn = MessageSendParams & {
-  queueOperationId: string;
-};
-
-export type QueueTurnResult = {
-  accepted: true;
-  delivery: 'queued' | 'sent';
-  operationId: string;
-  replayed: boolean;
-  turnId: string | null;
-};
-
-export type DurableArtifact = {
-  hash: string;
-  byteLength: number;
-  mediaType: string;
-  offset: number;
-  bytes: Buffer;
-};
-
-export type ArtifactScrubReport = {
-  orphanStoragePaths: string[];
-  referencedArtifacts: number;
-  verifiedBytes: number;
-};
-
-export type DurableContextBoundarySnapshot = DurableContextSnapshot & {
-  frame: ThreadContextFrameCandidate;
-  scopeId: string;
-  scopeKind: 'turn' | 'work_unit';
-  nextFrameOrdinal: number;
-};
-
-export type DurableInferenceContext = {
-  basisSequence: number;
-  logicalHash: string;
-  renderedHash: string;
-  orderedMessageHashes: readonly string[];
-  messageCount: number;
-  fixedContractsHash: string;
-  frame: ThreadContextFrameCandidate;
-  frameBuildDurationMs: number;
-  activeMessages: readonly LogicalContextMessage[];
 };
 
 type StoredCreateOutcome = {
@@ -344,7 +154,6 @@ type OperationReplayRow = {
   value_json: string;
   project_id: string;
   conversation_id: string;
-  strand_id: string;
   thread_document_id: string;
   thread_version_id: string;
 };
@@ -353,7 +162,7 @@ type ProjectRow = {
   project_id: string;
 };
 
-export class AgentJournalRepository {
+export class AgentStateStore implements AgentStore {
   readonly databasePath: string;
   private readonly storage: AgentDatabase;
   private readonly now: () => number;
@@ -363,7 +172,7 @@ export class AgentJournalRepository {
   private writerTail: Promise<void> = Promise.resolve();
   private closePromise: Promise<void> | null = null;
 
-  private constructor(storage: AgentDatabase, options: AgentJournalRepositoryOptions) {
+  private constructor(storage: AgentDatabase, options: AgentStateStoreOptions) {
     this.storage = storage;
     this.databasePath = storage.paths.database;
     this.now = options.now ?? Date.now;
@@ -371,17 +180,16 @@ export class AgentJournalRepository {
     this.artifacts = new AgentArtifactStore(storage.paths);
   }
 
-  static async open(options: AgentJournalRepositoryOptions = {}) {
+  static async open(options: AgentStateStoreOptions = {}) {
     const storage = await openAgentDatabase(options);
-    const repository = new AgentJournalRepository(storage, options);
+    const store = new AgentStateStore(storage, options);
     try {
-      await repository.validateArtifactMetadata();
-      repository.orphanArtifactPaths = await repository.findArtifactOrphans();
-      await repository.recoverInterruptedTurns();
-      await repository.upgradeLegacyAssistantProjections();
-      await repository.rebuildJournalSearchIndex();
-      await repository.rebuildConversationResources();
-      return repository;
+      await store.validateArtifactMetadata();
+      store.orphanArtifactPaths = await store.findArtifactOrphans();
+      await store.recoverInterruptedTurns();
+      await store.rebuildHistorySearchIndex();
+      await store.rebuildConversationResources();
+      return store;
     } catch (error) {
       storage.close();
       throw error;
@@ -622,13 +430,12 @@ export class AgentJournalRepository {
         itemId = this.nextId('item');
         this.storage.database.prepare(`
           INSERT INTO transcript_items (
-            item_id, conversation_id, strand_id, turn_id, first_sequence,
+            item_id, conversation_id, turn_id, first_sequence,
             last_sequence, kind, status, value_json
-          ) VALUES (?, ?, ?, ?, ?, ?, 'assistant', 'running', ?)
+          ) VALUES (?, ?, ?, ?, ?, 'assistant', 'running', ?)
         `).run(
           itemId,
           handle.conversationId,
-          handle.strandId,
           handle.turnId,
           sequence,
           sequence,
@@ -681,11 +488,10 @@ export class AgentJournalRepository {
         createdAt: recordedAt,
       });
       this.insertArtifact(args.artifact, sequence);
-      this.indexJournalText({
-        ref: `journal://tool/${encodeURIComponent(input.callId)}`,
+      this.indexHistoryText({
+        ref: `history://tool/${encodeURIComponent(input.callId)}`,
         projectId: handle.projectId,
         conversationId: handle.conversationId,
-        strandId: handle.strandId,
         turnId: handle.turnId,
         kind: `operation:${input.name}`,
         sequence,
@@ -695,13 +501,12 @@ export class AgentJournalRepository {
       const itemId = this.nextId('item');
       this.storage.database.prepare(`
         INSERT INTO transcript_items (
-          item_id, conversation_id, strand_id, turn_id, first_sequence,
+          item_id, conversation_id, turn_id, first_sequence,
           last_sequence, kind, status, value_json
-        ) VALUES (?, ?, ?, ?, ?, ?, 'tool', 'running', ?)
+        ) VALUES (?, ?, ?, ?, ?, 'tool', 'running', ?)
       `).run(
         itemId,
         handle.conversationId,
-        handle.strandId,
         handle.turnId,
         sequence,
         sequence,
@@ -809,8 +614,8 @@ export class AgentJournalRepository {
     const dispatch = await this.prepareText(renderInspectableProviderPayload(input.payload), true);
     if (!dispatch.artifact) throw new Error('Provider dispatch payload must be stored durably.');
     const dispatchArtifact = dispatch.artifact;
-    const manifestValue: PromptManifest = {
-      version: PROMPT_MANIFEST_VERSION,
+    const manifestValue: InferenceContextManifest = {
+      version: INFERENCE_CONTEXT_MANIFEST_VERSION,
       compilerVersion: input.context.frame.compilerVersion,
       policyVersion: input.context.frame.policyVersion,
       piVersion: '0.84.0',
@@ -818,7 +623,6 @@ export class AgentJournalRepository {
       modelId: input.modelId,
       projectId: handle.projectId,
       conversationId: handle.conversationId,
-      strandId: handle.strandId,
       turnId: handle.turnId,
       scopeId: handle.scopeId,
       frameId,
@@ -827,7 +631,7 @@ export class AgentJournalRepository {
       threadVersionId: input.context.frame.threadVersionId,
       context: {
         semanticHash: input.context.frame.semanticHash,
-        bootstrapHash: input.context.frame.bootstrapHash,
+        contextEnvelopeHash: input.context.frame.contextEnvelopeHash,
         logicalHash: input.context.logicalHash,
         renderedHash: input.context.renderedHash,
         orderedMessageHashes: input.context.orderedMessageHashes,
@@ -854,18 +658,18 @@ export class AgentJournalRepository {
         },
       },
     };
-    const [manifest, bootstrap] = await Promise.all([
-      this.prepareJson(promptManifestValue(manifestValue), true),
-      this.prepareText(input.context.frame.bootstrap, true),
+    const [manifest, contextEnvelope] = await Promise.all([
+      this.prepareJson(inferenceContextManifestValue(manifestValue), true),
+      this.prepareText(input.context.frame.contextEnvelope, true),
     ]);
-    if (!manifest.artifact || !bootstrap.artifact) {
+    if (!manifest.artifact || !contextEnvelope.artifact) {
       throw new Error('Inference context artifacts must be stored durably.');
     }
-    if (bootstrap.sha256 !== input.context.frame.bootstrapHash) {
-      throw new Error('Compiled bootstrap hash changed before durable commit.');
+    if (contextEnvelope.sha256 !== input.context.frame.contextEnvelopeHash) {
+      throw new Error('Compiled context envelope hash changed before durable commit.');
     }
     const manifestArtifact = manifest.artifact;
-    const bootstrapArtifact = bootstrap.artifact;
+    const contextEnvelopeArtifact = contextEnvelope.artifact;
     return this.enqueueWrite(() => this.storage.transaction(() => {
       this.assertRunningHandle(handle);
       const running = this.storage.database.prepare(`
@@ -884,7 +688,7 @@ export class AgentJournalRepository {
       const basisSequence = this.currentHead(handle);
       if (input.context.basisSequence !== basisSequence) {
         throw new Error(
-          `Provider context basis ${input.context.basisSequence} is stale; journal head is ${basisSequence}.`,
+          `Provider context basis ${input.context.basisSequence} is stale; event head is ${basisSequence}.`,
         );
       }
       const sequence = this.insertEvent({
@@ -896,16 +700,16 @@ export class AgentJournalRepository {
         payload: {
           estimatedInputTokens: input.estimatedInputTokens,
           frameId,
-          frameRef: `journal://frame/${encodeURIComponent(frameId)}`,
+          frameRef: `history://frame/${encodeURIComponent(frameId)}`,
           inferenceId,
           inputHash: input.context.renderedHash,
           manifestArtifactHash: manifestArtifact.hash,
-          manifestVersion: PROMPT_MANIFEST_VERSION,
+          manifestVersion: INFERENCE_CONTEXT_MANIFEST_VERSION,
           contextLogicalHash: input.context.logicalHash,
           contextMessageCount: input.context.messageCount,
           contextRenderedHash: input.context.renderedHash,
           frameOrdinal,
-          bootstrapHash: bootstrapArtifact.hash,
+          contextEnvelopeHash: contextEnvelopeArtifact.hash,
           semanticHash: input.context.frame.semanticHash,
           ordinal,
           requestMode: input.requestMode,
@@ -918,21 +722,20 @@ export class AgentJournalRepository {
         createdAt: recordedAt,
       });
       this.insertArtifact(manifestArtifact, sequence);
-      this.insertArtifact(bootstrapArtifact, sequence);
+      this.insertArtifact(contextEnvelopeArtifact, sequence);
       this.insertArtifact(dispatchArtifact, sequence);
       this.storage.database.prepare(`
         INSERT INTO context_frames (
-          frame_id, project_id, conversation_id, strand_id, turn_id,
+          frame_id, project_id, conversation_id, turn_id,
           scope_id, ordinal, basis_sequence, compiler_version,
-          thread_version_id, manifest_artifact_hash, bootstrap_artifact_hash,
+          thread_version_id, manifest_artifact_hash, context_envelope_artifact_hash,
           input_hash, ordered_item_hashes_json, estimated_input_tokens,
           created_sequence, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         frameId,
         handle.projectId,
         handle.conversationId,
-        handle.strandId,
         handle.turnId,
         handle.scopeId,
         frameOrdinal,
@@ -940,7 +743,7 @@ export class AgentJournalRepository {
         input.context.frame.compilerVersion,
         input.context.frame.threadVersionId,
         manifestArtifact.hash,
-        bootstrapArtifact.hash,
+        contextEnvelopeArtifact.hash,
         input.context.renderedHash,
         canonicalJson(input.context.orderedMessageHashes),
         input.estimatedInputTokens,
@@ -949,17 +752,16 @@ export class AgentJournalRepository {
       );
       this.storage.database.prepare(`
         INSERT INTO inferences (
-          inference_id, project_id, conversation_id, strand_id, turn_id,
+          inference_id, project_id, conversation_id, turn_id,
           scope_id, frame_id, ordinal, basis_sequence, state, request_mode,
           dispatch_artifact_hash, input_hash, estimated_input_tokens,
           reported_input_tokens, reported_output_tokens,
           reported_cache_read_tokens, started_sequence, terminal_sequence
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL)
       `).run(
         inferenceId,
         handle.projectId,
         handle.conversationId,
-        handle.strandId,
         handle.turnId,
         handle.scopeId,
         frameId,
@@ -988,7 +790,7 @@ export class AgentJournalRepository {
         frameId,
         manifest: manifestValue,
         manifestArtifact,
-        bootstrapArtifact,
+        contextEnvelopeArtifact,
         dispatchArtifact,
         activeMessages: input.context.activeMessages,
         buildDurationMs: input.context.frameBuildDurationMs,
@@ -1138,17 +940,15 @@ export class AgentJournalRepository {
       this.insertArtifact(inspectableArtifact, sequence, 'inspectable');
       this.storage.database.prepare(`
         INSERT INTO provider_items (
-          provider_item_id, inference_id, project_id, conversation_id,
-          strand_id, turn_id, scope_id, ordinal, item_type,
+          provider_item_id, inference_id, project_id, conversation_id, turn_id, scope_id, ordinal, item_type,
           upstream_item_id, raw_artifact_hash, inspectable_artifact_hash,
           created_sequence, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'assistant_message', NULL, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'assistant_message', NULL, ?, ?, ?, ?)
       `).run(
         providerItemId,
         inference.inference_id,
         handle.projectId,
         handle.conversationId,
-        handle.strandId,
         handle.turnId,
         handle.scopeId,
         ordinal,
@@ -1558,7 +1358,7 @@ export class AgentJournalRepository {
       ORDER BY first_sequence, item_id
     `).all(params.conversationId, ...selectedTurnIds) as TranscriptWindowItemRow[];
     const eventRows = this.storage.database.prepare(`
-      SELECT sequence, event_id, project_id, conversation_id, strand_id,
+      SELECT sequence, event_id, project_id, conversation_id,
              turn_id, scope_id, type, actor, visibility, causal_event_id,
              operation_id, payload_json, artifact_hash, created_at
       FROM events
@@ -1889,7 +1689,6 @@ export class AgentJournalRepository {
       : [activeScope.rootScopeId];
     const visibleScopeSet = new Set(visibleScopeIds);
     const allEvents = (await this.readEvents({ conversationId }))
-      .filter((event) => event.strandId === activeScope.strandId)
       .filter((event) =>
         event.scopeId === null ||
         scopeKinds.get(event.scopeId) === 'turn' ||
@@ -1905,21 +1704,20 @@ export class AgentJournalRepository {
       SELECT d.document_id, d.head_version_id, v.content_artifact_hash
       FROM state_documents d
       JOIN document_versions v ON v.version_id = d.head_version_id
-      WHERE d.conversation_id = ? AND d.strand_id = ?
-        AND d.scope_kind = 'strand' AND d.key = 'thread.md'
-    `).get(conversationId, activeScope.strandId) as {
+      WHERE d.conversation_id = ?
+        AND d.scope_kind = 'conversation' AND d.key = 'thread.md'
+    `).get(conversationId) as {
       document_id: string;
       head_version_id: string;
       content_artifact_hash: string;
     } | undefined;
-    if (!thread) throw new Error('The active strand has no thread.md document.');
+    if (!thread) throw new Error('The conversation has no Thread document.');
     const threadMarkdown = await this.readArtifactTextByHash(thread.content_artifact_hash);
     const basisSequence = allEvents.at(-1)!.sequence;
     const source: ThreadContextSource = {
       basisSequence,
       projectId: activeScope.projectId,
       conversationId,
-      strandId: activeScope.strandId,
       turnId: activeScope.turnId,
       scopeId: activeScope.scopeId,
       scopeKind: activeScope.kind,
@@ -2029,7 +1827,7 @@ export class AgentJournalRepository {
     this.assertOpen();
     await this.writerTail;
     const row = this.storage.database.prepare(`
-      SELECT t.project_id, t.conversation_id, t.strand_id, t.turn_id,
+      SELECT t.project_id, t.conversation_id, t.turn_id,
              t.root_scope_id, s.scope_id, s.kind
       FROM turns t
       JOIN execution_scopes s ON s.turn_id = t.turn_id
@@ -2039,7 +1837,7 @@ export class AgentJournalRepository {
                (s.kind = 'work_unit') DESC, s.created_sequence DESC
       LIMIT 1
     `).get(conversationId) as {
-      project_id: string; conversation_id: string; strand_id: string;
+      project_id: string; conversation_id: string;
       turn_id: string; root_scope_id: string; scope_id: string;
       kind: 'turn' | 'work_unit';
     } | undefined;
@@ -2047,7 +1845,6 @@ export class AgentJournalRepository {
     const handle: DurableTurnHandle = {
       projectId: row.project_id,
       conversationId: row.conversation_id,
-      strandId: row.strand_id,
       turnId: row.turn_id,
       scopeId: row.scope_id,
     };
@@ -2104,7 +1901,7 @@ export class AgentJournalRepository {
     return { handle, rootHandle, prompt };
   }
 
-  private async logicalReplayEvents(events: readonly AgentJournalEvent[]) {
+  private async logicalReplayEvents(events: readonly AgentStateEvent[]) {
     const replay: LogicalReplayEvent[] = [];
     for (const event of events) {
       if (!event.turnId || !event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
@@ -2201,32 +1998,32 @@ export class AgentJournalRepository {
     return replay;
   }
 
-  async searchJournal(
+  async searchHistory(
     conversationId: string,
-    input: JournalSearchInput,
-    options: JournalSearchOptions = {},
-  ): Promise<JournalSearchResult> {
+    input: HistorySearchInput,
+    options: HistorySearchOptions = {},
+  ): Promise<HistorySearchResult> {
     this.assertOpen();
     await this.writerTail;
     const query = input.query.trim();
-    if (!query) throw new TypeError('Journal search query cannot be empty.');
-    const limit = boundedSafeInteger(input.limit ?? 10, 1, 20, 'journal search limit');
+    if (!query) throw new TypeError('History search query cannot be empty.');
+    const limit = boundedSafeInteger(input.limit ?? 10, 1, 20, 'history search limit');
     const scope = input.scope ?? 'project';
     const identity = this.contextIdentity(conversationId);
-    const terms = journalSearchTerms(query);
-    if (terms.length === 0) throw new TypeError('Journal search query must contain searchable text.');
+    const terms = historySearchTerms(query);
+    if (terms.length === 0) throw new TypeError('History search query must contain searchable text.');
     const ftsQuery = terms.map((term) => `"${term.replaceAll('"', '""')}"`).join(' AND ');
     const rows = this.storage.database.prepare(`
-      SELECT ref, conversation_id, strand_id, turn_id, kind, sequence, text,
-             bm25(journal_search_index) AS relevance
-      FROM journal_search_index
-      WHERE journal_search_index MATCH ?
+      SELECT ref, conversation_id, turn_id, kind, sequence, text,
+             bm25(history_search_index) AS relevance
+      FROM history_search_index
+      WHERE history_search_index MATCH ?
         AND project_id = ?
         AND (? = 'project' OR conversation_id = ?)
         AND (? = 'operations' OR kind NOT LIKE 'operation:%')
         AND (? = '' OR ref <> ?)
       ORDER BY
-        CASE WHEN strand_id = ? THEN 0 WHEN conversation_id = ? THEN 1 ELSE 2 END,
+        CASE WHEN conversation_id = ? THEN 0 ELSE 1 END,
         relevance,
         CAST(sequence AS INTEGER) DESC,
         ref
@@ -2239,13 +2036,11 @@ export class AgentJournalRepository {
       input.include ?? '',
       options.excludeRef ?? '',
       options.excludeRef ?? '',
-      identity.strandId,
       conversationId,
       limit + 1,
     ) as Array<{
       ref: string;
       conversation_id: string;
-      strand_id: string;
       turn_id: string;
       kind: string;
       sequence: number;
@@ -2259,8 +2054,7 @@ export class AgentJournalRepository {
       excerpt: matchingExcerpt(row.text, terms, 480),
       ...(row.conversation_id ? { conversationId: row.conversation_id } : {}),
       ...(row.turn_id ? { turnId: row.turn_id } : {}),
-      sequence: safeInteger(Number(row.sequence), 'journal search sequence'),
-      historical: row.conversation_id !== conversationId || row.strand_id !== identity.strandId,
+      sequence: safeInteger(Number(row.sequence), 'history search sequence'),
     }));
     return {
       query,
@@ -2271,16 +2065,16 @@ export class AgentJournalRepository {
     };
   }
 
-  async openJournal(
+  async openHistory(
     conversationId: string,
-    input: JournalOpenInput,
-  ): Promise<JournalOpenResult> {
+    input: HistoryOpenInput,
+  ): Promise<HistoryOpenResult> {
     this.assertOpen();
     await this.writerTail;
     const content = await this.resolveOpenableContent(conversationId, input.ref);
     const bytes = Buffer.from(content, 'utf8');
-    const offset = boundedSafeInteger(input.offset ?? 0, 0, bytes.byteLength, 'journal open offset');
-    const maxBytes = boundedSafeInteger(input.maxBytes ?? 24 * 1024, 256, 32 * 1024, 'journal open maxBytes');
+    const offset = boundedSafeInteger(input.offset ?? 0, 0, bytes.byteLength, 'history open offset');
+    const maxBytes = boundedSafeInteger(input.maxBytes ?? 24 * 1024, 256, 32 * 1024, 'history open maxBytes');
     const slice = boundedUtf8Slice(bytes, offset, maxBytes);
     return {
       ref: input.ref,
@@ -2298,18 +2092,18 @@ export class AgentJournalRepository {
 
   private async resolveOpenableContent(conversationId: string, ref: string): Promise<string> {
     const identity = this.contextIdentity(conversationId);
-    const eventMatch = /^journal:\/\/event\/(\d+)$/u.exec(ref);
-    const eventIdMatch = /^journal:\/\/event-id\/([^/?#]+)$/u.exec(ref);
+    const eventMatch = /^history:\/\/event\/(\d+)$/u.exec(ref);
+    const eventIdMatch = /^history:\/\/event-id\/([^/?#]+)$/u.exec(ref);
     if (eventMatch || eventIdMatch) {
       const selector = eventMatch ? 'sequence = ?' : 'event_id = ?';
       const value = eventMatch ? Number(eventMatch[1]) : decodeURIComponent(eventIdMatch![1]!);
       const row = this.storage.database.prepare(`
-        SELECT sequence, event_id, project_id, conversation_id, strand_id,
+        SELECT sequence, event_id, project_id, conversation_id,
                turn_id, scope_id, type, actor, visibility, causal_event_id,
                operation_id, payload_json, artifact_hash, created_at
         FROM events WHERE project_id = ? AND ${selector}
       `).get(identity.projectId, value) as EventRow | undefined;
-      if (!row) throw new Error(`Journal event reference ${ref} does not exist in this project.`);
+      if (!row) throw new Error(`History event reference ${ref} does not exist in this project.`);
       const event = decodeEventRow(row);
       return canonicalJson({
         ...event,
@@ -2317,10 +2111,10 @@ export class AgentJournalRepository {
       } as unknown as CanonicalJsonValue);
     }
 
-    const artifactMatch = /^journal:\/\/artifact\/([0-9a-f]{64})$/u.exec(ref);
+    const artifactMatch = /^history:\/\/artifact\/([0-9a-f]{64})$/u.exec(ref);
     if (artifactMatch) return this.openArtifactText(identity.projectId, artifactMatch[1]!);
 
-    const documentVersionMatch = /^journal:\/\/document-version\/([^/?#]+)$/u.exec(ref);
+    const documentVersionMatch = /^history:\/\/document-version\/([^/?#]+)$/u.exec(ref);
     if (documentVersionMatch) {
       const versionId = decodeURIComponent(documentVersionMatch[1]!);
       const row = this.storage.database.prepare(`
@@ -2346,7 +2140,7 @@ export class AgentJournalRepository {
       });
     }
 
-    const messageMatch = /^journal:\/\/message\/([^/?#]+)$/u.exec(ref);
+    const messageMatch = /^history:\/\/message\/([^/?#]+)$/u.exec(ref);
     if (messageMatch) {
       const messageId = decodeURIComponent(messageMatch[1]!);
       const row = this.storage.database.prepare(`
@@ -2359,7 +2153,7 @@ export class AgentJournalRepository {
         role: string; visibility: string; state: string;
         content_artifact_hash: string; created_sequence: number;
       } | undefined;
-      if (!row) throw new Error(`Journal message ${messageId} does not exist in this project.`);
+      if (!row) throw new Error(`History message ${messageId} does not exist in this project.`);
       return canonicalJson({
         id: row.message_id,
         turnId: row.turn_id,
@@ -2376,7 +2170,7 @@ export class AgentJournalRepository {
       });
     }
 
-    const journalTurn = /^journal:\/\/turn\/([^/?#]+)(#assistant|#call=[^#]+)?$/u.exec(ref);
+    const journalTurn = /^history:\/\/turn\/([^/?#]+)(#assistant|#call=[^#]+)?$/u.exec(ref);
     const agentTurn = /^agent:\/\/conversation\/([^/?#]+)\/turn\/([^/?#]+)(#assistant|#call=[^#]+)?$/u.exec(ref);
     if (journalTurn || agentTurn) {
       if (agentTurn && decodeURIComponent(agentTurn[1]!) !== conversationId) {
@@ -2390,7 +2184,7 @@ export class AgentJournalRepository {
       `).get(identity.projectId, turnId) as {
         turn_id: string; state: string; accepted_sequence: number; terminal_sequence: number | null;
       } | undefined;
-      if (!turn) throw new Error(`Journal turn ${turnId} does not exist in this project.`);
+      if (!turn) throw new Error(`History turn ${turnId} does not exist in this project.`);
       if (fragment === '#assistant') {
         const item = this.storage.database.prepare(`
           SELECT message_id FROM messages
@@ -2399,11 +2193,11 @@ export class AgentJournalRepository {
         if (!item) throw new Error(`Turn ${turnId} has no assistant message.`);
         return this.resolveOpenableContent(
           conversationId,
-          `journal://message/${encodeURIComponent(item.message_id)}`,
+          `history://message/${encodeURIComponent(item.message_id)}`,
         );
       }
       if (fragment.startsWith('#call=')) {
-        return this.resolveOpenableContent(conversationId, `journal://tool/${fragment.slice(6)}`);
+        return this.resolveOpenableContent(conversationId, `history://tool/${fragment.slice(6)}`);
       }
       return canonicalJson({
         ...turn,
@@ -2411,11 +2205,11 @@ export class AgentJournalRepository {
       } as unknown as CanonicalJsonValue);
     }
 
-    const toolMatch = /^journal:\/\/tool\/([^/?#]+)$/u.exec(ref);
+    const toolMatch = /^history:\/\/tool\/([^/?#]+)$/u.exec(ref);
     if (toolMatch) {
       const callId = decodeURIComponent(toolMatch[1]!);
       const rows = this.storage.database.prepare(`
-        SELECT sequence, event_id, project_id, conversation_id, strand_id,
+        SELECT sequence, event_id, project_id, conversation_id,
                turn_id, scope_id, type, actor, visibility, causal_event_id,
                operation_id, payload_json, artifact_hash, created_at
         FROM events
@@ -2423,7 +2217,7 @@ export class AgentJournalRepository {
           AND json_extract(payload_json, '$.callId') = ?
         ORDER BY sequence
       `).all(identity.projectId, callId) as EventRow[];
-      if (rows.length === 0) throw new Error(`Journal tool call ${callId} does not exist in this project.`);
+      if (rows.length === 0) throw new Error(`History tool call ${callId} does not exist in this project.`);
       const events = await Promise.all(rows.map(async (row) => {
         const event = decodeEventRow(row);
         return { ...event, payload: await this.expandEventPayload(event) };
@@ -2431,7 +2225,7 @@ export class AgentJournalRepository {
       return canonicalJson({ callId, events } as unknown as CanonicalJsonValue);
     }
 
-    const scopeMatch = /^journal:\/\/scope\/([^/?#]+)(\/trace)?$/u.exec(ref);
+    const scopeMatch = /^history:\/\/scope\/([^/?#]+)(\/trace)?$/u.exec(ref);
     if (scopeMatch) {
       const scopeId = decodeURIComponent(scopeMatch[1]!);
       const row = this.storage.database.prepare(`
@@ -2452,8 +2246,8 @@ export class AgentJournalRepository {
         state: row.state,
         createdSequence: row.created_sequence,
         terminalSequence: row.terminal_sequence,
-        resultRef: row.result_artifact_hash ? `journal://artifact/${row.result_artifact_hash}` : null,
-        traceRef: `journal://scope/${encodeURIComponent(scopeId)}/trace`,
+        resultRef: row.result_artifact_hash ? `history://artifact/${row.result_artifact_hash}` : null,
+        traceRef: `history://scope/${encodeURIComponent(scopeId)}/trace`,
       };
       if (!scopeMatch[2]) return canonicalJson(common);
       return canonicalJson({
@@ -2462,24 +2256,27 @@ export class AgentJournalRepository {
       } as unknown as CanonicalJsonValue);
     }
 
-    const frameMatch = /^journal:\/\/frame\/([^/?#]+)$/u.exec(ref);
+    const frameMatch = /^history:\/\/frame\/([^/?#]+)$/u.exec(ref);
     if (frameMatch) {
       const frameId = decodeURIComponent(frameMatch[1]!);
       const row = this.storage.database.prepare(`
         SELECT frame_id, scope_id, turn_id, ordinal, basis_sequence,
                compiler_version, thread_version_id, manifest_artifact_hash,
-               bootstrap_artifact_hash, input_hash, ordered_item_hashes_json,
+               context_envelope_artifact_hash, input_hash, ordered_item_hashes_json,
                estimated_input_tokens, created_sequence
         FROM context_frames WHERE project_id = ? AND frame_id = ?
       `).get(identity.projectId, frameId) as Record<string, unknown> | undefined;
       if (!row) throw new Error(`Context frame ${frameId} does not exist in this project.`);
       const manifestHash = requiredString(row.manifest_artifact_hash as CanonicalJsonValue, 'manifest hash');
-      const bootstrapHash = requiredString(row.bootstrap_artifact_hash as CanonicalJsonValue, 'bootstrap hash');
+      const contextEnvelopeHash = requiredString(
+        row.context_envelope_artifact_hash as CanonicalJsonValue,
+        'context envelope hash',
+      );
       const normalizedRow = normalizeJson(row) as Record<string, CanonicalJsonValue>;
       return canonicalJson({
         ...normalizedRow,
-        manifestRef: `journal://artifact/${manifestHash}`,
-        bootstrapRef: `journal://artifact/${bootstrapHash}`,
+        manifestRef: `history://artifact/${manifestHash}`,
+        contextEnvelopeRef: `history://artifact/${contextEnvelopeHash}`,
       });
     }
 
@@ -2507,12 +2304,12 @@ export class AgentJournalRepository {
       return canonicalJson({ conversationId, turns: normalizeJson(rows) });
     }
 
-    throw new Error(`Unsupported journal reference ${ref}.`);
+    throw new Error(`Unsupported History reference ${ref}.`);
   }
 
   private async expandedEventsFor(where: string, parameters: readonly (string | number)[]) {
     const rows = this.storage.database.prepare(`
-      SELECT sequence, event_id, project_id, conversation_id, strand_id,
+      SELECT sequence, event_id, project_id, conversation_id,
              turn_id, scope_id, type, actor, visibility, causal_event_id,
              operation_id, payload_json, artifact_hash, created_at
       FROM events WHERE ${where} ORDER BY sequence
@@ -2536,7 +2333,7 @@ export class AgentJournalRepository {
               OR EXISTS (
                 SELECT 1 FROM json_tree(e.payload_json) linked
                 WHERE linked.value = a.hash
-                   OR linked.value = 'journal://artifact/' || a.hash
+                   OR linked.value = 'history://artifact/' || a.hash
               )
             )
         )
@@ -2568,8 +2365,8 @@ export class AgentJournalRepository {
       SELECT d.document_id, d.head_version_id, v.content_artifact_hash
       FROM conversations c
       JOIN state_documents d
-        ON d.conversation_id = c.conversation_id AND d.strand_id = c.head_strand_id
-       AND d.scope_kind = 'strand' AND d.key = 'thread.md'
+        ON d.conversation_id = c.conversation_id
+       AND d.scope_kind = 'conversation' AND d.key = 'thread.md'
       JOIN document_versions v ON v.version_id = d.head_version_id
       WHERE c.conversation_id = ?
     `).get(conversationId) as {
@@ -2582,7 +2379,7 @@ export class AgentJournalRepository {
       documentId: row.document_id,
       versionId: row.head_version_id,
       content: await this.readArtifactTextByHash(row.content_artifact_hash),
-      ref: `journal://document-version/${encodeURIComponent(row.head_version_id)}`,
+      ref: `history://document-version/${encodeURIComponent(row.head_version_id)}`,
     };
   }
 
@@ -2603,8 +2400,8 @@ export class AgentJournalRepository {
              previous.content_artifact_hash AS previous_artifact_hash
       FROM conversations c
       JOIN state_documents d
-        ON d.conversation_id = c.conversation_id AND d.strand_id = c.head_strand_id
-       AND d.scope_kind = 'strand' AND d.key = 'thread.md'
+        ON d.conversation_id = c.conversation_id
+       AND d.scope_kind = 'conversation' AND d.key = 'thread.md'
       JOIN document_versions current ON current.version_id = d.head_version_id
       LEFT JOIN document_versions previous ON previous.version_id = current.parent_version_id
       WHERE c.conversation_id = ?
@@ -2709,13 +2506,13 @@ export class AgentJournalRepository {
       SELECT d.head_version_id, v.content_artifact_hash
       FROM state_documents d
       JOIN document_versions v ON v.version_id = d.head_version_id
-      WHERE d.conversation_id = ? AND d.strand_id = ?
-        AND d.scope_kind = 'strand' AND d.key = 'thread.md'
-    `).get(handle.conversationId, handle.strandId) as {
+      WHERE d.conversation_id = ?
+        AND d.scope_kind = 'conversation' AND d.key = 'thread.md'
+    `).get(handle.conversationId) as {
       head_version_id: string;
       content_artifact_hash: string;
     } | undefined;
-    if (!row) throw new Error('The active strand has no thread.md document.');
+    if (!row) throw new Error('The conversation has no Thread document.');
     if (row.head_version_id !== input.baseVersionId) {
       throw new Error(
         `The Thread changed from ${input.baseVersionId} to ${row.head_version_id}; read it and retry.`,
@@ -2757,13 +2554,13 @@ export class AgentJournalRepository {
       const document = this.storage.database.prepare(`
         SELECT document_id, head_version_id
         FROM state_documents
-        WHERE conversation_id = ? AND strand_id = ?
-          AND scope_kind = 'strand' AND key = 'thread.md'
-      `).get(handle.conversationId, handle.strandId) as {
+        WHERE conversation_id = ?
+          AND scope_kind = 'conversation' AND key = 'thread.md'
+      `).get(handle.conversationId) as {
         document_id: string;
         head_version_id: string;
       } | undefined;
-      if (!document) throw new Error('The active strand has no thread.md document.');
+      if (!document) throw new Error('The conversation has no Thread document.');
       if (document.head_version_id !== baseVersionId) {
         throw new Error(
           `The Thread changed from ${baseVersionId} to ${document.head_version_id}; read it and retry.`,
@@ -2814,11 +2611,10 @@ export class AgentJournalRepository {
         WHERE document_id = ? AND head_version_id = ?
       `).run(versionId, sequence, recordedAt, document.document_id, baseVersionId);
       if (updated.changes !== 1) throw new Error('thread.md compare-and-swap failed.');
-      this.indexJournalText({
-        ref: `journal://document-version/${encodeURIComponent(versionId)}`,
+      this.indexHistoryText({
+        ref: `history://document-version/${encodeURIComponent(versionId)}`,
         projectId: handle.projectId,
         conversationId: handle.conversationId,
-        strandId: handle.strandId,
         turnId: handle.turnId,
         kind: 'thread-document',
         sequence,
@@ -2828,7 +2624,7 @@ export class AgentJournalRepository {
         documentId: document.document_id,
         versionId,
         content,
-        ref: `journal://document-version/${encodeURIComponent(versionId)}`,
+        ref: `history://document-version/${encodeURIComponent(versionId)}`,
       };
     }));
   }
@@ -2891,15 +2687,14 @@ export class AgentJournalRepository {
       });
       this.storage.database.prepare(`
         INSERT INTO execution_scopes (
-          scope_id, project_id, conversation_id, strand_id, turn_id,
+          scope_id, project_id, conversation_id, turn_id,
           parent_scope_id, kind, objective_json, state, created_sequence,
           terminal_sequence, result_artifact_hash, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'work_unit', ?, 'running', ?, NULL, NULL, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, 'work_unit', ?, 'running', ?, NULL, NULL, ?, ?)
       `).run(
         child.scopeId,
         child.projectId,
         child.conversationId,
-        child.strandId,
         child.turnId,
         handle.scopeId,
         canonicalJson({ doneWhen, objective, resources: materializedResources.map(({ view }) => view) }),
@@ -2910,11 +2705,10 @@ export class AgentJournalRepository {
       for (const resource of materializedResources) {
         this.insertArtifact(resource.artifact, sequence, 'content');
       }
-      this.indexJournalText({
-        ref: `journal://scope/${encodeURIComponent(child.scopeId)}`,
+      this.indexHistoryText({
+        ref: `history://scope/${encodeURIComponent(child.scopeId)}`,
         projectId: child.projectId,
         conversationId: child.conversationId,
-        strandId: child.strandId,
         turnId: child.turnId,
         kind: 'work-unit-objective',
         sequence,
@@ -3005,7 +2799,7 @@ export class AgentJournalRepository {
         payload: {
           resources: prepared.resources.map(({ view }) => view),
           parentScopeId: parentHandle.scopeId,
-          resultRef: `journal://artifact/${prepared.resultArtifact.hash}`,
+          resultRef: `history://artifact/${prepared.resultArtifact.hash}`,
           scopeId: handle.scopeId,
           status: prepared.status,
         },
@@ -3021,11 +2815,10 @@ export class AgentJournalRepository {
         SET state = 'completed', terminal_sequence = ?, result_artifact_hash = ?, updated_at = ?
         WHERE scope_id = ? AND state = 'running' AND terminal_sequence IS NULL
       `).run(terminalSequence, prepared.resultArtifact.hash, recordedAt, handle.scopeId);
-      this.indexJournalText({
-        ref: `journal://artifact/${prepared.resultArtifact.hash}`,
+      this.indexHistoryText({
+        ref: `history://artifact/${prepared.resultArtifact.hash}`,
         projectId: handle.projectId,
         conversationId: handle.conversationId,
-        strandId: handle.strandId,
         turnId: handle.turnId,
         kind: 'work-unit-result',
         sequence: terminalSequence,
@@ -3041,7 +2834,7 @@ export class AgentJournalRepository {
           childScopeId: handle.scopeId,
           content: prepared.folded.ref,
           kind: 'work_unit_result',
-          resultRef: `journal://artifact/${prepared.resultArtifact.hash}`,
+          resultRef: `history://artifact/${prepared.resultArtifact.hash}`,
         },
         artifactHash: artifactHash(prepared.folded.ref),
         createdAt: recordedAt,
@@ -3053,7 +2846,7 @@ export class AgentJournalRepository {
         result: prepared.result,
         ...(prepared.threadUpdate ? { threadUpdate: prepared.threadUpdate } : {}),
         resources: prepared.resources.map(({ view }) => view),
-        resultRef: `journal://artifact/${prepared.resultArtifact.hash}`,
+        resultRef: `history://artifact/${prepared.resultArtifact.hash}`,
         scopeId: handle.scopeId,
       };
     }));
@@ -3074,7 +2867,7 @@ export class AgentJournalRepository {
     for (const resource of resources) {
       let content: string;
       let source: 'file' | 'history';
-      if (resource.ref.startsWith('journal://')) {
+      if (resource.ref.startsWith('history://')) {
         content = await this.resolveOpenableContent(handle.conversationId, resource.ref);
         source = 'history';
       } else {
@@ -3106,7 +2899,7 @@ export class AgentJournalRepository {
           ...resource,
           inclusion,
           snapshot: {
-            ref: `journal://artifact/${artifact.hash}`,
+            ref: `history://artifact/${artifact.hash}`,
             hash: artifact.hash,
             byteLength: artifact.byteLength,
             mediaType: artifact.mediaType,
@@ -3141,25 +2934,23 @@ export class AgentJournalRepository {
 
   private contextIdentity(conversationId: string) {
     const row = this.storage.database.prepare(`
-      SELECT c.project_id, c.head_strand_id, c.cwd
+      SELECT c.project_id, c.cwd
       FROM conversations c
       WHERE c.conversation_id = ?
     `).get(conversationId) as {
       project_id: string;
-      head_strand_id: string;
       cwd: string;
     } | undefined;
     if (!row) throw new Error(`Conversation ${conversationId} has no context identity.`);
     return {
       projectId: row.project_id,
-      strandId: row.head_strand_id,
       cwd: row.cwd,
     };
   }
 
   private activeScopeIdentity(conversationId: string) {
     const row = this.storage.database.prepare(`
-      SELECT c.project_id, c.cwd, c.reasoning, t.turn_id, t.strand_id,
+      SELECT c.project_id, c.cwd, c.reasoning, t.turn_id,
              t.root_scope_id, s.scope_id, s.parent_scope_id, s.kind,
              s.objective_json
       FROM conversations c
@@ -3176,7 +2967,6 @@ export class AgentJournalRepository {
       cwd: string;
       reasoning: string;
       turn_id: string;
-      strand_id: string;
       root_scope_id: string;
       scope_id: string;
       parent_scope_id: string | null;
@@ -3189,7 +2979,6 @@ export class AgentJournalRepository {
       cwd: row.cwd,
       reasoning: row.reasoning,
       turnId: row.turn_id,
-      strandId: row.strand_id,
       rootScopeId: row.root_scope_id,
       scopeId: row.scope_id,
       parentScopeId: row.parent_scope_id,
@@ -3200,7 +2989,7 @@ export class AgentJournalRepository {
 
   private async assistantVisibleText(turnId: string) {
     const rows = this.storage.database.prepare(`
-      SELECT sequence, event_id, project_id, conversation_id, strand_id,
+      SELECT sequence, event_id, project_id, conversation_id,
              turn_id, scope_id, type, actor, visibility, causal_event_id,
              operation_id, payload_json, artifact_hash, created_at
       FROM events
@@ -3217,7 +3006,7 @@ export class AgentJournalRepository {
     return parts.join('');
   }
 
-  private async expandEventPayload(event: AgentJournalEvent): Promise<CanonicalJsonValue> {
+  private async expandEventPayload(event: AgentStateEvent): Promise<CanonicalJsonValue> {
     if (!event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
       return event.payload;
     }
@@ -3259,7 +3048,7 @@ export class AgentJournalRepository {
     }
     const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
     const rows = this.storage.database.prepare(`
-      SELECT sequence, event_id, project_id, conversation_id, strand_id,
+      SELECT sequence, event_id, project_id, conversation_id,
              turn_id, scope_id, type, actor, visibility, causal_event_id,
              operation_id, payload_json, artifact_hash, created_at
       FROM events
@@ -3267,15 +3056,6 @@ export class AgentJournalRepository {
       ORDER BY sequence
     `).all(...parameters) as EventRow[];
     return rows.map(decodeEventRow);
-  }
-
-  async journalHead() {
-    this.assertOpen();
-    await this.writerTail;
-    const row = this.storage.database.prepare(
-      'SELECT COALESCE(MAX(sequence), 0) AS sequence FROM events',
-    ).get() as { sequence: number };
-    return safeInteger(row.sequence, 'journal head');
   }
 
   async readResourceProjections(
@@ -3391,8 +3171,8 @@ export class AgentJournalRepository {
       const insideReplay = this.readQueuedReplay(params, argumentsHash);
       if (insideReplay) return insideReplay;
       const conversation = this.storage.database.prepare(`
-        SELECT project_id, head_strand_id FROM conversations WHERE conversation_id = ?
-      `).get(params.conversationId) as { project_id: string; head_strand_id: string } | undefined;
+        SELECT project_id FROM conversations WHERE conversation_id = ?
+      `).get(params.conversationId) as { project_id: string } | undefined;
       if (!conversation) throw new Error(`Conversation ${params.conversationId} does not exist.`);
       const duplicateClient = this.storage.database.prepare(`
         SELECT operation_id FROM operations
@@ -3406,7 +3186,6 @@ export class AgentJournalRepository {
         eventId: this.nextId('event'),
         projectId: conversation.project_id,
         conversationId: params.conversationId,
-        strandId: conversation.head_strand_id,
         operationId: params.operationId,
         type: 'operation.accepted',
         actor: 'harness',
@@ -3426,15 +3205,14 @@ export class AgentJournalRepository {
       };
       this.storage.database.prepare(`
         INSERT INTO operations (
-          operation_id, project_id, conversation_id, strand_id, turn_id,
+          operation_id, project_id, conversation_id, turn_id,
           scope_id, kind, arguments_hash, state, accepted_sequence,
           terminal_sequence, result_artifact_hash, value_json
-        ) VALUES (?, ?, ?, ?, NULL, NULL, 'message.queue', ?, 'queued', ?, NULL, NULL, ?)
+        ) VALUES (?, ?, ?, NULL, NULL, 'message.queue', ?, 'queued', ?, NULL, NULL, ?)
       `).run(
         params.operationId,
         conversation.project_id,
         params.conversationId,
-        conversation.head_strand_id,
         argumentsHash,
         acceptedSequence,
         canonicalJson(value),
@@ -3488,8 +3266,6 @@ export class AgentJournalRepository {
         eventId: this.nextId('event'),
         projectId: row.project_id,
         conversationId: row.conversation_id,
-        strandId: row.strand_id,
-        operationId,
         type: 'operation.succeeded',
         payload: { kind: 'message.queue', result: { turnId } },
         createdAt: recordedAt,
@@ -3513,8 +3289,6 @@ export class AgentJournalRepository {
         eventId: this.nextId('event'),
         projectId: row.project_id,
         conversationId,
-        strandId: row.strand_id,
-        operationId,
         type: 'operation.failed',
         payload: { kind: 'message.queue', reason: 'removed' },
         createdAt: recordedAt,
@@ -3529,12 +3303,11 @@ export class AgentJournalRepository {
 
   private queuedOperationIdentity(operationId: string) {
     return this.storage.database.prepare(`
-      SELECT project_id, conversation_id, strand_id, state, value_json
+      SELECT project_id, conversation_id, state, value_json
       FROM operations WHERE operation_id = ? AND kind = 'message.queue'
     `).get(operationId) as {
       project_id: string;
       conversation_id: string;
-      strand_id: string;
       state: string;
       value_json: string;
     } | undefined;
@@ -3575,17 +3348,15 @@ export class AgentJournalRepository {
       const insideReplay = this.readTurnReplay(params, argumentsHash);
       if (insideReplay) return insideReplay;
       const conversation = this.storage.database.prepare(`
-        SELECT c.project_id, c.head_strand_id, c.state,
+        SELECT c.project_id, c.state,
                d.head_version_id AS thread_version_id
         FROM conversations c
         JOIN state_documents d
           ON d.conversation_id = c.conversation_id
-         AND d.strand_id = c.head_strand_id
-         AND d.scope_kind = 'strand' AND d.key = 'thread.md'
+         AND d.scope_kind = 'conversation' AND d.key = 'thread.md'
         WHERE c.conversation_id = ?
       `).get(params.conversationId) as {
         project_id: string;
-        head_strand_id: string;
         state: string;
         thread_version_id: string;
       } | undefined;
@@ -3595,7 +3366,6 @@ export class AgentJournalRepository {
       const handle: DurableTurnHandle = {
         projectId: conversation.project_id,
         conversationId: params.conversationId,
-        strandId: conversation.head_strand_id,
         turnId: this.nextId('turn'),
         scopeId: this.nextId('scope'),
       };
@@ -3689,16 +3459,15 @@ export class AgentJournalRepository {
 
       this.storage.database.prepare(`
         INSERT INTO turns (
-          turn_id, project_id, conversation_id, strand_id, client_message_id,
+          turn_id, project_id, conversation_id, client_message_id,
           root_scope_id, state, accepted_sequence, terminal_sequence,
           thread_version_before, thread_version_after,
           created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, NULL, ?, NULL, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, 'running', ?, NULL, ?, NULL, ?, ?)
       `).run(
         handle.turnId,
         handle.projectId,
         handle.conversationId,
-        handle.strandId,
         params.clientMessageId,
         handle.scopeId,
         acceptedTurnSequence,
@@ -3708,15 +3477,14 @@ export class AgentJournalRepository {
       );
       this.storage.database.prepare(`
         INSERT INTO execution_scopes (
-          scope_id, project_id, conversation_id, strand_id, turn_id,
+          scope_id, project_id, conversation_id, turn_id,
           parent_scope_id, kind, objective_json, state, created_sequence,
           terminal_sequence, result_artifact_hash, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, NULL, 'turn', ?, 'running', ?, NULL, NULL, ?, ?)
+        ) VALUES (?, ?, ?, ?, NULL, 'turn', ?, 'running', ?, NULL, NULL, ?, ?)
       `).run(
         handle.scopeId,
         handle.projectId,
         handle.conversationId,
-        handle.strandId,
         handle.turnId,
         canonicalJson({ intent: 'Serve the accepted user turn.' }),
         scopeSequence,
@@ -3727,26 +3495,24 @@ export class AgentJournalRepository {
       const userMessageId = this.nextId('message');
       this.storage.database.prepare(`
         INSERT INTO messages (
-          message_id, project_id, conversation_id, strand_id, turn_id,
+          message_id, project_id, conversation_id, turn_id,
           scope_id, ordinal, role, visibility, state, content_artifact_hash,
           provider_item_id, created_sequence, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 0, 'user', 'transcript', 'completed', ?, NULL, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, 0, 'user', 'transcript', 'completed', ?, NULL, ?, ?)
       `).run(
         userMessageId,
         handle.projectId,
         handle.conversationId,
-        handle.strandId,
         handle.turnId,
         handle.scopeId,
         input.messageArtifact.hash,
         messageSequence,
         recordedAt,
       );
-      this.indexJournalText({
-        ref: `journal://message/${encodeURIComponent(userMessageId)}`,
+      this.indexHistoryText({
+        ref: `history://message/${encodeURIComponent(userMessageId)}`,
         projectId: handle.projectId,
         conversationId: handle.conversationId,
-        strandId: handle.strandId,
         turnId: handle.turnId,
         kind: 'user-message',
         sequence: messageSequence,
@@ -3754,13 +3520,12 @@ export class AgentJournalRepository {
       });
       this.storage.database.prepare(`
         INSERT INTO transcript_items (
-          item_id, conversation_id, strand_id, turn_id, first_sequence,
+          item_id, conversation_id, turn_id, first_sequence,
           last_sequence, kind, status, value_json
-        ) VALUES (?, ?, ?, ?, ?, ?, 'user', 'completed', ?)
+        ) VALUES (?, ?, ?, ?, ?, 'user', 'completed', ?)
       `).run(
         userItemId,
         handle.conversationId,
-        handle.strandId,
         handle.turnId,
         messageSequence,
         messageSequence,
@@ -3773,15 +3538,14 @@ export class AgentJournalRepository {
       );
       this.storage.database.prepare(`
         INSERT INTO operations (
-          operation_id, project_id, conversation_id, strand_id, turn_id,
+          operation_id, project_id, conversation_id, turn_id,
           scope_id, kind, arguments_hash, state, accepted_sequence,
           terminal_sequence, result_artifact_hash, value_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'succeeded', ?, ?, NULL, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'succeeded', ?, ?, NULL, ?)
       `).run(
         operationId,
         handle.projectId,
         handle.conversationId,
-        handle.strandId,
         handle.turnId,
         handle.scopeId,
         SEND_MESSAGE_KIND,
@@ -3843,7 +3607,7 @@ export class AgentJournalRepository {
       throw new OperationConflictError(params.operationId);
     }
     const operationRow = this.storage.database.prepare(`
-      SELECT t.project_id, t.conversation_id, t.strand_id, t.turn_id,
+      SELECT t.project_id, t.conversation_id, t.turn_id,
              t.root_scope_id, t.client_message_id, o.kind,
              o.arguments_hash, o.terminal_sequence, ti.first_sequence,
              ti.item_id, message.created_at AS transcript_created_at
@@ -3855,7 +3619,6 @@ export class AgentJournalRepository {
     `).get(params.operationId) as {
       project_id: string;
       conversation_id: string;
-      strand_id: string;
       turn_id: string;
       root_scope_id: string;
       client_message_id: string;
@@ -3897,7 +3660,6 @@ export class AgentJournalRepository {
     row: {
       project_id: string;
       conversation_id: string;
-      strand_id: string;
       turn_id: string;
       root_scope_id: string;
       terminal_sequence: number;
@@ -3912,7 +3674,6 @@ export class AgentJournalRepository {
       operationId: params.operationId,
       projectId: row.project_id,
       conversationId: row.conversation_id,
-      strandId: row.strand_id,
       turnId: row.turn_id,
       scopeId: row.root_scope_id,
       clientMessageId: params.clientMessageId,
@@ -3945,7 +3706,6 @@ export class AgentJournalRepository {
       `).get(params.cwd) as ProjectRow | undefined;
       const projectId = existingProject?.project_id ?? this.nextId('project');
       const conversationId = this.nextId('conversation');
-      const rootStrandId = this.nextId('strand');
       const threadDocumentId = this.nextId('document');
       const threadVersionId = this.nextId('document-version');
       const recordedAt = safeTimestamp(this.now());
@@ -3962,7 +3722,6 @@ export class AgentJournalRepository {
         eventId: this.nextId('event'),
         projectId,
         conversationId,
-        strandId: rootStrandId,
         operationId: params.operationId,
         type: 'operation.accepted',
         payload: { argumentsHash, kind: CREATE_CONVERSATION_KIND },
@@ -3974,7 +3733,6 @@ export class AgentJournalRepository {
           eventId: this.nextId('event'),
           projectId,
           conversationId,
-          strandId: rootStrandId,
           operationId: params.operationId,
           type: 'project.created',
           payload: {
@@ -3990,20 +3748,15 @@ export class AgentJournalRepository {
         eventId: this.nextId('event'),
         projectId,
         conversationId,
-        strandId: rootStrandId,
         operationId: params.operationId,
         type: 'conversation.created',
         payload: {
           conversationId,
           cwd: params.cwd,
-          forkedFromSequence: null,
-          headStrandId: rootStrandId,
           modelId: params.modelId,
-          parentStrandId: null,
           projectId,
           reasoning: params.reasoning,
           state: 'idle',
-          strandState: 'active',
           threadDocumentId,
           threadVersionId,
           inheritedThreadVersionId,
@@ -4016,7 +3769,6 @@ export class AgentJournalRepository {
         eventId: this.nextId('event'),
         projectId,
         conversationId,
-        strandId: rootStrandId,
         operationId: params.operationId,
         type: 'operation.succeeded',
         payload: { kind: CREATE_CONVERSATION_KIND, result: outcome },
@@ -4047,8 +3799,8 @@ export class AgentJournalRepository {
       this.storage.database.prepare(`
         INSERT INTO conversations (
           conversation_id, project_id, title, cwd, model_id, reasoning,
-          head_strand_id, state, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          state, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         conversationId,
         projectId,
@@ -4056,28 +3808,20 @@ export class AgentJournalRepository {
         params.cwd,
         params.modelId,
         params.reasoning,
-        rootStrandId,
         'idle',
         recordedAt,
         recordedAt,
       );
       this.storage.database.prepare(`
-        INSERT INTO strands (
-          strand_id, conversation_id, parent_strand_id, forked_from_sequence,
-          state, created_at
-        ) VALUES (?, ?, NULL, NULL, ?, ?)
-      `).run(rootStrandId, conversationId, 'active', recordedAt);
-      this.storage.database.prepare(`
         INSERT INTO state_documents (
-          document_id, project_id, conversation_id, strand_id, scope_kind,
+          document_id, project_id, conversation_id, scope_kind,
           key, head_version_id, created_sequence, updated_sequence,
           created_at, updated_at
-        ) VALUES (?, ?, ?, ?, 'strand', 'thread.md', NULL, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, 'conversation', 'thread.md', NULL, ?, ?, ?, ?)
       `).run(
         threadDocumentId,
         projectId,
         conversationId,
-        rootStrandId,
         conversationSequence,
         conversationSequence,
         recordedAt,
@@ -4093,29 +3837,26 @@ export class AgentJournalRepository {
       this.storage.database.prepare(`
         UPDATE state_documents SET head_version_id = ? WHERE document_id = ?
       `).run(threadVersionId, threadDocumentId);
-      this.indexJournalText({
-        ref: `journal://document-version/${encodeURIComponent(threadVersionId)}`,
+      this.indexHistoryText({
+        ref: `history://document-version/${encodeURIComponent(threadVersionId)}`,
         projectId,
         conversationId,
-        strandId: rootStrandId,
         kind: 'thread-document',
         sequence: conversationSequence,
         text: initialThreadContent,
       });
       this.storage.database.prepare(`
         INSERT INTO operations (
-          operation_id, project_id, conversation_id, strand_id, turn_id,
+          operation_id, project_id, conversation_id, turn_id,
           scope_id, kind, arguments_hash, state, accepted_sequence,
           terminal_sequence, result_artifact_hash, value_json
-        ) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, NULL, ?)
+        ) VALUES (?, ?, ?, NULL, NULL, ?, ?, 'succeeded', ?, ?, NULL, ?)
       `).run(
         params.operationId,
         projectId,
         conversationId,
-        rootStrandId,
         CREATE_CONVERSATION_KIND,
         argumentsHash,
-        'succeeded',
         acceptedSequence,
         terminalSequence,
         canonicalJson(outcome),
@@ -4124,7 +3865,6 @@ export class AgentJournalRepository {
 
       return {
         ...outcome,
-        rootStrandId,
         basisSequence: terminalSequence,
         replayed: false,
       };
@@ -4160,13 +3900,13 @@ export class AgentJournalRepository {
   private readCreateReplay(operationId: string, argumentsHash: string): CreateConversationResult | null {
     const row = this.storage.database.prepare(`
       SELECT o.kind, o.arguments_hash, o.state, o.terminal_sequence,
-             o.value_json, o.project_id, o.conversation_id, o.strand_id,
+             o.value_json, o.project_id, o.conversation_id,
              d.document_id AS thread_document_id,
              d.head_version_id AS thread_version_id
       FROM operations o
       JOIN state_documents d
-        ON d.conversation_id = o.conversation_id AND d.strand_id = o.strand_id
-       AND d.scope_kind = 'strand' AND d.key = 'thread.md'
+        ON d.conversation_id = o.conversation_id
+       AND d.scope_kind = 'conversation' AND d.key = 'thread.md'
       WHERE o.operation_id = ?
     `).get(operationId) as OperationReplayRow | undefined;
     if (!row) return null;
@@ -4186,7 +3926,6 @@ export class AgentJournalRepository {
     );
     return {
       ...outcome,
-      rootStrandId: row.strand_id,
       basisSequence: safeInteger(row.terminal_sequence, 'operation terminal sequence'),
       replayed: true,
     };
@@ -4195,15 +3934,14 @@ export class AgentJournalRepository {
   private async recoverInterruptedTurns() {
     this.assertOpen();
     const rows = this.storage.database.prepare(`
-      SELECT i.inference_id, i.project_id, i.conversation_id, i.strand_id,
+      SELECT i.inference_id, i.project_id, i.conversation_id,
              i.turn_id, i.scope_id
       FROM inferences i
       JOIN turns t ON t.turn_id = i.turn_id
       WHERE i.state = 'running' AND t.terminal_sequence IS NULL
       ORDER BY i.started_sequence
     `).all() as Array<{
-      inference_id: string; project_id: string; conversation_id: string;
-      strand_id: string; turn_id: string; scope_id: string;
+      inference_id: string; project_id: string; conversation_id: string; turn_id: string; scope_id: string;
     }>;
     for (const row of rows) {
       await this.enqueueWrite(() => this.storage.transaction(() => {
@@ -4212,7 +3950,6 @@ export class AgentJournalRepository {
           eventId: this.nextId('event'),
           projectId: row.project_id,
           conversationId: row.conversation_id,
-          strandId: row.strand_id,
           turnId: row.turn_id,
           scopeId: row.scope_id,
           type: 'inference.interrupted',
@@ -4397,35 +4134,6 @@ export class AgentJournalRepository {
     };
   }
 
-  private async upgradeLegacyAssistantProjections() {
-    const rows = this.storage.database.prepare(`
-      SELECT ti.item_id, ti.turn_id, ti.value_json, t.terminal_sequence
-      FROM transcript_items ti
-      JOIN turns t ON t.turn_id = ti.turn_id
-      WHERE ti.kind = 'assistant' AND t.terminal_sequence IS NOT NULL
-      ORDER BY ti.first_sequence, ti.item_id
-    `).all() as Array<{
-      item_id: string;
-      turn_id: string;
-      value_json: string;
-      terminal_sequence: number;
-    }>;
-    for (const row of rows) {
-      if (parseFinalAssistantProjection(row.value_json)) continue;
-      const prepared = await this.prepareAssistantProjection(row.turn_id);
-      if (!prepared || prepared.itemId !== row.item_id) {
-        throw new Error(`Assistant projection ${row.item_id} could not be rebuilt.`);
-      }
-      await this.enqueueWrite(() => this.storage.transaction(() => {
-        const sequence = safeInteger(row.terminal_sequence, 'turn terminal sequence');
-        for (const artifact of prepared.artifacts) this.insertArtifact(artifact, sequence);
-        this.storage.database.prepare(`
-          UPDATE transcript_items SET value_json = ? WHERE item_id = ?
-        `).run(prepared.valueJson, row.item_id);
-      }));
-    }
-  }
-
   private async validateArtifactMetadata() {
     for (const row of this.artifactRows()) {
       await this.artifacts.validateMetadata({
@@ -4463,12 +4171,11 @@ export class AgentJournalRepository {
       const row = this.storage.database.prepare(`
         SELECT state, terminal_sequence, created_at
         FROM turns
-        WHERE project_id = ? AND conversation_id = ? AND strand_id = ?
+        WHERE project_id = ? AND conversation_id = ?
           AND turn_id = ? AND root_scope_id = ?
       `).get(
         handle.projectId,
         handle.conversationId,
-        handle.strandId,
         handle.turnId,
         handle.scopeId,
       ) as { state: string; terminal_sequence: number | null; created_at: number } | undefined;
@@ -4549,15 +4256,14 @@ export class AgentJournalRepository {
         `).get(handle.scopeId) as { ordinal: number };
         this.storage.database.prepare(`
           INSERT INTO messages (
-            message_id, project_id, conversation_id, strand_id, turn_id,
+            message_id, project_id, conversation_id, turn_id,
             scope_id, ordinal, role, visibility, state, content_artifact_hash,
             provider_item_id, created_sequence, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'assistant', 'transcript', ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, 'assistant', 'transcript', ?, ?, ?, ?, ?)
         `).run(
           finalization.assistantMessageId,
           handle.projectId,
           handle.conversationId,
-          handle.strandId,
           handle.turnId,
           handle.scopeId,
           safeNonnegativeInteger(ordinal.ordinal, 'assistant message ordinal'),
@@ -4568,11 +4274,10 @@ export class AgentJournalRepository {
           recordedAt,
         );
         if (assistant?.text) {
-          this.indexJournalText({
-            ref: `journal://turn/${encodeURIComponent(handle.turnId)}#assistant`,
+          this.indexHistoryText({
+            ref: `history://turn/${encodeURIComponent(handle.turnId)}#assistant`,
             projectId: handle.projectId,
             conversationId: handle.conversationId,
-            strandId: handle.strandId,
             turnId: handle.turnId,
             kind: status === 'completed' ? 'assistant-outcome' : 'assistant-response',
             sequence,
@@ -4583,10 +4288,10 @@ export class AgentJournalRepository {
       const thread = this.storage.database.prepare(`
         SELECT d.head_version_id
         FROM state_documents d
-        WHERE d.conversation_id = ? AND d.strand_id = ?
-          AND d.scope_kind = 'strand' AND d.key = 'thread.md'
-      `).get(handle.conversationId, handle.strandId) as { head_version_id: string } | undefined;
-      if (!thread?.head_version_id) throw new Error('The active strand has no thread.md version.');
+        WHERE d.conversation_id = ?
+          AND d.scope_kind = 'conversation' AND d.key = 'thread.md'
+      `).get(handle.conversationId) as { head_version_id: string } | undefined;
+      if (!thread?.head_version_id) throw new Error('The conversation has no Thread version.');
       this.storage.database.prepare(`
         UPDATE inferences
         SET state = ?, terminal_sequence = ?
@@ -4642,13 +4347,12 @@ export class AgentJournalRepository {
       SELECT 1 AS present
       FROM turns t
       JOIN execution_scopes s ON s.turn_id = t.turn_id
-      WHERE t.project_id = ? AND t.conversation_id = ? AND t.strand_id = ?
+      WHERE t.project_id = ? AND t.conversation_id = ?
         AND t.turn_id = ? AND s.scope_id = ? AND t.terminal_sequence IS NULL
         AND s.terminal_sequence IS NULL
     `).get(
       handle.projectId,
       handle.conversationId,
-      handle.strandId,
       handle.turnId,
       handle.scopeId,
     );
@@ -4991,20 +4695,19 @@ export class AgentJournalRepository {
           OR EXISTS (
             SELECT 1 FROM json_tree(source.payload_json) linked
             WHERE linked.value = ?
-               OR linked.value = 'journal://artifact/' || ?
+               OR linked.value = 'history://artifact/' || ?
           )
         )
       LIMIT 1
     `).get(sequence, artifact.hash, artifact.hash, artifact.hash);
     if (linked) return;
     const source = this.storage.database.prepare(`
-      SELECT project_id, conversation_id, strand_id, turn_id, scope_id,
+      SELECT project_id, conversation_id, turn_id, scope_id,
              event_id, created_at
       FROM events WHERE sequence = ?
     `).get(sequence) as {
       project_id: string;
       conversation_id: string;
-      strand_id: string;
       turn_id: string | null;
       scope_id: string | null;
       event_id: string;
@@ -5015,44 +4718,41 @@ export class AgentJournalRepository {
       eventId: this.nextId('event'),
       projectId: source.project_id,
       conversationId: source.conversation_id,
-      strandId: source.strand_id,
       ...(source.turn_id ? { turnId: source.turn_id } : {}),
       ...(source.scope_id ? { scopeId: source.scope_id } : {}),
       type: 'artifact.linked',
       actor: 'harness',
       visibility: 'internal',
       payload: {
-        artifactRef: `journal://artifact/${artifact.hash}`,
-        sourceEventRef: `journal://event-id/${source.event_id}`,
+        artifactRef: `history://artifact/${artifact.hash}`,
+        sourceEventRef: `history://event-id/${source.event_id}`,
       },
       artifactHash: artifact.hash,
       createdAt: source.created_at,
     });
   }
 
-  private indexJournalText(input: {
+  private indexHistoryText(input: {
     ref: string;
     projectId: string;
     conversationId?: string | null;
-    strandId?: string | null;
     turnId?: string | null;
     kind: string;
     sequence: number;
     text: string;
   }) {
     this.storage.database.prepare(`
-      DELETE FROM journal_search_index
+      DELETE FROM history_search_index
       WHERE ref = ? AND kind = ? AND project_id = ? AND conversation_id = ?
     `).run(input.ref, input.kind, input.projectId, input.conversationId ?? '');
     this.storage.database.prepare(`
-      INSERT INTO journal_search_index (
-        ref, project_id, conversation_id, strand_id, turn_id, kind, sequence, text
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO history_search_index (
+        ref, project_id, conversation_id, turn_id, kind, sequence, text
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.ref,
       input.projectId,
       input.conversationId ?? '',
-      input.strandId ?? '',
       input.turnId ?? '',
       input.kind,
       input.sequence,
@@ -5060,17 +4760,17 @@ export class AgentJournalRepository {
     );
   }
 
-  private async rebuildJournalSearchIndex() {
-    type SearchEntry = Parameters<AgentJournalRepository['indexJournalText']>[0];
+  private async rebuildHistorySearchIndex() {
+    type SearchEntry = Parameters<AgentStateStore['indexHistoryText']>[0];
     const entries: SearchEntry[] = [];
     const messageRows = this.storage.database.prepare(`
-      SELECT message_id, project_id, conversation_id, strand_id, turn_id,
+      SELECT message_id, project_id, conversation_id, turn_id,
              role, state, content_artifact_hash, created_sequence
       FROM messages
       WHERE visibility = 'transcript' AND role IN ('user', 'assistant')
       ORDER BY created_sequence
     `).all() as Array<{
-      message_id: string; project_id: string; conversation_id: string; strand_id: string;
+      message_id: string; project_id: string; conversation_id: string;
       turn_id: string; role: 'user' | 'assistant'; state: string;
       content_artifact_hash: string; created_sequence: number;
     }>;
@@ -5081,50 +4781,48 @@ export class AgentJournalRepository {
       if (typeof value.text !== 'string' || value.text.length === 0) continue;
       entries.push({
         ref: row.role === 'assistant'
-          ? `journal://turn/${encodeURIComponent(row.turn_id)}#assistant`
-          : `journal://message/${encodeURIComponent(row.message_id)}`,
+          ? `history://turn/${encodeURIComponent(row.turn_id)}#assistant`
+          : `history://message/${encodeURIComponent(row.message_id)}`,
         projectId: row.project_id,
         conversationId: row.conversation_id,
-        strandId: row.strand_id,
         turnId: row.turn_id,
         kind: row.role === 'assistant'
           ? row.state === 'completed' ? 'assistant-outcome' : 'assistant-response'
           : 'user-message',
-        sequence: safeInteger(row.created_sequence, 'journal message sequence'),
+        sequence: safeInteger(row.created_sequence, 'History message sequence'),
         text: value.text,
       });
     }
 
     const documentRows = this.storage.database.prepare(`
-      SELECT v.version_id, d.project_id, d.conversation_id, d.strand_id,
+      SELECT v.version_id, d.project_id, d.conversation_id,
              v.based_on_turn_id, v.content_artifact_hash, v.created_sequence
       FROM document_versions v
       JOIN state_documents d ON d.document_id = v.document_id
       ORDER BY v.created_sequence, v.version_id
     `).all() as Array<{
-      version_id: string; project_id: string; conversation_id: string; strand_id: string;
+      version_id: string; project_id: string; conversation_id: string;
       based_on_turn_id: string | null; content_artifact_hash: string; created_sequence: number;
     }>;
     for (const row of documentRows) {
       entries.push({
-        ref: `journal://document-version/${encodeURIComponent(row.version_id)}`,
+        ref: `history://document-version/${encodeURIComponent(row.version_id)}`,
         projectId: row.project_id,
         conversationId: row.conversation_id,
-        strandId: row.strand_id,
         turnId: row.based_on_turn_id,
         kind: 'thread-document',
-        sequence: safeInteger(row.created_sequence, 'journal document sequence'),
+        sequence: safeInteger(row.created_sequence, 'History document sequence'),
         text: await this.readArtifactTextByHash(row.content_artifact_hash),
       });
     }
 
     const scopeRows = this.storage.database.prepare(`
-      SELECT scope_id, project_id, conversation_id, strand_id, turn_id,
+      SELECT scope_id, project_id, conversation_id, turn_id,
              objective_json, created_sequence, terminal_sequence, result_artifact_hash
       FROM execution_scopes WHERE kind = 'work_unit'
       ORDER BY created_sequence, scope_id
     `).all() as Array<{
-      scope_id: string; project_id: string; conversation_id: string; strand_id: string;
+      scope_id: string; project_id: string; conversation_id: string;
       turn_id: string; objective_json: string; created_sequence: number;
       terminal_sequence: number | null; result_artifact_hash: string | null;
     }>;
@@ -5132,25 +4830,23 @@ export class AgentJournalRepository {
       const objective = JSON.parse(row.objective_json) as { objective?: unknown };
       if (typeof objective.objective === 'string' && objective.objective.length > 0) {
         entries.push({
-          ref: `journal://artifact/${row.result_artifact_hash}`,
+          ref: `history://artifact/${row.result_artifact_hash}`,
           projectId: row.project_id,
           conversationId: row.conversation_id,
-          strandId: row.strand_id,
           turnId: row.turn_id,
           kind: 'work-unit-objective',
-          sequence: safeInteger(row.created_sequence, 'journal work-unit sequence'),
+          sequence: safeInteger(row.created_sequence, 'History work-unit sequence'),
           text: objective.objective,
         });
       }
       if (row.result_artifact_hash && row.terminal_sequence !== null) {
         entries.push({
-          ref: `journal://scope/${encodeURIComponent(row.scope_id)}`,
+          ref: `history://scope/${encodeURIComponent(row.scope_id)}`,
           projectId: row.project_id,
           conversationId: row.conversation_id,
-          strandId: row.strand_id,
           turnId: row.turn_id,
           kind: 'work-unit-result',
-          sequence: safeInteger(row.terminal_sequence, 'journal work-unit result sequence'),
+          sequence: safeInteger(row.terminal_sequence, 'History work-unit result sequence'),
           text: await this.readArtifactTextByHash(row.result_artifact_hash),
         });
       }
@@ -5162,13 +4858,12 @@ export class AgentJournalRepository {
         continue;
       }
       const payload = event.payload as Record<string, CanonicalJsonValue>;
-      const callId = requiredString(payload.callId, 'journal tool call id');
-      const name = requiredString(payload.name, 'journal tool name');
+      const callId = requiredString(payload.callId, 'History tool call id');
+      const name = requiredString(payload.name, 'History tool name');
       entries.push({
-        ref: `journal://tool/${encodeURIComponent(callId)}`,
+        ref: `history://tool/${encodeURIComponent(callId)}`,
         projectId: event.projectId,
         conversationId: event.conversationId,
-        strandId: event.strandId,
         turnId: event.turnId,
         kind: `operation:${name}`,
         sequence: event.sequence,
@@ -5177,8 +4872,8 @@ export class AgentJournalRepository {
     }
 
     this.storage.transaction(() => {
-      this.storage.database.exec('DELETE FROM journal_search_index');
-      for (const entry of entries) this.indexJournalText(entry);
+      this.storage.database.exec('DELETE FROM history_search_index');
+      for (const entry of entries) this.indexHistoryText(entry);
     });
   }
 
@@ -5283,17 +4978,16 @@ export class AgentJournalRepository {
     const row = this.storage.database.prepare(`
       SELECT MAX(sequence) AS sequence
       FROM events
-      WHERE project_id = ? AND conversation_id = ? AND strand_id = ?
-    `).get(handle.projectId, handle.conversationId, handle.strandId) as { sequence: number | null };
-    if (row.sequence === null) throw new Error('The durable strand has no journal basis.');
-    return safeInteger(row.sequence, 'journal head');
+      WHERE project_id = ? AND conversation_id = ?
+    `).get(handle.projectId, handle.conversationId) as { sequence: number | null };
+    if (row.sequence === null) throw new Error('The durable conversation has no event basis.');
+    return safeInteger(row.sequence, 'event head');
   }
 
   private insertEvent(event: {
     eventId: string;
     projectId: string;
     conversationId: string;
-    strandId: string;
     turnId?: string;
     scopeId?: string;
     operationId?: string;
@@ -5310,16 +5004,15 @@ export class AgentJournalRepository {
     }
     const row = this.storage.database.prepare(`
       INSERT INTO events (
-        event_id, project_id, conversation_id, strand_id, turn_id, scope_id,
+        event_id, project_id, conversation_id, turn_id, scope_id,
         type, actor, visibility, causal_event_id, operation_id, payload_json,
         artifact_hash, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
       RETURNING sequence
     `).get(
       event.eventId,
       event.projectId,
       event.conversationId,
-      event.strandId,
       event.turnId ?? null,
       event.scopeId ?? null,
       event.type,
@@ -5346,7 +5039,7 @@ export class AgentJournalRepository {
   }
 
   private assertOpen() {
-    if (this.closePromise) throw new Error('Agent journal repository is closed.');
+    if (this.closePromise) throw new Error('Agent state store is closed.');
   }
 }
 
@@ -5369,46 +5062,6 @@ export class ClientMessageConflictError extends Error {
     this.clientMessageId = clientMessageId;
   }
 }
-
-export class DurableTranscriptSelectionError extends Error {
-  readonly code = -32602;
-
-  constructor(message: string) {
-    super(message);
-    this.name = 'DurableTranscriptSelectionError';
-  }
-}
-
-export type PreparedReference = {
-  ref: DurableContentRef;
-  artifact: StagedArtifact | null;
-  sha256: string;
-  text: string;
-};
-
-type PreparedWorkUnitResource = {
-  artifact: StagedArtifact;
-  content: string;
-  view: WorkUnitResourceView;
-};
-
-export type PreparedWorkUnitEntry = {
-  child: DurableTurnHandle;
-  doneWhen: string[];
-  materializedResources: PreparedWorkUnitResource[];
-  objective: string;
-  orientation: PreparedReference;
-};
-
-export type PreparedWorkUnitReturn = {
-  status: WorkUnitReturnStatus;
-  result: string;
-  threadUpdate?: string;
-  resources: PreparedWorkUnitResource[];
-  bundle: string;
-  resultArtifact: StagedArtifact;
-  folded: PreparedReference;
-};
 
 type PreparedUserInput = {
   artifacts: StagedArtifact[];
@@ -5472,7 +5125,6 @@ type EventRow = {
   event_id: string;
   project_id: string;
   conversation_id: string;
-  strand_id: string;
   turn_id: string | null;
   scope_id: string | null;
   type: string;
@@ -5485,13 +5137,12 @@ type EventRow = {
   created_at: number;
 };
 
-function decodeEventRow(row: EventRow): AgentJournalEvent {
+function decodeEventRow(row: EventRow): AgentStateEvent {
   return {
     sequence: safeInteger(row.sequence, 'event sequence'),
     eventId: row.event_id,
     projectId: row.project_id,
     conversationId: row.conversation_id,
-    strandId: row.strand_id,
     turnId: row.turn_id,
     scopeId: row.scope_id,
     type: row.type,
@@ -5625,9 +5276,9 @@ function decodeStoredOutcome(
 
 function contextInspectorValue(input: {
   frameId: string;
-  manifest: PromptManifest;
+  manifest: InferenceContextManifest;
   manifestArtifact: StagedArtifact;
-  bootstrapArtifact: StagedArtifact;
+  contextEnvelopeArtifact: StagedArtifact;
   dispatchArtifact: StagedArtifact;
   activeMessages: readonly LogicalContextMessage[];
   buildDurationMs: number;
@@ -5640,7 +5291,7 @@ function contextInspectorValue(input: {
     const semantic = canonicalJson(logicalMessageSemanticValue(message));
     const existing = groups.get(message.turnId) ?? {
       turnId: message.turnId,
-      source: `journal://turn/${encodeURIComponent(message.turnId)}`,
+      source: `history://turn/${encodeURIComponent(message.turnId)}`,
       messageCount: 0,
       estimatedTokens: 0,
       roles: { user: 0, assistant: 0, tool: 0 },
@@ -5652,7 +5303,7 @@ function contextInspectorValue(input: {
   }
   const orderedGroups = [...groups.values()];
   return {
-    version: 4,
+    version: 5,
     conversationId: input.manifest.conversationId,
     inferenceId: input.manifest.inferenceId,
     frameId: input.frameId,
@@ -5669,7 +5320,7 @@ function contextInspectorValue(input: {
     policyVersion: input.manifest.policyVersion,
     estimatedInputTokens: input.manifest.context.estimatedInputTokens,
     semanticHash: input.manifest.context.semanticHash,
-    bootstrapHash: input.manifest.context.bootstrapHash,
+    contextEnvelopeHash: input.manifest.context.contextEnvelopeHash,
     buildDurationMs: safeNonnegativeInteger(input.buildDurationMs, 'context frame build duration'),
     transportMode: input.manifest.transport.requestMode,
     messageCount: input.manifest.context.messageCount,
@@ -5682,10 +5333,10 @@ function contextInspectorValue(input: {
       byteLength: input.manifestArtifact.byteLength,
       mediaType: input.manifestArtifact.mediaType,
     },
-    bootstrapArtifact: {
-      hash: input.bootstrapArtifact.hash,
-      byteLength: input.bootstrapArtifact.byteLength,
-      mediaType: input.bootstrapArtifact.mediaType,
+    contextEnvelopeArtifact: {
+      hash: input.contextEnvelopeArtifact.hash,
+      byteLength: input.contextEnvelopeArtifact.byteLength,
+      mediaType: input.contextEnvelopeArtifact.mediaType,
     },
     dispatchArtifact: {
       hash: input.dispatchArtifact.hash,
@@ -6001,7 +5652,7 @@ function matchingExcerpt(value: string, terms: readonly string[], maxCodePoints:
   return `${start > 0 ? '…' : ''}${text}${start + maxCodePoints < codePoints.length ? '…' : ''}`;
 }
 
-function journalSearchTerms(value: string) {
+function historySearchTerms(value: string) {
   return [...new Set(
     (value.toLocaleLowerCase().match(/[\p{L}\p{N}_./:@+-]+/gu) ?? [])
       .filter((term) => /[\p{L}\p{N}_]/u.test(term)),
@@ -6069,18 +5720,9 @@ function applyExactThreadEdits(content: string, edits: ThreadPatchInput['edits']
   return next;
 }
 
-function modelHistoryRef(ref: string) {
-  return ref.replace(/^journal:\/\//u, 'history://');
-}
-
 function modelPromptWorkUnitResource(resource: PreparedWorkUnitResource): MaterializedPromptResource {
   return {
     ...resource.view,
-    ref: modelHistoryRef(resource.view.ref),
-    snapshot: {
-      ...resource.view.snapshot,
-      ref: modelHistoryRef(resource.view.snapshot.ref),
-    },
     content: resource.content,
   };
 }
@@ -6120,7 +5762,7 @@ function normalizeWorkUnitResources(resources: readonly WorkUnitResourceRef[]) {
   return normalized;
 }
 
-export function normalizeWorkUnitReturnInput(input: WorkUnitReturnInput): {
+function normalizeWorkUnitReturnInput(input: WorkUnitReturnInput): {
   status: WorkUnitReturnStatus;
   result: string;
   threadUpdate?: string;

@@ -6,7 +6,7 @@ import { join } from 'node:path';
 
 import { AgentServer } from '../../server/src/agent-server.ts';
 import { PiEngine } from '../../server/src/pi-runtime.ts';
-import { AgentJournalRepository } from '../../server/src/storage/repository.ts';
+import { AgentStateStore } from '../../server/src/storage/agent-state-store.ts';
 
 const FIRST_SENTINEL = 'REMUX_REAL_PROVIDER_RECOVERY_OK';
 const SECOND_SENTINEL = 'REMUX_REAL_PROVIDER_REUSE_OK';
@@ -28,8 +28,8 @@ const engine = await PiEngine.create({
     return 1;
   },
 });
-const repository = await AgentJournalRepository.open({ dataRoot });
-const server = new AgentServer({ engine, journal: repository, notify() {} });
+const repository = await AgentStateStore.open({ dataRoot });
+const server = new AgentServer({ engine, store: repository, notify() {} });
 
 try {
   await server.initialize();
@@ -182,11 +182,11 @@ async function sendAndWait(
 }
 
 async function assistantText(
-  journal: AgentJournalRepository,
+  store: AgentStateStore,
   conversationId: string,
   turnId: string,
 ) {
-  const actions = await journal.readTranscriptActions(conversationId);
+  const actions = await store.readTranscriptActions(conversationId);
   return actions
     .flatMap((action) =>
       action.type === 'assistant' && action.turnId === turnId ? [action.textDelta] : [])

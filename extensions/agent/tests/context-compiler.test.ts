@@ -9,7 +9,7 @@ test('thread context compilation is deterministic and preserves exact active-tur
   const left = compileThreadContext(source, { contextWindow: 400_000 });
   const right = compileThreadContext(source, { contextWindow: 400_000 });
   assert.deepEqual(left, right);
-  assert.equal(left.frame.compilerVersion, 'agent-thread-compiler-v3');
+  assert.equal(left.frame.compilerVersion, 'agent-context-compiler-v4');
   assert.deepEqual(left.frame.dialogueTurnIds, ['turn:prior']);
   assert.deepEqual(left.messages.map(({ role }) => role), [
     'user', 'assistant', 'user', 'assistant', 'tool',
@@ -26,8 +26,8 @@ test('thread context compilation is deterministic and preserves exact active-tur
     assert.equal(activeAssistant.reasoning, 'active private reasoning');
     assert.equal(activeAssistant.toolCalls.length, 1);
   }
-  assert.match(left.frame.bootstrap, /Current objective/u);
-  assert.doesNotMatch(left.frame.bootstrap, /Prior outcome/u);
+  assert.match(left.frame.contextEnvelope, /Current objective/u);
+  assert.doesNotMatch(left.frame.contextEnvelope, /Prior outcome/u);
   assert.equal(left.frame.scopeKind, 'turn');
   assert.equal(left.frame.pressureNoticed, false);
 });
@@ -76,7 +76,6 @@ function fixtureSource(): ThreadContextSource {
     basisSequence: 42,
     projectId: 'project:1',
     conversationId: 'conversation:1',
-    strandId: 'strand:1',
     turnId: 'turn:active',
     scopeId: 'scope:active',
     scopeKind: 'turn',

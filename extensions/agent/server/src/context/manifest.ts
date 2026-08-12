@@ -1,8 +1,8 @@
 import type { CanonicalJsonValue } from '../storage/canonical-json.ts';
 
-export const CONTEXT_COMPILER_VERSION = 'agent-thread-compiler-v3' as const;
-export const CONTEXT_POLICY_VERSION = 'agent-thread-policy-v4' as const;
-export const PROMPT_MANIFEST_VERSION = 'agent-thread-prompt-v4' as const;
+export const CONTEXT_COMPILER_VERSION = 'agent-context-compiler-v4' as const;
+export const CONTEXT_POLICY_VERSION = 'agent-context-policy-v5' as const;
+export const INFERENCE_CONTEXT_MANIFEST_VERSION = 'agent-inference-context-v5' as const;
 
 export type ThreadContextLayerKind =
   | 'thread_document'
@@ -25,16 +25,15 @@ export type ContextOmission = {
 
 /**
  * The durable description of the exact context selected for one provider
- * scope. Unlike the retired shadow candidate, this is the frame that is
- * actually dispatched.
+ * scope. This is the frame that is actually dispatched.
  */
 export type ThreadContextFrameCandidate = {
   compilerVersion: typeof CONTEXT_COMPILER_VERSION;
   policyVersion: typeof CONTEXT_POLICY_VERSION;
   basisSequence: number;
   threadVersionId: string;
-  bootstrap: string;
-  bootstrapHash: string;
+  contextEnvelope: string;
+  contextEnvelopeHash: string;
   semanticHash: string;
   estimatedInputTokens: number;
   orderedMessageHashes: readonly string[];
@@ -50,8 +49,8 @@ export type ThreadContextFrameCandidate = {
   omissions: readonly ContextOmission[];
 };
 
-export type PromptManifest = {
-  version: typeof PROMPT_MANIFEST_VERSION;
+export type InferenceContextManifest = {
+  version: typeof INFERENCE_CONTEXT_MANIFEST_VERSION;
   compilerVersion: typeof CONTEXT_COMPILER_VERSION;
   policyVersion: typeof CONTEXT_POLICY_VERSION;
   piVersion: '0.84.0';
@@ -59,7 +58,6 @@ export type PromptManifest = {
   modelId: string;
   projectId: string;
   conversationId: string;
-  strandId: string;
   turnId: string;
   scopeId: string;
   frameId: string;
@@ -68,7 +66,7 @@ export type PromptManifest = {
   threadVersionId: string;
   context: {
     semanticHash: string;
-    bootstrapHash: string;
+    contextEnvelopeHash: string;
     logicalHash: string;
     renderedHash: string;
     orderedMessageHashes: readonly string[];
@@ -96,6 +94,6 @@ export type PromptManifest = {
   };
 };
 
-export function promptManifestValue(manifest: PromptManifest): CanonicalJsonValue {
+export function inferenceContextManifestValue(manifest: InferenceContextManifest): CanonicalJsonValue {
   return manifest as unknown as CanonicalJsonValue;
 }

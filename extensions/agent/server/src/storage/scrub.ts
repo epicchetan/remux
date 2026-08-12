@@ -1,14 +1,14 @@
 import { resolve } from 'node:path';
 
-import { AgentJournalRepository } from './repository.ts';
+import { AgentStateStore } from './agent-state-store.ts';
 
 const dataRoot = dataRootArgument(process.argv.slice(2));
-const repository = await AgentJournalRepository.open(dataRoot ? { dataRoot } : {});
+const store = await AgentStateStore.open(dataRoot ? { dataRoot } : {});
 try {
-  const report = await repository.scrubArtifacts();
+  const report = await store.scrubArtifacts();
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 } finally {
-  await repository.close();
+  await store.close();
 }
 
 function dataRootArgument(args: string[]) {

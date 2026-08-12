@@ -295,7 +295,7 @@ export class PiEngine implements AgentEngine {
           // Pi does not wait for asynchronous message_end extension handlers
           // before it begins the following tool/model cycle. The exact
           // provider item and terminal inference boundary must reach the
-          // journal before compiling the next frame, both to prevent two
+          // durable state before compiling the next frame, both to prevent two
           // running inferences in one scope and to compile from the real head.
           await awaitProviderDurability();
           const compileStartedAt = performance.now();
@@ -698,7 +698,7 @@ function contextFrameMessage(
     content: [
       'The following is the living Thread for this conversation. The exact user message after it is the current request. Exact earlier activity remains available through History tools.',
       scopeBoundary,
-      candidate.bootstrap,
+      candidate.contextEnvelope,
     ].join('\n\n'),
     // This synthetic control message is stable while its content is stable.
     // Event timestamps belong to the durable messages below; changing this

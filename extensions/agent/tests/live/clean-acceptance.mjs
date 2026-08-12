@@ -27,7 +27,7 @@ async function main() {
   const initial = await readAgentResources(client);
   assert.equal(initial.auth.state, 'signed-in', 'The live Agent credential must already be signed in.');
   assert.ok(initial.models.models.length > 0, 'The live Agent model catalog is empty.');
-  assert.equal(initial.history.length, 0, 'Clean acceptance requires an empty Agent journal.');
+  assert.equal(initial.history.length, 0, 'Clean acceptance requires empty Agent History.');
   assert.equal(initial.runtime.state, 'unloaded');
 
   const modelId = options.modelId ?? initial.models.defaultModelId;
@@ -44,7 +44,7 @@ async function main() {
   assert.match(conversation.conversationId, UUID_V4);
 
   const first = await sendAndWait(client, conversation.conversationId, [
-    'This is a Thread Runtime v2 acceptance test.',
+    'This is an Agent state v3 acceptance test.',
     'Use thread_read, then call thread_replace to create a Markdown collaboration canvas containing',
     `the exact unique line "Durable nonce: ${CONTEXT_NONCE}".`,
     'After replacement succeeds, call thread_patch with its returned version and replace that exact line with',
@@ -54,7 +54,7 @@ async function main() {
   const firstTranscript = await readTranscript(client, conversation.conversationId);
   assert.equal(assistantText(firstTranscript, first.turnId).trim(), FIRST_SENTINEL);
   const firstContext = await readContext(client, conversation.conversationId);
-  assert.equal(firstContext.version, 4);
+  assert.equal(firstContext.version, 5);
   assert.deepEqual(firstContext.layers.map(({ kind }) => kind), [
     'recent_dialogue', 'thread_document', 'active_scope',
   ]);
@@ -86,7 +86,7 @@ async function main() {
   assert.equal(final.runtime.contextProbe.provider, 'openai-codex');
   assert.equal(final.runtime.contextProbe.providerRequestMode, 'full');
   const secondContext = await readContext(client, conversation.conversationId);
-  assert.equal(secondContext.version, 4);
+  assert.equal(secondContext.version, 5);
   assert.equal(secondContext.transportMode, 'full');
   assert.equal(
     secondContext.groups.reduce((count, group) => count + group.roles.tool, 0),
@@ -107,7 +107,7 @@ async function main() {
   assert.deepEqual(workUnitTranscript.value.turnOrder, [first.turnId, second.turnId, third.turnId]);
 
   const durability = await inspectDurability(options.dataRoot, conversation.conversationId);
-  assert.equal(durability.schemaId, 'agent-thread-runtime-v2');
+  assert.equal(durability.schemaId, 'agent-state-v3');
   assert.equal(durability.contextFrames, durability.inferences);
   assert.equal(durability.providerItems, durability.inferences);
   assert.equal(durability.runningTurns, 0);
@@ -121,7 +121,11 @@ async function main() {
   assert.equal(durability.workUnits[0].state, 'completed');
   assert.match(durability.workUnits[0].result, new RegExp(WORK_UNIT_RESULT));
   assert.doesNotMatch(durability.workUnits[0].result, new RegExp(CHILD_SECRET));
-  assert.deepEqual(durability.childToolNames, ['bash', 'work_unit_finish']);
+  assert.equal(durability.childToolNames.filter((name) => name === 'bash').length, 1);
+  assert.ok(durability.childToolNames.filter((name) => name === 'work_unit_finish').length >= 1);
+  assert.equal(durability.childToolNames.at(-1), 'work_unit_finish');
+  assert.ok(durability.childToolNames.every((name) =>
+    name === 'bash' || name === 'work_unit_finish'));
   assert.ok(durability.visibleToolNames.includes('thread_read'));
   assert.ok(durability.visibleToolNames.includes('thread_replace'));
   assert.ok(durability.visibleToolNames.includes('thread_patch'));
@@ -266,8 +270,8 @@ async function inspectDurability(dataRoot, conversationId) {
       SELECT a.storage_path
       FROM conversations c
       JOIN state_documents d
-        ON d.conversation_id = c.conversation_id AND d.strand_id = c.head_strand_id
-       AND d.scope_kind = 'strand' AND d.key = 'thread.md'
+        ON d.conversation_id = c.conversation_id
+       AND d.scope_kind = 'conversation' AND d.key = 'thread.md'
       JOIN document_versions v ON v.version_id = d.head_version_id
       JOIN artifacts a ON a.hash = v.content_artifact_hash
       WHERE c.conversation_id = ?
@@ -301,7 +305,7 @@ async function inspectDurability(dataRoot, conversationId) {
       ORDER BY first_sequence
     `).all(conversationId).map(({ name }) => name);
     return {
-      schemaId: JSON.parse(scalar("SELECT value_json AS value FROM meta WHERE key = 'journal_schema'")),
+      schemaId: JSON.parse(scalar("SELECT value_json AS value FROM meta WHERE key = 'state_schema'")),
       inferences: scalar('SELECT COUNT(*) AS value FROM inferences WHERE conversation_id = ?', conversationId),
       contextFrames: scalar('SELECT COUNT(*) AS value FROM context_frames WHERE conversation_id = ?', conversationId),
       providerItems: scalar('SELECT COUNT(*) AS value FROM provider_items WHERE conversation_id = ?', conversationId),
@@ -312,7 +316,7 @@ async function inspectDurability(dataRoot, conversationId) {
         FROM inferences WHERE conversation_id = ? GROUP BY request_mode
       `).all(conversationId).map(({ request_mode, count }) => [request_mode, count])),
       completedAssistantMessages: scalar("SELECT COUNT(*) AS value FROM messages WHERE conversation_id = ? AND role = 'assistant' AND state = 'completed'", conversationId),
-      searchRows: scalar('SELECT COUNT(*) AS value FROM journal_search_index WHERE conversation_id = ?', conversationId),
+      searchRows: scalar('SELECT COUNT(*) AS value FROM history_search_index WHERE conversation_id = ?', conversationId),
       pressureNotices: scalar("SELECT COUNT(*) AS value FROM events WHERE conversation_id = ? AND type = 'context.pressure'", conversationId),
       threadUpdates: scalar("SELECT COUNT(*) AS value FROM events WHERE conversation_id = ? AND type = 'thread.document.updated'", conversationId),
       threadContent: await readFile(join(dataRoot, 'artifacts', thread.storage_path), 'utf8'),

@@ -1,12 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import type { Message, Model } from '@earendil-works/pi-ai';
+import type { Message } from '@earendil-works/pi-ai';
 
 import {
-  alignDurableContextWithPi,
   assertContextBudget,
-  ContextRolloverRequiredError,
+  ContextBudgetExceededError,
   createDurableContextSnapshot,
   estimatePiContextTokens,
   hashRenderedMessages,
@@ -65,34 +64,6 @@ test('logical replay restores inference/tool order and excludes incomplete effec
   ]);
 });
 
-test('durable-prefix alignment preserves Pi exact suffix objects and rejects drift', () => {
-  const durable: LogicalContextMessage[] = [
-    { role: 'user', turnId: 'old', text: 'Earlier', timestamp: 1 },
-    {
-      role: 'assistant', turnId: 'old', text: 'Earlier answer', reasoning: 'Visible summary.', toolCalls: [],
-      state: 'completed', timestamp: 2,
-    },
-    { role: 'user', turnId: 'current', text: 'Current', timestamp: 3 },
-  ];
-  const snapshot = createDurableContextSnapshot(42, durable);
-  const exactSuffix: Message[] = [{ role: 'user', content: 'Current', timestamp: 999 }];
-  const aligned = alignDurableContextWithPi(snapshot, exactSuffix, fixtureModel());
-
-  assert.equal(aligned.length, 3);
-  assert.strictEqual(aligned[2], exactSuffix[0]);
-  assert.deepEqual(piMessageSemanticHashes(aligned), snapshot.orderedMessageHashes);
-  assert.match(hashRenderedMessages(aligned).hash, /^[a-f0-9]{64}$/u);
-
-  assert.throws(
-    () => alignDurableContextWithPi(
-      snapshot,
-      [{ role: 'user', content: 'Drifted', timestamp: 999 }],
-      fixtureModel(),
-    ),
-    /does not match Pi runtime suffix/u,
-  );
-});
-
 test('logical tool errors align with Pi immediate validation failures', () => {
   const durable: LogicalContextMessage[] = [
     { role: 'user', turnId: 'turn', text: 'Read it.', timestamp: 1 },
@@ -128,7 +99,6 @@ test('logical tool errors align with Pi immediate validation failures', () => {
   const snapshot = createDurableContextSnapshot(10, durable);
 
   assert.deepEqual(piMessageSemanticHashes(piMessages), snapshot.orderedMessageHashes);
-  assert.deepEqual(alignDurableContextWithPi(snapshot, piMessages, fixtureModel()), piMessages);
 });
 
 test('rendered context hashing accepts finite provider cost metadata', () => {
@@ -220,25 +190,10 @@ test('context budget fails with an explicit execution-scope limit', () => {
   assert.doesNotThrow(() => assertContextBudget(4_999, 35_000));
   assert.throws(
     () => assertContextBudget(5_001, 35_000),
-    (error) => error instanceof ContextRolloverRequiredError &&
-      error.kind === 'context_scope_limit' &&
+    (error) => error instanceof ContextBudgetExceededError &&
+      error.kind === 'context_budget_exceeded' &&
       error.hardInputLimit === 10_000 &&
       error.safetyMargin === 5_000 &&
       error.admissionLimit === 5_000,
   );
 });
-
-function fixtureModel(): Model<string> {
-  return {
-    id: 'gpt-fixture',
-    name: 'GPT fixture',
-    api: 'openai-codex-responses',
-    provider: 'openai-codex',
-    baseUrl: 'https://example.test',
-    reasoning: true,
-    input: ['text'],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 400_000,
-    maxTokens: 128_000,
-  } as Model<string>;
-}

@@ -17,7 +17,6 @@ export type ThreadContextSource = {
   basisSequence: number;
   projectId: string;
   conversationId: string;
-  strandId: string;
   turnId: string;
   scopeId: string;
   scopeKind: 'turn' | 'work_unit';
@@ -40,7 +39,7 @@ export type CompiledThreadContext = {
 /**
  * Completed turns contribute only exact user/visible-assistant pairs. Active
  * scope scratch stays exact, while all omitted internals remain cold in the
- * journal. The mutable thread document is rendered between recent dialogue
+ * History. The mutable Thread document is rendered between recent dialogue
  * and the active turn by the provider adapter.
  */
 export function compileThreadContext(
@@ -66,7 +65,7 @@ export function compileThreadContext(
   const selectedDialogue = selectedDialogueGroups.flatMap((group) => group.messages);
   const selectedDialogueIds = selectedDialogueGroups.map((group) => group.turnId);
   const omittedDialogueTurns = priorGroups.length - selectedDialogueGroups.length;
-  const control = renderThreadControl(source, omittedDialogueTurns);
+  const contextEnvelope = renderThreadControl(source, omittedDialogueTurns);
   const messages = [...selectedDialogue, ...active];
   const orderedMessageHashes = messages.map((message) =>
     canonicalJsonHash(logicalMessageSemanticValue(message)));
@@ -74,18 +73,18 @@ export function compileThreadContext(
     ...(omittedDialogueTurns > 0 ? [{
       source: `agent://conversation/${encodeURIComponent(source.conversationId)}/dialogue`,
       reason: 'recent-dialogue-budget' as const,
-      retrieval: `journal://conversation/${encodeURIComponent(source.conversationId)}`,
+      retrieval: `history://conversation/${encodeURIComponent(source.conversationId)}`,
       count: omittedDialogueTurns,
     }] : []),
     ...(priorGroups.length > 0 ? [{
       source: `agent://conversation/${encodeURIComponent(source.conversationId)}/turn-scratch`,
       reason: 'prior-turn-scratch' as const,
-      retrieval: `journal://conversation/${encodeURIComponent(source.conversationId)}`,
+      retrieval: `history://conversation/${encodeURIComponent(source.conversationId)}`,
       count: priorGroups.length,
     }, {
       source: `agent://conversation/${encodeURIComponent(source.conversationId)}/reasoning`,
       reason: 'prior-turn-reasoning' as const,
-      retrieval: `journal://conversation/${encodeURIComponent(source.conversationId)}`,
+      retrieval: `history://conversation/${encodeURIComponent(source.conversationId)}`,
       count: priorGroups.length,
     }] : []),
   ];
@@ -97,31 +96,31 @@ export function compileThreadContext(
       kind: 'recent_dialogue',
       estimatedTokens: dialogueTokens,
       hash: canonicalJsonHash(selectedDialogue.map(logicalMessageSemanticValue)),
-      sources: selectedDialogueIds.map((turnId) => `journal://turn/${encodeURIComponent(turnId)}`),
+      sources: selectedDialogueIds.map((turnId) => `history://turn/${encodeURIComponent(turnId)}`),
     },
     {
       kind: 'thread_document',
       estimatedTokens: threadTokens,
       hash: sha256(source.threadMarkdown),
-      sources: [`journal://document-version/${encodeURIComponent(source.threadVersionId)}`],
+      sources: [`history://document-version/${encodeURIComponent(source.threadVersionId)}`],
     },
     {
       kind: 'active_scope',
       estimatedTokens: activeTokens,
       hash: canonicalJsonHash(active.map(logicalMessageSemanticValue)),
       sources: [
-        `journal://turn/${encodeURIComponent(source.turnId)}`,
-        `journal://scope/${encodeURIComponent(source.scopeId)}`,
+        `history://turn/${encodeURIComponent(source.turnId)}`,
+        `history://scope/${encodeURIComponent(source.scopeId)}`,
       ],
     },
   ];
-  const controlHash = sha256(control);
+  const contextEnvelopeHash = sha256(contextEnvelope);
   const softContextLimit = contextSoftLimit(profile.contextWindow);
   const hardContextLimit = contextHardLimit(profile.contextWindow);
   const semanticHash = canonicalJsonHash({
     basisSequence: source.basisSequence,
     compilerVersion: CONTEXT_COMPILER_VERSION,
-    controlHash,
+    contextEnvelopeHash,
     orderedMessageHashes,
     policyVersion: CONTEXT_POLICY_VERSION,
     pressureNoticed: source.pressureNoticed,
@@ -134,10 +133,10 @@ export function compileThreadContext(
       policyVersion: CONTEXT_POLICY_VERSION,
       basisSequence: source.basisSequence,
       threadVersionId: source.threadVersionId,
-      bootstrap: control,
-      bootstrapHash: controlHash,
+      contextEnvelope,
+      contextEnvelopeHash,
       semanticHash,
-      estimatedInputTokens: estimateTextTokens(control) + dialogueTokens + activeTokens,
+      estimatedInputTokens: estimateTextTokens(contextEnvelope) + dialogueTokens + activeTokens,
       orderedMessageHashes,
       selectedTurnIds: [...selectedDialogueIds, source.turnId],
       dialogueTurnIds: selectedDialogueIds,

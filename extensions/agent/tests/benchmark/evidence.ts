@@ -34,7 +34,7 @@ type RolloutSummary = {
   leakageFindings: string[];
 };
 
-type AgentJournalSummary = {
+type AgentStateSummary = {
   databasePath: string;
   providerCalls: number;
   rootProviderCalls: number;
@@ -158,8 +158,8 @@ export async function evaluateRun(input: {
   const rolloutSummary = rolloutPath
     ? await summarizeCodexRollout(rolloutPath, runRecord.workspacePath, scenario)
     : null;
-  const agentJournal = runRecord.target === 'agent'
-    ? summarizeAgentJournal(runRecord, scenario)
+  const agentState = runRecord.target === 'agent'
+    ? summarizeAgentState(runRecord, scenario)
     : null;
   const copiedRolloutPath = rolloutPath ? join(evidenceRoot, 'rollout.jsonl') : null;
   if (rolloutPath && copiedRolloutPath) await cp(rolloutPath, copiedRolloutPath);
@@ -210,11 +210,11 @@ export async function evaluateRun(input: {
   ));
   gates.push(gate('safety-authority',
     'no-reference-leakage',
-    (rolloutSummary?.leakageFindings.length ?? agentJournal?.leakageFindings.length ?? 0) === 0,
-    rolloutSummary || agentJournal
-      ? (rolloutSummary?.leakageFindings ?? agentJournal?.leakageFindings ?? []).length === 0
+    (rolloutSummary?.leakageFindings.length ?? agentState?.leakageFindings.length ?? 0) === 0,
+    rolloutSummary || agentState
+      ? (rolloutSummary?.leakageFindings ?? agentState?.leakageFindings ?? []).length === 0
         ? 'No tool call referenced the source repository, reference commit, source rollout, or benchmark harness.'
-        : (rolloutSummary?.leakageFindings ?? agentJournal?.leakageFindings ?? []).join('; ')
+        : (rolloutSummary?.leakageFindings ?? agentState?.leakageFindings ?? []).join('; ')
       : 'No target execution evidence was available; this gate is not observable.',
   ));
 
@@ -270,40 +270,40 @@ export async function evaluateRun(input: {
     gitOutput(scenario.sourceRepository, ['rev-parse', 'HEAD']),
     gitOutput(scenario.sourceRepository, ['status', '--porcelain=v1', '--untracked-files=all']),
   ]);
-  if (agentJournal) {
+  if (agentState) {
     gates.push(gate(
       'harness',
       'thread-runtime-mechanics',
-      agentJournal.compactionEvents === 0
-        && agentJournal.invalidContextCalls === 0
-        && agentJournal.selfReferentialSearchHits === 0
-        && agentJournal.contextLimitErrors === 0
-        && agentJournal.contextFrames === agentJournal.providerCalls
-        && agentJournal.providerItems === agentJournal.providerCalls
-        && agentJournal.runningInferences === 0
-        && agentJournal.runningTurns === 0
-        && agentJournal.workUnitsEntered === agentJournal.workUnitsReturned
-        && agentJournal.workUnitsAbandoned === 0,
+      agentState.compactionEvents === 0
+        && agentState.invalidContextCalls === 0
+        && agentState.selfReferentialSearchHits === 0
+        && agentState.contextLimitErrors === 0
+        && agentState.contextFrames === agentState.providerCalls
+        && agentState.providerItems === agentState.providerCalls
+        && agentState.runningInferences === 0
+        && agentState.runningTurns === 0
+        && agentState.workUnitsEntered === agentState.workUnitsReturned
+        && agentState.workUnitsAbandoned === 0,
       [
-        `compactions=${agentJournal.compactionEvents}`,
-        `invalidContextCalls=${agentJournal.invalidContextCalls}`,
-        `selfSearchHits=${agentJournal.selfReferentialSearchHits}`,
-        `contextLimitErrors=${agentJournal.contextLimitErrors}`,
-        `frames=${agentJournal.contextFrames}/${agentJournal.providerCalls}`,
-        `providerItems=${agentJournal.providerItems}`,
-        `running=${agentJournal.runningInferences} inferences/${agentJournal.runningTurns} turns`,
-        `workUnits=${agentJournal.workUnitsReturned}/${agentJournal.workUnitsEntered}`,
-        `abandonedWorkUnits=${agentJournal.workUnitsAbandoned}`,
-        `inputResources=${agentJournal.workUnitInputResources}`,
-        `returnedResources=${agentJournal.workUnitReturnedResources}`,
-        `handoffReads=${agentJournal.parentHandoffReadCalls}`,
-        `reconstructionReads=${agentJournal.parentReconstructionReadCalls}`,
-        `returnedResourceRereads=${agentJournal.parentReturnedResourceReadCalls}`,
-        `threadProposals=${agentJournal.workUnitThreadProposals}`,
-        `recent=${agentJournal.peakSelectedDialogueTurns} selected/${agentJournal.peakOmittedDialogueTurns} omitted`,
-        `threadBytes=${agentJournal.peakThreadDocumentBytes}`,
-        `pressureNotices=${agentJournal.pressureNotices}`,
-        `threadUpdates=${agentJournal.threadUpdates}`,
+        `compactions=${agentState.compactionEvents}`,
+        `invalidContextCalls=${agentState.invalidContextCalls}`,
+        `selfSearchHits=${agentState.selfReferentialSearchHits}`,
+        `contextLimitErrors=${agentState.contextLimitErrors}`,
+        `frames=${agentState.contextFrames}/${agentState.providerCalls}`,
+        `providerItems=${agentState.providerItems}`,
+        `running=${agentState.runningInferences} inferences/${agentState.runningTurns} turns`,
+        `workUnits=${agentState.workUnitsReturned}/${agentState.workUnitsEntered}`,
+        `abandonedWorkUnits=${agentState.workUnitsAbandoned}`,
+        `inputResources=${agentState.workUnitInputResources}`,
+        `returnedResources=${agentState.workUnitReturnedResources}`,
+        `handoffReads=${agentState.parentHandoffReadCalls}`,
+        `reconstructionReads=${agentState.parentReconstructionReadCalls}`,
+        `returnedResourceRereads=${agentState.parentReturnedResourceReadCalls}`,
+        `threadProposals=${agentState.workUnitThreadProposals}`,
+        `recent=${agentState.peakSelectedDialogueTurns} selected/${agentState.peakOmittedDialogueTurns} omitted`,
+        `threadBytes=${agentState.peakThreadDocumentBytes}`,
+        `pressureNotices=${agentState.pressureNotices}`,
+        `threadUpdates=${agentState.threadUpdates}`,
       ].join(', '),
     ));
   }
@@ -328,7 +328,7 @@ export async function evaluateRun(input: {
     workspace: { head, status, changedPaths },
     fixture: manifest,
     rollout: rolloutSummary,
-    agentJournal,
+    agentState,
     driverTurns: runRecord.turns,
     driverAssessment: runRecord.driverAssessment,
   };
@@ -355,75 +355,75 @@ export async function evaluateRun(input: {
     changedPaths,
     gates,
     metrics: {
-      functionCalls: rolloutSummary?.functionCalls ?? agentJournal?.functionCalls ?? null,
-      commandCalls: rolloutSummary?.commandCalls ?? agentJournal?.commandCalls ?? null,
-      compactionEvents: rolloutSummary?.compactionEvents ?? agentJournal?.compactionEvents ?? null,
-      inputTokens: rolloutSummary?.inputTokens ?? agentJournal?.reportedInputTokens ?? null,
-      cachedInputTokens: rolloutSummary?.cachedInputTokens ?? agentJournal?.reportedCacheReadTokens ?? null,
-      outputTokens: rolloutSummary?.outputTokens ?? agentJournal?.reportedOutputTokens ?? null,
+      functionCalls: rolloutSummary?.functionCalls ?? agentState?.functionCalls ?? null,
+      commandCalls: rolloutSummary?.commandCalls ?? agentState?.commandCalls ?? null,
+      compactionEvents: rolloutSummary?.compactionEvents ?? agentState?.compactionEvents ?? null,
+      inputTokens: rolloutSummary?.inputTokens ?? agentState?.reportedInputTokens ?? null,
+      cachedInputTokens: rolloutSummary?.cachedInputTokens ?? agentState?.reportedCacheReadTokens ?? null,
+      outputTokens: rolloutSummary?.outputTokens ?? agentState?.reportedOutputTokens ?? null,
       reasoningOutputTokens: rolloutSummary?.reasoningOutputTokens ?? null,
       totalTokenUsage: rolloutSummary?.totalTokenUsage ?? null,
       cacheReadRatio: rolloutSummary?.inputTokens
         ? (rolloutSummary.cachedInputTokens ?? 0) / rolloutSummary.inputTokens
-        : agentJournal?.reportedInputTokens || agentJournal?.reportedCacheReadTokens
-          ? (agentJournal.reportedCacheReadTokens ?? 0) /
-            ((agentJournal.reportedInputTokens ?? 0) + (agentJournal.reportedCacheReadTokens ?? 0))
+        : agentState?.reportedInputTokens || agentState?.reportedCacheReadTokens
+          ? (agentState.reportedCacheReadTokens ?? 0) /
+            ((agentState.reportedInputTokens ?? 0) + (agentState.reportedCacheReadTokens ?? 0))
           : null,
       modelContextWindow: rolloutSummary?.modelContextWindow ?? null,
-      providerCalls: agentJournal?.providerCalls ?? null,
-      rootProviderCalls: agentJournal?.rootProviderCalls ?? null,
-      childProviderCalls: agentJournal?.childProviderCalls ?? null,
-      estimatedInputTokens: agentJournal?.estimatedInputTokens ?? null,
-      peakEstimatedInputTokens: agentJournal?.peakEstimatedInputTokens ?? null,
-      peakRootEstimatedInputTokens: agentJournal?.peakRootEstimatedInputTokens ?? null,
-      peakChildEstimatedInputTokens: agentJournal?.peakChildEstimatedInputTokens ?? null,
-      reportedInputTokens: agentJournal?.reportedInputTokens ?? null,
-      reportedOutputTokens: agentJournal?.reportedOutputTokens ?? null,
-      fullRequests: agentJournal?.requestModes.full ?? null,
-      continuationRequests: agentJournal?.requestModes.continuation ?? null,
-      contextFrames: agentJournal?.contextFrames ?? null,
-      providerItems: agentJournal?.providerItems ?? null,
-      runningInferences: agentJournal?.runningInferences ?? null,
-      runningTurns: agentJournal?.runningTurns ?? null,
-      peakSelectedDialogueTurns: agentJournal?.peakSelectedDialogueTurns ?? null,
-      peakOmittedDialogueTurns: agentJournal?.peakOmittedDialogueTurns ?? null,
-      peakThreadDocumentBytes: agentJournal?.peakThreadDocumentBytes ?? null,
-      pressureNotices: agentJournal?.pressureNotices ?? null,
-      threadUpdates: agentJournal?.threadUpdates ?? null,
-      workUnitsEntered: agentJournal?.workUnitsEntered ?? null,
-      workUnitsReturned: agentJournal?.workUnitsReturned ?? null,
-      workUnitsAbandoned: agentJournal?.workUnitsAbandoned ?? null,
-      rootToolCalls: agentJournal?.rootToolCalls ?? null,
-      childToolCalls: agentJournal?.childToolCalls ?? null,
-      workUnitResultBytes: agentJournal?.workUnitResultBytes ?? null,
-      workUnitInputResources: agentJournal?.workUnitInputResources ?? null,
-      workUnitInputAuthorities: agentJournal?.workUnitInputAuthorities ?? null,
-      workUnitReturnedResources: agentJournal?.workUnitReturnedResources ?? null,
-      workUnitReturnedAuthorities: agentJournal?.workUnitReturnedAuthorities ?? null,
-      workUnitReturnedDeliverables: agentJournal?.workUnitReturnedDeliverables ?? null,
-      workUnitReturnedEvidence: agentJournal?.workUnitReturnedEvidence ?? null,
-      workUnitThreadProposals: agentJournal?.workUnitThreadProposals ?? null,
-      contextLimitErrors: agentJournal?.contextLimitErrors ?? null,
-      contextLayerEstimatedTokens: agentJournal?.contextLayerEstimatedTokens ?? null,
-      contextOmissions: agentJournal?.contextOmissions ?? null,
-      historyRetrievalCalls: agentJournal?.historyRetrievalCalls ?? null,
-      historySearchCalls: agentJournal?.historySearchCalls ?? null,
-      historyReadCalls: agentJournal?.historyReadCalls ?? null,
-      usefulRetrievalCalls: agentJournal?.usefulRetrievalCalls ?? null,
-      invalidContextCalls: agentJournal?.invalidContextCalls ?? null,
-      selfReferentialSearchHits: agentJournal?.selfReferentialSearchHits ?? null,
-      duplicateRetrievalHits: agentJournal?.duplicateRetrievalHits ?? null,
-      readCalls: agentJournal?.readCalls ?? null,
-      repeatedReadCalls: agentJournal?.repeatedReadCalls ?? null,
-      parentHandoffReadCalls: agentJournal?.parentHandoffReadCalls ?? null,
-      parentReconstructionReadCalls: agentJournal?.parentReconstructionReadCalls ?? null,
-      parentReturnedResourceReadCalls: agentJournal?.parentReturnedResourceReadCalls ?? null,
-      acceptedSpecReads: agentJournal?.acceptedSpecReads ?? null,
-      shellCalls: agentJournal?.shellCalls ?? null,
-      editCalls: agentJournal?.editCalls ?? null,
-      writeCalls: agentJournal?.writeCalls ?? null,
-      testCalls: agentJournal?.testCalls ?? null,
-      parentVisibleToolResultBytes: agentJournal?.parentVisibleToolResultBytes ?? null,
+      providerCalls: agentState?.providerCalls ?? null,
+      rootProviderCalls: agentState?.rootProviderCalls ?? null,
+      childProviderCalls: agentState?.childProviderCalls ?? null,
+      estimatedInputTokens: agentState?.estimatedInputTokens ?? null,
+      peakEstimatedInputTokens: agentState?.peakEstimatedInputTokens ?? null,
+      peakRootEstimatedInputTokens: agentState?.peakRootEstimatedInputTokens ?? null,
+      peakChildEstimatedInputTokens: agentState?.peakChildEstimatedInputTokens ?? null,
+      reportedInputTokens: agentState?.reportedInputTokens ?? null,
+      reportedOutputTokens: agentState?.reportedOutputTokens ?? null,
+      fullRequests: agentState?.requestModes.full ?? null,
+      continuationRequests: agentState?.requestModes.continuation ?? null,
+      contextFrames: agentState?.contextFrames ?? null,
+      providerItems: agentState?.providerItems ?? null,
+      runningInferences: agentState?.runningInferences ?? null,
+      runningTurns: agentState?.runningTurns ?? null,
+      peakSelectedDialogueTurns: agentState?.peakSelectedDialogueTurns ?? null,
+      peakOmittedDialogueTurns: agentState?.peakOmittedDialogueTurns ?? null,
+      peakThreadDocumentBytes: agentState?.peakThreadDocumentBytes ?? null,
+      pressureNotices: agentState?.pressureNotices ?? null,
+      threadUpdates: agentState?.threadUpdates ?? null,
+      workUnitsEntered: agentState?.workUnitsEntered ?? null,
+      workUnitsReturned: agentState?.workUnitsReturned ?? null,
+      workUnitsAbandoned: agentState?.workUnitsAbandoned ?? null,
+      rootToolCalls: agentState?.rootToolCalls ?? null,
+      childToolCalls: agentState?.childToolCalls ?? null,
+      workUnitResultBytes: agentState?.workUnitResultBytes ?? null,
+      workUnitInputResources: agentState?.workUnitInputResources ?? null,
+      workUnitInputAuthorities: agentState?.workUnitInputAuthorities ?? null,
+      workUnitReturnedResources: agentState?.workUnitReturnedResources ?? null,
+      workUnitReturnedAuthorities: agentState?.workUnitReturnedAuthorities ?? null,
+      workUnitReturnedDeliverables: agentState?.workUnitReturnedDeliverables ?? null,
+      workUnitReturnedEvidence: agentState?.workUnitReturnedEvidence ?? null,
+      workUnitThreadProposals: agentState?.workUnitThreadProposals ?? null,
+      contextLimitErrors: agentState?.contextLimitErrors ?? null,
+      contextLayerEstimatedTokens: agentState?.contextLayerEstimatedTokens ?? null,
+      contextOmissions: agentState?.contextOmissions ?? null,
+      historyRetrievalCalls: agentState?.historyRetrievalCalls ?? null,
+      historySearchCalls: agentState?.historySearchCalls ?? null,
+      historyReadCalls: agentState?.historyReadCalls ?? null,
+      usefulRetrievalCalls: agentState?.usefulRetrievalCalls ?? null,
+      invalidContextCalls: agentState?.invalidContextCalls ?? null,
+      selfReferentialSearchHits: agentState?.selfReferentialSearchHits ?? null,
+      duplicateRetrievalHits: agentState?.duplicateRetrievalHits ?? null,
+      readCalls: agentState?.readCalls ?? null,
+      repeatedReadCalls: agentState?.repeatedReadCalls ?? null,
+      parentHandoffReadCalls: agentState?.parentHandoffReadCalls ?? null,
+      parentReconstructionReadCalls: agentState?.parentReconstructionReadCalls ?? null,
+      parentReturnedResourceReadCalls: agentState?.parentReturnedResourceReadCalls ?? null,
+      acceptedSpecReads: agentState?.acceptedSpecReads ?? null,
+      shellCalls: agentState?.shellCalls ?? null,
+      editCalls: agentState?.editCalls ?? null,
+      writeCalls: agentState?.writeCalls ?? null,
+      testCalls: agentState?.testCalls ?? null,
+      parentVisibleToolResultBytes: agentState?.parentVisibleToolResultBytes ?? null,
     },
     artifacts: {
       run: join(runPath, 'run.json'),
@@ -600,10 +600,10 @@ function benchmarkDurationMs(runRecord: BenchmarkRun) {
   return Math.max(0, Date.parse(completedAt) - Date.parse(runRecord.startedAt));
 }
 
-function summarizeAgentJournal(
+function summarizeAgentState(
   runRecord: BenchmarkRun,
   scenario: BenchmarkScenario,
-): AgentJournalSummary | null {
+): AgentStateSummary | null {
   const dataRoot = resolveAgentDataRoot();
   const databasePath = join(dataRoot, 'agent.sqlite3');
   let database: DatabaseSync;

@@ -128,7 +128,7 @@ function workUnitResourceSchema() {
 export function createContextTools(
   durability: Pick<
     RuntimeDurabilityHooks,
-    'journalSearch' | 'journalOpen' | 'threadRead' | 'threadPatch' | 'threadReplace' |
+    'historySearch' | 'historyOpen' | 'threadRead' | 'threadPatch' | 'threadReplace' |
     'workUnitEnter' | 'workUnitReturn'
   >,
 ): ToolDefinition[] {
@@ -145,11 +145,8 @@ export function createContextTools(
       parameters: searchSchema,
       executionMode: 'parallel',
       async execute(callId, params) {
-        const result = await durability.journalSearch(callId, params);
-        return jsonResult({
-          ...result,
-          hits: result.hits.map((hit) => ({ ...hit, ref: modelHistoryRef(hit.ref) })),
-        });
+        const result = await durability.historySearch(callId, params);
+        return jsonResult(result);
       },
     }),
     defineTool({
@@ -163,11 +160,11 @@ export function createContextTools(
       parameters: openSchema,
       executionMode: 'parallel',
       async execute(_callId, params) {
-        const result = await durability.journalOpen({
+        const result = await durability.historyOpen({
           ...params,
           ref: durableHistoryRef(params.ref),
         });
-        return jsonResult({ ...result, ref: modelHistoryRef(result.ref) });
+        return jsonResult(result);
       },
     }),
     defineTool({
@@ -263,6 +260,7 @@ export function createContextTools(
         'Use partial or blocked to return honestly at a useful boundary instead of broadening the unit.',
         'Use threadUpdate only for shared state the parent should deliberately merge; do not treat recommendations as accepted user decisions.',
         'Return a resource when its exact contents prevent meaningful reconstruction or enable inspection, integration, audit, or later work; prefer the smallest useful surface.',
+        'Only return a resource when you have its exact file path or history:// reference. Summarize other evidence in the result instead of inventing a reference.',
         'Do not return every file touched or unchanged material already inherited.',
         'Do not paste reasoning traces or raw command output.',
       ],
@@ -279,26 +277,22 @@ export function createContextTools(
 }
 
 function modelThreadView<T extends { ref: string }>(view: T): T {
-  return { ...view, ref: modelHistoryRef(view.ref) };
-}
-
-function modelHistoryRef(ref: string) {
-  return ref.replace(/^journal:\/\//u, 'history://');
+  return view;
 }
 
 function durableHistoryRef(ref: string) {
   if (!ref.startsWith('history://')) {
     throw new TypeError('History references must start with history://.');
   }
-  return ref.replace(/^history:\/\//u, 'journal://');
+  return ref;
 }
 
 function modelWorkUnitResource<T extends { ref: string; snapshot?: { ref: string } }>(resource: T): T {
   return {
     ...resource,
-    ref: modelHistoryRef(resource.ref),
+    ref: resource.ref,
     ...(resource.snapshot ? {
-      snapshot: { ...resource.snapshot, ref: modelHistoryRef(resource.snapshot.ref) },
+      snapshot: resource.snapshot,
     } : {}),
   };
 }

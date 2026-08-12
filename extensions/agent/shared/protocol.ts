@@ -130,7 +130,7 @@ export type ContextInspectorArtifact = {
 };
 
 export type ContextInspectorValue = {
-  version: 4;
+  version: 5;
   conversationId: string;
   inferenceId: string;
   frameId: string;
@@ -140,7 +140,7 @@ export type ContextInspectorValue = {
   policyVersion: string;
   estimatedInputTokens: number;
   semanticHash: string;
-  bootstrapHash: string;
+  contextEnvelopeHash: string;
   buildDurationMs: number;
   transportMode: 'full' | 'continuation';
   messageCount: number;
@@ -149,7 +149,7 @@ export type ContextInspectorValue = {
   renderedHash: string;
   fixedContractsHash: string;
   manifestArtifact: ContextInspectorArtifact;
-  bootstrapArtifact: ContextInspectorArtifact;
+  contextEnvelopeArtifact: ContextInspectorArtifact;
   dispatchArtifact: ContextInspectorArtifact;
   groups: ReadonlyArray<{
     turnId: string;

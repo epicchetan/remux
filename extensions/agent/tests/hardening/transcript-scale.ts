@@ -22,7 +22,7 @@ import {
 } from '../../shared/transcript.ts';
 import { AgentServer } from '../../server/src/agent-server.ts';
 import { FixtureEngine } from '../../server/src/fixture-engine.ts';
-import { AgentJournalRepository } from '../../server/src/storage/repository.ts';
+import { AgentStateStore } from '../../server/src/storage/agent-state-store.ts';
 import { EphemeralTranscriptProjector } from '../../server/src/transcript-projector.ts';
 
 const COMPLETED_TURNS = 250;
@@ -40,10 +40,10 @@ const dataRoot = join(root, 'data');
 const workspace = join(root, 'workspace');
 await mkdir(workspace);
 
-let repository: AgentJournalRepository | null = null;
+let repository: AgentStateStore | null = null;
 let server: AgentServer | null = null;
 try {
-  repository = await AgentJournalRepository.open({ dataRoot });
+  repository = await AgentStateStore.open({ dataRoot });
   const conversation = await repository.createConversation({
     operationId: randomUUID(),
     cwd: workspace,
@@ -118,7 +118,7 @@ try {
         textDelta: 'Partial restart output.',
       });
       await repository.close();
-      repository = await AgentJournalRepository.open({ dataRoot });
+      repository = await AgentStateStore.open({ dataRoot });
     }
 
     if ((index + 1) % 50 === 0) {
@@ -241,7 +241,7 @@ try {
 
   server = new AgentServer({
     engine: new FixtureEngine(),
-    journal: repository,
+    store: repository,
     notify: () => {},
   });
   await server.initialize();
@@ -309,14 +309,14 @@ try {
   const startupDurations: number[] = [];
   for (let sample = 0; sample < STARTUP_SAMPLES; sample += 1) {
     const startedAt = performance.now();
-    const opened = await AgentJournalRepository.open({ dataRoot });
+    const opened = await AgentStateStore.open({ dataRoot });
     await opened.readResourceProjections(['conversation-list']);
     startupDurations.push(performance.now() - startedAt);
     await opened.close();
   }
   assert.ok(p95(startupDurations) <= 1_500, `startup p95 was ${p95(startupDurations)} ms`);
 
-  const finalRepository = await AgentJournalRepository.open({ dataRoot });
+  const finalRepository = await AgentStateStore.open({ dataRoot });
   const scrubStartedAt = performance.now();
   const scrub = await finalRepository.scrubArtifacts();
   const scrubElapsedMs = performance.now() - scrubStartedAt;

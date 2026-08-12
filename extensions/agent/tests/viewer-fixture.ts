@@ -216,7 +216,7 @@ export async function installAgentHost(page: Page) {
 
     function contextValue(_decision: 'append' | 'roll') {
       return {
-        version: 4,
+        version: 5,
         conversationId,
         inferenceId: 'fixture-inference',
         frameId: 'fixture-frame',
@@ -226,7 +226,7 @@ export async function installAgentHost(page: Page) {
         policyVersion: 'agent-thread-policy-v3',
         estimatedInputTokens: 3_200,
         semanticHash: 'b'.repeat(64),
-        bootstrapHash: contextBootstrapHash,
+        contextEnvelopeHash: contextBootstrapHash,
         buildDurationMs: 2,
         transportMode: 'continuation',
         messageCount: 2,
@@ -235,7 +235,7 @@ export async function installAgentHost(page: Page) {
         renderedHash: '9'.repeat(64),
         fixedContractsHash: '0'.repeat(64),
         manifestArtifact: { hash: 'e'.repeat(64), byteLength: 1_200, mediaType: 'application/json' },
-        bootstrapArtifact: {
+        contextEnvelopeArtifact: {
           hash: contextBootstrapHash,
           byteLength: new TextEncoder().encode(contextBootstrapText).byteLength,
           mediaType: 'text/plain; charset=utf-8',
@@ -272,7 +272,7 @@ export async function installAgentHost(page: Page) {
         omissions: [{
           source: 'agent://conversation/fixture/turns',
           reason: 'dialogue-tail-budget',
-          retrieval: 'journal://conversation/fixture/turns?before=latest',
+          retrieval: 'history://conversation/fixture/turns?before=latest',
           count: 4,
         }],
         omissionsTruncated: false,

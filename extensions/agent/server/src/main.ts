@@ -1,10 +1,10 @@
 import { AgentServer } from './agent-server.ts';
 import { FixtureEngine } from './fixture-engine.ts';
 import { JsonRpcOutput, serveStdio } from './json-rpc.ts';
-import { AgentJournalRepository } from './storage/repository.ts';
+import { AgentStateStore } from './storage/agent-state-store.ts';
 
 const output = new JsonRpcOutput();
-const journal = await AgentJournalRepository.open();
+const store = await AgentStateStore.open();
 let server: AgentServer | null = null;
 try {
   const engine = process.env.REMUX_AGENT_FIXTURE === '1'
@@ -12,7 +12,7 @@ try {
     : await import('./pi-runtime.ts').then(({ PiEngine }) => PiEngine.create());
   const activeServer = new AgentServer({
     engine,
-    journal,
+    store,
     notify: (method, params) => output.notify(method, params),
   });
   server = activeServer;
@@ -20,6 +20,6 @@ try {
   await serveStdio((method, params) => activeServer.handle(method, params), output);
 } finally {
   await server?.close();
-  await journal.close();
+  await store.close();
   await output.flush();
 }

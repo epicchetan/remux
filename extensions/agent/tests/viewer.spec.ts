@@ -117,8 +117,8 @@ test('shows actual dispatch and compiled-frame evidence for a durable inference'
   await dispatch.getByRole('button', { name: 'Close Captured harness-visible request context' }).click();
 
   await panel.getByRole('button', { name: /Open compiled Thread context/u }).click();
-  const bootstrap = page.getByRole('dialog', { name: 'Exact dispatched Thread context' });
-  await expect(bootstrap).toContainText('<thread version="fixture-thread-version">');
+  const contextEnvelope = page.getByRole('dialog', { name: 'Exact dispatched Thread context' });
+  await expect(contextEnvelope).toContainText('<thread version="fixture-thread-version">');
 });
 
 test('opens the current Thread and its previous durable version', async ({ page }) => {

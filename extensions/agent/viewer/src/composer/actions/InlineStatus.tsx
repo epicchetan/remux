@@ -65,7 +65,7 @@ function ContextInspector({ value }: { value: ContextInspectorValue }) {
             <span>{value.pressureNoticed ? 'pressure noticed' : 'healthy'}</span>
           </div>
           <ContextArtifactButton
-            artifact={value.bootstrapArtifact}
+            artifact={value.contextEnvelopeArtifact}
             label="Open compiled Thread context"
             title="Exact dispatched Thread context"
           />

@@ -36,7 +36,7 @@ Use thread_patch for ordinary revision and thread_replace only to initialize, de
 
 ## Work units
 
-Use a work unit for the largest coherent outcome that the parent can independently assess, while leaving the unit enough room to validate its result and return a useful continuation. Scope by semantic boundary rather than arbitrary files or token quotas. Repository grounding, implementation, focused investigation, independent audit, and substantial validation are common boundaries.
+Use a work unit for the largest coherent outcome that the parent can independently assess, while leaving the unit enough room to validate its own result and return a useful continuation. Scope by semantic boundary rather than arbitrary files or token quotas. Start another unit only for a genuinely separate unresolved seam; repository grounding, implementation, focused investigation, and substantial validation can each be useful boundaries when they stand on their own.
 
 Before starting one, identify:
 
@@ -65,7 +65,7 @@ After a return, deliberately choose one of three paths:
 
 1. **Accept and continue** when the result is low risk and adequately supported.
 2. **Spot-check a named seam** when a particular claim or mutable surface is acceptance-critical.
-3. **Start an independent audit work unit** when broad verification is warranted.
+3. **Start an independent audit work unit** when the user requests one or the risk warrants a genuinely separate perspective.
 
 Work-unit claims are evidence, not automatic proof, but owning acceptance does not mean replaying the implementation. Use the continuation and returned resources first. Do not reopen the same surface merely to reconstruct what the unit did. Reread when the source may be stale, the handoff is insufficient, a named risk needs direct inspection, or no independent verification covers an acceptance-critical claim.
 

@@ -4,7 +4,7 @@ import type {
   AgentTranscriptSyncRequest,
   AgentTranscriptSyncResource,
 } from '../../shared/transcript.ts';
-import type { AgentConversationJournal } from './conversation-journal.ts';
+import type { AgentStore } from './agent-store.ts';
 import { createReplayedTranscriptProjector } from './transcript-replay.ts';
 import {
   EphemeralTranscriptProjector,
@@ -12,8 +12,8 @@ import {
 } from './transcript-projector.ts';
 import type {
   DurableTranscriptWindow,
-} from './storage/repository.ts';
-import { DurableTranscriptSelectionError } from './storage/repository.ts';
+} from './domain/state.ts';
+import { DurableTranscriptSelectionError } from './domain/errors.ts';
 
 type FrozenProjection = {
   bytes: number;
@@ -22,16 +22,16 @@ type FrozenProjection = {
 };
 
 export class TranscriptProjectionRouter {
-  private readonly journal: AgentConversationJournal;
+  private readonly store: AgentStore;
   private readonly maxFrozenBytes: number;
   private readonly frozen = new Map<string, FrozenProjection>();
   private frozenBytes = 0;
 
   constructor(options: {
-    journal: AgentConversationJournal;
+    store: AgentStore;
     maxFrozenBytes?: number;
   }) {
-    this.journal = options.journal;
+    this.store = options.store;
     this.maxFrozenBytes = options.maxFrozenBytes ?? 16 * 1024 * 1024;
   }
 
@@ -41,20 +41,20 @@ export class TranscriptProjectionRouter {
     liveProjector: EphemeralTranscriptProjector | null;
   }): Promise<AgentTranscriptResourcesReadResult> {
     if (options.liveProjector?.conversationId === options.params.conversationId) {
-      const basisSequence = await this.journal.readTranscriptBasis(options.params.conversationId);
+      const basisSequence = await this.store.readTranscriptBasis(options.params.conversationId);
       if (basisSequence === null) throw new TranscriptProtocolError(-32015, 'Conversation not found.');
       options.liveProjector.fenceBasis(basisSequence);
       return options.liveProjector.read(options.params, options.serverGeneration);
     }
 
-    const basisSequence = await this.journal.readTranscriptBasis(options.params.conversationId);
+    const basisSequence = await this.store.readTranscriptBasis(options.params.conversationId);
     if (basisSequence === null) throw new TranscriptProtocolError(-32015, 'Conversation not found.');
     const key = projectionCacheKey(options.params, basisSequence);
     let entry = this.frozen.get(key);
     if (!entry) {
-      let projection: Awaited<ReturnType<AgentConversationJournal['readTranscriptWindowProjection']>>;
+      let projection: Awaited<ReturnType<AgentStore['readTranscriptWindowProjection']>>;
       try {
-        projection = await this.journal.readTranscriptWindowProjection(options.params);
+        projection = await this.store.readTranscriptWindowProjection(options.params);
       } catch (error) {
         if (error instanceof DurableTranscriptSelectionError) {
           throw new TranscriptProtocolError(error.code, error.message);
