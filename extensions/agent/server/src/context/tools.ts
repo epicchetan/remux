@@ -229,6 +229,8 @@ export function createContextTools(
         'Keep the turn plan in the parent. State one outcome, observable doneWhen conditions, and the next decision or action this return should unlock.',
         'Ask for only the exact resources this child should have directly in context.',
         'Use the largest coherent unit the parent can independently assess while leaving room for the child to validate and return cleanly.',
+        'Prefer one closed-loop deliverable: keep its necessary inspection, implementation, and focused validation together instead of mechanically creating audit, implementation, and final-audit units.',
+        'Use a separate audit unit only when the user asks for one or a named risk needs a genuinely independent perspective.',
         'Work units cannot be nested.',
         'Finish by calling work_unit_finish.',
       ],
@@ -257,6 +259,7 @@ export function createContextTools(
       promptSnippet: 'Finish the work unit and return what its parent needs',
       promptGuidelines: [
         'Put the established outcome, changed state or findings, supporting validation, remaining uncertainty, and next useful parent edge in result.',
+        'For implementation work, finish the focused validation this unit can perform before returning; identify validation that was impossible rather than silently delegating routine checking to the parent.',
         'Use partial or blocked to return honestly at a useful boundary instead of broadening the unit.',
         'Use threadUpdate only for shared state the parent should deliberately merge; do not treat recommendations as accepted user decisions.',
         'Return a resource when its exact contents prevent meaningful reconstruction or enable inspection, integration, audit, or later work; prefer the smallest useful surface.',

@@ -36,6 +36,7 @@ export async function installAgentHost(page: Page) {
     const markdownTranscript = route.get('fixtureMarkdown') === '1';
     const overflowTranscript = route.get('fixtureOverflow') === '1';
     const exactTranscript = route.get('fixtureExact') === '1';
+    const legacyInferenceTrace = route.get('fixtureLegacyInferenceTrace') === '1';
     const exactArtifactHash = 'a'.repeat(64);
     const pickedImageHash = 'b'.repeat(64);
     const pickedImageDataUrl = 'data:image/png;base64,iVBORw0KGgo=';
@@ -80,15 +81,13 @@ export async function installAgentHost(page: Page) {
     const turns: Turn[] = [];
     const turnsByConversation = new Map<string, Turn[]>([[conversationId, turns]]);
     const pendingQueue: Array<{ clientMessageId: string; operationId: string; parts?: any[]; text: string }> = [];
-    const workGroups = new Map<string, any>();
-    const workDetails = new Map<string, any>();
+    const executionScopes = new Map<string, any>();
     const requestLog: Array<{ method: string; summary: string }> = [];
     let sequence = 1;
     let turnCounter = 0;
     let lifecycleEpoch = 1;
     let nextTranscriptDelayMs = 0;
     let nextMessageError: string | null = null;
-    let staleNextWorkPage = false;
     let viewportMetrics = {
       keyboardHeight: 0,
       keyboardVisible: false,
@@ -366,14 +365,13 @@ export async function installAgentHost(page: Page) {
       turnCounter += 1;
       const id = `fixture-turn-${turnCounter}`;
       const workId = `${id}:work`;
-      const groupId = `${id}:workspace-reads`;
-      const rowId = `${id}:readme`;
-      const filesGroupId = `${id}:changed-files`;
-      const fileRowId = `${id}:index-change`;
+      const scopeId = `00000000-0000-4000-8000-${String(turnCounter).padStart(12, '0')}`;
+      const rootScopeId = `10000000-0000-4000-8000-${String(turnCounter).padStart(12, '0')}`;
+      const startedAt = Date.now();
       const turn: Turn = {
         id,
         status: 'inProgress',
-        startedAt: Date.now(),
+        startedAt,
         completedAt: null,
         durationMs: null,
         error: null,
@@ -385,59 +383,104 @@ export async function installAgentHost(page: Page) {
             ...(parts ? { parts: storedFixtureParts(parts) } : {}),
           },
           {
-            id: workId, type: 'work', state: 'running', revision: '1',
-            layoutRevision: '1', durationMs: null,
-            timeline: [
-              { id: `${id}:reason`, type: 'text', revision: '1', text: 'Checking context.' },
-              {
-                id: groupId, type: 'group', revision: '1', groupType: 'activity',
-                title: 'Workspace reads', status: 'running', rowCount: 1, hasMoreRows: false,
-              },
-              {
-                id: filesGroupId, type: 'group', revision: '1', groupType: 'files',
-                title: 'Changed files', status: 'running', rowCount: 1, hasMoreRows: false,
-              },
-            ],
+            id: workId, type: 'work', scopeId: rootScopeId, state: 'running', revision: '1',
+            layoutRevision: '1', durationMs: null, inferenceCount: 1,
+            operationCount: 3, workUnitCount: 1,
           },
           { id: `${id}:assistant`, type: 'assistantMessage', revision: '1', text: '' },
         ],
       };
-      workGroups.set(groupKey(id, workId, groupId), {
-        conversationId, turnId: id, segmentId: workId, groupId,
-        type: 'activity', title: 'Workspace reads', revision: '1', layoutRevision: '1',
-        rows: [{
-          id: rowId, type: 'activity', revision: '1', kind: 'read', status: 'running',
-          text: 'Read README.md', path: 'README.md', durationMs: null, hasDetail: true,
+      executionScopes.set(executionScopeKey(id, rootScopeId), {
+        conversationId, turnId: id, scopeId: rootScopeId,
+        parentScopeId: null, parentOperationId: null, kind: 'turn', state: 'running',
+        revision: 'root:1', basisSequence: sequence, startedAt, completedAt: null,
+        durationMs: null, objective: null, doneWhen: [], providedResources: [],
+        inferenceOrder: [`${id}:inference:root`],
+        inferences: [{
+          id: `${id}:inference:root`, ordinal: 0, state: 'completed', revision: 'inference:root:1',
+          startedAt, completedAt: startedAt + 80, durationMs: 80,
+          ...(!legacyInferenceTrace
+            ? { contentOrder: ['reasoning', 'commentary', 'actions'] }
+            : {}),
+          commentary: {
+            kind: 'assistantCommentary', state: 'final', text: 'Grounding the change in the current workspace.',
+          },
+          reasoning: {
+            kind: 'providerSummary', state: 'final', text: '**Checking context.**',
+          },
+          actionGroup: {
+            id: `${id}:actions:root`, status: 'running', callCount: 3,
+            calls: [
+              {
+                id: `${id}:operation:readme`, callId: `${id}:readme`, name: 'workspace.read',
+                presentation: { category: 'read', label: 'Read README.md', subject: 'README.md' },
+                status: 'completed', revision: 'operation:readme:1',
+                detailPreview: 'Read the workspace overview before editing.',
+                outputPreview: '# Remux\n\nFixture file output.', durationMs: 42,
+                childScopeId: null, childObjective: null, childState: null,
+                childDurationMs: null, childOperationCount: 0,
+                childReturnedResourceCount: 0, hasDetail: true,
+              },
+              {
+                id: `${id}:operation:edit`, callId: `${id}:edit`, name: 'workspace.edit',
+                presentation: { category: 'edit', label: 'Edited index.ts', subject: 'src/index.ts' },
+                status: 'completed', revision: 'operation:edit:1',
+                detailPreview: 'src/index.ts', outputPreview: '+export const value = 1;',
+                durationMs: 34, childScopeId: null, childObjective: null,
+                childState: null, childDurationMs: null, childOperationCount: 0,
+                childReturnedResourceCount: 0, hasDetail: true,
+              },
+              {
+                id: `${id}:operation:work-unit`, callId: `${id}:work-unit`, name: 'work_unit_start',
+                presentation: { category: 'tool', label: 'Work Unit Start', subject: null },
+                status: 'running', revision: 'operation:work-unit:1',
+                detailPreview: 'Verify the focused seam', outputPreview: null, durationMs: null,
+                childScopeId: scopeId, childObjective: 'Verify the focused seam',
+                childState: 'running', childDurationMs: null, childOperationCount: 1,
+                childReturnedResourceCount: 0, hasDetail: true,
+              },
+            ],
+          },
         }],
-        nextCursor: null,
+        window: { startIndex: 0, endIndexExclusive: 1, hasEarlier: false, hasLater: false },
+        result: null, returnedResources: [], threadUpdate: null,
       });
-      workDetails.set(detailKey(id, workId, groupId, rowId), {
-        conversationId, turnId: id, segmentId: workId, groupId, rowId,
-        revision: '1', layoutRevision: '1',
-        detail: {
-          type: 'activity', detail: 'Read the workspace overview before editing.',
-          output: '# Remux\n\nFixture file output.',
-        },
-        truncation: { originalBytes: 38, returnedBytes: 38, truncated: false },
-      });
-      workGroups.set(groupKey(id, workId, filesGroupId), {
-        conversationId, turnId: id, segmentId: workId, groupId: filesGroupId,
-        type: 'files', title: 'Changed files', revision: '1', layoutRevision: '1',
-        rows: [{
-          id: fileRowId, type: 'fileChange', revision: '1', kind: 'edited',
-          status: 'completed', path: 'src/index.ts', additions: 2, deletions: 1,
-          hasDetail: true,
+      executionScopes.set(executionScopeKey(id, scopeId), {
+        conversationId, turnId: id, scopeId, parentScopeId: rootScopeId,
+        parentOperationId: `${id}:operation:work-unit`, kind: 'workUnit', state: 'running',
+        revision: 'child:1', basisSequence: sequence, startedAt, completedAt: null,
+        durationMs: null,
+        objective: 'Verify the focused seam against its governing compatibility contract without changing unrelated runtime behavior.',
+        doneWhen: ['The exact contract and implementation agree.'],
+        providedResources: [
+          { ref: 'docs/seam-contract.md', role: 'authority', description: 'Exact seam contract.' },
+          { ref: 'src/index.ts', role: 'deliverable', description: 'Verified implementation.' },
+        ],
+        inferenceOrder: [`${id}:inference:child`],
+        inferences: [{
+          id: `${id}:inference:child`, ordinal: 0, state: 'completed', revision: 'inference:child:1',
+          startedAt: startedAt + 90, completedAt: startedAt + 180, durationMs: 90,
+          ...(!legacyInferenceTrace ? { contentOrder: ['reasoning', 'actions'] } : {}),
+          commentary: null,
+          reasoning: {
+            kind: 'providerSummary', state: 'final',
+            text: 'Compared the implementation with its contract.',
+          },
+          actionGroup: {
+            id: `${id}:actions:child`, status: 'completed', callCount: 1,
+            calls: [{
+              id: `${id}:operation:test`, callId: `${id}:test`, name: 'bash',
+              presentation: { category: 'command', label: 'Shell command', subject: 'npm test -- seam' },
+              status: 'completed', revision: 'operation:test:1',
+              detailPreview: 'npm test -- seam', outputPreview: '1 test passed', durationMs: 120,
+              childScopeId: null, childObjective: null,
+              childState: null, childDurationMs: null, childOperationCount: 0,
+              childReturnedResourceCount: 0, hasDetail: true,
+            }],
+          },
         }],
-        nextCursor: null,
-      });
-      workDetails.set(detailKey(id, workId, filesGroupId, fileRowId), {
-        conversationId, turnId: id, segmentId: workId, groupId: filesGroupId,
-        rowId: fileRowId, revision: '1', layoutRevision: '1',
-        detail: {
-          type: 'fileChange',
-          diff: '@@ -1,2 +1,3 @@\n-old value\n+export const value = 1;\n context',
-        },
-        truncation: { originalBytes: 66, returnedBytes: 66, truncated: false },
+        window: { startIndex: 0, endIndexExclusive: 1, hasEarlier: false, hasLater: false },
+        result: null, returnedResources: [], threadUpdate: null,
       });
       turns.push(turn);
       touchTurn(turn);
@@ -476,18 +519,45 @@ export async function installAgentHost(page: Page) {
       if (work) {
         work.state = outcome;
         work.durationMs = turn.durationMs;
-        for (const entry of work.timeline) {
-          if (entry.type === 'group') entry.status = outcome;
-        }
-        const group = workGroups.get(groupKey(turn.id, work.id, work.timeline[1].id));
-        if (group) {
-          group.revision = String(sequence + 1);
-          group.layoutRevision = String(sequence + 1);
-          for (const row of group.rows) {
-            row.status = outcome;
-            row.durationMs = turn.durationMs;
-            row.revision = String(sequence + 1);
+        const rootScope = executionScopes.get(executionScopeKey(turn.id, work.scopeId));
+        const workCall = rootScope?.inferences[0]?.actionGroup?.calls
+          .find((call: any) => call.childScopeId);
+        if (rootScope) {
+          rootScope.revision = `root:${sequence + 1}`;
+          rootScope.basisSequence = sequence + 1;
+          rootScope.state = outcome;
+          rootScope.completedAt = turn.completedAt;
+          rootScope.durationMs = turn.durationMs;
+          if (workCall) {
+            workCall.status = outcome === 'completed' ? 'completed' : 'interrupted';
+            workCall.durationMs = turn.durationMs;
+            workCall.revision = `operation:work-unit:${sequence + 1}`;
+            workCall.childState = outcome === 'completed' ? 'completed' : 'abandoned';
+            workCall.childDurationMs = turn.durationMs;
+            workCall.childReturnedResourceCount = outcome === 'completed' ? 1 : 0;
           }
+          if (rootScope.inferences[0]?.actionGroup) {
+            rootScope.inferences[0].actionGroup.status = outcome;
+          }
+        }
+        const childScope = workCall?.childScopeId
+          ? executionScopes.get(executionScopeKey(turn.id, workCall.childScopeId))
+          : null;
+        if (childScope) {
+          childScope.revision = `child:${sequence + 1}`;
+          childScope.basisSequence = sequence + 1;
+          childScope.state = outcome === 'completed' ? 'completed' : 'abandoned';
+          childScope.completedAt = turn.completedAt;
+          childScope.durationMs = turn.durationMs;
+          childScope.result = outcome === 'completed'
+            ? '## Verified\n\n**The focused seam matches its exact contract without changing unrelated runtime behavior.**'
+            : null;
+          childScope.threadUpdate = outcome === 'completed'
+            ? 'Record the focused seam as verified.'
+            : null;
+          childScope.returnedResources = outcome === 'completed'
+            ? [{ ref: 'src/index.ts', role: 'evidence', description: 'Verified implementation.' }]
+            : [];
         }
       }
       if (outcome === 'completed') {
@@ -516,12 +586,20 @@ export async function installAgentHost(page: Page) {
       });
       invalidateTranscript(turn.id, 'terminal', false);
       if (work) {
-        const group = work.timeline.find((entry: any) => entry.type === 'group');
-        if (group) {
+        dispatchInvalidations([{
+          type: 'executionScope',
+          key: executionScopeKey(turn.id, work.scopeId),
+          conversationId, turnId: turn.id, scopeId: work.scopeId,
+          reason: 'terminal', affectsLayout: true, basisSequence: sequence,
+        }]);
+        const rootScope = executionScopes.get(executionScopeKey(turn.id, work.scopeId));
+        const childScopeId = rootScope?.inferences[0]?.actionGroup?.calls
+          .find((call: any) => call.childScopeId)?.childScopeId;
+        if (childScopeId) {
           dispatchInvalidations([{
-            type: 'workGroup',
-            key: groupKey(turn.id, work.id, group.id),
-            conversationId, turnId: turn.id, segmentId: work.id, groupId: group.id,
+            type: 'executionScope',
+            key: executionScopeKey(turn.id, childScopeId),
+            conversationId, turnId: turn.id, scopeId: childScopeId,
             reason: 'terminal', affectsLayout: true, basisSequence: sequence,
           }]);
         }
@@ -607,8 +685,8 @@ export async function installAgentHost(page: Page) {
       const selected = targetTurns.slice(start, end);
       const known = new Map((request.knownTurns ?? []).map((entry: any) => [entry.turnId, entry.renderRevision]));
       return {
-        protocolVersion: 2,
-        projectionVersion: 'agent-turn-render-v2',
+        protocolVersion: 4,
+        projectionVersion: 'agent-turn-render-v4',
         conversationId: targetConversationId,
         conversationRevision: `conversation:${sequence}`,
         basisSequence: sequence,
@@ -650,61 +728,46 @@ export async function installAgentHost(page: Page) {
               revision: value.conversationRevision, value,
             };
           }
-          if (request.type === 'workGroup') {
-            const key = groupKey(request.turnId, request.segmentId, request.groupId);
-            const value = workGroups.get(key);
+          if (request.type === 'executionScope') {
+            const key = executionScopeKey(request.turnId, request.scopeId);
+            const value = executionScopes.get(key);
             if (!value) return { requestIndex, key, status: 'missing' };
-            if (!request.cursor && request.knownRevision === value.revision) {
+            if (request.knownRevision === value.revision) {
               return { requestIndex, key, status: 'notModified', revision: value.revision };
             }
-            const cursor = request.cursor ? decodeWorkCursor(String(request.cursor)) : null;
-            if (cursor && staleNextWorkPage) {
-              staleNextWorkPage = false;
-              value.revision = `${value.revision}:changed`;
-              value.layoutRevision = value.revision;
-            }
-            if (cursor && cursor.revision !== value.revision) {
-              return {
-                requestIndex, key, status: 'error', code: 'staleCursor',
-                reason: 'The fixture work group changed.', revision: value.revision,
-              };
-            }
-            const start = cursor?.offset ?? 0;
-            const end = Math.min(value.rows.length, start + Number(request.limit ?? 200));
-            const page = {
-              ...value,
-              rows: value.rows.slice(start, end),
-              nextCursor: end < value.rows.length ? encodeWorkCursor(value.revision, end) : null,
-            };
-            return { requestIndex, key, status: 'ok', revision: value.revision, value: page };
+            return { requestIndex, key, status: 'ok', revision: value.revision, value };
           }
-          const key = detailKey(request.turnId, request.segmentId, request.groupId, request.rowId);
-          const value = workDetails.get(key);
-          if (!value) return { requestIndex, key, status: 'missing' };
-          if (request.knownRevision === value.revision) return { requestIndex, key, status: 'notModified', revision: value.revision };
-          return { requestIndex, key, status: 'ok', revision: value.revision, value };
+          if (request.type === 'operationDetail') {
+            const key = `operationDetail:${conversationId}:${request.turnId}:${request.scopeId}:${request.operationId}`;
+            const scope = executionScopes.get(executionScopeKey(request.turnId, request.scopeId));
+            const call = scope?.inferences
+              .flatMap((inference: any) => inference.actionGroup?.calls ?? [])
+              .find((candidate: any) => candidate.id === request.operationId);
+            if (!call) return { requestIndex, key, status: 'missing' };
+            const value = {
+              conversationId, turnId: request.turnId, scopeId: request.scopeId,
+              operationId: request.operationId, revision: call.revision,
+              detail: call.detailPreview, output: call.outputPreview,
+              truncation: {
+                originalBytes: String(call.detailPreview ?? '').length + String(call.outputPreview ?? '').length,
+                returnedBytes: String(call.detailPreview ?? '').length + String(call.outputPreview ?? '').length,
+                truncated: false,
+              },
+            };
+            if (request.knownRevision === value.revision) {
+              return { requestIndex, key, status: 'notModified', revision: value.revision };
+            }
+            return { requestIndex, key, status: 'ok', revision: value.revision, value };
+          }
+          return { requestIndex, key: `unknown:${request.type}`, status: 'missing' };
         }),
       };
     }
 
-    function groupKey(turnId: string, segmentId: string, groupId: string) {
-      return `workGroup:${conversationId}:${turnId}:${segmentId}:${groupId}`;
+    function executionScopeKey(turnId: string, scopeId: string) {
+      return `executionScope:${conversationId}:${turnId}:${scopeId}`;
     }
 
-    function detailKey(turnId: string, segmentId: string, groupId: string, rowId: string) {
-      return `workEntryDetail:${conversationId}:${turnId}:${segmentId}:${groupId}:${rowId}`;
-    }
-
-    function encodeWorkCursor(revision: string, offset: number) {
-      return btoa(JSON.stringify({ offset, revision, version: 1 }))
-        .replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
-    }
-
-    function decodeWorkCursor(cursor: string) {
-      const base64 = cursor.replaceAll('-', '+').replaceAll('_', '/');
-      const value = JSON.parse(atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, '=')));
-      return { offset: Number(value.offset), revision: String(value.revision) };
-    }
 
     function resultFor(request: HostRequest) {
       const params = request.params ?? {};
@@ -1077,37 +1140,34 @@ export async function installAgentHost(page: Page) {
         delayNextTranscript(delayMs: number) {
           nextTranscriptDelayMs = Math.max(0, delayMs);
         },
-        populateLatestWorkGroup(rowCount: number) {
+        reviseLatestExecutionScope() {
           const turn = turns.at(-1);
           const work = turn?.segments.find((segment) => segment.type === 'work');
-          const group = work?.timeline.find((entry: any) => entry.type === 'group');
-          if (!turn || !work || !group) throw new Error('No fixture work group is available.');
-          const key = groupKey(turn.id, work.id, group.id);
-          const value = workGroups.get(key);
-          if (!value) throw new Error('No fixture work resource is available.');
-          const first = value.rows[0];
-          value.rows = Array.from({ length: Math.max(1, rowCount) }, (_, index) => index === 0
-            ? first
-            : {
-                id: `${turn.id}:generated-${index}`,
-                type: 'activity',
-                revision: `generated-${index}`,
-                kind: 'read',
-                status: 'completed',
-                text: `Read generated-${index}.md`,
-                path: `generated-${index}.md`,
-                durationMs: 10,
-                hasDetail: false,
-              });
-          value.revision = `${turn.id}:paged:${sequence + 1}`;
-          value.layoutRevision = value.revision;
-          group.rowCount = value.rows.length;
-          group.revision = value.revision;
-          touchTurn(turn);
-          invalidateTranscript(turn.id, 'runtimeEvent', false);
-        },
-        staleNextWorkPage() {
-          staleNextWorkPage = true;
+          if (!turn || !work) throw new Error('No fixture execution scope is available.');
+          const key = executionScopeKey(turn.id, work.scopeId);
+          const value = executionScopes.get(key);
+          if (!value) throw new Error('No fixture execution-scope resource is available.');
+          sequence += 1;
+          const inferenceId = `${turn.id}:inference:refresh`;
+          value.revision = `root:${sequence}`;
+          value.basisSequence = sequence;
+          value.inferenceOrder = [value.inferenceOrder[0], inferenceId];
+          value.inferences = [value.inferences[0], {
+            id: inferenceId, ordinal: 1, state: 'completed', revision: `inference:refresh:${sequence}`,
+            startedAt: Date.now(), completedAt: Date.now() + 10, durationMs: 10,
+            ...(!legacyInferenceTrace ? { contentOrder: ['reasoning'] } : {}),
+            commentary: null,
+            reasoning: {
+              kind: 'providerSummary', state: 'final',
+              text: 'Validated the refreshed execution-scope revision.',
+            },
+            actionGroup: null,
+          }];
+          dispatchInvalidations([{
+            type: 'executionScope', key, conversationId, turnId: turn.id,
+            scopeId: work.scopeId, reason: 'runtimeEvent', affectsLayout: true,
+            basisSequence: sequence,
+          }]);
         },
         rejectNextMessage(message = 'Another conversation has an active turn.') {
           nextMessageError = message;

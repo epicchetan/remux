@@ -6,15 +6,15 @@ import {
   AGENT_TRANSCRIPT_PROTOCOL_VERSION,
   DEFAULT_TRANSCRIPT_PREPEND_TURNS,
   DEFAULT_TRANSCRIPT_TAIL_TURNS,
-  workEntryDetailResourceKey,
-  workGroupResourceKey,
+  executionScopeResourceKey,
+  operationDetailResourceKey,
   type AgentTranscriptResourceResult,
+  type AgentExecutionScopeResource,
+  type AgentExecutionScopeRequest,
+  type AgentOperationDetailResource,
   type AgentTranscriptSyncRequest,
   type AgentTranscriptSyncResource,
   type AgentTurnRenderFrame,
-  type AgentWorkEntryDetailResource,
-  type AgentWorkGroupResource,
-  type AgentWorkRenderSegment,
 } from '../../../shared/transcript';
 import { readTranscriptResources } from '../ipc/transcript';
 import { batchExternalStoreUpdates, createExternalStore } from './externalStore';
@@ -36,19 +36,19 @@ export type TranscriptTurnResourceEntry = {
   turn: AgentTurnRenderFrame;
 };
 
-export type TranscriptWorkGroupEntry =
-  | { resource: AgentWorkGroupResource; revision: string; status: 'ready' }
+export type TranscriptExecutionScopeEntry =
+  | { resource: AgentExecutionScopeResource; revision: string; status: 'ready' }
   | {
-      resource: AgentWorkGroupResource | null;
+      resource: AgentExecutionScopeResource | null;
       revision: string | null;
       status: 'error' | 'loading' | 'missing';
-      errorCode?: 'staleCursor' | 'resourceUnavailable';
+      errorCode?: 'resourceUnavailable';
     };
 
-export type TranscriptWorkEntryDetailEntry =
-  | { resource: AgentWorkEntryDetailResource; revision: string; status: 'ready' }
+export type TranscriptOperationDetailEntry =
+  | { resource: AgentOperationDetailResource; revision: string; status: 'ready' }
   | {
-      resource: AgentWorkEntryDetailResource | null;
+      resource: AgentOperationDetailResource | null;
       revision: string | null;
       status: 'error' | 'loading' | 'missing';
       errorCode?: 'resourceUnavailable';
@@ -59,18 +59,17 @@ type TranscriptResourceStoreState = {
   basisSequence: number | null;
   conversationRevision: string | null;
   error: string | null;
+  executionScopesByKey: Record<string, TranscriptExecutionScopeEntry>;
   isWorking: boolean;
+  operationDetailsByKey: Record<string, TranscriptOperationDetailEntry>;
   serverGeneration: string | null;
   status: TranscriptStatus;
   turnOrder: string[];
   turnResourcesById: Record<string, TranscriptTurnResourceEntry>;
   window: AgentTranscriptSyncResource['window'] | null;
-  workEntryDetailsByKey: Record<string, TranscriptWorkEntryDetailEntry>;
-  workGroupsByKey: Record<string, TranscriptWorkGroupEntry>;
   workingTurnId: string | null;
-  ensureWorkEntryDetail: (input: WorkEntryInput) => Promise<void>;
-  ensureWorkGroup: (input: WorkGroupInput) => Promise<void>;
-  ensureWorkResources: (input: { segmentId: string; turnId: string }) => Promise<void>;
+  ensureExecutionScope: (input: ExecutionScopeInput) => Promise<void>;
+  ensureOperationDetail: (input: OperationDetailInput) => Promise<void>;
   focusTranscriptTurn: (turnId: string) => Promise<boolean>;
   invalidateTranscriptResources: (
     invalidations: AgentResourceInvalidation[],
@@ -78,18 +77,21 @@ type TranscriptResourceStoreState = {
   ) => Promise<void>;
   loadEarlierTranscriptResources: () => Promise<void>;
   loadLaterTranscriptResources: () => Promise<void>;
-  loadMoreWorkGroup: (input: WorkGroupInput) => Promise<void>;
   refreshActiveTranscriptResources: (options?: TranscriptRefreshOptions) => Promise<void>;
   setActiveConversationId: (conversationId: string | null) => Promise<void>;
 };
 
-type WorkGroupInput = {
-  groupId: string;
-  segmentId: string;
+type ExecutionScopeInput = {
+  scopeId: string;
   turnId: string;
+  window?: AgentExecutionScopeRequest['window'];
 };
 
-type WorkEntryInput = WorkGroupInput & { rowId: string };
+type OperationDetailInput = {
+  operationId: string;
+  scopeId: string;
+  turnId: string;
+};
 
 export type TranscriptRefreshOptions = {
   forceFullMeasure?: boolean;
@@ -102,30 +104,27 @@ let syncGeneration = 0;
 let transcriptGenerationEpoch = 0;
 let lifecycleState: 'active' | 'background' | 'inactive' = 'active';
 let dirtyWhileInactive = false;
-const groupRequests = new Map<string, Promise<void>>();
-const detailRequests = new Map<string, Promise<void>>();
+const executionScopeRequests = new Map<string, Promise<void>>();
+const dirtyExecutionScopeRequests = new Set<string>();
+const operationDetailRequests = new Map<string, Promise<void>>();
 
 const actions: Pick<
   TranscriptResourceStoreState,
-  | 'ensureWorkEntryDetail'
-  | 'ensureWorkGroup'
-  | 'ensureWorkResources'
+  | 'ensureExecutionScope'
+  | 'ensureOperationDetail'
   | 'focusTranscriptTurn'
   | 'invalidateTranscriptResources'
   | 'loadEarlierTranscriptResources'
   | 'loadLaterTranscriptResources'
-  | 'loadMoreWorkGroup'
   | 'refreshActiveTranscriptResources'
   | 'setActiveConversationId'
 > = {
-  ensureWorkEntryDetail,
-  ensureWorkGroup,
-  ensureWorkResources,
+  ensureExecutionScope,
+  ensureOperationDetail,
   focusTranscriptTurn,
   invalidateTranscriptResources,
   loadEarlierTranscriptResources,
   loadLaterTranscriptResources,
-  loadMoreWorkGroup,
   refreshActiveTranscriptResources,
   async setActiveConversationId(conversationId) {
     const state = resourceStore.getState();
@@ -134,8 +133,9 @@ const actions: Pick<
     syncGeneration += 1;
     transcriptGenerationEpoch += 1;
     streamingRefreshScheduler.cancelPending();
-    groupRequests.clear();
-    detailRequests.clear();
+    executionScopeRequests.clear();
+    dirtyExecutionScopeRequests.clear();
+    operationDetailRequests.clear();
     dirtyWhileInactive = false;
     resetTranscriptLayoutForConversation(conversationId);
 
@@ -208,37 +208,32 @@ export async function invalidateTranscriptResources(
     !invalidation.affectsOrder);
 
   const workRefreshes = relevant.flatMap((invalidation) => {
-    if (invalidation.type === 'workGroup') {
-      const key = workGroupResourceKey(
+    if (invalidation.type === 'executionScope') {
+      const key = executionScopeResourceKey(
         invalidation.conversationId,
         invalidation.turnId,
-        invalidation.segmentId,
-        invalidation.groupId,
+        invalidation.scopeId,
       );
-      return resourceStore.getState().workGroupsByKey[key]
-        ? [ensureWorkGroup({
-            groupId: invalidation.groupId,
-            segmentId: invalidation.segmentId,
+      const state = resourceStore.getState();
+      const refreshes: Promise<void>[] = state.executionScopesByKey[key]
+        ? [ensureExecutionScope({
+            scopeId: invalidation.scopeId,
             turnId: invalidation.turnId,
           }, true)]
         : [];
-    }
-    if (invalidation.type === 'workEntryDetail') {
-      const key = workEntryDetailResourceKey(
-        invalidation.conversationId,
-        invalidation.turnId,
-        invalidation.segmentId,
-        invalidation.groupId,
-        invalidation.rowId,
-      );
-      return resourceStore.getState().workEntryDetailsByKey[key]
-        ? [ensureWorkEntryDetail({
-            groupId: invalidation.groupId,
-            rowId: invalidation.rowId,
-            segmentId: invalidation.segmentId,
+      for (const detail of Object.values(state.operationDetailsByKey)) {
+        if (
+          detail.resource?.turnId === invalidation.turnId &&
+          detail.resource.scopeId === invalidation.scopeId
+        ) {
+          refreshes.push(ensureOperationDetail({
+            operationId: detail.resource.operationId,
+            scopeId: invalidation.scopeId,
             turnId: invalidation.turnId,
-          }, true)]
-        : [];
+          }, true));
+        }
+      }
+      return refreshes;
     }
     return [];
   });
@@ -309,33 +304,22 @@ async function focusTranscriptTurn(turnId: string) {
   return outcome === 'applied' && Boolean(resourceStore.getState().turnResourcesById[turnId]);
 }
 
-async function ensureWorkResources({ segmentId, turnId }: { segmentId: string; turnId: string }) {
-  const turn = resourceStore.getState().turnResourcesById[turnId]?.turn;
-  const work = turn?.segments.find((segment): segment is AgentWorkRenderSegment =>
-    segment.type === 'work' && segment.id === segmentId);
-  if (!work) return;
-  await Promise.all(work.timeline
-    .filter((entry) => entry.type === 'group')
-    .map((group) => ensureWorkGroup({ groupId: group.id, segmentId, turnId })));
-}
-
-async function ensureWorkGroup(input: WorkGroupInput, force = false) {
+async function ensureOperationDetail(input: OperationDetailInput, force = false) {
   const conversationId = resourceStore.getState().activeConversationId;
   if (!conversationId) return;
-  const key = workGroupResourceKey(
+  const key = operationDetailResourceKey(
     conversationId,
     input.turnId,
-    input.segmentId,
-    input.groupId,
+    input.scopeId,
+    input.operationId,
   );
-  const existing = resourceStore.getState().workGroupsByKey[key];
+  const existing = resourceStore.getState().operationDetailsByKey[key];
   if (!force && (existing?.status === 'ready' || existing?.status === 'loading')) return;
-  const pending = groupRequests.get(key);
+  const pending = operationDetailRequests.get(key);
   if (pending) return pending;
-
   resourceStore.setState({
-    workGroupsByKey: {
-      ...resourceStore.getState().workGroupsByKey,
+    operationDetailsByKey: {
+      ...resourceStore.getState().operationDetailsByKey,
       [key]: {
         resource: existing?.resource ?? null,
         revision: existing?.revision ?? null,
@@ -343,146 +327,36 @@ async function ensureWorkGroup(input: WorkGroupInput, force = false) {
       },
     },
   });
-  const request: Promise<void> = readWorkGroup(conversationId, input, existing?.revision ?? undefined)
-    .finally(() => {
-      if (groupRequests.get(key) === request) groupRequests.delete(key);
-    });
-  groupRequests.set(key, request);
-  return request;
-}
-
-async function loadMoreWorkGroup(input: WorkGroupInput) {
-  const conversationId = resourceStore.getState().activeConversationId;
-  if (!conversationId) return;
-  const key = workGroupResourceKey(
-    conversationId,
-    input.turnId,
-    input.segmentId,
-    input.groupId,
-  );
-  const existing = resourceStore.getState().workGroupsByKey[key];
-  if (existing?.status !== 'ready' || !existing.resource.nextCursor || groupRequests.has(key)) return;
-  const request: Promise<void> = readWorkGroup(
-    conversationId,
-    input,
-    undefined,
-    existing.resource.nextCursor,
-    existing.resource,
-  ).finally(() => {
-    if (groupRequests.get(key) === request) groupRequests.delete(key);
-  });
-  groupRequests.set(key, request);
-  return request;
-}
-
-async function readWorkGroup(
-  conversationId: string,
-  input: WorkGroupInput,
-  knownRevision?: string,
-  cursor?: string,
-  previous?: AgentWorkGroupResource,
-) {
-  const key = workGroupResourceKey(conversationId, input.turnId, input.segmentId, input.groupId);
-  const requestEpoch = transcriptGenerationEpoch;
-  try {
-    const response = await readTranscriptResources(conversationId, [{
-      type: 'workGroup',
-      protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
-      turnId: input.turnId,
-      segmentId: input.segmentId,
-      groupId: input.groupId,
-      limit: 200,
-      ...(knownRevision ? { knownRevision } : {}),
-      ...(cursor ? { cursor } : {}),
-    }]);
-    if (
-      resourceStore.getState().activeConversationId !== conversationId ||
-      requestEpoch !== transcriptGenerationEpoch ||
-      !acceptScopedResponseGeneration(response.serverGeneration)
-    ) return;
-    const result = response.resources[0];
-    if (result?.status === 'notModified') {
-      if (previous) setWorkGroup(key, previous);
-      else {
-        const current = resourceStore.getState().workGroupsByKey[key]?.resource;
-        if (current) setWorkGroup(key, current);
-      }
-      return;
-    }
-    const value = result?.status === 'ok' ? result.value as AgentWorkGroupResource : null;
-    if (!value) {
-      setWorkGroupFailure(
-        key,
-        result?.status === 'missing' ? 'missing' : 'error',
-        result?.code === 'staleCursor' ? 'staleCursor' : 'resourceUnavailable',
-      );
-      return;
-    }
-    setWorkGroup(key, previous ? mergeWorkGroupPage(previous, value) : value);
-  } catch {
-    if (requestEpoch === transcriptGenerationEpoch) {
-      setWorkGroupFailure(key, 'error', 'resourceUnavailable');
-    }
-  }
-}
-
-async function ensureWorkEntryDetail(input: WorkEntryInput, force = false) {
-  const conversationId = resourceStore.getState().activeConversationId;
-  if (!conversationId) return;
-  const key = workEntryDetailResourceKey(
-    conversationId,
-    input.turnId,
-    input.segmentId,
-    input.groupId,
-    input.rowId,
-  );
-  const existing = resourceStore.getState().workEntryDetailsByKey[key];
-  if (!force && (existing?.status === 'ready' || existing?.status === 'loading')) return;
-  const pending = detailRequests.get(key);
-  if (pending) return pending;
-
-  resourceStore.setState({
-    workEntryDetailsByKey: {
-      ...resourceStore.getState().workEntryDetailsByKey,
-      [key]: {
-        resource: existing?.resource ?? null,
-        revision: existing?.revision ?? null,
-        status: 'loading',
-      },
-    },
-  });
-  const request: Promise<void> = readWorkEntryDetail(
+  const request: Promise<void> = readOperationDetail(
     conversationId,
     input,
     existing?.revision ?? undefined,
   ).finally(() => {
-    if (detailRequests.get(key) === request) detailRequests.delete(key);
+    if (operationDetailRequests.get(key) === request) operationDetailRequests.delete(key);
   });
-  detailRequests.set(key, request);
+  operationDetailRequests.set(key, request);
   return request;
 }
 
-async function readWorkEntryDetail(
+async function readOperationDetail(
   conversationId: string,
-  input: WorkEntryInput,
+  input: OperationDetailInput,
   knownRevision?: string,
 ) {
-  const key = workEntryDetailResourceKey(
+  const key = operationDetailResourceKey(
     conversationId,
     input.turnId,
-    input.segmentId,
-    input.groupId,
-    input.rowId,
+    input.scopeId,
+    input.operationId,
   );
   const requestEpoch = transcriptGenerationEpoch;
   try {
     const response = await readTranscriptResources(conversationId, [{
-      type: 'workEntryDetail',
+      type: 'operationDetail',
       protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
       turnId: input.turnId,
-      segmentId: input.segmentId,
-      groupId: input.groupId,
-      rowId: input.rowId,
+      scopeId: input.scopeId,
+      operationId: input.operationId,
       ...(knownRevision ? { knownRevision } : {}),
     }]);
     if (
@@ -492,26 +366,93 @@ async function readWorkEntryDetail(
     ) return;
     const result = response.resources[0];
     if (result?.status === 'notModified') {
-      const current = resourceStore.getState().workEntryDetailsByKey[key];
-      if (current?.resource) setWorkEntryDetail(key, current.resource);
+      const current = resourceStore.getState().operationDetailsByKey[key];
+      if (current?.resource) setOperationDetail(key, current.resource);
       return;
     }
-    const value = result?.status === 'ok'
-      ? result.value as AgentWorkEntryDetailResource
-      : null;
+    const value = result?.status === 'ok' ? result.value as AgentOperationDetailResource : null;
     if (!value) {
-      setWorkEntryDetailFailure(
-        key,
-        result?.status === 'missing' ? 'missing' : 'error',
-        'resourceUnavailable',
-      );
+      setOperationDetailFailure(key, result?.status === 'missing' ? 'missing' : 'error');
       return;
     }
-    setWorkEntryDetail(key, value);
+    setOperationDetail(key, value);
   } catch {
-    if (requestEpoch === transcriptGenerationEpoch) {
-      setWorkEntryDetailFailure(key, 'error', 'resourceUnavailable');
+    if (requestEpoch === transcriptGenerationEpoch) setOperationDetailFailure(key, 'error');
+  }
+}
+
+async function ensureExecutionScope(input: ExecutionScopeInput, force = false) {
+  const conversationId = resourceStore.getState().activeConversationId;
+  if (!conversationId) return;
+  const key = executionScopeResourceKey(conversationId, input.turnId, input.scopeId);
+  const existing = resourceStore.getState().executionScopesByKey[key];
+  if (!force && !input.window && (existing?.status === 'ready' || existing?.status === 'loading')) return;
+  const pending = executionScopeRequests.get(key);
+  if (pending) {
+    if (force) dirtyExecutionScopeRequests.add(key);
+    return pending;
+  }
+
+  resourceStore.setState({
+    executionScopesByKey: {
+      ...resourceStore.getState().executionScopesByKey,
+      [key]: {
+        resource: existing?.resource ?? null,
+        revision: existing?.revision ?? null,
+        status: 'loading',
+      },
+    },
+  });
+  const request: Promise<void> = readExecutionScope(
+    conversationId,
+    input,
+    input.window ? undefined : existing?.revision ?? undefined,
+    input.window ? existing?.resource ?? undefined : undefined,
+  ).finally(() => {
+    if (executionScopeRequests.get(key) !== request) return;
+    executionScopeRequests.delete(key);
+    if (dirtyExecutionScopeRequests.delete(key)) void ensureExecutionScope(input, true);
+  });
+  executionScopeRequests.set(key, request);
+  return request;
+}
+
+async function readExecutionScope(
+  conversationId: string,
+  input: ExecutionScopeInput,
+  knownRevision?: string,
+  previous?: AgentExecutionScopeResource,
+) {
+  const key = executionScopeResourceKey(conversationId, input.turnId, input.scopeId);
+  const requestEpoch = transcriptGenerationEpoch;
+  try {
+    const response = await readTranscriptResources(conversationId, [{
+      type: 'executionScope',
+      protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
+      turnId: input.turnId,
+      scopeId: input.scopeId,
+      ...(input.window ? { window: input.window } : {}),
+      ...(knownRevision ? { knownRevision } : {}),
+    }]);
+    if (
+      resourceStore.getState().activeConversationId !== conversationId ||
+      requestEpoch !== transcriptGenerationEpoch ||
+      !acceptScopedResponseGeneration(response.serverGeneration)
+    ) return;
+    const result = response.resources[0];
+    if (result?.status === 'notModified') {
+      const current = resourceStore.getState().executionScopesByKey[key];
+      if (current?.resource) setExecutionScope(key, current.resource);
+      return;
     }
+    const value = result?.status === 'ok' ? result.value as AgentExecutionScopeResource : null;
+    if (!value) {
+      setExecutionScopeFailure(key, result?.status === 'missing' ? 'missing' : 'error');
+      return;
+    }
+    setExecutionScope(key, previous ? mergeExecutionScopeWindow(previous, value) : value);
+  } catch {
+    if (requestEpoch === transcriptGenerationEpoch) setExecutionScopeFailure(key, 'error');
   }
 }
 
@@ -680,57 +621,49 @@ function layoutSnapshot() {
   };
 }
 
-function setWorkGroup(key: string, resource: AgentWorkGroupResource) {
+function setExecutionScope(key: string, resource: AgentExecutionScopeResource) {
   resourceStore.setState({
-    workGroupsByKey: {
-      ...resourceStore.getState().workGroupsByKey,
+    executionScopesByKey: {
+      ...resourceStore.getState().executionScopesByKey,
       [key]: { resource, revision: resource.revision, status: 'ready' },
     },
   });
 }
 
-function setWorkGroupFailure(
-  key: string,
-  status: 'error' | 'missing',
-  errorCode: 'staleCursor' | 'resourceUnavailable',
-) {
-  const existing = resourceStore.getState().workGroupsByKey[key];
+function setExecutionScopeFailure(key: string, status: 'error' | 'missing') {
+  const existing = resourceStore.getState().executionScopesByKey[key];
   resourceStore.setState({
-    workGroupsByKey: {
-      ...resourceStore.getState().workGroupsByKey,
+    executionScopesByKey: {
+      ...resourceStore.getState().executionScopesByKey,
       [key]: {
         resource: existing?.resource ?? null,
         revision: existing?.revision ?? null,
         status,
-        errorCode,
+        errorCode: 'resourceUnavailable',
       },
     },
   });
 }
 
-function setWorkEntryDetail(key: string, resource: AgentWorkEntryDetailResource) {
+function setOperationDetail(key: string, resource: AgentOperationDetailResource) {
   resourceStore.setState({
-    workEntryDetailsByKey: {
-      ...resourceStore.getState().workEntryDetailsByKey,
+    operationDetailsByKey: {
+      ...resourceStore.getState().operationDetailsByKey,
       [key]: { resource, revision: resource.revision, status: 'ready' },
     },
   });
 }
 
-function setWorkEntryDetailFailure(
-  key: string,
-  status: 'error' | 'missing',
-  errorCode: 'resourceUnavailable',
-) {
-  const existing = resourceStore.getState().workEntryDetailsByKey[key];
+function setOperationDetailFailure(key: string, status: 'error' | 'missing') {
+  const existing = resourceStore.getState().operationDetailsByKey[key];
   resourceStore.setState({
-    workEntryDetailsByKey: {
-      ...resourceStore.getState().workEntryDetailsByKey,
+    operationDetailsByKey: {
+      ...resourceStore.getState().operationDetailsByKey,
       [key]: {
         resource: existing?.resource ?? null,
         revision: existing?.revision ?? null,
         status,
-        errorCode,
+        errorCode: 'resourceUnavailable',
       },
     },
   });
@@ -750,20 +683,34 @@ function acceptScopedResponseGeneration(serverGeneration: string) {
   return knownGeneration === null || knownGeneration === serverGeneration;
 }
 
-function mergeWorkGroupPage(
-  previous: AgentWorkGroupResource,
-  page: AgentWorkGroupResource,
+function mergeExecutionScopeWindow(
+  previous: AgentExecutionScopeResource,
+  page: AgentExecutionScopeResource,
 ) {
   if (
     previous.conversationId !== page.conversationId ||
     previous.turnId !== page.turnId ||
-    previous.segmentId !== page.segmentId ||
-    previous.groupId !== page.groupId ||
+    previous.scopeId !== page.scopeId ||
     previous.revision !== page.revision
   ) return page;
-  const rows = new Map(previous.rows.map((row) => [row.id, row]));
-  for (const row of page.rows) rows.set(row.id, row);
-  return { ...page, rows: [...rows.values()] };
+  const byId = new Map(previous.inferences.map((inference) => [inference.id, inference]));
+  for (const inference of page.inferences) byId.set(inference.id, inference);
+  return {
+    ...page,
+    inferences: page.inferenceOrder.flatMap((inferenceId) => {
+      const inference = byId.get(inferenceId);
+      return inference ? [inference] : [];
+    }),
+    window: {
+      startIndex: Math.min(previous.window.startIndex, page.window.startIndex),
+      endIndexExclusive: Math.max(
+        previous.window.endIndexExclusive,
+        page.window.endIndexExclusive,
+      ),
+      hasEarlier: previous.window.hasEarlier && page.window.hasEarlier,
+      hasLater: previous.window.hasLater && page.window.hasLater,
+    },
+  };
 }
 
 function transitionTranscriptGeneration(serverGeneration: string) {
@@ -771,15 +718,16 @@ function transitionTranscriptGeneration(serverGeneration: string) {
   if (state.serverGeneration === serverGeneration) return false;
   transcriptGenerationEpoch += 1;
   streamingRefreshScheduler.cancelPending();
-  groupRequests.clear();
-  detailRequests.clear();
+  executionScopeRequests.clear();
+  dirtyExecutionScopeRequests.clear();
+  operationDetailRequests.clear();
   resourceStore.setState({
     basisSequence: null,
     conversationRevision: null,
     error: null,
+    executionScopesByKey: {},
+    operationDetailsByKey: {},
     serverGeneration,
-    workEntryDetailsByKey: {},
-    workGroupsByKey: {},
   });
   return true;
 }
@@ -810,14 +758,14 @@ function resetTranscriptResourceState(): Omit<
     basisSequence: null,
     conversationRevision: null,
     error: null,
+    executionScopesByKey: {},
     isWorking: false,
+    operationDetailsByKey: {},
     serverGeneration: null,
     status: 'idle',
     turnOrder: [],
     turnResourcesById: {},
     window: null,
-    workEntryDetailsByKey: {},
-    workGroupsByKey: {},
     workingTurnId: null,
   };
 }
@@ -841,7 +789,6 @@ const streamingRefreshScheduler = new StreamingRefreshScheduler<AgentResourceInv
 });
 
 configureTranscriptLayoutResourceAdapter({
-  ensureWorkResources,
   getSnapshot: layoutSnapshot,
   loadActiveTranscript: () => refreshActiveTranscriptResources({
     forceFullMeasure: true,

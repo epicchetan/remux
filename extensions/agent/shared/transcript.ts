@@ -1,5 +1,5 @@
-export const AGENT_TRANSCRIPT_PROTOCOL_VERSION = 2 as const;
-export const AGENT_TRANSCRIPT_PROJECTION_VERSION = 'agent-turn-render-v2' as const;
+export const AGENT_TRANSCRIPT_PROTOCOL_VERSION = 4 as const;
+export const AGENT_TRANSCRIPT_PROJECTION_VERSION = 'agent-turn-render-v4' as const;
 
 export const DEFAULT_TRANSCRIPT_TAIL_TURNS = 24;
 export const DEFAULT_TRANSCRIPT_PREPEND_TURNS = 16;
@@ -9,9 +9,6 @@ export const MAX_TRANSCRIPT_REQUESTS = 64;
 export const MAX_TRANSCRIPT_RESPONSE_BYTES = 8 * 1024 * 1024;
 export const MAX_TURN_FRAME_BYTES = 1024 * 1024;
 export const MAX_VISIBLE_TEXT_BYTES = 48 * 1024;
-export const DEFAULT_WORK_GROUP_ROWS = 200;
-export const MAX_WORK_GROUP_ROWS = 256;
-export const WORK_GROUP_ROW_LIMITS = [50, 100, 200] as const;
 export const MAX_WORK_ENTRY_DETAIL_BYTES = 64 * 1024;
 
 export type AgentTurnStatus =
@@ -77,37 +74,24 @@ export type AgentAssistantMessageSegment = {
   content?: AgentTextContentReference;
 };
 
-export type AgentWorkTextTimelineEntry = {
-  id: string;
-  type: 'text';
-  revision: string;
-  text: string;
-  content?: AgentTextContentReference;
-};
-
-export type AgentWorkGroupTimelineEntry = {
-  id: string;
-  type: 'group';
-  revision: string;
-  groupType: 'activity' | 'files' | 'text' | 'tools';
-  title: string;
-  status: 'running' | 'completed' | 'failed' | 'interrupted';
-  rowCount: number;
-  hasMoreRows: boolean;
-};
-
-export type AgentWorkTimelineEntry =
-  | AgentWorkTextTimelineEntry
-  | AgentWorkGroupTimelineEntry;
+export type AgentWorkUnitStatus =
+  | 'running'
+  | 'completed'
+  | 'partial'
+  | 'blocked'
+  | 'abandoned';
 
 export type AgentWorkRenderSegment = {
   id: string;
   type: 'work';
+  scopeId: string;
   state: 'running' | 'completed' | 'failed' | 'interrupted';
   revision: string;
   layoutRevision: string;
   durationMs: number | null;
-  timeline: AgentWorkTimelineEntry[];
+  inferenceCount: number;
+  operationCount: number;
+  workUnitCount: number;
 };
 
 export type AgentTurnSegment =
@@ -195,112 +179,67 @@ export type AgentTurnRenderResult =
       frame: AgentTurnRenderFrame;
     };
 
-export type AgentWorkGroupRequest = {
-  type: 'workGroup';
+export type AgentExecutionScopeRequest = {
+  type: 'executionScope';
   protocolVersion: typeof AGENT_TRANSCRIPT_PROTOCOL_VERSION;
   turnId: string;
-  segmentId: string;
-  groupId: string;
-  cursor?: string;
-  limit?: number;
+  scopeId: string;
   knownRevision?: string;
+  window?:
+    | { kind: 'tail'; count?: number }
+    | { kind: 'around'; inferenceId: string; before: number; after: number }
+    | { kind: 'range'; startInferenceId: string; endInferenceId: string };
 };
 
-export type AgentWorkEntryDetailRequest = {
-  type: 'workEntryDetail';
-  protocolVersion: typeof AGENT_TRANSCRIPT_PROTOCOL_VERSION;
-  turnId: string;
-  segmentId: string;
-  groupId: string;
-  rowId: string;
-  knownRevision?: string;
+export type AgentWorkUnitResourceReference = {
+  ref: string;
+  role: 'authority' | 'deliverable' | 'evidence';
+  description?: string;
 };
 
-export type AgentWorkActivityRow = {
-  id: string;
-  type: 'activity';
-  revision: string;
-  kind: 'read';
-  status: 'running' | 'completed' | 'failed' | 'interrupted';
-  text: string;
-  path: string | null;
-  durationMs: number | null;
-  hasDetail: boolean;
-};
-
-export type AgentWorkFileChangeRow = {
-  id: string;
-  type: 'fileChange';
-  revision: string;
-  kind: 'added' | 'deleted' | 'edited' | 'moved';
-  status: 'completed' | 'failed';
-  path: string;
-  additions: number;
-  deletions: number;
-  hasDetail: boolean;
-};
-
-export type AgentWorkToolRow = {
-  id: string;
-  type: 'tool';
-  revision: string;
-  category: 'generic';
-  status: 'running' | 'completed' | 'failed' | 'interrupted';
+export type AgentToolPresentation = {
+  category: 'command' | 'read' | 'edit' | 'search' | 'context' | 'tool';
   label: string;
+  subject: string | null;
+};
+
+export type AgentToolCallSummary = {
+  id: string;
+  callId: string;
+  name: string;
+  presentation: AgentToolPresentation;
+  status: 'running' | 'completed' | 'failed' | 'interrupted';
+  revision: string;
   detailPreview: string | null;
+  outputPreview: string | null;
+  durationMs: number | null;
+  childScopeId: string | null;
+  childObjective: string | null;
+  childState: 'running' | 'completed' | 'partial' | 'blocked' | 'failed' |
+    'interrupted' | 'abandoned' | null;
+  childDurationMs: number | null;
+  childOperationCount: number;
+  childReturnedResourceCount: number;
   hasDetail: boolean;
 };
 
-export type AgentWorkTextRow = {
-  id: string;
-  type: 'text';
-  revision: string;
-  text: string;
-  hasDetail: false;
+export type AgentOperationDetailRequest = {
+  type: 'operationDetail';
+  protocolVersion: typeof AGENT_TRANSCRIPT_PROTOCOL_VERSION;
+  turnId: string;
+  scopeId: string;
+  operationId: string;
+  knownRevision?: string;
 };
 
-export type AgentWorkRowSummary =
-  | AgentWorkActivityRow
-  | AgentWorkFileChangeRow
-  | AgentWorkToolRow
-  | AgentWorkTextRow;
-
-export type AgentWorkGroupResource = {
+export type AgentOperationDetailResource = {
   conversationId: string;
   turnId: string;
-  segmentId: string;
-  groupId: string;
-  type: 'activity' | 'files' | 'text' | 'tools';
-  title: string;
+  scopeId: string;
+  operationId: string;
   revision: string;
-  layoutRevision: string;
-  rows: AgentWorkRowSummary[];
-  nextCursor: string | null;
-};
-
-export type AgentWorkEntryDetailResource = {
-  conversationId: string;
-  turnId: string;
-  segmentId: string;
-  groupId: string;
-  rowId: string;
-  revision: string;
-  layoutRevision: string;
-  detail:
-    | {
-        type: 'activity';
-        detail: string | null;
-        output: string | null;
-      }
-    | {
-        type: 'fileChange';
-        diff: string;
-      }
-    | {
-        type: 'tool';
-        detail: string | null;
-        result: string | null;
-      };
+  detail: string | null;
+  output: string | null;
   truncation: {
     originalBytes: number;
     returnedBytes: number;
@@ -312,10 +251,70 @@ export type AgentWorkEntryDetailResource = {
   };
 };
 
+export type AgentInferenceTrace = {
+  id: string;
+  ordinal: number;
+  state: 'running' | 'completed' | 'failed' | 'interrupted' | 'superseded';
+  revision: string;
+  startedAt: number;
+  completedAt: number | null;
+  durationMs: number | null;
+  /** Provider content order. Absent only during a viewer/server rolling reload. */
+  contentOrder?: Array<'reasoning' | 'commentary' | 'actions'>;
+  commentary: null | {
+    kind: 'assistantCommentary';
+    state: 'streaming' | 'final' | 'partial';
+    text: string;
+    content?: AgentTextContentReference;
+  };
+  reasoning: null | {
+    kind: 'providerSummary';
+    state: 'streaming' | 'final' | 'partial';
+    text: string;
+    content?: AgentTextContentReference;
+  };
+  actionGroup: null | {
+    id: string;
+    status: 'running' | 'completed' | 'failed' | 'interrupted';
+    callCount: number;
+    calls: AgentToolCallSummary[];
+  };
+};
+
+export type AgentExecutionScopeResource = {
+  conversationId: string;
+  turnId: string;
+  scopeId: string;
+  parentScopeId: string | null;
+  parentOperationId: string | null;
+  kind: 'turn' | 'workUnit';
+  state: 'running' | 'completed' | 'partial' | 'blocked' | 'failed' |
+    'interrupted' | 'abandoned';
+  revision: string;
+  basisSequence: number;
+  startedAt: number;
+  completedAt: number | null;
+  durationMs: number | null;
+  objective: string | null;
+  doneWhen: string[];
+  providedResources: AgentWorkUnitResourceReference[];
+  inferenceOrder: string[];
+  inferences: AgentInferenceTrace[];
+  window: {
+    startIndex: number;
+    endIndexExclusive: number;
+    hasEarlier: boolean;
+    hasLater: boolean;
+  };
+  result: string | null;
+  returnedResources: AgentWorkUnitResourceReference[];
+  threadUpdate: string | null;
+};
+
 export type AgentTranscriptResourceRequest =
   | AgentTranscriptSyncRequest
-  | AgentWorkGroupRequest
-  | AgentWorkEntryDetailRequest;
+  | AgentExecutionScopeRequest
+  | AgentOperationDetailRequest;
 
 export type AgentTranscriptResourcesReadParams = {
   conversationId: string;
@@ -329,7 +328,7 @@ export type AgentTranscriptResourceResult = {
   code?: 'staleCursor' | 'resourceUnavailable';
   revision?: string;
   reason?: string;
-  value?: AgentTranscriptSyncResource | AgentWorkGroupResource | AgentWorkEntryDetailResource;
+  value?: AgentTranscriptSyncResource | AgentExecutionScopeResource | AgentOperationDetailResource;
 };
 
 export type AgentTranscriptResourcesReadResult = {
@@ -355,44 +354,29 @@ export type AgentResourceInvalidation =
       basisSequence: number;
     }
   | {
-      type: 'workGroup';
+      type: 'executionScope';
       key: string;
       conversationId: string;
       turnId: string;
-      segmentId: string;
-      groupId: string;
-      reason: 'runtimeEvent' | 'terminal';
-      affectsLayout: boolean;
-      basisSequence: number;
-    }
-  | {
-      type: 'workEntryDetail';
-      key: string;
-      conversationId: string;
-      turnId: string;
-      segmentId: string;
-      groupId: string;
-      rowId: string;
+      scopeId: string;
       reason: 'runtimeEvent' | 'terminal';
       affectsLayout: boolean;
       basisSequence: number;
     };
 
-export function workGroupResourceKey(
+export function executionScopeResourceKey(
   conversationId: string,
   turnId: string,
-  segmentId: string,
-  groupId: string,
+  scopeId: string,
 ) {
-  return `workGroup:${conversationId}:${turnId}:${segmentId}:${groupId}`;
+  return `executionScope:${conversationId}:${turnId}:${scopeId}`;
 }
 
-export function workEntryDetailResourceKey(
+export function operationDetailResourceKey(
   conversationId: string,
   turnId: string,
-  segmentId: string,
-  groupId: string,
-  rowId: string,
+  scopeId: string,
+  operationId: string,
 ) {
-  return `workEntryDetail:${conversationId}:${turnId}:${segmentId}:${groupId}:${rowId}`;
+  return `operationDetail:${conversationId}:${turnId}:${scopeId}:${operationId}`;
 }

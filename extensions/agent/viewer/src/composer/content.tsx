@@ -19,18 +19,21 @@ export function ComposerContent({
   conversation,
   contextInspector,
   conversationSelected,
+  mainView,
   onInterrupt,
   onEdit,
   onFork,
   onQueueChanged,
   onSend,
   onSignOut,
+  onToggleThread,
   runtimeError,
   queue,
 }: {
   conversation: ConversationValue | null;
   contextInspector: ContextInspectorValue | null;
   conversationSelected: boolean;
+  mainView: 'chat' | 'thread';
   onInterrupt: () => Promise<void>;
   onEdit: ComposerBranchCallback<ComposerEditTarget>;
   onFork: ComposerBranchCallback<ComposerForkTarget>;
@@ -40,6 +43,7 @@ export function ComposerContent({
     setPhase: (phase: 'sending' | 'updating-transcript') => void,
   ) => Promise<void>;
   onSignOut: () => void;
+  onToggleThread: () => void;
   queue: AgentPendingQueueValue | null;
   runtimeError: string | null;
 }) {
@@ -67,11 +71,14 @@ export function ComposerContent({
           canStart={Boolean((conversation || (!conversationSelected && cwd && modelId)) && !loading)}
           conversationExists={conversationSelected}
           isWorking={working}
+          mainView={mainView}
           onEdit={onEdit}
           onFork={onFork}
           onInterrupt={onInterrupt}
           onSend={onSend}
           onSignOut={onSignOut}
+          onToggleThread={onToggleThread}
+          threadAvailable={Boolean(conversation)}
         />
       </div>
       {!pickerOpen ? <ComposerStatusMessageRow runtimeError={runtimeError} /> : null}

@@ -24,6 +24,11 @@ test('the production system prompt is the repository-owned Markdown file', async
   assert.match(markdown, /Spot-check a named seam/u);
   assert.match(markdown, /Start an independent audit work unit/u);
   assert.match(markdown, /without reconstructing the child trace/u);
+  assert.match(markdown, /Use `commentary` for sparse, user-readable progress/u);
+  assert.match(markdown, /generally 8–15 words/u);
+  assert.match(markdown, /do not repeat the visible reasoning headline/u);
+  assert.match(markdown, /Do not mechanically split ordinary work into audit, implementation, and final-audit units/u);
+  assert.match(markdown, /same model rereading the same surface is usually repetition/u);
   assert.match(markdown, /The current user message and observed repository state override/u);
 });
 
@@ -46,6 +51,10 @@ test('the repository-owned work-unit prompt renders its objective and typed reso
   assert.match(rendered, /contract body/u);
   assert.match(rendered, /enable the parent's next decision or action/u);
   assert.match(rendered, /prevent meaningful reconstruction/u);
+  assert.match(rendered, /Complete the stated outcome as one closed loop/u);
+  assert.match(rendered, /Do not hand routine validation back to the parent/u);
+  assert.match(rendered, /generally 8–15 words/u);
+  assert.match(rendered, /repeat the visible reasoning headline/u);
   assert.doesNotMatch(rendered, /\{\{/u);
 
   const withoutResources = renderWorkUnitPrompt({ objective: 'Audit validation.', doneWhen: [], resources: [] });

@@ -12,10 +12,18 @@ import { FixtureProvider } from '../server/src/fixture-provider.ts';
 import type { ModelProvider, ModelSession } from '../server/src/model-provider.ts';
 import { AgentStateStore } from '../server/src/storage/agent-state-store.ts';
 import type { DurableTurnHandle } from '../server/src/domain/state.ts';
+import type { WorkUnitEnterInput } from '../server/src/domain/work.ts';
 import { AGENT_STATE_TABLES } from '../server/src/storage/schema.ts';
+import {
+  AGENT_TRANSCRIPT_PROJECTION_VERSION,
+  AGENT_TRANSCRIPT_PROTOCOL_VERSION,
+} from '../shared/transcript.ts';
 
-test('Agent state v3 owns one clean schema and compiles the accepted user turn', async (t) => {
+test('Agent state v4 owns one clean schema and compiles the accepted user turn', async (t) => {
   const fixture = await repositoryFixture(t);
+  const [emptyHistory] = await fixture.repository.readResourceProjections(['conversation-list']);
+  assert.equal(emptyHistory?.basisSequence, 0);
+  assert.deepEqual(emptyHistory?.value, { conversations: [], truncated: false });
   const conversation = await fixture.repository.createConversation({
     operationId: crypto.randomUUID(),
     cwd: fixture.cwd,
@@ -114,6 +122,10 @@ test('actual frames, exact provider reasoning, restart recovery, and next-turn e
 
   await fixture.repository.appendAssistantCheckpoint(turn, { textDelta: 'Implemented.', reasoningDelta: '' });
   await fixture.repository.finishTurn(turn, { status: 'completed' });
+  const [completedSummary] = await fixture.repository.readResourceProjections([
+    `conversation:${conversation.conversationId}`,
+  ]);
+  assert.equal((completedSummary?.value as { preview?: string }).preview, 'Implemented.');
   const followup = await accept(fixture.repository, conversation.conversationId, 'What changed?');
   const next = await fixture.repository.compileContext(conversation.conversationId);
   const priorAssistant = next.messages.find((message) =>
@@ -129,6 +141,123 @@ test('actual frames, exact provider reasoning, restart recovery, and next-turn e
     message.turnId !== turn.turnId || message.role !== 'tool'));
   await fixture.repository.finishTurn(followup, { status: 'interrupted' });
   assert.ok(provider.providerItemId);
+});
+
+test('provider commentary stays in its inference while only the final answer reaches the transcript response', async (t) => {
+  const fixture = await repositoryFixture(t);
+  const conversation = await fixture.repository.createConversation({
+    operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'gpt-5.6-codex', reasoning: 'high',
+  });
+  const turn = await accept(fixture.repository, conversation.conversationId, 'Inspect the current state.');
+  const firstContext = await fixture.repository.compileContext(conversation.conversationId);
+  await startInference(fixture.repository, turn, firstContext);
+  const commentary = 'I’m grounding this in the current implementation first.';
+  await fixture.repository.appendAssistantCheckpoint(turn, {
+    textDelta: commentary,
+    reasoningDelta: 'Need one exact read.',
+    textPhase: 'commentary',
+  });
+  const first = await fixture.repository.finalizeInference(turn, {
+    state: 'completed',
+    providerMessage: assistantMessage({
+      content: [
+        { type: 'thinking', thinking: 'Need one exact read.', thinkingSignature: 'reasoning-one' },
+        {
+          type: 'text', text: commentary,
+          textSignature: JSON.stringify({ v: 1, id: 'commentary-one', phase: 'commentary' }),
+        },
+        { type: 'toolCall', id: 'call:read', name: 'workspace.read', arguments: { path: 'README.md' } },
+      ],
+      stopReason: 'toolUse',
+    }),
+    calls: [{ callId: 'call:read', name: 'workspace.read', args: { path: 'README.md' } }],
+  });
+  const phaseDatabase = new DatabaseSync(fixture.repository.databasePath, { readOnly: true });
+  const phaseRow = phaseDatabase.prepare(`
+    SELECT assistant_text_phase FROM inferences WHERE inference_id = ?
+  `).get(first.inferenceId) as { assistant_text_phase: string | null };
+  const checkpointRow = phaseDatabase.prepare(`
+    SELECT e.payload_json, i.assistant_text_phase
+    FROM events e
+    LEFT JOIN inferences i
+      ON i.inference_id = json_extract(e.payload_json, '$.inferenceId')
+    WHERE e.scope_id = ? AND e.type = 'assistant.checkpoint'
+    ORDER BY e.sequence LIMIT 1
+  `).get(turn.scopeId) as { payload_json: string; assistant_text_phase: string | null };
+  phaseDatabase.close();
+  assert.equal(phaseRow.assistant_text_phase, 'commentary');
+  assert.equal(checkpointRow.assistant_text_phase, 'commentary');
+  await fixture.repository.recordToolStarted(turn, {
+    callId: 'call:read', name: 'workspace.read', args: { path: 'README.md' },
+    sourceInferenceId: first.inferenceId,
+  });
+  await fixture.repository.recordToolFinished(turn, {
+    callId: 'call:read', result: { path: 'README.md' }, isError: false,
+  });
+  const firstTrace = await fixture.repository.readExecutionScopeTranscriptResource(
+    conversation.conversationId,
+    {
+      type: 'executionScope',
+      protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
+      turnId: turn.turnId,
+      scopeId: turn.scopeId,
+    },
+  );
+  assert.deepEqual(firstTrace?.inferences[0]?.contentOrder, [
+    'reasoning',
+    'commentary',
+    'actions',
+  ]);
+
+  const secondContext = await fixture.repository.compileContext(conversation.conversationId);
+  await startInference(fixture.repository, turn, secondContext);
+  const answer = 'The current implementation is grounded and ready.';
+  await fixture.repository.appendAssistantCheckpoint(turn, {
+    textDelta: answer, reasoningDelta: '', textPhase: 'final_answer',
+  });
+  await fixture.repository.finalizeInference(turn, {
+    state: 'completed',
+    providerMessage: assistantMessage({
+      content: [{
+        type: 'text', text: answer,
+        textSignature: JSON.stringify({ v: 1, id: 'final-one', phase: 'final_answer' }),
+      }],
+      stopReason: 'stop',
+    }),
+    calls: [],
+  });
+  await fixture.repository.finishTurn(turn, { status: 'completed' });
+
+  const projectionDatabase = new DatabaseSync(fixture.repository.databasePath, { readOnly: true });
+  const projectionRow = projectionDatabase.prepare(`
+    SELECT value_json FROM transcript_items WHERE turn_id = ? AND kind = 'assistant'
+  `).get(turn.turnId) as { value_json: string };
+  projectionDatabase.close();
+  assert.equal((JSON.parse(projectionRow.value_json) as { summaryText?: string }).summaryText, answer);
+
+  const actions = await fixture.repository.readTranscriptActions(conversation.conversationId);
+  assert.deepEqual(
+    actions.flatMap((action) => action.type === 'assistant' && action.textDelta
+      ? [action.textDelta]
+      : []),
+    [answer],
+  );
+  const assistantText = actions.flatMap((action) =>
+    action.type === 'assistant' ? [action.textDelta] : []).join('');
+  assert.equal(assistantText, answer);
+  assert.doesNotMatch(assistantText, /grounding this/u);
+
+  const scope = await fixture.repository.readExecutionScopeTranscriptResource(
+    conversation.conversationId,
+    {
+      type: 'executionScope',
+      protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
+      turnId: turn.turnId,
+      scopeId: turn.scopeId,
+    },
+  );
+  assert.equal(scope?.inferences[0]?.commentary?.text, commentary);
+  assert.equal(scope?.inferences[1]?.commentary, null);
 });
 
 test('thread.md patches and replacements are CAS-versioned with exact fork inheritance', async (t) => {
@@ -234,27 +363,34 @@ test('bounded work units inherit typed resources and fold back only their contin
   const root = await accept(fixture.repository, conversation.conversationId, 'Solve the parent task.');
   const rootContext = await fixture.repository.compileContext(conversation.conversationId);
   await startInference(fixture.repository, root, rootContext);
-  await fixture.repository.recordProviderItem(root, assistantMessage({
+  await fixture.repository.appendAssistantCheckpoint(root, {
+    textDelta: '', reasoningDelta: 'parent reasoning',
+  });
+  const rootFinalization = await fixture.repository.finalizeInference(root, {
+    state: 'completed',
+    providerMessage: assistantMessage({
     content: [
       { type: 'thinking', thinking: 'parent reasoning', thinkingSignature: 'parent-signature' },
       { type: 'toolCall', id: 'call:enter', name: 'work_unit_start', arguments: { objective: 'Inspect one seam.' } },
     ],
     stopReason: 'toolUse',
-  }));
-  await fixture.repository.appendAssistantCheckpoint(root, {
-    textDelta: '', reasoningDelta: 'parent reasoning',
+    }),
+    calls: [{
+      callId: 'call:enter', name: 'work_unit_start', args: { objective: 'Inspect one seam.' },
+    }],
   });
-  await fixture.repository.finishInference(root, { state: 'completed' });
-  await fixture.repository.recordToolStarted(root, {
-    callId: 'call:enter', name: 'work_unit_start', args: { objective: 'Inspect one seam.' },
-  });
-  const entered = await fixture.repository.enterWorkUnit(root, {
+  const preparedEntry = await fixture.repository.prepareWorkUnitEntry(root, {
     objective: 'Inspect one seam.',
     doneWhen: ['The seam is verified against its exact contract.'],
     resources: [
       { ref: 'docs/seam-contract.md', role: 'authority', description: 'Exact seam contract.' },
       { ref: `history://turn/${root.turnId}`, role: 'evidence', description: 'Current request.' },
     ],
+  });
+  const parentCall = rootFinalization.calls[0]!;
+  const entered = await fixture.repository.commitWorkUnitEntry(root, preparedEntry, {
+    parentInferenceId: rootFinalization.inferenceId,
+    parentOperationId: parentCall.operationId,
   });
   await fixture.repository.recordToolFinished(root, {
     callId: 'call:enter', result: { scopeId: entered.handle.scopeId }, isError: false,
@@ -299,25 +435,39 @@ test('bounded work units inherit typed resources and fold back only their contin
   );
 
   await startInference(fixture.repository, entered.handle, childContext);
-  await fixture.repository.recordProviderItem(entered.handle, assistantMessage({
+  assert.notEqual(await fixture.repository.appendAssistantCheckpoint(entered.handle, {
+    textDelta: '', reasoningDelta: 'CHILD_PRIVATE_REASONING',
+  }), null);
+  await fixture.repository.finalizeInference(entered.handle, {
+    state: 'completed',
+    providerMessage: assistantMessage({
     content: [
       { type: 'thinking', thinking: 'CHILD_PRIVATE_REASONING', thinkingSignature: 'child-signature' },
       { type: 'toolCall', id: 'call:child', name: 'bash', arguments: { command: 'true' } },
     ],
     stopReason: 'toolUse',
-  }));
-  assert.equal(await fixture.repository.appendAssistantCheckpoint(entered.handle, {
-    textDelta: '', reasoningDelta: 'CHILD_PRIVATE_REASONING',
-  }), null);
-  await fixture.repository.finishInference(entered.handle, { state: 'completed' });
-  await fixture.repository.recordToolStarted(entered.handle, {
-    callId: 'call:child', name: 'bash', args: { command: 'true' },
+    }),
+    calls: [{ callId: 'call:child', name: 'bash', args: { command: 'true' } }],
   });
   await fixture.repository.recordToolFinished(entered.handle, {
     callId: 'call:child', result: { secret: 'CHILD_TOOL_RESULT' }, isError: false,
   });
-  await fixture.repository.recordToolStarted(entered.handle, {
-    callId: 'call:return', name: 'work_unit_finish', args: { result: 'The seam is sound.' },
+  const returnContext = await fixture.repository.compileContext(conversation.conversationId);
+  await startInference(fixture.repository, entered.handle, returnContext);
+  await fixture.repository.finalizeInference(entered.handle, {
+    state: 'completed',
+    providerMessage: assistantMessage({
+      content: [{
+        type: 'toolCall',
+        id: 'call:return',
+        name: 'work_unit_finish',
+        arguments: { result: 'The seam is sound.' },
+      }],
+      stopReason: 'toolUse',
+    }),
+    calls: [{
+      callId: 'call:return', name: 'work_unit_finish', args: { result: 'The seam is sound.' },
+    }],
   });
   await fixture.repository.recordToolFinished(entered.handle, {
     callId: 'call:return', result: { state: 'returning' }, isError: false,
@@ -348,6 +498,50 @@ test('bounded work units inherit typed resources and fold back only their contin
   assert.equal(returned.threadUpdate, 'Record that the seam contract was verified.');
   assert.equal(returned.resources[1]?.ref, 'src/seam.ts');
   assert.equal(returned.resources[1]?.inclusion, 'materialized');
+  const rootTrace = await fixture.repository.readExecutionScopeTranscriptResource(
+    conversation.conversationId,
+    {
+      type: 'executionScope',
+      protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
+      turnId: root.turnId,
+      scopeId: root.scopeId,
+    },
+  );
+  const linkedCall = rootTrace?.inferences[0]?.actionGroup?.calls[0];
+  assert.equal(linkedCall?.childScopeId, entered.handle.scopeId);
+  assert.equal(linkedCall?.childObjective, 'Inspect one seam.');
+  assert.equal(linkedCall?.childState, 'completed');
+  assert.ok((linkedCall?.childOperationCount ?? 0) >= 1);
+  assert.equal(linkedCall?.childReturnedResourceCount, 2);
+  const childTrace = await fixture.repository.readExecutionScopeTranscriptResource(
+    conversation.conversationId,
+    {
+      type: 'executionScope',
+      protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
+      turnId: root.turnId,
+      scopeId: entered.handle.scopeId,
+    },
+  );
+  assert.equal(childTrace?.parentOperationId, parentCall.operationId);
+  assert.equal(childTrace?.state, 'completed');
+  assert.match(childTrace?.result ?? '', /The seam is sound/u);
+  assert.match(childTrace?.threadUpdate ?? '', /seam contract was verified/u);
+  assert.ok(childTrace?.returnedResources.some((resource) => resource.ref === 'src/seam.ts'));
+  assert.equal(childTrace?.inferences[0]?.reasoning?.text, 'CHILD_PRIVATE_REASONING');
+  assert.equal(childTrace?.inferences[0]?.actionGroup?.calls[0]?.name, 'bash');
+  const projection = await fixture.repository.readTranscriptWindowProjection({
+    conversationId: conversation.conversationId,
+    requests: [{
+      type: 'transcriptSync',
+      protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
+      projectionVersion: AGENT_TRANSCRIPT_PROJECTION_VERSION,
+      window: { kind: 'tail', count: 24 },
+    }],
+  });
+  assert.ok(projection?.actions.some((action) =>
+    action.type === 'work-unit-start' && action.scopeId === entered.handle.scopeId));
+  assert.ok(projection?.actions.some((action) =>
+    action.type === 'work-unit-finish' && action.scopeId === entered.handle.scopeId));
   const deliverableSnapshot = await fixture.repository.openHistory(
     conversation.conversationId,
     { ref: returned.resources[1]!.snapshot.ref },
@@ -372,7 +566,7 @@ test('bounded work units inherit typed resources and fold back only their contin
     assert.equal(thinking?.type === 'thinking' ? thinking.thinkingSignature : null, 'parent-signature');
   }
 
-  const inheritedUnit = await fixture.repository.enterWorkUnit(root, {
+  const inheritedUnit = await enterWorkUnit(fixture.repository, root, {
     objective: 'Use the already-returned seam implementation.',
     resources: [{ ref: 'src/seam.ts', role: 'authority' }],
   });
@@ -390,7 +584,7 @@ test('bounded work units inherit typed resources and fold back only their contin
   });
 
   await writeFile(join(fixture.cwd, 'src/seam.ts'), 'export const seam = "revised";\n');
-  const revisedUnit = await fixture.repository.enterWorkUnit(root, {
+  const revisedUnit = await enterWorkUnit(fixture.repository, root, {
     objective: 'Inspect the revised seam implementation.',
     resources: [{ ref: 'src/seam.ts', role: 'deliverable' }],
   });
@@ -445,7 +639,7 @@ test('work-unit handoffs may use the available parent context beyond the former 
     operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'model', reasoning: 'high',
   });
   const root = await accept(fixture.repository, conversation.conversationId, 'Audit the architecture.');
-  const entered = await fixture.repository.enterWorkUnit(root, {
+  const entered = await enterWorkUnit(fixture.repository, root, {
     objective: 'Return a repository-grounded architecture audit.',
     resources: [{ ref: 'docs/architecture.md', role: 'authority' }],
   });
@@ -491,7 +685,7 @@ test('work-unit directory resources are correctable before the durable entry com
   });
   assert.ok(eventsBeforeRetry.every(({ type }) => type !== 'work_unit.entered'));
 
-  const entered = await fixture.repository.enterWorkUnit(root, {
+  const entered = await enterWorkUnit(fixture.repository, root, {
     objective: 'Implement the seam file.',
     resources: [{ ref: 'src/seam.ts', role: 'deliverable' }],
   });
@@ -509,7 +703,7 @@ test('turn failure abandons an unreturned work unit with its own terminal event'
     operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'model', reasoning: 'high',
   });
   const root = await accept(fixture.repository, conversation.conversationId, 'Run bounded work.');
-  const entered = await fixture.repository.enterWorkUnit(root, {
+  const entered = await enterWorkUnit(fixture.repository, root, {
     objective: 'Exercise abnormal child cleanup.', resources: [],
   });
   const childContext = await fixture.repository.compileContext(conversation.conversationId);
@@ -728,11 +922,14 @@ test('a provider attempt with a durable tool effect cannot be superseded', async
   });
   const turn = await accept(fixture.repository, conversation.conversationId, 'Do not replay effects.');
   const context = await fixture.repository.compileContext(conversation.conversationId);
-  await startInference(fixture.repository, turn, context);
-  await fixture.repository.finishInference(turn, { state: 'failed' });
+  const inference = await startInference(fixture.repository, turn, context);
   await fixture.repository.recordToolStarted(turn, {
-    callId: 'durable-effect', name: 'bash', args: { command: 'touch sentinel' },
+    callId: 'durable-effect',
+    name: 'bash',
+    args: { command: 'touch sentinel' },
+    sourceInferenceId: inference.inferenceId,
   });
+  await fixture.repository.finishInference(turn, { state: 'failed' });
   await assert.rejects(
     fixture.repository.supersedeInference(turn, {
       attempt: 1, maxAttempts: 2, delayMs: 500, error: 'WebSocket error',
@@ -789,6 +986,41 @@ test('the public fixture runtime commits a v5 frame and completes through normal
   assert.equal(durableTurn.state, 'completed');
   assert.equal(durableTurn.terminal, true);
   assert.equal(typeof durableTurn.terminalSequence, 'number');
+  const traceDatabase = new DatabaseSync(fixture.repository.databasePath, { readOnly: true });
+  const identity = traceDatabase.prepare(`
+    SELECT root_scope_id FROM turns WHERE turn_id = ?
+  `).get(sent.turnId) as { root_scope_id: string };
+  const unlinkedCalls = traceDatabase.prepare(`
+    SELECT COUNT(*) AS count FROM operations
+    WHERE turn_id = ? AND kind = 'tool.call' AND source_inference_id IS NULL
+  `).get(sent.turnId) as { count: number };
+  traceDatabase.close();
+  assert.equal(unlinkedCalls.count, 0);
+  const executionScope = await fixture.repository.readExecutionScopeTranscriptResource(
+    created.conversationId,
+    {
+      type: 'executionScope',
+      protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
+      turnId: sent.turnId,
+      scopeId: identity.root_scope_id,
+    },
+  );
+  assert.equal(executionScope?.state, 'completed');
+  assert.equal(executionScope?.inferences.length, 1);
+  assert.deepEqual(executionScope?.inferences[0]?.contentOrder, ['reasoning', 'actions']);
+  assert.equal(executionScope?.inferences[0]?.reasoning?.state, 'final');
+  assert.equal(
+    executionScope?.inferences[0]?.reasoning?.text,
+    'Inspecting the fixture workspace.',
+  );
+  assert.deepEqual(
+    executionScope?.inferences[0]?.actionGroup?.calls.map(({ name, status }) => ({ name, status })),
+    [{ name: 'workspace.read', status: 'completed' }],
+  );
+  assert.deepEqual(
+    executionScope?.inferences[0]?.actionGroup?.calls[0]?.presentation,
+    { category: 'read', label: 'Read README.md', subject: 'README.md' },
+  );
   const events = await fixture.repository.readEvents({ conversationId: created.conversationId });
   assert.ok(events.some(({ type }) => type === 'provider.item.recorded'));
   assert.ok(events.some(({ type }) => type === 'turn.terminal'));
@@ -894,6 +1126,35 @@ function accept(repository: AgentStateStore, conversationId: string, text: strin
   });
 }
 
+async function enterWorkUnit(
+  repository: AgentStateStore,
+  handle: DurableTurnHandle,
+  input: WorkUnitEnterInput,
+) {
+  const context = await repository.compileContext(handle.conversationId);
+  await startInference(repository, handle, context);
+  const callId = `call:${crypto.randomUUID()}`;
+  const finalization = await repository.finalizeInference(handle, {
+    state: 'completed',
+    providerMessage: assistantMessage({
+      content: [{ type: 'toolCall', id: callId, name: 'work_unit_start', arguments: input }],
+      stopReason: 'toolUse',
+    }),
+    calls: [{ callId, name: 'work_unit_start', args: input }],
+  });
+  const prepared = await repository.prepareWorkUnitEntry(handle, input);
+  const entered = await repository.commitWorkUnitEntry(handle, prepared, {
+    parentInferenceId: finalization.inferenceId,
+    parentOperationId: finalization.calls[0]!.operationId,
+  });
+  await repository.recordToolFinished(handle, {
+    callId,
+    result: { scopeId: entered.handle.scopeId },
+    isError: false,
+  });
+  return entered;
+}
+
 async function startInference(
   repository: AgentStateStore,
   handle: DurableTurnHandle,
@@ -993,7 +1254,9 @@ class RecoveringTransportFixtureProvider implements ModelProvider {
           context: durableFixtureContext(firstContext),
         });
         options.onEvent({ type: 'assistant-start' });
-        options.onEvent({ type: 'assistant-text', delta: 'Partial transport output.' });
+        options.onEvent({
+          type: 'assistant-text', delta: 'Partial transport output.', phase: 'commentary',
+        });
         await options.durability.afterProviderCall?.({
           plannedRequestMode: 'full',
           actualRequestMode: 'full',
@@ -1009,6 +1272,7 @@ class RecoveringTransportFixtureProvider implements ModelProvider {
         await options.durability.beforeAssistantMessageEnd({
           inferenceState: 'failed',
           text: 'Partial transport output.',
+          textPhase: 'commentary',
           reasoning: '',
           calls: [],
           providerMessage: fixtureProviderMessage('Partial transport output.', 'error'),
@@ -1029,7 +1293,7 @@ class RecoveringTransportFixtureProvider implements ModelProvider {
         });
         const recovered = 'Recovered through a fresh provider frame.';
         options.onEvent({ type: 'assistant-start' });
-        options.onEvent({ type: 'assistant-text', delta: recovered });
+        options.onEvent({ type: 'assistant-text', delta: recovered, phase: 'final_answer' });
         await options.durability.afterProviderCall?.({
           plannedRequestMode: 'full',
           actualRequestMode: 'full',
@@ -1045,6 +1309,7 @@ class RecoveringTransportFixtureProvider implements ModelProvider {
         await options.durability.beforeAssistantMessageEnd({
           inferenceState: 'completed',
           text: recovered,
+          textPhase: 'final_answer',
           reasoning: '',
           calls: [],
           providerMessage: fixtureProviderMessage(recovered, 'stop'),

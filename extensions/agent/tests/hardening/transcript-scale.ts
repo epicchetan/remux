@@ -15,9 +15,8 @@ import {
   type AgentTranscriptSyncRequest,
   type AgentTranscriptSyncResource,
   type AgentTurnRenderFrame,
-  type AgentWorkEntryDetailResource,
-  type AgentWorkGroupResource,
-  type AgentWorkGroupTimelineEntry,
+  type AgentExecutionScopeResource,
+  type AgentOperationDetailResource,
   type AgentWorkRenderSegment,
 } from '../../shared/transcript.ts';
 import { AgentServer } from '../../server/src/agent-server.ts';
@@ -83,12 +82,31 @@ try {
 
     if (index === 50) {
       workTurnId = turn.turnId;
+      const context = await repository.compileContext(conversation.conversationId);
+      const inference = await repository.startInference(turn, {
+        modelId: 'gpt-5.4-fixture',
+        requestMode: 'full',
+        estimatedInputTokens: 2_000,
+        payload: { messages: [] },
+        context: {
+          basisSequence: context.basisSequence,
+          logicalHash: context.logicalHash,
+          renderedHash: 'a'.repeat(64),
+          orderedMessageHashes: context.orderedMessageHashes,
+          messageCount: context.messages.length + 1,
+          fixedContractsHash: 'b'.repeat(64),
+          frame: context.frame,
+          frameBuildDurationMs: 1,
+          activeMessages: context.messages,
+        },
+      });
       for (let row = 0; row < TOOL_ROWS; row += 1) {
         const callId = `hardening-call-${row}`;
         await repository.recordToolStarted(turn, {
           callId,
           name: 'workspace.read',
           args: { path: `generated-${row}.md` },
+          sourceInferenceId: inference.inferenceId,
         });
         const result = row === 0
           ? { output: 'r'.repeat(TOOL_RESULT_BYTES) }
@@ -98,6 +116,7 @@ try {
           process.stderr.write(`seeded ${row + 1}/${TOOL_ROWS} work rows\n`);
         }
       }
+      await repository.finishInference(turn, { state: 'completed' });
     }
 
     await repository.finishTurn(turn, index === 45
@@ -107,18 +126,22 @@ try {
         : { status: 'completed' });
 
     if (index === 47) {
-      const interrupted = await repository.acceptTurn({
+      const restartTurn: Awaited<ReturnType<AgentStateStore['acceptTurn']>> =
+        await repository.acceptTurn({
         operationId: randomUUID(),
         conversationId: conversation.conversationId,
         clientMessageId: randomUUID(),
         text: 'Recover this unfinished turn as interrupted by restart.',
-      });
-      await repository.appendAssistantCheckpoint(interrupted, {
+        });
+      await repository.appendAssistantCheckpoint(restartTurn, {
         reasoningDelta: '',
         textDelta: 'Partial restart output.',
       });
       await repository.close();
       repository = await AgentStateStore.open({ dataRoot });
+      const recovery = await repository.resumeActiveTurn(conversation.conversationId);
+      assert.equal(recovery?.rootHandle.turnId, restartTurn.turnId);
+      await repository.finishTurn(recovery!.rootHandle, { status: 'interrupted' });
     }
 
     if ((index + 1) % 50 === 0) {
@@ -143,6 +166,7 @@ try {
   });
   checkpointProjector.beginTurn({
     turnId: activeTail.turnId,
+    scopeId: activeTail.scopeId,
     clientMessageId: activeTail.clientMessageId,
     text: 'Keep one streaming tail turn active for the corpus.',
     sequence: activeTail.transcriptSequence,
@@ -255,48 +279,36 @@ try {
   const work = workFrame.segments.find((segment): segment is AgentWorkRenderSegment =>
     segment.type === 'work');
   assert.ok(work);
-  const group = work.timeline.find((entry): entry is AgentWorkGroupTimelineEntry =>
-    entry.type === 'group');
-  assert.ok(group);
-  assert.equal(group.rowCount, TOOL_ROWS);
-
-  let cursor: string | null = null;
-  const rowIds: string[] = [];
-  let firstPage: AgentWorkGroupResource | null = null;
-  do {
-    const pageResult = await transcriptRead(server, conversation.conversationId, [{
-      type: 'workGroup',
-      protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
-      turnId: workFrame.id,
-      segmentId: work.id,
-      groupId: group.id,
-      limit: 200,
-      ...(cursor ? { cursor } : {}),
-    }]);
-    const pageEntry = pageResult.resources[0];
-    assert.equal(pageEntry?.status, 'ok');
-    const page = pageEntry?.status === 'ok' ? pageEntry.value as AgentWorkGroupResource : null;
-    assert.ok(page);
-    firstPage ??= page;
-    rowIds.push(...page.rows.map((row) => row.id));
-    cursor = page.nextCursor;
-  } while (cursor);
-  assert.equal(rowIds.length, TOOL_ROWS);
-  assert.equal(new Set(rowIds).size, TOOL_ROWS);
-  assert.ok(firstPage);
-
-  const detailResult = await transcriptRead(server, conversation.conversationId, [{
-    type: 'workEntryDetail',
+  const scopeResult = await transcriptRead(server, conversation.conversationId, [{
+    type: 'executionScope',
     protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
     turnId: workFrame.id,
-    segmentId: work.id,
-    groupId: group.id,
-    rowId: firstPage.rows[0]!.id,
+    scopeId: work.scopeId,
+  }]);
+  const scopeEntry = scopeResult.resources[0];
+  assert.equal(scopeEntry?.status, 'ok');
+  const scope = scopeEntry?.status === 'ok'
+    ? scopeEntry.value as AgentExecutionScopeResource
+    : null;
+  assert.ok(scope);
+  assert.equal(scope.inferences.length, 1);
+  const calls = scope.inferences[0]?.actionGroup?.calls ?? [];
+  assert.equal(calls.length, TOOL_ROWS);
+  assert.equal(new Set(calls.map((call) => call.id)).size, TOOL_ROWS);
+  const firstCall = calls[0];
+  assert.ok(firstCall);
+
+  const detailResult = await transcriptRead(server, conversation.conversationId, [{
+    type: 'operationDetail',
+    protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
+    turnId: workFrame.id,
+    scopeId: work.scopeId,
+    operationId: firstCall.id,
   }]);
   const detailEntry = detailResult.resources[0];
   assert.equal(detailEntry?.status, 'ok');
   const detail = detailEntry?.status === 'ok'
-    ? detailEntry.value as AgentWorkEntryDetailResource
+    ? detailEntry.value as AgentOperationDetailResource
     : null;
   assert.ok(detail?.truncation.truncated);
   assert.ok(detail.content?.output?.artifactHash);
@@ -332,7 +344,7 @@ try {
       artifacts: artifactTotals.count,
       completedTurns: COMPLETED_TURNS,
       totalTurns: turnCount,
-      workRows: rowIds.length,
+      workRows: calls.length,
     },
     p95Ms: {
       around: rounded(p95(aroundDurations)),

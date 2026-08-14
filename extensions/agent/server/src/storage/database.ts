@@ -95,7 +95,7 @@ export async function openAgentDatabase(options: AgentDataRootOptions = {}) {
     } else if (version !== AGENT_STATE_SCHEMA_VERSION) {
       throw new AgentSchemaVersionError(
         `Agent state schema ${version} is not ${AGENT_STATE_SCHEMA_VERSION}; ` +
-        'Agent state v3 requires a fresh Agent data root.',
+        'Agent state v4 requires a fresh Agent data root.',
       );
     }
 

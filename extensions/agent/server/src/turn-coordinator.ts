@@ -12,6 +12,7 @@ import {
 import type { AgentResourceInvalidation } from '../../shared/transcript.ts';
 import type { AgentStore } from './agent-store.ts';
 import type {
+  AssistantTextPhase,
   ModelSession,
   ModelSessionEvent,
   WorkUnitEnterInput,
@@ -57,15 +58,21 @@ export class TurnCoordinator {
   private turnWriteError: unknown = null;
   private activeDurableTurn: DurableTurnHandle | null = null;
   private activeDurableScope: DurableTurnHandle | null = null;
-  private readonly toolScopes = new Map<string, DurableTurnHandle>();
+  private readonly toolScopes = new Map<string, {
+    handle: DurableTurnHandle;
+    operationId: string;
+    sourceInferenceId: string;
+  }>();
   private readonly pendingWorkUnitReturns = new Map<string, {
     handle: DurableTurnHandle;
     prepared: PreparedWorkUnitReturn;
   }>();
   private activeTurnStartedMonotonicAt: number | null = null;
   private pendingAssistantText = '';
+  private pendingAssistantTextPhase: AssistantTextPhase | null = null;
   private pendingAssistantReasoning = '';
   private inferenceAssistantText = '';
+  private inferenceAssistantTextPhase: AssistantTextPhase | null = null;
   private inferenceAssistantReasoning = '';
   private assistantFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private turnCompletion: Promise<void> | null = null;
@@ -92,6 +99,7 @@ export class TurnCoordinator {
     this.turnCompletion = null;
     this.durabilityFailure = null;
     this.inferenceAssistantText = '';
+    this.inferenceAssistantTextPhase = null;
     this.inferenceAssistantReasoning = '';
     runtimeValue.state = 'running';
     runtimeValue.activeTurnId = turnId;
@@ -101,6 +109,7 @@ export class TurnCoordinator {
     try {
       this.options.projector()?.beginTurn({
         turnId,
+        scopeId: durable.scopeId,
         clientMessageId: params.clientMessageId,
         text: params.text,
         ...(durable.userParts ? { parts: durable.userParts } : {}),
@@ -153,6 +162,7 @@ export class TurnCoordinator {
       beforeAssistantMessageEnd: (input: {
         inferenceState: 'completed' | 'failed' | 'interrupted';
         text: string;
+        textPhase: AssistantTextPhase;
         reasoning: string;
         calls: Array<{ callId: string; name: string; args: unknown }>;
         providerMessage: AssistantMessage;
@@ -217,10 +227,10 @@ export class TurnCoordinator {
         }
         break;
       case 'assistant-text':
-        if (turnId) this.bufferAssistantCheckpoint(event.delta, '');
+        if (turnId) this.bufferAssistantCheckpoint(event.delta, '', event.phase);
         break;
       case 'assistant-reasoning':
-        if (turnId) this.bufferAssistantCheckpoint('', event.delta);
+        if (turnId) this.bufferAssistantCheckpoint('', event.delta, null);
         break;
       case 'inference-end':
         void this.finishInferenceBoundary(conversationId, event.state)
@@ -314,7 +324,7 @@ export class TurnCoordinator {
     const runtime = this.resources.get<AgentRuntimeValue>(AGENT_RESOURCE_KEYS.runtime);
     const modelId = runtime?.contextProbe?.modelId;
     if (!modelId) throw new Error('Provider dispatch has no durable model identity.');
-    await this.enqueueTurnWrite(() => this.store.startInference(handle, {
+    const started = await this.enqueueTurnWrite(() => this.store.startInference(handle, {
       modelId,
       requestMode: input.requestMode,
       estimatedInputTokens: input.estimatedInputTokens,
@@ -322,8 +332,14 @@ export class TurnCoordinator {
       ...(input.retryOfInferenceId ? { retryOfInferenceId: input.retryOfInferenceId } : {}),
       context: input.context,
     }));
+    this.options.projector()?.startInference(handle.turnId, {
+      scopeId: handle.scopeId,
+      sequence: started.sequence,
+      basisSequence: started.sequence,
+    });
     this.resources.invalidateKey(contextResourceKey(conversationId), 'updated');
     this.inferenceAssistantText = '';
+    this.inferenceAssistantTextPhase = null;
     this.inferenceAssistantReasoning = '';
   }
 
@@ -335,8 +351,10 @@ export class TurnCoordinator {
     await this.flushAssistantCheckpoint();
     const result = await this.enqueueTurnWrite(() => this.store.supersedeInference(handle, input));
     this.inferenceAssistantText = '';
+    this.inferenceAssistantTextPhase = null;
     this.inferenceAssistantReasoning = '';
     this.pendingAssistantText = '';
+    this.pendingAssistantTextPhase = null;
     this.pendingAssistantReasoning = '';
     this.resources.invalidateKey(contextResourceKey(conversationId), 'updated');
     if (this.isRootScope(handle)) {
@@ -415,6 +433,7 @@ export class TurnCoordinator {
     input: {
       inferenceState: 'completed' | 'failed' | 'interrupted';
       text: string;
+      textPhase: AssistantTextPhase;
       reasoning: string;
       calls: Array<{ callId: string; name: string; args: unknown }>;
       providerMessage: AssistantMessage;
@@ -422,40 +441,65 @@ export class TurnCoordinator {
   ) {
     const handle = this.requiredActiveDurableScope(conversationId);
     await this.flushAssistantCheckpoint();
-    await this.enqueueTurnWrite(() => this.store.recordProviderItem(handle, input.providerMessage));
     const textDelta = finalizedSuffix(this.inferenceAssistantText, input.text, 'assistant text');
     const reasoningDelta = finalizedSuffix(
       this.inferenceAssistantReasoning,
       input.reasoning,
       'assistant reasoning',
+      true,
     );
     if (textDelta || reasoningDelta) {
       await this.enqueueTurnWrite(async () => {
-        const mutation = await this.store.appendAssistantCheckpoint(handle, { textDelta, reasoningDelta });
+        const mutation = await this.store.appendAssistantCheckpoint(handle, {
+          textDelta,
+          reasoningDelta,
+          ...(textDelta ? { textPhase: input.textPhase } : {}),
+        });
         if (!mutation) return;
         if (this.isRootScope(handle)) {
           this.resources.invalidateKey(conversationResourceKey(handle.conversationId));
           this.resources.invalidateKey(AGENT_RESOURCE_KEYS.conversationList);
           const projection = transcriptMutation(mutation);
           if (reasoningDelta) this.options.projector()?.appendReasoning(handle.turnId, reasoningDelta, projection);
-          if (textDelta) this.options.projector()?.appendAssistantText(handle.turnId, textDelta, projection);
+          if (textDelta && input.textPhase === 'final_answer') {
+            this.options.projector()?.appendAssistantText(handle.turnId, textDelta, projection);
+          }
+        } else {
+          this.options.projector()?.touchWorkUnit(handle.turnId, {
+            scopeId: handle.scopeId,
+            ...transcriptTerminalMutation(mutation),
+          });
         }
       });
     }
     this.inferenceAssistantText = input.text;
+    this.inferenceAssistantTextPhase = input.textPhase;
     this.inferenceAssistantReasoning = input.reasoning;
-    await this.enqueueTurnWrite(() => this.store.finishInference(handle, { state: input.inferenceState }));
-    for (const call of input.calls) {
-      this.toolScopes.set(call.callId, handle);
-      const inserted = await this.enqueueTurnWrite(() => this.store.recordToolStarted(handle, call));
-      if (inserted && this.isRootScope(handle)) {
+    const finalized = await this.enqueueTurnWrite(() => this.store.finalizeInference(handle, {
+      state: input.inferenceState,
+      providerMessage: input.providerMessage,
+      calls: input.calls,
+    }));
+    for (const inserted of finalized.calls) {
+      this.toolScopes.set(inserted.callId, {
+        handle,
+        operationId: inserted.operationId,
+        sourceInferenceId: finalized.inferenceId,
+      });
+      if (this.isRootScope(handle)) {
         this.options.projector()?.startTool(handle.turnId, {
-          callId: call.callId,
-          name: call.name,
-          args: call.args,
+          callId: inserted.callId,
+          name: inserted.name,
+          args: input.calls.find((call) => call.callId === inserted.callId)?.args ?? null,
           ...(inserted.detailText === undefined ? {} : { detailText: inserted.detailText }),
           ...(inserted.detailContent ? { detailContent: inserted.detailContent } : {}),
           ...transcriptMutation(inserted),
+        });
+      } else {
+        this.options.projector()?.touchWorkUnit(handle.turnId, {
+          scopeId: handle.scopeId,
+          operationStarted: true,
+          ...transcriptTerminalMutation(inserted),
         });
       }
     }
@@ -465,10 +509,14 @@ export class TurnCoordinator {
     conversationId: string,
     input: { callId: string; name: string; args: unknown },
   ) {
-    const handle = this.toolScopes.get(input.callId) ?? this.requiredActiveDurableScope(conversationId);
-    this.toolScopes.set(input.callId, handle);
+    const tracked = this.toolScopes.get(input.callId);
+    if (!tracked) throw new Error(`Tool call ${input.callId} has no finalized source inference.`);
+    const handle = tracked.handle;
     await this.flushAssistantCheckpoint();
-    const inserted = await this.enqueueTurnWrite(() => this.store.recordToolStarted(handle, input));
+    const inserted = await this.enqueueTurnWrite(() => this.store.recordToolStarted(handle, {
+      ...input,
+      sourceInferenceId: tracked.sourceInferenceId,
+    }));
     if (inserted && this.isRootScope(handle)) {
       this.options.projector()?.startTool(handle.turnId, {
         callId: input.callId,
@@ -478,6 +526,12 @@ export class TurnCoordinator {
         ...(inserted.detailContent ? { detailContent: inserted.detailContent } : {}),
         ...transcriptMutation(inserted),
       });
+    } else if (inserted) {
+      this.options.projector()?.touchWorkUnit(handle.turnId, {
+        scopeId: handle.scopeId,
+        operationStarted: true,
+        ...transcriptTerminalMutation(inserted),
+      });
     }
   }
 
@@ -485,7 +539,9 @@ export class TurnCoordinator {
     conversationId: string,
     input: { callId: string; name: string; result: unknown; isError: boolean },
   ) {
-    const handle = this.toolScopes.get(input.callId) ?? this.requiredActiveDurableScope(conversationId);
+    const tracked = this.toolScopes.get(input.callId);
+    if (!tracked) throw new Error(`Tool call ${input.callId} has no durable execution identity.`);
+    const handle = tracked.handle;
     await this.flushAssistantCheckpoint();
     const inserted = await this.enqueueTurnWrite(() => this.store.recordToolFinished(handle, input));
     if (inserted && this.isRootScope(handle)) {
@@ -497,6 +553,11 @@ export class TurnCoordinator {
         ...(inserted.outputContent ? { outputContent: inserted.outputContent } : {}),
         ...transcriptMutation(inserted),
       });
+    } else if (inserted) {
+      this.options.projector()?.touchWorkUnit(handle.turnId, {
+        scopeId: handle.scopeId,
+        ...transcriptTerminalMutation(inserted),
+      });
     }
     const pendingReturn = this.pendingWorkUnitReturns.get(input.callId);
     if (input.name === 'work_unit_finish' && !input.isError) {
@@ -505,6 +566,15 @@ export class TurnCoordinator {
       }
       const returned = await this.enqueueTurnWrite(() =>
         this.store.commitWorkUnitReturn(handle, pendingReturn.prepared));
+      this.options.projector()?.finishWorkUnit(handle.turnId, {
+        scopeId: returned.scopeId,
+        status: returned.status,
+        resultPreview: workUnitResultPreview(returned.result),
+        resourceCount: returned.resources.length,
+        sequence: returned.transcriptSequence,
+        basisSequence: returned.transcriptSequence,
+        createdAt: returned.transcriptCreatedAt,
+      });
       this.activeDurableScope = returned.parentHandle;
     }
     this.pendingWorkUnitReturns.delete(input.callId);
@@ -515,9 +585,24 @@ export class TurnCoordinator {
     const parent = this.requiredActiveDurableScope(conversationId);
     if (!this.isRootScope(parent)) throw new Error('Work units cannot be nested.');
     await this.flushAssistantCheckpoint();
+    const parentCall = this.toolScopes.get(callId);
+    if (!parentCall || parentCall.handle.scopeId !== parent.scopeId) {
+      throw new Error('The work unit has no durable parent operation.');
+    }
     const prepared = await this.store.prepareWorkUnitEntry(parent, input);
-    const entered = await this.enqueueTurnWrite(() => this.store.commitWorkUnitEntry(parent, prepared));
-    this.toolScopes.set(callId, parent);
+    const entered = await this.enqueueTurnWrite(() => this.store.commitWorkUnitEntry(parent, prepared, {
+      parentOperationId: parentCall.operationId,
+      parentInferenceId: parentCall.sourceInferenceId,
+    }));
+    this.options.projector()?.startWorkUnit(parent.turnId, {
+      scopeId: entered.handle.scopeId,
+      objective: entered.objective,
+      doneWhen: entered.doneWhen,
+      resourceCount: entered.resources.length,
+      sequence: entered.transcriptSequence,
+      basisSequence: entered.transcriptSequence,
+      createdAt: entered.transcriptCreatedAt,
+    });
     this.activeDurableScope = entered.handle;
     return {
       scopeId: entered.handle.scopeId,
@@ -537,15 +622,32 @@ export class TurnCoordinator {
     const handle = this.requiredActiveDurableScope(conversationId);
     if (this.isRootScope(handle)) throw new Error('No work unit is active.');
     const prepared = await this.store.prepareWorkUnitReturn(handle, input);
-    this.toolScopes.set(callId, handle);
+    const tracked = this.toolScopes.get(callId);
+    if (!tracked || tracked.handle.scopeId !== handle.scopeId) {
+      throw new Error('The work unit return has no durable operation identity.');
+    }
     this.pendingWorkUnitReturns.set(callId, { handle, prepared });
     return { scopeId: handle.scopeId, state: 'returning' as const };
   }
 
-  private bufferAssistantCheckpoint(textDelta: string, reasoningDelta: string) {
+  private bufferAssistantCheckpoint(
+    textDelta: string,
+    reasoningDelta: string,
+    textPhase: AssistantTextPhase | null,
+  ) {
+    if (
+      textDelta &&
+      this.inferenceAssistantTextPhase &&
+      textPhase &&
+      this.inferenceAssistantTextPhase !== textPhase
+    ) {
+      throw new Error('One provider inference emitted mixed assistant text phases.');
+    }
     this.inferenceAssistantText += textDelta;
+    if (textDelta && textPhase) this.inferenceAssistantTextPhase = textPhase;
     this.inferenceAssistantReasoning += reasoningDelta;
     this.pendingAssistantText += textDelta;
+    if (textDelta && textPhase) this.pendingAssistantTextPhase = textPhase;
     this.pendingAssistantReasoning += reasoningDelta;
     const pendingBytes = Buffer.byteLength(this.pendingAssistantText, 'utf8') +
       Buffer.byteLength(this.pendingAssistantReasoning, 'utf8');
@@ -571,20 +673,33 @@ export class TurnCoordinator {
     if (this.assistantFlushTimer) clearTimeout(this.assistantFlushTimer);
     this.assistantFlushTimer = null;
     const textDelta = this.pendingAssistantText;
+    const textPhase = this.pendingAssistantTextPhase;
     const reasoningDelta = this.pendingAssistantReasoning;
     this.pendingAssistantText = '';
+    this.pendingAssistantTextPhase = null;
     this.pendingAssistantReasoning = '';
     const handle = this.activeDurableScope;
     if (!handle || (!textDelta && !reasoningDelta)) return this.turnWriteTail;
     return this.enqueueTurnWrite(async () => {
-      const mutation = await this.store.appendAssistantCheckpoint(handle, { textDelta, reasoningDelta });
+      const mutation = await this.store.appendAssistantCheckpoint(handle, {
+        textDelta,
+        reasoningDelta,
+        ...(textDelta && textPhase ? { textPhase } : {}),
+      });
       if (!mutation) return;
       if (this.isRootScope(handle)) {
         this.resources.invalidateKey(conversationResourceKey(handle.conversationId));
         this.resources.invalidateKey(AGENT_RESOURCE_KEYS.conversationList);
         const projection = transcriptMutation(mutation);
         if (reasoningDelta) this.options.projector()?.appendReasoning(handle.turnId, reasoningDelta, projection);
-        if (textDelta) this.options.projector()?.appendAssistantText(handle.turnId, textDelta, projection);
+        if (textDelta && textPhase === 'final_answer') {
+          this.options.projector()?.appendAssistantText(handle.turnId, textDelta, projection);
+        }
+      } else {
+        this.options.projector()?.touchWorkUnit(handle.turnId, {
+          scopeId: handle.scopeId,
+          ...transcriptTerminalMutation(mutation),
+        });
       }
     });
   }
@@ -723,9 +838,15 @@ export class TurnCoordinator {
   }
 }
 
-function finalizedSuffix(observed: string, finalized: string, label: string) {
+function finalizedSuffix(
+  observed: string,
+  finalized: string,
+  label: string,
+  allowAuthoritativeRewrite = false,
+) {
   if (!finalized.startsWith(observed)) {
     if (observed.startsWith(finalized) && observed.slice(finalized.length).trim() === '') return '';
+    if (allowAuthoritativeRewrite) return '';
     throw new Error(`Pi finalized ${label} by rewriting already recorded content.`);
   }
   return finalized.slice(observed.length);
@@ -746,6 +867,14 @@ function transcriptTerminalMutation(mutation: DurableTranscriptMutation) {
     basisSequence: mutation.basisSequence,
     createdAt: mutation.createdAt,
   };
+}
+
+function workUnitResultPreview(value: string) {
+  const normalized = value.replace(/\s+/gu, ' ').trim();
+  const codePoints = [...normalized];
+  return codePoints.length <= 320
+    ? normalized
+    : `${codePoints.slice(0, 319).join('')}…`;
 }
 
 function safeMessage(error: unknown) {

@@ -57,7 +57,7 @@ test('reconstructs and lazily continues a durable conversation across a server g
   await expect(page.getByText('The fixture stream completed.')).toBeVisible();
 });
 
-test('preserves open work and reloads its lazy detail across a server generation reset', async ({ page }) => {
+test('preserves open work and reloads its execution scope across a server generation reset', async ({ page }) => {
   await page.goto('/viewers/agent/');
   await messageBox(page).fill('Inspect durable work across restart');
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
@@ -65,17 +65,23 @@ test('preserves open work and reloads its lazy detail across a server generation
 
   const workHeader = page.locator('.codex-work-header');
   await workHeader.click();
-  const readRow = page.getByRole('button', { name: /Read README\.md/u });
+  const actionSummary = page.getByRole('button', { name: /Edited index\.ts · Read 1 file/u });
+  await actionSummary.click();
+  const readRow = page.getByRole('button', { name: /workspace\.read/u });
   await readRow.click();
   await expect(page.getByText('Read the workspace overview before editing.')).toBeVisible();
 
-  const detailReadsBeforeReset = await transcriptRequestCount(page, 'workEntryDetail');
+  const scopeReadsBeforeReset = await transcriptRequestCount(page, 'executionScope');
+  const detailReadsBeforeReset = await transcriptRequestCount(page, 'operationDetail');
   await page.evaluate(() => (window as any).__agentFixture.resetGeneration());
 
   await expect(workHeader).toHaveAttribute('aria-expanded', 'true');
+  await expect(actionSummary).toHaveAttribute('aria-expanded', 'true');
   await expect(readRow).toHaveAttribute('aria-expanded', 'true');
   await expect(page.getByText('Read the workspace overview before editing.')).toBeVisible();
-  await expect.poll(() => transcriptRequestCount(page, 'workEntryDetail'))
+  await expect.poll(() => transcriptRequestCount(page, 'executionScope'))
+    .toBeGreaterThan(scopeReadsBeforeReset);
+  await expect.poll(() => transcriptRequestCount(page, 'operationDetail'))
     .toBeGreaterThan(detailReadsBeforeReset);
 });
 

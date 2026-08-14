@@ -8,8 +8,8 @@ import { DatabaseSync } from 'node:sqlite';
 
 import WebSocket from 'ws';
 
-const TRANSCRIPT_PROTOCOL_VERSION = 2;
-const TRANSCRIPT_PROJECTION_VERSION = 'agent-turn-render-v2';
+const TRANSCRIPT_PROTOCOL_VERSION = 4;
+const TRANSCRIPT_PROJECTION_VERSION = 'agent-turn-render-v4';
 const FIRST_SENTINEL = 'REMUX_THREAD_FIRST_OK';
 const CONTEXT_NONCE = 'REMUX_CONTEXT_8AUG26';
 const SECOND_SENTINEL = `${CONTEXT_NONCE} REMUX_THREAD_SECOND_OK`;
@@ -44,7 +44,7 @@ async function main() {
   assert.match(conversation.conversationId, UUID_V4);
 
   const first = await sendAndWait(client, conversation.conversationId, [
-    'This is an Agent state v3 acceptance test.',
+    'This is an Agent state v4 acceptance test.',
     'Use thread_read, then call thread_replace to create a Markdown collaboration canvas containing',
     `the exact unique line "Durable nonce: ${CONTEXT_NONCE}".`,
     'After replacement succeeds, call thread_patch with its returned version and replace that exact line with',
@@ -107,7 +107,7 @@ async function main() {
   assert.deepEqual(workUnitTranscript.value.turnOrder, [first.turnId, second.turnId, third.turnId]);
 
   const durability = await inspectDurability(options.dataRoot, conversation.conversationId);
-  assert.equal(durability.schemaId, 'agent-state-v3');
+  assert.equal(durability.schemaId, 'agent-state-v4');
   assert.equal(durability.contextFrames, durability.inferences);
   assert.equal(durability.providerItems, durability.inferences);
   assert.equal(durability.runningTurns, 0);

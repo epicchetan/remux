@@ -48,6 +48,20 @@ try {
         .waitFor({ timeout: 20_000 });
     }
     await page.getByRole('button', { name: 'Send message', exact: true }).waitFor();
+    if (options.openWork) {
+      const workHeader = transcript.locator('.codex-work-header').last();
+      await workHeader.waitFor({ timeout: 20_000 });
+      await workHeader.click();
+      await transcript.locator('.agent-inference').last().waitFor({ timeout: 20_000 });
+      const workUnit = transcript.locator('.agent-work-unit-header').last();
+      if (await workUnit.count()) {
+        await workUnit.click();
+        await transcript.locator('.agent-work-unit-content').last().waitFor({ timeout: 20_000 });
+        await transcript.locator('.agent-work-unit-content .agent-execution-scope').last()
+          .waitFor({ timeout: 20_000 });
+      }
+      await page.waitForTimeout(100);
+    }
 
     if (target.name === 'desktop') {
       await page.getByLabel('Agent history').waitFor();
@@ -73,6 +87,31 @@ try {
         const bounds = element.getBoundingClientRect();
         return { left: bounds.left, right: bounds.right, width: bounds.width };
       };
+      const workOffenders = Array.from(document.querySelectorAll([
+        '.agent-execution-scope',
+        '.agent-inference',
+        '.agent-work-unit',
+        '.agent-work-unit-content',
+        '.agent-reasoning-block',
+        '.agent-commentary-block',
+        '.agent-action-sequence',
+        '.agent-tool-call',
+        '.codex-markdown',
+        '.codex-md-text-line',
+      ].join(','))).flatMap((element) => {
+        if (!(element instanceof HTMLElement)) return [];
+        const bounds = element.getBoundingClientRect();
+        const outside = bounds.left < contentRect.left - 1 || bounds.right > contentRect.right + 1;
+        const intrinsic = element.scrollWidth > element.clientWidth + 1;
+        return outside || intrinsic ? [{
+          className: element.className,
+          clientWidth: element.clientWidth,
+          left: bounds.left,
+          right: bounds.right,
+          scrollWidth: element.scrollWidth,
+          text: (element.textContent ?? '').replace(/\s+/gu, ' ').trim().slice(0, 160),
+        }] : [];
+      });
       return {
         contentLeft: contentRect.left,
         contentRight: contentRect.right,
@@ -85,10 +124,14 @@ try {
         transcriptSlot: rect('.remux-transcript-slot'),
         transcriptOverflow: transcript.scrollWidth - transcript.clientWidth,
         viewportWidth: window.innerWidth,
+        workOffenders,
       };
     });
     assert.ok(geometry.documentOverflow <= 1, `${target.name} document overflowed by ${geometry.documentOverflow}px.`);
-    assert.ok(geometry.transcriptOverflow <= 1, `${target.name} transcript overflowed by ${geometry.transcriptOverflow}px.`);
+    assert.ok(
+      geometry.transcriptOverflow <= 1,
+      `${target.name} transcript overflowed by ${geometry.transcriptOverflow}px: ${JSON.stringify(geometry.workOffenders)}.`,
+    );
     assert.ok(geometry.contentLeft >= -1, `${target.name} transcript escaped the left edge.`);
     assert.ok(geometry.contentRight <= geometry.viewportWidth + 1, `${target.name} transcript escaped the right edge.`);
     assert.ok(
@@ -123,7 +166,7 @@ function parseOptions(args) {
   const flags = new Set();
   for (let index = 0; index < args.length; index += 1) {
     const key = args[index];
-    if (key === '--generic') {
+    if (key === '--generic' || key === '--open-work') {
       flags.add(key);
       continue;
     }
@@ -141,6 +184,7 @@ function parseOptions(args) {
     conversationId,
     cwd: resolve(values.get('--cwd') ?? repositoryRoot),
     generic: flags.has('--generic'),
+    openWork: flags.has('--open-work'),
     httpBase: values.get('--http-base') ?? 'http://127.0.0.1:48123',
     outputDir: resolve(values.get('--output-dir') ?? '/tmp/remux-agent-live-viewer'),
     tokenFile: resolve(values.get('--token-file') ?? resolve(repositoryRoot, '.remux/auth-token')),

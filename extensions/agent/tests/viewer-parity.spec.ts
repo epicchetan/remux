@@ -82,7 +82,7 @@ test('loads oversized exact content only after an explicit viewer action', async
   await expect.poll(() => artifactRequestCount(page)).toBe(1);
 });
 
-test('loads work summaries and entry details only after disclosure', async ({ page }) => {
+test('loads semantic inference traces and child scopes only after disclosure', async ({ page }) => {
   await page.goto('/viewers/agent/');
   await page.getByRole('textbox', { name: 'Message', exact: true }).fill('Inspect work details');
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
@@ -90,59 +90,170 @@ test('loads work summaries and entry details only after disclosure', async ({ pa
 
   const workHeader = page.locator('.codex-work-header');
   await expect(workHeader).toHaveAttribute('aria-expanded', 'false');
-  expect(await transcriptRequestTypes(page)).not.toContain('workGroup');
+  expect(await transcriptRequestTypes(page)).not.toContain('executionScope');
   await workHeader.click();
-  const reasoning = page.locator('.agent-reasoning-disclosure');
-  await expect(reasoning.locator('> summary')).toContainText('Reasoning');
-  await expect(reasoning.locator('> summary')).toContainText('1 update');
-  await expect(page.getByText('Checking context.', { exact: true })).toBeHidden();
-  await reasoning.locator('> summary').click();
-  await expect(page.getByText('Checking context.', { exact: true })).toBeVisible();
-  await expect(page.getByText('Workspace reads')).toBeVisible();
-  expect(await transcriptRequestTypes(page)).toContain('workGroup');
-  expect(await transcriptRequestTypes(page)).not.toContain('workEntryDetail');
-  const readRow = page.getByRole('button', { name: /Read README\.md/u });
-  await readRow.click();
+  await expect(page.locator('.agent-commentary-block')).toContainText(
+    'Grounding the change in the current workspace.',
+  );
+  const reasoning = page.locator('.agent-reasoning-block');
+  await expect(reasoning.first()).toContainText('Checking context.');
+  const parentInference = page.locator('.agent-inference').first();
+  await expect(parentInference.locator(':scope > .agent-reasoning-block')).toHaveCount(1);
+  await expect(parentInference.locator(':scope > .agent-commentary-block')).toHaveCount(1);
+  const parentSurfaceOrder = await parentInference.locator(':scope > *').evaluateAll((elements) =>
+    elements.map((element) => element.classList.contains('agent-reasoning-block')
+      ? 'reasoning'
+      : element.classList.contains('agent-commentary-block')
+        ? 'commentary'
+        : element.classList.contains('agent-action-sequence')
+          ? 'actions'
+          : 'unknown'));
+  expect(parentSurfaceOrder).toEqual(['reasoning', 'commentary', 'actions']);
+  await expect(parentInference.locator(':scope > .agent-commentary-block')).toHaveCSS(
+    'font-weight',
+    '400',
+  );
+  await expect(reasoning.first().locator('.codex-md-inline-strong')).toHaveCSS(
+    'font-weight',
+    '400',
+  );
+  const parentActions = page.getByRole('button', { name: /Edited index\.ts · Read 1 file/u });
+  await expect(parentActions).toBeVisible();
+  expect(await transcriptRequestTypes(page)).toContain('executionScope');
+  expect((await transcriptRequestTypes(page) as string[])
+    .filter((type) => type === 'executionScope')).toHaveLength(1);
+
+  const focusedUnit = page.getByRole('button', { name: /Verify the focused seam/u });
+  await expect(focusedUnit).toBeVisible();
+  expect(await focusedUnit.locator(':scope > span').evaluateAll((elements) =>
+    elements.map((element) => element.className))).toEqual([
+    'agent-work-unit-state',
+    'agent-work-unit-copy',
+    'agent-work-unit-chevron',
+  ]);
+  await expect(page.locator('.codex-work-separator')).toHaveCount(1);
+  await expect(page.locator('.agent-work-unit')).toHaveCSS('border-left-width', '0px');
+  await expect(reasoning.first()).toHaveCSS('border-left-width', '0px');
+  await focusedUnit.hover();
+  await expect(focusedUnit).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
+  await focusedUnit.click();
+  await expect(page.getByText('Assignment', { exact: true })).toBeVisible();
+  await expect(page.getByText('The exact contract and implementation agree.')).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Verified' })).toBeVisible();
+  await expect(page.getByText('Handoff', { exact: true })).toBeVisible();
+  await expect(page.getByText('Record the focused seam as verified.')).toBeVisible();
+  expect((await transcriptRequestTypes(page) as string[])
+    .filter((type) => type === 'executionScope')).toHaveLength(2);
+  expect(await transcriptRequestTypes(page)).not.toContain('operationDetail');
+  const childReasoning = reasoning.filter({ hasText: 'Compared the implementation with its contract.' });
+  await expect(childReasoning).toContainText(
+    'Compared the implementation with its contract.',
+  );
+  const childActions = page.getByRole('button', { name: /Ran 1 command/u });
+  await childActions.click();
+  const childTool = page.locator('.agent-tool-call').filter({ hasText: 'bash' });
+  await expect(childTool).toHaveCSS('border-left-width', '0px');
+  await expect(page.locator('.agent-work-unit-assignment')).toHaveCSS('border-bottom-width', '0px');
+  await expect(page.locator('.agent-work-unit-outcome')).toHaveCSS('border-top-width', '0px');
+  await childTool.locator('> button').click();
+  await expect(childTool).toContainText('1 test passed');
+  expect(await transcriptRequestTypes(page)).toContain('operationDetail');
+
+  await parentActions.click();
+  const readRow = page.locator('.agent-tool-call').filter({ hasText: 'workspace.read' });
+  await readRow.locator('> button').click();
   await expect(page.getByText('Read the workspace overview before editing.')).toBeVisible();
   await expect(page.getByText(/Fixture file output/u)).toBeVisible();
-  expect(await transcriptRequestTypes(page)).toContain('workEntryDetail');
 
-  await page.getByRole('button', { name: /src\/index\.ts/u }).click();
-  await expect(page.locator('.codex-diff-line-added')).toContainText('+export const value = 1;');
+  const editRow = page.locator('.agent-tool-call').filter({ hasText: 'workspace.edit' });
+  await editRow.locator('> button').click();
+  await expect(editRow).toContainText('+export const value = 1;');
+
+  const workContainment = await page.evaluate(() => {
+    const scroller = document.querySelector<HTMLElement>('[data-testid="agent-transcript-scroll"]');
+    const content = document.querySelector<HTMLElement>('[data-testid="agent-transcript-content"]');
+    if (!scroller || !content) throw new Error('Transcript containment elements are missing.');
+    const rail = content.getBoundingClientRect();
+    const offenders = Array.from(document.querySelectorAll<HTMLElement>([
+      '.agent-execution-scope',
+      '.agent-action-run',
+      '.agent-work-unit',
+      '.agent-tool-call',
+      '.agent-work-unit .codex-markdown',
+      '.agent-work-unit .codex-md-text-line',
+      '.agent-reasoning-block .codex-md-text-line',
+    ].join(','))).flatMap((element) => {
+      const rect = element.getBoundingClientRect();
+      const exceedsRail = rect.left < rail.left - 1 || rect.right > rail.right + 1;
+      const hasIntrinsicOverflow = element.scrollWidth > element.clientWidth + 1;
+      return exceedsRail || hasIntrinsicOverflow
+        ? [{
+            className: element.className,
+            clientWidth: element.clientWidth,
+            left: rect.left,
+            right: rect.right,
+            scrollWidth: element.scrollWidth,
+          }]
+        : [];
+    });
+    return {
+      offenders,
+      scrollerClientWidth: scroller.clientWidth,
+      scrollerScrollWidth: scroller.scrollWidth,
+    };
+  });
+  expect(workContainment.offenders).toEqual([]);
+  expect(workContainment.scrollerScrollWidth).toBeLessThanOrEqual(
+    workContainment.scrollerClientWidth + 1,
+  );
 
   await workHeader.click();
   await expect(workHeader).toHaveAttribute('aria-expanded', 'false');
 });
 
-test('recovers stale work pagination without mixing group revisions', async ({ page }) => {
+test('opens work traces while the running server still serves the prior inference shape', async ({ page }) => {
+  await page.goto('/viewers/agent/?fixtureLegacyInferenceTrace=1');
+  await page.getByRole('textbox', { name: 'Message', exact: true }).fill('Inspect work details');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect(page.getByText('The fixture stream completed.')).toBeVisible();
+
+  await page.locator('.codex-work-header').click();
+  const parentInference = page.locator('.agent-inference').first();
+  await expect(parentInference.locator(':scope > .agent-reasoning-block')).toContainText(
+    'Checking context.',
+  );
+  await expect(parentInference.locator(':scope > .agent-commentary-block')).toContainText(
+    'Grounding the change in the current workspace.',
+  );
+  await expect(page.getByRole('button', { name: /Edited index\.ts · Read 1 file/u })).toBeVisible();
+
+  await page.getByRole('button', { name: /Verify the focused seam/u }).click();
+  await expect(page.getByText('Compared the implementation with its contract.')).toBeVisible();
+  await expect(page.getByRole('button', { name: /Ran 1 command/u })).toBeVisible();
+  await expect(page.locator('.agent-work-unit-outcome .codex-markdown strong').first()).toHaveCSS(
+    'text-transform',
+    'none',
+  );
+  await expect(page.getByRole('button', { name: 'Send message', exact: true })).toBeVisible();
+});
+
+test('refreshes an open execution scope as one semantic revision', async ({ page }) => {
   await page.goto('/viewers/agent/');
   await page.getByRole('textbox', { name: 'Message', exact: true }).fill('Create paged work');
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
   await expect(page.getByText('The fixture stream completed.')).toBeVisible();
-  await page.evaluate(() => (window as any).__agentFixture.populateLatestWorkGroup(205));
-
   await page.locator('.codex-work-header').click();
-  const activityRows = page.locator('.codex-work-group[data-group-type="activity"] .codex-work-row');
-  await expect(activityRows).toHaveCount(200);
-  await page.evaluate(() => (window as any).__agentFixture.staleNextWorkPage());
-  await page.getByRole('button', { name: 'Load more' }).click();
-  const failure = page.locator('.codex-work-error');
-  await expect(failure).toContainText('Work changed while the next page was loading.');
-  await expect(activityRows).toHaveCount(200);
-
-  await failure.getByRole('button', { name: 'Retry' }).click();
-  await expect(failure).toHaveCount(0);
-  await page.getByRole('button', { name: 'Load more' }).click();
-  await expect(activityRows).toHaveCount(205);
-  expect(await activityRows.evaluateAll((rows) =>
-    new Set(rows.map((row) => row.textContent)).size)).toBe(205);
-  const continuationRequests = await page.evaluate(() => (window as any).__agentFixture.requestLog
-    .filter((entry: { method: string }) => entry.method === 'remux/agent/transcript/resources/read')
-    .flatMap((entry: { summary: string }) => JSON.parse(entry.summary))
-    .filter((request: any) => request.type === 'workGroup' && request.cursor));
-  expect(continuationRequests.length).toBeGreaterThanOrEqual(2);
-  expect(continuationRequests.every((request: any) =>
-    !/^\d+$/.test(request.cursor) && request.knownRevision === undefined)).toBe(true);
+  await expect(page.locator('.agent-inference')).toHaveCount(1);
+  const readsBefore = (await transcriptRequestTypes(page) as string[])
+    .filter((type) => type === 'executionScope').length;
+  await page.evaluate(() => (window as any).__agentFixture.reviseLatestExecutionScope());
+  await expect(page.locator('.agent-inference')).toHaveCount(2);
+  await expect(page.getByText('Validated the refreshed execution-scope revision.', { exact: true }).first())
+    .toBeVisible();
+  const readsAfter = (await transcriptRequestTypes(page) as string[])
+    .filter((type) => type === 'executionScope').length;
+  expect(readsAfter).toBeGreaterThan(readsBefore);
+  await expect(page.locator('.agent-inference').filter({ hasText: 'Checking context.' })).toHaveCount(1);
 });
 
 test('pages only after a user scroll and preserves the mounted row anchor', async ({ page }) => {

@@ -37,6 +37,7 @@ import { useAgentResources } from './app/useAgentResources.ts';
 import { readInitialTarget, useAgentNavigation } from './app/useAgentNavigation.ts';
 import { useConversationActions } from './app/useConversationActions.ts';
 import { AgentTranscript } from './transcript/index.ts';
+import { ThreadView } from './thread/ThreadView.tsx';
 import { getTranscriptResourceState } from './transcript/resourceStore.ts';
 import {
   requestTranscriptTurnScroll,
@@ -52,6 +53,7 @@ export function App() {
   );
   const [draft, setDraft] = useState<AgentNewChatDraft | null>(() =>
     initialTarget.kind === 'draft' ? initialDraft(initialTarget.id) : null);
+  const [mainView, setMainView] = useState<'chat' | 'thread'>('chat');
   useEffect(() => {
     if (initialTarget.kind === 'conversation' && initialTarget.focusTurnId) {
       requestTranscriptTurnScroll(initialTarget.id, initialTarget.focusTurnId);
@@ -125,6 +127,10 @@ export function App() {
     activeDraftIdRef.current = activeDraftId;
     draftRef.current = draft;
   }, [activeConversationId, activeDraftId, draft]);
+
+  useEffect(() => {
+    setMainView('chat');
+  }, [activeConversationId, activeDraftId]);
 
   const restoreComposerSnapshot = useCallback((snapshot: ReturnType<typeof createEmptyComposerSnapshot>) => {
     composerRestorePendingRef.current = snapshot.contentKey;
@@ -338,8 +344,9 @@ export function App() {
         onStartNewChat={() => startNewChat()}
       />
       <section className="remux-main-pane" ref={mainPaneRef} style={mainPaneStyle}>
-        <div className="remux-transcript-slot">
-          {conversation ? <AgentTranscript conversationId={conversation.id} /> : (
+        <div className="remux-transcript-slot" data-main-view={mainView}>
+          <div aria-hidden={mainView === 'thread'} className="agent-chat-view">
+            {conversation ? <AgentTranscript conversationId={conversation.id} /> : (
             <div className="remux-new-chat-empty">
               <div className="remux-new-chat-empty-card">
                 <div className="remux-new-chat-empty-title">
@@ -352,13 +359,22 @@ export function App() {
                 </div>
               </div>
             </div>
-          )}
+            )}
+          </div>
+          {mainView === 'thread' && conversation ? (
+            <ThreadView
+              conversationId={conversation.id}
+              latestTurnId={conversation.latestTurnId}
+              versionHint={contextInspector?.threadVersionId ?? null}
+            />
+          ) : null}
         </div>
         <div className="remux-bottom-bar-slot" ref={bottomBarSlotRef}>
           <ComposerContent
             conversation={conversation}
             contextInspector={contextInspector}
             conversationSelected={Boolean(activeConversationId)}
+            mainView={mainView}
             onInterrupt={interrupt}
             onEdit={(target, input, setPhase) => branchMessage('edit', target, input, setPhase)}
             onFork={(target, input, setPhase) => branchMessage('fork', target, input, setPhase)}
@@ -367,6 +383,7 @@ export function App() {
               : Promise.resolve()}
             onSend={send}
             onSignOut={() => void runAuth(() => agentCommands.logout())}
+            onToggleThread={() => setMainView((current) => current === 'chat' ? 'thread' : 'chat')}
             runtimeError={error ?? conversation?.error ?? null}
             queue={queue}
           />

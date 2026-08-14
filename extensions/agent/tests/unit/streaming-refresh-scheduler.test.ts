@@ -12,22 +12,21 @@ import {
 test('partitions structural and cadence-limited transcript invalidations', () => {
   const streaming = transcriptInvalidation('runtimeEvent', false);
   const structural = transcriptInvalidation('sendAccepted', true);
-  const group: AgentResourceInvalidation = {
-    type: 'workGroup',
-    key: 'workGroup:conversation:turn:segment:group',
+  const scope: AgentResourceInvalidation = {
+    type: 'executionScope',
+    key: 'executionScope:conversation:turn:scope',
     conversationId: 'conversation',
     turnId: 'turn',
-    segmentId: 'segment',
-    groupId: 'group',
+    scopeId: 'scope',
     reason: 'runtimeEvent',
     affectsLayout: true,
     basisSequence: 1,
   };
 
   assert.deepEqual(
-    partitionStreamingTranscriptInvalidations([streaming, structural, group]),
+    partitionStreamingTranscriptInvalidations([streaming, structural, scope]),
     {
-      immediateInvalidations: [structural, group],
+      immediateInvalidations: [structural, scope],
       streamingInvalidations: [streaming],
     },
   );
@@ -47,6 +46,23 @@ test('accepts only basis-fenced transcript invalidations', () => {
     invalidations: [unfenced],
     serverGeneration: 'generation-v2',
   }).invalidations, []);
+});
+
+test('accepts durable execution-scope invalidations', () => {
+  const invalidation: AgentResourceInvalidation = {
+    type: 'executionScope',
+    key: 'executionScope:conversation:turn:scope',
+    conversationId: 'conversation',
+    turnId: 'turn',
+    scopeId: 'scope',
+    reason: 'runtimeEvent',
+    affectsLayout: true,
+    basisSequence: 7,
+  };
+  assert.deepEqual(parseAgentInvalidationEnvelope({
+    invalidations: [invalidation],
+    serverGeneration: 'generation-v2',
+  }).invalidations, [invalidation]);
 });
 
 test('publishes the leading refresh immediately and coalesces latest revisions', async () => {

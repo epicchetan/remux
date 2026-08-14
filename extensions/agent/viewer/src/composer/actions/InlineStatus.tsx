@@ -2,7 +2,6 @@ import type { ContextInspectorValue, ConversationValue } from '../../../../share
 import { reasoningLabel, resolveModel } from '../config/modelSelection.ts';
 import { useComposerStore } from '../store.ts';
 import { ContextArtifactButton } from './ContextArtifactButton.tsx';
-import { ThreadCanvasButton } from './ThreadCanvasButton.tsx';
 
 export function ComposerInlineStatus({
   conversation,
@@ -27,11 +26,6 @@ export function ComposerInlineStatus({
       </div>
       {conversation ? (
         <div className="remux-composer-status-actions">
-          <ThreadCanvasButton
-            conversationId={conversation.id}
-            latestTurnId={conversation.latestTurnId}
-            versionHint={contextInspector?.threadVersionId ?? null}
-          />
           {contextInspector ? <ContextInspector value={contextInspector} /> : null}
         </div>
       ) : null}

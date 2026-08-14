@@ -53,6 +53,7 @@ import type {
   DurableContentRef,
   DurableContextBoundarySnapshot,
   DurableInferenceContext,
+  DurableInferenceFinalization,
   DurableQueuedTurn,
   DurableResourceProjection,
   DurableTranscriptAction,
@@ -61,6 +62,7 @@ import type {
   DurableTranscriptProjectionAction,
   DurableTranscriptWindow,
   DurableTranscriptWindowProjection,
+  DurableToolCallMutation,
   DurableTurnErrorCode,
   DurableTurnHandle,
   DurableTurnStatus,
@@ -155,7 +157,6 @@ export class AgentStateStore extends ThreadState implements AgentStore {
       await store.validateArtifactMetadata();
       store.orphanArtifactPaths = await store.findArtifactOrphans();
       await store.recoverInterruptedTurns();
-      await store.rebuildHistorySearchIndex();
       await store.rebuildConversationResources();
       return store;
     } catch (error) {
@@ -306,7 +307,11 @@ export class AgentStateStore extends ThreadState implements AgentStore {
 
   async appendAssistantCheckpoint(
     handle: DurableTurnHandle,
-    checkpoint: { textDelta: string; reasoningDelta: string },
+    checkpoint: {
+      textDelta: string;
+      reasoningDelta: string;
+      textPhase?: 'commentary' | 'final_answer';
+    },
   ) {
     this.assertOpen();
     if (!checkpoint.textDelta && !checkpoint.reasoningDelta) return Promise.resolve(null);
@@ -321,6 +326,7 @@ export class AgentStateStore extends ThreadState implements AgentStore {
       payload = {
         reasoning: reasoningArtifact.ref,
         text: textArtifact.ref,
+        ...(checkpoint.textPhase ? { textPhase: checkpoint.textPhase } : {}),
       };
     }
     return this.enqueueWrite(() => this.storage.transaction(() => {
@@ -350,7 +356,13 @@ export class AgentStateStore extends ThreadState implements AgentStore {
       });
       this.insertArtifact(textArtifact?.artifact ?? null, sequence);
       this.insertArtifact(reasoningArtifact?.artifact ?? null, sequence);
-      if (scope.kind === 'work_unit') return null;
+      if (scope.kind === 'work_unit') {
+        return {
+          basisSequence: sequence,
+          createdAt: recordedAt,
+          itemId: null,
+        } satisfies DurableTranscriptMutation;
+      }
       const existing = this.storage.database.prepare(`
         SELECT item_id, value_json
         FROM transcript_items
@@ -367,13 +379,14 @@ export class AgentStateStore extends ThreadState implements AgentStore {
             summaryText: '',
             textByteLength: 0,
           };
-      const summary = appendAssistantSummary(prior, checkpoint.textDelta);
+      const visibleText = checkpoint.textPhase === 'commentary' ? '' : checkpoint.textDelta;
+      const summary = appendAssistantSummary(prior, visibleText);
       const value = canonicalJson({
         reasoningByteLength:
           prior.reasoningByteLength + Buffer.byteLength(checkpoint.reasoningDelta, 'utf8'),
         summaryPendingSpace: summary.pendingSpace,
         summaryText: summary.text,
-        textByteLength: prior.textByteLength + Buffer.byteLength(checkpoint.textDelta, 'utf8'),
+        textByteLength: prior.textByteLength + Buffer.byteLength(visibleText, 'utf8'),
         version: 2,
       });
       let itemId: string;
@@ -403,12 +416,6 @@ export class AgentStateStore extends ThreadState implements AgentStore {
       this.storage.database.prepare(`
         UPDATE conversations SET updated_at = ? WHERE conversation_id = ?
       `).run(recordedAt, handle.conversationId);
-      this.refreshConversationResources(handle.conversationId, sequence, {
-        role: 'assistant',
-        text: summary.text,
-        sequence,
-        turnId: handle.turnId,
-      });
       return {
         basisSequence: sequence,
         createdAt: recordedAt,
@@ -419,33 +426,74 @@ export class AgentStateStore extends ThreadState implements AgentStore {
 
   async recordToolStarted(
     handle: DurableTurnHandle,
-    input: { callId: string; name: string; args: unknown },
+    input: { callId: string; name: string; args: unknown; sourceInferenceId?: string },
   ) {
     this.assertOpen();
     const args = await this.prepareJson(input.args);
     return this.enqueueWrite(() => this.storage.transaction(() => {
       this.assertRunningHandle(handle);
       const scope = this.scopeIdentity(handle.scopeId);
-      const duplicateEvent = this.storage.database.prepare(`
-        SELECT 1 FROM events
-        WHERE scope_id = ? AND type = 'tool.called'
-          AND json_extract(payload_json, '$.callId') = ?
-      `).get(handle.scopeId, input.callId);
-      if (duplicateEvent) return null;
+      const duplicateOperation = this.storage.database.prepare(`
+        SELECT operation_id, source_inference_id, kind
+        FROM operations WHERE scope_id = ? AND call_id = ?
+      `).get(handle.scopeId, input.callId) as {
+        operation_id: string;
+        source_inference_id: string | null;
+        kind: string;
+      } | undefined;
+      if (duplicateOperation) {
+        if (
+          duplicateOperation.source_inference_id !== (input.sourceInferenceId ?? null) ||
+          duplicateOperation.kind !== 'tool.call'
+        ) throw new Error(`Tool call ${input.callId} conflicts with its durable source inference.`);
+        return null;
+      }
+      if (input.sourceInferenceId) {
+        const sourceInference = this.storage.database.prepare(`
+          SELECT 1 FROM inferences WHERE inference_id = ? AND scope_id = ?
+        `).get(input.sourceInferenceId, handle.scopeId);
+        if (!sourceInference) throw new Error(`Tool call ${input.callId} has no durable source inference.`);
+      }
       const duplicate = scope.kind === 'turn' ? this.findToolItem(handle.turnId, input.callId) : null;
       if (duplicate) return null;
+      const operationId = this.nextId('operation');
       const recordedAt = safeTimestamp(this.now());
       const sequence = this.insertEvent({
         ...handle,
         eventId: this.nextId('event'),
+        operationId,
         type: 'tool.called',
         actor: 'model',
         visibility: scope.kind === 'turn' ? 'transcript' : 'internal',
-        payload: { args: args.ref, callId: input.callId, name: input.name },
+        payload: {
+          args: args.ref,
+          callId: input.callId,
+          name: input.name,
+          operationId,
+          sourceInferenceId: input.sourceInferenceId ?? null,
+        },
         artifactHash: artifactHash(args.ref),
         createdAt: recordedAt,
       });
       this.insertArtifact(args.artifact, sequence);
+      this.storage.database.prepare(`
+        INSERT INTO operations (
+          operation_id, project_id, conversation_id, turn_id, scope_id,
+          source_inference_id, call_id, kind, arguments_hash, state,
+          accepted_sequence, terminal_sequence, result_artifact_hash, value_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'tool.call', ?, 'running', ?, NULL, NULL, ?)
+      `).run(
+        operationId,
+        handle.projectId,
+        handle.conversationId,
+        handle.turnId,
+        handle.scopeId,
+        input.sourceInferenceId ?? null,
+        input.callId,
+        args.sha256,
+        sequence,
+        canonicalJson({ args: args.ref, callId: input.callId, name: input.name, result: null }),
+      );
       this.indexHistoryText({
         ref: `history://tool/${encodeURIComponent(input.callId)}`,
         projectId: handle.projectId,
@@ -455,7 +503,17 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         sequence,
         text: `${input.name}\n${args.text}`,
       });
-      if (scope.kind === 'work_unit') return null;
+      if (scope.kind === 'work_unit') {
+        return {
+          basisSequence: sequence,
+          createdAt: recordedAt,
+          itemId: null,
+          callId: input.callId,
+          name: input.name,
+          operationId,
+          sourceInferenceId: input.sourceInferenceId ?? null,
+        } satisfies DurableToolCallMutation;
+      }
       const itemId = this.nextId('item');
       this.storage.database.prepare(`
         INSERT INTO transcript_items (
@@ -477,7 +535,11 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         itemId,
         detailText: projected.text,
         ...(projected.content ? { detailContent: projected.content } : {}),
-      } satisfies DurableTranscriptMutation;
+        callId: input.callId,
+        name: input.name,
+        operationId,
+        sourceInferenceId: input.sourceInferenceId ?? null,
+      } satisfies DurableToolCallMutation;
     }));
   }
 
@@ -490,23 +552,22 @@ export class AgentStateStore extends ThreadState implements AgentStore {
     const mutation = await this.enqueueWrite(() => this.storage.transaction(() => {
       this.assertRunningHandle(handle);
       const scope = this.scopeIdentity(handle.scopeId);
+      const operation = this.storage.database.prepare(`
+        SELECT operation_id, state, value_json
+        FROM operations WHERE scope_id = ? AND call_id = ? AND kind = 'tool.call'
+      `).get(handle.scopeId, input.callId) as {
+        operation_id: string;
+        state: string;
+        value_json: string;
+      } | undefined;
+      if (!operation) throw new Error(`Tool call ${input.callId} was not durably started.`);
+      if (operation.state !== 'running') return null;
       if (scope.kind === 'work_unit') {
-        const started = this.storage.database.prepare(`
-          SELECT 1 FROM events
-          WHERE scope_id = ? AND type = 'tool.called'
-            AND json_extract(payload_json, '$.callId') = ?
-        `).get(handle.scopeId, input.callId);
-        if (!started) throw new Error(`Tool call ${input.callId} was not durably started.`);
-        const completed = this.storage.database.prepare(`
-          SELECT 1 FROM events
-          WHERE scope_id = ? AND type = 'tool.completed'
-            AND json_extract(payload_json, '$.callId') = ?
-        `).get(handle.scopeId, input.callId);
-        if (completed) return null;
         const recordedAt = safeTimestamp(this.now());
         const sequence = this.insertEvent({
           ...handle,
           eventId: this.nextId('event'),
+          operationId: operation.operation_id,
           type: 'tool.completed',
           actor: 'harness',
           visibility: 'internal',
@@ -515,7 +576,23 @@ export class AgentStateStore extends ThreadState implements AgentStore {
           createdAt: recordedAt,
         });
         this.insertArtifact(result.artifact, sequence);
-        return null;
+        const value = JSON.parse(operation.value_json) as Record<string, CanonicalJsonValue>;
+        this.storage.database.prepare(`
+          UPDATE operations
+          SET state = ?, terminal_sequence = ?, result_artifact_hash = ?, value_json = ?
+          WHERE operation_id = ? AND state = 'running'
+        `).run(
+          input.isError ? 'failed' : 'completed',
+          sequence,
+          artifactHash(result.ref),
+          canonicalJson({ ...value, isError: input.isError, result: result.ref }),
+          operation.operation_id,
+        );
+        return {
+          basisSequence: sequence,
+          createdAt: recordedAt,
+          itemId: null,
+        } satisfies DurableTranscriptMutation;
       }
       const item = this.findToolItem(handle.turnId, input.callId);
       if (!item) throw new Error(`Tool call ${input.callId} was not durably started.`);
@@ -524,6 +601,7 @@ export class AgentStateStore extends ThreadState implements AgentStore {
       const sequence = this.insertEvent({
         ...handle,
         eventId: this.nextId('event'),
+        operationId: operation.operation_id,
         type: 'tool.completed',
         actor: 'harness',
         visibility: 'transcript',
@@ -532,6 +610,18 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         createdAt: recordedAt,
       });
       this.insertArtifact(result.artifact, sequence);
+      const operationValue = JSON.parse(operation.value_json) as Record<string, CanonicalJsonValue>;
+      this.storage.database.prepare(`
+        UPDATE operations
+        SET state = ?, terminal_sequence = ?, result_artifact_hash = ?, value_json = ?
+        WHERE operation_id = ? AND state = 'running'
+      `).run(
+        input.isError ? 'failed' : 'completed',
+        sequence,
+        artifactHash(result.ref),
+        canonicalJson({ ...operationValue, isError: input.isError, result: result.ref }),
+        operation.operation_id,
+      );
       const value = JSON.parse(item.value_json) as Record<string, CanonicalJsonValue>;
       this.storage.database.prepare(`
         UPDATE transcript_items
@@ -853,9 +943,12 @@ export class AgentStateStore extends ThreadState implements AgentStore {
 
   async recordProviderItem(handle: DurableTurnHandle, message: AssistantMessage) {
     this.assertOpen();
-    const [raw, inspectable] = await Promise.all([
+    const visible = visibleAssistantContent(message);
+    const [raw, inspectable, reasoningSummary, assistantText] = await Promise.all([
       this.prepareProviderJson(message),
       this.prepareProviderJson(sanitizeProviderPayload(message)),
+      visible.reasoning ? this.prepareText(visible.reasoning, true) : null,
+      visible.text ? this.prepareText(visible.text, true) : null,
     ]);
     if (!raw.artifact || !inspectable.artifact) {
       throw new Error('Provider items must be stored as durable artifacts.');
@@ -890,12 +983,16 @@ export class AgentStateStore extends ThreadState implements AgentStore {
           ordinal,
           providerItemId,
           rawArtifactHash: rawArtifact.hash,
+          reasoningSummaryArtifactHash: reasoningSummary?.artifact?.hash ?? null,
+          assistantTextArtifactHash: assistantText?.artifact?.hash ?? null,
         },
         artifactHash: inspectableArtifact.hash,
         createdAt: recordedAt,
       });
       this.insertArtifact(rawArtifact, sequence, 'private');
       this.insertArtifact(inspectableArtifact, sequence, 'inspectable');
+      this.insertArtifact(reasoningSummary?.artifact ?? null, sequence, 'inspectable');
+      this.insertArtifact(assistantText?.artifact ?? null, sequence, 'inspectable');
       this.storage.database.prepare(`
         INSERT INTO provider_items (
           provider_item_id, inference_id, project_id, conversation_id, turn_id, scope_id, ordinal, item_type,
@@ -918,15 +1015,247 @@ export class AgentStateStore extends ThreadState implements AgentStore {
       this.storage.database.prepare(`
         UPDATE inferences
         SET reported_input_tokens = ?, reported_output_tokens = ?,
-            reported_cache_read_tokens = ?
+            reported_cache_read_tokens = ?, reasoning_summary_artifact_hash = ?,
+            assistant_text_artifact_hash = ?, assistant_text_phase = ?
         WHERE inference_id = ?
       `).run(
         safeNonnegativeInteger(message.usage.input, 'provider input tokens'),
         safeNonnegativeInteger(message.usage.output, 'provider output tokens'),
         safeNonnegativeInteger(message.usage.cacheRead, 'provider cache-read tokens'),
+        reasoningSummary?.artifact?.hash ?? null,
+        assistantText?.artifact?.hash ?? null,
+        visible.phase,
         inference.inference_id,
       );
       return { providerItemId, inferenceId: inference.inference_id, ordinal, sequence };
+    }));
+  }
+
+  async finalizeInference(
+    handle: DurableTurnHandle,
+    input: {
+      state: 'completed' | 'failed' | 'interrupted';
+      providerMessage: AssistantMessage;
+      calls: Array<{ callId: string; name: string; args: unknown }>;
+    },
+  ): Promise<DurableInferenceFinalization> {
+    this.assertOpen();
+    if (new Set(input.calls.map((call) => call.callId)).size !== input.calls.length) {
+      throw new Error('A provider inference returned duplicate tool-call identities.');
+    }
+    const visible = visibleAssistantContent(input.providerMessage);
+    const [raw, inspectable, reasoningSummary, assistantText, preparedCalls] = await Promise.all([
+      this.prepareProviderJson(input.providerMessage),
+      this.prepareProviderJson(sanitizeProviderPayload(input.providerMessage)),
+      visible.reasoning ? this.prepareText(visible.reasoning, true) : null,
+      visible.text ? this.prepareText(visible.text, true) : null,
+      Promise.all(input.calls.map(async (call) => ({
+        ...call,
+        prepared: await this.prepareJson(call.args),
+      }))),
+    ]);
+    if (!raw.artifact || !inspectable.artifact) {
+      throw new Error('Provider items must be stored as durable artifacts.');
+    }
+    const rawArtifact = raw.artifact;
+    const inspectableArtifact = inspectable.artifact;
+    const providerItemId = this.nextId('provider-item');
+    return this.enqueueWrite(() => this.storage.transaction(() => {
+      this.assertRunningHandle(handle);
+      const scope = this.scopeIdentity(handle.scopeId);
+      const inference = this.storage.database.prepare(`
+        SELECT inference_id FROM inferences
+        WHERE scope_id = ? AND state = 'running'
+        ORDER BY ordinal DESC LIMIT 1
+      `).get(handle.scopeId) as { inference_id: string } | undefined;
+      if (!inference) throw new Error('A provider item has no running inference fence.');
+      const ordinalRow = this.storage.database.prepare(`
+        SELECT COALESCE(MAX(ordinal), -1) + 1 AS ordinal
+        FROM provider_items WHERE inference_id = ?
+      `).get(inference.inference_id) as { ordinal: number };
+      const ordinal = safeInteger(ordinalRow.ordinal, 'provider item ordinal');
+      const recordedAt = safeTimestamp(this.now());
+      const providerSequence = this.insertEvent({
+        ...handle,
+        eventId: this.nextId('event'),
+        type: 'provider.item.recorded',
+        actor: 'harness',
+        visibility: 'internal',
+        payload: {
+          inferenceId: inference.inference_id,
+          inspectableArtifactHash: inspectableArtifact.hash,
+          itemType: 'assistant_message',
+          ordinal,
+          providerItemId,
+          rawArtifactHash: rawArtifact.hash,
+          reasoningSummaryArtifactHash: reasoningSummary?.artifact?.hash ?? null,
+          assistantTextArtifactHash: assistantText?.artifact?.hash ?? null,
+        },
+        artifactHash: inspectableArtifact.hash,
+        createdAt: recordedAt,
+      });
+      this.insertArtifact(rawArtifact, providerSequence, 'private');
+      this.insertArtifact(inspectableArtifact, providerSequence, 'inspectable');
+      this.insertArtifact(reasoningSummary?.artifact ?? null, providerSequence, 'inspectable');
+      this.insertArtifact(assistantText?.artifact ?? null, providerSequence, 'inspectable');
+      this.storage.database.prepare(`
+        INSERT INTO provider_items (
+          provider_item_id, inference_id, project_id, conversation_id, turn_id, scope_id, ordinal, item_type,
+          upstream_item_id, raw_artifact_hash, inspectable_artifact_hash,
+          created_sequence, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'assistant_message', NULL, ?, ?, ?, ?)
+      `).run(
+        providerItemId,
+        inference.inference_id,
+        handle.projectId,
+        handle.conversationId,
+        handle.turnId,
+        handle.scopeId,
+        ordinal,
+        rawArtifact.hash,
+        inspectableArtifact.hash,
+        providerSequence,
+        recordedAt,
+      );
+      this.storage.database.prepare(`
+        UPDATE inferences
+        SET reported_input_tokens = ?, reported_output_tokens = ?,
+            reported_cache_read_tokens = ?, reasoning_summary_artifact_hash = ?,
+            assistant_text_artifact_hash = ?, assistant_text_phase = ?
+        WHERE inference_id = ?
+      `).run(
+        safeNonnegativeInteger(input.providerMessage.usage.input, 'provider input tokens'),
+        safeNonnegativeInteger(input.providerMessage.usage.output, 'provider output tokens'),
+        safeNonnegativeInteger(input.providerMessage.usage.cacheRead, 'provider cache-read tokens'),
+        reasoningSummary?.artifact?.hash ?? null,
+        assistantText?.artifact?.hash ?? null,
+        visible.phase,
+        inference.inference_id,
+      );
+
+      const calls: DurableToolCallMutation[] = [];
+      for (const call of preparedCalls) {
+        const duplicate = this.storage.database.prepare(`
+          SELECT 1 FROM operations WHERE scope_id = ? AND call_id = ?
+        `).get(handle.scopeId, call.callId);
+        if (duplicate) throw new Error(`Tool call ${call.callId} was already durably recorded.`);
+        if (scope.kind === 'turn' && this.findToolItem(handle.turnId, call.callId)) {
+          throw new Error(`Tool call ${call.callId} already has a transcript identity.`);
+        }
+        const operationId = this.nextId('operation');
+        const sequence = this.insertEvent({
+          ...handle,
+          eventId: this.nextId('event'),
+          operationId,
+          type: 'tool.called',
+          actor: 'model',
+          visibility: scope.kind === 'turn' ? 'transcript' : 'internal',
+          payload: {
+            args: call.prepared.ref,
+            callId: call.callId,
+            name: call.name,
+            operationId,
+            sourceInferenceId: inference.inference_id,
+          },
+          artifactHash: artifactHash(call.prepared.ref),
+          createdAt: recordedAt,
+        });
+        this.insertArtifact(call.prepared.artifact, sequence);
+        this.storage.database.prepare(`
+          INSERT INTO operations (
+            operation_id, project_id, conversation_id, turn_id, scope_id,
+            source_inference_id, call_id, kind, arguments_hash, state,
+            accepted_sequence, terminal_sequence, result_artifact_hash, value_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'tool.call', ?, 'running', ?, NULL, NULL, ?)
+        `).run(
+          operationId,
+          handle.projectId,
+          handle.conversationId,
+          handle.turnId,
+          handle.scopeId,
+          inference.inference_id,
+          call.callId,
+          call.prepared.sha256,
+          sequence,
+          canonicalJson({
+            args: call.prepared.ref,
+            callId: call.callId,
+            name: call.name,
+            result: null,
+          }),
+        );
+        this.indexHistoryText({
+          ref: `history://tool/${encodeURIComponent(call.callId)}`,
+          projectId: handle.projectId,
+          conversationId: handle.conversationId,
+          turnId: handle.turnId,
+          kind: `operation:${call.name}`,
+          sequence,
+          text: `${call.name}\n${call.prepared.text}`,
+        });
+        let itemId: string | null = null;
+        let detailText: string | undefined;
+        let detailContent: AgentTextContentReference | undefined;
+        if (scope.kind === 'turn') {
+          itemId = this.nextId('item');
+          this.storage.database.prepare(`
+            INSERT INTO transcript_items (
+              item_id, conversation_id, turn_id, first_sequence,
+              last_sequence, kind, status, value_json
+            ) VALUES (?, ?, ?, ?, ?, 'tool', 'running', ?)
+          `).run(
+            itemId,
+            handle.conversationId,
+            handle.turnId,
+            sequence,
+            sequence,
+            canonicalJson({
+              args: call.prepared.ref,
+              callId: call.callId,
+              name: call.name,
+              result: null,
+            }),
+          );
+          const projected = preparedTextProjection(call.prepared, MAX_VISIBLE_TEXT_BYTES / 2);
+          detailText = projected.text;
+          detailContent = projected.content;
+        }
+        calls.push({
+          basisSequence: sequence,
+          createdAt: recordedAt,
+          itemId,
+          ...(detailText === undefined ? {} : { detailText }),
+          ...(detailContent ? { detailContent } : {}),
+          callId: call.callId,
+          name: call.name,
+          operationId,
+          sourceInferenceId: inference.inference_id,
+        });
+      }
+
+      const terminalSequence = this.insertEvent({
+        ...handle,
+        eventId: this.nextId('event'),
+        type: `inference.${input.state}`,
+        actor: 'harness',
+        visibility: 'internal',
+        payload: {
+          inferenceId: inference.inference_id,
+          reportedInputTokens: input.providerMessage.usage.input,
+          reportedOutputTokens: input.providerMessage.usage.output,
+        },
+        createdAt: recordedAt,
+      });
+      this.storage.database.prepare(`
+        UPDATE inferences
+        SET state = ?, terminal_sequence = ?
+        WHERE inference_id = ? AND state = 'running'
+      `).run(input.state, terminalSequence, inference.inference_id);
+      return {
+        inferenceId: inference.inference_id,
+        sequence: terminalSequence,
+        calls,
+      } satisfies DurableInferenceFinalization;
     }));
   }
 
@@ -1162,6 +1491,13 @@ export class AgentStateStore extends ThreadState implements AgentStore {
     }
     const actions: DurableTranscriptProjectionAction[] = [];
     const startedAtByTurn = new Map<string, number>();
+    const assistantPhaseByInference = new Map((this.storage.database.prepare(`
+      SELECT inference_id, assistant_text_phase
+      FROM inferences WHERE conversation_id = ?
+    `).all(conversationId) as Array<{
+      inference_id: string;
+      assistant_text_phase: 'commentary' | 'final_answer' | null;
+    }>).map((row) => [row.inference_id, row.assistant_text_phase]));
     const supersededInferenceIds = new Set(events.flatMap((event) => {
       if (event.type !== 'inference.superseded' || !event.payload ||
         typeof event.payload !== 'object' || Array.isArray(event.payload)) return [];
@@ -1189,6 +1525,7 @@ export class AgentStateStore extends ThreadState implements AgentStore {
             'user transcript item',
           ),
           turnId: event.turnId,
+          scopeId: requiredString(event.scopeId, 'root scope id'),
           clientMessageId: requiredString(payload.clientMessageId, 'clientMessageId'),
           text: await this.readTextRef(payload.content),
           ...(parts.length > 0 ? { parts } : {}),
@@ -1196,6 +1533,9 @@ export class AgentStateStore extends ThreadState implements AgentStore {
       } else if (event.type === 'assistant.checkpoint' && event.visibility === 'transcript') {
         const inferenceId = payload.inferenceId;
         if (typeof inferenceId === 'string' && supersededInferenceIds.has(inferenceId)) continue;
+        const textPhase = typeof inferenceId === 'string'
+          ? assistantPhaseByInference.get(inferenceId) ?? checkpointTextPhase(payload)
+          : checkpointTextPhase(payload);
         actions.push({
           type: 'assistant',
           sequence: event.sequence,
@@ -1205,9 +1545,11 @@ export class AgentStateStore extends ThreadState implements AgentStore {
             'assistant transcript item',
           ),
           turnId: event.turnId,
-          textDelta: payload.textDelta === undefined
-            ? await this.readTextRef(payload.text)
-            : requiredString(payload.textDelta, 'textDelta'),
+          textDelta: textPhase === 'commentary'
+            ? ''
+            : payload.textDelta === undefined
+              ? await this.readTextRef(payload.text)
+              : requiredString(payload.textDelta, 'textDelta'),
           reasoningDelta: payload.reasoningDelta === undefined
             ? await this.readTextRef(payload.reasoning)
             : requiredString(payload.reasoningDelta, 'reasoningDelta'),
@@ -1257,6 +1599,8 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         });
       }
     }
+    actions.push(...await this.readWorkUnitProjectionActions(conversationId));
+    actions.sort((left, right) => left.sequence - right.sequence);
     return {
       basisSequence: events.at(-1)!.sequence,
       actions,
@@ -1345,8 +1689,6 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         }
       }
     }
-    const requestedDetailIds = new Set(params.requests.flatMap((request) =>
-      request.type === 'workEntryDetail' ? [request.rowId] : []));
     const finalizedAssistantTurns = new Set<string>();
     const ordered: Array<{
       orderSequence: number;
@@ -1417,6 +1759,7 @@ export class AgentStateStore extends ThreadState implements AgentStore {
             createdAt: event.createdAt,
             itemId: item.item_id,
             turnId: event.turnId,
+            scopeId: requiredString(event.scopeId, 'root scope id'),
             clientMessageId: requiredString(payload.clientMessageId, 'clientMessageId'),
             text: projected.text,
             ...(parts.length > 0 ? { parts } : {}),
@@ -1455,9 +1798,8 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         const item = toolItemsByCall.get(`${event.turnId}\0${callId}`);
         if (!item) throw new Error('Durable tool transcript item is missing.');
         const value = JSON.parse(item.value_json) as Record<string, CanonicalJsonValue>;
-        const shouldReadDetail = requestedDetailIds.has(item.item_id);
         const argsRef = value.args ?? payload.args;
-        const args = await this.projectToolValue(argsRef, shouldReadDetail);
+        const args = await this.projectToolValue(argsRef, false);
         ordered.push({
           orderSequence: event.sequence,
           priority: 0,
@@ -1479,8 +1821,7 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         const item = toolItemsByCall.get(`${event.turnId}\0${callId}`);
         if (!item) throw new Error('Durable tool transcript item is missing.');
         const value = JSON.parse(item.value_json) as Record<string, CanonicalJsonValue>;
-        const shouldReadDetail = requestedDetailIds.has(item.item_id);
-        const result = await this.projectToolValue(value.result ?? payload.result, shouldReadDetail);
+        const result = await this.projectToolValue(value.result ?? payload.result, false);
         ordered.push({
           orderSequence: event.sequence,
           priority: 0,
@@ -1515,6 +1856,12 @@ export class AgentStateStore extends ThreadState implements AgentStore {
           },
         });
       }
+    }
+    for (const action of await this.readWorkUnitProjectionActions(
+      params.conversationId,
+      selectedTurnIds,
+    )) {
+      ordered.push({ orderSequence: action.sequence, priority: 0, action });
     }
     ordered.sort((left, right) =>
       left.orderSequence - right.orderSequence || left.priority - right.priority);
@@ -2409,6 +2756,18 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         basis_sequence: number;
         value_json: string;
       } | undefined;
+      if (!row && key === 'conversation-list') {
+        const conversationCount = this.storage.database.prepare(`
+          SELECT COUNT(*) AS count FROM conversations
+        `).get() as { count: number };
+        if (conversationCount.count === 0) {
+          return {
+            key,
+            basisSequence: 0,
+            value: renderConversationList([]),
+          };
+        }
+      }
       if (!row) return null;
       return {
         key: row.resource_key as DurableResourceProjection['key'],
@@ -3309,8 +3668,10 @@ export class AgentStateStore extends ThreadState implements AgentStore {
     `).get(turnId) as { item_id: string } | undefined;
     if (!item) return;
     const rows = this.storage.database.prepare(`
-      SELECT e.payload_json
+      SELECT e.payload_json, i.assistant_text_phase
       FROM events e
+      LEFT JOIN inferences i
+        ON i.inference_id = json_extract(e.payload_json, '$.inferenceId')
       WHERE e.turn_id = ? AND e.visibility = 'transcript'
         AND e.type = 'assistant.checkpoint'
         AND NOT EXISTS (
@@ -3321,7 +3682,10 @@ export class AgentStateStore extends ThreadState implements AgentStore {
                 json_extract(e.payload_json, '$.inferenceId')
         )
       ORDER BY e.sequence
-    `).all(turnId) as Array<{ payload_json: string }>;
+    `).all(turnId) as Array<{
+      payload_json: string;
+      assistant_text_phase: 'commentary' | 'final_answer' | null;
+    }>;
     let summaryText = '';
     let summaryPendingSpace = false;
     let textByteLength = 0;
@@ -3334,10 +3698,12 @@ export class AgentStateStore extends ThreadState implements AgentStore {
       const reasoningDelta = payload.reasoningDelta === undefined
         ? await this.readTextRef(payload.reasoning)
         : requiredString(payload.reasoningDelta, 'reasoningDelta');
-      const summary = appendAssistantSummary({ summaryText, summaryPendingSpace }, textDelta);
+      const textPhase = row.assistant_text_phase ?? checkpointTextPhase(payload);
+      const visibleText = textPhase === 'commentary' ? '' : textDelta;
+      const summary = appendAssistantSummary({ summaryText, summaryPendingSpace }, visibleText);
       summaryText = summary.text;
       summaryPendingSpace = summary.pendingSpace;
-      textByteLength += Buffer.byteLength(textDelta, 'utf8');
+      textByteLength += Buffer.byteLength(visibleText, 'utf8');
       reasoningByteLength += Buffer.byteLength(reasoningDelta, 'utf8');
     }
     await this.enqueueWrite(() => this.storage.database.prepare(`
@@ -3361,8 +3727,10 @@ export class AgentStateStore extends ThreadState implements AgentStore {
     `).get(turnId) as { item_id: string } | undefined;
     if (!item) return null;
     const rows = this.storage.database.prepare(`
-      SELECT sequence, type, payload_json
+      SELECT e.sequence, e.type, e.payload_json, i.assistant_text_phase
       FROM events e
+      LEFT JOIN inferences i
+        ON i.inference_id = json_extract(e.payload_json, '$.inferenceId')
       WHERE e.turn_id = ? AND e.visibility = 'transcript'
         AND e.type IN ('assistant.checkpoint', 'tool.called')
         AND (
@@ -3379,6 +3747,7 @@ export class AgentStateStore extends ThreadState implements AgentStore {
       sequence: number;
       type: string;
       payload_json: string;
+      assistant_text_phase: 'commentary' | 'final_answer' | null;
     }>;
     const textParts: string[] = [];
     let textFirstSequence: number | null = null;
@@ -3401,7 +3770,8 @@ export class AgentStateStore extends ThreadState implements AgentStore {
       const reasoningDelta = payload.reasoningDelta === undefined
         ? await this.readTextRef(payload.reasoning)
         : requiredString(payload.reasoningDelta, 'reasoningDelta');
-      if (textDelta) {
+      const textPhase = row.assistant_text_phase ?? checkpointTextPhase(payload);
+      if (textDelta && textPhase !== 'commentary') {
         textFirstSequence ??= safeInteger(row.sequence, 'assistant text first sequence');
         textLastSequence = safeInteger(row.sequence, 'assistant text last sequence');
         textParts.push(textDelta);
@@ -3653,7 +4023,18 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         UPDATE conversations SET state = 'idle', updated_at = ?
         WHERE conversation_id = ?
       `).run(recordedAt, handle.conversationId);
-      this.refreshConversationResources(handle.conversationId, sequence);
+      this.refreshConversationResources(
+        handle.conversationId,
+        sequence,
+        assistant?.text
+          ? {
+              role: 'assistant',
+              text: assistant.text,
+              sequence,
+              turnId: handle.turnId,
+            }
+          : undefined,
+      );
       return {
         basisSequence: sequence,
         createdAt: recordedAt,
@@ -3932,123 +4313,6 @@ export class AgentStateStore extends ThreadState implements AgentStore {
     );
   }
 
-  private async rebuildHistorySearchIndex() {
-    type SearchEntry = Parameters<AgentStateStore['indexHistoryText']>[0];
-    const entries: SearchEntry[] = [];
-    const messageRows = this.storage.database.prepare(`
-      SELECT message_id, project_id, conversation_id, turn_id,
-             role, state, content_artifact_hash, created_sequence
-      FROM messages
-      WHERE visibility = 'transcript' AND role IN ('user', 'assistant')
-      ORDER BY created_sequence
-    `).all() as Array<{
-      message_id: string; project_id: string; conversation_id: string;
-      turn_id: string; role: 'user' | 'assistant'; state: string;
-      content_artifact_hash: string; created_sequence: number;
-    }>;
-    for (const row of messageRows) {
-      const value = JSON.parse(await this.readArtifactTextByHash(row.content_artifact_hash)) as {
-        text?: unknown;
-      };
-      if (typeof value.text !== 'string' || value.text.length === 0) continue;
-      entries.push({
-        ref: row.role === 'assistant'
-          ? `history://turn/${encodeURIComponent(row.turn_id)}#assistant`
-          : `history://message/${encodeURIComponent(row.message_id)}`,
-        projectId: row.project_id,
-        conversationId: row.conversation_id,
-        turnId: row.turn_id,
-        kind: row.role === 'assistant'
-          ? row.state === 'completed' ? 'assistant-outcome' : 'assistant-response'
-          : 'user-message',
-        sequence: safeInteger(row.created_sequence, 'History message sequence'),
-        text: value.text,
-      });
-    }
-
-    const documentRows = this.storage.database.prepare(`
-      SELECT v.version_id, d.project_id, d.conversation_id,
-             v.based_on_turn_id, v.content_artifact_hash, v.created_sequence
-      FROM document_versions v
-      JOIN state_documents d ON d.document_id = v.document_id
-      ORDER BY v.created_sequence, v.version_id
-    `).all() as Array<{
-      version_id: string; project_id: string; conversation_id: string;
-      based_on_turn_id: string | null; content_artifact_hash: string; created_sequence: number;
-    }>;
-    for (const row of documentRows) {
-      entries.push({
-        ref: `history://document-version/${encodeURIComponent(row.version_id)}`,
-        projectId: row.project_id,
-        conversationId: row.conversation_id,
-        turnId: row.based_on_turn_id,
-        kind: 'thread-document',
-        sequence: safeInteger(row.created_sequence, 'History document sequence'),
-        text: await this.readArtifactTextByHash(row.content_artifact_hash),
-      });
-    }
-
-    const scopeRows = this.storage.database.prepare(`
-      SELECT scope_id, project_id, conversation_id, turn_id,
-             objective_json, created_sequence, terminal_sequence, result_artifact_hash
-      FROM execution_scopes WHERE kind = 'work_unit'
-      ORDER BY created_sequence, scope_id
-    `).all() as Array<{
-      scope_id: string; project_id: string; conversation_id: string;
-      turn_id: string; objective_json: string; created_sequence: number;
-      terminal_sequence: number | null; result_artifact_hash: string | null;
-    }>;
-    for (const row of scopeRows) {
-      const objective = JSON.parse(row.objective_json) as { objective?: unknown };
-      if (typeof objective.objective === 'string' && objective.objective.length > 0) {
-        entries.push({
-          ref: `history://artifact/${row.result_artifact_hash}`,
-          projectId: row.project_id,
-          conversationId: row.conversation_id,
-          turnId: row.turn_id,
-          kind: 'work-unit-objective',
-          sequence: safeInteger(row.created_sequence, 'History work-unit sequence'),
-          text: objective.objective,
-        });
-      }
-      if (row.result_artifact_hash && row.terminal_sequence !== null) {
-        entries.push({
-          ref: `history://scope/${encodeURIComponent(row.scope_id)}`,
-          projectId: row.project_id,
-          conversationId: row.conversation_id,
-          turnId: row.turn_id,
-          kind: 'work-unit-result',
-          sequence: safeInteger(row.terminal_sequence, 'History work-unit result sequence'),
-          text: await this.readArtifactTextByHash(row.result_artifact_hash),
-        });
-      }
-    }
-
-    const toolEvents = (await this.readEvents({})).filter((event) => event.type === 'tool.called');
-    for (const event of toolEvents) {
-      if (!event.turnId || !event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
-        continue;
-      }
-      const payload = event.payload as Record<string, CanonicalJsonValue>;
-      const callId = requiredString(payload.callId, 'History tool call id');
-      const name = requiredString(payload.name, 'History tool name');
-      entries.push({
-        ref: `history://tool/${encodeURIComponent(callId)}`,
-        projectId: event.projectId,
-        conversationId: event.conversationId,
-        turnId: event.turnId,
-        kind: `operation:${name}`,
-        sequence: event.sequence,
-        text: `${name}\n${canonicalJson(await this.readJsonRef(payload.args))}`,
-      });
-    }
-
-    this.storage.transaction(() => {
-      this.storage.database.exec('DELETE FROM history_search_index');
-      for (const entry of entries) this.indexHistoryText(entry);
-    });
-  }
-
   private async attachActiveProviderMessages(
     messages: readonly LogicalContextMessage[],
     scopeIds: readonly string[],
@@ -4249,6 +4513,7 @@ function stripTranscriptProjectionMetadata(
       return {
         type: action.type,
         turnId: action.turnId,
+        scopeId: action.scopeId,
         clientMessageId: action.clientMessageId,
         text: action.text,
       };
@@ -4274,6 +4539,26 @@ function stripTranscriptProjectionMetadata(
         callId: action.callId,
         result: action.result,
         isError: action.isError,
+      };
+    case 'work-unit-start':
+      return {
+        type: action.type,
+        turnId: action.turnId,
+        scopeId: action.scopeId,
+        objective: action.objective,
+        doneWhen: action.doneWhen,
+        resourceCount: action.resourceCount,
+        operationCount: action.operationCount,
+      };
+    case 'work-unit-finish':
+      return {
+        type: action.type,
+        turnId: action.turnId,
+        scopeId: action.scopeId,
+        status: action.status,
+        resultPreview: action.resultPreview,
+        resourceCount: action.resourceCount,
+        ...(action.durationMs === undefined ? {} : { durationMs: action.durationMs }),
       };
     case 'terminal':
       return {
@@ -4672,6 +4957,40 @@ function sanitizeProviderPayload(value: unknown, key = ''): unknown {
     ]));
   }
   return value;
+}
+
+function visibleAssistantContent(message: AssistantMessage) {
+  let text = '';
+  const reasoning: string[] = [];
+  const phases = new Set<'commentary' | 'final_answer'>();
+  for (const block of message.content) {
+    if (block.type === 'text') {
+      text += block.text;
+      if (block.textSignature) {
+        try {
+          const signature = JSON.parse(block.textSignature) as { phase?: unknown };
+          if (signature.phase === 'commentary' || signature.phase === 'final_answer') {
+            phases.add(signature.phase);
+          }
+        } catch {
+          // Legacy/plain provider signatures carry identity but no phase.
+        }
+      }
+    }
+    else if (block.type === 'thinking' && block.thinking) reasoning.push(block.thinking);
+  }
+  const phase = phases.size === 1
+    ? [...phases][0]!
+    : message.stopReason === 'stop'
+      ? 'final_answer' as const
+      : 'commentary' as const;
+  return { text, phase, reasoning: reasoning.join('\n\n') };
+}
+
+function checkpointTextPhase(
+  payload: Record<string, CanonicalJsonValue>,
+): 'commentary' | 'final_answer' {
+  return payload.textPhase === 'commentary' ? 'commentary' : 'final_answer';
 }
 
 function requiredTurnStatus(value: CanonicalJsonValue | undefined): DurableTurnStatus {

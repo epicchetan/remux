@@ -44,7 +44,6 @@ type TranscriptDisclosureReconcileOptions = {
 };
 
 type TranscriptLayoutResourceAdapter = {
-  ensureWorkResources: (input: { segmentId: string; turnId: string }) => Promise<void>;
   getSnapshot: () => TranscriptLayoutResourceSnapshot;
   loadActiveTranscript: () => Promise<void>;
 };
@@ -246,8 +245,6 @@ const actions: Pick<
         openWorkByKey,
       },
     });
-
-    void resourceAdapter?.ensureWorkResources({ segmentId: input.segmentId, turnId: input.turnId });
   },
 };
 

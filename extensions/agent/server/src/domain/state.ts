@@ -93,6 +93,19 @@ export type DurableTranscriptMutation = {
   outputContent?: AgentTextContentReference;
 };
 
+export type DurableToolCallMutation = DurableTranscriptMutation & {
+  callId: string;
+  name: string;
+  operationId: string;
+  sourceInferenceId: string | null;
+};
+
+export type DurableInferenceFinalization = {
+  inferenceId: string;
+  sequence: number;
+  calls: DurableToolCallMutation[];
+};
+
 export type DurableTurnStatus = 'completed' | 'failed' | 'interrupted' | 'interrupted_by_restart';
 export type DurableTurnErrorCode = 'provider_error' | 'runtime_error' | 'storage_error';
 
@@ -100,6 +113,7 @@ export type DurableTranscriptAction =
   | {
       type: 'turn';
       turnId: string;
+      scopeId: string;
       clientMessageId: string;
       text: string;
       parts?: AgentUserMessagePart[];
@@ -130,6 +144,24 @@ export type DurableTranscriptAction =
       isError: boolean;
       outputText?: string;
       outputContent?: AgentTextContentReference;
+    }
+  | {
+      type: 'work-unit-start';
+      turnId: string;
+      scopeId: string;
+      objective: string;
+      doneWhen: string[];
+      resourceCount: number;
+      operationCount: number;
+    }
+  | {
+      type: 'work-unit-finish';
+      turnId: string;
+      scopeId: string;
+      status: WorkUnitReturnStatus | 'abandoned';
+      resultPreview: string | null;
+      resourceCount: number;
+      durationMs?: number;
     }
   | {
       type: 'terminal';

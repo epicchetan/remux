@@ -7,6 +7,14 @@ import { join } from 'node:path';
 import { AgentServer } from '../../server/src/agent-server.ts';
 import { OpenAICodexProvider } from '../../server/src/providers/openai-codex/openai-codex-provider.ts';
 import { AgentStateStore } from '../../server/src/storage/agent-state-store.ts';
+import {
+  AGENT_TRANSCRIPT_PROJECTION_VERSION,
+  AGENT_TRANSCRIPT_PROTOCOL_VERSION,
+  type AgentExecutionScopeResource,
+  type AgentOperationDetailResource,
+  type AgentTurnRenderFrame,
+  type AgentWorkRenderSegment,
+} from '../../shared/transcript.ts';
 
 const FIRST_SENTINEL = 'REMUX_REAL_PROVIDER_RECOVERY_OK';
 const SECOND_SENTINEL = 'REMUX_REAL_PROVIDER_REUSE_OK';
@@ -126,6 +134,31 @@ try {
   assert.equal(resumedParentTransport.connectionsReused, 1);
   assert.equal(resumedParentTransport.connectionsCreated, 0);
 
+  const trace = await readSemanticTrace(server, created.conversationId, third.turnId);
+  const workUnitStart = trace.root.inferences
+    .flatMap((inference) => inference.actionGroup?.calls ?? [])
+    .find(({ name }) => name === 'work_unit_start');
+  assert.ok(workUnitStart, 'The parent semantic trace is missing work_unit_start.');
+  assert.equal(workUnitStart.childScopeId, entered.scopeId);
+  assert.ok(
+    [...trace.root.inferences, ...trace.child.inferences]
+      .some((inference) => Boolean(inference.reasoning?.text.trim())),
+    'The real provider returned no visible reasoning summary in the semantic trace.',
+  );
+  const childCalls = trace.child.inferences
+    .flatMap((inference) => inference.actionGroup?.calls ?? [])
+    .map(({ name }) => name);
+  assert.ok(childCalls.includes('bash'));
+  assert.ok(childCalls.includes('work_unit_finish'));
+  const workUnitStartDetail = await readOperationDetail(
+    server,
+    created.conversationId,
+    third.turnId,
+    trace.root.scopeId,
+    workUnitStart.id,
+  );
+  assert.match(workUnitStartDetail.detail ?? '', /Verify child provider isolation/u);
+
   process.stdout.write(`${JSON.stringify({
     ok: true,
     modelId: MODEL_ID,
@@ -147,12 +180,96 @@ try {
       providerCalls: childTransports.length,
       parentResumedAfterSequence: returned.sequence,
     },
+    semanticTrace: {
+      childCalls,
+      childInferences: trace.child.inferences.length,
+      reasoningSummaries: [...trace.root.inferences, ...trace.child.inferences]
+        .filter((inference) => Boolean(inference.reasoning?.text.trim())).length,
+      commentaryUpdates: [...trace.root.inferences, ...trace.child.inferences]
+        .filter((inference) => Boolean(inference.commentary?.text.trim())).length,
+      rootInferences: trace.root.inferences.length,
+    },
     sentinels: [FIRST_SENTINEL, SECOND_SENTINEL, THIRD_SENTINEL],
   }, null, 2)}\n`);
 } finally {
   await server.close();
   await repository.close();
   await rm(dataRoot, { recursive: true, force: true });
+}
+
+async function readSemanticTrace(
+  runtime: AgentServer,
+  conversationId: string,
+  turnId: string,
+) {
+  const sync = await runtime.handle('remux/agent/transcript/resources/read', {
+    conversationId,
+    requests: [{
+      type: 'transcriptSync',
+      protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
+      projectionVersion: AGENT_TRANSCRIPT_PROJECTION_VERSION,
+      window: { kind: 'around', turnId, before: 0, after: 0 },
+    }],
+  }) as { resources: Array<{ status: string; value?: { turns: unknown[] } }> };
+  const syncEntry = sync.resources[0];
+  assert.equal(syncEntry?.status, 'ok');
+  const turn = syncEntry?.value?.turns[0] as {
+    status: string;
+    frame?: AgentTurnRenderFrame;
+  } | undefined;
+  assert.equal(turn?.status, 'ok');
+  const work = turn?.frame?.segments.find((segment): segment is AgentWorkRenderSegment =>
+    segment.type === 'work');
+  assert.ok(work, 'The live turn is missing its root Work segment.');
+  const root = await readExecutionScope(runtime, conversationId, turnId, work.scopeId);
+  const childCall = root.inferences
+    .flatMap((inference) => inference.actionGroup?.calls ?? [])
+    .find(({ childScopeId }) => childScopeId !== null);
+  assert.ok(childCall?.childScopeId, 'The parent trace is missing its linked child scope.');
+  const child = await readExecutionScope(runtime, conversationId, turnId, childCall.childScopeId);
+  return { child, root };
+}
+
+async function readExecutionScope(
+  runtime: AgentServer,
+  conversationId: string,
+  turnId: string,
+  scopeId: string,
+) {
+  const response = await runtime.handle('remux/agent/transcript/resources/read', {
+    conversationId,
+    requests: [{
+      type: 'executionScope',
+      protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
+      turnId,
+      scopeId,
+    }],
+  }) as { resources: Array<{ status: string; value?: AgentExecutionScopeResource }> };
+  assert.equal(response.resources[0]?.status, 'ok');
+  assert.ok(response.resources[0]?.value);
+  return response.resources[0].value;
+}
+
+async function readOperationDetail(
+  runtime: AgentServer,
+  conversationId: string,
+  turnId: string,
+  scopeId: string,
+  operationId: string,
+) {
+  const response = await runtime.handle('remux/agent/transcript/resources/read', {
+    conversationId,
+    requests: [{
+      type: 'operationDetail',
+      protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
+      turnId,
+      scopeId,
+      operationId,
+    }],
+  }) as { resources: Array<{ status: string; value?: AgentOperationDetailResource }> };
+  assert.equal(response.resources[0]?.status, 'ok');
+  assert.ok(response.resources[0]?.value);
+  return response.resources[0].value;
 }
 
 async function sendAndWait(

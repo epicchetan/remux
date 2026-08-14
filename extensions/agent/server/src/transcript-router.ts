@@ -4,6 +4,11 @@ import type {
   AgentTranscriptSyncRequest,
   AgentTranscriptSyncResource,
 } from '../../shared/transcript.ts';
+import {
+  executionScopeResourceKey,
+  MAX_TRANSCRIPT_RESPONSE_BYTES,
+  operationDetailResourceKey,
+} from '../../shared/transcript.ts';
 import type { AgentStore } from './agent-store.ts';
 import { createReplayedTranscriptProjector } from './transcript-replay.ts';
 import {
@@ -44,7 +49,10 @@ export class TranscriptProjectionRouter {
       const basisSequence = await this.store.readTranscriptBasis(options.params.conversationId);
       if (basisSequence === null) throw new TranscriptProtocolError(-32015, 'Conversation not found.');
       options.liveProjector.fenceBasis(basisSequence);
-      return options.liveProjector.read(options.params, options.serverGeneration);
+      return this.withDurableScopeResources(
+        options.params,
+        options.liveProjector.read(options.params, options.serverGeneration),
+      );
     }
 
     const basisSequence = await this.store.readTranscriptBasis(options.params.conversationId);
@@ -84,7 +92,42 @@ export class TranscriptProjectionRouter {
     const normalized = normalizeTranscriptWindows(options.params, entry.windows);
     const response = entry.projector.read(normalized, options.serverGeneration);
     applyDurableWindows(response, entry.windows);
-    return response;
+    return this.withDurableScopeResources(options.params, response);
+  }
+
+  private async withDurableScopeResources(
+    params: AgentTranscriptResourcesReadParams,
+    response: AgentTranscriptResourcesReadResult,
+  ) {
+    const resources = [...response.resources];
+    for (const [requestIndex, request] of params.requests.entries()) {
+      if (
+        request.type !== 'executionScope' &&
+        request.type !== 'operationDetail'
+      ) continue;
+      const key = request.type === 'executionScope'
+          ? executionScopeResourceKey(params.conversationId, request.turnId, request.scopeId)
+          : operationDetailResourceKey(
+              params.conversationId,
+              request.turnId,
+              request.scopeId,
+              request.operationId,
+            );
+      const value = request.type === 'executionScope'
+          ? await this.store.readExecutionScopeTranscriptResource(params.conversationId, request)
+          : await this.store.readOperationDetailTranscriptResource(params.conversationId, request);
+      resources[requestIndex] = !value
+        ? { requestIndex, key, status: 'missing' }
+        : request.knownRevision === value.revision &&
+            (request.type !== 'executionScope' || request.window === undefined)
+          ? { requestIndex, key, status: 'notModified', revision: value.revision }
+          : { requestIndex, key, status: 'ok', revision: value.revision, value };
+    }
+    const hydrated = { ...response, resources };
+    if (Buffer.byteLength(JSON.stringify(hydrated), 'utf8') > MAX_TRANSCRIPT_RESPONSE_BYTES) {
+      throw new TranscriptProtocolError(-32018, 'Transcript response exceeds the 8 MiB limit.');
+    }
+    return hydrated;
   }
 
   clear() {
@@ -110,8 +153,7 @@ function projectionCacheKey(
 ) {
   const selection = params.requests.map((request) => {
     if (request.type === 'transcriptSync') return { type: request.type, window: request.window };
-    if (request.type === 'workGroup') return { type: request.type, turnId: request.turnId };
-    return { type: request.type, turnId: request.turnId, rowId: request.rowId };
+    return { type: request.type, turnId: request.turnId, scopeId: request.scopeId };
   });
   return [
     params.conversationId,

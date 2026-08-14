@@ -23,6 +23,7 @@ import type {
   ReasoningLevel,
 } from '../../../../shared/protocol.ts';
 import type {
+  AssistantTextPhase,
   ModelProvider,
   ModelSession,
   ModelSessionEventSink,
@@ -273,6 +274,7 @@ export class OpenAICodexProvider implements ModelProvider {
         await options.durability.beforeAssistantMessageEnd({
           inferenceState: assistantInferenceState(message.stopReason),
           text: content.text,
+          textPhase: assistantTextPhase(message),
           reasoning: content.reasoning,
           calls,
           providerMessage: message,
@@ -368,6 +370,8 @@ export class OpenAICodexProvider implements ModelProvider {
           throw error;
         }
       });
+      pi.on('before_provider_request', (event) =>
+        requestConciseReasoningSummary(event.payload));
       pi.on('message_end', async (event) => {
         if (event.message.role !== 'assistant') return;
         await ensureAssistantDurable(event.message);
@@ -457,6 +461,7 @@ export class OpenAICodexProvider implements ModelProvider {
         // hook ordering: no request may overtake the preceding provider
         // item's durable terminal boundary.
         await awaitProviderDurability();
+        if (options.reasoning !== 'off') assertConciseReasoningSummary(payload);
         const context = pendingContext;
         pendingContext = null;
         if (!context) {
@@ -714,7 +719,12 @@ function projectPiEvent(event: AgentSessionEvent, sink: ModelSessionEventSink) {
       return;
     case 'message_update':
       if (event.assistantMessageEvent.type === 'text_delta') {
-        sink({ type: 'assistant-text', delta: event.assistantMessageEvent.delta });
+        if (event.message.role !== 'assistant') return;
+        sink({
+          type: 'assistant-text',
+          delta: event.assistantMessageEvent.delta,
+          phase: streamingAssistantTextPhase(event.message),
+        });
       } else if (event.assistantMessageEvent.type === 'thinking_delta') {
         sink({ type: 'assistant-reasoning', delta: event.assistantMessageEvent.delta });
       }
@@ -759,6 +769,55 @@ function durableAssistantContent(
   // thinking blocks. Pi renders those summaries as Markdown paragraphs, so
   // preserve the same paragraph boundary when reconciling the final message.
   return { text, reasoning: reasoning.join('\n\n') };
+}
+
+function streamingAssistantTextPhase(message: AssistantMessage): AssistantTextPhase {
+  return message.stopReason === 'stop' ? 'final_answer' : 'commentary';
+}
+
+function assistantTextPhase(message: AssistantMessage): AssistantTextPhase {
+  const phases = new Set<AssistantTextPhase>(message.content.flatMap((block): AssistantTextPhase[] => {
+    if (block.type !== 'text' || !block.textSignature) return [];
+    try {
+      const value = JSON.parse(block.textSignature) as { phase?: unknown };
+      return value.phase === 'commentary' || value.phase === 'final_answer'
+        ? [value.phase]
+        : [];
+    } catch {
+      return [];
+    }
+  }));
+  if (phases.size === 1) return [...phases][0]!;
+  return streamingAssistantTextPhase(message);
+}
+
+export function requestConciseReasoningSummary(payload: unknown): unknown {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return payload;
+  const request = payload as Record<string, unknown>;
+  const reasoning = request.reasoning;
+  if (!reasoning || typeof reasoning !== 'object' || Array.isArray(reasoning)) return payload;
+  return {
+    ...request,
+    reasoning: {
+      ...reasoning,
+      summary: 'concise',
+    },
+  };
+}
+
+function assertConciseReasoningSummary(payload: unknown): void {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error('Provider request is missing the reasoning summary contract.');
+  }
+  const reasoning = (payload as Record<string, unknown>).reasoning;
+  if (
+    !reasoning ||
+    typeof reasoning !== 'object' ||
+    Array.isArray(reasoning) ||
+    (reasoning as Record<string, unknown>).summary !== 'concise'
+  ) {
+    throw new Error('Provider request must ask OpenAI for a concise reasoning summary.');
+  }
 }
 
 function assistantText(message: AssistantMessage) {

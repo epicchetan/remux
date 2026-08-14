@@ -89,16 +89,38 @@ export class FixtureProvider implements ModelProvider {
           for (const delta of ['Fixture ', 'response ', `for “${text}”.`]) {
             await delay(25, signal);
             response += delta;
-            options.onEvent({ type: 'assistant-text', delta });
+            options.onEvent({ type: 'assistant-text', delta, phase: 'final_answer' });
           }
           await options.durability.beforeAssistantMessageEnd({
             inferenceState: 'completed',
             text: response,
+            textPhase: 'final_answer',
             reasoning: '',
-            calls: [],
+            calls: [{
+              callId: 'fixture-read',
+              name: 'workspace.read',
+              args: { path: 'README.md' },
+            }],
             providerMessage: {
               role: 'assistant',
-              content: [{ type: 'text', text: response }],
+              content: [
+                {
+                  type: 'thinking',
+                  thinking: 'Inspecting the fixture workspace.',
+                  thinkingSignature: 'fixture-reasoning-signature',
+                },
+                {
+                  type: 'text',
+                  text: response,
+                  textSignature: JSON.stringify({ v: 1, id: 'fixture-response', phase: 'final_answer' }),
+                },
+                {
+                  type: 'toolCall',
+                  id: 'fixture-read',
+                  name: 'workspace.read',
+                  arguments: { path: 'README.md' },
+                },
+              ],
               api: 'openai-responses',
               provider: 'openai-codex',
               model: options.modelId,
@@ -110,7 +132,7 @@ export class FixtureProvider implements ModelProvider {
                 totalTokens: estimatedInputTokens + Math.max(1, Math.ceil(response.length / 4)),
                 cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
               },
-              stopReason: 'stop',
+              stopReason: 'toolUse',
               timestamp: Date.now(),
             },
           });

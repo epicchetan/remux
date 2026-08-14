@@ -1,5 +1,9 @@
 import { randomUUID } from 'node:crypto';
 
+import {
+  AGENT_TRANSCRIPT_PROJECTION_VERSION,
+  AGENT_TRANSCRIPT_PROTOCOL_VERSION,
+} from '../../shared/transcript.ts';
 import type {
   BenchmarkConversationTarget,
   BenchmarkTarget,
@@ -244,8 +248,8 @@ class AgentBenchmarkTarget implements BenchmarkConversationTarget {
       conversationId,
       requests: [{
         type: 'transcriptSync',
-        protocolVersion: 2,
-        projectionVersion: 'agent-turn-render-v2',
+        protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
+        projectionVersion: AGENT_TRANSCRIPT_PROJECTION_VERSION,
         window: { kind: 'tail', count: 40 },
       }],
     }, this.nextReadKey(`transcript:${conversationId}`)));

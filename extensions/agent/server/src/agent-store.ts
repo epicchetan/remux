@@ -13,6 +13,8 @@ import type {
   DurableArtifact,
   DurableContextBoundarySnapshot,
   DurableInferenceContext,
+  DurableInferenceFinalization,
+  DurableToolCallMutation,
   DurableQueuedTurn,
   PreparedWorkUnitReturn,
   PreparedWorkUnitEntry,
@@ -22,6 +24,7 @@ import type { AgentResourceKey } from '../../shared/protocol.ts';
 import type { ThreadCanvasValue } from '../../shared/protocol.ts';
 import type { TurnReadValue } from '../../shared/protocol.ts';
 import type { AssistantMessage } from '@earendil-works/pi-ai';
+import type { AssistantTextPhase } from './model-provider.ts';
 import type {
   HistoryOpenInput,
   HistoryOpenResult,
@@ -36,7 +39,13 @@ import type {
   WorkUnitReturnInput,
   WorkUnitReturnStatus,
 } from './domain/work.ts';
-import type { AgentTranscriptResourcesReadParams } from '../../shared/transcript.ts';
+import type {
+  AgentExecutionScopeRequest,
+  AgentExecutionScopeResource,
+  AgentOperationDetailRequest,
+  AgentOperationDetailResource,
+  AgentTranscriptResourcesReadParams,
+} from '../../shared/transcript.ts';
 
 export interface AgentStore {
   createConversation(params: CreateConversationParams): Promise<CreateConversationResult>;
@@ -50,12 +59,12 @@ export interface AgentStore {
   removeQueuedTurn(conversationId: string, operationId: string): Promise<boolean>;
   appendAssistantCheckpoint(
     handle: DurableTurnHandle,
-    checkpoint: { textDelta: string; reasoningDelta: string },
+    checkpoint: { textDelta: string; reasoningDelta: string; textPhase?: AssistantTextPhase },
   ): Promise<DurableTranscriptMutation | null>;
   recordToolStarted(
     handle: DurableTurnHandle,
-    input: { callId: string; name: string; args: unknown },
-  ): Promise<DurableTranscriptMutation | null>;
+    input: { callId: string; name: string; args: unknown; sourceInferenceId?: string },
+  ): Promise<DurableToolCallMutation | null>;
   recordToolFinished(
     handle: DurableTurnHandle,
     input: { callId: string; result: unknown; isError: boolean },
@@ -96,6 +105,14 @@ export interface AgentStore {
     },
   ): Promise<boolean>;
   recordProviderItem(handle: DurableTurnHandle, message: AssistantMessage): Promise<unknown>;
+  finalizeInference(
+    handle: DurableTurnHandle,
+    input: {
+      state: 'completed' | 'failed' | 'interrupted';
+      providerMessage: AssistantMessage;
+      calls: Array<{ callId: string; name: string; args: unknown }>;
+    },
+  ): Promise<DurableInferenceFinalization>;
   finishInference(
     handle: DurableTurnHandle,
     input: { state: 'completed' | 'failed' | 'interrupted' },
@@ -132,6 +149,14 @@ export interface AgentStore {
   readTranscriptWindowProjection(
     params: AgentTranscriptResourcesReadParams,
   ): Promise<DurableTranscriptWindowProjection | null>;
+  readExecutionScopeTranscriptResource(
+    conversationId: string,
+    request: AgentExecutionScopeRequest,
+  ): Promise<AgentExecutionScopeResource | null>;
+  readOperationDetailTranscriptResource(
+    conversationId: string,
+    request: AgentOperationDetailRequest,
+  ): Promise<AgentOperationDetailResource | null>;
   readResourceProjections(
     keys: readonly AgentResourceKey[],
   ): Promise<Array<DurableResourceProjection | null>>;
@@ -150,13 +175,6 @@ export interface AgentStore {
   readTurn(conversationId: string, turnId: string): Promise<TurnReadValue>;
   patchThread(handle: DurableTurnHandle, input: ThreadPatchInput): Promise<ThreadDocumentView>;
   replaceThread(handle: DurableTurnHandle, input: ThreadReplaceInput): Promise<ThreadDocumentView>;
-  enterWorkUnit(handle: DurableTurnHandle, input: WorkUnitEnterInput): Promise<{
-    handle: DurableTurnHandle;
-    parentScopeId: string;
-    objective: string;
-    doneWhen: string[];
-    resources: WorkUnitResourceView[];
-  }>;
   prepareWorkUnitEntry(
     handle: DurableTurnHandle,
     input: WorkUnitEnterInput,
@@ -164,12 +182,15 @@ export interface AgentStore {
   commitWorkUnitEntry(
     handle: DurableTurnHandle,
     prepared: PreparedWorkUnitEntry,
+    linkage: { parentOperationId: string; parentInferenceId: string },
   ): Promise<{
     handle: DurableTurnHandle;
     parentScopeId: string;
     objective: string;
     doneWhen: string[];
     resources: WorkUnitResourceView[];
+    transcriptSequence: number;
+    transcriptCreatedAt: number;
   }>;
   prepareWorkUnitReturn(
     handle: DurableTurnHandle,
@@ -186,6 +207,8 @@ export interface AgentStore {
     resources: WorkUnitResourceView[];
     resultRef: string;
     scopeId: string;
+    transcriptSequence: number;
+    transcriptCreatedAt: number;
   }>;
   returnWorkUnit(handle: DurableTurnHandle, input: WorkUnitReturnInput): Promise<{
     parentHandle: DurableTurnHandle;
@@ -195,5 +218,7 @@ export interface AgentStore {
     resources: WorkUnitResourceView[];
     resultRef: string;
     scopeId: string;
+    transcriptSequence: number;
+    transcriptCreatedAt: number;
   }>;
 }

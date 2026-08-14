@@ -9,20 +9,50 @@ export type AgentInvalidationEnvelope = {
   serverGeneration: string | null;
 };
 
-export function subscribeAgentResourceInvalidations(
-  onGenericInvalidation: (invalidations: AgentResourceInvalidation[]) => void,
-) {
-  return subscribeIpcEvents((events) => {
+type GenericInvalidationListener = (invalidations: AgentResourceInvalidation[]) => void;
+
+const genericListeners = new Set<GenericInvalidationListener>();
+const pendingGenericInvalidations = new Map<string, AgentResourceInvalidation>();
+let stopBridge: (() => void) | null = null;
+
+export function startAgentResourceInvalidationBridge() {
+  if (stopBridge) return stopBridge;
+  const unsubscribe = subscribeIpcEvents((events) => {
     const envelopes = events
       .filter((event) => event.method === AGENT_METHODS.resourcesInvalidated)
       .map((event) => parseAgentInvalidationEnvelope(event.params));
     for (const envelope of envelopes) {
       const invalidations = dedupeInvalidations(envelope.invalidations);
       if (invalidations.length === 0) continue;
-      onGenericInvalidation(invalidations.filter((value) => value.type === 'resource'));
+      const generic = invalidations.filter((value) => value.type === 'resource');
+      if (genericListeners.size === 0) {
+        for (const invalidation of generic) {
+          pendingGenericInvalidations.set(`${invalidation.type}:${invalidation.key}`, invalidation);
+        }
+      } else {
+        for (const listener of genericListeners) listener(generic);
+      }
       void invalidateTranscriptResources(invalidations, envelope.serverGeneration);
     }
   });
+  stopBridge = () => {
+    unsubscribe();
+    stopBridge = null;
+  };
+  return stopBridge;
+}
+
+export function subscribeAgentResourceInvalidations(
+  onGenericInvalidation: (invalidations: AgentResourceInvalidation[]) => void,
+) {
+  startAgentResourceInvalidationBridge();
+  genericListeners.add(onGenericInvalidation);
+  if (pendingGenericInvalidations.size > 0) {
+    const pending = [...pendingGenericInvalidations.values()];
+    pendingGenericInvalidations.clear();
+    onGenericInvalidation(pending);
+  }
+  return () => genericListeners.delete(onGenericInvalidation);
 }
 
 export function parseAgentInvalidationEnvelope(params: unknown): AgentInvalidationEnvelope {
@@ -78,16 +108,11 @@ function isAgentResourceInvalidation(value: unknown): value is AgentResourceInva
       typeof invalidation.affectsOrder === 'boolean' &&
       typeof invalidation.affectsLayout === 'boolean';
   }
-  if (
-    invalidation.type === 'workGroup' ||
-    invalidation.type === 'workEntryDetail'
-  ) {
+  if (invalidation.type === 'executionScope') {
     return typeof invalidation.turnId === 'string' &&
-      typeof invalidation.segmentId === 'string' &&
-      typeof invalidation.groupId === 'string' &&
+      typeof invalidation.scopeId === 'string' &&
       typeof invalidation.affectsLayout === 'boolean' &&
-      (invalidation.reason === 'runtimeEvent' || invalidation.reason === 'terminal') &&
-      (invalidation.type !== 'workEntryDetail' || typeof invalidation.rowId === 'string');
+      (invalidation.reason === 'runtimeEvent' || invalidation.reason === 'terminal');
   }
   return false;
 }

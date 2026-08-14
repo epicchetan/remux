@@ -2,8 +2,8 @@ import type { DatabaseSync } from 'node:sqlite';
 
 import { canonicalJson, canonicalJsonHash } from './canonical-json.ts';
 
-export const AGENT_STATE_SCHEMA_VERSION = 3;
-export const AGENT_STATE_SCHEMA_ID = 'agent-state-v3';
+export const AGENT_STATE_SCHEMA_VERSION = 4;
+export const AGENT_STATE_SCHEMA_ID = 'agent-state-v4';
 
 export const AGENT_STATE_TABLES = [
   'meta',
@@ -42,8 +42,8 @@ const EXPECTED_COLUMNS: Record<typeof AGENT_STATE_TABLES[number], string[]> = {
   ],
   execution_scopes: [
     'scope_id', 'project_id', 'conversation_id', 'turn_id', 'parent_scope_id',
-    'kind', 'objective_json', 'state', 'created_sequence', 'terminal_sequence',
-    'result_artifact_hash', 'created_at', 'updated_at',
+    'parent_operation_id', 'kind', 'objective_json', 'state', 'created_sequence',
+    'terminal_sequence', 'result_artifact_hash', 'created_at', 'updated_at',
   ],
   events: [
     'sequence', 'event_id', 'project_id', 'conversation_id', 'turn_id',
@@ -62,8 +62,8 @@ const EXPECTED_COLUMNS: Record<typeof AGENT_STATE_TABLES[number], string[]> = {
   resources: ['resource_key', 'basis_sequence', 'value_json', 'updated_at'],
   operations: [
     'operation_id', 'project_id', 'conversation_id', 'turn_id', 'scope_id',
-    'kind', 'arguments_hash', 'state', 'accepted_sequence', 'terminal_sequence',
-    'result_artifact_hash', 'value_json',
+    'source_inference_id', 'call_id', 'kind', 'arguments_hash', 'state',
+    'accepted_sequence', 'terminal_sequence', 'result_artifact_hash', 'value_json',
   ],
   artifacts: [
     'hash', 'byte_length', 'media_type', 'created_sequence', 'storage_path',
@@ -93,7 +93,9 @@ const EXPECTED_COLUMNS: Record<typeof AGENT_STATE_TABLES[number], string[]> = {
     'frame_id', 'ordinal', 'basis_sequence', 'state', 'request_mode',
     'dispatch_artifact_hash', 'input_hash', 'estimated_input_tokens',
     'reported_input_tokens', 'reported_output_tokens',
-    'reported_cache_read_tokens', 'started_sequence', 'terminal_sequence',
+    'reported_cache_read_tokens', 'reasoning_summary_artifact_hash',
+    'assistant_text_artifact_hash', 'assistant_text_phase', 'started_sequence',
+    'terminal_sequence',
   ],
   provider_items: [
     'provider_item_id', 'inference_id', 'project_id', 'conversation_id',
@@ -182,6 +184,7 @@ CREATE TABLE execution_scopes (
   conversation_id TEXT NOT NULL,
   turn_id TEXT NOT NULL,
   parent_scope_id TEXT,
+  parent_operation_id TEXT,
   kind TEXT NOT NULL CHECK (kind IN ('turn', 'work_unit')),
   objective_json TEXT NOT NULL CHECK (json_valid(objective_json)),
   state TEXT NOT NULL CHECK (state IN ('running', 'completed', 'failed', 'abandoned', 'interrupted')),
@@ -193,14 +196,18 @@ CREATE TABLE execution_scopes (
   UNIQUE (conversation_id, scope_id),
   UNIQUE (conversation_id, turn_id, scope_id),
   UNIQUE (project_id, conversation_id, turn_id, scope_id),
-  CHECK ((kind = 'turn' AND parent_scope_id IS NULL) OR
-         (kind = 'work_unit' AND parent_scope_id IS NOT NULL)),
+  UNIQUE (parent_operation_id),
+  CHECK ((kind = 'turn' AND parent_scope_id IS NULL AND parent_operation_id IS NULL) OR
+         (kind = 'work_unit' AND parent_scope_id IS NOT NULL AND parent_operation_id IS NOT NULL)),
   CHECK (terminal_sequence IS NULL OR terminal_sequence >= created_sequence),
   FOREIGN KEY (project_id, conversation_id, turn_id)
     REFERENCES turns(project_id, conversation_id, turn_id)
     DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (project_id, conversation_id, turn_id, parent_scope_id)
     REFERENCES execution_scopes(project_id, conversation_id, turn_id, scope_id)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (parent_operation_id, project_id, conversation_id)
+    REFERENCES operations(operation_id, project_id, conversation_id)
     DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (created_sequence, project_id, conversation_id)
     REFERENCES events(sequence, project_id, conversation_id)
@@ -308,6 +315,8 @@ CREATE TABLE operations (
   conversation_id TEXT NOT NULL,
   turn_id TEXT,
   scope_id TEXT,
+  source_inference_id TEXT,
+  call_id TEXT,
   kind TEXT NOT NULL,
   arguments_hash TEXT NOT NULL CHECK (length(arguments_hash) = 64 AND arguments_hash NOT GLOB '*[^0-9a-f]*'),
   state TEXT NOT NULL,
@@ -316,6 +325,7 @@ CREATE TABLE operations (
   result_artifact_hash TEXT,
   value_json TEXT NOT NULL CHECK (json_valid(value_json)),
   UNIQUE (operation_id, project_id, conversation_id),
+  UNIQUE (scope_id, call_id),
   CHECK (scope_id IS NULL OR turn_id IS NOT NULL),
   CHECK (terminal_sequence IS NULL OR terminal_sequence > accepted_sequence),
   FOREIGN KEY (project_id, conversation_id)
@@ -325,6 +335,8 @@ CREATE TABLE operations (
     DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (project_id, conversation_id, turn_id, scope_id)
     REFERENCES execution_scopes(project_id, conversation_id, turn_id, scope_id)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (source_inference_id) REFERENCES inferences(inference_id)
     DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (accepted_sequence, project_id, conversation_id)
     REFERENCES events(sequence, project_id, conversation_id)
@@ -449,6 +461,9 @@ CREATE TABLE inferences (
   reported_input_tokens INTEGER CHECK (reported_input_tokens >= 0),
   reported_output_tokens INTEGER CHECK (reported_output_tokens >= 0),
   reported_cache_read_tokens INTEGER CHECK (reported_cache_read_tokens >= 0),
+  reasoning_summary_artifact_hash TEXT,
+  assistant_text_artifact_hash TEXT,
+  assistant_text_phase TEXT CHECK (assistant_text_phase IN ('commentary', 'final_answer')),
   started_sequence INTEGER NOT NULL UNIQUE,
   terminal_sequence INTEGER UNIQUE,
   UNIQUE (scope_id, ordinal),
@@ -460,6 +475,10 @@ CREATE TABLE inferences (
     REFERENCES events(sequence, project_id, conversation_id)
     DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (dispatch_artifact_hash) REFERENCES artifacts(hash)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (reasoning_summary_artifact_hash) REFERENCES artifacts(hash)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (assistant_text_artifact_hash) REFERENCES artifacts(hash)
     DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (started_sequence, project_id, conversation_id)
     REFERENCES events(sequence, project_id, conversation_id)
@@ -523,6 +542,8 @@ CREATE INDEX messages_by_conversation_sequence ON messages(conversation_id, crea
 CREATE INDEX transcript_items_by_conversation_sequence ON transcript_items(conversation_id, first_sequence);
 CREATE INDEX transcript_items_by_turn_sequence ON transcript_items(conversation_id, turn_id, first_sequence);
 CREATE INDEX operations_nonterminal ON operations(state) WHERE terminal_sequence IS NULL;
+CREATE INDEX operations_by_inference ON operations(source_inference_id, accepted_sequence)
+  WHERE source_inference_id IS NOT NULL;
 CREATE UNIQUE INDEX state_documents_project_key
   ON state_documents(project_id, key) WHERE scope_kind = 'project';
 CREATE UNIQUE INDEX state_documents_conversation_key

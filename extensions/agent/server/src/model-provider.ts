@@ -44,9 +44,11 @@ export type {
   WorkUnitView,
 } from './domain/work.ts';
 
+export type AssistantTextPhase = 'commentary' | 'final_answer';
+
 export type ModelSessionEvent =
   | { type: 'assistant-start' }
-  | { type: 'assistant-text'; delta: string }
+  | { type: 'assistant-text'; delta: string; phase: AssistantTextPhase }
   | { type: 'assistant-reasoning'; delta: string }
   | { type: 'inference-end'; state: 'completed' | 'failed' | 'interrupted' }
   | { type: 'assistant-complete'; interrupted: boolean; error?: string }
@@ -67,6 +69,7 @@ export type ModelSessionDurabilityHooks = {
   beforeAssistantMessageEnd(input: {
     inferenceState: 'completed' | 'failed' | 'interrupted';
     text: string;
+    textPhase: AssistantTextPhase;
     reasoning: string;
     calls: Array<{ callId: string; name: string; args: unknown }>;
     providerMessage: AssistantMessage;

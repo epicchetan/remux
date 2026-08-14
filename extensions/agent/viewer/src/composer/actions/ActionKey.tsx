@@ -3,6 +3,7 @@ import { useCallback, useRef, type ReactNode } from 'react';
 export type ComposerAction = {
   busy?: boolean;
   className?: string;
+  testId?: string;
   disabled?: boolean;
   icon: ReactNode;
   label: string;
@@ -24,6 +25,7 @@ export function ComposerActionKey({ action }: { action: ComposerAction }) {
     <button
       aria-label={action.label}
       className={`remux-composer-action-button${action.tone === 'send' ? ' remux-composer-send-button' : ''}${action.busy ? ' is-busy' : ''}${action.className ? ` ${action.className}` : ''}`}
+      data-testid={action.testId}
       data-remux-preserve-focus={action.preserveFocus ? 'true' : undefined}
       disabled={action.disabled}
       onClick={(event) => {

@@ -46,6 +46,7 @@ export function replayTranscriptActions(
       case 'turn':
         projector.beginTurn({
           turnId: action.turnId,
+          scopeId: action.scopeId,
           clientMessageId: action.clientMessageId,
           text: action.text,
           ...('parts' in action && action.parts ? { parts: action.parts } : {}),
@@ -107,6 +108,26 @@ export function replayTranscriptActions(
           ...('outputContent' in action && action.outputContent
             ? { outputContent: action.outputContent }
             : {}),
+          ...projectionMutation(action),
+        });
+        break;
+      case 'work-unit-start':
+        projector.startWorkUnit(action.turnId, {
+          scopeId: action.scopeId,
+          objective: action.objective,
+          doneWhen: action.doneWhen,
+          resourceCount: action.resourceCount,
+          operationCount: action.operationCount,
+          ...projectionMutation(action),
+        });
+        break;
+      case 'work-unit-finish':
+        projector.finishWorkUnit(action.turnId, {
+          scopeId: action.scopeId,
+          status: action.status,
+          resultPreview: action.resultPreview,
+          resourceCount: action.resourceCount,
+          ...(action.durationMs === undefined ? {} : { durationMs: action.durationMs }),
           ...projectionMutation(action),
         });
         break;

@@ -124,19 +124,23 @@ test('shows actual dispatch and compiled-frame evidence for a durable inference'
 test('opens the current Thread and its previous durable version', async ({ page }) => {
   await page.goto(conversationUrl());
 
-  await page.getByTestId('thread-canvas-open').click();
-  const canvas = page.getByRole('dialog', { name: 'Thread' });
-  await expect(canvas).toBeVisible();
-  await expect(canvas).toContainText('Ledger — 0DTE heat maps');
-  await expect(canvas).toContainText('Candidate interpretations');
-  await expect(canvas).toContainText('Current conversational edge');
-  await expect(canvas).toContainText('version 3');
+  const conversation = transcript(page);
+  await expect(conversation.getByText('Recovered from authoritative resources.')).toBeVisible();
+  await page.getByTestId('thread-view-toggle').click();
+  const thread = page.getByRole('region', { name: 'Thread' });
+  await expect(thread).toBeVisible();
+  await expect(conversation).toBeHidden();
+  await expect(thread).toContainText('Ledger — 0DTE heat maps');
+  await expect(thread).toContainText('Candidate interpretations');
+  await expect(thread).toContainText('Current conversational edge');
+  await expect(thread).toContainText('version 3');
 
-  await canvas.getByRole('button', { name: 'Previous' }).click();
-  await expect(canvas).toContainText('Earlier canvas');
-  await expect(canvas).toContainText('Choose the first metric.');
-  await canvas.getByRole('button', { name: 'Close Thread' }).click();
-  await expect(canvas).toHaveCount(0);
+  await thread.getByRole('button', { name: 'Previous' }).click();
+  await expect(thread).toContainText('Earlier canvas');
+  await expect(thread).toContainText('Choose the first metric.');
+  await page.getByRole('button', { name: 'Back to conversation' }).click();
+  await expect(thread).toHaveCount(0);
+  await expect(conversation.getByText('Recovered from authoritative resources.')).toBeVisible();
 });
 
 test('selects history through the desktop sidebar or mobile sheet and restores target drafts', async ({ page, isMobile }) => {
