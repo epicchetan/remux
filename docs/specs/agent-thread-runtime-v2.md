@@ -1,8 +1,8 @@
 # Agent Thread Runtime v2: exact dialogue and living thread state
 
 Status: Implemented
-Last verified: 2026-08-11
-Canonical code: `extensions/agent/server/src/{context,storage,pi-runtime.ts,agent-server.ts}` and `extensions/agent/tests/`
+Last verified: 2026-08-14
+Canonical code: `extensions/agent/server/src/{context,providers/openai-codex,storage,turn-coordinator.ts}` and `extensions/agent/tests/`
 Replaces: the turn-capsule layer in `agent-thread-runtime-v1.md`
 
 The later `agent-living-thread-canvas-v1.md` checkpoint supersedes this
@@ -60,9 +60,8 @@ project
             ├── tool operations and artifacts
             └── optional work units
                 ├── exact private child trace
-                └── bounded continuation bundle
-                    ├── result Markdown
-                    ├── proposed Thread update
+                └── terminal work_unit_finish result
+                    ├── status and result Markdown
                     └── authority/deliverable/evidence snapshots
 ```
 
@@ -104,15 +103,24 @@ and assistant messages remain in their original provider order. The harness
 rebuilds context only at a semantic boundary: new user turn, work-unit entry,
 work-unit return, pressure notice, or crash recovery.
 
-A work unit inherits the parent provider anchor and a focused orientation. The
-parent supplies one semantic objective, optional observable `doneWhen`
-conditions, and selected resources classified as authority, deliverable, or
-evidence. Each resource is resolved to an immutable content-addressed snapshot
-before the boundary succeeds and its exact UTF-8 contents are materialized into
-the child context. Its trace remains private. The model-facing
-`work_unit_finish` tool closes it with completed, partial, or blocked status and
-contributes only its explicit continuation bundle plus selected exact resource
-snapshots to the parent.
+A work unit executes behind the parent's still-pending `work_unit_start` call.
+The child branches from that exact provider response and continues from a
+`toolResult` for the start call; the harness does not invent a user message or
+rewrite the parent's provider trace. The start arguments carry one semantic
+objective, optional observable `doneWhen` conditions, and selected resources
+classified as authority, deliverable, or evidence. Each resource is resolved
+to an immutable content-addressed snapshot before entry succeeds. New snapshot
+bodies are materialized in the start result while unchanged inherited bodies
+remain earlier in the exact parent prefix.
+
+The child trace remains private and inspectable. Its terminal
+`work_unit_finish` call carries completed, partial, or blocked status, one
+free-form result, and optional resources. That payload resolves the original
+parent `work_unit_start` call. The parent then continues from its original
+provider response plus that single tool result; child reasoning, commentary,
+and intermediate calls are absent. The child cannot update the Thread. If it
+stops without the terminal call, the harness closes it as blocked and restores
+the parent rather than leaving the active scope stranded.
 
 ## Exact recent dialogue
 
@@ -169,10 +177,11 @@ It must not retain:
   contract, or observed repository state.
 
 The parent model uses the compare-and-swap `thread_read`, `thread_patch`, and
-`thread_replace` tools. A work unit cannot update the document directly; it may
-return a proposed Thread update, which the parent deliberately merges after
-accounting for user decisions and newer evidence. Recommendations therefore do
-not become accepted state merely because an audit child proposed them.
+`thread_replace` tools. A work unit cannot update the document directly. Its
+result reports the durable consequence the parent may choose to incorporate
+after accounting for user decisions and newer evidence. Recommendations
+therefore do not become accepted state merely because an audit child returned
+them.
 
 The foreground model revises `thread.md` near the end of a meaningful turn when
 future context changed, then sends its user-facing response. A transient answer
@@ -291,24 +300,20 @@ threshold remains model-aware and is recorded in context evidence.
 
 ## Parent coordination
 
-Returned work-unit bundles accumulate in the active parent scope. Each bundle
-has three focused parts:
+Each completed work unit contributes one normal tool result to the parent. It
+contains required status and free-form result Markdown plus optional exact
+resources classified as authority, deliverable, or evidence. The child does not
+propose a separate Thread patch; Thread ownership stays with the parent after it
+integrates the result.
 
-1. required result Markdown with the outcome, changes, validation, and
-   unresolved issues;
-2. optional proposed Thread Markdown for the parent to merge; and
-3. optional exact resources classified as authority, deliverable, or evidence.
-
-The primary result and Thread proposal have no fixed low byte cap: the child
-branch is discarded, so only the returned bundle consumes the parent scope's
-remaining context. Resource descriptors remain capped separately at 16 KiB and
-sixteen entries, but selected resource bodies are not truncated or replaced by
-pointers. They are copied exactly into the receiving context and retained as
-content-addressed snapshots. The complete rendered bundle is stored as the
-execution scope's immutable Markdown result artifact and folded into the
-parent. Structured resource metadata, including hash, byte length, source, and
-whether the body was newly materialized or already inherited, is retained on
-the return event.
+The result has no fixed low byte cap because the private child branch is absent
+from the resumed parent context. Resource descriptors remain capped separately
+at 16 KiB and sixteen entries. Newly returned resource bodies are copied exactly
+into the tool result and retained as content-addressed snapshots; unchanged
+inherited bodies are referenced without duplication. The exact result is stored
+as the execution scope's immutable Markdown result artifact. Structured resource
+metadata retains hash, byte length, source, and whether the body was newly
+materialized or already inherited.
 
 All deterministic return validation and normalization happens before
 `work_unit_finish` reports tool success. The durable scope transition still
@@ -316,12 +321,10 @@ commits after the tool-result boundary, preserving replay order. A malformed
 handoff therefore remains a correctable child tool error rather than becoming a
 failed parent transition.
 
-This preserves the behavior measured in the three-unit turn, where bounded
-returns left the parent well below pressure, while making continuation-critical
-sources inspectable. A later work unit inherits returned resource bodies already
-present in the parent and may receive additional selected resources through
-`work_unit_start`; it does not inherit the prior child's private trace or every
-file the child touched.
+This keeps continuation-critical sources inspectable. A later work unit inherits
+returned resource bodies already present in the parent and may receive additional
+selected resources through `work_unit_start`; it does not inherit a prior child's
+private trace or every file that child touched.
 
 An internal parent checkpoint is explicitly deferred. It becomes eligible only
 if a controlled multi-unit task shows that concise sibling returns push the
@@ -391,10 +394,11 @@ manifest evidence remains available to tests and future diagnostics.
 
 ## System-prompt behavior
 
-The production prompts are repository-owned Markdown at
-`extensions/agent/server/prompts/system.md` and `work-unit.md`; they are copied
-into the server build and loaded at startup rather than hidden in TypeScript.
-The prompt remains descriptive rather than procedural. It teaches these
+The production prompt is repository-owned Markdown at
+`extensions/agent/server/prompts/system.md`; it is copied into the server build
+and loaded at startup rather than hidden in TypeScript. Parent and child use the
+same operating model with scope-valid tool profiles. The prompt remains
+descriptive rather than procedural. It teaches these
 invariants:
 
 - recent dialogue is exact but may contain superseded statements;

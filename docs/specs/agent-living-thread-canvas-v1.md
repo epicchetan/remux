@@ -3,8 +3,7 @@
 Status: Implemented checkpoint
 Date: 2026-08-11
 Builds on: `agent-thread-runtime-v2.md`
-Canonical prompt: `extensions/agent/server/prompts/system.md` and
-`extensions/agent/server/prompts/work-unit.md`
+Canonical prompt: `extensions/agent/server/prompts/system.md`
 
 ## Outcome
 
@@ -93,8 +92,8 @@ The clean model-facing surface is:
 - `history_search` and `history_read`: retrieve exact omitted evidence through
   model-facing `history://` references; and
 - `work_unit_start` and `work_unit_finish`: isolate substantial bounded work and
-  fold back a result, proposed Thread update, and durable authority,
-  deliverable, or evidence references.
+  resolve the pending parent tool call with a result and selected durable
+  authority, deliverable, or evidence resources. Thread edits remain parent-owned.
 
 The model-facing prompt and tool descriptions never require the terms
 `thread.md`, journal, cold history, provider frame, branch-scoped state, or CAS.

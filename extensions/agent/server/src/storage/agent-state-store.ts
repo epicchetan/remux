@@ -1983,6 +1983,19 @@ export class AgentStateStore extends ThreadState implements AgentStore {
     this.assertOpen();
     await this.writerTail;
     const activeScope = this.activeScopeIdentity(conversationId);
+    const incompleteOperation = this.storage.database.prepare(`
+      SELECT call_id, value_json
+      FROM operations
+      WHERE scope_id = ? AND kind = 'tool.call' AND state = 'running'
+      ORDER BY accepted_sequence
+      LIMIT 1
+    `).get(activeScope.scopeId) as { call_id: string | null; value_json: string } | undefined;
+    if (incompleteOperation) {
+      const value = JSON.parse(incompleteOperation.value_json) as Record<string, CanonicalJsonValue>;
+      throw new Error(
+        `Cannot compile context while tool operation ${String(value.name ?? incompleteOperation.call_id ?? 'unknown')} is still running.`,
+      );
+    }
     const scopeKinds = new Map((this.storage.database.prepare(`
       SELECT scope_id, kind FROM execution_scopes WHERE conversation_id = ?
     `).all(conversationId) as Array<{
@@ -2288,6 +2301,16 @@ export class AgentStateStore extends ThreadState implements AgentStore {
           callId: requiredString(payload.callId, 'callId'),
           result: await this.readJsonRef(payload.result),
           isError: payload.isError === true,
+        });
+      } else if (event.type === 'work_unit.bootstrap') {
+        replay.push({
+          type: 'tool-completed',
+          sequence: event.sequence,
+          turnId: event.turnId,
+          timestamp: event.createdAt,
+          callId: requiredString(payload.callId, 'callId'),
+          result: await this.readJsonRef(payload.result),
+          isError: false,
         });
       } else if (event.type === 'turn.terminal') {
         const status = requiredTurnStatus(payload.status);
@@ -2702,6 +2725,9 @@ export class AgentStateStore extends ThreadState implements AgentStore {
       return { ...payload, args: normalizeJson(await this.readJsonRef(payload.args)) };
     }
     if (event.type === 'tool.completed' && payload.result !== undefined) {
+      return { ...payload, result: normalizeJson(await this.readJsonRef(payload.result)) };
+    }
+    if (event.type === 'work_unit.bootstrap' && payload.result !== undefined) {
       return { ...payload, result: normalizeJson(await this.readJsonRef(payload.result)) };
     }
     return payload;
@@ -3642,6 +3668,38 @@ export class AgentStateStore extends ThreadState implements AgentStore {
           WHERE inference_id = ? AND state = 'running'
         `).run(sequence, row.inference_id);
       }));
+    }
+    const operations = this.storage.database.prepare(`
+      SELECT o.call_id, o.project_id, o.conversation_id, o.turn_id, o.scope_id
+      FROM operations o
+      JOIN turns t ON t.turn_id = o.turn_id
+      JOIN execution_scopes s ON s.scope_id = o.scope_id
+      WHERE o.kind = 'tool.call' AND o.state = 'running'
+        AND t.terminal_sequence IS NULL AND s.terminal_sequence IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM execution_scopes child
+          WHERE child.parent_operation_id = o.operation_id
+            AND child.terminal_sequence IS NULL
+        )
+      ORDER BY o.accepted_sequence
+    `).all() as Array<{
+      call_id: string;
+      project_id: string;
+      conversation_id: string;
+      turn_id: string;
+      scope_id: string;
+    }>;
+    for (const operation of operations) {
+      await this.recordToolFinished({
+        projectId: operation.project_id,
+        conversationId: operation.conversation_id,
+        turnId: operation.turn_id,
+        scopeId: operation.scope_id,
+      }, {
+        callId: operation.call_id,
+        result: { error: 'Tool execution was interrupted by a process restart.' },
+        isError: true,
+      });
     }
   }
 

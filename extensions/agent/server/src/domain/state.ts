@@ -291,15 +291,12 @@ export type PreparedWorkUnitEntry = {
   doneWhen: string[];
   materializedResources: PreparedWorkUnitResource[];
   objective: string;
-  orientation: PreparedReference;
+  bootstrap: PreparedReference;
 };
 
 export type PreparedWorkUnitReturn = {
   status: WorkUnitReturnStatus;
   result: string;
-  threadUpdate?: string;
   resources: PreparedWorkUnitResource[];
-  bundle: string;
   resultArtifact: DurableArtifactDescriptor;
-  folded: PreparedReference;
 };

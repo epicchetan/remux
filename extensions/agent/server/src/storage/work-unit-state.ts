@@ -32,11 +32,6 @@ import type {
   PreparedWorkUnitResource,
   PreparedWorkUnitReturn,
 } from '../domain/state.ts';
-import {
-  renderMaterializedResourceSection,
-  renderWorkUnitPrompt,
-  type MaterializedPromptResource,
-} from '../prompts.ts';
 import { AgentStateCore } from './state-core.ts';
 import { parseReference, safeTimestamp } from './state-codec.ts';
 
@@ -77,26 +72,28 @@ export abstract class WorkUnitState extends AgentStateCore {
     }
     const doneWhen = normalizeWorkUnitDoneWhen(input.doneWhen ?? []);
     const resources = normalizeWorkUnitResources(input.resources ?? []);
+    const child: DurableTurnHandle = { ...handle, scopeId: this.nextId('scope') };
     const materializedResources = await this.prepareWorkUnitResources(
       handle,
       resources,
       this.parentMaterializedResourceHashes(handle.turnId),
     );
-    const orientation = await this.prepareText(renderWorkUnitPrompt({
-      objective,
-      doneWhen,
-      resources: materializedResources.map(modelPromptWorkUnitResource),
-    }));
-    const child: DurableTurnHandle = { ...handle, scopeId: this.nextId('scope') };
-    return { child, doneWhen, materializedResources, objective, orientation };
+    const bootstrap = await this.prepareJson({
+      boundary: 'work_unit',
+      historyRef: `history://scope/${encodeURIComponent(child.scopeId)}`,
+      resources: materializedResources.map(contextWorkUnitResource),
+      scopeId: child.scopeId,
+      state: 'running',
+    });
+    return { bootstrap, child, doneWhen, materializedResources, objective };
   }
 
   commitWorkUnitEntry(
     handle: DurableTurnHandle,
     prepared: PreparedWorkUnitEntry,
-    linkage: { parentOperationId: string; parentInferenceId: string },
+    linkage: { parentCallId: string; parentOperationId: string; parentInferenceId: string },
   ) {
-    const { child, doneWhen, materializedResources, objective, orientation } = prepared;
+    const { bootstrap, child, doneWhen, materializedResources, objective } = prepared;
     return this.enqueueWrite(() => this.storage.transaction(() => {
       this.assertRunningHandle(handle);
       const parent = this.scopeIdentity(handle.scopeId);
@@ -171,23 +168,27 @@ export abstract class WorkUnitState extends AgentStateCore {
         sequence,
         text: objective,
       });
-      const orientationSequence = this.insertEvent({
+      const bootstrapSequence = this.insertEvent({
         ...child,
         eventId: this.nextId('event'),
-        type: 'message.internal',
+        type: 'work_unit.bootstrap',
         actor: 'harness',
         visibility: 'internal',
-        payload: { content: orientation.ref, kind: 'work_unit_orientation' },
-        artifactHash: artifactHash(orientation.ref),
+        payload: {
+          callId: linkage.parentCallId,
+          name: 'work_unit_start',
+          result: bootstrap.ref,
+        },
+        artifactHash: artifactHash(bootstrap.ref),
         createdAt: recordedAt,
       });
-      this.insertArtifact(orientation.artifact, orientationSequence);
+      this.insertArtifact(bootstrap.artifact, bootstrapSequence);
       return {
         handle: child,
         parentScopeId: handle.scopeId,
         objective,
         doneWhen,
-        resources: materializedResources.map(({ view }) => view),
+        resources: materializedResources.map(contextWorkUnitResource),
         transcriptSequence: sequence,
         transcriptCreatedAt: recordedAt,
       };
@@ -210,25 +211,130 @@ export abstract class WorkUnitState extends AgentStateCore {
       normalized.resources,
       this.parentMaterializedResourceHashes(handle.turnId),
     );
-    const bundle = renderWorkUnitReturnBundle({
-      resources: resources.map(modelPromptWorkUnitResource),
-      result: normalized.result,
-      status: normalized.status,
-      threadUpdate: normalized.threadUpdate,
-    });
     const resultArtifact = await this.artifacts.put(
-      Buffer.from(bundle, 'utf8'),
+      Buffer.from(normalized.result, 'utf8'),
       'text/markdown; charset=utf-8',
     );
-    const folded = await this.prepareText([
-      'Current work: parent conversation. The focused work unit is closed; do not call work_unit_finish again.',
-      `The work unit returned from history://scope/${encodeURIComponent(handle.scopeId)}.`,
-      '',
-      bundle,
-      '',
-      `Exact work-unit History: history://scope/${encodeURIComponent(handle.scopeId)}`,
-    ].join('\n'));
-    return { ...normalized, bundle, folded, resources, resultArtifact };
+    return { ...normalized, resources, resultArtifact };
+  }
+
+  async commitWorkUnitFinish(
+    handle: DurableTurnHandle,
+    callId: string,
+    prepared: PreparedWorkUnitReturn,
+  ) {
+    this.assertOpen();
+    const resultRef = `history://artifact/${prepared.resultArtifact.hash}`;
+    const historyRef = `history://scope/${encodeURIComponent(handle.scopeId)}`;
+    const completion = {
+      scopeId: handle.scopeId,
+      status: prepared.status,
+      result: prepared.result,
+      resources: prepared.resources.map(contextWorkUnitResource),
+      resultRef,
+      historyRef,
+    };
+    const toolResult = await this.prepareJson(completion);
+    return this.enqueueWrite(() => this.storage.transaction(() => {
+      this.assertRunningHandle(handle);
+      const child = this.scopeIdentity(handle.scopeId);
+      if (child.kind !== 'work_unit' || child.parent_scope_id === null) {
+        throw new Error('No work unit is active.');
+      }
+      const parentHandle = { ...handle, scopeId: child.parent_scope_id };
+      const parent = this.scopeIdentity(parentHandle.scopeId);
+      if (parent.kind !== 'turn' || parent.state !== 'running') {
+        throw new Error('The work unit parent is no longer running.');
+      }
+      const operation = this.storage.database.prepare(`
+        SELECT operation_id, state, value_json
+        FROM operations
+        WHERE scope_id = ? AND call_id = ? AND kind = 'tool.call'
+      `).get(handle.scopeId, callId) as {
+        operation_id: string;
+        state: string;
+        value_json: string;
+      } | undefined;
+      if (!operation) throw new Error(`Tool call ${callId} was not durably started.`);
+      const operationValue = JSON.parse(operation.value_json) as Record<string, CanonicalJsonValue>;
+      if (operationValue.name !== 'work_unit_finish') {
+        throw new Error(`Tool call ${callId} is not a work_unit_finish operation.`);
+      }
+      if (operation.state !== 'running') {
+        throw new Error(`Tool call ${callId} is already ${operation.state}.`);
+      }
+
+      const recordedAt = safeTimestamp(this.now());
+      const toolSequence = this.insertEvent({
+        ...handle,
+        eventId: this.nextId('event'),
+        operationId: operation.operation_id,
+        type: 'tool.completed',
+        actor: 'harness',
+        visibility: 'internal',
+        payload: { callId, isError: false, result: toolResult.ref },
+        artifactHash: artifactHash(toolResult.ref),
+        createdAt: recordedAt,
+      });
+      this.insertArtifact(toolResult.artifact, toolSequence);
+      this.storage.database.prepare(`
+        UPDATE operations
+        SET state = 'completed', terminal_sequence = ?, result_artifact_hash = ?, value_json = ?
+        WHERE operation_id = ? AND state = 'running'
+      `).run(
+        toolSequence,
+        artifactHash(toolResult.ref),
+        canonicalJson({ ...operationValue, isError: false, result: toolResult.ref }),
+        operation.operation_id,
+      );
+
+      const terminalSequence = this.insertEvent({
+        ...handle,
+        eventId: this.nextId('event'),
+        type: 'work_unit.returned',
+        actor: 'model',
+        visibility: 'internal',
+        payload: {
+          resources: prepared.resources.map(({ view }) => view),
+          parentScopeId: parentHandle.scopeId,
+          resultRef,
+          scopeId: handle.scopeId,
+          status: prepared.status,
+        },
+        artifactHash: prepared.resultArtifact.hash,
+        createdAt: recordedAt,
+      });
+      this.insertArtifact(prepared.resultArtifact, terminalSequence, 'content');
+      for (const resource of prepared.resources) {
+        this.insertArtifact(resource.artifact, terminalSequence, 'content');
+      }
+      const updated = this.storage.database.prepare(`
+        UPDATE execution_scopes
+        SET state = 'completed', terminal_sequence = ?, result_artifact_hash = ?, updated_at = ?
+        WHERE scope_id = ? AND state = 'running' AND terminal_sequence IS NULL
+      `).run(terminalSequence, prepared.resultArtifact.hash, recordedAt, handle.scopeId);
+      if (updated.changes !== 1) throw new Error('The work unit terminal transition was not committed.');
+      this.indexHistoryText({
+        ref: resultRef,
+        projectId: handle.projectId,
+        conversationId: handle.conversationId,
+        turnId: handle.turnId,
+        kind: 'work-unit-result',
+        sequence: terminalSequence,
+        text: prepared.result,
+      });
+      return {
+        ...completion,
+        parentHandle,
+        toolMutation: {
+          basisSequence: toolSequence,
+          createdAt: recordedAt,
+          itemId: null,
+        },
+        transcriptSequence: terminalSequence,
+        transcriptCreatedAt: recordedAt,
+      };
+    }));
   }
 
   commitWorkUnitReturn(handle: DurableTurnHandle, prepared: PreparedWorkUnitReturn) {
@@ -275,31 +381,15 @@ export abstract class WorkUnitState extends AgentStateCore {
         turnId: handle.turnId,
         kind: 'work-unit-result',
         sequence: terminalSequence,
-        text: prepared.bundle,
+        text: prepared.result,
       });
-      const foldedSequence = this.insertEvent({
-        ...parentHandle,
-        eventId: this.nextId('event'),
-        type: 'message.internal',
-        actor: 'harness',
-        visibility: 'internal',
-        payload: {
-          childScopeId: handle.scopeId,
-          content: prepared.folded.ref,
-          kind: 'work_unit_result',
-          resultRef: `history://artifact/${prepared.resultArtifact.hash}`,
-        },
-        artifactHash: artifactHash(prepared.folded.ref),
-        createdAt: recordedAt,
-      });
-      this.insertArtifact(prepared.folded.artifact, foldedSequence);
       return {
         parentHandle,
         status: prepared.status,
         result: prepared.result,
-        ...(prepared.threadUpdate ? { threadUpdate: prepared.threadUpdate } : {}),
-        resources: prepared.resources.map(({ view }) => view),
+        resources: prepared.resources.map(contextWorkUnitResource),
         resultRef: `history://artifact/${prepared.resultArtifact.hash}`,
+        historyRef: `history://scope/${encodeURIComponent(handle.scopeId)}`,
         scopeId: handle.scopeId,
         transcriptSequence: terminalSequence,
         transcriptCreatedAt: recordedAt,
@@ -348,10 +438,9 @@ export abstract class WorkUnitState extends AgentStateCore {
     const objective = scope.kind === 'work_unit'
       ? parseWorkUnitObjective(scope.objective_json)
       : { objective: null, doneWhen: [], resources: [] };
-    const bundle = scope.result_artifact_hash
+    const result = scope.result_artifact_hash
       ? await this.readArtifactTextByHash(scope.result_artifact_hash)
       : null;
-    const sections = bundle ? workUnitBundleSections(bundle) : { result: null, threadUpdate: null };
     const returnedResources = parseWorkUnitResourceReferences(terminal?.resources);
     const rows = this.storage.database.prepare(`
       SELECT i.inference_id, i.ordinal, i.state, i.started_sequence,
@@ -592,9 +681,8 @@ export abstract class WorkUnitState extends AgentStateCore {
         hasEarlier: selection.startIndex > 0,
         hasLater: selection.endIndexExclusive < rows.length,
       },
-      result: sections.result,
+      result,
       returnedResources,
-      threadUpdate: sections.threadUpdate,
     };
   }
 
@@ -713,10 +801,9 @@ export abstract class WorkUnitState extends AgentStateCore {
         ...objective.resources,
         ...parseWorkUnitResourceReferences(terminal?.resources),
       ]);
-      const bundle = row.result_artifact_hash
+      const result = row.result_artifact_hash
         ? await this.readArtifactTextByHash(row.result_artifact_hash)
         : null;
-      const result = bundle ? workUnitBundleSections(bundle).result : null;
       const transcriptStatus = workUnitTranscriptStatus(row.state, terminal?.status);
       actions.push({
         type: 'work-unit-start',
@@ -1239,19 +1326,6 @@ function selectExecutionScopeWindow<T extends { inference_id: string }>(
   };
 }
 
-function workUnitBundleSections(bundle: string) {
-  return {
-    result: markdownSection(bundle, 'Result'),
-    threadUpdate: markdownSection(bundle, 'Proposed Thread update'),
-  };
-}
-
-function markdownSection(markdown: string, heading: string) {
-  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
-  const match = new RegExp(`(?:^|\\n)## ${escaped}\\s*\\n([\\s\\S]*?)(?=\\n## |$)`, 'u').exec(markdown);
-  return match?.[1]?.trim() || null;
-}
-
 function truncateWorkUnitPreview(value: string, maxCodePoints: number) {
   const codePoints = [...value];
   return codePoints.length <= maxCodePoints
@@ -1259,8 +1333,11 @@ function truncateWorkUnitPreview(value: string, maxCodePoints: number) {
     : `${codePoints.slice(0, Math.max(0, maxCodePoints - 1)).join('')}…`;
 }
 
-function modelPromptWorkUnitResource(resource: PreparedWorkUnitResource): MaterializedPromptResource {
-  return { ...resource.view, content: resource.content };
+function contextWorkUnitResource(resource: PreparedWorkUnitResource) {
+  return {
+    ...resource.view,
+    ...(resource.view.inclusion === 'materialized' ? { content: resource.content } : {}),
+  };
 }
 
 function normalizeWorkUnitDoneWhen(values: readonly string[]) {
@@ -1296,7 +1373,6 @@ function normalizeWorkUnitResources(resources: readonly WorkUnitResourceRef[]) {
 function normalizeWorkUnitReturnInput(input: WorkUnitReturnInput): {
   status: WorkUnitReturnStatus;
   result: string;
-  threadUpdate?: string;
   resources: WorkUnitResourceRef[];
 } {
   if (input.status !== 'completed' && input.status !== 'partial' && input.status !== 'blocked') {
@@ -1305,12 +1381,8 @@ function normalizeWorkUnitReturnInput(input: WorkUnitReturnInput): {
   if (typeof input.result !== 'string') throw new TypeError('A work unit result must be text.');
   const result = input.result.trim();
   if (!result) throw new TypeError('A work unit result is required.');
-  if (input.threadUpdate !== undefined && typeof input.threadUpdate !== 'string') {
-    throw new TypeError('A proposed Thread update must be text.');
-  }
-  const threadUpdate = input.threadUpdate?.trim() || undefined;
   const resources = normalizeWorkUnitResources(input.resources ?? []);
-  return { status: input.status, result, ...(threadUpdate ? { threadUpdate } : {}), resources };
+  return { status: input.status, result, resources };
 }
 
 function normalizeWorkUnitResourceRef(value: unknown) {
@@ -1331,25 +1403,4 @@ function normalizeWorkUnitResourceText(value: unknown, label: string, maxBytes: 
     throw new TypeError(`A work unit ${label} is too large.`);
   }
   return normalized;
-}
-
-function renderWorkUnitReturnBundle(input: {
-  status: WorkUnitReturnStatus;
-  result: string;
-  threadUpdate?: string;
-  resources: readonly MaterializedPromptResource[];
-}) {
-  const sections = [
-    '# Completed work unit', '', '## Status', '', input.status, '', '## Result', '', input.result,
-  ];
-  if (input.threadUpdate) {
-    sections.push(
-      '', '## Proposed Thread update', '',
-      'The parent must deliberately merge this proposal; it has not been applied automatically.',
-      '', input.threadUpdate,
-    );
-  }
-  const resourceSection = renderMaterializedResourceSection('Materialized resources', input.resources);
-  if (resourceSection) sections.push('', resourceSection);
-  return sections.join('\n').trim();
 }

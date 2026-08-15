@@ -18,8 +18,8 @@ import type {
   ThreadPatchInput,
   ThreadReplaceInput,
   WorkUnitEnterInput,
+  WorkUnitCompletion,
   WorkUnitReturnInput,
-  WorkUnitReturnPending,
   WorkUnitView,
 } from './domain/work.ts';
 
@@ -35,11 +35,12 @@ export type {
   ThreadPatchInput,
   ThreadReplaceInput,
   WorkUnitEnterInput,
+  WorkUnitCompletion,
+  WorkUnitContextResource,
   WorkUnitResourceRef,
   WorkUnitResourceRole,
   WorkUnitResourceView,
   WorkUnitReturnInput,
-  WorkUnitReturnPending,
   WorkUnitReturnStatus,
   WorkUnitView,
 } from './domain/work.ts';
@@ -112,7 +113,8 @@ export type ModelSessionDurabilityHooks = {
   threadPatch(input: ThreadPatchInput): Promise<ThreadDocumentView>;
   threadReplace(input: ThreadReplaceInput): Promise<ThreadDocumentView>;
   workUnitEnter(callId: string, input: WorkUnitEnterInput): Promise<WorkUnitView>;
-  workUnitReturn(callId: string, input: WorkUnitReturnInput): Promise<WorkUnitReturnPending>;
+  workUnitFinish(callId: string, input: WorkUnitReturnInput): Promise<WorkUnitCompletion>;
+  workUnitAbort(input: { reason: string }): Promise<WorkUnitCompletion>;
 };
 
 export interface ModelSession {

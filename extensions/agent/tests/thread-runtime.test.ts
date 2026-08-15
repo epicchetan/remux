@@ -143,6 +143,42 @@ test('actual frames, exact provider reasoning, restart recovery, and next-turn e
   assert.ok(provider.providerItemId);
 });
 
+test('restart recovery terminalizes an incomplete tool operation before compiling again', async (t) => {
+  const fixture = await repositoryFixture(t);
+  const conversation = await fixture.repository.createConversation({
+    operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'gpt-5.6-codex', reasoning: 'high',
+  });
+  const turn = await accept(fixture.repository, conversation.conversationId, 'Inspect the interrupted tool.');
+  const context = await fixture.repository.compileContext(conversation.conversationId);
+  await startInference(fixture.repository, turn, context);
+  await fixture.repository.finalizeInference(turn, {
+    state: 'completed',
+    providerMessage: assistantMessage({
+      content: [{ type: 'toolCall', id: 'call:interrupted', name: 'bash', arguments: { command: 'true' } }],
+      stopReason: 'toolUse',
+    }),
+    calls: [{ callId: 'call:interrupted', name: 'bash', args: { command: 'true' } }],
+  });
+  await assert.rejects(
+    fixture.repository.compileContext(conversation.conversationId),
+    /bash is still running/u,
+  );
+
+  await fixture.repository.close();
+  fixture.repository = await AgentStateStore.open({ dataRoot: fixture.dataRoot });
+  const recovered = await fixture.repository.resumeActiveTurn(conversation.conversationId);
+  assert.equal(recovered?.handle.scopeId, turn.scopeId);
+  const compiled = await fixture.repository.compileContext(conversation.conversationId);
+  const interrupted = compiled.messages.find((message) =>
+    message.role === 'tool' && message.callId === 'call:interrupted');
+  assert.equal(interrupted?.role, 'tool');
+  if (interrupted?.role === 'tool') {
+    assert.equal(interrupted.isError, true);
+    assert.match(JSON.stringify(interrupted.result), /process restart/u);
+  }
+  await fixture.repository.finishTurn(turn, { status: 'interrupted' });
+});
+
 test('provider commentary stays in its inference while only the final answer reaches the transcript response', async (t) => {
   const fixture = await repositoryFixture(t);
   const conversation = await fixture.repository.createConversation({
@@ -355,7 +391,7 @@ test('thread.md patches reject missing, ambiguous, empty, and partially applicab
   await fixture.repository.finishTurn(turn, { status: 'interrupted' });
 });
 
-test('bounded work units inherit typed resources and fold back only their continuation bundle', async (t) => {
+test('bounded work units branch behind a pending tool call and fold back only their result', async (t) => {
   const fixture = await repositoryFixture(t);
   const conversation = await fixture.repository.createConversation({
     operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'model', reasoning: 'high',
@@ -389,24 +425,24 @@ test('bounded work units inherit typed resources and fold back only their contin
   });
   const parentCall = rootFinalization.calls[0]!;
   const entered = await fixture.repository.commitWorkUnitEntry(root, preparedEntry, {
+    parentCallId: 'call:enter',
     parentInferenceId: rootFinalization.inferenceId,
     parentOperationId: parentCall.operationId,
-  });
-  await fixture.repository.recordToolFinished(root, {
-    callId: 'call:enter', result: { scopeId: entered.handle.scopeId }, isError: false,
   });
 
   const childContext = await fixture.repository.compileContext(conversation.conversationId);
   assert.equal(childContext.scopeKind, 'work_unit');
   assert.equal(childContext.scopeId, entered.handle.scopeId);
+  assert.equal(childContext.messages.filter(({ role }) => role === 'user').length, 1);
   assert.ok(childContext.messages.some((message) =>
-    message.role === 'user' && message.text.includes('Inspect one seam.')));
-  assert.ok(childContext.messages.some((message) =>
-    message.role === 'user' && message.text.includes(`history://turn/${root.turnId}`)));
-  assert.ok(childContext.messages.some((message) =>
-    message.role === 'user' && message.text.includes('docs/seam-contract.md')));
-  assert.ok(childContext.messages.some((message) =>
-    message.role === 'user' && message.text.includes('The seam must be sound.')));
+    message.role === 'assistant' && message.toolCalls.some((call) =>
+      call.name === 'work_unit_start' && JSON.stringify(call.args).includes('Inspect one seam.'))));
+  const bootstrap = childContext.messages.find((message) =>
+    message.role === 'tool' && message.callId === 'call:enter');
+  assert.equal(bootstrap?.role, 'tool');
+  assert.match(JSON.stringify(bootstrap), /history:\/\/turn\//u);
+  assert.match(JSON.stringify(bootstrap), /docs\/seam-contract\.md/u);
+  assert.match(JSON.stringify(bootstrap), /The seam must be sound\./u);
   assert.ok(childContext.messages.some((message) =>
     message.role === 'user' && message.text.includes('Solve the parent task.')));
   assert.doesNotMatch(
@@ -459,6 +495,44 @@ test('bounded work units inherit typed resources and fold back only their contin
     providerMessage: assistantMessage({
       content: [{
         type: 'toolCall',
+        id: 'call:return-invalid',
+        name: 'work_unit_finish',
+        arguments: { result: 'This references a missing resource.' },
+      }],
+      stopReason: 'toolUse',
+    }),
+    calls: [{
+      callId: 'call:return-invalid',
+      name: 'work_unit_finish',
+      args: { result: 'This references a missing resource.' },
+    }],
+  });
+  await assert.rejects(
+    fixture.repository.prepareWorkUnitReturn(entered.handle, {
+      status: 'completed',
+      result: 'This invalid boundary must remain correctable.',
+      resources: [{ ref: 'missing-resource.txt', role: 'evidence' }],
+    }),
+    /missing-resource\.txt|ENOENT/u,
+  );
+  await assert.rejects(
+    fixture.repository.compileContext(conversation.conversationId),
+    /work_unit_finish is still running/u,
+  );
+  await fixture.repository.recordToolFinished(entered.handle, {
+    callId: 'call:return-invalid', result: { error: 'missing-resource.txt was not found' }, isError: true,
+  });
+  assert.equal(
+    (await fixture.repository.compileContext(conversation.conversationId)).scopeId,
+    entered.handle.scopeId,
+  );
+  const retryContext = await fixture.repository.compileContext(conversation.conversationId);
+  await startInference(fixture.repository, entered.handle, retryContext);
+  await fixture.repository.finalizeInference(entered.handle, {
+    state: 'completed',
+    providerMessage: assistantMessage({
+      content: [{
+        type: 'toolCall',
         id: 'call:return',
         name: 'work_unit_finish',
         arguments: { result: 'The seam is sound.' },
@@ -469,35 +543,47 @@ test('bounded work units inherit typed resources and fold back only their contin
       callId: 'call:return', name: 'work_unit_finish', args: { result: 'The seam is sound.' },
     }],
   });
-  await fixture.repository.recordToolFinished(entered.handle, {
-    callId: 'call:return', result: { state: 'returning' }, isError: false,
-  });
-  await assert.rejects(
-    fixture.repository.prepareWorkUnitReturn(entered.handle, {
-      status: 'completed',
-      result: 'This invalid boundary must remain correctable.',
-      resources: [{ ref: 'missing-resource.txt', role: 'evidence' }],
-    }),
-    /missing-resource\.txt|ENOENT/u,
-  );
-  assert.equal(
-    (await fixture.repository.compileContext(conversation.conversationId)).scopeId,
-    entered.handle.scopeId,
-  );
-  const returned = await fixture.repository.returnWorkUnit(entered.handle, {
+  const preparedReturn = await fixture.repository.prepareWorkUnitReturn(entered.handle, {
     status: 'completed',
-    result: '## Result\n\nThe seam is sound.',
-    threadUpdate: 'Record that the seam contract was verified.',
+    result: 'The seam is sound.',
     resources: [
       { ref: 'docs/seam-contract.md', role: 'authority', description: 'Exact seam contract.' },
       { ref: 'src/seam.ts', role: 'deliverable', description: 'Verified implementation.' },
     ],
   });
+  const returned = await fixture.repository.commitWorkUnitFinish(
+    entered.handle,
+    'call:return',
+    preparedReturn,
+  );
   assert.equal(returned.status, 'completed');
   assert.equal(returned.parentHandle.scopeId, root.scopeId);
-  assert.equal(returned.threadUpdate, 'Record that the seam contract was verified.');
   assert.equal(returned.resources[1]?.ref, 'src/seam.ts');
   assert.equal(returned.resources[1]?.inclusion, 'materialized');
+  assert.equal(returned.resources[1]?.content, 'export const seam = "sound";\n');
+  const database = new DatabaseSync(fixture.repository.databasePath, { readOnly: true });
+  const finishOperation = database.prepare(`
+    SELECT state, terminal_sequence FROM operations WHERE scope_id = ? AND call_id = ?
+  `).get(entered.handle.scopeId, 'call:return') as { state: string; terminal_sequence: number };
+  const childScope = database.prepare(`
+    SELECT state, terminal_sequence FROM execution_scopes WHERE scope_id = ?
+  `).get(entered.handle.scopeId) as { state: string; terminal_sequence: number };
+  database.close();
+  assert.equal(finishOperation.state, 'completed');
+  assert.equal(childScope.state, 'completed');
+  assert.ok(finishOperation.terminal_sequence < childScope.terminal_sequence);
+  await fixture.repository.recordToolFinished(root, {
+    callId: 'call:enter',
+    result: {
+      scopeId: returned.scopeId,
+      status: returned.status,
+      result: returned.result,
+      resources: returned.resources,
+      resultRef: returned.resultRef,
+      historyRef: returned.historyRef,
+    },
+    isError: false,
+  });
   const rootTrace = await fixture.repository.readExecutionScopeTranscriptResource(
     conversation.conversationId,
     {
@@ -525,7 +611,6 @@ test('bounded work units inherit typed resources and fold back only their contin
   assert.equal(childTrace?.parentOperationId, parentCall.operationId);
   assert.equal(childTrace?.state, 'completed');
   assert.match(childTrace?.result ?? '', /The seam is sound/u);
-  assert.match(childTrace?.threadUpdate ?? '', /seam contract was verified/u);
   assert.ok(childTrace?.returnedResources.some((resource) => resource.ref === 'src/seam.ts'));
   assert.equal(childTrace?.inferences[0]?.reasoning?.text, 'CHILD_PRIVATE_REASONING');
   assert.equal(childTrace?.inferences[0]?.actionGroup?.calls[0]?.name, 'bash');
@@ -553,10 +638,7 @@ test('bounded work units inherit typed resources and fold back only their contin
   assert.equal(resumed.scopeId, root.scopeId);
   const resumedText = JSON.stringify(resumed.messages);
   assert.match(resumedText, /The seam is sound/u);
-  assert.match(resumedText, /Proposed Thread update/u);
-  assert.match(resumedText, /Record that the seam contract was verified/u);
   assert.match(resumedText, /docs\/seam-contract\.md|src\/seam\.ts/u);
-  assert.match(resumedText, /Current work: parent conversation/u);
   assert.match(resumedText, /history:\/\/scope/u);
   assert.doesNotMatch(resumedText, /CHILD_PRIVATE_REASONING|CHILD_TOOL_RESULT|child-signature/u);
   const resumedAssistant = resumed.messages.find((message) => message.role === 'assistant');
@@ -572,15 +654,18 @@ test('bounded work units inherit typed resources and fold back only their contin
   });
   assert.equal(inheritedUnit.resources[0]?.inclusion, 'inherited');
   const inheritedContext = await fixture.repository.compileContext(conversation.conversationId);
-  const inheritedOrientation = inheritedContext.messages.at(-1);
-  assert.equal(inheritedOrientation?.role, 'user');
-  if (inheritedOrientation?.role === 'user') {
-    assert.match(inheritedOrientation.text, /already materialized earlier in the active parent context/u);
-    assert.doesNotMatch(inheritedOrientation.text, /export const seam = "sound"/u);
+  const inheritedBootstrap = inheritedContext.messages.at(-1);
+  assert.equal(inheritedBootstrap?.role, 'tool');
+  if (inheritedBootstrap?.role === 'tool') {
+    assert.match(JSON.stringify(inheritedBootstrap.result), /"inclusion":"inherited"/u);
+    assert.doesNotMatch(JSON.stringify(inheritedBootstrap.result), /export const seam = "sound"/u);
   }
-  await fixture.repository.returnWorkUnit(inheritedUnit.handle, {
+  const inheritedReturn = await fixture.repository.returnWorkUnit(inheritedUnit.handle, {
     status: 'completed',
     result: 'The inherited snapshot was sufficient.',
+  });
+  await fixture.repository.recordToolFinished(root, {
+    callId: inheritedUnit.parentCallId, result: workUnitCompletion(inheritedReturn), isError: false,
   });
 
   await writeFile(join(fixture.cwd, 'src/seam.ts'), 'export const seam = "revised";\n');
@@ -591,14 +676,18 @@ test('bounded work units inherit typed resources and fold back only their contin
   assert.equal(revisedUnit.resources[0]?.inclusion, 'materialized');
   assert.notEqual(revisedUnit.resources[0]?.snapshot.hash, returned.resources[1]?.snapshot.hash);
   const revisedContext = await fixture.repository.compileContext(conversation.conversationId);
-  const revisedOrientation = revisedContext.messages.at(-1);
-  assert.equal(revisedOrientation?.role, 'user');
-  if (revisedOrientation?.role === 'user') {
-    assert.match(revisedOrientation.text, /export const seam = "revised"/u);
+  const revisedBootstrap = revisedContext.messages.at(-1);
+  assert.equal(revisedBootstrap?.role, 'tool');
+  if (revisedBootstrap?.role === 'tool') {
+    const result = revisedBootstrap.result as { resources?: Array<{ content?: string }> };
+    assert.equal(result.resources?.[0]?.content, 'export const seam = "revised";\n');
   }
-  await fixture.repository.returnWorkUnit(revisedUnit.handle, {
+  const revisedReturn = await fixture.repository.returnWorkUnit(revisedUnit.handle, {
     status: 'completed',
     result: 'The revised snapshot was inspected.',
+  });
+  await fixture.repository.recordToolFinished(root, {
+    callId: revisedUnit.parentCallId, result: workUnitCompletion(revisedReturn), isError: false,
   });
 
   await fixture.repository.appendAssistantCheckpoint(root, { textDelta: 'Parent complete.', reasoningDelta: '' });
@@ -608,6 +697,11 @@ test('bounded work units inherit typed resources and fold back only their contin
   assert.match(transcriptText, /work_unit_start|Parent complete/u);
   assert.doesNotMatch(transcriptText, /call:child|call:return|CHILD_PRIVATE_REASONING|CHILD_TOOL_RESULT/u);
   const durableEvents = await fixture.repository.readEvents({ conversationId: conversation.conversationId });
+  assert.ok(durableEvents.some(({ type }) => type === 'work_unit.bootstrap'));
+  assert.ok(durableEvents.every((event) => {
+    if (event.type !== 'message.internal' || !event.payload || typeof event.payload !== 'object') return true;
+    return !JSON.stringify(event.payload).includes('work_unit_');
+  }));
   const returnedEvent = durableEvents.find(({ type }) => type === 'work_unit.returned');
   const returnedPayload = returnedEvent?.payload;
   if (!returnedPayload || typeof returnedPayload !== 'object' || Array.isArray(returnedPayload)) {
@@ -628,8 +722,7 @@ test('bounded work units inherit typed resources and fold back only their contin
   assert.ok(result);
   const opened = await fixture.repository.openHistory(conversation.conversationId, { ref: result!.ref });
   assert.match(opened.content, /The seam is sound/u);
-  assert.match(opened.content, /Proposed Thread update/u);
-  assert.match(opened.content, /### authority: `docs\/seam-contract\.md`/u);
+  assert.doesNotMatch(opened.content, /Proposed Thread update/u);
   assert.equal((await fixture.repository.readThread(conversation.conversationId)).content, '# Thread\n');
 });
 
@@ -644,25 +737,23 @@ test('work-unit handoffs may use the available parent context beyond the former 
     resources: [{ ref: 'docs/architecture.md', role: 'authority' }],
   });
   const result = `## Audit result\n\n${'Detailed repository-grounded finding.\n'.repeat(520)}RESULT_END`;
-  const threadUpdate = `# Proposed Thread\n\n${'Durable architectural detail.\n'.repeat(650)}THREAD_END`;
   assert.ok(Buffer.byteLength(result, 'utf8') > 16 * 1024);
-  assert.ok(Buffer.byteLength(threadUpdate, 'utf8') > 16 * 1024);
 
   const returned = await fixture.repository.returnWorkUnit(entered.handle, {
     status: 'partial',
     result,
-    threadUpdate,
     resources: [{ ref: 'docs/architecture.md', role: 'authority' }],
   });
   assert.equal(returned.result, result);
-  assert.equal(returned.threadUpdate, threadUpdate);
   assert.equal(returned.parentHandle.scopeId, root.scopeId);
+  await fixture.repository.recordToolFinished(root, {
+    callId: entered.parentCallId, result: workUnitCompletion(returned), isError: false,
+  });
 
   const resumed = await fixture.repository.compileContext(conversation.conversationId);
   assert.equal(resumed.scopeKind, 'turn');
   const resumedText = JSON.stringify(resumed.messages);
   assert.match(resumedText, /RESULT_END/u);
-  assert.match(resumedText, /THREAD_END/u);
   await fixture.repository.finishTurn(root, { status: 'interrupted' });
 });
 
@@ -690,9 +781,12 @@ test('work-unit directory resources are correctable before the durable entry com
     resources: [{ ref: 'src/seam.ts', role: 'deliverable' }],
   });
   assert.equal(entered.resources[0]?.snapshot.source, 'file');
-  await fixture.repository.returnWorkUnit(entered.handle, {
+  const returned = await fixture.repository.returnWorkUnit(entered.handle, {
     status: 'completed',
     result: 'The corrected file resource was accepted.',
+  });
+  await fixture.repository.recordToolFinished(root, {
+    callId: entered.parentCallId, result: workUnitCompletion(returned), isError: false,
   });
   await fixture.repository.finishTurn(root, { status: 'completed' });
 });
@@ -1144,15 +1238,22 @@ async function enterWorkUnit(
   });
   const prepared = await repository.prepareWorkUnitEntry(handle, input);
   const entered = await repository.commitWorkUnitEntry(handle, prepared, {
+    parentCallId: callId,
     parentInferenceId: finalization.inferenceId,
     parentOperationId: finalization.calls[0]!.operationId,
   });
-  await repository.recordToolFinished(handle, {
-    callId,
-    result: { scopeId: entered.handle.scopeId },
-    isError: false,
-  });
-  return entered;
+  return { ...entered, parentCallId: callId };
+}
+
+function workUnitCompletion(returned: Awaited<ReturnType<AgentStateStore['returnWorkUnit']>>) {
+  return {
+    scopeId: returned.scopeId,
+    status: returned.status,
+    result: returned.result,
+    resources: returned.resources,
+    resultRef: returned.resultRef,
+    historyRef: returned.historyRef,
+  };
 }
 
 async function startInference(

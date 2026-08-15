@@ -443,7 +443,7 @@ export async function installAgentHost(page: Page) {
           },
         }],
         window: { startIndex: 0, endIndexExclusive: 1, hasEarlier: false, hasLater: false },
-        result: null, returnedResources: [], threadUpdate: null,
+        result: null, returnedResources: [],
       });
       executionScopes.set(executionScopeKey(id, scopeId), {
         conversationId, turnId: id, scopeId, parentScopeId: rootScopeId,
@@ -480,7 +480,7 @@ export async function installAgentHost(page: Page) {
           },
         }],
         window: { startIndex: 0, endIndexExclusive: 1, hasEarlier: false, hasLater: false },
-        result: null, returnedResources: [], threadUpdate: null,
+        result: null, returnedResources: [],
       });
       turns.push(turn);
       touchTurn(turn);
@@ -551,9 +551,6 @@ export async function installAgentHost(page: Page) {
           childScope.durationMs = turn.durationMs;
           childScope.result = outcome === 'completed'
             ? '## Verified\n\n**The focused seam matches its exact contract without changing unrelated runtime behavior.**'
-            : null;
-          childScope.threadUpdate = outcome === 'completed'
-            ? 'Record the focused seam as verified.'
             : null;
           childScope.returnedResources = outcome === 'completed'
             ? [{ ref: 'src/index.ts', role: 'evidence', description: 'Verified implementation.' }]

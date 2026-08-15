@@ -34,8 +34,8 @@ import type {
   ThreadDocumentView,
   ThreadPatchInput,
   ThreadReplaceInput,
+  WorkUnitContextResource,
   WorkUnitEnterInput,
-  WorkUnitResourceView,
   WorkUnitReturnInput,
   WorkUnitReturnStatus,
 } from './domain/work.ts';
@@ -182,13 +182,13 @@ export interface AgentStore {
   commitWorkUnitEntry(
     handle: DurableTurnHandle,
     prepared: PreparedWorkUnitEntry,
-    linkage: { parentOperationId: string; parentInferenceId: string },
+    linkage: { parentCallId: string; parentOperationId: string; parentInferenceId: string },
   ): Promise<{
     handle: DurableTurnHandle;
     parentScopeId: string;
     objective: string;
     doneWhen: string[];
-    resources: WorkUnitResourceView[];
+    resources: WorkUnitContextResource[];
     transcriptSequence: number;
     transcriptCreatedAt: number;
   }>;
@@ -196,6 +196,22 @@ export interface AgentStore {
     handle: DurableTurnHandle,
     input: WorkUnitReturnInput,
   ): Promise<PreparedWorkUnitReturn>;
+  commitWorkUnitFinish(
+    handle: DurableTurnHandle,
+    callId: string,
+    prepared: PreparedWorkUnitReturn,
+  ): Promise<{
+    parentHandle: DurableTurnHandle;
+    status: WorkUnitReturnStatus;
+    result: string;
+    resources: WorkUnitContextResource[];
+    resultRef: string;
+    historyRef: string;
+    scopeId: string;
+    toolMutation: DurableTranscriptMutation;
+    transcriptSequence: number;
+    transcriptCreatedAt: number;
+  }>;
   commitWorkUnitReturn(
     handle: DurableTurnHandle,
     prepared: PreparedWorkUnitReturn,
@@ -203,9 +219,9 @@ export interface AgentStore {
     parentHandle: DurableTurnHandle;
     status: WorkUnitReturnStatus;
     result: string;
-    threadUpdate?: string;
-    resources: WorkUnitResourceView[];
+    resources: WorkUnitContextResource[];
     resultRef: string;
+    historyRef: string;
     scopeId: string;
     transcriptSequence: number;
     transcriptCreatedAt: number;
@@ -214,9 +230,9 @@ export interface AgentStore {
     parentHandle: DurableTurnHandle;
     status: WorkUnitReturnStatus;
     result: string;
-    threadUpdate?: string;
-    resources: WorkUnitResourceView[];
+    resources: WorkUnitContextResource[];
     resultRef: string;
+    historyRef: string;
     scopeId: string;
     transcriptSequence: number;
     transcriptCreatedAt: number;

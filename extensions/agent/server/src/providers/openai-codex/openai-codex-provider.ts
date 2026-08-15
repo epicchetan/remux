@@ -12,6 +12,7 @@ import {
   ModelRuntime,
   SessionManager,
   SettingsManager,
+  type AgentSession,
   type AgentSessionEvent,
   type ExtensionFactory,
 } from '@earendil-works/pi-coding-agent';
@@ -28,6 +29,11 @@ import type {
   ModelSession,
   ModelSessionEventSink,
 } from '../../model-provider.ts';
+import type {
+  WorkUnitCompletion,
+  WorkUnitEnterInput,
+  WorkUnitView,
+} from '../../domain/work.ts';
 import {
   assertContextBudget,
   estimatePiContextTokens,
@@ -42,7 +48,7 @@ import {
   PARENT_CONTEXT_TOOL_NAMES,
   WORK_UNIT_CONTEXT_TOOL_NAMES,
 } from '../../context/tools.ts';
-import { canonicalJsonHash } from '../../storage/canonical-json.ts';
+import { canonicalJson, canonicalJsonHash } from '../../storage/canonical-json.ts';
 import { createRemuxAgentSession } from './pi-session.ts';
 import { REMUX_SYSTEM_PROMPT } from '../../prompts.ts';
 import {
@@ -86,7 +92,7 @@ function providerContract() {
     'write@pi-0.84',
     'history@1',
     'thread@3',
-    'work-unit@2',
+    'work-unit@4',
     'provider-retry@1',
     'provider-lanes@1',
   ];
@@ -229,6 +235,12 @@ export class OpenAICodexProvider implements ModelProvider {
     let providerDurabilityTail: Promise<void> = Promise.resolve();
     let providerDurabilityError: unknown = null;
     let pendingAgentEnd: Extract<AgentSessionEvent, { type: 'agent_end' }> | null = null;
+    let activeChildSession: AgentSession | null = null;
+    let activeChildCompletion: WorkUnitCompletion | null = null;
+    let activeChildFinishAttempted = false;
+    let activeChildFinishFailure: string | null = null;
+    const directlyFinalizedToolCalls = new Set<string>();
+    let interruptRequested = false;
     const assistantDurability = new WeakMap<AssistantMessage, Promise<void>>();
     const awaitProviderDurability = async () => {
       await providerDurabilityTail;
@@ -376,37 +388,183 @@ export class OpenAICodexProvider implements ModelProvider {
         if (event.message.role !== 'assistant') return;
         await ensureAssistantDurable(event.message);
       });
-      // tool_call/tool_result are Pi's awaited execution gates. The similarly
-      // named tool_execution_* events are observational notifications and Pi
-      // does not wait for asynchronous extension handlers there.
-      pi.on('tool_call', async (event) => {
-        await awaitProviderDurability();
-        await options.durability.beforeTool({
-          callId: event.toolCallId,
-          name: durableToolName(event.toolName),
-          args: event.input,
-        });
+    };
+
+    const finalizeDurableTool = async (input: {
+      callId: string;
+      name: string;
+      content: unknown;
+      details?: unknown;
+      isError: boolean;
+    }) => {
+      const name = durableToolName(input.name);
+      const result = durableToolResult({ content: input.content }, input.isError);
+      if (name === 'work_unit_finish') {
+        activeChildFinishAttempted = true;
+        if (!input.isError) {
+          const completion = workUnitCompletion(input.details ?? result);
+          if (!completion) {
+            throw new Error('work_unit_finish returned without a durable completion payload.');
+          }
+          activeChildCompletion = completion;
+          activeChildFinishFailure = null;
+          return completion;
+        }
+        activeChildFinishFailure = toolResultText(input.content) || 'The finish tool failed.';
+      }
+      await options.durability.afterTool({
+        callId: input.callId,
+        name,
+        result,
+        isError: input.isError,
       });
-      pi.on('tool_result', async (event) => {
-        await options.durability.afterTool({
+      return null;
+    };
+
+    const installDurableToolHooks = (target: AgentSession) => {
+      const piBeforeToolCall = target.agent.beforeToolCall;
+      const piAfterToolCall = target.agent.afterToolCall;
+      target.agent.beforeToolCall = async (context, signal) => {
+        try {
+          const piResult = await piBeforeToolCall?.(context, signal);
+          if (piResult?.block) return piResult;
+          await awaitProviderDurability();
+          const name = durableToolName(context.toolCall.name);
+          if (name === 'work_unit_finish') activeChildFinishAttempted = true;
+          await options.durability.beforeTool({
+            callId: context.toolCall.id,
+            name,
+            args: context.args,
+          });
+          return piResult;
+        } catch (error) {
+          providerDurabilityError ??= error;
+          throw error;
+        }
+      };
+      target.agent.afterToolCall = async (context, signal) => {
+        directlyFinalizedToolCalls.add(context.toolCall.id);
+        try {
+          const piResult = await piAfterToolCall?.(context, signal);
+          const content = piResult?.content ?? context.result.content;
+          const details = piResult?.details ?? context.result.details;
+          const isError = piResult?.isError ?? context.isError;
+          const completion = await finalizeDurableTool({
+            callId: context.toolCall.id,
+            name: context.toolCall.name,
+            content,
+            details,
+            isError,
+          });
+          if (!completion) return piResult;
+          return {
+            ...piResult,
+            content: [{ type: 'text' as const, text: JSON.stringify(completion) }],
+            details: completion,
+            isError: false,
+            terminate: true,
+          };
+        } catch (error) {
+          providerDurabilityError ??= error;
+          const message = `Durable tool finalization failed: ${safeMessage(error)}`;
+          return {
+            content: [{ type: 'text' as const, text: message }],
+            details: { error: message },
+            isError: true,
+            ...(context.toolCall.name === 'work_unit_finish' ? { terminate: true } : {}),
+          };
+        }
+      };
+    };
+
+    const reconcileObservedToolEnd = (event: Extract<AgentSessionEvent, { type: 'tool_execution_end' }>) => {
+      if (directlyFinalizedToolCalls.delete(event.toolCallId)) return;
+      const priorDurability = providerDurabilityTail;
+      const durability = (async () => {
+        await priorDurability;
+        if (providerDurabilityError) throw providerDurabilityError;
+        await finalizeDurableTool({
           callId: event.toolCallId,
-          name: durableToolName(event.toolName),
-          result: durableToolResult({ content: event.content }, event.isError),
+          name: event.toolName,
+          content: event.result?.content,
+          details: event.result?.details,
           isError: event.isError,
         });
-        if (!event.isError && event.toolName === 'work_unit_start') {
-          pi.setActiveTools(WORK_UNIT_ACTIVE_TOOL_NAMES);
-        } else if (!event.isError && event.toolName === 'work_unit_finish') {
-          const completedLaneId = activeProviderSessionId;
-          const controls = requiredProviderTransportControls(providerTransportControls);
-          controls.close(completedLaneId);
-          controls.resetStats(completedLaneId);
-          providerSessionIds.delete(completedLaneId);
-          providerLanes.delete(completedLaneId);
-          pi.setActiveTools(PARENT_ACTIVE_TOOL_NAMES);
-        }
+      })();
+      const settled = durability.catch((error) => {
+        providerDurabilityError ??= error;
       });
+      providerDurabilityTail = Promise.all([priorDurability, settled]).then(() => undefined);
     };
+
+    const providerPreflight = async (payload: unknown) => {
+      // Keep the provider fence defensive even if Pi changes its context hook
+      // ordering: no request may overtake the preceding provider item's
+      // durable terminal boundary.
+      await awaitProviderDurability();
+      if (options.reasoning !== 'off') assertConciseReasoningSummary(payload);
+      const context = pendingContext;
+      pendingContext = null;
+      if (!context) {
+        if (pendingContextError) {
+          throw new Error(
+            `Durable context compilation failed: ${safeMessage(pendingContextError)}`,
+            { cause: pendingContextError },
+          );
+        }
+        throw new Error('Provider dispatch has no committed durable context fence.');
+      }
+      const lanePlan = planProviderLaneRequest(
+        providerLanes.get(context.providerSessionId),
+        context.orderedMessageHashes,
+      );
+      const requestMode = lanePlan.requestMode;
+      const estimatedInputTokens = Math.max(
+        context.estimatedInputTokens,
+        Math.ceil(Buffer.byteLength(JSON.stringify(payload), 'utf8') / 4),
+      );
+      await options.durability.beforeProviderCall({
+        payload,
+        requestMode,
+        estimatedInputTokens,
+        ...(pendingRetryOfInferenceId
+          ? { retryOfInferenceId: pendingRetryOfInferenceId }
+          : {}),
+        context: {
+          basisSequence: context.basisSequence,
+          logicalHash: context.logicalHash,
+          renderedHash: context.renderedHash,
+          orderedMessageHashes: context.orderedMessageHashes,
+          messageCount: context.messageCount,
+          fixedContractsHash: context.fixedContractsHash,
+          frame: context.frame,
+          frameBuildDurationMs: context.frameBuildDurationMs,
+          activeMessages: context.activeMessages,
+        },
+      });
+      pendingRetryOfInferenceId = null;
+      assertContextBudget(estimatedInputTokens, model.contextWindow);
+      const transportStats = requiredProviderTransportControls(providerTransportControls)
+        .getStats(context.providerSessionId);
+      pendingTransport = {
+        providerSessionId: context.providerSessionId,
+        plannedRequestMode: requestMode,
+        startedAt: performance.now(),
+        firstEventAt: null,
+        requests: transportStats?.requests ?? 0,
+        connectionsCreated: transportStats?.connectionsCreated ?? 0,
+        connectionsReused: transportStats?.connectionsReused ?? 0,
+        fullContextRequests: transportStats?.fullContextRequests ?? 0,
+        deltaRequests: transportStats?.deltaRequests ?? 0,
+        websocketFailures: transportStats?.websocketFailures ?? 0,
+        sseFallbacks: transportStats?.sseFallbacks ?? 0,
+      };
+      providerLanes.set(context.providerSessionId, lanePlan.next);
+      probe = { ...probe, providerRequestMode: requestMode };
+      options.onEvent({ type: 'context-probe', probe });
+    };
+
+    let runWorkUnit: (callId: string, input: WorkUnitEnterInput) => Promise<WorkUnitCompletion>;
 
     const settingsManager = SettingsManager.inMemory({
       compaction: { enabled: false },
@@ -443,10 +601,10 @@ export class OpenAICodexProvider implements ModelProvider {
       model,
       thinkingLevel: options.reasoning,
       customTools: [
-        // The awaited tool_call/tool_result gates above own durability for all
-        // tools. Avoid a second direct durability wrapper on workspace_read.
         createWorkspaceReadTool(options.cwd, undefined, this.workspaceRead),
-        ...createContextTools(options.durability),
+        ...createContextTools(options.durability, {
+          runWorkUnit: (callId, input) => runWorkUnit(callId, input),
+        }),
       ],
       resourceLoader,
       sessionManager,
@@ -456,80 +614,12 @@ export class OpenAICodexProvider implements ModelProvider {
       registerProviderTransportControls: (controls) => {
         providerTransportControls = controls;
       },
-      providerPreflight: async (payload) => {
-        // Keep the provider fence defensive even if Pi changes its context
-        // hook ordering: no request may overtake the preceding provider
-        // item's durable terminal boundary.
-        await awaitProviderDurability();
-        if (options.reasoning !== 'off') assertConciseReasoningSummary(payload);
-        const context = pendingContext;
-        pendingContext = null;
-        if (!context) {
-          if (pendingContextError) {
-            throw new Error(
-              `Durable context compilation failed: ${safeMessage(pendingContextError)}`,
-              { cause: pendingContextError },
-            );
-          }
-          throw new Error('Provider dispatch has no committed durable context fence.');
-        }
-        const lanePlan = planProviderLaneRequest(
-          providerLanes.get(context.providerSessionId),
-          context.orderedMessageHashes,
-        );
-        const requestMode = lanePlan.requestMode;
-        const estimatedInputTokens = Math.max(
-          context.estimatedInputTokens,
-          Math.ceil(Buffer.byteLength(JSON.stringify(payload), 'utf8') / 4),
-        );
-        await options.durability.beforeProviderCall({
-          payload,
-          requestMode,
-          estimatedInputTokens,
-          ...(pendingRetryOfInferenceId
-            ? { retryOfInferenceId: pendingRetryOfInferenceId }
-            : {}),
-          context: {
-            basisSequence: context.basisSequence,
-            logicalHash: context.logicalHash,
-            renderedHash: context.renderedHash,
-            orderedMessageHashes: context.orderedMessageHashes,
-            messageCount: context.messageCount,
-            fixedContractsHash: context.fixedContractsHash,
-            frame: context.frame,
-            frameBuildDurationMs: context.frameBuildDurationMs,
-            activeMessages: context.activeMessages,
-          },
-        });
-        pendingRetryOfInferenceId = null;
-        // The rejected inference is now itself durable. Throwing here still
-        // precedes provider I/O; Pi emits its normal failed inference boundary.
-        assertContextBudget(estimatedInputTokens, model.contextWindow);
-        const transportStats = requiredProviderTransportControls(providerTransportControls)
-          .getStats(context.providerSessionId);
-        pendingTransport = {
-          providerSessionId: context.providerSessionId,
-          plannedRequestMode: requestMode,
-          startedAt: performance.now(),
-          firstEventAt: null,
-          requests: transportStats?.requests ?? 0,
-          connectionsCreated: transportStats?.connectionsCreated ?? 0,
-          connectionsReused: transportStats?.connectionsReused ?? 0,
-          fullContextRequests: transportStats?.fullContextRequests ?? 0,
-          deltaRequests: transportStats?.deltaRequests ?? 0,
-          websocketFailures: transportStats?.websocketFailures ?? 0,
-          sseFallbacks: transportStats?.sseFallbacks ?? 0,
-        };
-        providerLanes.set(context.providerSessionId, lanePlan.next);
-        probe = {
-          ...probe,
-          providerRequestMode: requestMode,
-        };
-        options.onEvent({ type: 'context-probe', probe });
-      },
+      providerPreflight,
     });
+    installDurableToolHooks(session);
     session.setActiveToolsByName(PARENT_ACTIVE_TOOL_NAMES);
     const unsubscribe = session.subscribe((event) => {
+      if (event.type === 'tool_execution_end') reconcileObservedToolEnd(event);
       if (event.type === 'message_update' && pendingTransport?.firstEventAt === null) {
         pendingTransport.firstEventAt = performance.now();
       }
@@ -585,10 +675,179 @@ export class OpenAICodexProvider implements ModelProvider {
       projectPiEvent(event, options.onEvent);
     });
 
+    runWorkUnit = async (callId, input) => {
+      const entered = await options.durability.workUnitEnter(callId, input);
+      const childSettings = SettingsManager.inMemory({
+        compaction: { enabled: false },
+        retry: {
+          enabled: true,
+          maxRetries: 2,
+          baseDelayMs: 500,
+          provider: { maxRetries: 0, maxRetryDelayMs: 0 },
+        },
+        transport: 'websocket-cached',
+        enableAnalytics: false,
+        enableInstallTelemetry: false,
+      });
+      const childResources = new DefaultResourceLoader({
+        cwd: options.cwd,
+        agentDir: getAgentDir(),
+        settingsManager: childSettings,
+        extensionFactories: [{ name: 'remux-context-probe', factory: probeExtension, hidden: true }],
+        noExtensions: true,
+        noSkills: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        noContextFiles: true,
+        systemPrompt,
+      });
+      await childResources.reload();
+      const childSessionManager = SessionManager.inMemory(options.cwd);
+      const { session: child } = await createRemuxAgentSession({
+        cwd: options.cwd,
+        modelRuntime: this.modelRuntime,
+        model,
+        thinkingLevel: options.reasoning,
+        customTools: [
+          createWorkspaceReadTool(options.cwd, undefined, this.workspaceRead),
+          ...createContextTools(options.durability, {
+            runWorkUnit: (nestedCallId, nestedInput) => runWorkUnit(nestedCallId, nestedInput),
+          }),
+        ],
+        resourceLoader: childResources,
+        sessionManager: childSessionManager,
+        settingsManager: childSettings,
+        providerSessionId: () => activeProviderSessionId,
+        providerWebSocketFaultAfterEvents: this.providerWebSocketFaultAfterEvents,
+        registerProviderTransportControls: (controls) => {
+          providerTransportControls = controls;
+        },
+        providerPreflight,
+      });
+      installDurableToolHooks(child);
+      child.setActiveToolsByName(WORK_UNIT_ACTIVE_TOOL_NAMES);
+      const bootstrap = workUnitBootstrap(entered);
+      child.agent.state.messages = [{
+        role: 'toolResult',
+        toolCallId: callId,
+        toolName: 'work_unit_start',
+        content: [{ type: 'text', text: canonicalJson(bootstrap) }],
+        details: bootstrap,
+        isError: false,
+        timestamp: Date.now(),
+      }];
+      child.agent.shouldStopAfterTurn = ({ message, toolResults }) => {
+        const calledFinish = message.content.some((block) =>
+          block.type === 'toolCall' && block.name === 'work_unit_finish');
+        const finished = toolResults.some((result) =>
+          result.toolName === 'work_unit_finish' && !result.isError);
+        return calledFinish && finished;
+      };
+
+      activeChildSession = child;
+      activeChildCompletion = null;
+      activeChildFinishAttempted = false;
+      activeChildFinishFailure = null;
+      let childAgentEnd: Extract<AgentSessionEvent, { type: 'agent_end' }> | null = null;
+      const unsubscribeChild = child.subscribe((event) => {
+        if (event.type === 'tool_execution_end') reconcileObservedToolEnd(event);
+        if (event.type === 'message_update' && pendingTransport?.firstEventAt === null) {
+          pendingTransport.firstEventAt = performance.now();
+        }
+        if (event.type === 'auto_retry_start') {
+          const priorDurability = providerDurabilityTail;
+          const durability = (async () => {
+            await priorDurability;
+            if (providerDurabilityError) throw providerDurabilityError;
+            const superseded = await options.durability.supersedeProviderAttempt({
+              attempt: event.attempt,
+              maxAttempts: event.maxAttempts,
+              delayMs: event.delayMs,
+              error: safeMessage(event.errorMessage),
+            });
+            pendingRetryOfInferenceId = superseded.inferenceId;
+            const controls = requiredProviderTransportControls(providerTransportControls);
+            controls.close(activeProviderSessionId);
+            if (event.attempt === 1) controls.resetStats(activeProviderSessionId);
+            pendingTransport = null;
+            providerLanes.set(
+              activeProviderSessionId,
+              invalidateProviderLane(providerLanes.get(activeProviderSessionId)),
+            );
+          })();
+          const settled = durability.catch((error) => {
+            providerDurabilityError ??= error;
+          });
+          providerDurabilityTail = Promise.all([priorDurability, settled]).then(() => undefined);
+          return;
+        }
+        if (event.type === 'auto_retry_end' && event.success && event.attempt >= 2) {
+          const controls = requiredProviderTransportControls(providerTransportControls);
+          controls.close(activeProviderSessionId);
+          controls.resetStats(activeProviderSessionId);
+          providerLanes.set(
+            activeProviderSessionId,
+            invalidateProviderLane(providerLanes.get(activeProviderSessionId)),
+          );
+          return;
+        }
+        if (event.type === 'agent_end') {
+          childAgentEnd = event;
+          return;
+        }
+        projectPiEvent(event, options.onEvent);
+      });
+
+      try {
+        await child.continue();
+        const agentEnd = childAgentEnd as Extract<AgentSessionEvent, { type: 'agent_end' }> | null;
+        if (!agentEnd) throw new Error('Pi completed a work unit without an agent_end boundary.');
+        const finalAssistant = [...agentEnd.messages]
+          .reverse()
+          .find((message): message is AssistantMessage => message.role === 'assistant');
+        if (finalAssistant) await ensureAssistantDurable(finalAssistant);
+        await providerDurabilityTail;
+        if (providerDurabilityError) throw providerDurabilityError;
+        const completion = activeChildCompletion as WorkUnitCompletion | null;
+        if (!completion) {
+          if (activeChildFinishAttempted) {
+            throw new Error(activeChildFinishFailure
+              ? `The work unit ended after work_unit_finish failed: ${activeChildFinishFailure}`
+              : 'The work unit ended after work_unit_finish failed to commit.');
+          }
+          throw new Error('The work unit ended without calling work_unit_finish.');
+        }
+        return completion;
+      } catch (error) {
+        if (interruptRequested || activeChildCompletion) throw error;
+        if (providerDurabilityError) throw error;
+        const recovered = await options.durability.workUnitAbort({ reason: safeMessage(error) });
+        pendingTransport = null;
+        return recovered;
+      } finally {
+        unsubscribeChild();
+        activeChildSession = null;
+        activeChildCompletion = null;
+        activeChildFinishAttempted = false;
+        activeChildFinishFailure = null;
+        try {
+          await child.abort();
+        } finally {
+          child.dispose();
+          const controls = requiredProviderTransportControls(providerTransportControls);
+          controls.close(entered.scopeId);
+          controls.resetStats(entered.scopeId);
+          providerSessionIds.delete(entered.scopeId);
+          providerLanes.delete(entered.scopeId);
+        }
+      }
+    };
+
     return {
       async prompt(input) {
         providerDurabilityError = null;
         pendingAgentEnd = null;
+        interruptRequested = false;
         await session.prompt(input.text, {
           expandPromptTemplates: false,
           images: input.images?.map((image): ImageContent => ({ type: 'image', ...image })),
@@ -611,12 +870,19 @@ export class OpenAICodexProvider implements ModelProvider {
         projectPiEvent(agentEnd, options.onEvent);
       },
       async interrupt() {
-        await session.abort();
+        interruptRequested = true;
+        await Promise.all([
+          session.abort(),
+          activeChildSession?.abort() ?? Promise.resolve(),
+        ]);
       },
       async dispose() {
         unsubscribe();
         try {
-          await session.abort();
+          await Promise.all([
+            session.abort(),
+            activeChildSession?.abort() ?? Promise.resolve(),
+          ]);
         } finally {
           session.dispose();
           for (const providerSessionId of providerSessionIds) {
@@ -689,6 +955,16 @@ function requiredProviderTransportControls(
     throw new Error('Pi did not register provider transport controls from its active pi-ai runtime.');
   }
   return controls;
+}
+
+function workUnitBootstrap(entered: WorkUnitView) {
+  return {
+    boundary: 'work_unit',
+    historyRef: `history://scope/${encodeURIComponent(entered.scopeId)}`,
+    resources: entered.resources,
+    scopeId: entered.scopeId,
+    state: entered.state,
+  };
 }
 
 function contextFrameMessage(
@@ -831,6 +1107,20 @@ function durableToolResult(value: unknown, isError: boolean): unknown {
   if (isError) return { error: text };
   if (text === '') return null;
   return parseProviderToolResultText(text);
+}
+
+function workUnitCompletion(value: unknown): WorkUnitCompletion | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  if (
+    typeof candidate.scopeId !== 'string' ||
+    !['completed', 'partial', 'blocked'].includes(String(candidate.status)) ||
+    typeof candidate.result !== 'string' ||
+    !Array.isArray(candidate.resources) ||
+    typeof candidate.resultRef !== 'string' ||
+    typeof candidate.historyRef !== 'string'
+  ) return null;
+  return candidate as WorkUnitCompletion;
 }
 
 function toolResultText(content: unknown) {

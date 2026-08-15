@@ -59,7 +59,6 @@ type AgentStateSummary = {
   workUnitReturnedAuthorities: number;
   workUnitReturnedDeliverables: number;
   workUnitReturnedEvidence: number;
-  workUnitThreadProposals: number;
   estimatedInputTokens: number;
   peakEstimatedInputTokens: number;
   peakRootEstimatedInputTokens: number;
@@ -299,7 +298,6 @@ export async function evaluateRun(input: {
         `handoffReads=${agentState.parentHandoffReadCalls}`,
         `reconstructionReads=${agentState.parentReconstructionReadCalls}`,
         `returnedResourceRereads=${agentState.parentReturnedResourceReadCalls}`,
-        `threadProposals=${agentState.workUnitThreadProposals}`,
         `recent=${agentState.peakSelectedDialogueTurns} selected/${agentState.peakOmittedDialogueTurns} omitted`,
         `threadBytes=${agentState.peakThreadDocumentBytes}`,
         `pressureNotices=${agentState.pressureNotices}`,
@@ -402,7 +400,6 @@ export async function evaluateRun(input: {
       workUnitReturnedAuthorities: agentState?.workUnitReturnedAuthorities ?? null,
       workUnitReturnedDeliverables: agentState?.workUnitReturnedDeliverables ?? null,
       workUnitReturnedEvidence: agentState?.workUnitReturnedEvidence ?? null,
-      workUnitThreadProposals: agentState?.workUnitThreadProposals ?? null,
       contextLimitErrors: agentState?.contextLimitErrors ?? null,
       contextLayerEstimatedTokens: agentState?.contextLayerEstimatedTokens ?? null,
       contextOmissions: agentState?.contextOmissions ?? null,
@@ -697,16 +694,6 @@ function summarizeAgentState(
         workUnitReturnedEvidence += resources.filter(({ role }) => role === 'evidence').length;
       }
     }
-    const workUnitThreadProposals = workUnitRows.filter(({ storage_path }) => {
-      if (!storage_path) return false;
-      try {
-        return readFileSync(join(dataRoot, 'artifacts', storage_path), 'utf8')
-          .includes('## Proposed Thread update');
-      } catch {
-        return false;
-      }
-    }).length;
-
     const toolNames: Record<string, number> = {};
     const requestModes: Record<string, number> = {};
     const contextLayerEstimatedTokens: Record<string, number> = {};
@@ -917,7 +904,6 @@ function summarizeAgentState(
       workUnitReturnedAuthorities,
       workUnitReturnedDeliverables,
       workUnitReturnedEvidence,
-      workUnitThreadProposals,
       estimatedInputTokens: inferenceRows.reduce((sum, row) => sum + row.estimated_input_tokens, 0),
       peakEstimatedInputTokens: Math.max(0, ...inferenceRows.map((row) => row.estimated_input_tokens)),
       peakRootEstimatedInputTokens: Math.max(0, ...rootInferences.map((row) => row.estimated_input_tokens)),

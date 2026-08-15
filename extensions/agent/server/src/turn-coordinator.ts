@@ -22,8 +22,8 @@ import type {
   DurableInferenceContext,
   DurableTranscriptMutation,
   DurableTurnHandle,
-  PreparedWorkUnitReturn,
 } from './domain/state.ts';
+import type { WorkUnitCompletion } from './domain/work.ts';
 import { createReplayedTranscriptProjector } from './transcript-replay.ts';
 import type { EphemeralTranscriptProjector } from './transcript-projector.ts';
 import { ResourceStore } from './resources.ts';
@@ -62,10 +62,6 @@ export class TurnCoordinator {
     handle: DurableTurnHandle;
     operationId: string;
     sourceInferenceId: string;
-  }>();
-  private readonly pendingWorkUnitReturns = new Map<string, {
-    handle: DurableTurnHandle;
-    prepared: PreparedWorkUnitReturn;
   }>();
   private activeTurnStartedMonotonicAt: number | null = null;
   private pendingAssistantText = '';
@@ -210,8 +206,10 @@ export class TurnCoordinator {
         this.store.replaceThread(this.requiredActiveDurableScope(conversationId), input),
       workUnitEnter: (callId: string, input: WorkUnitEnterInput) =>
         this.enterWorkUnit(conversationId, callId, input),
-      workUnitReturn: (callId: string, input: WorkUnitReturnInput) =>
-        this.requestWorkUnitReturn(conversationId, callId, input),
+      workUnitFinish: (callId: string, input: WorkUnitReturnInput) =>
+        this.finishWorkUnit(conversationId, callId, input),
+      workUnitAbort: (input: { reason: string }) =>
+        this.abortWorkUnit(conversationId, input.reason),
     };
   }
 
@@ -538,7 +536,7 @@ export class TurnCoordinator {
   private async afterTool(
     conversationId: string,
     input: { callId: string; name: string; result: unknown; isError: boolean },
-  ) {
+  ): Promise<void> {
     const tracked = this.toolScopes.get(input.callId);
     if (!tracked) throw new Error(`Tool call ${input.callId} has no durable execution identity.`);
     const handle = tracked.handle;
@@ -559,25 +557,6 @@ export class TurnCoordinator {
         ...transcriptTerminalMutation(inserted),
       });
     }
-    const pendingReturn = this.pendingWorkUnitReturns.get(input.callId);
-    if (input.name === 'work_unit_finish' && !input.isError) {
-      if (!pendingReturn || pendingReturn.handle.scopeId !== handle.scopeId) {
-        throw new Error('The work unit return boundary was not prepared.');
-      }
-      const returned = await this.enqueueTurnWrite(() =>
-        this.store.commitWorkUnitReturn(handle, pendingReturn.prepared));
-      this.options.projector()?.finishWorkUnit(handle.turnId, {
-        scopeId: returned.scopeId,
-        status: returned.status,
-        resultPreview: workUnitResultPreview(returned.result),
-        resourceCount: returned.resources.length,
-        sequence: returned.transcriptSequence,
-        basisSequence: returned.transcriptSequence,
-        createdAt: returned.transcriptCreatedAt,
-      });
-      this.activeDurableScope = returned.parentHandle;
-    }
-    this.pendingWorkUnitReturns.delete(input.callId);
     this.toolScopes.delete(input.callId);
   }
 
@@ -591,6 +570,7 @@ export class TurnCoordinator {
     }
     const prepared = await this.store.prepareWorkUnitEntry(parent, input);
     const entered = await this.enqueueTurnWrite(() => this.store.commitWorkUnitEntry(parent, prepared, {
+      parentCallId: callId,
       parentOperationId: parentCall.operationId,
       parentInferenceId: parentCall.sourceInferenceId,
     }));
@@ -614,20 +594,73 @@ export class TurnCoordinator {
     };
   }
 
-  private async requestWorkUnitReturn(
+  private async finishWorkUnit(
     conversationId: string,
     callId: string,
     input: WorkUnitReturnInput,
-  ) {
+  ): Promise<WorkUnitCompletion> {
     const handle = this.requiredActiveDurableScope(conversationId);
     if (this.isRootScope(handle)) throw new Error('No work unit is active.');
-    const prepared = await this.store.prepareWorkUnitReturn(handle, input);
     const tracked = this.toolScopes.get(callId);
     if (!tracked || tracked.handle.scopeId !== handle.scopeId) {
       throw new Error('The work unit return has no durable operation identity.');
     }
-    this.pendingWorkUnitReturns.set(callId, { handle, prepared });
-    return { scopeId: handle.scopeId, state: 'returning' as const };
+    const prepared = await this.store.prepareWorkUnitReturn(handle, input);
+    const returned = await this.enqueueTurnWrite(() =>
+      this.store.commitWorkUnitFinish(handle, callId, prepared));
+    this.options.projector()?.touchWorkUnit(handle.turnId, {
+      scopeId: handle.scopeId,
+      ...transcriptTerminalMutation(returned.toolMutation),
+    });
+    this.options.projector()?.finishWorkUnit(handle.turnId, {
+      scopeId: returned.scopeId,
+      status: returned.status,
+      resultPreview: workUnitResultPreview(returned.result),
+      resourceCount: returned.resources.length,
+      sequence: returned.transcriptSequence,
+      basisSequence: returned.transcriptSequence,
+      createdAt: returned.transcriptCreatedAt,
+    });
+    this.activeDurableScope = returned.parentHandle;
+    this.toolScopes.delete(callId);
+    return {
+      scopeId: returned.scopeId,
+      status: returned.status,
+      result: returned.result,
+      resources: returned.resources,
+      resultRef: returned.resultRef,
+      historyRef: returned.historyRef,
+    };
+  }
+
+  private async abortWorkUnit(conversationId: string, reason: string): Promise<WorkUnitCompletion> {
+    const handle = this.requiredActiveDurableScope(conversationId);
+    if (this.isRootScope(handle)) throw new Error('No work unit is active.');
+    const normalizedReason = safeMessage(reason);
+    const prepared = await this.store.prepareWorkUnitReturn(handle, {
+      status: 'blocked',
+      result: `The work unit stopped without a committed handoff: ${normalizedReason}`,
+    });
+    const returned = await this.enqueueTurnWrite(() =>
+      this.store.commitWorkUnitReturn(handle, prepared));
+    this.options.projector()?.finishWorkUnit(handle.turnId, {
+      scopeId: returned.scopeId,
+      status: returned.status,
+      resultPreview: workUnitResultPreview(returned.result),
+      resourceCount: returned.resources.length,
+      sequence: returned.transcriptSequence,
+      basisSequence: returned.transcriptSequence,
+      createdAt: returned.transcriptCreatedAt,
+    });
+    this.activeDurableScope = returned.parentHandle;
+    return {
+      scopeId: returned.scopeId,
+      status: returned.status,
+      result: returned.result,
+      resources: returned.resources,
+      resultRef: returned.resultRef,
+      historyRef: returned.historyRef,
+    };
   }
 
   private bufferAssistantCheckpoint(
@@ -827,7 +860,6 @@ export class TurnCoordinator {
     this.activeDurableTurn = null;
     this.activeDurableScope = null;
     this.toolScopes.clear();
-    this.pendingWorkUnitReturns.clear();
     this.activeTurnStartedMonotonicAt = null;
   }
 

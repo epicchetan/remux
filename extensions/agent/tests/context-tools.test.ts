@@ -11,7 +11,6 @@ test('model-facing context tools use Thread, History, and work-unit start/finish
     openedRef?: string;
     resources?: Array<{ ref: string }>;
     returnedResources?: Array<{ ref: string }>;
-    threadUpdate?: string;
   } = {};
   const tools = createContextTools({
     async historySearch(callId, input) {
@@ -67,10 +66,16 @@ test('model-facing context tools use Thread, History, and work-unit start/finish
         state: 'running',
       };
     },
-    async workUnitReturn(_callId, input) {
+    async workUnitFinish(_callId, input) {
       seen.returnedResources = input.resources;
-      seen.threadUpdate = input.threadUpdate;
-      return { scopeId: 'child', state: 'returning' };
+      return {
+        scopeId: 'child',
+        status: input.status,
+        result: input.result,
+        resources: [],
+        resultRef: `history://artifact/${'b'.repeat(64)}`,
+        historyRef: 'history://scope/child',
+      };
     },
   });
   assert.deepEqual(tools.map(({ name }) => name), [
@@ -91,11 +96,11 @@ test('model-facing context tools use Thread, History, and work-unit start/finish
   const byName = new Map(tools.map((tool) => [tool.name, tool]));
   const finishSchema = byName.get('work_unit_finish')!.parameters as {
     required?: string[];
-    properties?: { result?: { maxLength?: number }; threadUpdate?: { maxLength?: number } };
+    properties?: { result?: { maxLength?: number } };
   };
   assert.deepEqual(finishSchema.required, ['status', 'result']);
   assert.equal(finishSchema.properties?.result?.maxLength, undefined);
-  assert.equal(finishSchema.properties?.threadUpdate?.maxLength, undefined);
+  assert.equal('threadUpdate' in (finishSchema.properties ?? {}), false);
   assert.equal('artifacts' in (finishSchema.properties ?? {}), false);
   const context = {} as ExtensionContext;
   const search = await byName.get('history_search')!.execute(
@@ -128,11 +133,10 @@ test('model-facing context tools use Thread, History, and work-unit start/finish
     (work.details as { resources: Array<{ ref: string }> }).resources.map(({ ref }) => ref),
     ['history://turn/prior', 'docs/contract.md'],
   );
-  await byName.get('work_unit_finish')!.execute(
+  const finished = await byName.get('work_unit_finish')!.execute(
     'finish', {
       status: 'completed',
       result: 'The seam is sound.',
-      threadUpdate: 'Mark the seam verified.',
       resources: [
         { ref: 'history://turn/prior', role: 'evidence' },
         { ref: 'src/seam.ts', role: 'deliverable' },
@@ -140,11 +144,12 @@ test('model-facing context tools use Thread, History, and work-unit start/finish
     },
     undefined, undefined, context,
   );
-  assert.equal(seen.threadUpdate, 'Mark the seam verified.');
   assert.deepEqual(seen.returnedResources?.map(({ ref }) => ref), [
     'history://turn/prior',
     'src/seam.ts',
   ]);
+  assert.equal(finished.terminate, true);
+  assert.equal((finished.details as { status: string }).status, 'completed');
 
   const formerBoundary = `## Detailed result\n\n${'repository-grounded finding\n'.repeat(800)}`;
   assert.ok(Buffer.byteLength(formerBoundary, 'utf8') > 16 * 1024);

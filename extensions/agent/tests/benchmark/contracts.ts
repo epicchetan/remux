@@ -231,7 +231,6 @@ export type BenchmarkReport = {
     workUnitReturnedAuthorities: number | null;
     workUnitReturnedDeliverables: number | null;
     workUnitReturnedEvidence: number | null;
-    workUnitThreadProposals: number | null;
     contextLimitErrors: number | null;
     contextLayerEstimatedTokens: Record<string, number> | null;
     contextOmissions: number | null;

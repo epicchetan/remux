@@ -38,6 +38,7 @@ export const LEDGER_PROJECTION_TIME_BARS_SCENARIO: BenchmarkScenario = {
     ],
     constraints: [
       'Do not expose the historical reference implementation or evaluator-only tests.',
+      'Treat the isolated checkout as the complete task and test environment; do not use another checkout, host data, environment files, rollouts, or benchmark internals.',
       'Do not commit or push.',
       'Preserve unrelated work and keep changes within the projection/session/CLI surface authorized by the governing specification.',
     ],

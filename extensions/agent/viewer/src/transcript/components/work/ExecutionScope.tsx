@@ -615,15 +615,12 @@ function WorkUnitAssignment({
 }
 
 function WorkUnitOutcome({ laneWidth, value }: { laneWidth: number; value: AgentExecutionScopeResource }) {
-  if (!value.result && !value.threadUpdate && !value.returnedResources.length) return null;
+  if (!value.result && !value.returnedResources.length) return null;
   return (
     <div className="agent-work-unit-outcome">
       <strong>Handoff</strong>
       {value.result ? (
         <section><MarkdownBlock density="work" width={laneWidth}>{value.result}</MarkdownBlock></section>
-      ) : null}
-      {value.threadUpdate ? (
-        <section><strong>Proposed Thread update</strong><MarkdownBlock density="work" width={laneWidth}>{value.threadUpdate}</MarkdownBlock></section>
       ) : null}
       {value.returnedResources.length ? <ResourceList label="Returned resources" resources={value.returnedResources} /> : null}
     </div>

@@ -29,7 +29,6 @@ export type WorkUnitEnterInput = {
 export type WorkUnitReturnInput = {
   status: WorkUnitReturnStatus;
   result: string;
-  threadUpdate?: string;
   resources?: WorkUnitResourceRef[];
 };
 
@@ -54,18 +53,32 @@ export type WorkUnitResourceView = WorkUnitResourceRef & {
   inclusion: 'materialized' | 'inherited';
 };
 
+export type WorkUnitContextResource = WorkUnitResourceView & {
+  /** Exact boundary snapshot, present only when it was not already inherited. */
+  content?: string;
+};
+
 export type WorkUnitView = {
   scopeId: string;
   parentScopeId: string;
   objective: string;
   doneWhen: string[];
-  resources: WorkUnitResourceView[];
+  resources: WorkUnitContextResource[];
   state: 'running';
 };
 
 export type WorkUnitReturnPending = {
   scopeId: string;
   state: 'returning';
+};
+
+export type WorkUnitCompletion = {
+  scopeId: string;
+  status: WorkUnitReturnStatus;
+  result: string;
+  resources: WorkUnitContextResource[];
+  resultRef: string;
+  historyRef: string;
 };
 
 export type HistorySearchInput = {

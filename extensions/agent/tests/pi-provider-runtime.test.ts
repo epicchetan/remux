@@ -10,11 +10,19 @@ import {
 
 const root = resolve(import.meta.dirname, '../../..');
 
-test('the pinned Pi seam separates prompt caching from scope-local WebSocket lanes', async () => {
-  const [sdk, provider, nestedProvider, providerTypes, nestedProviderTypes] = await Promise.all([
+test('the pinned Pi seam supports host continuation and scope-local WebSocket lanes', async () => {
+  const [sdk, agentSession, agentSessionTypes, provider, nestedProvider, providerTypes, nestedProviderTypes] = await Promise.all([
     readFile(resolve(
       root,
       'node_modules/@earendil-works/pi-coding-agent/dist/core/sdk.js',
+    ), 'utf8'),
+    readFile(resolve(
+      root,
+      'node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.js',
+    ), 'utf8'),
+    readFile(resolve(
+      root,
+      'node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.d.ts',
     ), 'utf8'),
     readFile(resolve(
       root,
@@ -37,6 +45,8 @@ test('the pinned Pi seam separates prompt caching from scope-local WebSocket lan
   assert.match(sdk, /websocketSessionId: providerSessionId\?\.\(\) \?\? options\?\.sessionId/u);
   assert.match(sdk, /debugWebSocketDropAfterEvents: providerWebSocketFaultAfterEvents\?\.\(\)/u);
   assert.match(sdk, /registerProviderTransportControls/u);
+  assert.match(agentSession, /async continue\(\) \{\s+this\._isAgentRunActive = true;/u);
+  assert.match(agentSessionTypes, /continue\(\): Promise<void>/u);
   for (const source of [provider, nestedProvider]) {
     assert.match(source, /options\?\.websocketSessionId \?\? options\?\.sessionId/u);
     assert.match(source, /websocketSessionId: options\?\.websocketSessionId/u);
@@ -58,6 +68,15 @@ test('the Agent runtime owns bounded durable retries and selects one provider la
   assert.match(runtime, /snapshot\.scopeKind === 'work_unit'\s+\? snapshot\.scopeId\s+: parentProviderSessionId/u);
   assert.match(runtime, /provider-retry@1/u);
   assert.match(runtime, /provider-lanes@1/u);
+  assert.match(runtime, /child\.agent\.state\.messages = \[\{\s+role: 'toolResult'/u);
+  assert.match(runtime, /await child\.continue\(\)/u);
+  assert.match(runtime, /The work unit ended without calling work_unit_finish/u);
+  assert.match(runtime, /installDurableToolHooks\(session\)/u);
+  assert.match(runtime, /installDurableToolHooks\(child\)/u);
+  assert.match(runtime, /target\.agent\.beforeToolCall = async/u);
+  assert.match(runtime, /target\.agent\.afterToolCall = async/u);
+  assert.doesNotMatch(runtime, /pi\.on\('tool_(?:call|result)'/u);
+  assert.match(runtime, /work_unit_finish returned without a durable completion payload/u);
   assert.match(
     runtime,
     /if \(finalAssistant\) await ensureAssistantDurable\(finalAssistant\);/u,
@@ -71,10 +90,11 @@ test('parent and work-unit provider lanes continue independently', () => {
   const rootSecond = planProviderLaneRequest(rootFirst.next, ['root-user', 'root-assistant']);
   assert.equal(rootSecond.requestMode, 'continuation');
 
-  const childFirst = planProviderLaneRequest(undefined, ['child-orientation']);
+  const childFirst = planProviderLaneRequest(undefined, ['parent-tool-call', 'child-start-result']);
   assert.equal(childFirst.requestMode, 'full');
   const childSecond = planProviderLaneRequest(childFirst.next, [
-    'child-orientation',
+    'parent-tool-call',
+    'child-start-result',
     'child-assistant',
   ]);
   assert.equal(childSecond.requestMode, 'continuation');

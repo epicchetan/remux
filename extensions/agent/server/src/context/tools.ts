@@ -2,6 +2,7 @@ import { Type } from '@earendil-works/pi-ai';
 import { defineTool, type ToolDefinition } from '@earendil-works/pi-coding-agent';
 
 import type { ModelSessionDurabilityHooks } from '../model-provider.ts';
+import type { WorkUnitCompletion, WorkUnitEnterInput } from '../domain/work.ts';
 
 export const PARENT_CONTEXT_TOOL_NAMES = [
   'history_search',
@@ -97,12 +98,8 @@ const workUnitReturnSchema = Type.Object({
   }),
   result: Type.String({
     minLength: 1,
-    description: 'Decision-ready Markdown continuation that lets the parent proceed without reconstructing the work-unit trace.',
+    description: 'The useful outcome, evidence, uncertainty, and next edge the parent needs. Markdown is allowed but no fixed template is required.',
   }),
-  threadUpdate: Type.Optional(Type.String({
-    minLength: 1,
-    description: 'Proposed Markdown for the parent to merge into the Thread. It is not applied automatically.',
-  })),
   resources: Type.Optional(Type.Array(workUnitResourceSchema(), {
     maxItems: 16,
     description: 'Selected exact authorities, deliverables, or evidence that prevent meaningful reconstruction or enable the next action.',
@@ -129,8 +126,11 @@ export function createContextTools(
   durability: Pick<
     ModelSessionDurabilityHooks,
     'historySearch' | 'historyOpen' | 'threadRead' | 'threadPatch' | 'threadReplace' |
-    'workUnitEnter' | 'workUnitReturn'
+    'workUnitEnter' | 'workUnitFinish'
   >,
+  runtime?: {
+    runWorkUnit(callId: string, input: WorkUnitEnterInput): Promise<WorkUnitCompletion>;
+  },
 ): ToolDefinition[] {
   return [
     defineTool({
@@ -237,10 +237,13 @@ export function createContextTools(
       parameters: workUnitEnterSchema,
       executionMode: 'sequential',
       async execute(callId, params) {
-        const result = await durability.workUnitEnter(callId, {
+        const input = {
           ...params,
           resources: params.resources?.map(durableWorkUnitResource),
-        });
+        };
+        const result = runtime
+          ? await runtime.runWorkUnit(callId, input)
+          : await durability.workUnitEnter(callId, input);
         return jsonResult({
           ...result,
           resources: result.resources.map(modelWorkUnitResource),
@@ -251,9 +254,9 @@ export function createContextTools(
       name: 'work_unit_finish',
       label: 'Finish work unit',
       description: [
-        'Finish the active work unit with a continuation that enables the parent\'s next decision or action without reconstructing the child trace.',
-        'The status and result are required; a proposed Thread update and resources are optional.',
-        'Returned resources are snapshotted and materialized into the parent context.',
+        'Finish the active work unit and resolve the parent work_unit_start call.',
+        'The status and result are required; selected resources are optional.',
+        'New resource snapshots are materialized directly in the parent tool result.',
         'Detailed scratch remains in History and is not replayed into the parent.',
       ].join(' '),
       promptSnippet: 'Finish the work unit and return what its parent needs',
@@ -261,7 +264,6 @@ export function createContextTools(
         'Put the established outcome, changed state or findings, supporting validation, remaining uncertainty, and next useful parent edge in result.',
         'For implementation work, finish the focused validation this unit can perform before returning; identify validation that was impossible rather than silently delegating routine checking to the parent.',
         'Use partial or blocked to return honestly at a useful boundary instead of broadening the unit.',
-        'Use threadUpdate only for shared state the parent should deliberately merge; do not treat recommendations as accepted user decisions.',
         'Return a resource when its exact contents prevent meaningful reconstruction or enable inspection, integration, audit, or later work; prefer the smallest useful surface.',
         'Only return a resource when you have its exact file path or history:// reference. Summarize other evidence in the result instead of inventing a reference.',
         'Do not return every file touched or unchanged material already inherited.',
@@ -270,10 +272,10 @@ export function createContextTools(
       parameters: workUnitReturnSchema,
       executionMode: 'sequential',
       async execute(callId, params) {
-        return jsonResult(await durability.workUnitReturn(callId, {
+        return jsonResult(await durability.workUnitFinish(callId, {
           ...params,
           resources: params.resources?.map(durableWorkUnitResource),
-        }));
+        }), true);
       },
     }),
   ];
@@ -315,9 +317,10 @@ function durableWorkUnitResource<T extends { ref: string; snapshot?: { ref: stri
   };
 }
 
-function jsonResult(value: unknown) {
+function jsonResult(value: unknown, terminate = false) {
   return {
     content: [{ type: 'text' as const, text: JSON.stringify(value) }],
     details: value,
+    ...(terminate ? { terminate: true } : {}),
   };
 }

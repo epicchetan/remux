@@ -308,7 +308,6 @@ export type AgentExecutionScopeResource = {
   };
   result: string | null;
   returnedResources: AgentWorkUnitResourceReference[];
-  threadUpdate: string | null;
 };
 
 export type AgentTranscriptResourceRequest =

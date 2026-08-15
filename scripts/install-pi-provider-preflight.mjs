@@ -27,6 +27,35 @@ for (const [name, root] of [
 const baseReplacements = [
   {
     root: codingAgentRoot,
+    path: 'dist/core/agent-session.js',
+    before: `    async _handlePostAgentRun() {`,
+    after: `    /** Continue from an already-materialized user or tool-result boundary. */
+    async continue() {
+        this._isAgentRunActive = true;
+        try {
+            await this.agent.continue();
+            while (await this._handlePostAgentRun()) {
+                await this.agent.continue();
+            }
+        }
+        finally {
+            this._systemPromptOverride = undefined;
+            this._flushPendingBashMessages();
+            await this._emitAgentSettled();
+        }
+    }
+    async _handlePostAgentRun() {`,
+  },
+  {
+    root: codingAgentRoot,
+    path: 'dist/core/agent-session.d.ts',
+    before: `    private _handlePostAgentRun;`,
+    after: `    /** Continue from an already-materialized user or tool-result boundary. */
+    continue(): Promise<void>;
+    private _handlePostAgentRun;`,
+  },
+  {
+    root: codingAgentRoot,
     path: 'dist/core/sdk.js',
     before: [
       `    const extensionRunnerRef = {};
