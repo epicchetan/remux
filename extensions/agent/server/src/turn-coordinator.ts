@@ -20,6 +20,7 @@ import type {
 } from './model-provider.ts';
 import type {
   DurableInferenceContext,
+  InstallContextCompactionInput,
   DurableTranscriptMutation,
   DurableTurnHandle,
 } from './domain/state.ts';
@@ -150,6 +151,13 @@ export class TurnCoordinator {
   durabilityHooks(conversationId: string) {
     return {
       compileContext: () => this.compileContext(conversationId),
+      recordContextCompactionWarning: (input: {
+        epoch: number;
+        estimatedInputTokens: number;
+        targetTokens: number;
+      }) => this.recordContextCompactionWarning(conversationId, input),
+      installContextCompaction: (input: InstallContextCompactionInput) =>
+        this.installContextCompaction(conversationId, input),
       beforeAssistantMessageEnd: (input: {
         inferenceState: 'completed' | 'failed' | 'interrupted';
         text: string;
@@ -329,6 +337,24 @@ export class TurnCoordinator {
     this.inferenceAssistantText = '';
     this.inferenceAssistantTextPhase = null;
     this.inferenceAssistantReasoning = '';
+  }
+
+  private async recordContextCompactionWarning(
+    conversationId: string,
+    input: { epoch: number; estimatedInputTokens: number; targetTokens: number },
+  ) {
+    const handle = this.requiredActiveDurableScope(conversationId);
+    await this.enqueueTurnWrite(() => this.store.recordContextCompactionWarning(handle, input));
+    this.resources.invalidateKey(contextResourceKey(conversationId), 'updated');
+  }
+
+  private async installContextCompaction(
+    conversationId: string,
+    input: InstallContextCompactionInput,
+  ) {
+    const handle = this.requiredActiveDurableScope(conversationId);
+    await this.enqueueTurnWrite(() => this.store.installContextCompaction(handle, input));
+    this.resources.invalidateKey(contextResourceKey(conversationId), 'updated');
   }
 
   private async supersedeProviderAttempt(

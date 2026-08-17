@@ -6,6 +6,7 @@ import {
   logicalMessageSemanticValue,
   type LogicalContextMessage,
 } from '../logical-context.ts';
+import type { ProviderCompactionCheckpoint } from './compaction.ts';
 import { canonicalJson, canonicalJsonHash } from '../storage/canonical-json.ts';
 import {
   CONTEXT_COMPILER_VERSION,
@@ -127,6 +128,65 @@ export function compileTurnContext(source: TurnContextSource): CompiledTurnConte
       scopeKind: source.scopeKind,
       layers,
       omissions,
+    },
+  };
+}
+
+/**
+ * Compile only activity after an installed provider-native checkpoint. The
+ * checkpoint already represents every selected turn and active-scope item at
+ * compactedThroughSequence, while the journal remains complete for History.
+ */
+export function compileCompactedTurnContext(
+  source: TurnContextSource,
+  checkpoint: ProviderCompactionCheckpoint,
+): CompiledTurnContext {
+  const requestedPlan = normalizeTurnContextPlan(source.contextPlan);
+  const messages = [...source.messages];
+  const orderedMessageHashes = messages.map((message) =>
+    canonicalJsonHash(logicalMessageSemanticValue(message)));
+  const active = messages.filter((message) => message.turnId === source.turnId);
+  const checkpointValue = {
+    epoch: checkpoint.epoch,
+    inputHash: checkpoint.inputHash,
+    installedSequence: checkpoint.installedSequence,
+    compactedThroughSequence: checkpoint.compactedThroughSequence,
+  };
+  const checkpointTokens = checkpoint.retainedInputTokens + (checkpoint.usage.outputTokens ?? 0);
+  const layers: TurnContextLayer[] = [
+    {
+      kind: 'provider_checkpoint',
+      estimatedTokens: checkpointTokens,
+      hash: canonicalJsonHash(checkpointValue),
+      sources: [`history://compaction/${encodeURIComponent(String(checkpoint.installedSequence))}`],
+    },
+    contextLayer('active_scope', active, [
+      `history://turn/${encodeURIComponent(source.turnId)}`,
+      `history://scope/${encodeURIComponent(source.scopeId)}`,
+    ]),
+  ];
+  const estimatedInputTokens = checkpointTokens + estimateMessagesTokens(messages);
+  return {
+    messages,
+    frame: {
+      compilerVersion: CONTEXT_COMPILER_VERSION,
+      policyVersion: CONTEXT_POLICY_VERSION,
+      basisSequence: source.basisSequence,
+      requestedPlan,
+      resolvedTurns: checkpoint.resolvedTurns,
+      semanticHash: canonicalJsonHash({
+        basisSequence: source.basisSequence,
+        checkpoint: checkpointValue,
+        orderedMessageHashes,
+        policyVersion: CONTEXT_POLICY_VERSION,
+        requestedPlan,
+      }),
+      estimatedInputTokens,
+      orderedMessageHashes,
+      selectedTurnIds: checkpoint.selectedTurnIds,
+      scopeKind: source.scopeKind,
+      layers,
+      omissions: [],
     },
   };
 }

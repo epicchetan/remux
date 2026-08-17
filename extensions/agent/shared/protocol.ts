@@ -129,7 +129,7 @@ export type ContextInspectorArtifact = {
 };
 
 export type ContextInspectorValue = {
-  version: 6;
+  version: 7;
   conversationId: string;
   inferenceId: string;
   frameId: string;
@@ -165,7 +165,7 @@ export type ContextInspectorValue = {
     estimatedTokens: number;
   }>;
   layers: ReadonlyArray<{
-    kind: 'selected_dialogue' | 'selected_full_turns' | 'active_scope';
+    kind: 'selected_dialogue' | 'selected_full_turns' | 'provider_checkpoint' | 'active_scope';
     hash: string;
     estimatedTokens: number;
     sources: readonly string[];
@@ -179,6 +179,14 @@ export type ContextInspectorValue = {
     count: number;
   }>;
   omissionsTruncated: boolean;
+  compaction: {
+    epoch: number;
+    checkpointSequence: number | null;
+    compactedThroughSequence: number | null;
+    warningIssued: boolean;
+    modelRequested: boolean;
+    policyInputTokens: number;
+  };
 };
 
 export type TurnReadParams = {

@@ -36,11 +36,13 @@ test('parent and child context-tool profiles expose only scope-valid actions', (
   assert.deepEqual(PARENT_CONTEXT_TOOL_NAMES, [
     'history_search',
     'history_read',
+    'context_compact',
     'work_unit_start',
   ]);
   assert.deepEqual(WORK_UNIT_CONTEXT_TOOL_NAMES, [
     'history_search',
     'history_read',
+    'context_compact',
     'work_unit_finish',
   ]);
   assert.ok(!PARENT_CONTEXT_TOOL_NAMES.includes('work_unit_finish' as never));

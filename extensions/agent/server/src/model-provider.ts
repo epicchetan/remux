@@ -8,6 +8,7 @@ import type { AssistantMessage } from '@earendil-works/pi-ai';
 import type {
   DurableContextBoundarySnapshot,
   DurableInferenceContext,
+  InstallContextCompactionInput,
 } from './domain/state.ts';
 import type {
   HistoryOpenInput,
@@ -52,6 +53,12 @@ export type ModelSessionEventSink = (event: ModelSessionEvent) => void;
 
 export type ModelSessionDurabilityHooks = {
   compileContext(): Promise<DurableContextBoundarySnapshot>;
+  recordContextCompactionWarning(input: {
+    epoch: number;
+    estimatedInputTokens: number;
+    targetTokens: number;
+  }): Promise<void>;
+  installContextCompaction(input: InstallContextCompactionInput): Promise<void>;
   beforeAssistantMessageEnd(input: {
     inferenceState: 'completed' | 'failed' | 'interrupted';
     text: string;

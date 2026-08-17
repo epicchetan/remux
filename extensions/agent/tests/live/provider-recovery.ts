@@ -157,7 +157,7 @@ try {
     trace.root.scopeId,
     workUnitStart.id,
   );
-  assert.match(workUnitStartDetail.detail ?? '', /Verify child provider isolation/u);
+  assert.match(workUnitStartDetail.detail ?? '', /Verify provider isolation/u);
 
   process.stdout.write(`${JSON.stringify({
     ok: true,

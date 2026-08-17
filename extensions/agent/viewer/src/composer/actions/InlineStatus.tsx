@@ -39,7 +39,10 @@ function ContextInspector({ value }: { value: ContextInspectorValue }) {
   return (
     <details className="agent-context-inspector" data-testid="context-inspector">
       <summary>
-        dialogue {formatTokens(tokens('selected_dialogue'))} · full {formatTokens(tokens('selected_full_turns'))} · active {formatTokens(tokens('active_scope'))} · {value.scopeKind === 'work_unit' ? 'work unit' : 'turn'}
+        {value.compaction.epoch > 0
+          ? <>checkpoint {formatTokens(tokens('provider_checkpoint'))} · active {formatTokens(tokens('active_scope'))}</>
+          : <>dialogue {formatTokens(tokens('selected_dialogue'))} · full {formatTokens(tokens('selected_full_turns'))} · active {formatTokens(tokens('active_scope'))}</>}
+        {' · '}{value.scopeKind === 'work_unit' ? 'work unit' : 'turn'}
       </summary>
       <section className="agent-context-inspector-panel" aria-label="Inference context inspector">
         <header>
@@ -54,6 +57,7 @@ function ContextInspector({ value }: { value: ContextInspectorValue }) {
           <div className="agent-context-inspector-metrics">
             <span>{formatTokens(value.estimatedInputTokens)} estimated</span>
             <span>{value.messageCount} messages / {value.turnCount} turns</span>
+            {value.compaction.epoch > 0 ? <span>context epoch {value.compaction.epoch}</span> : null}
             <span>latest {value.requestedPlan.automaticDialogueTurns} dialogue</span>
             <span>{value.requestedPlan.overrides.length} explicit override{value.requestedPlan.overrides.length === 1 ? '' : 's'}</span>
           </div>
@@ -112,7 +116,9 @@ function ContextInspector({ value }: { value: ContextInspectorValue }) {
                 </div>
               ))}
             </div>
-          ) : <p>No completed-turn material was omitted from this frame.</p>}
+          ) : <p>{value.compaction.epoch > 0
+            ? 'Earlier active work is represented by the provider checkpoint; exact events remain in History.'
+            : 'No completed-turn material was omitted from this frame.'}</p>}
         </section>
         <footer>
           <span>frame <code>{shortHash(value.frameId)}</code> · basis {value.basisSequence}</span>
@@ -141,6 +147,8 @@ function layerLabel(kind: ContextInspectorValue['layers'][number]['kind']) {
       return 'dialogue turns';
     case 'selected_full_turns':
       return 'full turns';
+    case 'provider_checkpoint':
+      return 'provider checkpoint';
     case 'active_scope':
       return 'current work';
   }

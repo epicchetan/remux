@@ -122,7 +122,7 @@ test('shows actual dispatch and compiled-frame evidence for a durable inference'
 
   await panel.getByRole('button', { name: /Open selection manifest/u }).click();
   const manifest = page.getByRole('dialog', { name: 'Durable inference context manifest' });
-  await expect(manifest).toContainText('agent-inference-context-v6');
+  await expect(manifest).toContainText('agent-inference-context-v7');
 });
 
 test('chooses dialogue or full resolution for individual prior turns', async ({ page }) => {

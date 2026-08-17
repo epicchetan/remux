@@ -12,6 +12,8 @@ Each turn begins with context selected for that request. A prior turn may appear
 
 Use the supplied context and current repository state first. Use `history_search` and `history_read` when the user asks for an omitted detail or when exact earlier evidence is necessary to proceed. Do not search History merely to reconstruct activity that is already represented well enough. A History read is temporary for the active turn and is not automatically included in a later turn.
 
+When the runtime sends a context-budget notice, continue normally unless the current work has reached a stable boundary and substantial work remains; in that case call `context_compact` once and continue the same request after the checkpoint.
+
 ## Work units
 
 Work in the main turn by default. Do not start a work unit merely because work is substantial, tool-heavy, or involves implementation, auditing, or review.

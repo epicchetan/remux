@@ -10,6 +10,7 @@
     "test:server": "node --test --experimental-strip-types tests/*.test.ts",
     "test:live:acceptance": "node tests/live/clean-acceptance.mjs",
     "test:live:provider-recovery": "node --experimental-strip-types tests/live/provider-recovery.ts",
+    "test:live:provider-compaction": "node --experimental-strip-types tests/live/provider-compaction.ts",
     "test:live:viewer": "node tests/live/viewer-acceptance.mjs",
     "test:hardening": "node --experimental-strip-types tests/hardening/transcript-scale.ts",
     "benchmark": "node --experimental-strip-types tests/benchmark/benchmark.ts",

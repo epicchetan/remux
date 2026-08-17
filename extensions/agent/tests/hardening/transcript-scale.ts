@@ -99,6 +99,7 @@ try {
           frame: context.frame,
           frameBuildDurationMs: 1,
           activeMessages: context.messages,
+          compaction: context.compaction,
         },
       });
       for (let row = 0; row < TOOL_ROWS; row += 1) {

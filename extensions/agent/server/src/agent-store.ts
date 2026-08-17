@@ -14,6 +14,7 @@ import type {
   DurableContextBoundarySnapshot,
   DurableInferenceContext,
   DurableInferenceFinalization,
+  InstallContextCompactionInput,
   DurableToolCallMutation,
   DurableQueuedTurn,
   PreparedWorkUnitReturn,
@@ -123,6 +124,14 @@ export interface AgentStore {
     },
   ): Promise<DurableTranscriptMutation | null>;
   compileContext(conversationId: string): Promise<DurableContextBoundarySnapshot>;
+  recordContextCompactionWarning(
+    handle: DurableTurnHandle,
+    input: { epoch: number; estimatedInputTokens: number; targetTokens: number },
+  ): Promise<void>;
+  installContextCompaction(
+    handle: DurableTurnHandle,
+    input: InstallContextCompactionInput,
+  ): Promise<void>;
   resumeActiveTurn(conversationId: string): Promise<{
     handle: DurableTurnHandle;
     rootHandle: DurableTurnHandle;

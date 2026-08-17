@@ -47,7 +47,7 @@ export async function installAgentHost(page: Page) {
     const contextManifestHash = 'e'.repeat(64);
     const contextDispatchHash = 'f'.repeat(64);
     const contextManifestText = JSON.stringify({
-      version: 'agent-inference-context-v6',
+      version: 'agent-inference-context-v7',
       context: {
         requestedPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
         resolvedTurns: [{ turnId: 'fixture-turn', resolution: 'dialogue', origin: 'automatic' }],
@@ -225,7 +225,7 @@ export async function installAgentHost(page: Page) {
 
     function contextValue(_decision: 'append' | 'roll') {
       return {
-        version: 6,
+        version: 7,
         conversationId,
         inferenceId: 'fixture-inference',
         frameId: 'fixture-frame',
@@ -284,6 +284,14 @@ export async function installAgentHost(page: Page) {
           count: 4,
         }],
         omissionsTruncated: false,
+        compaction: {
+          epoch: 0,
+          checkpointSequence: null,
+          compactedThroughSequence: null,
+          warningIssued: false,
+          modelRequested: false,
+          policyInputTokens: 3_200,
+        },
       };
     }
 

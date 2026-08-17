@@ -67,6 +67,7 @@ export class FixtureProvider implements ModelProvider {
             frame: context.frame,
             frameBuildDurationMs: 0,
             activeMessages: context.messages,
+            compaction: context.compaction,
           },
         });
         options.onEvent({

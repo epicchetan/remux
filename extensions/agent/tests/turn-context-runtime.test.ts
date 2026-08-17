@@ -56,6 +56,161 @@ test('Agent state v6 owns one clean schema and compiles the accepted user turn',
   await fixture.repository.finishTurn(turn, { status: 'interrupted' });
 });
 
+test('provider compaction checkpoints survive restart and replay only the new epoch tail', async (t) => {
+  const fixture = await repositoryFixture(t);
+  const conversation = await fixture.repository.createConversation({
+    operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'gpt-5.6-codex', reasoning: 'high',
+  });
+  const turn = await accept(
+    fixture.repository,
+    conversation.conversationId,
+    'Carry this exact active turn through a provider checkpoint.',
+  );
+  const initial = await fixture.repository.compileContext(conversation.conversationId);
+  assert.equal(initial.compaction.epoch, 0);
+  assert.equal(initial.compaction.checkpoint, null);
+  await fixture.repository.recordContextCompactionWarning(turn, {
+    epoch: 0,
+    estimatedInputTokens: 180_000,
+    targetTokens: 220_400,
+  });
+  const warned = await fixture.repository.compileContext(conversation.conversationId);
+  assert.equal(warned.compaction.warningIssued, true);
+  await startInference(fixture.repository, turn, warned);
+  const compactCallId = 'call:context-compact';
+  await fixture.repository.finalizeInference(turn, {
+    state: 'completed',
+    providerMessage: assistantMessage({
+      content: [{ type: 'toolCall', id: compactCallId, name: 'context_compact', arguments: {} }],
+      stopReason: 'toolUse',
+    }),
+    calls: [{ callId: compactCallId, name: 'context_compact', args: {} }],
+  });
+  await fixture.repository.recordToolFinished(turn, {
+    callId: compactCallId, result: { requested: true }, isError: false,
+  });
+  const requested = await fixture.repository.compileContext(conversation.conversationId);
+  assert.equal(requested.compaction.modelRequested, true);
+  const inputHash = 'd'.repeat(64);
+  const install = {
+    expectedBasisSequence: requested.basisSequence,
+    trigger: 'model' as const,
+    inputHash,
+    policyInputTokens: 220_450,
+    retainedInputTokens: 12,
+    retainedInput: [{
+      type: 'message', role: 'user', content: [{ type: 'input_text', text: 'retained user request' }],
+    }],
+    providerItem: { type: 'compaction', id: 'cmp-1', encrypted_content: 'opaque-provider-memory' },
+    usage: { inputTokens: 220_450, outputTokens: 800, cachedInputTokens: 200_000 },
+    durationMs: 125,
+    context: durableFixtureContext(requested),
+  };
+  await fixture.repository.installContextCompaction(turn, install);
+  await fixture.repository.installContextCompaction(turn, install);
+
+  const compacted = await fixture.repository.compileContext(conversation.conversationId);
+  assert.equal(compacted.compaction.epoch, 1);
+  assert.equal(compacted.compaction.warningIssued, false);
+  assert.equal(compacted.compaction.checkpoint?.inputHash, inputHash);
+  assert.deepEqual(compacted.messages, []);
+  assert.deepEqual(compacted.frame.layers.map(({ kind }) => kind), [
+    'provider_checkpoint', 'active_scope',
+  ]);
+  const checkpointSearch = await fixture.repository.searchHistory(conversation.conversationId, {
+    query: 'Context epoch 1', scope: 'conversation',
+  });
+  const checkpointHit = checkpointSearch.hits.find(({ kind }) => kind === 'context-compaction');
+  assert.ok(checkpointHit);
+  const checkpointHistory = await fixture.repository.openHistory(conversation.conversationId, {
+    ref: checkpointHit.ref,
+  });
+  assert.match(checkpointHistory.content, /private opaque checkpoint/u);
+  assert.doesNotMatch(checkpointHistory.content, /opaque-provider-memory/u);
+
+  await startInference(fixture.repository, turn, compacted);
+  await fixture.repository.appendAssistantCheckpoint(turn, {
+    textDelta: 'Post-checkpoint continuation.', reasoningDelta: 'Fresh epoch reasoning.',
+  });
+  await fixture.repository.finishInference(turn, { state: 'completed' });
+  const continued = await fixture.repository.compileContext(conversation.conversationId);
+  assert.deepEqual(continued.messages.map(({ role }) => role), ['assistant']);
+
+  await fixture.repository.close();
+  fixture.repository = await AgentStateStore.open({ dataRoot: fixture.dataRoot });
+  const restarted = await fixture.repository.compileContext(conversation.conversationId);
+  const restartedProviderItem = restarted.compaction.checkpoint?.providerItem;
+  assert.ok(
+    restartedProviderItem && typeof restartedProviderItem === 'object' && !Array.isArray(restartedProviderItem),
+  );
+  assert.equal(restartedProviderItem.type, 'compaction');
+  assert.equal(restarted.compaction.checkpoint?.epoch, 1);
+  assert.deepEqual(restarted.messages.map(({ role }) => role), ['assistant']);
+  await fixture.repository.finishTurn(turn, { status: 'completed' });
+});
+
+test('work units inherit the parent provider checkpoint and may advance their own branch epoch', async (t) => {
+  const fixture = await repositoryFixture(t);
+  const conversation = await fixture.repository.createConversation({
+    operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'gpt-5.6-codex', reasoning: 'high',
+  });
+  const root = await accept(
+    fixture.repository,
+    conversation.conversationId,
+    'This original request should remain behind the parent checkpoint.',
+  );
+  const initial = await fixture.repository.compileContext(conversation.conversationId);
+  await fixture.repository.installContextCompaction(root, {
+    expectedBasisSequence: initial.basisSequence,
+    trigger: 'automatic',
+    inputHash: '1'.repeat(64),
+    policyInputTokens: 220_500,
+    retainedInputTokens: 8,
+    retainedInput: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'retained' }] }],
+    providerItem: { type: 'compaction', encrypted_content: 'parent-opaque' },
+    usage: { inputTokens: 220_500, outputTokens: 500, cachedInputTokens: 190_000 },
+    durationMs: 100,
+    context: durableFixtureContext(initial),
+  });
+  const entered = await enterWorkUnit(fixture.repository, root, {
+    boundary: 'Verify that the inherited provider checkpoint remains the context root.',
+  });
+  const child = await fixture.repository.compileContext(conversation.conversationId);
+  assert.equal(child.scopeId, entered.handle.scopeId);
+  assert.equal(child.compaction.epoch, 1);
+  assert.equal(child.compaction.checkpoint?.inputHash, '1'.repeat(64));
+  assert.equal(child.frame.layers[0]?.kind, 'provider_checkpoint');
+  assert.doesNotMatch(JSON.stringify(child.messages), /original request should remain/u);
+
+  await fixture.repository.installContextCompaction(entered.handle, {
+    expectedBasisSequence: child.basisSequence,
+    trigger: 'automatic',
+    inputHash: '2'.repeat(64),
+    policyInputTokens: 220_600,
+    retainedInputTokens: 7,
+    retainedInput: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'child retained' }] }],
+    providerItem: { type: 'compaction', encrypted_content: 'child-opaque' },
+    usage: { inputTokens: 220_600, outputTokens: 450, cachedInputTokens: 200_000 },
+    durationMs: 110,
+    context: durableFixtureContext(child),
+  });
+  const advanced = await fixture.repository.compileContext(conversation.conversationId);
+  assert.equal(advanced.compaction.epoch, 2);
+  assert.equal(advanced.compaction.checkpoint?.inputHash, '2'.repeat(64));
+
+  const returned = await fixture.repository.returnWorkUnit(entered.handle, {
+    status: 'completed', result: 'The inherited checkpoint remained valid.', artifacts: [],
+  });
+  await fixture.repository.recordToolFinished(root, {
+    callId: entered.parentCallId, result: workUnitCompletion(returned), isError: false,
+  });
+  const resumed = await fixture.repository.compileContext(conversation.conversationId);
+  assert.equal(resumed.scopeId, root.scopeId);
+  assert.equal(resumed.compaction.epoch, 1);
+  assert.equal(resumed.compaction.checkpoint?.inputHash, '1'.repeat(64));
+  await fixture.repository.finishTurn(root, { status: 'interrupted' });
+});
+
 test('actual frames, exact provider reasoning, restart recovery, and next-turn eviction work together', async (t) => {
   const fixture = await repositoryFixture(t);
   const conversation = await fixture.repository.createConversation({
@@ -920,7 +1075,7 @@ test('the public fixture runtime commits a v6 frame and completes through normal
     `context:${created.conversationId}`,
   ]);
   const inspector = projections[0]?.value as { version?: number; frameId?: string; layers?: unknown[] };
-  assert.equal(inspector.version, 6);
+  assert.equal(inspector.version, 7);
   assert.equal(typeof inspector.frameId, 'string');
   assert.equal(inspector.layers?.length, 3);
   const durableTurn = await server.handle('remux/agent/turn/read', {
@@ -1135,6 +1290,7 @@ async function startInference(
       frame: context.frame,
       frameBuildDurationMs: 1,
       activeMessages: context.messages,
+      compaction: context.compaction,
     },
   });
 }
@@ -1297,6 +1453,7 @@ function durableFixtureContext(
     frame: context.frame,
     frameBuildDurationMs: 0,
     activeMessages: context.messages,
+    compaction: context.compaction,
   };
 }
 

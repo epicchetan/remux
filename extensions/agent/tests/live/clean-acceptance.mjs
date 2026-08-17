@@ -51,7 +51,7 @@ async function main() {
   const firstTranscript = await readTranscript(client, conversation.conversationId);
   assert.equal(assistantText(firstTranscript, first.turnId).trim(), FIRST_SENTINEL);
   const firstContext = await readContext(client, conversation.conversationId);
-  assert.equal(firstContext.version, 6);
+  assert.equal(firstContext.version, 7);
   assert.deepEqual(firstContext.layers.map(({ kind }) => kind), [
     'selected_dialogue', 'selected_full_turns', 'active_scope',
   ]);
@@ -87,7 +87,7 @@ async function main() {
   assert.equal(final.runtime.contextProbe.provider, 'openai-codex');
   assert.equal(final.runtime.contextProbe.providerRequestMode, 'full');
   const secondContext = await readContext(client, conversation.conversationId);
-  assert.equal(secondContext.version, 6);
+  assert.equal(secondContext.version, 7);
   assert.equal(secondContext.transportMode, 'full');
   assert.deepEqual(secondContext.selectedTurns.map(({ turnId, resolution, origin }) => ({
     turnId, resolution, origin,

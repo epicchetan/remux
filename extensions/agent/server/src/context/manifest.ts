@@ -6,7 +6,7 @@ import type { CanonicalJsonValue } from '../storage/canonical-json.ts';
 
 export const CONTEXT_COMPILER_VERSION = 'agent-turn-context-v1' as const;
 export const CONTEXT_POLICY_VERSION = 'agent-explicit-selection-v1' as const;
-export const INFERENCE_CONTEXT_MANIFEST_VERSION = 'agent-inference-context-v6' as const;
+export const INFERENCE_CONTEXT_MANIFEST_VERSION = 'agent-inference-context-v7' as const;
 
 export type SelectedTurnResolution = Exclude<TurnContextResolution, 'off'>;
 
@@ -19,6 +19,7 @@ export type ResolvedTurnContextSource = {
 export type TurnContextLayerKind =
   | 'selected_dialogue'
   | 'selected_full_turns'
+  | 'provider_checkpoint'
   | 'active_scope';
 
 export type TurnContextLayer = {
@@ -78,6 +79,14 @@ export type InferenceContextManifest = {
     scopeKind: 'turn' | 'work_unit';
     layers: readonly TurnContextLayer[];
     omissions: readonly ContextOmission[];
+    compaction: {
+      epoch: number;
+      checkpointSequence: number | null;
+      compactedThroughSequence: number | null;
+      warningIssued: boolean;
+      modelRequested: boolean;
+      policyInputTokens: number;
+    };
   };
   transport: {
     requestMode: 'full' | 'continuation';

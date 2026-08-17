@@ -267,8 +267,7 @@ export async function evaluateRun(input: {
     gates.push(gate(
       'harness',
       'explicit-turn-context-mechanics',
-      agentState.compactionEvents === 0
-        && agentState.invalidContextCalls === 0
+      agentState.invalidContextCalls === 0
         && agentState.selfReferentialSearchHits === 0
         && agentState.contextLimitErrors === 0
         && agentState.contextFrames === agentState.providerCalls

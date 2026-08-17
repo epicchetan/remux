@@ -34,6 +34,10 @@ import type {
   WorkUnitEnterInput,
   WorkUnitView,
 } from '../../domain/work.ts';
+import type {
+  DurableContextBoundarySnapshot,
+  DurableInferenceContext,
+} from '../../domain/state.ts';
 import {
   estimatePiContextTokens,
   hashRenderedMessages,
@@ -42,6 +46,17 @@ import {
   type LogicalContextMessage,
 } from '../../logical-context.ts';
 import type { TurnContextFrameCandidate } from '../../context/manifest.ts';
+import {
+  buildCompactionReplacement,
+  contextBudgetNotice,
+  estimateProviderRequestTokens,
+  hashProviderInput,
+  injectContextBudgetNotice,
+  injectProviderCompaction,
+  resolveContextCompactionPolicy,
+  type ContextCompactionPolicy,
+  type ContextCompactionState,
+} from '../../context/compaction.ts';
 import {
   createContextTools,
   PARENT_CONTEXT_TOOL_NAMES,
@@ -60,6 +75,10 @@ import {
   readWorkspaceFile,
   type WorkspaceReadExecutor,
 } from '../../workspace-read.ts';
+import {
+  OpenAICodexRemoteCompactionClient,
+  type RemoteCompactionClient,
+} from './remote-compaction.ts';
 
 const PROVIDER = 'openai-codex';
 const BASE_TOOL_NAMES = ['read', 'bash', 'edit', 'write', 'workspace_read'] as const;
@@ -82,6 +101,21 @@ type ProviderTransportControls = {
   resetStats(sessionId?: string): void;
 };
 
+type PendingProviderContext = {
+  providerSessionId: string;
+  basisSequence: number;
+  logicalHash: string;
+  renderedHash: string;
+  orderedMessageHashes: string[];
+  messageCount: number;
+  estimatedInputTokens: number;
+  fixedContractsHash: string;
+  frame: TurnContextFrameCandidate;
+  frameBuildDurationMs: number;
+  activeMessages: readonly LogicalContextMessage[];
+  compaction: ContextCompactionState;
+};
+
 function providerContract() {
   const systemPrompt = REMUX_SYSTEM_PROMPT;
   const tools = [
@@ -90,7 +124,8 @@ function providerContract() {
     'edit@pi-0.84',
     'write@pi-0.84',
     'history@1',
-    'work-unit@4',
+    'work-unit@5',
+    'context-compaction@1',
     'turn-context@1',
     'provider-retry@1',
     'provider-lanes@1',
@@ -113,15 +148,21 @@ export class OpenAICodexProvider implements ModelProvider {
   private readonly modelRuntime: ModelRuntime;
   private readonly workspaceRead: WorkspaceReadExecutor;
   private readonly providerWebSocketFaultAfterEvents: (() => number | undefined) | undefined;
+  private readonly remoteCompaction: RemoteCompactionClient;
+  private readonly compactionPolicyOverride: Partial<ContextCompactionPolicy>;
 
   private constructor(
     modelRuntime: ModelRuntime,
     workspaceRead: WorkspaceReadExecutor,
     providerWebSocketFaultAfterEvents: (() => number | undefined) | undefined,
+    remoteCompaction: RemoteCompactionClient,
+    compactionPolicyOverride: Partial<ContextCompactionPolicy>,
   ) {
     this.modelRuntime = modelRuntime;
     this.workspaceRead = workspaceRead;
     this.providerWebSocketFaultAfterEvents = providerWebSocketFaultAfterEvents;
+    this.remoteCompaction = remoteCompaction;
+    this.compactionPolicyOverride = compactionPolicyOverride;
   }
 
   static async create(options: {
@@ -129,6 +170,10 @@ export class OpenAICodexProvider implements ModelProvider {
     workspaceRead?: WorkspaceReadExecutor;
     /** Test-only hook for deterministic response-started WebSocket failure coverage. */
     providerWebSocketFaultAfterEvents?: () => number | undefined;
+    /** Test-only injection point for deterministic remote-compaction coverage. */
+    remoteCompaction?: RemoteCompactionClient;
+    /** Test-only threshold override; production derives limits from the model window. */
+    compactionPolicy?: Partial<ContextCompactionPolicy>;
   } = {}) {
     const modelRuntime = options.modelRuntime ?? await ModelRuntime.create({
       allowModelNetwork: false,
@@ -137,6 +182,8 @@ export class OpenAICodexProvider implements ModelProvider {
       modelRuntime,
       options.workspaceRead ?? readWorkspaceFile,
       options.providerWebSocketFaultAfterEvents,
+      options.remoteCompaction ?? new OpenAICodexRemoteCompactionClient(modelRuntime),
+      options.compactionPolicy ?? {},
     );
   }
 
@@ -186,6 +233,10 @@ export class OpenAICodexProvider implements ModelProvider {
     const model = this.modelRuntime.getModel(PROVIDER, options.modelId);
     if (!model) throw new Error(`Unknown OpenAI Codex model: ${options.modelId}`);
     const { systemPrompt, fixedContractsHash } = providerContract();
+    const compactionPolicy = resolveContextCompactionPolicy(
+      model.contextWindow,
+      this.compactionPolicyOverride,
+    );
 
     let probe: ContextProbe = {
       hookVersion: 'agent-durable-v1',
@@ -216,20 +267,10 @@ export class OpenAICodexProvider implements ModelProvider {
       websocketFailures: number;
       sseFallbacks: number;
     } | null = null;
-    let pendingContext: {
-      providerSessionId: string;
-      basisSequence: number;
-      logicalHash: string;
-      renderedHash: string;
-      orderedMessageHashes: string[];
-      messageCount: number;
-      estimatedInputTokens: number;
-      fixedContractsHash: string;
-      frame: TurnContextFrameCandidate;
-      frameBuildDurationMs: number;
-      activeMessages: readonly LogicalContextMessage[];
-    } | null = null;
+    let pendingContext: PendingProviderContext | null = null;
     let pendingContextError: unknown = null;
+    let pendingCompactionAbort: AbortController | null = null;
+    const budgetNotices = new Map<string, { position: number; text: string }>();
     let providerDurabilityTail: Promise<void> = Promise.resolve();
     let providerDurabilityError: unknown = null;
     let pendingAgentEnd: Extract<AgentSessionEvent, { type: 'agent_end' }> | null = null;
@@ -264,6 +305,7 @@ export class OpenAICodexProvider implements ModelProvider {
       const transport = pendingTransport;
       pendingTransport = null;
       const durability = (async () => {
+        if (!transport && providerDurabilityError) throw providerDurabilityError;
         if (transport) {
           const completedAt = performance.now();
           const controls = requiredProviderTransportControls(providerTransportControls);
@@ -343,7 +385,20 @@ export class OpenAICodexProvider implements ModelProvider {
               estimatedInputTokens: estimatePiContextTokens(messages, systemPrompt),
             };
           };
-          const compiled = await compileFrame();
+          let compiled = await compileFrame();
+          if (
+            compactionPolicy.enabled &&
+            compiled.estimatedInputTokens >= compactionPolicy.warningTokens &&
+            compiled.estimatedInputTokens < compactionPolicy.targetTokens &&
+            !compiled.snapshot.compaction.warningIssued
+          ) {
+            await options.durability.recordContextCompactionWarning({
+              epoch: compiled.snapshot.compaction.epoch,
+              estimatedInputTokens: compiled.estimatedInputTokens,
+              targetTokens: compactionPolicy.targetTokens,
+            });
+            compiled = await compileFrame();
+          }
           const { snapshot, messages, estimatedInputTokens } = compiled;
           const frameBuildDurationMs = Math.max(0, Math.round(performance.now() - compileStartedAt));
           const rendered = hashRenderedMessages(messages);
@@ -359,6 +414,7 @@ export class OpenAICodexProvider implements ModelProvider {
             frame: snapshot.frame,
             frameBuildDurationMs,
             activeMessages: snapshot.messages,
+            compaction: snapshot.compaction,
           };
           probe = {
             ...probe,
@@ -375,11 +431,119 @@ export class OpenAICodexProvider implements ModelProvider {
           throw error;
         }
       });
-      pi.on('before_provider_request', (event) => requestReasoningControls(
-        event.payload,
-        supportsAllTurnsReasoning(model) &&
-          Boolean(pendingContext?.frame.resolvedTurns.some(({ resolution }) => resolution === 'full')),
-      ));
+      pi.on('before_provider_request', async (event) => {
+        let payload = requestReasoningControls(
+          event.payload,
+          supportsAllTurnsReasoning(model) &&
+            Boolean(pendingContext?.frame.resolvedTurns.some(({ resolution }) => resolution === 'full')),
+        );
+        const context = pendingContext;
+        if (!context) return payload;
+        let stage = 'prepare provider payload';
+        try {
+          if (context.compaction.checkpoint) {
+            payload = injectProviderCompaction(payload, context.compaction.checkpoint);
+          }
+          let policyInputTokens = Math.max(
+            context.estimatedInputTokens,
+            estimateProviderRequestTokens(payload),
+          );
+          let trigger = context.compaction.modelRequested
+            ? 'model' as const
+            : policyInputTokens >= compactionPolicy.targetTokens
+              ? 'automatic' as const
+              : null;
+          const warningKey = `${context.providerSessionId}:${context.compaction.epoch}`;
+          if (context.compaction.warningIssued && !trigger) {
+            const payloadWithoutNotice = payload;
+            const existing = budgetNotices.get(warningKey);
+            const insertionPosition = existing?.position ?? hashProviderInput(payload).itemCount;
+            const notice = existing?.text ?? contextBudgetNotice({
+              estimatedTokens: policyInputTokens,
+              targetTokens: compactionPolicy.targetTokens,
+            });
+            payload = injectContextBudgetNotice(
+              payload,
+              notice,
+              insertionPosition,
+            );
+            budgetNotices.set(warningKey, { position: insertionPosition, text: notice });
+            policyInputTokens = Math.max(policyInputTokens, estimateProviderRequestTokens(payload));
+            if (policyInputTokens >= compactionPolicy.targetTokens) {
+              payload = payloadWithoutNotice;
+              trigger = 'automatic';
+            }
+          }
+          if (compactionPolicy.enabled && trigger) {
+            budgetNotices.delete(warningKey);
+            stage = 'request remote compaction';
+            const inputHash = hashProviderInput(payload).hash;
+            const abort = new AbortController();
+            pendingCompactionAbort = abort;
+            let compacted;
+            try {
+              compacted = await this.remoteCompaction.compact({
+                model,
+                payload,
+                signal: abort.signal,
+              });
+            } finally {
+              if (pendingCompactionAbort === abort) pendingCompactionAbort = null;
+            }
+            const replacement = buildCompactionReplacement(
+              payload,
+              compacted.providerItem,
+              compactionPolicy.retainedMessageTokens,
+            );
+            stage = 'install durable checkpoint';
+            await options.durability.installContextCompaction({
+              expectedBasisSequence: context.basisSequence,
+              trigger,
+              inputHash,
+              policyInputTokens,
+              retainedInputTokens: replacement.retainedInputTokens,
+              retainedInput: replacement.retainedInput,
+              providerItem: replacement.providerItem,
+              usage: compacted.usage,
+              durationMs: compacted.durationMs,
+              context: durableInferenceContext(context),
+            });
+            stage = 'compile checkpoint continuation';
+            const compileStartedAt = performance.now();
+            const snapshot = await options.durability.compileContext();
+            const checkpoint = snapshot.compaction.checkpoint;
+            if (!checkpoint || checkpoint.inputHash !== inputHash) {
+              throw new Error('Installed context compaction was not visible at the durable boundary.');
+            }
+            activeProviderSessionId = snapshot.scopeId;
+            payload = replacement.payload;
+            pendingContext = pendingContextFromProviderPayload({
+              snapshot,
+              payload,
+              providerSessionId: activeProviderSessionId,
+              fixedContractsHash,
+              frameBuildDurationMs: Math.max(0, Math.round(performance.now() - compileStartedAt)),
+            });
+            const controls = requiredProviderTransportControls(providerTransportControls);
+            controls.close(activeProviderSessionId);
+            controls.resetStats(activeProviderSessionId);
+            providerLanes.set(
+              activeProviderSessionId,
+              invalidateProviderLane(providerLanes.get(activeProviderSessionId)),
+            );
+          } else {
+            pendingContext = pendingContextWithProviderPayload(context, payload, policyInputTokens);
+          }
+          return payload;
+        } catch (error) {
+          pendingContext = null;
+          pendingContextError = new Error(
+            `Provider-native context compaction failed while attempting to ${stage}: ${safeMessage(error)}`,
+            { cause: error },
+          );
+          return payload;
+        }
+      });
       pi.on('message_end', async (event) => {
         if (event.message.role !== 'assistant') return;
         await ensureAssistantDurable(event.message);
@@ -498,6 +662,17 @@ export class OpenAICodexProvider implements ModelProvider {
       // ordering: no request may overtake the preceding provider item's
       // durable terminal boundary.
       await awaitProviderDurability();
+      if (pendingContextError) {
+        const error = pendingContextError;
+        pendingContextError = null;
+        pendingContext = null;
+        const wrapped = new Error(
+          `Durable context compilation failed: ${safeMessage(error)}`,
+          { cause: error },
+        );
+        providerDurabilityError ??= wrapped;
+        throw wrapped;
+      }
       if (options.reasoning !== 'off') {
         assertReasoningControls(
           payload,
@@ -508,13 +683,9 @@ export class OpenAICodexProvider implements ModelProvider {
       const context = pendingContext;
       pendingContext = null;
       if (!context) {
-        if (pendingContextError) {
-          throw new Error(
-            `Durable context compilation failed: ${safeMessage(pendingContextError)}`,
-            { cause: pendingContextError },
-          );
-        }
-        throw new Error('Provider dispatch has no committed durable context fence.');
+        const error = new Error('Provider dispatch has no committed durable context fence.');
+        providerDurabilityError ??= error;
+        throw error;
       }
       const lanePlan = planProviderLaneRequest(
         providerLanes.get(context.providerSessionId),
@@ -542,6 +713,7 @@ export class OpenAICodexProvider implements ModelProvider {
           frame: context.frame,
           frameBuildDurationMs: context.frameBuildDurationMs,
           activeMessages: context.activeMessages,
+          compaction: context.compaction,
         },
       });
       pendingRetryOfInferenceId = null;
@@ -561,7 +733,15 @@ export class OpenAICodexProvider implements ModelProvider {
         sseFallbacks: transportStats?.sseFallbacks ?? 0,
       };
       providerLanes.set(context.providerSessionId, lanePlan.next);
-      probe = { ...probe, providerRequestMode: requestMode };
+      const providerInput = hashProviderInput(payload);
+      probe = {
+        ...probe,
+        messageCount: context.messageCount,
+        messageHash: context.renderedHash,
+        orderedMessageHashes: context.orderedMessageHashes,
+        estimatedBytes: providerInput.estimatedBytes,
+        providerRequestMode: requestMode,
+      };
       options.onEvent({ type: 'context-probe', probe });
     };
 
@@ -871,6 +1051,7 @@ export class OpenAICodexProvider implements ModelProvider {
       },
       async interrupt() {
         interruptRequested = true;
+        pendingCompactionAbort?.abort(new Error('Agent turn interrupted.'));
         await Promise.all([
           session.abort(),
           activeChildSession?.abort() ?? Promise.resolve(),
@@ -878,6 +1059,7 @@ export class OpenAICodexProvider implements ModelProvider {
       },
       async dispose() {
         unsubscribe();
+        pendingCompactionAbort?.abort(new Error('Agent session disposed.'));
         try {
           await Promise.all([
             session.abort(),
@@ -893,6 +1075,63 @@ export class OpenAICodexProvider implements ModelProvider {
       },
     };
   }
+}
+
+function durableInferenceContext(context: PendingProviderContext): DurableInferenceContext {
+  return {
+    basisSequence: context.basisSequence,
+    logicalHash: context.logicalHash,
+    renderedHash: context.renderedHash,
+    orderedMessageHashes: context.orderedMessageHashes,
+    messageCount: context.messageCount,
+    fixedContractsHash: context.fixedContractsHash,
+    frame: context.frame,
+    frameBuildDurationMs: context.frameBuildDurationMs,
+    activeMessages: context.activeMessages,
+    compaction: context.compaction,
+  };
+}
+
+function pendingContextWithProviderPayload(
+  context: PendingProviderContext,
+  payload: unknown,
+  estimatedInputTokens = estimateProviderRequestTokens(payload),
+): PendingProviderContext {
+  const rendered = hashProviderInput(payload);
+  return {
+    ...context,
+    renderedHash: rendered.hash,
+    orderedMessageHashes: rendered.orderedHashes,
+    messageCount: rendered.itemCount,
+    estimatedInputTokens: Math.max(estimatedInputTokens, estimateProviderRequestTokens(payload)),
+  };
+}
+
+function pendingContextFromProviderPayload(input: {
+  snapshot: DurableContextBoundarySnapshot;
+  payload: unknown;
+  providerSessionId: string;
+  fixedContractsHash: string;
+  frameBuildDurationMs: number;
+}): PendingProviderContext {
+  const rendered = hashProviderInput(input.payload);
+  return {
+    providerSessionId: input.providerSessionId,
+    basisSequence: input.snapshot.basisSequence,
+    logicalHash: input.snapshot.logicalHash,
+    renderedHash: rendered.hash,
+    orderedMessageHashes: rendered.orderedHashes,
+    messageCount: rendered.itemCount,
+    estimatedInputTokens: Math.max(
+      input.snapshot.frame.estimatedInputTokens,
+      estimateProviderRequestTokens(input.payload),
+    ),
+    fixedContractsHash: input.fixedContractsHash,
+    frame: input.snapshot.frame,
+    frameBuildDurationMs: input.frameBuildDurationMs,
+    activeMessages: input.snapshot.messages,
+    compaction: input.snapshot.compaction,
+  };
 }
 
 function observedTransportMode(

@@ -60,6 +60,7 @@ test('model-facing context tools use History and work-unit start/finish language
   assert.deepEqual(tools.map(({ name }) => name), [
     'history_search',
     'history_read',
+    'context_compact',
     'work_unit_start',
     'work_unit_finish',
   ]);
@@ -89,6 +90,13 @@ test('model-facing context tools use History and work-unit start/finish language
   );
   assert.equal(seen.openedRef, 'history://turn/prior');
   assert.equal((opened.details as { ref: string }).ref, 'history://turn/prior');
+  const compacted = await byName.get('context_compact')!.execute(
+    'compact', {}, undefined, undefined, context,
+  );
+  assert.deepEqual(compacted.details, {
+    requested: true,
+    continuation: 'Compaction will occur before the next inference.',
+  });
   const work = await byName.get('work_unit_start')!.execute(
     'work', {
       boundary: 'Inspect the seam and close when its exact contract is verified.',

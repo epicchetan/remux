@@ -33,6 +33,7 @@ import {
   type LogicalReplayEvent,
 } from '../logical-context.ts';
 import {
+  compileCompactedTurnContext,
   compileTurnContext,
   normalizeTurnContextPlan,
   type TurnContextSource,
@@ -56,6 +57,7 @@ import type {
   DurableContextBoundarySnapshot,
   DurableInferenceContext,
   DurableInferenceFinalization,
+  InstallContextCompactionInput,
   DurableQueuedTurn,
   DurableResourceProjection,
   DurableTranscriptAction,
@@ -72,9 +74,16 @@ import type {
   QueueTurnResult,
 } from '../domain/state.ts';
 import {
+  CONTEXT_COMPACTION_VERSION,
+  type ContextCompactionState,
+  type ContextCompactionTrigger,
+  type ProviderCompactionCheckpoint,
+} from '../context/compaction.ts';
+import {
   INFERENCE_CONTEXT_MANIFEST_VERSION,
   inferenceContextManifestValue,
   type InferenceContextManifest,
+  type ResolvedTurnContextSource,
 } from '../context/manifest.ts';
 import {
   CONVERSATION_PREVIEW_CODE_POINTS,
@@ -673,6 +682,14 @@ export class AgentStateStore extends TurnState implements AgentStore {
         scopeKind: input.context.frame.scopeKind,
         layers: input.context.frame.layers,
         omissions: input.context.frame.omissions,
+        compaction: {
+          epoch: input.context.compaction.epoch,
+          checkpointSequence: input.context.compaction.checkpoint?.installedSequence ?? null,
+          compactedThroughSequence: input.context.compaction.checkpoint?.compactedThroughSequence ?? null,
+          warningIssued: input.context.compaction.warningIssued,
+          modelRequested: input.context.compaction.modelRequested,
+          policyInputTokens: input.context.compaction.policyInputTokens,
+        },
       },
       transport: {
         requestMode: input.requestMode,
@@ -1939,6 +1956,136 @@ export class AgentStateStore extends TurnState implements AgentStore {
     return { value: {}, text: projected.text, content: projected.content };
   }
 
+  async recordContextCompactionWarning(
+    handle: DurableTurnHandle,
+    input: { epoch: number; estimatedInputTokens: number; targetTokens: number },
+  ) {
+    this.assertOpen();
+    return this.enqueueWrite(() => this.storage.transaction(() => {
+      this.assertRunningHandle(handle);
+      const epoch = safeNonnegativeInteger(input.epoch, 'context compaction warning epoch');
+      const estimatedInputTokens = safeNonnegativeInteger(
+        input.estimatedInputTokens,
+        'context compaction warning input tokens',
+      );
+      const targetTokens = safeNonnegativeInteger(
+        input.targetTokens,
+        'context compaction warning target tokens',
+      );
+      const existing = this.storage.database.prepare(`
+        SELECT 1 FROM events
+        WHERE scope_id = ? AND type = 'context.compaction.warning'
+          AND json_extract(payload_json, '$.epoch') = ?
+      `).get(handle.scopeId, epoch);
+      if (existing) return;
+      const recordedAt = safeTimestamp(this.now());
+      this.insertEvent({
+        ...handle,
+        eventId: this.nextId('event'),
+        type: 'context.compaction.warning',
+        actor: 'harness',
+        visibility: 'internal',
+        payload: { epoch, estimatedInputTokens, targetTokens },
+        createdAt: recordedAt,
+      });
+    }));
+  }
+
+  async installContextCompaction(
+    handle: DurableTurnHandle,
+    input: InstallContextCompactionInput,
+  ) {
+    this.assertOpen();
+    const [retained, providerItem] = await Promise.all([
+      this.prepareProviderJson(input.retainedInput),
+      this.prepareProviderJson(input.providerItem),
+    ]);
+    if (!retained.artifact || !providerItem.artifact) {
+      throw new Error('Context compaction artifacts must be stored durably.');
+    }
+    const retainedArtifact = retained.artifact;
+    const providerItemArtifact = providerItem.artifact;
+    return this.enqueueWrite(() => this.storage.transaction(() => {
+      this.assertRunningHandle(handle);
+      const duplicate = this.storage.database.prepare(`
+        SELECT sequence FROM events
+        WHERE scope_id = ? AND type = 'context.compaction.installed'
+          AND json_extract(payload_json, '$.inputHash') = ?
+        ORDER BY sequence DESC LIMIT 1
+      `).get(handle.scopeId, input.inputHash) as { sequence: number } | undefined;
+      if (duplicate) return;
+      const head = this.currentHead(handle);
+      if (head !== input.expectedBasisSequence) {
+        throw new Error(
+          `Context compaction basis ${input.expectedBasisSequence} is stale; event head is ${head}.`,
+        );
+      }
+      if (input.context.basisSequence !== input.expectedBasisSequence) {
+        throw new Error('Context compaction durable context does not match its expected basis.');
+      }
+      const latest = this.latestContextCompactionRow(handle.scopeId);
+      if (latest && latest.epoch !== input.context.compaction.epoch) {
+        throw new Error('Context compaction epoch changed before installation.');
+      }
+      const epoch = input.context.compaction.epoch + 1;
+      const recordedAt = safeTimestamp(this.now());
+      const sequence = this.insertEvent({
+        ...handle,
+        eventId: this.nextId('event'),
+        type: 'context.compaction.installed',
+        actor: 'harness',
+        visibility: 'internal',
+        payload: {
+          version: CONTEXT_COMPACTION_VERSION,
+          epoch,
+          compactedThroughSequence: head,
+          trigger: input.trigger,
+          inputHash: requiredHash(input.inputHash, 'context compaction input hash'),
+          policyInputTokens: safeNonnegativeInteger(
+            input.policyInputTokens,
+            'context compaction policy input tokens',
+          ),
+          retainedInputTokens: safeNonnegativeInteger(
+            input.retainedInputTokens,
+            'context compaction retained input tokens',
+          ),
+          retainedInput: retained.ref,
+          providerItem: providerItem.ref,
+          usage: {
+            inputTokens: nullableNonnegativeInteger(input.usage.inputTokens, 'compaction input tokens'),
+            outputTokens: nullableNonnegativeInteger(input.usage.outputTokens, 'compaction output tokens'),
+            cachedInputTokens: nullableNonnegativeInteger(
+              input.usage.cachedInputTokens,
+              'compaction cached input tokens',
+            ),
+          },
+          durationMs: safeNonnegativeInteger(input.durationMs, 'context compaction duration'),
+          requestedPlan: input.context.frame.requestedPlan,
+          resolvedTurns: [...input.context.frame.resolvedTurns],
+          selectedTurnIds: [...input.context.frame.selectedTurnIds],
+        },
+        artifactHash: providerItemArtifact.hash,
+        createdAt: recordedAt,
+      });
+      this.insertArtifact(retainedArtifact, sequence, 'private');
+      this.insertArtifact(providerItemArtifact, sequence, 'private');
+      this.indexHistoryText({
+        ref: `history://compaction/${encodeURIComponent(String(sequence))}`,
+        projectId: handle.projectId,
+        conversationId: handle.conversationId,
+        turnId: handle.turnId,
+        kind: 'context-compaction',
+        sequence,
+        text: [
+          `Context epoch ${epoch}`,
+          `trigger=${input.trigger}`,
+          `inputTokens=${input.usage.inputTokens ?? input.policyInputTokens}`,
+          `retainedTokens=${input.retainedInputTokens}`,
+        ].join(' '),
+      });
+    }));
+  }
+
   async compileContext(
     conversationId: string,
   ): Promise<DurableContextBoundarySnapshot> {
@@ -1976,7 +2123,11 @@ export class AgentStateStore extends TurnState implements AgentStore {
         scopeKinds.get(event.scopeId) === 'turn' ||
         visibleScopeSet.has(event.scopeId));
     if (allEvents.length === 0) throw new Error(`Conversation ${conversationId} does not exist.`);
-    const replay = await this.logicalReplayEvents(allEvents);
+    const checkpoint = await this.readEffectiveContextCompaction(activeScope.scopeId);
+    const replayEvents = checkpoint
+      ? allEvents.filter((event) => event.sequence > checkpoint.compactedThroughSequence)
+      : allEvents;
+    const replay = await this.logicalReplayEvents(replayEvents);
     const baseMessages = reduceLogicalReplay(replay);
     const turn = this.storage.database.prepare(`
       SELECT context_plan_json FROM turns
@@ -1996,7 +2147,9 @@ export class AgentStateStore extends TurnState implements AgentStore {
       omittedPriorWorkUnits,
       messages: baseMessages,
     };
-    const preview = compileTurnContext(source);
+    const preview = checkpoint
+      ? compileCompactedTurnContext(source, checkpoint)
+      : compileTurnContext(source);
     const fullTurnIds = preview.frame.resolvedTurns
       .filter(({ resolution }) => resolution === 'full')
       .map(({ turnId }) => turnId);
@@ -2008,9 +2161,20 @@ export class AgentStateStore extends TurnState implements AgentStore {
       ...visibleScopeIds,
       ...fullRootScopes.map(({ root_scope_id }) => root_scope_id),
     ];
-    const logicalMessages = await this.attachProviderMessages(baseMessages, providerScopeIds);
-    const compiled = compileTurnContext({ ...source, messages: logicalMessages });
+    const logicalMessages = await this.attachProviderMessages(
+      baseMessages,
+      providerScopeIds,
+      checkpoint?.compactedThroughSequence,
+    );
+    const compiled = checkpoint
+      ? compileCompactedTurnContext({ ...source, messages: logicalMessages }, checkpoint)
+      : compileTurnContext({ ...source, messages: logicalMessages });
     const snapshot = createDurableContextSnapshot(basisSequence, compiled.messages);
+    const compaction = this.contextCompactionState(
+      activeScope.scopeId,
+      checkpoint,
+      compiled.frame.estimatedInputTokens,
+    );
     const frameRow = this.storage.database.prepare(`
       SELECT MAX(ordinal) AS frame_ordinal
       FROM context_frames WHERE scope_id = ?
@@ -2024,6 +2188,7 @@ export class AgentStateStore extends TurnState implements AgentStore {
       scopeId: activeScope.scopeId,
       scopeKind: activeScope.kind,
       nextFrameOrdinal,
+      compaction,
     };
   }
 
@@ -2331,6 +2496,35 @@ export class AgentStateStore extends TurnState implements AgentStore {
 
     const artifactMatch = /^history:\/\/artifact\/([0-9a-f]{64})$/u.exec(ref);
     if (artifactMatch) return this.openArtifactText(identity.projectId, artifactMatch[1]!);
+
+    const compactionMatch = /^history:\/\/compaction\/(\d+)$/u.exec(ref);
+    if (compactionMatch) {
+      const sequence = safeNonnegativeInteger(Number(compactionMatch[1]), 'context compaction sequence');
+      const row = this.storage.database.prepare(`
+        SELECT scope_id, turn_id, payload_json, created_at
+        FROM events
+        WHERE project_id = ? AND conversation_id = ? AND sequence = ?
+          AND type = 'context.compaction.installed'
+      `).get(identity.projectId, conversationId, sequence) as {
+        scope_id: string; turn_id: string; payload_json: string; created_at: number;
+      } | undefined;
+      if (!row) throw new Error(`Context compaction ${sequence} does not exist in this conversation.`);
+      const payload = JSON.parse(row.payload_json) as Record<string, CanonicalJsonValue>;
+      const {
+        retainedInput: _retainedInput,
+        providerItem: _providerItem,
+        ...inspectable
+      } = payload;
+      return canonicalJson({
+        sequence,
+        scopeId: row.scope_id,
+        turnId: row.turn_id,
+        createdAt: row.created_at,
+        ...inspectable,
+        providerState: 'private opaque checkpoint',
+        exactScopeHistory: `history://scope/${encodeURIComponent(row.scope_id)}/trace`,
+      });
+    }
 
     const messageMatch = /^history:\/\/message\/([^/?#]+)$/u.exec(ref);
     if (messageMatch) {
@@ -4146,9 +4340,110 @@ export class AgentStateStore extends TurnState implements AgentStore {
     );
   }
 
+  private latestContextCompactionRow(scopeId: string) {
+    const row = this.storage.database.prepare(`
+      SELECT sequence, payload_json FROM events
+      WHERE scope_id = ? AND type = 'context.compaction.installed'
+      ORDER BY sequence DESC LIMIT 1
+    `).get(scopeId) as { sequence: number; payload_json: string } | undefined;
+    if (!row) return null;
+    const payload = JSON.parse(row.payload_json) as Record<string, CanonicalJsonValue>;
+    return {
+      sequence: safeInteger(row.sequence, 'context compaction sequence'),
+      epoch: safeNonnegativeInteger(payload.epoch, 'context compaction epoch'),
+      payload,
+    };
+  }
+
+  private async readContextCompaction(scopeId: string): Promise<ProviderCompactionCheckpoint | null> {
+    const row = this.latestContextCompactionRow(scopeId);
+    if (!row) return null;
+    const { payload } = row;
+    if (payload.version !== CONTEXT_COMPACTION_VERSION) {
+      throw new Error(`Unsupported context compaction version ${String(payload.version)}.`);
+    }
+    const retainedInput = normalizeJson(await this.readJsonRef(payload.retainedInput));
+    const providerItem = normalizeJson(await this.readJsonRef(payload.providerItem));
+    if (!Array.isArray(retainedInput)) throw new Error('Context compaction retained input is invalid.');
+    const usage = requiredRecord(payload.usage, 'context compaction usage');
+    const requestedPlan = normalizeTurnContextPlan(payload.requestedPlan as unknown as TurnContextPlan);
+    const resolvedTurns = requiredResolvedTurns(payload.resolvedTurns);
+    const selectedTurnIds = requiredStringArray(payload.selectedTurnIds, 'selected turn IDs');
+    return {
+      version: CONTEXT_COMPACTION_VERSION,
+      epoch: row.epoch,
+      compactedThroughSequence: safeNonnegativeInteger(
+        payload.compactedThroughSequence,
+        'compacted-through sequence',
+      ),
+      installedSequence: row.sequence,
+      trigger: requiredContextCompactionTrigger(payload.trigger),
+      inputHash: requiredHash(payload.inputHash, 'context compaction input hash'),
+      policyInputTokens: safeNonnegativeInteger(payload.policyInputTokens, 'compaction policy input tokens'),
+      retainedInputTokens: safeNonnegativeInteger(
+        payload.retainedInputTokens,
+        'compaction retained input tokens',
+      ),
+      retainedInput,
+      providerItem,
+      usage: {
+        inputTokens: nullableNonnegativeInteger(usage.inputTokens, 'compaction input tokens'),
+        outputTokens: nullableNonnegativeInteger(usage.outputTokens, 'compaction output tokens'),
+        cachedInputTokens: nullableNonnegativeInteger(
+          usage.cachedInputTokens,
+          'compaction cached input tokens',
+        ),
+      },
+      durationMs: safeNonnegativeInteger(payload.durationMs, 'compaction duration'),
+      requestedPlan,
+      resolvedTurns,
+      selectedTurnIds,
+    };
+  }
+
+  private async readEffectiveContextCompaction(scopeId: string) {
+    let currentScopeId: string | null = scopeId;
+    while (currentScopeId) {
+      const checkpoint = await this.readContextCompaction(currentScopeId);
+      if (checkpoint) return checkpoint;
+      currentScopeId = this.scopeIdentity(currentScopeId).parent_scope_id;
+    }
+    return null;
+  }
+
+  private contextCompactionState(
+    scopeId: string,
+    checkpoint: ProviderCompactionCheckpoint | null,
+    policyInputTokens: number,
+  ): ContextCompactionState {
+    const epoch = checkpoint?.epoch ?? 0;
+    const warning = this.storage.database.prepare(`
+      SELECT 1 FROM events
+      WHERE scope_id = ? AND type = 'context.compaction.warning'
+        AND json_extract(payload_json, '$.epoch') = ?
+        AND sequence > ?
+      ORDER BY sequence DESC LIMIT 1
+    `).get(scopeId, epoch, checkpoint?.installedSequence ?? 0);
+    const requested = this.storage.database.prepare(`
+      SELECT 1 FROM operations
+      WHERE scope_id = ? AND kind = 'tool.call' AND state = 'completed'
+        AND terminal_sequence > ?
+        AND json_extract(value_json, '$.name') = 'context_compact'
+      ORDER BY terminal_sequence DESC LIMIT 1
+    `).get(scopeId, checkpoint?.compactedThroughSequence ?? 0);
+    return {
+      checkpoint,
+      epoch,
+      warningIssued: Boolean(warning),
+      modelRequested: Boolean(requested),
+      policyInputTokens: safeNonnegativeInteger(policyInputTokens, 'context compaction policy tokens'),
+    };
+  }
+
   private async attachProviderMessages(
     messages: readonly LogicalContextMessage[],
     scopeIds: readonly string[],
+    afterSequence?: number,
   ): Promise<LogicalContextMessage[]> {
     const uniqueScopeIds = [...new Set(scopeIds)];
     if (uniqueScopeIds.length === 0) return [...messages];
@@ -4157,13 +4452,14 @@ export class AgentStateStore extends TurnState implements AgentStore {
       FROM provider_items pi
       WHERE pi.scope_id IN (${sqlPlaceholders(uniqueScopeIds.length)})
         AND pi.item_type = 'assistant_message'
+        AND pi.created_sequence > ?
         AND NOT EXISTS (
           SELECT 1 FROM events e
           WHERE e.scope_id = pi.scope_id AND e.type = 'inference.superseded'
             AND json_extract(e.payload_json, '$.inferenceId') = pi.inference_id
         )
       ORDER BY pi.created_sequence
-    `).all(...uniqueScopeIds) as Array<{ turn_id: string; raw_artifact_hash: string }>;
+    `).all(...uniqueScopeIds, afterSequence ?? 0) as Array<{ turn_id: string; raw_artifact_hash: string }>;
     if (rows.length === 0) return [...messages];
     const providerMessages = new Map<string, AssistantMessage[]>();
     for (const row of rows) {
@@ -4347,6 +4643,49 @@ function requiredSequenceTimestamp(timestamps: Map<number, number>, sequence: nu
   return timestamp;
 }
 
+function requiredRecord(value: CanonicalJsonValue | undefined, label: string) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`Invalid durable ${label}.`);
+  }
+  return value as Record<string, CanonicalJsonValue>;
+}
+
+function nullableNonnegativeInteger(value: unknown, label: string): number | null {
+  if (value === null) return null;
+  return safeNonnegativeInteger(value, label);
+}
+
+function requiredStringArray(value: CanonicalJsonValue | undefined, label: string) {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
+    throw new Error(`Invalid durable ${label}.`);
+  }
+  return value as string[];
+}
+
+function requiredContextCompactionTrigger(value: CanonicalJsonValue | undefined): ContextCompactionTrigger {
+  if (value !== 'model' && value !== 'automatic') {
+    throw new Error(`Invalid durable context compaction trigger ${String(value)}.`);
+  }
+  return value;
+}
+
+function requiredResolvedTurns(value: CanonicalJsonValue | undefined): ResolvedTurnContextSource[] {
+  if (!Array.isArray(value)) throw new Error('Invalid durable resolved turn context.');
+  return value.map((entry, index) => {
+    const turn = requiredRecord(entry, `resolved turn ${index}`);
+    const turnId = requiredString(turn.turnId, `resolved turn ${index} ID`);
+    const resolution = turn.resolution;
+    const origin = turn.origin;
+    if (resolution !== 'dialogue' && resolution !== 'full') {
+      throw new Error(`Invalid durable resolved turn ${index} resolution.`);
+    }
+    if (origin !== 'automatic' && origin !== 'explicit') {
+      throw new Error(`Invalid durable resolved turn ${index} origin.`);
+    }
+    return { turnId, resolution, origin };
+  });
+}
+
 function stripTranscriptProjectionMetadata(
   action: DurableTranscriptProjectionAction,
 ): DurableTranscriptAction {
@@ -4463,7 +4802,7 @@ function contextInspectorValue(input: {
   }
   const orderedGroups = [...groups.values()];
   return {
-    version: 6,
+    version: 7,
     conversationId: input.manifest.conversationId,
     inferenceId: input.manifest.inferenceId,
     frameId: input.frameId,
@@ -4511,6 +4850,7 @@ function contextInspectorValue(input: {
     })),
     omissions: input.manifest.context.omissions.slice(0, omissionLimit),
     omissionsTruncated: input.manifest.context.omissions.length > omissionLimit,
+    compaction: input.manifest.context.compaction,
   };
 }
 

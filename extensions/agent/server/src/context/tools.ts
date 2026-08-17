@@ -7,12 +7,14 @@ import type { WorkUnitCompletion, WorkUnitEnterInput } from '../domain/work.ts';
 export const PARENT_CONTEXT_TOOL_NAMES = [
   'history_search',
   'history_read',
+  'context_compact',
   'work_unit_start',
 ] as const;
 
 export const WORK_UNIT_CONTEXT_TOOL_NAMES = [
   'history_search',
   'history_read',
+  'context_compact',
   'work_unit_finish',
 ] as const;
 
@@ -36,6 +38,8 @@ const workUnitEnterSchema = Type.Object({
     description: 'The outcome of this optional independently verifiable slice and the evidence that will establish it.',
   }),
 });
+
+const contextCompactSchema = Type.Object({});
 
 const workUnitReturnSchema = Type.Object({
   status: Type.Union([
@@ -101,6 +105,26 @@ export function createContextTools(
           ref: durableHistoryRef(params.ref),
         });
         return jsonResult(result);
+      },
+    }),
+    defineTool({
+      name: 'context_compact',
+      label: 'Compact context',
+      description: [
+        'Request provider-native compaction of the current execution scope before the next inference.',
+        'Use after a context-budget notice when the current work has reached a stable boundary and substantial work remains.',
+        'This preserves exact History, does not end the turn, and does not require a manual summary.',
+      ].join(' '),
+      promptSnippet: 'Compact the current execution scope at a stable boundary',
+      promptGuidelines: [
+        'Call only after a context-budget notice or when the runtime explicitly asks for a context checkpoint.',
+        'Do not call merely to organize ordinary work, and do not write a separate summary first.',
+        'Continue the same request after compaction.',
+      ],
+      parameters: contextCompactSchema,
+      executionMode: 'sequential',
+      async execute() {
+        return jsonResult({ requested: true, continuation: 'Compaction will occur before the next inference.' });
       },
     }),
     defineTool({

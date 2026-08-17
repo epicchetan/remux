@@ -16,6 +16,11 @@ import type {
   DurableContextSnapshot,
   LogicalContextMessage,
 } from '../logical-context.ts';
+import type {
+  ContextCompactionState,
+  ContextCompactionTrigger,
+  ContextCompactionUsage,
+} from '../context/compaction.ts';
 import type { TurnContextFrameCandidate } from '../context/manifest.ts';
 import type { CanonicalJsonValue } from '../storage/canonical-json.ts';
 import type {
@@ -245,6 +250,7 @@ export type DurableContextBoundarySnapshot = DurableContextSnapshot & {
   scopeId: string;
   scopeKind: 'turn' | 'work_unit';
   nextFrameOrdinal: number;
+  compaction: ContextCompactionState;
 };
 
 export type DurableInferenceContext = {
@@ -257,6 +263,20 @@ export type DurableInferenceContext = {
   frame: TurnContextFrameCandidate;
   frameBuildDurationMs: number;
   activeMessages: readonly LogicalContextMessage[];
+  compaction: ContextCompactionState;
+};
+
+export type InstallContextCompactionInput = {
+  expectedBasisSequence: number;
+  trigger: ContextCompactionTrigger;
+  inputHash: string;
+  policyInputTokens: number;
+  retainedInputTokens: number;
+  retainedInput: unknown[];
+  providerItem: unknown;
+  usage: ContextCompactionUsage;
+  durationMs: number;
+  context: DurableInferenceContext;
 };
 
 export type DurableArtifactDescriptor = {
