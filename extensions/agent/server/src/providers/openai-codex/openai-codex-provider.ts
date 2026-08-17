@@ -35,14 +35,13 @@ import type {
   WorkUnitView,
 } from '../../domain/work.ts';
 import {
-  assertContextBudget,
   estimatePiContextTokens,
   hashRenderedMessages,
   parseProviderToolResultText,
   renderDurablePiPrefix,
   type LogicalContextMessage,
 } from '../../logical-context.ts';
-import type { ThreadContextFrameCandidate } from '../../context/manifest.ts';
+import type { TurnContextFrameCandidate } from '../../context/manifest.ts';
 import {
   createContextTools,
   PARENT_CONTEXT_TOOL_NAMES,
@@ -91,8 +90,8 @@ function providerContract() {
     'edit@pi-0.84',
     'write@pi-0.84',
     'history@1',
-    'thread@3',
     'work-unit@4',
+    'turn-context@1',
     'provider-retry@1',
     'provider-lanes@1',
   ];
@@ -200,7 +199,6 @@ export class OpenAICodexProvider implements ModelProvider {
       providerRequestMode: 'none',
     };
     let pendingRetryOfInferenceId: string | null = null;
-    let parentProviderSessionId = '';
     let activeProviderSessionId = '';
     let providerTransportControls: ProviderTransportControls | null = null;
     const providerSessionIds = new Set<string>();
@@ -227,7 +225,7 @@ export class OpenAICodexProvider implements ModelProvider {
       messageCount: number;
       estimatedInputTokens: number;
       fixedContractsHash: string;
-      frame: ThreadContextFrameCandidate;
+      frame: TurnContextFrameCandidate;
       frameBuildDurationMs: number;
       activeMessages: readonly LogicalContextMessage[];
     } | null = null;
@@ -245,6 +243,20 @@ export class OpenAICodexProvider implements ModelProvider {
     const awaitProviderDurability = async () => {
       await providerDurabilityTail;
       if (providerDurabilityError) throw providerDurabilityError;
+    };
+    const failClosedProviderRetry = (target: AgentSession, error: unknown) => {
+      providerDurabilityError ??= error;
+      // Pi emits auto_retry_start synchronously and then waits on an
+      // abortable backoff before continuing the provider loop. A retry whose
+      // durable predecessor cannot be superseded (most importantly, because
+      // it may already have executed a tool) must stop that loop immediately.
+      // Queue the abort outside the subscriber so Pi can finish publishing
+      // the event and our durability tail can observe the original failure.
+      queueMicrotask(() => {
+        void target.abort().catch((abortError) => {
+          providerDurabilityError ??= abortError;
+        });
+      });
     };
     const ensureAssistantDurable = (message: AssistantMessage) => {
       const existing = assistantDurability.get(message);
@@ -314,43 +326,24 @@ export class OpenAICodexProvider implements ModelProvider {
           await awaitProviderDurability();
           const compileStartedAt = performance.now();
           const compileFrame = async () => {
-            const snapshot = await options.durability.compileContext(model.contextWindow);
-            activeProviderSessionId = snapshot.scopeKind === 'work_unit'
-              ? snapshot.scopeId
-              : parentProviderSessionId;
+            const snapshot = await options.durability.compileContext();
+            // Every root turn and work unit is its own provider lane. This
+            // makes arbitrary cross-turn selection a deliberate full request,
+            // while inference cycles inside one scope remain continuations.
+            activeProviderSessionId = snapshot.scopeId;
             if (!providerSessionIds.has(activeProviderSessionId)) {
               providerSessionIds.add(activeProviderSessionId);
               requiredProviderTransportControls(providerTransportControls)
                 .resetStats(activeProviderSessionId);
             }
-            const dialogueTurnIds = new Set(snapshot.frame.dialogueTurnIds);
-            const recentDialogue = snapshot.messages.filter((message) =>
-              dialogueTurnIds.has(message.turnId));
-            const activeScope = snapshot.messages.filter((message) =>
-              !dialogueTurnIds.has(message.turnId));
-            const messages: Message[] = [
-              ...renderDurablePiPrefix(recentDialogue, model),
-              contextFrameMessage(snapshot.frame, snapshot.scopeKind),
-              ...renderDurablePiPrefix(activeScope, model),
-            ];
+            const messages: Message[] = renderDurablePiPrefix(snapshot.messages, model);
             return {
               snapshot,
               messages,
               estimatedInputTokens: estimatePiContextTokens(messages, systemPrompt),
             };
           };
-          let compiled = await compileFrame();
-          if (
-            compiled.estimatedInputTokens >= compiled.snapshot.frame.softContextLimit &&
-            !compiled.snapshot.frame.pressureNoticed
-          ) {
-            const recorded = await options.durability.noticeContextPressure({
-              estimatedInputTokens: compiled.estimatedInputTokens,
-              softContextLimit: compiled.snapshot.frame.softContextLimit,
-              hardContextLimit: compiled.snapshot.frame.hardContextLimit,
-            });
-            if (recorded) compiled = await compileFrame();
-          }
+          const compiled = await compileFrame();
           const { snapshot, messages, estimatedInputTokens } = compiled;
           const frameBuildDurationMs = Math.max(0, Math.round(performance.now() - compileStartedAt));
           const rendered = hashRenderedMessages(messages);
@@ -382,8 +375,11 @@ export class OpenAICodexProvider implements ModelProvider {
           throw error;
         }
       });
-      pi.on('before_provider_request', (event) =>
-        requestConciseReasoningSummary(event.payload));
+      pi.on('before_provider_request', (event) => requestReasoningControls(
+        event.payload,
+        supportsAllTurnsReasoning(model) &&
+          Boolean(pendingContext?.frame.resolvedTurns.some(({ resolution }) => resolution === 'full')),
+      ));
       pi.on('message_end', async (event) => {
         if (event.message.role !== 'assistant') return;
         await ensureAssistantDurable(event.message);
@@ -502,7 +498,13 @@ export class OpenAICodexProvider implements ModelProvider {
       // ordering: no request may overtake the preceding provider item's
       // durable terminal boundary.
       await awaitProviderDurability();
-      if (options.reasoning !== 'off') assertConciseReasoningSummary(payload);
+      if (options.reasoning !== 'off') {
+        assertReasoningControls(
+          payload,
+          supportsAllTurnsReasoning(model) &&
+            Boolean(pendingContext?.frame.resolvedTurns.some(({ resolution }) => resolution === 'full')),
+        );
+      }
       const context = pendingContext;
       pendingContext = null;
       if (!context) {
@@ -543,7 +545,6 @@ export class OpenAICodexProvider implements ModelProvider {
         },
       });
       pendingRetryOfInferenceId = null;
-      assertContextBudget(estimatedInputTokens, model.contextWindow);
       const transportStats = requiredProviderTransportControls(providerTransportControls)
         .getStats(context.providerSessionId);
       pendingTransport = {
@@ -593,7 +594,6 @@ export class OpenAICodexProvider implements ModelProvider {
     await resourceLoader.reload();
     const sessionManager = SessionManager.inMemory(options.cwd);
     const sessionId = sessionManager.getSessionId();
-    parentProviderSessionId = sessionId;
     activeProviderSessionId = sessionId;
     const { session } = await createRemuxAgentSession({
       cwd: options.cwd,
@@ -650,7 +650,7 @@ export class OpenAICodexProvider implements ModelProvider {
           );
         })();
         const settled = durability.catch((error) => {
-          providerDurabilityError ??= error;
+          failClosedProviderRetry(session, error);
         });
         providerDurabilityTail = Promise.all([priorDurability, settled]).then(() => undefined);
         return;
@@ -776,7 +776,7 @@ export class OpenAICodexProvider implements ModelProvider {
             );
           })();
           const settled = durability.catch((error) => {
-            providerDurabilityError ??= error;
+            failClosedProviderRetry(child, error);
           });
           providerDurabilityTail = Promise.all([priorDurability, settled]).then(() => undefined);
           return;
@@ -958,34 +958,7 @@ function requiredProviderTransportControls(
 }
 
 function workUnitBootstrap(entered: WorkUnitView) {
-  return {
-    boundary: 'work_unit',
-    historyRef: `history://scope/${encodeURIComponent(entered.scopeId)}`,
-    resources: entered.resources,
-    scopeId: entered.scopeId,
-    state: entered.state,
-  };
-}
-
-function contextFrameMessage(
-  candidate: ThreadContextFrameCandidate,
-  scopeKind: 'turn' | 'work_unit',
-): Message {
-  const scopeBoundary = scopeKind === 'work_unit'
-    ? 'Current work: focused work unit. Keep scratch local and finish with work_unit_finish.'
-    : 'Current work: parent conversation. work_unit_finish is valid only after work_unit_start has opened a work unit.';
-  return {
-    role: 'user',
-    content: [
-      'The following is the living Thread for this conversation. The exact user message after it is the current request. Exact earlier activity remains available through History tools.',
-      scopeBoundary,
-      candidate.contextEnvelope,
-    ].join('\n\n'),
-    // This synthetic control message is stable while its content is stable.
-    // Event timestamps belong to the durable messages below; changing this
-    // timestamp on every inference would invalidate the provider prefix cache.
-    timestamp: 0,
-  };
+  return { state: entered.state === 'running' ? 'work_unit' : entered.state };
 }
 
 function projectPiEvent(event: AgentSessionEvent, sink: ModelSessionEventSink) {
@@ -1067,33 +1040,58 @@ function assistantTextPhase(message: AssistantMessage): AssistantTextPhase {
   return streamingAssistantTextPhase(message);
 }
 
-export function requestConciseReasoningSummary(payload: unknown): unknown {
+export function requestReasoningControls(payload: unknown, includePriorReasoning = false): unknown {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return payload;
   const request = payload as Record<string, unknown>;
   const reasoning = request.reasoning;
   if (!reasoning || typeof reasoning !== 'object' || Array.isArray(reasoning)) return payload;
+  if (!supportsReasoningControlsModelId(request.model)) {
+    const { summary: _summary, context: _context, ...supported } = reasoning as Record<string, unknown>;
+    return Object.keys(supported).length === Object.keys(reasoning).length
+      ? payload
+      : { ...request, reasoning: supported };
+  }
   return {
     ...request,
     reasoning: {
       ...reasoning,
       summary: 'concise',
+      ...(includePriorReasoning ? { context: 'all_turns' } : {}),
     },
   };
 }
 
-function assertConciseReasoningSummary(payload: unknown): void {
+function assertReasoningControls(payload: unknown, includePriorReasoning: boolean): void {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     throw new Error('Provider request is missing the reasoning summary contract.');
   }
   const reasoning = (payload as Record<string, unknown>).reasoning;
+  if (!supportsReasoningControlsModelId((payload as Record<string, unknown>).model)) {
+    if (
+      reasoning && typeof reasoning === 'object' && !Array.isArray(reasoning) &&
+      ('summary' in reasoning || 'context' in reasoning)
+    ) {
+      throw new Error('Provider request contains reasoning controls unsupported by this model.');
+    }
+    return;
+  }
   if (
     !reasoning ||
     typeof reasoning !== 'object' ||
     Array.isArray(reasoning) ||
-    (reasoning as Record<string, unknown>).summary !== 'concise'
+    (reasoning as Record<string, unknown>).summary !== 'concise' ||
+    (includePriorReasoning && (reasoning as Record<string, unknown>).context !== 'all_turns')
   ) {
-    throw new Error('Provider request must ask OpenAI for a concise reasoning summary.');
+    throw new Error('Provider request must apply the configured reasoning continuity contract.');
   }
+}
+
+function supportsAllTurnsReasoning(model: Model<string>) {
+  return supportsReasoningControlsModelId(model.id);
+}
+
+function supportsReasoningControlsModelId(value: unknown) {
+  return typeof value === 'string' && /(?:^|[^0-9])5\.6(?:[^0-9]|$)/u.test(value);
 }
 
 function assistantText(message: AssistantMessage) {
@@ -1116,7 +1114,7 @@ function workUnitCompletion(value: unknown): WorkUnitCompletion | null {
     typeof candidate.scopeId !== 'string' ||
     !['completed', 'partial', 'blocked'].includes(String(candidate.status)) ||
     typeof candidate.result !== 'string' ||
-    !Array.isArray(candidate.resources) ||
+    !Array.isArray(candidate.artifacts) ||
     typeof candidate.resultRef !== 'string' ||
     typeof candidate.historyRef !== 'string'
   ) return null;

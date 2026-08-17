@@ -12,7 +12,7 @@ import type {
   AgentOperationDetailRequest,
   AgentOperationDetailResource,
   AgentToolCallSummary,
-  AgentWorkUnitResourceReference,
+  AgentWorkUnitArtifactReference,
   AgentWorkUnitStatus,
 } from '../../../shared/transcript.ts';
 
@@ -20,7 +20,6 @@ import type { CanonicalJsonValue } from './canonical-json.ts';
 import { canonicalJson } from './canonical-json.ts';
 import type {
   WorkUnitEnterInput,
-  WorkUnitResourceRef,
   WorkUnitReturnInput,
   WorkUnitReturnStatus,
 } from '../domain/work.ts';
@@ -28,8 +27,8 @@ import type {
   DurableContentRef,
   DurableTranscriptProjectionAction,
   DurableTurnHandle,
+  PreparedWorkUnitArtifact,
   PreparedWorkUnitEntry,
-  PreparedWorkUnitResource,
   PreparedWorkUnitReturn,
 } from '../domain/state.ts';
 import { AgentStateCore } from './state-core.ts';
@@ -65,27 +64,10 @@ export abstract class WorkUnitState extends AgentStateCore {
   ): Promise<PreparedWorkUnitEntry> {
     this.assertOpen();
     this.assertRunningHandle(handle);
-    const objective = input.objective.trim();
-    if (!objective) throw new TypeError('A work unit objective is required.');
-    if (Buffer.byteLength(objective, 'utf8') > 4 * 1024) {
-      throw new TypeError('A work unit objective must not exceed 4 KiB.');
-    }
-    const doneWhen = normalizeWorkUnitDoneWhen(input.doneWhen ?? []);
-    const resources = normalizeWorkUnitResources(input.resources ?? []);
-    const child: DurableTurnHandle = { ...handle, scopeId: this.nextId('scope') };
-    const materializedResources = await this.prepareWorkUnitResources(
-      handle,
-      resources,
-      this.parentMaterializedResourceHashes(handle.turnId),
-    );
-    const bootstrap = await this.prepareJson({
-      boundary: 'work_unit',
-      historyRef: `history://scope/${encodeURIComponent(child.scopeId)}`,
-      resources: materializedResources.map(contextWorkUnitResource),
-      scopeId: child.scopeId,
-      state: 'running',
-    });
-    return { bootstrap, child, doneWhen, materializedResources, objective };
+    const boundary = normalizeWorkUnitBoundary(input.boundary);
+    const scope: DurableTurnHandle = { ...handle, scopeId: this.nextId('scope') };
+    const bootstrap = await this.prepareJson({ state: 'work_unit' });
+    return { bootstrap, scope, boundary };
   }
 
   commitWorkUnitEntry(
@@ -93,7 +75,7 @@ export abstract class WorkUnitState extends AgentStateCore {
     prepared: PreparedWorkUnitEntry,
     linkage: { parentCallId: string; parentOperationId: string; parentInferenceId: string },
   ) {
-    const { bootstrap, child, doneWhen, materializedResources, objective } = prepared;
+    const { bootstrap, scope, boundary } = prepared;
     return this.enqueueWrite(() => this.storage.transaction(() => {
       this.assertRunningHandle(handle);
       const parent = this.scopeIdentity(handle.scopeId);
@@ -124,52 +106,49 @@ export abstract class WorkUnitState extends AgentStateCore {
       if (runningChild) throw new Error('A work unit is already active for this turn.');
       const recordedAt = safeTimestamp(this.now());
       const sequence = this.insertEvent({
-        ...child,
+        ...scope,
         eventId: this.nextId('event'),
         type: 'work_unit.entered',
         actor: 'model',
         visibility: 'internal',
         payload: {
-          doneWhen,
-          objective,
+          boundary,
           parentInferenceId: linkage.parentInferenceId,
           parentOperationId: linkage.parentOperationId,
           parentScopeId: handle.scopeId,
-          resources: materializedResources.map(({ view }) => view),
-          scopeId: child.scopeId,
+          scopeId: scope.scopeId,
         },
         createdAt: recordedAt,
       });
       this.storage.database.prepare(`
         INSERT INTO execution_scopes (
           scope_id, project_id, conversation_id, turn_id,
-          parent_scope_id, parent_operation_id, kind, objective_json, state, created_sequence,
+          parent_scope_id, parent_operation_id, kind, boundary_text, state, created_sequence,
           terminal_sequence, result_artifact_hash, created_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, 'work_unit', ?, 'running', ?, NULL, NULL, ?, ?)
       `).run(
-        child.scopeId,
-        child.projectId,
-        child.conversationId,
-        child.turnId,
+        scope.scopeId,
+        scope.projectId,
+        scope.conversationId,
+        scope.turnId,
         handle.scopeId,
         linkage.parentOperationId,
-        canonicalJson({ doneWhen, objective, resources: materializedResources.map(({ view }) => view) }),
+        boundary,
         sequence,
         recordedAt,
         recordedAt,
       );
-      for (const resource of materializedResources) this.insertArtifact(resource.artifact, sequence, 'content');
       this.indexHistoryText({
-        ref: `history://scope/${encodeURIComponent(child.scopeId)}`,
-        projectId: child.projectId,
-        conversationId: child.conversationId,
-        turnId: child.turnId,
-        kind: 'work-unit-objective',
+        ref: `history://scope/${encodeURIComponent(scope.scopeId)}`,
+        projectId: scope.projectId,
+        conversationId: scope.conversationId,
+        turnId: scope.turnId,
+        kind: 'work-unit-boundary',
         sequence,
-        text: objective,
+        text: boundary,
       });
       const bootstrapSequence = this.insertEvent({
-        ...child,
+        ...scope,
         eventId: this.nextId('event'),
         type: 'work_unit.bootstrap',
         actor: 'harness',
@@ -184,11 +163,9 @@ export abstract class WorkUnitState extends AgentStateCore {
       });
       this.insertArtifact(bootstrap.artifact, bootstrapSequence);
       return {
-        handle: child,
+        handle: scope,
         parentScopeId: handle.scopeId,
-        objective,
-        doneWhen,
-        resources: materializedResources.map(contextWorkUnitResource),
+        boundary,
         transcriptSequence: sequence,
         transcriptCreatedAt: recordedAt,
       };
@@ -206,16 +183,12 @@ export abstract class WorkUnitState extends AgentStateCore {
       throw new Error('No work unit is active.');
     }
     const normalized = normalizeWorkUnitReturnInput(input);
-    const resources = await this.prepareWorkUnitResources(
-      handle,
-      normalized.resources,
-      this.parentMaterializedResourceHashes(handle.turnId),
-    );
+    const artifacts = await this.prepareWorkUnitArtifacts(handle, normalized.artifacts);
     const resultArtifact = await this.artifacts.put(
       Buffer.from(normalized.result, 'utf8'),
       'text/markdown; charset=utf-8',
     );
-    return { ...normalized, resources, resultArtifact };
+    return { ...normalized, artifacts, resultArtifact };
   }
 
   async commitWorkUnitFinish(
@@ -230,7 +203,7 @@ export abstract class WorkUnitState extends AgentStateCore {
       scopeId: handle.scopeId,
       status: prepared.status,
       result: prepared.result,
-      resources: prepared.resources.map(contextWorkUnitResource),
+      artifacts: prepared.artifacts.map(({ view }) => view),
       resultRef,
       historyRef,
     };
@@ -295,7 +268,7 @@ export abstract class WorkUnitState extends AgentStateCore {
         actor: 'model',
         visibility: 'internal',
         payload: {
-          resources: prepared.resources.map(({ view }) => view),
+          artifacts: prepared.artifacts.map(({ view }) => view),
           parentScopeId: parentHandle.scopeId,
           resultRef,
           scopeId: handle.scopeId,
@@ -305,8 +278,8 @@ export abstract class WorkUnitState extends AgentStateCore {
         createdAt: recordedAt,
       });
       this.insertArtifact(prepared.resultArtifact, terminalSequence, 'content');
-      for (const resource of prepared.resources) {
-        this.insertArtifact(resource.artifact, terminalSequence, 'content');
+      for (const artifact of prepared.artifacts) {
+        this.insertArtifact(artifact.artifact, terminalSequence, 'content');
       }
       const updated = this.storage.database.prepare(`
         UPDATE execution_scopes
@@ -358,7 +331,7 @@ export abstract class WorkUnitState extends AgentStateCore {
         actor: 'model',
         visibility: 'internal',
         payload: {
-          resources: prepared.resources.map(({ view }) => view),
+          artifacts: prepared.artifacts.map(({ view }) => view),
           parentScopeId: parentHandle.scopeId,
           resultRef: `history://artifact/${prepared.resultArtifact.hash}`,
           scopeId: handle.scopeId,
@@ -368,7 +341,7 @@ export abstract class WorkUnitState extends AgentStateCore {
         createdAt: recordedAt,
       });
       this.insertArtifact(prepared.resultArtifact, terminalSequence, 'content');
-      for (const resource of prepared.resources) this.insertArtifact(resource.artifact, terminalSequence, 'content');
+      for (const artifact of prepared.artifacts) this.insertArtifact(artifact.artifact, terminalSequence, 'content');
       this.storage.database.prepare(`
         UPDATE execution_scopes
         SET state = 'completed', terminal_sequence = ?, result_artifact_hash = ?, updated_at = ?
@@ -387,7 +360,7 @@ export abstract class WorkUnitState extends AgentStateCore {
         parentHandle,
         status: prepared.status,
         result: prepared.result,
-        resources: prepared.resources.map(contextWorkUnitResource),
+        artifacts: prepared.artifacts.map(({ view }) => view),
         resultRef: `history://artifact/${prepared.resultArtifact.hash}`,
         historyRef: `history://scope/${encodeURIComponent(handle.scopeId)}`,
         scopeId: handle.scopeId,
@@ -409,7 +382,7 @@ export abstract class WorkUnitState extends AgentStateCore {
     await this.writerTail;
     const scope = this.storage.database.prepare(`
       SELECT s.scope_id, s.turn_id, s.parent_scope_id, s.parent_operation_id,
-             s.kind, s.objective_json, s.state, s.created_sequence,
+             s.kind, s.boundary_text, s.state, s.created_sequence,
              s.terminal_sequence, s.result_artifact_hash, s.created_at, s.updated_at,
              terminal.payload_json AS terminal_payload
       FROM execution_scopes s
@@ -421,7 +394,7 @@ export abstract class WorkUnitState extends AgentStateCore {
       parent_scope_id: string | null;
       parent_operation_id: string | null;
       kind: 'turn' | 'work_unit';
-      objective_json: string;
+      boundary_text: string | null;
       state: string;
       created_sequence: number;
       terminal_sequence: number | null;
@@ -435,13 +408,10 @@ export abstract class WorkUnitState extends AgentStateCore {
     const terminal = scope.terminal_payload
       ? JSON.parse(scope.terminal_payload) as Record<string, unknown>
       : null;
-    const objective = scope.kind === 'work_unit'
-      ? parseWorkUnitObjective(scope.objective_json)
-      : { objective: null, doneWhen: [], resources: [] };
     const result = scope.result_artifact_hash
       ? await this.readArtifactTextByHash(scope.result_artifact_hash)
       : null;
-    const returnedResources = parseWorkUnitResourceReferences(terminal?.resources);
+    const artifacts = parseWorkUnitArtifactReferences(terminal?.artifacts);
     const rows = this.storage.database.prepare(`
       SELECT i.inference_id, i.ordinal, i.state, i.started_sequence,
              i.terminal_sequence, i.reasoning_summary_artifact_hash,
@@ -506,7 +476,7 @@ export abstract class WorkUnitState extends AgentStateCore {
         SELECT o.operation_id, o.call_id, o.state, o.accepted_sequence,
                o.terminal_sequence, o.value_json,
                accepted.created_at AS started_at, terminal.created_at AS completed_at,
-               child.scope_id AS child_scope_id, child.objective_json AS child_objective_json,
+               child.scope_id AS child_scope_id, child.boundary_text AS child_boundary,
                child.state AS child_state, child.created_at AS child_created_at,
                child.updated_at AS child_updated_at,
                child.terminal_sequence AS child_terminal_sequence,
@@ -533,7 +503,7 @@ export abstract class WorkUnitState extends AgentStateCore {
         started_at: number;
         completed_at: number | null;
         child_scope_id: string | null;
-        child_objective_json: string | null;
+        child_boundary: string | null;
         child_state: string | null;
         child_created_at: number | null;
         child_updated_at: number | null;
@@ -562,8 +532,8 @@ export abstract class WorkUnitState extends AgentStateCore {
             operation.child_created_at === null || operation.child_updated_at === null
           ? null
           : Math.max(0, operation.child_updated_at - operation.child_created_at);
-        const childReturnedResourceCount = parseWorkUnitResourceReferences(
-          childTerminal?.resources,
+        const childArtifactCount = parseWorkUnitArtifactReferences(
+          childTerminal?.artifacts,
         ).length;
         const name = typeof value.name === 'string' ? value.name : 'tool';
         calls.push({
@@ -581,13 +551,11 @@ export abstract class WorkUnitState extends AgentStateCore {
             : await this.readWorkUnitEventPreview(value.result),
           durationMs: completedAt === null ? null : Math.max(0, completedAt - operation.started_at),
           childScopeId: operation.child_scope_id,
-          childObjective: operation.child_objective_json
-            ? parseWorkUnitObjective(operation.child_objective_json).objective
-            : null,
+          childBoundary: operation.child_boundary,
           childState,
           childDurationMs,
           childOperationCount: operation.child_operation_count,
-          childReturnedResourceCount,
+          childArtifactCount,
           hasDetail: true,
         });
       }
@@ -612,7 +580,7 @@ export abstract class WorkUnitState extends AgentStateCore {
           call.childState,
           call.childDurationMs,
           call.childOperationCount,
-          call.childReturnedResourceCount,
+          call.childArtifactCount,
         ].join(':')),
       ].join(':');
       inferences.push({
@@ -670,9 +638,7 @@ export abstract class WorkUnitState extends AgentStateCore {
       startedAt: scope.created_at,
       completedAt: scope.terminal_sequence === null ? null : scope.updated_at,
       durationMs: scope.terminal_sequence === null ? null : Math.max(0, scope.updated_at - scope.created_at),
-      objective: objective.objective,
-      doneWhen: objective.doneWhen,
-      providedResources: objective.resources,
+      boundary: scope.boundary_text,
       inferenceOrder: rows.map((row) => row.inference_id),
       inferences,
       window: {
@@ -682,7 +648,7 @@ export abstract class WorkUnitState extends AgentStateCore {
         hasLater: selection.endIndexExclusive < rows.length,
       },
       result,
-      returnedResources,
+      artifacts,
     };
   }
 
@@ -757,7 +723,7 @@ export abstract class WorkUnitState extends AgentStateCore {
     if (turnIds && turnIds.length === 0) return [];
     const rows = (turnIds
       ? this.storage.database.prepare(`
-          SELECT s.scope_id, s.turn_id, s.objective_json, s.state,
+          SELECT s.scope_id, s.turn_id, s.boundary_text, s.state,
                  s.created_sequence, s.terminal_sequence, s.result_artifact_hash,
                  s.created_at, s.updated_at, terminal.payload_json AS terminal_payload,
                  (SELECT COUNT(*) FROM operations o
@@ -769,7 +735,7 @@ export abstract class WorkUnitState extends AgentStateCore {
           ORDER BY s.created_sequence, s.scope_id
         `).all(conversationId, ...turnIds)
       : this.storage.database.prepare(`
-          SELECT s.scope_id, s.turn_id, s.objective_json, s.state,
+          SELECT s.scope_id, s.turn_id, s.boundary_text, s.state,
                  s.created_sequence, s.terminal_sequence, s.result_artifact_hash,
                  s.created_at, s.updated_at, terminal.payload_json AS terminal_payload,
                  (SELECT COUNT(*) FROM operations o
@@ -781,7 +747,7 @@ export abstract class WorkUnitState extends AgentStateCore {
         `).all(conversationId)) as Array<{
           scope_id: string;
           turn_id: string;
-          objective_json: string;
+          boundary_text: string;
           state: string;
           created_sequence: number;
           terminal_sequence: number | null;
@@ -793,14 +759,10 @@ export abstract class WorkUnitState extends AgentStateCore {
         }>;
     const actions: DurableTranscriptProjectionAction[] = [];
     for (const row of rows) {
-      const objective = parseWorkUnitObjective(row.objective_json);
       const terminal = row.terminal_payload
         ? JSON.parse(row.terminal_payload) as Record<string, unknown>
         : null;
-      const resources = uniqueWorkUnitReferences([
-        ...objective.resources,
-        ...parseWorkUnitResourceReferences(terminal?.resources),
-      ]);
+      const artifacts = parseWorkUnitArtifactReferences(terminal?.artifacts);
       const result = row.result_artifact_hash
         ? await this.readArtifactTextByHash(row.result_artifact_hash)
         : null;
@@ -809,9 +771,7 @@ export abstract class WorkUnitState extends AgentStateCore {
         type: 'work-unit-start',
         turnId: row.turn_id,
         scopeId: row.scope_id,
-        objective: objective.objective,
-        doneWhen: objective.doneWhen,
-        resourceCount: resources.length,
+        boundary: row.boundary_text,
         operationCount: row.operation_count,
         sequence: row.created_sequence,
         createdAt: row.created_at,
@@ -828,7 +788,7 @@ export abstract class WorkUnitState extends AgentStateCore {
           resultPreview: result
             ? truncateWorkUnitPreview(result.replace(/\s+/gu, ' ').trim(), 320)
             : null,
-          resourceCount: resources.length,
+          artifactCount: artifacts.length,
           durationMs: Math.max(0, row.updated_at - row.created_at),
           sequence: row.terminal_sequence,
           createdAt: row.updated_at,
@@ -1021,7 +981,7 @@ export abstract class WorkUnitState extends AgentStateCore {
     const row = this.storage.database.prepare(`
       SELECT c.project_id, c.cwd, c.reasoning, t.turn_id,
              t.root_scope_id, s.scope_id, s.parent_scope_id, s.kind,
-             s.objective_json
+             s.boundary_text
       FROM conversations c
       JOIN turns t ON t.conversation_id = c.conversation_id
       JOIN execution_scopes s ON s.turn_id = t.turn_id
@@ -1040,7 +1000,7 @@ export abstract class WorkUnitState extends AgentStateCore {
       scope_id: string;
       parent_scope_id: string | null;
       kind: 'turn' | 'work_unit';
-      objective_json: string;
+      boundary_text: string | null;
     } | undefined;
     if (!row) throw new Error(`Conversation ${conversationId} has no active context boundary.`);
     return {
@@ -1052,49 +1012,43 @@ export abstract class WorkUnitState extends AgentStateCore {
       scopeId: row.scope_id,
       parentScopeId: row.parent_scope_id,
       kind: row.kind,
-      objective: JSON.parse(row.objective_json) as CanonicalJsonValue,
+      boundary: row.boundary_text,
     };
   }
 
-  private async prepareWorkUnitResources(
+  private async prepareWorkUnitArtifacts(
     handle: DurableTurnHandle,
-    resources: readonly WorkUnitResourceRef[],
-    inheritedHashes: ReadonlySet<string>,
-  ): Promise<PreparedWorkUnitResource[]> {
+    refs: readonly string[],
+  ): Promise<PreparedWorkUnitArtifact[]> {
     const identity = this.contextIdentity(handle.conversationId);
-    const seen = new Set(inheritedHashes);
-    const prepared: PreparedWorkUnitResource[] = [];
-    for (const resource of resources) {
+    const prepared: PreparedWorkUnitArtifact[] = [];
+    for (const ref of refs) {
       let content: string;
       let source: 'file' | 'history';
-      if (resource.ref.startsWith('history://')) {
-        content = await this.resolveOpenableContent(handle.conversationId, resource.ref);
+      if (ref.startsWith('history://')) {
+        content = await this.resolveOpenableContent(handle.conversationId, ref);
         source = 'history';
       } else {
-        const path = isAbsolute(resource.ref) ? resource.ref : resolve(identity.cwd, resource.ref);
+        const path = isAbsolute(ref) ? ref : resolve(identity.cwd, ref);
         const metadata = await stat(path);
         if (!metadata.isFile()) {
           throw new TypeError(
-            `Work unit resource ${resource.ref} must be a UTF-8 text file; directories are not supported.`,
+            `Work unit artifact ${ref} must be a UTF-8 text file; directories are not supported.`,
           );
         }
         const bytes = await readFile(path);
         try {
           content = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
         } catch {
-          throw new TypeError(`Work unit resource ${resource.ref} is not UTF-8 text.`);
+          throw new TypeError(`Work unit artifact ${ref} is not UTF-8 text.`);
         }
         source = 'file';
       }
       const artifact = await this.artifacts.put(Buffer.from(content, 'utf8'), 'text/plain; charset=utf-8');
-      const inclusion = seen.has(artifact.hash) ? 'inherited' : 'materialized';
-      seen.add(artifact.hash);
       prepared.push({
         artifact,
-        content,
         view: {
-          ...resource,
-          inclusion,
+          ref,
           snapshot: {
             ref: `history://artifact/${artifact.hash}`,
             hash: artifact.hash,
@@ -1107,68 +1061,28 @@ export abstract class WorkUnitState extends AgentStateCore {
     }
     return prepared;
   }
-
-  private parentMaterializedResourceHashes(turnId: string) {
-    const rows = this.storage.database.prepare(`
-      SELECT payload_json FROM events
-      WHERE turn_id = ? AND type = 'work_unit.returned'
-      ORDER BY sequence
-    `).all(turnId) as Array<{ payload_json: string }>;
-    const hashes = new Set<string>();
-    for (const row of rows) {
-      const payload = JSON.parse(row.payload_json) as { resources?: unknown };
-      if (!Array.isArray(payload.resources)) continue;
-      for (const value of payload.resources) {
-        if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
-        const snapshot = (value as { snapshot?: unknown }).snapshot;
-        if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) continue;
-        const hash = (snapshot as { hash?: unknown }).hash;
-        if (typeof hash === 'string' && /^[0-9a-f]{64}$/u.test(hash)) hashes.add(hash);
-      }
-    }
-    return hashes;
-  }
 }
 
 function artifactHash(ref: DurableContentRef) {
   return ref.kind === 'artifact' ? ref.hash : null;
 }
 
-function parseWorkUnitObjective(value: string) {
-  const parsed = JSON.parse(value) as Record<string, unknown>;
-  return {
-    objective: typeof parsed.objective === 'string' ? parsed.objective : 'Focused work unit',
-    doneWhen: Array.isArray(parsed.doneWhen)
-      ? parsed.doneWhen.filter((entry): entry is string => typeof entry === 'string')
-      : [],
-    resources: parseWorkUnitResourceReferences(parsed.resources),
-  };
-}
-
-function parseWorkUnitResourceReferences(value: unknown): AgentWorkUnitResourceReference[] {
+function parseWorkUnitArtifactReferences(value: unknown): AgentWorkUnitArtifactReference[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((entry) => {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
-    const resource = entry as Record<string, unknown>;
-    if (
-      typeof resource.ref !== 'string' ||
-      (resource.role !== 'authority' && resource.role !== 'deliverable' && resource.role !== 'evidence')
-    ) return [];
+    const artifact = entry as Record<string, unknown>;
+    const snapshot = artifact.snapshot;
+    if (typeof artifact.ref !== 'string' || !snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+      return [];
+    }
+    const descriptor = snapshot as Record<string, unknown>;
+    if (typeof descriptor.ref !== 'string' || !Number.isSafeInteger(descriptor.byteLength)) return [];
     return [{
-      ref: resource.ref,
-      role: resource.role,
-      ...(typeof resource.description === 'string' ? { description: resource.description } : {}),
+      ref: artifact.ref,
+      snapshotRef: descriptor.ref,
+      byteLength: descriptor.byteLength as number,
     }];
-  });
-}
-
-function uniqueWorkUnitReferences(values: AgentWorkUnitResourceReference[]) {
-  const seen = new Set<string>();
-  return values.filter((resource) => {
-    const key = `${resource.role}\0${resource.ref}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
   });
 }
 
@@ -1200,9 +1114,6 @@ function toolPresentation(
     return { category: 'command', label: 'Shell command', subject: command };
   }
   if (normalized === 'read' || normalized.endsWith('_read')) {
-    if (normalized.includes('thread')) {
-      return { category: 'context', label: 'Read Thread', subject: null };
-    }
     if (normalized.includes('history')) {
       return { category: 'context', label: 'Read History', subject: ref };
     }
@@ -1221,21 +1132,12 @@ function toolPresentation(
   }
   if (normalized === 'edit' || normalized.endsWith('_edit') || normalized === 'write' ||
       normalized.endsWith('_write')) {
-    if (normalized.includes('thread')) {
-      return { category: 'context', label: 'Updated Thread', subject: null };
-    }
     const verb = normalized === 'write' || normalized.endsWith('_write') ? 'Wrote' : 'Edited';
     return {
       category: 'edit',
       label: path ? `${verb} ${toolSubjectName(path)}` : `${verb} file`,
       subject: path,
     };
-  }
-  if (normalized === 'thread_patch' || normalized === 'thread_replace') {
-    return { category: 'context', label: 'Updated Thread', subject: null };
-  }
-  if (normalized.startsWith('thread_')) {
-    return { category: 'context', label: humanizeToolName(name), subject: null };
   }
   return { category: 'tool', label: humanizeToolName(name), subject: null };
 }
@@ -1333,39 +1235,28 @@ function truncateWorkUnitPreview(value: string, maxCodePoints: number) {
     : `${codePoints.slice(0, Math.max(0, maxCodePoints - 1)).join('')}…`;
 }
 
-function contextWorkUnitResource(resource: PreparedWorkUnitResource) {
-  return {
-    ...resource.view,
-    ...(resource.view.inclusion === 'materialized' ? { content: resource.content } : {}),
-  };
+function normalizeWorkUnitBoundary(value: unknown) {
+  if (typeof value !== 'string') throw new TypeError('A work unit boundary must be text.');
+  const boundary = value.trim().replace(/\s+/gu, ' ');
+  if (!boundary) throw new TypeError('A work unit boundary is required.');
+  if (Buffer.byteLength(boundary, 'utf8') > 4 * 1024) {
+    throw new TypeError('A work unit boundary must not exceed 4 KiB.');
+  }
+  return boundary;
 }
 
-function normalizeWorkUnitDoneWhen(values: readonly string[]) {
-  if (values.length > 16) throw new TypeError('A work unit accepts at most sixteen done-when conditions.');
-  const normalized = values.map((value) =>
-    normalizeWorkUnitResourceText(value, 'done-when condition', 4 * 1024));
-  return [...new Set(normalized)];
-}
-
-function normalizeWorkUnitResources(resources: readonly WorkUnitResourceRef[]) {
-  if (resources.length > 16) throw new TypeError('A work unit accepts at most sixteen resource references.');
-  const normalized: WorkUnitResourceRef[] = [];
+function normalizeWorkUnitArtifacts(values: readonly string[]) {
+  if (values.length > 16) throw new TypeError('A work unit accepts at most sixteen artifact references.');
+  const normalized: string[] = [];
   const seen = new Set<string>();
-  for (const resource of resources) {
-    const ref = normalizeWorkUnitResourceRef(resource.ref);
-    if (resource.role !== 'authority' && resource.role !== 'deliverable' && resource.role !== 'evidence') {
-      throw new TypeError('A work unit resource role must be authority, deliverable, or evidence.');
-    }
-    const description = resource.description === undefined
-      ? undefined
-      : normalizeWorkUnitResourceText(resource.description, 'resource description', 2 * 1024);
-    const identity = `${resource.role}\0${ref}`;
-    if (seen.has(identity)) continue;
-    seen.add(identity);
-    normalized.push({ ref, role: resource.role, ...(description ? { description } : {}) });
+  for (const value of values) {
+    const ref = normalizeWorkUnitArtifactRef(value);
+    if (seen.has(ref)) continue;
+    seen.add(ref);
+    normalized.push(ref);
   }
   if (Buffer.byteLength(canonicalJson(normalized), 'utf8') > 16 * 1024) {
-    throw new TypeError('Work unit resource references must not exceed 16 KiB in total.');
+    throw new TypeError('Work unit artifact references must not exceed 16 KiB in total.');
   }
   return normalized;
 }
@@ -1373,7 +1264,7 @@ function normalizeWorkUnitResources(resources: readonly WorkUnitResourceRef[]) {
 function normalizeWorkUnitReturnInput(input: WorkUnitReturnInput): {
   status: WorkUnitReturnStatus;
   result: string;
-  resources: WorkUnitResourceRef[];
+  artifacts: string[];
 } {
   if (input.status !== 'completed' && input.status !== 'partial' && input.status !== 'blocked') {
     throw new TypeError('A work unit status must be completed, partial, or blocked.');
@@ -1381,26 +1272,16 @@ function normalizeWorkUnitReturnInput(input: WorkUnitReturnInput): {
   if (typeof input.result !== 'string') throw new TypeError('A work unit result must be text.');
   const result = input.result.trim();
   if (!result) throw new TypeError('A work unit result is required.');
-  const resources = normalizeWorkUnitResources(input.resources ?? []);
-  return { status: input.status, result, resources };
+  const artifacts = normalizeWorkUnitArtifacts(input.artifacts ?? []);
+  return { status: input.status, result, artifacts };
 }
 
-function normalizeWorkUnitResourceRef(value: unknown) {
-  if (typeof value !== 'string') throw new TypeError('A work unit resource reference must be text.');
+function normalizeWorkUnitArtifactRef(value: unknown) {
+  if (typeof value !== 'string') throw new TypeError('A work unit artifact reference must be text.');
   const normalized = value.trim();
-  if (!normalized) throw new TypeError('A work unit resource reference is required.');
+  if (!normalized) throw new TypeError('A work unit artifact reference is required.');
   if (Buffer.byteLength(normalized, 'utf8') > 4 * 1024) {
-    throw new TypeError('A work unit resource reference is too large.');
-  }
-  return normalized;
-}
-
-function normalizeWorkUnitResourceText(value: unknown, label: string, maxBytes: number) {
-  if (typeof value !== 'string') throw new TypeError(`A work unit ${label} must be text.`);
-  const normalized = value.trim().replace(/\s+/gu, ' ');
-  if (!normalized) throw new TypeError(`A work unit ${label} is required.`);
-  if (Buffer.byteLength(normalized, 'utf8') > maxBytes) {
-    throw new TypeError(`A work unit ${label} is too large.`);
+    throw new TypeError('A work unit artifact reference is too large.');
   }
   return normalized;
 }

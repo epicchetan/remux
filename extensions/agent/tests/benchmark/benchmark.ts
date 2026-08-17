@@ -21,6 +21,10 @@ import {
 import { createRunWorkspace, prepareFixture } from './fixture.ts';
 import { RemuxBenchmarkClient } from './remux-client.ts';
 import { benchmarkScenario, benchmarkScenarios } from './scenarios.ts';
+import type {
+  TurnContextPlan,
+  TurnContextResolution,
+} from '../../shared/protocol.ts';
 
 const REPOSITORY_ROOT = resolve(import.meta.dirname, '../../../..');
 const DEFAULT_DATA_ROOT = join(homedir(), '.local', 'state', 'remux', 'benchmarks');
@@ -124,6 +128,7 @@ async function commandStart(options: Options, client: RemuxBenchmarkClient) {
   const workspacePath = await createRunWorkspace(prepared.manifest, runPath);
   const target = createBenchmarkTarget(options.target, client);
   const modelId = requiredOption(options.modelId, '--model');
+  const contextPlan = resolveContextPlan(options.target, options, []);
   const startedAt = new Date().toISOString();
   const sourceBefore = await snapshotWorkspace(scenario.sourceRepository);
   const started = await target.start({
@@ -133,6 +138,7 @@ async function commandStart(options: Options, client: RemuxBenchmarkClient) {
     reviewMode: options.reviewMode,
     speed: options.speed,
     text,
+    contextPlan,
   });
   const runRecord: BenchmarkRun = {
     version: 3,
@@ -149,7 +155,7 @@ async function commandStart(options: Options, client: RemuxBenchmarkClient) {
     reasoning: options.reasoning,
     reviewMode: options.reviewMode,
     speed: options.speed,
-    contextArchitecture: options.target === 'agent' ? 'thread-runtime-v2' : 'codex-app-server',
+    contextArchitecture: options.target === 'agent' ? 'explicit-turn-context-v1' : 'codex-app-server',
     stopReason: null,
     driverAssessment: null,
     startedAt,
@@ -171,6 +177,7 @@ async function commandStart(options: Options, client: RemuxBenchmarkClient) {
       driverNote: options.driverNote,
       driverEvent,
       authority: turnAuthority(scenario.driverBrief.defaultAuthority, options),
+      contextPlan,
       turnId: started.turnId,
       startedAt,
       target,
@@ -186,16 +193,9 @@ async function commandStart(options: Options, client: RemuxBenchmarkClient) {
 async function commandObserve(options: Options, client: RemuxBenchmarkClient) {
   const { runRecord } = await loadRequiredRun(options);
   const target = createBenchmarkTarget(runRecord.target, client);
-  const [transcript, workspace, thread] = await Promise.all([
+  const [transcript, workspace] = await Promise.all([
     target.readTranscript(runRecord.conversationId),
     snapshotWorkspace(runRecord.workspacePath),
-    runRecord.target === 'agent'
-      ? client.query(
-        'remux/agent/thread/read',
-        { conversationId: runRecord.conversationId },
-        `benchmark:observe:${runRecord.runId}`,
-      ).catch((error) => ({ error: error instanceof Error ? error.message : String(error) }))
-      : Promise.resolve(null),
   ]);
   const last = runRecord.turns.at(-1);
   printJson({
@@ -211,7 +211,6 @@ async function commandObserve(options: Options, client: RemuxBenchmarkClient) {
       status: transcript.turnStatusByTurn[last.turnId] ?? null,
     } : null,
     workspace,
-    thread,
   });
 }
 
@@ -224,9 +223,14 @@ async function commandSend(options: Options, client: RemuxBenchmarkClient) {
   assertWithinBudget(runRecord, scenario);
   const priorAuthority = runRecord.turns.at(-1)?.authority ?? scenario.driverBrief.defaultAuthority;
   const target = createBenchmarkTarget(runRecord.target, client);
+  const contextPlan = resolveContextPlan(runRecord.target, options, runRecord.turns);
   const startedAt = new Date().toISOString();
   try {
-    const started = await target.send({ conversationId: runRecord.conversationId, text });
+    const started = await target.send({
+      conversationId: runRecord.conversationId,
+      text,
+      contextPlan,
+    });
     await finishTurn({
       runRecord,
       runPath,
@@ -234,6 +238,7 @@ async function commandSend(options: Options, client: RemuxBenchmarkClient) {
       driverNote: options.driverNote,
       driverEvent,
       authority: turnAuthority(priorAuthority, options),
+      contextPlan,
       turnId: started.turnId,
       startedAt,
       target,
@@ -390,6 +395,7 @@ async function finishTurn(input: {
   driverNote: string | null;
   driverEvent: BenchmarkDriverEvent | null;
   authority: BenchmarkTurnRecord['authority'];
+  contextPlan: TurnContextPlan | null;
   turnId: string;
   startedAt: string;
   target: ReturnType<typeof createBenchmarkTarget>;
@@ -401,9 +407,6 @@ async function finishTurn(input: {
     target.readTranscript(runRecord.conversationId),
     snapshotWorkspace(runRecord.workspacePath),
   ]);
-  const threadSnapshot = target.readThread
-    ? await target.readThread(runRecord.conversationId)
-    : null;
   const completedAt = new Date().toISOString();
   runRecord.turns.push({
     sequence: runRecord.turns.length + 1,
@@ -417,7 +420,7 @@ async function finishTurn(input: {
     activeDurationMs: Math.max(0, Date.parse(completedAt) - Date.parse(input.startedAt)),
     workspaceHeadAfter: workspace.head,
     workspaceStatusAfter: workspace.status,
-    threadSnapshot,
+    contextPlan: input.contextPlan,
   });
   await persistTurnEvidence({
     runPath,
@@ -500,7 +503,12 @@ function printRunProgress(runRecord: BenchmarkRun) {
     stopReason: runRecord.stopReason,
     target: runRecord.target,
     conversationId: runRecord.conversationId,
-    turns: runRecord.turns.map(({ sequence, turnId, authority }) => ({ sequence, turnId, authority })),
+    turns: runRecord.turns.map(({ sequence, turnId, authority, contextPlan }) => ({
+      sequence,
+      turnId,
+      authority,
+      contextPlan,
+    })),
     workspacePath: runRecord.workspacePath,
     reportPath: runRecord.reportPath,
     error: runRecord.error,
@@ -546,6 +554,13 @@ function parseOptions(args: string[]): Options {
     mayWrite: optionalBoolean(values.get('--may-write'), '--may-write'),
     mayCommit: optionalBoolean(values.get('--may-commit'), '--may-commit'),
     mayPush: optionalBoolean(values.get('--may-push'), '--may-push'),
+    automaticDialogueTurns: optionalNonNegativeInteger(
+      values.get('--automatic-dialogue-turns'),
+      '--automatic-dialogue-turns',
+    ),
+    contextDialogue: optionalSequenceList(values.get('--context-dialogue'), '--context-dialogue'),
+    contextFull: optionalSequenceList(values.get('--context-full'), '--context-full'),
+    contextOff: optionalSequenceList(values.get('--context-off'), '--context-off'),
   };
 }
 
@@ -573,13 +588,82 @@ type Options = {
   mayWrite: boolean | null;
   mayCommit: boolean | null;
   mayPush: boolean | null;
+  automaticDialogueTurns: number | null;
+  contextDialogue: number[];
+  contextFull: number[];
+  contextOff: number[];
 };
+
+function resolveContextPlan(
+  target: BenchmarkTarget,
+  options: Options,
+  priorTurns: BenchmarkTurnRecord[],
+): TurnContextPlan | null {
+  const hasExplicitOptions = options.automaticDialogueTurns !== null ||
+    options.contextDialogue.length > 0 ||
+    options.contextFull.length > 0 ||
+    options.contextOff.length > 0;
+  if (target === 'codex') {
+    if (hasExplicitOptions) {
+      throw new Error('Codex owns its context policy; context-selection options are Agent-only.');
+    }
+    return null;
+  }
+
+  const resolutions = new Map<number, TurnContextResolution>();
+  const add = (sequences: number[], resolution: TurnContextResolution) => {
+    for (const sequence of sequences) {
+      const prior = resolutions.get(sequence);
+      if (prior && prior !== resolution) {
+        throw new Error(`Prior turn ${sequence} has conflicting ${prior} and ${resolution} resolutions.`);
+      }
+      resolutions.set(sequence, resolution);
+    }
+  };
+  add(options.contextDialogue, 'dialogue');
+  add(options.contextFull, 'full');
+  add(options.contextOff, 'off');
+
+  return {
+    version: 1,
+    automaticDialogueTurns: options.automaticDialogueTurns ?? 2,
+    overrides: [...resolutions.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([sequence, resolution]) => {
+        const turn = priorTurns[sequence - 1];
+        if (!turn || turn.sequence !== sequence) {
+          throw new Error(
+            `Context selection references prior turn ${sequence}, but only ${priorTurns.length} turn(s) exist.`,
+          );
+        }
+        return { turnId: turn.turnId, resolution };
+      }),
+  };
+}
 
 function optionalBoolean(value: string | undefined, name: string) {
   if (value === undefined) return null;
   if (value === 'true') return true;
   if (value === 'false') return false;
   throw new Error(`${name} must be true or false.`);
+}
+
+function optionalNonNegativeInteger(value: string | undefined, name: string) {
+  if (value === undefined) return null;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative safe integer.`);
+  }
+  return parsed;
+}
+
+function optionalSequenceList(value: string | undefined, name: string) {
+  if (value === undefined || value.trim() === '') return [];
+  const sequences = value.split(',').map((entry) => Number(entry.trim()));
+  if (sequences.some((sequence) => !Number.isSafeInteger(sequence) || sequence < 1)) {
+    throw new Error(`${name} must be a comma-separated list of positive turn numbers.`);
+  }
+  return [...new Set(sequences)];
 }
 
 function stopReason(value: string): NonNullable<BenchmarkRun['stopReason']> {
@@ -626,16 +710,8 @@ async function persistTurnEvidence(input: {
     writeFile(join(root, 'user.md'), `${input.turn.text}\n`),
     writeFile(join(root, 'assistant.md'), `${input.assistant}\n`),
     writeFile(join(root, 'driver-event.json'), `${JSON.stringify(input.turn.driverEvent, null, 2)}\n`),
+    writeFile(join(root, 'context-plan.json'), `${JSON.stringify(input.turn.contextPlan, null, 2)}\n`),
     writeFile(join(root, 'workspace-status.txt'), `${input.turn.workspaceStatusAfter}\n`),
-    input.turn.threadSnapshot
-      ? writeFile(join(root, 'thread.md'), input.turn.threadSnapshot.content)
-      : Promise.resolve(),
-    input.turn.threadSnapshot
-      ? writeFile(join(root, 'thread-metadata.json'), `${JSON.stringify({
-          ...input.turn.threadSnapshot,
-          content: undefined,
-        }, null, 2)}\n`)
-      : Promise.resolve(),
   ]);
 }
 
@@ -685,6 +761,7 @@ function printHelp() {
     `  benchmark start --target agent|codex --model id [--text prompt|--text-file path] [--driver-event path]\n` +
     `  benchmark observe --run id\n` +
     `  benchmark send --run id [--text prompt|--text-file path] [--driver-event path] [--may-write true]\n` +
+    `    Agent context: [--automatic-dialogue-turns n] [--context-full 1,2] [--context-dialogue 1] [--context-off 2]\n` +
     `  benchmark stop --run id --reason accepted|abandoned|budget-exhausted [--note assessment]\n` +
     `  benchmark status --run id\n` +
     `  benchmark evaluate --run id\n` +

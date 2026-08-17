@@ -10,9 +10,9 @@ import WebSocket from 'ws';
 
 const TRANSCRIPT_PROTOCOL_VERSION = 4;
 const TRANSCRIPT_PROJECTION_VERSION = 'agent-turn-render-v4';
-const FIRST_SENTINEL = 'REMUX_THREAD_FIRST_OK';
 const CONTEXT_NONCE = 'REMUX_CONTEXT_8AUG26';
-const SECOND_SENTINEL = `${CONTEXT_NONCE} REMUX_THREAD_SECOND_OK`;
+const FIRST_SENTINEL = `${CONTEXT_NONCE} REMUX_TURN_FIRST_OK`;
+const SECOND_SENTINEL = `${CONTEXT_NONCE} REMUX_TURN_SECOND_OK`;
 const CHILD_SECRET = 'REMUX_CHILD_TRACE_MUST_STAY_PRIVATE';
 const WORK_UNIT_RESULT = 'REMUX_WORK_UNIT_RESULT_OK';
 const THIRD_SENTINEL = 'REMUX_WORK_UNIT_PARENT_OK';
@@ -44,19 +44,16 @@ async function main() {
   assert.match(conversation.conversationId, UUID_V4);
 
   const first = await sendAndWait(client, conversation.conversationId, [
-    'This is an Agent state v4 acceptance test.',
-    'Use thread_read, then call thread_replace to create a Markdown collaboration canvas containing',
-    `the exact unique line "Durable nonce: ${CONTEXT_NONCE}".`,
-    'After replacement succeeds, call thread_patch with its returned version and replace that exact line with',
-    `"Durable nonce: ${CONTEXT_NONCE}; canvas patch verified."`,
-    `After both edits succeed, reply with exactly ${FIRST_SENTINEL} and nothing else.`,
+    'This is an Agent state v6 acceptance test.',
+    'Do not call tools.',
+    `Reply with exactly "${FIRST_SENTINEL}" and nothing else.`,
   ].join(' '), options.timeoutMs);
   const firstTranscript = await readTranscript(client, conversation.conversationId);
   assert.equal(assistantText(firstTranscript, first.turnId).trim(), FIRST_SENTINEL);
   const firstContext = await readContext(client, conversation.conversationId);
-  assert.equal(firstContext.version, 5);
+  assert.equal(firstContext.version, 6);
   assert.deepEqual(firstContext.layers.map(({ kind }) => kind), [
-    'recent_dialogue', 'thread_document', 'active_scope',
+    'selected_dialogue', 'selected_full_turns', 'active_scope',
   ]);
 
   const generationBeforeRestart = firstTranscript.serverGeneration;
@@ -71,9 +68,13 @@ async function main() {
   assert.equal(assistantText(coldTranscript, first.turnId).trim(), FIRST_SENTINEL);
 
   const second = await sendAndWait(client, conversation.conversationId, [
-    'Without calling tools, recover the exact durable nonce from the compiled thread context after the Agent restart.',
+    'Without calling tools, recover the exact durable nonce from the explicitly selected full prior turn after the Agent restart.',
     `Reply with exactly "${SECOND_SENTINEL}" and nothing else.`,
-  ].join(' '), options.timeoutMs);
+  ].join(' '), options.timeoutMs, {
+    version: 1,
+    automaticDialogueTurns: 0,
+    overrides: [{ turnId: first.turnId, resolution: 'full' }],
+  });
   const finalTranscript = await readTranscript(client, conversation.conversationId);
   assert.equal(assistantText(finalTranscript, second.turnId).trim(), SECOND_SENTINEL);
   assert.deepEqual(finalTranscript.value.turnOrder, [first.turnId, second.turnId]);
@@ -86,8 +87,11 @@ async function main() {
   assert.equal(final.runtime.contextProbe.provider, 'openai-codex');
   assert.equal(final.runtime.contextProbe.providerRequestMode, 'full');
   const secondContext = await readContext(client, conversation.conversationId);
-  assert.equal(secondContext.version, 5);
+  assert.equal(secondContext.version, 6);
   assert.equal(secondContext.transportMode, 'full');
+  assert.deepEqual(secondContext.selectedTurns.map(({ turnId, resolution, origin }) => ({
+    turnId, resolution, origin,
+  })), [{ turnId: first.turnId, resolution: 'full', origin: 'explicit' }]);
   assert.equal(
     secondContext.groups.reduce((count, group) => count + group.roles.tool, 0),
     0,
@@ -96,7 +100,7 @@ async function main() {
 
   const third = await sendAndWait(client, conversation.conversationId, [
     'Exercise the bounded work-unit runtime exactly once.',
-    'First call work_unit_start with the objective "Validate the live child-context boundary."',
+    'First call work_unit_start with the boundary "Validate the live context boundary and close after the marker is observed."',
     `Inside that work unit, call bash with command "printf ${CHILD_SECRET}",`,
     `then call work_unit_finish with status completed and a concise Markdown result containing exactly the marker ${WORK_UNIT_RESULT}`,
     `but not the child-only marker ${CHILD_SECRET}.`,
@@ -107,16 +111,15 @@ async function main() {
   assert.deepEqual(workUnitTranscript.value.turnOrder, [first.turnId, second.turnId, third.turnId]);
 
   const durability = await inspectDurability(options.dataRoot, conversation.conversationId);
-  assert.equal(durability.schemaId, 'agent-state-v4');
+  assert.equal(durability.schemaId, 'agent-state-v6');
   assert.equal(durability.contextFrames, durability.inferences);
   assert.equal(durability.providerItems, durability.inferences);
   assert.equal(durability.runningTurns, 0);
   assert.equal(durability.runningInferences, 0);
-  assert.ok((durability.requestModes.continuation ?? 0) >= 2);
+  assert.ok((durability.requestModes.full ?? 0) >= 3);
+  assert.ok(durability.childContinuationCalls >= 1);
   assert.equal(durability.completedAssistantMessages, 3);
   assert.ok(durability.searchRows >= 7);
-  assert.ok(durability.threadUpdates >= 2);
-  assert.match(durability.threadContent, new RegExp(CONTEXT_NONCE));
   assert.equal(durability.workUnits.length, 1);
   assert.equal(durability.workUnits[0].state, 'completed');
   assert.match(durability.workUnits[0].result, new RegExp(WORK_UNIT_RESULT));
@@ -126,9 +129,6 @@ async function main() {
   assert.equal(durability.childToolNames.at(-1), 'work_unit_finish');
   assert.ok(durability.childToolNames.every((name) =>
     name === 'bash' || name === 'work_unit_finish'));
-  assert.ok(durability.visibleToolNames.includes('thread_read'));
-  assert.ok(durability.visibleToolNames.includes('thread_replace'));
-  assert.ok(durability.visibleToolNames.includes('thread_patch'));
   assert.equal(durability.visibleToolNames.filter((name) => name === 'work_unit_start').length, 1);
   assert.equal(durability.visibleToolNames.includes('bash'), false);
   assert.equal(durability.visibleToolNames.includes('work_unit_finish'), false);
@@ -163,11 +163,18 @@ async function main() {
   }
 }
 
-async function sendAndWait(client, conversationId, text, timeoutMs) {
+async function sendAndWait(
+  client,
+  conversationId,
+  text,
+  timeoutMs,
+  contextPlan = { version: 1, automaticDialogueTurns: 2, overrides: [] },
+) {
   const accepted = await client.command('remux/agent/conversation/message/send', {
     operationId: randomUUID(),
     conversationId,
     clientMessageId: randomUUID(),
+    contextPlan,
     text,
   });
   assert.equal(accepted.accepted, true);
@@ -266,17 +273,6 @@ async function inspectDurability(dataRoot, conversationId) {
   const database = new DatabaseSync(join(dataRoot, 'agent.sqlite3'), { readOnly: true });
   try {
     const scalar = (sql, ...params) => database.prepare(sql).get(...params).value;
-    const thread = database.prepare(`
-      SELECT a.storage_path
-      FROM conversations c
-      JOIN state_documents d
-        ON d.conversation_id = c.conversation_id
-       AND d.scope_kind = 'conversation' AND d.key = 'thread.md'
-      JOIN document_versions v ON v.version_id = d.head_version_id
-      JOIN artifacts a ON a.hash = v.content_artifact_hash
-      WHERE c.conversation_id = ?
-    `).get(conversationId);
-    assert.ok(thread?.storage_path, 'The live thread.md artifact is missing.');
     const workUnitRows = database.prepare(`
       SELECT s.scope_id, s.state, a.storage_path
       FROM execution_scopes s
@@ -317,9 +313,6 @@ async function inspectDurability(dataRoot, conversationId) {
       `).all(conversationId).map(({ request_mode, count }) => [request_mode, count])),
       completedAssistantMessages: scalar("SELECT COUNT(*) AS value FROM messages WHERE conversation_id = ? AND role = 'assistant' AND state = 'completed'", conversationId),
       searchRows: scalar('SELECT COUNT(*) AS value FROM history_search_index WHERE conversation_id = ?', conversationId),
-      pressureNotices: scalar("SELECT COUNT(*) AS value FROM events WHERE conversation_id = ? AND type = 'context.pressure'", conversationId),
-      threadUpdates: scalar("SELECT COUNT(*) AS value FROM events WHERE conversation_id = ? AND type = 'thread.document.updated'", conversationId),
-      threadContent: await readFile(join(dataRoot, 'artifacts', thread.storage_path), 'utf8'),
       workUnits,
       childToolNames,
       visibleToolNames,
@@ -327,6 +320,12 @@ async function inspectDurability(dataRoot, conversationId) {
         SELECT COUNT(*) AS value
         FROM inferences i JOIN execution_scopes s ON s.scope_id = i.scope_id
         WHERE i.conversation_id = ? AND s.kind = 'work_unit'
+      `, conversationId),
+      childContinuationCalls: scalar(`
+        SELECT COUNT(*) AS value
+        FROM inferences i JOIN execution_scopes s ON s.scope_id = i.scope_id
+        WHERE i.conversation_id = ? AND s.kind = 'work_unit'
+          AND i.request_mode = 'continuation'
       `, conversationId),
       finalScopeKind: scalar(`
         SELECT s.kind AS value

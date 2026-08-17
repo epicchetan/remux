@@ -16,27 +16,18 @@ test('the production system prompt is the repository-owned Markdown file', async
   assert.equal(REMUX_SYSTEM_PROMPT, markdown);
   assert.match(markdown, /## Runtime/u);
   assert.match(markdown, /## How to work/u);
-  assert.match(markdown, /## Thread/u);
-  assert.match(markdown, /## History/u);
-  assert.match(markdown, /The parent owns any subsequent Thread update/u);
-  assert.match(markdown, /Resources are selective exact context bridges/u);
-  assert.match(markdown, /accept and continue/u);
-  assert.match(markdown, /spot-check a named acceptance-critical seam/u);
-  assert.match(markdown, /start an independent audit unit/u);
-  assert.match(markdown, /The parent remains parked at that exact provider response/u);
-  assert.match(markdown, /There is no synthetic user request between them/u);
-  assert.match(markdown, /terminal call resolves the parent's still-pending `work_unit_start`/u);
+  assert.match(markdown, /## History and execution/u);
+  assert.match(markdown, /A prior turn may appear as dialogue only/u);
+  assert.match(markdown, /complete parent reasoning and execution trajectory/u);
+  assert.match(markdown, /disposable continuation segment/u);
+  assert.match(markdown, /not delegation to another agent/u);
+  assert.match(markdown, /There is no synthetic user request/u);
+  assert.match(markdown, /one brief, user-readable boundary statement/u);
+  assert.match(markdown, /Artifact contents are stored in History but are never injected automatically/u);
   assert.match(markdown, /Use `commentary` for sparse, user-readable progress/u);
   assert.match(markdown, /Do not repeat the visible reasoning summary/u);
-  assert.match(markdown, /Owning acceptance does not mean replaying the child's implementation/u);
-  assert.match(markdown, /The current user message and observed repository state override/u);
-  assert.match(markdown, /current shared planning, design, and alignment document/u);
-  assert.match(markdown, /not general memory, a transcript, an activity log, an execution summary/u);
-  assert.match(markdown, /A turn beginning, a tool running, or a work unit completing is not by itself a reason/u);
-  assert.match(markdown, /coherent semantic slice that can ordinarily complete comfortably inside one model context/u);
-  assert.match(markdown, /do not put the entire task into one child/u);
-  assert.match(markdown, /Do not repeat the same inspection or validation merely to gain confidence/u);
-  assert.match(markdown, /generic correctness, and the possibility of hidden bugs are not by themselves specific risks/u);
+  assert.match(markdown, /Choose a segment that can ordinarily complete comfortably inside one model context/u);
+  assert.match(markdown, /Do not repeat the same inspection or validation merely because it happened inside a work unit/u);
   assert.match(markdown, /Most turns should not need them/u);
   assert.doesNotMatch(markdown, /continuation bundle|proposed Thread update/iu);
 });
@@ -45,9 +36,6 @@ test('parent and child context-tool profiles expose only scope-valid actions', (
   assert.deepEqual(PARENT_CONTEXT_TOOL_NAMES, [
     'history_search',
     'history_read',
-    'thread_read',
-    'thread_patch',
-    'thread_replace',
     'work_unit_start',
   ]);
   assert.deepEqual(WORK_UNIT_CONTEXT_TOOL_NAMES, [
@@ -56,6 +44,5 @@ test('parent and child context-tool profiles expose only scope-valid actions', (
     'work_unit_finish',
   ]);
   assert.ok(!PARENT_CONTEXT_TOOL_NAMES.includes('work_unit_finish' as never));
-  assert.ok(!WORK_UNIT_CONTEXT_TOOL_NAMES.includes('thread_patch' as never));
   assert.ok(!WORK_UNIT_CONTEXT_TOOL_NAMES.includes('work_unit_start' as never));
 });

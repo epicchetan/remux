@@ -1,3 +1,5 @@
+import type { TurnContextPlan } from '../../shared/protocol.ts';
+
 export const BENCHMARK_FORMAT_VERSION = 3 as const;
 
 export type BenchmarkTarget = 'agent' | 'codex';
@@ -107,14 +109,6 @@ export type BenchmarkDriverEvent = {
   decisions: BenchmarkDriverDecision[];
 };
 
-export type BenchmarkThreadSnapshot = {
-  versionId: string;
-  ordinal: number;
-  content: string;
-  byteLength: number;
-  previousVersionId: string | null;
-};
-
 export type BenchmarkTurnRecord = {
   sequence: number;
   text: string;
@@ -131,7 +125,8 @@ export type BenchmarkTurnRecord = {
   activeDurationMs: number;
   workspaceHeadAfter: string;
   workspaceStatusAfter: string;
-  threadSnapshot: BenchmarkThreadSnapshot | null;
+  /** Exact context selection sent for this turn. Codex owns its policy remotely. */
+  contextPlan: TurnContextPlan | null;
 };
 
 export type BenchmarkRun = {
@@ -149,7 +144,7 @@ export type BenchmarkRun = {
   reasoning: string;
   reviewMode: string;
   speed: string;
-  contextArchitecture: 'thread-runtime-v2' | 'codex-app-server';
+  contextArchitecture: 'explicit-turn-context-v1' | 'codex-app-server';
   stopReason: 'accepted' | 'abandoned' | 'budget-exhausted' | null;
   driverAssessment: string | null;
   startedAt: string;
@@ -215,22 +210,21 @@ export type BenchmarkReport = {
     runningInferences: number | null;
     runningTurns: number | null;
     peakSelectedDialogueTurns: number | null;
-    peakOmittedDialogueTurns: number | null;
-    peakThreadDocumentBytes: number | null;
-    pressureNotices: number | null;
-    threadUpdates: number | null;
+    peakSelectedFullTurns: number | null;
+    peakUnselectedTurns: number | null;
+    turnsWithExplicitContext: number | null;
+    explicitContextOverrides: number | null;
+    requestedDialogueOverrides: number | null;
+    requestedFullOverrides: number | null;
+    requestedOffOverrides: number | null;
     workUnitsEntered: number | null;
     workUnitsReturned: number | null;
     workUnitsAbandoned: number | null;
     rootToolCalls: number | null;
     childToolCalls: number | null;
     workUnitResultBytes: number | null;
-    workUnitInputResources: number | null;
-    workUnitInputAuthorities: number | null;
-    workUnitReturnedResources: number | null;
-    workUnitReturnedAuthorities: number | null;
-    workUnitReturnedDeliverables: number | null;
-    workUnitReturnedEvidence: number | null;
+    workUnitArtifacts: number | null;
+    workUnitArtifactBytes: number | null;
     contextLimitErrors: number | null;
     contextLayerEstimatedTokens: Record<string, number> | null;
     contextOmissions: number | null;
@@ -245,7 +239,7 @@ export type BenchmarkReport = {
     repeatedReadCalls: number | null;
     parentHandoffReadCalls: number | null;
     parentReconstructionReadCalls: number | null;
-    parentReturnedResourceReadCalls: number | null;
+    parentArtifactReadCalls: number | null;
     acceptedSpecReads: number | null;
     shellCalls: number | null;
     editCalls: number | null;
@@ -287,14 +281,18 @@ export interface BenchmarkConversationTarget {
     reviewMode: string;
     speed: string;
     text: string;
+    contextPlan?: TurnContextPlan | null;
   }): Promise<StartedBenchmarkTurn>;
-  send(input: { conversationId: string; text: string }): Promise<{ turnId: string }>;
+  send(input: {
+    conversationId: string;
+    text: string;
+    contextPlan?: TurnContextPlan | null;
+  }): Promise<{ turnId: string }>;
   waitForTerminal(input: {
     conversationId: string;
     turnId: string;
     timeoutMs: number;
   }): Promise<void>;
   readTranscript(conversationId: string): Promise<VisibleBenchmarkTranscript>;
-  readThread?(conversationId: string): Promise<BenchmarkThreadSnapshot>;
   interrupt(input: { conversationId: string; turnId?: string }): Promise<void>;
 }

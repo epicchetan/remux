@@ -37,18 +37,22 @@ export async function installAgentHost(page: Page) {
     const overflowTranscript = route.get('fixtureOverflow') === '1';
     const exactTranscript = route.get('fixtureExact') === '1';
     const legacyInferenceTrace = route.get('fixtureLegacyInferenceTrace') === '1';
+    const contextTurns = route.get('fixtureContextTurns') === '1';
     const exactArtifactHash = 'a'.repeat(64);
     const pickedImageHash = 'b'.repeat(64);
     const pickedImageDataUrl = 'data:image/png;base64,iVBORw0KGgo=';
     const pickedImageBytes = Uint8Array.from(atob(pickedImageDataUrl.split(',')[1]!), (value) => value.charCodeAt(0));
     const exactPreview = 'Exact preview. ';
     const exactFullText = `${exactPreview}The remaining response is fetched only when requested.`;
-    const contextBootstrapHash = 'd'.repeat(64);
+    const contextManifestHash = 'e'.repeat(64);
     const contextDispatchHash = 'f'.repeat(64);
-    const contextBootstrapText = [
-      '<thread version="fixture-thread-version"># Thread\\n\\nFixture context</thread>',
-      '<history>All eligible completed conversation turns are currently shown.</history>',
-    ].join('\n');
+    const contextManifestText = JSON.stringify({
+      version: 'agent-inference-context-v6',
+      context: {
+        requestedPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
+        resolvedTurns: [{ turnId: 'fixture-turn', resolution: 'dialogue', origin: 'automatic' }],
+      },
+    }, null, 2);
     const contextDispatchText = JSON.stringify({
       input: [{ role: 'user', content: 'Fixture provider input' }],
       model: 'gpt-5.4-fixture',
@@ -56,7 +60,7 @@ export async function installAgentHost(page: Page) {
     }, null, 2);
     const artifactTexts = new Map([
       [exactArtifactHash, exactFullText],
-      [contextBootstrapHash, contextBootstrapText],
+      [contextManifestHash, contextManifestText],
       [contextDispatchHash, contextDispatchText],
     ]);
     const artifactBytes = new Map([[pickedImageHash, {
@@ -110,6 +114,12 @@ export async function installAgentHost(page: Page) {
         }
         sequence = 72;
         turnCounter = 72;
+      } else if (contextTurns) {
+        for (let index = 1; index <= 4; index += 1) {
+          turns.push(completedTurn(`turn-${index}`, `Context request ${index}`, `Context answer ${index}.`));
+        }
+        sequence = 4;
+        turnCounter = 4;
       } else if (exactTranscript) {
         const exact = completedTurn('exact-turn', 'Show the bounded response', exactPreview);
         const assistant = exact.segments.find((segment) => segment.type === 'assistantMessage');
@@ -215,17 +225,15 @@ export async function installAgentHost(page: Page) {
 
     function contextValue(_decision: 'append' | 'roll') {
       return {
-        version: 5,
+        version: 6,
         conversationId,
         inferenceId: 'fixture-inference',
         frameId: 'fixture-frame',
         basisSequence: sequence,
-        threadVersionId: 'fixture-thread-version',
-        compilerVersion: 'agent-thread-compiler-v3',
-        policyVersion: 'agent-thread-policy-v3',
+        compilerVersion: 'agent-turn-context-v1',
+        policyVersion: 'agent-explicit-selection-v1',
         estimatedInputTokens: 3_200,
         semanticHash: 'b'.repeat(64),
-        contextEnvelopeHash: contextBootstrapHash,
         buildDurationMs: 2,
         transportMode: 'continuation',
         messageCount: 2,
@@ -233,11 +241,10 @@ export async function installAgentHost(page: Page) {
         logicalHash: '8'.repeat(64),
         renderedHash: '9'.repeat(64),
         fixedContractsHash: '0'.repeat(64),
-        manifestArtifact: { hash: 'e'.repeat(64), byteLength: 1_200, mediaType: 'application/json' },
-        contextEnvelopeArtifact: {
-          hash: contextBootstrapHash,
-          byteLength: new TextEncoder().encode(contextBootstrapText).byteLength,
-          mediaType: 'text/plain; charset=utf-8',
+        manifestArtifact: {
+          hash: contextManifestHash,
+          byteLength: new TextEncoder().encode(contextManifestText).byteLength,
+          mediaType: 'application/json',
         },
         dispatchArtifact: {
           hash: contextDispatchHash,
@@ -252,26 +259,28 @@ export async function installAgentHost(page: Page) {
           roles: { user: 1, assistant: 1, tool: 0 },
         }],
         groupsTruncated: false,
-        dialogueTurnIds: ['fixture-turn'],
-        omittedDialogueTurns: 4,
-        threadDocumentBytes: 128,
         scopeKind: 'turn',
-        softContextLimit: 200_000,
-        hardContextLimit: 370_000,
-        pressureNoticed: false,
-        layers: ['recent_dialogue', 'thread_document', 'active_scope']
+        requestedPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
+        selectedTurns: [{
+          turnId: 'fixture-turn',
+          resolution: 'dialogue',
+          origin: 'automatic',
+          messageCount: 2,
+          estimatedTokens: 310,
+        }],
+        layers: ['selected_dialogue', 'selected_full_turns', 'active_scope']
           .map((kind, index) => ({
             kind,
             hash: String(index + 1).repeat(64).slice(0, 64),
-            estimatedTokens: 100 + index,
+            estimatedTokens: [100, 0, 102][index],
             sources: [`agent://fixture/${kind}`],
             sourceCount: 1,
             sourcesTruncated: false,
           })),
         omissions: [{
           source: 'agent://conversation/fixture/turns',
-          reason: 'dialogue-tail-budget',
-          retrieval: 'history://conversation/fixture/turns?before=latest',
+          reason: 'not-selected',
+          retrieval: 'history://conversation/fixture',
           count: 4,
         }],
         omissionsTruncated: false,
@@ -394,7 +403,7 @@ export async function installAgentHost(page: Page) {
         conversationId, turnId: id, scopeId: rootScopeId,
         parentScopeId: null, parentOperationId: null, kind: 'turn', state: 'running',
         revision: 'root:1', basisSequence: sequence, startedAt, completedAt: null,
-        durationMs: null, objective: null, doneWhen: [], providedResources: [],
+        durationMs: null, boundary: null,
         inferenceOrder: [`${id}:inference:root`],
         inferences: [{
           id: `${id}:inference:root`, ordinal: 0, state: 'completed', revision: 'inference:root:1',
@@ -417,45 +426,41 @@ export async function installAgentHost(page: Page) {
                 status: 'completed', revision: 'operation:readme:1',
                 detailPreview: 'Read the workspace overview before editing.',
                 outputPreview: '# Remux\n\nFixture file output.', durationMs: 42,
-                childScopeId: null, childObjective: null, childState: null,
+                childScopeId: null, childBoundary: null, childState: null,
                 childDurationMs: null, childOperationCount: 0,
-                childReturnedResourceCount: 0, hasDetail: true,
+                childArtifactCount: 0, hasDetail: true,
               },
               {
                 id: `${id}:operation:edit`, callId: `${id}:edit`, name: 'workspace.edit',
                 presentation: { category: 'edit', label: 'Edited index.ts', subject: 'src/index.ts' },
                 status: 'completed', revision: 'operation:edit:1',
                 detailPreview: 'src/index.ts', outputPreview: '+export const value = 1;',
-                durationMs: 34, childScopeId: null, childObjective: null,
+                durationMs: 34, childScopeId: null, childBoundary: null,
                 childState: null, childDurationMs: null, childOperationCount: 0,
-                childReturnedResourceCount: 0, hasDetail: true,
+                childArtifactCount: 0, hasDetail: true,
               },
               {
                 id: `${id}:operation:work-unit`, callId: `${id}:work-unit`, name: 'work_unit_start',
                 presentation: { category: 'tool', label: 'Work Unit Start', subject: null },
                 status: 'running', revision: 'operation:work-unit:1',
                 detailPreview: 'Verify the focused seam', outputPreview: null, durationMs: null,
-                childScopeId: scopeId, childObjective: 'Verify the focused seam',
+                childScopeId: scopeId,
+                childBoundary: 'Verify the focused seam and close when its exact contract agrees.',
                 childState: 'running', childDurationMs: null, childOperationCount: 1,
-                childReturnedResourceCount: 0, hasDetail: true,
+                childArtifactCount: 0, hasDetail: true,
               },
             ],
           },
         }],
         window: { startIndex: 0, endIndexExclusive: 1, hasEarlier: false, hasLater: false },
-        result: null, returnedResources: [],
+        result: null, artifacts: [],
       });
       executionScopes.set(executionScopeKey(id, scopeId), {
         conversationId, turnId: id, scopeId, parentScopeId: rootScopeId,
         parentOperationId: `${id}:operation:work-unit`, kind: 'workUnit', state: 'running',
         revision: 'child:1', basisSequence: sequence, startedAt, completedAt: null,
         durationMs: null,
-        objective: 'Verify the focused seam against its governing compatibility contract without changing unrelated runtime behavior.',
-        doneWhen: ['The exact contract and implementation agree.'],
-        providedResources: [
-          { ref: 'docs/seam-contract.md', role: 'authority', description: 'Exact seam contract.' },
-          { ref: 'src/index.ts', role: 'deliverable', description: 'Verified implementation.' },
-        ],
+        boundary: 'Verify the focused seam against its governing compatibility contract and close when the exact contract and implementation agree.',
         inferenceOrder: [`${id}:inference:child`],
         inferences: [{
           id: `${id}:inference:child`, ordinal: 0, state: 'completed', revision: 'inference:child:1',
@@ -473,14 +478,14 @@ export async function installAgentHost(page: Page) {
               presentation: { category: 'command', label: 'Shell command', subject: 'npm test -- seam' },
               status: 'completed', revision: 'operation:test:1',
               detailPreview: 'npm test -- seam', outputPreview: '1 test passed', durationMs: 120,
-              childScopeId: null, childObjective: null,
+              childScopeId: null, childBoundary: null,
               childState: null, childDurationMs: null, childOperationCount: 0,
-              childReturnedResourceCount: 0, hasDetail: true,
+              childArtifactCount: 0, hasDetail: true,
             }],
           },
         }],
         window: { startIndex: 0, endIndexExclusive: 1, hasEarlier: false, hasLater: false },
-        result: null, returnedResources: [],
+        result: null, artifacts: [],
       });
       turns.push(turn);
       touchTurn(turn);
@@ -534,7 +539,7 @@ export async function installAgentHost(page: Page) {
             workCall.revision = `operation:work-unit:${sequence + 1}`;
             workCall.childState = outcome === 'completed' ? 'completed' : 'abandoned';
             workCall.childDurationMs = turn.durationMs;
-            workCall.childReturnedResourceCount = outcome === 'completed' ? 1 : 0;
+            workCall.childArtifactCount = outcome === 'completed' ? 1 : 0;
           }
           if (rootScope.inferences[0]?.actionGroup) {
             rootScope.inferences[0].actionGroup.status = outcome;
@@ -552,8 +557,12 @@ export async function installAgentHost(page: Page) {
           childScope.result = outcome === 'completed'
             ? '## Verified\n\n**The focused seam matches its exact contract without changing unrelated runtime behavior.**'
             : null;
-          childScope.returnedResources = outcome === 'completed'
-            ? [{ ref: 'src/index.ts', role: 'evidence', description: 'Verified implementation.' }]
+          childScope.artifacts = outcome === 'completed'
+            ? [{
+                ref: 'src/index.ts',
+                snapshotRef: `history://artifact/${'a'.repeat(64)}`,
+                byteLength: 23,
+              }]
             : [];
         }
       }
@@ -793,38 +802,6 @@ export async function installAgentHost(page: Page) {
         };
       }
       if (request.method === 'remux/agent/transcript/resources/read') return transcriptResult(params);
-      if (request.method === 'remux/agent/thread/read') {
-        const currentContent = [
-          '# Ledger — 0DTE heat maps',
-          '',
-          'The active canvas preserves the user intuition and the unresolved design space.',
-          '',
-          '## Candidate interpretations',
-          '',
-          '- Trade activity',
-          '- Open-interest positioning',
-          '- Modeled gamma exposure',
-          '',
-          '## Current conversational edge',
-          '',
-          'Inspect the existing Ledger data path before choosing the persisted representation.',
-        ].join('\n');
-        const previousContent = '# Ledger — 0DTE heat maps\n\n## Earlier canvas\n\nChoose the first metric.\n';
-        return {
-          conversationId: params.conversationId,
-          documentId: 'fixture-thread-document',
-          current: {
-            versionId: 'fixture-thread-version', ordinal: 3,
-            basedOnTurnId: turns.at(-1)?.id ?? null, createdAt: 1_700_000_003_000,
-            content: currentContent, byteLength: new TextEncoder().encode(currentContent).byteLength,
-          },
-          previous: {
-            versionId: 'fixture-thread-version-previous', ordinal: 2,
-            basedOnTurnId: turns.at(-2)?.id ?? null, createdAt: 1_700_000_002_000,
-            content: previousContent, byteLength: new TextEncoder().encode(previousContent).byteLength,
-          },
-        };
-      }
       if (request.method === 'remux/agent/artifact/read') {
         const binary = artifactBytes.get(params.hash);
         if (binary && params.range.kind === 'bytes') {
@@ -857,8 +834,8 @@ export async function installAgentHost(page: Page) {
           ? { kind: 'utf8', offset: end, byteLength: Number(params.range.byteLength) }
           : null;
         return {
-          hash: exactArtifactHash,
-          mediaType: 'text/plain; charset=utf-8',
+          hash: params.hash,
+          mediaType: params.hash === contextManifestHash ? 'application/json' : 'text/plain; charset=utf-8',
           totalByteLength: bytes.byteLength,
           totalLineCount: null,
           range: { kind: 'utf8', offset: start, byteLength: end - start },

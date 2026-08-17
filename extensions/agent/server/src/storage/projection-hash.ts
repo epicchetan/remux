@@ -4,7 +4,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { AGENT_STATE_SCHEMA_VERSION } from './schema.ts';
 import { canonicalJson, type CanonicalJsonValue } from './canonical-json.ts';
 
-const PROJECTION_VERSION = 'agent-state-projection-v3';
+const PROJECTION_VERSION = 'agent-state-projection-v5';
 
 const projectionTables = [
   { name: 'projects', order: ['project_id'] },
@@ -16,8 +16,6 @@ const projectionTables = [
   { name: 'resources', order: ['resource_key'] },
   { name: 'operations', order: ['operation_id'] },
   { name: 'artifacts', order: ['hash'], omit: ['storage_path'] },
-  { name: 'state_documents', order: ['document_id'] },
-  { name: 'document_versions', order: ['version_id'] },
   { name: 'context_frames', order: ['frame_id'] },
   { name: 'inferences', order: ['inference_id'] },
   { name: 'provider_items', order: ['provider_item_id'] },

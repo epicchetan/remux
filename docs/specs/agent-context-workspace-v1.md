@@ -1,7 +1,7 @@
 # Agent context workspace v1
 
-Status: Active Spec
-Last verified: 2026-08-09
+Status: Archived; superseded by `agent-explicit-turn-context-v1.md`
+Last verified: 2026-08-16
 Canonical code: `extensions/agent/server/src/context/`,
 `extensions/agent/server/src/project-state/`, and
 `extensions/agent/server/src/storage/repository.ts`

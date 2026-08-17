@@ -1,4 +1,8 @@
-import type { ReasoningLevel } from '../../../shared/protocol.ts';
+import type { ReasoningLevel, TurnContextPlan } from '../../../shared/protocol.ts';
+import {
+  createDefaultTurnContextPlan,
+  parsePersistedTurnContextPlan,
+} from '../composer/context/contextPlan.ts';
 import {
   createComposerSnapshot,
   type ComposerAttachmentResource,
@@ -13,6 +17,7 @@ export type AgentNewChatDraft = {
   modelId: string;
   reasoning: ReasoningLevel;
   snapshot: ComposerSnapshot;
+  contextPlan: TurnContextPlan;
   updatedAt: number;
 };
 
@@ -33,6 +38,7 @@ export function loadNewChatDraft(id: string): AgentNewChatDraft | null {
     modelId: parsed.modelId,
     reasoning: parsed.reasoning,
     snapshot,
+    contextPlan: parsePersistedTurnContextPlan(parsed.contextPlan) ?? createDefaultTurnContextPlan(),
     updatedAt: typeof parsed.updatedAt === 'number' ? parsed.updatedAt : Date.now(),
   };
 }
@@ -48,16 +54,33 @@ export function removeNewChatDraft(id: string) {
   remove(storageKey(NEW_CHAT_PREFIX, id));
 }
 
-export function loadConversationDraft(conversationId: string) {
-  return parseSnapshot(readJson(storageKey(CONVERSATION_PREFIX, conversationId))?.snapshot);
+export type AgentConversationDraft = {
+  contextPlan: TurnContextPlan;
+  snapshot: ComposerSnapshot;
+};
+
+export function loadConversationDraft(conversationId: string): AgentConversationDraft {
+  const parsed = readJson(storageKey(CONVERSATION_PREFIX, conversationId));
+  return {
+    contextPlan: parsePersistedTurnContextPlan(parsed?.contextPlan) ?? createDefaultTurnContextPlan(),
+    snapshot: parseSnapshot(parsed?.snapshot) ?? createComposerSnapshot({ parts: [] }, new Map()),
+  };
 }
 
-export function persistConversationDraft(conversationId: string, snapshot: ComposerSnapshot) {
-  if (snapshot.isEmpty) {
+export function persistConversationDraft(
+  conversationId: string,
+  snapshot: ComposerSnapshot,
+  contextPlan: TurnContextPlan,
+) {
+  const defaultPlan = createDefaultTurnContextPlan();
+  const hasCustomContext = contextPlan.automaticDialogueTurns !== defaultPlan.automaticDialogueTurns ||
+    contextPlan.overrides.length > 0;
+  if (snapshot.isEmpty && !hasCustomContext) {
     removeConversationDraft(conversationId);
     return;
   }
   writeJson(storageKey(CONVERSATION_PREFIX, conversationId), {
+    contextPlan,
     snapshot: persistedSnapshot(snapshot),
     updatedAt: Date.now(),
   });

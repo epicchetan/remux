@@ -43,22 +43,16 @@ type AgentStateSummary = {
   runningInferences: number;
   runningTurns: number;
   peakSelectedDialogueTurns: number;
-  peakOmittedDialogueTurns: number;
-  peakThreadDocumentBytes: number;
-  pressureNotices: number;
-  threadUpdates: number;
+  peakSelectedFullTurns: number;
+  peakUnselectedTurns: number;
   workUnitsEntered: number;
   workUnitsReturned: number;
   workUnitsAbandoned: number;
   rootToolCalls: number;
   childToolCalls: number;
   workUnitResultBytes: number;
-  workUnitInputResources: number;
-  workUnitInputAuthorities: number;
-  workUnitReturnedResources: number;
-  workUnitReturnedAuthorities: number;
-  workUnitReturnedDeliverables: number;
-  workUnitReturnedEvidence: number;
+  workUnitArtifacts: number;
+  workUnitArtifactBytes: number;
   estimatedInputTokens: number;
   peakEstimatedInputTokens: number;
   peakRootEstimatedInputTokens: number;
@@ -85,7 +79,7 @@ type AgentStateSummary = {
   repeatedReadCalls: number;
   parentHandoffReadCalls: number;
   parentReconstructionReadCalls: number;
-  parentReturnedResourceReadCalls: number;
+  parentArtifactReadCalls: number;
   acceptedSpecReads: number;
   shellCalls: number;
   editCalls: number;
@@ -272,7 +266,7 @@ export async function evaluateRun(input: {
   if (agentState) {
     gates.push(gate(
       'harness',
-      'thread-runtime-mechanics',
+      'explicit-turn-context-mechanics',
       agentState.compactionEvents === 0
         && agentState.invalidContextCalls === 0
         && agentState.selfReferentialSearchHits === 0
@@ -293,15 +287,12 @@ export async function evaluateRun(input: {
         `running=${agentState.runningInferences} inferences/${agentState.runningTurns} turns`,
         `workUnits=${agentState.workUnitsReturned}/${agentState.workUnitsEntered}`,
         `abandonedWorkUnits=${agentState.workUnitsAbandoned}`,
-        `inputResources=${agentState.workUnitInputResources}`,
-        `returnedResources=${agentState.workUnitReturnedResources}`,
+        `artifacts=${agentState.workUnitArtifacts}/${agentState.workUnitArtifactBytes}B`,
         `handoffReads=${agentState.parentHandoffReadCalls}`,
         `reconstructionReads=${agentState.parentReconstructionReadCalls}`,
-        `returnedResourceRereads=${agentState.parentReturnedResourceReadCalls}`,
-        `recent=${agentState.peakSelectedDialogueTurns} selected/${agentState.peakOmittedDialogueTurns} omitted`,
-        `threadBytes=${agentState.peakThreadDocumentBytes}`,
-        `pressureNotices=${agentState.pressureNotices}`,
-        `threadUpdates=${agentState.threadUpdates}`,
+        `artifactReads=${agentState.parentArtifactReadCalls}`,
+        `selected=${agentState.peakSelectedDialogueTurns} dialogue/${agentState.peakSelectedFullTurns} full`,
+        `unselected=${agentState.peakUnselectedTurns}`,
       ].join(', '),
     ));
   }
@@ -384,22 +375,25 @@ export async function evaluateRun(input: {
       runningInferences: agentState?.runningInferences ?? null,
       runningTurns: agentState?.runningTurns ?? null,
       peakSelectedDialogueTurns: agentState?.peakSelectedDialogueTurns ?? null,
-      peakOmittedDialogueTurns: agentState?.peakOmittedDialogueTurns ?? null,
-      peakThreadDocumentBytes: agentState?.peakThreadDocumentBytes ?? null,
-      pressureNotices: agentState?.pressureNotices ?? null,
-      threadUpdates: agentState?.threadUpdates ?? null,
+      peakSelectedFullTurns: agentState?.peakSelectedFullTurns ?? null,
+      peakUnselectedTurns: agentState?.peakUnselectedTurns ?? null,
+      turnsWithExplicitContext: runRecord.target === 'agent'
+        ? runRecord.turns.filter((turn) => (turn.contextPlan?.overrides.length ?? 0) > 0).length
+        : null,
+      explicitContextOverrides: runRecord.target === 'agent'
+        ? runRecord.turns.reduce((sum, turn) => sum + (turn.contextPlan?.overrides.length ?? 0), 0)
+        : null,
+      requestedDialogueOverrides: contextOverrideCount(runRecord, 'dialogue'),
+      requestedFullOverrides: contextOverrideCount(runRecord, 'full'),
+      requestedOffOverrides: contextOverrideCount(runRecord, 'off'),
       workUnitsEntered: agentState?.workUnitsEntered ?? null,
       workUnitsReturned: agentState?.workUnitsReturned ?? null,
       workUnitsAbandoned: agentState?.workUnitsAbandoned ?? null,
       rootToolCalls: agentState?.rootToolCalls ?? null,
       childToolCalls: agentState?.childToolCalls ?? null,
       workUnitResultBytes: agentState?.workUnitResultBytes ?? null,
-      workUnitInputResources: agentState?.workUnitInputResources ?? null,
-      workUnitInputAuthorities: agentState?.workUnitInputAuthorities ?? null,
-      workUnitReturnedResources: agentState?.workUnitReturnedResources ?? null,
-      workUnitReturnedAuthorities: agentState?.workUnitReturnedAuthorities ?? null,
-      workUnitReturnedDeliverables: agentState?.workUnitReturnedDeliverables ?? null,
-      workUnitReturnedEvidence: agentState?.workUnitReturnedEvidence ?? null,
+      workUnitArtifacts: agentState?.workUnitArtifacts ?? null,
+      workUnitArtifactBytes: agentState?.workUnitArtifactBytes ?? null,
       contextLimitErrors: agentState?.contextLimitErrors ?? null,
       contextLayerEstimatedTokens: agentState?.contextLayerEstimatedTokens ?? null,
       contextOmissions: agentState?.contextOmissions ?? null,
@@ -414,7 +408,7 @@ export async function evaluateRun(input: {
       repeatedReadCalls: agentState?.repeatedReadCalls ?? null,
       parentHandoffReadCalls: agentState?.parentHandoffReadCalls ?? null,
       parentReconstructionReadCalls: agentState?.parentReconstructionReadCalls ?? null,
-      parentReturnedResourceReadCalls: agentState?.parentReturnedResourceReadCalls ?? null,
+      parentArtifactReadCalls: agentState?.parentArtifactReadCalls ?? null,
       acceptedSpecReads: agentState?.acceptedSpecReads ?? null,
       shellCalls: agentState?.shellCalls ?? null,
       editCalls: agentState?.editCalls ?? null,
@@ -432,6 +426,15 @@ export async function evaluateRun(input: {
   };
   await writeJson(reportPath, report);
   return report;
+}
+
+function contextOverrideCount(
+  runRecord: BenchmarkRun,
+  resolution: 'dialogue' | 'full' | 'off',
+) {
+  if (runRecord.target !== 'agent') return null;
+  return runRecord.turns.reduce((sum, turn) => sum +
+    (turn.contextPlan?.overrides.filter((override) => override.resolution === resolution).length ?? 0), 0);
 }
 
 export async function preflightScenario(input: {
@@ -674,24 +677,15 @@ function summarizeAgentState(
       storage_path: string | null;
     }>;
 
-    let workUnitInputResources = 0;
-    let workUnitInputAuthorities = 0;
-    let workUnitReturnedResources = 0;
-    let workUnitReturnedAuthorities = 0;
-    let workUnitReturnedDeliverables = 0;
-    let workUnitReturnedEvidence = 0;
+    let workUnitArtifacts = 0;
+    let workUnitArtifactBytes = 0;
     for (const row of eventRows) {
       const payload = objectValue(row.payload_json ? JSON.parse(row.payload_json) : null);
-      if (row.type === 'work_unit.entered') {
-        const resources = arrayValue(payload.resources).map(objectValue);
-        workUnitInputResources += resources.length;
-        workUnitInputAuthorities += resources.filter(({ role }) => role === 'authority').length;
-      } else if (row.type === 'work_unit.returned') {
-        const resources = arrayValue(payload.resources).map(objectValue);
-        workUnitReturnedResources += resources.length;
-        workUnitReturnedAuthorities += resources.filter(({ role }) => role === 'authority').length;
-        workUnitReturnedDeliverables += resources.filter(({ role }) => role === 'deliverable').length;
-        workUnitReturnedEvidence += resources.filter(({ role }) => role === 'evidence').length;
+      if (row.type === 'work_unit.returned') {
+        const artifacts = arrayValue(payload.artifacts).map(objectValue);
+        workUnitArtifacts += artifacts.length;
+        workUnitArtifactBytes += artifacts.reduce((sum, artifact) =>
+          sum + (numberValue(objectValue(artifact.snapshot).byteLength) ?? 0), 0);
       }
     }
     const toolNames: Record<string, number> = {};
@@ -810,9 +804,7 @@ function summarizeAgentState(
         parentVisibleToolResultBytes += numberValue(objectValue(payload.result).byteLength) ?? 0;
       }
       const isError = payload.isError === true;
-      if (isError && [
-        'history_search', 'history_read', 'thread_read', 'thread_patch', 'thread_replace',
-      ].includes(call.name)) {
+      if (isError && ['history_search', 'history_read'].includes(call.name)) {
         invalidContextCalls += 1;
       }
       if (isError) continue;
@@ -836,23 +828,16 @@ function summarizeAgentState(
 
     let contextOmissions = 0;
     let peakSelectedDialogueTurns = 0;
-    let peakOmittedDialogueTurns = 0;
-    let peakThreadDocumentBytes = 0;
+    let peakSelectedFullTurns = 0;
+    let peakUnselectedTurns = 0;
     for (const row of frameRows) {
       const manifest = readArtifactJson(dataRoot, row.storage_path);
       const context = objectValue(manifest.context);
-      peakSelectedDialogueTurns = Math.max(
-        peakSelectedDialogueTurns,
-        arrayValue(context.dialogueTurnIds).length,
-      );
-      peakOmittedDialogueTurns = Math.max(
-        peakOmittedDialogueTurns,
-        numberValue(context.omittedDialogueTurns) ?? 0,
-      );
-      peakThreadDocumentBytes = Math.max(
-        peakThreadDocumentBytes,
-        numberValue(context.threadDocumentBytes) ?? 0,
-      );
+      const resolvedTurns = arrayValue(context.resolvedTurns).map(objectValue);
+      peakSelectedDialogueTurns = Math.max(peakSelectedDialogueTurns, resolvedTurns
+        .filter(({ resolution }) => resolution === 'dialogue').length);
+      peakSelectedFullTurns = Math.max(peakSelectedFullTurns, resolvedTurns
+        .filter(({ resolution }) => resolution === 'full').length);
       for (const layerValue of arrayValue(context.layers)) {
         const layer = objectValue(layerValue);
         const kind = stringValue(layer.kind) ?? 'unknown';
@@ -860,7 +845,10 @@ function summarizeAgentState(
           + (numberValue(layer.estimatedTokens) ?? 0);
       }
       for (const omissionValue of arrayValue(context.omissions)) {
-        contextOmissions += numberValue(objectValue(omissionValue).count) ?? 0;
+        const omission = objectValue(omissionValue);
+        const count = numberValue(omission.count) ?? 0;
+        contextOmissions += count;
+        if (omission.reason === 'not-selected') peakUnselectedTurns = Math.max(peakUnselectedTurns, count);
       }
     }
     for (const row of inferenceRows) {
@@ -888,22 +876,16 @@ function summarizeAgentState(
       runningInferences: scalar("SELECT COUNT(*) AS count FROM inferences WHERE conversation_id = ? AND state = 'running'"),
       runningTurns: scalar("SELECT COUNT(*) AS count FROM turns WHERE conversation_id = ? AND state = 'running'"),
       peakSelectedDialogueTurns,
-      peakOmittedDialogueTurns,
-      peakThreadDocumentBytes,
-      pressureNotices: eventRows.filter(({ type }) => type === 'context.pressure').length,
-      threadUpdates: eventRows.filter(({ type }) => type === 'thread.document.updated').length,
+      peakSelectedFullTurns,
+      peakUnselectedTurns,
       workUnitsEntered: workUnitRows.length,
       workUnitsReturned: workUnitRows.filter(({ state }) => state === 'completed').length,
       workUnitsAbandoned: workUnitRows.filter(({ state }) => state !== 'completed').length,
       rootToolCalls,
       childToolCalls,
       workUnitResultBytes: workUnitRows.reduce((sum, row) => sum + row.result_bytes, 0),
-      workUnitInputResources,
-      workUnitInputAuthorities,
-      workUnitReturnedResources,
-      workUnitReturnedAuthorities,
-      workUnitReturnedDeliverables,
-      workUnitReturnedEvidence,
+      workUnitArtifacts,
+      workUnitArtifactBytes,
       estimatedInputTokens: inferenceRows.reduce((sum, row) => sum + row.estimated_input_tokens, 0),
       peakEstimatedInputTokens: Math.max(0, ...inferenceRows.map((row) => row.estimated_input_tokens)),
       peakRootEstimatedInputTokens: Math.max(0, ...rootInferences.map((row) => row.estimated_input_tokens)),
@@ -931,7 +913,7 @@ function summarizeAgentState(
         .reduce((total, count) => total + Math.max(0, count - 1), 0),
       parentHandoffReadCalls: handoffReads.total,
       parentReconstructionReadCalls: handoffReads.unreturned,
-      parentReturnedResourceReadCalls: handoffReads.returned,
+      parentArtifactReadCalls: handoffReads.returned,
       acceptedSpecReads,
       shellCalls,
       editCalls,
@@ -977,7 +959,7 @@ function measureParentHandoffReads(
       .map(({ path }) => path));
     if (childPaths.size === 0) continue;
 
-    const returnedPaths = new Set(arrayValue(payload.resources)
+    const returnedPaths = new Set(arrayValue(payload.artifacts)
       .map(objectValue)
       .map(({ ref }) => stringValue(ref))
       .filter((ref): ref is string => typeof ref === 'string' && !ref.includes('://'))

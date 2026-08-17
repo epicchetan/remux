@@ -21,7 +21,6 @@ import type {
   QueueTurnResult,
 } from './domain/state.ts';
 import type { AgentResourceKey } from '../../shared/protocol.ts';
-import type { ThreadCanvasValue } from '../../shared/protocol.ts';
 import type { TurnReadValue } from '../../shared/protocol.ts';
 import type { AssistantMessage } from '@earendil-works/pi-ai';
 import type { AssistantTextPhase } from './model-provider.ts';
@@ -31,10 +30,7 @@ import type {
   HistorySearchInput,
   HistorySearchOptions,
   HistorySearchResult,
-  ThreadDocumentView,
-  ThreadPatchInput,
-  ThreadReplaceInput,
-  WorkUnitContextResource,
+  WorkUnitArtifactView,
   WorkUnitEnterInput,
   WorkUnitReturnInput,
   WorkUnitReturnStatus,
@@ -126,18 +122,7 @@ export interface AgentStore {
       durationMs?: number;
     },
   ): Promise<DurableTranscriptMutation | null>;
-  compileContext(
-    conversationId: string,
-    contextWindow?: number,
-  ): Promise<DurableContextBoundarySnapshot>;
-  recordContextPressure(
-    handle: DurableTurnHandle,
-    input: {
-      estimatedInputTokens: number;
-      softContextLimit: number;
-      hardContextLimit: number;
-    },
-  ): Promise<boolean>;
+  compileContext(conversationId: string): Promise<DurableContextBoundarySnapshot>;
   resumeActiveTurn(conversationId: string): Promise<{
     handle: DurableTurnHandle;
     rootHandle: DurableTurnHandle;
@@ -170,11 +155,7 @@ export interface AgentStore {
     options?: HistorySearchOptions,
   ): Promise<HistorySearchResult>;
   openHistory(conversationId: string, input: HistoryOpenInput): Promise<HistoryOpenResult>;
-  readThread(conversationId: string): Promise<ThreadDocumentView>;
-  readThreadHistory(conversationId: string): Promise<ThreadCanvasValue>;
   readTurn(conversationId: string, turnId: string): Promise<TurnReadValue>;
-  patchThread(handle: DurableTurnHandle, input: ThreadPatchInput): Promise<ThreadDocumentView>;
-  replaceThread(handle: DurableTurnHandle, input: ThreadReplaceInput): Promise<ThreadDocumentView>;
   prepareWorkUnitEntry(
     handle: DurableTurnHandle,
     input: WorkUnitEnterInput,
@@ -186,9 +167,7 @@ export interface AgentStore {
   ): Promise<{
     handle: DurableTurnHandle;
     parentScopeId: string;
-    objective: string;
-    doneWhen: string[];
-    resources: WorkUnitContextResource[];
+    boundary: string;
     transcriptSequence: number;
     transcriptCreatedAt: number;
   }>;
@@ -204,7 +183,7 @@ export interface AgentStore {
     parentHandle: DurableTurnHandle;
     status: WorkUnitReturnStatus;
     result: string;
-    resources: WorkUnitContextResource[];
+    artifacts: WorkUnitArtifactView[];
     resultRef: string;
     historyRef: string;
     scopeId: string;
@@ -219,7 +198,7 @@ export interface AgentStore {
     parentHandle: DurableTurnHandle;
     status: WorkUnitReturnStatus;
     result: string;
-    resources: WorkUnitContextResource[];
+    artifacts: WorkUnitArtifactView[];
     resultRef: string;
     historyRef: string;
     scopeId: string;
@@ -230,7 +209,7 @@ export interface AgentStore {
     parentHandle: DurableTurnHandle;
     status: WorkUnitReturnStatus;
     result: string;
-    resources: WorkUnitContextResource[];
+    artifacts: WorkUnitArtifactView[];
     resultRef: string;
     historyRef: string;
     scopeId: string;

@@ -191,10 +191,10 @@ export type AgentExecutionScopeRequest = {
     | { kind: 'range'; startInferenceId: string; endInferenceId: string };
 };
 
-export type AgentWorkUnitResourceReference = {
+export type AgentWorkUnitArtifactReference = {
   ref: string;
-  role: 'authority' | 'deliverable' | 'evidence';
-  description?: string;
+  snapshotRef: string;
+  byteLength: number;
 };
 
 export type AgentToolPresentation = {
@@ -214,12 +214,12 @@ export type AgentToolCallSummary = {
   outputPreview: string | null;
   durationMs: number | null;
   childScopeId: string | null;
-  childObjective: string | null;
+  childBoundary: string | null;
   childState: 'running' | 'completed' | 'partial' | 'blocked' | 'failed' |
     'interrupted' | 'abandoned' | null;
   childDurationMs: number | null;
   childOperationCount: number;
-  childReturnedResourceCount: number;
+  childArtifactCount: number;
   hasDetail: boolean;
 };
 
@@ -295,9 +295,7 @@ export type AgentExecutionScopeResource = {
   startedAt: number;
   completedAt: number | null;
   durationMs: number | null;
-  objective: string | null;
-  doneWhen: string[];
-  providedResources: AgentWorkUnitResourceReference[];
+  boundary: string | null;
   inferenceOrder: string[];
   inferences: AgentInferenceTrace[];
   window: {
@@ -307,7 +305,7 @@ export type AgentExecutionScopeResource = {
     hasLater: boolean;
   };
   result: string | null;
-  returnedResources: AgentWorkUnitResourceReference[];
+  artifacts: AgentWorkUnitArtifactReference[];
 };
 
 export type AgentTranscriptResourceRequest =

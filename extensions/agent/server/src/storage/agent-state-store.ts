@@ -14,6 +14,7 @@ import {
   type ConversationSummary,
   type ContextInspectorValue,
   type ReasoningLevel,
+  type TurnContextPlan,
 } from '../../../shared/protocol.ts';
 import {
   DEFAULT_TRANSCRIPT_TAIL_TURNS,
@@ -32,8 +33,9 @@ import {
   type LogicalReplayEvent,
 } from '../logical-context.ts';
 import {
-  compileThreadContext,
-  type ThreadContextSource,
+  compileTurnContext,
+  normalizeTurnContextPlan,
+  type TurnContextSource,
 } from '../context/compiler.ts';
 import type {
   HistoryOpenInput,
@@ -94,7 +96,7 @@ import {
   EVENT_PAYLOAD_LIMIT_BYTES,
   type AgentStateCoreOptions,
 } from './state-core.ts';
-import { ThreadState } from './thread-state.ts';
+import { TurnState } from './turn-state.ts';
 import {
   artifactRef,
   boundedSafeInteger,
@@ -125,8 +127,6 @@ type StoredCreateOutcome = {
   operationId: string;
   projectId: string;
   conversationId: string;
-  threadDocumentId: string;
-  threadVersionId: string;
 };
 
 type OperationReplayRow = {
@@ -137,15 +137,13 @@ type OperationReplayRow = {
   value_json: string;
   project_id: string;
   conversation_id: string;
-  thread_document_id: string;
-  thread_version_id: string;
 };
 
 type ProjectRow = {
   project_id: string;
 };
 
-export class AgentStateStore extends ThreadState implements AgentStore {
+export class AgentStateStore extends TurnState implements AgentStore {
   private constructor(storage: AgentDatabase, options: AgentStateStoreOptions) {
     super(storage, options);
   }
@@ -201,24 +199,9 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         cwd: normalized.cwd,
         modelId: normalized.modelId,
         reasoning: normalized.reasoning,
-        ...(normalized.inheritThreadFrom ? { inheritThreadFrom: normalized.inheritThreadFrom } : {}),
       },
     });
-    const inheritedThread = normalized.inheritThreadFrom
-      ? await this.readInheritedThread(normalized.inheritThreadFrom)
-      : null;
-    const initialThreadContent = inheritedThread?.content ?? '# Thread\n';
-    const initialThread = await this.artifacts.put(
-      Buffer.from(initialThreadContent, 'utf8'),
-      'text/markdown; charset=utf-8',
-    );
-    return this.enqueueWrite(() => this.createConversationTransaction(
-      normalized,
-      argumentsHash,
-      initialThread,
-      initialThreadContent,
-      inheritedThread?.versionId ?? null,
-    ));
+    return this.enqueueWrite(() => this.createConversationTransaction(normalized, argumentsHash));
   }
 
   async acceptTurn(params: AcceptTurnParams): Promise<AcceptTurnResult> {
@@ -277,6 +260,7 @@ export class AgentStateStore extends ThreadState implements AgentStore {
       queueOperationId: row.operation_id,
       conversationId,
       clientMessageId: value.clientMessageId,
+      contextPlan: value.contextPlan,
       text: await this.readTextRef(value.content),
       ...(parts ? { parts } : {}),
     };
@@ -676,23 +660,17 @@ export class AgentStateStore extends ThreadState implements AgentStore {
       frameId,
       inferenceId,
       basisSequence: input.context.basisSequence,
-      threadVersionId: input.context.frame.threadVersionId,
       context: {
         semanticHash: input.context.frame.semanticHash,
-        contextEnvelopeHash: input.context.frame.contextEnvelopeHash,
         logicalHash: input.context.logicalHash,
         renderedHash: input.context.renderedHash,
         orderedMessageHashes: input.context.orderedMessageHashes,
         messageCount: input.context.messageCount,
         estimatedInputTokens: input.estimatedInputTokens,
+        requestedPlan: input.context.frame.requestedPlan,
+        resolvedTurns: input.context.frame.resolvedTurns,
         selectedTurnIds: input.context.frame.selectedTurnIds,
-        dialogueTurnIds: input.context.frame.dialogueTurnIds,
-        omittedDialogueTurns: input.context.frame.omittedDialogueTurns,
-        threadDocumentBytes: input.context.frame.threadDocumentBytes,
         scopeKind: input.context.frame.scopeKind,
-        softContextLimit: input.context.frame.softContextLimit,
-        hardContextLimit: input.context.frame.hardContextLimit,
-        pressureNoticed: input.context.frame.pressureNoticed,
         layers: input.context.frame.layers,
         omissions: input.context.frame.omissions,
       },
@@ -706,18 +684,9 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         },
       },
     };
-    const [manifest, contextEnvelope] = await Promise.all([
-      this.prepareJson(inferenceContextManifestValue(manifestValue), true),
-      this.prepareText(input.context.frame.contextEnvelope, true),
-    ]);
-    if (!manifest.artifact || !contextEnvelope.artifact) {
-      throw new Error('Inference context artifacts must be stored durably.');
-    }
-    if (contextEnvelope.sha256 !== input.context.frame.contextEnvelopeHash) {
-      throw new Error('Compiled context envelope hash changed before durable commit.');
-    }
+    const manifest = await this.prepareJson(inferenceContextManifestValue(manifestValue), true);
+    if (!manifest.artifact) throw new Error('Inference context manifest must be stored durably.');
     const manifestArtifact = manifest.artifact;
-    const contextEnvelopeArtifact = contextEnvelope.artifact;
     return this.enqueueWrite(() => this.storage.transaction(() => {
       this.assertRunningHandle(handle);
       const running = this.storage.database.prepare(`
@@ -757,7 +726,6 @@ export class AgentStateStore extends ThreadState implements AgentStore {
           contextMessageCount: input.context.messageCount,
           contextRenderedHash: input.context.renderedHash,
           frameOrdinal,
-          contextEnvelopeHash: contextEnvelopeArtifact.hash,
           semanticHash: input.context.frame.semanticHash,
           ordinal,
           requestMode: input.requestMode,
@@ -770,16 +738,14 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         createdAt: recordedAt,
       });
       this.insertArtifact(manifestArtifact, sequence);
-      this.insertArtifact(contextEnvelopeArtifact, sequence);
       this.insertArtifact(dispatchArtifact, sequence);
       this.storage.database.prepare(`
         INSERT INTO context_frames (
           frame_id, project_id, conversation_id, turn_id,
           scope_id, ordinal, basis_sequence, compiler_version,
-          thread_version_id, manifest_artifact_hash, context_envelope_artifact_hash,
-          input_hash, ordered_item_hashes_json, estimated_input_tokens,
+          manifest_artifact_hash, input_hash, ordered_item_hashes_json, estimated_input_tokens,
           created_sequence, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         frameId,
         handle.projectId,
@@ -789,9 +755,7 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         frameOrdinal,
         basisSequence,
         input.context.frame.compilerVersion,
-        input.context.frame.threadVersionId,
         manifestArtifact.hash,
-        contextEnvelopeArtifact.hash,
         input.context.renderedHash,
         canonicalJson(input.context.orderedMessageHashes),
         input.estimatedInputTokens,
@@ -838,7 +802,6 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         frameId,
         manifest: manifestValue,
         manifestArtifact,
-        contextEnvelopeArtifact,
         dispatchArtifact,
         activeMessages: input.context.activeMessages,
         buildDurationMs: input.context.frameBuildDurationMs,
@@ -1978,7 +1941,6 @@ export class AgentStateStore extends ThreadState implements AgentStore {
 
   async compileContext(
     conversationId: string,
-    contextWindow = 400_000,
   ): Promise<DurableContextBoundarySnapshot> {
     this.assertOpen();
     await this.writerTail;
@@ -2006,6 +1968,8 @@ export class AgentStateStore extends ThreadState implements AgentStore {
       ? [activeScope.rootScopeId, activeScope.scopeId]
       : [activeScope.rootScopeId];
     const visibleScopeSet = new Set(visibleScopeIds);
+    const omittedPriorWorkUnits = [...scopeKinds].filter(([scopeId, kind]) =>
+      kind === 'work_unit' && !visibleScopeSet.has(scopeId)).length;
     const allEvents = (await this.readEvents({ conversationId }))
       .filter((event) =>
         event.scopeId === null ||
@@ -2013,39 +1977,39 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         visibleScopeSet.has(event.scopeId));
     if (allEvents.length === 0) throw new Error(`Conversation ${conversationId} does not exist.`);
     const replay = await this.logicalReplayEvents(allEvents);
-    const logicalMessages = await this.attachActiveProviderMessages(
-      reduceLogicalReplay(replay),
-      visibleScopeIds,
-      activeScope.turnId,
-    );
-    const thread = this.storage.database.prepare(`
-      SELECT d.document_id, d.head_version_id, v.content_artifact_hash
-      FROM state_documents d
-      JOIN document_versions v ON v.version_id = d.head_version_id
-      WHERE d.conversation_id = ?
-        AND d.scope_kind = 'conversation' AND d.key = 'thread.md'
-    `).get(conversationId) as {
-      document_id: string;
-      head_version_id: string;
-      content_artifact_hash: string;
-    } | undefined;
-    if (!thread) throw new Error('The conversation has no Thread document.');
-    const threadMarkdown = await this.readArtifactTextByHash(thread.content_artifact_hash);
+    const baseMessages = reduceLogicalReplay(replay);
+    const turn = this.storage.database.prepare(`
+      SELECT context_plan_json FROM turns
+      WHERE conversation_id = ? AND turn_id = ?
+    `).get(conversationId, activeScope.turnId) as { context_plan_json: string } | undefined;
+    if (!turn) throw new Error(`Active turn ${activeScope.turnId} has no context plan.`);
+    const contextPlan = normalizeTurnContextPlan(JSON.parse(turn.context_plan_json));
     const basisSequence = allEvents.at(-1)!.sequence;
-    const source: ThreadContextSource = {
+    const source: TurnContextSource = {
       basisSequence,
       projectId: activeScope.projectId,
       conversationId,
       turnId: activeScope.turnId,
       scopeId: activeScope.scopeId,
       scopeKind: activeScope.kind,
-      threadVersionId: thread.head_version_id,
-      threadMarkdown,
-      messages: logicalMessages,
-      pressureNoticed: allEvents.some((event) =>
-        event.scopeId === activeScope.scopeId && event.type === 'context.pressure'),
+      contextPlan,
+      omittedPriorWorkUnits,
+      messages: baseMessages,
     };
-    const compiled = compileThreadContext(source, { contextWindow });
+    const preview = compileTurnContext(source);
+    const fullTurnIds = preview.frame.resolvedTurns
+      .filter(({ resolution }) => resolution === 'full')
+      .map(({ turnId }) => turnId);
+    const fullRootScopes = fullTurnIds.length === 0 ? [] : (this.storage.database.prepare(`
+      SELECT turn_id, root_scope_id FROM turns
+      WHERE conversation_id = ? AND turn_id IN (${sqlPlaceholders(fullTurnIds.length)})
+    `).all(conversationId, ...fullTurnIds) as Array<{ turn_id: string; root_scope_id: string }>);
+    const providerScopeIds = [
+      ...visibleScopeIds,
+      ...fullRootScopes.map(({ root_scope_id }) => root_scope_id),
+    ];
+    const logicalMessages = await this.attachProviderMessages(baseMessages, providerScopeIds);
+    const compiled = compileTurnContext({ ...source, messages: logicalMessages });
     const snapshot = createDurableContextSnapshot(basisSequence, compiled.messages);
     const frameRow = this.storage.database.prepare(`
       SELECT MAX(ordinal) AS frame_ordinal
@@ -2061,80 +2025,6 @@ export class AgentStateStore extends ThreadState implements AgentStore {
       scopeKind: activeScope.kind,
       nextFrameOrdinal,
     };
-  }
-
-  async recordContextPressure(
-    handle: DurableTurnHandle,
-    input: {
-      estimatedInputTokens: number;
-      softContextLimit: number;
-      hardContextLimit: number;
-    },
-  ) {
-    this.assertOpen();
-    const estimatedInputTokens = safeNonnegativeInteger(
-      input.estimatedInputTokens,
-      'estimated input tokens',
-    );
-    const softContextLimit = safeNonnegativeInteger(
-      input.softContextLimit,
-      'soft context limit',
-    );
-    const hardContextLimit = safeNonnegativeInteger(
-      input.hardContextLimit,
-      'hard context limit',
-    );
-    const scope = this.scopeIdentity(handle.scopeId);
-    const notice = await this.prepareText(scope.kind === 'work_unit'
-      ? [
-          'Context pressure notice: this bounded work unit is approaching its healthy context boundary.',
-          'Return at the current coherent checkpoint, perform the most important remaining validation, then call work_unit_finish with completed, partial, or blocked status and what the parent needs.',
-          'Do not claim unperformed work or validation. Exact evidence remains available through History.',
-        ].join('\n\n')
-      : [
-          'Context pressure notice: this parent turn is approaching its healthy context boundary.',
-          'Integrate completed work, update the Thread if future shared state changed, and complete the user turn honestly.',
-          'Do not claim unperformed work or validation. Exact evidence remains available through History.',
-        ].join('\n\n'));
-    return this.enqueueWrite(() => this.storage.transaction(() => {
-      this.assertRunningHandle(handle);
-      const existing = this.storage.database.prepare(`
-        SELECT 1 FROM events WHERE scope_id = ? AND type = 'context.pressure'
-      `).get(handle.scopeId);
-      if (existing) return false;
-      const recordedAt = safeTimestamp(this.now());
-      const pressureEventId = this.nextId('event');
-      const pressureSequence = this.insertEvent({
-        ...handle,
-        eventId: pressureEventId,
-        type: 'context.pressure',
-        actor: 'harness',
-        visibility: 'internal',
-        payload: {
-          estimatedInputTokens,
-          hardContextLimit,
-          scopeKind: scope.kind,
-          softContextLimit,
-        },
-        createdAt: recordedAt,
-      });
-      const messageSequence = this.insertEvent({
-        ...handle,
-        eventId: this.nextId('event'),
-        type: 'message.internal',
-        actor: 'harness',
-        visibility: 'internal',
-        payload: {
-          content: notice.ref,
-          kind: 'context_pressure',
-          pressureSequence,
-        },
-        artifactHash: artifactHash(notice.ref),
-        createdAt: recordedAt,
-      });
-      this.insertArtifact(notice.artifact, messageSequence);
-      return true;
-    }));
   }
 
   async resumeActiveTurn(conversationId: string): Promise<{
@@ -2170,7 +2060,7 @@ export class AgentStateStore extends ThreadState implements AgentStore {
     const prompt = row.kind === 'work_unit'
       ? [
           'The runtime restarted inside this bounded work unit.',
-          'Continue its objective from the exact child context and durable tool results.',
+          'Continue from the exact work-unit context and durable tool results.',
           'Do not answer the user directly; finish by calling work_unit_finish.',
         ].join(' ')
       : [
@@ -2442,32 +2332,6 @@ export class AgentStateStore extends ThreadState implements AgentStore {
     const artifactMatch = /^history:\/\/artifact\/([0-9a-f]{64})$/u.exec(ref);
     if (artifactMatch) return this.openArtifactText(identity.projectId, artifactMatch[1]!);
 
-    const documentVersionMatch = /^history:\/\/document-version\/([^/?#]+)$/u.exec(ref);
-    if (documentVersionMatch) {
-      const versionId = decodeURIComponent(documentVersionMatch[1]!);
-      const row = this.storage.database.prepare(`
-        SELECT v.version_id, v.document_id, v.ordinal, v.parent_version_id,
-               v.content_artifact_hash, v.based_on_turn_id, v.created_sequence
-        FROM document_versions v
-        JOIN state_documents d ON d.document_id = v.document_id
-        WHERE d.project_id = ? AND v.version_id = ?
-      `).get(identity.projectId, versionId) as {
-        version_id: string; document_id: string; ordinal: number;
-        parent_version_id: string | null; content_artifact_hash: string;
-        based_on_turn_id: string | null; created_sequence: number;
-      } | undefined;
-      if (!row) throw new Error(`Thread document version ${versionId} does not exist in this project.`);
-      return canonicalJson({
-        versionId: row.version_id,
-        documentId: row.document_id,
-        ordinal: row.ordinal,
-        parentVersionId: row.parent_version_id,
-        basedOnTurnId: row.based_on_turn_id,
-        createdSequence: row.created_sequence,
-        content: await this.openArtifactText(identity.projectId, row.content_artifact_hash),
-      });
-    }
-
     const messageMatch = /^history:\/\/message\/([^/?#]+)$/u.exec(ref);
     if (messageMatch) {
       const messageId = decodeURIComponent(messageMatch[1]!);
@@ -2557,11 +2421,11 @@ export class AgentStateStore extends ThreadState implements AgentStore {
     if (scopeMatch) {
       const scopeId = decodeURIComponent(scopeMatch[1]!);
       const row = this.storage.database.prepare(`
-        SELECT scope_id, parent_scope_id, kind, objective_json, state,
+        SELECT scope_id, parent_scope_id, kind, boundary_text, state,
                created_sequence, terminal_sequence, result_artifact_hash
         FROM execution_scopes WHERE project_id = ? AND scope_id = ?
       `).get(identity.projectId, scopeId) as {
-        scope_id: string; parent_scope_id: string | null; kind: string; objective_json: string;
+        scope_id: string; parent_scope_id: string | null; kind: string; boundary_text: string | null;
         state: string; created_sequence: number; terminal_sequence: number | null;
         result_artifact_hash: string | null;
       } | undefined;
@@ -2570,7 +2434,7 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         scopeId: row.scope_id,
         parentScopeId: row.parent_scope_id,
         kind: row.kind,
-        objective: JSON.parse(row.objective_json) as CanonicalJsonValue,
+        boundary: row.boundary_text,
         state: row.state,
         createdSequence: row.created_sequence,
         terminalSequence: row.terminal_sequence,
@@ -2589,22 +2453,17 @@ export class AgentStateStore extends ThreadState implements AgentStore {
       const frameId = decodeURIComponent(frameMatch[1]!);
       const row = this.storage.database.prepare(`
         SELECT frame_id, scope_id, turn_id, ordinal, basis_sequence,
-               compiler_version, thread_version_id, manifest_artifact_hash,
-               context_envelope_artifact_hash, input_hash, ordered_item_hashes_json,
+               compiler_version, manifest_artifact_hash,
+               input_hash, ordered_item_hashes_json,
                estimated_input_tokens, created_sequence
         FROM context_frames WHERE project_id = ? AND frame_id = ?
       `).get(identity.projectId, frameId) as Record<string, unknown> | undefined;
       if (!row) throw new Error(`Context frame ${frameId} does not exist in this project.`);
       const manifestHash = requiredString(row.manifest_artifact_hash as CanonicalJsonValue, 'manifest hash');
-      const contextEnvelopeHash = requiredString(
-        row.context_envelope_artifact_hash as CanonicalJsonValue,
-        'context envelope hash',
-      );
       const normalizedRow = normalizeJson(row) as Record<string, CanonicalJsonValue>;
       return canonicalJson({
         ...normalizedRow,
         manifestRef: `history://artifact/${manifestHash}`,
-        contextEnvelopeRef: `history://artifact/${contextEnvelopeHash}`,
       });
     }
 
@@ -2903,6 +2762,7 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         attachmentCount: input.parts?.filter((part) => part.type === 'image').length ?? 0,
         clientMessageId: params.clientMessageId,
         content: input.content.ref,
+        contextPlan: normalizedContextPlan(params.contextPlan),
         dispatchOperationId: this.nextId('operation'),
         mentionCount: input.parts?.filter((part) => part.type === 'mention').length ?? 0,
         ...(input.parts ? { parts: input.parts } : {}),
@@ -3053,20 +2913,22 @@ export class AgentStateStore extends ThreadState implements AgentStore {
       const insideReplay = this.readTurnReplay(params, argumentsHash);
       if (insideReplay) return insideReplay;
       const conversation = this.storage.database.prepare(`
-        SELECT c.project_id, c.state,
-               d.head_version_id AS thread_version_id
+        SELECT c.project_id, c.state
         FROM conversations c
-        JOIN state_documents d
-          ON d.conversation_id = c.conversation_id
-         AND d.scope_kind = 'conversation' AND d.key = 'thread.md'
         WHERE c.conversation_id = ?
       `).get(params.conversationId) as {
         project_id: string;
         state: string;
-        thread_version_id: string;
       } | undefined;
       if (!conversation) throw new Error(`Conversation ${params.conversationId} does not exist.`);
       if (conversation.state === 'running') throw new Error('A durable turn is already running.');
+      const contextPlan = normalizedContextPlan(params.contextPlan);
+      for (const override of contextPlan.overrides) {
+        const source = this.storage.database.prepare(`
+          SELECT 1 FROM turns WHERE conversation_id = ? AND turn_id = ?
+        `).get(params.conversationId, override.turnId);
+        if (!source) throw new Error(`Context override references unavailable turn ${override.turnId}.`);
+      }
 
       const handle: DurableTurnHandle = {
         projectId: conversation.project_id,
@@ -3095,6 +2957,7 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         visibility: 'internal',
         payload: {
           clientMessageId: params.clientMessageId,
+          contextPlan,
           rootScopeId: handle.scopeId,
           turnId: handle.turnId,
         },
@@ -3145,7 +3008,7 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         visibility: 'internal',
         payload: {
           scopeId: handle.scopeId,
-          threadVersionId: conversation.thread_version_id,
+          contextPlan,
           turnId: handle.turnId,
         },
         createdAt: recordedAt,
@@ -3166,9 +3029,8 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         INSERT INTO turns (
           turn_id, project_id, conversation_id, client_message_id,
           root_scope_id, state, accepted_sequence, terminal_sequence,
-          thread_version_before, thread_version_after,
-          created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, 'running', ?, NULL, ?, NULL, ?, ?)
+          context_plan_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 'running', ?, NULL, ?, ?, ?)
       `).run(
         handle.turnId,
         handle.projectId,
@@ -3176,22 +3038,21 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         params.clientMessageId,
         handle.scopeId,
         acceptedTurnSequence,
-        conversation.thread_version_id,
+        canonicalJson(contextPlan),
         recordedAt,
         recordedAt,
       );
       this.storage.database.prepare(`
         INSERT INTO execution_scopes (
           scope_id, project_id, conversation_id, turn_id,
-          parent_scope_id, kind, objective_json, state, created_sequence,
+          parent_scope_id, kind, boundary_text, state, created_sequence,
           terminal_sequence, result_artifact_hash, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, NULL, 'turn', ?, 'running', ?, NULL, NULL, ?, ?)
+        ) VALUES (?, ?, ?, ?, NULL, 'turn', NULL, 'running', ?, NULL, NULL, ?, ?)
       `).run(
         handle.scopeId,
         handle.projectId,
         handle.conversationId,
         handle.turnId,
-        canonicalJson({ intent: 'Serve the accepted user turn.' }),
         scopeSequence,
         recordedAt,
         recordedAt,
@@ -3393,9 +3254,6 @@ export class AgentStateStore extends ThreadState implements AgentStore {
   private createConversationTransaction(
     params: CreateConversationParams,
     argumentsHash: string,
-    initialThread: StagedArtifact,
-    initialThreadContent: string,
-    inheritedThreadVersionId: string | null,
   ): CreateConversationResult {
     const replay = this.readCreateReplay(params.operationId, argumentsHash);
     if (replay) return replay;
@@ -3411,16 +3269,12 @@ export class AgentStateStore extends ThreadState implements AgentStore {
       `).get(params.cwd) as ProjectRow | undefined;
       const projectId = existingProject?.project_id ?? this.nextId('project');
       const conversationId = this.nextId('conversation');
-      const threadDocumentId = this.nextId('document');
-      const threadVersionId = this.nextId('document-version');
       const recordedAt = safeTimestamp(this.now());
       const outcome: StoredCreateOutcome = {
         accepted: true,
         operationId: params.operationId,
         projectId,
         conversationId,
-        threadDocumentId,
-        threadVersionId,
       };
 
       const acceptedSequence = this.insertEvent({
@@ -3462,12 +3316,8 @@ export class AgentStateStore extends ThreadState implements AgentStore {
           projectId,
           reasoning: params.reasoning,
           state: 'idle',
-          threadDocumentId,
-          threadVersionId,
-          inheritedThreadVersionId,
           title: INITIAL_TITLE,
         },
-        artifactHash: initialThread.hash,
         createdAt: recordedAt,
       });
       const terminalSequence = this.insertEvent({
@@ -3518,39 +3368,6 @@ export class AgentStateStore extends ThreadState implements AgentStore {
         recordedAt,
       );
       this.storage.database.prepare(`
-        INSERT INTO state_documents (
-          document_id, project_id, conversation_id, scope_kind,
-          key, head_version_id, created_sequence, updated_sequence,
-          created_at, updated_at
-        ) VALUES (?, ?, ?, 'conversation', 'thread.md', NULL, ?, ?, ?, ?)
-      `).run(
-        threadDocumentId,
-        projectId,
-        conversationId,
-        conversationSequence,
-        conversationSequence,
-        recordedAt,
-        recordedAt,
-      );
-      this.insertArtifact(initialThread, conversationSequence, 'content');
-      this.storage.database.prepare(`
-        INSERT INTO document_versions (
-          version_id, document_id, ordinal, parent_version_id,
-          content_artifact_hash, based_on_turn_id, created_sequence, created_at
-        ) VALUES (?, ?, 0, NULL, ?, NULL, ?, ?)
-      `).run(threadVersionId, threadDocumentId, initialThread.hash, conversationSequence, recordedAt);
-      this.storage.database.prepare(`
-        UPDATE state_documents SET head_version_id = ? WHERE document_id = ?
-      `).run(threadVersionId, threadDocumentId);
-      this.indexHistoryText({
-        ref: `history://document-version/${encodeURIComponent(threadVersionId)}`,
-        projectId,
-        conversationId,
-        kind: 'thread-document',
-        sequence: conversationSequence,
-        text: initialThreadContent,
-      });
-      this.storage.database.prepare(`
         INSERT INTO operations (
           operation_id, project_id, conversation_id, turn_id,
           scope_id, kind, arguments_hash, state, accepted_sequence,
@@ -3576,42 +3393,11 @@ export class AgentStateStore extends ThreadState implements AgentStore {
     });
   }
 
-  private async readInheritedThread(
-    source: NonNullable<CreateConversationParams['inheritThreadFrom']>,
-  ) {
-    await this.writerTail;
-    const column = source.position === 'before' ? 'thread_version_before' : 'thread_version_after';
-    const row = this.storage.database.prepare(`
-      SELECT t.${column} AS version_id, v.content_artifact_hash
-      FROM turns t
-      JOIN document_versions v ON v.version_id = t.${column}
-      WHERE t.conversation_id = ? AND t.turn_id = ?
-        AND t.terminal_sequence IS NOT NULL
-    `).get(source.conversationId, source.turnId) as {
-      version_id: string;
-      content_artifact_hash: string;
-    } | undefined;
-    if (!row) {
-      throw new Error(
-        `Cannot inherit thread.md ${source.position} turn ${source.turnId} in ${source.conversationId}.`,
-      );
-    }
-    return {
-      versionId: row.version_id,
-      content: await this.readArtifactTextByHash(row.content_artifact_hash),
-    };
-  }
-
   private readCreateReplay(operationId: string, argumentsHash: string): CreateConversationResult | null {
     const row = this.storage.database.prepare(`
       SELECT o.kind, o.arguments_hash, o.state, o.terminal_sequence,
-             o.value_json, o.project_id, o.conversation_id,
-             d.document_id AS thread_document_id,
-             d.head_version_id AS thread_version_id
+             o.value_json, o.project_id, o.conversation_id
       FROM operations o
-      JOIN state_documents d
-        ON d.conversation_id = o.conversation_id
-       AND d.scope_kind = 'conversation' AND d.key = 'thread.md'
       WHERE o.operation_id = ?
     `).get(operationId) as OperationReplayRow | undefined;
     if (!row) return null;
@@ -3626,8 +3412,6 @@ export class AgentStateStore extends ThreadState implements AgentStore {
       operationId,
       row.project_id,
       row.conversation_id,
-      row.thread_document_id,
-      row.thread_version_id,
     );
     return {
       ...outcome,
@@ -4033,13 +3817,6 @@ export class AgentStateStore extends ThreadState implements AgentStore {
           });
         }
       }
-      const thread = this.storage.database.prepare(`
-        SELECT d.head_version_id
-        FROM state_documents d
-        WHERE d.conversation_id = ?
-          AND d.scope_kind = 'conversation' AND d.key = 'thread.md'
-      `).get(handle.conversationId) as { head_version_id: string } | undefined;
-      if (!thread?.head_version_id) throw new Error('The conversation has no Thread version.');
       this.storage.database.prepare(`
         UPDATE inferences
         SET state = ?, terminal_sequence = ?
@@ -4061,13 +3838,11 @@ export class AgentStateStore extends ThreadState implements AgentStore {
       );
       this.storage.database.prepare(`
         UPDATE turns
-        SET state = ?, terminal_sequence = ?, thread_version_after = ?,
-            updated_at = ?
+        SET state = ?, terminal_sequence = ?, updated_at = ?
         WHERE turn_id = ? AND terminal_sequence IS NULL
       `).run(
         status,
         sequence,
-        thread.head_version_id,
         recordedAt,
         handle.turnId,
       );
@@ -4371,31 +4146,39 @@ export class AgentStateStore extends ThreadState implements AgentStore {
     );
   }
 
-  private async attachActiveProviderMessages(
+  private async attachProviderMessages(
     messages: readonly LogicalContextMessage[],
     scopeIds: readonly string[],
-    turnId: string,
   ): Promise<LogicalContextMessage[]> {
-    if (scopeIds.length === 0) return [...messages];
+    const uniqueScopeIds = [...new Set(scopeIds)];
+    if (uniqueScopeIds.length === 0) return [...messages];
     const rows = this.storage.database.prepare(`
-      SELECT pi.raw_artifact_hash
+      SELECT pi.turn_id, pi.raw_artifact_hash
       FROM provider_items pi
-      WHERE pi.scope_id IN (${sqlPlaceholders(scopeIds.length)})
-        AND pi.turn_id = ? AND pi.item_type = 'assistant_message'
+      WHERE pi.scope_id IN (${sqlPlaceholders(uniqueScopeIds.length)})
+        AND pi.item_type = 'assistant_message'
         AND NOT EXISTS (
           SELECT 1 FROM events e
           WHERE e.scope_id = pi.scope_id AND e.type = 'inference.superseded'
             AND json_extract(e.payload_json, '$.inferenceId') = pi.inference_id
         )
       ORDER BY pi.created_sequence
-    `).all(...scopeIds, turnId) as Array<{ raw_artifact_hash: string }>;
+    `).all(...uniqueScopeIds) as Array<{ turn_id: string; raw_artifact_hash: string }>;
     if (rows.length === 0) return [...messages];
-    const providerMessages = await Promise.all(rows.map(async ({ raw_artifact_hash }) =>
-      JSON.parse(await this.readArtifactTextByHash(raw_artifact_hash)) as AssistantMessage));
-    let activeAssistantIndex = 0;
+    const providerMessages = new Map<string, AssistantMessage[]>();
+    for (const row of rows) {
+      const messagesForTurn = providerMessages.get(row.turn_id) ?? [];
+      messagesForTurn.push(
+        JSON.parse(await this.readArtifactTextByHash(row.raw_artifact_hash)) as AssistantMessage,
+      );
+      providerMessages.set(row.turn_id, messagesForTurn);
+    }
+    const indexes = new Map<string, number>();
     return messages.map((message): LogicalContextMessage => {
-      if (message.role !== 'assistant' || message.turnId !== turnId) return message;
-      const providerMessage = providerMessages[activeAssistantIndex++];
+      if (message.role !== 'assistant') return message;
+      const index = indexes.get(message.turnId) ?? 0;
+      const providerMessage = providerMessages.get(message.turnId)?.[index];
+      indexes.set(message.turnId, index + 1);
       return providerMessage ? { ...message, providerMessage } : message;
     });
   }
@@ -4443,6 +4226,7 @@ type QueuedOperationValue = {
   attachmentCount: number;
   clientMessageId: string;
   content: DurableContentRef;
+  contextPlan: TurnContextPlan;
   dispatchOperationId: string;
   mentionCount: number;
   parts?: AgentUserMessagePart[];
@@ -4603,9 +4387,7 @@ function stripTranscriptProjectionMetadata(
         type: action.type,
         turnId: action.turnId,
         scopeId: action.scopeId,
-        objective: action.objective,
-        doneWhen: action.doneWhen,
-        resourceCount: action.resourceCount,
+        boundary: action.boundary,
         operationCount: action.operationCount,
       };
     case 'work-unit-finish':
@@ -4615,7 +4397,7 @@ function stripTranscriptProjectionMetadata(
         scopeId: action.scopeId,
         status: action.status,
         resultPreview: action.resultPreview,
-        resourceCount: action.resourceCount,
+        artifactCount: action.artifactCount,
         ...(action.durationMs === undefined ? {} : { durationMs: action.durationMs }),
       };
     case 'terminal':
@@ -4635,17 +4417,13 @@ function decodeStoredOutcome(
   operationId: string,
   projectId: string,
   conversationId: string,
-  threadDocumentId: string,
-  threadVersionId: string,
 ): StoredCreateOutcome {
   const parsed = JSON.parse(value) as Partial<StoredCreateOutcome>;
   if (
     parsed.accepted !== true ||
     parsed.operationId !== operationId ||
     parsed.projectId !== projectId ||
-    parsed.conversationId !== conversationId ||
-    parsed.threadDocumentId !== threadDocumentId ||
-    parsed.threadVersionId !== threadVersionId
+    parsed.conversationId !== conversationId
   ) {
     throw new Error(`Operation ${operationId} has an invalid durable outcome.`);
   }
@@ -4654,8 +4432,6 @@ function decodeStoredOutcome(
     operationId,
     projectId,
     conversationId,
-    threadDocumentId,
-    threadVersionId,
   };
 }
 
@@ -4663,7 +4439,6 @@ function contextInspectorValue(input: {
   frameId: string;
   manifest: InferenceContextManifest;
   manifestArtifact: StagedArtifact;
-  contextEnvelopeArtifact: StagedArtifact;
   dispatchArtifact: StagedArtifact;
   activeMessages: readonly LogicalContextMessage[];
   buildDurationMs: number;
@@ -4688,24 +4463,25 @@ function contextInspectorValue(input: {
   }
   const orderedGroups = [...groups.values()];
   return {
-    version: 5,
+    version: 6,
     conversationId: input.manifest.conversationId,
     inferenceId: input.manifest.inferenceId,
     frameId: input.frameId,
     basisSequence: input.manifest.basisSequence,
-    threadVersionId: input.manifest.threadVersionId,
-    dialogueTurnIds: [...input.manifest.context.dialogueTurnIds],
-    omittedDialogueTurns: input.manifest.context.omittedDialogueTurns,
-    threadDocumentBytes: input.manifest.context.threadDocumentBytes,
     scopeKind: input.manifest.context.scopeKind,
-    softContextLimit: input.manifest.context.softContextLimit,
-    hardContextLimit: input.manifest.context.hardContextLimit,
-    pressureNoticed: input.manifest.context.pressureNoticed,
+    requestedPlan: input.manifest.context.requestedPlan,
+    selectedTurns: input.manifest.context.resolvedTurns.map((turn) => {
+      const group = groups.get(turn.turnId);
+      return {
+        ...turn,
+        messageCount: group?.messageCount ?? 0,
+        estimatedTokens: group?.estimatedTokens ?? 0,
+      };
+    }),
     compilerVersion: input.manifest.compilerVersion,
     policyVersion: input.manifest.policyVersion,
     estimatedInputTokens: input.manifest.context.estimatedInputTokens,
     semanticHash: input.manifest.context.semanticHash,
-    contextEnvelopeHash: input.manifest.context.contextEnvelopeHash,
     buildDurationMs: safeNonnegativeInteger(input.buildDurationMs, 'context frame build duration'),
     transportMode: input.manifest.transport.requestMode,
     messageCount: input.manifest.context.messageCount,
@@ -4717,11 +4493,6 @@ function contextInspectorValue(input: {
       hash: input.manifestArtifact.hash,
       byteLength: input.manifestArtifact.byteLength,
       mediaType: input.manifestArtifact.mediaType,
-    },
-    contextEnvelopeArtifact: {
-      hash: input.contextEnvelopeArtifact.hash,
-      byteLength: input.contextEnvelopeArtifact.byteLength,
-      mediaType: input.contextEnvelopeArtifact.mediaType,
     },
     dispatchArtifact: {
       hash: input.dispatchArtifact.hash,
@@ -4864,19 +4635,33 @@ function validateCreateConversationParams(params: CreateConversationParams): Cre
     throw new TypeError('modelId must contain 1 to 256 UTF-8 bytes.');
   }
   if (!isReasoningLevel(params.reasoning)) throw new TypeError('reasoning is invalid.');
-  if (params.inheritThreadFrom) {
-    if (!UUID_V4.test(params.inheritThreadFrom.conversationId)) {
-      throw new TypeError('inheritThreadFrom.conversationId must be a lowercase UUID v4.');
-    }
-    if (!UUID_V4.test(params.inheritThreadFrom.turnId)) {
-      throw new TypeError('inheritThreadFrom.turnId must be a lowercase UUID v4.');
-    }
-    if (
-      params.inheritThreadFrom.position !== 'before' &&
-      params.inheritThreadFrom.position !== 'after'
-    ) throw new TypeError('inheritThreadFrom.position is invalid.');
-  }
   return { ...params };
+}
+
+function normalizedContextPlan(value: unknown): TurnContextPlan {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('contextPlan must be an object.');
+  }
+  const candidate = value as Record<string, unknown>;
+  if (!Array.isArray(candidate.overrides)) throw new TypeError('contextPlan.overrides must be an array.');
+  const plan: TurnContextPlan = {
+    version: candidate.version as 1,
+    automaticDialogueTurns: candidate.automaticDialogueTurns as number,
+    overrides: candidate.overrides.map((entry, index) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw new TypeError(`contextPlan override ${index + 1} must be an object.`);
+      }
+      const override = entry as Record<string, unknown>;
+      if (typeof override.turnId !== 'string' || !UUID_V4.test(override.turnId)) {
+        throw new TypeError(`contextPlan override ${index + 1} turnId must be a lowercase UUID v4.`);
+      }
+      return {
+        turnId: override.turnId,
+        resolution: override.resolution as TurnContextPlan['overrides'][number]['resolution'],
+      };
+    }),
+  };
+  return normalizeTurnContextPlan(plan);
 }
 
 function validateAcceptTurnParams(params: AcceptTurnParams): AcceptTurnParams {
@@ -4887,7 +4672,7 @@ function validateAcceptTurnParams(params: AcceptTurnParams): AcceptTurnParams {
   if (params.parts !== undefined && params.parts.length === 0) {
     throw new TypeError('Message parts cannot be empty.');
   }
-  return { ...params };
+  return { ...params, contextPlan: normalizedContextPlan(params.contextPlan) };
 }
 
 function messageArgumentsHash(params: AcceptTurnParams) {
@@ -4897,6 +4682,7 @@ function messageArgumentsHash(params: AcceptTurnParams) {
     params: {
       clientMessageId: params.clientMessageId,
       conversationId: params.conversationId,
+      contextPlan: normalizedContextPlan(params.contextPlan),
       ...(params.parts ? { parts: agentComposerPartsHashValue(params.parts) } : {}),
       textHash,
     },
@@ -4914,11 +4700,13 @@ function parseQueuedOperationValue(json: string): QueuedOperationValue {
   }
   const value = parsed as Record<string, CanonicalJsonValue>;
   const parts = value.parts === undefined ? undefined : parseStoredUserParts(value.parts);
+  const contextPlan = normalizedContextPlan(value.contextPlan);
   const turnId = value.turnId === undefined ? undefined : requiredString(value.turnId, 'queued turnId');
   return {
     attachmentCount: requiredNonnegativeInteger(value.attachmentCount, 'queued attachmentCount'),
     clientMessageId: requiredString(value.clientMessageId, 'queued clientMessageId'),
     content: parseReference(value.content),
+    contextPlan,
     dispatchOperationId: requiredString(value.dispatchOperationId, 'queued dispatchOperationId'),
     mentionCount: requiredNonnegativeInteger(value.mentionCount, 'queued mentionCount'),
     ...(parts ? { parts } : {}),

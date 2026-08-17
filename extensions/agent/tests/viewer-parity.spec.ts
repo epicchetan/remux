@@ -137,17 +137,13 @@ test('loads semantic inference traces and child scopes only after disclosure', a
   await focusedUnit.hover();
   await expect(focusedUnit).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
   await focusedUnit.click();
-  await expect(page.getByText('Assignment', { exact: true })).toBeVisible();
-  await expect(page.getByText('The exact contract and implementation agree.')).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Verified' })).toBeVisible();
-  await expect(page.getByText('Handoff', { exact: true })).toBeVisible();
+  await expect(page.getByText('Result', { exact: true })).toBeVisible();
   await expect(page.getByText(
     'The focused seam matches its exact contract without changing unrelated runtime behavior.',
   )).toBeVisible();
-  await expect(page.getByText('Returned resources', { exact: true })).toBeVisible();
-  await expect(page.locator('.agent-work-unit-outcome').getByText(
-    'Verified implementation.',
-  )).toBeVisible();
+  await expect(page.getByText('Artifacts', { exact: true })).toBeVisible();
+  await expect(page.locator('.agent-work-unit-outcome').getByText('src/index.ts')).toBeVisible();
   expect((await transcriptRequestTypes(page) as string[])
     .filter((type) => type === 'executionScope')).toHaveLength(2);
   expect(await transcriptRequestTypes(page)).not.toContain('operationDetail');
@@ -159,7 +155,6 @@ test('loads semantic inference traces and child scopes only after disclosure', a
   await childActions.click();
   const childTool = page.locator('.agent-tool-call').filter({ hasText: 'bash' });
   await expect(childTool).toHaveCSS('border-left-width', '0px');
-  await expect(page.locator('.agent-work-unit-assignment')).toHaveCSS('border-bottom-width', '0px');
   await expect(page.locator('.agent-work-unit-outcome')).toHaveCSS('border-top-width', '0px');
   await childTool.locator('> button').click();
   await expect(childTool).toContainText('1 test passed');

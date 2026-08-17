@@ -231,6 +231,7 @@ test('Agent adapter waits for durable completion before reading the terminal tra
 
 test('Agent benchmark always enters the single production context architecture', async () => {
   const creates: Array<Record<string, unknown>> = [];
+  const sends: Array<Record<string, unknown>> = [];
   const fake = {
     async query() {
       return { resources: [
@@ -243,6 +244,7 @@ test('Agent benchmark always enters the single production context architecture',
         creates.push(params as Record<string, unknown>);
         return { conversationId: `conversation-${creates.length}` };
       }
+      sends.push(params as Record<string, unknown>);
       return { accepted: true, turnId: `turn-${creates.length}` };
     },
   };
@@ -260,6 +262,41 @@ test('Agent benchmark always enters the single production context architecture',
   });
   assert.equal('contextMode' in creates[0]!, false);
   assert.equal('workUnits' in creates[0]!, false);
+  assert.deepEqual(sends[0]?.contextPlan, {
+    version: 1,
+    automaticDialogueTurns: 2,
+    overrides: [],
+  });
+});
+
+test('Agent benchmark forwards an exact per-turn context plan', async () => {
+  const sends: Array<Record<string, unknown>> = [];
+  const fake = {
+    async query() {
+      return { resources: [
+        { key: 'auth', status: 'ok', value: { state: 'signed-in' } },
+        { key: 'models', status: 'ok', value: { models: [{ id: 'gpt-test', supportedReasoning: ['high'] }] } },
+      ] };
+    },
+    async command(method: string, params: unknown) {
+      if (method === 'remux/agent/conversation/create') {
+        return { conversationId: 'conversation-context' };
+      }
+      sends.push(params as Record<string, unknown>);
+      return { accepted: true, turnId: `turn-${sends.length}` };
+    },
+  };
+  const target = createBenchmarkTarget('agent', fake as unknown as RemuxBenchmarkClient);
+  const contextPlan = {
+    version: 1 as const,
+    automaticDialogueTurns: 1,
+    overrides: [{ turnId: 'prior-turn', resolution: 'full' as const }],
+  };
+  await target.start({
+    cwd: '/fixture', modelId: 'gpt-test', reasoning: 'high', reviewMode: 'full-access',
+    speed: 'default', text: 'continue', contextPlan,
+  });
+  assert.deepEqual(sends[0]?.contextPlan, contextPlan);
 });
 
 test('rollout evidence reports token, compaction, tool, and leakage signals', async (context) => {

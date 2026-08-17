@@ -1,6 +1,6 @@
 # Agent Living Thread Canvas v1
 
-Status: Implemented checkpoint
+Status: Archived; superseded by `agent-explicit-turn-context-v1.md`
 Date: 2026-08-11
 Builds on: `agent-thread-runtime-v2.md`
 Canonical prompt: `extensions/agent/server/prompts/system.md`

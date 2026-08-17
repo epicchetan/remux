@@ -4,10 +4,10 @@ import {
   AGENT_TRANSCRIPT_PROJECTION_VERSION,
   AGENT_TRANSCRIPT_PROTOCOL_VERSION,
 } from '../../shared/transcript.ts';
+import type { TurnContextPlan } from '../../shared/protocol.ts';
 import type {
   BenchmarkConversationTarget,
   BenchmarkTarget,
-  BenchmarkThreadSnapshot,
   VisibleBenchmarkTranscript,
 } from './contracts.ts';
 import { RemuxBenchmarkClient } from './remux-client.ts';
@@ -36,6 +36,7 @@ class CodexBenchmarkTarget implements BenchmarkConversationTarget {
     reviewMode: string;
     speed: string;
     text: string;
+    contextPlan?: TurnContextPlan | null;
   }) {
     const models = objectValue(await this.client.query(
       'remux/codex/models/read',
@@ -71,7 +72,11 @@ class CodexBenchmarkTarget implements BenchmarkConversationTarget {
     };
   }
 
-  async send(input: { conversationId: string; text: string }) {
+  async send(input: {
+    conversationId: string;
+    text: string;
+    contextPlan?: TurnContextPlan | null;
+  }) {
     const response = objectValue(await this.client.command('remux/codex/thread/message/send', {
       clientMessageId: randomUUID(),
       threadId: input.conversationId,
@@ -166,6 +171,7 @@ class AgentBenchmarkTarget implements BenchmarkConversationTarget {
     reviewMode: string;
     speed: string;
     text: string;
+    contextPlan?: TurnContextPlan | null;
   }) {
     const resources = objectValue(await this.client.query('remux/agent/resources/read', {
       requests: [{ key: 'auth' }, { key: 'models' }],
@@ -192,15 +198,28 @@ class AgentBenchmarkTarget implements BenchmarkConversationTarget {
       reasoning: input.reasoning,
     }));
     const conversationId = requiredString(created.conversationId, 'Agent create response conversationId');
-    const sent = await this.send({ conversationId, text: input.text });
+    const sent = await this.send({
+      conversationId,
+      text: input.text,
+      contextPlan: input.contextPlan,
+    });
     return { conversationId, turnId: sent.turnId, modelId: input.modelId };
   }
 
-  async send(input: { conversationId: string; text: string }) {
+  async send(input: {
+    conversationId: string;
+    text: string;
+    contextPlan?: TurnContextPlan | null;
+  }) {
     const response = objectValue(await this.client.command('remux/agent/conversation/message/send', {
       operationId: randomUUID(),
       conversationId: input.conversationId,
       clientMessageId: randomUUID(),
+      contextPlan: input.contextPlan ?? {
+        version: 1,
+        automaticDialogueTurns: 2,
+        overrides: [],
+      },
       text: input.text,
     }));
     if (response.accepted !== true) throw new Error('Agent did not accept the benchmark message.');
@@ -283,21 +302,6 @@ class AgentBenchmarkTarget implements BenchmarkConversationTarget {
     };
   }
 
-  async readThread(conversationId: string): Promise<BenchmarkThreadSnapshot> {
-    const value = objectValue(await this.client.query('remux/agent/thread/read', {
-      conversationId,
-    }, this.nextReadKey(`thread:${conversationId}`)));
-    const current = objectValue(value.current);
-    const previous = objectValue(value.previous);
-    return {
-      versionId: requiredString(current.versionId, 'Agent Thread versionId'),
-      ordinal: requiredNumber(current.ordinal, 'Agent Thread ordinal'),
-      content: requiredString(current.content, 'Agent Thread content'),
-      byteLength: requiredNumber(current.byteLength, 'Agent Thread byteLength'),
-      previousVersionId: stringValue(previous.versionId),
-    };
-  }
-
   async interrupt(input: { conversationId: string; turnId?: string }) {
     await this.client.command('remux/agent/conversation/turn/interrupt', {
       operationId: randomUUID(),
@@ -333,13 +337,6 @@ function requiredString(value: unknown, label: string) {
   const result = stringValue(value);
   if (!result) throw new Error(`${label} is missing.`);
   return result;
-}
-
-function requiredNumber(value: unknown, label: string) {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
-    throw new Error(`${label} is missing or invalid.`);
-  }
-  return value;
 }
 
 function delay(ms: number) {

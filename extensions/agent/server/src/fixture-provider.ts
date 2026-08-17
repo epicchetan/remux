@@ -51,7 +51,7 @@ export class FixtureProvider implements ModelProvider {
         const text = input.text;
         controller = new AbortController();
         const signal = controller.signal;
-        const context = await options.durability.compileContext(fixtureModels[0]!.contextWindow);
+        const context = await options.durability.compileContext();
         const estimatedInputTokens = context.frame.estimatedInputTokens;
         await options.durability.beforeProviderCall({
           payload: { messages: [{ role: 'user', content: text }] },

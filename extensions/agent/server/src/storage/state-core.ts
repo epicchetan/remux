@@ -36,9 +36,7 @@ export type AgentStateIdKind =
   | 'message'
   | 'inference'
   | 'frame'
-  | 'provider-item'
-  | 'document'
-  | 'document-version';
+  | 'provider-item';
 
 export type AgentStateCoreOptions = {
   now?: () => number;

@@ -9,6 +9,7 @@ import {
 import { ComposerContent } from './composer/content.tsx';
 import { AgentAuthScreen } from './auth/AgentAuthScreen.tsx';
 import { createEmptyComposerSnapshot } from './composer/model/composerModel.ts';
+import { createDefaultTurnContextPlan } from './composer/context/contextPlan.ts';
 import { composerResourcesFromSnapshot } from './composer/model/userInputInterop.ts';
 import { ComposerMentionPicker } from './composer/mentions/MentionPicker.tsx';
 import { parseComposerMentionQuery } from './composer/mentions/mentionSearch.ts';
@@ -37,7 +38,6 @@ import { useAgentResources } from './app/useAgentResources.ts';
 import { readInitialTarget, useAgentNavigation } from './app/useAgentNavigation.ts';
 import { useConversationActions } from './app/useConversationActions.ts';
 import { AgentTranscript } from './transcript/index.ts';
-import { ThreadView } from './thread/ThreadView.tsx';
 import { getTranscriptResourceState } from './transcript/resourceStore.ts';
 import {
   requestTranscriptTurnScroll,
@@ -53,7 +53,6 @@ export function App() {
   );
   const [draft, setDraft] = useState<AgentNewChatDraft | null>(() =>
     initialTarget.kind === 'draft' ? initialDraft(initialTarget.id) : null);
-  const [mainView, setMainView] = useState<'chat' | 'thread'>('chat');
   useEffect(() => {
     if (initialTarget.kind === 'conversation' && initialTarget.focusTurnId) {
       requestTranscriptTurnScroll(initialTarget.id, initialTarget.focusTurnId);
@@ -90,12 +89,14 @@ export function App() {
   const modelId = useComposerStore((state) => state.modelId);
   const reasoning = useComposerStore((state) => state.reasoning);
   const composerSnapshot = useComposerStore((state) => state.snapshot);
+  const contextPlan = useComposerStore((state) => state.contextPlan);
   const composerPresentationRequest = useComposerStore((state) => state.composerPresentationRequest);
   const editTarget = useComposerStore((state) => state.editTarget);
   const focusComposer = useComposerStore((state) => state.focusComposer);
   const forkTarget = useComposerStore((state) => state.forkTarget);
   const mentionSession = useComposerStore((state) => state.mentionSession);
   const setComposerDocument = useComposerStore((state) => state.setComposerDocument);
+  const setContextPlan = useComposerStore((state) => state.setContextPlan);
   const setModelId = useComposerStore((state) => state.setModelId);
   const setReasoning = useComposerStore((state) => state.setReasoning);
   const composerRestorePendingRef = useRef<string | null>(null);
@@ -128,10 +129,6 @@ export function App() {
     draftRef.current = draft;
   }, [activeConversationId, activeDraftId, draft]);
 
-  useEffect(() => {
-    setMainView('chat');
-  }, [activeConversationId, activeDraftId]);
-
   const restoreComposerSnapshot = useCallback((snapshot: ReturnType<typeof createEmptyComposerSnapshot>) => {
     composerRestorePendingRef.current = snapshot.contentKey;
     setComposerDocument(snapshot.document, composerResourcesFromSnapshot(snapshot));
@@ -146,11 +143,16 @@ export function App() {
       if (currentDraft.cwd) setCwd(currentDraft.cwd);
       if (currentDraft.modelId) setModelId(currentDraft.modelId);
       setReasoning(currentDraft.reasoning);
+      setContextPlan(currentDraft.contextPlan);
       restoreComposerSnapshot(currentDraft.snapshot);
     } else if (activeConversationId) {
-      restoreComposerSnapshot(loadConversationDraft(activeConversationId) ?? createEmptyComposerSnapshot());
+      const currentDraft = loadConversationDraft(activeConversationId);
+      setContextPlan(currentDraft.contextPlan);
+      restoreComposerSnapshot(currentDraft.snapshot);
+    } else {
+      setContextPlan(createDefaultTurnContextPlan());
     }
-  }, [activeConversationId, activeDraftId, restoreComposerSnapshot, setCwd, setModelId, setReasoning]);
+  }, [activeConversationId, activeDraftId, restoreComposerSnapshot, setContextPlan, setCwd, setModelId, setReasoning]);
 
   useEffect(() => {
     const pendingRestore = composerRestorePendingRef.current;
@@ -160,7 +162,7 @@ export function App() {
     }
     if (!activeDraftId || draft?.id !== activeDraftId) {
       if (activeConversationId) {
-        persistConversationDraft(activeConversationId, composerSnapshot);
+        persistConversationDraft(activeConversationId, composerSnapshot, contextPlan);
       }
       return;
     }
@@ -168,6 +170,7 @@ export function App() {
       draft.cwd === cwd &&
       draft.modelId === modelId &&
       draft.reasoning === reasoning &&
+      sameContextPlan(draft.contextPlan, contextPlan) &&
       draft.snapshot.contentKey === composerSnapshot.contentKey
     ) return;
     const next = {
@@ -175,13 +178,14 @@ export function App() {
       cwd,
       modelId,
       reasoning,
+      contextPlan,
       snapshot: composerSnapshot,
       updatedAt: Date.now(),
     };
     draftRef.current = next;
     setDraft(next);
     persistNewChatDraft(next);
-  }, [activeConversationId, activeDraftId, composerSnapshot, cwd, draft, modelId, reasoning]);
+  }, [activeConversationId, activeDraftId, composerSnapshot, contextPlan, cwd, draft, modelId, reasoning]);
 
   useEffect(() => {
     if (!activeConversationId || !conversationSummary) return;
@@ -200,6 +204,7 @@ export function App() {
         cwd: useConversationStore.getState().cwd,
         modelId: useComposerStore.getState().modelId,
         reasoning: useComposerStore.getState().reasoning,
+        contextPlan: useComposerStore.getState().contextPlan,
         snapshot,
         updatedAt: Date.now(),
       };
@@ -209,7 +214,9 @@ export function App() {
       return;
     }
     const currentConversationId = activeConversationIdRef.current;
-    if (currentConversationId) persistConversationDraft(currentConversationId, snapshot);
+    if (currentConversationId) {
+      persistConversationDraft(currentConversationId, snapshot, useComposerStore.getState().contextPlan);
+    }
   }, []);
 
   const activateDraft = useCallback((nextDraft: AgentNewChatDraft) => {
@@ -222,10 +229,11 @@ export function App() {
     setCwd(nextDraft.cwd);
     if (nextDraft.modelId) setModelId(nextDraft.modelId);
     setReasoning(nextDraft.reasoning);
+    setContextPlan(nextDraft.contextPlan);
     restoreComposerSnapshot(nextDraft.snapshot);
     setError(null);
     void getTranscriptResourceState().setActiveConversationId(null);
-  }, [restoreComposerSnapshot, setCwd, setModelId, setReasoning]);
+  }, [restoreComposerSnapshot, setContextPlan, setCwd, setModelId, setReasoning]);
 
   const selectDraft = useCallback(() => {
     const nextDraft = draftRef.current;
@@ -254,6 +262,7 @@ export function App() {
       id,
       modelId: selected?.modelId ?? useComposerStore.getState().modelId,
       reasoning: selected?.reasoning ?? useComposerStore.getState().reasoning,
+      contextPlan: createDefaultTurnContextPlan(),
       snapshot: createEmptyComposerSnapshot(),
       updatedAt: Date.now(),
     };
@@ -270,13 +279,15 @@ export function App() {
       activeDraftIdRef.current = null;
       setActiveConversationId(normalized);
       setActiveDraftId(null);
-      restoreComposerSnapshot(loadConversationDraft(normalized) ?? createEmptyComposerSnapshot());
+      const currentDraft = loadConversationDraft(normalized);
+      setContextPlan(currentDraft.contextPlan);
+      restoreComposerSnapshot(currentDraft.snapshot);
       setError(null);
       void getTranscriptResourceState().setActiveConversationId(normalized);
       void ensureConversation(normalized);
     }
     if (focusTurnId) requestTranscriptTurnScroll(normalized, focusTurnId);
-  }, [ensureConversation, restoreComposerSnapshot, saveCurrentTargetDraft]);
+  }, [ensureConversation, restoreComposerSnapshot, saveCurrentTargetDraft, setContextPlan]);
 
   useAgentNavigation({
     activeConversationId,
@@ -344,8 +355,8 @@ export function App() {
         onStartNewChat={() => startNewChat()}
       />
       <section className="remux-main-pane" ref={mainPaneRef} style={mainPaneStyle}>
-        <div className="remux-transcript-slot" data-main-view={mainView}>
-          <div aria-hidden={mainView === 'thread'} className="agent-chat-view">
+        <div className="remux-transcript-slot">
+          <div className="agent-chat-view">
             {conversation ? <AgentTranscript conversationId={conversation.id} /> : (
             <div className="remux-new-chat-empty">
               <div className="remux-new-chat-empty-card">
@@ -361,20 +372,12 @@ export function App() {
             </div>
             )}
           </div>
-          {mainView === 'thread' && conversation ? (
-            <ThreadView
-              conversationId={conversation.id}
-              latestTurnId={conversation.latestTurnId}
-              versionHint={contextInspector?.threadVersionId ?? null}
-            />
-          ) : null}
         </div>
         <div className="remux-bottom-bar-slot" ref={bottomBarSlotRef}>
           <ComposerContent
             conversation={conversation}
             contextInspector={contextInspector}
             conversationSelected={Boolean(activeConversationId)}
-            mainView={mainView}
             onInterrupt={interrupt}
             onEdit={(target, input, setPhase) => branchMessage('edit', target, input, setPhase)}
             onFork={(target, input, setPhase) => branchMessage('fork', target, input, setPhase)}
@@ -383,7 +386,6 @@ export function App() {
               : Promise.resolve()}
             onSend={send}
             onSignOut={() => void runAuth(() => agentCommands.logout())}
-            onToggleThread={() => setMainView((current) => current === 'chat' ? 'thread' : 'chat')}
             runtimeError={error ?? conversation?.error ?? null}
             queue={queue}
           />
@@ -406,9 +408,22 @@ function initialDraft(id: string): AgentNewChatDraft {
     id,
     modelId: '',
     reasoning: 'high',
+    contextPlan: createDefaultTurnContextPlan(),
     snapshot: createEmptyComposerSnapshot(),
     updatedAt: Date.now(),
   };
+}
+
+function sameContextPlan(
+  left: AgentNewChatDraft['contextPlan'],
+  right: AgentNewChatDraft['contextPlan'],
+) {
+  return left.automaticDialogueTurns === right.automaticDialogueTurns &&
+    left.overrides.length === right.overrides.length &&
+    left.overrides.every((override, index) => {
+      const candidate = right.overrides[index];
+      return candidate?.turnId === override.turnId && candidate.resolution === override.resolution;
+    });
 }
 
 function projectConversation(summary: ConversationSummary, runtime: AgentRuntimeValue | null): ConversationValue {

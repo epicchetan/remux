@@ -12,7 +12,6 @@ import {
   type ModelsValue,
   type ResourceReadParams,
   type ResourceReadResult,
-  type ThreadReadParams,
   type TurnReadParams,
 } from '../../shared/protocol.ts';
 import type { AgentResourceInvalidation } from '../../shared/transcript.ts';
@@ -68,7 +67,6 @@ export class AgentServer {
       readTranscriptResources: (params) => this.readTranscriptResources(params),
       readModels: () => this.refreshModels(),
       readArtifact: (params) => this.readArtifact(params),
-      readThread: (params) => this.readThreadCanvas(params),
       readTurn: (params) => this.readDurableTurn(params),
       searchFiles: (params) => searchAgentFiles(params),
       startLogin: () => this.startLogin(),
@@ -246,14 +244,6 @@ export class AgentServer {
       truncated: nextRange !== null,
       nextRange,
     };
-  }
-
-  private async readThreadCanvas(params: ThreadReadParams) {
-    await this.conversations.turns.settleWrites();
-    if (!this.store.readThreadHistory) {
-      throw new RpcFault(-32030, 'Durable thread history is unavailable.');
-    }
-    return this.store.readThreadHistory(params.conversationId);
   }
 
   private async readDurableTurn(params: TurnReadParams) {

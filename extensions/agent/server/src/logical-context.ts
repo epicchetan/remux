@@ -375,37 +375,6 @@ export function estimatePiContextTokens(messages: Message[], fixedPrompt: string
   return Math.max(piEstimate + Math.ceil(fixedPrompt.length / 4) + 1_000, byteEstimate + 1_000);
 }
 
-export function assertContextBudget(estimatedInputTokens: number, contextWindow: number) {
-  const hardInputLimit = Math.max(0, contextWindow - 25_000);
-  const safetyMargin = 5_000;
-  if (estimatedInputTokens + safetyMargin > hardInputLimit) {
-    throw new ContextBudgetExceededError(estimatedInputTokens, hardInputLimit, safetyMargin);
-  }
-}
-
-export class ContextBudgetExceededError extends Error {
-  readonly kind = 'context_budget_exceeded';
-  readonly estimatedInputTokens: number;
-  readonly hardInputLimit: number;
-  readonly safetyMargin: number;
-  readonly admissionLimit: number;
-
-  constructor(estimatedInputTokens: number, hardInputLimit: number, safetyMargin: number) {
-    const admissionLimit = Math.max(0, hardInputLimit - safetyMargin);
-    super(
-      `Context requires an estimated ${estimatedInputTokens} input tokens plus a ` +
-      `${safetyMargin}-token safety margin; the effective admission limit is ` +
-      `${admissionLimit} tokens (${hardInputLimit} hard). End this execution scope and continue ` +
-      'in a smaller work unit.',
-    );
-    this.name = 'ContextBudgetExceededError';
-    this.estimatedInputTokens = estimatedInputTokens;
-    this.hardInputLimit = hardInputLimit;
-    this.safetyMargin = safetyMargin;
-    this.admissionLimit = admissionLimit;
-  }
-}
-
 function providerVisiblePiMessage(message: Message) {
   if (message.role === 'user') {
     return { role: message.role, content: message.content };

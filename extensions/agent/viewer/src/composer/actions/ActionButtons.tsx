@@ -1,4 +1,4 @@
-import { ArrowDown, ArrowLeft, ArrowUp, Check, FileText, History, Loader2, MessageSquare, PanelRightOpen, Send, Square } from 'lucide-react';
+import { ArrowDown, ArrowLeft, ArrowUp, Check, History, Loader2, PanelRightOpen, Send, Square } from 'lucide-react';
 import { openHostOverview } from '@remux/viewer-kit/host';
 
 import { parentDirectory } from '../../conversation/format.ts';
@@ -7,7 +7,8 @@ import { useConversationStore } from '../../conversation/store.ts';
 import { useTranscriptViewportControls } from '../../transcript/index.ts';
 import { ComposerAttachmentButton } from '../attachments/AttachmentButton.tsx';
 import { ComposerConfigButton } from '../config/ConfigButton.tsx';
-import type { AgentComposerMessagePart } from '../../../../shared/protocol.ts';
+import { ComposerContextButton } from '../context/ContextButton.tsx';
+import type { AgentComposerMessagePart, TurnContextPlan } from '../../../../shared/protocol.ts';
 import { ComposerActionKey, type ComposerAction } from './ActionKey.tsx';
 import { useComposerTurnAction } from './turnAction.ts';
 import type { ComposerEditTarget, ComposerForkTarget } from '../store.ts';
@@ -16,29 +17,23 @@ export function ComposerActionButtons({
   canStart,
   conversationExists,
   isWorking,
-  mainView,
   onInterrupt,
   onEdit,
   onFork,
   onSend,
   onSignOut,
-  onToggleThread,
-  threadAvailable,
 }: {
   canStart: boolean;
   conversationExists: boolean;
   isWorking: boolean;
-  mainView: 'chat' | 'thread';
   onInterrupt: () => Promise<void>;
   onEdit: ComposerBranchCallback<ComposerEditTarget>;
   onFork: ComposerBranchCallback<ComposerForkTarget>;
   onSend: (
-    input: { displayText: string; parts: AgentComposerMessagePart[] },
+    input: { contextPlan: TurnContextPlan; displayText: string; parts: AgentComposerMessagePart[] },
     setPhase: (phase: 'sending' | 'updating-transcript') => void,
   ) => Promise<void>;
   onSignOut: () => void;
-  onToggleThread: () => void;
-  threadAvailable: boolean;
 }) {
   const { canScrollDown, canScrollUp, scrollDown, scrollUp } = useTranscriptViewportControls();
   const openMobileSidebar = useAgentSidebarStore((state) => state.openMobile);
@@ -59,17 +54,11 @@ export function ComposerActionButtons({
     icon: <History className="size-4" />,
     label: 'Open history',
     onClick: openMobileSidebar,
-  }, ...(threadAvailable ? [{
-    className: mainView === 'thread' ? 'is-active' : undefined,
-    icon: mainView === 'thread' ? <MessageSquare className="size-4" /> : <FileText className="size-4" />,
-    label: mainView === 'thread' ? 'Back to conversation' : 'Open Thread',
-    onClick: onToggleThread,
-    testId: 'thread-view-toggle',
-  }] : [])];
+  }];
   const navigation: ComposerAction[] = pickerOpen ? [
     { disabled: !parent, icon: <ArrowLeft className="size-4" />, label: 'Parent directory', onClick: () => parent && setPickerPath(parent), preserveFocus: true },
     { disabled: !pickerPath, icon: <Check className="size-4" />, label: 'Select directory', onClick: selectPickerPath, preserveFocus: true, tone: 'send' },
-  ] : mainView === 'thread' ? [] : [
+  ] : [
     { disabled: !canScrollUp, icon: <ArrowUp className="size-4" />, label: 'Previous turn', onClick: scrollUp },
     { disabled: !canScrollDown, icon: <ArrowDown className="size-4" />, label: 'Next turn or bottom', onClick: scrollDown },
   ];
@@ -78,6 +67,7 @@ export function ComposerActionButtons({
     <div className="remux-composer-actions">
       <div className="remux-composer-action-group">
         {left.map((action) => <ComposerActionKey action={action} key={action.label} />)}
+        <ComposerContextButton disabled={pickerOpen || !conversationExists} />
         <ComposerConfigButton disabled={pickerOpen} locked={conversationExists} onSignOut={onSignOut} />
       </div>
       <div className="remux-composer-action-group remux-composer-action-group-right">
@@ -111,6 +101,6 @@ export function ComposerActionButtons({
 
 type ComposerBranchCallback<T> = (
   target: T,
-  input: { displayText: string; parts: AgentComposerMessagePart[] },
+  input: { contextPlan: TurnContextPlan; displayText: string; parts: AgentComposerMessagePart[] },
   setPhase: (phase: 'sending' | 'updating-transcript') => void,
 ) => Promise<void>;

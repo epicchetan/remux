@@ -149,12 +149,7 @@ export class TurnCoordinator {
 
   durabilityHooks(conversationId: string) {
     return {
-      compileContext: (contextWindow: number) => this.compileContext(conversationId, contextWindow),
-      noticeContextPressure: (input: {
-        estimatedInputTokens: number;
-        softContextLimit: number;
-        hardContextLimit: number;
-      }) => this.noticeContextPressure(conversationId, input),
+      compileContext: () => this.compileContext(conversationId),
       beforeAssistantMessageEnd: (input: {
         inferenceState: 'completed' | 'failed' | 'interrupted';
         text: string;
@@ -199,11 +194,6 @@ export class TurnCoordinator {
       },
       historyOpen: (input: Parameters<AgentStore['openHistory']>[1]) =>
         this.store.openHistory(conversationId, input),
-      threadRead: () => this.store.readThread(conversationId),
-      threadPatch: (input: Parameters<AgentStore['patchThread']>[1]) =>
-        this.store.patchThread(this.requiredActiveDurableScope(conversationId), input),
-      threadReplace: (input: Parameters<AgentStore['replaceThread']>[1]) =>
-        this.store.replaceThread(this.requiredActiveDurableScope(conversationId), input),
       workUnitEnter: (callId: string, input: WorkUnitEnterInput) =>
         this.enterWorkUnit(conversationId, callId, input),
       workUnitFinish: (callId: string, input: WorkUnitReturnInput) =>
@@ -379,21 +369,11 @@ export class TurnCoordinator {
     return result;
   }
 
-  private async compileContext(conversationId: string, contextWindow: number) {
+  private async compileContext(conversationId: string) {
     this.requiredActiveDurableScope(conversationId);
     await this.flushAssistantCheckpoint();
     await this.settleWrites();
-    return this.store.compileContext(conversationId, contextWindow);
-  }
-
-  private async noticeContextPressure(
-    conversationId: string,
-    input: { estimatedInputTokens: number; softContextLimit: number; hardContextLimit: number },
-  ) {
-    const handle = this.requiredActiveDurableScope(conversationId);
-    const recorded = await this.enqueueTurnWrite(() => this.store.recordContextPressure(handle, input));
-    if (recorded) this.resources.invalidateKey(contextResourceKey(conversationId), 'updated');
-    return recorded;
+    return this.store.compileContext(conversationId);
   }
 
   private async afterProviderCall(
@@ -576,9 +556,7 @@ export class TurnCoordinator {
     }));
     this.options.projector()?.startWorkUnit(parent.turnId, {
       scopeId: entered.handle.scopeId,
-      objective: entered.objective,
-      doneWhen: entered.doneWhen,
-      resourceCount: entered.resources.length,
+      boundary: entered.boundary,
       sequence: entered.transcriptSequence,
       basisSequence: entered.transcriptSequence,
       createdAt: entered.transcriptCreatedAt,
@@ -587,9 +565,7 @@ export class TurnCoordinator {
     return {
       scopeId: entered.handle.scopeId,
       parentScopeId: entered.parentScopeId,
-      objective: entered.objective,
-      doneWhen: entered.doneWhen,
-      resources: entered.resources,
+      boundary: entered.boundary,
       state: 'running' as const,
     };
   }
@@ -616,7 +592,7 @@ export class TurnCoordinator {
       scopeId: returned.scopeId,
       status: returned.status,
       resultPreview: workUnitResultPreview(returned.result),
-      resourceCount: returned.resources.length,
+      artifactCount: returned.artifacts.length,
       sequence: returned.transcriptSequence,
       basisSequence: returned.transcriptSequence,
       createdAt: returned.transcriptCreatedAt,
@@ -627,7 +603,7 @@ export class TurnCoordinator {
       scopeId: returned.scopeId,
       status: returned.status,
       result: returned.result,
-      resources: returned.resources,
+      artifacts: returned.artifacts,
       resultRef: returned.resultRef,
       historyRef: returned.historyRef,
     };
@@ -647,7 +623,7 @@ export class TurnCoordinator {
       scopeId: returned.scopeId,
       status: returned.status,
       resultPreview: workUnitResultPreview(returned.result),
-      resourceCount: returned.resources.length,
+      artifactCount: returned.artifacts.length,
       sequence: returned.transcriptSequence,
       basisSequence: returned.transcriptSequence,
       createdAt: returned.transcriptCreatedAt,
@@ -657,7 +633,7 @@ export class TurnCoordinator {
       scopeId: returned.scopeId,
       status: returned.status,
       result: returned.result,
-      resources: returned.resources,
+      artifacts: returned.artifacts,
       resultRef: returned.resultRef,
       historyRef: returned.historyRef,
     };

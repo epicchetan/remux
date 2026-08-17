@@ -343,9 +343,7 @@ export class EphemeralTranscriptProjector {
 
   startWorkUnit(turnId: string, input: {
     scopeId: string;
-    objective: string;
-    doneWhen: string[];
-    resourceCount: number;
+    boundary: string;
     operationCount?: number;
     sequence?: number;
     basisSequence?: number;
@@ -395,7 +393,7 @@ export class EphemeralTranscriptProjector {
     scopeId: string;
     status: 'completed' | 'partial' | 'blocked' | 'abandoned';
     resultPreview: string | null;
-    resourceCount: number;
+    artifactCount: number;
     durationMs?: number;
     sequence?: number;
     basisSequence?: number;

@@ -63,6 +63,7 @@ try {
       operationId: randomUUID(),
       conversationId: conversation.conversationId,
       clientMessageId: randomUUID(),
+      contextPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
       text,
     });
     turnIds.push(turn.turnId);
@@ -131,6 +132,7 @@ try {
         operationId: randomUUID(),
         conversationId: conversation.conversationId,
         clientMessageId: randomUUID(),
+        contextPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
         text: 'Recover this unfinished turn as interrupted by restart.',
         });
       await repository.appendAssistantCheckpoint(restartTurn, {
@@ -154,6 +156,7 @@ try {
     operationId: randomUUID(),
     conversationId: conversation.conversationId,
     clientMessageId: randomUUID(),
+    contextPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
     text: 'Keep one streaming tail turn active for the corpus.',
   });
 

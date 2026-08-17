@@ -114,9 +114,7 @@ export function replayTranscriptActions(
       case 'work-unit-start':
         projector.startWorkUnit(action.turnId, {
           scopeId: action.scopeId,
-          objective: action.objective,
-          doneWhen: action.doneWhen,
-          resourceCount: action.resourceCount,
+          boundary: action.boundary,
           operationCount: action.operationCount,
           ...projectionMutation(action),
         });
@@ -126,7 +124,7 @@ export function replayTranscriptActions(
           scopeId: action.scopeId,
           status: action.status,
           resultPreview: action.resultPreview,
-          resourceCount: action.resourceCount,
+          artifactCount: action.artifactCount,
           ...(action.durationMs === undefined ? {} : { durationMs: action.durationMs }),
           ...projectionMutation(action),
         });

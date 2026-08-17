@@ -3,6 +3,7 @@ import { realpath, stat } from 'node:fs/promises';
 
 import {
   AGENT_RESOURCE_KEYS,
+  DEFAULT_TURN_CONTEXT_DIALOGUE_TURNS,
   conversationResourceKey,
   queueResourceKey,
   type AgentCommandErrorData,
@@ -271,19 +272,25 @@ export class ConversationController {
       cwd: source.cwd,
       modelId: source.modelId,
       reasoning: source.reasoning,
-      inheritThreadFrom: {
-        conversationId: params.sourceConversationId,
-        turnId: params.sourceTurnId,
-        position: mode === 'edit' ? 'before' : 'after',
-      },
     });
-    await this.cloneTranscriptPrefix(branch.conversationId, prefix, params.operationId);
+    const clonedTurnIds = await this.cloneTranscriptPrefix(
+      branch.conversationId,
+      prefix,
+      params.operationId,
+    );
     this.resources.invalidateKey(AGENT_RESOURCE_KEYS.conversationList, 'created');
     this.resources.invalidateKey(conversationResourceKey(branch.conversationId), 'created');
     const sent = await this.sendMessage({
       operationId: derivedUuid(params.operationId, 'branch-message'),
       conversationId: branch.conversationId,
       clientMessageId: params.clientMessageId,
+      contextPlan: {
+        ...params.contextPlan,
+        overrides: params.contextPlan.overrides.flatMap((override) => {
+          const clonedTurnId = clonedTurnIds.get(override.turnId);
+          return clonedTurnId ? [{ ...override, turnId: clonedTurnId }] : [];
+        }),
+      },
       text: params.text,
       ...(params.parts ? { parts: params.parts } : {}),
     });
@@ -335,6 +342,7 @@ export class ConversationController {
     actions: readonly DurableTranscriptProjectionAction[],
     branchOperationId: string,
   ) {
+    const clonedTurnIds = new Map<string, string>();
     const turns = groupedTranscriptActions(actions);
     for (const turn of turns) {
       const user = turn.find((action) => action.type === 'turn');
@@ -344,9 +352,15 @@ export class ConversationController {
         operationId: derivedUuid(branchOperationId, `clone-operation:${user.turnId}`),
         conversationId,
         clientMessageId: derivedUuid(branchOperationId, `clone-message:${user.turnId}`),
+        contextPlan: {
+          version: 1,
+          automaticDialogueTurns: DEFAULT_TURN_CONTEXT_DIALOGUE_TURNS,
+          overrides: [],
+        },
         text: user.text,
         ...(parts ? { parts } : {}),
       });
+      clonedTurnIds.set(user.turnId, handle.turnId);
       const existing = (await this.store.readTranscriptActions(conversationId))
         .filter((action) => action.turnId === handle.turnId);
       if (existing.some((action) => action.type === 'terminal')) continue;
@@ -394,6 +408,7 @@ export class ConversationController {
         durationMs: terminal.durationMs,
       });
     }
+    return clonedTurnIds;
   }
 
   private async hydrateBranchParts(parts: NonNullable<DurableTranscriptAction & { type: 'turn' }>['parts']) {

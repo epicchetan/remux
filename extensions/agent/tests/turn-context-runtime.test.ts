@@ -13,13 +13,14 @@ import type { ModelProvider, ModelSession } from '../server/src/model-provider.t
 import { AgentStateStore } from '../server/src/storage/agent-state-store.ts';
 import type { DurableTurnHandle } from '../server/src/domain/state.ts';
 import type { WorkUnitEnterInput } from '../server/src/domain/work.ts';
+import type { TurnContextPlan } from '../shared/protocol.ts';
 import { AGENT_STATE_TABLES } from '../server/src/storage/schema.ts';
 import {
   AGENT_TRANSCRIPT_PROJECTION_VERSION,
   AGENT_TRANSCRIPT_PROTOCOL_VERSION,
 } from '../shared/transcript.ts';
 
-test('Agent state v4 owns one clean schema and compiles the accepted user turn', async (t) => {
+test('Agent state v6 owns one clean schema and compiles the accepted user turn', async (t) => {
   const fixture = await repositoryFixture(t);
   const [emptyHistory] = await fixture.repository.readResourceProjections(['conversation-list']);
   assert.equal(emptyHistory?.basisSequence, 0);
@@ -30,18 +31,14 @@ test('Agent state v4 owns one clean schema and compiles the accepted user turn',
     modelId: 'gpt-5.6-codex',
     reasoning: 'high',
   });
-  const thread = await fixture.repository.readThread(conversation.conversationId);
-  assert.equal(thread.content, '# Thread\n');
   const turn = await accept(fixture.repository, conversation.conversationId, 'Build the compiler.');
   const context = await fixture.repository.compileContext(conversation.conversationId);
   assert.deepEqual(context.messages.map(({ role }) => role), ['user']);
   assert.equal(context.messages[0]?.turnId, turn.turnId);
-  assert.equal(context.frame.threadVersionId, conversation.threadVersionId);
   assert.deepEqual(context.frame.selectedTurnIds, [turn.turnId]);
-  assert.match(context.frame.contextEnvelope, /<thread version=/u);
-  assert.match(context.frame.contextEnvelope, /<history>/u);
-  assert.match(context.frame.contextEnvelope, /history_search and history_read/u);
-  assert.doesNotMatch(context.frame.contextEnvelope, /thread\.md|journal|cold_history|cold history/iu);
+  assert.deepEqual(context.frame.requestedPlan, {
+    version: 1, automaticDialogueTurns: 2, overrides: [],
+  });
 
   const database = new DatabaseSync(fixture.repository.databasePath);
   t.after(() => database.close());
@@ -136,10 +133,39 @@ test('actual frames, exact provider reasoning, restart recovery, and next-turn e
     assert.equal(priorAssistant.providerMessage, undefined);
     assert.deepEqual(priorAssistant.toolCalls, []);
   }
-  assert.deepEqual(next.frame.dialogueTurnIds, [turn.turnId]);
+  assert.deepEqual(next.frame.resolvedTurns, [{
+    turnId: turn.turnId, resolution: 'dialogue', origin: 'automatic',
+  }]);
   assert.ok(next.messages.every((message) =>
     message.turnId !== turn.turnId || message.role !== 'tool'));
-  await fixture.repository.finishTurn(followup, { status: 'interrupted' });
+  await fixture.repository.appendAssistantCheckpoint(followup, {
+    textDelta: 'The implementation changed.', reasoningDelta: '',
+  });
+  await fixture.repository.finishTurn(followup, { status: 'completed' });
+
+  const fullTurn = await accept(
+    fixture.repository,
+    conversation.conversationId,
+    'Revisit the original reasoning.',
+    {
+      version: 1,
+      automaticDialogueTurns: 0,
+      overrides: [{ turnId: turn.turnId, resolution: 'full' as const }],
+    },
+  );
+  const full = await fixture.repository.compileContext(conversation.conversationId);
+  assert.deepEqual(full.frame.resolvedTurns, [{
+    turnId: turn.turnId, resolution: 'full', origin: 'explicit',
+  }]);
+  const fullAssistant = full.messages.find((message) =>
+    message.turnId === turn.turnId && message.role === 'assistant' && message.providerMessage);
+  assert.equal(fullAssistant?.role, 'assistant');
+  if (fullAssistant?.role === 'assistant') {
+    const thinking = fullAssistant.providerMessage?.content.find(({ type }) => type === 'thinking');
+    assert.equal(thinking?.type, 'thinking');
+    if (thinking?.type === 'thinking') assert.equal(thinking.thinkingSignature, 'opaque-provider-state');
+  }
+  await fixture.repository.finishTurn(fullTurn, { status: 'interrupted' });
   assert.ok(provider.providerItemId);
 });
 
@@ -296,101 +322,6 @@ test('provider commentary stays in its inference while only the final answer rea
   assert.equal(scope?.inferences[1]?.commentary, null);
 });
 
-test('thread.md patches and replacements are CAS-versioned with exact fork inheritance', async (t) => {
-  const fixture = await repositoryFixture(t);
-  const source = await fixture.repository.createConversation({
-    operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'model', reasoning: 'high',
-  });
-  const turn = await accept(fixture.repository, source.conversationId, 'Choose the design.');
-  const initialized = await fixture.repository.replaceThread(turn, {
-    baseVersionId: source.threadVersionId,
-    content: '# Thread\n\n## Design space\n\nCandidate: exact dialogue.\n\n## Current edge\n\nChoose the state model.\n',
-  });
-  const updated = await fixture.repository.patchThread(turn, {
-    baseVersionId: initialized.versionId,
-    edits: [
-      {
-        oldText: 'Candidate: exact dialogue.',
-        newText: 'Accepted: exact dialogue with a living semantic canvas.',
-      },
-      {
-        oldText: 'Choose the state model.',
-        newText: 'Implement the accepted state model.',
-      },
-    ],
-  });
-  await assert.rejects(
-    fixture.repository.replaceThread(turn, {
-      baseVersionId: source.threadVersionId,
-      content: '# Thread\n\nStale overwrite.\n',
-    }),
-    /changed from/u,
-  );
-  const history = await fixture.repository.readThreadHistory(source.conversationId);
-  assert.equal(history.current.versionId, updated.versionId);
-  assert.equal(history.current.content, updated.content);
-  assert.equal(history.previous?.versionId, initialized.versionId);
-  assert.equal(history.previous?.content, initialized.content);
-  await fixture.repository.appendAssistantCheckpoint(turn, { textDelta: 'Accepted.', reasoningDelta: '' });
-  await fixture.repository.finishTurn(turn, { status: 'completed' });
-
-  const edited = await fixture.repository.createConversation({
-    operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'model', reasoning: 'high',
-    inheritThreadFrom: { conversationId: source.conversationId, turnId: turn.turnId, position: 'before' },
-  });
-  const forked = await fixture.repository.createConversation({
-    operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'model', reasoning: 'high',
-    inheritThreadFrom: { conversationId: source.conversationId, turnId: turn.turnId, position: 'after' },
-  });
-  assert.equal((await fixture.repository.readThread(edited.conversationId)).content, '# Thread\n');
-  assert.equal((await fixture.repository.readThread(forked.conversationId)).content, updated.content);
-});
-
-test('thread.md patches reject missing, ambiguous, empty, and partially applicable edits atomically', async (t) => {
-  const fixture = await repositoryFixture(t);
-  const conversation = await fixture.repository.createConversation({
-    operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'model', reasoning: 'high',
-  });
-  const turn = await accept(fixture.repository, conversation.conversationId, 'Maintain the canvas.');
-  const initialized = await fixture.repository.replaceThread(turn, {
-    baseVersionId: conversation.threadVersionId,
-    content: '# Canvas\n\nCandidate\n\nCandidate\n\n## Edge\n\nExplore.\n',
-  });
-  await assert.rejects(
-    fixture.repository.patchThread(turn, {
-      baseVersionId: initialized.versionId,
-      edits: [{ oldText: 'Candidate', newText: 'Accepted' }],
-    }),
-    /ambiguous/u,
-  );
-  await assert.rejects(
-    fixture.repository.patchThread(turn, {
-      baseVersionId: initialized.versionId,
-      edits: [{ oldText: 'Missing', newText: 'Accepted' }],
-    }),
-    /did not match/u,
-  );
-  await assert.rejects(
-    fixture.repository.patchThread(turn, {
-      baseVersionId: initialized.versionId,
-      edits: [{ oldText: '', newText: 'Accepted' }],
-    }),
-    /non-empty/u,
-  );
-  await assert.rejects(
-    fixture.repository.patchThread(turn, {
-      baseVersionId: initialized.versionId,
-      edits: [
-        { oldText: 'Explore.', newText: 'Implement.' },
-        { oldText: 'Missing after first edit', newText: 'No partial write.' },
-      ],
-    }),
-    /did not match/u,
-  );
-  assert.equal((await fixture.repository.readThread(conversation.conversationId)).content, initialized.content);
-  await fixture.repository.finishTurn(turn, { status: 'interrupted' });
-});
-
 test('bounded work units branch behind a pending tool call and fold back only their result', async (t) => {
   const fixture = await repositoryFixture(t);
   const conversation = await fixture.repository.createConversation({
@@ -407,21 +338,20 @@ test('bounded work units branch behind a pending tool call and fold back only th
     providerMessage: assistantMessage({
     content: [
       { type: 'thinking', thinking: 'parent reasoning', thinkingSignature: 'parent-signature' },
-      { type: 'toolCall', id: 'call:enter', name: 'work_unit_start', arguments: { objective: 'Inspect one seam.' } },
+      { type: 'toolCall', id: 'call:enter', name: 'work_unit_start', arguments: {
+        boundary: 'Inspect the seam and close when its exact contract is verified.',
+      } },
     ],
     stopReason: 'toolUse',
     }),
     calls: [{
-      callId: 'call:enter', name: 'work_unit_start', args: { objective: 'Inspect one seam.' },
+      callId: 'call:enter', name: 'work_unit_start', args: {
+        boundary: 'Inspect the seam and close when its exact contract is verified.',
+      },
     }],
   });
   const preparedEntry = await fixture.repository.prepareWorkUnitEntry(root, {
-    objective: 'Inspect one seam.',
-    doneWhen: ['The seam is verified against its exact contract.'],
-    resources: [
-      { ref: 'docs/seam-contract.md', role: 'authority', description: 'Exact seam contract.' },
-      { ref: `history://turn/${root.turnId}`, role: 'evidence', description: 'Current request.' },
-    ],
+    boundary: 'Inspect the seam and close when its exact contract is verified.',
   });
   const parentCall = rootFinalization.calls[0]!;
   const entered = await fixture.repository.commitWorkUnitEntry(root, preparedEntry, {
@@ -436,13 +366,12 @@ test('bounded work units branch behind a pending tool call and fold back only th
   assert.equal(childContext.messages.filter(({ role }) => role === 'user').length, 1);
   assert.ok(childContext.messages.some((message) =>
     message.role === 'assistant' && message.toolCalls.some((call) =>
-      call.name === 'work_unit_start' && JSON.stringify(call.args).includes('Inspect one seam.'))));
+      call.name === 'work_unit_start' && JSON.stringify(call.args).includes('Inspect the seam'))));
   const bootstrap = childContext.messages.find((message) =>
     message.role === 'tool' && message.callId === 'call:enter');
   assert.equal(bootstrap?.role, 'tool');
-  assert.match(JSON.stringify(bootstrap), /history:\/\/turn\//u);
-  assert.match(JSON.stringify(bootstrap), /docs\/seam-contract\.md/u);
-  assert.match(JSON.stringify(bootstrap), /The seam must be sound\./u);
+  assert.match(JSON.stringify(bootstrap), /"state":"work_unit"/u);
+  assert.doesNotMatch(JSON.stringify(bootstrap), /docs\/seam-contract\.md|The seam must be sound\./u);
   assert.ok(childContext.messages.some((message) =>
     message.role === 'user' && message.text.includes('Solve the parent task.')));
   assert.doesNotMatch(
@@ -455,21 +384,6 @@ test('bounded work units branch behind a pending tool call and fold back only th
     const thinking = inherited.providerMessage?.content.find(({ type }) => type === 'thinking');
     assert.equal(thinking?.type === 'thinking' ? thinking.thinkingSignature : null, 'parent-signature');
   }
-  await assert.rejects(
-    fixture.repository.patchThread(entered.handle, {
-      baseVersionId: conversation.threadVersionId,
-      edits: [{ oldText: '# Thread', newText: '# Child mutation' }],
-    }),
-    /parent-owned/u,
-  );
-  await assert.rejects(
-    fixture.repository.replaceThread(entered.handle, {
-      baseVersionId: conversation.threadVersionId,
-      content: '# Child mutation\n',
-    }),
-    /parent-owned/u,
-  );
-
   await startInference(fixture.repository, entered.handle, childContext);
   assert.notEqual(await fixture.repository.appendAssistantCheckpoint(entered.handle, {
     textDelta: '', reasoningDelta: 'CHILD_PRIVATE_REASONING',
@@ -497,30 +411,38 @@ test('bounded work units branch behind a pending tool call and fold back only th
         type: 'toolCall',
         id: 'call:return-invalid',
         name: 'work_unit_finish',
-        arguments: { result: 'This references a missing resource.' },
+        arguments: {
+          status: 'completed',
+          result: 'This references a missing artifact.',
+          artifacts: ['missing-artifact.txt'],
+        },
       }],
       stopReason: 'toolUse',
     }),
     calls: [{
       callId: 'call:return-invalid',
       name: 'work_unit_finish',
-      args: { result: 'This references a missing resource.' },
+      args: {
+        status: 'completed',
+        result: 'This references a missing artifact.',
+        artifacts: ['missing-artifact.txt'],
+      },
     }],
   });
   await assert.rejects(
     fixture.repository.prepareWorkUnitReturn(entered.handle, {
       status: 'completed',
       result: 'This invalid boundary must remain correctable.',
-      resources: [{ ref: 'missing-resource.txt', role: 'evidence' }],
+      artifacts: ['missing-artifact.txt'],
     }),
-    /missing-resource\.txt|ENOENT/u,
+    /missing-artifact\.txt|ENOENT/u,
   );
   await assert.rejects(
     fixture.repository.compileContext(conversation.conversationId),
     /work_unit_finish is still running/u,
   );
   await fixture.repository.recordToolFinished(entered.handle, {
-    callId: 'call:return-invalid', result: { error: 'missing-resource.txt was not found' }, isError: true,
+    callId: 'call:return-invalid', result: { error: 'missing-artifact.txt was not found' }, isError: true,
   });
   assert.equal(
     (await fixture.repository.compileContext(conversation.conversationId)).scopeId,
@@ -535,21 +457,26 @@ test('bounded work units branch behind a pending tool call and fold back only th
         type: 'toolCall',
         id: 'call:return',
         name: 'work_unit_finish',
-        arguments: { result: 'The seam is sound.' },
+        arguments: {
+          status: 'completed',
+          result: 'The seam is sound.',
+          artifacts: ['docs/seam-contract.md', 'src/seam.ts'],
+        },
       }],
       stopReason: 'toolUse',
     }),
     calls: [{
-      callId: 'call:return', name: 'work_unit_finish', args: { result: 'The seam is sound.' },
+      callId: 'call:return', name: 'work_unit_finish', args: {
+        status: 'completed',
+        result: 'The seam is sound.',
+        artifacts: ['docs/seam-contract.md', 'src/seam.ts'],
+      },
     }],
   });
   const preparedReturn = await fixture.repository.prepareWorkUnitReturn(entered.handle, {
     status: 'completed',
     result: 'The seam is sound.',
-    resources: [
-      { ref: 'docs/seam-contract.md', role: 'authority', description: 'Exact seam contract.' },
-      { ref: 'src/seam.ts', role: 'deliverable', description: 'Verified implementation.' },
-    ],
+    artifacts: ['docs/seam-contract.md', 'src/seam.ts'],
   });
   const returned = await fixture.repository.commitWorkUnitFinish(
     entered.handle,
@@ -558,9 +485,9 @@ test('bounded work units branch behind a pending tool call and fold back only th
   );
   assert.equal(returned.status, 'completed');
   assert.equal(returned.parentHandle.scopeId, root.scopeId);
-  assert.equal(returned.resources[1]?.ref, 'src/seam.ts');
-  assert.equal(returned.resources[1]?.inclusion, 'materialized');
-  assert.equal(returned.resources[1]?.content, 'export const seam = "sound";\n');
+  assert.equal(returned.artifacts[1]?.ref, 'src/seam.ts');
+  assert.equal(returned.artifacts[1]?.snapshot.source, 'file');
+  assert.equal(returned.artifacts[1]?.snapshot.byteLength, 29);
   const database = new DatabaseSync(fixture.repository.databasePath, { readOnly: true });
   const finishOperation = database.prepare(`
     SELECT state, terminal_sequence FROM operations WHERE scope_id = ? AND call_id = ?
@@ -578,7 +505,7 @@ test('bounded work units branch behind a pending tool call and fold back only th
       scopeId: returned.scopeId,
       status: returned.status,
       result: returned.result,
-      resources: returned.resources,
+      artifacts: returned.artifacts,
       resultRef: returned.resultRef,
       historyRef: returned.historyRef,
     },
@@ -595,10 +522,13 @@ test('bounded work units branch behind a pending tool call and fold back only th
   );
   const linkedCall = rootTrace?.inferences[0]?.actionGroup?.calls[0];
   assert.equal(linkedCall?.childScopeId, entered.handle.scopeId);
-  assert.equal(linkedCall?.childObjective, 'Inspect one seam.');
+  assert.equal(
+    linkedCall?.childBoundary,
+    'Inspect the seam and close when its exact contract is verified.',
+  );
   assert.equal(linkedCall?.childState, 'completed');
   assert.ok((linkedCall?.childOperationCount ?? 0) >= 1);
-  assert.equal(linkedCall?.childReturnedResourceCount, 2);
+  assert.equal(linkedCall?.childArtifactCount, 2);
   const childTrace = await fixture.repository.readExecutionScopeTranscriptResource(
     conversation.conversationId,
     {
@@ -611,7 +541,7 @@ test('bounded work units branch behind a pending tool call and fold back only th
   assert.equal(childTrace?.parentOperationId, parentCall.operationId);
   assert.equal(childTrace?.state, 'completed');
   assert.match(childTrace?.result ?? '', /The seam is sound/u);
-  assert.ok(childTrace?.returnedResources.some((resource) => resource.ref === 'src/seam.ts'));
+  assert.ok(childTrace?.artifacts.some((artifact) => artifact.ref === 'src/seam.ts'));
   assert.equal(childTrace?.inferences[0]?.reasoning?.text, 'CHILD_PRIVATE_REASONING');
   assert.equal(childTrace?.inferences[0]?.actionGroup?.calls[0]?.name, 'bash');
   const projection = await fixture.repository.readTranscriptWindowProjection({
@@ -629,7 +559,7 @@ test('bounded work units branch behind a pending tool call and fold back only th
     action.type === 'work-unit-finish' && action.scopeId === entered.handle.scopeId));
   const deliverableSnapshot = await fixture.repository.openHistory(
     conversation.conversationId,
-    { ref: returned.resources[1]!.snapshot.ref },
+    { ref: returned.artifacts[1]!.snapshot.ref },
   );
   assert.equal(deliverableSnapshot.content, 'export const seam = "sound";\n');
 
@@ -640,6 +570,7 @@ test('bounded work units branch behind a pending tool call and fold back only th
   assert.match(resumedText, /The seam is sound/u);
   assert.match(resumedText, /docs\/seam-contract\.md|src\/seam\.ts/u);
   assert.match(resumedText, /history:\/\/scope/u);
+  assert.doesNotMatch(resumedText, /The seam must be sound|export const seam/u);
   assert.doesNotMatch(resumedText, /CHILD_PRIVATE_REASONING|CHILD_TOOL_RESULT|child-signature/u);
   const resumedAssistant = resumed.messages.find((message) => message.role === 'assistant');
   assert.equal(resumedAssistant?.role, 'assistant');
@@ -648,44 +579,22 @@ test('bounded work units branch behind a pending tool call and fold back only th
     assert.equal(thinking?.type === 'thinking' ? thinking.thinkingSignature : null, 'parent-signature');
   }
 
-  const inheritedUnit = await enterWorkUnit(fixture.repository, root, {
-    objective: 'Use the already-returned seam implementation.',
-    resources: [{ ref: 'src/seam.ts', role: 'authority' }],
-  });
-  assert.equal(inheritedUnit.resources[0]?.inclusion, 'inherited');
-  const inheritedContext = await fixture.repository.compileContext(conversation.conversationId);
-  const inheritedBootstrap = inheritedContext.messages.at(-1);
-  assert.equal(inheritedBootstrap?.role, 'tool');
-  if (inheritedBootstrap?.role === 'tool') {
-    assert.match(JSON.stringify(inheritedBootstrap.result), /"inclusion":"inherited"/u);
-    assert.doesNotMatch(JSON.stringify(inheritedBootstrap.result), /export const seam = "sound"/u);
-  }
-  const inheritedReturn = await fixture.repository.returnWorkUnit(inheritedUnit.handle, {
-    status: 'completed',
-    result: 'The inherited snapshot was sufficient.',
-  });
-  await fixture.repository.recordToolFinished(root, {
-    callId: inheritedUnit.parentCallId, result: workUnitCompletion(inheritedReturn), isError: false,
-  });
-
   await writeFile(join(fixture.cwd, 'src/seam.ts'), 'export const seam = "revised";\n');
   const revisedUnit = await enterWorkUnit(fixture.repository, root, {
-    objective: 'Inspect the revised seam implementation.',
-    resources: [{ ref: 'src/seam.ts', role: 'deliverable' }],
+    boundary: 'Inspect the revised seam implementation and report the durable result.',
   });
-  assert.equal(revisedUnit.resources[0]?.inclusion, 'materialized');
-  assert.notEqual(revisedUnit.resources[0]?.snapshot.hash, returned.resources[1]?.snapshot.hash);
   const revisedContext = await fixture.repository.compileContext(conversation.conversationId);
   const revisedBootstrap = revisedContext.messages.at(-1);
   assert.equal(revisedBootstrap?.role, 'tool');
   if (revisedBootstrap?.role === 'tool') {
-    const result = revisedBootstrap.result as { resources?: Array<{ content?: string }> };
-    assert.equal(result.resources?.[0]?.content, 'export const seam = "revised";\n');
+    assert.doesNotMatch(JSON.stringify(revisedBootstrap.result), /export const seam/u);
   }
   const revisedReturn = await fixture.repository.returnWorkUnit(revisedUnit.handle, {
     status: 'completed',
     result: 'The revised snapshot was inspected.',
+    artifacts: ['src/seam.ts'],
   });
+  assert.notEqual(revisedReturn.artifacts[0]?.snapshot.hash, returned.artifacts[1]?.snapshot.hash);
   await fixture.repository.recordToolFinished(root, {
     callId: revisedUnit.parentCallId, result: workUnitCompletion(revisedReturn), isError: false,
   });
@@ -708,12 +617,8 @@ test('bounded work units branch behind a pending tool call and fold back only th
     assert.fail('The work-unit return event is missing its object payload.');
   }
   assert.deepEqual(
-    (returnedPayload.resources as Array<{ ref: string; role: string }> | undefined)
-      ?.map(({ ref, role }) => ({ ref, role })),
-    [
-      { ref: 'docs/seam-contract.md', role: 'authority' },
-      { ref: 'src/seam.ts', role: 'deliverable' },
-    ],
+    (returnedPayload.artifacts as Array<{ ref: string }> | undefined)?.map(({ ref }) => ref),
+    ['docs/seam-contract.md', 'src/seam.ts'],
   );
   const resultSearch = await fixture.repository.searchHistory(conversation.conversationId, {
     query: 'seam sound', scope: 'conversation',
@@ -722,8 +627,7 @@ test('bounded work units branch behind a pending tool call and fold back only th
   assert.ok(result);
   const opened = await fixture.repository.openHistory(conversation.conversationId, { ref: result!.ref });
   assert.match(opened.content, /The seam is sound/u);
-  assert.doesNotMatch(opened.content, /Proposed Thread update/u);
-  assert.equal((await fixture.repository.readThread(conversation.conversationId)).content, '# Thread\n');
+  assert.doesNotMatch(opened.content, /CHILD_PRIVATE_REASONING/u);
 });
 
 test('work-unit handoffs may use the available parent context beyond the former static limit', async (t) => {
@@ -733,8 +637,7 @@ test('work-unit handoffs may use the available parent context beyond the former 
   });
   const root = await accept(fixture.repository, conversation.conversationId, 'Audit the architecture.');
   const entered = await enterWorkUnit(fixture.repository, root, {
-    objective: 'Return a repository-grounded architecture audit.',
-    resources: [{ ref: 'docs/architecture.md', role: 'authority' }],
+    boundary: 'Return a repository-grounded architecture audit with a clear conclusion.',
   });
   const result = `## Audit result\n\n${'Detailed repository-grounded finding.\n'.repeat(520)}RESULT_END`;
   assert.ok(Buffer.byteLength(result, 'utf8') > 16 * 1024);
@@ -742,7 +645,7 @@ test('work-unit handoffs may use the available parent context beyond the former 
   const returned = await fixture.repository.returnWorkUnit(entered.handle, {
     status: 'partial',
     result,
-    resources: [{ ref: 'docs/architecture.md', role: 'authority' }],
+    artifacts: ['docs/architecture.md'],
   });
   assert.equal(returned.result, result);
   assert.equal(returned.parentHandle.scopeId, root.scopeId);
@@ -757,34 +660,34 @@ test('work-unit handoffs may use the available parent context beyond the former 
   await fixture.repository.finishTurn(root, { status: 'interrupted' });
 });
 
-test('work-unit directory resources are correctable before the durable entry commit', async (t) => {
+test('work-unit directory artifacts are correctable before the durable finish commit', async (t) => {
   const fixture = await repositoryFixture(t);
   const conversation = await fixture.repository.createConversation({
     operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'model', reasoning: 'high',
   });
   const root = await accept(fixture.repository, conversation.conversationId, 'Implement the seam.');
 
+  const entered = await enterWorkUnit(fixture.repository, root, {
+    boundary: 'Implement the seam file and preserve it as an artifact.',
+  });
   await assert.rejects(
-    fixture.repository.prepareWorkUnitEntry(root, {
-      objective: 'Implement the source tree.',
-      resources: [{ ref: 'src', role: 'deliverable' }],
+    fixture.repository.prepareWorkUnitReturn(entered.handle, {
+      status: 'completed',
+      result: 'The source tree is complete.',
+      artifacts: ['src'],
     }),
     /must be a UTF-8 text file; directories are not supported/u,
   );
   const eventsBeforeRetry = await fixture.repository.readEvents({
     conversationId: conversation.conversationId,
   });
-  assert.ok(eventsBeforeRetry.every(({ type }) => type !== 'work_unit.entered'));
-
-  const entered = await enterWorkUnit(fixture.repository, root, {
-    objective: 'Implement the seam file.',
-    resources: [{ ref: 'src/seam.ts', role: 'deliverable' }],
-  });
-  assert.equal(entered.resources[0]?.snapshot.source, 'file');
+  assert.ok(eventsBeforeRetry.every(({ type }) => type !== 'work_unit.returned'));
   const returned = await fixture.repository.returnWorkUnit(entered.handle, {
     status: 'completed',
-    result: 'The corrected file resource was accepted.',
+    result: 'The corrected file artifact was accepted.',
+    artifacts: ['src/seam.ts'],
   });
+  assert.equal(returned.artifacts[0]?.snapshot.source, 'file');
   await fixture.repository.recordToolFinished(root, {
     callId: entered.parentCallId, result: workUnitCompletion(returned), isError: false,
   });
@@ -798,7 +701,7 @@ test('turn failure abandons an unreturned work unit with its own terminal event'
   });
   const root = await accept(fixture.repository, conversation.conversationId, 'Run bounded work.');
   const entered = await enterWorkUnit(fixture.repository, root, {
-    objective: 'Exercise abnormal child cleanup.', resources: [],
+    boundary: 'Exercise abnormal work-unit cleanup and stop before returning.',
   });
   const childContext = await fixture.repository.compileContext(conversation.conversationId);
   await startInference(fixture.repository, entered.handle, childContext);
@@ -822,7 +725,7 @@ test('turn failure abandons an unreturned work unit with its own terminal event'
   assert.equal(await fixture.repository.resumeActiveTurn(conversation.conversationId), null);
 });
 
-test('History retrieval exposes Thread documents and exact visible outcomes but not private provider artifacts', async (t) => {
+test('History retrieval exposes exact visible outcomes but not private provider artifacts', async (t) => {
   const fixture = await repositoryFixture(t);
   const conversation = await fixture.repository.createConversation({
     operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'model', reasoning: 'high',
@@ -831,15 +734,10 @@ test('History retrieval exposes Thread documents and exact visible outcomes but 
   await fixture.repository.appendAssistantCheckpoint(turn, {
     textDelta: 'Cobalt behavior is retained in exact history.', reasoningDelta: '',
   });
-  await fixture.repository.replaceThread(turn, {
-    baseVersionId: conversation.threadVersionId,
-    content: '# Thread\n\nConstraint: preserve cobalt behavior.\n',
-  });
   await fixture.repository.finishTurn(turn, { status: 'completed' });
   const search = await fixture.repository.searchHistory(conversation.conversationId, {
     query: 'cobalt', scope: 'conversation',
   });
-  assert.ok(search.hits.some(({ kind }) => kind === 'thread-document'));
   const outcome = search.hits.find(({ kind }) => kind === 'assistant-outcome');
   assert.ok(outcome);
   const opened = await fixture.repository.openHistory(conversation.conversationId, { ref: outcome!.ref });
@@ -848,7 +746,7 @@ test('History retrieval exposes Thread documents and exact visible outcomes but 
   const safelyTokenized = await fixture.repository.searchHistory(conversation.conversationId, {
     query: 'cobalt (behavior):', scope: 'conversation',
   });
-  assert.ok(safelyTokenized.hits.length >= 2);
+  assert.ok(safelyTokenized.hits.length >= 1);
   assert.deepEqual(
     safelyTokenized.hits.map(({ ref, kind }) => ({ ref, kind })),
     (await fixture.repository.searchHistory(conversation.conversationId, {
@@ -861,7 +759,6 @@ test('History retrieval exposes Thread documents and exact visible outcomes but 
   const rebuilt = await fixture.repository.searchHistory(conversation.conversationId, {
     query: 'cobalt behavior', scope: 'conversation',
   });
-  assert.ok(rebuilt.hits.some(({ kind }) => kind === 'thread-document'));
   assert.ok(rebuilt.hits.some(({ kind }) => kind === 'assistant-outcome'));
 });
 
@@ -891,48 +788,6 @@ test('History retrieval can exclude the active search without hiding prior opera
   });
   assert.ok(search.hits.some(({ ref }) => ref === 'history://tool/prior-validation'));
   assert.ok(search.hits.every(({ ref }) => ref !== 'history://tool/active-search'));
-  await fixture.repository.finishTurn(turn, { status: 'interrupted' });
-});
-
-test('context pressure is durable, scope-specific, and emitted at most once across restart', async (t) => {
-  const fixture = await repositoryFixture(t);
-  const conversation = await fixture.repository.createConversation({
-    operationId: crypto.randomUUID(), cwd: fixture.cwd, modelId: 'model', reasoning: 'high',
-  });
-  const turn = await accept(
-    fixture.repository,
-    conversation.conversationId,
-    `Perform a coherent task with enough active text to cross a test boundary. ${'pressure '.repeat(80)}`,
-  );
-  const before = await fixture.repository.compileContext(conversation.conversationId, 120);
-  assert.equal(before.frame.pressureNoticed, false);
-  assert.ok(before.frame.estimatedInputTokens >= before.frame.softContextLimit);
-  assert.equal(await fixture.repository.recordContextPressure(turn, {
-    estimatedInputTokens: before.frame.estimatedInputTokens,
-    softContextLimit: before.frame.softContextLimit,
-    hardContextLimit: before.frame.hardContextLimit,
-  }), true);
-  assert.equal(await fixture.repository.recordContextPressure(turn, {
-    estimatedInputTokens: before.frame.estimatedInputTokens + 1,
-    softContextLimit: before.frame.softContextLimit,
-    hardContextLimit: before.frame.hardContextLimit,
-  }), false);
-  const noticed = await fixture.repository.compileContext(conversation.conversationId, 120);
-  assert.equal(noticed.frame.pressureNoticed, true);
-  assert.ok(noticed.messages.some((message) =>
-    message.role === 'user' && message.text.includes('Context pressure notice')));
-
-  await fixture.repository.close();
-  fixture.repository = await AgentStateStore.open({ dataRoot: fixture.dataRoot });
-  const recovery = await fixture.repository.resumeActiveTurn(conversation.conversationId);
-  assert.equal(recovery?.handle.turnId, turn.turnId);
-  assert.equal(await fixture.repository.recordContextPressure(turn, {
-    estimatedInputTokens: noticed.frame.estimatedInputTokens,
-    softContextLimit: noticed.frame.softContextLimit,
-    hardContextLimit: noticed.frame.hardContextLimit,
-  }), false);
-  const events = await fixture.repository.readEvents({ conversationId: conversation.conversationId });
-  assert.equal(events.filter(({ type }) => type === 'context.pressure').length, 1);
   await fixture.repository.finishTurn(turn, { status: 'interrupted' });
 });
 
@@ -1033,7 +888,7 @@ test('a provider attempt with a durable tool effect cannot be superseded', async
   await fixture.repository.finishTurn(turn, { status: 'failed', error: 'Transport failed.' });
 });
 
-test('the public fixture runtime commits a v5 frame and completes through normal server hooks', async (t) => {
+test('the public fixture runtime commits a v6 frame and completes through normal server hooks', async (t) => {
   const fixture = await repositoryFixture(t);
   const server = new AgentServer({
     provider: new FixtureProvider(),
@@ -1052,6 +907,7 @@ test('the public fixture runtime commits a v5 frame and completes through normal
     operationId: crypto.randomUUID(),
     conversationId: created.conversationId,
     clientMessageId: crypto.randomUUID(),
+    contextPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
     text: 'Exercise the public path.',
   }) as { turnId: string };
   await eventually(async () => {
@@ -1064,15 +920,9 @@ test('the public fixture runtime commits a v5 frame and completes through normal
     `context:${created.conversationId}`,
   ]);
   const inspector = projections[0]?.value as { version?: number; frameId?: string; layers?: unknown[] };
-  assert.equal(inspector.version, 5);
+  assert.equal(inspector.version, 6);
   assert.equal(typeof inspector.frameId, 'string');
   assert.equal(inspector.layers?.length, 3);
-  const thread = await server.handle('remux/agent/thread/read', {
-    conversationId: created.conversationId,
-  }) as { current?: { content?: string; ordinal?: number }; previous?: unknown };
-  assert.equal(thread.current?.content, '# Thread\n');
-  assert.equal(thread.current?.ordinal, 0);
-  assert.equal(thread.previous, null);
   const durableTurn = await server.handle('remux/agent/turn/read', {
     conversationId: created.conversationId,
     turnId: sent.turnId,
@@ -1139,6 +989,7 @@ test('the public runtime recovers a response-started transport drop without dupl
     operationId: crypto.randomUUID(),
     conversationId: created.conversationId,
     clientMessageId: crypto.randomUUID(),
+    contextPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
     text: 'Survive a dropped WebSocket.',
   }) as { turnId: string };
   await eventually(async () => {
@@ -1211,11 +1062,17 @@ async function repositoryFixture(t: TestContext) {
   return fixture;
 }
 
-function accept(repository: AgentStateStore, conversationId: string, text: string) {
+function accept(
+  repository: AgentStateStore,
+  conversationId: string,
+  text: string,
+  contextPlan: TurnContextPlan = { version: 1, automaticDialogueTurns: 2, overrides: [] },
+) {
   return repository.acceptTurn({
     operationId: crypto.randomUUID(),
     conversationId,
     clientMessageId: crypto.randomUUID(),
+    contextPlan,
     text,
   });
 }
@@ -1250,7 +1107,7 @@ function workUnitCompletion(returned: Awaited<ReturnType<AgentStateStore['return
     scopeId: returned.scopeId,
     status: returned.status,
     result: returned.result,
-    resources: returned.resources,
+    artifacts: returned.artifacts,
     resultRef: returned.resultRef,
     historyRef: returned.historyRef,
   };
@@ -1347,7 +1204,7 @@ class RecoveringTransportFixtureProvider implements ModelProvider {
     let interrupted = false;
     return {
       async prompt() {
-        const firstContext = await options.durability.compileContext(400_000);
+        const firstContext = await options.durability.compileContext();
         await options.durability.beforeProviderCall({
           payload: { input: 'first-attempt' },
           requestMode: 'full',
@@ -1384,7 +1241,7 @@ class RecoveringTransportFixtureProvider implements ModelProvider {
           delayMs: 0,
           error: 'WebSocket error',
         });
-        const retryContext = await options.durability.compileContext(400_000);
+        const retryContext = await options.durability.compileContext();
         await options.durability.beforeProviderCall({
           payload: { input: 'fresh-full-retry' },
           requestMode: 'full',

@@ -39,7 +39,7 @@ function ContextInspector({ value }: { value: ContextInspectorValue }) {
   return (
     <details className="agent-context-inspector" data-testid="context-inspector">
       <summary>
-        Thread {formatTokens(tokens('thread_document'))} · recent {formatTokens(tokens('recent_dialogue'))} · active {formatTokens(tokens('active_scope'))} · {value.scopeKind === 'work_unit' ? 'work unit' : 'turn'}
+        dialogue {formatTokens(tokens('selected_dialogue'))} · full {formatTokens(tokens('selected_full_turns'))} · active {formatTokens(tokens('active_scope'))} · {value.scopeKind === 'work_unit' ? 'work unit' : 'turn'}
       </summary>
       <section className="agent-context-inspector-panel" aria-label="Inference context inspector">
         <header>
@@ -48,20 +48,19 @@ function ContextInspector({ value }: { value: ContextInspectorValue }) {
         </header>
         <section className="agent-context-inspector-section">
           <div className="agent-context-inspector-heading">
-            <strong>Thread context</strong>
+            <strong>Selected turn context</strong>
             <span>{value.transportMode} transport</span>
           </div>
           <div className="agent-context-inspector-metrics">
             <span>{formatTokens(value.estimatedInputTokens)} estimated</span>
             <span>{value.messageCount} messages / {value.turnCount} turns</span>
-            <span>{formatBytes(value.threadDocumentBytes)} Thread</span>
-            <span>{formatTokens(value.softContextLimit)} soft / {formatTokens(value.hardContextLimit)} hard</span>
-            <span>{value.pressureNoticed ? 'pressure noticed' : 'healthy'}</span>
+            <span>latest {value.requestedPlan.automaticDialogueTurns} dialogue</span>
+            <span>{value.requestedPlan.overrides.length} explicit override{value.requestedPlan.overrides.length === 1 ? '' : 's'}</span>
           </div>
           <ContextArtifactButton
-            artifact={value.contextEnvelopeArtifact}
-            label="Open compiled Thread context"
-            title="Exact dispatched Thread context"
+            artifact={value.manifestArtifact}
+            label="Open selection manifest"
+            title="Durable inference context manifest"
           />
         </section>
         <div className="agent-context-inspector-blocks">
@@ -75,20 +74,23 @@ function ContextInspector({ value }: { value: ContextInspectorValue }) {
         </div>
         <section className="agent-context-inspector-section">
           <div className="agent-context-inspector-heading">
-            <strong>Selected dialogue</strong>
-            <span>{value.dialogueTurnIds.length} shown · {value.omittedDialogueTurns} in History</span>
+            <strong>Selected prior turns</strong>
+            <span>{value.selectedTurns.length} included</span>
           </div>
           <div className="agent-context-actual-groups">
             <div>
               <span>system + tool contracts</span>
               <code>{shortHash(value.fixedContractsHash)}</code>
             </div>
-            {value.groups.filter((group) => value.dialogueTurnIds.includes(group.turnId)).map((group) => (
-              <div key={group.turnId} title={group.source}>
-                <span>turn {shortHash(group.turnId)}</span>
-                <span>{formatRoles(group.roles)} · {formatTokens(group.estimatedTokens)}</span>
-              </div>
-            ))}
+            {value.selectedTurns.map((selection) => {
+              const group = value.groups.find(({ turnId }) => turnId === selection.turnId);
+              return (
+                <div key={selection.turnId} title={group?.source}>
+                  <span>{selection.resolution} · turn {shortHash(selection.turnId)}</span>
+                  <span>{selection.origin} · {formatTokens(selection.estimatedTokens)}</span>
+                </div>
+              );
+            })}
           </div>
           <ContextArtifactButton
             artifact={value.dispatchArtifact}
@@ -125,20 +127,8 @@ function formatTokens(value: number) {
   return value >= 1_000 ? `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}k` : String(value);
 }
 
-function formatBytes(value: number) {
-  return value >= 1024 ? `${(value / 1024).toFixed(value >= 10 * 1024 ? 0 : 1)} KiB` : `${value} B`;
-}
-
 function shortHash(value: string) {
   return value.slice(0, 10);
-}
-
-function formatRoles(roles: { user: number; assistant: number; tool: number }) {
-  return [
-    roles.user ? `${roles.user} user` : '',
-    roles.assistant ? `${roles.assistant} assistant` : '',
-    roles.tool ? `${roles.tool} tool` : '',
-  ].filter(Boolean).join(' · ');
 }
 
 function compactSource(source: string) {
@@ -147,10 +137,10 @@ function compactSource(source: string) {
 
 function layerLabel(kind: ContextInspectorValue['layers'][number]['kind']) {
   switch (kind) {
-    case 'thread_document':
-      return 'Thread';
-    case 'recent_dialogue':
-      return 'recent conversation';
+    case 'selected_dialogue':
+      return 'dialogue turns';
+    case 'selected_full_turns':
+      return 'full turns';
     case 'active_scope':
       return 'current work';
   }

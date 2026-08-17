@@ -8,7 +8,7 @@
     "build:viewer": "vite build --config viewer/vite.config.ts",
     "test": "npm run test:server && npm run test:unit && npm run test:viewer",
     "test:server": "node --test --experimental-strip-types tests/*.test.ts",
-    "test:live:thread": "node tests/live/clean-acceptance.mjs",
+    "test:live:acceptance": "node tests/live/clean-acceptance.mjs",
     "test:live:provider-recovery": "node --experimental-strip-types tests/live/provider-recovery.ts",
     "test:live:viewer": "node tests/live/viewer-acceptance.mjs",
     "test:hardening": "node --experimental-strip-types tests/hardening/transcript-scale.ts",

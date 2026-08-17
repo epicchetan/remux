@@ -1,48 +1,19 @@
-export type ThreadDocumentView = {
-  documentId: string;
-  versionId: string;
-  content: string;
-  ref: string;
-};
-
-export type ThreadPatchEdit = {
-  oldText: string;
-  newText: string;
-};
-
-export type ThreadPatchInput = {
-  baseVersionId: string;
-  edits: ThreadPatchEdit[];
-};
-
-export type ThreadReplaceInput = {
-  baseVersionId: string;
-  content: string;
-};
-
 export type WorkUnitEnterInput = {
-  objective: string;
-  doneWhen?: string[];
-  resources?: WorkUnitResourceRef[];
+  /** One concise model-authored statement of the work and its closing condition. */
+  boundary: string;
 };
 
 export type WorkUnitReturnInput = {
   status: WorkUnitReturnStatus;
   result: string;
-  resources?: WorkUnitResourceRef[];
+  /** Optional files or History references worth retaining as immutable snapshots. */
+  artifacts?: string[];
 };
 
 export type WorkUnitReturnStatus = 'completed' | 'partial' | 'blocked';
 
-export type WorkUnitResourceRole = 'authority' | 'deliverable' | 'evidence';
-
-export type WorkUnitResourceRef = {
+export type WorkUnitArtifactView = {
   ref: string;
-  role: WorkUnitResourceRole;
-  description?: string;
-};
-
-export type WorkUnitResourceView = WorkUnitResourceRef & {
   snapshot: {
     ref: string;
     hash: string;
@@ -50,20 +21,12 @@ export type WorkUnitResourceView = WorkUnitResourceRef & {
     mediaType: string;
     source: 'file' | 'history';
   };
-  inclusion: 'materialized' | 'inherited';
-};
-
-export type WorkUnitContextResource = WorkUnitResourceView & {
-  /** Exact boundary snapshot, present only when it was not already inherited. */
-  content?: string;
 };
 
 export type WorkUnitView = {
   scopeId: string;
   parentScopeId: string;
-  objective: string;
-  doneWhen: string[];
-  resources: WorkUnitContextResource[];
+  boundary: string;
   state: 'running';
 };
 
@@ -76,7 +39,7 @@ export type WorkUnitCompletion = {
   scopeId: string;
   status: WorkUnitReturnStatus;
   result: string;
-  resources: WorkUnitContextResource[];
+  artifacts: WorkUnitArtifactView[];
   resultRef: string;
   historyRef: string;
 };
@@ -111,7 +74,11 @@ export type HistorySearchResult = {
   retention: 'ephemeral';
 };
 
-export type HistoryOpenInput = { ref: string; offset?: number; maxBytes?: number };
+export type HistoryOpenInput = {
+  ref: string;
+  offset?: number;
+  maxBytes?: number;
+};
 
 export type HistoryOpenResult = {
   ref: string;

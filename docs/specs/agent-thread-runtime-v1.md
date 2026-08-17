@@ -1,6 +1,6 @@
 # Agent Thread Runtime v1
 
-Status: Accepted implementation spec
+Status: Archived; superseded by `agent-explicit-turn-context-v1.md`
 Accepted: 2026-08-10
 Replaces: the Agent shadow/stateful/working-memory context experiments
 

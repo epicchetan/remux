@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 
-import type { ModelsValue, ReasoningLevel } from '../../../shared/protocol.ts';
+import type { ModelsValue, ReasoningLevel, TurnContextPlan } from '../../../shared/protocol.ts';
+import { createDefaultTurnContextPlan } from './context/contextPlan.ts';
 import { preferredReasoning, resolveModel } from './config/modelSelection.ts';
 import {
   createEmptyComposerSnapshot,
@@ -38,6 +39,7 @@ export type ComposerSubmission = {
   kind: ComposerSubmissionKind;
   phase: ComposerSubmissionPhase;
   snapshot: ComposerSnapshot;
+  contextPlan: TurnContextPlan;
   turnId: string | null;
 };
 
@@ -60,6 +62,7 @@ type ComposerStoreState = {
     kind: ComposerSubmissionKind;
     phase: ComposerSubmissionPhase;
     snapshot?: ComposerSnapshot;
+    contextPlan?: TurnContextPlan;
     turnId?: string | null;
   }) => ComposerSubmission;
   blurComposer: () => void;
@@ -69,6 +72,7 @@ type ComposerStoreState = {
   clearMode: () => void;
   clearSubmission: (id?: number) => void;
   composerPresentationRequest: ComposerPresentationRequest;
+  contextPlan: TurnContextPlan;
   editTarget: ComposerEditTarget | null;
   failSubmission: (id: number, message: string) => void;
   focusComposer: () => void;
@@ -81,6 +85,7 @@ type ComposerStoreState = {
   preEditSnapshot: ComposerSnapshot | null;
   reasoning: ReasoningLevel;
   setComposerDocument: (document: ComposerDocument, resources?: ComposerAttachmentResource[]) => void;
+  setContextPlan: (contextPlan: TurnContextPlan) => void;
   setDocument: (document: ComposerDocument, resources?: ComposerAttachmentResource[]) => void;
   setEditorController: (controller: ComposerEditorController | null) => void;
   setMentionSession: (session: ComposerMentionSession | null) => void;
@@ -103,13 +108,21 @@ const noopSetDocument = () => undefined;
 let submissionId = 0;
 
 export const useComposerStore = create<ComposerStoreState>((set, get) => ({
-  beginSubmission: ({ conversationId = null, kind, phase, snapshot = get().snapshot, turnId = null }) => {
+  beginSubmission: ({
+    conversationId = null,
+    contextPlan = get().contextPlan,
+    kind,
+    phase,
+    snapshot = get().snapshot,
+    turnId = null,
+  }) => {
     const submission: ComposerSubmission = {
       conversationId,
       id: ++submissionId,
       kind,
       phase,
       snapshot,
+      contextPlan,
       turnId,
     };
     set({ isSubmitting: true, submission, submissionError: null });
@@ -142,6 +155,7 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
       : { isSubmitting: false, submission: null }
   )),
   composerPresentationRequest: { id: 0, reason: 'edit' },
+  contextPlan: createDefaultTurnContextPlan(),
   editTarget: null,
   failSubmission: (id, message) => set((state) => state.submission?.id === id
     ? {
@@ -160,6 +174,7 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
   preEditSnapshot: null,
   reasoning: 'high',
   setComposerDocument: noopSetDocument,
+  setContextPlan: (contextPlan) => set({ contextPlan }),
   setDocument: noopSetDocument,
   setEditorController: (controller) => set({
     blurComposer: controller?.blurComposer ?? noop,

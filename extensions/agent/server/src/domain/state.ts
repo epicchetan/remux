@@ -6,6 +6,7 @@ import type {
   ContextInspectorValue,
   MessageSendParams,
   ReasoningLevel,
+  TurnContextPlan,
 } from '../../../shared/protocol.ts';
 import type {
   AgentTextContentReference,
@@ -15,10 +16,10 @@ import type {
   DurableContextSnapshot,
   LogicalContextMessage,
 } from '../logical-context.ts';
-import type { ThreadContextFrameCandidate } from '../context/manifest.ts';
+import type { TurnContextFrameCandidate } from '../context/manifest.ts';
 import type { CanonicalJsonValue } from '../storage/canonical-json.ts';
 import type {
-  WorkUnitResourceView,
+  WorkUnitArtifactView,
   WorkUnitReturnStatus,
 } from './work.ts';
 
@@ -27,11 +28,6 @@ export type CreateConversationParams = {
   cwd: string;
   modelId: string;
   reasoning: ReasoningLevel;
-  inheritThreadFrom?: {
-    conversationId: string;
-    turnId: string;
-    position: 'before' | 'after';
-  };
 };
 
 export type CreateConversationResult = {
@@ -39,8 +35,6 @@ export type CreateConversationResult = {
   operationId: string;
   projectId: string;
   conversationId: string;
-  threadDocumentId: string;
-  threadVersionId: string;
   basisSequence: number;
   replayed: boolean;
 };
@@ -67,6 +61,7 @@ export type AcceptTurnParams = {
   conversationId: string;
   clientMessageId: string;
   parts?: AgentComposerMessagePart[];
+  contextPlan: TurnContextPlan;
   text: string;
 };
 
@@ -149,9 +144,7 @@ export type DurableTranscriptAction =
       type: 'work-unit-start';
       turnId: string;
       scopeId: string;
-      objective: string;
-      doneWhen: string[];
-      resourceCount: number;
+      boundary: string;
       operationCount: number;
     }
   | {
@@ -160,7 +153,7 @@ export type DurableTranscriptAction =
       scopeId: string;
       status: WorkUnitReturnStatus | 'abandoned';
       resultPreview: string | null;
-      resourceCount: number;
+      artifactCount: number;
       durationMs?: number;
     }
   | {
@@ -248,7 +241,7 @@ export type ArtifactScrubReport = {
 };
 
 export type DurableContextBoundarySnapshot = DurableContextSnapshot & {
-  frame: ThreadContextFrameCandidate;
+  frame: TurnContextFrameCandidate;
   scopeId: string;
   scopeKind: 'turn' | 'work_unit';
   nextFrameOrdinal: number;
@@ -261,7 +254,7 @@ export type DurableInferenceContext = {
   orderedMessageHashes: readonly string[];
   messageCount: number;
   fixedContractsHash: string;
-  frame: ThreadContextFrameCandidate;
+  frame: TurnContextFrameCandidate;
   frameBuildDurationMs: number;
   activeMessages: readonly LogicalContextMessage[];
 };
@@ -280,23 +273,20 @@ export type PreparedReference = {
   text: string;
 };
 
-export type PreparedWorkUnitResource = {
+export type PreparedWorkUnitArtifact = {
   artifact: DurableArtifactDescriptor;
-  content: string;
-  view: WorkUnitResourceView;
+  view: WorkUnitArtifactView;
 };
 
 export type PreparedWorkUnitEntry = {
-  child: DurableTurnHandle;
-  doneWhen: string[];
-  materializedResources: PreparedWorkUnitResource[];
-  objective: string;
+  scope: DurableTurnHandle;
+  boundary: string;
   bootstrap: PreparedReference;
 };
 
 export type PreparedWorkUnitReturn = {
   status: WorkUnitReturnStatus;
   result: string;
-  resources: PreparedWorkUnitResource[];
+  artifacts: PreparedWorkUnitArtifact[];
   resultArtifact: DurableArtifactDescriptor;
 };

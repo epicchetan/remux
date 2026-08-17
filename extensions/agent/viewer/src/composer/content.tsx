@@ -3,6 +3,7 @@ import type {
   AgentPendingQueueValue,
   ContextInspectorValue,
   ConversationValue,
+  TurnContextPlan,
 } from '../../../shared/protocol.ts';
 import { useConversationStore } from '../conversation/store.ts';
 import { ComposerActionButtons } from './actions/ActionButtons.tsx';
@@ -19,31 +20,27 @@ export function ComposerContent({
   conversation,
   contextInspector,
   conversationSelected,
-  mainView,
   onInterrupt,
   onEdit,
   onFork,
   onQueueChanged,
   onSend,
   onSignOut,
-  onToggleThread,
   runtimeError,
   queue,
 }: {
   conversation: ConversationValue | null;
   contextInspector: ContextInspectorValue | null;
   conversationSelected: boolean;
-  mainView: 'chat' | 'thread';
   onInterrupt: () => Promise<void>;
   onEdit: ComposerBranchCallback<ComposerEditTarget>;
   onFork: ComposerBranchCallback<ComposerForkTarget>;
   onQueueChanged: () => Promise<void>;
   onSend: (
-    input: { displayText: string; parts: AgentComposerMessagePart[] },
+    input: { contextPlan: TurnContextPlan; displayText: string; parts: AgentComposerMessagePart[] },
     setPhase: (phase: 'sending' | 'updating-transcript') => void,
   ) => Promise<void>;
   onSignOut: () => void;
-  onToggleThread: () => void;
   queue: AgentPendingQueueValue | null;
   runtimeError: string | null;
 }) {
@@ -71,14 +68,11 @@ export function ComposerContent({
           canStart={Boolean((conversation || (!conversationSelected && cwd && modelId)) && !loading)}
           conversationExists={conversationSelected}
           isWorking={working}
-          mainView={mainView}
           onEdit={onEdit}
           onFork={onFork}
           onInterrupt={onInterrupt}
           onSend={onSend}
           onSignOut={onSignOut}
-          onToggleThread={onToggleThread}
-          threadAvailable={Boolean(conversation)}
         />
       </div>
       {!pickerOpen ? <ComposerStatusMessageRow runtimeError={runtimeError} /> : null}
@@ -91,6 +85,6 @@ export function ComposerContent({
 
 type ComposerBranchCallback<T> = (
   target: T,
-  input: { displayText: string; parts: AgentComposerMessagePart[] },
+  input: { contextPlan: TurnContextPlan; displayText: string; parts: AgentComposerMessagePart[] },
   setPhase: (phase: 'sending' | 'updating-transcript') => void,
 ) => Promise<void>;

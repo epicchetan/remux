@@ -1,4 +1,4 @@
-Status: Active Spec
+Status: Archived; context architecture superseded by `agent-explicit-turn-context-v1.md`
 Last verified: 2026-08-08
 Canonical code: The Phase 0–1A foundation and authoritative stateful context workspace are implemented in `extensions/agent/`; provider-context details are governed by `agent-context-workspace-v1.md`; child work scopes and a first-class process registry remain open
 

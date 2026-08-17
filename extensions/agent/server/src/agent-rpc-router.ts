@@ -9,9 +9,10 @@ import {
   type MessageSendParams,
   type ReasoningLevel,
   type ResourceReadParams,
-  type ThreadReadParams,
   type TurnInterruptParams,
   type TurnReadParams,
+  type TurnContextOverride,
+  type TurnContextPlan,
 } from '../../shared/protocol.ts';
 import { agentPromptText, parseAgentComposerParts } from './user-input.ts';
 
@@ -38,7 +39,6 @@ type AgentRpcHandlers = {
   readTranscriptResources: (params: unknown) => Promise<unknown>;
   readModels: () => Promise<unknown>;
   readArtifact: (params: ArtifactReadParams) => Promise<unknown>;
-  readThread: (params: ThreadReadParams) => Promise<unknown>;
   readTurn: (params: TurnReadParams) => Promise<unknown>;
   searchFiles: (params: AgentFileSearchParams) => Promise<unknown>;
   startLogin: () => unknown;
@@ -73,8 +73,6 @@ export class AgentRpcRouter {
         return this.handlers.readModels();
       case AGENT_METHODS.artifactRead:
         return this.handlers.readArtifact(parseArtifactRead(params));
-      case AGENT_METHODS.threadRead:
-        return this.handlers.readThread(parseThreadRead(params));
       case AGENT_METHODS.turnRead:
         return this.handlers.readTurn(parseTurnRead(params));
       case AGENT_METHODS.filesSearch:
@@ -184,11 +182,6 @@ function parseArtifactRead(params: unknown): ArtifactReadParams {
   throw new RpcFault(-32602, 'range.kind must be bytes, utf8, or lines.');
 }
 
-function parseThreadRead(params: unknown): ThreadReadParams {
-  const value = objectValue(params);
-  return { conversationId: requiredUuidV4(value.conversationId, 'conversationId') };
-}
-
 function parseTurnRead(params: unknown): TurnReadParams {
   const value = objectValue(params);
   return {
@@ -213,6 +206,7 @@ function parseMessageSend(params: unknown): MessageSendParams {
       operationId: requiredUuidV4(value.operationId, 'operationId'),
       conversationId: requiredUuidV4(value.conversationId, 'conversationId'),
       clientMessageId: requiredUuidV4(value.clientMessageId, 'clientMessageId'),
+      contextPlan: parseTurnContextPlan(value.contextPlan),
       text: requiredString(value.text, 'text'),
     };
   }
@@ -226,9 +220,40 @@ function parseMessageSend(params: unknown): MessageSendParams {
     operationId: requiredUuidV4(value.operationId, 'operationId'),
     conversationId: requiredUuidV4(value.conversationId, 'conversationId'),
     clientMessageId: requiredUuidV4(value.clientMessageId, 'clientMessageId'),
+    contextPlan: parseTurnContextPlan(value.contextPlan),
     parts,
     text: agentPromptText(parts),
   };
+}
+
+function parseTurnContextPlan(value: unknown): TurnContextPlan {
+  const plan = objectValue(value);
+  if (plan.version !== 1) throw new RpcFault(-32602, 'contextPlan.version must be 1.');
+  const automaticDialogueTurns = boundedInteger(
+    plan.automaticDialogueTurns,
+    'contextPlan.automaticDialogueTurns',
+    0,
+    Number.MAX_SAFE_INTEGER,
+  );
+  if (!Array.isArray(plan.overrides)) {
+    throw new RpcFault(-32602, 'contextPlan.overrides must be an array.');
+  }
+  const seen = new Set<string>();
+  const overrides = plan.overrides.map((entry, index) => {
+    const override = objectValue(entry);
+    const turnId = requiredUuidV4(override.turnId, `contextPlan.overrides[${index}].turnId`);
+    if (seen.has(turnId)) throw new RpcFault(-32602, `contextPlan override ${turnId} is duplicated.`);
+    seen.add(turnId);
+    if (
+      override.resolution !== 'off' &&
+      override.resolution !== 'dialogue' &&
+      override.resolution !== 'full'
+    ) {
+      throw new RpcFault(-32602, `contextPlan override ${turnId} has an invalid resolution.`);
+    }
+    return { turnId, resolution: override.resolution as TurnContextOverride['resolution'] };
+  });
+  return { version: 1, automaticDialogueTurns, overrides };
 }
 
 function parseMessageQueueMutation(params: unknown): MessageQueueMutationParams {
@@ -250,6 +275,7 @@ function parseMessageBranch(params: unknown): MessageBranchParams {
   return {
     operationId: requiredUuidV4(value.operationId, 'operationId'),
     clientMessageId: requiredUuidV4(value.clientMessageId, 'clientMessageId'),
+    contextPlan: parseTurnContextPlan(value.contextPlan),
     sourceConversationId: requiredUuidV4(value.sourceConversationId, 'sourceConversationId'),
     sourceTurnId: requiredUuidV4(value.sourceTurnId, 'sourceTurnId'),
     sourceMessageId: requiredUuidV4(value.sourceMessageId, 'sourceMessageId'),

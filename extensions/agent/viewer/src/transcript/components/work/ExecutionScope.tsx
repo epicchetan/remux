@@ -20,7 +20,7 @@ import {
   type AgentExecutionScopeResource,
   type AgentInferenceTrace,
   type AgentToolCallSummary,
-  type AgentWorkUnitResourceReference,
+  type AgentWorkUnitArtifactReference,
 } from '../../../../../shared/transcript.ts';
 import { useTranscriptLayoutStore } from '../../layoutStore.ts';
 import { useTranscriptResourceStore } from '../../resourceStore.ts';
@@ -114,9 +114,6 @@ function ExecutionScopeBody({
       data-state={value.state}
       ref={scopeRef}
     >
-      {value.kind === 'workUnit' ? (
-        <WorkUnitAssignment laneWidth={scopeWidth} value={value} />
-      ) : null}
       <div className="agent-inference-list">
         {value.inferences.map((inference) => (
           <InferenceTrace
@@ -214,10 +211,10 @@ function InferenceTrace({
               {items.map((item) => item.kind === 'scope' ? (
                 <ExecutionScopeDisclosure
                   conversationId={conversationId}
-                  fallbackTitle={item.call.childObjective ?? 'Focused work unit'}
+                  fallbackTitle={item.call.childBoundary ?? 'Focused work unit'}
                   fallbackDurationMs={item.call.childDurationMs}
                   fallbackOperationCount={item.call.childOperationCount}
-                  fallbackResourceCount={item.call.childReturnedResourceCount}
+                  fallbackArtifactCount={item.call.childArtifactCount}
                   fallbackState={item.call.childState ?? item.call.status}
                   key={item.call.id}
                   laneWidth={laneWidth}
@@ -359,7 +356,7 @@ function ExecutionScopeDisclosure({
   conversationId,
   fallbackDurationMs,
   fallbackOperationCount,
-  fallbackResourceCount,
+  fallbackArtifactCount,
   fallbackState,
   fallbackTitle,
   laneWidth,
@@ -371,7 +368,7 @@ function ExecutionScopeDisclosure({
   conversationId: string;
   fallbackDurationMs: number | null;
   fallbackOperationCount: number;
-  fallbackResourceCount: number;
+  fallbackArtifactCount: number;
   fallbackState: AgentExecutionScopeResource['state'] | AgentToolCallSummary['status'];
   fallbackTitle: string;
   laneWidth: number;
@@ -386,7 +383,7 @@ function ExecutionScopeDisclosure({
   const setOnlyOpen = useTranscriptLayoutStore((state) => state.setOnlyOpenWorkChildDisclosure);
   const scope = useTranscriptResourceStore((state) => state.executionScopesByKey[key]?.resource);
   const ensureScope = useTranscriptResourceStore((state) => state.ensureExecutionScope);
-  const title = scope?.objective ?? fallbackTitle;
+  const title = scope?.boundary ?? fallbackTitle;
   const displayStatus = scope?.state ?? fallbackState;
   const durationMs = scope?.durationMs ?? fallbackDurationMs;
   const operationCount = scope
@@ -394,7 +391,7 @@ function ExecutionScopeDisclosure({
         count + (inference.actionGroup?.calls.filter((call) =>
           call.name !== 'work_unit_finish').length ?? 0), 0)
     : fallbackOperationCount;
-  const resourceCount = scope?.returnedResources.length ?? fallbackResourceCount;
+  const artifactCount = scope?.artifacts.length ?? fallbackArtifactCount;
 
   useEffect(() => {
     if (open && !scope) void ensureScope({ scopeId, turnId });
@@ -414,7 +411,7 @@ function ExecutionScopeDisclosure({
       >
         <span className="agent-work-unit-state"><ScopeStateIcon status={displayStatus} /></span>
         <span className="agent-work-unit-copy">
-          <span className="agent-work-unit-objective">{title}</span>
+          <span className="agent-work-unit-boundary">{title}</span>
           <span className="agent-work-unit-meta">
             Work unit · {displayStatus}{durationMs === null || durationMs === undefined
               ? ''
@@ -422,8 +419,8 @@ function ExecutionScopeDisclosure({
             {operationCount > 0
               ? ` · ${operationCount} ${operationCount === 1 ? 'call' : 'calls'}`
               : ''}
-            {resourceCount > 0
-              ? ` · ${resourceCount} ${resourceCount === 1 ? 'resource' : 'resources'}`
+            {artifactCount > 0
+              ? ` · ${artifactCount} ${artifactCount === 1 ? 'artifact' : 'artifacts'}`
               : ''}
           </span>
         </span>
@@ -593,52 +590,36 @@ function ToolCall({
   );
 }
 
-function WorkUnitAssignment({
-  laneWidth,
-  value,
-}: {
-  laneWidth: number;
-  value: AgentExecutionScopeResource;
-}) {
-  return (
-    <div className="agent-work-unit-assignment">
-      <strong>Assignment</strong>
-      {value.objective ? (
-        <MarkdownBlock density="work" width={laneWidth}>{value.objective}</MarkdownBlock>
-      ) : null}
-      {value.doneWhen.length ? (
-        <section><strong>Done when</strong><ul>{value.doneWhen.map((item) => <li key={item}>{item}</li>)}</ul></section>
-      ) : null}
-      {value.providedResources.length ? <ResourceList label="Provided resources" resources={value.providedResources} /> : null}
-    </div>
-  );
-}
-
 function WorkUnitOutcome({ laneWidth, value }: { laneWidth: number; value: AgentExecutionScopeResource }) {
-  if (!value.result && !value.returnedResources.length) return null;
+  if (!value.result && !value.artifacts.length) return null;
   return (
     <div className="agent-work-unit-outcome">
-      <strong>Handoff</strong>
+      <strong>Result</strong>
       {value.result ? (
         <section><MarkdownBlock density="work" width={laneWidth}>{value.result}</MarkdownBlock></section>
       ) : null}
-      {value.returnedResources.length ? <ResourceList label="Returned resources" resources={value.returnedResources} /> : null}
+      {value.artifacts.length ? <ArtifactList artifacts={value.artifacts} /> : null}
     </div>
   );
 }
 
-function ResourceList({ label, resources }: { label: string; resources: AgentWorkUnitResourceReference[] }) {
+function ArtifactList({ artifacts }: { artifacts: AgentWorkUnitArtifactReference[] }) {
   return (
-    <section className="agent-scope-resources">
-      <strong>{label}</strong>
-      {resources.map((resource) => (
-        <div key={`${resource.role}:${resource.ref}`}>
-          <span>{resource.role}</span><code>{resource.ref}</code>
-          {resource.description ? <small>{resource.description}</small> : null}
+    <section className="agent-scope-artifacts">
+      <strong>Artifacts</strong>
+      {artifacts.map((artifact) => (
+        <div key={artifact.snapshotRef} title={artifact.snapshotRef}>
+          <code>{artifact.ref}</code>
+          <small>{formatArtifactBytes(artifact.byteLength)} · exact snapshot</small>
         </div>
       ))}
     </section>
   );
+}
+
+function formatArtifactBytes(byteLength: number) {
+  if (byteLength < 1024) return `${byteLength} B`;
+  return `${Math.round(byteLength / 1024)} KB`;
 }
 
 function ScopeStateIcon({ status }: { status: AgentExecutionScopeResource['state'] | AgentToolCallSummary['status'] }) {

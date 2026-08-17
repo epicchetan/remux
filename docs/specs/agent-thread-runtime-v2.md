@@ -1,9 +1,9 @@
 # Agent Thread Runtime v2: exact dialogue and living thread state
 
-Status: Implemented
-Last verified: 2026-08-14
+Status: Archived; superseded by `agent-explicit-turn-context-v1.md`
+Last verified: 2026-08-16
 Canonical code: `extensions/agent/server/src/{context,providers/openai-codex,storage,turn-coordinator.ts}` and `extensions/agent/tests/`
-Replaces: the turn-capsule layer in `agent-thread-runtime-v1.md`
+Replaced by: `agent-explicit-turn-context-v1.md`
 
 The later `agent-living-thread-canvas-v1.md` checkpoint supersedes this
 document's thin-brief guidance and model-facing `thread_update` operation while

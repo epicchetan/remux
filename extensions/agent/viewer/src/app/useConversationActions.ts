@@ -7,6 +7,7 @@ import {
   type AgentResourceKey,
   type ConversationValue,
   type ReasoningLevel,
+  type TurnContextPlan,
 } from '../../../shared/protocol.ts';
 import type { ComposerEditTarget, ComposerForkTarget } from '../composer/store.ts';
 import {
@@ -97,7 +98,7 @@ export function useConversationActions(options: {
   ]);
 
   const send = useCallback(async (
-    input: { displayText: string; parts: AgentComposerMessagePart[] },
+    input: { contextPlan: TurnContextPlan; displayText: string; parts: AgentComposerMessagePart[] },
     setPhase: (phase: ComposerPhase) => void,
   ) => {
     setError(null);
@@ -111,6 +112,7 @@ export function useConversationActions(options: {
         operationId: createViewerUuid(),
         conversationId: activeId,
         clientMessageId,
+        contextPlan: input.contextPlan,
         parts: input.parts,
         text: input.displayText,
       });
@@ -138,7 +140,7 @@ export function useConversationActions(options: {
   const branchMessage = useCallback(async (
     mode: 'edit' | 'fork',
     target: ComposerEditTarget | ComposerForkTarget,
-    input: { displayText: string; parts: AgentComposerMessagePart[] },
+    input: { contextPlan: TurnContextPlan; displayText: string; parts: AgentComposerMessagePart[] },
     setPhase: (phase: ComposerPhase) => void,
   ) => {
     setError(null);
@@ -148,6 +150,7 @@ export function useConversationActions(options: {
       mode,
       operationId: createViewerUuid(),
       clientMessageId,
+      contextPlan: input.contextPlan,
       parts: input.parts,
       text: input.displayText,
       sourceConversationId: target.conversationId,

@@ -22,6 +22,10 @@ test('starts with the authoritative model and sends the first message once', asy
   await expect.poll(() => commandCount(page, 'remux/agent/conversation/create')).toBe(1);
   await expect.poll(() => commandCount(page, 'remux/agent/conversation/message/send')).toBe(1);
   await expect.poll(() => lastConversationOperationId(page)).toMatch(UUID_V4);
+  await expect.poll(async () => (await lastCommandParams(
+    page,
+    'remux/agent/conversation/message/send',
+  )).contextPlan).toEqual({ version: 1, automaticDialogueTurns: 2, overrides: [] });
 });
 
 test('sends with a portable UUID when crypto.randomUUID is unavailable', async ({ page }) => {
@@ -100,15 +104,15 @@ test('shows actual dispatch and compiled-frame evidence for a durable inference'
   await page.goto(conversationUrl());
 
   const inspector = page.getByTestId('context-inspector');
-  await expect(inspector.locator('summary')).toContainText('Thread 101 · recent 100 · active 102 · turn');
+  await expect(inspector.locator('summary')).toContainText('dialogue 100 · full 0 · active 102 · turn');
   await inspector.locator('summary').click();
   const panel = page.getByRole('region', { name: 'Inference context inspector' });
   await expect(panel).toContainText('Actual inference context');
   await expect(panel).toContainText('continuation transport');
-  await expect(panel).toContainText('Thread context');
-  await expect(panel).toContainText('Thread');
+  await expect(panel).toContainText('Selected turn context');
+  await expect(panel).toContainText('dialogue turns');
   await expect(panel).toContainText('current work');
-  await expect(panel).toContainText('1 shown · 4 in History');
+  await expect(panel).toContainText('1 included');
   await expect(panel).toContainText('retrievable omissions');
 
   await panel.getByRole('button', { name: /Open captured request context/u }).click();
@@ -116,31 +120,34 @@ test('shows actual dispatch and compiled-frame evidence for a durable inference'
   await expect(dispatch).toContainText('Fixture provider input');
   await dispatch.getByRole('button', { name: 'Close Captured harness-visible request context' }).click();
 
-  await panel.getByRole('button', { name: /Open compiled Thread context/u }).click();
-  const contextEnvelope = page.getByRole('dialog', { name: 'Exact dispatched Thread context' });
-  await expect(contextEnvelope).toContainText('<thread version="fixture-thread-version">');
+  await panel.getByRole('button', { name: /Open selection manifest/u }).click();
+  const manifest = page.getByRole('dialog', { name: 'Durable inference context manifest' });
+  await expect(manifest).toContainText('agent-inference-context-v6');
 });
 
-test('opens the current Thread and its previous durable version', async ({ page }) => {
-  await page.goto(conversationUrl());
+test('chooses dialogue or full resolution for individual prior turns', async ({ page }) => {
+  await page.goto(conversationUrl('&fixtureContextTurns=1'));
 
-  const conversation = transcript(page);
-  await expect(conversation.getByText('Recovered from authoritative resources.')).toBeVisible();
-  await page.getByTestId('thread-view-toggle').click();
-  const thread = page.getByRole('region', { name: 'Thread' });
-  await expect(thread).toBeVisible();
-  await expect(conversation).toBeHidden();
-  await expect(thread).toContainText('Ledger — 0DTE heat maps');
-  await expect(thread).toContainText('Candidate interpretations');
-  await expect(thread).toContainText('Current conversational edge');
-  await expect(thread).toContainText('version 3');
+  await page.getByRole('button', { name: 'Choose prior turn context' }).click();
+  const picker = page.locator('.agent-context-picker-panel');
+  await expect(picker).toContainText('The latest two turns use dialogue by default.');
 
-  await thread.getByRole('button', { name: 'Previous' }).click();
-  await expect(thread).toContainText('Earlier canvas');
-  await expect(thread).toContainText('Choose the first metric.');
-  await page.getByRole('button', { name: 'Back to conversation' }).click();
-  await expect(thread).toHaveCount(0);
-  await expect(conversation.getByText('Recovered from authoritative resources.')).toBeVisible();
+  const latest = picker.locator('.agent-context-picker-turn').filter({ hasText: 'Context request 4' });
+  await latest.getByRole('button', { name: 'Full' }).click();
+  const oldest = picker.locator('.agent-context-picker-turn').filter({ hasText: 'Context request 1' });
+  await oldest.getByRole('button', { name: 'Dialogue' }).click();
+
+  await messageBox(page).fill('Use the selected context');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  const params = await lastCommandParams(page, 'remux/agent/conversation/message/send');
+  expect(params.contextPlan).toEqual({
+    version: 1,
+    automaticDialogueTurns: 2,
+    overrides: [
+      { turnId: 'turn-4', resolution: 'full' },
+      { turnId: 'turn-1', resolution: 'dialogue' },
+    ],
+  });
 });
 
 test('selects history through the desktop sidebar or mobile sheet and restores target drafts', async ({ page, isMobile }) => {

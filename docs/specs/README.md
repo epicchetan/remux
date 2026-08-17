@@ -23,7 +23,7 @@ Canonical code: ...
 ```
 
 The active Agent context implementation contract is
-[agent-thread-runtime-v2.md](agent-thread-runtime-v2.md).
+[agent-explicit-turn-context-v1.md](agent-explicit-turn-context-v1.md).
 
 ## Codex Specs
 
@@ -70,14 +70,15 @@ The active Agent context implementation contract is
 
 | Spec | Status | Notes |
 | --- | --- | --- |
-| [agent-runtime-and-epoch-context.md](agent-runtime-and-epoch-context.md) | Active Spec | Single-provider Remux agent built on embedded Pi + the owner's `openai-codex` subscription, with a purpose-built Remux UI and OAuth. Phase 0–1A.3 foundation is implemented; provider-context behavior is now governed by `agent-context-workspace-v1.md`. No native/manual compaction, app-server/API-key/Anthropic fallback, narration, research, subagents, review mode, or old-history import. |
-| [agent-durable-epoch-core.md](agent-durable-epoch-core.md) | Active Spec | Phase 0A–1D durable schema, replay, prompt-manifest, and inspector reference. Its diagnostic shadow design has been superseded by the model-managed workspace and active context-frame compiler in `agent-context-workspace-v1.md`. |
+| [agent-runtime-and-epoch-context.md](agent-runtime-and-epoch-context.md) | Archived | Original single-provider harness and phased epoch plan. Provider/auth/UI foundations remain useful rationale; current context behavior is governed by `agent-explicit-turn-context-v1.md`. |
+| [agent-durable-epoch-core.md](agent-durable-epoch-core.md) | Archived | Historical durable-journal, shadow-compiler, and rollover plan. The journal survived; epoch and shadow-context semantics did not. |
 | [agent-turns-and-work-units.md](agent-turns-and-work-units.md) | Active Spec | Empirically grounded refinement separating the user-visible turn from internal context lifetimes: schema v1 gives every direct turn a root execution scope and reserves optional child work scopes for bounded tool traces, resumable execution, evidence-backed handoffs, and local epochs while the parent retains intent, steering, permissions, and integration. Child execution remains inactive. |
-| [agent-background-working-memory-v1.md](agent-background-working-memory-v1.md) | Implementation Spec | Experimental journal-derived working-memory cache: non-blocking Sol compiler, foreground retain/release controls, epoch-only activation, exact hot tail, and causal benchmark arm. |
+| [agent-background-working-memory-v1.md](agent-background-working-memory-v1.md) | R&D evidence | Historical background working-memory experiment; not part of the current runtime. |
 | [agent-bounded-work-units-v2.md](agent-bounded-work-units-v2.md) | Implemented experiment | Foreground-authored bounded child scopes, exact range evidence, early checkpoint budgets, and E0 results: context pressure fell sharply without compaction, but runtime/quality missed Codex and sticky whole-file state polluted the handoff layer, so it is not the default. |
-| [agent-thread-runtime-v1.md](agent-thread-runtime-v1.md) | Implemented checkpoint | Single-path replacement that proved versioned `thread.md`, exact active provider state, and bounded work-unit branches. Its duplicated turn-capsule layer is superseded by v2. |
-| [agent-thread-runtime-v2.md](agent-thread-runtime-v2.md) | Implemented | Clean no-migration cutover to exact recent dialogue, one living branch `thread.md`, indexed cold journal retrieval, semantic work-unit handoffs, and durable soft context pressure; real smoke passed and the first frozen benchmark exposed a model-quality failure plus a fixed terminal-durability race. |
-| [agent-living-thread-canvas-v1.md](agent-living-thread-canvas-v1.md) | Implemented checkpoint | Evolves the v2 thread brief into a rich semantic collaboration canvas with exact atomic patch/replace tools, parent-owned exploration and evidence integration, and a read-only current/previous Markdown viewer. Canvas organization is intentionally not optimized around prompt caching. |
+| [agent-thread-runtime-v1.md](agent-thread-runtime-v1.md) | Archived | Historical versioned-Thread and turn-capsule checkpoint. |
+| [agent-thread-runtime-v2.md](agent-thread-runtime-v2.md) | Archived | Historical exact-dialogue/living-Thread checkpoint, superseded by explicit per-turn context. |
+| [agent-living-thread-canvas-v1.md](agent-living-thread-canvas-v1.md) | Archived | Historical model-authored Thread canvas, removed from the runtime. |
+| [agent-explicit-turn-context-v1.md](agent-explicit-turn-context-v1.md) | Implemented | Current clean architecture: user-selected off/dialogue/full prior-turn resolution, exact active scopes, fresh root provider lanes, no Thread state, and no harness context limits or compaction. |
 | [agent-inference-trace-and-resilient-streaming.md](agent-inference-trace-and-resilient-streaming.md) | Active Spec | Decision-complete recursive inference/work-unit trace and viewer reliability plan: semantic provider summaries, tool calls grouped by source inference, server-authoritative scope resources, pre-React invalidation subscription, background/cold-reopen recovery, restart fencing, notification seam, and real lifecycle smoke gates. |
 | [agent-ledger-benchmark-corpus.md](agent-ledger-benchmark-corpus.md) | R&D evidence + Adaptive v2 | Detailed Ledger/Remux transcript corpus plus sanitized production-path fixtures, the adaptive owner-driven controller, frozen reference validation, and measured Codex/Agent runs. |
 | [agent-ui-parity-and-phased-delivery.md](agent-ui-parity-and-phased-delivery.md) | Active Spec | Normative alignment for continuously porting the stable Codex UI into Agent, activating behavior only with Agent-owned server semantics, preserving owner review at each checkpoint, excluding narration/App Server-only features, and cutting over without a late bulk parity phase. |

@@ -64,8 +64,14 @@ test('the Agent runtime owns bounded durable retries and selects one provider la
   const runtime = await readFile(resolve(root, 'extensions/agent/server/src/providers/openai-codex/openai-codex-provider.ts'), 'utf8');
   assert.match(runtime, /enabled: true,\s+maxRetries: 2,\s+baseDelayMs: 500/u);
   assert.match(runtime, /supersedeProviderAttempt/u);
+  assert.match(runtime, /const failClosedProviderRetry = \(target: AgentSession, error: unknown\)/u);
+  assert.equal(
+    runtime.match(/failClosedProviderRetry\((?:session|child), error\)/gu)?.length,
+    2,
+    'unsafe parent and child retries must both abort their active Pi session',
+  );
   assert.match(runtime, /providerSessionId: \(\) => activeProviderSessionId/u);
-  assert.match(runtime, /snapshot\.scopeKind === 'work_unit'\s+\? snapshot\.scopeId\s+: parentProviderSessionId/u);
+  assert.match(runtime, /activeProviderSessionId = snapshot\.scopeId/u);
   assert.match(runtime, /provider-retry@1/u);
   assert.match(runtime, /provider-lanes@1/u);
   assert.match(runtime, /child\.agent\.state\.messages = \[\{\s+role: 'toolResult'/u);

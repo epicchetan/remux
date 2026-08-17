@@ -1,16 +1,28 @@
+import type {
+  TurnContextPlan,
+  TurnContextResolution,
+} from '../../../shared/protocol.ts';
 import type { CanonicalJsonValue } from '../storage/canonical-json.ts';
 
-export const CONTEXT_COMPILER_VERSION = 'agent-context-compiler-v4' as const;
-export const CONTEXT_POLICY_VERSION = 'agent-context-policy-v5' as const;
-export const INFERENCE_CONTEXT_MANIFEST_VERSION = 'agent-inference-context-v5' as const;
+export const CONTEXT_COMPILER_VERSION = 'agent-turn-context-v1' as const;
+export const CONTEXT_POLICY_VERSION = 'agent-explicit-selection-v1' as const;
+export const INFERENCE_CONTEXT_MANIFEST_VERSION = 'agent-inference-context-v6' as const;
 
-export type ThreadContextLayerKind =
-  | 'thread_document'
-  | 'recent_dialogue'
+export type SelectedTurnResolution = Exclude<TurnContextResolution, 'off'>;
+
+export type ResolvedTurnContextSource = {
+  turnId: string;
+  resolution: SelectedTurnResolution;
+  origin: 'automatic' | 'explicit';
+};
+
+export type TurnContextLayerKind =
+  | 'selected_dialogue'
+  | 'selected_full_turns'
   | 'active_scope';
 
-export type ThreadContextLayer = {
-  kind: ThreadContextLayerKind;
+export type TurnContextLayer = {
+  kind: TurnContextLayerKind;
   estimatedTokens: number;
   hash: string;
   sources: readonly string[];
@@ -18,34 +30,24 @@ export type ThreadContextLayer = {
 
 export type ContextOmission = {
   source: string;
-  reason: 'recent-dialogue-budget' | 'prior-turn-scratch' | 'prior-turn-reasoning';
+  reason: 'not-selected' | 'prior-work-unit-trace';
   retrieval: string;
   count: number;
 };
 
-/**
- * The durable description of the exact context selected for one provider
- * scope. This is the frame that is actually dispatched.
- */
-export type ThreadContextFrameCandidate = {
+/** Durable, deterministic description of the exact context selected for one provider scope. */
+export type TurnContextFrameCandidate = {
   compilerVersion: typeof CONTEXT_COMPILER_VERSION;
   policyVersion: typeof CONTEXT_POLICY_VERSION;
   basisSequence: number;
-  threadVersionId: string;
-  contextEnvelope: string;
-  contextEnvelopeHash: string;
+  requestedPlan: TurnContextPlan;
+  resolvedTurns: readonly ResolvedTurnContextSource[];
   semanticHash: string;
   estimatedInputTokens: number;
   orderedMessageHashes: readonly string[];
   selectedTurnIds: readonly string[];
-  dialogueTurnIds: readonly string[];
-  omittedDialogueTurns: number;
-  threadDocumentBytes: number;
   scopeKind: 'turn' | 'work_unit';
-  softContextLimit: number;
-  hardContextLimit: number;
-  pressureNoticed: boolean;
-  layers: readonly ThreadContextLayer[];
+  layers: readonly TurnContextLayer[];
   omissions: readonly ContextOmission[];
 };
 
@@ -63,24 +65,18 @@ export type InferenceContextManifest = {
   frameId: string;
   inferenceId: string;
   basisSequence: number;
-  threadVersionId: string;
   context: {
     semanticHash: string;
-    contextEnvelopeHash: string;
     logicalHash: string;
     renderedHash: string;
     orderedMessageHashes: readonly string[];
     messageCount: number;
     estimatedInputTokens: number;
+    requestedPlan: TurnContextPlan;
+    resolvedTurns: readonly ResolvedTurnContextSource[];
     selectedTurnIds: readonly string[];
-    dialogueTurnIds: readonly string[];
-    omittedDialogueTurns: number;
-    threadDocumentBytes: number;
     scopeKind: 'turn' | 'work_unit';
-    softContextLimit: number;
-    hardContextLimit: number;
-    pressureNoticed: boolean;
-    layers: readonly ThreadContextLayer[];
+    layers: readonly TurnContextLayer[];
     omissions: readonly ContextOmission[];
   };
   transport: {

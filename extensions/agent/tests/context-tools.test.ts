@@ -5,12 +5,12 @@ import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 
 import { createContextTools } from '../server/src/context/tools.ts';
 
-test('model-facing context tools use Thread, History, and work-unit start/finish language', async () => {
+test('model-facing context tools use History and work-unit start/finish language', async () => {
   const seen: {
     searchCallId?: string;
     openedRef?: string;
-    resources?: Array<{ ref: string }>;
-    returnedResources?: Array<{ ref: string }>;
+    boundary?: string;
+    artifacts?: string[];
   } = {};
   const tools = createContextTools({
     async historySearch(callId, input) {
@@ -36,43 +36,22 @@ test('model-facing context tools use Thread, History, and work-unit start/finish
         retention: 'ephemeral',
       };
     },
-    async threadRead() {
-      return { documentId: 'thread', versionId: 'v1', content: '# Thread\n', ref: 'history://document-version/v1' };
-    },
-    async threadPatch() {
-      return { documentId: 'thread', versionId: 'v2', content: '# Thread\n\nUpdated.\n', ref: 'history://document-version/v2' };
-    },
-    async threadReplace() {
-      return { documentId: 'thread', versionId: 'v3', content: '# Thread\n\nReplaced.\n', ref: 'history://document-version/v3' };
-    },
     async workUnitEnter(_callId, input) {
-      seen.resources = input.resources;
+      seen.boundary = input.boundary;
       return {
         scopeId: 'child',
         parentScopeId: 'parent',
-        objective: input.objective,
-        doneWhen: input.doneWhen ?? [],
-        resources: (input.resources ?? []).map((resource) => ({
-          ...resource,
-          inclusion: 'materialized' as const,
-          snapshot: {
-            ref: `history://artifact/${'a'.repeat(64)}`,
-            hash: 'a'.repeat(64),
-            byteLength: 13,
-            mediaType: 'text/plain; charset=utf-8',
-            source: resource.ref.startsWith('history://') ? 'history' as const : 'file' as const,
-          },
-        })),
+        boundary: input.boundary,
         state: 'running',
       };
     },
     async workUnitFinish(_callId, input) {
-      seen.returnedResources = input.resources;
+      seen.artifacts = input.artifacts;
       return {
         scopeId: 'child',
         status: input.status,
         result: input.result,
-        resources: [],
+        artifacts: [],
         resultRef: `history://artifact/${'b'.repeat(64)}`,
         historyRef: 'history://scope/child',
       };
@@ -81,9 +60,6 @@ test('model-facing context tools use Thread, History, and work-unit start/finish
   assert.deepEqual(tools.map(({ name }) => name), [
     'history_search',
     'history_read',
-    'thread_read',
-    'thread_patch',
-    'thread_replace',
     'work_unit_start',
     'work_unit_finish',
   ]);
@@ -101,7 +77,7 @@ test('model-facing context tools use Thread, History, and work-unit start/finish
   assert.deepEqual(finishSchema.required, ['status', 'result']);
   assert.equal(finishSchema.properties?.result?.maxLength, undefined);
   assert.equal('threadUpdate' in (finishSchema.properties ?? {}), false);
-  assert.equal('artifacts' in (finishSchema.properties ?? {}), false);
+  assert.equal('artifacts' in (finishSchema.properties ?? {}), true);
   const context = {} as ExtensionContext;
   const search = await byName.get('history_search')!.execute(
     'search', { query: 'prior' }, undefined, undefined, context,
@@ -113,38 +89,23 @@ test('model-facing context tools use Thread, History, and work-unit start/finish
   );
   assert.equal(seen.openedRef, 'history://turn/prior');
   assert.equal((opened.details as { ref: string }).ref, 'history://turn/prior');
-  const thread = await byName.get('thread_read')!.execute(
-    'thread', {}, undefined, undefined, context,
-  );
-  assert.equal((thread.details as { ref: string }).ref, 'history://document-version/v1');
   const work = await byName.get('work_unit_start')!.execute(
     'work', {
-      objective: 'Inspect the seam.',
-      doneWhen: ['The seam has exact evidence.'],
-      resources: [
-        { ref: 'history://turn/prior', role: 'evidence' },
-        { ref: 'docs/contract.md', role: 'authority' },
-      ],
+      boundary: 'Inspect the seam and close when its exact contract is verified.',
     },
     undefined, undefined, context,
   );
-  assert.deepEqual(seen.resources?.map(({ ref }) => ref), ['history://turn/prior', 'docs/contract.md']);
-  assert.deepEqual(
-    (work.details as { resources: Array<{ ref: string }> }).resources.map(({ ref }) => ref),
-    ['history://turn/prior', 'docs/contract.md'],
-  );
+  assert.equal(seen.boundary, 'Inspect the seam and close when its exact contract is verified.');
+  assert.equal((work.details as { boundary: string }).boundary, seen.boundary);
   const finished = await byName.get('work_unit_finish')!.execute(
     'finish', {
       status: 'completed',
       result: 'The seam is sound.',
-      resources: [
-        { ref: 'history://turn/prior', role: 'evidence' },
-        { ref: 'src/seam.ts', role: 'deliverable' },
-      ],
+      artifacts: ['history://turn/prior', 'src/seam.ts'],
     },
     undefined, undefined, context,
   );
-  assert.deepEqual(seen.returnedResources?.map(({ ref }) => ref), [
+  assert.deepEqual(seen.artifacts, [
     'history://turn/prior',
     'src/seam.ts',
   ]);

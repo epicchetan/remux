@@ -1,6 +1,7 @@
 import { useState } from 'react';
 
-import type { AgentComposerMessagePart } from '../../../../shared/protocol.ts';
+import type { AgentComposerMessagePart, TurnContextPlan } from '../../../../shared/protocol.ts';
+import { createDefaultTurnContextPlan } from '../context/contextPlan.ts';
 import { buildComposerSendProjection } from '../model/sendProjection.ts';
 import {
   type ComposerEditTarget,
@@ -24,13 +25,14 @@ export function useComposerTurnAction({
   onEdit: ComposerBranchCallback<ComposerEditTarget>;
   onFork: ComposerBranchCallback<ComposerForkTarget>;
   onSend: (
-    input: { displayText: string; parts: AgentComposerMessagePart[] },
+    input: { contextPlan: TurnContextPlan; displayText: string; parts: AgentComposerMessagePart[] },
     setPhase: (phase: 'sending' | 'updating-transcript') => void,
   ) => Promise<void>;
 }) {
   const snapshot = useComposerStore((state) => state.snapshot);
   const editTarget = useComposerStore((state) => state.editTarget);
   const forkTarget = useComposerStore((state) => state.forkTarget);
+  const contextPlan = useComposerStore((state) => state.contextPlan);
   const submission = useComposerStore((state) => state.submission);
   const beginSubmission = useComposerStore((state) => state.beginSubmission);
   const clearComposer = useComposerStore((state) => state.clearComposer);
@@ -38,6 +40,7 @@ export function useComposerTurnAction({
   const clearSubmission = useComposerStore((state) => state.clearSubmission);
   const failSubmission = useComposerStore((state) => state.failSubmission);
   const setSubmissionPhase = useComposerStore((state) => state.setSubmissionPhase);
+  const setContextPlan = useComposerStore((state) => state.setContextPlan);
   const [isStopping, setStopping] = useState(false);
 
   const handleSend = () => {
@@ -49,8 +52,9 @@ export function useComposerTurnAction({
       kind,
       phase: conversationExists ? 'sending' : 'starting-conversation',
       snapshot,
+      contextPlan,
     });
-    const input = { displayText: projection.displayText, parts: projection.parts };
+    const input = { contextPlan, displayText: projection.displayText, parts: projection.parts };
     const setPhase = (phase: 'sending' | 'updating-transcript') => setSubmissionPhase(next.id, phase);
     const request = editTarget
       ? onEdit(editTarget, input, setPhase)
@@ -63,6 +67,9 @@ export function useComposerTurnAction({
           clearComposer();
         }
         clearMode();
+        if (useComposerStore.getState().contextPlan === next.contextPlan) {
+          setContextPlan(createDefaultTurnContextPlan());
+        }
         clearSubmission(next.id);
       })
       .catch((error) => {
@@ -94,6 +101,6 @@ export function useComposerTurnAction({
 
 type ComposerBranchCallback<T> = (
   target: T,
-  input: { displayText: string; parts: AgentComposerMessagePart[] },
+  input: { contextPlan: TurnContextPlan; displayText: string; parts: AgentComposerMessagePart[] },
   setPhase: (phase: 'sending' | 'updating-transcript') => void,
 ) => Promise<void>;

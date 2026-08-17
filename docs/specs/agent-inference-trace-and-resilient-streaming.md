@@ -1,10 +1,10 @@
 Status: Implemented (automated acceptance complete; physical-phone acceptance pending)
-Last verified: 2026-08-12
+Last verified: 2026-08-16
 Canonical code: `extensions/agent/{server,shared,viewer}/`, with the stable lifecycle and transcript comparison in `extensions/codex/{server,shared,viewer}/`
 
 # Agent inference traces and resilient viewer streaming
 
-Implementation baseline: Agent state schema v4 and transcript protocol/projection
+Implementation baseline: Agent state schema v5 and transcript protocol/projection
 v3. The retired flat `workGroup`, `workEntryDetail`, and `workUnit` resource
 paths have been removed; `executionScope` and `operationDetail` are the only
 Work-detail resources.
@@ -36,7 +36,7 @@ turn
 │   │           │   ├── assistant commentary
 │   │           │   ├── provider reasoning summary
 │   │           │   └── tool-call group
-│   │           └── result, returned resources, and proposed Thread update
+│   │           └── result and returned resources
 │   └── inference 3
 │       └── provider reasoning summary
 └── assistant response
@@ -62,9 +62,9 @@ deltas directly to React state.
 
 ## Relationship to current Agent specifications
 
-- [`agent-thread-runtime-v2.md`](agent-thread-runtime-v2.md) remains normative
-  for provider context, exact recent dialogue, `thread.md`, journal retrieval,
-  and work-unit continuation semantics.
+- [`agent-explicit-turn-context-v1.md`](agent-explicit-turn-context-v1.md) is
+  normative for user-selected prior-turn context, exact active scopes, History
+  retrieval, and work-unit continuation semantics.
 - [`agent-ui-parity-and-phased-delivery.md`](agent-ui-parity-and-phased-delivery.md)
   remains normative for the copied Codex design system, virtualizer, composer,
   and interaction parity.
@@ -152,7 +152,7 @@ contract.
 - Group the tool calls emitted by an inference directly beneath its reasoning.
 - Render work units as nested instances of the same execution trace.
 - Show a work unit's model-authored objective, completion criteria, provided
-  resources, result, returned resources, and proposed Thread update.
+  resources, result, and returned resources.
 - Keep exact tool arguments, outputs, diffs, provider payloads, and oversized
   reasoning available through bounded detail reads.
 - Preserve streaming assistant output, stable virtualizer identity, bottom
@@ -474,8 +474,7 @@ Opening a work unit shows:
 3. provided authority/deliverable/evidence resources;
 4. its inference trace rendered by the same component as root Work;
 5. result;
-6. returned resources; and
-7. proposed Thread update.
+6. returned resources.
 
 The exact compiled provider payload is not shown by default. An advanced
 diagnostic action may open the already-durable context manifest and dispatch

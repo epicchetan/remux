@@ -1,6 +1,6 @@
 # Agent background working memory v1
 
-Status: Implemented; diagnostic benchmark complete
+Status: R&D evidence; superseded by `agent-explicit-turn-context-v1.md`
 Last verified: 2026-08-09
 Builds on: [`agent-context-workspace-v1.md`](agent-context-workspace-v1.md)
 

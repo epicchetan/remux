@@ -8,7 +8,6 @@ export const AGENT_METHODS = {
   authLogout: 'remux/agent/auth/logout',
   modelsRead: 'remux/agent/models/read',
   artifactRead: 'remux/agent/artifact/read',
-  threadRead: 'remux/agent/thread/read',
   turnRead: 'remux/agent/turn/read',
   conversationCreate: 'remux/agent/conversation/create',
   messageSend: 'remux/agent/conversation/message/send',
@@ -130,17 +129,15 @@ export type ContextInspectorArtifact = {
 };
 
 export type ContextInspectorValue = {
-  version: 5;
+  version: 6;
   conversationId: string;
   inferenceId: string;
   frameId: string;
   basisSequence: number;
-  threadVersionId: string;
   compilerVersion: string;
   policyVersion: string;
   estimatedInputTokens: number;
   semanticHash: string;
-  contextEnvelopeHash: string;
   buildDurationMs: number;
   transportMode: 'full' | 'continuation';
   messageCount: number;
@@ -149,7 +146,6 @@ export type ContextInspectorValue = {
   renderedHash: string;
   fixedContractsHash: string;
   manifestArtifact: ContextInspectorArtifact;
-  contextEnvelopeArtifact: ContextInspectorArtifact;
   dispatchArtifact: ContextInspectorArtifact;
   groups: ReadonlyArray<{
     turnId: string;
@@ -159,15 +155,17 @@ export type ContextInspectorValue = {
     roles: { user: number; assistant: number; tool: number };
   }>;
   groupsTruncated: boolean;
-  dialogueTurnIds: readonly string[];
-  omittedDialogueTurns: number;
-  threadDocumentBytes: number;
   scopeKind: 'turn' | 'work_unit';
-  softContextLimit: number;
-  hardContextLimit: number;
-  pressureNoticed: boolean;
+  requestedPlan: TurnContextPlan;
+  selectedTurns: ReadonlyArray<{
+    turnId: string;
+    resolution: Exclude<TurnContextResolution, 'off'>;
+    origin: 'automatic' | 'explicit';
+    messageCount: number;
+    estimatedTokens: number;
+  }>;
   layers: ReadonlyArray<{
-    kind: 'thread_document' | 'recent_dialogue' | 'active_scope';
+    kind: 'selected_dialogue' | 'selected_full_turns' | 'active_scope';
     hash: string;
     estimatedTokens: number;
     sources: readonly string[];
@@ -183,26 +181,6 @@ export type ContextInspectorValue = {
   omissionsTruncated: boolean;
 };
 
-export type ThreadCanvasVersion = {
-  versionId: string;
-  ordinal: number;
-  basedOnTurnId: string | null;
-  createdAt: number;
-  content: string;
-  byteLength: number;
-};
-
-export type ThreadCanvasValue = {
-  conversationId: string;
-  documentId: string;
-  current: ThreadCanvasVersion;
-  previous: ThreadCanvasVersion | null;
-};
-
-export type ThreadReadParams = {
-  conversationId: string;
-};
-
 export type TurnReadParams = {
   conversationId: string;
   turnId: string;
@@ -216,8 +194,7 @@ export type TurnReadValue = {
   terminalSequence: number | null;
   error: string | null;
   errorCode: 'provider_error' | 'runtime_error' | 'storage_error' | null;
-  threadVersionBefore: string;
-  threadVersionAfter: string | null;
+  contextPlan: TurnContextPlan;
   createdAt: number;
   updatedAt: number;
 };
@@ -361,11 +338,27 @@ export type AgentComposerMessagePart =
       type: 'mention';
     };
 
+export const DEFAULT_TURN_CONTEXT_DIALOGUE_TURNS = 2;
+
+export type TurnContextResolution = 'off' | 'dialogue' | 'full';
+
+export type TurnContextOverride = {
+  turnId: string;
+  resolution: TurnContextResolution;
+};
+
+export type TurnContextPlan = {
+  version: 1;
+  automaticDialogueTurns: number;
+  overrides: TurnContextOverride[];
+};
+
 export type MessageSendParams = {
   operationId: string;
   conversationId: string;
   clientMessageId: string;
   parts?: AgentComposerMessagePart[];
+  contextPlan: TurnContextPlan;
   text: string;
 };
 
@@ -386,6 +379,7 @@ export type MessageBranchParams = {
   clientMessageId: string;
   operationId: string;
   parts?: AgentComposerMessagePart[];
+  contextPlan: TurnContextPlan;
   sourceConversationId: string;
   sourceMessageId: string;
   sourceTurnId: string;

@@ -6,6 +6,7 @@ import {
   type MessageBranchResult,
   type MessageSendResult,
   type ReasoningLevel,
+  type TurnContextPlan,
 } from '../../../shared/protocol.ts';
 
 export const agentCommands = {
@@ -28,6 +29,7 @@ export const agentCommands = {
     conversationId: string;
     clientMessageId: string;
     parts: AgentComposerMessagePart[];
+    contextPlan: TurnContextPlan;
     text: string;
   }) {
     return rpc.command<MessageSendResult>(AGENT_METHODS.messageSend, input);
@@ -37,6 +39,7 @@ export const agentCommands = {
     operationId: string;
     clientMessageId: string;
     parts: AgentComposerMessagePart[];
+    contextPlan: TurnContextPlan;
     text: string;
     sourceConversationId: string;
     sourceMessageId: string;

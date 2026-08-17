@@ -14,9 +14,6 @@ import type {
   HistoryOpenResult,
   HistorySearchInput,
   HistorySearchResult,
-  ThreadDocumentView,
-  ThreadPatchInput,
-  ThreadReplaceInput,
   WorkUnitEnterInput,
   WorkUnitCompletion,
   WorkUnitReturnInput,
@@ -30,16 +27,9 @@ export type {
   HistorySearchInput,
   HistorySearchOptions,
   HistorySearchResult,
-  ThreadDocumentView,
-  ThreadPatchEdit,
-  ThreadPatchInput,
-  ThreadReplaceInput,
   WorkUnitEnterInput,
   WorkUnitCompletion,
-  WorkUnitContextResource,
-  WorkUnitResourceRef,
-  WorkUnitResourceRole,
-  WorkUnitResourceView,
+  WorkUnitArtifactView,
   WorkUnitReturnInput,
   WorkUnitReturnStatus,
   WorkUnitView,
@@ -61,12 +51,7 @@ export type ModelSessionEvent =
 export type ModelSessionEventSink = (event: ModelSessionEvent) => void;
 
 export type ModelSessionDurabilityHooks = {
-  compileContext(contextWindow: number): Promise<DurableContextBoundarySnapshot>;
-  noticeContextPressure(input: {
-    estimatedInputTokens: number;
-    softContextLimit: number;
-    hardContextLimit: number;
-  }): Promise<boolean>;
+  compileContext(): Promise<DurableContextBoundarySnapshot>;
   beforeAssistantMessageEnd(input: {
     inferenceState: 'completed' | 'failed' | 'interrupted';
     text: string;
@@ -109,9 +94,6 @@ export type ModelSessionDurabilityHooks = {
   }): Promise<void>;
   historySearch(callId: string, input: HistorySearchInput): Promise<HistorySearchResult>;
   historyOpen(input: HistoryOpenInput): Promise<HistoryOpenResult>;
-  threadRead(): Promise<ThreadDocumentView>;
-  threadPatch(input: ThreadPatchInput): Promise<ThreadDocumentView>;
-  threadReplace(input: ThreadReplaceInput): Promise<ThreadDocumentView>;
   workUnitEnter(callId: string, input: WorkUnitEnterInput): Promise<WorkUnitView>;
   workUnitFinish(callId: string, input: WorkUnitReturnInput): Promise<WorkUnitCompletion>;
   workUnitAbort(input: { reason: string }): Promise<WorkUnitCompletion>;

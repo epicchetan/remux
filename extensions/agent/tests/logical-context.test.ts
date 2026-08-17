@@ -4,8 +4,6 @@ import test from 'node:test';
 import type { Message } from '@earendil-works/pi-ai';
 
 import {
-  assertContextBudget,
-  ContextBudgetExceededError,
   createDurableContextSnapshot,
   estimatePiContextTokens,
   hashRenderedMessages,
@@ -183,17 +181,5 @@ test('tool-result semantics preserve provider-visible unsafe JSON as exact text'
   assert.deepEqual(
     piMessageSemanticHashes([piMessage]),
     createDurableContextSnapshot(1, [durable]).orderedMessageHashes,
-  );
-});
-
-test('context budget fails with an explicit execution-scope limit', () => {
-  assert.doesNotThrow(() => assertContextBudget(4_999, 35_000));
-  assert.throws(
-    () => assertContextBudget(5_001, 35_000),
-    (error) => error instanceof ContextBudgetExceededError &&
-      error.kind === 'context_budget_exceeded' &&
-      error.hardInputLimit === 10_000 &&
-      error.safetyMargin === 5_000 &&
-      error.admissionLimit === 5_000,
   );
 });

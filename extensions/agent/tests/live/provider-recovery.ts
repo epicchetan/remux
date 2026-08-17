@@ -84,7 +84,7 @@ try {
   assert.equal(retryTransport.websocketFailures, 0);
 
   const second = await sendAndWait(server, created.conversationId, [
-    'Verify that the recovered provider lane remains reusable.',
+    'Verify that a fresh turn remains usable after provider recovery.',
     'Do not call tools.',
     `Reply with exactly ${SECOND_SENTINEL} and nothing else.`,
   ].join(' '));
@@ -96,14 +96,14 @@ try {
   const continuedTransport = objectPayload(finalTransports[2]?.payload);
   assert.equal(continuedTransport.actualRequestMode, 'full');
   assert.equal(continuedTransport.carrier, 'websocket');
-  assert.equal(continuedTransport.connectionsReused, 1);
-  assert.equal(continuedTransport.connectionsCreated, 0);
+  assert.equal(continuedTransport.connectionsReused, 0);
+  assert.equal(continuedTransport.connectionsCreated, 1);
   assert.equal(continuedTransport.websocketFailures, 0);
   assert.equal(continuedTransport.sseFallbacks, 0);
 
   const third = await sendAndWait(server, created.conversationId, [
     'Exercise one focused work unit for the provider-lane smoke.',
-    'Call work_unit_start with objective "Verify child provider isolation."',
+    'Call work_unit_start with boundary "Verify provider isolation and close after the marker is observed."',
     `Inside the work unit call bash with command "printf ${CHILD_MARKER}".`,
     `Then call work_unit_finish with status completed and a concise result containing ${CHILD_MARKER}.`,
     `After the parent resumes, reply with exactly ${THIRD_SENTINEL} and nothing else.`,
@@ -281,6 +281,11 @@ async function sendAndWait(
     operationId: randomUUID(),
     conversationId,
     clientMessageId: randomUUID(),
+    contextPlan: {
+      version: 1,
+      automaticDialogueTurns: 2,
+      overrides: [],
+    },
     text,
   }) as { turnId: string };
   const deadline = Date.now() + TIMEOUT_MS;
