@@ -33,7 +33,7 @@ const workUnitEnterSchema = Type.Object({
   boundary: Type.String({
     minLength: 1,
     maxLength: 4 * 1024,
-    description: 'A brief, user-readable statement of the independently verifiable slice being entered and the evidence that will establish it.',
+    description: 'The outcome of this optional independently verifiable slice and the evidence that will establish it.',
   }),
 });
 
@@ -107,14 +107,15 @@ export function createContextTools(
       name: 'work_unit_start',
       label: 'Start work unit',
       description: [
-        'Open a disposable continuation segment inside the current turn.',
+        'Open an optional disposable continuation segment inside the current turn.',
         'The same assistant retains the current request, reasoning, plan, and tool state; this is not delegation to another agent.',
         'Detailed reasoning and tool activity inside the segment remain in History but leave active context after work_unit_finish.',
       ].join(' '),
-      promptSnippet: 'Open one coherent disposable work segment',
+      promptSnippet: 'Open an optional disposable work segment',
       promptGuidelines: [
-        'Use a work unit for one independently verifiable slice of inspection, implementation, or validation that may consume substantial context. The main turn retains the overall request; do not assign the whole turn by default.',
-        'Write one brief boundary statement containing both the work being entered and its natural closing condition. Do not restate the full request or emit separate narration that duplicates it.',
+        'Work in the main turn by default. Do not start a work unit merely because work is substantial, tool-heavy, or involves ordinary implementation, auditing, or review.',
+        'Use one when the user requests it or an accepted plan already contains a distinct independently verifiable slice likely to consume substantial context.',
+        'Write one brief boundary statement containing the outcome and the evidence that will establish it.',
         'Continue the existing turn naturally; do not reorient as another agent or repeat context you already have.',
         'Work units cannot be nested.',
         'Finish by calling work_unit_finish.',
@@ -138,6 +139,7 @@ export function createContextTools(
       ].join(' '),
       promptSnippet: 'Close the work unit and preserve what the continuing turn needs',
       promptGuidelines: [
+        'Always provide status as completed, partial, or blocked.',
         'Put the outcome, important changed state or findings, supporting validation, remaining uncertainty, and next useful edge in result.',
         'For implementation work, finish the focused validation this unit can perform before closing; identify validation that was impossible.',
         'Use partial or blocked to return honestly at a useful boundary instead of broadening the unit.',
