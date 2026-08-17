@@ -117,8 +117,14 @@ test('loads semantic inference traces and child scopes only after disclosure', a
     'font-weight',
     '400',
   );
+  await expect(page.locator('.agent-inference-list').first()).toHaveCSS('row-gap', '8px');
+  await expect(parentInference).toHaveCSS('row-gap', '4px');
+  await expect(parentInference).toHaveCSS('padding-top', '0px');
+  await expect(reasoning.first()).toHaveCSS('padding-top', '0px');
   const parentActions = page.getByRole('button', { name: /Edited index\.ts · Read 1 file/u });
   await expect(parentActions).toBeVisible();
+  await expect(parentActions).toHaveCSS('font-size', '13px');
+  await expect(parentActions).toHaveCSS('line-height', '18px');
   expect(await transcriptRequestTypes(page)).toContain('executionScope');
   expect((await transcriptRequestTypes(page) as string[])
     .filter((type) => type === 'executionScope')).toHaveLength(1);
@@ -153,6 +159,11 @@ test('loads semantic inference traces and child scopes only after disclosure', a
   );
   const childActions = page.getByRole('button', { name: /Ran 1 command/u });
   await childActions.click();
+  const childActionBody = childActions.locator('xpath=..').locator('.agent-action-run-body');
+  await expect(childActionBody).toHaveCSS('row-gap', '4px');
+  await expect(childActionBody).toHaveCSS('padding-top', '4px');
+  await expect(childActionBody).toHaveCSS('padding-left', '0px');
+  await expect(page.locator('.agent-work-unit-content')).toHaveCSS('padding-left', '24px');
   const childTool = page.locator('.agent-tool-call').filter({ hasText: 'bash' });
   await expect(childTool).toHaveCSS('border-left-width', '0px');
   await expect(page.locator('.agent-work-unit-outcome')).toHaveCSS('border-top-width', '0px');

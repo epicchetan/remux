@@ -31,6 +31,8 @@ export function WorkSection({
   const setAdditionalHeight = useTranscriptLayoutStore((state) => state.setOpenWorkAdditionalHeight);
   const ensureExecutionScope = useTranscriptResourceStore((state) => state.ensureExecutionScope);
   const contentRef = useRef<HTMLDivElement | null>(null);
+  const heightRafRef = useRef<number | null>(null);
+  const pendingHeightRef = useRef<number | null>(null);
   const isOpen = Boolean(openWork);
 
   useEffect(() => {
@@ -40,11 +42,30 @@ export function WorkSection({
   useLayoutEffect(() => {
     const element = contentRef.current;
     if (!element || !isOpen) return;
-    const publish = () => setAdditionalHeight(workKey, rowId, element.getBoundingClientRect().height);
+
+    const publish = () => {
+      pendingHeightRef.current = Math.max(0, Math.ceil(element.getBoundingClientRect().height));
+      if (heightRafRef.current !== null) return;
+
+      heightRafRef.current = window.requestAnimationFrame(() => {
+        heightRafRef.current = null;
+        const pendingHeight = pendingHeightRef.current;
+        pendingHeightRef.current = null;
+        if (pendingHeight !== null) setAdditionalHeight(workKey, rowId, pendingHeight);
+      });
+    };
+
     publish();
     const observer = new ResizeObserver(publish);
     observer.observe(element);
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      if (heightRafRef.current !== null) {
+        window.cancelAnimationFrame(heightRafRef.current);
+        heightRafRef.current = null;
+      }
+      pendingHeightRef.current = null;
+    };
   }, [isOpen, rowId, setAdditionalHeight, workKey]);
 
   const completed = segment.state !== 'running';

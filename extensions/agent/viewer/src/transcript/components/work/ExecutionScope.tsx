@@ -469,7 +469,7 @@ function ActionRun({
     <section className="agent-action-run" data-state={status}>
       <button
         aria-expanded={open}
-        className="codex-work-row-button codex-work-summary-button"
+        className="agent-action-run-header codex-work-row-button codex-work-summary-button"
         data-remux-no-composer-focus="true"
         data-testid={`agent-action-summary-${disclosureKey}`}
         onClick={() => setOnlyOpen(workKey, siblingKeys, open ? null : disclosureKey)}
@@ -525,7 +525,7 @@ function ToolCall({
     <section className="agent-tool-call codex-work-row-frame" data-state={call.status}>
       <button
         aria-expanded={open}
-        className="codex-work-row"
+        className="agent-tool-call-header codex-work-row"
         data-remux-no-composer-focus="true"
         onClick={() => {
           toggle(workKey, key);
