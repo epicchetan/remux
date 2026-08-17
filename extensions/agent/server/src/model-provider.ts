@@ -107,7 +107,11 @@ export type ModelSessionDurabilityHooks = {
 };
 
 export interface ModelSession {
-  prompt(input: { text: string; images?: Array<{ data: string; mimeType: string }> }): Promise<void>;
+  prompt(input: {
+    text: string;
+    reasoning: ReasoningLevel;
+    images?: Array<{ data: string; mimeType: string }>;
+  }): Promise<void>;
   interrupt(): Promise<void>;
   dispose(): Promise<void>;
 }

@@ -72,6 +72,8 @@ test('the Agent runtime owns bounded durable retries and selects one provider la
   );
   assert.match(runtime, /providerSessionId: \(\) => activeProviderSessionId/u);
   assert.match(runtime, /activeProviderSessionId = snapshot\.scopeId/u);
+  assert.match(runtime, /session\.setThinkingLevel\(activeReasoning\)/u);
+  assert.match(runtime, /thinkingLevel: activeReasoning/u);
   assert.match(runtime, /provider-retry@1/u);
   assert.match(runtime, /provider-lanes@1/u);
   assert.match(runtime, /child\.agent\.state\.messages = \[\{\s+role: 'toolResult'/u);

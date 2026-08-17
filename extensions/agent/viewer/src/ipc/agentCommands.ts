@@ -30,6 +30,7 @@ export const agentCommands = {
     clientMessageId: string;
     parts: AgentComposerMessagePart[];
     contextPlan: TurnContextPlan;
+    reasoning: ReasoningLevel;
     text: string;
   }) {
     return rpc.command<MessageSendResult>(AGENT_METHODS.messageSend, input);
@@ -40,6 +41,7 @@ export const agentCommands = {
     clientMessageId: string;
     parts: AgentComposerMessagePart[];
     contextPlan: TurnContextPlan;
+    reasoning: ReasoningLevel;
     text: string;
     sourceConversationId: string;
     sourceMessageId: string;

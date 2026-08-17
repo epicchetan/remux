@@ -3,15 +3,13 @@ import { useCallback, type Dispatch, type MutableRefObject, type SetStateAction 
 import {
   AGENT_RESOURCE_KEYS,
   queueResourceKey,
-  type AgentComposerMessagePart,
   type AgentResourceKey,
   type ConversationValue,
-  type ReasoningLevel,
-  type TurnContextPlan,
 } from '../../../shared/protocol.ts';
+import type { TurnSubmissionInput } from '../composer/actions/turnAction.ts';
 import type { ComposerEditTarget, ComposerForkTarget } from '../composer/store.ts';
 import {
-  removeConversationDraft,
+  clearConversationDraftContent,
   removeNewChatDraft,
   type AgentNewChatDraft,
 } from '../conversation/drafts.ts';
@@ -40,7 +38,6 @@ export function useConversationActions(options: {
   cwd: string;
   draftRef: MutableRefObject<AgentNewChatDraft | null>;
   modelId: string;
-  reasoning: ReasoningLevel;
   refresh: (keys?: AgentResourceKey[]) => Promise<void>;
   selectConversation: (conversationId: string, focusTurnId?: string | null) => void;
   setActiveConversationId: Dispatch<SetStateAction<string | null>>;
@@ -55,7 +52,6 @@ export function useConversationActions(options: {
     cwd,
     draftRef,
     modelId,
-    reasoning,
     refresh,
     selectConversation,
     setActiveConversationId,
@@ -64,7 +60,7 @@ export function useConversationActions(options: {
     setError,
   } = options;
   const ensureConversation = useConversationHistoryStore((state) => state.ensureConversation);
-  const createConversation = useCallback(async () => {
+  const createConversation = useCallback(async (reasoning: TurnSubmissionInput['reasoning']) => {
     if (!modelId || !cwd) throw new Error('Choose a workspace and model first.');
     const operationId = activeDraftIdRef.current ?? loadOrCreateDraftOperationId();
     const sourceDraftId = activeDraftIdRef.current;
@@ -91,18 +87,17 @@ export function useConversationActions(options: {
     draftRef,
     ensureConversation,
     modelId,
-    reasoning,
     setActiveConversationId,
     setActiveDraftId,
     setDraft,
   ]);
 
   const send = useCallback(async (
-    input: { contextPlan: TurnContextPlan; displayText: string; parts: AgentComposerMessagePart[] },
+    input: TurnSubmissionInput,
     setPhase: (phase: ComposerPhase) => void,
   ) => {
     setError(null);
-    const activeId = activeConversationIdRef.current ?? await createConversation();
+    const activeId = activeConversationIdRef.current ?? await createConversation(input.reasoning);
     setPhase('sending');
     const clientMessageId = createViewerUuid();
     trackTranscriptUserMessage(activeId, clientMessageId);
@@ -114,6 +109,7 @@ export function useConversationActions(options: {
         clientMessageId,
         contextPlan: input.contextPlan,
         parts: input.parts,
+        reasoning: input.reasoning,
         text: input.displayText,
       });
     } catch (reason) {
@@ -123,7 +119,7 @@ export function useConversationActions(options: {
     if (sent.turnId) trackTranscriptUserMessage(activeId, clientMessageId, sent.turnId);
     else discardTranscriptUserMessage(clientMessageId);
     setPhase('updating-transcript');
-    removeConversationDraft(activeId);
+    clearConversationDraftContent(activeId);
     await Promise.all([
       refresh([AGENT_RESOURCE_KEYS.runtime, queueResourceKey(activeId)]),
       ensureConversation(activeId, true),
@@ -140,7 +136,7 @@ export function useConversationActions(options: {
   const branchMessage = useCallback(async (
     mode: 'edit' | 'fork',
     target: ComposerEditTarget | ComposerForkTarget,
-    input: { contextPlan: TurnContextPlan; displayText: string; parts: AgentComposerMessagePart[] },
+    input: TurnSubmissionInput,
     setPhase: (phase: ComposerPhase) => void,
   ) => {
     setError(null);
@@ -152,6 +148,7 @@ export function useConversationActions(options: {
       clientMessageId,
       contextPlan: input.contextPlan,
       parts: input.parts,
+      reasoning: input.reasoning,
       text: input.displayText,
       sourceConversationId: target.conversationId,
       sourceMessageId: mode === 'edit'
@@ -159,7 +156,7 @@ export function useConversationActions(options: {
         : (target as ComposerForkTarget).assistantMessageId,
       sourceTurnId: target.turnId,
     });
-    removeConversationDraft(target.conversationId);
+    clearConversationDraftContent(target.conversationId);
     trackTranscriptUserMessage(result.conversationId, clientMessageId, result.turnId);
     setPhase('updating-transcript');
     await ensureConversation(result.conversationId, true);

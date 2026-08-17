@@ -67,6 +67,7 @@ export type AcceptTurnParams = {
   clientMessageId: string;
   parts?: AgentComposerMessagePart[];
   contextPlan: TurnContextPlan;
+  reasoning: ReasoningLevel;
   text: string;
 };
 

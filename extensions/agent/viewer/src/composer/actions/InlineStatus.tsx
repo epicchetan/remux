@@ -14,7 +14,6 @@ export function ComposerInlineStatus({
   const models = useComposerStore((state) => state.models);
   const configuredReasoning = useComposerStore((state) => state.reasoning);
   const modelId = conversation?.modelId ?? configuredModel;
-  const reasoning = conversation?.reasoning ?? configuredReasoning;
   const model = resolveModel(models, modelId);
 
   return (
@@ -22,7 +21,7 @@ export function ComposerInlineStatus({
       <div className="remux-composer-status-group">
         <span className="truncate">{model?.name ?? (modelId || 'Loading models')}</span>
         <span className="remux-composer-status-separator" aria-hidden="true">/</span>
-        <span className="truncate">{reasoningLabel(reasoning)} reasoning</span>
+        <span className="truncate">{reasoningLabel(configuredReasoning)} reasoning</span>
       </div>
       {conversation ? (
         <div className="remux-composer-status-actions">

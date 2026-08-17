@@ -285,6 +285,7 @@ export interface BenchmarkConversationTarget {
   }): Promise<StartedBenchmarkTurn>;
   send(input: {
     conversationId: string;
+    reasoning: string;
     text: string;
     contextPlan?: TurnContextPlan | null;
   }): Promise<{ turnId: string }>;

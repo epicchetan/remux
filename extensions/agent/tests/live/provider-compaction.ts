@@ -98,6 +98,7 @@ async function sendAndWait(runtime: AgentServer, conversationId: string, text: s
     conversationId,
     clientMessageId: randomUUID(),
     contextPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
+    reasoning: 'high',
     text,
   }) as { turnId: string };
   const deadline = Date.now() + TIMEOUT_MS;

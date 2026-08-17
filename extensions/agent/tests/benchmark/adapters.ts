@@ -200,6 +200,7 @@ class AgentBenchmarkTarget implements BenchmarkConversationTarget {
     const conversationId = requiredString(created.conversationId, 'Agent create response conversationId');
     const sent = await this.send({
       conversationId,
+      reasoning: input.reasoning,
       text: input.text,
       contextPlan: input.contextPlan,
     });
@@ -208,6 +209,7 @@ class AgentBenchmarkTarget implements BenchmarkConversationTarget {
 
   async send(input: {
     conversationId: string;
+    reasoning: string;
     text: string;
     contextPlan?: TurnContextPlan | null;
   }) {
@@ -220,6 +222,7 @@ class AgentBenchmarkTarget implements BenchmarkConversationTarget {
         automaticDialogueTurns: 2,
         overrides: [],
       },
+      reasoning: input.reasoning,
       text: input.text,
     }));
     if (response.accepted !== true) throw new Error('Agent did not accept the benchmark message.');

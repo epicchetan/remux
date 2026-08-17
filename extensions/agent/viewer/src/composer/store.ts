@@ -40,6 +40,7 @@ export type ComposerSubmission = {
   phase: ComposerSubmissionPhase;
   snapshot: ComposerSnapshot;
   contextPlan: TurnContextPlan;
+  reasoning: ReasoningLevel;
   turnId: string | null;
 };
 
@@ -63,6 +64,7 @@ type ComposerStoreState = {
     phase: ComposerSubmissionPhase;
     snapshot?: ComposerSnapshot;
     contextPlan?: TurnContextPlan;
+    reasoning?: ReasoningLevel;
     turnId?: string | null;
   }) => ComposerSubmission;
   blurComposer: () => void;
@@ -115,6 +117,7 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
     contextPlan = get().contextPlan,
     kind,
     phase,
+    reasoning = get().reasoning,
     snapshot = get().snapshot,
     turnId = null,
   }) => {
@@ -125,6 +128,7 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
       phase,
       snapshot,
       contextPlan,
+      reasoning,
       turnId,
     };
     set({ isSubmitting: true, submission, submissionError: null });

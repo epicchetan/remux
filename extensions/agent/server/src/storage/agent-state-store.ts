@@ -272,6 +272,7 @@ export class AgentStateStore extends TurnState implements AgentStore {
       conversationId,
       clientMessageId: value.clientMessageId,
       contextPlan: value.contextPlan,
+      reasoning: value.reasoning,
       text: await this.readTextRef(value.content),
       ...(parts ? { parts } : {}),
     };
@@ -2198,14 +2199,18 @@ export class AgentStateStore extends TurnState implements AgentStore {
     handle: DurableTurnHandle;
     rootHandle: DurableTurnHandle;
     prompt: string;
+    reasoning: ReasoningLevel;
   } | null> {
     this.assertOpen();
     await this.writerTail;
     const row = this.storage.database.prepare(`
       SELECT t.project_id, t.conversation_id, t.turn_id,
-             t.root_scope_id, s.scope_id, s.kind
+             t.root_scope_id, s.scope_id, s.kind,
+             COALESCE(json_extract(a.payload_json, '$.reasoning'), c.reasoning) AS reasoning
       FROM turns t
       JOIN execution_scopes s ON s.turn_id = t.turn_id
+      JOIN conversations c ON c.conversation_id = t.conversation_id
+      JOIN events a ON a.sequence = t.accepted_sequence AND a.type = 'turn.accepted'
       WHERE t.conversation_id = ? AND t.terminal_sequence IS NULL
         AND s.terminal_sequence IS NULL
       ORDER BY t.accepted_sequence DESC,
@@ -2215,6 +2220,7 @@ export class AgentStateStore extends TurnState implements AgentStore {
       project_id: string; conversation_id: string;
       turn_id: string; root_scope_id: string; scope_id: string;
       kind: 'turn' | 'work_unit';
+      reasoning: string;
     } | undefined;
     if (!row) return null;
     const handle: DurableTurnHandle = {
@@ -2273,7 +2279,8 @@ export class AgentStateStore extends TurnState implements AgentStore {
       });
       this.insertArtifact(content.artifact, sequence);
     }));
-    return { handle, rootHandle, prompt };
+    if (!isReasoningLevel(row.reasoning)) throw new Error('Active turn reasoning is invalid.');
+    return { handle, rootHandle, prompt, reasoning: row.reasoning };
   }
 
   private async logicalReplayEvents(events: readonly AgentStateEvent[]) {
@@ -2984,6 +2991,7 @@ export class AgentStateStore extends TurnState implements AgentStore {
         mentionCount: input.parts?.filter((part) => part.type === 'mention').length ?? 0,
         ...(input.parts ? { parts: input.parts } : {}),
         preview: truncateSummaryText(params.text),
+        reasoning: params.reasoning,
       };
       this.storage.database.prepare(`
         INSERT INTO operations (
@@ -3175,6 +3183,7 @@ export class AgentStateStore extends TurnState implements AgentStore {
         payload: {
           clientMessageId: params.clientMessageId,
           contextPlan,
+          reasoning: params.reasoning,
           rootScopeId: handle.scopeId,
           turnId: handle.turnId,
         },
@@ -3226,6 +3235,7 @@ export class AgentStateStore extends TurnState implements AgentStore {
         payload: {
           scopeId: handle.scopeId,
           contextPlan,
+          reasoning: params.reasoning,
           turnId: handle.turnId,
         },
         createdAt: recordedAt,
@@ -4550,6 +4560,7 @@ type QueuedOperationValue = {
   mentionCount: number;
   parts?: AgentUserMessagePart[];
   preview: string;
+  reasoning: ReasoningLevel;
   turnId?: string;
 };
 
@@ -5035,6 +5046,7 @@ function validateAcceptTurnParams(params: AcceptTurnParams): AcceptTurnParams {
   if (params.parts !== undefined && params.parts.length === 0) {
     throw new TypeError('Message parts cannot be empty.');
   }
+  if (!isReasoningLevel(params.reasoning)) throw new TypeError('reasoning is invalid.');
   return { ...params, contextPlan: normalizedContextPlan(params.contextPlan) };
 }
 
@@ -5046,6 +5058,7 @@ function messageArgumentsHash(params: AcceptTurnParams) {
       clientMessageId: params.clientMessageId,
       conversationId: params.conversationId,
       contextPlan: normalizedContextPlan(params.contextPlan),
+      reasoning: params.reasoning,
       ...(params.parts ? { parts: agentComposerPartsHashValue(params.parts) } : {}),
       textHash,
     },
@@ -5074,6 +5087,7 @@ function parseQueuedOperationValue(json: string): QueuedOperationValue {
     mentionCount: requiredNonnegativeInteger(value.mentionCount, 'queued mentionCount'),
     ...(parts ? { parts } : {}),
     preview: typeof value.preview === 'string' ? value.preview : '',
+    reasoning: requiredReasoningLevel(value.reasoning, 'queued reasoning'),
     ...(turnId ? { turnId } : {}),
   };
 }
@@ -5256,4 +5270,11 @@ function requiredProjectionItemId(value: string | undefined, label: string) {
 function isReasoningLevel(value: string): value is ReasoningLevel {
   return value === 'off' || value === 'minimal' || value === 'low' || value === 'medium' ||
     value === 'high' || value === 'xhigh' || value === 'max';
+}
+
+function requiredReasoningLevel(value: CanonicalJsonValue | undefined, label: string): ReasoningLevel {
+  if (typeof value !== 'string' || !isReasoningLevel(value)) {
+    throw new Error(`${label} is invalid.`);
+  }
+  return value;
 }

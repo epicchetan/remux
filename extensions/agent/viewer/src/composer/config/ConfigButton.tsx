@@ -10,13 +10,13 @@ type ConfigSection = 'model' | 'reasoning';
 export function ComposerConfigButton({
   contextOpen,
   disabled = false,
-  locked = false,
+  modelLocked = false,
   onToggleContext,
   onSignOut,
 }: {
   contextOpen: boolean;
   disabled?: boolean;
-  locked?: boolean;
+  modelLocked?: boolean;
   onToggleContext: () => void;
   onSignOut: () => void;
 }) {
@@ -95,7 +95,7 @@ export function ComposerConfigButton({
           />
           <ConfigAction
             active={contextOpen}
-            disabled={!locked}
+            disabled={!modelLocked}
             icon={<Layers3 className="size-4" />}
             label="Turn context"
             onClick={() => {
@@ -105,7 +105,7 @@ export function ComposerConfigButton({
           />
           {models?.models.length ? (
             <ConfigRow
-              disabled={locked}
+              disabled={modelLocked}
               expanded={expanded === 'model'}
               icon={<Boxes className="size-4" />}
               label={selectedModel?.name ?? modelId}
@@ -123,7 +123,6 @@ export function ComposerConfigButton({
           ) : null}
           {selectedModel ? (
             <ConfigRow
-              disabled={locked}
               expanded={expanded === 'reasoning'}
               icon={<Sparkles className="size-4" />}
               label={reasoningLabel(reasoning)}
@@ -139,7 +138,7 @@ export function ComposerConfigButton({
               />
             </ConfigRow>
           ) : null}
-          {locked ? <div className="remux-composer-config-note">Start a new chat to change model settings.</div> : null}
+          {modelLocked ? <div className="remux-composer-config-note">Model is fixed for this chat.</div> : null}
         </div>
       ) : null}
     </div>

@@ -59,6 +59,7 @@ export function removeNewChatDraft(id: string) {
 export type AgentConversationDraft = {
   contextPlan: TurnContextPlan;
   preserveContextPlan: boolean;
+  reasoning: ReasoningLevel | null;
   snapshot: ComposerSnapshot;
 };
 
@@ -67,6 +68,7 @@ export function loadConversationDraft(conversationId: string): AgentConversation
   return {
     contextPlan: parsePersistedTurnContextPlan(parsed?.contextPlan) ?? createDefaultTurnContextPlan(),
     preserveContextPlan: parsed?.preserveContextPlan === true,
+    reasoning: isReasoningLevel(parsed?.reasoning) ? parsed.reasoning : null,
     snapshot: parseSnapshot(parsed?.snapshot) ?? createComposerSnapshot({ parts: [] }, new Map()),
   };
 }
@@ -76,20 +78,30 @@ export function persistConversationDraft(
   snapshot: ComposerSnapshot,
   contextPlan: TurnContextPlan,
   preserveContextPlan: boolean,
+  reasoning: ReasoningLevel,
 ) {
-  const defaultPlan = createDefaultTurnContextPlan();
-  const hasCustomContext = contextPlan.automaticDialogueTurns !== defaultPlan.automaticDialogueTurns ||
-    contextPlan.overrides.length > 0;
-  if (snapshot.isEmpty && !hasCustomContext && !preserveContextPlan) {
-    removeConversationDraft(conversationId);
-    return;
-  }
   writeJson(storageKey(CONVERSATION_PREFIX, conversationId), {
     contextPlan,
     preserveContextPlan,
+    reasoning,
     snapshot: persistedSnapshot(snapshot),
     updatedAt: Date.now(),
   });
+}
+
+export function clearConversationDraftContent(conversationId: string) {
+  const current = loadConversationDraft(conversationId);
+  if (!current.reasoning) {
+    removeConversationDraft(conversationId);
+    return;
+  }
+  persistConversationDraft(
+    conversationId,
+    createComposerSnapshot({ parts: [] }, new Map()),
+    current.contextPlan,
+    current.preserveContextPlan,
+    current.reasoning,
+  );
 }
 
 export function removeConversationDraft(conversationId: string) {

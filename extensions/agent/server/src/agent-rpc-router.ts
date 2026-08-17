@@ -207,6 +207,7 @@ function parseMessageSend(params: unknown): MessageSendParams {
       conversationId: requiredUuidV4(value.conversationId, 'conversationId'),
       clientMessageId: requiredUuidV4(value.clientMessageId, 'clientMessageId'),
       contextPlan: parseTurnContextPlan(value.contextPlan),
+      reasoning: reasoningLevel(value.reasoning),
       text: requiredString(value.text, 'text'),
     };
   }
@@ -221,6 +222,7 @@ function parseMessageSend(params: unknown): MessageSendParams {
     conversationId: requiredUuidV4(value.conversationId, 'conversationId'),
     clientMessageId: requiredUuidV4(value.clientMessageId, 'clientMessageId'),
     contextPlan: parseTurnContextPlan(value.contextPlan),
+    reasoning: reasoningLevel(value.reasoning),
     parts,
     text: agentPromptText(parts),
   };
@@ -276,6 +278,7 @@ function parseMessageBranch(params: unknown): MessageBranchParams {
     operationId: requiredUuidV4(value.operationId, 'operationId'),
     clientMessageId: requiredUuidV4(value.clientMessageId, 'clientMessageId'),
     contextPlan: parseTurnContextPlan(value.contextPlan),
+    reasoning: reasoningLevel(value.reasoning),
     sourceConversationId: requiredUuidV4(value.sourceConversationId, 'sourceConversationId'),
     sourceTurnId: requiredUuidV4(value.sourceTurnId, 'sourceTurnId'),
     sourceMessageId: requiredUuidV4(value.sourceMessageId, 'sourceMessageId'),

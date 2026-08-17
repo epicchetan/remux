@@ -1,6 +1,10 @@
 import { useState } from 'react';
 
-import type { AgentComposerMessagePart, TurnContextPlan } from '../../../../shared/protocol.ts';
+import type {
+  AgentComposerMessagePart,
+  ReasoningLevel,
+  TurnContextPlan,
+} from '../../../../shared/protocol.ts';
 import { createDefaultTurnContextPlan } from '../context/contextPlan.ts';
 import { buildComposerSendProjection } from '../model/sendProjection.ts';
 import {
@@ -25,7 +29,7 @@ export function useComposerTurnAction({
   onEdit: ComposerBranchCallback<ComposerEditTarget>;
   onFork: ComposerBranchCallback<ComposerForkTarget>;
   onSend: (
-    input: { contextPlan: TurnContextPlan; displayText: string; parts: AgentComposerMessagePart[] },
+    input: TurnSubmissionInput,
     setPhase: (phase: 'sending' | 'updating-transcript') => void,
   ) => Promise<void>;
 }) {
@@ -33,6 +37,7 @@ export function useComposerTurnAction({
   const editTarget = useComposerStore((state) => state.editTarget);
   const forkTarget = useComposerStore((state) => state.forkTarget);
   const contextPlan = useComposerStore((state) => state.contextPlan);
+  const reasoning = useComposerStore((state) => state.reasoning);
   const submission = useComposerStore((state) => state.submission);
   const beginSubmission = useComposerStore((state) => state.beginSubmission);
   const clearComposer = useComposerStore((state) => state.clearComposer);
@@ -53,8 +58,9 @@ export function useComposerTurnAction({
       phase: conversationExists ? 'sending' : 'starting-conversation',
       snapshot,
       contextPlan,
+      reasoning,
     });
-    const input = { contextPlan, displayText: projection.displayText, parts: projection.parts };
+    const input = { contextPlan, displayText: projection.displayText, parts: projection.parts, reasoning };
     const setPhase = (phase: 'sending' | 'updating-transcript') => setSubmissionPhase(next.id, phase);
     const request = editTarget
       ? onEdit(editTarget, input, setPhase)
@@ -102,6 +108,13 @@ export function useComposerTurnAction({
 
 type ComposerBranchCallback<T> = (
   target: T,
-  input: { contextPlan: TurnContextPlan; displayText: string; parts: AgentComposerMessagePart[] },
+  input: TurnSubmissionInput,
   setPhase: (phase: 'sending' | 'updating-transcript') => void,
 ) => Promise<void>;
+
+export type TurnSubmissionInput = {
+  contextPlan: TurnContextPlan;
+  displayText: string;
+  parts: AgentComposerMessagePart[];
+  reasoning: ReasoningLevel;
+};

@@ -47,6 +47,7 @@ try {
   const model = models.find(({ id }) => id === MODEL_ID);
   assert.ok(model, `The real-provider smoke model is unavailable: ${MODEL_ID}`);
   assert.ok(model.supportedReasoning.includes('high'));
+  assert.ok(model.supportedReasoning.includes('medium'));
 
   const created = await server.handle('remux/agent/conversation/create', {
     operationId: randomUUID(),
@@ -87,8 +88,9 @@ try {
     'Verify that a fresh turn remains usable after provider recovery.',
     'Do not call tools.',
     `Reply with exactly ${SECOND_SENTINEL} and nothing else.`,
-  ].join(' '));
+  ].join(' '), 'medium');
   assert.equal(await assistantText(repository, created.conversationId, second.turnId), SECOND_SENTINEL);
+  assert.equal((await repository.readTurn(created.conversationId, second.turnId)).reasoning, 'medium');
 
   const finalEvents = await repository.readEvents({ conversationId: created.conversationId });
   const finalTransports = finalEvents.filter(({ type }) => type === 'inference.transport');
@@ -276,6 +278,7 @@ async function sendAndWait(
   runtime: AgentServer,
   conversationId: string,
   text: string,
+  reasoning: 'high' | 'medium' = 'high',
 ) {
   const accepted = await runtime.handle('remux/agent/conversation/message/send', {
     operationId: randomUUID(),
@@ -286,6 +289,7 @@ async function sendAndWait(
       automaticDialogueTurns: 2,
       overrides: [],
     },
+    reasoning,
     text,
   }) as { turnId: string };
   const deadline = Date.now() + TIMEOUT_MS;

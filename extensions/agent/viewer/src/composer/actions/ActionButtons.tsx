@@ -7,9 +7,8 @@ import { useConversationStore } from '../../conversation/store.ts';
 import { useTranscriptViewportControls } from '../../transcript/index.ts';
 import { ComposerAttachmentButton } from '../attachments/AttachmentButton.tsx';
 import { ComposerConfigButton } from '../config/ConfigButton.tsx';
-import type { AgentComposerMessagePart, TurnContextPlan } from '../../../../shared/protocol.ts';
 import { ComposerActionKey, type ComposerAction } from './ActionKey.tsx';
-import { useComposerTurnAction } from './turnAction.ts';
+import { useComposerTurnAction, type TurnSubmissionInput } from './turnAction.ts';
 import type { ComposerEditTarget, ComposerForkTarget } from '../store.ts';
 
 export function ComposerActionButtons({
@@ -32,7 +31,7 @@ export function ComposerActionButtons({
   onEdit: ComposerBranchCallback<ComposerEditTarget>;
   onFork: ComposerBranchCallback<ComposerForkTarget>;
   onSend: (
-    input: { contextPlan: TurnContextPlan; displayText: string; parts: AgentComposerMessagePart[] },
+    input: TurnSubmissionInput,
     setPhase: (phase: 'sending' | 'updating-transcript') => void,
   ) => Promise<void>;
   onSignOut: () => void;
@@ -73,7 +72,7 @@ export function ComposerActionButtons({
         <ComposerConfigButton
           contextOpen={contextOpen}
           disabled={pickerOpen}
-          locked={conversationExists}
+          modelLocked={conversationExists}
           onSignOut={onSignOut}
           onToggleContext={onToggleContext}
         />
@@ -109,6 +108,6 @@ export function ComposerActionButtons({
 
 type ComposerBranchCallback<T> = (
   target: T,
-  input: { contextPlan: TurnContextPlan; displayText: string; parts: AgentComposerMessagePart[] },
+  input: TurnSubmissionInput,
   setPhase: (phase: 'sending' | 'updating-transcript') => void,
 ) => Promise<void>;

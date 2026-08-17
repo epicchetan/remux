@@ -54,7 +54,7 @@ export class FixtureProvider implements ModelProvider {
         const context = await options.durability.compileContext();
         const estimatedInputTokens = context.frame.estimatedInputTokens;
         await options.durability.beforeProviderCall({
-          payload: { messages: [{ role: 'user', content: text }] },
+          payload: { messages: [{ role: 'user', content: text }], reasoning: input.reasoning },
           requestMode: 'full',
           estimatedInputTokens,
           context: {

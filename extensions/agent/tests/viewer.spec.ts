@@ -26,6 +26,10 @@ test('starts with the authoritative model and sends the first message once', asy
     page,
     'remux/agent/conversation/message/send',
   )).contextPlan).toEqual({ version: 1, automaticDialogueTurns: 2, overrides: [] });
+  await expect.poll(async () => (await lastCommandParams(
+    page,
+    'remux/agent/conversation/message/send',
+  )).reasoning).toBe('high');
 });
 
 test('sends with a portable UUID when crypto.randomUUID is unavailable', async ({ page }) => {
@@ -345,7 +349,7 @@ test('selects a workspace through the bounded directory picker', async ({ page }
   }).toBe('/tmp/remux-fixture/packages');
 });
 
-test('locks model settings to an active conversation and unlocks a new chat', async ({ page, isMobile }) => {
+test('keeps the model conversation-scoped and reasoning next-turn scoped', async ({ page, isMobile }) => {
   await page.getByRole('button', { name: 'Preferences' }).click();
   await expect(page.getByRole('button', { name: 'Reload' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'GPT-5.4 Fixture' })).toBeEnabled();
@@ -358,11 +362,26 @@ test('locks model settings to an active conversation and unlocks a new chat', as
   }
   await page.getByRole('button', { name: 'Preferences' }).click();
   await expect(page.getByRole('button', { name: 'GPT-5.4 Fixture' })).toBeDisabled();
-  await expect(page.getByText('Start a new chat to change model settings.')).toBeVisible();
+  await expect(page.getByText('Model is fixed for this chat.')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'High', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'High', exact: true }).click();
+  await page.getByRole('button', { name: 'Medium', exact: true }).click();
   await page.keyboard.press('Escape');
+  await expect(page.getByText('Medium reasoning', { exact: true })).toBeVisible();
+
+  await messageBox(page).fill('Use medium effort for this turn');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect.poll(async () => (await lastCommandParams(
+    page,
+    'remux/agent/conversation/message/send',
+  )).reasoning).toBe('medium');
+  await expect(page.getByText('The fixture stream completed.', { exact: true })).toBeVisible();
+  await page.reload();
+  await expect(page.getByText('Medium reasoning', { exact: true })).toBeVisible();
 
   await startNewChat(page, isMobile);
   await expect(page.getByRole('button', { name: 'Choose workspace' })).toBeEnabled();
+  await expect(page.getByText('Medium reasoning', { exact: true })).toBeVisible();
 });
 
 test('paints the config menu and action shell in dark and light themes', async ({ page }) => {
@@ -444,6 +463,10 @@ test('queues a follow-up during active work and dispatches it after stop', async
 
 test('edits a completed user message into an immutable branch', async ({ page }) => {
   await page.goto(conversationUrl());
+  await page.getByRole('button', { name: 'Preferences' }).click();
+  await page.getByRole('button', { name: 'High', exact: true }).click();
+  await page.getByRole('button', { name: 'Medium', exact: true }).click();
+  await page.keyboard.press('Escape');
   await page.getByRole('button', { name: 'Edit message', exact: true }).click();
   await expect(page.getByText('Editing message', { exact: true })).toBeVisible();
   await messageBox(page).fill('Replacement prompt');
@@ -452,6 +475,10 @@ test('edits a completed user message into an immutable branch', async ({ page })
   await expect.poll(() => currentResourceId(page)).not.toBe(FIXTURE_CONVERSATION_ID);
   await expect(transcript(page).getByText('Replacement prompt', { exact: true })).toBeVisible();
   await expect.poll(() => commandCount(page, 'remux/agent/conversation/message/edit')).toBe(1);
+  await expect.poll(async () => (await lastCommandParams(
+    page,
+    'remux/agent/conversation/message/edit',
+  )).reasoning).toBe('medium');
 });
 
 test('forks a completed response with its visible prefix intact', async ({ page }) => {

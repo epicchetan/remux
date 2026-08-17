@@ -57,6 +57,51 @@ test('Agent state v6 owns one clean schema and compiles the accepted user turn',
   await fixture.repository.finishTurn(turn, { status: 'interrupted' });
 });
 
+test('turn reasoning is immutable across accepted, queued, and restarted work', async (t) => {
+  const fixture = await repositoryFixture(t);
+  const conversation = await fixture.repository.createConversation({
+    operationId: crypto.randomUUID(),
+    cwd: fixture.cwd,
+    modelId: 'gpt-5.6-codex',
+    reasoning: 'high',
+  });
+  const acceptedParams = {
+    operationId: crypto.randomUUID(),
+    conversationId: conversation.conversationId,
+    clientMessageId: crypto.randomUUID(),
+    contextPlan: { version: 1 as const, automaticDialogueTurns: 2, overrides: [] },
+    reasoning: 'low' as const,
+    text: 'Persist this turn at low effort.',
+  };
+  const turn = await fixture.repository.acceptTurn(acceptedParams);
+  assert.equal((await fixture.repository.readTurn(conversation.conversationId, turn.turnId)).reasoning, 'low');
+  await assert.rejects(
+    fixture.repository.reconcileTurn({ ...acceptedParams, reasoning: 'medium' }),
+    /different arguments/u,
+  );
+
+  await fixture.repository.close();
+  fixture.repository = await AgentStateStore.open({ dataRoot: fixture.dataRoot });
+  const recovered = await fixture.repository.resumeActiveTurn(conversation.conversationId);
+  assert.equal(recovered?.reasoning, 'low');
+  await fixture.repository.finishTurn(turn, { status: 'interrupted' });
+
+  const queuedParams = {
+    operationId: crypto.randomUUID(),
+    conversationId: conversation.conversationId,
+    clientMessageId: crypto.randomUUID(),
+    contextPlan: { version: 1 as const, automaticDialogueTurns: 2, overrides: [] },
+    reasoning: 'xhigh' as const,
+    text: 'Keep this queued request at extra-high effort.',
+  };
+  await fixture.repository.enqueueTurn(queuedParams);
+  const queued = await fixture.repository.readQueuedTurn(
+    conversation.conversationId,
+    queuedParams.operationId,
+  );
+  assert.equal(queued?.reasoning, 'xhigh');
+});
+
 test('obsolete context inspector projections are purged instead of migrated', async (t) => {
   const fixture = await repositoryFixture(t);
   const conversation = await fixture.repository.createConversation({
@@ -1106,6 +1151,7 @@ test('the public fixture runtime commits a v6 frame and completes through normal
     conversationId: created.conversationId,
     clientMessageId: crypto.randomUUID(),
     contextPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
+    reasoning: 'medium',
     text: 'Exercise the public path.',
   }) as { turnId: string };
   await eventually(async () => {
@@ -1124,7 +1170,8 @@ test('the public fixture runtime commits a v6 frame and completes through normal
   const durableTurn = await server.handle('remux/agent/turn/read', {
     conversationId: created.conversationId,
     turnId: sent.turnId,
-  }) as { state?: string; terminal?: boolean; terminalSequence?: number | null };
+  }) as { reasoning?: string; state?: string; terminal?: boolean; terminalSequence?: number | null };
+  assert.equal(durableTurn.reasoning, 'medium');
   assert.equal(durableTurn.state, 'completed');
   assert.equal(durableTurn.terminal, true);
   assert.equal(typeof durableTurn.terminalSequence, 'number');
@@ -1188,6 +1235,7 @@ test('the public runtime recovers a response-started transport drop without dupl
     conversationId: created.conversationId,
     clientMessageId: crypto.randomUUID(),
     contextPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
+    reasoning: 'medium',
     text: 'Survive a dropped WebSocket.',
   }) as { turnId: string };
   await eventually(async () => {
@@ -1271,6 +1319,7 @@ function accept(
     conversationId,
     clientMessageId: crypto.randomUUID(),
     contextPlan,
+    reasoning: 'high',
     text,
   });
 }
@@ -1393,7 +1442,7 @@ class RecoveringTransportFixtureProvider implements ModelProvider {
       name: 'GPT-5.6 Recovery Fixture',
       provider: 'openai-codex' as const,
       contextWindow: 400_000,
-      supportedReasoning: ['high' as const],
+      supportedReasoning: ['medium' as const, 'high' as const],
     }];
   }
 

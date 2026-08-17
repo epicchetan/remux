@@ -13,6 +13,7 @@ import { createDefaultTurnContextPlan } from './composer/context/contextPlan.ts'
 import { composerResourcesFromSnapshot } from './composer/model/userInputInterop.ts';
 import { ComposerMentionPicker } from './composer/mentions/MentionPicker.tsx';
 import { parseComposerMentionQuery } from './composer/mentions/mentionSearch.ts';
+import { preferredReasoning, resolveModel } from './composer/config/modelSelection.ts';
 import { useComposerStore } from './composer/store.ts';
 import { AgentDirectoryPicker } from './conversation/DirectoryPicker.tsx';
 import {
@@ -102,6 +103,7 @@ export function App() {
   const setPreserveContextPlan = useComposerStore((state) => state.setPreserveContextPlan);
   const setReasoning = useComposerStore((state) => state.setReasoning);
   const composerRestorePendingRef = useRef<string | null>(null);
+  const conversationSettingsTargetRef = useRef<string | null>(null);
   const mainPaneRef = useRef<HTMLElement | null>(null);
   const bottomBarSlotRef = useRef<HTMLDivElement | null>(null);
   const mentionQuery = mentionSession
@@ -138,6 +140,7 @@ export function App() {
 
   useEffect(() => {
     if (activeDraftId) {
+      conversationSettingsTargetRef.current = null;
       const currentDraft = draftRef.current?.id === activeDraftId
         ? draftRef.current
         : loadNewChatDraft(activeDraftId);
@@ -150,10 +153,17 @@ export function App() {
       restoreComposerSnapshot(currentDraft.snapshot);
     } else if (activeConversationId) {
       const currentDraft = loadConversationDraft(activeConversationId);
+      if (currentDraft.reasoning) {
+        setReasoning(currentDraft.reasoning);
+        conversationSettingsTargetRef.current = activeConversationId;
+      } else {
+        conversationSettingsTargetRef.current = null;
+      }
       setContextPlan(currentDraft.contextPlan);
       setPreserveContextPlan(currentDraft.preserveContextPlan);
       restoreComposerSnapshot(currentDraft.snapshot);
     } else {
+      conversationSettingsTargetRef.current = null;
       setContextPlan(createDefaultTurnContextPlan());
       setPreserveContextPlan(false);
     }
@@ -167,11 +177,13 @@ export function App() {
     }
     if (!activeDraftId || draft?.id !== activeDraftId) {
       if (activeConversationId) {
+        if (conversationSettingsTargetRef.current !== activeConversationId) return;
         persistConversationDraft(
           activeConversationId,
           composerSnapshot,
           contextPlan,
           preserveContextPlan,
+          reasoning,
         );
       }
       return;
@@ -203,7 +215,15 @@ export function App() {
     if (!activeConversationId || !conversationSummary) return;
     setCwd(conversationSummary.cwd);
     setModelId(conversationSummary.modelId);
-    setReasoning(conversationSummary.reasoning);
+    if (conversationSettingsTargetRef.current !== activeConversationId) {
+      const currentDraft = loadConversationDraft(activeConversationId);
+      const requested = currentDraft.reasoning ?? conversationSummary.reasoning;
+      const selected = resolveModel(useComposerStore.getState().models, conversationSummary.modelId);
+      setReasoning(selected && !selected.supportedReasoning.includes(requested)
+        ? preferredReasoning(selected)
+        : requested);
+      conversationSettingsTargetRef.current = activeConversationId;
+    }
   }, [activeConversationId, conversationSummary, setCwd, setModelId, setReasoning]);
 
   const saveCurrentTargetDraft = useCallback(() => {
@@ -234,11 +254,13 @@ export function App() {
         snapshot,
         composer.contextPlan,
         composer.preserveContextPlan,
+        composer.reasoning,
       );
     }
   }, []);
 
   const activateDraft = useCallback((nextDraft: AgentNewChatDraft) => {
+    conversationSettingsTargetRef.current = null;
     activeConversationIdRef.current = null;
     activeDraftIdRef.current = nextDraft.id;
     draftRef.current = nextDraft;
@@ -282,7 +304,7 @@ export function App() {
       id,
       modelId: selected?.modelId ?? useComposerStore.getState().modelId,
       preserveContextPlan: false,
-      reasoning: selected?.reasoning ?? useComposerStore.getState().reasoning,
+      reasoning: useComposerStore.getState().reasoning,
       contextPlan: createDefaultTurnContextPlan(),
       snapshot: createEmptyComposerSnapshot(),
       updatedAt: Date.now(),
@@ -301,6 +323,12 @@ export function App() {
       setActiveConversationId(normalized);
       setActiveDraftId(null);
       const currentDraft = loadConversationDraft(normalized);
+      if (currentDraft.reasoning) {
+        setReasoning(currentDraft.reasoning);
+        conversationSettingsTargetRef.current = normalized;
+      } else {
+        conversationSettingsTargetRef.current = null;
+      }
       setContextPlan(currentDraft.contextPlan);
       setPreserveContextPlan(currentDraft.preserveContextPlan);
       restoreComposerSnapshot(currentDraft.snapshot);
@@ -309,7 +337,7 @@ export function App() {
       void ensureConversation(normalized);
     }
     if (focusTurnId) requestTranscriptTurnScroll(normalized, focusTurnId);
-  }, [ensureConversation, restoreComposerSnapshot, saveCurrentTargetDraft, setContextPlan, setPreserveContextPlan]);
+  }, [ensureConversation, restoreComposerSnapshot, saveCurrentTargetDraft, setContextPlan, setPreserveContextPlan, setReasoning]);
 
   useAgentNavigation({
     activeConversationId,
@@ -341,7 +369,6 @@ export function App() {
     cwd,
     draftRef,
     modelId,
-    reasoning,
     refresh,
     selectConversation,
     setActiveConversationId,

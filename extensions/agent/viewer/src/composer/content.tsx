@@ -1,14 +1,13 @@
 import { useEffect, useState } from 'react';
 
 import type {
-  AgentComposerMessagePart,
   AgentPendingQueueValue,
   ContextInspectorValue,
   ConversationValue,
-  TurnContextPlan,
 } from '../../../shared/protocol.ts';
 import { useConversationStore } from '../conversation/store.ts';
 import { ComposerActionButtons } from './actions/ActionButtons.tsx';
+import type { TurnSubmissionInput } from './actions/turnAction.ts';
 import { ComposerInlineStatus } from './actions/InlineStatus.tsx';
 import { ComposerStatusMessageRow } from './actions/StatusMessageRow.tsx';
 import { ComposerLexicalInput } from './editor/LexicalInput.tsx';
@@ -40,7 +39,7 @@ export function ComposerContent({
   onFork: ComposerBranchCallback<ComposerForkTarget>;
   onQueueChanged: () => Promise<void>;
   onSend: (
-    input: { contextPlan: TurnContextPlan; displayText: string; parts: AgentComposerMessagePart[] },
+    input: TurnSubmissionInput,
     setPhase: (phase: 'sending' | 'updating-transcript') => void,
   ) => Promise<void>;
   onSignOut: () => void;
@@ -102,6 +101,6 @@ export function ComposerContent({
 
 type ComposerBranchCallback<T> = (
   target: T,
-  input: { contextPlan: TurnContextPlan; displayText: string; parts: AgentComposerMessagePart[] },
+  input: TurnSubmissionInput,
   setPhase: (phase: 'sending' | 'updating-transcript') => void,
 ) => Promise<void>;

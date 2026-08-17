@@ -47,7 +47,7 @@ async function main() {
     'This is an Agent state v6 acceptance test.',
     'Do not call tools.',
     `Reply with exactly "${FIRST_SENTINEL}" and nothing else.`,
-  ].join(' '), options.timeoutMs);
+  ].join(' '), options.timeoutMs, options.reasoning);
   const firstTranscript = await readTranscript(client, conversation.conversationId);
   assert.equal(assistantText(firstTranscript, first.turnId).trim(), FIRST_SENTINEL);
   const firstContext = await readContext(client, conversation.conversationId);
@@ -70,7 +70,7 @@ async function main() {
   const second = await sendAndWait(client, conversation.conversationId, [
     'Without calling tools, recover the exact durable nonce from the explicitly selected full prior turn after the Agent restart.',
     `Reply with exactly "${SECOND_SENTINEL}" and nothing else.`,
-  ].join(' '), options.timeoutMs, {
+  ].join(' '), options.timeoutMs, options.reasoning, {
     version: 1,
     automaticDialogueTurns: 0,
     overrides: [{ turnId: first.turnId, resolution: 'full' }],
@@ -105,7 +105,7 @@ async function main() {
     `then call work_unit_finish with status completed and a concise Markdown result containing exactly the marker ${WORK_UNIT_RESULT}`,
     `but not the child-only marker ${CHILD_SECRET}.`,
     `After the parent context resumes, reply with exactly ${THIRD_SENTINEL} and nothing else.`,
-  ].join(' '), options.timeoutMs);
+  ].join(' '), options.timeoutMs, options.reasoning);
   const workUnitTranscript = await readTranscript(client, conversation.conversationId);
   assert.equal(assistantText(workUnitTranscript, third.turnId).trim(), THIRD_SENTINEL);
   assert.deepEqual(workUnitTranscript.value.turnOrder, [first.turnId, second.turnId, third.turnId]);
@@ -168,6 +168,7 @@ async function sendAndWait(
   conversationId,
   text,
   timeoutMs,
+  reasoning,
   contextPlan = { version: 1, automaticDialogueTurns: 2, overrides: [] },
 ) {
   const accepted = await client.command('remux/agent/conversation/message/send', {
@@ -175,6 +176,7 @@ async function sendAndWait(
     conversationId,
     clientMessageId: randomUUID(),
     contextPlan,
+    reasoning,
     text,
   });
   assert.equal(accepted.accepted, true);

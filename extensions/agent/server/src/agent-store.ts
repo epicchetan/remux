@@ -21,8 +21,7 @@ import type {
   PreparedWorkUnitEntry,
   QueueTurnResult,
 } from './domain/state.ts';
-import type { AgentResourceKey } from '../../shared/protocol.ts';
-import type { TurnReadValue } from '../../shared/protocol.ts';
+import type { AgentResourceKey, ReasoningLevel, TurnReadValue } from '../../shared/protocol.ts';
 import type { AssistantMessage } from '@earendil-works/pi-ai';
 import type { AssistantTextPhase } from './model-provider.ts';
 import type {
@@ -136,6 +135,7 @@ export interface AgentStore {
     handle: DurableTurnHandle;
     rootHandle: DurableTurnHandle;
     prompt: string;
+    reasoning: ReasoningLevel;
   } | null>;
   readTranscriptActions(conversationId: string): Promise<DurableTranscriptAction[]>;
   readTranscriptBasis(conversationId: string): Promise<number | null>;

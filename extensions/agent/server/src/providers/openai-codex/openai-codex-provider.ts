@@ -237,6 +237,7 @@ export class OpenAICodexProvider implements ModelProvider {
       model.contextWindow,
       this.compactionPolicyOverride,
     );
+    let activeReasoning = options.reasoning;
 
     let probe: ContextProbe = {
       hookVersion: 'agent-durable-v1',
@@ -673,7 +674,7 @@ export class OpenAICodexProvider implements ModelProvider {
         providerDurabilityError ??= wrapped;
         throw wrapped;
       }
-      if (options.reasoning !== 'off') {
+      if (activeReasoning !== 'off') {
         assertReasoningControls(
           payload,
           supportsAllTurnsReasoning(model) &&
@@ -887,7 +888,7 @@ export class OpenAICodexProvider implements ModelProvider {
         cwd: options.cwd,
         modelRuntime: this.modelRuntime,
         model,
-        thinkingLevel: options.reasoning,
+        thinkingLevel: activeReasoning,
         customTools: [
           createWorkspaceReadTool(options.cwd, undefined, this.workspaceRead),
           ...createContextTools(options.durability, {
@@ -1028,6 +1029,8 @@ export class OpenAICodexProvider implements ModelProvider {
         providerDurabilityError = null;
         pendingAgentEnd = null;
         interruptRequested = false;
+        activeReasoning = input.reasoning;
+        session.setThinkingLevel(activeReasoning);
         await session.prompt(input.text, {
           expandPromptTemplates: false,
           images: input.images?.map((image): ImageContent => ({ type: 'image', ...image })),
