@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Brain, Loader2, MessageSquareText, Minus, X } from 'lucide-react';
+import { Brain, Loader2, MessageSquareText, Minus, RotateCcw, X } from 'lucide-react';
 
 import type {
   TurnContextResolution,
@@ -7,6 +7,7 @@ import type {
 import { useTranscriptResourceStore } from '../../transcript/resourceStore.ts';
 import { useComposerStore } from '../store.ts';
 import {
+  createDefaultTurnContextPlan,
   effectiveTurnContextResolution,
   withTurnContextResolution,
 } from './contextPlan.ts';
@@ -71,17 +72,23 @@ export function ComposerContextTray({ onClose }: { onClose: () => void }) {
           </button>
         </div>
         <button
+          aria-label="Reset context choices"
+          className="agent-context-tray-button"
+          onClick={() => setContextPlan(createDefaultTurnContextPlan())}
+          title="Reset context choices"
+          type="button"
+        >
+          <RotateCcw className="size-4" />
+        </button>
+        <button
           aria-label="Close turn context settings"
-          className="agent-context-tray-close"
+          className="agent-context-tray-button"
           onClick={onClose}
           type="button"
         >
           <X className="size-4" />
         </button>
       </header>
-      <p className="agent-context-tray-help">
-        Recent turns use dialogue by default. Full also includes reasoning and tool activity.
-      </p>
       <div aria-label="Recent turns" className="agent-context-picker-list">
         {recentTurns.map((turn) => {
           const resolution = effectiveTurnContextResolution(contextPlan, eligibleTurnIds, turn.turnId);

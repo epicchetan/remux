@@ -256,13 +256,18 @@ export class AgentStateStore extends TurnState implements AgentStore {
     const condition = operationId ? 'AND o.operation_id = ?' : '';
     const parameters = operationId ? [conversationId, operationId] : [conversationId];
     const row = this.storage.database.prepare(`
-      SELECT o.operation_id, o.value_json
+      SELECT o.operation_id, o.value_json, c.model_id
       FROM operations o
+      JOIN conversations c ON c.conversation_id = o.conversation_id
       WHERE o.conversation_id = ? AND o.kind = 'message.queue' AND o.state = 'queued'
       ${condition}
       ORDER BY o.accepted_sequence, o.operation_id
       LIMIT 1
-    `).get(...parameters) as { operation_id: string; value_json: string } | undefined;
+    `).get(...parameters) as {
+      operation_id: string;
+      value_json: string;
+      model_id: string;
+    } | undefined;
     if (!row) return null;
     const value = parseQueuedOperationValue(row.value_json);
     const parts = await this.rehydrateStoredUserParts(value.parts);
@@ -271,6 +276,7 @@ export class AgentStateStore extends TurnState implements AgentStore {
       queueOperationId: row.operation_id,
       conversationId,
       clientMessageId: value.clientMessageId,
+      modelId: value.modelId ?? row.model_id,
       contextPlan: value.contextPlan,
       reasoning: value.reasoning,
       text: await this.readTextRef(value.content),
@@ -2198,6 +2204,7 @@ export class AgentStateStore extends TurnState implements AgentStore {
   async resumeActiveTurn(conversationId: string): Promise<{
     handle: DurableTurnHandle;
     rootHandle: DurableTurnHandle;
+    modelId: string;
     prompt: string;
     reasoning: ReasoningLevel;
   } | null> {
@@ -2206,11 +2213,18 @@ export class AgentStateStore extends TurnState implements AgentStore {
     const row = this.storage.database.prepare(`
       SELECT t.project_id, t.conversation_id, t.turn_id,
              t.root_scope_id, s.scope_id, s.kind,
+             COALESCE(
+               json_extract(a.payload_json, '$.modelId'),
+               json_extract(cc.payload_json, '$.modelId'),
+               c.model_id
+             ) AS model_id,
              COALESCE(json_extract(a.payload_json, '$.reasoning'), c.reasoning) AS reasoning
       FROM turns t
       JOIN execution_scopes s ON s.turn_id = t.turn_id
       JOIN conversations c ON c.conversation_id = t.conversation_id
       JOIN events a ON a.sequence = t.accepted_sequence AND a.type = 'turn.accepted'
+      LEFT JOIN events cc
+        ON cc.conversation_id = t.conversation_id AND cc.type = 'conversation.created'
       WHERE t.conversation_id = ? AND t.terminal_sequence IS NULL
         AND s.terminal_sequence IS NULL
       ORDER BY t.accepted_sequence DESC,
@@ -2220,6 +2234,7 @@ export class AgentStateStore extends TurnState implements AgentStore {
       project_id: string; conversation_id: string;
       turn_id: string; root_scope_id: string; scope_id: string;
       kind: 'turn' | 'work_unit';
+      model_id: string;
       reasoning: string;
     } | undefined;
     if (!row) return null;
@@ -2279,8 +2294,9 @@ export class AgentStateStore extends TurnState implements AgentStore {
       });
       this.insertArtifact(content.artifact, sequence);
     }));
+    if (!row.model_id) throw new Error('Active turn model is invalid.');
     if (!isReasoningLevel(row.reasoning)) throw new Error('Active turn reasoning is invalid.');
-    return { handle, rootHandle, prompt, reasoning: row.reasoning };
+    return { handle, rootHandle, modelId: row.model_id, prompt, reasoning: row.reasoning };
   }
 
   private async logicalReplayEvents(events: readonly AgentStateEvent[]) {
@@ -2989,6 +3005,7 @@ export class AgentStateStore extends TurnState implements AgentStore {
         contextPlan: normalizedContextPlan(params.contextPlan),
         dispatchOperationId: this.nextId('operation'),
         mentionCount: input.parts?.filter((part) => part.type === 'mention').length ?? 0,
+        modelId: params.modelId,
         ...(input.parts ? { parts: input.parts } : {}),
         preview: truncateSummaryText(params.text),
         reasoning: params.reasoning,
@@ -3183,6 +3200,7 @@ export class AgentStateStore extends TurnState implements AgentStore {
         payload: {
           clientMessageId: params.clientMessageId,
           contextPlan,
+          modelId: params.modelId,
           reasoning: params.reasoning,
           rootScopeId: handle.scopeId,
           turnId: handle.turnId,
@@ -3235,6 +3253,7 @@ export class AgentStateStore extends TurnState implements AgentStore {
         payload: {
           scopeId: handle.scopeId,
           contextPlan,
+          modelId: params.modelId,
           reasoning: params.reasoning,
           turnId: handle.turnId,
         },
@@ -3348,9 +3367,10 @@ export class AgentStateStore extends TurnState implements AgentStore {
         canonicalJson(outcome),
       );
       this.storage.database.prepare(`
-        UPDATE conversations SET state = 'running', updated_at = ?
+        UPDATE conversations
+        SET model_id = ?, reasoning = ?, state = 'running', updated_at = ?
         WHERE conversation_id = ?
-      `).run(recordedAt, handle.conversationId);
+      `).run(params.modelId, params.reasoning, recordedAt, handle.conversationId);
       const summary = this.refreshConversationResources(
         handle.conversationId,
         terminalOperationSequence,
@@ -4558,6 +4578,7 @@ type QueuedOperationValue = {
   contextPlan: TurnContextPlan;
   dispatchOperationId: string;
   mentionCount: number;
+  modelId?: string;
   parts?: AgentUserMessagePart[];
   preview: string;
   reasoning: ReasoningLevel;
@@ -5043,6 +5064,9 @@ function validateAcceptTurnParams(params: AcceptTurnParams): AcceptTurnParams {
   if (!UUID_V4.test(params.conversationId)) throw new TypeError('conversationId must be a lowercase UUID v4.');
   if (!UUID_V4.test(params.clientMessageId)) throw new TypeError('clientMessageId must be a lowercase UUID v4.');
   if (!params.text.trim()) throw new TypeError('Message text cannot be empty.');
+  if (!params.modelId || Buffer.byteLength(params.modelId, 'utf8') > 256) {
+    throw new TypeError('modelId must contain 1 to 256 UTF-8 bytes.');
+  }
   if (params.parts !== undefined && params.parts.length === 0) {
     throw new TypeError('Message parts cannot be empty.');
   }
@@ -5058,6 +5082,7 @@ function messageArgumentsHash(params: AcceptTurnParams) {
       clientMessageId: params.clientMessageId,
       conversationId: params.conversationId,
       contextPlan: normalizedContextPlan(params.contextPlan),
+      modelId: params.modelId,
       reasoning: params.reasoning,
       ...(params.parts ? { parts: agentComposerPartsHashValue(params.parts) } : {}),
       textHash,
@@ -5085,6 +5110,9 @@ function parseQueuedOperationValue(json: string): QueuedOperationValue {
     contextPlan,
     dispatchOperationId: requiredString(value.dispatchOperationId, 'queued dispatchOperationId'),
     mentionCount: requiredNonnegativeInteger(value.mentionCount, 'queued mentionCount'),
+    ...(value.modelId === undefined
+      ? {}
+      : { modelId: requiredString(value.modelId, 'queued modelId') }),
     ...(parts ? { parts } : {}),
     preview: typeof value.preview === 'string' ? value.preview : '',
     reasoning: requiredReasoningLevel(value.reasoning, 'queued reasoning'),

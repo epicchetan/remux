@@ -57,7 +57,7 @@ test('Agent state v6 owns one clean schema and compiles the accepted user turn',
   await fixture.repository.finishTurn(turn, { status: 'interrupted' });
 });
 
-test('turn reasoning is immutable across accepted, queued, and restarted work', async (t) => {
+test('turn model and reasoning are immutable across accepted, queued, and restarted work', async (t) => {
   const fixture = await repositoryFixture(t);
   const conversation = await fixture.repository.createConversation({
     operationId: crypto.randomUUID(),
@@ -69,20 +69,28 @@ test('turn reasoning is immutable across accepted, queued, and restarted work', 
     operationId: crypto.randomUUID(),
     conversationId: conversation.conversationId,
     clientMessageId: crypto.randomUUID(),
+    modelId: 'gpt-5.6-codex',
     contextPlan: { version: 1 as const, automaticDialogueTurns: 2, overrides: [] },
     reasoning: 'low' as const,
     text: 'Persist this turn at low effort.',
   };
   const turn = await fixture.repository.acceptTurn(acceptedParams);
-  assert.equal((await fixture.repository.readTurn(conversation.conversationId, turn.turnId)).reasoning, 'low');
+  const accepted = await fixture.repository.readTurn(conversation.conversationId, turn.turnId);
+  assert.equal(accepted.modelId, 'gpt-5.6-codex');
+  assert.equal(accepted.reasoning, 'low');
   await assert.rejects(
     fixture.repository.reconcileTurn({ ...acceptedParams, reasoning: 'medium' }),
+    /different arguments/u,
+  );
+  await assert.rejects(
+    fixture.repository.reconcileTurn({ ...acceptedParams, modelId: 'gpt-5.6-sol' }),
     /different arguments/u,
   );
 
   await fixture.repository.close();
   fixture.repository = await AgentStateStore.open({ dataRoot: fixture.dataRoot });
   const recovered = await fixture.repository.resumeActiveTurn(conversation.conversationId);
+  assert.equal(recovered?.modelId, 'gpt-5.6-codex');
   assert.equal(recovered?.reasoning, 'low');
   await fixture.repository.finishTurn(turn, { status: 'interrupted' });
 
@@ -90,6 +98,7 @@ test('turn reasoning is immutable across accepted, queued, and restarted work', 
     operationId: crypto.randomUUID(),
     conversationId: conversation.conversationId,
     clientMessageId: crypto.randomUUID(),
+    modelId: 'gpt-5.6-sol',
     contextPlan: { version: 1 as const, automaticDialogueTurns: 2, overrides: [] },
     reasoning: 'xhigh' as const,
     text: 'Keep this queued request at extra-high effort.',
@@ -99,6 +108,7 @@ test('turn reasoning is immutable across accepted, queued, and restarted work', 
     conversation.conversationId,
     queuedParams.operationId,
   );
+  assert.equal(queued?.modelId, 'gpt-5.6-sol');
   assert.equal(queued?.reasoning, 'xhigh');
 });
 
@@ -1131,12 +1141,66 @@ test('a provider attempt with a durable tool effect cannot be superseded', async
   await fixture.repository.finishTurn(turn, { status: 'failed', error: 'Transport failed.' });
 });
 
+test('the public runtime defaults to Sol and switches provider sessions per turn', async (t) => {
+  const fixture = await repositoryFixture(t);
+  const provider = new SwitchingModelFixtureProvider();
+  const server = new AgentServer({ provider, store: fixture.repository, notify() {} });
+  t.after(() => server.close());
+  await server.initialize();
+
+  const resources = await server.handle('remux/agent/resources/read', {
+    requests: [{ key: 'models' }],
+  }) as { resources: Array<{ value?: { defaultModelId?: string | null } }> };
+  assert.equal(resources.resources[0]?.value?.defaultModelId, 'gpt-5.6-sol');
+
+  const created = await server.handle('remux/agent/conversation/create', {
+    operationId: crypto.randomUUID(),
+    cwd: fixture.cwd,
+    modelId: 'gpt-5.4-fixture',
+    reasoning: 'high',
+  }) as { conversationId: string };
+  const first = await server.handle('remux/agent/conversation/message/send', {
+    operationId: crypto.randomUUID(),
+    conversationId: created.conversationId,
+    clientMessageId: crypto.randomUUID(),
+    modelId: 'gpt-5.4-fixture',
+    contextPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
+    reasoning: 'high',
+    text: 'Use the initial model.',
+  }) as { turnId: string };
+  await eventually(() => runtimeIsIdle(server, created.conversationId));
+
+  const second = await server.handle('remux/agent/conversation/message/send', {
+    operationId: crypto.randomUUID(),
+    conversationId: created.conversationId,
+    clientMessageId: crypto.randomUUID(),
+    modelId: 'gpt-5.6-sol',
+    contextPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
+    reasoning: 'medium',
+    text: 'Switch models for this turn.',
+  }) as { turnId: string };
+  await eventually(() => runtimeIsIdle(server, created.conversationId));
+
+  assert.deepEqual(provider.createdModelIds, ['gpt-5.4-fixture', 'gpt-5.6-sol']);
+  assert.equal((await fixture.repository.readTurn(created.conversationId, first.turnId)).modelId, 'gpt-5.4-fixture');
+  const durableSecond = await fixture.repository.readTurn(created.conversationId, second.turnId);
+  assert.equal(durableSecond.modelId, 'gpt-5.6-sol');
+  assert.equal(durableSecond.reasoning, 'medium');
+  const [summary] = await fixture.repository.readResourceProjections([
+    `conversation:${created.conversationId}`,
+  ]);
+  assert.equal((summary?.value as { modelId?: string } | undefined)?.modelId, 'gpt-5.6-sol');
+});
+
 test('the public fixture runtime commits a v6 frame and completes through normal server hooks', async (t) => {
   const fixture = await repositoryFixture(t);
+  const notifications: Array<{ method: string; params: unknown }> = [];
   const server = new AgentServer({
     provider: new FixtureProvider(),
     store: fixture.repository,
-    notify() {},
+    notify(method, params) {
+      if (method === 'remux/notifications/request') notifications.push({ method, params });
+    },
   });
   t.after(() => server.close());
   await server.initialize();
@@ -1150,6 +1214,7 @@ test('the public fixture runtime commits a v6 frame and completes through normal
     operationId: crypto.randomUUID(),
     conversationId: created.conversationId,
     clientMessageId: crypto.randomUUID(),
+    modelId: 'gpt-5.4-fixture',
     contextPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
     reasoning: 'medium',
     text: 'Exercise the public path.',
@@ -1213,6 +1278,71 @@ test('the public fixture runtime commits a v6 frame and completes through normal
   const events = await fixture.repository.readEvents({ conversationId: created.conversationId });
   assert.ok(events.some(({ type }) => type === 'provider.item.recorded'));
   assert.ok(events.some(({ type }) => type === 'turn.terminal'));
+  assert.deepEqual(notifications, [{
+    method: 'remux/notifications/request',
+    params: {
+      body: 'Fixture response for “Exercise the public path.”.',
+      extensionId: 'agent',
+      id: `agent-turn:${created.conversationId}:${sent.turnId}:${durableTurn.terminalSequence}`,
+      target: {
+        focusId: sent.turnId,
+        focusKind: 'turn',
+        resourceId: created.conversationId,
+        resourceKind: 'agentConversation',
+      },
+      title: 'Agent finished',
+      viewId: 'main',
+    },
+  }]);
+});
+
+test('the public runtime emits one durable failure notification with the provider error', async (t) => {
+  const fixture = await repositoryFixture(t);
+  const notifications: Array<{ method: string; params: Record<string, unknown> }> = [];
+  const server = new AgentServer({
+    provider: new FailingFixtureProvider(),
+    store: fixture.repository,
+    notify(method, params) {
+      if (method === 'remux/notifications/request') {
+        notifications.push({ method, params: params as Record<string, unknown> });
+      }
+    },
+  });
+  t.after(() => server.close());
+  await server.initialize();
+  const created = await server.handle('remux/agent/conversation/create', {
+    operationId: crypto.randomUUID(),
+    cwd: fixture.cwd,
+    modelId: 'gpt-5.4-fixture',
+    reasoning: 'high',
+  }) as { conversationId: string };
+  const sent = await server.handle('remux/agent/conversation/message/send', {
+    operationId: crypto.randomUUID(),
+    conversationId: created.conversationId,
+    clientMessageId: crypto.randomUUID(),
+    modelId: 'gpt-5.4-fixture',
+    contextPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
+    reasoning: 'medium',
+    text: 'Exercise the failure path.',
+  }) as { turnId: string };
+
+  await eventually(async () => {
+    const response = await server.handle('remux/agent/resources/read', {
+      requests: [{ key: 'runtime' }],
+    }) as { resources: Array<{ value?: { state?: string } }> };
+    return response.resources[0]?.value?.state === 'error';
+  });
+
+  const turn = await fixture.repository.readTurn(created.conversationId, sent.turnId);
+  assert.equal(turn.state, 'failed');
+  assert.equal(turn.error, 'Fixture provider failed.');
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0]?.params.title, 'Agent turn failed');
+  assert.equal(notifications[0]?.params.body, 'Fixture provider failed.');
+  assert.equal(
+    notifications[0]?.params.id,
+    `agent-turn:${created.conversationId}:${sent.turnId}:${turn.terminalSequence}`,
+  );
 });
 
 test('the public runtime recovers a response-started transport drop without duplicating partial output', async (t) => {
@@ -1234,6 +1364,7 @@ test('the public runtime recovers a response-started transport drop without dupl
     operationId: crypto.randomUUID(),
     conversationId: created.conversationId,
     clientMessageId: crypto.randomUUID(),
+    modelId: 'gpt-5.6-recovery-fixture',
     contextPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
     reasoning: 'medium',
     text: 'Survive a dropped WebSocket.',
@@ -1318,6 +1449,7 @@ function accept(
     operationId: crypto.randomUUID(),
     conversationId,
     clientMessageId: crypto.randomUUID(),
+    modelId: 'gpt-5.6-codex',
     contextPlan,
     reasoning: 'high',
     text,
@@ -1417,6 +1549,44 @@ async function eventually(check: () => Promise<boolean>, timeoutMs = 3_000) {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   assert.fail(`Condition was not met within ${timeoutMs} ms.`);
+}
+
+async function runtimeIsIdle(server: AgentServer, conversationId: string) {
+  const response = await server.handle('remux/agent/resources/read', {
+    requests: [{ key: 'runtime' }],
+  }) as { resources: Array<{ value?: { conversationId?: string | null; state?: string } }> };
+  const runtime = response.resources[0]?.value;
+  return runtime?.conversationId === conversationId && runtime.state === 'idle';
+}
+
+class SwitchingModelFixtureProvider extends FixtureProvider {
+  readonly createdModelIds: string[] = [];
+
+  override async listModels() {
+    return [
+      {
+        id: 'gpt-5.4-fixture',
+        name: 'GPT-5.4 Fixture',
+        provider: 'openai-codex' as const,
+        contextWindow: 400_000,
+        supportedReasoning: ['medium' as const, 'high' as const],
+      },
+      {
+        id: 'gpt-5.6-sol',
+        name: 'GPT-5.6 Sol',
+        provider: 'openai-codex' as const,
+        contextWindow: 1_000_000,
+        supportedReasoning: ['medium' as const, 'high' as const],
+      },
+    ];
+  }
+
+  override async createSession(
+    options: Parameters<ModelProvider['createSession']>[0],
+  ): Promise<ModelSession> {
+    this.createdModelIds.push(options.modelId);
+    return super.createSession(options);
+  }
 }
 
 class RecoveringTransportFixtureProvider implements ModelProvider {
@@ -1528,6 +1698,18 @@ class RecoveringTransportFixtureProvider implements ModelProvider {
       async dispose() {
         interrupted = true;
       },
+    };
+  }
+}
+
+class FailingFixtureProvider extends FixtureProvider {
+  override async createSession(): Promise<ModelSession> {
+    return {
+      async prompt() {
+        throw new Error('Fixture provider failed.');
+      },
+      async interrupt() {},
+      async dispose() {},
     };
   }
 }

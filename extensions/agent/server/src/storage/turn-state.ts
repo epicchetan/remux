@@ -11,12 +11,19 @@ export abstract class TurnState extends WorkUnitState {
     const row = this.storage.database.prepare(`
       SELECT t.state, t.terminal_sequence, t.context_plan_json,
              t.created_at, t.updated_at,
+             COALESCE(
+               json_extract(a.payload_json, '$.modelId'),
+               json_extract(cc.payload_json, '$.modelId'),
+               c.model_id
+             ) AS model_id,
              COALESCE(json_extract(a.payload_json, '$.reasoning'), c.reasoning) AS reasoning,
              json_extract(e.payload_json, '$.error') AS error,
              json_extract(e.payload_json, '$.errorCode') AS error_code
       FROM turns t
       JOIN conversations c ON c.conversation_id = t.conversation_id
       JOIN events a ON a.sequence = t.accepted_sequence AND a.type = 'turn.accepted'
+      LEFT JOIN events cc
+        ON cc.conversation_id = t.conversation_id AND cc.type = 'conversation.created'
       LEFT JOIN events e ON e.sequence = t.terminal_sequence AND e.type = 'turn.terminal'
       WHERE t.conversation_id = ? AND t.turn_id = ?
     `).get(conversationId, turnId) as {
@@ -27,12 +34,14 @@ export abstract class TurnState extends WorkUnitState {
       updated_at: number;
       error: string | null;
       error_code: string | null;
+      model_id: string;
       reasoning: string;
     } | undefined;
     if (!row) throw new Error(`Turn ${turnId} does not exist in conversation ${conversationId}.`);
     return {
       conversationId,
       turnId,
+      modelId: durableModelId(row.model_id),
       reasoning: durableReasoningLevel(row.reasoning),
       state: durableTurnReadState(row.state),
       terminal: row.terminal_sequence !== null,
@@ -46,6 +55,13 @@ export abstract class TurnState extends WorkUnitState {
       updatedAt: safeTimestamp(row.updated_at),
     };
   }
+}
+
+function durableModelId(value: string) {
+  if (!value || Buffer.byteLength(value, 'utf8') > 256) {
+    throw new Error('Durable turn model is invalid.');
+  }
+  return value;
 }
 
 function durableReasoningLevel(value: string): ReasoningLevel {

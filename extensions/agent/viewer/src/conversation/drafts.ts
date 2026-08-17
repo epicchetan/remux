@@ -58,6 +58,7 @@ export function removeNewChatDraft(id: string) {
 
 export type AgentConversationDraft = {
   contextPlan: TurnContextPlan;
+  modelId: string | null;
   preserveContextPlan: boolean;
   reasoning: ReasoningLevel | null;
   snapshot: ComposerSnapshot;
@@ -67,6 +68,7 @@ export function loadConversationDraft(conversationId: string): AgentConversation
   const parsed = readJson(storageKey(CONVERSATION_PREFIX, conversationId));
   return {
     contextPlan: parsePersistedTurnContextPlan(parsed?.contextPlan) ?? createDefaultTurnContextPlan(),
+    modelId: typeof parsed?.modelId === 'string' && parsed.modelId ? parsed.modelId : null,
     preserveContextPlan: parsed?.preserveContextPlan === true,
     reasoning: isReasoningLevel(parsed?.reasoning) ? parsed.reasoning : null,
     snapshot: parseSnapshot(parsed?.snapshot) ?? createComposerSnapshot({ parts: [] }, new Map()),
@@ -77,11 +79,13 @@ export function persistConversationDraft(
   conversationId: string,
   snapshot: ComposerSnapshot,
   contextPlan: TurnContextPlan,
+  modelId: string,
   preserveContextPlan: boolean,
   reasoning: ReasoningLevel,
 ) {
   writeJson(storageKey(CONVERSATION_PREFIX, conversationId), {
     contextPlan,
+    modelId,
     preserveContextPlan,
     reasoning,
     snapshot: persistedSnapshot(snapshot),
@@ -99,6 +103,7 @@ export function clearConversationDraftContent(conversationId: string) {
     conversationId,
     createComposerSnapshot({ parts: [] }, new Map()),
     current.contextPlan,
+    current.modelId ?? '',
     current.preserveContextPlan,
     current.reasoning,
   );

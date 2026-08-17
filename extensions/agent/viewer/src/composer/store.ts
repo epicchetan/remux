@@ -37,6 +37,7 @@ export type ComposerSubmission = {
   conversationId: string | null;
   id: number;
   kind: ComposerSubmissionKind;
+  modelId: string;
   phase: ComposerSubmissionPhase;
   snapshot: ComposerSnapshot;
   contextPlan: TurnContextPlan;
@@ -61,6 +62,7 @@ type ComposerStoreState = {
   beginSubmission: (input: {
     conversationId?: string | null;
     kind: ComposerSubmissionKind;
+    modelId?: string;
     phase: ComposerSubmissionPhase;
     snapshot?: ComposerSnapshot;
     contextPlan?: TurnContextPlan;
@@ -116,6 +118,7 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
     conversationId = null,
     contextPlan = get().contextPlan,
     kind,
+    modelId = get().modelId,
     phase,
     reasoning = get().reasoning,
     snapshot = get().snapshot,
@@ -125,6 +128,7 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
       conversationId,
       id: ++submissionId,
       kind,
+      modelId,
       phase,
       snapshot,
       contextPlan,

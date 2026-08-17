@@ -63,6 +63,7 @@ try {
       operationId: randomUUID(),
       conversationId: conversation.conversationId,
       clientMessageId: randomUUID(),
+      modelId: 'gpt-5.4-fixture',
       contextPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
       reasoning: 'high',
       text,
@@ -131,12 +132,13 @@ try {
     if (index === 47) {
       const restartTurn: Awaited<ReturnType<AgentStateStore['acceptTurn']>> =
         await repository.acceptTurn({
-        operationId: randomUUID(),
-        conversationId: conversation.conversationId,
-        clientMessageId: randomUUID(),
-        contextPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
-        reasoning: 'high',
-        text: 'Recover this unfinished turn as interrupted by restart.',
+          operationId: randomUUID(),
+          conversationId: conversation.conversationId,
+          clientMessageId: randomUUID(),
+          modelId: 'gpt-5.4-fixture',
+          contextPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
+          reasoning: 'high',
+          text: 'Recover this unfinished turn as interrupted by restart.',
         });
       await repository.appendAssistantCheckpoint(restartTurn, {
         reasoningDelta: '',
@@ -159,6 +161,7 @@ try {
     operationId: randomUUID(),
     conversationId: conversation.conversationId,
     clientMessageId: randomUUID(),
+    modelId: 'gpt-5.4-fixture',
     contextPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
     reasoning: 'high',
     text: 'Keep one streaming tail turn active for the corpus.',

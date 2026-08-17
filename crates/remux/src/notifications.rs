@@ -1,6 +1,6 @@
 //! Push notification manager, ported 1:1 from `cli/notifications.cjs` —
-//! including its extension-specific correlation tables (codex turn/compact
-//! methods, terminal session start/attach/kill) with `once`/`target`
+//! including its extension-specific correlation tables (Agent and Codex
+//! turns, Codex compaction, terminal session start/attach/kill) with `once`/`target`
 //! audience lifetimes. That hardcoded knowledge is acknowledged debt, not to
 //! be redesigned in this pass.
 //!
@@ -27,6 +27,7 @@ pub const VISIBILITY_CHECK_TIMEOUT_MS: u64 = 500;
 pub const EXPO_PUSH_SEND_URL: &str = "https://exp.host/--/api/v2/push/send";
 
 const CODEX_COMPACT_REQUEST_METHOD: &str = "remux/codex/thread/compact";
+const AGENT_MESSAGE_SEND_METHOD: &str = "remux/agent/conversation/message/send";
 const TERMINAL_SESSION_ATTACH_METHOD: &str = "remux/terminal/session/attach";
 const TERMINAL_SESSION_KILL_METHOD: &str = "remux/terminal/session/kill";
 const TERMINAL_SESSION_START_METHOD: &str = "remux/terminal/session/start";
@@ -36,6 +37,11 @@ const CODEX_TURN_REQUEST_METHODS: [&str; 4] = [
     "remux/codex/thread/message/fork",
     "remux/codex/thread/message/send",
     "remux/codex/thread/message/start",
+];
+
+const AGENT_BRANCH_REQUEST_METHODS: [&str; 2] = [
+    "remux/agent/conversation/message/edit",
+    "remux/agent/conversation/message/fork",
 ];
 
 /// The slice of a WS client the manager needs; `WsClient` implements it, and
@@ -834,6 +840,28 @@ fn audience_change_for_client_request(
     request: &Value,
     result: &Value,
 ) -> Option<AudienceChange> {
+    if method == AGENT_MESSAGE_SEND_METHOD || AGENT_BRANCH_REQUEST_METHODS.contains(&method) {
+        let turn_id = required_string(result.get("turnId"))?;
+        let conversation_id = optional_string(result.get("conversationId")).or_else(|| {
+            optional_string(
+                request
+                    .get("params")
+                    .and_then(|params| params.get("conversationId")),
+            )
+        })?;
+        return Some(AudienceChange::Record {
+            lifetime: Lifetime::Once,
+            target: serde_json::json!({
+                "extensionId": "agent",
+                "focusId": turn_id,
+                "focusKind": "turn",
+                "resourceId": conversation_id,
+                "resourceKind": "agentConversation",
+                "viewId": "main",
+            }),
+        });
+    }
+
     if CODEX_TURN_REQUEST_METHODS.contains(&method) {
         let thread_id = required_string(result.get("threadId"))?;
         let turn_id = required_string(result.get("turnId"))?;

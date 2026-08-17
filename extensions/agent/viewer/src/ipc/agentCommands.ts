@@ -28,6 +28,7 @@ export const agentCommands = {
     operationId: string;
     conversationId: string;
     clientMessageId: string;
+    modelId: string;
     parts: AgentComposerMessagePart[];
     contextPlan: TurnContextPlan;
     reasoning: ReasoningLevel;
@@ -39,6 +40,7 @@ export const agentCommands = {
     mode: 'edit' | 'fork';
     operationId: string;
     clientMessageId: string;
+    modelId: string;
     parts: AgentComposerMessagePart[];
     contextPlan: TurnContextPlan;
     reasoning: ReasoningLevel;

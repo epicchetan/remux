@@ -12,7 +12,7 @@ test.beforeEach(async ({ page }) => {
 });
 
 test('starts with the authoritative model and sends the first message once', async ({ page }) => {
-  await expect(page.getByText('GPT-5.4 Fixture')).toBeVisible();
+  await expect(page.getByText('GPT-5.6 Sol')).toBeVisible();
   await messageBox(page).fill('Inspect the workspace');
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
 
@@ -30,6 +30,10 @@ test('starts with the authoritative model and sends the first message once', asy
     page,
     'remux/agent/conversation/message/send',
   )).reasoning).toBe('high');
+  await expect.poll(async () => (await lastCommandParams(
+    page,
+    'remux/agent/conversation/message/send',
+  )).modelId).toBe('gpt-5.6-sol');
 });
 
 test('sends with a portable UUID when crypto.randomUUID is unavailable', async ({ page }) => {
@@ -99,7 +103,7 @@ test('reconstructs a conversation from route-addressed turn frames', async ({ pa
   await page.goto(conversationUrl());
 
   await expect(transcript(page).getByText('Recovered from authoritative resources.')).toBeVisible();
-  await expect(page.getByText('GPT-5.4 Fixture')).toBeVisible();
+  await expect(page.getByText('GPT-5.6 Sol')).toBeVisible();
   const history = await openHistory(page, isMobile);
   await expect(history.getByRole('button', { name: 'Start new chat', exact: true })).toBeVisible();
 });
@@ -144,7 +148,7 @@ test('opens newest-first turn context below the composer actions', async ({ page
   await page.getByRole('button', { name: 'Preferences' }).click();
   await page.getByRole('button', { name: 'Turn context' }).click();
   const picker = page.getByRole('region', { name: 'Turn context settings' });
-  await expect(picker).toContainText('Recent turns use dialogue by default.');
+  await expect(picker).not.toContainText('Recent turns use dialogue by default.');
   await expect(page.locator('[data-remux-composer-config-panel]')).toHaveCount(0);
 
   const rows = picker.locator('.agent-context-picker-turn');
@@ -152,13 +156,31 @@ test('opens newest-first turn context below the composer actions', async ({ page
   await expect(rows.nth(0)).toContainText('Context request 4');
   await expect(rows.nth(1)).toContainText('Context request 3');
   await expect(rows.nth(3)).toContainText('Context request 1');
+  const list = picker.locator('.agent-context-picker-list');
+  const sizing = await list.evaluate((element) => ({
+    clientHeight: element.clientHeight,
+    rowHeight: element.querySelector('.agent-context-picker-turn')?.getBoundingClientRect().height ?? 0,
+    scrollHeight: element.scrollHeight,
+  }));
+  expect(sizing.scrollHeight).toBeGreaterThan(sizing.clientHeight);
+  expect(sizing.clientHeight).toBeLessThanOrEqual(sizing.rowHeight * 3 + 1);
   const positions = await page.locator('.remux-composer-actions, .agent-context-tray').evaluateAll((elements) =>
     elements.map((element) => element.getBoundingClientRect().top));
   expect(positions[1]).toBeGreaterThan(positions[0]);
 
+  const reset = picker.getByRole('button', { name: 'Reset context choices' });
+  const close = picker.getByRole('button', { name: 'Close turn context settings' });
+  expect(await reset.evaluate((element) => element.getBoundingClientRect().left))
+    .toBeLessThan(await close.evaluate((element) => element.getBoundingClientRect().left));
+
   const latest = picker.locator('.agent-context-picker-turn').filter({ hasText: 'Context request 4' });
   await latest.getByRole('button', { name: 'Full' }).click();
   const oldest = picker.locator('.agent-context-picker-turn').filter({ hasText: 'Context request 1' });
+  await oldest.getByRole('button', { name: 'Dialogue' }).click();
+  await reset.click();
+  await expect(latest.getByRole('button', { name: 'Dialogue' })).toHaveAttribute('aria-pressed', 'true');
+  await expect(oldest.getByRole('button', { name: 'Off' })).toHaveAttribute('aria-pressed', 'true');
+  await latest.getByRole('button', { name: 'Full' }).click();
   await oldest.getByRole('button', { name: 'Dialogue' }).click();
 
   await messageBox(page).fill('Use the selected context');
@@ -349,20 +371,21 @@ test('selects a workspace through the bounded directory picker', async ({ page }
   }).toBe('/tmp/remux-fixture/packages');
 });
 
-test('keeps the model conversation-scoped and reasoning next-turn scoped', async ({ page, isMobile }) => {
+test('uses current composer model and reasoning for every turn', async ({ page, isMobile }) => {
   await page.getByRole('button', { name: 'Preferences' }).click();
   await expect(page.getByRole('button', { name: 'Reload' })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'GPT-5.4 Fixture' })).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'GPT-5.6 Sol' })).toBeEnabled();
   await page.keyboard.press('Escape');
 
-  await messageBox(page).fill('Start a locked conversation');
+  await messageBox(page).fill('Start with Sol');
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
   if (!isMobile) {
     await expect(page.getByRole('button', { name: 'Start new chat', exact: true })).toBeVisible();
   }
   await page.getByRole('button', { name: 'Preferences' }).click();
-  await expect(page.getByRole('button', { name: 'GPT-5.4 Fixture' })).toBeDisabled();
-  await expect(page.getByText('Model is fixed for this chat.')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'GPT-5.6 Sol' })).toBeEnabled();
+  await page.getByRole('button', { name: 'GPT-5.6 Sol' }).click();
+  await page.getByRole('button', { name: 'GPT-5.4 Fixture' }).click();
   await expect(page.getByRole('button', { name: 'High', exact: true })).toBeEnabled();
   await page.getByRole('button', { name: 'High', exact: true }).click();
   await page.getByRole('button', { name: 'Medium', exact: true }).click();
@@ -375,12 +398,17 @@ test('keeps the model conversation-scoped and reasoning next-turn scoped', async
     page,
     'remux/agent/conversation/message/send',
   )).reasoning).toBe('medium');
+  await expect.poll(async () => (await lastCommandParams(
+    page,
+    'remux/agent/conversation/message/send',
+  )).modelId).toBe('gpt-5.4-fixture');
   await expect(page.getByText('The fixture stream completed.', { exact: true })).toBeVisible();
   await page.reload();
   await expect(page.getByText('Medium reasoning', { exact: true })).toBeVisible();
 
   await startNewChat(page, isMobile);
   await expect(page.getByRole('button', { name: 'Choose workspace' })).toBeEnabled();
+  await expect(page.getByText('GPT-5.4 Fixture')).toBeVisible();
   await expect(page.getByText('Medium reasoning', { exact: true })).toBeVisible();
 });
 
@@ -464,6 +492,8 @@ test('queues a follow-up during active work and dispatches it after stop', async
 test('edits a completed user message into an immutable branch', async ({ page }) => {
   await page.goto(conversationUrl());
   await page.getByRole('button', { name: 'Preferences' }).click();
+  await page.getByRole('button', { name: 'GPT-5.6 Sol' }).click();
+  await page.getByRole('button', { name: 'GPT-5.4 Fixture' }).click();
   await page.getByRole('button', { name: 'High', exact: true }).click();
   await page.getByRole('button', { name: 'Medium', exact: true }).click();
   await page.keyboard.press('Escape');
@@ -479,6 +509,10 @@ test('edits a completed user message into an immutable branch', async ({ page })
     page,
     'remux/agent/conversation/message/edit',
   )).reasoning).toBe('medium');
+  await expect.poll(async () => (await lastCommandParams(
+    page,
+    'remux/agent/conversation/message/edit',
+  )).modelId).toBe('gpt-5.4-fixture');
 });
 
 test('forks a completed response with its visible prefix intact', async ({ page }) => {
@@ -492,6 +526,10 @@ test('forks a completed response with its visible prefix intact', async ({ page 
   await expect(transcript(page).getByText('Resume this conversation', { exact: true })).toBeVisible();
   await expect(transcript(page).getByText('Fork follow-up', { exact: true })).toBeVisible();
   await expect.poll(() => commandCount(page, 'remux/agent/conversation/message/fork')).toBe(1);
+  await expect.poll(async () => (await lastCommandParams(
+    page,
+    'remux/agent/conversation/message/fork',
+  )).modelId).toBe('gpt-5.6-sol');
 });
 
 function conversationUrl(extra = '') {

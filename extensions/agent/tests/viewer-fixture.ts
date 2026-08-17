@@ -75,17 +75,30 @@ export async function installAgentHost(page: Page) {
         userCode: null, expiresAt: null, progress: null, error: null,
       } }],
       ['models', { revision: 1, value: {
-        defaultModelId: signedOut ? null : 'gpt-5.4-fixture', error: null,
-        models: signedOut ? [] : [{
-          id: 'gpt-5.4-fixture', name: 'GPT-5.4 Fixture', provider: 'openai-codex',
-          contextWindow: 400000, supportedReasoning: ['low', 'medium', 'high', 'xhigh'],
-        }],
+        defaultModelId: signedOut ? null : 'gpt-5.6-sol', error: null,
+        models: signedOut ? [] : [
+          {
+            id: 'gpt-5.4-fixture', name: 'GPT-5.4 Fixture', provider: 'openai-codex',
+            contextWindow: 400000, supportedReasoning: ['low', 'medium', 'high', 'xhigh'],
+          },
+          {
+            id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', provider: 'openai-codex',
+            contextWindow: 1000000, supportedReasoning: ['low', 'medium', 'high', 'xhigh'],
+          },
+        ],
       } }],
       ['runtime', { revision: 1, value: runtimeValue('unloaded') }],
     ]);
     const turns: Turn[] = [];
     const turnsByConversation = new Map<string, Turn[]>([[conversationId, turns]]);
-    const pendingQueue: Array<{ clientMessageId: string; operationId: string; parts?: any[]; text: string }> = [];
+    const pendingQueue: Array<{
+      clientMessageId: string;
+      modelId: string;
+      operationId: string;
+      parts?: any[];
+      reasoning: string;
+      text: string;
+    }> = [];
     const executionScopes = new Map<string, any>();
     const requestLog: Array<{ method: string; summary: string }> = [];
     let sequence = 1;
@@ -653,13 +666,21 @@ export async function installAgentHost(page: Page) {
       invalidateResource(key, entry ? 'updated' : 'created');
     }
 
-    function startFixtureMessage(params: { clientMessageId: string; parts?: any[]; text: string }) {
+    function startFixtureMessage(params: {
+      clientMessageId: string;
+      modelId: string;
+      parts?: any[];
+      reasoning: string;
+      text: string;
+    }) {
       const turn = createRunningTurn(String(params.text), String(params.clientMessageId), params.parts);
       updateResource(conversationKey, (summary) => {
         summary.status = 'running';
         summary.title = String(params.text);
         summary.preview = String(params.text);
         summary.latestTurnId = turn.id;
+        summary.modelId = params.modelId;
+        summary.reasoning = params.reasoning;
         summary.updatedAt = Date.now();
       });
       updateResource('runtime', (runtime) => {
@@ -667,6 +688,7 @@ export async function installAgentHost(page: Page) {
         runtime.state = 'running';
         runtime.activeTurnId = turn.id;
         runtime.activeTurnElapsedMs = 0;
+        runtime.contextProbe.modelId = params.modelId;
       });
       invalidateTranscript(turn.id, 'sendAccepted', true);
       const text = String(params.text);
@@ -883,8 +905,10 @@ export async function installAgentHost(page: Page) {
         if (runtime?.state === 'running' || runtime?.state === 'interrupting') {
           pendingQueue.push({
             clientMessageId: String(params.clientMessageId),
+            modelId: String(params.modelId),
             operationId: String(params.operationId),
             ...(Array.isArray(params.parts) ? { parts: params.parts } : {}),
+            reasoning: String(params.reasoning),
             text: String(params.text),
           });
           syncFixtureQueue();
@@ -894,7 +918,9 @@ export async function installAgentHost(page: Page) {
         }
         const turn = startFixtureMessage({
           clientMessageId: String(params.clientMessageId),
+          modelId: String(params.modelId),
           ...(Array.isArray(params.parts) ? { parts: params.parts } : {}),
+          reasoning: String(params.reasoning),
           text: String(params.text),
         });
         updateResource('runtime', (value) => {
@@ -955,7 +981,9 @@ export async function installAgentHost(page: Page) {
           value: {
             ...conversationSummary('/tmp/remux-fixture', 'idle', branchId),
             latestTurnId: replacement.id,
+            modelId: String(params.modelId),
             preview: String(params.text),
+            reasoning: String(params.reasoning),
             title: String(params.text),
           },
         });

@@ -30,6 +30,7 @@ import { createReplayedTranscriptProjector } from './transcript-replay.ts';
 import type { EphemeralTranscriptProjector } from './transcript-projector.ts';
 import { agentPromptImages } from './user-input.ts';
 import { TurnCoordinator } from './turn-coordinator.ts';
+import type { AgentTurnTerminalNotificationInput } from './app-notifications.ts';
 
 type ConversationControllerOptions = {
   provider: ModelProvider;
@@ -37,6 +38,7 @@ type ConversationControllerOptions = {
   resources: ResourceStore;
   monotonicNow?: () => number;
   publishProjectorInvalidations: (invalidations: AgentResourceInvalidation[]) => void;
+  publishTurnNotification: (input: AgentTurnTerminalNotificationInput) => Promise<void>;
 };
 
 /** Owns conversation selection, runtime hydration, branching, and the message queue. */
@@ -47,6 +49,7 @@ export class ConversationController {
   private readonly store: AgentStore;
   private readonly resources: ResourceStore;
   private sessionValue: ModelSession | null = null;
+  private sessionModelIdValue: string | null = null;
   private projectorValue: EphemeralTranscriptProjector | null = null;
   private conversationIdValue: string | null = null;
   private conversationOperationId: string | null = null;
@@ -75,6 +78,7 @@ export class ConversationController {
       },
       dispatchNextQueuedMessage: (conversationId) => this.dispatchNextQueuedMessage(conversationId),
       publishProjectorInvalidations: options.publishProjectorInvalidations,
+      publishTurnNotification: options.publishTurnNotification,
     });
   }
 
@@ -143,8 +147,7 @@ export class ConversationController {
     await this.loadModelSession({
       id: durable.conversationId,
       cwd,
-      modelId: params.modelId,
-    }, params.operationId, params.reasoning);
+    }, params.operationId, params.modelId, params.reasoning);
     return { conversationId: durable.conversationId };
   }
 
@@ -181,7 +184,11 @@ export class ConversationController {
       turnId: replay.turnId,
     };
 
-    await this.assertTurnReasoningAvailable(params.conversationId, params.reasoning);
+    this.assertTurnConfigurationAvailable(
+      params.conversationId,
+      params.modelId,
+      params.reasoning,
+    );
 
     const currentRuntime = this.resources.get<AgentRuntimeValue>(AGENT_RESOURCE_KEYS.runtime);
     if (
@@ -198,7 +205,11 @@ export class ConversationController {
         turnId: null,
       };
     }
-    const runtimeState = await this.ensureModelSession(params.conversationId, params.reasoning);
+    const runtimeState = await this.ensureModelSession(
+      params.conversationId,
+      params.modelId,
+      params.reasoning,
+    );
     if (!this.sessionValue) throw new RpcFault(-32012, 'The conversation runtime is unavailable.');
     let durable: Awaited<ReturnType<AgentStore['acceptTurn']>>;
     try {
@@ -265,6 +276,11 @@ export class ConversationController {
     if (active?.state === 'running' || active?.state === 'interrupting') {
       throw new RpcFault(-32013, 'Wait for the active turn to finish before editing or forking.');
     }
+    this.assertTurnConfigurationAvailable(
+      params.sourceConversationId,
+      params.modelId,
+      params.reasoning,
+    );
     const source = await this.readConversationSummary(params.sourceConversationId);
     const projection = await this.store.readTranscriptProjection(params.sourceConversationId);
     if (!projection) throw new RpcFault(-32015, 'Source conversation transcript was not found.');
@@ -272,7 +288,7 @@ export class ConversationController {
     const branch = await this.store.createConversation({
       operationId: params.operationId,
       cwd: source.cwd,
-      modelId: source.modelId,
+      modelId: params.modelId,
       reasoning: params.reasoning,
     });
     const clonedTurnIds = await this.cloneTranscriptPrefix(
@@ -287,6 +303,7 @@ export class ConversationController {
       operationId: derivedUuid(params.operationId, 'branch-message'),
       conversationId: branch.conversationId,
       clientMessageId: params.clientMessageId,
+      modelId: params.modelId,
       contextPlan: {
         ...params.contextPlan,
         overrides: params.contextPlan.overrides.flatMap((override) => {
@@ -306,6 +323,7 @@ export class ConversationController {
     const previous = this.sessionValue;
     await this.turns.disposeConversation(previous, this.conversationIdValue);
     this.sessionValue = null;
+    this.sessionModelIdValue = null;
     this.projectorValue = null;
     if (previous) await previous.dispose();
     this.conversationIdValue = null;
@@ -363,6 +381,7 @@ export class ConversationController {
           automaticDialogueTurns: DEFAULT_TURN_CONTEXT_DIALOGUE_TURNS,
           overrides: [],
         },
+        modelId: sourceTurn.modelId,
         reasoning: sourceTurn.reasoning,
         text: user.text,
         ...(parts ? { parts } : {}),
@@ -439,6 +458,7 @@ export class ConversationController {
 
   private async ensureModelSession(
     conversationId: string,
+    modelId: string,
     reasoning: MessageSendParams['reasoning'],
   ) {
     const current = this.resources.get<AgentRuntimeValue>(AGENT_RESOURCE_KEYS.runtime);
@@ -449,16 +469,16 @@ export class ConversationController {
       current?.conversationId === conversationId
     ) {
       if (current.state === 'running' || current.state === 'interrupting') throw turnActiveFault(current);
-      if (current.state === 'error') {
+      if (current.state === 'error' || this.sessionModelIdValue !== modelId) {
         const summary = await this.readConversationSummary(conversationId);
         await this.disposeConversation();
-        return this.loadModelSession(summary, null, reasoning);
+        return this.loadModelSession(summary, null, modelId, reasoning);
       }
       return current;
     }
     this.assertRuntimeSwitchAvailable(conversationId);
     const summary = await this.readConversationSummary(conversationId);
-    return this.loadModelSession(summary, null, reasoning);
+    return this.loadModelSession(summary, null, modelId, reasoning);
   }
 
   private async readConversationSummary(conversationId: string) {
@@ -469,12 +489,19 @@ export class ConversationController {
     return projection.value as ConversationSummary;
   }
 
-  private async assertTurnReasoningAvailable(conversationId: string, reasoning: MessageSendParams['reasoning']) {
-    const conversation = await this.readConversationSummary(conversationId);
+  private assertTurnConfigurationAvailable(
+    conversationId: string,
+    modelId: string,
+    reasoning: MessageSendParams['reasoning'],
+  ) {
     const models = this.resources.get<ModelsValue>(AGENT_RESOURCE_KEYS.models);
-    const model = models?.models.find(({ id }) => id === conversation.modelId);
-    if (!model?.supportedReasoning.includes(reasoning)) {
-      throw new RpcFault(-32602, 'The selected reasoning level is unavailable for this model.');
+    const model = models?.models.find(({ id }) => id === modelId);
+    if (!model) {
+      const data: AgentCommandErrorData = { kind: 'model_unavailable', conversationId, modelId };
+      throw new RpcFault(-32020, 'The selected model is no longer available.', data);
+    }
+    if (!model.supportedReasoning.includes(reasoning)) {
+      throw new RpcFault(-32602, 'The selected reasoning level is unavailable for the selected model.');
     }
   }
 
@@ -486,8 +513,9 @@ export class ConversationController {
   }
 
   private async loadModelSession(
-    conversation: Pick<ConversationSummary, 'id' | 'cwd' | 'modelId'>,
+    conversation: Pick<ConversationSummary, 'id' | 'cwd'>,
     operationId: string | null,
+    requestedModelId: string,
     initialReasoning: MessageSendParams['reasoning'],
   ) {
     const current = this.resources.get<AgentRuntimeValue>(AGENT_RESOURCE_KEYS.runtime);
@@ -495,21 +523,28 @@ export class ConversationController {
       this.conversationIdValue === conversation.id &&
       this.sessionValue &&
       this.projectorValue &&
+      this.sessionModelIdValue === requestedModelId &&
       current?.conversationId === conversation.id
     ) return current;
 
     this.assertRuntimeSwitchAvailable(conversation.id);
     const auth = this.resources.get<AuthValue>(AGENT_RESOURCE_KEYS.auth);
     if (auth?.state !== 'signed-in') throw new RpcFault(-32011, 'Sign in before continuing a conversation.');
+    const resumed = await this.store.resumeActiveTurn(conversation.id);
+    const modelId = resumed?.modelId ?? requestedModelId;
+    const reasoning = resumed?.reasoning ?? initialReasoning;
     const models = this.resources.get<ModelsValue>(AGENT_RESOURCE_KEYS.models);
-    const model = models?.models.find(({ id }) => id === conversation.modelId);
+    const model = models?.models.find(({ id }) => id === modelId);
     if (!model) {
       const data: AgentCommandErrorData = {
         kind: 'model_unavailable',
         conversationId: conversation.id,
-        modelId: conversation.modelId,
+        modelId,
       };
-      throw new RpcFault(-32020, 'The conversation model is no longer available.', data);
+      throw new RpcFault(-32020, 'The selected model is no longer available.', data);
+    }
+    if (!model.supportedReasoning.includes(reasoning)) {
+      throw new RpcFault(-32602, 'The selected reasoning level is unavailable for the selected model.');
     }
     let cwd: string;
     try {
@@ -525,7 +560,7 @@ export class ConversationController {
     }
 
     await this.disposeConversation();
-    const loading = runtimeValue(conversation.id, conversation.modelId, 'loading');
+    const loading = runtimeValue(conversation.id, modelId, 'loading');
     this.resources.set(AGENT_RESOURCE_KEYS.runtime, loading);
     try {
       const transcript = await this.store.readTranscriptProjection(conversation.id);
@@ -539,16 +574,16 @@ export class ConversationController {
       });
       const session = await this.provider.createSession({
         cwd,
-        modelId: conversation.modelId,
-        reasoning: initialReasoning,
+        modelId,
+        reasoning,
         onEvent: (event) => this.turns.applySessionEvent(conversation.id, event),
         durability: this.turns.durabilityHooks(conversation.id),
       });
       this.sessionValue = session;
+      this.sessionModelIdValue = modelId;
       this.projectorValue = projector;
       this.conversationIdValue = conversation.id;
       this.conversationOperationId = operationId;
-      const resumed = await this.store.resumeActiveTurn(conversation.id);
       if (resumed) this.turns.resume(resumed.rootHandle, resumed.handle);
       const loaded = resumed ? {
         ...loading,
@@ -565,6 +600,7 @@ export class ConversationController {
       return loaded;
     } catch (error) {
       this.sessionValue = null;
+      this.sessionModelIdValue = null;
       this.projectorValue = null;
       this.conversationIdValue = null;
       this.conversationOperationId = null;

@@ -172,6 +172,40 @@ fn turn_completed_intent() -> Value {
     })
 }
 
+fn record_agent_turn(fixture: &Fixture, client: &Arc<MockClient>, method: &str) {
+    let request = json!({
+        "method": method,
+        "params": { "conversationId": "conversation-1" },
+    });
+    let result = if method == "remux/agent/conversation/message/send" {
+        json!({ "accepted": true, "operationId": "operation-1", "turnId": "turn-1" })
+    } else {
+        json!({ "conversationId": "conversation-1", "turnId": "turn-1" })
+    };
+    fixture
+        .manager
+        .record_client_request(client.as_ref(), &request, &result);
+}
+
+fn agent_turn_completed_intent() -> Value {
+    json!({
+        "method": "remux/notifications/request",
+        "params": {
+            "body": "The Agent implementation is complete.",
+            "extensionId": "agent",
+            "id": "agent-turn:conversation-1:turn-1:42",
+            "target": {
+                "focusId": "turn-1",
+                "focusKind": "turn",
+                "resourceId": "conversation-1",
+                "resourceKind": "agentConversation",
+            },
+            "title": "Agent finished",
+            "viewId": "main",
+        }
+    })
+}
+
 fn terminal_intent(seq: &str) -> Value {
     json!({
         "method": "remux/notifications/request",
@@ -239,6 +273,80 @@ async fn pushes_turn_completion_to_the_originating_client() {
             "to": "ExponentPushToken[test]",
         })
     );
+}
+
+#[tokio::test]
+async fn pushes_agent_turn_completion_to_the_originating_client() {
+    let fixture = fixture();
+    let client = MockClient::new(false);
+    register(&fixture, &client).await;
+    record_agent_turn(&fixture, &client, "remux/agent/conversation/message/send");
+
+    assert!(
+        fixture
+            .manager
+            .handle_extension_notification(&agent_turn_completed_intent())
+            .await
+    );
+
+    let pushes = fixture.pushes.lock().unwrap();
+    assert_eq!(pushes.len(), 1);
+    let delivered = &pushes[0].1["data"]["remuxNotificationIntent"];
+    assert_eq!(delivered["extensionId"], "agent");
+    assert_eq!(delivered["title"], "Agent finished");
+    assert_eq!(delivered["target"]["resourceKind"], "agentConversation");
+    assert_eq!(delivered["target"]["resourceId"], "conversation-1");
+    assert_eq!(delivered["target"]["focusId"], "turn-1");
+}
+
+#[tokio::test]
+async fn records_agent_send_edit_and_fork_as_turn_audiences() {
+    for method in [
+        "remux/agent/conversation/message/send",
+        "remux/agent/conversation/message/edit",
+        "remux/agent/conversation/message/fork",
+    ] {
+        let fixture = fixture();
+        let client = MockClient::new(false);
+        register(&fixture, &client).await;
+        record_agent_turn(&fixture, &client, method);
+
+        fixture
+            .manager
+            .handle_extension_notification(&agent_turn_completed_intent())
+            .await;
+        assert_eq!(
+            fixture.pushes.lock().unwrap().len(),
+            1,
+            "{method} should notify"
+        );
+    }
+}
+
+#[tokio::test]
+async fn does_not_record_an_agent_audience_before_a_queued_turn_has_an_identity() {
+    let fixture = fixture();
+    let client = MockClient::new(false);
+    register(&fixture, &client).await;
+    fixture.manager.record_client_request(
+        client.as_ref(),
+        &json!({
+            "method": "remux/agent/conversation/message/send",
+            "params": { "conversationId": "conversation-1" },
+        }),
+        &json!({
+            "accepted": true,
+            "delivery": "queued",
+            "operationId": "operation-1",
+            "turnId": null,
+        }),
+    );
+
+    fixture
+        .manager
+        .handle_extension_notification(&agent_turn_completed_intent())
+        .await;
+    assert!(fixture.pushes.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

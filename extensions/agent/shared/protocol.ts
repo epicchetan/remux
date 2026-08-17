@@ -309,6 +309,7 @@ export type TurnReadParams = {
 export type TurnReadValue = {
   conversationId: string;
   turnId: string;
+  modelId: string;
   reasoning: ReasoningLevel;
   state: 'running' | 'completed' | 'failed' | 'interrupted' | 'interrupted_by_restart';
   terminal: boolean;
@@ -478,6 +479,7 @@ export type MessageSendParams = {
   operationId: string;
   conversationId: string;
   clientMessageId: string;
+  modelId: string;
   parts?: AgentComposerMessagePart[];
   contextPlan: TurnContextPlan;
   reasoning: ReasoningLevel;
@@ -500,6 +502,7 @@ export type MessageQueueMutationResult = {
 export type MessageBranchParams = {
   clientMessageId: string;
   operationId: string;
+  modelId: string;
   parts?: AgentComposerMessagePart[];
   contextPlan: TurnContextPlan;
   reasoning: ReasoningLevel;

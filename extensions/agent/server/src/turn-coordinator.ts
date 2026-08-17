@@ -29,6 +29,7 @@ import { createReplayedTranscriptProjector } from './transcript-replay.ts';
 import type { EphemeralTranscriptProjector } from './transcript-projector.ts';
 import { ResourceStore } from './resources.ts';
 import { RpcFault } from './agent-rpc-router.ts';
+import type { AgentTurnTerminalNotificationInput } from './app-notifications.ts';
 
 type TurnCoordinatorOptions = {
   store: AgentStore;
@@ -42,6 +43,7 @@ type TurnCoordinatorOptions = {
   enqueueConversationCommand: (work: () => void | Promise<void>) => void;
   dispatchNextQueuedMessage: (conversationId: string) => Promise<void>;
   publishProjectorInvalidations: (invalidations: AgentResourceInvalidation[]) => void;
+  publishTurnNotification: (input: AgentTurnTerminalNotificationInput) => Promise<void>;
 };
 
 type AcceptedTurn = Awaited<ReturnType<AgentStore['acceptTurn']>>;
@@ -118,12 +120,13 @@ export class TurnCoordinator {
       });
     } catch (error) {
       const message = safeMessage(error);
-      await this.store.finishTurn(durable, {
+      const mutation = await this.store.finishTurn(durable, {
         status: 'failed',
         error: message,
         errorCode: 'runtime_error',
         durationMs: this.activeTurnDurationMs(),
       });
+      await this.publishTerminalNotification(durable, 'failed', message, mutation);
       this.resources.invalidateKey(conversationResourceKey(params.conversationId));
       this.resources.invalidateKey(AGENT_RESOURCE_KEYS.conversationList);
       this.activeDurableTurn = null;
@@ -785,6 +788,7 @@ export class TurnCoordinator {
         errorCode: 'storage_error',
         durationMs,
       });
+      await this.publishTerminalNotification(handle, 'failed', message, mutation);
       this.turnWriteError = null;
       this.turnWriteTail = Promise.resolve();
       this.resources.invalidateKey(conversationResourceKey(conversationId));
@@ -826,6 +830,7 @@ export class TurnCoordinator {
       errorCode: error ? 'provider_error' : null,
       durationMs,
     });
+    await this.publishTerminalNotification(handle, status, error ?? null, mutation);
     this.resources.invalidateKey(conversationResourceKey(conversationId));
     this.resources.invalidateKey(AGENT_RESOURCE_KEYS.conversationList);
     runtimeValue.state = error ? 'error' : 'idle';
@@ -850,6 +855,27 @@ export class TurnCoordinator {
     const runtimeValue = this.resources.get<AgentRuntimeValue>(AGENT_RESOURCE_KEYS.runtime);
     if (runtimeValue?.conversationId !== id) throw new RpcFault(-32015, 'Conversation not found.');
     return runtimeValue;
+  }
+
+  private async publishTerminalNotification(
+    handle: DurableTurnHandle,
+    status: AgentTurnTerminalNotificationInput['status'],
+    error: string | null,
+    mutation: DurableTranscriptMutation | null,
+  ) {
+    if (!mutation) return;
+    try {
+      await this.options.publishTurnNotification({
+        conversationId: handle.conversationId,
+        turnId: handle.turnId,
+        terminalSequence: mutation.basisSequence,
+        status,
+        error,
+      });
+    } catch {
+      // Notification delivery is a projection of durable state and must never
+      // turn an already-committed model result into a runtime failure.
+    }
   }
 
   private activeTurnDurationMs() {

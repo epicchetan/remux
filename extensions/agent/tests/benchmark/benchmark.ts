@@ -228,6 +228,7 @@ async function commandSend(options: Options, client: RemuxBenchmarkClient) {
   try {
     const started = await target.send({
       conversationId: runRecord.conversationId,
+      modelId: runRecord.modelId,
       reasoning: runRecord.reasoning,
       text,
       contextPlan,
@@ -376,6 +377,7 @@ async function commandSentinel(options: Options, client: RemuxBenchmarkClient) {
   await target.waitForTerminal({ conversationId: first.conversationId, turnId: first.turnId, timeoutMs: options.timeoutMs });
   const second = await target.send({
     conversationId: first.conversationId,
+    modelId: requiredOption(options.modelId, '--model'),
     reasoning: options.reasoning,
     text: 'Do not call tools or change files. Reply exactly: BENCHMARK_SENTINEL_TWO',
   });

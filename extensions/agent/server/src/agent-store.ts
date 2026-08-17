@@ -134,6 +134,7 @@ export interface AgentStore {
   resumeActiveTurn(conversationId: string): Promise<{
     handle: DurableTurnHandle;
     rootHandle: DurableTurnHandle;
+    modelId: string;
     prompt: string;
     reasoning: ReasoningLevel;
   } | null>;

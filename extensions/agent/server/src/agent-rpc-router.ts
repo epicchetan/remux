@@ -206,6 +206,7 @@ function parseMessageSend(params: unknown): MessageSendParams {
       operationId: requiredUuidV4(value.operationId, 'operationId'),
       conversationId: requiredUuidV4(value.conversationId, 'conversationId'),
       clientMessageId: requiredUuidV4(value.clientMessageId, 'clientMessageId'),
+      modelId: requiredString(value.modelId, 'modelId'),
       contextPlan: parseTurnContextPlan(value.contextPlan),
       reasoning: reasoningLevel(value.reasoning),
       text: requiredString(value.text, 'text'),
@@ -221,6 +222,7 @@ function parseMessageSend(params: unknown): MessageSendParams {
     operationId: requiredUuidV4(value.operationId, 'operationId'),
     conversationId: requiredUuidV4(value.conversationId, 'conversationId'),
     clientMessageId: requiredUuidV4(value.clientMessageId, 'clientMessageId'),
+    modelId: requiredString(value.modelId, 'modelId'),
     contextPlan: parseTurnContextPlan(value.contextPlan),
     reasoning: reasoningLevel(value.reasoning),
     parts,
@@ -277,6 +279,7 @@ function parseMessageBranch(params: unknown): MessageBranchParams {
   return {
     operationId: requiredUuidV4(value.operationId, 'operationId'),
     clientMessageId: requiredUuidV4(value.clientMessageId, 'clientMessageId'),
+    modelId: requiredString(value.modelId, 'modelId'),
     contextPlan: parseTurnContextPlan(value.contextPlan),
     reasoning: reasoningLevel(value.reasoning),
     sourceConversationId: requiredUuidV4(value.sourceConversationId, 'sourceConversationId'),

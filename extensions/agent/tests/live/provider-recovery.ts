@@ -284,6 +284,7 @@ async function sendAndWait(
     operationId: randomUUID(),
     conversationId,
     clientMessageId: randomUUID(),
+    modelId: MODEL_ID,
     contextPlan: {
       version: 1,
       automaticDialogueTurns: 2,

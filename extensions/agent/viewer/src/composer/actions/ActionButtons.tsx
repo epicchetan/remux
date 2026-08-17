@@ -71,8 +71,8 @@ export function ComposerActionButtons({
         {left.map((action) => <ComposerActionKey action={action} key={action.label} />)}
         <ComposerConfigButton
           contextOpen={contextOpen}
+          conversationExists={conversationExists}
           disabled={pickerOpen}
-          modelLocked={conversationExists}
           onSignOut={onSignOut}
           onToggleContext={onToggleContext}
         />

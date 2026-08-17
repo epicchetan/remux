@@ -74,6 +74,7 @@ class CodexBenchmarkTarget implements BenchmarkConversationTarget {
 
   async send(input: {
     conversationId: string;
+    modelId: string;
     text: string;
     contextPlan?: TurnContextPlan | null;
   }) {
@@ -200,6 +201,7 @@ class AgentBenchmarkTarget implements BenchmarkConversationTarget {
     const conversationId = requiredString(created.conversationId, 'Agent create response conversationId');
     const sent = await this.send({
       conversationId,
+      modelId: input.modelId,
       reasoning: input.reasoning,
       text: input.text,
       contextPlan: input.contextPlan,
@@ -209,6 +211,7 @@ class AgentBenchmarkTarget implements BenchmarkConversationTarget {
 
   async send(input: {
     conversationId: string;
+    modelId: string;
     reasoning: string;
     text: string;
     contextPlan?: TurnContextPlan | null;
@@ -222,6 +225,7 @@ class AgentBenchmarkTarget implements BenchmarkConversationTarget {
         automaticDialogueTurns: 2,
         overrides: [],
       },
+      modelId: input.modelId,
       reasoning: input.reasoning,
       text: input.text,
     }));

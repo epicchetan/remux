@@ -3,11 +3,13 @@ import { randomUUID } from 'node:crypto';
 import {
   AGENT_METHODS,
   AGENT_RESOURCE_KEYS,
+  conversationResourceKey,
   type ArtifactReadParams,
   type ArtifactReadRange,
   type ArtifactReadResult,
   type AgentRuntimeValue,
   type AuthValue,
+  type ConversationSummary,
   type LoginCancelParams,
   type ModelsValue,
   type ResourceReadParams,
@@ -18,6 +20,10 @@ import type { AgentResourceInvalidation } from '../../shared/transcript.ts';
 import type { AgentStore } from './agent-store.ts';
 import type { ModelProvider } from './model-provider.ts';
 import { ArtifactIntegrityError } from './domain/errors.ts';
+import {
+  createAgentTurnNotification,
+  type AgentTurnTerminalNotificationInput,
+} from './app-notifications.ts';
 import { AgentRpcRouter, RpcFault } from './agent-rpc-router.ts';
 export { RpcFault } from './agent-rpc-router.ts';
 import { ConversationController } from './conversation-controller.ts';
@@ -30,6 +36,7 @@ import {
 } from './transcript-projector.ts';
 
 const MAX_ARTIFACT_READ_BYTES = 48 * 1024;
+const DEFAULT_AGENT_MODEL_ID = 'gpt-5.6-sol';
 
 export class AgentServer {
   readonly resources: ResourceStore;
@@ -61,6 +68,7 @@ export class AgentServer {
       resources: this.resources,
       ...(options.monotonicNow ? { monotonicNow: options.monotonicNow } : {}),
       publishProjectorInvalidations: (invalidations) => this.publishProjectorInvalidations(invalidations),
+      publishTurnNotification: (input) => this.publishTurnNotification(input),
     });
     this.rpc = new AgentRpcRouter({
       readResources: (params) => this.readResources(params),
@@ -117,7 +125,13 @@ export class AgentServer {
     } else {
       try {
         const models = await this.provider.listModels();
-        value = { models, defaultModelId: models[0]?.id ?? null, error: null };
+        value = {
+          models,
+          defaultModelId: models.find(({ id }) => id === DEFAULT_AGENT_MODEL_ID)?.id
+            ?? models[0]?.id
+            ?? null,
+          error: null,
+        };
       } catch (error) {
         value = { models: [], defaultModelId: null, error: safeMessage(error) };
       }
@@ -402,6 +416,18 @@ export class AgentServer {
       invalidations,
       serverGeneration: this.resources.serverGeneration,
     });
+  }
+
+  private async publishTurnNotification(input: AgentTurnTerminalNotificationInput) {
+    const [projection] = await this.store.readResourceProjections([
+      conversationResourceKey(input.conversationId),
+    ]);
+    if (!projection || projection.key !== conversationResourceKey(input.conversationId)) return;
+    const notification = createAgentTurnNotification(
+      input,
+      projection.value as ConversationSummary,
+    );
+    if (notification) this.notify(notification.method, notification.params);
   }
 }
 

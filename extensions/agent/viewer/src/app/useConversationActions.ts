@@ -37,7 +37,6 @@ export function useConversationActions(options: {
   conversation: ConversationValue | null;
   cwd: string;
   draftRef: MutableRefObject<AgentNewChatDraft | null>;
-  modelId: string;
   refresh: (keys?: AgentResourceKey[]) => Promise<void>;
   selectConversation: (conversationId: string, focusTurnId?: string | null) => void;
   setActiveConversationId: Dispatch<SetStateAction<string | null>>;
@@ -51,7 +50,6 @@ export function useConversationActions(options: {
     conversation,
     cwd,
     draftRef,
-    modelId,
     refresh,
     selectConversation,
     setActiveConversationId,
@@ -60,7 +58,10 @@ export function useConversationActions(options: {
     setError,
   } = options;
   const ensureConversation = useConversationHistoryStore((state) => state.ensureConversation);
-  const createConversation = useCallback(async (reasoning: TurnSubmissionInput['reasoning']) => {
+  const createConversation = useCallback(async (
+    modelId: TurnSubmissionInput['modelId'],
+    reasoning: TurnSubmissionInput['reasoning'],
+  ) => {
     if (!modelId || !cwd) throw new Error('Choose a workspace and model first.');
     const operationId = activeDraftIdRef.current ?? loadOrCreateDraftOperationId();
     const sourceDraftId = activeDraftIdRef.current;
@@ -86,7 +87,6 @@ export function useConversationActions(options: {
     cwd,
     draftRef,
     ensureConversation,
-    modelId,
     setActiveConversationId,
     setActiveDraftId,
     setDraft,
@@ -97,7 +97,8 @@ export function useConversationActions(options: {
     setPhase: (phase: ComposerPhase) => void,
   ) => {
     setError(null);
-    const activeId = activeConversationIdRef.current ?? await createConversation(input.reasoning);
+    const activeId = activeConversationIdRef.current
+      ?? await createConversation(input.modelId, input.reasoning);
     setPhase('sending');
     const clientMessageId = createViewerUuid();
     trackTranscriptUserMessage(activeId, clientMessageId);
@@ -107,6 +108,7 @@ export function useConversationActions(options: {
         operationId: createViewerUuid(),
         conversationId: activeId,
         clientMessageId,
+        modelId: input.modelId,
         contextPlan: input.contextPlan,
         parts: input.parts,
         reasoning: input.reasoning,
@@ -146,6 +148,7 @@ export function useConversationActions(options: {
       mode,
       operationId: createViewerUuid(),
       clientMessageId,
+      modelId: input.modelId,
       contextPlan: input.contextPlan,
       parts: input.parts,
       reasoning: input.reasoning,

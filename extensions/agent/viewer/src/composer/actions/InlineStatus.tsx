@@ -13,13 +13,12 @@ export function ComposerInlineStatus({
   const configuredModel = useComposerStore((state) => state.modelId);
   const models = useComposerStore((state) => state.models);
   const configuredReasoning = useComposerStore((state) => state.reasoning);
-  const modelId = conversation?.modelId ?? configuredModel;
-  const model = resolveModel(models, modelId);
+  const model = resolveModel(models, configuredModel);
 
   return (
     <div className="remux-composer-inline-status" data-remux-no-composer-focus>
       <div className="remux-composer-status-group">
-        <span className="truncate">{model?.name ?? (modelId || 'Loading models')}</span>
+        <span className="truncate">{model?.name ?? (configuredModel || 'Loading models')}</span>
         <span className="remux-composer-status-separator" aria-hidden="true">/</span>
         <span className="truncate">{reasoningLabel(configuredReasoning)} reasoning</span>
       </div>

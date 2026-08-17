@@ -153,12 +153,13 @@ export function App() {
       restoreComposerSnapshot(currentDraft.snapshot);
     } else if (activeConversationId) {
       const currentDraft = loadConversationDraft(activeConversationId);
+      if (currentDraft.modelId) setModelId(currentDraft.modelId);
       if (currentDraft.reasoning) {
         setReasoning(currentDraft.reasoning);
-        conversationSettingsTargetRef.current = activeConversationId;
-      } else {
-        conversationSettingsTargetRef.current = null;
       }
+      conversationSettingsTargetRef.current = currentDraft.modelId || currentDraft.reasoning
+        ? activeConversationId
+        : null;
       setContextPlan(currentDraft.contextPlan);
       setPreserveContextPlan(currentDraft.preserveContextPlan);
       restoreComposerSnapshot(currentDraft.snapshot);
@@ -182,6 +183,7 @@ export function App() {
           activeConversationId,
           composerSnapshot,
           contextPlan,
+          modelId,
           preserveContextPlan,
           reasoning,
         );
@@ -214,11 +216,12 @@ export function App() {
   useEffect(() => {
     if (!activeConversationId || !conversationSummary) return;
     setCwd(conversationSummary.cwd);
-    setModelId(conversationSummary.modelId);
     if (conversationSettingsTargetRef.current !== activeConversationId) {
       const currentDraft = loadConversationDraft(activeConversationId);
-      const requested = currentDraft.reasoning ?? conversationSummary.reasoning;
-      const selected = resolveModel(useComposerStore.getState().models, conversationSummary.modelId);
+      const composer = useComposerStore.getState();
+      const selected = resolveModel(composer.models, currentDraft.modelId ?? composer.modelId);
+      if (selected) setModelId(selected.id);
+      const requested = currentDraft.reasoning ?? composer.reasoning;
       setReasoning(selected && !selected.supportedReasoning.includes(requested)
         ? preferredReasoning(selected)
         : requested);
@@ -253,6 +256,7 @@ export function App() {
         currentConversationId,
         snapshot,
         composer.contextPlan,
+        composer.modelId,
         composer.preserveContextPlan,
         composer.reasoning,
       );
@@ -302,7 +306,7 @@ export function App() {
     const nextDraft: AgentNewChatDraft = {
       cwd: selected?.cwd ?? useConversationStore.getState().cwd,
       id,
-      modelId: selected?.modelId ?? useComposerStore.getState().modelId,
+      modelId: useComposerStore.getState().modelId,
       preserveContextPlan: false,
       reasoning: useComposerStore.getState().reasoning,
       contextPlan: createDefaultTurnContextPlan(),
@@ -323,12 +327,13 @@ export function App() {
       setActiveConversationId(normalized);
       setActiveDraftId(null);
       const currentDraft = loadConversationDraft(normalized);
+      if (currentDraft.modelId) setModelId(currentDraft.modelId);
       if (currentDraft.reasoning) {
         setReasoning(currentDraft.reasoning);
-        conversationSettingsTargetRef.current = normalized;
-      } else {
-        conversationSettingsTargetRef.current = null;
       }
+      conversationSettingsTargetRef.current = currentDraft.modelId || currentDraft.reasoning
+        ? normalized
+        : null;
       setContextPlan(currentDraft.contextPlan);
       setPreserveContextPlan(currentDraft.preserveContextPlan);
       restoreComposerSnapshot(currentDraft.snapshot);
@@ -337,7 +342,7 @@ export function App() {
       void ensureConversation(normalized);
     }
     if (focusTurnId) requestTranscriptTurnScroll(normalized, focusTurnId);
-  }, [ensureConversation, restoreComposerSnapshot, saveCurrentTargetDraft, setContextPlan, setPreserveContextPlan, setReasoning]);
+  }, [ensureConversation, restoreComposerSnapshot, saveCurrentTargetDraft, setContextPlan, setModelId, setPreserveContextPlan, setReasoning]);
 
   useAgentNavigation({
     activeConversationId,
@@ -368,7 +373,6 @@ export function App() {
     conversation,
     cwd,
     draftRef,
-    modelId,
     refresh,
     selectConversation,
     setActiveConversationId,

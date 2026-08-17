@@ -37,6 +37,7 @@ export function useComposerTurnAction({
   const editTarget = useComposerStore((state) => state.editTarget);
   const forkTarget = useComposerStore((state) => state.forkTarget);
   const contextPlan = useComposerStore((state) => state.contextPlan);
+  const modelId = useComposerStore((state) => state.modelId);
   const reasoning = useComposerStore((state) => state.reasoning);
   const submission = useComposerStore((state) => state.submission);
   const beginSubmission = useComposerStore((state) => state.beginSubmission);
@@ -55,12 +56,19 @@ export function useComposerTurnAction({
     const kind = editTarget ? 'edit' : forkTarget ? 'fork' : conversationExists ? 'send' : 'new-chat';
     const next = beginSubmission({
       kind,
+      modelId,
       phase: conversationExists ? 'sending' : 'starting-conversation',
       snapshot,
       contextPlan,
       reasoning,
     });
-    const input = { contextPlan, displayText: projection.displayText, parts: projection.parts, reasoning };
+    const input = {
+      contextPlan,
+      displayText: projection.displayText,
+      modelId,
+      parts: projection.parts,
+      reasoning,
+    };
     const setPhase = (phase: 'sending' | 'updating-transcript') => setSubmissionPhase(next.id, phase);
     const request = editTarget
       ? onEdit(editTarget, input, setPhase)
@@ -115,6 +123,7 @@ type ComposerBranchCallback<T> = (
 export type TurnSubmissionInput = {
   contextPlan: TurnContextPlan;
   displayText: string;
+  modelId: string;
   parts: AgentComposerMessagePart[];
   reasoning: ReasoningLevel;
 };
