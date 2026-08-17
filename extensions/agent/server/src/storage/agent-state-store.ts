@@ -8,6 +8,7 @@ import { DurableTranscriptSelectionError } from '../domain/errors.ts';
 
 import {
   conversationResourceKey,
+  isContextInspectorValue,
   queueResourceKey,
   type AgentComposerMessagePart,
   type AgentResourceKey,
@@ -164,6 +165,7 @@ export class AgentStateStore extends TurnState implements AgentStore {
       await store.validateArtifactMetadata();
       store.orphanArtifactPaths = await store.findArtifactOrphans();
       await store.recoverInterruptedTurns();
+      store.purgeStaleContextResources();
       await store.rebuildConversationResources();
       return store;
     } catch (error) {
@@ -2848,11 +2850,32 @@ export class AgentStateStore extends TurnState implements AgentStore {
         }
       }
       if (!row) return null;
+      const value: unknown = JSON.parse(row.value_json);
+      if (key.startsWith('context:') && !isContextInspectorValue(value)) return null;
       return {
         key: row.resource_key as DurableResourceProjection['key'],
         basisSequence: safeInteger(row.basis_sequence, 'resource basis sequence'),
-        value: JSON.parse(row.value_json) as DurableResourceProjection['value'],
+        value: value as DurableResourceProjection['value'],
       };
+    });
+  }
+
+  private purgeStaleContextResources() {
+    this.assertOpen();
+    const rows = this.storage.database.prepare(`
+      SELECT resource_key, value_json
+      FROM resources WHERE resource_key LIKE 'context:%'
+    `).all() as Array<{ resource_key: string; value_json: string }>;
+    const staleKeys = rows
+      .filter(({ value_json }) => !isContextInspectorValue(JSON.parse(value_json)))
+      .map(({ resource_key }) => resource_key);
+    if (staleKeys.length === 0) return 0;
+    return this.storage.transaction(() => {
+      const remove = this.storage.database.prepare(`
+        DELETE FROM resources WHERE resource_key = ?
+      `);
+      for (const key of staleKeys) remove.run(key);
+      return staleKeys.length;
     });
   }
 

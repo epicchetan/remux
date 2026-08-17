@@ -37,6 +37,7 @@ export async function installAgentHost(page: Page) {
     const overflowTranscript = route.get('fixtureOverflow') === '1';
     const exactTranscript = route.get('fixtureExact') === '1';
     const legacyInferenceTrace = route.get('fixtureLegacyInferenceTrace') === '1';
+    const staleContextInspector = route.get('fixtureStaleContextInspector') === '1';
     const contextTurns = route.get('fixtureContextTurns') === '1';
     const exactArtifactHash = 'a'.repeat(64);
     const pickedImageHash = 'b'.repeat(64);
@@ -107,7 +108,12 @@ export async function installAgentHost(page: Page) {
         value: conversationSummary('/tmp/remux-fixture', 'idle'),
       });
       resources.set('runtime', { revision: 2, value: runtimeValue('idle') });
-      resources.set(contextKey, { revision: 1, value: contextValue('append') });
+      const context: any = contextValue('append');
+      if (staleContextInspector) {
+        context.version = 6;
+        delete context.compaction;
+      }
+      resources.set(contextKey, { revision: 1, value: context });
       if (longTranscript) {
         for (let index = 1; index <= 72; index += 1) {
           turns.push(completedTurn(`turn-${index}`, `Historical request ${index}`, `Historical answer ${index}.`));

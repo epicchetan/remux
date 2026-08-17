@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { Boxes, Check, ChevronDown, LogOut, Play, RefreshCw, Sparkles, Wrench } from 'lucide-react';
+import { Boxes, Check, ChevronDown, Layers3, LogOut, Play, RefreshCw, Sparkles, Wrench } from 'lucide-react';
 import { reloadHostView } from '@remux/viewer-kit/host';
 
 import { reasoningLabel, resolveModel } from './modelSelection.ts';
@@ -8,12 +8,16 @@ import { useComposerStore } from '../store.ts';
 type ConfigSection = 'model' | 'reasoning';
 
 export function ComposerConfigButton({
+  contextOpen,
   disabled = false,
   locked = false,
+  onToggleContext,
   onSignOut,
 }: {
+  contextOpen: boolean;
   disabled?: boolean;
   locked?: boolean;
+  onToggleContext: () => void;
   onSignOut: () => void;
 }) {
   const modelId = useComposerStore((state) => state.modelId);
@@ -89,6 +93,16 @@ export function ComposerConfigButton({
               onSignOut();
             }}
           />
+          <ConfigAction
+            active={contextOpen}
+            disabled={!locked}
+            icon={<Layers3 className="size-4" />}
+            label="Turn context"
+            onClick={() => {
+              setOpen(false);
+              onToggleContext();
+            }}
+          />
           {models?.models.length ? (
             <ConfigRow
               disabled={locked}
@@ -132,9 +146,21 @@ export function ComposerConfigButton({
   );
 }
 
-function ConfigAction({ icon, label, onClick }: { icon: ReactNode; label: string; onClick: () => void }) {
+function ConfigAction({ active = false, disabled = false, icon, label, onClick }: {
+  active?: boolean;
+  disabled?: boolean;
+  icon: ReactNode;
+  label: string;
+  onClick: () => void;
+}) {
   return (
-    <button className="remux-composer-config-row" onClick={onClick} type="button">
+    <button
+      aria-pressed={active || undefined}
+      className={`remux-composer-config-row${active ? ' is-open' : ''}`}
+      disabled={disabled}
+      onClick={onClick}
+      type="button"
+    >
       <span className="remux-composer-config-icon">{icon}</span>
       <span className="remux-composer-config-label">{label}</span>
       <Play className="remux-composer-config-chevron" />

@@ -11,6 +11,7 @@ import { AgentServer } from '../server/src/agent-server.ts';
 import { FixtureProvider } from '../server/src/fixture-provider.ts';
 import type { ModelProvider, ModelSession } from '../server/src/model-provider.ts';
 import { AgentStateStore } from '../server/src/storage/agent-state-store.ts';
+import { canonicalJson } from '../server/src/storage/canonical-json.ts';
 import type { DurableTurnHandle } from '../server/src/domain/state.ts';
 import type { WorkUnitEnterInput } from '../server/src/domain/work.ts';
 import type { TurnContextPlan } from '../shared/protocol.ts';
@@ -54,6 +55,48 @@ test('Agent state v6 owns one clean schema and compiles the accepted user turn',
     'strands', 'context_spaces', 'project_primaries', 'epochs', 'context_compilations',
   ]) assert.equal(tableNames.has(removed), false);
   await fixture.repository.finishTurn(turn, { status: 'interrupted' });
+});
+
+test('obsolete context inspector projections are purged instead of migrated', async (t) => {
+  const fixture = await repositoryFixture(t);
+  const conversation = await fixture.repository.createConversation({
+    operationId: crypto.randomUUID(),
+    cwd: fixture.cwd,
+    modelId: 'gpt-5.6-codex',
+    reasoning: 'high',
+  });
+  const databasePath = fixture.repository.databasePath;
+  await fixture.repository.close();
+
+  const database = new DatabaseSync(databasePath);
+  const basis = database.prepare(`SELECT MAX(sequence) AS sequence FROM events`).get() as {
+    sequence: number;
+  };
+  database.prepare(`
+    INSERT INTO resources (resource_key, basis_sequence, value_json, updated_at)
+    VALUES (?, ?, ?, ?)
+  `).run(
+    `context:${conversation.conversationId}`,
+    basis.sequence,
+    canonicalJson({ conversationId: conversation.conversationId, version: 6 }),
+    Date.now(),
+  );
+  database.close();
+
+  fixture.repository = await AgentStateStore.open({ dataRoot: fixture.dataRoot });
+  const [context, summary] = await fixture.repository.readResourceProjections([
+    `context:${conversation.conversationId}`,
+    `conversation:${conversation.conversationId}`,
+  ]);
+  assert.equal(context, null);
+  assert.equal((summary?.value as { id?: string } | undefined)?.id, conversation.conversationId);
+
+  const reopened = new DatabaseSync(databasePath, { readOnly: true });
+  t.after(() => reopened.close());
+  const stale = reopened.prepare(`
+    SELECT COUNT(*) AS count FROM resources WHERE resource_key = ?
+  `).get(`context:${conversation.conversationId}`) as { count: number };
+  assert.equal(stale.count, 0);
 });
 
 test('provider compaction checkpoints survive restart and replay only the new epoch tail', async (t) => {

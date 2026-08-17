@@ -2254,30 +2254,43 @@
 .agent-context-inspector-blocks { display: grid; gap: 4px; margin: 10px 0; }
 .agent-context-inspector-blocks > div { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 10px; border-top: 1px solid color-mix(in srgb, var(--border) 65%, transparent); padding-top: 4px; }
 .agent-context-inspector-blocks > div > span:not(:first-child) { color: var(--muted-foreground); }
-.agent-context-picker-panel {
-  position: absolute;
-  bottom: calc(100% + 10px);
-  left: -90px;
-  z-index: 60;
+.agent-context-tray {
   display: grid;
-  width: min(390px, calc(100vw - 24px));
-  max-height: min(540px, calc(100dvh - 150px));
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  width: 100%;
+  min-width: 0;
+  max-height: min(320px, 38dvh);
+  grid-template-rows: auto auto minmax(0, 1fr);
   overflow: hidden;
   border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
-  border-radius: 12px;
-  background: color-mix(in srgb, var(--background) 97%, var(--muted));
-  box-shadow: var(--rmx-shadow-menu);
+  border-radius: 10px;
+  background:
+    linear-gradient(
+      to bottom,
+      color-mix(in srgb, var(--chrome-hover) 62%, var(--background) 38%),
+      color-mix(in srgb, var(--chrome) 86%, var(--background) 14%)
+    );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--foreground) 6%, transparent),
+    var(--rmx-shadow-raised);
   color: var(--foreground);
   text-align: left;
 }
-.agent-context-picker-header { display: grid; gap: 6px; border-bottom: 1px solid color-mix(in srgb, var(--border) 68%, transparent); padding: 11px 12px 10px; }
-.agent-context-picker-header > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
-.agent-context-picker-header strong { font-size: 13px; line-height: 18px; }
-.agent-context-picker-header span { color: var(--muted-foreground); font-size: 11px; white-space: nowrap; }
-.agent-context-picker-header p { margin: 0; color: var(--muted-foreground); font-size: 11px; line-height: 15px; }
-.agent-context-picker-list { min-height: 0; overflow: auto; overscroll-behavior: contain; }
-.agent-context-picker-turn { display: grid; min-width: 0; min-height: 72px; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 8px 10px 8px 12px; }
+.agent-context-tray-header { display: grid; min-width: 0; min-height: 42px; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 10px; padding: 5px 6px 5px 10px; }
+.agent-context-tray-heading { display: grid; min-width: 0; gap: 1px; }
+.agent-context-tray-heading strong { overflow: hidden; font-size: 13px; line-height: 17px; text-overflow: ellipsis; white-space: nowrap; }
+.agent-context-tray-heading span { overflow: hidden; color: var(--muted-foreground); font-size: 10px; line-height: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.agent-context-retention { display: flex; align-items: center; gap: 7px; color: var(--muted-foreground); font-size: 11px; line-height: 15px; white-space: nowrap; }
+.agent-context-retention-switch { position: relative; width: 32px; height: 19px; flex: 0 0 auto; border: 1px solid color-mix(in srgb, var(--border) 88%, transparent); border-radius: 999px; background: linear-gradient(to bottom, color-mix(in srgb, var(--chrome-hover) 70%, var(--foreground) 2%), color-mix(in srgb, var(--chrome) 88%, var(--background) 12%)); box-shadow: inset 0 1px 2px color-mix(in srgb, var(--background) 70%, transparent); padding: 0; transition: background-color 120ms ease, border-color 120ms ease; }
+.agent-context-retention-switch > span { position: absolute; top: 3px; left: 3px; width: 11px; height: 11px; border-radius: 50%; background: color-mix(in srgb, var(--muted-foreground) 88%, var(--foreground) 12%); box-shadow: 0 1px 2px rgb(0 0 0 / 35%); transition: left 120ms ease, background-color 120ms ease; }
+.agent-context-retention-switch[aria-checked='true'] { border-color: color-mix(in srgb, var(--composer-accent) 65%, var(--border)); background: color-mix(in srgb, var(--composer-accent) 30%, var(--chrome)); }
+.agent-context-retention-switch[aria-checked='true'] > span { left: 16px; background: color-mix(in srgb, var(--composer-accent) 76%, var(--foreground) 24%); }
+.agent-context-retention-switch:focus-visible,
+.agent-context-tray-close:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.agent-context-tray-close { display: grid; width: 30px; height: 28px; flex: 0 0 auto; place-items: center; border: 1px solid color-mix(in srgb, var(--border) 82%, transparent); border-radius: 7px; background: linear-gradient(to bottom, color-mix(in srgb, var(--chrome-hover) 70%, var(--foreground) 2%), color-mix(in srgb, var(--chrome) 88%, var(--background) 12%)); box-shadow: var(--rmx-shadow-raised); color: var(--muted-foreground); padding: 0; }
+.agent-context-tray-close:active { box-shadow: var(--rmx-shadow-pressed); transform: translateY(1px); }
+.agent-context-tray-help { margin: 0; border-top: 1px solid color-mix(in srgb, var(--border) 52%, transparent); padding: 5px 10px; color: var(--muted-foreground); font-size: 10px; line-height: 14px; }
+.agent-context-picker-list { min-height: 0; overflow-x: hidden; overflow-y: auto; border-top: 1px solid color-mix(in srgb, var(--border) 58%, transparent); overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+.agent-context-picker-turn { display: grid; min-width: 0; min-height: 62px; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px; background: color-mix(in srgb, var(--background) 24%, transparent); padding: 7px 8px 7px 10px; }
 .agent-context-picker-turn + .agent-context-picker-turn { border-top: 1px solid color-mix(in srgb, var(--border) 52%, transparent); }
 .agent-context-picker-turn-copy { display: grid; min-width: 0; gap: 1px; }
 .agent-context-picker-turn-copy > span { color: var(--muted-foreground); font-size: 10px; line-height: 13px; text-transform: uppercase; }
@@ -2285,17 +2298,16 @@
 .agent-context-picker-turn-copy > small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-context-picker-turn-copy > strong { font-size: 12px; font-weight: 560; line-height: 17px; }
 .agent-context-picker-turn-copy > small { color: var(--muted-foreground); font-size: 11px; line-height: 15px; }
-.agent-context-resolution { display: flex; flex: 0 0 auto; overflow: hidden; border: 1px solid color-mix(in srgb, var(--border) 78%, transparent); border-radius: 8px; background: color-mix(in srgb, var(--secondary) 42%, transparent); }
-.agent-context-resolution button { display: grid; width: 29px; height: 28px; place-items: center; border: 0; background: transparent; color: var(--muted-foreground); padding: 0; }
+.agent-context-resolution { display: flex; flex: 0 0 auto; overflow: hidden; border: 1px solid color-mix(in srgb, var(--border) 82%, transparent); border-radius: 8px; background: linear-gradient(to bottom, color-mix(in srgb, var(--chrome-hover) 72%, var(--foreground) 2%), color-mix(in srgb, var(--chrome) 88%, var(--background) 12%)); box-shadow: var(--rmx-shadow-raised); }
+.agent-context-resolution button { display: grid; width: 30px; height: 29px; place-items: center; border: 0; background: transparent; color: var(--muted-foreground); padding: 0; }
 .agent-context-resolution button + button { border-left: 1px solid color-mix(in srgb, var(--border) 58%, transparent); }
-.agent-context-resolution button.is-active { background: color-mix(in srgb, var(--foreground) 12%, var(--secondary)); color: var(--foreground); }
+.agent-context-resolution button.is-active { background: color-mix(in srgb, var(--composer-accent) 22%, var(--chrome)); color: color-mix(in srgb, var(--composer-accent) 72%, var(--foreground) 28%); }
 .agent-context-resolution button:focus-visible { position: relative; outline: 2px solid var(--ring); outline-offset: -2px; }
 .agent-context-picker-empty { margin: 0; color: var(--muted-foreground); font-size: 12px; padding: 18px 12px; text-align: center; }
 .agent-context-picker-load { display: flex; min-height: 34px; align-items: center; justify-content: center; gap: 6px; border: 0; border-top: 1px solid color-mix(in srgb, var(--border) 68%, transparent); background: transparent; color: var(--muted-foreground); font-size: 11px; }
 .agent-context-picker-load:hover:not(:disabled) { color: var(--foreground); }
 @media (max-width: 560px) {
   .agent-exact-content-backdrop { padding: 8px; }
-  .agent-context-picker-panel { left: -78px; }
   .agent-context-picker-turn { grid-template-columns: minmax(0, 1fr) auto; }
 }
 .remux-composer-config-note { color: var(--muted-foreground); font-size: 11px; line-height: 15px; padding: 5px 8px; }

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState, type RefObject } from 'react'
 import {
   AGENT_RESOURCE_KEYS,
   contextResourceKey,
+  isContextInspectorValue,
   queueResourceKey,
   type AgentPendingQueueValue,
   type AgentResourceKey,
@@ -62,7 +63,9 @@ export function useAgentResources(
         if (key === AGENT_RESOURCE_KEYS.auth) setAuth(value as AuthValue);
         if (key === AGENT_RESOURCE_KEYS.models) setModels(value as ModelsValue);
         if (key === AGENT_RESOURCE_KEYS.runtime) setRuntime(value as AgentRuntimeValue);
-        if (key.startsWith('context:')) setContextInspector(value as ContextInspectorValue);
+        if (key.startsWith('context:')) {
+          setContextInspector(isContextInspectorValue(value) ? value : null);
+        }
         if (key.startsWith('queue:')) setQueue(value as AgentPendingQueueValue);
       }
       setError(null);

@@ -1,3 +1,5 @@
+import { useEffect, useState } from 'react';
+
 import type {
   AgentComposerMessagePart,
   AgentPendingQueueValue,
@@ -11,6 +13,7 @@ import { ComposerInlineStatus } from './actions/InlineStatus.tsx';
 import { ComposerStatusMessageRow } from './actions/StatusMessageRow.tsx';
 import { ComposerLexicalInput } from './editor/LexicalInput.tsx';
 import { ComposerEditBar } from './edit/EditBar.tsx';
+import { ComposerContextTray } from './context/ContextTray.tsx';
 import { NewChatBar } from './newChat/NewChatBar.tsx';
 import { OperationQueueTray } from './queue/OperationQueueTray.tsx';
 import { useComposerStore } from './store.ts';
@@ -48,8 +51,17 @@ export function ComposerContent({
   const pickerOpen = useConversationStore((state) => state.directoryPickerOpen);
   const openPicker = useConversationStore((state) => state.openDirectoryPicker);
   const modelId = useComposerStore((state) => state.modelId);
+  const [contextTrayOpen, setContextTrayOpen] = useState(false);
   const working = conversation?.status === 'running' || conversation?.status === 'interrupting';
   const loading = conversation?.status === 'loading';
+
+  useEffect(() => {
+    setContextTrayOpen(false);
+  }, [conversation?.id]);
+
+  useEffect(() => {
+    if (pickerOpen || !conversationSelected) setContextTrayOpen(false);
+  }, [conversationSelected, pickerOpen]);
 
   return (
     <div className="remux-bottom-bar border-t border-border" data-remux-composer-root>
@@ -66,6 +78,7 @@ export function ComposerContent({
         <ComposerLexicalInput hidden={pickerOpen} />
         <ComposerActionButtons
           canStart={Boolean((conversation || (!conversationSelected && cwd && modelId)) && !loading)}
+          contextOpen={contextTrayOpen}
           conversationExists={conversationSelected}
           isWorking={working}
           onEdit={onEdit}
@@ -73,7 +86,11 @@ export function ComposerContent({
           onInterrupt={onInterrupt}
           onSend={onSend}
           onSignOut={onSignOut}
+          onToggleContext={() => setContextTrayOpen((open) => !open)}
         />
+        {!pickerOpen && conversationSelected && contextTrayOpen ? (
+          <ComposerContextTray onClose={() => setContextTrayOpen(false)} />
+        ) : null}
       </div>
       {!pickerOpen ? <ComposerStatusMessageRow runtimeError={runtimeError} /> : null}
       {!pickerOpen ? (

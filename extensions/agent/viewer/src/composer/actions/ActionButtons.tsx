@@ -7,7 +7,6 @@ import { useConversationStore } from '../../conversation/store.ts';
 import { useTranscriptViewportControls } from '../../transcript/index.ts';
 import { ComposerAttachmentButton } from '../attachments/AttachmentButton.tsx';
 import { ComposerConfigButton } from '../config/ConfigButton.tsx';
-import { ComposerContextButton } from '../context/ContextButton.tsx';
 import type { AgentComposerMessagePart, TurnContextPlan } from '../../../../shared/protocol.ts';
 import { ComposerActionKey, type ComposerAction } from './ActionKey.tsx';
 import { useComposerTurnAction } from './turnAction.ts';
@@ -15,6 +14,7 @@ import type { ComposerEditTarget, ComposerForkTarget } from '../store.ts';
 
 export function ComposerActionButtons({
   canStart,
+  contextOpen,
   conversationExists,
   isWorking,
   onInterrupt,
@@ -22,8 +22,10 @@ export function ComposerActionButtons({
   onFork,
   onSend,
   onSignOut,
+  onToggleContext,
 }: {
   canStart: boolean;
+  contextOpen: boolean;
   conversationExists: boolean;
   isWorking: boolean;
   onInterrupt: () => Promise<void>;
@@ -34,6 +36,7 @@ export function ComposerActionButtons({
     setPhase: (phase: 'sending' | 'updating-transcript') => void,
   ) => Promise<void>;
   onSignOut: () => void;
+  onToggleContext: () => void;
 }) {
   const { canScrollDown, canScrollUp, scrollDown, scrollUp } = useTranscriptViewportControls();
   const openMobileSidebar = useAgentSidebarStore((state) => state.openMobile);
@@ -67,8 +70,13 @@ export function ComposerActionButtons({
     <div className="remux-composer-actions">
       <div className="remux-composer-action-group">
         {left.map((action) => <ComposerActionKey action={action} key={action.label} />)}
-        <ComposerContextButton disabled={pickerOpen || !conversationExists} />
-        <ComposerConfigButton disabled={pickerOpen} locked={conversationExists} onSignOut={onSignOut} />
+        <ComposerConfigButton
+          contextOpen={contextOpen}
+          disabled={pickerOpen}
+          locked={conversationExists}
+          onSignOut={onSignOut}
+          onToggleContext={onToggleContext}
+        />
       </div>
       <div className="remux-composer-action-group remux-composer-action-group-right">
         {navigation.map((action) => <ComposerActionKey action={action} key={action.label} />)}

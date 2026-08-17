@@ -100,6 +100,14 @@ test('reconstructs a conversation from route-addressed turn frames', async ({ pa
   await expect(history.getByRole('button', { name: 'Start new chat', exact: true })).toBeVisible();
 });
 
+test('keeps the transcript usable when optional context diagnostics are obsolete', async ({ page }) => {
+  await page.goto(conversationUrl('&fixtureStaleContextInspector=1'));
+
+  await expect(transcript(page).getByText('Recovered from authoritative resources.')).toBeVisible();
+  await expect(page.getByTestId('context-inspector')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Send message', exact: true })).toBeVisible();
+});
+
 test('shows actual dispatch and compiled-frame evidence for a durable inference', async ({ page }) => {
   await page.goto(conversationUrl());
 
@@ -125,12 +133,24 @@ test('shows actual dispatch and compiled-frame evidence for a durable inference'
   await expect(manifest).toContainText('agent-inference-context-v7');
 });
 
-test('chooses dialogue or full resolution for individual prior turns', async ({ page }) => {
+test('opens newest-first turn context below the composer actions', async ({ page }) => {
   await page.goto(conversationUrl('&fixtureContextTurns=1'));
 
-  await page.getByRole('button', { name: 'Choose prior turn context' }).click();
-  const picker = page.locator('.agent-context-picker-panel');
-  await expect(picker).toContainText('The latest two turns use dialogue by default.');
+  await expect(page.getByRole('button', { name: 'Choose prior turn context' })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Preferences' }).click();
+  await page.getByRole('button', { name: 'Turn context' }).click();
+  const picker = page.getByRole('region', { name: 'Turn context settings' });
+  await expect(picker).toContainText('Recent turns use dialogue by default.');
+  await expect(page.locator('[data-remux-composer-config-panel]')).toHaveCount(0);
+
+  const rows = picker.locator('.agent-context-picker-turn');
+  await expect(rows).toHaveCount(4);
+  await expect(rows.nth(0)).toContainText('Context request 4');
+  await expect(rows.nth(1)).toContainText('Context request 3');
+  await expect(rows.nth(3)).toContainText('Context request 1');
+  const positions = await page.locator('.remux-composer-actions, .agent-context-tray').evaluateAll((elements) =>
+    elements.map((element) => element.getBoundingClientRect().top));
+  expect(positions[1]).toBeGreaterThan(positions[0]);
 
   const latest = picker.locator('.agent-context-picker-turn').filter({ hasText: 'Context request 4' });
   await latest.getByRole('button', { name: 'Full' }).click();
@@ -148,6 +168,73 @@ test('chooses dialogue or full resolution for individual prior turns', async ({ 
       { turnId: 'turn-1', resolution: 'dialogue' },
     ],
   });
+});
+
+test('keeps explicit context choices after send only when requested', async ({ page }) => {
+  await page.goto(conversationUrl('&fixtureContextTurns=1'));
+  await page.getByRole('button', { name: 'Preferences' }).click();
+  await page.getByRole('button', { name: 'Turn context' }).click();
+  const picker = page.getByRole('region', { name: 'Turn context settings' });
+  const latest = picker.locator('.agent-context-picker-turn').filter({ hasText: 'Context request 4' });
+  await latest.getByRole('button', { name: 'Full' }).click();
+  await picker.getByRole('switch', { name: 'Keep context choices after sending' }).click();
+
+  await messageBox(page).fill('Use and preserve the selected context');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect.poll(() => commandCount(page, 'remux/agent/conversation/message/send')).toBe(1);
+  await expect(transcript(page).getByText('The fixture stream completed.', { exact: true })).toBeVisible();
+
+  await page.reload();
+  await page.getByRole('button', { name: 'Preferences' }).click();
+  await page.getByRole('button', { name: 'Turn context' }).click();
+  const restoredPicker = page.getByRole('region', { name: 'Turn context settings' });
+  await expect(restoredPicker.getByRole('switch', { name: 'Keep context choices after sending' }))
+    .toHaveAttribute('aria-checked', 'true');
+  const restoredLatest = restoredPicker.locator('.agent-context-picker-turn')
+    .filter({ hasText: 'Context request 4' });
+  await expect(restoredLatest.getByRole('button', { name: 'Full' })).toHaveAttribute('aria-pressed', 'true');
+
+  await messageBox(page).fill('Use the preserved context again');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect.poll(() => commandCount(page, 'remux/agent/conversation/message/send')).toBe(1);
+
+  const params = await lastCommandParams(page, 'remux/agent/conversation/message/send');
+  expect(params.contextPlan.overrides).toContainEqual({ turnId: 'turn-4', resolution: 'full' });
+  await expect(restoredPicker.getByRole('switch', { name: 'Keep context choices after sending' }))
+    .toHaveAttribute('aria-checked', 'true');
+});
+
+test('resets explicit context choices after send by default', async ({ page }) => {
+  await page.goto(conversationUrl('&fixtureContextTurns=1'));
+  await page.getByRole('button', { name: 'Preferences' }).click();
+  await page.getByRole('button', { name: 'Turn context' }).click();
+  const picker = page.getByRole('region', { name: 'Turn context settings' });
+  const latest = picker.locator('.agent-context-picker-turn').filter({ hasText: 'Context request 4' });
+  await latest.getByRole('button', { name: 'Full' }).click();
+
+  await messageBox(page).fill('Use the selected context once');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect(transcript(page).getByText('The fixture stream completed.', { exact: true })).toBeVisible();
+  await messageBox(page).fill('Return to the context default');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect.poll(() => commandCount(page, 'remux/agent/conversation/message/send')).toBe(2);
+
+  const params = await lastCommandParams(page, 'remux/agent/conversation/message/send');
+  expect(params.contextPlan).toEqual({ version: 1, automaticDialogueTurns: 2, overrides: [] });
+});
+
+test('bounds long recent-turn context to its own scroll area', async ({ page }) => {
+  await page.goto(conversationUrl('&fixtureLong=1'));
+  await page.getByRole('button', { name: 'Preferences' }).click();
+  await page.getByRole('button', { name: 'Turn context' }).click();
+  const picker = page.getByRole('region', { name: 'Turn context settings' });
+  const list = picker.locator('.agent-context-picker-list');
+  const rows = picker.locator('.agent-context-picker-turn');
+
+  await expect(rows.first()).toContainText('Historical request 72');
+  await expect(rows.first()).toContainText('Turn 72');
+  await expect(rows.nth(1)).toContainText('Historical request 71');
+  expect(await list.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true);
 });
 
 test('selects history through the desktop sidebar or mobile sheet and restores target drafts', async ({ page, isMobile }) => {

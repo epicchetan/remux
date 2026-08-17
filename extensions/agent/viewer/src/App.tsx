@@ -90,6 +90,7 @@ export function App() {
   const reasoning = useComposerStore((state) => state.reasoning);
   const composerSnapshot = useComposerStore((state) => state.snapshot);
   const contextPlan = useComposerStore((state) => state.contextPlan);
+  const preserveContextPlan = useComposerStore((state) => state.preserveContextPlan);
   const composerPresentationRequest = useComposerStore((state) => state.composerPresentationRequest);
   const editTarget = useComposerStore((state) => state.editTarget);
   const focusComposer = useComposerStore((state) => state.focusComposer);
@@ -98,6 +99,7 @@ export function App() {
   const setComposerDocument = useComposerStore((state) => state.setComposerDocument);
   const setContextPlan = useComposerStore((state) => state.setContextPlan);
   const setModelId = useComposerStore((state) => state.setModelId);
+  const setPreserveContextPlan = useComposerStore((state) => state.setPreserveContextPlan);
   const setReasoning = useComposerStore((state) => state.setReasoning);
   const composerRestorePendingRef = useRef<string | null>(null);
   const mainPaneRef = useRef<HTMLElement | null>(null);
@@ -144,15 +146,18 @@ export function App() {
       if (currentDraft.modelId) setModelId(currentDraft.modelId);
       setReasoning(currentDraft.reasoning);
       setContextPlan(currentDraft.contextPlan);
+      setPreserveContextPlan(currentDraft.preserveContextPlan);
       restoreComposerSnapshot(currentDraft.snapshot);
     } else if (activeConversationId) {
       const currentDraft = loadConversationDraft(activeConversationId);
       setContextPlan(currentDraft.contextPlan);
+      setPreserveContextPlan(currentDraft.preserveContextPlan);
       restoreComposerSnapshot(currentDraft.snapshot);
     } else {
       setContextPlan(createDefaultTurnContextPlan());
+      setPreserveContextPlan(false);
     }
-  }, [activeConversationId, activeDraftId, restoreComposerSnapshot, setContextPlan, setCwd, setModelId, setReasoning]);
+  }, [activeConversationId, activeDraftId, restoreComposerSnapshot, setContextPlan, setCwd, setModelId, setPreserveContextPlan, setReasoning]);
 
   useEffect(() => {
     const pendingRestore = composerRestorePendingRef.current;
@@ -162,13 +167,19 @@ export function App() {
     }
     if (!activeDraftId || draft?.id !== activeDraftId) {
       if (activeConversationId) {
-        persistConversationDraft(activeConversationId, composerSnapshot, contextPlan);
+        persistConversationDraft(
+          activeConversationId,
+          composerSnapshot,
+          contextPlan,
+          preserveContextPlan,
+        );
       }
       return;
     }
     if (
       draft.cwd === cwd &&
       draft.modelId === modelId &&
+      draft.preserveContextPlan === preserveContextPlan &&
       draft.reasoning === reasoning &&
       sameContextPlan(draft.contextPlan, contextPlan) &&
       draft.snapshot.contentKey === composerSnapshot.contentKey
@@ -177,6 +188,7 @@ export function App() {
       ...draft,
       cwd,
       modelId,
+      preserveContextPlan,
       reasoning,
       contextPlan,
       snapshot: composerSnapshot,
@@ -185,7 +197,7 @@ export function App() {
     draftRef.current = next;
     setDraft(next);
     persistNewChatDraft(next);
-  }, [activeConversationId, activeDraftId, composerSnapshot, contextPlan, cwd, draft, modelId, reasoning]);
+  }, [activeConversationId, activeDraftId, composerSnapshot, contextPlan, cwd, draft, modelId, preserveContextPlan, reasoning]);
 
   useEffect(() => {
     if (!activeConversationId || !conversationSummary) return;
@@ -203,6 +215,7 @@ export function App() {
         ...current,
         cwd: useConversationStore.getState().cwd,
         modelId: useComposerStore.getState().modelId,
+        preserveContextPlan: useComposerStore.getState().preserveContextPlan,
         reasoning: useComposerStore.getState().reasoning,
         contextPlan: useComposerStore.getState().contextPlan,
         snapshot,
@@ -215,7 +228,13 @@ export function App() {
     }
     const currentConversationId = activeConversationIdRef.current;
     if (currentConversationId) {
-      persistConversationDraft(currentConversationId, snapshot, useComposerStore.getState().contextPlan);
+      const composer = useComposerStore.getState();
+      persistConversationDraft(
+        currentConversationId,
+        snapshot,
+        composer.contextPlan,
+        composer.preserveContextPlan,
+      );
     }
   }, []);
 
@@ -230,10 +249,11 @@ export function App() {
     if (nextDraft.modelId) setModelId(nextDraft.modelId);
     setReasoning(nextDraft.reasoning);
     setContextPlan(nextDraft.contextPlan);
+    setPreserveContextPlan(nextDraft.preserveContextPlan);
     restoreComposerSnapshot(nextDraft.snapshot);
     setError(null);
     void getTranscriptResourceState().setActiveConversationId(null);
-  }, [restoreComposerSnapshot, setContextPlan, setCwd, setModelId, setReasoning]);
+  }, [restoreComposerSnapshot, setContextPlan, setCwd, setModelId, setPreserveContextPlan, setReasoning]);
 
   const selectDraft = useCallback(() => {
     const nextDraft = draftRef.current;
@@ -261,6 +281,7 @@ export function App() {
       cwd: selected?.cwd ?? useConversationStore.getState().cwd,
       id,
       modelId: selected?.modelId ?? useComposerStore.getState().modelId,
+      preserveContextPlan: false,
       reasoning: selected?.reasoning ?? useComposerStore.getState().reasoning,
       contextPlan: createDefaultTurnContextPlan(),
       snapshot: createEmptyComposerSnapshot(),
@@ -281,13 +302,14 @@ export function App() {
       setActiveDraftId(null);
       const currentDraft = loadConversationDraft(normalized);
       setContextPlan(currentDraft.contextPlan);
+      setPreserveContextPlan(currentDraft.preserveContextPlan);
       restoreComposerSnapshot(currentDraft.snapshot);
       setError(null);
       void getTranscriptResourceState().setActiveConversationId(normalized);
       void ensureConversation(normalized);
     }
     if (focusTurnId) requestTranscriptTurnScroll(normalized, focusTurnId);
-  }, [ensureConversation, restoreComposerSnapshot, saveCurrentTargetDraft, setContextPlan]);
+  }, [ensureConversation, restoreComposerSnapshot, saveCurrentTargetDraft, setContextPlan, setPreserveContextPlan]);
 
   useAgentNavigation({
     activeConversationId,
@@ -407,6 +429,7 @@ function initialDraft(id: string): AgentNewChatDraft {
     cwd: '',
     id,
     modelId: '',
+    preserveContextPlan: false,
     reasoning: 'high',
     contextPlan: createDefaultTurnContextPlan(),
     snapshot: createEmptyComposerSnapshot(),

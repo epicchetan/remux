@@ -67,7 +67,8 @@ export function useComposerTurnAction({
           clearComposer();
         }
         clearMode();
-        if (useComposerStore.getState().contextPlan === next.contextPlan) {
+        const current = useComposerStore.getState();
+        if (current.contextPlan === next.contextPlan && !current.preserveContextPlan) {
           setContextPlan(createDefaultTurnContextPlan());
         }
         clearSubmission(next.id);

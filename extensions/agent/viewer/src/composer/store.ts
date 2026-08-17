@@ -83,6 +83,7 @@ type ComposerStoreState = {
   models: ModelsValue | null;
   openAttachmentPicker: (kind?: ComposerAttachmentPickerKind) => void;
   preEditSnapshot: ComposerSnapshot | null;
+  preserveContextPlan: boolean;
   reasoning: ReasoningLevel;
   setComposerDocument: (document: ComposerDocument, resources?: ComposerAttachmentResource[]) => void;
   setContextPlan: (contextPlan: TurnContextPlan) => void;
@@ -91,6 +92,7 @@ type ComposerStoreState = {
   setMentionSession: (session: ComposerMentionSession | null) => void;
   setModelId: (modelId: string) => void;
   setModels: (models: ModelsValue) => void;
+  setPreserveContextPlan: (preserve: boolean) => void;
   setReasoning: (reasoning: ReasoningLevel) => void;
   setSnapshot: (snapshot: ComposerSnapshot) => void;
   setSubmissionConversation: (id: number, conversationId: string) => void;
@@ -172,6 +174,7 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
   models: null,
   openAttachmentPicker: noop,
   preEditSnapshot: null,
+  preserveContextPlan: false,
   reasoning: 'high',
   setComposerDocument: noopSetDocument,
   setContextPlan: (contextPlan) => set({ contextPlan }),
@@ -205,6 +208,7 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
         : preferredReasoning(selected),
     };
   }),
+  setPreserveContextPlan: (preserveContextPlan) => set({ preserveContextPlan }),
   setReasoning: (reasoning) => set({ reasoning }),
   setSnapshot: (snapshot) => set({ snapshot, submissionError: null }),
   setSubmissionConversation: (id, conversationId) => set((state) => state.submission?.id === id

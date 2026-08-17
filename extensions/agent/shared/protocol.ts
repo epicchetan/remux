@@ -128,8 +128,10 @@ export type ContextInspectorArtifact = {
   mediaType: string;
 };
 
+export const CONTEXT_INSPECTOR_VERSION = 7 as const;
+
 export type ContextInspectorValue = {
-  version: 7;
+  version: typeof CONTEXT_INSPECTOR_VERSION;
   conversationId: string;
   inferenceId: string;
   frameId: string;
@@ -188,6 +190,116 @@ export type ContextInspectorValue = {
     policyInputTokens: number;
   };
 };
+
+export function isContextInspectorValue(value: unknown): value is ContextInspectorValue {
+  if (!isRecord(value) || value.version !== CONTEXT_INSPECTOR_VERSION) return false;
+  return typeof value.conversationId === 'string' &&
+    typeof value.inferenceId === 'string' &&
+    typeof value.frameId === 'string' &&
+    isNonnegativeSafeInteger(value.basisSequence) &&
+    typeof value.compilerVersion === 'string' &&
+    typeof value.policyVersion === 'string' &&
+    isNonnegativeSafeInteger(value.estimatedInputTokens) &&
+    typeof value.semanticHash === 'string' &&
+    isNonnegativeSafeInteger(value.buildDurationMs) &&
+    (value.transportMode === 'full' || value.transportMode === 'continuation') &&
+    isNonnegativeSafeInteger(value.messageCount) &&
+    isNonnegativeSafeInteger(value.turnCount) &&
+    typeof value.logicalHash === 'string' &&
+    typeof value.renderedHash === 'string' &&
+    typeof value.fixedContractsHash === 'string' &&
+    isContextInspectorArtifact(value.manifestArtifact) &&
+    isContextInspectorArtifact(value.dispatchArtifact) &&
+    Array.isArray(value.groups) && value.groups.every(isContextInspectorGroup) &&
+    typeof value.groupsTruncated === 'boolean' &&
+    (value.scopeKind === 'turn' || value.scopeKind === 'work_unit') &&
+    isTurnContextPlan(value.requestedPlan) &&
+    Array.isArray(value.selectedTurns) && value.selectedTurns.every(isContextInspectorTurn) &&
+    Array.isArray(value.layers) && value.layers.every(isContextInspectorLayer) &&
+    Array.isArray(value.omissions) && value.omissions.every(isContextInspectorOmission) &&
+    typeof value.omissionsTruncated === 'boolean' &&
+    isContextInspectorCompaction(value.compaction);
+}
+
+function isContextInspectorArtifact(value: unknown): value is ContextInspectorArtifact {
+  return isRecord(value) &&
+    typeof value.hash === 'string' &&
+    isNonnegativeSafeInteger(value.byteLength) &&
+    typeof value.mediaType === 'string';
+}
+
+function isContextInspectorGroup(value: unknown) {
+  return isRecord(value) &&
+    typeof value.turnId === 'string' &&
+    typeof value.source === 'string' &&
+    isNonnegativeSafeInteger(value.messageCount) &&
+    isNonnegativeSafeInteger(value.estimatedTokens) &&
+    isRecord(value.roles) &&
+    isNonnegativeSafeInteger(value.roles.user) &&
+    isNonnegativeSafeInteger(value.roles.assistant) &&
+    isNonnegativeSafeInteger(value.roles.tool);
+}
+
+function isTurnContextPlan(value: unknown): value is TurnContextPlan {
+  return isRecord(value) &&
+    value.version === 1 &&
+    isNonnegativeSafeInteger(value.automaticDialogueTurns) &&
+    Array.isArray(value.overrides) &&
+    value.overrides.every((override) => isRecord(override) &&
+      typeof override.turnId === 'string' &&
+      (override.resolution === 'off' || override.resolution === 'dialogue' ||
+        override.resolution === 'full'));
+}
+
+function isContextInspectorTurn(value: unknown) {
+  return isRecord(value) &&
+    typeof value.turnId === 'string' &&
+    (value.resolution === 'dialogue' || value.resolution === 'full') &&
+    (value.origin === 'automatic' || value.origin === 'explicit') &&
+    isNonnegativeSafeInteger(value.messageCount) &&
+    isNonnegativeSafeInteger(value.estimatedTokens);
+}
+
+function isContextInspectorLayer(value: unknown) {
+  return isRecord(value) &&
+    (value.kind === 'selected_dialogue' || value.kind === 'selected_full_turns' ||
+      value.kind === 'provider_checkpoint' || value.kind === 'active_scope') &&
+    typeof value.hash === 'string' &&
+    isNonnegativeSafeInteger(value.estimatedTokens) &&
+    Array.isArray(value.sources) && value.sources.every((source) => typeof source === 'string') &&
+    isNonnegativeSafeInteger(value.sourceCount) &&
+    typeof value.sourcesTruncated === 'boolean';
+}
+
+function isContextInspectorOmission(value: unknown) {
+  return isRecord(value) &&
+    typeof value.source === 'string' &&
+    typeof value.reason === 'string' &&
+    typeof value.retrieval === 'string' &&
+    isNonnegativeSafeInteger(value.count);
+}
+
+function isContextInspectorCompaction(value: unknown) {
+  return isRecord(value) &&
+    isNonnegativeSafeInteger(value.epoch) &&
+    isNullableNonnegativeSafeInteger(value.checkpointSequence) &&
+    isNullableNonnegativeSafeInteger(value.compactedThroughSequence) &&
+    typeof value.warningIssued === 'boolean' &&
+    typeof value.modelRequested === 'boolean' &&
+    isNonnegativeSafeInteger(value.policyInputTokens);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isNonnegativeSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isNullableNonnegativeSafeInteger(value: unknown): value is number | null {
+  return value === null || isNonnegativeSafeInteger(value);
+}
 
 export type TurnReadParams = {
   conversationId: string;
