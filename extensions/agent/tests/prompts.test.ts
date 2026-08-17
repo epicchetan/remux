@@ -26,8 +26,10 @@ test('the production system prompt is the repository-owned Markdown file', async
   assert.match(markdown, /Artifact contents are stored in History but are never injected automatically/u);
   assert.match(markdown, /Use `commentary` for sparse, user-readable progress/u);
   assert.match(markdown, /Do not repeat the visible reasoning summary/u);
-  assert.match(markdown, /Choose a segment that can ordinarily complete comfortably inside one model context/u);
-  assert.match(markdown, /Do not repeat the same inspection or validation merely because it happened inside a work unit/u);
+  assert.match(markdown, /one independently verifiable slice/u);
+  assert.match(markdown, /Do not assign the whole turn by default/u);
+  assert.match(markdown, /enter a distinct remaining slice, perform missing cross-slice integration validation once, or answer the user/u);
+  assert.match(markdown, /Do not reread files, repeat searches, or rerun focused validation already covered by the result/u);
   assert.match(markdown, /Most turns should not need them/u);
   assert.doesNotMatch(markdown, /continuation bundle|proposed Thread update/iu);
 });

@@ -33,7 +33,7 @@ const workUnitEnterSchema = Type.Object({
   boundary: Type.String({
     minLength: 1,
     maxLength: 4 * 1024,
-    description: 'A brief, user-readable statement of the coherent work being entered and the observable point at which this work unit should close.',
+    description: 'A brief, user-readable statement of the independently verifiable slice being entered and the evidence that will establish it.',
   }),
 });
 
@@ -113,7 +113,7 @@ export function createContextTools(
       ].join(' '),
       promptSnippet: 'Open one coherent disposable work segment',
       promptGuidelines: [
-        'Use a work unit for a coherent stretch of inspection, implementation, or validation that may consume substantial context. Small changes, short tool sequences, conversation, and final response drafting do not need one.',
+        'Use a work unit for one independently verifiable slice of inspection, implementation, or validation that may consume substantial context. The main turn retains the overall request; do not assign the whole turn by default.',
         'Write one brief boundary statement containing both the work being entered and its natural closing condition. Do not restate the full request or emit separate narration that duplicates it.',
         'Continue the existing turn naturally; do not reorient as another agent or repeat context you already have.',
         'Work units cannot be nested.',
