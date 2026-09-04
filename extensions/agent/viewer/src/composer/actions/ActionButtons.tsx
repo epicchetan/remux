@@ -63,14 +63,7 @@ export function ComposerActionButtons({
   const providerCapabilities = runtime?.capabilities
     ?? providers?.providers.find(({ providerInstanceId }) =>
       providerInstanceId === selectedProviderInstanceId)?.capabilities;
-  const canSteerCurrentConfiguration = Boolean(
-    isWorking && runtime?.capabilities.turns.steer &&
-    runtime.composer.nextTurn.model === runtime.activeConfiguration.model &&
-    runtime.composer.nextTurn.effort === runtime.activeConfiguration.effort,
-  );
-  const canSubmitAtCurrentBoundary = !isWorking || Boolean(
-    runtime && (runtime.capabilities.turns.queue || canSteerCurrentConfiguration),
-  );
+  const canSubmitAtCurrentBoundary = !isWorking || Boolean(runtime);
   const turn = useComposerTurnAction({
     canStart: canStart && canSubmitAtCurrentBoundary,
     conversationExists,
@@ -143,7 +136,7 @@ export function ComposerActionButtons({
               ? 'Save edited message'
               : turn.forkTarget
                 ? 'Send forked message'
-              : isWorking && !canSteerCurrentConfiguration ? 'Queue message' : 'Send message',
+              : isWorking ? 'Queue message' : 'Send message',
           onClick: turn.handleSend,
           tone: 'send',
         }} /> : null}

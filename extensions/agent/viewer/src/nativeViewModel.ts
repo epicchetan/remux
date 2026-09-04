@@ -152,6 +152,7 @@ export function projectNativeQueue(resource: AgentQueueResource | null): AgentPe
     entries: resource.entries.map((entry) => ({
       id: entry.kind === 'message' ? entry.turnId : entry.operationId,
       createdAt: entry.createdAt,
+      ...(entry.kind === 'message' && entry.state !== 'dispatching' ? { state: entry.state } : {}),
       text: entry.kind === 'message'
         ? entry.content.flatMap((part) => part.type === 'text' ? [part.text] : []).join('\n')
         : 'Compact context',

@@ -261,7 +261,9 @@ export class NativeAgentCoordinator {
   private readonly federationForSession?: NativeCoordinatorOptions['federationForSession'];
   private readonly onDiagnostic?: NativeCoordinatorOptions['onDiagnostic'];
   private readonly sessionSweep: ReturnType<typeof setInterval>;
+  private readonly queueSweep: ReturnType<typeof setInterval>;
   private initializePromise?: Promise<void>;
+  private initialized = false;
   private closed = false;
 
   constructor(options: NativeCoordinatorOptions) {
@@ -282,6 +284,11 @@ export class NativeAgentCoordinator {
     this.onDiagnostic = options.onDiagnostic;
     this.sessionSweep = setInterval(() => void this.evictIdleSessions(), IDLE_PROVIDER_SESSION_SWEEP_MS);
     this.sessionSweep.unref?.();
+    this.queueSweep = setInterval(
+      () => this.wakeDurableQueues(),
+      UNAVAILABLE_PROVIDER_REPROBE_INTERVAL_MS,
+    );
+    this.queueSweep.unref?.();
   }
 
   initialize() {
@@ -350,6 +357,12 @@ export class NativeAgentCoordinator {
     for (const execution of this.journal.federatedExecutionsNeedingRecovery()) {
       await this.recoverFederatedExecution(execution);
     }
+    // The durable queue is a server-owned command lane. A process may stop
+    // after committing a follow-up but before its dispatch microtask runs, so
+    // initialization must wake idle lanes without waiting for a viewer read or
+    // another provider event.
+    this.initialized = true;
+    this.wakeDurableQueues();
     this.invalidateGlobal();
   }
 
@@ -798,12 +811,12 @@ export class NativeAgentCoordinator {
     const compactionRunning = compaction?.state === 'running';
     const hasQueuedWork = this.journal.queuedEntries(conversation.conversationId).length > 0;
     const laneBusy = Boolean(conversation.activeTurnId) || compactionRunning || hasQueuedWork;
-    const configurationMatchesActive = model === runtime!.activeConfiguration.model
-      && input.effort === runtime!.activeConfiguration.effort;
-    const shouldSteer = Boolean(conversation.activeTurnId) && (
-      input.delivery === 'steer'
-      || (input.delivery === 'auto' && capabilities.turns.steer && configurationMatchesActive)
-    );
+    const shouldSteer = Boolean(conversation.activeTurnId) && input.delivery === 'steer';
+    if (input.delivery === 'steer' && !conversation.activeTurnId) {
+      const error = coordinatorError('conversation_busy', 'There is no active turn to steer.');
+      this.journal.rejectCommand(input.commandId, error.message, this.now());
+      throw error;
+    }
     if (shouldSteer) {
       if (!capabilities.turns.steer) {
         const error = coordinatorError('capability_unavailable', 'Provider does not support native turn steering.');
@@ -813,54 +826,16 @@ export class NativeAgentCoordinator {
       return this.steer(input, conversation);
     }
     const turnId = stableUuid(`turn\0${input.commandId}`);
-    if (laneBusy) {
-      if (!capabilities.turns.queue) {
-        const error = coordinatorError('conversation_busy', 'Conversation is busy and provider queueing is unavailable.');
-        this.journal.rejectCommand(input.commandId, error.message, this.now());
-        throw error;
-      }
-      const result: NativeMessageSendResult = {
-        accepted: true,
-        commandId: input.commandId,
-        turnId,
-        delivery: 'queued',
-      };
-      this.journal.transaction(() => {
-        this.journal.createTurn({
-          turnId,
-          conversationId: conversation.conversationId,
-          executionId: conversation.rootExecutionId,
-          clientMessageId: input.clientMessageId,
-          commandId: input.commandId,
-          content: input.content,
-          model,
-          ...(effort ? { effort } : {}),
-          state: 'queued',
-          now: this.now(),
-        });
-        this.journal.enqueueTurn({
-          commandId: input.commandId,
-          conversationId: conversation.conversationId,
-          turnId,
-          clientMessageId: input.clientMessageId,
-          content: input.content,
-          model,
-          ...(effort ? { effort } : {}),
-          now: this.now(),
-        });
-        this.journal.acceptCommand(input.commandId, result, this.now());
-      });
-      this.invalidateConversation(conversation.conversationId);
-      if (!conversation.activeTurnId && !compactionRunning) void this.dispatchNext(conversation.conversationId);
-      return result;
-    }
+    const result: NativeMessageSendResult = {
+      accepted: true,
+      commandId: input.commandId,
+      turnId,
+      delivery: laneBusy ? 'queued' : 'sent',
+    };
+    // Immediate and follow-up messages cross the same atomic durability
+    // boundary. The dispatcher may claim an idle lane right away, but the RPC
+    // acknowledgment never depends on the WebView remaining connected.
     this.journal.transaction(() => {
-      this.journal.updateConversationConfiguration(
-        conversation.conversationId,
-        model,
-        effort,
-        this.now(),
-      );
       this.journal.createTurn({
         turnId,
         conversationId: conversation.conversationId,
@@ -870,37 +845,25 @@ export class NativeAgentCoordinator {
         content: input.content,
         model,
         ...(effort ? { effort } : {}),
-        state: 'running',
+        state: 'queued',
         now: this.now(),
       });
-      this.journal.markCommandDispatching(input.commandId, this.now());
-    });
-    const result: NativeMessageSendResult = {
-      accepted: true,
-      commandId: input.commandId,
-      turnId,
-      delivery: 'sent',
-    };
-    try {
-      await this.dispatchTurn(
-        this.requireConversation(conversation.conversationId),
+      this.journal.enqueueTurn({
+        commandId: input.commandId,
+        conversationId: conversation.conversationId,
         turnId,
-        input.commandId,
-        input.content,
+        clientMessageId: input.clientMessageId,
+        content: input.content,
         model,
-        effort,
-      );
+        ...(effort ? { effort } : {}),
+        access: input.access,
+        now: this.now(),
+      });
       this.journal.acceptCommand(input.commandId, result, this.now());
-      this.invalidateConversation(conversation.conversationId);
-      return result;
-    } catch (error) {
-      const message = safeMessage(error);
-      this.journal.rejectCommand(input.commandId, message, this.now());
-      this.journal.failTurnDispatch(turnId, message, this.now());
-      this.invalidateConversation(conversation.conversationId);
-      void this.dispatchNext(conversation.conversationId);
-      throw error;
-    }
+    });
+    this.invalidateConversation(conversation.conversationId);
+    void this.dispatchNext(conversation.conversationId);
+    return result;
   }
 
   async interruptTurn(unparsed: NativeTurnMutationCommand) {
@@ -2046,6 +2009,13 @@ export class NativeAgentCoordinator {
         this.now(),
         executionId,
       );
+      this.journal.markQueuedTurnDeliveryUnknown(activeTurn.turnId);
+    }
+    for (const turn of this.journal.turnsForExecution(executionId)) {
+      if ((turn.state === 'completed' || turn.state === 'failed' || turn.state === 'interrupted') &&
+          turn.outcome !== 'recovery_failed') {
+        this.journal.acknowledgeQueuedTurnDispatch(turn.turnId);
+      }
     }
     this.invalidateConversation(conversationId);
     const current = this.requireConversation(conversationId);
@@ -2058,6 +2028,7 @@ export class NativeAgentCoordinator {
     if (this.closed) return;
     this.closed = true;
     clearInterval(this.sessionSweep);
+    clearInterval(this.queueSweep);
     for (const job of this.hydrationJobs.values()) {
       job.controller.abort(new Error('Native Agent coordinator is closing.'));
     }
@@ -2191,12 +2162,34 @@ export class NativeAgentCoordinator {
         ).catch(() => [])
       : [];
     this.projector.setModels(registration.providerInstanceId, models);
-    if (probe.state === 'ready') await this.discoverProviderHistory(registration, probe.capabilities);
+    if (probe.state === 'ready') {
+      await this.discoverProviderHistory(registration, probe.capabilities);
+      for (const conversation of this.journal.conversations()
+        .filter(({ providerInstanceId }) => providerInstanceId === registration.providerInstanceId)) {
+        this.journal.releaseBlockedMessages(conversation.conversationId);
+        void this.dispatchNext(conversation.conversationId);
+      }
+    }
   }
 
-  private scheduleUnavailableProviderRefreshes() {
+  private wakeDurableQueues() {
+    if (this.closed || !this.initialized) return;
+    const providerInstanceIds = new Set<string>();
+    for (const conversationId of this.journal.conversationsWithQueuedWork()) {
+      const conversation = this.journal.conversation(conversationId);
+      if (!conversation) continue;
+      providerInstanceIds.add(conversation.providerInstanceId);
+      void this.dispatchNext(conversationId);
+    }
+    if (providerInstanceIds.size > 0) {
+      this.scheduleUnavailableProviderRefreshes(providerInstanceIds);
+    }
+  }
+
+  private scheduleUnavailableProviderRefreshes(providerFilter?: ReadonlySet<string>) {
     const now = this.now();
     for (const instance of this.journal.listProviderInstances()) {
+      if (providerFilter && !providerFilter.has(instance.providerInstanceId)) continue;
       if (instance.probe.state === 'ready' || this.providerLogins.has(instance.providerInstanceId)) continue;
       if (this.providerRefreshes.has(instance.providerInstanceId)) continue;
       const lastProbe = this.providerLastProbedAt.get(instance.providerInstanceId) ?? 0;
@@ -2664,7 +2657,15 @@ export class NativeAgentCoordinator {
       if (conversation.activeTurnId) return;
       const compaction = this.journal.latestCompactionOperation(conversationId);
       if (compaction?.state === 'running') return;
-      const queued = this.journal.dequeueNext(conversationId, this.now());
+      const provider = this.journal.providerInstance(conversation.providerInstanceId);
+      if (provider?.probe.state !== 'ready') {
+        if (this.journal.blockQueuedMessages(conversationId) > 0) {
+          this.invalidateConversation(conversationId);
+        }
+        return;
+      }
+      this.journal.releaseBlockedMessages(conversationId);
+      const queued = this.journal.claimNext(conversationId, this.now());
       if (!queued) return;
       if (queued.kind === 'compact') {
         try {
@@ -2692,9 +2693,13 @@ export class NativeAgentCoordinator {
           queued.model,
           queued.effort,
         );
+        this.journal.acknowledgeQueuedTurnDispatch(queued.turnId);
       } catch (error) {
+        // Once native dispatch begins, a transport failure may have happened
+        // after provider acceptance. Keep an explicit blocking record instead
+        // of silently retrying a coding action or advancing the FIFO.
+        this.journal.markQueuedTurnDeliveryUnknown(queued.turnId);
         this.journal.failTurnDispatch(queued.turnId, safeMessage(error), this.now());
-        queueMicrotask(() => void this.dispatchNext(conversationId));
       } finally {
         this.invalidateConversation(conversationId);
       }
@@ -2743,6 +2748,9 @@ export class NativeAgentCoordinator {
         this.now(),
         executionId,
       );
+      if (conversation.activeTurnId) {
+        this.journal.markQueuedTurnDeliveryUnknown(conversation.activeTurnId);
+      }
       this.invalidateConversation(conversation.conversationId);
     }
   }
@@ -3275,6 +3283,7 @@ export class NativeAgentCoordinator {
         this.automaticRecoveryAttempts.delete(executionId);
       }
       if (event.event.type === 'turn.completed' && event.scope.kind === 'turn') {
+        this.journal.acknowledgeQueuedTurnDispatch(event.scope.turnId);
         await this.sealTerminalOutput(event.scope.turnId);
         const conversation = this.requireConversation(conversationId);
         if (conversation.rootExecutionId === executionId) {

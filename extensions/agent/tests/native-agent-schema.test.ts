@@ -262,6 +262,45 @@ test('native Agent journal opener migrates a file-backed version 7 database', as
   }
 });
 
+test('native Agent schema migrates version 8 queued execution envelopes', () => {
+  const database = new DatabaseSync(':memory:');
+  try {
+    createNativeAgentSchema(database);
+    database.exec(`
+      ALTER TABLE queued_messages DROP COLUMN access;
+      ALTER TABLE queued_messages DROP COLUMN state;
+      INSERT INTO provider_instances(
+        provider_instance_id, provider, label, probe_state, probe_json,
+        capability_revision, updated_at
+      ) VALUES (
+        'fixture-local', 'fixture', 'Fixture', 'ready',
+        '{"state":"ready"}', 'fixture-capabilities', 1
+      );
+      INSERT INTO conversations(
+        conversation_id, provider_instance_id, root_execution_id,
+        parent_conversation_id, root_conversation_id, title, preview, cwd,
+        model, access, state, resumable, subtree_updated_at, created_at, updated_at
+      ) VALUES (
+        'conversation-1', 'fixture-local', 'execution-1', NULL,
+        'conversation-1', 'Queue migration', '', '/workspace',
+        'fixture-native-v1', 'workspace-write', 'idle', 1, 1, 1, 1
+      );
+      PRAGMA user_version = 8;
+    `);
+
+    migrateNativeAgentSchema(database, 8);
+
+    const columns = database.prepare('PRAGMA table_info(queued_messages)')
+      .all() as Array<{ name: string }>;
+    assert.ok(columns.some(({ name }) => name === 'access'));
+    assert.ok(columns.some(({ name }) => name === 'state'));
+    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+      NATIVE_AGENT_SCHEMA_VERSION);
+  } finally {
+    database.close();
+  }
+});
+
 test('native Agent schema rejects another application identity', () => {
   const database = new DatabaseSync(':memory:');
   try {

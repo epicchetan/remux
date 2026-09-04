@@ -1,10 +1,12 @@
 import type { Page } from '@playwright/test';
+import { NATIVE_AGENT_PROTOCOL_VERSION } from '../shared/native-agent-protocol.ts';
+import { AGENT_TRANSCRIPT_PROTOCOL_VERSION } from '../shared/transcript.ts';
 
 export const FIXTURE_CONVERSATION_ID = '11111111-1111-4111-8111-111111111111';
 export const FIXTURE_SECOND_CONVERSATION_ID = '22222222-2222-4222-8222-222222222222';
 
 export async function installAgentHost(page: Page) {
-  await page.addInitScript(() => {
+  await page.addInitScript(({ nativeProtocolVersion, transcriptProtocolVersion }) => {
     type HostRequest = {
       id?: number | string;
       method?: string;
@@ -422,7 +424,7 @@ export async function installAgentHost(page: Page) {
         message: {
           jsonrpc: '2.0', method: 'remux/agent/resources/invalidated',
           params: {
-            protocolVersion: 6,
+            protocolVersion: nativeProtocolVersion,
             serverGeneration: generation,
             basisSequence: sequence,
             keys,
@@ -776,6 +778,7 @@ export async function installAgentHost(page: Page) {
           createdAt: Date.now(),
           id: item.operationId,
           mentionCount: item.parts?.filter((part) => part.type === 'mention').length ?? 0,
+          state: 'queued',
           text: item.text,
         })),
       };
@@ -860,7 +863,7 @@ export async function installAgentHost(page: Page) {
       const selected = targetTurns.slice(start, end);
       const known = new Map((request.knownTurns ?? []).map((entry: any) => [entry.turnId, entry.renderRevision]));
       return {
-        protocolVersion: 6,
+        protocolVersion: transcriptProtocolVersion,
         projectionVersion: 'agent-turn-render-v6',
         conversationId: targetConversationId,
         conversationRevision: `conversation:${sequence}`,
@@ -1152,6 +1155,7 @@ export async function installAgentHost(page: Page) {
       return {
         conversationId: targetConversationId,
         entries: (queue?.entries ?? []).map((entry: any) => ({
+          kind: 'message',
           commandId: String(entry.id),
           turnId: String(entry.id),
           content: [
@@ -1164,6 +1168,10 @@ export async function installAgentHost(page: Page) {
               type: 'file-reference', path: `fixture-${index}.ts`,
             })),
           ],
+          model: 'gpt-5.6-sol',
+          effort: 'high',
+          access: 'workspace-write',
+          state: entry.state ?? 'queued',
           createdAt: Number(entry.createdAt ?? Date.now()),
         })),
       };
@@ -1566,7 +1574,7 @@ export async function installAgentHost(page: Page) {
     function nativeResourceResult(params: any) {
       const generationChanged = params.knownServerGeneration !== undefined && params.knownServerGeneration !== generation;
       return {
-        protocolVersion: 6,
+        protocolVersion: nativeProtocolVersion,
         serverGeneration: generation,
         capabilityRevision,
         changedKeys: generationChanged ? params.requests.map((item: any) => item.key) : [],
@@ -2339,5 +2347,8 @@ export async function installAgentHost(page: Page) {
         },
       },
     });
+  }, {
+    nativeProtocolVersion: NATIVE_AGENT_PROTOCOL_VERSION,
+    transcriptProtocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
   });
 }

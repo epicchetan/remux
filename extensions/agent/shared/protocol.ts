@@ -106,6 +106,7 @@ export type AgentPendingQueueEntry = {
   createdAt: number;
   id: string;
   mentionCount: number;
+  state?: 'queued' | 'blocked' | 'delivery-unknown';
   text: string;
 };
 
@@ -144,15 +145,13 @@ export type AgentTranscriptFence = {
   turnId: string;
 };
 
-export type MessageSendResult =
-  | {
-      accepted: true;
-      operationId: string;
-      turnId: string;
-      delivery?: 'sent';
-      transcriptFence?: AgentTranscriptFence;
-    }
-  | { accepted: true; operationId: string; turnId: null; delivery: 'queued' };
+export type MessageSendResult = {
+  accepted: true;
+  operationId: string;
+  turnId: string;
+  delivery: 'sent' | 'queued' | 'steered';
+  transcriptFence?: AgentTranscriptFence;
+};
 
 export type MessageBranchResult = {
   conversationId: string;

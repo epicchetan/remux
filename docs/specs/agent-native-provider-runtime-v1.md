@@ -755,11 +755,16 @@ responsive.
 
 Agent has one conversational input primitive: a normal chat message.
 
-When the root execution is idle, sending starts a new native provider turn.
-When it is running, the adapter capability determines whether a message is
-steered into the live turn or placed in Remux's durable FIFO follow-up queue.
-The composer labels that behavior; it never asks the user to choose an internal
-context plan.
+Every normal send first commits a logical turn and immutable execution envelope
+to Remux's durable per-conversation FIFO. An idle lane claims that entry
+immediately; a busy lane leaves it queued until the current native turn or
+compaction is terminal. Queue ownership is a Remux runtime capability, not a
+provider capability, and dispatch continues without a connected viewer.
+
+Native steering does not replace this behavior. If exposed, it is a separate,
+explicit action whose journal representation makes clear that content was sent
+to the current provider turn. An ordinary Send or Queue action never silently
+steers based on adapter capability.
 
 The following are intentionally absent from shared protocol and UI:
 
@@ -1154,12 +1159,10 @@ The composer shows a compact provider mark beside model/effort. It does not
 expose an internal harness selector. “Codex” means the native Codex adapter;
 “Claude” means the native Claude Code adapter.
 
-While running, the send affordance follows adapter capability:
-
-- steer immediately when native steering is supported and the user chooses
-  Send now;
-- otherwise append a durable FIFO follow-up; and
-- never invent an in-model form or context selection step.
+While running, the primary send affordance appends a durable FIFO follow-up for
+every provider. Optional native steering is a distinct control, never the
+implicit meaning of Send. Agent never invents an in-model form or context
+selection step.
 
 ### Mobile lifecycle
 
@@ -1298,9 +1301,13 @@ adapted to this smaller contract.
 Agent never mutates a provider's historical message in place.
 
 - **Follow-up:** send a normal new native turn to the same resumable session.
-- **Queue:** persist the exact user content and command ID; dispatch once, after
-  the prior turn reconciles idle. A queue item never captures a synthetic
-  provider context frame.
+- **Queue:** atomically persist the exact user content, command ID, logical turn
+  ID, provider instance, model, effort, access, and ordering before
+  acknowledgment. Dispatch once after prior work reconciles idle. A queue item
+  never captures a synthetic provider context frame. Startup and provider
+  readiness transitions wake idle lanes. Once native dispatch begins, an
+  unprovable result becomes delivery-unknown and blocks later work rather than
+  being blindly retried.
 - **Edit:** create a branch at the selected user message, then send replacement
   content as the next native turn on that branch. This uses
   `beforeNativeTurnId`; ordinary branching uses `throughNativeTurnId`. The two

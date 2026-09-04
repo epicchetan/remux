@@ -77,7 +77,9 @@ export function useComposerTurnAction({
     const input = {
       access: runtime?.composer.nextTurn.access ?? access,
       configurationRevision: runtime?.composer.revision ?? null,
-      delivery: 'auto' as const,
+      // Normal chat always enters the Agent runtime's durable lane. Native
+      // steering, when exposed, is a separate explicit action.
+      delivery: 'queue' as const,
       displayText: projection.displayText,
       modelId,
       parts: projection.parts,

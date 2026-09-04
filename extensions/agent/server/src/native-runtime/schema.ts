@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 
-export const NATIVE_AGENT_SCHEMA_VERSION = 8;
+export const NATIVE_AGENT_SCHEMA_VERSION = 9;
 export const NATIVE_AGENT_APPLICATION_ID = 0x524d584e; // RMXN
 export const NATIVE_AGENT_SCHEMA_ID = 'remux-agent-native-v1';
 
@@ -430,6 +430,9 @@ CREATE TABLE queued_messages (
   content_json TEXT NOT NULL CHECK (json_valid(content_json)),
   model TEXT,
   effort TEXT,
+  access TEXT NOT NULL CHECK (access IN ('read-only', 'workspace-write', 'full-access')),
+  state TEXT NOT NULL DEFAULT 'queued'
+    CHECK (state IN ('queued', 'dispatching', 'blocked', 'delivery_unknown')),
   ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   UNIQUE (conversation_id, ordinal),
@@ -480,7 +483,7 @@ export function createNativeAgentSchema(database: DatabaseSync) {
 }
 
 export function migrateNativeAgentSchema(database: DatabaseSync, fromVersion: number) {
-  if (fromVersion < 1 || fromVersion > 7) {
+  if (fromVersion < 1 || fromVersion > 8) {
     throw new NativeAgentSchemaError(`No Native Agent migration exists from schema ${fromVersion}.`);
   }
   if (fromVersion === 1) {
@@ -558,6 +561,24 @@ export function migrateNativeAgentSchema(database: DatabaseSync, fromVersion: nu
       ALTER TABLE conversations ADD COLUMN history_synced_revision TEXT;
       ALTER TABLE conversations ADD COLUMN history_synced_at INTEGER
         CHECK (history_synced_at IS NULL OR history_synced_at >= 0);
+    `);
+  }
+  if (fromVersion <= 8 && schemaObjectExists(database, 'table', 'queued_messages')) {
+    if (!schemaColumnExists(database, 'queued_messages', 'access')) {
+      database.exec('ALTER TABLE queued_messages ADD COLUMN access TEXT;');
+    }
+    if (!schemaColumnExists(database, 'queued_messages', 'state')) {
+      database.exec(`
+        ALTER TABLE queued_messages ADD COLUMN state TEXT NOT NULL DEFAULT 'queued'
+          CHECK (state IN ('queued', 'dispatching', 'blocked', 'delivery_unknown'));
+      `);
+    }
+    database.exec(`
+      UPDATE queued_messages
+      SET access = (
+        SELECT access FROM conversations
+        WHERE conversations.conversation_id = queued_messages.conversation_id
+      );
     `);
   }
   database.exec(`PRAGMA user_version = ${NATIVE_AGENT_SCHEMA_VERSION}`);
@@ -719,6 +740,11 @@ function schemaObjectExists(database: DatabaseSync, type: 'table' | 'index', nam
   return Boolean(database.prepare(`
     SELECT 1 AS present FROM sqlite_schema WHERE type = ? AND name = ?
   `).get(type, name));
+}
+
+function schemaColumnExists(database: DatabaseSync, table: string, column: string) {
+  return (database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+    .some(({ name }) => name === column);
 }
 
 export function listNativeAgentTables(database: DatabaseSync) {

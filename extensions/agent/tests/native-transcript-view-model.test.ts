@@ -11,6 +11,7 @@ import type {
   NativeAgentTurnFrame,
   NativeTranscriptWindow,
 } from '../shared/native-agent-protocol.ts';
+import { AGENT_TRANSCRIPT_PROTOCOL_VERSION } from '../shared/transcript.ts';
 
 test('federated children expose a lazy scope while native children stay provider-owned', () => {
   const turn = frame('root-turn', 'root-execution', 'completed', 'Root result.');
@@ -50,7 +51,7 @@ test('federated children expose a lazy scope while native children stay provider
     },
   } satisfies NativeTranscriptWindow, {
     type: 'executionScope',
-    protocolVersion: 6,
+    protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
     turnId: 'root-turn',
     scopeId: nativeFederatedScopeId('federated-child'),
   }, 14);
@@ -108,7 +109,7 @@ test('native provider blocks retain exact pass and block order while the termina
     turnOrder: [turn.turnId], turns: [turn],
     window: { startIndex: 0, endIndexExclusive: 1, hasEarlier: false, hasLater: false },
   }, {
-    type: 'executionScope', protocolVersion: 6, turnId: turn.turnId, scopeId: 'root-execution',
+    type: 'executionScope', protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION, turnId: turn.turnId, scopeId: 'root-execution',
   }, 1);
   assert.deepEqual(scope.inferences[0]?.blocks.map((value) =>
     value.type === 'action' ? value.call.name : value.text), [
@@ -171,7 +172,7 @@ test('an ordered context-compaction notice remains inside the work trace', () =>
     turnOrder: [turn.turnId], turns: [turn],
     window: { startIndex: 0, endIndexExclusive: 1, hasEarlier: false, hasLater: false },
   }, {
-    type: 'executionScope', protocolVersion: 6, turnId: turn.turnId, scopeId: 'root-execution',
+    type: 'executionScope', protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION, turnId: turn.turnId, scopeId: 'root-execution',
   }, 1);
   const blocks = scope.inferences[0]?.blocks ?? [];
   assert.deepEqual(blocks.map((item) => item.type === 'action' ? item.call.name : item.text), [
@@ -205,7 +206,7 @@ test('reasoning projection preserves native parts and recovers bold boundaries f
     turnOrder: [turn.turnId], turns: [turn],
     window: { startIndex: 0, endIndexExclusive: 1, hasEarlier: false, hasLater: false },
   }, {
-    type: 'executionScope', protocolVersion: 6, turnId: turn.turnId, scopeId: 'root-execution',
+    type: 'executionScope', protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION, turnId: turn.turnId, scopeId: 'root-execution',
   }, 1);
   const reasoning = scope.inferences[0]?.blocks.filter((value) => value.type === 'reasoning') ?? [];
   assert.deepEqual(reasoning.map((value) => value.type === 'reasoning' ? value.parts : null), [
@@ -229,7 +230,7 @@ test('file changes expose a disclosure only when an exact diff artifact exists',
     turnOrder: [turn.turnId], turns: [turn],
     window: { startIndex: 0, endIndexExclusive: 1, hasEarlier: false, hasLater: false },
   }, {
-    type: 'executionScope', protocolVersion: 6, turnId: turn.turnId, scopeId: 'root-execution',
+    type: 'executionScope', protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION, turnId: turn.turnId, scopeId: 'root-execution',
   }, 1);
   const calls = scope.inferences.flatMap(({ blocks }) => blocks.flatMap((value) =>
     value.type === 'action' && value.call.name === 'file_change' ? [value.call] : []));
@@ -272,7 +273,7 @@ test('linked file changes render at their provider block instead of a trailing c
     turnOrder: [turn.turnId], turns: [turn],
     window: { startIndex: 0, endIndexExclusive: 1, hasEarlier: false, hasLater: false },
   }, {
-    type: 'executionScope', protocolVersion: 6, turnId: turn.turnId, scopeId: 'root-execution',
+    type: 'executionScope', protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION, turnId: turn.turnId, scopeId: 'root-execution',
   }, 1);
 
   assert.equal(scope.inferences.length, 1);
@@ -315,7 +316,7 @@ test('Codex command actions become friendly file activity and hide the shell wra
     turnOrder: [turn.turnId], turns: [turn],
     window: { startIndex: 0, endIndexExclusive: 1, hasEarlier: false, hasLater: false },
   }, {
-    type: 'executionScope', protocolVersion: 6, turnId: turn.turnId, scopeId: 'root-execution',
+    type: 'executionScope', protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION, turnId: turn.turnId, scopeId: 'root-execution',
   }, 1);
   const action = scope.inferences[0]?.blocks.find((value) => value.type === 'action');
   assert.ok(action?.type === 'action');

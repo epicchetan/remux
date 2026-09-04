@@ -507,7 +507,7 @@ test('native journal projects native child identity without exposing a resume cu
   }
 });
 
-test('native journal queue is durable FIFO and ambiguous dispatch is never retried', () => {
+test('native journal queue is durable FIFO and retains a claim until provider acceptance', () => {
   const journal = createJournal();
   try {
     seedConversation(journal);
@@ -533,6 +533,7 @@ test('native journal queue is durable FIFO and ambiguous dispatch is never retri
         clientMessageId: `message-${index}`,
         content: [{ type: 'text', text: `Message ${index}` }],
         model: 'fixture-native-v1',
+        access: 'workspace-write',
         now: index + 2,
       });
     }
@@ -540,11 +541,19 @@ test('native journal queue is durable FIFO and ambiguous dispatch is never retri
       'turn-1',
       'turn-2',
     ]);
-    assert.equal(journal.dequeueTurn('conversation-1', 10)?.turnId, 'turn-1');
-    journal.markCommandDispatching('send-1', 11);
-    assert.equal(journal.markAmbiguousCommandsForRecovery(12), 1);
-    assert.equal(journal.commandReceipt('send-1')?.state, 'recovery_failed');
-    assert.equal(journal.dequeueTurn('conversation-1', 13)?.turnId, 'turn-2');
+    assert.equal(journal.claimQueuedTurn('conversation-1', 10)?.turnId, 'turn-1');
+    assert.deepEqual(journal.queuedMessages('conversation-1').map(({ turnId }) => turnId), [
+      'turn-2',
+    ]);
+    assert.equal(journal.claimQueuedTurn('conversation-1', 11), undefined,
+      'a dispatching head blocks later FIFO entries');
+    assert.equal(journal.acknowledgeQueuedTurnDispatch('turn-1'), true);
+    assert.equal(journal.claimQueuedTurn('conversation-1', 12)?.turnId, 'turn-2');
+    assert.equal(journal.markQueuedTurnDeliveryUnknown('turn-2'), true);
+    assert.equal(journal.queuedMessages('conversation-1')[0]?.state, 'delivery-unknown');
+    assert.equal(journal.claimQueuedTurn('conversation-1', 13), undefined,
+      'an ambiguous provider delivery is never retried');
+    assert.equal(journal.removeQueuedTurnById('conversation-1', 'turn-2', 14), true);
   } finally {
     journal.close();
   }

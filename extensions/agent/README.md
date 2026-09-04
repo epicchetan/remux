@@ -17,9 +17,10 @@ The canonical architecture and acceptance gates are in
 
 ## Product boundary
 
-Remux owns durable command receipts, the normalized display journal, bounded
-resource projection, the chat UI, long-thread virtualizer, mobile safe areas,
-WebView lifecycle recovery, attachments, and notifications. The provider owns
+Remux owns durable command receipts, per-conversation FIFO command lanes, the
+normalized display journal, bounded resource projection, the chat UI,
+long-thread virtualizer, mobile safe areas, WebView lifecycle recovery,
+attachments, and notifications. The provider owns
 its system behavior, model context, compaction, coding tools, permission model,
 tool loop, native history, and native subagents.
 
@@ -95,6 +96,12 @@ stop provider work or redispatch an accepted command. On foreground/reconnect,
 the viewer rereads authoritative runtime, transcript, queue, and any expanded
 child resources. Menus and sheets account for top, bottom, and keyboard safe
 areas.
+
+Normal messages are acknowledged only after their logical turn and immutable
+provider/model/effort/access envelope are committed to the Agent journal. The
+server serializes and wakes each conversation lane on enqueue, terminal events,
+provider recovery, and startup; Codex and Claude do not need to implement a
+native queue. Native steering is never selected implicitly by the composer.
 
 Native Agent data defaults to
 `$XDG_DATA_HOME/remux/agent-native-v1` or

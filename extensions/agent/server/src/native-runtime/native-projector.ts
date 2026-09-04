@@ -319,6 +319,7 @@ export class NativeAgentProjector {
     const canChangeAccess = conversation.resumable &&
       conversation.state === 'idle' &&
       conversation.activeTurnId === null &&
+      this.journal.queuedEntries(conversationId).length === 0 &&
       capabilities.session.resume &&
       capabilities.access.presets.length > 1;
     const usage = this.journal.latestUsage(conversationId) ?? emptyUsage();

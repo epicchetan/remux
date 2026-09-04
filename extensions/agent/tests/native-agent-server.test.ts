@@ -6,7 +6,10 @@ import { NativeAgentServer } from '../server/src/native-agent-server.ts';
 import { NativeFixtureAdapter } from '../server/src/native-fixture-adapter.ts';
 import { NativeAgentJournal } from '../server/src/native-runtime/native-journal.ts';
 import { createNativeAgentSchema } from '../server/src/native-runtime/schema.ts';
-import { NATIVE_AGENT_METHODS } from '../shared/native-agent-protocol.ts';
+import {
+  NATIVE_AGENT_METHODS,
+  NATIVE_AGENT_PROTOCOL_VERSION,
+} from '../shared/native-agent-protocol.ts';
 
 test('native Agent JSON-RPC surface serves versioned resources and commands only', async () => {
   const database = new DatabaseSync(':memory:');
@@ -32,7 +35,7 @@ test('native Agent JSON-RPC surface serves versioned resources and commands only
       visibility: 'foreground',
       requests: [{ key: 'agent/providers' }, { key: 'agent/models:fixture-local' }],
     }) as { protocolVersion: number; resources: Array<{ status: string }> };
-    assert.equal(providers.protocolVersion, 6);
+    assert.equal(providers.protocolVersion, NATIVE_AGENT_PROTOCOL_VERSION);
     assert.ok(providers.resources.every(({ status }) => status === 'ok'));
 
     const harnesses = await server.handle(NATIVE_AGENT_METHODS.runtimesRead, undefined) as {

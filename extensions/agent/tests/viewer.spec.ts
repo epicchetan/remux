@@ -728,6 +728,8 @@ test('queues a follow-up during active work and dispatches it after stop', async
   await messageBox(page).fill('Continue after the stop');
   await page.getByRole('button', { name: 'Queue message', exact: true }).click();
   await expect(page.getByText('Queued 1', { exact: true })).toBeVisible();
+  const queuedParams = await lastCommandParams(page, 'remux/agent/conversation/message/send');
+  expect(queuedParams.delivery).toBe('queue');
   await page.getByRole('button', { name: 'Stop turn', exact: true }).click();
 
   await expect(transcript(page).getByText('Continue after the stop', { exact: true })).toBeVisible();

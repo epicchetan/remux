@@ -997,7 +997,9 @@ test('coordinator fails closed across the composer capability matrix', async () 
     const capabilities = structuredClone(registration.probe.capabilities!);
     capabilities.access.presets = ['workspace-write'];
     capabilities.turns.interrupt = false;
-    capabilities.turns.steer = false;
+    // Native steering support must not change ordinary send into an implicit
+    // mutation of the active turn.
+    capabilities.turns.steer = true;
     capabilities.turns.queue = false;
     capabilities.content.images = false;
     capabilities.content.fileReferences = false;
@@ -1045,12 +1047,13 @@ test('coordinator fails closed across the composer capability matrix', async () 
       ...fileInput,
       content: [{ type: 'file-reference', path: 'README.md' }],
     }), isCoordinatorError('capability_unavailable'));
-    await assert.rejects(() => coordinator.sendMessage(configuredMessage(coordinator, {
+    const runtimeQueued = await coordinator.sendMessage(configuredMessage(coordinator, {
       commandId: 'send-unsupported-queue',
       conversationId: created.conversationId,
       clientMessageId: 'message-unsupported-queue',
-      content: [{ type: 'text', text: 'Cannot queue this.' }],
-    })), isCoordinatorError('conversation_busy'));
+      content: [{ type: 'text', text: 'The Agent runtime owns this queue.' }],
+    }));
+    assert.equal(runtimeQueued.delivery, 'queued');
     await assert.rejects(() => coordinator.interruptTurn({
       commandId: 'interrupt-unsupported',
       conversationId: created.conversationId,
@@ -1061,8 +1064,10 @@ test('coordinator fails closed across the composer capability matrix', async () 
       conversationId: created.conversationId,
     }), isCoordinatorError('capability_unavailable'));
 
-    await waitFor(() => journal.turn(active.turnId)?.state === 'completed');
+    await waitFor(() => journal.turn(runtimeQueued.turnId)?.state === 'completed');
     const runtime = coordinator.projector.runtimeResource(created.conversationId)!;
+    assert.equal(runtime.capabilities.turns.queue, true,
+      'the viewer sees the Agent lane even when the provider has no native queue');
     const source = journal.turn(active.turnId)!;
     await assert.rejects(() => coordinator.branchConversation({
       commandId: 'fork-unsupported',
@@ -1129,10 +1134,87 @@ test('native session opening is shared by concurrent hydration and message dispa
       content: [{ type: 'text', text: 'Use the session already being hydrated.' }],
     }));
     await Promise.all([hydration, send]);
+    await waitFor(() => (adapter.opened[0]?.providerDispatchCount ?? 0) === 1);
     assert.equal(adapter.opened.length, 1);
     assert.equal(adapter.opened[0]?.providerDispatchCount, 1);
   } finally {
     await replacement.close();
+    journal.close();
+  }
+});
+
+test('initialization wakes a durable idle queue without a connected viewer', async () => {
+  const journal = createJournal();
+  const original = new NativeAgentCoordinator({
+    journal,
+    providers: [{
+      providerInstanceId: 'fixture-local',
+      provider: 'fixture',
+      label: 'Fixture',
+      adapter: new NativeFixtureAdapter(),
+    }],
+  });
+  await original.initialize();
+  const created = await original.createConversation({
+    commandId: 'create-startup-queue',
+    providerInstanceId: 'fixture-local',
+    cwd: '/workspace/remux',
+    model: 'fixture-native-v1',
+    access: 'workspace-write',
+  });
+  await original.close();
+
+  const commandId = 'send-committed-before-restart';
+  const turnId = 'turn-committed-before-restart';
+  const content = [{ type: 'text' as const, text: 'Run after the Agent server restarts.' }];
+  journal.claimCommand(commandId, 'turn.send', { commandId }, Date.now());
+  journal.transaction(() => {
+    journal.createTurn({
+      turnId,
+      conversationId: created.conversationId,
+      executionId: journal.conversation(created.conversationId)!.rootExecutionId,
+      clientMessageId: 'message-committed-before-restart',
+      commandId,
+      content,
+      model: 'fixture-native-v1',
+      state: 'queued',
+      now: Date.now(),
+    });
+    journal.enqueueTurn({
+      commandId,
+      conversationId: created.conversationId,
+      turnId,
+      clientMessageId: 'message-committed-before-restart',
+      content,
+      model: 'fixture-native-v1',
+      access: 'workspace-write',
+      now: Date.now(),
+    });
+    journal.acceptCommand(commandId, {
+      accepted: true,
+      commandId,
+      turnId,
+      delivery: 'queued',
+    }, Date.now());
+  });
+
+  const resumedAdapter = new NativeFixtureAdapter();
+  const resumed = new NativeAgentCoordinator({
+    journal,
+    providers: [{
+      providerInstanceId: 'fixture-local',
+      provider: 'fixture',
+      label: 'Fixture',
+      adapter: resumedAdapter,
+    }],
+  });
+  try {
+    await resumed.initialize();
+    await waitFor(() => journal.turn(turnId)?.state === 'completed');
+    assert.equal(resumedAdapter.opened[0]?.providerDispatchCount, 1);
+    assert.equal(journal.queuedMessages(created.conversationId).length, 0);
+  } finally {
+    await resumed.close();
     journal.close();
   }
 });

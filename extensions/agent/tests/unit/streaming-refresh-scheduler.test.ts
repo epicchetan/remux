@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from '@playwright/test';
 
 import type { AgentResourceInvalidation } from '../../shared/transcript.ts';
+import { NATIVE_AGENT_PROTOCOL_VERSION } from '../../shared/native-agent-protocol.ts';
 import { parseAgentInvalidationEnvelope } from '../../viewer/src/ipc/resourceInvalidations.ts';
 import { partitionStreamingTranscriptInvalidations } from '../../viewer/src/transcript/streamingRefreshPolicy.ts';
 import {
@@ -34,18 +35,18 @@ test('partitions structural and cadence-limited transcript invalidations', () =>
 
 test('accepts only versioned native resource invalidations', () => {
   assert.deepEqual(parseAgentInvalidationEnvelope({
-    protocolVersion: 6,
+    protocolVersion: NATIVE_AGENT_PROTOCOL_VERSION,
     basisSequence: 4,
     keys: ['agent/transcript:conversation:tail-24'],
     serverGeneration: 'generation-v2',
   }), {
-    protocolVersion: 6,
+    protocolVersion: NATIVE_AGENT_PROTOCOL_VERSION,
     basisSequence: 4,
     keys: ['agent/transcript:conversation:tail-24'],
     serverGeneration: 'generation-v2',
   });
   assert.deepEqual(parseAgentInvalidationEnvelope({
-    protocolVersion: 6,
+    protocolVersion: NATIVE_AGENT_PROTOCOL_VERSION,
     keys: ['agent/transcript:conversation:tail-24'],
     serverGeneration: 'generation-v2',
   }).keys, []);
@@ -59,7 +60,7 @@ test('accepts only versioned native resource invalidations', () => {
 
 test('accepts native execution resource invalidations', () => {
   assert.deepEqual(parseAgentInvalidationEnvelope({
-    protocolVersion: 6,
+    protocolVersion: NATIVE_AGENT_PROTOCOL_VERSION,
     basisSequence: 7,
     keys: ['agent/execution:execution-1'],
     serverGeneration: 'generation-v2',

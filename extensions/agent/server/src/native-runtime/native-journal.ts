@@ -1314,14 +1314,15 @@ export class NativeAgentJournal {
     content: readonly UserContentPart[];
     model: string;
     effort?: string;
+    access: 'read-only' | 'workspace-write' | 'full-access';
     now: number;
   }) {
     const ordinal = this.nextQueueOrdinal(input.conversationId);
     this.database.prepare(`
       INSERT INTO queued_messages(
         command_id, conversation_id, turn_id, client_message_id, content_json,
-        model, effort, ordinal, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        model, effort, access, state, ordinal, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
     `).run(
       input.commandId,
       input.conversationId,
@@ -1330,33 +1331,81 @@ export class NativeAgentJournal {
       JSON.stringify(input.content),
       input.model,
       input.effort ?? null,
+      input.access,
       ordinal,
       input.now,
     );
   }
 
-  dequeueTurn(conversationId: string, now: number): NativeQueuedMessage | undefined {
+  claimQueuedTurn(conversationId: string, now: number): NativeQueuedMessage | undefined {
     return this.transaction(() => {
       const row = this.database.prepare(`
         SELECT * FROM queued_messages WHERE conversation_id = ? ORDER BY ordinal LIMIT 1
       `).get(conversationId) as Record<string, unknown> | undefined;
       if (!row) return undefined;
       const queued = queueRow(row);
-      this.database.prepare('DELETE FROM queued_messages WHERE command_id = ?').run(queued.commandId);
+      if (queued.state === 'dispatching' || queued.state === 'delivery-unknown') return undefined;
+      this.database.prepare(`
+        UPDATE queued_messages SET state = 'dispatching' WHERE command_id = ?
+      `).run(queued.commandId);
       this.database.prepare(`
         UPDATE turns SET state = 'running', started_at = ?, updated_at = ? WHERE turn_id = ?
       `).run(now, now, queued.turnId);
       this.database.prepare(`
         UPDATE conversations SET state = 'running', active_turn_id = ?,
-          model = ?, effort = ?, updated_at = ?
+          model = ?, effort = ?, access = ?, health_message = NULL, updated_at = ?
         WHERE conversation_id = ?
-      `).run(queued.turnId, queued.model, queued.effort ?? null, now, conversationId);
+      `).run(
+        queued.turnId,
+        queued.model,
+        queued.effort ?? null,
+        queued.access,
+        now,
+        conversationId,
+      );
       this.database.prepare(`
-        UPDATE executions SET state = 'running', outcome = NULL, completed_at = NULL, updated_at = ?
+        UPDATE executions SET state = 'running', outcome = NULL, completed_at = NULL,
+          model = ?, effort = ?, access = ?, updated_at = ?
         WHERE execution_id = (SELECT root_execution_id FROM conversations WHERE conversation_id = ?)
-      `).run(now, conversationId);
-      return queued;
+      `).run(queued.model, queued.effort ?? null, queued.access, now, conversationId);
+      return { ...queued, state: 'dispatching' };
     });
+  }
+
+  acknowledgeQueuedTurnDispatch(turnId: string) {
+    return this.database.prepare(`
+      DELETE FROM queued_messages WHERE turn_id = ? AND state = 'dispatching'
+    `).run(turnId).changes > 0;
+  }
+
+  markQueuedTurnDeliveryUnknown(turnId: string) {
+    return this.database.prepare(`
+      UPDATE queued_messages SET state = 'delivery_unknown'
+      WHERE turn_id = ? AND state = 'dispatching'
+    `).run(turnId).changes > 0;
+  }
+
+  blockQueuedMessages(conversationId: string) {
+    return this.database.prepare(`
+      UPDATE queued_messages SET state = 'blocked'
+      WHERE conversation_id = ? AND state = 'queued'
+    `).run(conversationId).changes;
+  }
+
+  releaseBlockedMessages(conversationId: string) {
+    return this.database.prepare(`
+      UPDATE queued_messages SET state = 'queued'
+      WHERE conversation_id = ? AND state = 'blocked'
+    `).run(conversationId).changes;
+  }
+
+  conversationsWithQueuedWork(): string[] {
+    return (this.database.prepare(`
+      SELECT conversation_id FROM queued_messages
+      UNION
+      SELECT conversation_id FROM queued_compactions
+      ORDER BY conversation_id
+    `).all() as Array<{ conversation_id: string }>).map(({ conversation_id }) => conversation_id);
   }
 
   updateConversationConfiguration(
@@ -1395,7 +1444,8 @@ export class NativeAgentJournal {
   removeQueuedTurn(conversationId: string, commandId: string, now: number) {
     return this.transaction(() => {
       const row = this.database.prepare(`
-        SELECT turn_id FROM queued_messages WHERE conversation_id = ? AND command_id = ?
+        SELECT turn_id FROM queued_messages
+        WHERE conversation_id = ? AND command_id = ? AND state != 'dispatching'
       `).get(conversationId, commandId) as { turn_id: string } | undefined;
       if (!row) return false;
       this.database.prepare('DELETE FROM queued_messages WHERE command_id = ?').run(commandId);
@@ -1416,7 +1466,9 @@ export class NativeAgentJournal {
 
   queuedMessages(conversationId: string): NativeQueuedMessage[] {
     return (this.database.prepare(`
-      SELECT * FROM queued_messages WHERE conversation_id = ? ORDER BY ordinal
+      SELECT * FROM queued_messages
+      WHERE conversation_id = ? AND state != 'dispatching'
+      ORDER BY ordinal
     `).all(conversationId) as Record<string, unknown>[]).map(queueRow);
   }
 
@@ -1471,11 +1523,11 @@ export class NativeAgentJournal {
   queuedEntries(conversationId: string): NativeQueueEntry[] {
     const entries = this.database.prepare(`
       SELECT 'message' AS queue_kind, ordinal, command_id, turn_id, client_message_id,
-        content_json, model, effort, created_at, NULL AS operation_id
-      FROM queued_messages WHERE conversation_id = ?
+        content_json, model, effort, access, state, created_at, NULL AS operation_id
+      FROM queued_messages WHERE conversation_id = ? AND state != 'dispatching'
       UNION ALL
       SELECT 'compact' AS queue_kind, ordinal, command_id, NULL, NULL, NULL, NULL, NULL,
-        created_at, operation_id
+        NULL, NULL, created_at, operation_id
       FROM queued_compactions WHERE conversation_id = ?
       ORDER BY ordinal
     `).all(conversationId, conversationId) as Record<string, unknown>[];
@@ -1489,11 +1541,24 @@ export class NativeAgentJournal {
       : queueRow(row));
   }
 
-  dequeueNext(conversationId: string, now: number): NativeQueueEntry | undefined {
+  claimNext(conversationId: string, now: number): NativeQueueEntry | undefined {
     return this.transaction(() => {
-      const next = this.queuedEntries(conversationId)[0];
+      const row = this.database.prepare(`
+        SELECT queue_kind, ordinal, command_id FROM (
+          SELECT 'message' AS queue_kind, ordinal, command_id
+          FROM queued_messages WHERE conversation_id = ?
+          UNION ALL
+          SELECT 'compact' AS queue_kind, ordinal, command_id
+          FROM queued_compactions WHERE conversation_id = ?
+        ) ORDER BY ordinal LIMIT 1
+      `).get(conversationId, conversationId) as {
+        queue_kind: 'message' | 'compact'; command_id: string;
+      } | undefined;
+      if (!row) return undefined;
+      if (row.queue_kind === 'message') return this.claimQueuedTurn(conversationId, now);
+      const next = this.queuedCompactions(conversationId)
+        .find(({ commandId }) => commandId === row.command_id);
       if (!next) return undefined;
-      if (next.kind === 'message') return this.dequeueTurn(conversationId, now);
       this.database.prepare('DELETE FROM queued_compactions WHERE command_id = ?').run(next.commandId);
       this.database.prepare(`
         UPDATE compaction_operations SET state = 'running', started_at = COALESCE(started_at, ?),
@@ -3444,6 +3509,10 @@ function queueRow(row: Record<string, unknown>): NativeQueuedMessage {
     content: JSON.parse(String(row.content_json)) as UserContentPart[],
     model: String(row.model),
     ...(row.effort === null ? {} : { effort: String(row.effort) }),
+    access: row.access as NativeQueuedMessage['access'],
+    state: row.state === 'delivery_unknown'
+      ? 'delivery-unknown'
+      : row.state as NativeQueuedMessage['state'],
     createdAt: Number(row.created_at),
   } as NativeQueuedMessage & { conversationId: string };
 }
@@ -3713,7 +3782,10 @@ export function viewerCapabilities(capabilities: ProviderCapabilities) {
     adapterVersion: capabilities.adapterVersion,
     authentication: capabilities.authentication,
     session: capabilities.session,
-    turns: capabilities.turns,
+    // Queueing is implemented by the Agent command lane. The provider field
+    // describes only whether the adapter also has a native queue primitive;
+    // viewers must see the runtime capability.
+    turns: { ...capabilities.turns, queue: true },
     content: capabilities.content,
     collaboration: capabilities.collaboration,
     access: capabilities.access,

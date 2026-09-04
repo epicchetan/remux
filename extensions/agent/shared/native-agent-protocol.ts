@@ -22,7 +22,7 @@ import type {
 import { parseUserContentParts, ProviderContractError } from './provider-runtime.ts';
 
 /** Viewer-safe resource and command contract for the provider-native runtime. */
-export const NATIVE_AGENT_PROTOCOL_VERSION = 6 as const;
+export const NATIVE_AGENT_PROTOCOL_VERSION = 7 as const;
 export const NATIVE_AGENT_LIMITS = {
   resourceBytes: 8 * 1024 * 1024,
   resourceReads: 64,
@@ -312,6 +312,8 @@ export type NativeQueuedMessage = {
   content: readonly UserContentPart[];
   model: string;
   effort?: string;
+  access: ProviderAccess;
+  state: 'queued' | 'dispatching' | 'blocked' | 'delivery-unknown';
   createdAt: number;
 };
 

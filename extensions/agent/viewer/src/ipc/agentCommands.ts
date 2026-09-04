@@ -125,7 +125,7 @@ export const agentCommands = {
       accepted: true,
       operationId: input.operationId,
       turnId: result.turnId,
-      delivery: result.delivery === 'steered' ? 'sent' : result.delivery,
+      delivery: result.delivery,
     } as MessageSendResult;
   },
   async branchMessage(input: {

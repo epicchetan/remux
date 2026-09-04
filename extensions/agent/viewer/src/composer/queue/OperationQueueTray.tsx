@@ -78,5 +78,8 @@ function QueueIconButton({ children, disabled, label, onClick }: {
 }
 
 function entryLabel(entry: AgentPendingQueueEntry) {
-  return entry.text || (entry.attachmentCount ? 'Image message' : 'Message');
+  const message = entry.text || (entry.attachmentCount ? 'Image message' : 'Message');
+  if (entry.state === 'delivery-unknown') return `Delivery uncertain — ${message}`;
+  if (entry.state === 'blocked') return `Waiting for provider — ${message}`;
+  return message;
 }
