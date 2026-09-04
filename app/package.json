@@ -14,6 +14,8 @@
     "eas:build:production": "node scripts/eas-with-env.mjs build --platform ios --profile production --non-interactive",
     "eas:update:preview": "node scripts/eas-with-env.mjs update --channel preview --environment preview --non-interactive",
     "eas:update:production": "node scripts/eas-with-env.mjs update --channel production --environment production --non-interactive",
+    "test:viewer-host-contract": "node --no-warnings scripts/test-viewer-host-contract.mjs",
+    "test:viewer-lifecycle": "node --no-warnings scripts/test-viewer-lifecycle.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

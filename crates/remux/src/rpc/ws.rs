@@ -1422,6 +1422,35 @@ fn dispatch_lane(client: &WsClient, method: &str, work: &DispatchWork) -> (Strin
             DispatchMode::Serial,
         );
     }
+    if method.starts_with("remux/agent/") {
+        if matches!(
+            method,
+            "remux/agent/resources/read"
+                | "remux/agent/transcript/resources/read"
+                | "remux/agent/models/read"
+                | "remux/agent/artifact/read"
+                | "remux/agent/turn/read"
+                | "remux/agent/files/search"
+        ) {
+            return (
+                "extension:agent:reads".to_string(),
+                DispatchMode::ConcurrentBusiness,
+            );
+        }
+        let params = dispatch_params(work);
+        let conversation_id = params
+            .and_then(|params| {
+                params
+                    .get("conversationId")
+                    .or_else(|| params.get("sourceConversationId"))
+            })
+            .and_then(Value::as_str)
+            .unwrap_or("__agent__");
+        return (
+            format!("extension:agent:conversation:{conversation_id}"),
+            DispatchMode::Serial,
+        );
+    }
     if method.starts_with("remux/terminal/") {
         let params = dispatch_params(work);
         if matches!(
@@ -1672,5 +1701,38 @@ mod tests {
             origin_context_key(Some(&serde_json::json!({ "tabId": "tab-a" }))),
             origin_context_key(Some(&serde_json::json!({ "tabId": "tab-b" })))
         );
+    }
+
+    #[test]
+    fn agent_reads_are_concurrent_and_mutations_are_conversation_serial() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let (control_sender, _control_receiver) = mpsc::channel(1);
+        let client = WsClient::new(sender, control_sender, 1);
+        let read = DispatchWork::Request {
+            id: serde_json::json!(1),
+            message: serde_json::json!({ "params": { "conversationId": "conversation-a" } }),
+        };
+        let (read_lane, read_mode) = dispatch_lane(
+            &client,
+            "remux/agent/transcript/resources/read",
+            &read,
+        );
+        assert_eq!(read_lane, "extension:agent:reads");
+        assert!(matches!(read_mode, DispatchMode::ConcurrentBusiness));
+
+        let mutation = DispatchWork::Request {
+            id: serde_json::json!(2),
+            message: serde_json::json!({ "params": { "conversationId": "conversation-a" } }),
+        };
+        let (mutation_lane, mutation_mode) = dispatch_lane(
+            &client,
+            "remux/agent/conversation/message/send",
+            &mutation,
+        );
+        assert_eq!(
+            mutation_lane,
+            "extension:agent:conversation:conversation-a"
+        );
+        assert!(matches!(mutation_mode, DispatchMode::Serial));
     }
 }

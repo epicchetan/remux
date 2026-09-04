@@ -2,10 +2,13 @@ import { authHeaders, currentRemuxOrigin } from './remuxSettingsStore';
 
 export type RemuxExtensionView = {
   entryUrl: string;
+  hostChrome: RemuxViewHostChrome;
   revision: string | null;
   route: string;
   url: string;
 };
+
+export type RemuxViewHostChrome = 'minimal' | 'none';
 
 export type RemuxExtension = {
   display: {
@@ -75,6 +78,7 @@ type RawExtensionDisplay = {
 
 type RawView = {
   entryUrl?: unknown;
+  hostChrome?: unknown;
   revision?: unknown;
   route?: unknown;
 };
@@ -201,6 +205,7 @@ function parseViews(rawViews: Record<string, unknown>, origin: string) {
 
     parsedViews[viewId] = {
       entryUrl: remuxPublicUrl(entryUrl, origin) ?? remuxViewerUrl(view.route, origin),
+      hostChrome: view.hostChrome === 'minimal' ? 'minimal' : 'none',
       revision: typeof view.revision === 'string' && view.revision.trim().length > 0
         ? view.revision
         : null,

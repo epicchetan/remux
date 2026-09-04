@@ -438,8 +438,11 @@ regrouped sheet:
   disabled unless running, Build — labeled `Build & Restart` while
   running) and a `Viewer` actions row (Build — disabled while the watcher
   owns the bundle, Start/Stop Watch). Serverless extensions render only
-  the Viewer group. A viewer build reloads the extension's tabs on
-  success.
+  the Viewer group. A viewer build is not reported complete until its
+  immutable snapshot is published. On completion, the always-mounted browser
+  shell force-refreshes the extension catalog and tab reconciliation adopts
+  any changed view revision. An unchanged content revision leaves mounted
+  tabs alone; server lifecycle/build and watch jobs do not reload viewers.
 
 ## Non-goals / punts
 

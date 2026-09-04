@@ -1,13 +1,58 @@
 import { rpc } from '@remux/viewer-kit/ipc';
 
-import {
-  AGENT_METHODS,
-  type ArtifactReadParams,
-  type ArtifactReadResult,
-} from '../../../shared/protocol';
+import { NATIVE_AGENT_METHODS, type NativeArtifactReadResult } from '../../../shared/native-agent-protocol.ts';
+import type { ArtifactReadParams, ArtifactReadResult } from '../../../shared/protocol.ts';
 
 export function readArtifactRange(params: ArtifactReadParams) {
-  return rpc.query<ArtifactReadResult>(AGENT_METHODS.artifactRead, params);
+  const offset = params.range.kind === 'lines' ? 0 : params.range.offset;
+  const byteLength = params.range.kind === 'lines' ? 256 * 1024 : params.range.byteLength;
+  return rpc.query<NativeArtifactReadResult>(NATIVE_AGENT_METHODS.artifactRead, {
+    artifactId: params.hash,
+    offset,
+    byteLength,
+  }).then((result): ArtifactReadResult => {
+    const nextOffset = result.offset + result.byteLength;
+    const hasNext = nextOffset < result.totalByteLength;
+    if (params.range.kind === 'utf8') {
+      return {
+        hash: result.artifactId,
+        mediaType: result.mimeType,
+        totalByteLength: result.totalByteLength,
+        totalLineCount: null,
+        range: { kind: 'utf8', offset: result.offset, byteLength: result.byteLength },
+        encoding: 'utf8',
+        content: decodeBase64Utf8(result.base64),
+        truncated: hasNext,
+        nextRange: hasNext ? {
+          kind: 'utf8',
+          offset: nextOffset,
+          byteLength: Math.min(48 * 1024, result.totalByteLength - nextOffset),
+        } : null,
+      };
+    }
+    return {
+      hash: result.artifactId,
+      mediaType: result.mimeType,
+      totalByteLength: result.totalByteLength,
+      totalLineCount: null,
+      range: { kind: 'bytes', offset: result.offset, byteLength: result.byteLength },
+      encoding: 'base64',
+      content: result.base64,
+      truncated: hasNext,
+      nextRange: hasNext ? {
+        kind: 'bytes',
+        offset: nextOffset,
+        byteLength: Math.min(48 * 1024, result.totalByteLength - nextOffset),
+      } : null,
+    };
+  });
+}
+
+function decodeBase64Utf8(encoded: string) {
+  const binary = atob(encoded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return new TextDecoder().decode(bytes);
 }
 
 export async function readArtifactDataUrl(hash: string, mimeType: string, byteLength: number) {

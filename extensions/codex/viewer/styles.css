@@ -537,6 +537,113 @@
     white-space: pre;
   }
 
+  .codex-md-math {
+    color: inherit;
+  }
+
+  .codex-md-inline-math {
+    display: inline-block;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    line-height: normal;
+    scrollbar-width: none;
+    vertical-align: baseline;
+  }
+
+  .codex-md-inline-math > .katex {
+    /* KaTeX defaults to 1.21em, which makes a lone inline variable project
+       well above surrounding prose even when the baselines are exact. */
+    font-size: 1em !important;
+  }
+
+  .codex-md-inline-math::-webkit-scrollbar,
+  .codex-md-display-math::-webkit-scrollbar {
+    display: none;
+  }
+
+  .codex-md-line-math-link {
+    display: inline;
+    max-width: 100%;
+  }
+
+  .codex-md-display-math-frame {
+    box-sizing: border-box;
+    display: flex;
+    max-width: 100%;
+    align-items: safe center;
+    justify-content: safe center;
+    overflow: auto;
+    padding: 4px 0;
+    scrollbar-width: none;
+  }
+
+  .codex-md-display-math-frame::-webkit-scrollbar {
+    display: none;
+  }
+
+  .codex-md-display-math {
+    display: block;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    flex: 0 0 100%;
+    line-height: normal;
+  }
+
+  .codex-md-display-math .katex-display > .katex {
+    white-space: normal !important;
+  }
+
+  .codex-md-display-math[data-constrained="true"] .katex-display > .katex {
+    text-align: left !important;
+  }
+
+  .codex-md-math .katex-display {
+    margin: 0 !important;
+  }
+
+  .codex-md-math-literal {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    overflow-wrap: anywhere;
+    color: var(--rmx-code-text);
+    font-family: var(--remux-font-mono);
+    font-size: 12px;
+    line-height: 18px;
+    padding: 0 14px;
+    white-space: pre-wrap;
+  }
+
+  .codex-md-math-measure-root {
+    position: fixed;
+    z-index: -1;
+    top: 0;
+    left: 0;
+    width: max-content;
+    height: max-content;
+    contain: layout style paint;
+    opacity: 0;
+    overflow: hidden;
+    pointer-events: none;
+  }
+
+  .codex-md-math-measure-row {
+    display: inline-block;
+    width: max-content;
+    height: max-content;
+  }
+
+  .codex-md-math-baseline-probe {
+    display: inline-block;
+    width: 0;
+    height: 0;
+    margin: 0;
+    padding: 0;
+    vertical-align: baseline;
+  }
+
   .codex-md-line-fragment.codex-md-inline-strong {
     font-weight: 700;
   }
@@ -1827,7 +1934,11 @@
     z-index: 40;
     display: grid;
     width: min(236px, calc(100vw - 28px));
+    max-height: min(520px, calc(100dvh - max(16px, env(safe-area-inset-top)) - max(16px, env(safe-area-inset-bottom)) - 72px));
     gap: 2px;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
     padding: 3px;
     border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
     border-radius: 10px;

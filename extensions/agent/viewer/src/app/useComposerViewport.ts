@@ -6,10 +6,12 @@ import {
   type CSSProperties,
   type RefObject,
 } from 'react';
+import { getHostLifecycleSnapshot, subscribeHostLifecycle } from '@remux/viewer-kit/host';
 
 import type { RemuxHostViewportMetrics } from '../ipc/types.ts';
 
 type ComposerViewportOptions = {
+  blurComposer: () => void;
   bottomBarSlotRef: RefObject<HTMLDivElement | null>;
   composerPresentationRequestId: number;
   directoryPickerOpen: boolean;
@@ -23,6 +25,7 @@ type ComposerViewportOptions = {
 
 export function useComposerViewport(options: ComposerViewportOptions) {
   const {
+    blurComposer,
     bottomBarSlotRef,
     composerPresentationRequestId,
     directoryPickerOpen,
@@ -40,6 +43,13 @@ export function useComposerViewport(options: ComposerViewportOptions) {
   const [pickerOverlayStyle, setPickerOverlayStyle] = useState<CSSProperties | null>(null);
   const pickerOverlayVisible = mentionPickerVisible || directoryPickerOpen;
   const composerShouldLift = presentationActive || directoryPickerOpen || composerDomFocused;
+
+  useEffect(() => subscribeHostLifecycle((lifecycle) => {
+    if (lifecycle.state !== 'active') {
+      blurComposer();
+      setComposerDomFocused(false);
+    }
+  }), [blurComposer]);
 
   const updatePickerGeometry = useCallback(() => {
     if (!pickerOverlayVisible) {
@@ -129,16 +139,19 @@ export function useComposerViewport(options: ComposerViewportOptions) {
   }, [bottomBarSlotRef, composerShouldLift, mainPaneRef, updateComposerLiftGeometry]);
 
   useEffect(() => {
-    if (composerPresentationRequestId === 0) return;
+    if (composerPresentationRequestId === 0 || !presentationActive) return;
     let cancelled = false;
     const frames: number[] = [];
     const timers: number[] = [];
+    const canPresent = () => (
+      getHostLifecycleSnapshot().state === 'active' && document.visibilityState !== 'hidden'
+    );
     const present = () => {
-      if (cancelled) return;
+      if (cancelled || !canPresent()) return;
       updateComposerLiftGeometry();
       const first = window.requestAnimationFrame(() => {
         const second = window.requestAnimationFrame(() => {
-          if (!cancelled) focusComposer();
+          if (!cancelled && canPresent()) focusComposer();
         });
         frames.push(second);
       });
@@ -151,7 +164,12 @@ export function useComposerViewport(options: ComposerViewportOptions) {
       frames.forEach((frame) => window.cancelAnimationFrame(frame));
       timers.forEach((timer) => window.clearTimeout(timer));
     };
-  }, [composerPresentationRequestId, focusComposer, updateComposerLiftGeometry]);
+  }, [
+    composerPresentationRequestId,
+    focusComposer,
+    presentationActive,
+    updateComposerLiftGeometry,
+  ]);
 
   useEffect(() => {
     if (!pickerOverlayVisible) {

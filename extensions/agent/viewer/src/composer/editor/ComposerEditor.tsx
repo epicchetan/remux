@@ -125,6 +125,13 @@ export function clearComposerEditor(editor: LexicalEditor) {
 
 export function setComposerEditorDocument(editor: LexicalEditor, document: ComposerDocument) {
   editor.update(() => {
+    // Restoring a draft is data synchronization, not an editing intent.
+    // Without these tags Lexical mirrors selectEnd() into the DOM, which
+    // focuses the contenteditable and opens the iOS keyboard while a newly
+    // selected conversation is still hydrating.
+    $addUpdateTag(SKIP_DOM_SELECTION_TAG);
+    $addUpdateTag(SKIP_SELECTION_FOCUS_TAG);
+
     const root = $getRoot();
     const paragraph = $createParagraphNode();
 

@@ -7,16 +7,25 @@ type AgentAuthScreenProps = {
   auth: AuthValue;
   busy: boolean;
   error: string | null;
+  loginMode: 'device-code' | 'browser' | 'none';
+  providerInstanceId: string | null;
   run: (action: () => Promise<unknown>) => void;
 };
 
-export function AgentAuthScreen({ auth, busy, error, run }: AgentAuthScreenProps) {
+export function AgentAuthScreen({
+  auth,
+  busy,
+  error,
+  loginMode,
+  providerInstanceId,
+  run,
+}: AgentAuthScreenProps) {
   return (
     <main className="agent-app agent-center">
       <section className="agent-auth-card">
         <div className="agent-auth-kicker">Remux Agent</div>
-        <h1>Connect your OpenAI subscription</h1>
-        <p>This runtime reads Pi’s OpenAI Codex OAuth credential store. Tokens never enter the viewer.</p>
+        <h1>Connect your {auth.displayLabel ?? 'agent'} subscription</h1>
+        <p>Remux starts the provider’s native sign-in flow. Subscription tokens never enter the viewer.</p>
         {auth.userCode ? <code className="agent-device-code">{auth.userCode}</code> : null}
         {auth.progress ? <p className="agent-muted">{auth.progress}</p> : null}
         {auth.error || error ? <p className="agent-error" role="alert">{auth.error ?? error}</p> : null}
@@ -34,8 +43,8 @@ export function AgentAuthScreen({ auth, busy, error, run }: AgentAuthScreenProps
               type="button"
               className="agent-secondary"
               onClick={() => {
-                if (auth.operationId) {
-                  run(() => agentCommands.cancelLogin(auth.operationId!));
+                if (auth.operationId && providerInstanceId) {
+                  run(() => agentCommands.cancelLogin(providerInstanceId));
                 }
               }}
             >
@@ -44,10 +53,14 @@ export function AgentAuthScreen({ auth, busy, error, run }: AgentAuthScreenProps
           ) : (
             <button
               type="button"
-              onClick={() => run(() => agentCommands.login())}
-              disabled={busy}
+              onClick={() => {
+                if (providerInstanceId && loginMode !== 'none') {
+                  run(() => agentCommands.login(providerInstanceId, loginMode));
+                }
+              }}
+              disabled={busy || !providerInstanceId || loginMode === 'none'}
             >
-              Sign in with device code
+              {loginMode === 'browser' ? 'Sign in in browser' : 'Sign in with device code'}
             </button>
           )}
         </div>

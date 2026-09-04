@@ -86,6 +86,7 @@ type WebViewStatus = {
 
 export type RemuxHostLifecycleEvent = {
   epoch: number;
+  inactiveForMs: number | null;
   reason: 'appState' | 'connect' | 'tabActive';
   state: 'active' | 'background' | 'inactive';
 };
@@ -128,6 +129,7 @@ const statusSubscribers = new Set<IpcStatusSubscriber>();
 const lifecycleSubscribers = new Set<IpcLifecycleSubscriber>();
 let lifecycleSnapshot: RemuxHostLifecycleEvent = {
   epoch: 0,
+  inactiveForMs: null,
   reason: 'connect',
   state: 'inactive',
 };
@@ -392,8 +394,17 @@ function handleNativeMessage(event: MessageEvent) {
 
   if (message.type === 'remux/lifecycle') {
     const previous = lifecycleSnapshot;
-    lifecycleSnapshot = message.lifecycle;
-    if (previous.epoch === message.lifecycle.epoch && previous.state === message.lifecycle.state) {
+    const reportedInactiveForMs = message.lifecycle.inactiveForMs;
+    lifecycleSnapshot = {
+      ...message.lifecycle,
+      inactiveForMs:
+        typeof reportedInactiveForMs === 'number' &&
+        Number.isFinite(reportedInactiveForMs) &&
+        reportedInactiveForMs >= 0
+          ? reportedInactiveForMs
+          : null,
+    };
+    if (previous.epoch === lifecycleSnapshot.epoch && previous.state === lifecycleSnapshot.state) {
       return;
     }
     for (const subscriber of lifecycleSubscribers) {

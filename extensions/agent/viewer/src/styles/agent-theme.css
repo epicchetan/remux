@@ -1,0 +1,149 @@
+/*
+ * Agent UI Visual System v1.
+ *
+ * The neutral palette, system font stack, and motion language are adapted
+ * from T3 Code (MIT, Copyright (c) 2026 T3 Tools Inc.). The Agent viewer owns
+ * this document, so these overrides intentionally stay local to this bundle
+ * instead of changing the shared Remux viewer-kit tokens.
+ */
+
+:root {
+  --agent-canvas: #0a0a0a;
+  --agent-sidebar: #000;
+  --agent-surface: #111;
+  --agent-surface-raised: #141414;
+  --agent-surface-overlay: #191919;
+  --agent-surface-hover: #141414;
+  --agent-message-surface: #141414;
+  --agent-input: #1e1e1e;
+  --agent-border: #191919;
+  --agent-border-strong: rgb(255 255 255 / 10%);
+  --agent-text: #f5f5f5;
+  --agent-text-secondary: #a3a3a3;
+  --agent-text-muted: #818181;
+  --agent-placeholder: #818181;
+  --agent-action: var(--rmx-orange-500);
+  --agent-action-hover: var(--rmx-orange-700);
+  --agent-action-foreground: var(--rmx-orange-50);
+  --agent-code-surface: #111;
+  --agent-font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --agent-font-mono: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+  --agent-prose-size: 13px;
+  --agent-prose-line: 18px;
+  --agent-work-size: 13px;
+  --agent-work-line: 18px;
+  --agent-meta-size: 12px;
+  --agent-meta-line: 16px;
+
+  --rmx-surface: var(--agent-canvas);
+  --rmx-surface-raised: var(--agent-surface);
+  --rmx-surface-hover: var(--agent-surface-raised);
+  --rmx-border: var(--agent-border);
+  --rmx-border-subtle: rgb(255 255 255 / 6%);
+  --rmx-code-bg: var(--agent-code-surface);
+  --rmx-code-border: var(--agent-border-strong);
+  --rmx-code-text: var(--agent-text);
+  --rmx-text: var(--agent-text);
+  --rmx-text-muted: var(--agent-text-muted);
+  --rmx-accent: var(--agent-action);
+  --rmx-accent-strong: var(--agent-action-hover);
+  --rmx-accent-foreground: var(--agent-action-foreground);
+  --rmx-primary-border: var(--rmx-orange-800);
+  --rmx-primary-edge: var(--rmx-orange-900);
+  --rmx-primary-shadow: var(--rmx-orange-950);
+  --rmx-focus-ring: var(--rmx-blue-400);
+
+  --background: var(--agent-canvas);
+  --foreground: var(--agent-text);
+  --card: var(--agent-surface);
+  --card-foreground: var(--agent-text);
+  --popover: var(--agent-surface-overlay);
+  --popover-foreground: var(--agent-text);
+  --primary: var(--agent-action);
+  --primary-foreground: var(--agent-action-foreground);
+  --secondary: var(--agent-surface-raised);
+  --secondary-foreground: var(--agent-text);
+  --muted: var(--agent-surface-raised);
+  --muted-foreground: var(--agent-text-muted);
+  --accent: var(--agent-surface-raised);
+  --accent-foreground: var(--agent-text);
+  --border: var(--agent-border);
+  --input: var(--agent-input);
+  --ring: var(--rmx-focus-ring);
+  --link: var(--rmx-focus-ring);
+  --sidebar: var(--agent-sidebar);
+  --sidebar-foreground: #f1f3f7;
+  --composer: var(--agent-surface-raised);
+  --composer-accent: var(--agent-action);
+  --chrome: var(--agent-surface-overlay);
+  --chrome-hover: #202020;
+
+  --remux-font-body-size: 15px;
+  --remux-font-body-line: 22px;
+  --remux-font-work-size: var(--agent-work-size);
+  --remux-font-work-line: var(--agent-work-line);
+  --remux-font-work-title-size: var(--remux-font-body-size);
+  --remux-font-work-title-line: var(--remux-font-body-line);
+  --remux-font-sans: var(--agent-font-sans);
+  --remux-font-mono: var(--agent-font-mono);
+  --remux-feed-max-width: 768px;
+  --remux-feed-pad-x: 20px;
+  --remux-turn-gap: 24px;
+  --remux-block-gap: 22px;
+  --remux-work-gap: 8px;
+  --remux-work-boundary-gap: 14px;
+  --remux-work-group-gap: 6px;
+  --remux-row-gap: 4px;
+
+  font-family: var(--agent-font-sans);
+}
+
+:root[data-remux-theme="light"] {
+  --agent-canvas: #fcfcfc;
+  --agent-sidebar: #fafafa;
+  --agent-surface: #fff;
+  --agent-surface-raised: #fcfcfc;
+  --agent-surface-overlay: #fff;
+  --agent-surface-hover: #f4f4f5;
+  --agent-message-surface: #f4f4f5;
+  --agent-input: #d4d4d8;
+  --agent-border: #e4e4e7;
+  --agent-border-strong: rgb(0 0 0 / 10%);
+  --agent-text: #27272a;
+  --agent-text-secondary: #52525b;
+  --agent-text-muted: #71717b;
+  --agent-placeholder: #71717b;
+  --agent-action: var(--rmx-orange-500);
+  --agent-action-hover: var(--rmx-orange-700);
+  --agent-action-foreground: var(--rmx-orange-50);
+  --agent-code-surface: #fff;
+  --rmx-border-subtle: rgb(0 0 0 / 8%);
+  --rmx-primary-border: var(--rmx-orange-700);
+  --rmx-primary-edge: var(--rmx-orange-800);
+  --rmx-primary-shadow: var(--rmx-orange-900);
+  --rmx-focus-ring: var(--rmx-blue-600);
+  --sidebar-foreground: var(--agent-text);
+  --chrome-hover: #f4f4f5;
+}
+
+@media (max-width: 639px) {
+  :root {
+    --remux-feed-pad-x: 12px;
+  }
+}
+
+html,
+body,
+#root,
+.agent-app {
+  background: var(--agent-canvas);
+  color: var(--agent-text);
+  font-family: var(--agent-font-sans);
+}
+
+button,
+input,
+textarea,
+[contenteditable="true"] {
+  font-family: inherit;
+}

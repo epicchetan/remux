@@ -26,10 +26,28 @@ import type {
   NarrationSourceDocument,
   NarrationSourceBlock,
 } from '@remux/narration-client/protocol';
+import { renderKatex, type TrustedKatexMarkup } from './katexAdapter';
+import {
+  mathMetricsRevision,
+  resolveMathMetrics,
+  type MathMetrics,
+} from './mathMetricsStore';
+import {
+  completeMarkdownCacheScope,
+  type MarkdownCacheScope,
+} from './markdownCache';
+import {
+  maskMarkdownMath,
+  splitMarkdownMathMarkers,
+  type MarkdownMathSource,
+  type MarkdownMathToken,
+  type MarkdownSourceRange,
+} from './mathSyntax';
 
 export type MarkdownDensity = 'default' | 'user' | 'work';
 
 export type MarkdownRenderOptions = {
+  cacheScope?: MarkdownCacheScope;
   richFileLinks?: boolean;
 };
 
@@ -59,7 +77,18 @@ export type MarkdownInline =
       file: MarkdownFileLink;
       href: string;
       type: 'fileLink';
+    }
+  | {
+      math: MarkdownMathSource;
+      type: 'math';
     };
+
+export type PreparedMarkdownMath = {
+  cacheScope: MarkdownCacheScope;
+  html: TrustedKatexMarkup | null;
+  metrics: MathMetrics | null;
+  source: MarkdownMathSource;
+};
 
 export type MarkdownFileLink = {
   displayName: string;
@@ -95,6 +124,11 @@ export type PreparedMarkdownBlock =
       narrationId: string;
       text: string;
       type: 'code';
+    }
+  | {
+      math: PreparedMarkdownMath;
+      narrationId: string;
+      type: 'mathDisplay';
     }
   | {
       children: PreparedMarkdownBlock[];
@@ -144,7 +178,8 @@ export type MarkdownInlineSource = {
   emphasis: boolean;
   file?: MarkdownFileLink;
   href: string | null;
-  kind: 'text' | 'code' | 'fileLink';
+  kind: 'text' | 'code' | 'fileLink' | 'math';
+  math?: PreparedMarkdownMath;
   strong: boolean;
 };
 
@@ -157,7 +192,10 @@ export type MarkdownLayoutLineFragment = {
 };
 
 export type MarkdownLayoutTextLine = {
+  ascent: number;
+  depth: number;
   fragments: MarkdownLayoutLineFragment[];
+  height: number;
   width: number;
 };
 
@@ -188,6 +226,19 @@ export type MarkdownLayoutBlock =
       text: string;
       textHeight: number;
       type: 'code';
+    })
+  | (MarkdownLayoutBlockBase & {
+      constrained: boolean;
+      html: TrustedKatexMarkup | null;
+      mathHeight: number;
+      naturalOuterHeight: number;
+      naturalWidth: number;
+      originalSource: string;
+      sourceEnd: number;
+      sourceStart: number;
+      tex: string;
+      type: 'mathDisplay';
+      wrapped: boolean;
     })
   | (MarkdownLayoutBlockBase & {
       children: MarkdownLayoutBlock[];
@@ -229,6 +280,7 @@ export type MarkdownLayoutTableCell = {
 
 export type MarkdownLayoutTableRow = {
   cells: MarkdownLayoutTableCell[];
+  contentHeight: number;
   header: boolean;
   height: number;
   lineCount: number;
@@ -258,6 +310,11 @@ export type RawMarkdownBlock =
       narrationId: string;
       text: string;
       type: 'code';
+    }
+  | {
+      math: MarkdownMathSource;
+      narrationId: string;
+      type: 'mathDisplay';
     }
   | {
       children: RawMarkdownBlock[];
@@ -302,7 +359,11 @@ type InlineMarks = {
   strong: boolean;
 };
 
-type MarkdownParseOptions = Required<MarkdownRenderOptions>;
+type MarkdownParseOptions = {
+  cacheScope: MarkdownCacheScope;
+  mathTokens: ReadonlyMap<string, MarkdownMathToken>;
+  richFileLinks: boolean;
+};
 
 type MarkdownInlineParseOptions = MarkdownParseOptions & {
   autolink: boolean;
@@ -387,6 +448,10 @@ export const markdownMetrics = {
     markerGap: 8,
     markerWidth: 24,
   },
+  math: {
+    displayCapHeight: 320,
+    displayPaddingY: 4,
+  },
   paragraph: {
     fontSize: {
       default: 13,
@@ -413,10 +478,14 @@ const documentCache = new Map<string, PreparedMarkdownDocument>();
 const rawDocumentCache = new Map<string, RawMarkdownBlock[]>();
 const preparedTextCache = new Map<string, PreparedText>();
 const layoutCache = new Map<string, MarkdownLayoutDocument>();
+const streamingDocumentCache = new Map<string, { key: string; value: PreparedMarkdownDocument }>();
+const streamingRawDocumentCache = new Map<string, { key: string; value: RawMarkdownBlock[] }>();
+const streamingLayoutCache = new Map<string, { key: string; value: MarkdownLayoutDocument }>();
 const maxDocumentCacheEntries = 300;
 const maxRawDocumentCacheEntries = 300;
 const maxPreparedTextCacheEntries = 1000;
 const maxLayoutCacheEntries = 500;
+const maxStreamingCacheScopes = 16;
 
 const emptyMarks: InlineMarks = {
   emphasis: false,
@@ -430,24 +499,47 @@ export function getPreparedMarkdownDocument(
   options: MarkdownRenderOptions = {},
 ) {
   const parseOptions = markdownParseOptions(options);
-  const key = `${density}\0${parseOptions.richFileLinks ? 'richFiles' : 'plainFiles'}\0${markdown}`;
-  const cached = documentCache.get(key);
+  const key = [
+    density,
+    parseOptions.richFileLinks ? 'richFiles' : 'plainFiles',
+    mathMetricsRevision(),
+    markdown,
+  ].join('\0');
+  const cached = readScopedCache(
+    documentCache,
+    streamingDocumentCache,
+    parseOptions.cacheScope,
+    key,
+  );
   if (cached) {
     return cached;
   }
 
   const rawBlocks = parseMarkdownBlocks(markdown, parseOptions);
   const prepared: PreparedMarkdownDocument = {
-    blocks: rawBlocks.map((block) => prepareMarkdownBlock(block, density)),
+    blocks: rawBlocks.map((block) => prepareMarkdownBlock(block, density, parseOptions.cacheScope)),
     density,
   };
 
-  remember(documentCache, key, prepared, maxDocumentCacheEntries);
+  writeScopedCache(
+    documentCache,
+    streamingDocumentCache,
+    parseOptions.cacheScope,
+    key,
+    prepared,
+    maxDocumentCacheEntries,
+  );
   return prepared;
 }
 
 export function parseMarkdownDocument(markdown: string, options: MarkdownRenderOptions = {}) {
   return parseMarkdownBlocks(markdown, markdownParseOptions(options));
+}
+
+export function releaseStreamingMarkdownCaches(scopeKey: string) {
+  streamingDocumentCache.delete(scopeKey);
+  streamingRawDocumentCache.delete(scopeKey);
+  streamingLayoutCache.delete(scopeKey);
 }
 
 export function narrationSourceBlocks(markdown: string): NarrationSourceBlock[] {
@@ -474,8 +566,19 @@ export function getMarkdownLayoutDocument(
   const parseOptions = markdownParseOptions(options);
   const safeWidth = Math.max(1, width);
   const roundedWidth = Math.round(safeWidth * 100) / 100;
-  const key = `${density}\0${parseOptions.richFileLinks ? 'richFiles' : 'plainFiles'}\0${roundedWidth}\0${markdown}`;
-  const cached = layoutCache.get(key);
+  const key = [
+    density,
+    parseOptions.richFileLinks ? 'richFiles' : 'plainFiles',
+    mathMetricsRevision(),
+    roundedWidth,
+    markdown,
+  ].join('\0');
+  const cached = readScopedCache(
+    layoutCache,
+    streamingLayoutCache,
+    parseOptions.cacheScope,
+    key,
+  );
   if (cached) {
     return cached;
   }
@@ -489,7 +592,14 @@ export function getMarkdownLayoutDocument(
     width: roundedWidth,
   };
 
-  remember(layoutCache, key, laidOut, maxLayoutCacheEntries);
+  writeScopedCache(
+    layoutCache,
+    streamingLayoutCache,
+    parseOptions.cacheScope,
+    key,
+    laidOut,
+    maxLayoutCacheEntries,
+  );
   return laidOut;
 }
 
@@ -557,8 +667,8 @@ function layoutPreparedMarkdownBlock(
   switch (block.type) {
     case 'paragraph': {
       const lineHeight = markdownMetrics.paragraph.lineHeight[density];
-      const lines = layoutInlineLines(block.lines, safeWidth);
-      const contentHeight = lines.length * lineHeight;
+      const lines = layoutInlineLines(block.lines, safeWidth, lineHeight);
+      const contentHeight = lines.reduce((total, line) => total + line.height, 0);
 
       return {
         contentHeight,
@@ -572,8 +682,8 @@ function layoutPreparedMarkdownBlock(
     }
     case 'heading': {
       const metrics = markdownMetrics.heading[density][block.depth];
-      const lines = layoutInlineLines(block.lines, safeWidth);
-      const contentHeight = lines.length * metrics.lineHeight;
+      const lines = layoutInlineLines(block.lines, safeWidth, metrics.lineHeight);
+      const contentHeight = lines.reduce((total, line) => total + line.height, 0);
 
       return {
         contentHeight,
@@ -606,6 +716,61 @@ function layoutPreparedMarkdownBlock(
         textHeight,
         topGap,
         type: 'code',
+      };
+    }
+    case 'mathDisplay': {
+      const lineHeight = markdownMetrics.paragraph.lineHeight[density];
+      const paddingHeight = markdownMetrics.math.displayPaddingY * 2;
+      const naturalMetrics = block.math.metrics;
+      const constrained = Boolean(
+        naturalMetrics && block.math.html && naturalMetrics.naturalWidth > safeWidth + 0.5
+      );
+      const renderedMetrics = constrained
+        ? resolveMathMetrics(
+            block.math.source.tex,
+            true,
+            { html: block.math.html!, status: 'valid' },
+            mathMetricContext(density, 'body'),
+            block.math.cacheScope,
+            safeWidth,
+          )
+        : naturalMetrics;
+      const validHeight = renderedMetrics?.height ?? 0;
+      const literalHeight = block.math.metrics
+        ? 0
+        : measurePlainTextHeight({
+            capHeight: markdownMetrics.math.displayCapHeight - paddingHeight,
+            font: fontForPlainText({ density, family: 'mono' }),
+            lineHeight: markdownMetrics.code.lineHeight[density],
+            text: block.math.source.originalSource,
+            whiteSpace: 'pre-wrap',
+            width: Math.max(1, safeWidth - markdownMetrics.code.paddingX * 2),
+          });
+      const mathHeight = Math.max(lineHeight, validHeight || literalHeight);
+      const naturalOuterHeight = mathHeight + paddingHeight;
+      const contentHeight = Math.min(naturalOuterHeight, markdownMetrics.math.displayCapHeight);
+      const wrapped = Boolean(
+        constrained && naturalMetrics && renderedMetrics &&
+        renderedMetrics.height > naturalMetrics.height + 0.5 &&
+        renderedMetrics.naturalWidth <= safeWidth + 1
+      );
+
+      return {
+        constrained,
+        contentHeight,
+        height: topGap + contentHeight,
+        html: block.math.html,
+        mathHeight,
+        naturalOuterHeight,
+        naturalWidth: block.math.metrics?.naturalWidth ?? safeWidth,
+        narrationId: block.narrationId,
+        originalSource: block.math.source.originalSource,
+        sourceEnd: block.math.source.sourceEnd,
+        sourceStart: block.math.source.sourceStart,
+        tex: block.math.source.tex,
+        topGap,
+        type: 'mathDisplay',
+        wrapped,
       };
     }
     case 'blockquote': {
@@ -721,7 +886,7 @@ function layoutPreparedMarkdownTable(
         columnWidths[columnIndex] - markdownMetrics.table.cellPaddingX * 2 -
           (columnIndex < columnCount - 1 ? borderWidth : 0),
       );
-      const lines = layoutInlineLines(row.cells[columnIndex]?.lines ?? [], innerWidth);
+      const lines = layoutInlineLines(row.cells[columnIndex]?.lines ?? [], innerWidth, lineHeight);
       lineCount = Math.max(lineCount, lines.length);
       return {
         align: block.align[columnIndex] ?? null,
@@ -729,11 +894,16 @@ function layoutPreparedMarkdownTable(
       };
     });
     const rowBorderHeight = rowIndex < block.rows.length - 1 ? borderWidth : 0;
+    const contentHeight = Math.max(
+      lineHeight,
+      ...cells.map((cell) => cell.lines.reduce((total, line) => total + line.height, 0)),
+    );
 
     return {
       cells,
+      contentHeight,
       header: row.header,
-      height: lineCount * lineHeight + markdownMetrics.table.cellPaddingY * 2 + rowBorderHeight,
+      height: contentHeight + markdownMetrics.table.cellPaddingY * 2 + rowBorderHeight,
       lineCount,
     };
   });
@@ -815,7 +985,9 @@ function cappedMarkdownBlockHeight(block: MarkdownLayoutBlock, remainingLines: n
       const lineCount = Math.max(1, block.lines.length);
       const visibleLines = Math.min(lineCount, remainingLines);
       return {
-        height: block.topGap + visibleLines * block.lineHeight,
+        height: block.topGap + block.lines
+          .slice(0, visibleLines)
+          .reduce((total, line) => total + line.height, 0),
         remainingLines: remainingLines - visibleLines,
       };
     }
@@ -828,6 +1000,11 @@ function cappedMarkdownBlockHeight(block: MarkdownLayoutBlock, remainingLines: n
         remainingLines: remainingLines - visibleLines,
       };
     }
+    case 'mathDisplay':
+      return {
+        height: block.topGap + block.contentHeight,
+        remainingLines: remainingLines - 1,
+      };
     case 'blockquote': {
       const capped = cappedMarkdownBlocksHeight(block.children, remainingLines);
       return {
@@ -862,7 +1039,7 @@ function cappedMarkdownBlockHeight(block: MarkdownLayoutBlock, remainingLines: n
         const visibleLines = Math.min(row.lineCount, nextRemainingLines);
         nextRemainingLines -= visibleLines;
         if (visibleLines < row.lineCount) {
-          height += markdownMetrics.table.cellPaddingY + visibleLines * block.lineHeight;
+          height += markdownMetrics.table.cellPaddingY + visibleTableRowContentHeight(row, visibleLines);
           return { height, remainingLines: nextRemainingLines };
         }
         height += row.height;
@@ -884,14 +1061,28 @@ function cappedMarkdownBlockHeight(block: MarkdownLayoutBlock, remainingLines: n
   }
 }
 
-function layoutInlineLines(lines: PreparedMarkdownInlineLine[], width: number) {
+function visibleTableRowContentHeight(row: MarkdownLayoutTableRow, visibleLines: number) {
+  return Math.max(
+    0,
+    ...row.cells.map((cell) => cell.lines
+      .slice(0, visibleLines)
+      .reduce((total, line) => total + line.height, 0)),
+  );
+}
+
+function layoutInlineLines(lines: PreparedMarkdownInlineLine[], width: number, baseLineHeight: number) {
   const laidOutLines: MarkdownLayoutTextLine[] = [];
   let logicalLineStart = 0;
+  const baseAscent = baseLineHeight * 0.78;
+  const baseDepth = baseLineHeight - baseAscent;
 
   for (const line of lines) {
     if (!line.prepared) {
       laidOutLines.push({
+        ascent: baseAscent,
+        depth: baseDepth,
         fragments: [],
+        height: baseLineHeight,
         width: 0,
       });
       logicalLineStart += line.displayLength + 1;
@@ -903,30 +1094,42 @@ function layoutInlineLines(lines: PreparedMarkdownInlineLine[], width: number) {
     walkRichInlineLineRanges(line.prepared, Math.max(1, width), (range) => {
       const materialized = materializeRichInlineLineRange(line.prepared!, range);
       emitted = true;
+      const fragments = materialized.fragments.map((fragment) => {
+        const itemIndex = fragment.itemIndex;
+        const itemText = line.itemTexts[itemIndex] ?? '';
+        const sourceCursor = itemSourceCursors[itemIndex] ?? 0;
+        const locatedStart = itemText.indexOf(fragment.text, sourceCursor);
+        const fragmentStart = locatedStart >= sourceCursor ? locatedStart : sourceCursor;
+        const displayStart = logicalLineStart + (line.itemStarts[itemIndex] ?? 0) + fragmentStart;
+        itemSourceCursors[itemIndex] = fragmentStart + fragment.text.length;
+        return {
+          displayEnd: displayStart + fragment.text.length,
+          displayStart,
+          gapBefore: fragment.gapBefore,
+          source: line.sources[itemIndex] ?? fallbackInlineSource,
+          text: fragment.text,
+        };
+      });
+      const mathMetrics = fragments
+        .map((fragment) => fragment.source.math?.metrics)
+        .filter((metrics): metrics is MathMetrics => Boolean(metrics));
+      const ascent = Math.max(baseAscent, ...mathMetrics.map((metrics) => metrics.ascent));
+      const depth = Math.max(baseDepth, ...mathMetrics.map((metrics) => metrics.depth));
       laidOutLines.push({
-        fragments: materialized.fragments.map((fragment) => {
-          const itemIndex = fragment.itemIndex;
-          const itemText = line.itemTexts[itemIndex] ?? '';
-          const sourceCursor = itemSourceCursors[itemIndex] ?? 0;
-          const locatedStart = itemText.indexOf(fragment.text, sourceCursor);
-          const fragmentStart = locatedStart >= sourceCursor ? locatedStart : sourceCursor;
-          const displayStart = logicalLineStart + (line.itemStarts[itemIndex] ?? 0) + fragmentStart;
-          itemSourceCursors[itemIndex] = fragmentStart + fragment.text.length;
-          return {
-            displayEnd: displayStart + fragment.text.length,
-            displayStart,
-            gapBefore: fragment.gapBefore,
-            source: line.sources[itemIndex] ?? fallbackInlineSource,
-            text: fragment.text,
-          };
-        }),
+        ascent,
+        depth,
+        fragments,
+        height: Math.max(baseLineHeight, Math.ceil(ascent + depth)),
         width: materialized.width,
       });
     });
 
     if (!emitted) {
       laidOutLines.push({
+        ascent: baseAscent,
+        depth: baseDepth,
         fragments: [],
+        height: baseLineHeight,
         width: 0,
       });
     }
@@ -1003,18 +1206,28 @@ export function fontForPlainText({
   return `${style}${weight} ${size}px ${markdownMetrics.fontFamily[family]}`;
 }
 
-function prepareMarkdownBlock(block: RawMarkdownBlock, density: MarkdownDensity): PreparedMarkdownBlock {
+function prepareMarkdownBlock(
+  block: RawMarkdownBlock,
+  density: MarkdownDensity,
+  cacheScope: MarkdownCacheScope,
+): PreparedMarkdownBlock {
   switch (block.type) {
     case 'paragraph':
       return {
-        lines: block.lines.map((line) => prepareInlineLine(line, density, 'body')),
+        lines: block.lines.map((line) => prepareInlineLine(line, density, 'body', emptyMarks, cacheScope)),
         narrationId: block.narrationId,
         type: 'paragraph',
       };
     case 'heading':
       return {
         depth: block.depth,
-        lines: block.lines.map((line) => prepareInlineLine(line, density, headingVariant(block.depth))),
+        lines: block.lines.map((line) => prepareInlineLine(
+          line,
+          density,
+          headingVariant(block.depth),
+          emptyMarks,
+          cacheScope,
+        )),
         narrationId: block.narrationId,
         type: 'heading',
       };
@@ -1025,16 +1238,22 @@ function prepareMarkdownBlock(block: RawMarkdownBlock, density: MarkdownDensity)
         text: stripSingleTrailingNewline(block.text),
         type: 'code',
       };
+    case 'mathDisplay':
+      return {
+        math: prepareMath(block.math, true, density, 'body', cacheScope),
+        narrationId: block.narrationId,
+        type: 'mathDisplay',
+      };
     case 'blockquote':
       return {
-        children: block.children.map((child) => prepareMarkdownBlock(child, density)),
+        children: block.children.map((child) => prepareMarkdownBlock(child, density, cacheScope)),
         narrationId: block.narrationId,
         type: 'blockquote',
       };
     case 'list':
       return {
         items: block.items.map((item) => ({
-          blocks: item.blocks.map((child) => prepareMarkdownBlock(child, density)),
+          blocks: item.blocks.map((child) => prepareMarkdownBlock(child, density, cacheScope)),
           marker: item.marker,
         })),
         narrationId: block.narrationId,
@@ -1053,6 +1272,7 @@ function prepareMarkdownBlock(block: RawMarkdownBlock, density: MarkdownDensity)
               density,
               'body',
               row.header ? { ...emptyMarks, strong: true } : emptyMarks,
+              cacheScope,
             )),
           })),
           header: row.header,
@@ -1069,8 +1289,9 @@ function prepareInlineLine(
   density: MarkdownDensity,
   variant: InlineVariant,
   initialMarks: InlineMarks = emptyMarks,
+  cacheScope: MarkdownCacheScope = completeMarkdownCacheScope,
 ): PreparedMarkdownInlineLine {
-  const { items, sources } = inlineRichItems(inlines, density, variant, initialMarks);
+  const { items, sources } = inlineRichItems(inlines, density, variant, initialMarks, cacheScope);
   const itemStarts: number[] = [];
   let displayLength = 0;
   for (const item of items) {
@@ -1088,11 +1309,45 @@ function prepareInlineLine(
   };
 }
 
+function prepareMath(
+  source: MarkdownMathSource,
+  displayMode: boolean,
+  density: MarkdownDensity,
+  variant: InlineVariant,
+  cacheScope: MarkdownCacheScope,
+): PreparedMarkdownMath {
+  const render = renderKatex(source.tex, displayMode, cacheScope);
+  if (render.status !== 'valid') {
+    return { cacheScope, html: null, metrics: null, source };
+  }
+  return {
+    cacheScope,
+    html: render.html,
+    metrics: resolveMathMetrics(
+      source.tex,
+      displayMode,
+      render,
+      mathMetricContext(density, variant),
+      cacheScope,
+    ),
+    source,
+  };
+}
+
+function mathMetricContext(density: MarkdownDensity, variant: InlineVariant) {
+  return {
+    fontSize: fontSizeForVariant(density, variant, 'sans'),
+    lineHeight: lineHeightForVariant(density, variant),
+    variant: density + ':' + variant,
+  };
+}
+
 function inlineRichItems(
   inlines: MarkdownInline[],
   density: MarkdownDensity,
   variant: InlineVariant,
   initialMarks: InlineMarks = emptyMarks,
+  cacheScope: MarkdownCacheScope = completeMarkdownCacheScope,
 ) {
   const items: RichInlineItem[] = [];
   const sources: MarkdownInlineSource[] = [];
@@ -1131,6 +1386,38 @@ function inlineRichItems(
             extraWidth = 0;
           }
           break;
+        case 'math': {
+          const math = prepareMath(child.math, false, density, variant, cacheScope);
+          const logicalText = child.math.tex.replace(/\s+/gu, ' ').trim();
+          if (!math.metrics || !math.html || !logicalText) {
+            const literalText = child.math.originalSource.replace(/\s+/gu, ' ');
+            items.push({
+              ...(extraWidth > 0 ? { extraWidth } : null),
+              font: fontForInlineText(density, variant, marks),
+              text: literalText,
+            });
+            sources.push(sourceFromMarks('text', marks));
+            extraWidth = 0;
+            break;
+          }
+          const font = fontForInlineText(density, variant, marks);
+          const textWidth = measureNaturalWidth(prepareWithSegments(logicalText, font));
+          items.push({
+            break: 'never',
+            extraWidth: math.metrics.naturalWidth - textWidth + extraWidth,
+            font,
+            text: logicalText,
+          });
+          sources.push({
+            emphasis: marks.emphasis,
+            href: marks.linkHref,
+            kind: 'math',
+            math,
+            strong: marks.strong,
+          });
+          extraWidth = 0;
+          break;
+        }
         case 'link':
           extraWidth = walk(child.children, { ...marks, linkHref: child.href }, extraWidth);
           break;
@@ -1234,6 +1521,19 @@ function fontSizeForVariant(density: MarkdownDensity, variant: InlineVariant, fa
   }
 }
 
+function lineHeightForVariant(density: MarkdownDensity, variant: InlineVariant) {
+  switch (variant) {
+    case 'heading1':
+      return markdownMetrics.heading[density][1].lineHeight;
+    case 'heading2':
+      return markdownMetrics.heading[density][2].lineHeight;
+    case 'heading3':
+      return markdownMetrics.heading[density][3].lineHeight;
+    case 'body':
+      return markdownMetrics.paragraph.lineHeight[density];
+  }
+}
+
 function headingVariant(depth: 1 | 2 | 3): InlineVariant {
   switch (depth) {
     case 1:
@@ -1247,21 +1547,78 @@ function headingVariant(depth: 1 | 2 | 3): InlineVariant {
 
 function markdownParseOptions(options: MarkdownRenderOptions = {}): MarkdownParseOptions {
   return {
+    cacheScope: options.cacheScope ?? completeMarkdownCacheScope,
+    mathTokens: new Map(),
     richFileLinks: options.richFileLinks ?? true,
   };
 }
 
 function parseMarkdownBlocks(markdown: string, options: MarkdownParseOptions): RawMarkdownBlock[] {
-  const key = `${options.richFileLinks ? 'richFiles' : 'plainFiles'}\0${markdown}`;
-  const cached = rawDocumentCache.get(key);
+  const key = [
+    options.richFileLinks ? 'richFiles' : 'plainFiles',
+    options.cacheScope.kind,
+    markdown,
+  ].join('\0');
+  const cached = readScopedCache(
+    rawDocumentCache,
+    streamingRawDocumentCache,
+    options.cacheScope,
+    key,
+  );
   if (cached) return cached;
-  const blocks = rootContentToRawBlocks(fromMarkdown(markdown, {
+  const sourceTree = parseMarkdownTree(markdown);
+  const mathMask = maskMarkdownMath(markdown, {
+    protectedRanges: markdownAstProtectedRanges(sourceTree),
+    streaming: options.cacheScope.kind === 'streaming',
+  });
+  const parseOptions: MarkdownParseOptions = {
+    ...options,
+    mathTokens: mathMask.tokenByMarker,
+  };
+  const parsedTree = mathMask.masked === markdown
+    ? sourceTree
+    : parseMarkdownTree(mathMask.masked);
+  const blocks = rootContentToRawBlocks(parsedTree.children, parseOptions);
+  assignNarrationIds(blocks, '');
+  writeScopedCache(
+    rawDocumentCache,
+    streamingRawDocumentCache,
+    options.cacheScope,
+    key,
+    blocks,
+    maxRawDocumentCacheEntries,
+  );
+  return blocks;
+}
+
+function parseMarkdownTree(markdown: string) {
+  return fromMarkdown(markdown, {
     extensions: [gfmTable()],
     mdastExtensions: [gfmTableFromMarkdown()],
-  }).children, options);
-  assignNarrationIds(blocks, '');
-  remember(rawDocumentCache, key, blocks, maxRawDocumentCacheEntries);
-  return blocks;
+  });
+}
+
+function markdownAstProtectedRanges(root: ReturnType<typeof parseMarkdownTree>) {
+  const ranges: MarkdownSourceRange[] = [];
+  const visit = (node: {
+    children?: unknown;
+    position?: { end?: { offset?: number }; start?: { offset?: number } };
+    type?: string;
+  }) => {
+    if (node.type === 'code' || node.type === 'inlineCode' || node.type === 'html') {
+      const start = node.position?.start?.offset;
+      const end = node.position?.end?.offset;
+      if (start !== undefined && end !== undefined && end > start) {
+        ranges.push({ end, start });
+      }
+    }
+    if (!Array.isArray(node.children)) return;
+    for (const child of node.children) {
+      if (child && typeof child === 'object') visit(child);
+    }
+  };
+  visit(root);
+  return ranges;
 }
 
 function assignNarrationIds(blocks: RawMarkdownBlock[], parentPath: string) {
@@ -1327,6 +1684,10 @@ function narrationSourceForBlock(
       text = stripSingleTrailingNewline(block.text);
       kind = block.language === 'mermaid' ? 'diagram' : 'code';
       break;
+    case 'mathDisplay':
+      text = block.math.tex;
+      kind = 'code';
+      break;
     case 'table':
       text = block.rows
         .map((row) => row.cells.map((cell) => narrationInlineText(cell.lines)).join(' | '))
@@ -1352,6 +1713,9 @@ function narrationInlineText(lines: MarkdownInline[][]) {
         case 'text':
         case 'code':
           text += inline.text;
+          break;
+        case 'math':
+          text += inline.math.tex;
           break;
         case 'fileLink':
           text += inline.file.displayName;
@@ -1415,13 +1779,7 @@ function isBlockContent(node: RootContent | BlockContent | DefinitionContent): n
 function blockContentToRawBlock(node: BlockContent, options: MarkdownParseOptions): RawMarkdownBlock[] {
   switch (node.type) {
     case 'paragraph':
-      return [
-        {
-          lines: phrasingToInlineLines(node.children, options),
-          narrationId: '',
-          type: 'paragraph',
-        },
-      ];
+      return paragraphContentToRawBlocks(node.children, options);
     case 'heading':
       return [
         {
@@ -1487,6 +1845,46 @@ function blockContentToRawBlock(node: BlockContent, options: MarkdownParseOption
   }
 }
 
+function paragraphContentToRawBlocks(
+  nodes: readonly PhrasingContent[],
+  options: MarkdownParseOptions,
+): RawMarkdownBlock[] {
+  const blocks: RawMarkdownBlock[] = [];
+  let pending: PhrasingContent[] = [];
+  const flushParagraph = () => {
+    if (pending.length === 0) return;
+    const lines = phrasingToInlineLines(pending, options);
+    if (lines.some((line) => line.length > 0)) {
+      blocks.push({ lines, narrationId: '', type: 'paragraph' });
+    }
+    pending = [];
+  };
+
+  for (const node of nodes) {
+    if (node.type !== 'text') {
+      pending.push(node);
+      continue;
+    }
+    for (const part of splitMarkdownMathMarkers(node.value, options.mathTokens)) {
+      if (part.type === 'token' && part.token.kind === 'display') {
+        flushParagraph();
+        blocks.push({
+          math: part.token.source,
+          narrationId: '',
+          type: 'mathDisplay',
+        });
+        continue;
+      }
+      const value = part.type === 'text' ? part.text : part.raw;
+      if (value) {
+        pending.push({ type: 'text', value } as PhrasingContent);
+      }
+    }
+  }
+  flushParagraph();
+  return blocks;
+}
+
 function textToParagraphBlocks(text: string): RawMarkdownBlock[] {
   return text.trim()
     ? [
@@ -1501,11 +1899,13 @@ function textToParagraphBlocks(text: string): RawMarkdownBlock[] {
 
 function phrasingToInlineLines(
   nodes: readonly PhrasingContent[],
-  options: MarkdownRenderOptions & { autolink?: boolean } = {},
+  options: MarkdownParseOptions & { autolink?: boolean },
 ): MarkdownInline[][] {
   const lines: MarkdownInline[][] = [[]];
   const inlineOptions: MarkdownInlineParseOptions = {
     autolink: options.autolink ?? true,
+    cacheScope: options.cacheScope,
+    mathTokens: options.mathTokens,
     richFileLinks: options.richFileLinks ?? true,
   };
 
@@ -1519,7 +1919,18 @@ function phrasingToInlineLines(
 function appendPhrasingNode(lines: MarkdownInline[][], node: PhrasingContent, options: MarkdownInlineParseOptions) {
   switch (node.type) {
     case 'text':
-      appendInlineText(lines, node.value, options.autolink);
+      for (const part of splitMarkdownMathMarkers(node.value, options.mathTokens)) {
+        if (part.type === 'text') {
+          appendInlineText(lines, part.text, options.autolink);
+        } else if (part.token.kind === 'inline') {
+          appendInline(lines, { math: part.token.source, type: 'math' });
+        } else {
+          const literal = part.token.kind === 'literal'
+            ? part.token.originalSource
+            : part.token.source.originalSource;
+          appendInlineText(lines, literal, options.autolink);
+        }
+      }
       return;
     case 'inlineCode':
       appendInline(lines, {
@@ -1545,7 +1956,7 @@ function appendPhrasingNode(lines: MarkdownInline[][], node: PhrasingContent, op
     case 'link': {
       const href = sanitizeHref(node.url);
       if (href) {
-        const label = phrasingNodesText(node.children);
+        const label = phrasingNodesText(node.children, options.mathTokens);
         const file =
           mentionLinkFromHref(href, label) ??
           (options.richFileLinks ? fileLinkFromHref(href, label) : null);
@@ -1827,8 +2238,19 @@ function markdownTextFromNode(node: unknown): string {
   return '';
 }
 
-function phrasingNodesText(nodes: readonly PhrasingContent[]) {
-  return nodes.map((node) => markdownTextFromNode(node)).join('');
+function phrasingNodesText(
+  nodes: readonly PhrasingContent[],
+  mathTokens: ReadonlyMap<string, MarkdownMathToken>,
+) {
+  return nodes.map((node) => {
+    const text = markdownTextFromNode(node);
+    return splitMarkdownMathMarkers(text, mathTokens).map((part) => {
+      if (part.type === 'text') return part.text;
+      return part.token.kind === 'literal'
+        ? part.token.originalSource
+        : part.token.source.originalSource;
+    }).join('');
+  }).join('');
 }
 
 function mergeAdjacentText(nodes: MarkdownInline[]) {
@@ -1859,4 +2281,39 @@ function remember<K, V>(cache: Map<K, V>, key: K, value: V, maxEntries: number) 
   }
 
   cache.set(key, value);
+}
+
+function readScopedCache<V>(
+  durable: Map<string, V>,
+  streaming: Map<string, { key: string; value: V }>,
+  scope: MarkdownCacheScope,
+  key: string,
+) {
+  if (scope.kind === 'complete') return durable.get(key);
+  const entry = streaming.get(scope.key);
+  if (!entry || entry.key !== key) return undefined;
+  streaming.delete(scope.key);
+  streaming.set(scope.key, entry);
+  return entry.value;
+}
+
+function writeScopedCache<V>(
+  durable: Map<string, V>,
+  streaming: Map<string, { key: string; value: V }>,
+  scope: MarkdownCacheScope,
+  key: string,
+  value: V,
+  maximum: number,
+) {
+  if (scope.kind === 'complete') {
+    remember(durable, key, value, maximum);
+    return;
+  }
+  streaming.delete(scope.key);
+  streaming.set(scope.key, { key, value });
+  while (streaming.size > maxStreamingCacheScopes) {
+    const oldest = streaming.keys().next().value as string | undefined;
+    if (oldest === undefined) return;
+    streaming.delete(oldest);
+  }
 }

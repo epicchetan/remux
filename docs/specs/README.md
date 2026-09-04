@@ -22,8 +22,15 @@ Last verified: YYYY-MM-DD
 Canonical code: ...
 ```
 
-The active Agent context implementation contract is
-[agent-explicit-turn-context-v1.md](agent-explicit-turn-context-v1.md).
+The active Agent provider/runtime contract is
+[agent-native-provider-runtime-v1.md](agent-native-provider-runtime-v1.md).
+Its ordered turn, journal, recovery, and child-rediscovery amendment is
+[agent-canonical-turn-journal-v2.md](agent-canonical-turn-journal-v2.md).
+Its composer, usage, and native Compact amendment is
+[agent-composer-control-plane-v2.md](agent-composer-control-plane-v2.md).
+Its conversation identity, edit/fork lineage, native branch, and sidebar-tree
+amendment is
+[agent-conversation-lineage-and-sidebar-tree-v1.md](agent-conversation-lineage-and-sidebar-tree-v1.md).
 
 ## Codex Specs
 
@@ -31,6 +38,7 @@ The active Agent context implementation contract is
 | --- | --- | --- |
 | [codex/assistant-narration.md](codex/assistant-narration.md) | Archived | Initial behavior and UI rationale; provider, RPC, cache, and readiness details are superseded by the implemented Narrate v5 spec. |
 | [codex/assistant-narration-planning-optimization.md](codex/assistant-narration-planning-optimization.md) | Archived | Historical v3 planning and highlighting rationale, superseded by the server-owned-group v5 replacement spec. |
+| [codex/assistant-math-rendering.md](codex/assistant-math-rendering.md) | Active Spec | Implementation and automated desktop/mobile validation landed; physical-phone validation remains. Covers display/inline KaTeX, Markdown-aware delimiters, snapshot-safe streaming, responsive safe display wrapping, exact measured geometry, literal fallback, narration, bounded caches, and t3code-informed mutable-tail discipline. |
 | [codex/narration-onnx-synthesis.md](codex/narration-onnx-synthesis.md) | Archived | Historical finite-task and native Kokoro rationale, superseded by task-v6 streaming in the Narrate v5 spec. |
 | [codex/thread-operation-queue.md](codex/thread-operation-queue.md) | Implemented | Hidden-when-empty process-memory queue for pending messages and compactions, with direct idle dispatch, steering, delete, and cancel-on-interrupt semantics. |
 | [codex/server-authoritative-transcript-windows.md](codex/server-authoritative-transcript-windows.md) | Active Spec | Version 2 implementation landed: self-contained turn frames, grouped work/detail disclosure, incremental rollout indexing, native lifecycle resume, window sliding, safe-area ownership, and Version 1 compatibility. Physical iOS validation and the observation-release cleanup remain. |
@@ -70,24 +78,29 @@ The active Agent context implementation contract is
 
 | Spec | Status | Notes |
 | --- | --- | --- |
-| [agent-runtime-and-epoch-context.md](agent-runtime-and-epoch-context.md) | Archived | Original single-provider harness and phased epoch plan. Provider/auth/UI foundations remain useful rationale; current context behavior is governed by `agent-explicit-turn-context-v1.md`. |
+| [multi-provider-agent-workspace-extension.md](multi-provider-agent-workspace-extension.md) | Archived prototype | Historical full-capsule T3 Code integration. Its provider analysis, gateway, and mobile findings remain evidence; its source and extension were removed when Agent became the product path. |
+| [agent-native-provider-runtime-v1.md](agent-native-provider-runtime-v1.md) | Active Spec — implementation landed; live/phone acceptance pending | Canonical Agent replacement: native Codex/Claude harness adapters, light durable coordinator, server-authoritative virtualized UI, chat-only interaction, native same-provider subagents, and scoped MCP cross-provider federation. |
+| [agent-canonical-turn-journal-v2.md](agent-canonical-turn-journal-v2.md) | Active Spec — implementation landed; physical-phone acceptance pending | Ordered provider-neutral turns and assistant passes, native reasoning boundaries, lazy exact-diff artifacts, stable block identity, scope-correct usage/compaction/child events, restart-safe reconciliation, legacy migration, and bounded federated-child rediscovery. |
+| [agent-composer-control-plane-v2.md](agent-composer-control-plane-v2.md) | Active Spec — implementation pending | Composer-only amendment: provider-scoped selection, server-side preferences, fail-closed capability gating, normalized context/plan usage, and provider-native Compact. Transcript and final meter presentation are deferred. |
+| [agent-conversation-lineage-and-sidebar-tree-v1.md](agent-conversation-lineage-and-sidebar-tree-v1.md) | Active Spec — implementation landed; live provider/physical-phone acceptance pending | Stable chats with immutable edit strands, explicit-fork child conversations, native Codex/Claude context branching, deterministic strand paths, historical transcript reads, and a virtualized mobile-safe sidebar tree. |
+| [agent-runtime-and-epoch-context.md](agent-runtime-and-epoch-context.md) | Archived | Original single-provider harness and phased epoch plan. Provider/auth/UI foundations remain historical rationale; current provider/runtime behavior is governed by `agent-native-provider-runtime-v1.md`. |
 | [agent-durable-epoch-core.md](agent-durable-epoch-core.md) | Archived | Historical durable-journal, shadow-compiler, and rollover plan. The journal survived; epoch and shadow-context semantics did not. |
-| [agent-turns-and-work-units.md](agent-turns-and-work-units.md) | Active Spec | Empirically grounded refinement separating the user-visible turn from internal context lifetimes: schema v1 gives every direct turn a root execution scope and reserves optional child work scopes for bounded tool traces, resumable execution, evidence-backed handoffs, and local epochs while the parent retains intent, steering, permissions, and integration. Child execution remains inactive. |
+| [agent-turns-and-work-units.md](agent-turns-and-work-units.md) | Archived | Historical custom work-unit design, superseded by provider-native children and MCP-federated cross-provider executions. |
 | [agent-background-working-memory-v1.md](agent-background-working-memory-v1.md) | R&D evidence | Historical background working-memory experiment; not part of the current runtime. |
 | [agent-bounded-work-units-v2.md](agent-bounded-work-units-v2.md) | Implemented experiment | Foreground-authored bounded child scopes, exact range evidence, early checkpoint budgets, and E0 results: context pressure fell sharply without compaction, but runtime/quality missed Codex and sticky whole-file state polluted the handoff layer, so it is not the default. |
 | [agent-thread-runtime-v1.md](agent-thread-runtime-v1.md) | Archived | Historical versioned-Thread and turn-capsule checkpoint. |
 | [agent-thread-runtime-v2.md](agent-thread-runtime-v2.md) | Archived | Historical exact-dialogue/living-Thread checkpoint, superseded by explicit per-turn context. |
 | [agent-living-thread-canvas-v1.md](agent-living-thread-canvas-v1.md) | Archived | Historical model-authored Thread canvas, removed from the runtime. |
-| [agent-explicit-turn-context-v1.md](agent-explicit-turn-context-v1.md) | Implemented | Current clean architecture: user-selected off/dialogue/full prior-turn resolution, exact active scopes, fresh root provider lanes, no Thread state, and no harness context limits or compaction. |
-| [agent-inference-trace-and-resilient-streaming.md](agent-inference-trace-and-resilient-streaming.md) | Active Spec | Decision-complete recursive inference/work-unit trace and viewer reliability plan: semantic provider summaries, tool calls grouped by source inference, server-authoritative scope resources, pre-React invalidation subscription, background/cold-reopen recovery, restart fencing, notification seam, and real lifecycle smoke gates. |
+| [agent-explicit-turn-context-v1.md](agent-explicit-turn-context-v1.md) | Archived | Historical Pi provider-lane and explicit context compiler, to be deleted at native Codex cutover. |
+| [agent-inference-trace-and-resilient-streaming.md](agent-inference-trace-and-resilient-streaming.md) | Archived | Historical custom inference/work-unit runtime. Its server-authoritative transcript and mobile recovery evidence is retained by the native-provider spec. |
 | [agent-ledger-benchmark-corpus.md](agent-ledger-benchmark-corpus.md) | R&D evidence + Adaptive v2 | Detailed Ledger/Remux transcript corpus plus sanitized production-path fixtures, the adaptive owner-driven controller, frozen reference validation, and measured Codex/Agent runs. |
-| [agent-ui-parity-and-phased-delivery.md](agent-ui-parity-and-phased-delivery.md) | Active Spec | Normative alignment for continuously porting the stable Codex UI into Agent, activating behavior only with Agent-owned server semantics, preserving owner review at each checkpoint, excluding narration/App Server-only features, and cutting over without a late bulk parity phase. |
-| [agent-phase-1a0-ui-port-scope.md](agent-phase-1a0-ui-port-scope.md) | Active Spec | Owner-approval contract for the first implementation checkpoint: exact Codex-to-Agent source/test closure, in-memory Agent turn-frame protocol, narration/exclusion removal audit, phased port sequence, and desktop/phone side-by-side acceptance. No durable journal or later Agent capability is authorized. |
-| [agent-phase-1a0-implementation-report.md](agent-phase-1a0-implementation-report.md) | Active Spec | Phase 1A.0 source/deviation/test record. Implementation, automated hardening, live desktop/physical-phone comparison, and explicit owner acceptance are complete. |
-| [agent-phase-1a1-durable-history-scope.md](agent-phase-1a1-durable-history-scope.md) | Active Spec | Implementation, automated closeout, and owner acceptance are complete: rebooted schema-v1 project/turn/execution-scope identity, SQLite journal/artifact foundation, deterministic replay, idempotent conversation creation/send, restart recovery, full-replay Pi hydration and budget guard, plus Agent-owned desktop/mobile conversation history. No child execution, epoch compilation, new coding effects, or later interaction features. |
-| [agent-phase-1a1-implementation-report.md](agent-phase-1a1-implementation-report.md) | Active Spec | Phase 1A.1 source, adaptation, test, and live-replay record. Implementation, automated closeout, and explicit owner desktop/physical-phone acceptance are complete. |
-| [agent-phase-1a2-transcript-hardening-scope.md](agent-phase-1a2-transcript-hardening-scope.md) | Active Spec | Phase 1A.2a–1A.2d implementation, automated closeout, clean-state live validation, and owner desktop/phone acceptance are complete. Protocol/revision fencing, bounded projection, exact oversized retrieval, lifecycle recovery, terminal fidelity, fault/scale gates, and full-replay provider behavior are recorded here. |
-| [agent-phase-1a2-implementation-report.md](agent-phase-1a2-implementation-report.md) | Active Spec | Phase 1A.2 source/version record, adaptations, fault and scale evidence, performance measurements, real-subscription replay, clean-state restart validation, and explicit owner acceptance. |
+| [agent-ui-parity-and-phased-delivery.md](agent-ui-parity-and-phased-delivery.md) | Archived | Historical UI port plan. The current viewer/virtualizer remains the retained foundation under the native-provider runtime spec. |
+| [agent-phase-1a0-ui-port-scope.md](agent-phase-1a0-ui-port-scope.md) | Archived | Historical UI-port checkpoint; accepted viewer behavior is retained by the native-provider runtime. |
+| [agent-phase-1a0-implementation-report.md](agent-phase-1a0-implementation-report.md) | Archived | Historical Phase 1A.0 source/deviation/test and owner-acceptance record. |
+| [agent-phase-1a1-durable-history-scope.md](agent-phase-1a1-durable-history-scope.md) | Archived | Historical Pi-era durable conversation scope; journal, artifact, idempotency, and recovery findings inform the replacement. |
+| [agent-phase-1a1-implementation-report.md](agent-phase-1a1-implementation-report.md) | Archived | Historical Phase 1A.1 durability and owner-acceptance record. |
+| [agent-phase-1a2-transcript-hardening-scope.md](agent-phase-1a2-transcript-hardening-scope.md) | Archived | Historical transcript-hardening scope; bounded resources, scale, lifecycle, and fault findings are retained. |
+| [agent-phase-1a2-implementation-report.md](agent-phase-1a2-implementation-report.md) | Archived | Historical Phase 1A.2 transcript, scale, lifecycle, and performance record. |
 | [viewer-kit.md](viewer-kit.md) | Active Spec | `@remux/viewer-kit` SDK Phase 1: host bridge, bootstrap, UI primitives, and the shared design-token contract. Satellites migrated; lifecycle deferred. |
 | [viewer-kit-phase-2.md](viewer-kit-phase-2.md) | Active Spec | Phase 2 frame depth: dual-substrate theme system, codex color onboarding, and the component library. Chat primitives + lifecycle out of scope. |
 | [viewer-kit-phase-3.md](viewer-kit-phase-3.md) | Active Spec | Theme-readiness & ownership: classify every theme-sensitive color as kit role / viewer extension / engine palette and tokenize the dark side. Substrate-neutral; Tailwind convergence is an optional Phase 4. Prerequisite for light mode. |

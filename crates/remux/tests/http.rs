@@ -39,11 +39,13 @@ fn fixture_extension(root: &std::path::Path) -> ExtensionManifest {
             title: "Codex Mobile".to_string(),
         },
         server: None,
+        gateway: None,
         views: vec![(
             "main".to_string(),
             View {
                 cache: ViewCachePolicy::Immutable,
                 entry: dist.join("index.html"),
+                host_chrome: Default::default(),
                 route: "/viewers/codex".to_string(),
                 build: None,
                 watch: None,
@@ -80,6 +82,9 @@ async fn serve_fixture(root: &std::path::Path) -> (SocketAddr, String) {
     let viewer_bundles = ViewerBundleRegistry::new(root, &[extension.clone()], journal);
     viewer_bundles.publish_all().await;
     let revision = viewer_bundles.current("codex", "main").unwrap().revision;
+    let extension_gateways =
+        remux::http::extension_gateways::ExtensionGatewayRegistry::new(root, &[extension.clone()])
+            .unwrap();
     let state = Arc::new(HttpState {
         viewer_providers: ViewerProvider::for_extension(&extension, viewer_bundles.clone()),
         viewer_bundles,
@@ -87,6 +92,7 @@ async fn serve_fixture(root: &std::path::Path) -> (SocketAddr, String) {
         extensions: vec![extension],
         invalid_extensions: Vec::new(),
         media_root: root.join(".remux/cache/media"),
+        extension_gateways,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -246,6 +252,7 @@ async fn serves_health_catalog_redirect_icons_viewers_and_404() {
                     "views": {
                         "main": {
                             "entryUrl": format!("/viewers/codex/_bundle/{revision}/"),
+                            "hostChrome": "none",
                             "revision": revision.clone(),
                             "route": "/viewers/codex",
                         }

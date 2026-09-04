@@ -1,6 +1,9 @@
-Status: Implemented (automated acceptance complete; physical-phone acceptance pending)
+Status: Archived
 Last verified: 2026-08-16
 Canonical code: `extensions/agent/{server,shared,viewer}/`, with the stable lifecycle and transcript comparison in `extensions/codex/{server,shared,viewer}/`
+Superseded by: `agent-native-provider-runtime-v1.md`. Its transcript and mobile
+recovery findings are retained by the replacement; its custom inference/work-unit
+runtime is not.
 
 # Agent inference traces and resilient viewer streaming
 

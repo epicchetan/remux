@@ -1,13 +1,8 @@
 import { useState, type ReactNode } from 'react';
-import { ChevronDown, ChevronUp, Play, Trash2 } from 'lucide-react';
-import { rpc } from '@remux/viewer-kit';
+import { ChevronDown, ChevronUp, Trash2 } from 'lucide-react';
 
-import {
-  AGENT_METHODS,
-  type AgentPendingQueueEntry,
-  type AgentPendingQueueValue,
-  type MessageQueueMutationResult,
-} from '../../../../shared/protocol.ts';
+import type { AgentPendingQueueEntry, AgentPendingQueueValue } from '../../../../shared/protocol.ts';
+import { agentCommands } from '../../ipc/agentCommands.ts';
 
 export function OperationQueueTray({ onChanged, queue }: {
   onChanged: () => Promise<void>;
@@ -17,13 +12,10 @@ export function OperationQueueTray({ onChanged, queue }: {
   const [pendingId, setPendingId] = useState<string | null>(null);
   if (!queue || queue.entries.length === 0) return null;
 
-  const mutate = async (method: string, operationId: string) => {
-    setPendingId(operationId);
+  const remove = async (turnId: string) => {
+    setPendingId(turnId);
     try {
-      await rpc.command<MessageQueueMutationResult>(method, {
-        conversationId: queue.conversationId,
-        operationId,
-      });
+      await agentCommands.removeQueued(queue.conversationId, turnId);
       await onChanged();
     } finally {
       setPendingId(null);
@@ -53,11 +45,8 @@ export function OperationQueueTray({ onChanged, queue }: {
                 <span className="remux-operation-queue-row-title">{entryLabel(entry)}</span>
               </span>
               <span className="remux-operation-queue-row-actions">
-                <QueueIconButton disabled={pendingId === entry.id} label="Send now" onClick={() => {
-                  void mutate(AGENT_METHODS.messageQueueRunNow, entry.id);
-                }}><Play className="size-3.5" /></QueueIconButton>
                 <QueueIconButton disabled={pendingId === entry.id} label="Delete queued entry" onClick={() => {
-                  void mutate(AGENT_METHODS.messageQueueRemove, entry.id);
+                  void remove(entry.id);
                 }}><Trash2 className="size-3.5" /></QueueIconButton>
               </span>
             </div>

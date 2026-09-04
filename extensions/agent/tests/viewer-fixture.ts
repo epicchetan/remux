@@ -14,7 +14,10 @@ export async function installAgentHost(page: Page) {
     type Resource = { revision: number; value: any };
     type Turn = {
       id: string;
-      status: 'inProgress' | 'completed' | 'failed' | 'interrupted';
+      pathEntryId?: string;
+      strandId?: string;
+      ordinal?: number;
+      status: 'queued' | 'inProgress' | 'completed' | 'failed' | 'interrupted';
       startedAt: number;
       completedAt: number | null;
       durationMs: number | null;
@@ -25,44 +28,46 @@ export async function installAgentHost(page: Page) {
     };
 
     const conversationId = '11111111-1111-4111-8111-111111111111';
+    const providerInstanceId = 'fixture-local';
+    const capabilityRevision = 'fixture-capabilities-v1';
     const conversationKey = `conversation:${conversationId}`;
-    const contextKey = `context:${conversationId}`;
     let generation = 'fixture-generation';
     const route = new URL(window.location.href).searchParams;
     const signedOut = route.get('fixtureSignedOut') === '1';
+    const resourceReadFailure = route.get('fixtureResourceFailure') === '1';
     const routedConversation = route.get('remuxResourceKind') === 'agentConversation'
       && route.get('remuxResourceId') === conversationId;
     const longTranscript = route.get('fixtureLong') === '1';
     const markdownTranscript = route.get('fixtureMarkdown') === '1';
     const overflowTranscript = route.get('fixtureOverflow') === '1';
     const exactTranscript = route.get('fixtureExact') === '1';
-    const legacyInferenceTrace = route.get('fixtureLegacyInferenceTrace') === '1';
-    const staleContextInspector = route.get('fixtureStaleContextInspector') === '1';
     const contextTurns = route.get('fixtureContextTurns') === '1';
+    const diffTranscript = route.get('fixtureDiff') === '1';
+    const runningTranscript = route.get('fixtureRunning') === '1';
+    const compactionTranscript = route.get('fixtureCompaction') === '1';
+    let historyState: 'failed' | 'ready' = route.get('fixtureHistoryFailed') === '1'
+      ? 'failed'
+      : 'ready';
+    const persistedNativeConfig = JSON.parse(
+      window.sessionStorage.getItem('remux.agent.fixture.native-config') ?? 'null',
+    ) as { modelId?: string; reasoning?: string } | null;
+    let nativeModelId = persistedNativeConfig?.modelId ?? 'gpt-5.6-sol';
+    let nativeReasoning = persistedNativeConfig?.reasoning ?? 'high';
+    let preferenceRevision = 'fixture-preference-v1';
+    let usageObservedAt = 1_700_000_000_000;
+    let contextUsedTokens = 36_000;
+    let fiveHourUsagePercent = 18;
+    let weeklyUsagePercent = 42;
     const exactArtifactHash = 'a'.repeat(64);
     const pickedImageHash = 'b'.repeat(64);
+    const diffArtifactHash = 'c'.repeat(64);
     const pickedImageDataUrl = 'data:image/png;base64,iVBORw0KGgo=';
     const pickedImageBytes = Uint8Array.from(atob(pickedImageDataUrl.split(',')[1]!), (value) => value.charCodeAt(0));
     const exactPreview = 'Exact preview. ';
     const exactFullText = `${exactPreview}The remaining response is fetched only when requested.`;
-    const contextManifestHash = 'e'.repeat(64);
-    const contextDispatchHash = 'f'.repeat(64);
-    const contextManifestText = JSON.stringify({
-      version: 'agent-inference-context-v7',
-      context: {
-        requestedPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
-        resolvedTurns: [{ turnId: 'fixture-turn', resolution: 'dialogue', origin: 'automatic' }],
-      },
-    }, null, 2);
-    const contextDispatchText = JSON.stringify({
-      input: [{ role: 'user', content: 'Fixture provider input' }],
-      model: 'gpt-5.4-fixture',
-      tools: [{ name: 'workspace_read' }],
-    }, null, 2);
     const artifactTexts = new Map([
       [exactArtifactHash, exactFullText],
-      [contextManifestHash, contextManifestText],
-      [contextDispatchHash, contextDispatchText],
+      [diffArtifactHash, '--- a/src/index.ts\n+++ b/src/index.ts\n@@ -0,0 +1 @@\n+export const value = 1;\n'],
     ]);
     const artifactBytes = new Map([[pickedImageHash, {
       bytes: pickedImageBytes,
@@ -91,6 +96,14 @@ export async function installAgentHost(page: Page) {
     ]);
     const turns: Turn[] = [];
     const turnsByConversation = new Map<string, Turn[]>([[conversationId, turns]]);
+    const versionsByConversation = new Map<string, Array<{
+      strandId: string;
+      reason: 'initial' | 'edit' | 'fork' | 'restore';
+      sourceStrandId: string | null;
+      sourcePathEntryId: string | null;
+      turns: Turn[];
+      createdAt: number;
+    }>>();
     const pendingQueue: Array<{
       clientMessageId: string;
       modelId: string;
@@ -104,7 +117,9 @@ export async function installAgentHost(page: Page) {
     let sequence = 1;
     let turnCounter = 0;
     let lifecycleEpoch = 1;
+    let invalidationsDropped = false;
     let nextTranscriptDelayMs = 0;
+    let transcriptFailuresRemaining = 0;
     let nextMessageError: string | null = null;
     let viewportMetrics = {
       keyboardHeight: 0,
@@ -121,24 +136,54 @@ export async function installAgentHost(page: Page) {
         value: conversationSummary('/tmp/remux-fixture', 'idle'),
       });
       resources.set('runtime', { revision: 2, value: runtimeValue('idle') });
-      const context: any = contextValue('append');
-      if (staleContextInspector) {
-        context.version = 6;
-        delete context.compaction;
-      }
-      resources.set(contextKey, { revision: 1, value: context });
-      if (longTranscript) {
+      if (runningTranscript) {
+        const running = createRunningTurn(
+          'Resume this running turn',
+          'fixture-running-client-message',
+        );
+        const storedStartedAt = Number(
+          window.sessionStorage.getItem('remux.agent.fixture.running-started-at'),
+        );
+        running.startedAt = Number.isFinite(storedStartedAt) && storedStartedAt > 0
+          ? storedStartedAt
+          : Date.now() - 3_000;
+        window.sessionStorage.setItem(
+          'remux.agent.fixture.running-started-at',
+          String(running.startedAt),
+        );
+        const summary = resources.get(conversationKey)!.value;
+        summary.status = 'running';
+        summary.latestTurnId = running.id;
+        summary.updatedAt = Date.now();
+        const runtime = runtimeValue('running');
+        runtime.activeTurnId = running.id;
+        resources.set('runtime', { revision: 3, value: runtime });
+      } else if (longTranscript) {
         for (let index = 1; index <= 72; index += 1) {
           turns.push(completedTurn(`turn-${index}`, `Historical request ${index}`, `Historical answer ${index}.`));
         }
         sequence = 72;
         turnCounter = 72;
       } else if (contextTurns) {
-        for (let index = 1; index <= 4; index += 1) {
+        for (let index = 1; index <= 7; index += 1) {
           turns.push(completedTurn(`turn-${index}`, `Context request ${index}`, `Context answer ${index}.`));
         }
-        sequence = 4;
-        turnCounter = 4;
+        sequence = 7;
+        turnCounter = 7;
+      } else if (compactionTranscript) {
+        const compacted = completedTurn(
+          'compaction-turn',
+          'Continue after the manual boundary.',
+          'Context restored.',
+        );
+        compacted.segments = [{
+          id: 'compaction:before', type: 'compaction', revision: 'before:completed',
+          status: 'compacted', trigger: 'manual', beforeTokens: 82_000, afterTokens: 9_000,
+        }, ...compacted.segments, {
+          id: 'compaction:after', type: 'compaction', revision: 'after:started',
+          status: 'compacting', trigger: 'automatic', beforeTokens: 96_000, afterTokens: null,
+        }];
+        turns.push(compacted);
       } else if (exactTranscript) {
         const exact = completedTurn('exact-turn', 'Show the bounded response', exactPreview);
         const assistant = exact.segments.find((segment) => segment.type === 'assistantMessage');
@@ -214,11 +259,22 @@ export async function installAgentHost(page: Page) {
         title: 'Resume this conversation',
         preview: 'Recovered from authoritative resources.',
         cwd,
-        modelId: 'gpt-5.4-fixture',
-        reasoning: 'high',
+        modelId: nativeModelId,
+        reasoning: nativeReasoning,
+        access: 'workspace-write',
         status,
         latestTurnId: targetTurns.at(-1)?.id ?? null,
+        parentConversationId: null,
+        rootConversationId: id,
+        forkedFromPathEntryId: null,
+        activeStrandId: `fixture-strand:${id}:initial`,
+        headRevision: 1,
+        versionCount: 1,
+        childCount: 0,
+        archivedAt: null,
+        metadataRevision: 1,
         createdAt: 1_700_000_000_000,
+        subtreeUpdatedAt: Date.now(),
         updatedAt: Date.now(),
       };
     }
@@ -227,90 +283,9 @@ export async function installAgentHost(page: Page) {
       return {
         conversationId: state === 'unloaded' ? null : conversationId,
         state,
-        activeTurnId: null,
+        activeTurnId: null as string | null,
         activeTurnElapsedMs: null,
         error: null,
-        contextProbe: {
-          hookVersion: 'agent-durable-v1', modelCallCount: routedConversation ? 1 : 0,
-          messageCount: routedConversation ? 2 : 0,
-          messageHash: routedConversation ? 'fixture-hash' : null,
-          orderedMessageHashes: routedConversation ? ['one', 'two'] : [],
-          estimatedBytes: routedConversation ? 256 : 0,
-          provider: 'openai-codex', modelId: 'gpt-5.4-fixture',
-          providerRequestMode: routedConversation ? 'continuation' : 'none',
-        },
-      };
-    }
-
-    function contextValue(_decision: 'append' | 'roll') {
-      return {
-        version: 7,
-        conversationId,
-        inferenceId: 'fixture-inference',
-        frameId: 'fixture-frame',
-        basisSequence: sequence,
-        compilerVersion: 'agent-turn-context-v1',
-        policyVersion: 'agent-explicit-selection-v1',
-        estimatedInputTokens: 3_200,
-        semanticHash: 'b'.repeat(64),
-        buildDurationMs: 2,
-        transportMode: 'continuation',
-        messageCount: 2,
-        turnCount: 1,
-        logicalHash: '8'.repeat(64),
-        renderedHash: '9'.repeat(64),
-        fixedContractsHash: '0'.repeat(64),
-        manifestArtifact: {
-          hash: contextManifestHash,
-          byteLength: new TextEncoder().encode(contextManifestText).byteLength,
-          mediaType: 'application/json',
-        },
-        dispatchArtifact: {
-          hash: contextDispatchHash,
-          byteLength: new TextEncoder().encode(contextDispatchText).byteLength,
-          mediaType: 'text/plain; charset=utf-8',
-        },
-        groups: [{
-          turnId: 'fixture-turn',
-          source: 'agent://conversation/fixture/turn/fixture-turn',
-          messageCount: 2,
-          estimatedTokens: 310,
-          roles: { user: 1, assistant: 1, tool: 0 },
-        }],
-        groupsTruncated: false,
-        scopeKind: 'turn',
-        requestedPlan: { version: 1, automaticDialogueTurns: 2, overrides: [] },
-        selectedTurns: [{
-          turnId: 'fixture-turn',
-          resolution: 'dialogue',
-          origin: 'automatic',
-          messageCount: 2,
-          estimatedTokens: 310,
-        }],
-        layers: ['selected_dialogue', 'selected_full_turns', 'active_scope']
-          .map((kind, index) => ({
-            kind,
-            hash: String(index + 1).repeat(64).slice(0, 64),
-            estimatedTokens: [100, 0, 102][index],
-            sources: [`agent://fixture/${kind}`],
-            sourceCount: 1,
-            sourcesTruncated: false,
-          })),
-        omissions: [{
-          source: 'agent://conversation/fixture/turns',
-          reason: 'not-selected',
-          retrieval: 'history://conversation/fixture',
-          count: 4,
-        }],
-        omissionsTruncated: false,
-        compaction: {
-          epoch: 0,
-          checkpointSequence: null,
-          compactedThroughSequence: null,
-          warningIssued: false,
-          modelRequested: false,
-          policyInputTokens: 3_200,
-        },
       };
     }
 
@@ -331,11 +306,55 @@ export async function installAgentHost(page: Page) {
       };
     }
 
+    function queuedTurn(id: string, clientMessageId: string, text: string, parts: any[]): Turn {
+      return {
+        id,
+        status: 'queued',
+        startedAt: Date.now(),
+        completedAt: null,
+        durationMs: null,
+        error: null,
+        renderRevision: `${id}:${sequence + 1}`,
+        layoutRevision: `${id}:${sequence + 1}`,
+        segments: [{
+          id: `${id}:user`, type: 'userMessage', clientMessageId,
+          revision: String(sequence + 1), text, parts,
+        }],
+      };
+    }
+
     function conversationSummaries() {
       return [...resources.entries()]
         .filter(([key]) => key.startsWith('conversation:'))
         .map(([, resource]) => resource.value)
         .sort((left, right) => right.updatedAt - left.updatedAt || right.id.localeCompare(left.id));
+    }
+
+    function fixturePathEntryId(targetConversationId: string, turnId: string) {
+      return `fixture-path:${targetConversationId}:${turnId}`;
+    }
+
+    function ensureConversationVersions(targetConversationId: string) {
+      const existing = versionsByConversation.get(targetConversationId);
+      if (existing) return existing;
+      const summary = resources.get(`conversation:${targetConversationId}`)?.value;
+      const initial = [{
+        strandId: String(summary?.activeStrandId ?? `fixture-strand:${targetConversationId}:initial`),
+        reason: 'initial' as const,
+        sourceStrandId: null,
+        sourcePathEntryId: null,
+        turns: structuredClone(turnsByConversation.get(targetConversationId) ?? []),
+        createdAt: Number(summary?.createdAt ?? Date.now()),
+      }];
+      versionsByConversation.set(targetConversationId, initial);
+      return initial;
+    }
+
+    function sourceTurnIndex(targetConversationId: string, sourcePathEntryId: string) {
+      const targetTurns = turnsByConversation.get(targetConversationId) ?? [];
+      return targetTurns.findIndex((turn) =>
+        fixturePathEntryId(targetConversationId, turn.id) === sourcePathEntryId ||
+        `legacy-path:${turn.id}` === sourcePathEntryId || turn.pathEntryId === sourcePathEntryId);
     }
 
     function syncConversationList() {
@@ -369,13 +388,54 @@ export async function installAgentHost(page: Page) {
     }
 
     function dispatchInvalidations(invalidations: any[]) {
+      if (invalidationsDropped) return;
+      const keys = [...new Set(invalidations.flatMap(nativeInvalidationKeys))];
+      if (keys.length === 0) return;
       dispatch({
         type: 'remux/event',
         message: {
           jsonrpc: '2.0', method: 'remux/agent/resources/invalidated',
-          params: { invalidations, serverGeneration: generation },
+          params: {
+            protocolVersion: 6,
+            serverGeneration: generation,
+            basisSequence: sequence,
+            keys,
+          },
         },
       });
+    }
+
+    function nativeInvalidationKeys(invalidation: any): string[] {
+      if (invalidation.type === 'transcript') {
+        const targetConversationId = String(invalidation.conversationId ?? conversationId);
+        return [
+          `agent/transcript:${targetConversationId}:tail-24`,
+          ...(invalidation.turnId ? [`agent/turn:${String(invalidation.turnId)}`] : []),
+        ];
+      }
+      if (invalidation.type === 'executionScope') {
+        if (!invalidation.turnId) return [];
+        const targetConversationId = String(invalidation.conversationId ?? conversationId);
+        return [
+          `agent/transcript:${targetConversationId}:tail-24`,
+          `agent/turn:${String(invalidation.turnId)}`,
+        ];
+      }
+      const key = String(invalidation.key ?? '');
+      if (key === 'auth') return ['agent/providers', `agent/models:${providerInstanceId}`];
+      if (key === 'models') return [`agent/models:${providerInstanceId}`];
+      if (key === 'conversation-list') return ['agent/conversations'];
+      if (key === 'runtime') return [`agent/runtime:${activeFixtureConversationId()}`];
+      if (key.startsWith('conversation-versions:')) {
+        return [`agent/conversation-versions:${key.slice('conversation-versions:'.length)}`];
+      }
+      if (key.startsWith('conversation:')) return [`agent/conversation:${key.slice('conversation:'.length)}`];
+      if (key.startsWith('queue:')) return [`agent/queue:${key.slice('queue:'.length)}`];
+      return [];
+    }
+
+    function activeFixtureConversationId() {
+      return String(resources.get('runtime')?.value.conversationId ?? conversationId);
     }
 
     function updateResource(key: string, mutate: (value: any) => void) {
@@ -397,9 +457,9 @@ export async function installAgentHost(page: Page) {
       }
     }
 
-    function createRunningTurn(text: string, clientMessageId: string, parts?: any[]) {
+    function createRunningTurn(text: string, clientMessageId: string, parts?: any[], queuedTurnId?: string) {
       turnCounter += 1;
-      const id = `fixture-turn-${turnCounter}`;
+      const id = queuedTurnId ?? `fixture-turn-${turnCounter}`;
       const workId = `${id}:work`;
       const scopeId = `00000000-0000-4000-8000-${String(turnCounter).padStart(12, '0')}`;
       const rootScopeId = `10000000-0000-4000-8000-${String(turnCounter).padStart(12, '0')}`;
@@ -421,7 +481,7 @@ export async function installAgentHost(page: Page) {
           {
             id: workId, type: 'work', scopeId: rootScopeId, state: 'running', revision: '1',
             layoutRevision: '1', durationMs: null, inferenceCount: 1,
-            operationCount: 3, workUnitCount: 1,
+            operationCount: 3, childExecutionCount: 1,
           },
           { id: `${id}:assistant`, type: 'assistantMessage', revision: '1', text: '' },
         ],
@@ -435,19 +495,20 @@ export async function installAgentHost(page: Page) {
         inferences: [{
           id: `${id}:inference:root`, ordinal: 0, state: 'completed', revision: 'inference:root:1',
           startedAt, completedAt: startedAt + 80, durationMs: 80,
-          ...(!legacyInferenceTrace
-            ? { contentOrder: ['reasoning', 'commentary', 'actions'] }
-            : {}),
-          commentary: {
-            kind: 'assistantCommentary', state: 'final', text: 'Grounding the change in the current workspace.',
-          },
-          reasoning: {
-            kind: 'providerSummary', state: 'final', text: '**Checking context.**',
-          },
-          actionGroup: {
-            id: `${id}:actions:root`, status: 'running', callCount: 3,
-            calls: [
-              {
+          blocks: [
+            {
+              id: `${id}:reasoning`, type: 'reasoning', state: 'final',
+              revision: 'reasoning:1',
+              text: '**Checking context.**\n**Reviewing workspace state.**',
+              parts: ['**Checking context.**', '**Reviewing workspace state.**'],
+            },
+            {
+              id: `${id}:commentary`, type: 'commentary', state: 'final',
+              revision: 'commentary:1', text: 'Grounding the change in the current workspace.',
+            },
+            {
+              id: `${id}:action:readme`, type: 'action', state: 'completed', revision: 'operation:readme:1',
+              call: {
                 id: `${id}:operation:readme`, callId: `${id}:readme`, name: 'workspace.read',
                 presentation: { category: 'read', label: 'Read README.md', subject: 'README.md' },
                 status: 'completed', revision: 'operation:readme:1',
@@ -457,34 +518,40 @@ export async function installAgentHost(page: Page) {
                 childDurationMs: null, childOperationCount: 0,
                 childArtifactCount: 0, hasDetail: true,
               },
-              {
+            },
+            {
+              id: `${id}:action:edit`, type: 'action', state: 'completed', revision: 'operation:edit:1',
+              call: {
                 id: `${id}:operation:edit`, callId: `${id}:edit`, name: 'workspace.edit',
                 presentation: { category: 'edit', label: 'Edited index.ts', subject: 'src/index.ts' },
                 status: 'completed', revision: 'operation:edit:1',
                 detailPreview: 'src/index.ts', outputPreview: '+export const value = 1;',
                 durationMs: 34, childScopeId: null, childBoundary: null,
                 childState: null, childDurationMs: null, childOperationCount: 0,
-                childArtifactCount: 0, hasDetail: true,
+                childArtifactCount: 0, hasDetail: true, diffArtifactId: diffArtifactHash,
               },
-              {
-                id: `${id}:operation:work-unit`, callId: `${id}:work-unit`, name: 'work_unit_start',
+            },
+            {
+              id: `${id}:action:child-agent`, type: 'action', state: 'running', revision: 'operation:child-agent:1',
+              call: {
+                id: `${id}:operation:child-agent`, callId: `${id}:child-agent`, name: 'native_subagent',
                 presentation: { category: 'tool', label: 'Work Unit Start', subject: null },
-                status: 'running', revision: 'operation:work-unit:1',
+                status: 'running', revision: 'operation:child-agent:1',
                 detailPreview: 'Verify the focused seam', outputPreview: null, durationMs: null,
                 childScopeId: scopeId,
                 childBoundary: 'Verify the focused seam and close when its exact contract agrees.',
                 childState: 'running', childDurationMs: null, childOperationCount: 1,
                 childArtifactCount: 0, hasDetail: true,
               },
-            ],
-          },
+            },
+          ],
         }],
         window: { startIndex: 0, endIndexExclusive: 1, hasEarlier: false, hasLater: false },
         result: null, artifacts: [],
       });
       executionScopes.set(executionScopeKey(id, scopeId), {
         conversationId, turnId: id, scopeId, parentScopeId: rootScopeId,
-        parentOperationId: `${id}:operation:work-unit`, kind: 'workUnit', state: 'running',
+        parentOperationId: `${id}:operation:child-agent`, kind: 'childExecution', state: 'running',
         revision: 'child:1', basisSequence: sequence, startedAt, completedAt: null,
         durationMs: null,
         boundary: 'Verify the focused seam against its governing compatibility contract and close when the exact contract and implementation agree.',
@@ -492,15 +559,12 @@ export async function installAgentHost(page: Page) {
         inferences: [{
           id: `${id}:inference:child`, ordinal: 0, state: 'completed', revision: 'inference:child:1',
           startedAt: startedAt + 90, completedAt: startedAt + 180, durationMs: 90,
-          ...(!legacyInferenceTrace ? { contentOrder: ['reasoning', 'actions'] } : {}),
-          commentary: null,
-          reasoning: {
-            kind: 'providerSummary', state: 'final',
-            text: 'Compared the implementation with its contract.',
-          },
-          actionGroup: {
-            id: `${id}:actions:child`, status: 'completed', callCount: 1,
-            calls: [{
+          blocks: [{
+            id: `${id}:child-reasoning`, type: 'reasoning', state: 'final',
+            revision: 'child-reasoning:1', text: 'Compared the implementation with its contract.',
+          }, {
+            id: `${id}:child-action:test`, type: 'action', state: 'completed', revision: 'operation:test:1',
+            call: {
               id: `${id}:operation:test`, callId: `${id}:test`, name: 'bash',
               presentation: { category: 'command', label: 'Shell command', subject: 'npm test -- seam' },
               status: 'completed', revision: 'operation:test:1',
@@ -508,13 +572,15 @@ export async function installAgentHost(page: Page) {
               childScopeId: null, childBoundary: null,
               childState: null, childDurationMs: null, childOperationCount: 0,
               childArtifactCount: 0, hasDetail: true,
-            }],
-          },
+            },
+          }],
         }],
         window: { startIndex: 0, endIndexExclusive: 1, hasEarlier: false, hasLater: false },
         result: null, artifacts: [],
       });
-      turns.push(turn);
+      const queuedIndex = turns.findIndex((candidate) => candidate.id === id);
+      if (queuedIndex >= 0) turns.splice(queuedIndex, 1, turn);
+      else turns.push(turn);
       touchTurn(turn);
       return turn;
     }
@@ -522,6 +588,7 @@ export async function installAgentHost(page: Page) {
     function storedFixtureParts(parts: any[]) {
       return parts.map((part) => {
         if (part.type !== 'image') return part;
+        if (part.artifactHash) return part;
         const encoded = String(part.dataUrl).split(',')[1] ?? '';
         const bytes = Uint8Array.from(atob(encoded), (value) => value.charCodeAt(0));
         artifactBytes.set(pickedImageHash, {
@@ -538,6 +605,30 @@ export async function installAgentHost(page: Page) {
       });
     }
 
+    function legacyPartsFromNative(content: any[]) {
+      return content.map((part) => {
+        if (part.type === 'file-reference') {
+          const path = String(part.path);
+          return {
+            type: 'mention', kind: 'file', path,
+            name: path.split(/[\\/]/u).filter(Boolean).at(-1) ?? path,
+          };
+        }
+        if (part.type === 'image-artifact') {
+          return {
+            type: 'image', artifactHash: String(part.artifactId),
+            mimeType: String(part.mimeType), name: String(part.name ?? 'Image'),
+            sizeBytes: Number(part.byteLength ?? artifactBytes.get(String(part.artifactId))?.bytes.byteLength ?? 0),
+          };
+        }
+        return { type: 'text', text: String(part.text ?? '') };
+      });
+    }
+
+    function nativeContentText(content: any[]) {
+      return content.flatMap((part) => part.type === 'text' ? [String(part.text)] : []).join('');
+    }
+
     function finishTurn(
       turn: Turn,
       outcome: 'completed' | 'failed' | 'interrupted',
@@ -552,8 +643,9 @@ export async function installAgentHost(page: Page) {
         work.state = outcome;
         work.durationMs = turn.durationMs;
         const rootScope = executionScopes.get(executionScopeKey(turn.id, work.scopeId));
-        const workCall = rootScope?.inferences[0]?.actionGroup?.calls
-          .find((call: any) => call.childScopeId);
+        const workBlock = rootScope?.inferences[0]?.blocks
+          .find((block: any) => block.type === 'action' && block.call.childScopeId);
+        const workCall = workBlock?.call;
         if (rootScope) {
           rootScope.revision = `root:${sequence + 1}`;
           rootScope.basisSequence = sequence + 1;
@@ -563,14 +655,12 @@ export async function installAgentHost(page: Page) {
           if (workCall) {
             workCall.status = outcome === 'completed' ? 'completed' : 'interrupted';
             workCall.durationMs = turn.durationMs;
-            workCall.revision = `operation:work-unit:${sequence + 1}`;
+            workCall.revision = `operation:child-agent:${sequence + 1}`;
             workCall.childState = outcome === 'completed' ? 'completed' : 'abandoned';
             workCall.childDurationMs = turn.durationMs;
             workCall.childArtifactCount = outcome === 'completed' ? 1 : 0;
           }
-          if (rootScope.inferences[0]?.actionGroup) {
-            rootScope.inferences[0].actionGroup.status = outcome;
-          }
+          if (workBlock) workBlock.state = workCall.status;
         }
         const childScope = workCall?.childScopeId
           ? executionScopes.get(executionScopeKey(turn.id, workCall.childScopeId))
@@ -626,8 +716,8 @@ export async function installAgentHost(page: Page) {
           reason: 'terminal', affectsLayout: true, basisSequence: sequence,
         }]);
         const rootScope = executionScopes.get(executionScopeKey(turn.id, work.scopeId));
-        const childScopeId = rootScope?.inferences[0]?.actionGroup?.calls
-          .find((call: any) => call.childScopeId)?.childScopeId;
+        const childScopeId = rootScope?.inferences[0]?.blocks
+          .find((block: any) => block.type === 'action' && block.call.childScopeId)?.call.childScopeId;
         if (childScopeId) {
           dispatchInvalidations([{
             type: 'executionScope',
@@ -669,11 +759,23 @@ export async function installAgentHost(page: Page) {
     function startFixtureMessage(params: {
       clientMessageId: string;
       modelId: string;
+      operationId?: string;
       parts?: any[];
       reasoning: string;
       text: string;
     }) {
-      const turn = createRunningTurn(String(params.text), String(params.clientMessageId), params.parts);
+      const turn = createRunningTurn(
+        String(params.text),
+        String(params.clientMessageId),
+        params.parts,
+        params.operationId,
+      );
+      nativeModelId = params.modelId;
+      nativeReasoning = params.reasoning;
+      window.sessionStorage.setItem('remux.agent.fixture.native-config', JSON.stringify({
+        modelId: nativeModelId,
+        reasoning: nativeReasoning,
+      }));
       updateResource(conversationKey, (summary) => {
         summary.status = 'running';
         summary.title = String(params.text);
@@ -688,7 +790,6 @@ export async function installAgentHost(page: Page) {
         runtime.state = 'running';
         runtime.activeTurnId = turn.id;
         runtime.activeTurnElapsedMs = 0;
-        runtime.contextProbe.modelId = params.modelId;
       });
       invalidateTranscript(turn.id, 'sendAccepted', true);
       const text = String(params.text);
@@ -727,8 +828,8 @@ export async function installAgentHost(page: Page) {
       const selected = targetTurns.slice(start, end);
       const known = new Map((request.knownTurns ?? []).map((entry: any) => [entry.turnId, entry.renderRevision]));
       return {
-        protocolVersion: 4,
-        projectionVersion: 'agent-turn-render-v4',
+        protocolVersion: 6,
+        projectionVersion: 'agent-turn-render-v6',
         conversationId: targetConversationId,
         conversationRevision: `conversation:${sequence}`,
         basisSequence: sequence,
@@ -783,7 +884,9 @@ export async function installAgentHost(page: Page) {
             const key = `operationDetail:${conversationId}:${request.turnId}:${request.scopeId}:${request.operationId}`;
             const scope = executionScopes.get(executionScopeKey(request.turnId, request.scopeId));
             const call = scope?.inferences
-              .flatMap((inference: any) => inference.actionGroup?.calls ?? [])
+              .flatMap((inference: any) => inference.blocks
+                .filter((block: any) => block.type === 'action')
+                .map((block: any) => block.call))
               .find((candidate: any) => candidate.id === request.operationId);
             if (!call) return { requestIndex, key, status: 'missing' };
             const value = {
@@ -810,6 +913,645 @@ export async function installAgentHost(page: Page) {
       return `executionScope:${conversationId}:${turnId}:${scopeId}`;
     }
 
+    function fixtureCapabilities() {
+      return {
+        provider: 'fixture',
+        providerVersion: 'viewer-fixture-1',
+        adapterVersion: 'provider-runtime-v1',
+        authentication: { login: 'device-code', logout: true },
+        session: {
+          create: true, resume: true, discoverHistory: false, readSnapshot: true,
+          forkNative: true, rollbackNative: true,
+        },
+        turns: {
+          interrupt: true, steer: false, queue: true,
+          changeModelOnExistingSession: true, changeEffortOnExistingSession: true,
+        },
+        content: {
+          images: true, fileReferences: true, reasoning: true, diffs: true,
+          webActivity: true,
+        },
+        collaboration: {
+          nativeSubagents: true, childTranscript: 'summary',
+          childSteer: false, childInterrupt: true,
+        },
+        access: {
+          presets: ['read-only', 'workspace-write', 'full-access'],
+          defaultPreset: 'workspace-write',
+        },
+        usage: {
+          turn: true, cumulative: true, context: 'provider',
+          plan: 'read-and-push', estimatedCost: false,
+        },
+        compaction: { automaticNative: true, manualNative: true },
+      };
+    }
+
+    function nativeProvidersValue() {
+      const auth = resources.get('auth')!.value;
+      const loginOperation = auth.operationId ? {
+        operationId: String(auth.operationId),
+        mode: 'device-code',
+        state: auth.state === 'signing-in' ? 'waiting' : auth.state === 'signed-in' ? 'completed' : 'failed',
+        ...(auth.verificationUri ? { verificationUri: String(auth.verificationUri) } : {}),
+        ...(auth.userCode ? { userCode: String(auth.userCode) } : {}),
+        ...(auth.error ? { error: String(auth.error) } : {}),
+        startedAt: Date.now() - 1_000,
+        ...(auth.state === 'signing-in' ? {} : { completedAt: Date.now() }),
+      } : undefined;
+      return {
+        providers: [{
+          providerInstanceId,
+          provider: 'fixture',
+          label: auth.displayLabel ?? 'Fixture subscription',
+          state: auth.state === 'signed-in' ? 'ready' : auth.state === 'signed-out' || auth.state === 'signing-in'
+            ? 'signed-out' : 'error',
+          ...(auth.error ? { message: String(auth.error) } : {}),
+          capabilityRevision,
+          capabilities: fixtureCapabilities(),
+          ...(loginOperation ? { loginOperation } : {}),
+          ...(auth.state === 'signed-in' ? {
+            stickyPreference: { model: nativeModelId, effort: nativeReasoning },
+          } : {}),
+          accountUsage: {
+            availability: 'available',
+            windows: [
+              { id: 'fixture:primary', label: '5 hours', kind: 'rolling', model: null, usedPercent: fiveHourUsagePercent, resetsAt: usageObservedAt + 3_600_000 },
+              { id: 'fixture:secondary', label: 'Weekly', kind: 'weekly', model: null, usedPercent: weeklyUsagePercent, resetsAt: usageObservedAt + 86_400_000 },
+            ],
+            source: 'provider-push', freshness: 'live', observedAt: usageObservedAt,
+          },
+        }],
+        defaultProviderInstanceId: providerInstanceId,
+        preferenceRevision,
+      };
+    }
+
+    function nativeModelsValue() {
+      const models = resources.get('models')!.value;
+      return {
+        providerInstanceId,
+        defaultModelId: models.defaultModelId,
+        error: models.error,
+        models: models.models.map((model: any) => ({
+          id: model.id,
+          name: model.name,
+          provider: 'fixture',
+          supportedEffort: model.supportedReasoning,
+          contextWindow: model.contextWindow,
+          isDefault: model.id === models.defaultModelId,
+        })),
+      };
+    }
+
+    function nativeConversationValue(summary: any, includeDetail = false) {
+      const targetConversationId = String(summary.id);
+      const targetTurns = turnsByConversation.get(targetConversationId) ?? [];
+      const activeTurnId = resources.get('runtime')?.value.conversationId === targetConversationId
+        ? resources.get('runtime')?.value.activeTurnId ?? null
+        : null;
+      const state = summary.status === 'running' ? 'running' : summary.status === 'error' ? 'failed' : 'idle';
+      const childCount = conversationSummaries().filter((candidate) =>
+        candidate.parentConversationId === targetConversationId && candidate.archivedAt === null).length;
+      const value: any = {
+        conversationId: targetConversationId,
+        provider: 'fixture',
+        providerInstanceId,
+        title: String(summary.title ?? ''),
+        preview: String(summary.preview ?? ''),
+        cwd: String(summary.cwd ?? '/tmp/remux-fixture'),
+        model: String(summary.modelId ?? 'gpt-5.6-sol'),
+        effort: String(summary.reasoning ?? 'high'),
+        access: String(summary.access ?? 'workspace-write'),
+        state,
+        rootExecutionId: `root:${targetConversationId}`,
+        parentConversationId: summary.parentConversationId ?? null,
+        rootConversationId: String(summary.rootConversationId ?? targetConversationId),
+        forkedFromPathEntryId: summary.forkedFromPathEntryId ?? null,
+        activeStrandId: String(summary.activeStrandId ?? `fixture-strand:${targetConversationId}:initial`),
+        headRevision: Number(summary.headRevision ?? 1),
+        versionCount: Number(summary.versionCount ?? 1),
+        childCount,
+        subtreeUpdatedAt: Number(summary.subtreeUpdatedAt ?? summary.updatedAt ?? Date.now()),
+        archivedAt: summary.archivedAt ?? null,
+        metadataRevision: Number(summary.metadataRevision ?? 1),
+        lastUsedModel: targetTurns.length > 0
+          ? String(summary.lastUsedModel ?? summary.modelId ?? nativeModelId)
+          : null,
+        lastActivityAt: Number(summary.lastActivityAt ?? summary.updatedAt ?? Date.now()),
+        activeTurnId,
+        history: historyState === 'failed'
+          ? { state: 'failed', error: 'Fixture history read failed.' }
+          : { state: 'ready' },
+        resumable: true,
+        createdAt: Number(summary.createdAt ?? Date.now()),
+        updatedAt: Number(summary.updatedAt ?? Date.now()),
+      };
+      if (includeDetail) {
+        value.capabilityRevision = capabilityRevision;
+        value.latestTurnId = summary.latestTurnId ?? targetTurns.at(-1)?.id ?? null;
+        value.turnCount = targetTurns.length;
+      }
+      return value;
+    }
+
+    function nativeRuntimeValue(targetConversationId: string) {
+      const summary = resources.get(`conversation:${targetConversationId}`)?.value;
+      if (!summary) return undefined;
+      const targetTurns = turnsByConversation.get(targetConversationId) ?? [];
+      const activeRuntime = resources.get('runtime')?.value;
+      const active = activeRuntime?.conversationId === targetConversationId;
+      const activeTurnId = active ? activeRuntime.activeTurnId ?? null : null;
+      const activeTurn = activeTurnId
+        ? targetTurns.find((turn) => turn.id === activeTurnId)
+        : undefined;
+      const state = active
+        ? activeRuntime.state === 'running' || activeRuntime.state === 'interrupting' ? 'running'
+          : activeRuntime.state === 'error' ? 'failed' : 'idle'
+        : summary.status === 'running' ? 'running' : summary.status === 'error' ? 'failed' : 'idle';
+      return {
+        conversationId: targetConversationId,
+        executionId: `root:${targetConversationId}`,
+        state,
+        activeTurnId,
+        activeTurnElapsedMs: activeTurn
+          ? Math.max(0, Date.now() - activeTurn.startedAt)
+          : null,
+        history: historyState === 'failed'
+          ? { state: 'failed', error: 'Fixture history read failed.' }
+          : { state: 'ready' },
+        provider: 'fixture',
+        providerInstanceId,
+        activeConfiguration: {
+          model: String(summary.modelId ?? 'gpt-5.6-sol'),
+          effort: String(summary.reasoning ?? 'high'),
+          access: String(summary.access ?? 'workspace-write'),
+        },
+        composer: {
+          revision: `${capabilityRevision}:${resources.get('runtime')?.revision ?? 0}:${targetConversationId}`,
+          providerInstanceId,
+          nextTurn: {
+            model: String(summary.modelId ?? 'gpt-5.6-sol'),
+            effort: String(summary.reasoning ?? 'high'),
+            access: String(summary.access ?? 'workspace-write'),
+            origin: 'last-used',
+          },
+          lastUsed: null,
+          editable: { model: true, effort: true, access: true },
+        },
+        capabilities: fixtureCapabilities(),
+        usage: {
+          turn: null,
+          cumulative: null,
+          context: {
+            usedTokens: contextUsedTokens, windowTokens: 100_000, percent: contextUsedTokens / 1_000,
+            measurement: 'provider', freshness: 'live', observedAt: usageObservedAt, turnId: null,
+          },
+          estimatedCost: null,
+        },
+        compaction: { policy: 'native-auto', operation: { state: 'idle', lastResult: null } },
+        ...(activeRuntime?.error ? { healthMessage: String(activeRuntime.error) } : {}),
+      };
+    }
+
+    function nativeQueueValue(targetConversationId: string) {
+      if (!resources.has(`conversation:${targetConversationId}`)) return undefined;
+      const queue = resources.get(`queue:${targetConversationId}`)?.value;
+      return {
+        conversationId: targetConversationId,
+        entries: (queue?.entries ?? []).map((entry: any) => ({
+          commandId: String(entry.id),
+          turnId: String(entry.id),
+          content: [
+            { type: 'text', text: String(entry.text ?? '') },
+            ...Array.from({ length: Number(entry.attachmentCount ?? 0) }, (_, index) => ({
+              type: 'image-artifact', artifactId: `${pickedImageHash}-${index}`,
+              mimeType: 'image/png', name: 'Image', byteLength: pickedImageBytes.byteLength,
+            })),
+            ...Array.from({ length: Number(entry.mentionCount ?? 0) }, (_, index) => ({
+              type: 'file-reference', path: `fixture-${index}.ts`,
+            })),
+          ],
+          createdAt: Number(entry.createdAt ?? Date.now()),
+        })),
+      };
+    }
+
+    function nativeTranscriptValue(
+      targetConversationId: string,
+      windowSpec: string,
+      explicitTurns?: Turn[],
+      explicitStrandId?: string,
+    ) {
+      const targetTurns = explicitTurns ?? turnsByConversation.get(targetConversationId);
+      if (!targetTurns || !resources.has(`conversation:${targetConversationId}`)) return undefined;
+      const range = nativeTranscriptRange(targetTurns, windowSpec);
+      const selected = targetTurns.slice(range.startIndex, range.endIndexExclusive);
+      const runtime = resources.get('runtime')?.value;
+      return {
+        conversationId: targetConversationId,
+        strandId: explicitStrandId ?? String(
+          resources.get(`conversation:${targetConversationId}`)?.value.activeStrandId ??
+          `fixture-strand:${targetConversationId}:initial`
+        ),
+        executionId: `root:${targetConversationId}`,
+        activeTurnId: explicitStrandId === undefined && runtime?.conversationId === targetConversationId
+          ? runtime.activeTurnId ?? null
+          : null,
+        turnOrder: targetTurns.map((turn) => turn.id),
+        turns: selected.map((turn) => nativeTurnValue(
+          turn,
+          targetConversationId,
+          targetTurns.indexOf(turn),
+        )),
+        window: {
+          ...range,
+          hasEarlier: range.startIndex > 0,
+          hasLater: range.endIndexExclusive < targetTurns.length,
+        },
+      };
+    }
+
+    function nativeTranscriptRange(targetTurns: Turn[], windowSpec: string) {
+      const length = targetTurns.length;
+      const tail = /^tail-(\d+)$/u.exec(windowSpec);
+      if (tail) {
+        const count = Math.min(40, Math.max(1, Number(tail[1])));
+        return { startIndex: Math.max(0, length - count), endIndexExclusive: length };
+      }
+      const around = /^around:([^:]+):(\d+):(\d+)$/u.exec(windowSpec);
+      if (around) {
+        const index = targetTurns.findIndex((turn) => turn.id === around[1]);
+        if (index >= 0) {
+          const before = Math.min(39, Number(around[2]));
+          const after = Math.min(39, Number(around[3]));
+          const startIndex = Math.max(0, index - before);
+          return { startIndex, endIndexExclusive: Math.min(length, startIndex + Math.min(40, before + after + 1)) };
+        }
+      }
+      const range = /^range:([^:]+):([^:]+)$/u.exec(windowSpec);
+      if (range) {
+        const first = targetTurns.findIndex((turn) => turn.id === range[1]);
+        const last = targetTurns.findIndex((turn) => turn.id === range[2]);
+        if (first >= 0 && last >= first) return { startIndex: first, endIndexExclusive: Math.min(last + 1, first + 40) };
+      }
+      return { startIndex: Math.max(0, length - 24), endIndexExclusive: length };
+    }
+
+    function nativeTurnValue(
+      turn: Turn,
+      targetConversationId = conversationId,
+      targetOrdinal = (turnsByConversation.get(targetConversationId) ?? []).indexOf(turn),
+    ) {
+      const user = turn.segments.find((segment) => segment.type === 'userMessage');
+      const assistant = turn.segments.find((segment) => segment.type === 'assistantMessage');
+      const work = turn.segments.find((segment) => segment.type === 'work');
+      const scope = work ? executionScopes.get(executionScopeKey(turn.id, work.scopeId)) : null;
+      const inferences = scope?.inferences ?? [];
+      const blocks = inferences.flatMap((inference: any) => inference.blocks ?? []);
+      const calls = blocks.filter((block: any) => block.type === 'action').map((block: any) => block.call);
+      const reasoning = blocks.filter((block: any) => block.type === 'reasoning')
+        .map((block: any) => block.text).join('\n\n');
+      const commentary = blocks.filter((block: any) => block.type === 'commentary')
+        .map((block: any) => block.text).join('\n\n');
+      const operations = calls.filter((call: any) => !call.childScopeId).map((call: any) => ({
+        eventId: String(call.id),
+        tool: {
+          callId: String(call.callId ?? call.id),
+          name: String(call.name ?? 'tool'),
+          category: nativeToolCategory(call.presentation?.category),
+          ...(call.presentation?.label ? { title: String(call.presentation.label) } : {}),
+        },
+        state: call.status === 'failed' ? 'failed' : call.status === 'completed' ? 'completed' : 'running',
+        ...(call.detailPreview === null || call.detailPreview === undefined ? {} : { inputPreview: String(call.detailPreview) }),
+        ...(call.outputPreview === null || call.outputPreview === undefined ? {} : { outputPreview: String(call.outputPreview) }),
+        startedAt: turn.startedAt,
+        ...(call.durationMs === null || call.durationMs === undefined ? {} : { completedAt: turn.startedAt + Number(call.durationMs) }),
+      }));
+      const fileChanges = diffTranscript ? calls.flatMap((call: any) => call.diffArtifactId ? [{
+        path: String(call.presentation?.subject ?? call.detailPreview ?? 'changed-file'),
+        kind: 'update',
+        blockId: String(call.callId ?? call.id),
+        diffArtifactId: String(call.diffArtifactId),
+      }] : []) : [];
+      const children = calls.flatMap((call: any) => {
+        if (!call.childScopeId) return [];
+        const child = executionScopes.get(executionScopeKey(turn.id, call.childScopeId));
+        return [{
+          executionId: String(call.childScopeId),
+          ownership: 'native',
+          provider: 'fixture',
+          providerInstanceId,
+          title: 'Native subagent',
+          state: nativeExecutionState(child?.state ?? call.childState),
+          ...(child?.result || call.childBoundary ? { summary: String(child?.result ?? call.childBoundary) } : {}),
+        }];
+      });
+      const nativePasses = inferences.map((inference: any, passOrdinal: number) => ({
+        passId: String(inference.id),
+        ordinal: passOrdinal,
+        state: inference.state === 'running' ? 'streaming' : 'completed',
+        blocks: (inference.blocks ?? []).map((block: any, blockOrdinal: number) =>
+          nativeBlockValue(turn, inference, block, blockOrdinal)),
+      }));
+      const assistantText = String(assistant?.text ?? '');
+      const userIndex = turn.segments.indexOf(user);
+      const compactionValue = (segment: any) => ({
+        operationId: String(segment.id).replace(/^compaction:/u, ''),
+        trigger: segment.trigger,
+        state: segment.status === 'compacting'
+          ? 'started'
+          : segment.status === 'failed' ? 'failed' : 'completed',
+        beforeTokens: segment.beforeTokens ?? null,
+        afterTokens: segment.afterTokens ?? null,
+        ...(segment.error ? { error: { code: 'fixture_compaction_failed', message: String(segment.error) } } : {}),
+        createdAt: turn.startedAt,
+        ...(segment.status === 'compacting' || turn.completedAt === null
+          ? {}
+          : { completedAt: turn.completedAt }),
+      });
+      const beforeUserCompactions = turn.segments.slice(0, Math.max(0, userIndex))
+        .filter((segment) => segment.type === 'compaction').map(compactionValue);
+      const afterTurnCompactions = turn.segments.slice(Math.max(0, userIndex + 1))
+        .filter((segment) => segment.type === 'compaction').map(compactionValue);
+      const finalBlockId = assistantText ? `final:${turn.id}` : null;
+      if (finalBlockId) {
+        const target = nativePasses.at(-1) ?? {
+          passId: `final-pass:${turn.id}`, ordinal: 0, state: 'completed', blocks: [],
+        };
+        if (nativePasses.length === 0) nativePasses.push(target);
+        target.blocks.push({
+          blockId: finalBlockId,
+          passId: target.passId,
+          ordinal: target.blocks.length,
+          kind: 'final-message',
+          state: turn.status === 'inProgress' ? 'streaming' : 'completed',
+          revision: 1,
+          payload: { kind: 'final-message', text: assistantText },
+          startedAt: turn.startedAt,
+          completedAt: turn.completedAt,
+        });
+      }
+      const state = turn.status === 'inProgress' ? 'running' : turn.status;
+      return {
+        turnId: turn.id,
+        pathEntryId: turn.pathEntryId ?? fixturePathEntryId(targetConversationId, turn.id),
+        strandId: turn.strandId ?? String(
+          resources.get(`conversation:${targetConversationId}`)?.value.activeStrandId ??
+          `fixture-strand:${targetConversationId}:initial`
+        ),
+        ordinal: turn.ordinal ?? Math.max(0, targetOrdinal),
+        clientMessageId: String(user?.clientMessageId ?? `fixture-client:${turn.id}`),
+        executionId: String(work?.scopeId ?? `root:${turn.id}`),
+        state,
+        ...(turn.status === 'inProgress' || turn.status === 'queued' ? {} : { outcome: turn.status }),
+        userContent: nativeUserContent(user),
+        ordering: 'native-exact',
+        passes: nativePasses,
+        finalBlockId,
+        ...(beforeUserCompactions.length > 0 || afterTurnCompactions.length > 0 ? {
+          boundaryCompactions: {
+            beforeUser: beforeUserCompactions,
+            afterTurn: afterTurnCompactions,
+          },
+        } : {}),
+        activity: {
+          reasoning,
+          commentary,
+          operations,
+          fileChanges,
+          web: [],
+          children,
+          notices: [],
+          compacted: false,
+        },
+        assistantText,
+        ...(assistant?.content ? {
+          assistantContent: {
+            artifactId: String(assistant.content.artifactHash),
+            sha256: String(assistant.content.sha256),
+            byteLength: Number(assistant.content.byteLength),
+            returnedBytes: Number(assistant.content.returnedBytes),
+            nextOffset: assistant.content.nextRange?.offset ?? null,
+          },
+        } : {}),
+        ...(turn.error ? { error: { code: turn.error.code, message: turn.error.message } } : {}),
+        startedAt: turn.startedAt,
+        ...(turn.completedAt === null ? {} : { completedAt: turn.completedAt }),
+        renderRevision: turn.renderRevision,
+        layoutRevision: turn.layoutRevision,
+      };
+    }
+
+    function nativeBlockValue(turn: Turn, inference: any, block: any, ordinal: number) {
+      const base = {
+        blockId: String(block.id),
+        passId: String(inference.id),
+        ordinal,
+        state: block.state === 'final' ? 'completed' : block.state,
+        revision: 1,
+        startedAt: turn.startedAt,
+        completedAt: block.state === 'streaming' || block.state === 'running'
+          ? null
+          : turn.completedAt,
+      };
+      if (block.type === 'reasoning' || block.type === 'commentary' || block.type === 'assistantText') {
+        const kind = block.type === 'reasoning'
+          ? 'reasoning-summary'
+          : block.type === 'commentary' ? 'commentary' : 'final-message';
+        return {
+          ...base,
+          kind,
+          payload: {
+            kind,
+            text: String(block.text),
+            ...(kind === 'reasoning-summary' && Array.isArray(block.parts)
+              ? { parts: block.parts.map(String) }
+              : {}),
+          },
+        };
+      }
+      if (block.type === 'notice') {
+        return {
+          ...base, kind: 'compatibility-notice',
+          payload: { kind: 'compatibility-notice', code: 'fixture_notice', message: String(block.text) },
+        };
+      }
+      const call = block.call;
+      if (call.childScopeId) {
+        return {
+          ...base,
+          kind: 'native-child',
+          payload: {
+            kind: 'native-child',
+            child: {
+              executionId: String(call.childScopeId), ownership: 'native', provider: 'fixture',
+              providerInstanceId, title: 'Native subagent',
+            },
+            executionState: nativeExecutionState(call.childState ?? call.status),
+            ...(call.outputPreview || call.childBoundary
+              ? { summary: String(call.outputPreview ?? call.childBoundary) }
+              : {}),
+          },
+        };
+      }
+      return {
+        ...base,
+        kind: 'tool',
+        payload: {
+          kind: 'tool',
+          tool: {
+            callId: String(call.callId ?? call.id),
+            name: String(call.name ?? 'tool'),
+            category: nativeToolCategory(call.presentation?.category),
+            ...(call.presentation?.label ? { title: String(call.presentation.label) } : {}),
+          },
+          ...(call.detailPreview === null || call.detailPreview === undefined
+            ? {}
+            : { inputPreview: String(call.detailPreview) }),
+          ...(call.outputPreview === null || call.outputPreview === undefined
+            ? {}
+            : { outputPreview: String(call.outputPreview) }),
+        },
+      };
+    }
+
+    function nativeUserContent(user: any) {
+      if (!user) return [{ type: 'text', text: '' }];
+      if (!Array.isArray(user.parts) || user.parts.length === 0) return [{ type: 'text', text: String(user.text ?? '') }];
+      return user.parts.map((part: any) => {
+        if (part.type === 'mention') return { type: 'file-reference', path: String(part.path) };
+        if (part.type === 'image') return {
+          type: 'image-artifact', artifactId: String(part.artifactHash),
+          mimeType: String(part.mimeType), name: String(part.name ?? 'Image'),
+          byteLength: Number(part.sizeBytes ?? 0),
+        };
+        return { type: 'text', text: String(part.text ?? '') };
+      });
+    }
+
+    function nativeToolCategory(category: unknown) {
+      if (category === 'command') return 'shell';
+      if (category === 'read' || category === 'edit') return 'file';
+      if (category === 'search') return 'search';
+      return 'collaboration';
+    }
+
+    function nativeExecutionState(state: unknown) {
+      if (state === 'completed') return 'idle';
+      if (state === 'failed') return 'failed';
+      if (state === 'interrupted' || state === 'abandoned') return 'interrupted';
+      return 'running';
+    }
+
+    function nativeResourceValue(key: string): { revision: number; value: any } | undefined {
+      if (key === 'agent/providers') return { revision: resources.get('auth')!.revision, value: nativeProvidersValue() };
+      if (key === `agent/models:${providerInstanceId}`) {
+        return { revision: resources.get('models')!.revision, value: nativeModelsValue() };
+      }
+      if (key === 'agent/conversations') {
+        return {
+          revision: resources.get('conversation-list')!.revision,
+          value: { conversations: conversationSummaries().map((summary) => nativeConversationValue(summary)), truncated: false },
+        };
+      }
+      if (key.startsWith('agent/conversation-versions:')) {
+        const targetConversationId = key.slice('agent/conversation-versions:'.length);
+        const summary = resources.get(`conversation:${targetConversationId}`)?.value;
+        if (!summary) return undefined;
+        const versions = ensureConversationVersions(targetConversationId);
+        const activeStrandId = String(summary.activeStrandId);
+        const active = versions.find((version) => version.strandId === activeStrandId);
+        if (active) active.turns = structuredClone(turnsByConversation.get(targetConversationId) ?? []);
+        return {
+          revision: Number(summary.headRevision ?? 1),
+          value: {
+            conversationId: targetConversationId,
+            headRevision: Number(summary.headRevision ?? 1),
+            versions: [...versions].reverse().map((version) => {
+              const last = version.turns.at(-1);
+              const user = last?.segments.find((segment) => segment.type === 'userMessage');
+              return {
+                strandId: version.strandId,
+                active: version.strandId === activeStrandId,
+                reason: version.reason,
+                sourceStrandId: version.sourceStrandId,
+                sourcePathEntryId: version.sourcePathEntryId,
+                turnCount: version.turns.length,
+                preview: String(user?.text ?? ''),
+                createdAt: version.createdAt,
+              };
+            }),
+          },
+        };
+      }
+      if (key.startsWith('agent/conversation:')) {
+        const targetConversationId = key.slice('agent/conversation:'.length);
+        const entry = resources.get(`conversation:${targetConversationId}`);
+        return entry ? { revision: entry.revision, value: nativeConversationValue(entry.value, true) } : undefined;
+      }
+      if (key.startsWith('agent/runtime:')) {
+        const targetConversationId = key.slice('agent/runtime:'.length);
+        const value = nativeRuntimeValue(targetConversationId);
+        return value ? { revision: resources.get('runtime')!.revision, value } : undefined;
+      }
+      if (key.startsWith('agent/queue:')) {
+        const targetConversationId = key.slice('agent/queue:'.length);
+        const value = nativeQueueValue(targetConversationId);
+        const revision = resources.get(`queue:${targetConversationId}`)?.revision ?? 0;
+        return value ? { revision, value } : undefined;
+      }
+      const strandTranscript = /^agent\/strand-transcript:([^:]+):([^:]+):(.+)$/u.exec(key);
+      if (strandTranscript) {
+        const targetConversationId = decodeURIComponent(strandTranscript[1]!);
+        const strandId = decodeURIComponent(strandTranscript[2]!);
+        const version = ensureConversationVersions(targetConversationId)
+          .find((candidate) => candidate.strandId === strandId);
+        if (!version) return undefined;
+        const value = nativeTranscriptValue(
+          targetConversationId,
+          strandTranscript[3]!,
+          version.turns,
+          strandId,
+        );
+        return value ? { revision: sequence, value } : undefined;
+      }
+      const transcript = /^agent\/transcript:([^:]+):(.+)$/u.exec(key);
+      if (transcript) {
+        const value = nativeTranscriptValue(transcript[1]!, transcript[2]!);
+        return value ? { revision: sequence, value } : undefined;
+      }
+      if (key.startsWith('agent/turn:')) {
+        const turnId = key.slice('agent/turn:'.length).replace(/:summary$/u, '');
+        for (const targetTurns of turnsByConversation.values()) {
+          const turn = targetTurns.find((candidate) => candidate.id === turnId);
+          if (turn) return { revision: sequence, value: nativeTurnValue(turn) };
+        }
+      }
+      return undefined;
+    }
+
+    function nativeResourceResult(params: any) {
+      const generationChanged = params.knownServerGeneration !== undefined && params.knownServerGeneration !== generation;
+      return {
+        protocolVersion: 6,
+        serverGeneration: generation,
+        capabilityRevision,
+        changedKeys: generationChanged ? params.requests.map((item: any) => item.key) : [],
+        resources: params.requests.map((item: any) => {
+          const entry = nativeResourceValue(String(item.key));
+          if (!entry) return { key: item.key, status: 'missing' };
+          if (!generationChanged && item.ifNoneMatch === entry.revision) {
+            return { key: item.key, status: 'notModified', revision: entry.revision, basisSequence: sequence };
+          }
+          return {
+            key: item.key, status: 'ok', revision: entry.revision,
+            basisSequence: sequence, value: entry.value,
+          };
+        }),
+      };
+    }
+
 
     function resultFor(request: HostRequest) {
       const params = request.params ?? {};
@@ -820,80 +1562,153 @@ export async function installAgentHost(page: Page) {
           : JSON.stringify(params),
       });
       if (request.method === 'remux/agent/resources/read') {
-        return {
-          resources: params.requests.map((item: any) => {
-            const entry = resources.get(item.key);
-            if (!entry) return { key: item.key, status: 'missing', serverGeneration: generation };
-            if (item.ifNoneMatch === entry.revision) {
-              return {
-                key: item.key, status: 'notModified', revision: entry.revision,
-                basisSequence: entry.revision, serverGeneration: generation,
-              };
-            }
-            return {
-              key: item.key, status: 'ok', revision: entry.revision,
-              basisSequence: entry.revision, serverGeneration: generation, value: entry.value,
-            };
-          }),
-        };
+        if (resourceReadFailure) throw new Error('Fixture Agent runtime is unavailable.');
+        return nativeResourceResult(params);
       }
-      if (request.method === 'remux/agent/transcript/resources/read') return transcriptResult(params);
+      if (request.method === 'remux/agent/transcript/resources/read') {
+        if (params.historySync === 'force') {
+          historyState = 'ready';
+          resources.get('runtime')!.revision += 1;
+        }
+        return nativeResourceResult(params);
+      }
       if (request.method === 'remux/agent/artifact/read') {
-        const binary = artifactBytes.get(params.hash);
-        if (binary && params.range.kind === 'bytes') {
-          const start = Math.min(Number(params.range.offset), binary.bytes.byteLength);
-          const end = Math.min(binary.bytes.byteLength, start + Number(params.range.byteLength));
+        const artifactId = String(params.artifactId);
+        const binary = artifactBytes.get(artifactId);
+        if (binary) {
+          const start = Math.min(Number(params.offset), binary.bytes.byteLength);
+          const end = Math.min(binary.bytes.byteLength, start + Number(params.byteLength));
           const selected = binary.bytes.slice(start, end);
-          const content = btoa(String.fromCharCode(...selected));
           return {
-            hash: params.hash,
-            mediaType: binary.mediaType,
+            artifactId,
+            mimeType: binary.mediaType,
             totalByteLength: binary.bytes.byteLength,
-            totalLineCount: null,
-            range: { kind: 'bytes', offset: start, byteLength: end - start },
-            encoding: 'base64',
-            content,
-            truncated: end < binary.bytes.byteLength,
-            nextRange: end < binary.bytes.byteLength
-              ? { kind: 'bytes', offset: end, byteLength: Number(params.range.byteLength) }
-              : null,
+            offset: start,
+            byteLength: end - start,
+            base64: btoa(String.fromCharCode(...selected)),
           };
         }
-        const artifactText = artifactTexts.get(params.hash);
-        if (artifactText === undefined || params.range.kind !== 'utf8') {
+        const artifactText = artifactTexts.get(artifactId);
+        if (artifactText === undefined) {
           throw new Error('Fixture artifact range was not found.');
         }
         const bytes = new TextEncoder().encode(artifactText);
-        const start = Math.min(Number(params.range.offset), bytes.byteLength);
-        const end = Math.min(bytes.byteLength, start + Number(params.range.byteLength));
-        const nextRange = end < bytes.byteLength
-          ? { kind: 'utf8', offset: end, byteLength: Number(params.range.byteLength) }
-          : null;
+        const start = Math.min(Number(params.offset), bytes.byteLength);
+        const end = Math.min(bytes.byteLength, start + Number(params.byteLength));
         return {
-          hash: params.hash,
-          mediaType: params.hash === contextManifestHash ? 'application/json' : 'text/plain; charset=utf-8',
+          artifactId,
+          mimeType: 'text/plain; charset=utf-8',
           totalByteLength: bytes.byteLength,
-          totalLineCount: null,
-          range: { kind: 'utf8', offset: start, byteLength: end - start },
-          encoding: 'utf8',
-          content: new TextDecoder().decode(bytes.slice(start, end)),
-          truncated: nextRange !== null,
-          nextRange,
+          offset: start,
+          byteLength: end - start,
+          base64: btoa(String.fromCharCode(...bytes.slice(start, end))),
+        };
+      }
+      if (request.method === 'remux/agent/artifact/put') {
+        const encoded = String(params.dataUrl).split(',')[1] ?? '';
+        const bytes = Uint8Array.from(atob(encoded), (value) => value.charCodeAt(0));
+        const mimeType = /^data:([^;]+);base64,/u.exec(String(params.dataUrl))?.[1] ?? 'image/png';
+        artifactBytes.set(pickedImageHash, { bytes, mediaType: mimeType });
+        return {
+          accepted: true,
+          artifactId: pickedImageHash,
+          mimeType,
+          ...(params.name ? { name: String(params.name) } : {}),
+          byteLength: bytes.byteLength,
         };
       }
       if (request.method === 'remux/agent/conversation/create') {
+        nativeModelId = String(params.model);
+        nativeReasoning = String(params.effort ?? 'off');
+        window.sessionStorage.setItem('remux.agent.fixture.native-config', JSON.stringify({
+          modelId: nativeModelId,
+          reasoning: nativeReasoning,
+        }));
         resources.set(conversationKey, {
           revision: 1,
-          value: { ...conversationSummary(params.cwd, 'idle'), modelId: params.modelId, reasoning: params.reasoning },
+          value: {
+            ...conversationSummary(params.cwd, 'idle'),
+            modelId: params.model,
+            reasoning: params.effort ?? 'off',
+            access: params.access,
+          },
         });
         resources.set('runtime', {
           revision: (resources.get('runtime')?.revision ?? 0) + 1,
-          value: { ...runtimeValue('idle'), contextProbe: { ...runtimeValue('idle').contextProbe, modelId: params.modelId } },
+          value: runtimeValue('idle'),
         });
         invalidateResource(conversationKey, 'created');
         syncConversationList();
         invalidateResource('runtime');
-        return { conversationId };
+        return { accepted: true, commandId: params.commandId, conversationId };
+      }
+      if (request.method === 'remux/agent/composer/provider-preference/set') {
+        nativeModelId = String(params.model);
+        nativeReasoning = String(params.effort ?? 'off');
+        preferenceRevision = `fixture-preference-v${Number(preferenceRevision.split('v').at(-1) ?? 1) + 1}`;
+        window.sessionStorage.setItem('remux.agent.fixture.native-config', JSON.stringify({
+          modelId: nativeModelId,
+          reasoning: nativeReasoning,
+        }));
+        const auth = resources.get('auth')!;
+        auth.revision += 1;
+        invalidateResource('auth');
+        return { accepted: true, revision: preferenceRevision };
+      }
+      if (request.method === 'remux/agent/composer/conversation-preference/set') {
+        nativeModelId = String(params.model);
+        nativeReasoning = String(params.effort ?? 'off');
+        preferenceRevision = `fixture-preference-v${Number(preferenceRevision.split('v').at(-1) ?? 1) + 1}`;
+        window.sessionStorage.setItem('remux.agent.fixture.native-config', JSON.stringify({
+          modelId: nativeModelId,
+          reasoning: nativeReasoning,
+        }));
+        const targetConversationKey = `conversation:${String(params.conversationId)}`;
+        const targetConversation = resources.get(targetConversationKey);
+        if (targetConversation) {
+          targetConversation.revision += 1;
+          targetConversation.value.modelId = nativeModelId;
+          targetConversation.value.reasoning = nativeReasoning;
+          targetConversation.value.updatedAt = Date.now();
+        }
+        const runtime = resources.get('runtime')!;
+        runtime.revision += 1;
+        const auth = resources.get('auth')!;
+        auth.revision += 1;
+        invalidateResource(targetConversationKey);
+        invalidateResource('runtime');
+        invalidateResource('auth');
+        return {
+          accepted: true,
+          revision: `${capabilityRevision}:${runtime.revision}:${String(params.conversationId)}`,
+        };
+      }
+      if (request.method === 'remux/agent/composer/conversation-access/set') {
+        const targetConversationKey = `conversation:${String(params.conversationId)}`;
+        const targetConversation = resources.get(targetConversationKey);
+        if (targetConversation) {
+          targetConversation.revision += 1;
+          targetConversation.value.access = String(params.access);
+          targetConversation.value.updatedAt = Date.now();
+        }
+        const runtime = resources.get('runtime')!;
+        runtime.revision += 1;
+        invalidateResource(targetConversationKey);
+        invalidateResource('runtime');
+        return {
+          accepted: true,
+          revision: `${capabilityRevision}:${runtime.revision}:${String(params.conversationId)}`,
+        };
+      }
+      if (request.method === 'remux/agent/conversation/compact') {
+        const runtime = resources.get('runtime')!;
+        runtime.revision += 1;
+        invalidateResource('runtime');
+        return {
+          accepted: true,
+          operationId: String(params.commandId),
+          delivery: 'sent',
+        };
       }
       if (request.method === 'remux/agent/conversation/message/send') {
         if (nextMessageError) {
@@ -902,51 +1717,50 @@ export async function installAgentHost(page: Page) {
           throw new Error(message);
         }
         const runtime = resources.get('runtime')?.value;
+        const content = Array.isArray(params.content) ? params.content : [];
+        const text = nativeContentText(content);
+        const parts = legacyPartsFromNative(content);
+        const conversation = resources.get(`conversation:${String(params.conversationId)}`)?.value
+          ?? resources.get(conversationKey)?.value;
         if (runtime?.state === 'running' || runtime?.state === 'interrupting') {
           pendingQueue.push({
             clientMessageId: String(params.clientMessageId),
-            modelId: String(params.modelId),
-            operationId: String(params.operationId),
-            ...(Array.isArray(params.parts) ? { parts: params.parts } : {}),
-            reasoning: String(params.reasoning),
-            text: String(params.text),
+            modelId: String(conversation?.modelId ?? 'gpt-5.6-sol'),
+            operationId: String(params.commandId),
+            parts,
+            reasoning: String(conversation?.reasoning ?? 'high'),
+            text,
           });
+          const queued = queuedTurn(String(params.commandId), String(params.clientMessageId), text, parts);
+          turns.push(queued);
+          touchTurn(queued);
           syncFixtureQueue();
+          invalidateTranscript(queued.id, 'sendAccepted', true);
           return {
-            accepted: true, delivery: 'queued', operationId: params.operationId, turnId: null,
+            accepted: true, commandId: params.commandId,
+            delivery: 'queued', turnId: params.commandId,
           };
         }
         const turn = startFixtureMessage({
           clientMessageId: String(params.clientMessageId),
-          modelId: String(params.modelId),
-          ...(Array.isArray(params.parts) ? { parts: params.parts } : {}),
-          reasoning: String(params.reasoning),
-          text: String(params.text),
+          modelId: String(conversation?.modelId ?? 'gpt-5.6-sol'),
+          parts,
+          reasoning: String(conversation?.reasoning ?? 'high'),
+          text,
         });
-        updateResource('runtime', (value) => {
-          value.contextProbe = {
-            ...value.contextProbe,
-            modelCallCount: 1,
-            messageCount: 1,
-            messageHash: 'fixture-hash',
-            orderedMessageHashes: ['fixture-message'],
-            estimatedBytes: 128,
-            providerRequestMode: 'full',
-          };
-        });
-        resources.set(contextKey, {
-          revision: (resources.get(contextKey)?.revision ?? 0) + 1,
-          value: contextValue('append'),
-        });
-        invalidateResource(contextKey);
-        return { accepted: true, operationId: params.operationId, turnId: turn.id };
+        return {
+          accepted: true,
+          commandId: params.commandId,
+          delivery: 'sent',
+          turnId: turn.id,
+        };
       }
       if (request.method === 'remux/agent/conversation/message/queue/remove') {
-        const index = pendingQueue.findIndex((entry) => entry.operationId === params.operationId);
+        const index = pendingQueue.findIndex((entry) => entry.operationId === params.turnId);
         if (index < 0) return { status: 'retained' };
         pendingQueue.splice(index, 1);
         syncFixtureQueue();
-        return { status: 'removed' };
+        return { accepted: true, commandId: params.commandId, status: 'removed' };
       }
       if (request.method === 'remux/agent/conversation/message/queue/run-now') {
         const index = pendingQueue.findIndex((entry) => entry.operationId === params.operationId);
@@ -960,42 +1774,180 @@ export async function installAgentHost(page: Page) {
         if (next) window.setTimeout(() => startFixtureMessage(next), 0);
         return { status: 'running' };
       }
+      if (request.method === 'remux/agent/conversation/rename') {
+        const targetConversationId = String(params.conversationId);
+        const entry = resources.get(`conversation:${targetConversationId}`);
+        if (!entry || Number(entry.value.metadataRevision) !== Number(params.expectedMetadataRevision)) {
+          throw new Error('Conversation metadata changed; refresh and retry.');
+        }
+        entry.value.title = String(params.title);
+        entry.value.metadataRevision = Number(entry.value.metadataRevision) + 1;
+        entry.value.updatedAt = Date.now();
+        entry.value.subtreeUpdatedAt = entry.value.updatedAt;
+        entry.revision += 1;
+        syncConversationList();
+        invalidateResource(`conversation:${targetConversationId}`);
+        return { accepted: true, metadataRevision: entry.value.metadataRevision };
+      }
+      if (request.method === 'remux/agent/conversation/archive/set') {
+        const targetConversationId = String(params.conversationId);
+        const entry = resources.get(`conversation:${targetConversationId}`);
+        if (!entry || Number(entry.value.metadataRevision) !== Number(params.expectedMetadataRevision)) {
+          throw new Error('Conversation metadata changed; refresh and retry.');
+        }
+        entry.value.archivedAt = params.archived ? Date.now() : null;
+        entry.value.metadataRevision = Number(entry.value.metadataRevision) + 1;
+        entry.value.updatedAt = Date.now();
+        entry.value.subtreeUpdatedAt = entry.value.updatedAt;
+        entry.revision += 1;
+        syncConversationList();
+        invalidateResource(`conversation:${targetConversationId}`);
+        return { accepted: true };
+      }
+      if (request.method === 'remux/agent/conversation/strand/activate') {
+        const targetConversationId = String(params.conversationId);
+        const entry = resources.get(`conversation:${targetConversationId}`);
+        if (!entry || Number(entry.value.headRevision) !== Number(params.expectedHeadRevision)) {
+          throw new Error('Conversation history changed; refresh and retry.');
+        }
+        const versions = ensureConversationVersions(targetConversationId);
+        const selected = versions.find((version) => version.strandId === String(params.strandId));
+        if (!selected) throw new Error('The selected fixture version does not exist.');
+        turnCounter += 1;
+        const restoreStrandId = `fixture-strand:${targetConversationId}:restore-${turnCounter}`;
+        const restoredTurns = structuredClone(selected.turns);
+        versions.push({
+          strandId: restoreStrandId,
+          reason: 'restore',
+          sourceStrandId: selected.strandId,
+          sourcePathEntryId: selected.turns.at(-1)
+            ? fixturePathEntryId(targetConversationId, selected.turns.at(-1)!.id)
+            : null,
+          turns: structuredClone(restoredTurns),
+          createdAt: Date.now(),
+        });
+        turnsByConversation.set(targetConversationId, restoredTurns);
+        Object.assign(entry.value, {
+          activeStrandId: restoreStrandId,
+          headRevision: Number(entry.value.headRevision) + 1,
+          versionCount: versions.length,
+          latestTurnId: restoredTurns.at(-1)?.id ?? null,
+          updatedAt: Date.now(),
+          subtreeUpdatedAt: Date.now(),
+        });
+        entry.revision += 1;
+        syncConversationList();
+        invalidateResource(`conversation:${targetConversationId}`);
+        invalidateResource(`conversation-versions:${targetConversationId}`);
+        invalidateTranscript(restoredTurns.at(-1)?.id ?? '', 'terminal', true, targetConversationId);
+        return {
+          accepted: true,
+          strandId: restoreStrandId,
+          headRevision: entry.value.headRevision,
+        };
+      }
       if (request.method === 'remux/agent/conversation/message/edit' ||
           request.method === 'remux/agent/conversation/message/fork') {
-        const branchId = `33333333-3333-4333-8333-${String(turnCounter + 1).padStart(12, '0')}`;
         const isFork = request.method.endsWith('/fork');
-        const sourceTurns = turnsByConversation.get(String(params.sourceConversationId)) ?? [];
-        const targetIndex = sourceTurns.findIndex((turn) => turn.id === params.sourceTurnId);
-        const prefix = isFork && targetIndex >= 0 ? sourceTurns.slice(0, targetIndex + 1) : sourceTurns.slice(0, Math.max(0, targetIndex));
+        const sourceConversationId = String(params.sourceConversationId);
+        const sourceTurns = turnsByConversation.get(sourceConversationId) ?? [];
+        const targetIndex = sourceTurnIndex(sourceConversationId, String(params.sourcePathEntryId));
+        if (targetIndex < 0) throw new Error('The fixture branch point is not on the active strand.');
+        const sourceResource = resources.get(`conversation:${sourceConversationId}`);
+        if (!sourceResource) throw new Error('The fixture source conversation does not exist.');
+        const sourceConversation = sourceResource.value;
+        if (String(params.sourceStrandId) !== String(sourceConversation.activeStrandId) ||
+            Number(params.expectedHeadRevision) !== Number(sourceConversation.headRevision)) {
+          throw new Error('Conversation history changed; refresh and retry.');
+        }
+        ensureConversationVersions(sourceConversationId);
+        turnCounter += 1;
+        const destinationConversationId = isFork
+          ? `33333333-3333-4333-8333-${String(turnCounter).padStart(12, '0')}`
+          : sourceConversationId;
+        const destinationStrandId = `fixture-strand:${destinationConversationId}:${turnCounter}`;
+        const prefix = sourceTurns.slice(0, isFork ? targetIndex + 1 : targetIndex);
+        const content = Array.isArray(params.content) ? params.content : [];
+        const text = nativeContentText(content);
         const replacement = completedTurn(
-          `branch-turn-${turnCounter + 1}`,
-          String(params.text),
+          `branch-turn-${turnCounter}`,
+          text,
           'The fixture branch completed.',
         );
         const replacementUser = replacement.segments.find((segment) => segment.type === 'userMessage');
-        if (replacementUser) replacementUser.clientMessageId = String(params.clientMessageId);
+        if (replacementUser) {
+          replacementUser.clientMessageId = String(params.clientMessageId);
+          replacementUser.parts = legacyPartsFromNative(content);
+        }
         const branchTurns = [...prefix.map((turn) => structuredClone(turn)), replacement];
-        turnsByConversation.set(branchId, branchTurns);
-        resources.set(`conversation:${branchId}`, {
-          revision: 1,
-          value: {
-            ...conversationSummary('/tmp/remux-fixture', 'idle', branchId),
-            latestTurnId: replacement.id,
-            modelId: String(params.modelId),
-            preview: String(params.text),
-            reasoning: String(params.reasoning),
-            title: String(params.text),
-          },
+        turnsByConversation.set(destinationConversationId, branchTurns);
+        const destinationVersions = isFork ? [] : ensureConversationVersions(sourceConversationId);
+        destinationVersions.push({
+          strandId: destinationStrandId,
+          reason: isFork ? 'fork' : 'edit',
+          sourceStrandId: String(sourceConversation.activeStrandId),
+          sourcePathEntryId: String(params.sourcePathEntryId),
+          turns: structuredClone(branchTurns),
+          createdAt: Date.now(),
         });
+        versionsByConversation.set(destinationConversationId, destinationVersions);
+        const now = Date.now();
+        if (isFork) {
+          resources.set(`conversation:${destinationConversationId}`, {
+            revision: 1,
+            value: {
+              ...conversationSummary('/tmp/remux-fixture', 'idle', destinationConversationId),
+              latestTurnId: replacement.id,
+              modelId: String(sourceConversation.modelId ?? 'gpt-5.6-sol'),
+              preview: text,
+              reasoning: String(sourceConversation.reasoning ?? 'high'),
+              access: String(sourceConversation.access ?? 'workspace-write'),
+              title: `${String(sourceConversation.title)} (fork)`,
+              parentConversationId: sourceConversationId,
+              rootConversationId: String(sourceConversation.rootConversationId ?? sourceConversationId),
+              forkedFromPathEntryId: String(params.sourcePathEntryId),
+              activeStrandId: destinationStrandId,
+              subtreeUpdatedAt: now,
+              updatedAt: now,
+            },
+          });
+          sourceConversation.subtreeUpdatedAt = now;
+          sourceResource.revision += 1;
+        } else {
+          Object.assign(sourceConversation, {
+            activeStrandId: destinationStrandId,
+            headRevision: Number(sourceConversation.headRevision) + 1,
+            versionCount: destinationVersions.length,
+            latestTurnId: replacement.id,
+            preview: text,
+            subtreeUpdatedAt: now,
+            updatedAt: now,
+          });
+          sourceResource.revision += 1;
+        }
         resources.set('runtime', {
           revision: (resources.get('runtime')?.revision ?? 0) + 1,
-          value: { ...runtimeValue('idle'), conversationId: branchId, activeTurnId: null },
+          value: { ...runtimeValue('idle'), conversationId: destinationConversationId, activeTurnId: null },
         });
         syncConversationList();
-        invalidateResource(`conversation:${branchId}`, 'created');
+        invalidateResource(
+          `conversation:${destinationConversationId}`,
+          isFork ? 'created' : 'updated',
+        );
+        invalidateResource(`conversation-versions:${destinationConversationId}`);
+        if (isFork) invalidateResource(`conversation:${sourceConversationId}`);
         invalidateResource('runtime');
-        invalidateTranscript(replacement.id, 'terminal', true, branchId);
-        return { conversationId: branchId, turnId: replacement.id };
+        invalidateTranscript(replacement.id, 'terminal', true, destinationConversationId);
+        return {
+          accepted: true,
+          commandId: params.commandId,
+          conversationId: destinationConversationId,
+          strandId: destinationStrandId,
+          headRevision: Number(
+            resources.get(`conversation:${destinationConversationId}`)?.value.headRevision ?? 1
+          ),
+          turnId: replacement.id,
+        };
       }
       if (request.method === 'remux/agent/files/search') {
         const query = String(params.query ?? '').toLowerCase();
@@ -1018,29 +1970,29 @@ export async function installAgentHost(page: Page) {
       if (request.method === 'remux/agent/conversation/turn/interrupt') {
         const turn = turns.find((candidate) => candidate.id === params.turnId);
         if (turn) finishTurn(turn, 'interrupted');
-        return { accepted: true };
+        return { accepted: true, commandId: params.commandId };
       }
-      if (request.method === 'remux/agent/auth/login/start') {
+      if (request.method === 'remux/agent/provider/login/start') {
         updateResource('auth', (auth) => Object.assign(auth, {
-          state: 'signing-in', operationId: 'fixture-login',
+          state: 'signing-in', operationId: params.commandId,
           verificationUri: 'https://example.test/device', userCode: 'REMUX-CODE',
           progress: 'Waiting for authorization.', error: null,
         }));
-        return { accepted: true, operationId: 'fixture-login' };
+        return { accepted: true, commandId: params.commandId, operationId: params.commandId };
       }
-      if (request.method === 'remux/agent/auth/login/cancel') {
+      if (request.method === 'remux/agent/provider/login/cancel') {
         updateResource('auth', (auth) => Object.assign(auth, {
           state: 'signed-out', operationId: null, verificationUri: null,
           userCode: null, progress: null,
         }));
-        return { accepted: true };
+        return { accepted: true, commandId: params.commandId };
       }
-      if (request.method === 'remux/agent/auth/logout') {
+      if (request.method === 'remux/agent/provider/logout') {
         updateResource('auth', (auth) => Object.assign(auth, {
           state: 'signed-out', operationId: null, displayLabel: null,
           verificationUri: null, userCode: null, progress: null, error: null,
         }));
-        return { accepted: true };
+        return { accepted: true, commandId: params.commandId };
       }
       if (request.method === 'remux/fs/readDirectory') {
         const path = String(params.path);
@@ -1102,10 +2054,28 @@ export async function installAgentHost(page: Page) {
           if (request.id !== undefined && request.method) {
             try {
               if (request.method === 'remux/agent/transcript/resources/read' && nextTranscriptDelayMs > 0) {
-                const result = resultFor(request);
+                // The native bridge crosses a JSON boundary. Snapshot delayed results now so
+                // later fixture mutations cannot retroactively alter an in-flight response.
+                const result = JSON.parse(JSON.stringify(resultFor(request)));
                 const delay = nextTranscriptDelayMs;
                 nextTranscriptDelayMs = 0;
                 setTimeout(() => dispatch({ type: 'remux/response', id: request.id, result }), delay);
+                return;
+              }
+              if (
+                request.method === 'remux/agent/transcript/resources/read' &&
+                transcriptFailuresRemaining > 0
+              ) {
+                transcriptFailuresRemaining -= 1;
+                dispatch({
+                  type: 'remux/error',
+                  id: request.id,
+                  error: {
+                    code: -32000,
+                    data: { kind: 'fixture_transient_failure' },
+                    message: 'Fixture transcript read failed transiently.',
+                  },
+                });
                 return;
               }
               dispatch({ type: 'remux/response', id: request.id, result: resultFor(request) });
@@ -1137,14 +2107,41 @@ export async function installAgentHost(page: Page) {
           sequence += 1;
           invalidateTranscript(turn.id, 'terminal', true);
         },
-        addConversation(input: { cwd?: string; id: string; preview?: string; title: string }) {
+        appendCompletedTurnTo(targetConversationId: string, user: string, assistant: string) {
+          const targetTurns = turnsByConversation.get(targetConversationId);
+          if (!targetTurns) throw new Error(`Unknown fixture conversation ${targetConversationId}.`);
+          turnCounter += 1;
+          const turn = completedTurn(`external-turn-${turnCounter}`, user, assistant);
+          targetTurns.push(turn);
+          sequence += 1;
+          invalidateTranscript(turn.id, 'terminal', true, targetConversationId);
+        },
+        reviseLatestAssistant(targetConversationId: string, assistantText: string) {
+          const turn = turnsByConversation.get(targetConversationId)?.at(-1);
+          const assistant = turn?.segments.find((segment) => segment.type === 'assistantMessage');
+          if (!turn || !assistant) {
+            throw new Error(`Fixture conversation ${targetConversationId} has no assistant turn.`);
+          }
+          assistant.text = assistantText;
+          touchTurn(turn);
+          invalidateTranscript(turn.id, 'runtimeEvent', false, targetConversationId);
+        },
+        addConversation(input: {
+          archivedAt?: number;
+          cwd?: string;
+          id: string;
+          preview?: string;
+          title: string;
+        }) {
           const key = `conversation:${input.id}`;
+          if (!turnsByConversation.has(input.id)) turnsByConversation.set(input.id, []);
           resources.set(key, {
             revision: 1,
             value: {
-              ...conversationSummary(input.cwd ?? '/tmp/remux-fixture', 'idle'),
+              ...conversationSummary(input.cwd ?? '/tmp/remux-fixture', 'idle', input.id),
               id: input.id,
               latestTurnId: null,
+              archivedAt: input.archivedAt ?? null,
               preview: input.preview ?? '',
               title: input.title,
               updatedAt: Date.now() + 1,
@@ -1153,8 +2150,49 @@ export async function installAgentHost(page: Page) {
           invalidateResource(key, 'created');
           syncConversationList();
         },
+        addConversations(inputs: Array<{
+          createdAt?: number;
+          cwd?: string;
+          id: string;
+          lastActivityAt?: number;
+          parentConversationId?: string;
+          preview?: string;
+          title: string;
+          updatedAt?: number;
+        }>) {
+          for (const input of inputs) {
+            if (!turnsByConversation.has(input.id)) turnsByConversation.set(input.id, []);
+            const parent = input.parentConversationId
+              ? resources.get(`conversation:${input.parentConversationId}`)?.value
+              : null;
+            const createdAt = input.createdAt ?? Date.now();
+            resources.set(`conversation:${input.id}`, {
+              revision: 1,
+              value: {
+                ...conversationSummary(input.cwd ?? '/tmp/remux-fixture', 'idle', input.id),
+                id: input.id,
+                parentConversationId: input.parentConversationId ?? null,
+                rootConversationId: String(parent?.rootConversationId ?? input.id),
+                createdAt,
+                lastActivityAt: input.lastActivityAt ?? input.updatedAt ?? createdAt,
+                latestTurnId: null,
+                preview: input.preview ?? '',
+                title: input.title,
+                subtreeUpdatedAt: createdAt,
+                updatedAt: input.updatedAt ?? createdAt,
+              },
+            });
+          }
+          syncConversationList();
+        },
         delayNextTranscript(delayMs: number) {
           nextTranscriptDelayMs = Math.max(0, delayMs);
+        },
+        dropInvalidations(value = true) {
+          invalidationsDropped = Boolean(value);
+        },
+        failNextTranscriptReads(count = 1) {
+          transcriptFailuresRemaining = Math.max(0, Number(count));
         },
         reviseLatestExecutionScope() {
           const turn = turns.at(-1);
@@ -1171,13 +2209,11 @@ export async function installAgentHost(page: Page) {
           value.inferences = [value.inferences[0], {
             id: inferenceId, ordinal: 1, state: 'completed', revision: `inference:refresh:${sequence}`,
             startedAt: Date.now(), completedAt: Date.now() + 10, durationMs: 10,
-            ...(!legacyInferenceTrace ? { contentOrder: ['reasoning'] } : {}),
-            commentary: null,
-            reasoning: {
-              kind: 'providerSummary', state: 'final',
+            blocks: [{
+              id: `${inferenceId}:reasoning`, type: 'reasoning', state: 'final',
+              revision: `reasoning:${sequence}`,
               text: 'Validated the refreshed execution-scope revision.',
-            },
-            actionGroup: null,
+            }],
           }];
           dispatchInvalidations([{
             type: 'executionScope', key, conversationId, turnId: turn.id,
@@ -1185,9 +2221,20 @@ export async function installAgentHost(page: Page) {
             basisSequence: sequence,
           }]);
         },
+        streamLatestAssistantText(text: string) {
+          const turn = turns.at(-1);
+          const assistant = turn?.segments.find((segment) => segment.type === 'assistantMessage');
+          if (!turn || turn.status !== 'inProgress' || !assistant) {
+            throw new Error('No running fixture assistant message is available.');
+          }
+          assistant.text = text;
+          touchTurn(turn);
+          invalidateTranscript(turn.id, 'runtimeEvent', false);
+        },
         rejectNextMessage(message = 'Another conversation has an active turn.') {
           nextMessageError = message;
         },
+        connection: dispatchStatus,
         lifecycle: dispatchLifecycle,
         navigate(resourceKind: string, resourceId: string, focusKind?: string, focusId?: string) {
           dispatch({
@@ -1226,6 +2273,22 @@ export async function installAgentHost(page: Page) {
             { type: 'resource', key: 'runtime', reason: 'updated' },
             { type: 'resource', key: conversationKey, reason: 'updated' },
           ]);
+        },
+        updateComposerUsage(input: {
+          contextUsedTokens: number;
+          fiveHourUsedPercent: number;
+          weeklyUsedPercent: number;
+        }) {
+          contextUsedTokens = input.contextUsedTokens;
+          fiveHourUsagePercent = input.fiveHourUsedPercent;
+          weeklyUsagePercent = input.weeklyUsedPercent;
+          usageObservedAt += 1_000;
+          const auth = resources.get('auth');
+          if (auth) auth.revision += 1;
+          const runtime = resources.get('runtime');
+          if (runtime) runtime.revision += 1;
+          invalidateResource('auth');
+          invalidateResource('runtime');
         },
         setViewportMetrics(metrics: Partial<typeof viewportMetrics>) {
           viewportMetrics = { ...viewportMetrics, ...metrics };

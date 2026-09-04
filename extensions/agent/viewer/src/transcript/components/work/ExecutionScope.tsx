@@ -5,38 +5,43 @@ import {
   ChevronDown,
   ChevronRight,
   CircleDot,
-  FilePenLine,
-  FolderOpen,
   Loader2,
   RotateCcw,
-  Search,
-  TerminalSquare,
-  Wrench,
 } from 'lucide-react';
 
 import {
   executionScopeResourceKey,
   operationDetailResourceKey,
   type AgentExecutionScopeResource,
+  type AgentInferenceBlock,
   type AgentInferenceTrace,
   type AgentToolCallSummary,
-  type AgentWorkUnitArtifactReference,
+  type AgentExecutionArtifactReference,
 } from '../../../../../shared/transcript.ts';
 import { useTranscriptLayoutStore } from '../../layoutStore.ts';
 import { useTranscriptResourceStore } from '../../resourceStore.ts';
 import { ExactContent } from '../ExactContent.tsx';
+import { CompactionDivider } from '../CompactionDivider.tsx';
+import { ArtifactDiff } from '../diff/ArtifactDiff.tsx';
 import { MarkdownBlock } from '../markdown/MarkdownBlock.tsx';
+import { LiveActivity } from './LiveActivity.tsx';
 import { formatWorkDuration } from './workDuration.ts';
+import { executionScopeIsWaitingForContent } from './workActivityState.ts';
+import { actionRunActivityKind, summarizeActionRun } from './workPresentation.ts';
 
 export function ExecutionScopeContent({
   conversationId,
+  isRunning = false,
   laneWidth,
+  responseStarted = false,
   scopeId,
   turnId,
   workKey,
 }: {
   conversationId: string;
+  isRunning?: boolean;
   laneWidth: number;
+  responseStarted?: boolean;
   scopeId: string;
   turnId: string;
   workKey: string;
@@ -50,6 +55,9 @@ export function ExecutionScopeContent({
   }, [ensureScope, entry, scopeId, turnId]);
 
   if ((!entry || entry.status === 'loading') && !entry?.resource) {
+    if (isRunning && !responseStarted) {
+      return <LiveActivity className="agent-thinking-placeholder" kind="thinking" label="Thinking" />;
+    }
     return <div className="codex-work-loading"><Loader2 className="size-3.5 animate-spin" /> Loading work…</div>;
   }
   if (!entry?.resource) {
@@ -66,6 +74,7 @@ export function ExecutionScopeContent({
     <ExecutionScopeBody
       conversationId={conversationId}
       laneWidth={laneWidth}
+      responseStarted={responseStarted}
       turnId={turnId}
       value={entry.resource}
       workKey={workKey}
@@ -76,12 +85,14 @@ export function ExecutionScopeContent({
 function ExecutionScopeBody({
   conversationId,
   laneWidth,
+  responseStarted,
   turnId,
   value,
   workKey,
 }: {
   conversationId: string;
   laneWidth: number;
+  responseStarted: boolean;
   turnId: string;
   value: AgentExecutionScopeResource;
   workKey: string;
@@ -145,9 +156,9 @@ function ExecutionScopeBody({
           Load earlier reasoning and tools
         </button>
       ) : null}
-      {value.kind === 'workUnit' ? <WorkUnitOutcome laneWidth={scopeWidth} value={value} /> : null}
-      {value.inferences.length === 0 && value.state === 'running' ? (
-        <p className="agent-scope-empty">Waiting for the first model response…</p>
+      {value.kind === 'childExecution' ? <ChildExecutionOutcome laneWidth={scopeWidth} value={value} /> : null}
+      {!responseStarted && executionScopeIsWaitingForContent(value) ? (
+        <LiveActivity className="agent-thinking-placeholder" kind="thinking" label="Thinking" />
       ) : null}
     </div>
   );
@@ -168,110 +179,110 @@ function InferenceTrace({
   turnId: string;
   workKey: string;
 }) {
-  const items = inference.actionGroup
-    ? actionTraceItems(scopeId, inference.actionGroup.id, inference.actionGroup.calls)
-    : [];
+  const items = inferenceTraceItems(scopeId, inference.blocks);
   const childCalls = items.filter((item) => item.kind === 'scope').map((item) => item.call);
   const childKeys = childCalls.map((call) =>
     executionScopeResourceKey(conversationId, turnId, call.childScopeId!));
   const actionKeys = items.filter((item) => item.kind === 'actions').map((item) => item.key);
-  const contentOrder = inferenceContentOrder(inference);
   return (
     <section className="agent-inference" data-state={inference.state}>
-      {contentOrder.map((kind) => {
-        if (kind === 'reasoning' && inference.reasoning) {
-          return (
-            <div className="agent-reasoning-block codex-work-entry codex-work-entry-block" data-state={inference.reasoning.state} key={kind}>
-              <MarkdownBlock density="work" width={laneWidth}>
-                {inference.reasoning.text}
-              </MarkdownBlock>
-              <ExactContent
-                content={inference.reasoning.content}
-                preview={inference.reasoning.text}
-                title="reasoning"
+      {items.map((item) => {
+        if (item.kind === 'text') {
+          if (item.block.type === 'notice' && item.block.code === 'context-compaction') {
+            return (
+              <CompactionDivider
+                key={item.block.id}
+                label={item.block.text}
+                status={item.block.state === 'streaming'
+                  ? 'compacting'
+                  : item.block.state === 'partial' ? 'failed' : 'compacted'}
               />
-            </div>
-          );
-        }
-        if (kind === 'commentary' && inference.commentary) {
+            );
+          }
+          const className = item.block.type === 'reasoning'
+            ? 'agent-reasoning-block'
+            : item.block.type === 'notice'
+              ? 'agent-notice-block'
+              : 'agent-commentary-block';
+          const title = item.block.type === 'reasoning'
+            ? 'reasoning'
+            : item.block.type === 'notice' ? 'provider notice' : 'progress update';
           return (
-            <div className="agent-commentary-block codex-work-entry codex-work-entry-block" data-state={inference.commentary.state} key={kind}>
-              <MarkdownBlock density="work" width={laneWidth}>{inference.commentary.text}</MarkdownBlock>
-              <ExactContent
-                content={inference.commentary.content}
-                preview={inference.commentary.text}
-                title="progress update"
-              />
-            </div>
-          );
-        }
-        if (kind === 'actions' && items.length) {
-          return (
-            <div className="agent-action-sequence" data-state={inference.actionGroup?.status} key={kind}>
-              {items.map((item) => item.kind === 'scope' ? (
-                <ExecutionScopeDisclosure
-                  conversationId={conversationId}
-                  fallbackTitle={item.call.childBoundary ?? 'Focused work unit'}
-                  fallbackDurationMs={item.call.childDurationMs}
-                  fallbackOperationCount={item.call.childOperationCount}
-                  fallbackArtifactCount={item.call.childArtifactCount}
-                  fallbackState={item.call.childState ?? item.call.status}
-                  key={item.call.id}
-                  laneWidth={laneWidth}
-                  scopeId={item.call.childScopeId!}
-                  siblingKeys={childKeys}
-                  turnId={turnId}
-                  workKey={workKey}
-                />
+            <div
+              className={`${className} codex-work-entry codex-work-entry-block`}
+              data-kind={item.block.type}
+              data-state={item.block.state}
+              key={item.block.id}
+            >
+              {item.block.type === 'reasoning' && item.block.parts?.length ? (
+                <div className="agent-reasoning-parts">
+                  {item.block.parts.map((part, index) => (
+                    <div className="agent-reasoning-part" key={`${item.block.id}:part:${index}`}>
+                      <MarkdownBlock density="work" width={laneWidth}>{part}</MarkdownBlock>
+                    </div>
+                  ))}
+                </div>
               ) : (
-                <ActionRun
-                  calls={item.calls}
-                  conversationId={conversationId}
-                  disclosureKey={item.key}
-                  key={item.key}
-                  scopeId={scopeId}
-                  siblingKeys={actionKeys}
-                  turnId={turnId}
-                  workKey={workKey}
-                />
-              ))}
+                <MarkdownBlock
+                  density="work"
+                  preserveSoftBreaks={item.block.type === 'reasoning'}
+                  width={laneWidth}
+                >
+                  {item.block.text}
+                </MarkdownBlock>
+              )}
+              <ExactContent
+                content={item.block.content}
+                preview={item.block.text}
+                title={title}
+              />
             </div>
           );
         }
-        return null;
+        if (item.kind === 'scope') {
+          return (
+            <ExecutionScopeDisclosure
+              conversationId={conversationId}
+              fallbackTitle={item.call.childBoundary ?? 'Agent task'}
+              fallbackDurationMs={item.call.childDurationMs}
+              fallbackOperationCount={item.call.childOperationCount}
+              fallbackArtifactCount={item.call.childArtifactCount}
+              fallbackState={item.call.childState ?? item.call.status}
+              key={item.call.id}
+              laneWidth={laneWidth}
+              scopeId={item.call.childScopeId!}
+              siblingKeys={childKeys}
+              turnId={turnId}
+              workKey={workKey}
+            />
+          );
+        }
+        return (
+          <div className="agent-action-sequence" data-state={actionRunState(item.calls)} key={item.key}>
+            <ActionRun
+              calls={item.calls}
+              conversationId={conversationId}
+              disclosureKey={item.key}
+              scopeId={scopeId}
+              siblingKeys={actionKeys}
+              turnId={turnId}
+              workKey={workKey}
+            />
+          </div>
+        );
       })}
     </section>
   );
 }
 
-function inferenceContentOrder(
-  inference: AgentInferenceTrace,
-): Array<'reasoning' | 'commentary' | 'actions'> {
-  const present = {
-    actions: Boolean(inference.actionGroup),
-    commentary: Boolean(inference.commentary),
-    reasoning: Boolean(inference.reasoning),
-  };
-  const order: Array<'reasoning' | 'commentary' | 'actions'> = [];
-  const add = (kind: 'reasoning' | 'commentary' | 'actions') => {
-    if (present[kind] && !order.includes(kind)) order.push(kind);
-  };
-  for (const kind of inference.contentOrder ?? []) add(kind);
-  // Additive transcript fields can be absent while viewer and server reload independently.
-  add('reasoning');
-  add('commentary');
-  add('actions');
-  return order;
-}
-
 type ActionTraceItem =
+  | { kind: 'text'; block: Extract<AgentInferenceBlock, { type: 'reasoning' | 'commentary' | 'assistantText' | 'notice' }> }
   | { kind: 'actions'; key: string; calls: AgentToolCallSummary[] }
   | { kind: 'scope'; call: AgentToolCallSummary };
 
-function actionTraceItems(
+function inferenceTraceItems(
   scopeId: string,
-  actionGroupId: string,
-  calls: AgentToolCallSummary[],
+  blocks: AgentInferenceBlock[],
 ): ActionTraceItem[] {
   const items: ActionTraceItem[] = [];
   let pending: AgentToolCallSummary[] = [];
@@ -280,56 +291,35 @@ function actionTraceItems(
     if (!pending.length) return;
     items.push({
       kind: 'actions',
-      key: `action-run:${scopeId}:${actionGroupId}:${runIndex}`,
+      key: `action-run:${scopeId}:${pending[0]!.id}:${pending.at(-1)!.id}:${runIndex}`,
       calls: pending,
     });
     pending = [];
     runIndex += 1;
   };
-  for (const call of calls) {
+  for (const block of blocks) {
+    if (block.type !== 'action') {
+      flush();
+      items.push({ kind: 'text', block });
+      continue;
+    }
+    const call = block.call;
     if (call.childScopeId) {
       flush();
       items.push({ kind: 'scope', call });
       continue;
     }
-    if (call.name === 'work_unit_finish') continue;
     pending.push(call);
   }
   flush();
   return items;
 }
 
-function summarizeActionRun(calls: AgentToolCallSummary[]) {
-  const counts = { command: 0, edit: 0, read: 0, search: 0, context: 0, tool: 0 };
-  const edited = new Set<string>();
-  for (const call of calls) {
-    counts[call.presentation.category] += 1;
-    if (call.presentation.category === 'edit' && call.presentation.subject) {
-      edited.add(fileName(call.presentation.subject));
-    }
-  }
-  const editedNames = [...edited];
-  const editedSummary = counts.edit === 1 && editedNames.length === 1
-    ? `Edited ${editedNames[0]}`
-    : counts.edit === 2 && editedNames.length === 2
-      ? `Edited ${editedNames[0]} and ${editedNames[1]}`
-      : counts.edit ? `Edited ${formatCount(counts.edit, 'file')}` : null;
-  return joinSummaryParts([
-    counts.command ? `Ran ${formatCount(counts.command, 'command')}` : null,
-    editedSummary,
-    counts.search ? `Searched ${formatCount(counts.search, 'time')}` : null,
-    counts.read ? `Read ${formatCount(counts.read, 'file')}` : null,
-    counts.context ? `Used ${formatCount(counts.context, 'context tool')}` : null,
-    counts.tool ? `Used ${formatCount(counts.tool, 'tool')}` : null,
-  ]) || 'Tool activity';
-}
-
-function actionRunIcon(calls: AgentToolCallSummary[]) {
-  if (calls.some((call) => call.presentation.category === 'command')) return TerminalSquare;
-  if (calls.some((call) => call.presentation.category === 'edit')) return FilePenLine;
-  if (calls.some((call) => call.presentation.category === 'search')) return Search;
-  if (calls.some((call) => call.presentation.category === 'read')) return FolderOpen;
-  return Wrench;
+function actionRunState(calls: AgentToolCallSummary[]) {
+  if (calls.some(({ status }) => status === 'running')) return 'running';
+  if (calls.some(({ status }) => status === 'failed')) return 'failed';
+  if (calls.some(({ status }) => status === 'interrupted')) return 'interrupted';
+  return 'completed';
 }
 
 function actionRunStatus(calls: AgentToolCallSummary[]): AgentToolCallSummary['status'] {
@@ -337,19 +327,6 @@ function actionRunStatus(calls: AgentToolCallSummary[]): AgentToolCallSummary['s
   if (calls.some((call) => call.status === 'failed')) return 'failed';
   if (calls.some((call) => call.status === 'interrupted')) return 'interrupted';
   return 'completed';
-}
-
-function formatCount(count: number, unit: string) {
-  return `${count} ${unit}${count === 1 ? '' : 's'}`;
-}
-
-function joinSummaryParts(parts: Array<string | null>) {
-  return parts.filter(Boolean).join(' · ');
-}
-
-function fileName(path: string) {
-  const segments = path.replace(/\\/gu, '/').split('/').filter(Boolean);
-  return segments.at(-1) ?? path;
 }
 
 function ExecutionScopeDisclosure({
@@ -388,8 +365,7 @@ function ExecutionScopeDisclosure({
   const durationMs = scope?.durationMs ?? fallbackDurationMs;
   const operationCount = scope
     ? scope.inferences.reduce((count, inference) =>
-        count + (inference.actionGroup?.calls.filter((call) =>
-          call.name !== 'work_unit_finish').length ?? 0), 0)
+        count + inference.blocks.filter((block) => block.type === 'action').length, 0)
     : fallbackOperationCount;
   const artifactCount = scope?.artifacts.length ?? fallbackArtifactCount;
 
@@ -398,10 +374,10 @@ function ExecutionScopeDisclosure({
   }, [ensureScope, open, scope, scopeId, turnId]);
 
   return (
-    <section className="agent-work-unit" data-state={displayStatus}>
+    <section className="agent-child-execution" data-state={displayStatus}>
       <button
         aria-expanded={open}
-        className="agent-work-unit-header"
+        className="agent-child-execution-header"
         data-remux-no-composer-focus="true"
         onClick={() => {
           setOnlyOpen(workKey, siblingKeys, open ? null : key);
@@ -409,11 +385,17 @@ function ExecutionScopeDisclosure({
         }}
         type="button"
       >
-        <span className="agent-work-unit-state"><ScopeStateIcon status={displayStatus} /></span>
-        <span className="agent-work-unit-copy">
-          <span className="agent-work-unit-boundary">{title}</span>
-          <span className="agent-work-unit-meta">
-            Work unit · {displayStatus}{durationMs === null || durationMs === undefined
+        <span className="agent-child-execution-copy">
+          <span className="agent-child-execution-boundary">
+            <LiveActivity
+              animated={displayStatus === 'running'}
+              className="agent-live-activity-inline"
+              kind="agent"
+              label={title}
+            />
+          </span>
+          <span className="agent-child-execution-meta">
+            Agent · {displayStatus}{durationMs === null || durationMs === undefined
               ? ''
               : ` · ${formatWorkDuration(durationMs)}`}
             {operationCount > 0
@@ -424,14 +406,15 @@ function ExecutionScopeDisclosure({
               : ''}
           </span>
         </span>
-        <span className="agent-work-unit-chevron">
+        <span className="agent-child-execution-chevron">
           {open ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
         </span>
       </button>
       {open ? (
-        <div className="agent-work-unit-content">
+        <div className="agent-child-execution-content">
           <ExecutionScopeContent
             conversationId={conversationId}
+            isRunning={displayStatus === 'running'}
             laneWidth={laneWidth}
             scopeId={scopeId}
             turnId={turnId}
@@ -463,7 +446,6 @@ function ActionRun({
   const open = useTranscriptLayoutStore((state) =>
     state.disclosure.openWorkByKey[workKey]?.openChildByKey[disclosureKey] ?? false);
   const setOnlyOpen = useTranscriptLayoutStore((state) => state.setOnlyOpenWorkChildDisclosure);
-  const Icon = actionRunIcon(calls);
   const status = actionRunStatus(calls);
   return (
     <section className="agent-action-run" data-state={status}>
@@ -475,9 +457,12 @@ function ActionRun({
         onClick={() => setOnlyOpen(workKey, siblingKeys, open ? null : disclosureKey)}
         type="button"
       >
-        <Icon className="size-4 shrink-0" />
-        <span className="min-w-0 flex-1 truncate">{summarizeActionRun(calls)}</span>
-        {status === 'running' ? <Loader2 className="size-3.5 shrink-0 animate-spin" /> : null}
+        <LiveActivity
+          animated={status === 'running'}
+          className="agent-live-activity-inline min-w-0 flex-1"
+          kind={actionRunActivityKind(calls)}
+          label={summarizeActionRun(calls)}
+        />
         {open ? <ChevronDown className="size-4 shrink-0" /> : <ChevronRight className="size-4 shrink-0" />}
       </button>
       {open ? (
@@ -519,40 +504,58 @@ function ToolCall({
   const detail = useTranscriptResourceStore((state) => state.operationDetailsByKey[resourceKey]);
   const ensureDetail = useTranscriptResourceStore((state) => state.ensureOperationDetail);
   useEffect(() => {
-    if (open && !detail) void ensureDetail({ operationId: call.id, scopeId, turnId });
-  }, [call.id, detail, ensureDetail, open, scopeId, turnId]);
-  return (
-    <section className="agent-tool-call codex-work-row-frame" data-state={call.status}>
-      <button
-        aria-expanded={open}
-        className="agent-tool-call-header codex-work-row"
-        data-remux-no-composer-focus="true"
-        onClick={() => {
-          toggle(workKey, key);
-          if (!open) void ensureDetail({ operationId: call.id, scopeId, turnId });
-        }}
-        type="button"
-      >
-        <span className="codex-work-row-icon"><ScopeStateIcon status={call.status} /></span>
-        <span className="codex-work-row-copy">
-          <span className="codex-work-row-title">{call.presentation.label}</span>
-          <span className="codex-work-row-meta">
-            {call.presentation.subject ? `${call.presentation.subject} · ` : ''}
-            {call.name} · {call.status}
-            {call.durationMs === null ? '' : ` · ${formatWorkDuration(call.durationMs)}`}
-          </span>
+    if (open && !call.diffArtifactId && !detail) {
+      void ensureDetail({ operationId: call.id, scopeId, turnId });
+    }
+  }, [call.diffArtifactId, call.id, detail, ensureDetail, open, scopeId, turnId]);
+  const headerContent = (
+    <>
+      <span className="codex-work-row-icon"><ScopeStateIcon status={call.status} /></span>
+      <span className="codex-work-row-copy">
+        <span className="codex-work-row-title">{call.presentation.label}</span>
+        <span className="codex-work-row-meta">
+          {call.presentation.subject ? `${call.presentation.subject} · ` : ''}
+          {call.name} · {call.status}
+          {call.durationMs === null ? '' : ` · ${formatWorkDuration(call.durationMs)}`}
         </span>
-        <ChevronRight className="size-3.5" />
-      </button>
-      {open ? (
+      </span>
+    </>
+  );
+  return (
+    <section
+      className="agent-tool-call codex-work-row-frame"
+      data-has-diff={call.diffArtifactId ? 'true' : 'false'}
+      data-state={call.status}
+    >
+      {call.hasDetail ? (
+        <button
+          aria-expanded={open}
+          className="agent-tool-call-header codex-work-row"
+          data-remux-no-composer-focus="true"
+          onClick={() => {
+            toggle(workKey, key);
+            if (!open && !call.diffArtifactId) {
+              void ensureDetail({ operationId: call.id, scopeId, turnId });
+            }
+          }}
+          type="button"
+        >
+          {headerContent}
+          {open ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
+        </button>
+      ) : (
+        <div className="agent-tool-call-header codex-work-row">{headerContent}</div>
+      )}
+      {open && call.hasDetail ? (
         <div className="codex-work-row-detail">
           <div className="codex-work-detail-copy">
-            {(!detail || detail.status === 'loading') && !detail?.resource ? (
+            {call.diffArtifactId ? <ArtifactDiff artifactId={call.diffArtifactId} /> : null}
+            {!call.diffArtifactId && (!detail || detail.status === 'loading') && !detail?.resource ? (
               <div className="codex-work-loading">
                 <Loader2 className="size-3.5 animate-spin" /> Loading detail…
               </div>
             ) : null}
-            {detail?.status === 'error' || detail?.status === 'missing' ? (
+            {!call.diffArtifactId && (detail?.status === 'error' || detail?.status === 'missing') ? (
               <div className="codex-work-error" role="alert">
                 <span>Tool detail is unavailable.</span>
                 <button
@@ -590,10 +593,10 @@ function ToolCall({
   );
 }
 
-function WorkUnitOutcome({ laneWidth, value }: { laneWidth: number; value: AgentExecutionScopeResource }) {
+function ChildExecutionOutcome({ laneWidth, value }: { laneWidth: number; value: AgentExecutionScopeResource }) {
   if (!value.result && !value.artifacts.length) return null;
   return (
-    <div className="agent-work-unit-outcome">
+    <div className="agent-child-execution-outcome">
       <strong>Result</strong>
       {value.result ? (
         <section><MarkdownBlock density="work" width={laneWidth}>{value.result}</MarkdownBlock></section>
@@ -603,7 +606,7 @@ function WorkUnitOutcome({ laneWidth, value }: { laneWidth: number; value: Agent
   );
 }
 
-function ArtifactList({ artifacts }: { artifacts: AgentWorkUnitArtifactReference[] }) {
+function ArtifactList({ artifacts }: { artifacts: AgentExecutionArtifactReference[] }) {
   return (
     <section className="agent-scope-artifacts">
       <strong>Artifacts</strong>
@@ -623,7 +626,7 @@ function formatArtifactBytes(byteLength: number) {
 }
 
 function ScopeStateIcon({ status }: { status: AgentExecutionScopeResource['state'] | AgentToolCallSummary['status'] }) {
-  if (status === 'running') return <CircleDot className="size-3.5" />;
-  if (status === 'completed') return <CheckCircle2 className="size-3.5" />;
-  return <AlertCircle className="size-3.5" />;
+  if (status === 'running') return <CircleDot className="size-4" />;
+  if (status === 'completed') return <CheckCircle2 className="size-4" />;
+  return <AlertCircle className="size-4" />;
 }

@@ -19,11 +19,16 @@ import { gfmTable } from 'micromark-extension-gfm-table';
 import type { AlignType, BlockContent, DefinitionContent, PhrasingContent, RootContent } from 'mdast';
 
 import { hostFileHrefInfoFromHref, webUrlFromHref } from '@remux/viewer-kit/links';
-
+import {
+  completeMarkdownCacheScope,
+  type MarkdownCacheScope,
+} from './markdownCache';
 
 export type MarkdownDensity = 'default' | 'user' | 'work';
 
 export type MarkdownRenderOptions = {
+  cacheScope?: MarkdownCacheScope;
+  preserveSoftBreaks?: boolean;
   richFileLinks?: boolean;
 };
 
@@ -296,7 +301,11 @@ type InlineMarks = {
   strong: boolean;
 };
 
-type MarkdownParseOptions = Required<MarkdownRenderOptions>;
+type MarkdownParseOptions = {
+  cacheScope: MarkdownCacheScope;
+  preserveSoftBreaks: boolean;
+  richFileLinks: boolean;
+};
 
 type MarkdownInlineParseOptions = MarkdownParseOptions & {
   autolink: boolean;
@@ -306,13 +315,13 @@ export type InlineVariant = 'body' | 'heading1' | 'heading2' | 'heading3';
 
 export const markdownMetrics = {
   blockGap: {
-    default: 8,
-    user: 8,
+    default: 10,
+    user: 10,
     work: 8,
   },
   blockquote: {
-    borderWidth: 3,
-    contentInset: 16,
+    borderWidth: 2,
+    contentInset: 13,
   },
   code: {
     borderWidth: 1,
@@ -335,8 +344,8 @@ export const markdownMetrics = {
     paddingY: 12,
   },
   fontFamily: {
-    mono: 'Menlo, Consolas, "Liberation Mono", monospace',
-    sans: 'Arial, "Helvetica Neue", sans-serif',
+    mono: 'ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace',
+    sans: '-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif',
   },
   heading: {
     default: {
@@ -407,10 +416,14 @@ const documentCache = new Map<string, PreparedMarkdownDocument>();
 const rawDocumentCache = new Map<string, RawMarkdownBlock[]>();
 const preparedTextCache = new Map<string, PreparedText>();
 const layoutCache = new Map<string, MarkdownLayoutDocument>();
+const streamingDocumentCache = new Map<string, { key: string; value: PreparedMarkdownDocument }>();
+const streamingRawDocumentCache = new Map<string, { key: string; value: RawMarkdownBlock[] }>();
+const streamingLayoutCache = new Map<string, { key: string; value: MarkdownLayoutDocument }>();
 const maxDocumentCacheEntries = 300;
 const maxRawDocumentCacheEntries = 300;
 const maxPreparedTextCacheEntries = 1000;
 const maxLayoutCacheEntries = 500;
+const maxStreamingCacheScopes = 16;
 
 const emptyMarks: InlineMarks = {
   emphasis: false,
@@ -424,8 +437,13 @@ export function getPreparedMarkdownDocument(
   options: MarkdownRenderOptions = {},
 ) {
   const parseOptions = markdownParseOptions(options);
-  const key = `${density}\0${parseOptions.richFileLinks ? 'richFiles' : 'plainFiles'}\0${markdown}`;
-  const cached = documentCache.get(key);
+  const key = `${density}\0${markdownParseCacheKey(parseOptions)}\0${markdown}`;
+  const cached = readScopedCache(
+    documentCache,
+    streamingDocumentCache,
+    parseOptions.cacheScope,
+    key,
+  );
   if (cached) {
     return cached;
   }
@@ -436,12 +454,25 @@ export function getPreparedMarkdownDocument(
     density,
   };
 
-  remember(documentCache, key, prepared, maxDocumentCacheEntries);
+  writeScopedCache(
+    documentCache,
+    streamingDocumentCache,
+    parseOptions.cacheScope,
+    key,
+    prepared,
+    maxDocumentCacheEntries,
+  );
   return prepared;
 }
 
 export function parseMarkdownDocument(markdown: string, options: MarkdownRenderOptions = {}) {
   return parseMarkdownBlocks(markdown, markdownParseOptions(options));
+}
+
+export function releaseStreamingMarkdownCaches(scopeKey: string) {
+  streamingDocumentCache.delete(scopeKey);
+  streamingRawDocumentCache.delete(scopeKey);
+  streamingLayoutCache.delete(scopeKey);
 }
 
 export function getMarkdownLayoutDocument(
@@ -453,8 +484,13 @@ export function getMarkdownLayoutDocument(
   const parseOptions = markdownParseOptions(options);
   const safeWidth = Math.max(1, width);
   const roundedWidth = Math.round(safeWidth * 100) / 100;
-  const key = `${density}\0${parseOptions.richFileLinks ? 'richFiles' : 'plainFiles'}\0${roundedWidth}\0${markdown}`;
-  const cached = layoutCache.get(key);
+  const key = `${density}\0${markdownParseCacheKey(parseOptions)}\0${roundedWidth}\0${markdown}`;
+  const cached = readScopedCache(
+    layoutCache,
+    streamingLayoutCache,
+    parseOptions.cacheScope,
+    key,
+  );
   if (cached) {
     return cached;
   }
@@ -468,7 +504,14 @@ export function getMarkdownLayoutDocument(
     width: roundedWidth,
   };
 
-  remember(layoutCache, key, laidOut, maxLayoutCacheEntries);
+  writeScopedCache(
+    layoutCache,
+    streamingLayoutCache,
+    parseOptions.cacheScope,
+    key,
+    laidOut,
+    maxLayoutCacheEntries,
+  );
   return laidOut;
 }
 
@@ -1226,20 +1269,41 @@ function headingVariant(depth: 1 | 2 | 3): InlineVariant {
 
 function markdownParseOptions(options: MarkdownRenderOptions = {}): MarkdownParseOptions {
   return {
+    cacheScope: options.cacheScope ?? completeMarkdownCacheScope,
+    preserveSoftBreaks: options.preserveSoftBreaks ?? false,
     richFileLinks: options.richFileLinks ?? true,
   };
 }
 
+function markdownParseCacheKey(options: MarkdownParseOptions) {
+  return [
+    options.richFileLinks ? 'richFiles' : 'plainFiles',
+    options.preserveSoftBreaks ? 'preserveSoftBreaks' : 'collapseSoftBreaks',
+  ].join(':');
+}
+
 function parseMarkdownBlocks(markdown: string, options: MarkdownParseOptions): RawMarkdownBlock[] {
-  const key = `${options.richFileLinks ? 'richFiles' : 'plainFiles'}\0${markdown}`;
-  const cached = rawDocumentCache.get(key);
+  const key = `${markdownParseCacheKey(options)}\0${markdown}`;
+  const cached = readScopedCache(
+    rawDocumentCache,
+    streamingRawDocumentCache,
+    options.cacheScope,
+    key,
+  );
   if (cached) return cached;
   const blocks = rootContentToRawBlocks(fromMarkdown(markdown, {
     extensions: [gfmTable()],
     mdastExtensions: [gfmTableFromMarkdown()],
   }).children, options);
   assignRenderIds(blocks, '');
-  remember(rawDocumentCache, key, blocks, maxRawDocumentCacheEntries);
+  writeScopedCache(
+    rawDocumentCache,
+    streamingRawDocumentCache,
+    options.cacheScope,
+    key,
+    blocks,
+    maxRawDocumentCacheEntries,
+  );
   return blocks;
 }
 
@@ -1390,6 +1454,7 @@ function phrasingToInlineLines(
   const lines: MarkdownInline[][] = [[]];
   const inlineOptions: MarkdownInlineParseOptions = {
     autolink: options.autolink ?? true,
+    preserveSoftBreaks: options.preserveSoftBreaks ?? false,
     richFileLinks: options.richFileLinks ?? true,
   };
 
@@ -1403,7 +1468,7 @@ function phrasingToInlineLines(
 function appendPhrasingNode(lines: MarkdownInline[][], node: PhrasingContent, options: MarkdownInlineParseOptions) {
   switch (node.type) {
     case 'text':
-      appendInlineText(lines, node.value, options.autolink);
+      appendInlineText(lines, node.value, options.autolink, options.preserveSoftBreaks);
       return;
     case 'inlineCode':
       appendInline(lines, {
@@ -1448,7 +1513,7 @@ function appendPhrasingNode(lines: MarkdownInline[][], node: PhrasingContent, op
           }));
         }
       } else {
-        appendInlineText(lines, markdownTextFromNode(node), options.autolink);
+        appendInlineText(lines, markdownTextFromNode(node), options.autolink, options.preserveSoftBreaks);
       }
       return;
     }
@@ -1457,27 +1522,46 @@ function appendPhrasingNode(lines: MarkdownInline[][], node: PhrasingContent, op
       appendInlineLines(lines, phrasingToInlineLines(node.children, options));
       return;
     case 'image':
-      appendInlineText(lines, node.alt || node.url, options.autolink);
+      appendInlineText(lines, node.alt || node.url, options.autolink, options.preserveSoftBreaks);
       return;
     case 'imageReference':
-      appendInlineText(lines, node.alt || node.label || node.identifier, options.autolink);
+      appendInlineText(
+        lines,
+        node.alt || node.label || node.identifier,
+        options.autolink,
+        options.preserveSoftBreaks,
+      );
       return;
     case 'html':
-      appendInlineText(lines, node.value, options.autolink);
+      appendInlineText(lines, node.value, options.autolink, options.preserveSoftBreaks);
       return;
     case 'footnoteReference':
-      appendInlineText(lines, `[^${node.label ?? node.identifier}]`, options.autolink);
+      appendInlineText(
+        lines,
+        `[^${node.label ?? node.identifier}]`,
+        options.autolink,
+        options.preserveSoftBreaks,
+      );
       return;
   }
 }
 
-function appendInlineText(lines: MarkdownInline[][], text: string, autolink = true) {
-  const normalized = text.replace(/\s+/g, ' ');
-  if (normalized) {
-    for (const inline of textToInlines(normalized, autolink)) {
-      appendInline(lines, inline);
+function appendInlineText(
+  lines: MarkdownInline[][],
+  text: string,
+  autolink = true,
+  preserveSoftBreaks = false,
+) {
+  const logicalLines = preserveSoftBreaks ? text.split(/\r\n?|\n/g) : [text];
+  logicalLines.forEach((logicalLine, index) => {
+    if (index > 0) lines.push([]);
+    const normalized = logicalLine.replace(/\s+/g, ' ');
+    if (normalized) {
+      for (const inline of textToInlines(normalized, autolink)) {
+        appendInline(lines, inline);
+      }
     }
-  }
+  });
 }
 
 function textToInlines(text: string, autolink: boolean): MarkdownInline[] {
@@ -1703,4 +1787,39 @@ function remember<K, V>(cache: Map<K, V>, key: K, value: V, maxEntries: number) 
   }
 
   cache.set(key, value);
+}
+
+function readScopedCache<V>(
+  durable: Map<string, V>,
+  streaming: Map<string, { key: string; value: V }>,
+  scope: MarkdownCacheScope,
+  key: string,
+) {
+  if (scope.kind === 'complete') return durable.get(key);
+  const entry = streaming.get(scope.key);
+  if (!entry || entry.key !== key) return undefined;
+  streaming.delete(scope.key);
+  streaming.set(scope.key, entry);
+  return entry.value;
+}
+
+function writeScopedCache<V>(
+  durable: Map<string, V>,
+  streaming: Map<string, { key: string; value: V }>,
+  scope: MarkdownCacheScope,
+  key: string,
+  value: V,
+  maximum: number,
+) {
+  if (scope.kind === 'complete') {
+    remember(durable, key, value, maximum);
+    return;
+  }
+  streaming.delete(scope.key);
+  streaming.set(scope.key, { key, value });
+  while (streaming.size > maxStreamingCacheScopes) {
+    const oldest = streaming.keys().next().value as string | undefined;
+    if (oldest === undefined) return;
+    streaming.delete(oldest);
+  }
 }

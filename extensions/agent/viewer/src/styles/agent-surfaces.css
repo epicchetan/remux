@@ -1,0 +1,89 @@
+/* Sidebar, pickers, dialogs, and state surfaces. */
+
+.agent-app > aside {
+  border-color: var(--agent-border);
+  background: var(--agent-sidebar);
+}
+
+.agent-app > aside button[aria-current="page"] {
+  background: var(--agent-surface);
+}
+
+.agent-app > aside button:hover {
+  background: color-mix(in srgb, var(--agent-text) 5%, transparent);
+}
+
+.agent-sidebar-title {
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.agent-app > aside button[aria-current="page"] {
+  box-shadow: inset 0 0 0 1px var(--agent-border);
+}
+
+[role="dialog"] {
+  color: var(--agent-text);
+}
+
+[data-radix-dialog-content],
+.agent-exact-content-dialog {
+  border-color: var(--agent-border-strong);
+  background: var(--agent-surface-overlay);
+}
+
+.agent-auth-card {
+  border-color: var(--agent-border-strong);
+  border-radius: 16px;
+  background: var(--agent-surface);
+  box-shadow: none;
+}
+
+.agent-transcript-state button,
+.agent-transcript-focus-error button,
+.agent-transcript-retry,
+.codex-work-error button,
+.agent-exact-content-dialog header button,
+.agent-exact-content-dialog footer button {
+  border-color: var(--agent-border-strong);
+  background: var(--agent-surface-raised);
+  box-shadow: none;
+}
+
+.remux-file-mention-picker {
+  background: var(--agent-surface-overlay);
+}
+
+.remux-directory-picker-search {
+  border-color: var(--agent-border-strong);
+  background: var(--agent-surface-raised);
+}
+
+.remux-file-mention-row-active,
+.remux-file-mention-row[aria-selected="true"] {
+  background: color-mix(in srgb, var(--agent-text) 7%, transparent);
+}
+
+.remux-file-mention-header-button {
+  background: color-mix(in srgb, var(--agent-text) 6%, transparent);
+}
+
+.codex-turn-error,
+.agent-transcript-focus-error {
+  border-color: color-mix(in srgb, var(--destructive) 36%, var(--agent-border));
+  background: color-mix(in srgb, var(--destructive) 10%, var(--agent-canvas));
+}
+
+.agent-exact-content-backdrop {
+  background: rgb(0 0 0 / 70%);
+  backdrop-filter: blur(4px);
+}
+
+.agent-exact-content-dialog {
+  border-radius: 16px;
+  box-shadow: 0 24px 80px rgb(0 0 0 / 46%);
+}
+
+.remux-new-chat-empty-card {
+  border-color: var(--agent-border-strong);
+}

@@ -1,17 +1,18 @@
 import { create } from 'zustand';
 
 import {
-  AGENT_RESOURCE_KEYS,
-  conversationResourceKey,
-  type ConversationListValue,
   type ConversationSummary,
 } from '../../../shared/protocol.ts';
-import type { AgentResourceInvalidation } from '../../../shared/transcript.ts';
+import {
+  NATIVE_AGENT_RESOURCE_KEYS,
+  type AgentConversationResource,
+  type AgentConversationsResource,
+  type NativeAgentResourceKey,
+} from '../../../shared/native-agent-protocol.ts';
 import { AgentResourceReader } from '../ipc/resources.ts';
+import { projectNativeConversation } from '../nativeViewModel.ts';
 
 export type ConversationHistoryStatus = 'idle' | 'loading' | 'ready' | 'failed';
-
-type ResourceInvalidation = Extract<AgentResourceInvalidation, { type: 'resource' }>;
 
 type ConversationHistoryStore = {
   conversationsById: Record<string, ConversationSummary>;
@@ -20,7 +21,7 @@ type ConversationHistoryStore = {
   order: string[];
   status: ConversationHistoryStatus;
   ensureConversation: (conversationId: string, force?: boolean) => Promise<ConversationSummary | null>;
-  invalidate: (invalidations: ResourceInvalidation[]) => Promise<void>;
+  invalidate: (keys: NativeAgentResourceKey[]) => Promise<void>;
   load: (options?: { preserveReady?: boolean }) => Promise<void>;
   resetReader: () => void;
 };
@@ -53,21 +54,22 @@ export const useConversationHistoryStore = create<ConversationHistoryStore>((set
 
     const generation = (summaryReadGeneration.get(normalized) ?? 0) + 1;
     summaryReadGeneration.set(normalized, generation);
-    const key = conversationResourceKey(normalized);
+    const key = `agent/conversation:${normalized}` as const;
     try {
       const update = await reader.read([key]);
       if (summaryReadGeneration.get(normalized) !== generation) {
         return get().conversationsById[normalized] ?? null;
       }
       const value = update.values.get(key);
-      if (isConversationSummary(value) && value.id === normalized) {
+      if (isNativeConversation(value) && value.conversationId === normalized) {
+        const summary = projectNativeConversation(value);
         if (!listedConversationIds.has(normalized)) routeSummaryIds.add(normalized);
         set((state) => ({
-          conversationsById: { ...state.conversationsById, [normalized]: value },
+          conversationsById: { ...state.conversationsById, [normalized]: summary },
           missingById: withoutKey(state.missingById, normalized),
           order: state.order.includes(normalized) ? state.order : [normalized, ...state.order],
         }));
-        return value;
+        return summary;
       }
       if (update.missing.includes(key)) {
         routeSummaryIds.delete(normalized);
@@ -83,30 +85,14 @@ export const useConversationHistoryStore = create<ConversationHistoryStore>((set
       return get().conversationsById[normalized] ?? null;
     }
   },
-  async invalidate(invalidations) {
-    const refreshHistory = invalidations.some(({ key }) => key === AGENT_RESOURCE_KEYS.conversationList);
-    const conversationInvalidations = invalidations.flatMap((invalidation) => {
-      if (!invalidation.key.startsWith('conversation:')) return [];
-      return [{
-        conversationId: invalidation.key.slice('conversation:'.length),
-        reason: invalidation.reason,
-      }];
-    });
+  async invalidate(keys) {
+    const refreshHistory = keys.includes(NATIVE_AGENT_RESOURCE_KEYS.conversations);
+    const conversationIds = keys.flatMap((key) =>
+      key.startsWith('agent/conversation:') ? [key.slice('agent/conversation:'.length)] : []);
 
     const tasks: Promise<unknown>[] = [];
     if (refreshHistory) tasks.push(get().load({ preserveReady: true }));
-    for (const { conversationId, reason } of conversationInvalidations) {
-      if (reason === 'deleted') {
-        routeSummaryIds.delete(conversationId);
-        set((state) => ({
-          conversationsById: withoutKey(state.conversationsById, conversationId),
-          missingById: { ...state.missingById, [conversationId]: true },
-          order: state.order.filter((id) => id !== conversationId),
-        }));
-      } else {
-        tasks.push(get().ensureConversation(conversationId, true));
-      }
-    }
+    for (const conversationId of conversationIds) tasks.push(get().ensureConversation(conversationId, true));
     await Promise.allSettled(tasks);
   },
   async load(options = {}) {
@@ -116,17 +102,18 @@ export const useConversationHistoryStore = create<ConversationHistoryStore>((set
       status: options.preserveReady && state.status === 'ready' ? 'ready' : 'loading',
     }));
     try {
-      const update = await reader.read([AGENT_RESOURCE_KEYS.conversationList]);
+      const update = await reader.read([NATIVE_AGENT_RESOURCE_KEYS.conversations]);
       if (generation !== historyReadGeneration) return;
-      const value = update.values.get(AGENT_RESOURCE_KEYS.conversationList);
-      if (isConversationList(value)) {
-        const listedIds = value.conversations.map(({ id }) => id);
+      const value = update.values.get(NATIVE_AGENT_RESOURCE_KEYS.conversations);
+      if (isNativeConversationList(value)) {
+        const conversations = value.conversations.map(projectNativeConversation);
+        const listedIds = conversations.map(({ id }) => id);
         listedConversationIds = new Set(listedIds);
         for (const id of listedIds) routeSummaryIds.delete(id);
         set((state) => ({
           conversationsById: {
             ...state.conversationsById,
-            ...Object.fromEntries(value.conversations.map((conversation) => [conversation.id, conversation])),
+            ...Object.fromEntries(conversations.map((conversation) => [conversation.id, conversation])),
           },
           error: null,
           missingById: withoutKeys(state.missingById, listedIds),
@@ -138,7 +125,7 @@ export const useConversationHistoryStore = create<ConversationHistoryStore>((set
         }));
         return;
       }
-      if (update.missing.includes(AGENT_RESOURCE_KEYS.conversationList)) {
+      if (update.missing.includes(NATIVE_AGENT_RESOURCE_KEYS.conversations)) {
         set({ error: 'Conversation history is unavailable.', status: 'failed' });
         return;
       }
@@ -156,24 +143,19 @@ export const useConversationHistoryStore = create<ConversationHistoryStore>((set
   },
 }));
 
-function isConversationList(value: unknown): value is ConversationListValue {
-  return Boolean(
-    value &&
-    typeof value === 'object' &&
-    Array.isArray((value as ConversationListValue).conversations) &&
-    (value as ConversationListValue).conversations.every(isConversationSummary) &&
-    typeof (value as ConversationListValue).truncated === 'boolean',
-  );
+function isNativeConversationList(value: unknown): value is AgentConversationsResource {
+  return Boolean(value && typeof value === 'object' &&
+    Array.isArray((value as AgentConversationsResource).conversations));
 }
 
-function isConversationSummary(value: unknown): value is ConversationSummary {
+function isNativeConversation(value: unknown): value is AgentConversationResource {
   if (!value || typeof value !== 'object') return false;
-  const summary = value as Partial<ConversationSummary>;
-  return typeof summary.id === 'string' &&
+  const summary = value as Partial<AgentConversationResource>;
+  return typeof summary.conversationId === 'string' &&
     typeof summary.title === 'string' &&
     typeof summary.preview === 'string' &&
     typeof summary.cwd === 'string' &&
-    typeof summary.modelId === 'string' &&
+    typeof summary.model === 'string' &&
     typeof summary.createdAt === 'number' &&
     typeof summary.updatedAt === 'number';
 }

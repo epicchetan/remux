@@ -53,8 +53,13 @@ export type HostTabUpdate = {
 };
 
 export type RemuxHostViewportMetrics = {
+  hostControlInsetLeft: number;
   keyboardHeight: number;
   keyboardVisible: boolean;
+  safeAreaBottom: number;
+  safeAreaLeft: number;
+  safeAreaRight: number;
+  safeAreaTop: number;
   visibleBottom: number;
   visibleTop: number;
   viewportHeight: number;

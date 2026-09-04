@@ -2,6 +2,7 @@ export {
   invalidateTranscriptResources,
   getTranscriptResourceState,
   refreshActiveTranscriptResources,
+  retryActiveTranscriptHistorySync,
   setTranscriptLifecycleState,
   useTranscriptResourceStore,
   type TranscriptStatus,

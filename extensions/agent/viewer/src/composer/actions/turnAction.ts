@@ -3,9 +3,9 @@ import { useState } from 'react';
 import type {
   AgentComposerMessagePart,
   ReasoningLevel,
-  TurnContextPlan,
 } from '../../../../shared/protocol.ts';
-import { createDefaultTurnContextPlan } from '../context/contextPlan.ts';
+import type { AgentRuntimeResource } from '../../../../shared/native-agent-protocol.ts';
+import type { ProviderAccess } from '../../../../shared/provider-runtime.ts';
 import { buildComposerSendProjection } from '../model/sendProjection.ts';
 import {
   type ComposerEditTarget,
@@ -21,6 +21,10 @@ export function useComposerTurnAction({
   onEdit,
   onFork,
   onSend,
+  runtime,
+  imagesEnabled,
+  fileReferencesEnabled,
+  branchEnabled,
 }: {
   canStart: boolean;
   conversationExists: boolean;
@@ -32,13 +36,18 @@ export function useComposerTurnAction({
     input: TurnSubmissionInput,
     setPhase: (phase: 'sending' | 'updating-transcript') => void,
   ) => Promise<void>;
+  runtime: AgentRuntimeResource | null;
+  imagesEnabled: boolean;
+  fileReferencesEnabled: boolean;
+  branchEnabled: boolean;
 }) {
   const snapshot = useComposerStore((state) => state.snapshot);
   const editTarget = useComposerStore((state) => state.editTarget);
   const forkTarget = useComposerStore((state) => state.forkTarget);
-  const contextPlan = useComposerStore((state) => state.contextPlan);
   const modelId = useComposerStore((state) => state.modelId);
   const reasoning = useComposerStore((state) => state.reasoning);
+  const providerInstanceId = useComposerStore((state) => state.providerInstanceId);
+  const access = useComposerStore((state) => state.access);
   const submission = useComposerStore((state) => state.submission);
   const beginSubmission = useComposerStore((state) => state.beginSubmission);
   const clearComposer = useComposerStore((state) => state.clearComposer);
@@ -46,11 +55,15 @@ export function useComposerTurnAction({
   const clearSubmission = useComposerStore((state) => state.clearSubmission);
   const failSubmission = useComposerStore((state) => state.failSubmission);
   const setSubmissionPhase = useComposerStore((state) => state.setSubmissionPhase);
-  const setContextPlan = useComposerStore((state) => state.setContextPlan);
   const [isStopping, setStopping] = useState(false);
+  const unsupportedContent = snapshot.document.parts.some((part) =>
+    (part.type === 'attachment' && !imagesEnabled)
+    || (part.type === 'mention' && !fileReferencesEnabled));
+  const unsupportedBranch = Boolean((editTarget || forkTarget) && !branchEnabled);
 
   const handleSend = () => {
-    if (submission || !canStart || (isWorking && Boolean(editTarget))) return;
+    if (submission || !canStart || unsupportedContent || unsupportedBranch
+        || (isWorking && Boolean(editTarget))) return;
     const projection = buildComposerSendProjection(snapshot);
     if (projection.type === 'error') return;
     const kind = editTarget ? 'edit' : forkTarget ? 'fork' : conversationExists ? 'send' : 'new-chat';
@@ -59,14 +72,16 @@ export function useComposerTurnAction({
       modelId,
       phase: conversationExists ? 'sending' : 'starting-conversation',
       snapshot,
-      contextPlan,
       reasoning,
     });
     const input = {
-      contextPlan,
+      access: runtime?.composer.nextTurn.access ?? access,
+      configurationRevision: runtime?.composer.revision ?? null,
+      delivery: 'auto' as const,
       displayText: projection.displayText,
       modelId,
       parts: projection.parts,
+      providerInstanceId: runtime?.providerInstanceId ?? providerInstanceId,
       reasoning,
     };
     const setPhase = (phase: 'sending' | 'updating-transcript') => setSubmissionPhase(next.id, phase);
@@ -81,10 +96,6 @@ export function useComposerTurnAction({
           clearComposer();
         }
         clearMode();
-        const current = useComposerStore.getState();
-        if (current.contextPlan === next.contextPlan && !current.preserveContextPlan) {
-          setContextPlan(createDefaultTurnContextPlan());
-        }
         clearSubmission(next.id);
       })
       .catch((error) => {
@@ -110,7 +121,10 @@ export function useComposerTurnAction({
     isStopping,
     isSubmitting: Boolean(submission),
     hasSendableContent: snapshot.hasSendableContent,
-    sendDisabled: Boolean(submission || !canStart || !snapshot.canSend || (isWorking && editTarget)),
+    sendDisabled: Boolean(
+      submission || !canStart || !snapshot.canSend || unsupportedContent || unsupportedBranch
+      || (isWorking && editTarget),
+    ),
   };
 }
 
@@ -121,9 +135,12 @@ type ComposerBranchCallback<T> = (
 ) => Promise<void>;
 
 export type TurnSubmissionInput = {
-  contextPlan: TurnContextPlan;
+  access: ProviderAccess;
+  configurationRevision: string | null;
+  delivery: 'auto' | 'queue' | 'steer';
   displayText: string;
   modelId: string;
   parts: AgentComposerMessagePart[];
+  providerInstanceId: string;
   reasoning: ReasoningLevel;
 };

@@ -12,6 +12,7 @@ await mkdir(options.outputDir, { recursive: true });
 
 const browser = await chromium.launch({ headless: true });
 const results = [];
+let promptSent = false;
 try {
   for (const target of [
     { name: 'desktop', viewport: { height: 900, width: 1280 } },
@@ -48,16 +49,77 @@ try {
         .waitFor({ timeout: 20_000 });
     }
     await page.getByRole('button', { name: 'Send message', exact: true }).waitFor();
+    if (options.sendPrompt && !promptSent) {
+      const textbox = page.getByRole('textbox', { name: 'Message', exact: true });
+      await textbox.fill(options.sendPrompt);
+      await page.getByRole('button', { name: 'Send message', exact: true }).click();
+      if (options.expectText) {
+        await transcript.locator('.codex-assistant-message')
+          .getByText(options.expectText, { exact: true }).last().waitFor({ timeout: 120_000 });
+      }
+      promptSent = true;
+    } else if (options.expectText) {
+      await transcript.locator('.codex-assistant-message')
+        .getByText(options.expectText, { exact: true }).last().waitFor({ timeout: 20_000 });
+    }
+    let composer = null;
+    if (options.expectComposerContext) {
+      const contextIndicator = page.locator('.remux-composer-context-percent');
+      await contextIndicator.waitFor({ timeout: 20_000 });
+      const usageRail = page.getByRole('button', { name: 'Show usage details' });
+      assert.match(await usageRail.textContent(), /context\s*\/\s*[\d.]+[km]? tokens/iu,
+        `${target.name} collapsed usage rail omitted its token count.`);
+      await usageRail.click();
+      const usageTray = page.getByRole('region', { name: 'Usage details' });
+      await usageTray.waitFor({ timeout: 20_000 });
+      await usageTray.locator('.remux-composer-plan-window').first().waitFor({ timeout: 20_000 });
+      await usageTray.getByText(/^Live usage · updated/u).waitFor({ timeout: 20_000 });
+      const usageScreenshot = resolve(options.outputDir, `${target.name}-usage.png`);
+      await page.screenshot({ fullPage: true, path: usageScreenshot });
+      const usage = {
+        context: await usageTray.locator('.remux-composer-usage-section').first().innerText(),
+        planWindows: await usageTray.locator('.remux-composer-plan-window').allInnerTexts(),
+        source: await usageTray.locator('.remux-composer-usage-source').textContent(),
+        screenshot: usageScreenshot,
+      };
+      await page.keyboard.press('Escape');
+      await usageTray.waitFor({ state: 'detached' });
+      await page.getByRole('button', { name: 'Preferences', exact: true }).click();
+      const configPanel = page.locator('[data-remux-composer-config-panel]');
+      await configPanel.waitFor();
+      const rows = await configPanel.locator('.remux-composer-config-row').evaluateAll((elements) =>
+        elements.map((element) => ({
+          disabled: element instanceof HTMLButtonElement ? element.disabled : null,
+          label: element.querySelector('.remux-composer-config-label')?.textContent?.trim() ?? '',
+        })));
+      const accessLabels = new Set(['Read only', 'Workspace write', 'Full access']);
+      const nonModelLabels = new Set([
+        'Reload', 'Compact context', 'Providers',
+        'Off', 'Minimal', 'Low', 'Medium', 'High', 'Extra high',
+        ...accessLabels,
+      ]);
+      const accessRow = rows.find(({ label }) => accessLabels.has(label));
+      const modelRow = rows.find(({ label }) => !nonModelLabels.has(label));
+      assert.equal(accessRow?.disabled, false, `${target.name} access control stayed locked.`);
+      assert.equal(modelRow?.disabled, false, `${target.name} model control stayed locked.`);
+      composer = {
+        contextText: await contextIndicator.textContent(),
+        contextTitle: await contextIndicator.getAttribute('title'),
+        rows,
+        usage,
+      };
+      await page.keyboard.press('Escape');
+    }
     if (options.openWork) {
       const workHeader = transcript.locator('.codex-work-header').last();
       await workHeader.waitFor({ timeout: 20_000 });
       await workHeader.click();
       await transcript.locator('.agent-inference').last().waitFor({ timeout: 20_000 });
-      const workUnit = transcript.locator('.agent-work-unit-header').last();
-      if (await workUnit.count()) {
-        await workUnit.click();
-        await transcript.locator('.agent-work-unit-content').last().waitFor({ timeout: 20_000 });
-        await transcript.locator('.agent-work-unit-content .agent-execution-scope').last()
+      const childExecution = transcript.locator('.agent-child-execution-header').last();
+      if (await childExecution.count()) {
+        await childExecution.click();
+        await transcript.locator('.agent-child-execution-content').last().waitFor({ timeout: 20_000 });
+        await transcript.locator('.agent-child-execution-content .agent-execution-scope').last()
           .waitFor({ timeout: 20_000 });
       }
       await page.waitForTimeout(100);
@@ -90,8 +152,8 @@ try {
       const workOffenders = Array.from(document.querySelectorAll([
         '.agent-execution-scope',
         '.agent-inference',
-        '.agent-work-unit',
-        '.agent-work-unit-content',
+        '.agent-child-execution',
+        '.agent-child-execution-content',
         '.agent-reasoning-block',
         '.agent-commentary-block',
         '.agent-action-sequence',
@@ -148,7 +210,7 @@ try {
 
     const screenshot = resolve(options.outputDir, `${target.name}.png`);
     await page.screenshot({ fullPage: true, path: screenshot });
-    results.push({ geometry, screenshot, target: target.name });
+    results.push({ composer, geometry, screenshot, target: target.name });
     await context.close();
   }
 } finally {
@@ -166,7 +228,7 @@ function parseOptions(args) {
   const flags = new Set();
   for (let index = 0; index < args.length; index += 1) {
     const key = args[index];
-    if (key === '--generic' || key === '--open-work') {
+    if (key === '--generic' || key === '--open-work' || key === '--expect-composer-context') {
       flags.add(key);
       continue;
     }
@@ -184,9 +246,12 @@ function parseOptions(args) {
     conversationId,
     cwd: resolve(values.get('--cwd') ?? repositoryRoot),
     generic: flags.has('--generic'),
+    expectComposerContext: flags.has('--expect-composer-context'),
     openWork: flags.has('--open-work'),
     httpBase: values.get('--http-base') ?? 'http://127.0.0.1:48123',
     outputDir: resolve(values.get('--output-dir') ?? '/tmp/remux-agent-live-viewer'),
+    sendPrompt: values.get('--send-prompt') ?? null,
+    expectText: values.get('--expect-text') ?? null,
     tokenFile: resolve(values.get('--token-file') ?? resolve(repositoryRoot, '.remux/auth-token')),
     wsEndpoint: values.get('--ws-endpoint') ?? 'ws://127.0.0.1:48123/ws',
   };

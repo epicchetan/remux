@@ -1,6 +1,8 @@
-Status: Active Spec
+Status: Archived
 Last verified: 2026-08-08
 Canonical code: Phase 1A.1 implementation, automated closeout, and owner live acceptance are complete; Phase 1A.2 supersedes its schema/protocol versions and closes the combined durable-transcript checkpoint
+Superseded by: `agent-native-provider-runtime-v1.md`. Durable transcript and
+idempotency findings remain evidence; Pi hydration/context semantics do not.
 
 # Agent Phase 1A.1 durable conversations and history scope
 

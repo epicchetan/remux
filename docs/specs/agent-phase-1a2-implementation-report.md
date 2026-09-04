@@ -1,5 +1,7 @@
-Status: Active Spec
+Status: Archived
 Last verified: 2026-08-08
+Superseded by: `agent-native-provider-runtime-v1.md`. Retained as historical
+transcript, scale, lifecycle, and performance evidence.
 Canonical code: Phase 1A.2a–1A.2d implementation, automated closeout, clean-state live validation, and owner desktop/physical-phone acceptance are complete in `extensions/agent/`
 
 # Agent Phase 1A.2 implementation report

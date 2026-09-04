@@ -51,7 +51,6 @@ type BrowserStore = {
   moveTab: (tabId: string, toIndex: number) => void;
   openResource: (target: BrowserResourceTarget, options?: BrowserOpenResourceOptions) => Promise<BrowserOpenResourceResult>;
   openOverview: (section?: BrowserSection) => void;
-  reloadExtensionTabs: (extensionId: string) => void;
   section: BrowserSection;
   selectTab: (tabId: string) => void;
   setSection: (section: BrowserSection) => void;
@@ -144,6 +143,19 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
   loadExtensions: (options = {}) => {
     const origin = currentRemuxOrigin();
     if (extensionLoadPromise && extensionLoadOrigin === origin) {
+      if (options.force) {
+        // A forced refresh carries stronger ordering than an ordinary catalog
+        // read. If one was already in flight before a build completed, wait
+        // for it and then fetch again so that stale response cannot consume
+        // the publication refresh.
+        return extensionLoadPromise
+          .catch(() => undefined)
+          .then(() => (
+            currentRemuxOrigin() === origin
+              ? get().loadExtensions({ force: true })
+              : undefined
+          ));
+      }
       return extensionLoadPromise;
     }
 
@@ -323,15 +335,6 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
       section: section ?? state.section,
     }));
     persistCurrentBrowserSession(get());
-  },
-  reloadExtensionTabs: (extensionId) => {
-    set((state) => ({
-      tabs: state.tabs.map((tab) => (
-        tab.extensionId === extensionId
-          ? adoptLatestViewRevision(tab, state.extensions, true)
-          : tab
-      )),
-    }));
   },
   section: 'tabs',
   selectTab: (tabId) => {

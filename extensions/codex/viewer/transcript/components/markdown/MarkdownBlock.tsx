@@ -1,4 +1,14 @@
-import { memo, useMemo, type CSSProperties, type MouseEvent, type RefCallback } from 'react';
+import {
+  Component,
+  memo,
+  useMemo,
+  useSyncExternalStore,
+  type CSSProperties,
+  type ErrorInfo,
+  type MouseEvent,
+  type ReactNode,
+  type RefCallback,
+} from 'react';
 
 import {
   cappedMarkdownLayoutDocumentHeight,
@@ -10,12 +20,17 @@ import {
   type MarkdownLayoutBlock,
   type MarkdownLayoutLineFragment,
 } from './markdownModel';
+import {
+  mathMetricsRevision,
+  subscribeMathMetrics,
+} from './mathMetricsStore';
 import { CodeBlock } from './CodeBlock';
 import { fileReferenceStyle } from '../file/FileReferenceChip';
 import { FileTypeIcon } from '../file/fileTypeIcons';
 import { cn } from '@remux/viewer-kit/shadcn';
 import { openHostHref, openHostTarget } from '@remux/viewer-kit/links';
 import { useNarrationBlockRef } from '../../../narration/blockRegistry';
+import { useNarrationElementLeafRegistration } from '../../../narration/elementLeafRegistry';
 import { useNarrationTextLeafRegistration } from '../../../narration/textLeafRegistry';
 
 const fallbackMarkdownWidth = 868;
@@ -25,19 +40,32 @@ export function MarkdownBlock({
   density = 'default',
   narrationAssistantMessageId = null,
   maxLines,
+  messageCacheKey = null,
   streaming = false,
   width = fallbackMarkdownWidth,
 }: {
   children: string;
   density?: MarkdownDensity;
   maxLines?: number;
+  messageCacheKey?: string | null;
   narrationAssistantMessageId?: string | null;
   streaming?: boolean;
   width?: number;
 }) {
+  const metricsRevision = useSyncExternalStore(
+    subscribeMathMetrics,
+    mathMetricsRevision,
+    mathMetricsRevision,
+  );
+  const cacheScope = streaming && messageCacheKey
+    ? { key: messageCacheKey, kind: 'streaming' as const }
+    : { kind: 'complete' as const };
   const document = useMemo(
-    () => getMarkdownLayoutDocument(children, density, width, { richFileLinks: !streaming }),
-    [children, density, streaming, width],
+    () => getMarkdownLayoutDocument(children, density, width, {
+      cacheScope,
+      richFileLinks: !streaming,
+    }),
+    [children, density, messageCacheKey, metricsRevision, streaming, width],
   );
   const height = maxLines === undefined
     ? document.height
@@ -58,7 +86,7 @@ export function MarkdownBlock({
         <MarkdownBlockNode
           assistantMessageId={narrationAssistantMessageId}
           block={block}
-          key={`${block.type}:${index}`}
+          key={markdownBlockRenderKey(block, index)}
         />
       ))}
     </div>
@@ -120,11 +148,13 @@ function MarkdownBlockContent({
         block={block}
         style={style}
       />;
+    case 'mathDisplay':
+      return <MarkdownDisplayMath block={block} style={style} />;
     case 'blockquote':
       return (
         <blockquote className="codex-md-block codex-md-blockquote" style={style}>
           {block.children.map((child, index) => (
-            <MarkdownBlockNode assistantMessageId={assistantMessageId} block={child} key={`${child.type}:${index}`} />
+            <MarkdownBlockNode assistantMessageId={assistantMessageId} block={child} key={markdownBlockRenderKey(child, index)} />
           ))}
         </blockquote>
       );
@@ -144,7 +174,7 @@ function MarkdownBlockContent({
                 <span className="codex-md-list-marker">{item.marker}</span>
                 <div className="codex-md-list-content">
                   {item.blocks.map((child, childIndex) => (
-                    <MarkdownBlockNode assistantMessageId={assistantMessageId} block={child} key={`${child.type}:${childIndex}`} />
+                    <MarkdownBlockNode assistantMessageId={assistantMessageId} block={child} key={markdownBlockRenderKey(child, childIndex)} />
                   ))}
                 </div>
               </div>
@@ -255,6 +285,53 @@ function contentStyle(block: MarkdownLayoutBlock): CSSProperties {
   };
 }
 
+function markdownBlockRenderKey(block: MarkdownLayoutBlock, index: number) {
+  return block.type === 'mathDisplay'
+    ? 'math:' + block.sourceStart + ':' + block.sourceEnd + ':' + stableTextHash(block.tex)
+    : block.type + ':' + index;
+}
+
+function stableTextHash(value: string) {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+function MarkdownDisplayMath({
+  block,
+  style,
+}: {
+  block: Extract<MarkdownLayoutBlock, { type: 'mathDisplay' }>;
+  style: CSSProperties;
+}) {
+  return (
+    <div
+      className="codex-md-block codex-md-display-math-frame"
+      data-constrained={block.constrained ? 'true' : undefined}
+      data-narration-surface="math"
+      data-wrapped={block.wrapped ? 'true' : undefined}
+      style={style}
+    >
+      <MathRenderBoundary fallback={(
+        <code className="codex-md-math-literal">{block.originalSource}</code>
+      )}>
+        {block.html ? (
+          <div
+            className="codex-md-math codex-md-display-math"
+            data-constrained={block.constrained ? 'true' : undefined}
+            dangerouslySetInnerHTML={{ __html: block.html }}
+          />
+        ) : (
+          <code className="codex-md-math-literal">{block.originalSource}</code>
+        )}
+      </MathRenderBoundary>
+    </div>
+  );
+}
+
 function MarkdownTextLines({
   assistantMessageId,
   blockId,
@@ -272,7 +349,7 @@ function MarkdownTextLines({
         <div
           className="codex-md-text-line"
           key={lineIndex}
-          style={{ height: `${lineHeight}px`, lineHeight: `${lineHeight}px` }}
+          style={{ height: `${line.height}px`, lineHeight: `${lineHeight}px` }}
         >
           {line.fragments.map((fragment, fragmentIndex) => (
             <MarkdownLineFragment
@@ -304,9 +381,42 @@ function MarkdownLineFragment({
     displayStart: fragment.displayStart,
     expectedText: fragment.text,
   });
+  const elementRegistration = useNarrationElementLeafRegistration({
+    assistantMessageId,
+    blockId,
+    displayEnd: fragment.displayEnd,
+    displayStart: fragment.displayStart,
+  });
   if (!fragment.text) return null;
-  const style = fragment.gapBefore > 0 ? { marginLeft: `${fragment.gapBefore}px` } : undefined;
   const source = fragment.source;
+  const style = {
+    ...(fragment.gapBefore > 0 ? { marginLeft: `${fragment.gapBefore}px` } : null),
+    ...(source.kind === 'math' && source.math?.metrics
+      ? { verticalAlign: `${-source.math.metrics.depth}px` }
+      : null),
+  } satisfies CSSProperties;
+
+  if (source.kind === 'math' && source.math?.html) {
+    const math = (
+      <span
+        className={inlineClassName(source)}
+        dangerouslySetInnerHTML={{ __html: source.math.html }}
+        ref={elementRegistration.setElement}
+        style={style}
+      />
+    );
+    return source.href ? (
+      <a
+        className="codex-md-line-math-link"
+        href={source.href}
+        onClick={(event) => handleCodexLinkClick(event, source.href!)}
+      >
+        <MathRenderBoundary fallback={source.math.source.originalSource}>{math}</MathRenderBoundary>
+      </a>
+    ) : (
+      <MathRenderBoundary fallback={source.math.source.originalSource}>{math}</MathRenderBoundary>
+    );
+  }
 
   if (source.kind === 'fileLink' && source.file && source.href) {
     return <FileLink
@@ -357,10 +467,33 @@ function inlineClassName(source: MarkdownInlineSource) {
   return cn(
     'codex-md-line-fragment',
     source.kind === 'code' && 'codex-md-inline-code',
+    source.kind === 'math' && 'codex-md-math codex-md-inline-math',
     source.href && 'codex-md-line-link',
     source.strong && 'codex-md-inline-strong',
     source.emphasis && 'codex-md-inline-emphasis',
   );
+}
+
+class MathRenderBoundary extends Component<
+  { children: ReactNode; fallback: ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    const development = (import.meta as ImportMeta & { env?: { DEV?: boolean } }).env?.DEV === true;
+    if (development) {
+      console.warn('[codex:math] Math node render failed', { error, info });
+    }
+  }
+
+  render() {
+    return this.state.failed ? this.props.fallback : this.props.children;
+  }
 }
 
 function FileLink({

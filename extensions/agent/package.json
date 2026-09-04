@@ -4,27 +4,21 @@
   "type": "module",
   "scripts": {
     "build": "npm run build:server && npm run build:viewer",
-    "build:server": "vite build --config server/vite.config.ts && node scripts/verify-built-prompts.mjs",
+    "build:server": "vite build --config server/vite.config.ts",
     "build:viewer": "vite build --config viewer/vite.config.ts",
     "test": "npm run test:server && npm run test:unit && npm run test:viewer",
     "test:server": "node --test --experimental-strip-types tests/*.test.ts",
-    "test:live:acceptance": "node tests/live/clean-acceptance.mjs",
-    "test:live:provider-recovery": "node --experimental-strip-types tests/live/provider-recovery.ts",
-    "test:live:provider-compaction": "node --experimental-strip-types tests/live/provider-compaction.ts",
     "test:live:viewer": "node tests/live/viewer-acceptance.mjs",
-    "test:hardening": "node --experimental-strip-types tests/hardening/transcript-scale.ts",
-    "benchmark": "node --experimental-strip-types tests/benchmark/benchmark.ts",
-    "storage:scrub": "node --experimental-strip-types server/src/storage/scrub.ts",
     "test:unit": "playwright test -c playwright.unit.config.ts",
     "test:viewer": "playwright test -c playwright.config.ts",
     "watch": "vite build --watch --config viewer/vite.config.ts"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.258",
     "@chenglou/pretext": "^0.0.7",
-    "@earendil-works/pi-ai": "0.84.0",
-    "@earendil-works/pi-coding-agent": "0.84.0",
     "@iconify/icons-vscode-icons": "^1.2.29",
     "@lexical/react": "^0.44.0",
+    "@modelcontextprotocol/sdk": "1.30.0",
     "@remux/viewer-kit": "*",
     "lexical": "^0.44.0",
     "lucide-react": "^1.14.0",
@@ -38,6 +32,7 @@
     "tw-animate-css": "^1.4.0",
     "typebox": "1.3.7",
     "uuid": "^14.0.0",
+    "zod": "4.5.4",
     "zustand": "^5.0.13"
   }
 }

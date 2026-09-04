@@ -3,6 +3,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 
 import type { AgentTurnSegment } from '../../../shared/transcript';
 import { AssistantMessage } from './components/assistantMessage';
+import { CompactionDivider } from './components/CompactionDivider';
 import { UserMessage } from './components/userMessage';
 import { WorkSection } from './components/work/WorkSection';
 import { transcriptLayout } from './layout/constants';
@@ -10,10 +11,12 @@ import type { TranscriptMeasuredRow, TranscriptMeasuredTurn } from './layout/typ
 import { useTranscriptLayoutStore } from './layoutStore';
 import { resolveTranscriptContentWidth } from './measureWidth';
 import {
+  getTranscriptResourceState,
   useTranscriptResourceStore,
   type TranscriptStatus,
 } from './resourceStore';
 import {
+  registerTranscriptViewportCapture,
   type TranscriptAutoScrollMode,
   useTranscriptViewportStore,
 } from './viewportStore';
@@ -31,10 +34,13 @@ import {
   autoScrollModeForStreamingTurn,
   initialTranscriptScrollTarget,
   nativeScrollOwnsTranscriptViewport,
+  nextUserMessageScrollAnchor,
+  previousUserMessageScrollAnchor,
   resolveInitialTranscriptScrollTarget,
   resolveSentMessageScroll,
+  transcriptMessageAnchorTopOffset,
   transcriptNativeScrollPhaseAfterEvent,
-  userMessageAnchorScrollTop,
+  userMessageScrollAnchors,
   type TranscriptNativeScrollPhase,
   type TranscriptScrollAnchor,
 } from './virtualizerScroll';
@@ -51,6 +57,19 @@ type TranscriptViewportAnchor = {
   rowId: string;
   turnId: string;
 };
+
+type TranscriptViewportCacheEntry =
+  | { kind: 'bottom' }
+  | { kind: 'user-message'; segmentId: string; turnId: string }
+  | { kind: 'row-offset'; anchor: TranscriptViewportAnchor };
+
+type TranscriptInitialViewportIntent = Extract<
+  TranscriptViewportCacheEntry,
+  { kind: 'bottom' | 'user-message' }
+>;
+
+const transcriptViewportAnchorCache = new Map<string, TranscriptViewportCacheEntry>();
+const MAX_CACHED_TRANSCRIPT_VIEWPORT_ANCHORS = 5;
 
 type TranscriptRowPosition = {
   rowId: string;
@@ -109,6 +128,7 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
   const streamingTurnId = workingTurnId;
   const expandedRows = useMemo(() => Object.values(openWorkByKey), [openWorkByKey]);
   const [viewportTopPadding, setViewportTopPadding] = useState<number>(transcriptLayout.viewport.padY);
+  const [anchorExtentFloorHeight, setAnchorExtentFloorHeight] = useState(0);
   const [anchorRunwayHeight, setAnchorRunwayHeight] = useState(0);
   const navigationAnchors = useMemo(
     () =>
@@ -121,33 +141,50 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
   );
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const measureRef = useRef<HTMLDivElement | null>(null);
+  const transcriptBodyRef = useRef<HTMLDivElement | null>(null);
+  const anchorRunwayRef = useRef<HTMLDivElement | null>(null);
   const rafRef = useRef<number | null>(null);
   const bottomScrollRafRef = useRef<number | null>(null);
   const scrollAnimationRafRef = useRef<number | null>(null);
+  const scrollAnimationReleaseRafRef = useRef<number | null>(null);
+  const initialPlacementReleaseRafRef = useRef<number | null>(null);
   const scrollAnimationCompletionRef = useRef<(() => void) | null>(null);
   const activeTurnIdsRef = useRef(activeTurnIds);
   const initialScrollConversationIdRef = useRef<string | null>(null);
+  const initialPlacementEpochRef = useRef(0);
+  const initialPlacementPendingRef = useRef(false);
+  const initialViewportIntentRef = useRef<TranscriptInitialViewportIntent | null>(null);
+  const captureViewportCacheEntryRef = useRef<() => TranscriptViewportCacheEntry | null>(() => null);
   const lastScrollTopRef = useRef(0);
   const navigationAnchorsRef = useRef(navigationAnchors);
   const expandedRowsRef = useRef(expandedRows);
   const programmaticScrollRef = useRef(false);
   const scrollAnchorRef = useRef<TranscriptViewportAnchor | null>(null);
   const autoScrollModeRef = useRef<TranscriptAutoScrollMode>(autoScrollMode);
+  const anchorExtentFloorHeightRef = useRef(0);
   const anchorRunwayHeightRef = useRef(0);
-  // Seeded so the first managed scroll never registers as viewport growth.
-  const managedClientHeightRef = useRef(Number.POSITIVE_INFINITY);
+  const viewportResizeSettlingRef = useRef(false);
   // Segment id of the anchor that ended the last managed scroll pinned.
   const anchorPinnedSegmentIdRef = useRef<string | null>(null);
+  // Historical Up/Down navigation needs a semantic cursor so sequential
+  // presses remain identity-based even after the viewport lands a few pixels
+  // away from the modeled row position. This is deliberately separate from
+  // sent-message auto-scroll ownership: historical navigation must settle and
+  // stop writing scrollTop once its animation completes.
+  const navigationCursorSegmentIdRef = useRef<string | null>(null);
   const nativeScrollPhaseRef = useRef<TranscriptNativeScrollPhase>('idle');
   const userScrollArmedRef = useRef(false);
   const turnsRef = useRef(turns);
-  const streamingTurnIdRef = useRef(streamingTurnId);
   const focusLoadRequestIdRef = useRef<number | null>(null);
   const [width, setWidth] = useState<number | null>(null);
 
   useEffect(() => {
     void setActiveConversationId(conversationId);
   }, [setActiveConversationId, conversationId]);
+
+  useLayoutEffect(() => {
+    navigationCursorSegmentIdRef.current = null;
+  }, [conversationId]);
 
   useLayoutEffect(() => {
     const content = measureRef.current;
@@ -213,10 +250,6 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
     turnsRef.current = turns;
   }, [turns]);
 
-  useLayoutEffect(() => {
-    streamingTurnIdRef.current = streamingTurnId;
-  }, [streamingTurnId]);
-
   const setViewportAutoScrollMode = useCallback((
     mode: TranscriptAutoScrollMode,
     _reason: TranscriptViewportModeChangeReason,
@@ -230,6 +263,8 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
 
   const setAnchorRunway = useCallback((height: number) => {
     const normalized = Math.max(0, height);
+    const runway = anchorRunwayRef.current;
+    if (runway) runway.style.height = `${normalized}px`;
     if (Math.abs(anchorRunwayHeightRef.current - normalized) <= 1) {
       return false;
     }
@@ -238,11 +273,29 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
     return true;
   }, []);
 
+  const setAnchorExtentFloor = useCallback((desiredScrollTop: number | null) => {
+    const viewport = viewportRef.current;
+    const content = measureRef.current;
+    const normalized = desiredScrollTop === null || !viewport || !content
+      ? 0
+      : computeAnchorExtentFloorHeight(viewport, content, desiredScrollTop);
+    if (content) content.style.minHeight = normalized > 0 ? `${normalized}px` : '';
+    if (Math.abs(anchorExtentFloorHeightRef.current - normalized) <= 1) {
+      return false;
+    }
+    anchorExtentFloorHeightRef.current = normalized;
+    setAnchorExtentFloorHeight(normalized);
+    return true;
+  }, []);
+
   const captureViewportAnchor = useCallback(() => {
     const viewport = viewportRef.current;
     if (!viewport || viewportLifecycleState !== 'active') {
       scrollAnchorRef.current = null;
       return null;
+    }
+    if (initialPlacementPendingRef.current) {
+      return scrollAnchorRef.current;
     }
 
     const anchor = captureMountedViewportAnchor(viewport) ??
@@ -254,7 +307,97 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
       });
     scrollAnchorRef.current = anchor;
     return anchor;
-  }, [viewportTopPadding]);
+  }, [viewportLifecycleState, viewportTopPadding]);
+
+  const captureViewportCacheEntry = useCallback((): TranscriptViewportCacheEntry | null => {
+    const viewport = viewportRef.current;
+    if (!viewport || viewportLifecycleState !== 'active') return null;
+
+    const naturalMaxScrollTop = naturalTranscriptMaxScrollableTop(
+      viewport,
+      transcriptBodyRef.current,
+      measureRef.current,
+    );
+    const mode = autoScrollModeRef.current;
+    if (
+      mode.type === 'bottom' ||
+      (
+        anchorRunwayHeightRef.current <= 1 &&
+        Math.abs(viewport.scrollTop - naturalMaxScrollTop) <= bottomStickThresholdPx
+      )
+    ) {
+      return { kind: 'bottom' };
+    }
+    if (mode.type === 'sent-message-anchor') {
+      return {
+        kind: 'user-message',
+        segmentId: mode.segmentId,
+        turnId: mode.turnId,
+      };
+    }
+
+    const latestUserMessage = navigationAnchorsRef.current.at(-1) ?? null;
+    if (latestUserMessage) {
+      const desiredScrollTop = mountedUserMessageAnchorScrollTop(
+        viewport,
+        latestUserMessage.segmentId,
+        transcriptMessageAnchorTopOffset(viewportTopPadding),
+      );
+      if (
+        desiredScrollTop !== null &&
+        Math.abs(viewport.scrollTop - desiredScrollTop) <= 2
+      ) {
+        return {
+          kind: 'user-message',
+          segmentId: latestUserMessage.segmentId,
+          turnId: latestUserMessage.turnId,
+        };
+      }
+    }
+
+    const anchor = captureViewportAnchor();
+    return anchor ? { kind: 'row-offset', anchor } : null;
+  }, [captureViewportAnchor, viewportLifecycleState, viewportTopPadding]);
+
+  useLayoutEffect(() => {
+    captureViewportCacheEntryRef.current = captureViewportCacheEntry;
+  }, [captureViewportCacheEntry]);
+
+  useLayoutEffect(() => registerTranscriptViewportCapture((outgoingConversationId) => {
+    const entry = captureViewportCacheEntryRef.current();
+    if (entry) cacheTranscriptViewportAnchor(outgoingConversationId, entry);
+  }), []);
+
+  useLayoutEffect(() => {
+    if (initialPlacementReleaseRafRef.current !== null) {
+      window.cancelAnimationFrame(initialPlacementReleaseRafRef.current);
+      initialPlacementReleaseRafRef.current = null;
+    }
+    initialPlacementEpochRef.current += 1;
+    initialPlacementPendingRef.current = false;
+    const cachedEntry = cachedTranscriptViewportAnchor(conversationId);
+    const cachedAnchor = cachedEntry?.kind === 'row-offset' ? cachedEntry.anchor : null;
+    scrollAnchorRef.current = cachedAnchor;
+    initialViewportIntentRef.current = cachedEntry?.kind === 'bottom' || cachedEntry?.kind === 'user-message'
+      ? cachedEntry
+      : null;
+    if (cachedAnchor) initialScrollConversationIdRef.current = conversationId;
+    return () => {
+      if (initialPlacementReleaseRafRef.current !== null) {
+        window.cancelAnimationFrame(initialPlacementReleaseRafRef.current);
+        initialPlacementReleaseRafRef.current = null;
+      }
+      initialPlacementEpochRef.current += 1;
+      initialPlacementPendingRef.current = false;
+      // setActiveConversationId captures synchronously before clearing the old
+      // layout. Once the resource store points elsewhere, this cleanup sees the
+      // replacement DOM and must not overwrite that accurate outgoing anchor.
+      if (getTranscriptResourceState().activeConversationId !== conversationId) return;
+      const entry = captureViewportCacheEntryRef.current();
+      if (!entry) return;
+      cacheTranscriptViewportAnchor(conversationId, entry);
+    };
+  }, [conversationId]);
 
   const scheduleRangeUpdate = useCallback(() => {
     if (rafRef.current !== null) {
@@ -285,6 +428,9 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
         viewport,
         navigationAnchorsRef.current,
         autoScrollModeRef.current,
+        naturalTranscriptMaxScrollableTop(viewport, transcriptBodyRef.current, measureRef.current),
+        anchorRunwayHeightRef.current,
+        navigationCursorSegmentIdRef.current,
       ));
 
       if (sameTurnIds(activeTurnIdsRef.current, nextActiveTurnIds)) {
@@ -304,38 +450,46 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
   const applyManagedScroll = useCallback(() => {
     const viewport = viewportRef.current;
     const mode = autoScrollModeRef.current;
-    if (!viewport) {
+    if (!viewport || viewportLifecycleState !== 'active') {
       return;
     }
 
     // Manual viewport ownership prevents content growth from moving the transcript.
     if (mode.type === 'off') {
-      managedClientHeightRef.current = viewport.clientHeight;
       anchorPinnedSegmentIdRef.current = null;
+      setAnchorExtentFloor(null);
       setAnchorRunway(0);
       return;
     }
     if (nativeScrollOwnsTranscriptViewport(nativeScrollPhaseRef.current)) {
       return;
     }
+    if (scrollAnimationRafRef.current !== null) {
+      return;
+    }
 
-    const viewportGrew = viewport.clientHeight > managedClientHeightRef.current + 1;
-    managedClientHeightRef.current = viewport.clientHeight;
-    const naturalMaxScrollTop = Math.max(
-      0,
-      maxScrollableTop(viewport) - anchorRunwayHeightRef.current,
+    const naturalMaxScrollTop = naturalTranscriptMaxScrollableTop(
+      viewport,
+      transcriptBodyRef.current,
+      measureRef.current,
     );
     let targetScrollTop = naturalMaxScrollTop;
+    let nextAnchorExtentFloor: number | null = null;
     let nextRunwayHeight = 0;
 
     if (mode.type === 'sent-message-anchor') {
-      const desiredScrollTop = anchorUserMessageScrollTop({
+      const measuredDesiredScrollTop = anchorUserMessageScrollTop({
         expandedRows: expandedRowsRef.current,
         segmentId: mode.segmentId,
         topPadding: viewportTopPadding,
         turnId: mode.turnId,
         turns: turnsRef.current,
       });
+      const desiredScrollTop = mountedUserMessageAnchorScrollTop(
+        viewport,
+        mode.segmentId,
+        transcriptMessageAnchorTopOffset(viewportTopPadding),
+      ) ?? measuredDesiredScrollTop;
       if (desiredScrollTop === null && mode.phase !== 'catching-up') {
         return;
       }
@@ -348,16 +502,17 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
         anchorPinnedSegmentIdRef.current = null;
       } else {
         const resolution = resolveSentMessageScroll({
+          anchorActivationAllowed: !viewportResizeSettlingRef.current,
           currentScrollTop: viewport.scrollTop,
           desiredScrollTop,
           naturalMaxScrollTop,
           phase: mode.phase,
           runwayHeight: anchorRunwayHeightRef.current,
-          viewportGrew,
           wasPinned: anchorPinnedSegmentIdRef.current === mode.segmentId,
         });
         anchorPinnedSegmentIdRef.current = resolution.phase === 'anchored' ? mode.segmentId : null;
         targetScrollTop = resolution.scrollTop;
+        nextAnchorExtentFloor = resolution.phase === 'anchored' ? desiredScrollTop : null;
         nextRunwayHeight = resolution.runwayHeight;
         if (resolution.phase !== mode.phase) {
           setViewportAutoScrollMode({ ...mode, phase: resolution.phase }, 'mount-stickiness');
@@ -367,6 +522,11 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
       anchorPinnedSegmentIdRef.current = null;
     }
 
+    // Keep the anchored scroll range valid continuously. A runway calculated
+    // by ResizeObserver is still one layout too late when content shrinks:
+    // the browser can clamp scrollTop before the observer repairs it. The
+    // extent floor exists before that shrink and prevents the clamp entirely.
+    setAnchorExtentFloor(nextAnchorExtentFloor);
     setAnchorRunway(nextRunwayHeight);
     const reachableTarget = Math.min(
       targetScrollTop,
@@ -384,6 +544,7 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
     });
   }, [
     scheduleRangeUpdate,
+    setAnchorExtentFloor,
     setAnchorRunway,
     setViewportAutoScrollMode,
     viewportLifecycleState,
@@ -404,13 +565,32 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
   }, [applyManagedScroll]);
 
   useLayoutEffect(() => {
+    const transcriptBody = transcriptBodyRef.current;
+    if (!transcriptBody) return;
+
+    const observer = new ResizeObserver(() => {
+      scheduleRangeUpdate();
+      if (
+        autoScrollModeRef.current.type !== 'off' &&
+        !nativeScrollOwnsTranscriptViewport(nativeScrollPhaseRef.current)
+      ) {
+        // ResizeObserver runs before paint. Correct the managed position here
+        // so streamed growth or work collapse never exposes a stale frame.
+        applyManagedScroll();
+      }
+    });
+    observer.observe(transcriptBody);
+    return () => observer.disconnect();
+  }, [applyManagedScroll, scheduleRangeUpdate]);
+
+  useLayoutEffect(() => {
     autoScrollModeRef.current = autoScrollMode;
     if (autoScrollMode.type !== 'off') {
       scheduleAutoScroll();
     }
   }, [autoScrollMode, scheduleAutoScroll]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const viewport = viewportRef.current;
     if (!viewport) {
       return;
@@ -420,13 +600,40 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
     // immediately — bottom stickiness re-pins, and a sent-message anchor that
     // was only satisfiable in a shrunken viewport releases its pin instead of
     // materializing runway once the viewport grows back.
+    let observedHeight = viewport.clientHeight;
+    let settleRaf: number | null = null;
+    let finalizeRaf: number | null = null;
+    const clearSettleFrames = () => {
+      if (settleRaf !== null) window.cancelAnimationFrame(settleRaf);
+      if (finalizeRaf !== null) window.cancelAnimationFrame(finalizeRaf);
+      settleRaf = null;
+      finalizeRaf = null;
+    };
     const observer = new ResizeObserver(() => {
+      const nextHeight = viewport.clientHeight;
+      if (Math.abs(nextHeight - observedHeight) > 1) {
+        observedHeight = nextHeight;
+        viewportResizeSettlingRef.current = true;
+        clearSettleFrames();
+        settleRaf = window.requestAnimationFrame(() => {
+          settleRaf = null;
+          finalizeRaf = window.requestAnimationFrame(() => {
+            finalizeRaf = null;
+            viewportResizeSettlingRef.current = false;
+            scheduleAutoScroll();
+          });
+        });
+      }
       if (autoScrollModeRef.current.type !== 'off') {
         scheduleAutoScroll();
       }
     });
     observer.observe(viewport);
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      clearSettleFrames();
+      viewportResizeSettlingRef.current = false;
+    };
   }, [scheduleAutoScroll]);
 
   const cancelScrollAnimation = useCallback(() => {
@@ -434,10 +641,48 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
       window.cancelAnimationFrame(scrollAnimationRafRef.current);
       scrollAnimationRafRef.current = null;
     }
+    if (scrollAnimationReleaseRafRef.current !== null) {
+      window.cancelAnimationFrame(scrollAnimationReleaseRafRef.current);
+      scrollAnimationReleaseRafRef.current = null;
+    }
     programmaticScrollRef.current = false;
     const completion = scrollAnimationCompletionRef.current;
     scrollAnimationCompletionRef.current = null;
     completion?.();
+  }, []);
+
+  const releaseProgrammaticScroll = useCallback((onReleased: () => void) => {
+    if (scrollAnimationReleaseRafRef.current !== null) {
+      window.cancelAnimationFrame(scrollAnimationReleaseRafRef.current);
+    }
+    // scheduleRangeUpdate publishes a new virtual range on the next frame.
+    // Retain ownership through that React commit so viewport-anchor restoration
+    // cannot reinterpret the navigation animation as a content-layout shift.
+    scrollAnimationReleaseRafRef.current = window.requestAnimationFrame(() => {
+      scrollAnimationReleaseRafRef.current = window.requestAnimationFrame(() => {
+        scrollAnimationReleaseRafRef.current = null;
+        programmaticScrollRef.current = false;
+        onReleased();
+      });
+    });
+  }, []);
+
+  const releaseInitialPlacement = useCallback((placementEpoch: number, onReleased: () => void) => {
+    if (initialPlacementReleaseRafRef.current !== null) {
+      window.cancelAnimationFrame(initialPlacementReleaseRafRef.current);
+    }
+    // Initial placement also publishes a new virtual range. Keep it distinct
+    // from navigation animation ownership so an event-listener refresh cannot
+    // cancel the release and leave anchor capture suppressed indefinitely.
+    initialPlacementReleaseRafRef.current = window.requestAnimationFrame(() => {
+      initialPlacementReleaseRafRef.current = window.requestAnimationFrame(() => {
+        initialPlacementReleaseRafRef.current = null;
+        if (initialPlacementEpochRef.current !== placementEpoch) return;
+        initialPlacementPendingRef.current = false;
+        programmaticScrollRef.current = false;
+        onReleased();
+      });
+    });
   }, []);
 
   const scrollToPosition = useCallback((
@@ -460,6 +705,7 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
       if (scrollAnimationCompletionRef.current !== completion) return;
       scrollAnimationCompletionRef.current = null;
       completion();
+      if (nextAutoScrollMode.type !== 'off') scheduleAutoScroll();
     };
 
     if (bottomScrollRafRef.current !== null) {
@@ -478,10 +724,7 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
       viewport.scrollTop = targetScrollTop;
       lastScrollTopRef.current = viewport.scrollTop;
       scheduleRangeUpdate();
-      window.requestAnimationFrame(() => {
-        programmaticScrollRef.current = false;
-        settle();
-      });
+      releaseProgrammaticScroll(settle);
       return;
     }
 
@@ -489,10 +732,7 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
       viewport.scrollTop = targetScrollTop;
       lastScrollTopRef.current = viewport.scrollTop;
       scheduleRangeUpdate();
-      window.requestAnimationFrame(() => {
-        programmaticScrollRef.current = false;
-        settle();
-      });
+      releaseProgrammaticScroll(settle);
       return;
     }
 
@@ -510,12 +750,64 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
       }
 
       scrollAnimationRafRef.current = null;
-      programmaticScrollRef.current = false;
-      settle();
+      releaseProgrammaticScroll(settle);
     };
 
     scrollAnimationRafRef.current = window.requestAnimationFrame(step);
-  }, [cancelScrollAnimation, scheduleRangeUpdate, setViewportAutoScrollMode]);
+  }, [
+    cancelScrollAnimation,
+    releaseProgrammaticScroll,
+    scheduleAutoScroll,
+    scheduleRangeUpdate,
+    setViewportAutoScrollMode,
+  ]);
+
+  const scrollToMessageAnchor = useCallback((anchor: TranscriptScrollAnchor) => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+
+    navigationCursorSegmentIdRef.current = anchor.segmentId;
+    const desiredScrollTop = mountedUserMessageAnchorScrollTop(
+      viewport,
+      anchor.segmentId,
+      transcriptMessageAnchorTopOffset(viewportTopPadding),
+    ) ?? anchor.scrollTop;
+    const targetsStreamingTurn = anchor.turnId === streamingTurnId;
+    const naturalMaxScrollTop = naturalTranscriptMaxScrollableTop(
+      viewport,
+      transcriptBodyRef.current,
+      measureRef.current,
+    );
+    if (targetsStreamingTurn) {
+      // Only a live turn needs continuing viewport ownership. Its runway keeps
+      // the sent user message pinned while content below it is still growing.
+      setAnchorExtentFloor(desiredScrollTop);
+      setAnchorRunway(Math.max(0, desiredScrollTop - naturalMaxScrollTop));
+    } else {
+      setAnchorExtentFloor(null);
+      setAnchorRunway(0);
+    }
+    scrollToPosition(
+      desiredScrollTop,
+      targetsStreamingTurn
+        ? {
+            phase: 'anchored',
+            segmentId: anchor.segmentId,
+            conversationId: activeConversationId ?? '',
+            type: 'sent-message-anchor',
+            turnId: anchor.turnId,
+          }
+        : { type: 'off' },
+      'scroll-navigation',
+    );
+  }, [
+    activeConversationId,
+    scrollToPosition,
+    setAnchorExtentFloor,
+    setAnchorRunway,
+    streamingTurnId,
+    viewportTopPadding,
+  ]);
 
   const scrollUp = useCallback(() => {
     const viewport = viewportRef.current;
@@ -523,22 +815,22 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
       return;
     }
 
-    const anchor = previousScrollAnchor(navigationAnchorsRef.current, viewport);
+    const mode = autoScrollModeRef.current;
+    const anchor = previousUserMessageScrollAnchor({
+      anchors: navigationAnchorsRef.current,
+      atBottom: mode.type === 'bottom' && isNearBottom(viewport),
+      currentSegmentId: mode.type === 'sent-message-anchor'
+        ? mode.segmentId
+        : navigationCursorSegmentIdRef.current,
+      scrollTop: viewport.scrollTop,
+      threshold: scrollNavigationThresholdPx,
+    });
     if (!anchor) {
       return;
     }
 
-    const nextMode = anchor === lastScrollAnchor(navigationAnchorsRef.current) && anchor.turnId === streamingTurnIdRef.current
-      ? {
-          phase: 'anchored' as const,
-          segmentId: anchor.segmentId,
-          conversationId: activeConversationId ?? '',
-          type: 'sent-message-anchor' as const,
-          turnId: anchor.turnId,
-        }
-      : { type: 'off' as const };
-    scrollToPosition(anchor.scrollTop, nextMode, 'scroll-navigation');
-  }, [activeConversationId, scrollToPosition]);
+    scrollToMessageAnchor(anchor);
+  }, [scrollToMessageAnchor]);
 
   const scrollDown = useCallback(() => {
     const viewport = viewportRef.current;
@@ -546,29 +838,35 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
       return;
     }
 
-    const anchor = nextScrollAnchor(navigationAnchorsRef.current, viewport);
+    const mode = autoScrollModeRef.current;
+    const naturalMaxScrollTop = naturalTranscriptMaxScrollableTop(
+      viewport,
+      transcriptBodyRef.current,
+      measureRef.current,
+    );
+    const anchor = nextUserMessageScrollAnchor({
+      anchors: navigationAnchorsRef.current,
+      atBottom: mode.type === 'bottom' && isNearBottom(viewport),
+      currentSegmentId: mode.type === 'sent-message-anchor'
+        ? mode.segmentId
+        : navigationCursorSegmentIdRef.current,
+      maxScrollTop: naturalMaxScrollTop,
+      scrollTop: viewport.scrollTop,
+      threshold: scrollNavigationThresholdPx,
+    });
     if (anchor) {
-      const nextMode = anchor === lastScrollAnchor(navigationAnchorsRef.current) && anchor.turnId === streamingTurnIdRef.current
-        ? {
-            phase: 'anchored' as const,
-            segmentId: anchor.segmentId,
-            conversationId: activeConversationId ?? '',
-            type: 'sent-message-anchor' as const,
-            turnId: anchor.turnId,
-          }
-        : { type: 'off' as const };
-      scrollToPosition(anchor.scrollTop, nextMode, 'scroll-navigation');
+      scrollToMessageAnchor(anchor);
       return;
     }
 
-    if (isNearBottom(viewport)) {
-      setViewportAutoScrollMode({ type: 'bottom' }, 'scroll-navigation-bottom');
-      setAnchorRunway(0);
-      return;
-    }
-
-    scrollToPosition(viewport.scrollHeight, { type: 'bottom' }, 'scroll-navigation-bottom');
-  }, [activeConversationId, scrollToPosition, setAnchorRunway, setViewportAutoScrollMode]);
+    // No later user row can reach the normal anchor offset. The remaining
+    // destination is the transcript's real bottom, not a synthetic runway
+    // that lifts an already-visible tail row to the top.
+    navigationCursorSegmentIdRef.current = null;
+    setAnchorExtentFloor(null);
+    setAnchorRunway(0);
+    scrollToPosition(naturalMaxScrollTop, { type: 'bottom' }, 'scroll-navigation-bottom');
+  }, [scrollToMessageAnchor, scrollToPosition, setAnchorExtentFloor, setAnchorRunway]);
 
   useEffect(() => {
     setScrollNavigationController({ scrollDown, scrollUp });
@@ -617,7 +915,8 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
       turnId: requestedTurnScroll.turnId,
     });
     if (desiredScrollTop === null) return;
-    scrollToPosition(desiredScrollTop, { type: 'off' }, 'host-navigate', true, () => {
+    navigationCursorSegmentIdRef.current = null;
+    scrollToPosition(desiredScrollTop, { type: 'off' }, 'host-navigate', false, () => {
       resolveTurnScroll(requestedTurnScroll.id);
     });
   }, [
@@ -698,6 +997,7 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
     const onTouchStart = () => {
       clearScrollSettleTimer();
       userScrollArmedRef.current = true;
+      navigationCursorSegmentIdRef.current = null;
       cancelScrollAnimation();
       if (bottomScrollRafRef.current !== null) {
         window.cancelAnimationFrame(bottomScrollRafRef.current);
@@ -710,6 +1010,7 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
       setViewportAutoScrollMode({ type: 'off' }, 'touch-start');
     };
     const onWheel = () => {
+      navigationCursorSegmentIdRef.current = null;
       cancelScrollAnimation();
       userScrollArmedRef.current = true;
       setViewportAutoScrollMode({ type: 'off' }, 'manual-scroll');
@@ -823,6 +1124,7 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
     }
 
     if (
+      initialPlacementPendingRef.current ||
       autoScrollModeRef.current.type !== 'off' ||
       nativeScrollOwnsTranscriptViewport(nativeScrollPhaseRef.current) ||
       programmaticScrollRef.current
@@ -931,6 +1233,15 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
       return;
     }
 
+    if (requestedTurnScroll?.conversationId === activeConversationId) {
+      // A route-addressed turn is the authoritative initial position. Mark the
+      // ordinary on-load placement consumed so it cannot race the focus scroll
+      // and snap the viewport back to the tail after the target is measured.
+      initialScrollConversationIdRef.current = activeConversationId;
+      initialViewportIntentRef.current = null;
+      return;
+    }
+
 
     const viewport = viewportRef.current;
     if (!viewport) {
@@ -944,40 +1255,98 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
       // heuristic must not clobber it: the anchor row may not even be in the
       // transcript yet. Start at the bottom and let the managed scroll own
       // positioning from here.
+      const placementEpoch = ++initialPlacementEpochRef.current;
+      initialPlacementPendingRef.current = true;
+      initialViewportIntentRef.current = null;
       programmaticScrollRef.current = true;
       viewport.scrollTop = maxScrollableTop(viewport);
       lastScrollTopRef.current = viewport.scrollTop;
-      window.requestAnimationFrame(() => {
-        programmaticScrollRef.current = false;
+      releaseInitialPlacement(placementEpoch, () => {
+        captureViewportAnchor();
+        scheduleRangeUpdate();
+        scheduleAutoScroll();
       });
       scheduleRangeUpdate();
       scheduleAutoScroll();
       return;
     }
-    const initialTarget = initialTranscriptScrollTarget({
+    const modeledInitialTarget = initialTranscriptScrollTarget({
       anchors: navigationAnchors,
+      conversationId: activeConversationId,
       streamingTurnId,
     });
+    // The layout model identifies the semantic destination, but its pixel
+    // position is provisional. Resolve completed transcripts from the mounted
+    // user row and the matching live content extent so markdown, attachments,
+    // and font wrapping cannot put the two sides of this comparison in
+    // different coordinate systems.
+    const cachedIntent = initialViewportIntentRef.current;
+    const streamingSegmentId = modeledInitialTarget?.mode.type === 'sent-message-anchor'
+      ? modeledInitialTarget.mode.segmentId
+      : null;
+    const streamingAnchor = streamingSegmentId
+      ? navigationAnchors.find((anchor) => anchor.segmentId === streamingSegmentId) ?? null
+      : null;
+    const cachedMessage = cachedIntent?.kind === 'user-message' ? cachedIntent : null;
+    const cachedAnchor = cachedMessage
+      ? navigationAnchors.find((anchor) =>
+          anchor.segmentId === cachedMessage.segmentId && anchor.turnId === cachedMessage.turnId) ?? null
+      : null;
+    const latestAnchor = navigationAnchors.at(-1) ?? null;
+    const targetAnchor = streamingAnchor ?? cachedAnchor ?? latestAnchor;
+    const mountedDesiredScrollTop = targetAnchor
+      ? mountedUserMessageAnchorScrollTop(
+          viewport,
+          targetAnchor.segmentId,
+          transcriptMessageAnchorTopOffset(viewportTopPadding),
+        )
+      : null;
+    const liveInitialTarget = cachedIntent?.kind === 'bottom'
+      ? null
+      : mountedDesiredScrollTop !== null
+        ? {
+            mode: modeledInitialTarget?.mode.type === 'sent-message-anchor'
+              ? modeledInitialTarget.mode
+              : { type: 'off' as const },
+            scrollTop: mountedDesiredScrollTop,
+          }
+        : modeledInitialTarget?.mode.type === 'sent-message-anchor'
+          ? modeledInitialTarget
+          : null;
+    const naturalMaxScrollTop = naturalTranscriptMaxScrollableTop(
+      viewport,
+      transcriptBodyRef.current,
+      measureRef.current,
+    );
     const resolvedInitialTarget = resolveInitialTranscriptScrollTarget({
-      maxScrollTop: maxScrollableTop(viewport),
-      target: initialTarget,
+      maxScrollTop: naturalMaxScrollTop,
+      target: liveInitialTarget,
     });
+    const placementEpoch = ++initialPlacementEpochRef.current;
+    initialPlacementPendingRef.current = true;
+    initialViewportIntentRef.current = null;
     setViewportAutoScrollMode(resolvedInitialTarget.mode, 'initial-scroll');
     programmaticScrollRef.current = true;
     viewport.scrollTop = resolvedInitialTarget.scrollTop;
     lastScrollTopRef.current = viewport.scrollTop;
-    window.requestAnimationFrame(() => {
-      programmaticScrollRef.current = false;
+    releaseInitialPlacement(placementEpoch, () => {
+      captureViewportAnchor();
+      scheduleRangeUpdate();
+      if (resolvedInitialTarget.mode.type !== 'off') scheduleAutoScroll();
     });
     scheduleRangeUpdate();
   }, [
     activeConversationId,
+    captureViewportAnchor,
     navigationAnchors,
+    releaseInitialPlacement,
+    requestedTurnScroll,
     scheduleAutoScroll,
     scheduleRangeUpdate,
     setViewportAutoScrollMode,
     status,
     streamingTurnId,
+    viewportTopPadding,
     width,
   ]);
 
@@ -994,8 +1363,9 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
           data-testid="agent-transcript-content"
           ref={measureRef}
           style={{
+            minHeight: anchorExtentFloorHeight > 0 ? `${anchorExtentFloorHeight}px` : undefined,
             paddingBottom: `${transcriptLayout.viewport.padY}px`,
-            paddingTop: `max(${transcriptLayout.viewport.padY}px, env(safe-area-inset-top))`,
+            paddingTop: `max(${transcriptLayout.viewport.padY}px, env(safe-area-inset-top), var(--remux-safe-area-top, 0px))`,
           }}
         >
           {turnScrollError && requestedTurnScroll ? (
@@ -1025,17 +1395,29 @@ export function VirtualizedTranscript({ conversationId }: { conversationId: stri
               <RotateCcw className="size-3" /> {error ?? 'Retry transcript'}
             </button>
           ) : null}
-          {width === null ? null : (
-            <VirtualizedTranscriptBody
-              bottomSpacerHeight={spacerRange.bottomSpacerHeight + anchorRunwayHeight}
-              conversationId={activeConversationId}
-              status={status}
-              topSpacerHeight={spacerRange.topSpacerHeight}
-              totalTurnCount={turns.length}
-              turns={renderTurns}
-              width={width}
-            />
-          )}
+          <div
+            data-testid="agent-transcript-body"
+            ref={transcriptBodyRef}
+            style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}
+          >
+            {width === null ? null : (
+              <VirtualizedTranscriptBody
+                bottomSpacerHeight={spacerRange.bottomSpacerHeight}
+                conversationId={activeConversationId}
+                status={status}
+                topSpacerHeight={spacerRange.topSpacerHeight}
+                totalTurnCount={turns.length}
+                turns={renderTurns}
+                width={width}
+              />
+            )}
+          </div>
+          <div
+            aria-hidden="true"
+            data-testid="agent-transcript-anchor-runway"
+            ref={anchorRunwayRef}
+            style={{ height: `${anchorRunwayHeight}px` }}
+          />
         </div>
       </div>
     </div>
@@ -1067,51 +1449,91 @@ function scrollNavigationAvailability(
   node: HTMLElement,
   anchors: TranscriptScrollAnchor[],
   mode: TranscriptAutoScrollMode,
+  naturalMaxScrollTop: number,
+  anchorRunwayHeight: number,
+  navigationCursorSegmentId: string | null,
 ) {
+  const currentSegmentId = mode.type === 'sent-message-anchor'
+    ? mode.segmentId
+    : navigationCursorSegmentId;
+  const atBottom = mode.type === 'bottom' &&
+    node.scrollTop >= naturalMaxScrollTop - bottomStickThresholdPx;
   return {
     canScrollDown:
-      Boolean(nextScrollAnchor(anchors, node)) ||
-      !isNearBottom(node) ||
-      mode.type !== 'bottom',
-    canScrollUp: Boolean(previousScrollAnchor(anchors, node)),
+      Boolean(nextUserMessageScrollAnchor({
+        anchors,
+        atBottom,
+        currentSegmentId,
+        maxScrollTop: naturalMaxScrollTop,
+        scrollTop: node.scrollTop,
+        threshold: scrollNavigationThresholdPx,
+      })) ||
+      node.scrollTop < naturalMaxScrollTop - scrollNavigationThresholdPx ||
+      anchorRunwayHeight > 1,
+    canScrollUp: Boolean(previousUserMessageScrollAnchor({
+      anchors,
+      atBottom,
+      currentSegmentId,
+      scrollTop: node.scrollTop,
+      threshold: scrollNavigationThresholdPx,
+    })),
   };
-}
-
-function previousScrollAnchor(anchors: TranscriptScrollAnchor[], node: HTMLElement) {
-  const maxScrollTop = maxScrollableTop(node);
-  const target = node.scrollTop - scrollNavigationThresholdPx;
-
-  for (let index = anchors.length - 1; index >= 0; index -= 1) {
-    const anchor = anchors[index];
-    if (anchor && clampedAnchorScrollTop(anchor, maxScrollTop) < target) {
-      return anchor;
-    }
-  }
-
-  return null;
-}
-
-function nextScrollAnchor(anchors: TranscriptScrollAnchor[], node: HTMLElement) {
-  const maxScrollTop = maxScrollableTop(node);
-  const target = node.scrollTop + scrollNavigationThresholdPx;
-  return anchors.find((anchor) => clampedAnchorScrollTop(anchor, maxScrollTop) > target) ?? null;
-}
-
-function lastScrollAnchor(anchors: TranscriptScrollAnchor[]) {
-  return anchors[anchors.length - 1] ?? null;
-}
-
-function clampedAnchorScrollTop(anchor: TranscriptScrollAnchor, maxScrollTop: number) {
-  return Math.max(0, Math.min(anchor.scrollTop, maxScrollTop));
 }
 
 function maxScrollableTop(node: HTMLElement) {
   return Math.max(0, node.scrollHeight - node.clientHeight);
 }
 
+function computeAnchorExtentFloorHeight(
+  viewport: HTMLElement,
+  content: HTMLElement,
+  desiredScrollTop: number,
+) {
+  const viewportBounds = viewport.getBoundingClientRect();
+  const contentBounds = content.getBoundingClientRect();
+  const contentTop = viewport.scrollTop + contentBounds.top - viewportBounds.top;
+  return Math.max(0, Math.ceil(desiredScrollTop + viewport.clientHeight - contentTop));
+}
+
+function naturalTranscriptMaxScrollableTop(
+  viewport: HTMLElement,
+  transcriptBody: HTMLElement | null,
+  content: HTMLElement | null,
+) {
+  if (!transcriptBody || !content) return maxScrollableTop(viewport);
+  const viewportBounds = viewport.getBoundingClientRect();
+  const bodyBounds = transcriptBody.getBoundingClientRect();
+  const contentStyle = window.getComputedStyle(content);
+  const bodyBottom = viewport.scrollTop + bodyBounds.bottom - viewportBounds.top;
+  return Math.max(
+    0,
+    bodyBottom + parseCssPixels(contentStyle.paddingBottom, 0) - viewport.clientHeight,
+  );
+}
+
 function parseCssPixels(value: string, fallback: number) {
   const parsed = Number.parseFloat(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function mountedUserMessageAnchorScrollTop(
+  viewport: HTMLElement,
+  segmentId: string,
+  anchorTop: number,
+) {
+  const viewportBounds = viewport.getBoundingClientRect();
+  const rows = viewport.querySelectorAll<HTMLElement>('[data-row-kind="userMessage"]');
+  for (const row of rows) {
+    if (
+      row.dataset.segmentId !== segmentId &&
+      row.dataset.clientMessageId !== segmentId
+    ) continue;
+    return Math.max(
+      0,
+      viewport.scrollTop + row.getBoundingClientRect().top - viewportBounds.top - anchorTop,
+    );
+  }
+  return null;
 }
 
 type ExpandedRowGeometry = {
@@ -1248,6 +1670,29 @@ function mountedViewportAnchor(
   };
 }
 
+function cachedTranscriptViewportAnchor(conversationId: string) {
+  const anchor = transcriptViewportAnchorCache.get(conversationId) ?? null;
+  if (!anchor) return null;
+  transcriptViewportAnchorCache.delete(conversationId);
+  transcriptViewportAnchorCache.set(conversationId, anchor);
+  return anchor;
+}
+
+function cacheTranscriptViewportAnchor(
+  conversationId: string,
+  anchor: TranscriptViewportCacheEntry,
+) {
+  transcriptViewportAnchorCache.delete(conversationId);
+  transcriptViewportAnchorCache.set(conversationId, anchor);
+  while (transcriptViewportAnchorCache.size > MAX_CACHED_TRANSCRIPT_VIEWPORT_ANCHORS) {
+    const oldestConversationId = transcriptViewportAnchorCache.keys().next().value as
+      | string
+      | undefined;
+    if (!oldestConversationId) return;
+    transcriptViewportAnchorCache.delete(oldestConversationId);
+  }
+}
+
 function scrollTopForMountedViewportAnchor(
   viewport: HTMLElement,
   anchor: TranscriptViewportAnchor,
@@ -1316,39 +1761,6 @@ function transcriptRowPositions({
 
   return positions;
 }
-
-function userMessageScrollAnchors({
-  expandedRows,
-  topPadding,
-  turns,
-}: {
-  expandedRows: TranscriptExpandedRow[];
-  topPadding: number;
-  turns: TranscriptMeasuredTurn[];
-}): TranscriptScrollAnchor[] {
-  const anchors: TranscriptScrollAnchor[] = [];
-  const expanded = expandedRowGeometry(turns, expandedRows);
-
-  turns.forEach((turn, turnIndex) => {
-    let rowTop = turn.collapsedTop + expanded.heightBeforeTurnIndex(turnIndex);
-
-    for (const row of turn.rows) {
-      if (row.segment.type === 'userMessage') {
-        anchors.push({
-          segmentId: row.segmentId,
-          scrollTop: userMessageAnchorScrollTop(rowTop, topPadding),
-          turnId: turn.turnId,
-        });
-      }
-
-      rowTop += row.height + expanded.heightAfterRow(turn.turnId, row.id);
-    }
-  });
-
-  return anchors;
-}
-
-
 
 function VirtualizedTranscriptBody({
   bottomSpacerHeight,
@@ -1446,6 +1858,7 @@ const TranscriptRow = memo(function TranscriptRow({
   return (
     <div
       className={`codex-transcript-row codex-transcript-row-${row.segment.type}`}
+      data-client-message-id={row.segment.type === 'userMessage' ? row.segment.clientMessageId ?? undefined : undefined}
       data-row-kind={row.segment.type === 'work' ? 'workSection' : row.segment.type}
       data-segment-id={row.segmentId}
       data-transcript-row-id={row.id}
@@ -1500,6 +1913,8 @@ function TranscriptSegmentBody({
         segment={segment}
         showActions={row.showUserActions}
         turnId={row.turnId}
+        pathEntryId={row.turn.pathEntryId}
+        strandId={row.turn.strandId}
       />
     );
   }
@@ -1511,7 +1926,18 @@ function TranscriptSegmentBody({
         showActions={row.showAssistantActions}
         turnStatus={row.turn.status}
         turnId={row.turnId}
+        pathEntryId={row.turn.pathEntryId}
+        strandId={row.turn.strandId}
         width={width}
+      />
+    );
+  }
+  if (segment.type === 'compaction') {
+    return (
+      <CompactionDivider
+        density="transcript"
+        status={segment.status}
+        title={segment.error}
       />
     );
   }
@@ -1519,6 +1945,8 @@ function TranscriptSegmentBody({
     <WorkSection
       conversationId={conversationId}
       laneWidth={width}
+      responseStarted={row.turn.segments.some((candidate) =>
+        candidate.type === 'assistantMessage' && Boolean(candidate.text.trim()))}
       rowId={row.id}
       segment={segment}
       turnId={row.turnId}

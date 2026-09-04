@@ -54,6 +54,23 @@ test('classifies web links, inline code, and local file links independently', ()
   assert.ok(line?.some((inline) => inline.type === 'fileLink' && inline.file.path === 'src/index.ts' && inline.file.line === 12));
 });
 
+test('preserves provider reasoning summary boundaries without changing ordinary Markdown soft breaks', () => {
+  const markdown = '**Analyzing flexbox shrink behavior**\n**Reviewing button group sizing details**';
+  const ordinary = parseMarkdownDocument(markdown);
+  const reasoning = parseMarkdownDocument(markdown, { preserveSoftBreaks: true });
+  const ordinaryParagraph = ordinary[0];
+  const reasoningParagraph = reasoning[0];
+
+  assert.equal(ordinaryParagraph?.type, 'paragraph');
+  assert.equal(reasoningParagraph?.type, 'paragraph');
+  if (ordinaryParagraph?.type !== 'paragraph' || reasoningParagraph?.type !== 'paragraph') return;
+  assert.equal(ordinaryParagraph.lines.length, 1);
+  assert.equal(reasoningParagraph.lines.length, 2);
+
+  const layout = getMarkdownLayoutDocument(markdown, 'work', 640, { preserveSoftBreaks: true });
+  assert.equal(layout.height, markdownMetrics.paragraph.lineHeight.work * 2);
+});
+
 test('lays out GFM tables and clamps tall fenced code', () => {
   const markdown = [
     '| Name | State |',

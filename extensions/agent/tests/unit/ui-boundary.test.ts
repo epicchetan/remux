@@ -3,16 +3,46 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { extname, join } from 'node:path';
 import { test } from '@playwright/test';
 
-test('Agent source does not import Codex or narration implementations', () => {
+test('Agent viewer does not import Codex or narration implementations', () => {
   const source = sourceText([
     new URL('../../viewer/src/', import.meta.url),
-    new URL('../../server/src/', import.meta.url),
     new URL('../../shared/', import.meta.url),
   ]);
 
   assert.doesNotMatch(source, /(?:@remux\/codex|extensions\/codex|@remux\/narration-client|narration-client)/u);
   assert.doesNotMatch(source, /remux\/codex\//u);
   assert.doesNotMatch(source, /codex-app-server|app-server-protocol/u);
+});
+
+test('native provider adapters do not reach into the legacy Codex extension', () => {
+  const source = sourceText([new URL('../../server/src/', import.meta.url)]);
+  assert.doesNotMatch(source, /(?:@remux\/codex|extensions\/codex|@remux\/narration-client|narration-client)/u);
+});
+
+test('the deleted Pi, context-compiler, and custom child runtime cannot return as a hidden fallback', () => {
+  const root = new URL('../../', import.meta.url);
+  const packageJson = readFileSync(new URL('package.json', root), 'utf8');
+  const productionSource = sourceText([
+    new URL('server/src/', root),
+    new URL('shared/', root),
+    new URL('viewer/src/', root),
+  ]);
+
+  assert.doesNotMatch(packageJson, /@earendil-works\/(?:pi-ai|pi-coding-agent)/u);
+  assert.doesNotMatch(
+    productionSource,
+    /@earendil-works\/(?:pi-ai|pi-coding-agent)|provider[- ]lanes?|remote[- ]compaction|context[_-]frame|work[_-]unit/iu,
+  );
+  for (const relativePath of [
+    'server/prompts/system.md',
+    'server/src/logical-context.ts',
+    'server/src/storage/work-unit-state.ts',
+  ]) {
+    assert.equal(existsSync(new URL(relativePath, root)), false, `${relativePath} must stay deleted`);
+  }
+  for (const relativePath of ['server/src/context/', 'server/src/providers/openai-codex/']) {
+    assert.deepEqual(filesUnder(new URL(relativePath, root).pathname), [], `${relativePath} must stay empty`);
+  }
 });
 
 test('the temporary flat transcript resource model stays removed', () => {
@@ -53,6 +83,7 @@ function sourceText(roots: URL[]) {
 }
 
 function filesUnder(path: string): string[] {
+  if (!existsSync(path)) return [];
   return readdirSync(path, { withFileTypes: true }).flatMap((entry) => {
     const child = join(path, entry.name);
     if (entry.isDirectory()) return filesUnder(child);

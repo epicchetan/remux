@@ -27,6 +27,7 @@ import type {
   WebViewRenderProcessGoneEvent,
   WebViewTerminatedEvent,
 } from 'react-native-webview/lib/WebViewTypes';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { RpcContract } from '@remux/viewer-kit/rpc';
 
 import { logRemuxDebug } from '../../remote/remuxDebug';
@@ -35,11 +36,24 @@ import {
   type RemuxConnectionStatus,
 } from '../../remote/RemuxConnectionProvider';
 import type { RemuxRpcMessage } from '../../remote/remuxRpcClient';
+import type { RemuxViewHostChrome } from '../../remote/remuxExtensions';
 import { useRemuxSettingsStore } from '../../remote/remuxSettingsStore';
 import { useTheme, type RemuxTheme, type RemuxThemeName } from '../../theme/ThemeProvider';
 import type { BrowserPendingNavigation, BrowserSection, ViewerTab } from '../../browser/browserTypes';
 import { serializedResourceKey } from '../../browser/resourceKeys';
 import { noteTabPreviewContentChanged } from '../../browser/tabPreviewCapture';
+import { NativeGlassIconButton } from '../../ui/NativeGlassIconButton';
+import {
+  HostLifecycleEvidenceClock,
+  type HostLifecycleEvent,
+} from './lifecycleEvidence';
+import {
+  createWebViewHostLayoutScript,
+  minimalHostControlInsetLeft,
+  minimalHostControlMargin,
+  minimalHostControlSize,
+  type NativeSafeAreaInsets,
+} from './hostLayout';
 
 let nextWebViewInstanceId = 1;
 
@@ -54,6 +68,11 @@ function effectiveLifecycleState(
     return 'inactive';
   }
   return 'active';
+}
+
+function monotonicNowMs() {
+  const now = globalThis.performance?.now?.();
+  return typeof now === 'number' && Number.isFinite(now) ? now : null;
 }
 
 function isImmutableViewerBundleUrl(url: string) {
@@ -154,12 +173,6 @@ type NativeToWebViewMessage =
       type: 'remux/lifecycle';
     };
 
-type HostLifecycleEvent = {
-  epoch: number;
-  reason: 'appState' | 'connect' | 'tabActive';
-  state: 'active' | 'background' | 'inactive';
-};
-
 type WebViewPageState =
   | { type: 'loading' }
   | { type: 'ready' }
@@ -179,8 +192,13 @@ type KeyboardFrame = {
 };
 
 type HostViewportMetrics = {
+  hostControlInsetLeft: number;
   keyboardHeight: number;
   keyboardVisible: boolean;
+  safeAreaBottom: number;
+  safeAreaLeft: number;
+  safeAreaRight: number;
+  safeAreaTop: number;
   visibleBottom: number;
   visibleTop: number;
   viewportHeight: number;
@@ -245,7 +263,6 @@ const healthPingTimeoutMs = 1500;
 const maxAutomaticReloadAttempts = 2;
 const previewKeyboardSettleTimeoutMs = 600;
 const webViewReadyTimeoutMs = 8000;
-
 type HealthPingWaiter = {
   epoch: number;
   reason: string;
@@ -255,10 +272,12 @@ type HealthPingWaiter = {
 
 type ExtensionWebViewProps = {
   active: boolean;
+  hostChrome?: RemuxViewHostChrome;
   onCloseTab?: () => void;
   onNavigationDelivered?: (nonce: string) => void;
   onOpenFile?: (params: HostFileOpenParams) => HostFileOpenResult | Promise<HostFileOpenResult>;
   onOpenOverview?: (section?: BrowserSection) => Promise<void> | void;
+  onReloadView?: () => Promise<string | null>;
   onTabUpdate?: (patch: ExtensionTabUpdate) => void;
   onViewerBundleUnavailable?: () => boolean | Promise<boolean>;
   pendingNavigation?: BrowserPendingNavigation | null;
@@ -276,10 +295,12 @@ export type ExtensionWebViewHandle = {
 export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebViewProps>(function ExtensionWebView(
   {
     active,
+    hostChrome = 'none',
     onCloseTab,
     onNavigationDelivered,
     onOpenFile,
     onOpenOverview,
+    onReloadView,
     onTabUpdate,
     onViewerBundleUnavailable,
     pendingNavigation = null,
@@ -292,7 +313,9 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
 ) {
   const remux = useRemuxConnection();
   const authToken = useRemuxSettingsStore((state) => state.token);
+  const safeAreaInsets = useSafeAreaInsets();
   const theme = useTheme();
+  const hostControlInsetLeft = hostChrome === 'minimal' ? minimalHostControlInsetLeft : 0;
   const [pageState, setPageState] = useState<WebViewPageState>({ type: 'loading' });
   const [reloadNonce, setReloadNonce] = useState(0);
   const [reloadTargetUrl, setReloadTargetUrl] = useState(sourceUrl);
@@ -300,9 +323,11 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
   const bundleRecoveryPendingRef = useRef(false);
   const activeRef = useRef(active);
   const appStateRef = useRef(AppState.currentState);
-  const lifecycleEpochRef = useRef(0);
-  const lifecycleStateRef = useRef<HostLifecycleEvent['state']>(
-    effectiveLifecycleState(AppState.currentState, active),
+  const lifecycleClockRef = useRef(
+    new HostLifecycleEvidenceClock(
+      effectiveLifecycleState(AppState.currentState, active),
+      monotonicNowMs(),
+    ),
   );
   const healthPingIdRef = useRef(0);
   const healthPingWaitersRef = useRef(new Map<string, HealthPingWaiter>());
@@ -328,8 +353,21 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
     tabId: tab.id,
   }), [tab.extensionId, tab.id, tab.resourceId, tab.resourceKind, tab.viewId]);
   const injectedBeforeContentLoaded = useMemo(
-    () => createWebViewBeforeContentLoadedScript(theme.name),
-    [theme.name],
+    () => createWebViewBeforeContentLoadedScript(
+      theme.name,
+      hostChrome,
+      hostControlInsetLeft,
+      safeAreaInsets,
+    ),
+    [
+      hostChrome,
+      hostControlInsetLeft,
+      safeAreaInsets.bottom,
+      safeAreaInsets.left,
+      safeAreaInsets.right,
+      safeAreaInsets.top,
+      theme.name,
+    ],
   );
 
   const clearReadyTimeout = useCallback(() => {
@@ -486,16 +524,8 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
 
   const postLifecycle = useCallback((reason: HostLifecycleEvent['reason']) => {
     const state = effectiveLifecycleState(appStateRef.current, activeRef.current);
-    if (state !== lifecycleStateRef.current) {
-      lifecycleStateRef.current = state;
-      lifecycleEpochRef.current += 1;
-    }
     postToWebView({
-      lifecycle: {
-        epoch: lifecycleEpochRef.current,
-        reason,
-        state,
-      },
+      lifecycle: lifecycleClockRef.current.sample(state, reason, monotonicNowMs()),
       type: 'remux/lifecycle',
     });
   }, [postToWebView]);
@@ -516,14 +546,25 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
     const keyboardHeight = keyboard.visible ? Math.max(0, webView.height - visibleBottom) : 0;
 
     return {
+      hostControlInsetLeft,
       keyboardHeight,
       keyboardVisible: keyboard.visible,
+      safeAreaBottom: safeAreaInsets.bottom,
+      safeAreaLeft: safeAreaInsets.left,
+      safeAreaRight: safeAreaInsets.right,
+      safeAreaTop: safeAreaInsets.top,
       visibleBottom,
       visibleTop: 0,
       viewportHeight: webView.height,
       viewportWidth: webView.width,
     };
-  }, []);
+  }, [
+    hostControlInsetLeft,
+    safeAreaInsets.bottom,
+    safeAreaInsets.left,
+    safeAreaInsets.right,
+    safeAreaInsets.top,
+  ]);
 
   const postViewportMetrics = useCallback(() => {
     postToWebView({
@@ -534,6 +575,11 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
       type: 'remux/event',
     });
   }, [hostViewportMetrics, postToWebView]);
+
+  useEffect(() => {
+    captureWebViewFrame();
+    requestAnimationFrame(postViewportMetrics);
+  }, [captureWebViewFrame, postViewportMetrics]);
 
   const postTheme = useCallback(() => {
     postToWebView({
@@ -563,13 +609,17 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
     }
   }, [active, onNavigationDelivered, pendingNavigation, postToWebView]);
 
-  const dismissKeyboard = useCallback(() => {
+  const releaseInputFocus = useCallback(() => {
     webViewRef.current?.injectJavaScript(dismissKeyboardScript);
     Keyboard.dismiss();
+  }, []);
+
+  const dismissKeyboard = useCallback(() => {
+    releaseInputFocus();
     captureWebViewFrame();
     setTimeout(postViewportMetrics, 0);
     setTimeout(postViewportMetrics, 120);
-  }, [captureWebViewFrame, postViewportMetrics]);
+  }, [captureWebViewFrame, postViewportMetrics, releaseInputFocus]);
 
   const prepareForPreviewCapture = useCallback(async () => {
     const keyboardWasVisible = keyboardFrameRef.current.visible;
@@ -643,13 +693,17 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
     advancePageEpoch(reason);
   }, [advancePageEpoch, clearReadyTimeout]);
 
-  const reloadWebView = useCallback((options: { automatic?: boolean; reason?: string } = {}) => {
+  const reloadWebView = useCallback((options: {
+    automatic?: boolean;
+    reason?: string;
+    targetUrl?: string;
+  } = {}) => {
     const reason = options.reason ?? 'manual';
     if (!options.automatic) {
       automaticReloadAttemptsRef.current = 0;
     }
 
-    const targetUrl = reloadSourceUrl ?? sourceUrl;
+    const targetUrl = options.targetUrl ?? reloadSourceUrl ?? sourceUrl;
     logRemuxDebug('webview:reload:requested', {
       automatic: options.automatic === true,
       instanceId: instanceIdRef.current,
@@ -670,6 +724,22 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
       return next;
     });
   }, [reloadSourceUrl, resetWebViewReadiness, sourceUrl]);
+
+  const reloadLatestWebView = useCallback(async (reason: string) => {
+    let targetUrl = reloadSourceUrl ?? sourceUrl;
+    if (onReloadView) {
+      try {
+        targetUrl = await onReloadView() ?? targetUrl;
+      } catch (reloadError) {
+        logRemuxDebug('webview:reload:catalog-refresh-failed', {
+          instanceId: instanceIdRef.current,
+          message: errorMessage(reloadError),
+          reason,
+        });
+      }
+    }
+    reloadWebView({ reason, targetUrl });
+  }, [onReloadView, reloadSourceUrl, reloadWebView, sourceUrl]);
 
   const activeSourceUrl = reloadNonce === 0 ? sourceUrl : reloadTargetUrl;
   const webViewSourceUrl = useMemo(
@@ -751,6 +821,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
           postActive(active);
           postLifecycle('connect');
           postTheme();
+          postViewportMetrics();
           break;
         case 'remux/health/pong': {
           const waiter = healthPingWaitersRef.current.get(message.id);
@@ -861,7 +932,9 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
               result: { ok: true },
               type: 'remux/response',
             }, { epoch: requestEpoch });
-            setTimeout(() => reloadWebView({ reason: 'host-request' }), 0);
+            setTimeout(() => {
+              void reloadLatestWebView('host-request');
+            }, 0);
             break;
           }
 
@@ -1048,6 +1121,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
       onCloseTab,
       onOpenFile,
       onOpenOverview,
+      reloadLatestWebView,
       onTabUpdate,
       pickAttachments,
       active,
@@ -1056,8 +1130,8 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
       postConnection,
       postStatus,
       postTheme,
+      postViewportMetrics,
       postToWebView,
-      reloadWebView,
       remux,
       remuxRequestContext,
       tab.id,
@@ -1086,13 +1160,28 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
 
   useEffect(() => {
     const wasActive = activeRef.current;
+    if (wasActive && !active) {
+      releaseInputFocus();
+    }
     activeRef.current = active;
     postActive(active);
     postLifecycle('tabActive');
     if (active && !wasActive) {
       postConnection();
+      captureWebViewFrame();
+      requestAnimationFrame(postViewportMetrics);
+      checkWebViewHealth('tab-active');
     }
-  }, [active, postActive, postConnection, postLifecycle]);
+  }, [
+    active,
+    captureWebViewFrame,
+    checkWebViewHealth,
+    postActive,
+    postConnection,
+    postLifecycle,
+    postViewportMetrics,
+    releaseInputFocus,
+  ]);
 
   useEffect(() => {
     postStatus();
@@ -1111,7 +1200,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
   }, [postTheme, theme.name]);
 
   useEffect(() => {
-    if (remux.status.type === 'connected') {
+    if (remux.status.type === 'connected' && activeRef.current) {
       checkWebViewHealth('connection-connected');
     }
   }, [checkWebViewHealth, remux.status.type]);
@@ -1119,8 +1208,11 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
   useEffect(() => {
     const subscription = AppState.addEventListener('change', (state) => {
       appStateRef.current = state;
+      if (state !== 'active' && activeRef.current) {
+        releaseInputFocus();
+      }
       postLifecycle('appState');
-      if (state !== 'active') {
+      if (state !== 'active' || !activeRef.current) {
         return;
       }
 
@@ -1139,7 +1231,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
     return () => {
       subscription.remove();
     };
-  }, [autoReloadWebView, checkWebViewHealth, postLifecycle, title]);
+  }, [autoReloadWebView, checkWebViewHealth, postLifecycle, releaseInputFocus, title]);
 
   useEffect(() => {
     const descriptor = descriptorRef.current;
@@ -1288,6 +1380,9 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
 
   useEffect(() => {
     const updateKeyboardFrame = (event: KeyboardEvent) => {
+      if (!activeRef.current || appStateRef.current !== 'active') {
+        return;
+      }
       const webView = webViewFrameRef.current;
       const keyboardBottom = webView.y + webView.height;
       const visible = event.endCoordinates.height > 0 && event.endCoordinates.screenY < keyboardBottom;
@@ -1303,6 +1398,9 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
 
     const clearKeyboardFrame = () => {
       keyboardFrameRef.current = { height: 0, screenY: 0, visible: false };
+      if (!activeRef.current || appStateRef.current !== 'active') {
+        return;
+      }
       captureWebViewFrame();
       requestAnimationFrame(postViewportMetrics);
     };
@@ -1320,7 +1418,14 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
   }, [captureWebViewFrame, postViewportMetrics]);
 
   return (
-    <View onLayout={captureWebViewFrame} ref={containerRef} style={styles.container}>
+    <View
+      onLayout={() => {
+        captureWebViewFrame();
+        requestAnimationFrame(postViewportMetrics);
+      }}
+      ref={containerRef}
+      style={styles.container}
+    >
       <WebView
         allowsBackForwardNavigationGestures={false}
         allowsInlineMediaPlayback
@@ -1356,6 +1461,28 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
         }}
         style={styles.webView}
       />
+      {hostChrome === 'minimal' ? (
+        <View
+          pointerEvents="box-none"
+          style={[
+            styles.hostChromeControl,
+            {
+              left: safeAreaInsets.left + minimalHostControlMargin,
+              top: safeAreaInsets.top + 4,
+            },
+          ]}
+        >
+          <NativeGlassIconButton
+            accessibilityLabel="Open Remux tabs"
+            iconSize={18}
+            onPress={() => {
+              void onOpenOverview?.('tabs');
+            }}
+            size={minimalHostControlSize}
+            systemImage="rectangle.grid.2x2"
+          />
+        </View>
+      ) : null}
       {pageState.type === 'loading' ? (
         <View style={styles.loadingOverlay}>
           <ActivityIndicator color={theme.textMuted} />
@@ -1380,7 +1507,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
             <Pressable
               accessibilityRole="button"
               onPress={() => {
-                reloadWebView({ reason: 'manual' });
+                void reloadLatestWebView('manual');
               }}
               style={styles.overlayButton}
             >
@@ -1792,8 +1919,17 @@ function isWebViewLogLevel(value: unknown): value is Extract<WebViewToNativeMess
 
 const webViewDiagnosticsVerboseConsole = false;
 
-function createWebViewBeforeContentLoadedScript(theme: RemuxThemeName) {
-  return `${createWebViewThemeScript(theme, false)}\n${webViewDiagnosticsScript}`;
+function createWebViewBeforeContentLoadedScript(
+  theme: RemuxThemeName,
+  hostChrome: RemuxViewHostChrome,
+  hostControlInsetLeft: number,
+  safeAreaInsets: NativeSafeAreaInsets,
+) {
+  return `${createWebViewThemeScript(theme, false)}\n${createWebViewHostLayoutScript(
+    hostChrome,
+    hostControlInsetLeft,
+    safeAreaInsets,
+  )}\n${webViewDiagnosticsScript}`;
 }
 
 function createWebViewThemeUpdateScript(theme: RemuxThemeName) {
@@ -1960,6 +2096,12 @@ function createStyles(theme: RemuxTheme) {
     fontWeight: '700',
     lineHeight: 26,
     textAlign: 'center',
+  },
+  hostChromeControl: {
+    height: minimalHostControlSize,
+    position: 'absolute',
+    width: minimalHostControlSize,
+    zIndex: 20,
   },
   loadingMessage: {
     color: theme.textMuted,

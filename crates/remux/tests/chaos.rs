@@ -3,15 +3,19 @@
 //! dead-pipe writes, SIGTERM/EOF-ignoring stops, crash loops → Failed,
 //! garbage stdout, truthful stop/restart with confirmed reap.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
 
-use remux::extensions::manifest::{BuildSpec, Display, ExtensionManifest, ServerSpec, View};
+use remux::extensions::manifest::{
+    BuildSpec, Display, ExtensionManifest, GatewaySpec, ServerSpec, View, ViewCachePolicy,
+};
 use remux::extensions::runstate::{read_start_ticks, sweep_orphans, RunEntry, RunRole, RunState};
 use remux::extensions::supervisor::{ExtensionCtx, ExtensionSupervisor, SupervisorConfig};
+use remux::http::extension_gateways::ExtensionGatewayRegistry;
 use remux::logs::{ExtensionLogs, Journal, StdTerminal};
 use remux::rpc::router::{BoxFuture, ExtensionServer, ServerStatus};
 
@@ -21,6 +25,10 @@ struct TestCtx {
     targeted: Mutex<Vec<(String, Value)>>,
     notifications: Mutex<Vec<Value>>,
     failures: Mutex<Vec<(String, String)>>,
+    published_views: Mutex<Vec<(String, String)>>,
+    view_publish_error: Mutex<Option<String>>,
+    gateway_registry: Mutex<Option<ExtensionGatewayRegistry>>,
+    prepared_gateways: Mutex<Vec<(String, u64, std::path::PathBuf)>>,
 }
 
 impl ExtensionCtx for TestCtx {
@@ -45,6 +53,65 @@ impl ExtensionCtx for TestCtx {
             .lock()
             .unwrap()
             .push((extension_id.to_string(), body));
+    }
+    fn prepare_extension_gateway(
+        &self,
+        extension_id: &str,
+        generation: u64,
+    ) -> Result<Option<std::path::PathBuf>, String> {
+        let registry = self.gateway_registry.lock().unwrap().clone();
+        let Some(registry) = registry else {
+            return Ok(None);
+        };
+        let path = registry.prepare_generation(extension_id, generation)?;
+        if let Some(path) = &path {
+            self.prepared_gateways.lock().unwrap().push((
+                extension_id.to_string(),
+                generation,
+                path.clone(),
+            ));
+        }
+        Ok(path)
+    }
+    fn activate_extension_gateway(
+        &self,
+        extension_id: &str,
+        generation: u64,
+    ) -> Result<(), String> {
+        self.gateway_registry
+            .lock()
+            .unwrap()
+            .as_ref()
+            .ok_or_else(|| "test gateway registry is unavailable".to_string())?
+            .activate_generation(extension_id, generation)
+    }
+    fn retire_extension_gateway(&self, extension_id: &str, generation: u64) {
+        if let Some(registry) = self.gateway_registry.lock().unwrap().as_ref() {
+            registry.retire_generation(extension_id, generation);
+        }
+    }
+    fn cleanup_extension_gateway(&self, extension_id: &str, generation: u64) {
+        if let Some(registry) = self.gateway_registry.lock().unwrap().as_ref() {
+            registry.cleanup_generation(extension_id, generation);
+        }
+    }
+    fn publish_view_bundle(
+        &self,
+        extension_id: &str,
+        view_id: &str,
+    ) -> BoxFuture<'_, Result<(), String>> {
+        let extension_id = extension_id.to_string();
+        let view_id = view_id.to_string();
+        Box::pin(async move {
+            if let Some(error) = self.view_publish_error.lock().unwrap().clone() {
+                return Err(error);
+            }
+            self.published_views
+                .lock()
+                .unwrap()
+                .push((extension_id, view_id));
+            Ok(())
+        })
     }
 }
 
@@ -84,11 +151,13 @@ fn fixture_manifest_with_server(root: &Path, server: ServerSpec) -> ExtensionMan
             title: "Fixture".to_string(),
         },
         server: Some(server),
+        gateway: None,
         views: vec![(
             "main".to_string(),
             View {
                 cache: Default::default(),
                 entry: root.join("index.html"),
+                host_chrome: Default::default(),
                 route: "/viewers/fixture".to_string(),
                 build: None,
                 watch: None,
@@ -168,6 +237,66 @@ async fn wait_for_state(
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+#[tokio::test]
+async fn manifest_gateway_receives_generation_socket_and_requires_stdio_readiness() {
+    let root = tempfile::tempdir().unwrap();
+    let mut manifest = fixture_manifest(root.path(), &["FIXTURE_GATEWAY_READY=1"]);
+    manifest.gateway = Some(GatewaySpec {
+        transport: "http+websocket".to_string(),
+        max_request_body_bytes: 16 * 1024 * 1024,
+    });
+    let registry = ExtensionGatewayRegistry::new(root.path(), &[manifest.clone()]).unwrap();
+    let ctx = Arc::new(TestCtx::default());
+    *ctx.gateway_registry.lock().unwrap() = Some(registry.clone());
+    let journal = Journal::new(root.path(), 15, Arc::new(StdTerminal)).unwrap();
+    let logs = ExtensionLogs::new(root.path());
+    let run_state = RunState::new(root.path());
+    let (supervisor, _actor) = ExtensionSupervisor::spawn(
+        manifest,
+        fast_config(),
+        ctx.clone(),
+        journal,
+        logs,
+        run_state,
+    );
+
+    let status = supervisor.start(false).await;
+    assert_eq!(status.state, "running");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while registry.active_generation("fixture") != Some(1) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fixture never completed the stdio gateway readiness handshake"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let ready_status = supervisor.status();
+    assert!(ready_status.gateway.declared);
+    assert!(ready_status.gateway.ready);
+    assert_eq!(ready_status.gateway.generation, Some(1));
+
+    let prepared = ctx.prepared_gateways.lock().unwrap().clone();
+    assert_eq!(prepared.len(), 1);
+    assert_eq!(prepared[0].0, "fixture");
+    assert_eq!(prepared[0].1, 1);
+    assert!(prepared[0].2.exists());
+    let mode = std::fs::metadata(&prepared[0].2)
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o077, 0);
+
+    let stopped = supervisor.stop().await;
+    assert_eq!(stopped.state, "stopped");
+    assert!(!stopped.gateway.ready);
+    assert_eq!(stopped.gateway.generation, None);
+    assert_eq!(registry.active_generation("fixture"), None);
+    assert!(
+        !prepared[0].2.exists(),
+        "socket is removed after child reap"
+    );
 }
 
 fn process_alive(pid: u32) -> bool {
@@ -839,11 +968,13 @@ fn view_manifest(
             title: "Fixture".to_string(),
         },
         server,
+        gateway: None,
         views: vec![(
             "main".to_string(),
             View {
-                cache: Default::default(),
+                cache: ViewCachePolicy::Immutable,
                 entry: root.join("dist/index.html"),
+                host_chrome: Default::default(),
                 route: "/viewers/fixture".to_string(),
                 build: build.map(job),
                 watch: watch.map(job),
@@ -904,6 +1035,10 @@ async fn serverless_start_runs_view_build_then_lands_stopped_and_built() {
     assert!(status.views.built);
     assert!(status.views.last_build_at_ms.is_some());
     assert_eq!(view_build_count(harness.root.path()), 1);
+    assert_eq!(
+        harness.ctx.published_views.lock().unwrap().as_slice(),
+        &[("fixture".to_string(), "main".to_string())],
+    );
 
     // The build ran under the lifecycle Building state and settled back.
     let states = harness.ctx.states();
@@ -1381,10 +1516,12 @@ async fn manual_views_build_forces_a_rebuild_without_lifecycle_changes() {
     assert!(status.views.last_build_at_ms.is_some());
     assert_eq!(status.state, "stopped");
     assert_eq!(view_build_count(harness.root.path()), 1);
+    assert_eq!(harness.ctx.published_views.lock().unwrap().len(), 1);
 
     // Bundle exists — a manual build still force-runs (unlike start).
     harness.supervisor.build_views().await.unwrap();
     assert_eq!(view_build_count(harness.root.path()), 2);
+    assert_eq!(harness.ctx.published_views.lock().unwrap().len(), 2);
     let started = harness.supervisor.start(false).await;
     assert_eq!(started.state, "stopped");
     assert_eq!(
@@ -1395,6 +1532,83 @@ async fn manual_views_build_forces_a_rebuild_without_lifecycle_changes() {
 
     // The lifecycle never left stopped/building territory — no failed.
     assert!(!harness.ctx.states().contains(&"failed".to_string()));
+}
+
+#[tokio::test]
+async fn manual_view_build_does_not_block_live_extension_rpc() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("dist")).unwrap();
+    std::fs::write(root.path().join("dist/index.html"), "old bundle").unwrap();
+    let harness = harness_with_manifest(root, fast_config(), |root| {
+        view_manifest(
+            root,
+            Some(ServerSpec {
+                transport: "stdio".to_string(),
+                command: env!("CARGO_BIN_EXE_remux-fixture-ext").to_string(),
+                args: Vec::new(),
+                cwd: root.to_path_buf(),
+                build: None,
+            }),
+            Some("sleep 0.4; echo new-bundle > dist/index.html"),
+            None,
+        )
+    });
+    assert!(harness.supervisor.start(false).await.running);
+
+    let build = tokio::spawn({
+        let supervisor = harness.supervisor.clone();
+        async move { supervisor.build_views().await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!build.is_finished(), "fixture build must still be running");
+
+    let rpc = tokio::time::timeout(
+        Duration::from_millis(200),
+        harness
+            .supervisor
+            .handle_rpc("fixture/echo".to_string(), None),
+    )
+    .await
+    .expect("live RPC must not queue behind the view build")
+    .unwrap();
+    assert_eq!(rpc["echo"], "fixture/echo");
+
+    let status = build.await.unwrap().unwrap();
+    assert!(status.running);
+    assert!(status.views.last_build_at_ms.is_some());
+    harness.supervisor.stop().await;
+}
+
+#[tokio::test]
+async fn manual_views_build_fails_until_the_immutable_bundle_is_published() {
+    let harness = harness_with_manifest(tempfile::tempdir().unwrap(), fast_config(), |root| {
+        view_manifest(root, None, Some(VIEW_BUILD_OK), None)
+    });
+    *harness.ctx.view_publish_error.lock().unwrap() =
+        Some("snapshot publication failed".to_string());
+
+    let err = harness.supervisor.build_views().await.unwrap_err();
+    assert_eq!(
+        err.message,
+        "viewer bundle publication failed — see extension logs"
+    );
+    assert!(harness.ctx.published_views.lock().unwrap().is_empty());
+    assert!(harness.supervisor.status().views.last_build_at_ms.is_none());
+}
+
+#[tokio::test]
+async fn manual_revalidate_view_build_does_not_require_snapshot_publication() {
+    let harness = harness_with_manifest(tempfile::tempdir().unwrap(), fast_config(), |root| {
+        let mut manifest = view_manifest(root, None, Some(VIEW_BUILD_OK), None);
+        manifest.views[0].1.cache = ViewCachePolicy::Revalidate;
+        manifest
+    });
+    *harness.ctx.view_publish_error.lock().unwrap() =
+        Some("snapshot publication should not run".to_string());
+
+    let status = harness.supervisor.build_views().await.unwrap();
+    assert!(status.views.last_build_at_ms.is_some());
+    assert!(harness.ctx.published_views.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

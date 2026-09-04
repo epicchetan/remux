@@ -1,15 +1,14 @@
 import { useCallback, type Dispatch, type MutableRefObject, type SetStateAction } from 'react';
 
 import {
-  AGENT_RESOURCE_KEYS,
-  queueResourceKey,
-  type AgentResourceKey,
   type ConversationValue,
 } from '../../../shared/protocol.ts';
+import type { AgentRuntimeResource, NativeAgentResourceKey } from '../../../shared/native-agent-protocol.ts';
 import type { TurnSubmissionInput } from '../composer/actions/turnAction.ts';
 import type { ComposerEditTarget, ComposerForkTarget } from '../composer/store.ts';
 import {
   clearConversationDraftContent,
+  persistConversationDraft,
   removeNewChatDraft,
   type AgentNewChatDraft,
 } from '../conversation/drafts.ts';
@@ -20,9 +19,11 @@ import {
   loadOrCreateDraftOperationId,
 } from '../identity.ts';
 import { agentCommands } from '../ipc/agentCommands.ts';
+import { useComposerStore } from '../composer/store.ts';
+import { resolveModel } from '../composer/config/modelSelection.ts';
 import {
   getTranscriptResourceState,
-  refreshActiveTranscriptResources,
+  recoverActiveTranscriptResources,
 } from '../transcript/resourceStore.ts';
 import {
   discardTranscriptUserMessage,
@@ -35,9 +36,10 @@ export function useConversationActions(options: {
   activeConversationIdRef: MutableRefObject<string | null>;
   activeDraftIdRef: MutableRefObject<string | null>;
   conversation: ConversationValue | null;
+  nativeRuntime: AgentRuntimeResource | null;
   cwd: string;
   draftRef: MutableRefObject<AgentNewChatDraft | null>;
-  refresh: (keys?: AgentResourceKey[]) => Promise<void>;
+  refresh: (keys?: NativeAgentResourceKey[]) => Promise<void>;
   selectConversation: (conversationId: string, focusTurnId?: string | null) => void;
   setActiveConversationId: Dispatch<SetStateAction<string | null>>;
   setActiveDraftId: Dispatch<SetStateAction<string | null>>;
@@ -48,6 +50,7 @@ export function useConversationActions(options: {
     activeConversationIdRef,
     activeDraftIdRef,
     conversation,
+    nativeRuntime,
     cwd,
     draftRef,
     refresh,
@@ -59,13 +62,29 @@ export function useConversationActions(options: {
   } = options;
   const ensureConversation = useConversationHistoryStore((state) => state.ensureConversation);
   const createConversation = useCallback(async (
-    modelId: TurnSubmissionInput['modelId'],
-    reasoning: TurnSubmissionInput['reasoning'],
+    input: TurnSubmissionInput,
   ) => {
-    if (!modelId || !cwd) throw new Error('Choose a workspace and model first.');
+    if (!input.modelId || !input.providerInstanceId || !cwd) {
+      throw new Error('Choose a workspace, provider, and model first.');
+    }
+    const selected = resolveModel(useComposerStore.getState().models, input.modelId);
+    if (!selected?.nativeId || selected.providerInstanceId !== input.providerInstanceId) {
+      throw new Error('The selected native provider model is unavailable.');
+    }
     const operationId = activeDraftIdRef.current ?? loadOrCreateDraftOperationId();
     const sourceDraftId = activeDraftIdRef.current;
-    const result = await agentCommands.createConversation({ operationId, cwd, modelId, reasoning });
+    const result = await agentCommands.createConversation({
+      operationId,
+      providerInstanceId: input.providerInstanceId,
+      cwd,
+      nativeModelId: selected.nativeId,
+      reasoning: input.reasoning,
+      access: input.access,
+    });
+    persistConversationDraft(
+      result.conversationId,
+      useComposerStore.getState().snapshot,
+    );
     confirmDraftOperationId(operationId);
     if (sourceDraftId) removeNewChatDraft(sourceDraftId);
     if (draftRef.current?.id === sourceDraftId) {
@@ -80,7 +99,10 @@ export function useConversationActions(options: {
       setActiveConversationId(result.conversationId);
       await getTranscriptResourceState().setActiveConversationId(result.conversationId);
     }
-    return result.conversationId;
+    return {
+      conversationId: result.conversationId,
+      runtime: await agentCommands.readRuntime(result.conversationId),
+    };
   }, [
     activeConversationIdRef,
     activeDraftIdRef,
@@ -97,10 +119,30 @@ export function useConversationActions(options: {
     setPhase: (phase: ComposerPhase) => void,
   ) => {
     setError(null);
-    const activeId = activeConversationIdRef.current
-      ?? await createConversation(input.modelId, input.reasoning);
+    const currentId = activeConversationIdRef.current;
+    const created = currentId ? null : await createConversation(input);
+    const activeId = currentId ?? created!.conversationId;
+    const submissionRuntime = created?.runtime
+      ?? (nativeRuntime?.conversationId === activeId ? nativeRuntime : null);
+    if (!submissionRuntime) throw new Error('Conversation configuration is still loading.');
+    const submittedProviderInstanceId = created
+      ? submissionRuntime.providerInstanceId
+      : input.providerInstanceId;
+    const submittedAccess = created
+      ? submissionRuntime.composer.nextTurn.access
+      : input.access;
+    const submittedConfigurationRevision = created
+      ? submissionRuntime.composer.revision
+      : input.configurationRevision;
+    if (!submittedConfigurationRevision) {
+      throw new Error('Conversation configuration is still loading.');
+    }
     setPhase('sending');
     const clientMessageId = createViewerUuid();
+    const selected = resolveModel(useComposerStore.getState().models, input.modelId);
+    if (!selected?.nativeId || selected.providerInstanceId !== submittedProviderInstanceId) {
+      throw new Error('The selected native provider model is unavailable.');
+    }
     trackTranscriptUserMessage(activeId, clientMessageId);
     let sent;
     try {
@@ -108,32 +150,39 @@ export function useConversationActions(options: {
         operationId: createViewerUuid(),
         conversationId: activeId,
         clientMessageId,
-        modelId: input.modelId,
-        contextPlan: input.contextPlan,
         parts: input.parts,
+        nativeModelId: selected.nativeId,
         reasoning: input.reasoning,
-        text: input.displayText,
+        providerInstanceId: submittedProviderInstanceId,
+        access: submittedAccess,
+        configurationRevision: submittedConfigurationRevision,
+        delivery: input.delivery,
       });
     } catch (reason) {
       discardTranscriptUserMessage(clientMessageId);
       throw reason;
     }
+    const transcriptFence = 'transcriptFence' in sent ? sent.transcriptFence : undefined;
     if (sent.turnId) trackTranscriptUserMessage(activeId, clientMessageId, sent.turnId);
     else discardTranscriptUserMessage(clientMessageId);
     setPhase('updating-transcript');
     clearConversationDraftContent(activeId);
     await Promise.all([
-      refresh([AGENT_RESOURCE_KEYS.runtime, queueResourceKey(activeId)]),
+      refresh([`agent/runtime:${activeId}`, `agent/queue:${activeId}`]),
       ensureConversation(activeId, true),
       ...(activeConversationIdRef.current === activeId
-        ? [refreshActiveTranscriptResources({
+        ? [recoverActiveTranscriptResources({
+            attempts: 4,
             forceFullMeasure: false,
             preserveReady: true,
+            requiredBasisSequence: transcriptFence?.basisSequence ?? null,
+            requiredServerGeneration: transcriptFence?.serverGeneration ?? null,
+            requiredTurnId: sent.turnId,
             windowPolicy: 'tail',
           })]
         : []),
     ]);
-  }, [activeConversationIdRef, createConversation, ensureConversation, refresh, setError]);
+  }, [activeConversationIdRef, createConversation, ensureConversation, nativeRuntime, refresh, setError]);
 
   const branchMessage = useCallback(async (
     mode: 'edit' | 'fork',
@@ -143,21 +192,31 @@ export function useConversationActions(options: {
   ) => {
     setError(null);
     setPhase('sending');
+    if (!nativeRuntime || nativeRuntime.conversationId !== target.conversationId) {
+      throw new Error('Conversation configuration is still loading.');
+    }
+    if (!input.configurationRevision) {
+      throw new Error('Conversation configuration is still loading.');
+    }
+    const selected = resolveModel(useComposerStore.getState().models, input.modelId);
+    if (!selected?.nativeId || selected.providerInstanceId !== input.providerInstanceId) {
+      throw new Error('The selected native provider model is unavailable.');
+    }
     const clientMessageId = createViewerUuid();
     const result = await agentCommands.branchMessage({
       mode,
       operationId: createViewerUuid(),
       clientMessageId,
-      modelId: input.modelId,
-      contextPlan: input.contextPlan,
       parts: input.parts,
-      reasoning: input.reasoning,
-      text: input.displayText,
       sourceConversationId: target.conversationId,
-      sourceMessageId: mode === 'edit'
-        ? (target as ComposerEditTarget).userMessageId
-        : (target as ComposerForkTarget).assistantMessageId,
-      sourceTurnId: target.turnId,
+      sourceStrandId: target.strandId,
+      sourcePathEntryId: target.pathEntryId,
+      expectedHeadRevision: target.headRevision,
+      providerInstanceId: input.providerInstanceId,
+      nativeModelId: selected.nativeId,
+      reasoning: input.reasoning,
+      access: input.access,
+      configurationRevision: input.configurationRevision,
     });
     clearConversationDraftContent(target.conversationId);
     trackTranscriptUserMessage(result.conversationId, clientMessageId, result.turnId);
@@ -166,28 +225,48 @@ export function useConversationActions(options: {
     selectConversation(result.conversationId, result.turnId);
     await getTranscriptResourceState().setActiveConversationId(result.conversationId);
     await Promise.all([
-      refresh([AGENT_RESOURCE_KEYS.runtime, queueResourceKey(result.conversationId)]),
-      refreshActiveTranscriptResources({
+      refresh([
+        `agent/runtime:${result.conversationId}`,
+        `agent/queue:${result.conversationId}`,
+      ]),
+      recoverActiveTranscriptResources({
+        attempts: 4,
         forceFullMeasure: true,
         preserveReady: false,
+        requiredTurnId: result.turnId,
         windowPolicy: 'tail',
       }),
     ]);
-  }, [ensureConversation, refresh, selectConversation, setError]);
+  }, [ensureConversation, nativeRuntime, refresh, selectConversation, setError]);
 
   const interrupt = useCallback(async () => {
     if (!conversation?.activeTurnId) return;
     setError(null);
     try {
       await agentCommands.interrupt(conversation.id, conversation.activeTurnId);
-      await refresh([AGENT_RESOURCE_KEYS.runtime]);
+      await refresh([`agent/runtime:${conversation.id}`]);
     } catch (reason) {
       setError(messageOf(reason));
       throw reason;
     }
   }, [conversation?.activeTurnId, conversation?.id, refresh, setError]);
 
-  return { branchMessage, interrupt, send };
+  const compact = useCallback(async () => {
+    if (!conversation?.id || nativeRuntime?.conversationId !== conversation.id) return;
+    setError(null);
+    try {
+      await agentCommands.compact(conversation.id);
+      await refresh([
+        `agent/runtime:${conversation.id}`,
+        `agent/queue:${conversation.id}`,
+      ]);
+    } catch (reason) {
+      setError(messageOf(reason));
+      throw reason;
+    }
+  }, [conversation?.id, nativeRuntime?.conversationId, refresh, setError]);
+
+  return { branchMessage, compact, interrupt, send };
 }
 
 function messageOf(error: unknown) {

@@ -46,6 +46,7 @@ export async function prepareAgentDataPaths(options: AgentDataRootOptions = {}) 
   await secureDirectory(paths.artifactObjects);
   await secureDirectory(paths.temporary);
   await createDatabaseFile(paths.database);
+  await secureDatabaseFile(paths.database);
   await secureDatabaseSidecars(paths.database);
   return paths;
 }
@@ -60,6 +61,7 @@ export async function secureDatabaseFile(path: string) {
 }
 
 export async function secureDatabaseSidecars(databasePath: string) {
+  await secureSidecarIfPresent(`${databasePath}-journal`);
   await secureSidecarIfPresent(`${databasePath}-wal`);
   await secureSidecarIfPresent(`${databasePath}-shm`);
 }

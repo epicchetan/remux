@@ -1,7 +1,7 @@
 # Remux Codex Extension
 
 Status: Current
-Last verified: 2026-08-06
+Last verified: 2026-08-19
 
 The Codex extension lets Remux host a mobile Codex transcript and composer experience. It is implemented as a static React viewer plus a Rust stdio JSON-RPC server.
 
@@ -78,4 +78,5 @@ cargo run --manifest-path extensions/codex/server/Cargo.toml --offline -- valida
 
 - [Codex extension architecture](../../docs/architecture/codex-extension.md)
 - [Codex streaming current state](../../docs/architecture/codex-streaming.md)
+- [Assistant math rendering](../../docs/specs/codex/assistant-math-rendering.md)
 - [Codex specs](../../docs/specs/README.md)

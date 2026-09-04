@@ -1,5 +1,7 @@
-Status: Active Spec
+Status: Archived
 Last verified: 2026-08-07
+Superseded by: `agent-native-provider-runtime-v1.md`. Retained as implementation
+evidence for the viewer foundation.
 Canonical code: Phase 1A.0 is owner-accepted in `extensions/agent/` and checkpointed at `8e96512f06ea354bd54f84f5e783161b786e1696`
 
 # Agent Phase 1A.0 implementation report

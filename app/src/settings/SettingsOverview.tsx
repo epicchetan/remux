@@ -68,7 +68,6 @@ import {
 export function SettingsOverview() {
   const catalogError = useBrowserStore((state) => state.catalogError);
   const extensions = useBrowserStore((state) => state.extensions);
-  const reloadExtensionTabs = useBrowserStore((state) => state.reloadExtensionTabs);
   const connection = useRemuxConnection();
   const insets = useSafeAreaInsets();
   const [extensionStatuses, setExtensionStatuses] = useState<Record<string, ExtensionServerStatus>>({});
@@ -156,10 +155,6 @@ export function SettingsOverview() {
         if (operationId.startsWith('codex-app-server:')) {
           void refreshCodexAppServerStatus();
         }
-        const extensionMatch = /^extension:([^:]+):/.exec(operationId);
-        if (state === 'completed' && extensionMatch) {
-          reloadExtensionTabs(extensionMatch[1]!);
-        }
       }
       return;
     }
@@ -174,7 +169,7 @@ export function SettingsOverview() {
       ...current,
       [status.extensionId]: status,
     }));
-  }), [connection, refreshCodexAppServerStatus, refreshServerStatuses, reloadExtensionTabs]);
+  }), [connection, refreshCodexAppServerStatus, refreshServerStatuses]);
 
   const runDetailAction = async (extensionId: string, action: ExtensionDetailAction) => {
     setExtensionStatusError(null);

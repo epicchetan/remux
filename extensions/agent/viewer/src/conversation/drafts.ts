@@ -1,8 +1,3 @@
-import type { ReasoningLevel, TurnContextPlan } from '../../../shared/protocol.ts';
-import {
-  createDefaultTurnContextPlan,
-  parsePersistedTurnContextPlan,
-} from '../composer/context/contextPlan.ts';
 import {
   createComposerSnapshot,
   type ComposerAttachmentResource,
@@ -14,11 +9,7 @@ import {
 export type AgentNewChatDraft = {
   cwd: string;
   id: string;
-  modelId: string;
-  preserveContextPlan: boolean;
-  reasoning: ReasoningLevel;
   snapshot: ComposerSnapshot;
-  contextPlan: TurnContextPlan;
   updatedAt: number;
 };
 
@@ -27,8 +18,7 @@ const CONVERSATION_PREFIX = 'remux.agent.conversation-draft.v1:';
 
 export function loadNewChatDraft(id: string): AgentNewChatDraft | null {
   const parsed = readJson(storageKey(NEW_CHAT_PREFIX, id));
-  if (!parsed || parsed.id !== id || typeof parsed.cwd !== 'string' ||
-      typeof parsed.modelId !== 'string' || !isReasoningLevel(parsed.reasoning)) {
+  if (!parsed || parsed.id !== id || typeof parsed.cwd !== 'string') {
     return null;
   }
   const snapshot = parseSnapshot(parsed.snapshot);
@@ -36,11 +26,7 @@ export function loadNewChatDraft(id: string): AgentNewChatDraft | null {
   return {
     cwd: parsed.cwd,
     id,
-    modelId: parsed.modelId,
-    preserveContextPlan: parsed.preserveContextPlan === true,
-    reasoning: parsed.reasoning,
     snapshot,
-    contextPlan: parsePersistedTurnContextPlan(parsed.contextPlan) ?? createDefaultTurnContextPlan(),
     updatedAt: typeof parsed.updatedAt === 'number' ? parsed.updatedAt : Date.now(),
   };
 }
@@ -57,20 +43,12 @@ export function removeNewChatDraft(id: string) {
 }
 
 export type AgentConversationDraft = {
-  contextPlan: TurnContextPlan;
-  modelId: string | null;
-  preserveContextPlan: boolean;
-  reasoning: ReasoningLevel | null;
   snapshot: ComposerSnapshot;
 };
 
 export function loadConversationDraft(conversationId: string): AgentConversationDraft {
   const parsed = readJson(storageKey(CONVERSATION_PREFIX, conversationId));
   return {
-    contextPlan: parsePersistedTurnContextPlan(parsed?.contextPlan) ?? createDefaultTurnContextPlan(),
-    modelId: typeof parsed?.modelId === 'string' && parsed.modelId ? parsed.modelId : null,
-    preserveContextPlan: parsed?.preserveContextPlan === true,
-    reasoning: isReasoningLevel(parsed?.reasoning) ? parsed.reasoning : null,
     snapshot: parseSnapshot(parsed?.snapshot) ?? createComposerSnapshot({ parts: [] }, new Map()),
   };
 }
@@ -78,35 +56,15 @@ export function loadConversationDraft(conversationId: string): AgentConversation
 export function persistConversationDraft(
   conversationId: string,
   snapshot: ComposerSnapshot,
-  contextPlan: TurnContextPlan,
-  modelId: string,
-  preserveContextPlan: boolean,
-  reasoning: ReasoningLevel,
 ) {
   writeJson(storageKey(CONVERSATION_PREFIX, conversationId), {
-    contextPlan,
-    modelId,
-    preserveContextPlan,
-    reasoning,
     snapshot: persistedSnapshot(snapshot),
     updatedAt: Date.now(),
   });
 }
 
 export function clearConversationDraftContent(conversationId: string) {
-  const current = loadConversationDraft(conversationId);
-  if (!current.reasoning) {
-    removeConversationDraft(conversationId);
-    return;
-  }
-  persistConversationDraft(
-    conversationId,
-    createComposerSnapshot({ parts: [] }, new Map()),
-    current.contextPlan,
-    current.modelId ?? '',
-    current.preserveContextPlan,
-    current.reasoning,
-  );
+  removeConversationDraft(conversationId);
 }
 
 export function removeConversationDraft(conversationId: string) {
@@ -203,11 +161,6 @@ function parseAttachment(value: unknown): ComposerAttachmentResource[] {
     previewUrl: candidate.dataUrl,
     sizeBytes: candidate.sizeBytes,
   }];
-}
-
-function isReasoningLevel(value: unknown): value is ReasoningLevel {
-  return value === 'off' || value === 'minimal' || value === 'low' ||
-    value === 'medium' || value === 'high' || value === 'xhigh' || value === 'max';
 }
 
 function storageKey(prefix: string, id: string) {

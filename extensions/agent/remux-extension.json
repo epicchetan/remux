@@ -21,6 +21,7 @@
       "route": "/viewers/agent",
       "entry": "viewer/dist/index.html",
       "cache": "immutable",
+      "hostChrome": "none",
       "build": {
         "command": "npm",
         "args": ["run", "build:viewer"],
@@ -37,7 +38,7 @@
     {
       "id": "new-chat",
       "view": "main",
-      "label": "Agent Preview",
+      "label": "Agent",
       "route": {
         "kind": "launch",
         "launch": "new-chat",

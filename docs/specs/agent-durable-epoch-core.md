@@ -1,6 +1,8 @@
-Status: Archived; context architecture superseded by `agent-explicit-turn-context-v1.md`
+Status: Archived; superseded by `agent-native-provider-runtime-v1.md`
 Last verified: 2026-08-08
 Canonical code: Phase 0 through Phase 1A.3 storage, replay, manifest, and inspector foundations are implemented in `extensions/agent/`; the authoritative provider-context mechanism is now defined by `agent-context-workspace-v1.md`
+The replacement retains applicable journal/artifact/idempotency evidence but not
+the epoch, compiler, Pi hydration, or custom compaction runtime.
 
 # Agent durable epoch core
 

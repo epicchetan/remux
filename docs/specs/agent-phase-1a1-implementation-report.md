@@ -1,5 +1,7 @@
-Status: Active Spec
+Status: Archived
 Last verified: 2026-08-08
+Superseded by: `agent-native-provider-runtime-v1.md`. Retained as historical
+durability and viewer evidence.
 Canonical code: Phase 1A.1 implementation, automated closeout, and owner live acceptance are complete; Phase 1A.2 supersedes its schema/protocol versions and closes the combined durable-transcript checkpoint
 
 # Agent Phase 1A.1 implementation report

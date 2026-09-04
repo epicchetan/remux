@@ -1,6 +1,8 @@
-Status: Active Spec
+Status: Archived
 Last verified: 2026-08-07
 Canonical code: Phase 1A.0a–1A.0d are implemented and owner-accepted in `extensions/agent/`; checkpoint `8e96512f06ea354bd54f84f5e783161b786e1696`
+Superseded by: `agent-native-provider-runtime-v1.md`. The accepted viewer-port
+evidence remains; the Pi-era implementation sequence is historical.
 
 # Agent Phase 1A.0 UI port foundation scope
 

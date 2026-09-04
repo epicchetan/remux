@@ -20,6 +20,9 @@ export function ViewerSurface({ active, onOpenOverview, surfaceRef, tab }: Viewe
   const loadExtensions = useBrowserStore((state) => state.loadExtensions);
   const openResource = useBrowserStore((state) => state.openResource);
   const updateTab = useBrowserStore((state) => state.updateTab);
+  const hostChrome = extensions
+    .find((extension) => extension.id === tab.extensionId)
+    ?.views[tab.viewId]?.hostChrome ?? 'none';
   const sourceUrlRef = useRef(tab.url);
   const descriptorRef = useRef({
     extensionId: tab.extensionId,
@@ -55,9 +58,13 @@ export function ViewerSurface({ active, onOpenOverview, surfaceRef, tab }: Viewe
   const closeCurrentTab = useCallback(() => {
     closeTab(tab.id, { returnToOverview: true });
   }, [closeTab, tab.id]);
+  const refreshViewerRevision = useCallback(async () => {
+    await loadExtensions({ force: true });
+    return useBrowserStore.getState().tabs.find((candidate) => candidate.id === tab.id)?.url ?? null;
+  }, [loadExtensions, tab.id]);
   const recoverUnavailableViewerBundle = useCallback(async () => {
     const before = useBrowserStore.getState().tabs.find((candidate) => candidate.id === tab.id);
-    await loadExtensions({ force: true });
+    await refreshViewerRevision();
     const after = useBrowserStore.getState().tabs.find((candidate) => candidate.id === tab.id);
     return Boolean(
       before
@@ -68,7 +75,7 @@ export function ViewerSurface({ active, onOpenOverview, surfaceRef, tab }: Viewe
         || after.url !== before.url
       )
     );
-  }, [loadExtensions, tab.id]);
+  }, [refreshViewerRevision, tab.id]);
 
   useEffect(() => {
     const descriptor = descriptorRef.current;
@@ -82,9 +89,11 @@ export function ViewerSurface({ active, onOpenOverview, surfaceRef, tab }: Viewe
   return (
     <ExtensionWebView
       active={active}
+      hostChrome={hostChrome}
       onCloseTab={closeCurrentTab}
       onOpenFile={openFile}
       onOpenOverview={onOpenOverview}
+      onReloadView={refreshViewerRevision}
       onViewerBundleUnavailable={recoverUnavailableViewerBundle}
       onNavigationDelivered={(nonce) => clearPendingNavigation(tab.id, nonce)}
       ref={surfaceRef}

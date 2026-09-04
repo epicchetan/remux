@@ -770,6 +770,7 @@ mod tests {
                 started_at_ms: Some(now_ms() - 500),
                 restart_count: 1,
             },
+            gateway: Default::default(),
         };
         let server = Arc::new(FixtureServer { status });
         let monitor = ResourceMonitor::new(

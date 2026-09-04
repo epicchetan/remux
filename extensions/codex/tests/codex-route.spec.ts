@@ -2139,6 +2139,181 @@ test.describe('codex viewer route', () => {
     )).toBeLessThan(0.5);
   });
 
+  test('renders inline and display math with contained measured geometry and literal fallback', async ({ page }) => {
+    const wideTerms = Array.from({ length: 50 }, (_, index) => `x_{${index}}`).join(' + ');
+    const unbreakableText = 'unbreakable'.repeat(36);
+    const tallEquation = '\\begin{aligned}' + Array.from(
+      { length: 28 },
+      (_, index) => `y_{${index}} &= ${index}`,
+    ).join(' \\\\ ') + '\\end{aligned}';
+    const mathMarkdown = [
+      'If the target is \\(T\\), stop is \\(S\\), and round-trip cost is \\(C\\).',
+      'The inline value is \\(p_t = \\frac{a}{b} + \\epsilon_t\\), while $5.00 stays currency.',
+      `Overwide inline stays local: \\(${wideTerms}\\).`,
+      '',
+      '\\[E = mc^2\\]',
+      '',
+      '\\[',
+      '\\text{observed price} = \\text{slow reference} + \\text{temporary',
+      'impact} + \\text{new information}',
+      '\\]',
+      '',
+      `\\[${wideTerms}\\]`,
+      '',
+      `\\[\\frac{\\text{${unbreakableText}}}{\\text{denominator}}\\]`,
+      '',
+      `\\[${tallEquation}\\]`,
+      '',
+      'Invalid math stays readable: \\(\\notARealCommand{x}\\).',
+      'Unsafe math stays literal: \\(\\href{javascript:alert(1)}{x}\\).',
+    ].join('\n');
+    await installMockRemuxHost(page, {
+      turns: [completedTurn({ assistantText: mathMarkdown })],
+    });
+
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+
+    const markdown = page.locator('[data-row-kind="assistantMessage"] .codex-markdown');
+    await expect(markdown.locator('.codex-md-inline-math .katex')).toHaveCount(5);
+    await expect(markdown.locator('.codex-md-display-math .katex')).toHaveCount(5);
+    await expect(markdown.locator('.codex-md-display-math math')).toHaveCount(5);
+    await expect(markdown).toContainText('$5.00');
+    await expect(markdown).toContainText('\\(\\notARealCommand{x}\\)');
+    await expect(markdown).toContainText('\\(\\href{javascript:alert(1)}{x}\\)');
+    await expect(markdown.locator('a[href^="javascript:"]')).toHaveCount(0);
+
+    const geometry = await markdown.evaluate((element) => {
+      const root = element as HTMLElement;
+      const displayFrame = root.querySelector<HTMLElement>('.codex-md-display-math-frame');
+      const displayMath = root.querySelector<HTMLElement>('.codex-md-display-math .katex');
+      const inlineMath = root.querySelector<HTMLElement>('.codex-md-inline-math .katex');
+      const inlineMathHost = inlineMath?.closest<HTMLElement>('.codex-md-inline-math');
+      const inlineLine = inlineMath?.closest<HTMLElement>('.codex-md-text-line');
+      const displayFrames = Array.from(
+        root.querySelectorAll<HTMLElement>('.codex-md-display-math-frame'),
+      );
+      const observedDisplayFrame = displayFrames[1];
+      const wrappableDisplayFrame = displayFrames[2];
+      const unbreakableDisplayFrame = displayFrames[3];
+      const tallDisplayFrame = displayFrames.at(-1);
+      const wideInlineHost = Array.from(
+        root.querySelectorAll<HTMLElement>('.codex-md-inline-math'),
+      ).at(-1);
+      const wrappableDisplayMath = wrappableDisplayFrame
+        ?.querySelector<HTMLElement>('.codex-md-display-math');
+      const observedDisplayMath = observedDisplayFrame
+        ?.querySelector<HTMLElement>('.codex-md-display-math');
+      const unbreakableDisplayMath = unbreakableDisplayFrame
+        ?.querySelector<HTMLElement>('.codex-md-display-math');
+      const tallDisplayMath = tallDisplayFrame?.querySelector<HTMLElement>('.codex-md-display-math');
+      const viewport = root.closest<HTMLElement>('.remux-transcript-viewport');
+      if (
+        !displayFrame || !displayMath || !inlineMath || !inlineMathHost || !inlineLine || !viewport ||
+        !observedDisplayFrame || !observedDisplayMath ||
+        !wrappableDisplayFrame || !wrappableDisplayMath ||
+        !unbreakableDisplayFrame || !unbreakableDisplayMath ||
+        !tallDisplayFrame || !tallDisplayMath || !wideInlineHost
+      ) {
+        throw new Error('Expected math geometry');
+      }
+      const mathBaselineProbe = document.createElement('span');
+      mathBaselineProbe.className = 'codex-md-math-baseline-probe';
+      const proseBaselineProbe = document.createElement('span');
+      proseBaselineProbe.className = 'codex-md-math-baseline-probe';
+      inlineMathHost.append(mathBaselineProbe);
+      inlineLine.append(proseBaselineProbe);
+      const inlineBaselineDelta = Math.abs(
+        mathBaselineProbe.getBoundingClientRect().top -
+        proseBaselineProbe.getBoundingClientRect().top,
+      );
+      const inlineVerticalAlign = getComputedStyle(inlineMathHost).verticalAlign;
+      mathBaselineProbe.remove();
+      proseBaselineProbe.remove();
+      const blockHeight = Array.from(root.children).reduce(
+        (total, child) => total + (child as HTMLElement).getBoundingClientRect().height,
+        0,
+      );
+      return {
+        blockHeight,
+        displayFrameHeight: displayFrame.getBoundingClientRect().height,
+        displayMathHeight: displayMath.getBoundingClientRect().height,
+        displayTextAlign: getComputedStyle(displayMath).textAlign,
+        documentClientWidth: document.documentElement.clientWidth,
+        documentScrollWidth: document.documentElement.scrollWidth,
+        displayFontSize: Number.parseFloat(getComputedStyle(displayMath).fontSize),
+        modeledHeight: Number.parseFloat(root.style.height),
+        inlineBottom: inlineMath.getBoundingClientRect().bottom,
+        inlineBaselineDelta,
+        inlineFontSize: Number.parseFloat(getComputedStyle(inlineMath).fontSize),
+        inlineLineBottom: inlineLine.getBoundingClientRect().bottom,
+        inlineProseFontSize: Number.parseFloat(getComputedStyle(inlineLine).fontSize),
+        inlineLineTop: inlineLine.getBoundingClientRect().top,
+        inlineTop: inlineMath.getBoundingClientRect().top,
+        inlineVerticalAlign,
+        observedLineCount: new Set(Array.from(
+          observedDisplayMath.querySelectorAll<HTMLElement>('.katex-html > .base'),
+          (base) => Math.round(base.getBoundingClientRect().top * 10) / 10,
+        )).size,
+        observedWrapped: observedDisplayFrame.dataset.wrapped ?? null,
+        rootHeight: root.getBoundingClientRect().height,
+        tallDisplayClientHeight: tallDisplayFrame.clientHeight,
+        tallDisplayContentTop: tallDisplayMath.getBoundingClientRect().top,
+        tallDisplayFrameTop: tallDisplayFrame.getBoundingClientRect().top,
+        tallDisplayScrollHeight: tallDisplayFrame.scrollHeight,
+        viewportWidth: viewport.getBoundingClientRect().width,
+        unbreakableClientWidth: unbreakableDisplayFrame.clientWidth,
+        unbreakableConstrained: unbreakableDisplayFrame.dataset.constrained ?? null,
+        unbreakableContentLeft: unbreakableDisplayMath.getBoundingClientRect().left,
+        unbreakableFrameLeft: unbreakableDisplayFrame.getBoundingClientRect().left,
+        unbreakableScrollWidth: unbreakableDisplayFrame.scrollWidth,
+        unbreakableWrapped: unbreakableDisplayFrame.dataset.wrapped ?? null,
+        wideInlineClientWidth: wideInlineHost.clientWidth,
+        wideInlineScrollWidth: wideInlineHost.scrollWidth,
+        wrappableClientWidth: wrappableDisplayFrame.clientWidth,
+        wrappableLineCount: new Set(Array.from(
+          wrappableDisplayMath.querySelectorAll<HTMLElement>('.katex-html > .base'),
+          (base) => Math.round(base.getBoundingClientRect().top * 10) / 10,
+        )).size,
+        wrappableScrollWidth: wrappableDisplayFrame.scrollWidth,
+        wrappableTextAlign: getComputedStyle(
+          wrappableDisplayMath.querySelector<HTMLElement>('.katex')!,
+        ).textAlign,
+        wrappableWrapped: wrappableDisplayFrame.dataset.wrapped ?? null,
+      };
+    });
+
+    expect(geometry.displayFrameHeight).toBeGreaterThan(geometry.displayMathHeight);
+    expect(geometry.displayFrameHeight - geometry.displayMathHeight).toBeLessThanOrEqual(9);
+    expect(geometry.displayTextAlign).toBe('center');
+    expect(geometry.inlineTop).toBeGreaterThanOrEqual(geometry.inlineLineTop - 1);
+    expect(geometry.inlineBottom).toBeLessThanOrEqual(geometry.inlineLineBottom + 1);
+    expect(geometry.inlineBaselineDelta).toBeLessThanOrEqual(1);
+    expect(
+      Math.abs(geometry.inlineFontSize - geometry.inlineProseFontSize),
+    ).toBeLessThanOrEqual(0.1);
+    expect(Number.parseFloat(geometry.inlineVerticalAlign)).toBeLessThan(0);
+    expect(geometry.displayFontSize).toBeGreaterThan(geometry.inlineProseFontSize * 1.1);
+    expect(Math.abs(geometry.rootHeight - geometry.modeledHeight)).toBeLessThanOrEqual(1);
+    expect(Math.abs(geometry.rootHeight - geometry.blockHeight)).toBeLessThanOrEqual(1);
+    expect(geometry.documentScrollWidth).toBeLessThanOrEqual(geometry.documentClientWidth + 1);
+    expect(geometry.tallDisplayClientHeight).toBeLessThanOrEqual(320);
+    expect(geometry.tallDisplayContentTop).toBeGreaterThanOrEqual(geometry.tallDisplayFrameTop - 1);
+    expect(geometry.tallDisplayScrollHeight).toBeGreaterThan(geometry.tallDisplayClientHeight + 1);
+    expect(geometry.wrappableWrapped).toBe('true');
+    expect(geometry.wrappableLineCount).toBeGreaterThan(1);
+    expect(geometry.wrappableScrollWidth).toBeLessThanOrEqual(geometry.wrappableClientWidth + 1);
+    expect(geometry.wrappableTextAlign).toBe('left');
+    if (geometry.viewportWidth <= 390) {
+      expect(geometry.observedWrapped).toBe('true');
+      expect(geometry.observedLineCount).toBeGreaterThan(1);
+    }
+    expect(geometry.unbreakableConstrained).toBe('true');
+    expect(geometry.unbreakableWrapped).toBeNull();
+    expect(geometry.unbreakableContentLeft).toBeGreaterThanOrEqual(geometry.unbreakableFrameLeft - 1);
+    expect(geometry.unbreakableScrollWidth).toBeGreaterThan(geometry.unbreakableClientWidth + 1);
+    expect(geometry.wideInlineScrollWidth).toBeGreaterThan(geometry.wideInlineClientWidth + 1);
+  });
+
   test('ellipsizes long file chips without drifting from the modeled markdown height', async ({ page }) => {
     const label = 'RPC Concurrency and Mobile Transport Resilience implementation specification and rollout notes';
     await installMockRemuxHost(page, {
@@ -3001,6 +3176,36 @@ test.describe('codex viewer route', () => {
     expect(await markdown.evaluate((element) => element.getBoundingClientRect().height)).toBe(height);
     await expect(markdown.locator('.codex-md-narrated-word')).toHaveCount(0);
     await expect(markdown.locator('.codex-md-file-link-narrating')).toHaveCount(0);
+  });
+
+  test('paints an inline math element when narration cues overlap its TeX range', async ({ page }) => {
+    await installMockRemuxHost(page, {
+      turns: [completedTurn({ assistantText: '\\(x^2\\) follows.' })],
+    });
+
+    await page.goto('/viewers/codex/?remuxResourceKind=thread&remuxResourceId=mock-thread-1');
+    const markdown = page.locator('[data-row-kind="assistantMessage"] .codex-markdown');
+    const math = markdown.locator('.codex-md-inline-math');
+    await expect(math).toBeVisible();
+    const initialHeight = await markdown.evaluate((element) => element.getBoundingClientRect().height);
+
+    await page.getByRole('button', { name: 'Narrate response' }).click();
+    const startRequest = (await capturedHostRequests(page))
+      .find((request) => request.method === 'remux/narrate/narration/start');
+    expect((startRequest?.params as {
+      document?: { blocks?: Array<{ text?: string }> };
+    })?.document?.blocks?.[0]?.text).toBe('x^2 follows.');
+
+    const word = markdown.locator('.codex-narration-word-rect');
+    await expect(word).toBeVisible();
+    expect(await word.evaluate((element, mathSelector) => {
+      const mathElement = document.querySelector<HTMLElement>(mathSelector)!;
+      const wordRect = element.getBoundingClientRect();
+      const mathRect = mathElement.getBoundingClientRect();
+      return Math.min(wordRect.right, mathRect.right) > Math.max(wordRect.left, mathRect.left)
+        && Math.min(wordRect.bottom, mathRect.bottom) > Math.max(wordRect.top, mathRect.top);
+    }, '.codex-md-inline-math')).toBe(true);
+    expect(await markdown.evaluate((element) => element.getBoundingClientRect().height)).toBe(initialHeight);
   });
 
   test('paints file-link text through the block overlay without activating the chip', async ({ page }) => {

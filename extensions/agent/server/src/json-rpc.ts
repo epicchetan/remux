@@ -1,6 +1,16 @@
 import { createInterface } from 'node:readline';
 
-import { RpcFault } from './agent-server.ts';
+export class RpcFault extends Error {
+  readonly code: number;
+  readonly data?: unknown;
+
+  constructor(code: number, message: string, data?: unknown) {
+    super(message);
+    this.name = 'RpcFault';
+    this.code = code;
+    if (data !== undefined) this.data = data;
+  }
+}
 
 type JsonRpcRequest = {
   jsonrpc?: unknown;
@@ -8,6 +18,13 @@ type JsonRpcRequest = {
   method?: unknown;
   params?: unknown;
 };
+
+export type JsonRpcRequestContext = {
+  requestId: string | number | null;
+  signal: AbortSignal;
+};
+
+type PendingRequestControllers = Map<string | number, AbortController>;
 
 export class JsonRpcOutput {
   private queue = Promise.resolve();
@@ -34,14 +51,19 @@ export class JsonRpcOutput {
 }
 
 export async function serveStdio(
-  handle: (method: string, params: unknown) => Promise<unknown>,
+  handle: (
+    method: string,
+    params: unknown,
+    context: JsonRpcRequestContext,
+  ) => Promise<unknown>,
   output: JsonRpcOutput,
   source: NodeJS.ReadableStream = process.stdin,
 ) {
   const input = createInterface({ input: source, crlfDelay: Infinity });
   const pending = new Set<Promise<void>>();
+  const controllers: PendingRequestControllers = new Map();
   input.on('line', (line) => {
-    const request = handleJsonRpcLine(line, handle, output);
+    const request = handleJsonRpcLine(line, handle, output, controllers);
     pending.add(request);
     void request.then(
       () => pending.delete(request),
@@ -49,13 +71,21 @@ export async function serveStdio(
     );
   });
   await new Promise<void>((resolve) => input.once('close', resolve));
+  for (const controller of controllers.values()) {
+    controller.abort(new Error('Agent RPC input closed.'));
+  }
   await Promise.all(pending);
 }
 
 export async function handleJsonRpcLine(
   line: string,
-  handle: (method: string, params: unknown) => Promise<unknown>,
+  handle: (
+    method: string,
+    params: unknown,
+    context: JsonRpcRequestContext,
+  ) => Promise<unknown>,
   output: JsonRpcOutput,
+  controllers: PendingRequestControllers = new Map(),
 ) {
   let request: JsonRpcRequest;
   try {
@@ -64,19 +94,36 @@ export async function handleJsonRpcLine(
     output.send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
     return;
   }
-  if (request.method === '$/cancelRequest') return;
+  if (request.method === '$/cancelRequest') {
+    const id = cancellationId(request.params);
+    if (id !== undefined) {
+      controllers.get(id)?.abort(new Error('Agent RPC request was cancelled by its caller.'));
+    }
+    return;
+  }
   if (typeof request.method !== 'string') {
     output.send({ jsonrpc: '2.0', id: request.id ?? null, error: { code: -32600, message: 'Invalid Request' } });
     return;
   }
+  const requestId = typeof request.id === 'string' || typeof request.id === 'number'
+    ? request.id
+    : null;
+  const controller = new AbortController();
+  if (requestId !== null) controllers.set(requestId, controller);
   try {
-    const result = await handle(request.method, request.params);
-    if (request.id !== undefined) output.send({ jsonrpc: '2.0', id: request.id, result });
+    const result = await handle(request.method, request.params, {
+      requestId,
+      signal: controller.signal,
+    });
+    if (request.id !== undefined && !controller.signal.aborted) {
+      output.send({ jsonrpc: '2.0', id: request.id, result });
+    }
   } catch (error) {
-    const fault = error instanceof RpcFault
+    if (controller.signal.aborted) return;
+    const fault = isRpcFault(error)
       ? error
       : new RpcFault(-32603, 'Internal error');
-    if (!(error instanceof RpcFault)) {
+    if (!isRpcFault(error)) {
       process.stderr.write(`agent request ${request.method} failed: ${errorMessage(error)}\n`);
     }
     if (request.id !== undefined) {
@@ -90,7 +137,25 @@ export async function handleJsonRpcLine(
         },
       });
     }
+  } finally {
+    if (requestId !== null && controllers.get(requestId) === controller) {
+      controllers.delete(requestId);
+    }
   }
+}
+
+function cancellationId(params: unknown) {
+  if (!params || typeof params !== 'object' || Array.isArray(params)) return undefined;
+  const id = (params as { id?: unknown }).id;
+  return typeof id === 'string' || typeof id === 'number' ? id : undefined;
+}
+
+function isRpcFault(error: unknown): error is { code: number; message: string; data?: unknown } {
+  return error instanceof RpcFault || Boolean(
+    error && typeof error === 'object' &&
+    typeof (error as { code?: unknown }).code === 'number' &&
+    typeof (error as { message?: unknown }).message === 'string',
+  );
 }
 
 function writeStdout(line: string) {

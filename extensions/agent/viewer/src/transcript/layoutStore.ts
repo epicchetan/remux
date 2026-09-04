@@ -62,6 +62,12 @@ type TranscriptLayoutStoreState = {
 };
 
 const transcriptMeasureCache = new TranscriptMeasureCache();
+const transcriptLayoutCache = new Map<string, Pick<
+  TranscriptLayoutStoreState,
+  'disclosure' | 'turnOrder' | 'turnsById'
+>>();
+const MAX_CACHED_TRANSCRIPT_LAYOUTS = 5;
+let activeLayoutConversationId: string | null = null;
 let resourceAdapter: TranscriptLayoutResourceAdapter | null = null;
 
 const actions: Pick<
@@ -268,13 +274,39 @@ export function configureTranscriptLayoutResourceAdapter(adapter: TranscriptLayo
   resourceAdapter = adapter;
 }
 
-export function resetTranscriptLayoutForConversation(conversationId?: string | null) {
-  layoutStore.setState({
+export function resetTranscriptLayoutForConversation(
+  conversationId?: string | null,
+  options: { restoreCached?: boolean } = {},
+) {
+  const normalizedConversationId = conversationId?.trim() || null;
+  if (activeLayoutConversationId) {
+    const state = layoutStore.getState();
+    transcriptLayoutCache.delete(activeLayoutConversationId);
+    transcriptLayoutCache.set(activeLayoutConversationId, {
+      disclosure: state.disclosure,
+      turnOrder: state.turnOrder,
+      turnsById: state.turnsById,
+    });
+    while (transcriptLayoutCache.size > MAX_CACHED_TRANSCRIPT_LAYOUTS) {
+      const oldestConversationId = transcriptLayoutCache.keys().next().value as string | undefined;
+      if (!oldestConversationId) break;
+      transcriptLayoutCache.delete(oldestConversationId);
+    }
+  }
+  const cached = normalizedConversationId && options.restoreCached !== false
+    ? transcriptLayoutCache.get(normalizedConversationId)
+    : undefined;
+  if (normalizedConversationId && cached) {
+    transcriptLayoutCache.delete(normalizedConversationId);
+    transcriptLayoutCache.set(normalizedConversationId, cached);
+  }
+  activeLayoutConversationId = normalizedConversationId;
+  layoutStore.setState(cached ?? {
     disclosure: emptyDisclosureState(),
     turnOrder: [],
     turnsById: {},
   });
-  resetTranscriptViewportForConversation(conversationId);
+  resetTranscriptViewportForConversation(normalizedConversationId);
 }
 
 export function reconcileTranscriptLayoutFromResources(

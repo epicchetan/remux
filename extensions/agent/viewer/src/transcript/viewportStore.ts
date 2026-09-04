@@ -8,6 +8,8 @@ type TranscriptScrollNavigationController = {
   scrollUp: () => void;
 };
 
+type TranscriptViewportCapture = (conversationId: string) => void;
+
 export type TranscriptAutoScrollMode =
   | { type: 'bottom' }
   | {
@@ -51,6 +53,7 @@ type TranscriptTurnScrollRequest = {
 
 const noopScrollNavigation = () => undefined;
 let turnScrollRequestId = 0;
+let activeTranscriptViewportCapture: TranscriptViewportCapture | null = null;
 
 const actions: Pick<
   TranscriptViewportStoreState,
@@ -189,6 +192,21 @@ export function getTranscriptViewportState() {
 
 export function subscribeTranscriptViewport(listener: () => void) {
   return viewportStore.subscribe(listener);
+}
+
+export function registerTranscriptViewportCapture(capture: TranscriptViewportCapture) {
+  activeTranscriptViewportCapture = capture;
+  return () => {
+    if (activeTranscriptViewportCapture === capture) {
+      activeTranscriptViewportCapture = null;
+    }
+  };
+}
+
+export function captureActiveTranscriptViewport(conversationId?: string | null) {
+  const normalizedConversationId = conversationId?.trim();
+  if (!normalizedConversationId) return;
+  activeTranscriptViewportCapture?.(normalizedConversationId);
 }
 
 export function resetTranscriptViewportForConversation(conversationId?: string | null) {

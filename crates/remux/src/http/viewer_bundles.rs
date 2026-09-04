@@ -2,11 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::event::ModifyKind;
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use sha2::{Digest, Sha256};
 
 use crate::extensions::manifest::{ExtensionManifest, ViewCachePolicy};
@@ -63,8 +64,9 @@ struct SourceFile {
 pub struct ViewerBundleRegistry {
     cache_root: PathBuf,
     journal: Arc<Journal>,
-    published: RwLock<HashMap<ViewerBundleKey, PublishedViewerBundle>>,
-    publish_lock: tokio::sync::Mutex<()>,
+    published: Arc<RwLock<HashMap<ViewerBundleKey, PublishedViewerBundle>>>,
+    publish_locks: Mutex<HashMap<ViewerBundleKey, Arc<tokio::sync::Mutex<()>>>>,
+    cleanup_running: AtomicBool,
     runtime: tokio::runtime::Handle,
     sources: HashMap<ViewerBundleKey, ViewerBundleSource>,
     watch_generations: Mutex<HashMap<ViewerBundleKey, u64>>,
@@ -115,8 +117,9 @@ impl ViewerBundleRegistry {
         Arc::new(Self {
             cache_root: root_dir.join(".remux/cache/viewers"),
             journal,
-            published: RwLock::new(HashMap::new()),
-            publish_lock: tokio::sync::Mutex::new(()),
+            published: Arc::new(RwLock::new(HashMap::new())),
+            publish_locks: Mutex::new(HashMap::new()),
+            cleanup_running: AtomicBool::new(false),
             runtime: tokio::runtime::Handle::current(),
             sources,
             watch_generations: Mutex::new(HashMap::new()),
@@ -126,9 +129,28 @@ impl ViewerBundleRegistry {
 
     pub async fn publish_all(self: &Arc<Self>) {
         let keys = self.sources.keys().cloned().collect::<Vec<_>>();
+        let mut publications = tokio::task::JoinSet::new();
         for key in keys {
-            self.publish_key(&key).await;
+            let registry = self.clone();
+            publications.spawn(async move {
+                let _ = registry.publish_key(&key).await;
+            });
         }
+        while publications.join_next().await.is_some() {}
+    }
+
+    /// Publishes one view immediately and resolves only after the catalog's
+    /// current revision points at the completed immutable snapshot.
+    pub async fn publish_now(
+        self: &Arc<Self>,
+        extension_id: &str,
+        view_id: &str,
+    ) -> Result<PublishedViewerBundle, String> {
+        let key = ViewerBundleKey {
+            extension_id: extension_id.to_string(),
+            view_id: view_id.to_string(),
+        };
+        self.publish_key(&key).await
     }
 
     pub fn schedule_publish(self: &Arc<Self>, extension_id: &str, view_id: &str) {
@@ -141,7 +163,7 @@ impl ViewerBundleRegistry {
         }
         let registry = self.clone();
         self.runtime.spawn(async move {
-            registry.publish_key(&key).await;
+            let _ = registry.publish_key(&key).await;
         });
     }
 
@@ -158,6 +180,9 @@ impl ViewerBundleRegistry {
                 let Ok(event) = event else {
                     return;
                 };
+                if !event_requires_publication(event.kind) {
+                    return;
+                }
                 for path in event.paths {
                     registry.schedule_path_publish(&path);
                 }
@@ -261,19 +286,38 @@ impl ViewerBundleRegistry {
                 {
                     return;
                 }
-                registry.publish_key(&key).await;
+                let _ = registry.publish_key(&key).await;
             });
         }
     }
 
-    async fn publish_key(self: &Arc<Self>, key: &ViewerBundleKey) {
+    async fn publish_key(
+        self: &Arc<Self>,
+        key: &ViewerBundleKey,
+    ) -> Result<PublishedViewerBundle, String> {
         let Some(source) = self.sources.get(key).cloned() else {
-            return;
+            return Err(format!(
+                "viewer bundle source is not declared extension={} view={}",
+                key.extension_id, key.view_id
+            ));
         };
         if !source.entry.is_file() {
-            return;
+            return Err(format!(
+                "viewer bundle entry is unavailable extension={} view={}",
+                key.extension_id, key.view_id
+            ));
         }
-        let _guard = self.publish_lock.lock().await;
+        // A view is serialized with itself so an explicit publication and a
+        // watcher publication cannot race. Different views publish in
+        // parallel; hashing a large unrelated bundle must not delay this one.
+        let publish_lock = {
+            let mut locks = self.publish_locks.lock().unwrap();
+            locks
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = publish_lock.lock().await;
         let started = Instant::now();
         let mut attempt = 0usize;
         let result = loop {
@@ -318,26 +362,56 @@ impl ViewerBundleRegistry {
                     bundle.total_bytes,
                     started.elapsed().as_millis(),
                 ));
-                let cache_root = self.cache_root.clone();
-                let published = self.published.read().unwrap().clone();
-                let cleanup =
-                    tokio::task::spawn_blocking(move || cleanup_snapshots(&cache_root, &published))
-                        .await
-                        .map_err(|error| format!("snapshot cleanup worker: {error}"))
-                        .and_then(|result| result);
-                if let Err(error) = cleanup {
-                    self.journal
-                        .warn(&format!("viewer bundle cleanup failed: {error}"));
-                }
+                self.schedule_cleanup();
+                Ok(bundle)
             }
-            Err(error) => self.journal.warn(&format!(
-                "viewer bundle publication failed extension={} view={} duration_ms={}: {error}",
-                key.extension_id,
-                key.view_id,
-                started.elapsed().as_millis(),
-            )),
+            Err(error) => {
+                self.journal.warn(&format!(
+                    "viewer bundle publication failed extension={} view={} duration_ms={}: {error}",
+                    key.extension_id,
+                    key.view_id,
+                    started.elapsed().as_millis(),
+                ));
+                Err(error)
+            }
         }
     }
+
+    fn schedule_cleanup(self: &Arc<Self>) {
+        if self.cleanup_running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let registry = self.clone();
+        self.runtime.spawn(async move {
+            let cache_root = registry.cache_root.clone();
+            let published = registry.published.clone();
+            let cleanup =
+                tokio::task::spawn_blocking(move || cleanup_snapshots(&cache_root, &published))
+                    .await
+                    .map_err(|error| format!("snapshot cleanup worker: {error}"))
+                    .and_then(|result| result);
+            if let Err(error) = cleanup {
+                registry
+                    .journal
+                    .warn(&format!("viewer bundle cleanup failed: {error}"));
+            }
+            registry.cleanup_running.store(false, Ordering::Release);
+        });
+    }
+}
+
+fn event_requires_publication(kind: EventKind) -> bool {
+    matches!(
+        kind,
+        // `Any` is retained for imprecise watcher backends where a mutating
+        // event cannot be classified more narrowly.
+        EventKind::Any
+            | EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Modify(
+                ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Name(_) | ModifyKind::Other
+            )
+    )
 }
 
 fn valid_revision(revision: &str) -> bool {
@@ -377,6 +451,37 @@ fn publish_snapshot(
         .join(&source.key.extension_id)
         .join(&source.key.view_id);
     fs::create_dir_all(&view_root).map_err(|error| error.to_string())?;
+
+    // Most publications are restart revalidations or a watcher following an
+    // explicit build publication. Hash the source first so an existing
+    // immutable snapshot can be adopted without copying the entire bundle to
+    // a temporary directory only to delete it again.
+    let (source_digest, source_bytes) = hash_files(&before)?;
+    let after_hash = collect_source_files(&source.source_root)?;
+    if before != after_hash {
+        return Err("viewer source changed during publication".to_string());
+    }
+    let revision = format!("sha256-{}", hex_lower(&source_digest));
+    let snapshot_root = view_root.join(&revision);
+    if snapshot_root.exists() {
+        let snapshot_entry = snapshot_root.join(&source.entry_relative_path);
+        if !snapshot_entry.is_file() {
+            return Err("published snapshot is missing its entry".to_string());
+        }
+        validate_entry_asset_urls(&snapshot_entry, &source.route)?;
+        return Ok(PublishedViewerBundle {
+            extension_id: source.key.extension_id.clone(),
+            view_id: source.key.view_id.clone(),
+            revision,
+            route: source.route.clone(),
+            entry_relative_path: source.entry_relative_path.clone(),
+            snapshot_root,
+            published_at_ms: now_ms(),
+            total_bytes: source_bytes,
+            file_count: before.len(),
+        });
+    }
+
     let temp = view_root.join(format!(
         ".tmp-{}-{}",
         std::process::id(),
@@ -396,7 +501,7 @@ fn publish_snapshot(
         }
     };
     let after = collect_source_files(&source.source_root)?;
-    if before != after {
+    if before != after || digest != source_digest {
         let _ = fs::remove_dir_all(&temp);
         return Err("viewer source changed during publication".to_string());
     }
@@ -411,13 +516,7 @@ fn publish_snapshot(
         return Err(error);
     }
 
-    let revision = format!("sha256-{}", hex_lower(&digest));
-    let snapshot_root = view_root.join(&revision);
-    if snapshot_root.exists() {
-        fs::remove_dir_all(&temp).map_err(|error| error.to_string())?;
-    } else {
-        fs::rename(&temp, &snapshot_root).map_err(|error| error.to_string())?;
-    }
+    fs::rename(&temp, &snapshot_root).map_err(|error| error.to_string())?;
     Ok(PublishedViewerBundle {
         extension_id: source.key.extension_id.clone(),
         view_id: source.key.view_id.clone(),
@@ -587,17 +686,45 @@ fn copy_and_hash_files(files: &[SourceFile], target: &Path) -> Result<(Vec<u8>, 
     Ok((hasher.finalize().to_vec(), total))
 }
 
+fn hash_files(files: &[SourceFile]) -> Result<(Vec<u8>, u64), String> {
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = vec![0u8; 64 * 1024];
+    for file in files {
+        let relative = file
+            .relative
+            .to_str()
+            .ok_or_else(|| "viewer path is not UTF-8".to_string())?;
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        hasher.update(file.len.to_be_bytes());
+        hasher.update([0]);
+
+        let mut input = fs::File::open(&file.source).map_err(|error| error.to_string())?;
+        loop {
+            let read = input.read(&mut buffer).map_err(|error| error.to_string())?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            total += read as u64;
+        }
+    }
+    Ok((hasher.finalize().to_vec(), total))
+}
+
 fn cleanup_snapshots(
     cache_root: &Path,
-    published: &HashMap<ViewerBundleKey, PublishedViewerBundle>,
+    published: &RwLock<HashMap<ViewerBundleKey, PublishedViewerBundle>>,
 ) -> Result<(), String> {
-    let current = published
+    let snapshot = published.read().unwrap().clone();
+    let current = snapshot
         .values()
         .map(|bundle| bundle.snapshot_root.clone())
         .collect::<HashSet<_>>();
     let mut candidates = Vec::new();
     let mut total = 0u64;
-    for (key, bundle) in published {
+    for (key, bundle) in &snapshot {
         let view_root = cache_root.join(&key.extension_id).join(&key.view_id);
         let mut revisions = directory_children(&view_root)?;
         revisions.sort_by_key(|path| modified_time(path));
@@ -614,7 +741,7 @@ fn cleanup_snapshots(
     }
     candidates.sort_by_key(|(modified, _, _)| *modified);
     for (_, bytes, path) in candidates {
-        let over_count = published.values().any(|bundle| {
+        let over_count = snapshot.values().any(|bundle| {
             path.parent() == bundle.snapshot_root.parent()
                 && directory_children(path.parent().unwrap_or(Path::new("/")))
                     .map(|children| children.len() > RETAIN_REVISIONS_PER_VIEW)
@@ -623,7 +750,16 @@ fn cleanup_snapshots(
         if total <= MAX_SNAPSHOT_BYTES && !over_count {
             continue;
         }
-        if current.contains(&path) {
+        // Publications run per-view and may complete while this cleanup is
+        // scanning. Recheck the live registry immediately before deletion so
+        // a snapshot that became current after our initial clone is protected.
+        if current.contains(&path)
+            || published
+                .read()
+                .unwrap()
+                .values()
+                .any(|bundle| bundle.snapshot_root == path)
+        {
             continue;
         }
         fs::remove_dir_all(&path).map_err(|error| error.to_string())?;
@@ -684,6 +820,7 @@ mod tests {
     use super::*;
     use crate::extensions::manifest::{Display, ExtensionManifest, View};
     use crate::logs::StdTerminal;
+    use notify::event::{AccessKind, DataChange, MetadataKind, RenameMode};
     use tempfile::TempDir;
 
     fn source(temp: &TempDir) -> ViewerBundleSource {
@@ -704,6 +841,91 @@ mod tests {
             entry: root.join("index.html"),
             source_root: root,
             entry_relative_path: PathBuf::from("index.html"),
+        }
+    }
+
+    #[test]
+    fn watcher_ignores_reads_and_metadata_but_accepts_content_changes() {
+        assert!(!event_requires_publication(EventKind::Access(
+            AccessKind::Read
+        )));
+        assert!(!event_requires_publication(EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::WriteTime),
+        )));
+        assert!(event_requires_publication(EventKind::Modify(
+            ModifyKind::Data(DataChange::Content),
+        )));
+        assert!(event_requires_publication(EventKind::Modify(
+            ModifyKind::Name(RenameMode::Both),
+        )));
+        assert!(event_requires_publication(EventKind::Create(
+            notify::event::CreateKind::File,
+        )));
+        assert!(event_requires_publication(EventKind::Remove(
+            notify::event::RemoveKind::File,
+        )));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn publishing_does_not_retrigger_the_source_watcher() {
+        let temp = TempDir::new().unwrap();
+        let fixture_source = source(&temp);
+        let manifest = ExtensionManifest {
+            display: Display {
+                icon: None,
+                icon_dark: None,
+                title: "Fixture".to_string(),
+            },
+            file_handlers: Vec::new(),
+            id: "fixture".to_string(),
+            launchers: Vec::new(),
+            name: "Fixture".to_string(),
+            root_dir: temp.path().to_path_buf(),
+            server: None,
+            gateway: None,
+            views: vec![(
+                "main".to_string(),
+                View {
+                    build: None,
+                    cache: ViewCachePolicy::Immutable,
+                    entry: fixture_source.entry.clone(),
+                    host_chrome: Default::default(),
+                    route: fixture_source.route.clone(),
+                    watch: None,
+                },
+            )],
+            workloads: Default::default(),
+        };
+        let journal = Journal::new(temp.path(), 2, Arc::new(StdTerminal)).unwrap();
+        let registry = ViewerBundleRegistry::new(temp.path(), &[manifest], journal);
+        registry.start_watching().unwrap();
+
+        let first = registry.publish_now("fixture", "main").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(WATCH_QUIET_MS * 2)).await;
+        assert!(
+            registry.watch_generations.lock().unwrap().is_empty(),
+            "snapshot reads must not schedule another publication"
+        );
+
+        fs::write(
+            fixture_source.source_root.join("assets/app.js"),
+            "console.log('changed')",
+        )
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if registry
+                .current("fixture", "main")
+                .is_some_and(|bundle| bundle.revision != first.revision)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "content mutation did not publish a new revision"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
@@ -802,12 +1024,14 @@ mod tests {
             name: "Fixture".to_string(),
             root_dir: temp.path().to_path_buf(),
             server: None,
+            gateway: None,
             views: vec![(
                 "main".to_string(),
                 View {
                     build: None,
                     cache: ViewCachePolicy::Revalidate,
                     entry: root.join("index.html"),
+                    host_chrome: Default::default(),
                     route: "/viewers/fixture".to_string(),
                     watch: None,
                 },

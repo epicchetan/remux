@@ -1,7 +1,8 @@
-export const transcriptMeasureCacheVersion = 4;
+export const transcriptMeasureCacheVersion = 5;
 
 export type TranscriptMeasureCacheLookup = {
   contentWidth: number;
+  mathMetricsRevision: number;
   threadId: string;
   turnId: string;
   turnRevision: string;
@@ -187,6 +188,7 @@ function cacheKey(lookup: TranscriptMeasureCacheLookup) {
     lookup.turnId,
     lookup.turnRevision,
     normalizedWidth(lookup.contentWidth),
+    lookup.mathMetricsRevision,
     lookup.userActionRowId ?? '',
     lookup.userMessageDisclosureRevision,
   ].join('\u001f');

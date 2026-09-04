@@ -27,6 +27,7 @@ import {
   flushDirtyTabPreviews,
   markAllTabPreviewsDirty,
   requestTabPreviewCapture,
+  tabPreviewNeedsCapture,
 } from './tabPreviewCapture';
 
 // Webviews re-theme via an injected script; give them a beat to repaint
@@ -87,6 +88,9 @@ export function BrowserShell() {
   }, [remuxOrigin, remuxToken]);
 
   const refreshTabPreview = useCallback(async (tabId: string) => {
+    if (!tabPreviewNeedsCapture(tabId)) {
+      return;
+    }
     const prepared = await (activeSurfaceRef.current?.prepareForPreviewCapture() ?? Promise.resolve(true));
     if (!prepared) {
       return;
@@ -128,6 +132,25 @@ export function BrowserShell() {
       void loadExtensions({ force: true });
     }
   }, [catalogOrigin, catalogStatus, loadExtensions, remuxOrigin, remux.status]);
+
+  // A successful viewer build is complete only after the runtime has
+  // published its immutable snapshot. Refreshing the catalog here lets the
+  // normal tab reconciliation adopt that revision, even when Settings has
+  // already unmounted by the time the background job finishes.
+  useEffect(() => remux.subscribe((message) => {
+    if (message.method !== 'remux/jobs/didChange' || !isRecord(message.params)) {
+      return;
+    }
+    const operationId = typeof message.params.operationId === 'string'
+      ? message.params.operationId
+      : '';
+    if (
+      message.params.state === 'completed'
+      && /^extension:[^:]+:views-build:/.test(operationId)
+    ) {
+      void loadExtensions({ force: true });
+    }
+  }), [loadExtensions, remux]);
 
   // Theme flips re-render every mounted webview, so previews captured in the
   // old appearance are stale everywhere. Re-shoot what's on screen and leave
@@ -184,7 +207,11 @@ export function BrowserShell() {
   return (
     <View style={styles.screen}>
       <View style={styles.surface}>
-        <ActiveSurface onOpenOverview={openHostOverview} surfaceRef={activeSurfaceRef} />
+        <ActiveSurface
+          onOpenOverview={openHostOverview}
+          surfaceActive={mode === 'surface'}
+          surfaceRef={activeSurfaceRef}
+        />
       </View>
 
       {mode === 'overview' ? <BrowserOverview /> : null}
@@ -330,4 +357,8 @@ function guardianRecoverySummary(guardian: ReturnType<typeof useRemuxConnection>
     ? ` · ${failures} failed ${failures === 1 ? 'start' : 'starts'}`
     : '';
   return `Runtime ${guardian.status.workerState}${failureText}. Guardian controls remain available.`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }

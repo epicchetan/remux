@@ -1,10 +1,12 @@
 # Agent context workspace v1
 
-Status: Archived; superseded by `agent-explicit-turn-context-v1.md`
+Status: Archived; superseded by `agent-native-provider-runtime-v1.md`
 Last verified: 2026-08-16
 Canonical code: `extensions/agent/server/src/context/`,
 `extensions/agent/server/src/project-state/`, and
 `extensions/agent/server/src/storage/repository.ts`
+The context workspace belongs to the Pi-based experimental harness and is not
+part of the native-provider replacement.
 
 This document defines the first authoritative Remux Agent context system. It
 replaces the diagnostic-only shadow compiler with a model-managed context

@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::extensions::manifest::{BuildSpec, ExtensionManifest, ServerSpec};
+use crate::extensions::manifest::{BuildSpec, ExtensionManifest, ServerSpec, ViewCachePolicy};
 use crate::extensions::process::{
     exit_parts, group_alive, harden_command, read_lines, send_sigterm, signal_group,
     spawn_extension, SpawnedChild, StdinCommand,
@@ -47,7 +47,8 @@ use crate::logs::{
 use crate::resource::{ResourceClass, ResourcePlacement};
 use crate::rpc::jsonrpc::{JsonRpcError, EXTENSION_ERROR};
 use crate::rpc::router::{
-    BoxFuture, ExtensionServer, LastExit, RpcResult, ServerStatus, ViewsFacet, WatchFacet,
+    BoxFuture, ExtensionServer, GatewayFacet, LastExit, RpcResult, ServerStatus, ViewsFacet,
+    WatchFacet,
 };
 use crate::time::now_ms;
 
@@ -63,6 +64,7 @@ pub const BUILD_FAILED_REASON: &str = "build-failed";
 
 pub const DID_CHANGE_STATUS_METHOD: &str = "remux/extensions/didChangeStatus";
 const MANAGEMENT_LOG_METHOD: &str = "remux/extension/managementLog";
+const GATEWAY_READY_METHOD: &str = "remux/extension/gatewayReady";
 const REMUX_NOTIFICATION_METHOD_PREFIX: &str = "remux/notifications/";
 const EXTENSION_NOTIFICATION_WORKERS: usize = 32;
 const EXTENSION_OUTBOUND_REQUESTS: usize = 32;
@@ -98,8 +100,33 @@ pub trait ExtensionCtx: Send + Sync {
     fn handle_extension_notification(&self, message: Value) -> BoxFuture<'_, bool>;
     /// Fires once per `failed` entry (crash budget exhausted or build failed).
     fn on_extension_failed(&self, _extension_id: &str, _name: &str, _body: String) {}
-    fn publish_view_bundle(&self, _extension_id: &str, _view_id: &str) {}
+    fn publish_view_bundle(
+        &self,
+        _extension_id: &str,
+        _view_id: &str,
+    ) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
     fn media_dir(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+    fn prepare_extension_gateway(
+        &self,
+        _extension_id: &str,
+        _generation: u64,
+    ) -> Result<Option<std::path::PathBuf>, String> {
+        Ok(None)
+    }
+    fn activate_extension_gateway(
+        &self,
+        _extension_id: &str,
+        _generation: u64,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn retire_extension_gateway(&self, _extension_id: &str, _generation: u64) {}
+    fn cleanup_extension_gateway(&self, _extension_id: &str, _generation: u64) {}
+    fn extension_data_dir(&self, _extension_id: &str) -> Option<std::path::PathBuf> {
         None
     }
 }
@@ -178,6 +205,10 @@ enum Cmd {
     WatchStop(oneshot::Sender<(ServerStatus, bool)>),
     ServerBuild(oneshot::Sender<Result<ServerStatus, JsonRpcError>>),
     ViewsBuild(oneshot::Sender<Result<ServerStatus, JsonRpcError>>),
+    ViewsBuildFinished {
+        ack: oneshot::Sender<Result<ServerStatus, JsonRpcError>>,
+        outcome: ManualViewsBuildOutcome,
+    },
     /// Internal: a watch child's monitor task reporting its exit. Stale
     /// generations (bumped by every watch stop) are ignored.
     WatchChildExited {
@@ -210,6 +241,7 @@ pub struct ExtensionSupervisor {
     /// by statting these at snapshot time so it is always fresh (a running
     /// watcher rewrites bundles behind the actor's back).
     built_entries: Vec<PathBuf>,
+    gateway_ready_generation: Arc<AtomicU64>,
 }
 
 struct CancelRpcOnDrop {
@@ -270,11 +302,16 @@ impl ExtensionSupervisor {
                 declared: extension.views.iter().any(|(_, view)| view.watch.is_some()),
                 ..WatchFacet::default()
             },
+            gateway: GatewayFacet {
+                declared: extension.gateway.is_some(),
+                ..GatewayFacet::default()
+            },
         }));
         let (commands, mailbox) = mpsc::channel(128);
         let resource_placement =
             ResourcePlacement::for_extension(&extension.id, &extension.root_dir);
 
+        let gateway_ready_generation = Arc::new(AtomicU64::new(0));
         let supervisor = Arc::new(Self {
             extension_id: extension.id.clone(),
             commands: commands.clone(),
@@ -282,6 +319,7 @@ impl ExtensionSupervisor {
             logs: logs.clone(),
             next_rpc_request_id: AtomicU64::new(1),
             built_entries,
+            gateway_ready_generation: gateway_ready_generation.clone(),
         });
 
         let actor = Actor {
@@ -296,6 +334,7 @@ impl ExtensionSupervisor {
             self_commands: commands,
             pending: Arc::new(Mutex::new(HashMap::new())),
             generation: Arc::new(AtomicU64::new(0)),
+            gateway_ready_generation,
             state: Lifecycle::Stopped,
             child: None,
             stdin: None,
@@ -307,6 +346,7 @@ impl ExtensionSupervisor {
             last_build_failed: false,
             failed_view_builds: HashSet::new(),
             last_view_build_at_ms: None,
+            views_build_in_flight: false,
             crash_times: VecDeque::new(),
             backoff_deadline: None,
             watch_enabled: false,
@@ -326,6 +366,9 @@ impl ExtensionSupervisor {
     fn snapshot(&self) -> ServerStatus {
         let mut status = self.status.lock().unwrap().clone();
         status.views.built = views_built(&self.built_entries);
+        let generation = self.gateway_ready_generation.load(Ordering::SeqCst);
+        status.gateway.ready = generation != 0;
+        status.gateway.generation = (generation != 0).then_some(generation);
         status
     }
 
@@ -468,6 +511,22 @@ enum BuildTarget {
     Viewer { view_id: String },
 }
 
+struct ManualViewsBuildOutcome {
+    completed_at_ms: Option<i64>,
+    failure: Option<(String, JsonRpcError)>,
+    successful_view_ids: Vec<String>,
+}
+
+#[derive(Clone)]
+struct BuildExecution {
+    cfg: SupervisorConfig,
+    extension_id: String,
+    journal: Arc<Journal>,
+    logs: Arc<ExtensionLogs>,
+    resource_placement: ResourcePlacement,
+    run_state: Arc<RunState>,
+}
+
 impl BuildTarget {
     fn meta(&self, channel: Option<LogChannel>, level: Option<LogLevel>) -> ExtensionLogMeta {
         match self {
@@ -478,6 +537,224 @@ impl BuildTarget {
                 ExtensionLogMeta::viewer(view_id.clone(), LogSource::Build, channel, level, "build")
             }
         }
+    }
+}
+
+impl BuildExecution {
+    async fn execute(
+        &self,
+        target: BuildTarget,
+        build: &BuildSpec,
+    ) -> Result<(), (Option<i32>, Option<String>, String)> {
+        self.journal(
+            "extension:build",
+            Some(serde_json::json!({
+                "command": build.command,
+                "args": build.args,
+                "cwd": build.cwd.to_string_lossy(),
+            })),
+            "info",
+        );
+        self.append_log(
+            &target,
+            &format!("starting: {} {}", build.command, build.args.join(" ")),
+            Some(LogLevel::Info),
+        );
+
+        let mut command = self.resource_placement.configure_command(
+            &build.command,
+            &build.args,
+            &build.cwd,
+            ResourceClass::Build,
+        );
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = match harden_command(&mut command).spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                self.append_log(
+                    &target,
+                    &format!("spawn failed: {error}"),
+                    Some(LogLevel::Error),
+                );
+                return Err((None, None, format!("build spawn failed: {error}")));
+            }
+        };
+
+        let pid = child.id().unwrap_or_default();
+        self.run_state.record(
+            &self.extension_id,
+            RunRole::Build,
+            RunEntry {
+                pid,
+                pgid: pid,
+                start_ticks: read_start_ticks(pid).unwrap_or(0),
+                started_at_ms: now_ms(),
+            },
+        );
+
+        for stream in [
+            child.stdout.take().map(BuildPipe::Stdout),
+            child.stderr.take().map(BuildPipe::Stderr),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let logs = self.logs.clone();
+            let extension_id = self.extension_id.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                let channel = match &stream {
+                    BuildPipe::Stdout(_) => LogChannel::Stdout,
+                    BuildPipe::Stderr(_) => LogChannel::Stderr,
+                };
+                let append = move |line: String| {
+                    if !line.trim().is_empty() {
+                        logs.append(&extension_id, target.meta(Some(channel), None), &line);
+                    }
+                };
+                match stream {
+                    BuildPipe::Stdout(pipe) => read_lines(pipe, append).await,
+                    BuildPipe::Stderr(pipe) => read_lines(pipe, append).await,
+                }
+            });
+        }
+
+        let timeout = std::time::Duration::from_millis(self.cfg.build_timeout_ms);
+        let status = match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(status) => status.ok(),
+            Err(_) => {
+                signal_group(pid, nix::sys::signal::Signal::SIGKILL);
+                let _ = child.wait().await;
+                self.run_state.remove(&self.extension_id, RunRole::Build);
+                self.append_log(
+                    &target,
+                    &format!("timed out after {}ms", self.cfg.build_timeout_ms),
+                    Some(LogLevel::Error),
+                );
+                return Err((None, None, "build timed out".to_string()));
+            }
+        };
+        self.run_state.remove(&self.extension_id, RunRole::Build);
+
+        let (code, signal) = status.map(exit_parts).unwrap_or((None, None));
+        if signal.is_none() && code == Some(0) {
+            self.append_log(&target, "completed", Some(LogLevel::Info));
+            self.journal("extension:build-done", None, "info");
+            return Ok(());
+        }
+
+        self.append_log(
+            &target,
+            &format!("failed {}", exit_summary(code, &signal)),
+            Some(LogLevel::Error),
+        );
+        Err((code, signal, "build failed".to_string()))
+    }
+
+    fn append_log(&self, target: &BuildTarget, message: &str, level: Option<LogLevel>) {
+        self.logs
+            .append(&self.extension_id, target.meta(None, level), message);
+    }
+
+    fn journal(&self, label: &str, detail: Option<Value>, level: &'static str) {
+        self.journal.event(JournalEvent {
+            detail,
+            label: Some(label.to_string()),
+            level,
+            source: format!("extension:{}", self.extension_id),
+            ..Default::default()
+        });
+    }
+}
+
+async fn run_manual_views_build(
+    declared: Vec<(String, crate::extensions::manifest::View)>,
+    watch_enabled: bool,
+    extension_id: &str,
+    execution: &BuildExecution,
+    ctx: &Arc<dyn ExtensionCtx>,
+) -> ManualViewsBuildOutcome {
+    let mut completed_at_ms = None;
+    let mut successful_view_ids = Vec::new();
+
+    for (view_id, view) in declared {
+        let target = BuildTarget::Viewer {
+            view_id: view_id.clone(),
+        };
+        if watch_enabled && view.watch.is_some() {
+            execution.append_log(
+                &target,
+                "skipping: watch owns the bundle",
+                Some(LogLevel::Info),
+            );
+            continue;
+        }
+
+        let build = view.build.as_ref().expect("filtered");
+        match execution.execute(target.clone(), build).await {
+            Ok(()) => {
+                if view.cache == ViewCachePolicy::Immutable {
+                    if let Err(message) = ctx.publish_view_bundle(extension_id, &view_id).await {
+                        execution.append_log(&target, &message, Some(LogLevel::Error));
+                        execution.journal(
+                            "extension:build-failed",
+                            Some(serde_json::json!({
+                                "message": message,
+                                "view": view_id,
+                            })),
+                            "error",
+                        );
+                        return ManualViewsBuildOutcome {
+                            completed_at_ms,
+                            failure: Some((
+                                view_id,
+                                JsonRpcError::new(
+                                    EXTENSION_ERROR,
+                                    "viewer bundle publication failed — see extension logs",
+                                ),
+                            )),
+                            successful_view_ids,
+                        };
+                    }
+                }
+                successful_view_ids.push(view_id);
+                completed_at_ms = Some(now_ms());
+            }
+            Err((code, signal, message)) => {
+                let summary = exit_summary(code, &signal);
+                execution.journal(
+                    "extension:build-failed",
+                    Some(serde_json::json!({
+                        "code": code,
+                        "signal": signal,
+                        "message": message,
+                        "view": view_id,
+                    })),
+                    "error",
+                );
+                return ManualViewsBuildOutcome {
+                    completed_at_ms,
+                    failure: Some((
+                        view_id,
+                        JsonRpcError::new(
+                            EXTENSION_ERROR,
+                            format!("view build failed ({summary}) — see extension logs"),
+                        ),
+                    )),
+                    successful_view_ids,
+                };
+            }
+        }
+    }
+
+    ManualViewsBuildOutcome {
+        completed_at_ms,
+        failure: None,
+        successful_view_ids,
     }
 }
 
@@ -494,6 +771,7 @@ struct Actor {
     self_commands: mpsc::Sender<Cmd>,
     pending: PendingMap,
     generation: Arc<AtomicU64>,
+    gateway_ready_generation: Arc<AtomicU64>,
     state: Lifecycle,
     child: Option<tokio::process::Child>,
     stdin: Option<mpsc::Sender<StdinCommand>>,
@@ -508,6 +786,7 @@ struct Actor {
     /// Per-view analog of `last_build_failed` (view ids).
     failed_view_builds: HashSet<String>,
     last_view_build_at_ms: Option<i64>,
+    views_build_in_flight: bool,
     crash_times: VecDeque<std::time::Instant>,
     backoff_deadline: Option<tokio::time::Instant>,
     // Watch facet — deliberately parallel to (not shared with) the server's
@@ -587,7 +866,14 @@ impl Actor {
                 let _ = ack.send(self.current_status());
             }
             Cmd::WatchStart(ack) => {
-                let result = self.handle_watch_start().await;
+                let result = if self.views_build_in_flight {
+                    Err(JsonRpcError::new(
+                        EXTENSION_ERROR,
+                        "view build already in progress",
+                    ))
+                } else {
+                    self.handle_watch_start().await
+                };
                 let _ = ack.send(result);
             }
             Cmd::WatchStop(ack) => {
@@ -600,12 +886,21 @@ impl Actor {
                 status,
             } => self.handle_watch_child_exited(generation, &view_id, status),
             Cmd::ServerBuild(ack) => {
-                let result = self.handle_server_build().await;
+                let result = if self.views_build_in_flight {
+                    Err(JsonRpcError::new(
+                        EXTENSION_ERROR,
+                        "view build already in progress",
+                    ))
+                } else {
+                    self.handle_server_build().await
+                };
                 let _ = ack.send(result);
             }
             Cmd::ViewsBuild(ack) => {
-                let result = self.handle_views_build().await;
-                let _ = ack.send(result);
+                self.start_views_build(ack);
+            }
+            Cmd::ViewsBuildFinished { ack, outcome } => {
+                self.finish_views_build(ack, outcome);
             }
             Cmd::Rpc {
                 request_id,
@@ -705,9 +1000,19 @@ impl Actor {
                 .await
             {
                 Ok(()) => {
+                    if view.cache == ViewCachePolicy::Immutable {
+                        if let Err(message) = self
+                            .ctx
+                            .publish_view_bundle(&self.extension.id, &view_id)
+                            .await
+                        {
+                            self.failed_view_builds.insert(view_id);
+                            self.fail_build(None, None, &message);
+                            return false;
+                        }
+                    }
                     self.failed_view_builds.remove(&view_id);
                     self.last_view_build_at_ms = Some(now_ms());
-                    self.ctx.publish_view_bundle(&self.extension.id, &view_id);
                 }
                 Err((code, signal, message)) => {
                     self.failed_view_builds.insert(view_id);
@@ -729,115 +1034,18 @@ impl Actor {
         target: BuildTarget,
         build: &BuildSpec,
     ) -> Result<(), (Option<i32>, Option<String>, String)> {
-        self.journal_lifecycle(
-            "extension:build",
-            Some(serde_json::json!({
-                "command": build.command,
-                "args": build.args,
-                "cwd": build.cwd.to_string_lossy(),
-            })),
-            "info",
-        );
-        self.append_build_log(
-            &target,
-            &format!("starting: {} {}", build.command, build.args.join(" ")),
-            Some(LogLevel::Info),
-        );
+        self.build_execution().execute(target, build).await
+    }
 
-        let mut command = self.resource_placement.configure_command(
-            &build.command,
-            &build.args,
-            &build.cwd,
-            ResourceClass::Build,
-        );
-        command
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = match harden_command(&mut command).spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                self.append_build_log(
-                    &target,
-                    &format!("spawn failed: {error}"),
-                    Some(LogLevel::Error),
-                );
-                return Err((None, None, format!("build spawn failed: {error}")));
-            }
-        };
-
-        let pid = child.id().unwrap_or_default();
-        self.run_state.record(
-            &self.extension.id,
-            RunRole::Build,
-            RunEntry {
-                pid,
-                pgid: pid,
-                start_ticks: read_start_ticks(pid).unwrap_or(0),
-                started_at_ms: now_ms(),
-            },
-        );
-
-        // Stream both pipes with typed target/channel metadata. Raw stderr is
-        // transport, not severity.
-        for stream in [
-            child.stdout.take().map(BuildPipe::Stdout),
-            child.stderr.take().map(BuildPipe::Stderr),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let logs = self.logs.clone();
-            let extension_id = self.extension.id.clone();
-            let target = target.clone();
-            tokio::spawn(async move {
-                let channel = match &stream {
-                    BuildPipe::Stdout(_) => LogChannel::Stdout,
-                    BuildPipe::Stderr(_) => LogChannel::Stderr,
-                };
-                let append = move |line: String| {
-                    if !line.trim().is_empty() {
-                        logs.append(&extension_id, target.meta(Some(channel), None), &line);
-                    }
-                };
-                match stream {
-                    BuildPipe::Stdout(pipe) => read_lines(pipe, append).await,
-                    BuildPipe::Stderr(pipe) => read_lines(pipe, append).await,
-                }
-            });
+    fn build_execution(&self) -> BuildExecution {
+        BuildExecution {
+            cfg: self.cfg,
+            extension_id: self.extension.id.clone(),
+            journal: self.journal.clone(),
+            logs: self.logs.clone(),
+            resource_placement: self.resource_placement.clone(),
+            run_state: self.run_state.clone(),
         }
-
-        let timeout = std::time::Duration::from_millis(self.cfg.build_timeout_ms);
-        let status = match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(status) => status.ok(),
-            Err(_) => {
-                signal_group(pid, nix::sys::signal::Signal::SIGKILL);
-                let _ = child.wait().await;
-                self.run_state.remove(&self.extension.id, RunRole::Build);
-                self.append_build_log(
-                    &target,
-                    &format!("timed out after {}ms", self.cfg.build_timeout_ms),
-                    Some(LogLevel::Error),
-                );
-                return Err((None, None, "build timed out".to_string()));
-            }
-        };
-        self.run_state.remove(&self.extension.id, RunRole::Build);
-
-        let (code, signal) = status.map(exit_parts).unwrap_or((None, None));
-        if signal.is_none() && code == Some(0) {
-            self.append_build_log(&target, "completed", Some(LogLevel::Info));
-            self.journal_lifecycle("extension:build-done", None, "info");
-            return Ok(());
-        }
-
-        self.append_build_log(
-            &target,
-            &format!("failed {}", exit_summary(code, &signal)),
-            Some(LogLevel::Error),
-        );
-        Err((code, signal, "build failed".to_string()))
     }
 
     fn fail_build(&mut self, code: Option<i32>, signal: Option<String>, message: &str) {
@@ -937,9 +1145,27 @@ impl Actor {
                 .await
             {
                 Ok(()) => {
+                    if view.cache == ViewCachePolicy::Immutable {
+                        if let Err(message) = self
+                            .ctx
+                            .publish_view_bundle(&self.extension.id, view_id)
+                            .await
+                        {
+                            self.failed_view_builds.insert(view_id.clone());
+                            self.watch_failed = true;
+                            self.append_build_log(
+                                &BuildTarget::Viewer {
+                                    view_id: view_id.clone(),
+                                },
+                                &message,
+                                Some(LogLevel::Error),
+                            );
+                            self.broadcast_status();
+                            return Err(JsonRpcError::new(EXTENSION_ERROR, message));
+                        }
+                    }
                     self.failed_view_builds.remove(view_id);
                     self.last_view_build_at_ms = Some(now_ms());
-                    self.ctx.publish_view_bundle(&self.extension.id, view_id);
                 }
                 Err((code, signal, message)) => {
                     // Watch-facet failure only: the extension lifecycle (and
@@ -1031,11 +1257,9 @@ impl Actor {
         }
     }
 
-    /// Manual view build (`views/build` RPC): force-runs every declared view
-    /// build in manifest order, skipping watch-owned views. Same contract as
-    /// `handle_server_build`: failure is an error, never a lifecycle change —
-    /// the previously built bundle keeps serving.
-    async fn handle_views_build(&mut self) -> Result<ServerStatus, JsonRpcError> {
+    /// Starts a manual view build without occupying the supervisor actor. The
+    /// request still resolves only after immutable publication completes.
+    fn start_views_build(&mut self, ack: oneshot::Sender<Result<ServerStatus, JsonRpcError>>) {
         let declared: Vec<(String, crate::extensions::manifest::View)> = self
             .extension
             .views
@@ -1044,68 +1268,59 @@ impl Actor {
             .cloned()
             .collect();
         if declared.is_empty() {
-            return Err(JsonRpcError::new(
+            let _ = ack.send(Err(JsonRpcError::new(
                 EXTENSION_ERROR,
                 "view build not declared",
-            ));
+            )));
+            return;
+        }
+        if self.views_build_in_flight {
+            let _ = ack.send(Err(JsonRpcError::new(
+                EXTENSION_ERROR,
+                "view build already in progress",
+            )));
+            return;
         }
 
-        for (view_id, view) in declared {
-            let build = view.build.as_ref().expect("filtered");
-            if self.watch_enabled && view.watch.is_some() {
-                self.append_build_log(
-                    &BuildTarget::Viewer {
-                        view_id: view_id.clone(),
-                    },
-                    "skipping: watch owns the bundle",
-                    Some(LogLevel::Info),
-                );
-                continue;
-            }
-            match self
-                .exec_build(
-                    BuildTarget::Viewer {
-                        view_id: view_id.clone(),
-                    },
-                    build,
-                )
-                .await
-            {
-                Ok(()) => {
-                    self.failed_view_builds.remove(&view_id);
-                    self.last_view_build_at_ms = Some(now_ms());
-                    self.ctx.publish_view_bundle(&self.extension.id, &view_id);
-                }
-                Err((code, signal, message)) => {
-                    self.failed_view_builds.insert(view_id.clone());
-                    self.journal_lifecycle(
-                        "extension:build-failed",
-                        Some(serde_json::json!({
-                            "code": code,
-                            "signal": signal,
-                            "message": message,
-                            "view": view_id,
-                        })),
-                        "error",
-                    );
-                    return Err(JsonRpcError::new(
-                        EXTENSION_ERROR,
-                        format!(
-                            "view build failed ({}) — see extension logs",
-                            exit_summary(code, &signal)
-                        ),
-                    ));
-                }
-            }
+        self.views_build_in_flight = true;
+        let execution = self.build_execution();
+        let ctx = self.ctx.clone();
+        let extension_id = self.extension.id.clone();
+        let watch_enabled = self.watch_enabled;
+        let sender = self.self_commands.clone();
+        tokio::spawn(async move {
+            let outcome =
+                run_manual_views_build(declared, watch_enabled, &extension_id, &execution, &ctx)
+                    .await;
+            let _ = sender.send(Cmd::ViewsBuildFinished { ack, outcome }).await;
+        });
+    }
+
+    fn finish_views_build(
+        &mut self,
+        ack: oneshot::Sender<Result<ServerStatus, JsonRpcError>>,
+        outcome: ManualViewsBuildOutcome,
+    ) {
+        self.views_build_in_flight = false;
+        for view_id in outcome.successful_view_ids {
+            self.failed_view_builds.remove(&view_id);
+        }
+        if let Some(completed_at_ms) = outcome.completed_at_ms {
+            self.last_view_build_at_ms = Some(completed_at_ms);
+        }
+        if let Some((view_id, error)) = outcome.failure {
+            self.failed_view_builds.insert(view_id);
+            self.broadcast_status();
+            let _ = ack.send(Err(error));
+            return;
         }
 
-        // A successful build resolves a serverless build-failed landing.
         if self.state == Lifecycle::Failed && self.extension.server.is_none() {
             self.set_state(Lifecycle::Stopped);
         } else {
-            self.broadcast_status(); // views.built / lastBuildAtMs changed
+            self.broadcast_status();
         }
-        Ok(self.current_status())
+        let _ = ack.send(Ok(self.current_status()));
     }
 
     /// Spawns a supervised child for every watched view that doesn't already
@@ -1506,6 +1721,7 @@ impl Actor {
     }
 
     fn spawn_child(&mut self, server: &ServerSpec) {
+        self.gateway_ready_generation.store(0, Ordering::SeqCst);
         self.set_state(Lifecycle::Starting);
         self.journal_lifecycle(
             "extension:start",
@@ -1519,14 +1735,36 @@ impl Actor {
         self.append_lifecycle_log("starting", LogLevel::Info);
 
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let gateway_socket = match self
+            .ctx
+            .prepare_extension_gateway(&self.extension.id, generation)
+        {
+            Ok(socket) => socket,
+            Err(error) => {
+                self.journal_lifecycle(
+                    "extension:gateway-provision-failed",
+                    Some(serde_json::json!({ "message": &error })),
+                    "error",
+                );
+                self.append_lifecycle_log(
+                    &format!("gateway provisioning failed: {error}"),
+                    LogLevel::Error,
+                );
+                self.record_crash();
+                return;
+            }
+        };
 
         let journal = self.journal.clone();
         let extension_id = self.extension.id.clone();
         let media_dir = self.ctx.media_dir();
+        let extension_data_dir = self.ctx.extension_data_dir(&self.extension.id);
         let spawned = spawn_extension(
             server,
             &self.resource_placement,
             media_dir.as_deref(),
+            gateway_socket.as_deref(),
+            extension_data_dir.as_deref(),
             move |error| {
                 journal.warn(&format!(
                     "[remux] failed to write to extension {extension_id}: {error}"
@@ -1563,6 +1801,10 @@ impl Actor {
                 self.set_state(Lifecycle::Running);
             }
             Err(error) => {
+                self.ctx
+                    .retire_extension_gateway(&self.extension.id, generation);
+                self.ctx
+                    .cleanup_extension_gateway(&self.extension.id, generation);
                 // Spawn failure counts as a crash — BackingOff (or Failed on
                 // budget), never runtime-fatal (was: fatal).
                 self.journal_lifecycle(
@@ -1577,6 +1819,7 @@ impl Actor {
     }
 
     async fn handle_unprompted_exit(&mut self, status: Option<std::process::ExitStatus>) {
+        let generation = self.generation.load(Ordering::SeqCst);
         let (code, signal) = status.map(exit_parts).unwrap_or((None, None));
         let clean = signal.is_none() && code.unwrap_or(0) == 0;
         self.journal_lifecycle(
@@ -1611,6 +1854,11 @@ impl Actor {
             at: now_ms(),
             reason: None,
         });
+        self.ctx
+            .retire_extension_gateway(&self.extension.id, generation);
+        self.gateway_ready_generation.store(0, Ordering::SeqCst);
+        self.ctx
+            .cleanup_extension_gateway(&self.extension.id, generation);
         self.generation.fetch_add(1, Ordering::SeqCst);
 
         if clean {
@@ -1685,6 +1933,7 @@ impl Actor {
     /// EOF-first step stays because it is the polite path both real servers
     /// honor (and lets them run their own child cleanup).
     async fn stop_child(&mut self) {
+        let generation = self.generation.load(Ordering::SeqCst);
         self.backoff_deadline = None;
         self.reject_pending(&format!("extension {} stopped", self.extension.id));
 
@@ -1695,6 +1944,11 @@ impl Actor {
         }
 
         let Some(mut child) = self.child.take() else {
+            self.ctx
+                .retire_extension_gateway(&self.extension.id, generation);
+            self.gateway_ready_generation.store(0, Ordering::SeqCst);
+            self.ctx
+                .cleanup_extension_gateway(&self.extension.id, generation);
             self.pid = None;
             self.pgid = None;
             self.started_at_ms = None;
@@ -1702,6 +1956,9 @@ impl Actor {
             return;
         };
         self.set_state(Lifecycle::Stopping);
+        self.ctx
+            .retire_extension_gateway(&self.extension.id, generation);
+        self.gateway_ready_generation.store(0, Ordering::SeqCst);
         self.append_lifecycle_log("stopping", LogLevel::Info);
 
         let eof_wait = std::time::Duration::from_millis(self.cfg.stop_eof_wait_ms);
@@ -1747,6 +2004,8 @@ impl Actor {
             }
         }
         self.run_state.remove(&self.extension.id, RunRole::Server);
+        self.ctx
+            .cleanup_extension_gateway(&self.extension.id, generation);
 
         let (code, signal) = status.map(exit_parts).unwrap_or((None, None));
         self.journal_lifecycle(
@@ -1780,6 +2039,8 @@ impl Actor {
         let extension_id = self.extension.id.clone();
         let stdin = self.stdin.clone().expect("running extension stdin");
         let outbound_permits = Arc::new(tokio::sync::Semaphore::new(EXTENSION_OUTBOUND_REQUESTS));
+        let gateway_ready_generation = self.gateway_ready_generation.clone();
+        let status = self.status.clone();
 
         tokio::spawn(async move {
             read_lines(stdout, move |line| {
@@ -1795,6 +2056,9 @@ impl Actor {
                     &logs,
                     &stdin,
                     &outbound_permits,
+                    generation,
+                    &gateway_ready_generation,
+                    &status,
                 );
             })
             .await;
@@ -1888,6 +2152,14 @@ impl Actor {
                 started_at_ms: self.watch_started_at_ms,
                 restart_count: self.watch_restart_count,
             },
+            gateway: {
+                let generation = self.gateway_ready_generation.load(Ordering::SeqCst);
+                GatewayFacet {
+                    declared: self.extension.gateway.is_some(),
+                    ready: generation != 0,
+                    generation: (generation != 0).then_some(generation),
+                }
+            },
         }
     }
 
@@ -1968,6 +2240,9 @@ fn handle_protocol_line(
     logs: &Arc<ExtensionLogs>,
     stdin: &mpsc::Sender<StdinCommand>,
     outbound_permits: &Arc<tokio::sync::Semaphore>,
+    generation: u64,
+    gateway_ready_generation: &Arc<AtomicU64>,
+    status: &Arc<Mutex<ServerStatus>>,
 ) {
     if line.trim().is_empty() {
         return;
@@ -2002,6 +2277,51 @@ fn handle_protocol_line(
     }
 
     if let Some((id, method, params)) = extension_request(&message) {
+        if method == GATEWAY_READY_METHOD {
+            let ready = params
+                .as_ref()
+                .and_then(|params| params.get("gatewayReady"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            let result = if ready {
+                ctx.activate_extension_gateway(extension_id, generation)
+                    .map(|_| {
+                        gateway_ready_generation.store(generation, Ordering::SeqCst);
+                        let ready_status = {
+                            let mut ready_status = status.lock().unwrap();
+                            ready_status.gateway.ready = true;
+                            ready_status.gateway.generation = Some(generation);
+                            ready_status.clone()
+                        };
+                        let mut params = Map::new();
+                        params.insert(
+                            "extensionId".to_string(),
+                            Value::from(extension_id.to_string()),
+                        );
+                        ready_status.append_to(&mut params);
+                        ctx.broadcast(serde_json::json!({
+                            "method": DID_CHANGE_STATUS_METHOD,
+                            "params": params,
+                        }));
+                        journal.event(JournalEvent {
+                            detail: Some(serde_json::json!({ "generation": generation })),
+                            label: Some("extension:gateway-ready".to_string()),
+                            level: "info",
+                            source: format!("extension:{extension_id}"),
+                            ..Default::default()
+                        });
+                        serde_json::json!({ "gatewayReady": true, "generation": generation })
+                    })
+                    .map_err(|message| JsonRpcError::new(EXTENSION_ERROR, message))
+            } else {
+                Err(JsonRpcError::new(
+                    EXTENSION_ERROR,
+                    "gateway readiness requires gatewayReady: true",
+                ))
+            };
+            send_extension_request_response(stdin, id, result);
+            return;
+        }
         let Ok(permit) = outbound_permits.clone().try_acquire_owned() else {
             journal.warn(&format!(
                 "[remux] extension outbound RPC queue full extension={extension_id} method={method}"

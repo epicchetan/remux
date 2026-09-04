@@ -7,8 +7,9 @@ import {
   nextRunningWorkDurationUpdateMs,
 } from '../../viewer/src/transcript/components/work/workDuration.ts';
 
-test('formats live duration only after its first completed second', () => {
-  assert.equal(formatRunningWorkDuration(999), null);
+test('formats live duration from zero so the header always includes a duration', () => {
+  assert.equal(formatRunningWorkDuration(0), '0s');
+  assert.equal(formatRunningWorkDuration(999), '0s');
   assert.equal(formatRunningWorkDuration(1_000), '1s');
   assert.equal(formatRunningWorkDuration(65_999), '1m 5s');
   assert.equal(formatRunningWorkDuration(3_661_000), '1h 1m');

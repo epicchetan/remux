@@ -3,6 +3,8 @@
 Status: Implemented experiment; not selected as default
 Last verified: 2026-08-10
 Canonical code: `extensions/agent/server/src/{pi-runtime.ts,engine.ts,context/,storage/repository.ts}` and `extensions/agent/tests/benchmark/`
+Superseded by: `agent-native-provider-runtime-v1.md`. Its measurements remain
+R&D evidence; custom bounded work units are deleted at Codex cutover.
 Builds on: [`agent-turns-and-work-units.md`](agent-turns-and-work-units.md),
 [`agent-context-workspace-v1.md`](agent-context-workspace-v1.md), and
 [`agent-ledger-benchmark-corpus.md`](agent-ledger-benchmark-corpus.md)

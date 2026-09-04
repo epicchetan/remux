@@ -6,6 +6,7 @@ type ConversationRuntimeStoreState = {
   activeTurnElapsedMs: number | null;
   activeTurnId: string | null;
   error: string | null;
+  canForkNative: boolean;
   status: AgentRuntimeValue['state'] | 'unavailable';
 };
 
@@ -14,6 +15,7 @@ const runtimeStore = createExternalStore<ConversationRuntimeStoreState>({
   activeTurnElapsedMs: null,
   activeTurnId: null,
   error: null,
+  canForkNative: false,
   status: 'unavailable',
 });
 
@@ -29,12 +31,14 @@ export function setConversationRuntime(runtime: AgentRuntimeValue | null) {
     activeTurnElapsedMs: runtime.activeTurnElapsedMs,
     activeTurnId: runtime.activeTurnId,
     error: runtime.error,
+    canForkNative: runtime.capabilities.session.forkNative,
     status: runtime.state,
   } : {
     activeConversationId: null,
     activeTurnElapsedMs: null,
     activeTurnId: null,
     error: null,
+    canForkNative: false,
     status: 'unavailable',
   });
 }

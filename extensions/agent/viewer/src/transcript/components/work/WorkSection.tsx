@@ -15,12 +15,14 @@ import { formatWorkDuration } from './workDuration.ts';
 export function WorkSection({
   conversationId,
   laneWidth,
+  responseStarted,
   rowId,
   segment,
   turnId,
 }: {
   conversationId: string;
   laneWidth: number;
+  responseStarted: boolean;
   rowId: string;
   segment: AgentWorkRenderSegment;
   turnId: string;
@@ -34,6 +36,7 @@ export function WorkSection({
   const heightRafRef = useRef<number | null>(null);
   const pendingHeightRef = useRef<number | null>(null);
   const isOpen = Boolean(openWork);
+  const completed = segment.state !== 'running';
 
   useEffect(() => {
     if (isOpen) void ensureExecutionScope({ scopeId: segment.scopeId, turnId });
@@ -68,7 +71,6 @@ export function WorkSection({
     };
   }, [isOpen, rowId, setAdditionalHeight, workKey]);
 
-  const completed = segment.state !== 'running';
   return (
     <section className="codex-work-section" data-state={segment.state}>
       <button
@@ -81,22 +83,23 @@ export function WorkSection({
         }}
         type="button"
       >
-        <span className="codex-work-header-chevron">
-          {isOpen ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
-        </span>
         <span className="codex-work-header-title">
           {completed && segment.durationMs !== null
             ? <>Worked for <span className="tabular-nums">{formatWorkDuration(segment.durationMs)}</span></>
             : <WorkingDuration completed={completed} turnId={turnId} />}
         </span>
-        <span className="codex-work-header-status">{segment.state}</span>
+        <span className="codex-work-header-chevron">
+          {isOpen ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
+        </span>
       </button>
       <Separator className="codex-work-separator" />
       {isOpen ? (
         <div className="codex-work-content" ref={contentRef}>
           <ExecutionScopeContent
             conversationId={conversationId}
+            isRunning={!completed}
             laneWidth={laneWidth}
+            responseStarted={responseStarted}
             scopeId={segment.scopeId}
             turnId={turnId}
             workKey={workKey}

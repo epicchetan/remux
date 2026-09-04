@@ -1,6 +1,8 @@
-Status: Active Spec
+Status: Archived
 Last verified: 2026-08-08
 Canonical code: Phase 1A.2a through Phase 1A.2d implementation, automated closeout, clean-state live validation, and owner desktop/physical-phone acceptance are complete in `extensions/agent/`
+Superseded by: `agent-native-provider-runtime-v1.md`. Its bounded transcript,
+artifact, fault, scale, and lifecycle requirements remain retained evidence.
 
 # Agent Phase 1A.2 durable transcript hardening scope
 

@@ -6,9 +6,11 @@ import type {
   AgentTurnRenderFrame,
 } from '../../../../shared/transcript';
 import { MarkdownBlock } from './markdown/MarkdownBlock';
+import { releaseStreamingMarkdownCaches } from './markdown/markdownModel';
 import { ExactContent } from './ExactContent';
 import { useComposerStore } from '../../composer/store.ts';
 import { useConversationRuntimeStore } from '../../conversation/runtimeStore.ts';
+import { useConversationHistoryStore } from '../../conversation/historyStore.ts';
 
 export function AssistantMessage({
   conversationId,
@@ -16,6 +18,8 @@ export function AssistantMessage({
   showActions = false,
   turnStatus,
   turnId,
+  pathEntryId,
+  strandId,
   width,
 }: {
   conversationId?: string | null;
@@ -23,19 +27,31 @@ export function AssistantMessage({
   showActions?: boolean;
   turnStatus: AgentTurnRenderFrame['status'];
   turnId?: string;
+  pathEntryId?: string;
+  strandId?: string;
   width: number;
 }) {
+  const streaming = turnStatus === 'inProgress';
+  useEffect(() => {
+    if (!streaming) {
+      releaseStreamingMarkdownCaches(segment.id);
+      return;
+    }
+    return () => releaseStreamingMarkdownCaches(segment.id);
+  }, [segment.id, streaming]);
   if (!segment.text.trim()) return null;
   return (
     <div className="codex-assistant-message">
-      <MarkdownBlock streaming={turnStatus === 'inProgress'} width={width}>
+      <MarkdownBlock messageCacheKey={segment.id} streaming={streaming} width={width}>
         {segment.text}
       </MarkdownBlock>
       <ExactContent content={segment.content} preview={segment.text} title="response" />
       {showActions && conversationId && turnId ? (
         <AssistantActions
           conversationId={conversationId}
+          pathEntryId={pathEntryId}
           segment={segment}
+          strandId={strandId}
           streaming={turnStatus === 'inProgress'}
           turnId={turnId}
         />
@@ -44,9 +60,11 @@ export function AssistantMessage({
   );
 }
 
-function AssistantActions({ conversationId, segment, streaming, turnId }: {
+function AssistantActions({ conversationId, pathEntryId, segment, strandId, streaming, turnId }: {
   conversationId: string;
+  pathEntryId?: string;
   segment: AgentAssistantMessageSegment;
+  strandId?: string;
   streaming: boolean;
   turnId: string;
 }) {
@@ -55,6 +73,8 @@ function AssistantActions({ conversationId, segment, streaming, turnId }: {
   const startFork = useComposerStore((state) => state.startFork);
   const runtimeConversationId = useConversationRuntimeStore((state) => state.activeConversationId);
   const runtimeStatus = useConversationRuntimeStore((state) => state.status);
+  const canForkNative = useConversationRuntimeStore((state) => state.canForkNative);
+  const summary = useConversationHistoryStore((state) => state.conversationsById[conversationId]);
   const working = runtimeConversationId === conversationId &&
     (runtimeStatus === 'running' || runtimeStatus === 'interrupting');
   useEffect(() => () => {
@@ -79,10 +99,17 @@ function AssistantActions({ conversationId, segment, streaming, turnId }: {
       <button
         aria-label="Fork from response"
         className="codex-user-action-button"
-        disabled={streaming || working}
+        disabled={streaming || working || !canForkNative || !summary}
         onClick={() => {
-          if (streaming || working) return;
-          startFork({ assistantMessageId: segment.id, conversationId, turnId });
+          if (streaming || working || !canForkNative || !summary) return;
+          startFork({
+            assistantMessageId: segment.id,
+            conversationId,
+            turnId,
+            pathEntryId: pathEntryId ?? `legacy-path:${turnId}`,
+            strandId: strandId ?? summary.activeStrandId,
+            headRevision: summary.headRevision,
+          });
         }}
         type="button"
       >

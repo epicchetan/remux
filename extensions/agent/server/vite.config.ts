@@ -9,7 +9,12 @@ export default defineConfig({
     minify: false,
     outDir: 'dist',
     rollupOptions: {
-      external: [/^@earendil-works\//, /^typebox$/],
+      external: [
+        /^@anthropic-ai\/claude-agent-sdk$/,
+        /^@modelcontextprotocol\/sdk(?:\/.*)?$/,
+        /^typebox$/,
+        /^zod(?:\/.*)?$/,
+      ],
       output: {
         entryFileNames: 'main.mjs',
       },

@@ -1,4 +1,4 @@
-import { useMemo, type Ref } from 'react';
+import { useCallback, useMemo, useRef, type Ref } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 
 import type { ExtensionWebViewHandle } from '../surfaces/viewer/ExtensionWebView';
@@ -10,10 +10,11 @@ import { setTabPreviewCaptureTarget } from './tabPreviewCapture';
 
 type ActiveSurfaceProps = {
   onOpenOverview?: (section?: BrowserSection) => Promise<void> | void;
+  surfaceActive: boolean;
   surfaceRef?: Ref<ExtensionWebViewHandle>;
 };
 
-export function ActiveSurface({ onOpenOverview, surfaceRef }: ActiveSurfaceProps) {
+export function ActiveSurface({ onOpenOverview, surfaceActive, surfaceRef }: ActiveSurfaceProps) {
   const theme = useTheme();
   const tabs = useBrowserStore((state) => state.tabs);
   const activeTab = useBrowserStore((state) => (
@@ -22,6 +23,20 @@ export function ActiveSurface({ onOpenOverview, surfaceRef }: ActiveSurfaceProps
   const catalogError = useBrowserStore((state) => state.catalogError);
   const catalogStatus = useBrowserStore((state) => state.catalogStatus);
   const styles = useMemo(() => createStyles(theme), [theme]);
+  const previewTargetRefs = useRef(new Map<
+    string,
+    (view: Parameters<typeof setTabPreviewCaptureTarget>[1]) => void
+  >());
+  const previewTargetRef = useCallback((tabId: string) => {
+    const existing = previewTargetRefs.current.get(tabId);
+    if (existing) return existing;
+    const callback = (view: Parameters<typeof setTabPreviewCaptureTarget>[1]) => {
+      setTabPreviewCaptureTarget(tabId, view);
+      if (!view) previewTargetRefs.current.delete(tabId);
+    };
+    previewTargetRefs.current.set(tabId, callback);
+    return callback;
+  }, []);
 
   if (!activeTab) {
     if (catalogStatus === 'idle' || catalogStatus === 'loading') {
@@ -53,29 +68,28 @@ export function ActiveSurface({ onOpenOverview, surfaceRef }: ActiveSurfaceProps
   return (
     <View style={styles.surfaceHost}>
       {viewerTabs.map((tab) => {
-        const visible = activeTab.kind === 'viewer' && activeTab.id === tab.id;
+        const selected = activeTab.kind === 'viewer' && activeTab.id === tab.id;
+        const interactive = selected && surfaceActive;
         return (
           <View
             key={`${tab.id}:${tab.reloadNonce}`}
-            pointerEvents={visible ? 'auto' : 'none'}
+            pointerEvents={interactive ? 'auto' : 'none'}
             style={[
               styles.extensionSurface,
-              visible ? styles.visibleSurface : styles.hiddenSurface,
+              selected ? styles.visibleSurface : styles.hiddenSurface,
             ]}
           >
             {/* Preview snapshots target this inner view: capturing a subtree
                 ignores the ancestor's opacity, so hidden tabs photograph too. */}
             <View
               collapsable={false}
-              ref={(view) => {
-                setTabPreviewCaptureTarget(tab.id, view);
-              }}
+              ref={previewTargetRef(tab.id)}
               style={styles.captureTarget}
             >
               <ViewerSurface
-                active={visible}
+                active={interactive}
                 onOpenOverview={onOpenOverview}
-                surfaceRef={visible ? surfaceRef : undefined}
+                surfaceRef={selected ? surfaceRef : undefined}
                 tab={tab}
               />
             </View>

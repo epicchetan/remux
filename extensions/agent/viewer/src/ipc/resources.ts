@@ -1,56 +1,86 @@
 import { rpc } from '@remux/viewer-kit/ipc';
 
 import {
-  AGENT_METHODS,
-  type AgentResourceKey,
-  type AgentResourceValue,
-  type ResourceReadResult,
-} from '../../../shared/protocol';
+  NATIVE_AGENT_METHODS,
+  type NativeAgentResourceKey,
+  type NativeAgentResourceReadResult,
+  type NativeAgentResourceValue,
+} from '../../../shared/native-agent-protocol.ts';
 
-export type AgentResourceReadUpdate = {
+export type NativeAgentResourceReadUpdate = {
+  capabilityRevision: string;
   generationChanged: boolean;
-  missing: AgentResourceKey[];
-  serverGeneration: string | null;
-  values: Map<AgentResourceKey, AgentResourceValue>;
+  missing: NativeAgentResourceKey[];
+  serverGeneration: string;
+  values: Map<NativeAgentResourceKey, NativeAgentResourceValue>;
 };
 
 export class AgentResourceReader {
-  private readonly revisions = new Map<AgentResourceKey, number>();
+  private readonly revisions = new Map<NativeAgentResourceKey, number>();
   private generation: string | null = null;
+  private capabilityRevision: string | null = null;
 
   clear() {
     this.revisions.clear();
+    this.generation = null;
+    this.capabilityRevision = null;
   }
 
-  async read(keys: AgentResourceKey[]): Promise<AgentResourceReadUpdate> {
-    const result = await rpc.query<ResourceReadResult>(AGENT_METHODS.resourcesRead, {
-      requests: keys.map((key) => ({
-        key,
-        ...(this.revisions.has(key) ? { ifNoneMatch: this.revisions.get(key) } : {}),
-      })),
-    });
-    const responseGeneration = result.resources[0]?.serverGeneration ?? null;
-    if (this.generation && responseGeneration && this.generation !== responseGeneration) {
+  async read(
+    keys: NativeAgentResourceKey[],
+    options: {
+      focusedConversationId?: string;
+      focusedExecutionId?: string;
+      signal?: AbortSignal;
+      visibility?: 'foreground' | 'background' | 'inactive';
+    } = {},
+  ): Promise<NativeAgentResourceReadUpdate> {
+    const result = await this.request(keys, options, true);
+    const generationChanged = this.generation !== null && this.generation !== result.serverGeneration;
+    const capabilitiesChanged = this.capabilityRevision !== null &&
+      this.capabilityRevision !== result.capabilityRevision;
+    if (generationChanged || capabilitiesChanged) {
       this.revisions.clear();
-      this.generation = responseGeneration;
-      const fresh = await rpc.query<ResourceReadResult>(AGENT_METHODS.resourcesRead, {
-        requests: keys.map((key) => ({ key })),
-      });
-      return this.apply(fresh, true);
+      return this.apply(await this.request(keys, options, false), generationChanged);
     }
     return this.apply(result, false);
   }
 
-  private apply(result: ResourceReadResult, generationChanged: boolean): AgentResourceReadUpdate {
-    const values = new Map<AgentResourceKey, AgentResourceValue>();
-    const missing: AgentResourceKey[] = [];
-    const serverGeneration = result.resources[0]?.serverGeneration ?? null;
+  private request(
+    keys: NativeAgentResourceKey[],
+    options: {
+      focusedConversationId?: string;
+      focusedExecutionId?: string;
+      signal?: AbortSignal;
+      visibility?: 'foreground' | 'background' | 'inactive';
+    },
+    conditional: boolean,
+  ) {
+    const { signal, ...params } = options;
+    return rpc.query<NativeAgentResourceReadResult>(NATIVE_AGENT_METHODS.resourcesRead, {
+      ...(conditional && this.generation ? { knownServerGeneration: this.generation } : {}),
+      ...(conditional && this.capabilityRevision
+        ? { capabilityRevision: this.capabilityRevision }
+        : {}),
+      ...params,
+      requests: keys.map((key) => ({
+        key,
+        ...(conditional && this.revisions.has(key)
+          ? { ifNoneMatch: this.revisions.get(key) }
+          : {}),
+      })),
+    }, { signal });
+  }
 
+  private apply(
+    result: NativeAgentResourceReadResult,
+    generationChanged: boolean,
+  ): NativeAgentResourceReadUpdate {
+    const values = new Map<NativeAgentResourceKey, NativeAgentResourceValue>();
+    const missing: NativeAgentResourceKey[] = [];
+    this.generation = result.serverGeneration;
+    this.capabilityRevision = result.capabilityRevision;
     for (const resource of result.resources) {
-      if (serverGeneration !== null && resource.serverGeneration !== serverGeneration) {
-        throw new Error('Agent resource batch mixed server generations.');
-      }
-      this.generation = resource.serverGeneration;
       if (resource.status === 'missing') {
         this.revisions.delete(resource.key);
         missing.push(resource.key);
@@ -59,7 +89,12 @@ export class AgentResourceReader {
       this.revisions.set(resource.key, resource.revision);
       if (resource.status === 'ok') values.set(resource.key, resource.value);
     }
-
-    return { generationChanged, missing, serverGeneration, values };
+    return {
+      capabilityRevision: result.capabilityRevision,
+      generationChanged,
+      missing,
+      serverGeneration: result.serverGeneration,
+      values,
+    };
   }
 }

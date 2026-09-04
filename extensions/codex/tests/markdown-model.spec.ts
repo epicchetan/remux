@@ -7,6 +7,7 @@ import {
   narrationSourceBlocks,
   narrationSourceDocument,
   parseMarkdownDocument,
+  type MarkdownInline,
 } from '../viewer/transcript/components/markdown/markdownModel';
 
 if (typeof globalThis.OffscreenCanvas === 'undefined') {
@@ -95,6 +96,230 @@ test.describe('markdownModel', () => {
       kind: 'paragraph',
       text: 'live_transcript.rs: filters HTTP APIs and notification-only state.',
     }]);
+  });
+
+  test('parses backslash and dollar display math as measured structural blocks', () => {
+    const observedPrice = [
+      'Before.',
+      '',
+      '\\[',
+      '\\text{observed price} = \\text{slow reference} + \\text{temporary',
+      'impact} + \\text{new information}',
+      '\\]',
+      '',
+      'After.',
+      '',
+      '$$E = mc^2$$',
+    ].join('\n');
+    const blocks = parseMarkdownDocument(observedPrice);
+
+    expect(blocks.map((block) => block.type)).toEqual([
+      'paragraph',
+      'mathDisplay',
+      'paragraph',
+      'mathDisplay',
+    ]);
+    expect(blocks[1]).toMatchObject({
+      math: {
+        delimiter: 'backslashDisplay',
+        tex: expect.stringContaining('\\text{temporary\nimpact}'),
+      },
+      type: 'mathDisplay',
+    });
+    expect(blocks[3]).toMatchObject({
+      math: { delimiter: 'dollarDisplay', tex: 'E = mc^2' },
+      type: 'mathDisplay',
+    });
+
+    const narration = narrationSourceBlocks(observedPrice);
+    expect(narration.map((block) => block.kind)).toEqual([
+      'paragraph',
+      'code',
+      'paragraph',
+      'code',
+    ]);
+    expect(narration[1]?.text).toContain('\\text{observed price}');
+
+    const layout = getMarkdownLayoutDocument(observedPrice, 'default', 360);
+    const displayBlocks = layout.blocks.filter((block) => block.type === 'mathDisplay');
+    expect(displayBlocks).toHaveLength(2);
+    expect(displayBlocks.every((block) => block.html !== null)).toBe(true);
+    expect(displayBlocks.every((block) => block.contentHeight > 0)).toBe(true);
+  });
+
+  test('parses conservative inline math without claiming currency, shell, code, or link destinations', () => {
+    const markdown = [
+      'Use \\(p_t\\), $O(n^2)$, and $5x$.',
+      'Pay $5.00 or $5.00 and $10.00; inspect $HOME and $(command).',
+      'Keep \x60\\(code\\)\x60, https://example.com/$plain$, and [destination](https://example.com/$x$) literal.',
+    ].join('\n');
+    const blocks = parseMarkdownDocument(markdown);
+    expect(blocks).toHaveLength(1);
+    const paragraph = blocks[0];
+    expect(paragraph?.type).toBe('paragraph');
+    if (paragraph?.type !== 'paragraph') throw new Error('Expected paragraph');
+
+    const inlines = paragraph.lines.flatMap((line) => flattenMarkdownInlines(line));
+    expect(inlines.filter((inline) => inline.type === 'math').map((inline) => (
+      inline.type === 'math' ? inline.math.tex : ''
+    ))).toEqual(['p_t', 'O(n^2)', '5x']);
+    expect(narrationSourceBlocks(markdown)[0]?.text).toContain(
+      'Pay $5.00 or $5.00 and $10.00; inspect $HOME and $(command).',
+    );
+    expect(narrationSourceBlocks(markdown)[0]?.text).toContain('https://example.com/$plain$');
+    expect(inlines.some((inline) => inline.type === 'code' && inline.text === '\\(code\\)')).toBe(true);
+  });
+
+  test('keeps math syntax literal in fenced code, raw HTML, and display-unsupported table cells', () => {
+    const markdown = [
+      '\x60\x60\x60tex',
+      '\\[code equation\\]',
+      '\x60\x60\x60',
+      '',
+      '<div>\\(html equation\\)</div>',
+      '',
+      '| Inline | Display |',
+      '| --- | --- |',
+      '| \\(x^2\\) | \\[y^2\\] |',
+    ].join('\n');
+    const blocks = parseMarkdownDocument(markdown);
+
+    expect(blocks.map((block) => block.type)).toEqual(['code', 'paragraph', 'table']);
+    expect(blocks[0]).toMatchObject({ text: '\\[code equation\\]', type: 'code' });
+    expect(narrationSourceBlocks(markdown)[1]?.text).toContain('\\(html equation\\)');
+    const table = blocks[2];
+    expect(table?.type).toBe('table');
+    if (table?.type !== 'table') throw new Error('Expected table');
+    const inlineCell = table.rows[1]?.cells[0]?.lines[0] ?? [];
+    const displayCell = table.rows[1]?.cells[1]?.lines[0] ?? [];
+    expect(flattenMarkdownInlines(inlineCell).some((inline) => inline.type === 'math')).toBe(true);
+    expect(flattenMarkdownInlines(displayCell)).toEqual([
+      { text: '\\[y^2\\]', type: 'text' },
+    ]);
+  });
+
+  test('uses Markdown block context for display math and indented code', () => {
+    const markdown = [
+      'Before \\[a = b\\] after.',
+      '',
+      '    \\[indented code stays literal\\]',
+      '',
+      '> \\[q = r\\]',
+      '',
+      '- item',
+      '',
+      '    \\[s = t\\]',
+      '',
+      '# Heading \\[u = v\\]',
+      '',
+      '[Label \\[w = z\\]](https://example.com)',
+    ].join('\n');
+    const blocks = parseMarkdownDocument(markdown);
+
+    expect(blocks.slice(0, 3).map((block) => block.type)).toEqual([
+      'paragraph',
+      'mathDisplay',
+      'paragraph',
+    ]);
+    expect(blocks[3]).toMatchObject({
+      text: '\\[indented code stays literal\\]',
+      type: 'code',
+    });
+    expect(blocks[4]).toMatchObject({
+      children: [expect.objectContaining({ type: 'mathDisplay' })],
+      type: 'blockquote',
+    });
+    expect(blocks[5]).toMatchObject({
+      items: [{
+        blocks: [
+          expect.objectContaining({ type: 'paragraph' }),
+          expect.objectContaining({ type: 'mathDisplay' }),
+        ],
+      }],
+      type: 'list',
+    });
+    expect(blocks[6]).toMatchObject({ type: 'heading' });
+    expect(blocks[7]).toMatchObject({ type: 'paragraph' });
+    expect(narrationSourceBlocks(markdown).map((block) => block.text)).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining('Heading \\[u = v\\]'),
+        expect.stringContaining('Label \\[w = z\\]'),
+      ]),
+    );
+  });
+
+  test('bounds formula count and source length with exact literal recovery', () => {
+    const many = Array.from({ length: 129 }, (_, index) => `\\(x_${index}\\)`).join(' ');
+    const manyBlock = parseMarkdownDocument(many)[0];
+    expect(manyBlock?.type).toBe('paragraph');
+    if (manyBlock?.type !== 'paragraph') throw new Error('Expected paragraph');
+    const manyInlines = manyBlock.lines.flatMap((line) => flattenMarkdownInlines(line));
+    expect(manyInlines.filter((inline) => inline.type === 'math')).toHaveLength(128);
+    expect(manyInlines.at(-1)).toEqual({ text: ' \\(x_128\\)', type: 'text' });
+
+    const long = `\\(${`x`.repeat(16_385)}\\)`;
+    const longBlock = parseMarkdownDocument(long)[0];
+    expect(longBlock?.type).toBe('paragraph');
+    if (longBlock?.type !== 'paragraph') throw new Error('Expected paragraph');
+    expect(flattenMarkdownInlines(longBlock.lines[0] ?? [])).toEqual([
+      { text: long, type: 'text' },
+    ]);
+  });
+
+  test('keeps incomplete and invalid math readable while streaming', () => {
+    const complete = '\\[\\frac{\\text{😀}}{y}\\]';
+    for (let end = 1; end <= complete.length; end += 1) {
+      const prefix = complete.slice(0, end);
+      expect(() => parseMarkdownDocument(prefix, {
+        cacheScope: { key: 'streaming-math', kind: 'streaming' },
+      })).not.toThrow();
+    }
+    expect(parseMarkdownDocument(complete, {
+      cacheScope: { key: 'streaming-math', kind: 'streaming' },
+    })[0]).toMatchObject({ type: 'mathDisplay' });
+
+    const invalid = getMarkdownLayoutDocument(
+      'Before \\(\\notARealCommand{x}\\) after.',
+      'default',
+      360,
+    );
+    const paragraph = invalid.blocks[0];
+    expect(paragraph?.type).toBe('paragraph');
+    if (paragraph?.type !== 'paragraph') throw new Error('Expected paragraph');
+    expect(paragraph.lines.flatMap((line) => line.fragments).map((fragment) => fragment.text).join(''))
+      .toContain('\\(\\notARealCommand{x}\\)');
+
+    const untrusted = getMarkdownLayoutDocument(
+      'Do not navigate: \\(\\href{javascript:alert(1)}{x}\\).',
+      'default',
+      360,
+    );
+    const untrustedParagraph = untrusted.blocks[0];
+    expect(untrustedParagraph?.type).toBe('paragraph');
+    if (untrustedParagraph?.type !== 'paragraph') throw new Error('Expected paragraph');
+    const untrustedFragments = untrustedParagraph.lines.flatMap((line) => line.fragments);
+    expect(untrustedFragments.every((fragment) => fragment.source.kind === 'text')).toBe(true);
+    expect(untrustedFragments.map((fragment) => fragment.text).join(''))
+      .toContain('\\(\\href{javascript:alert(1)}{x}\\)');
+  });
+
+  test('keeps mutable streaming prefixes out of the durable Markdown layout cache', () => {
+    const completed = getMarkdownLayoutDocument(
+      'A durable completed response with \\(x^2\\).',
+      'default',
+      360,
+    );
+    const streamingSource = '\\[' + 'x + '.repeat(420) + 'y\\]';
+    for (let end = 1; end <= streamingSource.length; end += 7) {
+      getMarkdownLayoutDocument(streamingSource.slice(0, end), 'default', 360, {
+        cacheScope: { key: 'one-mutable-tail', kind: 'streaming' },
+      });
+    }
+    expect(getMarkdownLayoutDocument(
+      'A durable completed response with \\(x^2\\).',
+      'default',
+      360,
+    )).toBe(completed);
   });
 
   test('ends an ordered list before following unindented paragraphs', () => {
@@ -501,6 +726,7 @@ test.describe('markdownModel', () => {
       '[Linked](https://example.com) next word after link',
       '`inlineCode` next word after code',
       '[app.ts](src/app.ts) next word after file chip',
+      'Value \\(x^2\\) next word after math',
       'alpha    beta\tgamma delta',
       'café 😀alpha beta repeated beta',
     ];
@@ -589,6 +815,15 @@ test.describe('markdownModel', () => {
   });
 
 });
+
+function flattenMarkdownInlines(inlines: MarkdownInline[]): MarkdownInline[] {
+  return inlines.flatMap((inline) => {
+    if (inline.type === 'link' || inline.type === 'strong' || inline.type === 'emphasis') {
+      return flattenMarkdownInlines(inline.children);
+    }
+    return [inline];
+  });
+}
 
 function gfmTableMarkdown() {
   return [

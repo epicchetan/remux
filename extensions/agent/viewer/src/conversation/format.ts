@@ -29,6 +29,7 @@ export function formatRelativeTime(timestampMs: number) {
 }
 
 function homeDirectory() {
+  if (typeof document === 'undefined') return null;
   const cwd = document.documentElement.dataset.remuxHome;
   return cwd?.replace(/\\/gu, '/').replace(/\/+$/u, '') || null;
 }

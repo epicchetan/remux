@@ -5,6 +5,7 @@ import {
   transcriptWorkDisclosureKey,
 } from './disclosureKeys';
 import { createExternalStore } from './externalStore';
+import { subscribeMathMetrics } from './components/markdown/mathMetricsStore';
 import { TranscriptMeasureCache } from './layout/measureCache';
 import { reconcileMeasuredTranscript } from './layout/reconcileMeasured';
 import type { TranscriptMeasuredTurn } from './layout/types';
@@ -257,6 +258,13 @@ const layoutStore = createExternalStore<TranscriptLayoutStoreState>({
   turnsById: {},
   width: null,
   ...actions,
+});
+
+subscribeMathMetrics(() => {
+  const resourceSnapshot = resourceAdapter?.getSnapshot();
+  if (resourceSnapshot?.status !== 'ready') return;
+  transcriptMeasureCache.clear();
+  reconcileTranscriptLayoutFromResources(resourceSnapshot, { forceFullMeasure: true });
 });
 
 export const useTranscriptLayoutStore = layoutStore.useStore;

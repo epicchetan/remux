@@ -3,6 +3,7 @@
 //! catalog → icon → root redirect → viewer providers → 404.
 
 pub mod catalog;
+pub mod extension_gateways;
 pub mod icons;
 pub mod media;
 pub mod viewer_bundles;
@@ -14,7 +15,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::Response;
-use axum::routing::get;
+use axum::routing::{any, get};
 use serde_json::Value;
 use tower_http::compression::{
     predicate::{DefaultPredicate, NotForContentType, Predicate},
@@ -34,6 +35,7 @@ pub struct HttpState {
     pub viewer_providers: Vec<ViewerProvider>,
     pub viewer_bundles: Arc<ViewerBundleRegistry>,
     pub media_root: std::path::PathBuf,
+    pub extension_gateways: extension_gateways::ExtensionGatewayRegistry,
 }
 
 pub struct ApiStatusState {
@@ -44,16 +46,42 @@ pub struct ApiStatusState {
     pub port: u16,
 }
 
+#[derive(Clone, Copy)]
+struct NotForExtensionGateway;
+
+impl Predicate for NotForExtensionGateway {
+    fn should_compress<B>(&self, response: &axum::http::Response<B>) -> bool
+    where
+        B: hyper::body::Body,
+    {
+        response
+            .extensions()
+            .get::<extension_gateways::GatewayResponse>()
+            .is_none()
+    }
+}
+
 /// Keep byte-addressable media out of the global response compression layer.
 /// Compressing an audio response changes its representation and causes
 /// `CompressionLayer` to remove `Accept-Ranges` and `Content-Length`.
 pub fn compression_layer() -> CompressionLayer<impl Predicate> {
-    CompressionLayer::new()
-        .compress_when(DefaultPredicate::new().and(NotForContentType::const_new("audio/")))
+    CompressionLayer::new().compress_when(
+        DefaultPredicate::new()
+            .and(NotForContentType::const_new("audio/"))
+            .and(NotForExtensionGateway),
+    )
 }
 
 pub fn build_router(state: Arc<HttpState>) -> axum::Router {
     axum::Router::new()
+        .route(
+            "/remux/extensions/{extension_id}/gateway",
+            any(handle_extension_gateway),
+        )
+        .route(
+            "/remux/extensions/{extension_id}/gateway/{*path}",
+            any(handle_extension_gateway),
+        )
         .fallback(handle_request)
         .with_state(state)
 }
@@ -73,8 +101,23 @@ pub fn build_router_with_status(
                 }
             }),
         )
+        .route(
+            "/remux/extensions/{extension_id}/gateway",
+            any(handle_extension_gateway),
+        )
+        .route(
+            "/remux/extensions/{extension_id}/gateway/{*path}",
+            any(handle_extension_gateway),
+        )
         .fallback(handle_request)
         .with_state(state)
+}
+
+async fn handle_extension_gateway(
+    State(state): State<Arc<HttpState>>,
+    request: axum::extract::Request,
+) -> Response {
+    extension_gateways::handle_request(&state.extension_gateways, request).await
 }
 
 async fn handle_request(

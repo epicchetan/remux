@@ -12,6 +12,8 @@ import {
   autoScrollModeForStreamingTurn,
   initialTranscriptScrollTarget,
   nativeScrollOwnsTranscriptViewport,
+  nextUserMessageScrollAnchor,
+  previousUserMessageScrollAnchor,
   resolveInitialTranscriptScrollTarget,
   resolveSentMessageScroll,
   transcriptMessageAnchorTopOffset,
@@ -55,6 +57,30 @@ test('measures turn prefixes and reserves actions for the latest user message', 
     layout.totalCollapsedHeight,
     layout.turns.reduce((total, turn) => total + turn.collapsedHeight, 0),
   );
+});
+
+test('includes attachment rails in virtual user-message heights', () => {
+  const textOnly = measureCollapsedTranscript({
+    turns: [frame('turn-text', [user('user-text', 'Use this image')])],
+    width: 600,
+  }).turns[0]?.rows[0]?.height;
+  const textAndImage = measureCollapsedTranscript({
+    turns: [frame('turn-image', [imageUser('user-image', 'Use this image')])],
+    width: 600,
+  }).turns[0]?.rows[0]?.height;
+  const imageOnly = measureCollapsedTranscript({
+    turns: [frame('turn-image-only', [imageUser('user-image-only', '')])],
+    width: 600,
+  }).turns[0]?.rows[0]?.height;
+
+  assert.equal(textAndImage, (textOnly ?? 0) + 62 + transcriptLayout.user.bubbleGap);
+  assert.equal(imageOnly,
+    62 +
+    transcriptLayout.user.bubblePaddingY * 2 +
+    transcriptLayout.user.bubbleBorderWidth * 2 +
+    transcriptLayout.user.actionTopGap +
+    transcriptLayout.user.actionHeight +
+    transcriptLayout.row.defaultGap);
 });
 
 test('reuses cached measurements for an unchanged frame revision', () => {
@@ -103,6 +129,76 @@ test('preserves sent-message identity and never steals manual scroll during stre
     nearBottom: true,
     streamingTurnId: 'turn',
   }), { type: 'bottom' });
+});
+
+test('navigates compact transcript tails by user-message identity instead of clamped scroll position', () => {
+  const anchors = [
+    { contentBottom: 150, contentTop: 124, segmentId: 'user-1', scrollTop: 100, turnId: 'turn-1' },
+    { contentBottom: 270, contentTop: 244, segmentId: 'user-2', scrollTop: 220, turnId: 'turn-2' },
+    { contentBottom: 390, contentTop: 364, segmentId: 'user-3', scrollTop: 340, turnId: 'turn-3' },
+  ];
+
+  assert.deepEqual(previousUserMessageScrollAnchor({
+    anchors,
+    atBottom: true,
+    scrollTop: 300,
+  }), anchors[1]);
+  assert.deepEqual(previousUserMessageScrollAnchor({
+    anchors,
+    atBottom: false,
+    currentSegmentId: 'user-3',
+    scrollTop: 340,
+  }), anchors[1]);
+  assert.deepEqual(nextUserMessageScrollAnchor({
+    anchors,
+    atBottom: false,
+    currentSegmentId: 'user-2',
+    maxScrollTop: 400,
+    scrollTop: 220,
+  }), anchors[2]);
+  assert.equal(nextUserMessageScrollAnchor({
+    anchors,
+    atBottom: false,
+    currentSegmentId: 'user-3',
+    maxScrollTop: 400,
+    scrollTop: 340,
+  }), null);
+});
+
+test('next-turn navigation does not manufacture runway for an unreachable message anchor', () => {
+  const anchors = [
+    { contentBottom: 120, contentTop: 60, segmentId: 'user-1', scrollTop: 36, turnId: 'turn-1' },
+    { contentBottom: 250, contentTop: 190, segmentId: 'user-2', scrollTop: 166, turnId: 'turn-2' },
+    { contentBottom: 380, contentTop: 320, segmentId: 'user-3', scrollTop: 296, turnId: 'turn-3' },
+  ];
+
+  assert.equal(nextUserMessageScrollAnchor({
+    anchors,
+    atBottom: false,
+    currentSegmentId: 'user-1',
+    maxScrollTop: 150,
+    scrollTop: 36,
+  }), null, 'an anchor beyond the natural bottom is represented by the bottom destination instead');
+});
+
+test('previous-turn navigation skips every user message already visible at the compact tail', () => {
+  const anchors = [
+    { contentBottom: 120, contentTop: 60, segmentId: 'user-1', scrollTop: 36, turnId: 'turn-1' },
+    { contentBottom: 250, contentTop: 190, segmentId: 'user-2', scrollTop: 166, turnId: 'turn-2' },
+    { contentBottom: 380, contentTop: 320, segmentId: 'user-3', scrollTop: 296, turnId: 'turn-3' },
+    { contentBottom: 510, contentTop: 450, segmentId: 'user-4', scrollTop: 426, turnId: 'turn-4' },
+  ];
+
+  assert.deepEqual(previousUserMessageScrollAnchor({
+    anchors,
+    atBottom: true,
+    scrollTop: 180,
+  }), anchors[0], 'visible tail messages are skipped in favor of the newest fully hidden row');
+  assert.equal(previousUserMessageScrollAnchor({
+    anchors,
+    atBottom: true,
+    scrollTop: 0,
+  }), null, 'Up is unavailable when every user message is already in view');
 });
 
 test('discards a rejected message anchor without disturbing the draft conversation', () => {
@@ -178,7 +274,6 @@ test('holds a pinned sent-message anchor with runway after content collapses', (
     naturalMaxScrollTop: 420,
     phase: 'anchored',
     runwayHeight: 0,
-    viewportGrew: false,
     wasPinned: true,
   }), {
     phase: 'anchored',
@@ -187,34 +282,84 @@ test('holds a pinned sent-message anchor with runway after content collapses', (
   });
 });
 
-test('releases a premature sent-message anchor when the viewport grows', () => {
+test('keeps an established sent-message anchor pinned when the viewport grows', () => {
   assert.deepEqual(resolveSentMessageScroll({
     currentScrollTop: 500,
     desiredScrollTop: 500,
     naturalMaxScrollTop: 420,
     phase: 'anchored',
     runwayHeight: 80,
-    viewportGrew: true,
     wasPinned: true,
+  }), {
+    phase: 'anchored',
+    runwayHeight: 80,
+    scrollTop: 500,
+  });
+});
+
+test('does not establish a new message pin during a transient viewport resize', () => {
+  assert.deepEqual(resolveSentMessageScroll({
+    anchorActivationAllowed: false,
+    currentScrollTop: 560,
+    desiredScrollTop: 500,
+    naturalMaxScrollTop: 600,
+    phase: 'catching-up',
+    runwayHeight: 0,
+    wasPinned: false,
   }), {
     phase: 'catching-up',
     runwayHeight: 0,
-    scrollTop: 420,
+    scrollTop: 560,
+  });
+  assert.deepEqual(resolveSentMessageScroll({
+    anchorActivationAllowed: true,
+    currentScrollTop: 560,
+    desiredScrollTop: 500,
+    naturalMaxScrollTop: 600,
+    phase: 'catching-up',
+    runwayHeight: 0,
+    wasPinned: false,
+  }), {
+    phase: 'anchored',
+    runwayHeight: 0,
+    scrollTop: 500,
   });
 });
 
 test('resolves initial transcript placement to an exact message anchor or sticky bottom', () => {
   const anchors = [
-    { segmentId: 'user-1', scrollTop: 120, turnId: 'turn-1' },
-    { segmentId: 'user-2', scrollTop: 640, turnId: 'turn-2' },
+    { contentBottom: 170, contentTop: 144, segmentId: 'user-1', scrollTop: 120, turnId: 'turn-1' },
+    { contentBottom: 690, contentTop: 664, segmentId: 'user-2', scrollTop: 640, turnId: 'turn-2' },
   ];
-  assert.deepEqual(initialTranscriptScrollTarget({ anchors, streamingTurnId: 'turn-1' }), {
-    mode: { type: 'off' },
+  const streamingTarget = initialTranscriptScrollTarget({
+    anchors,
+    conversationId: 'conversation',
+    streamingTurnId: 'turn-1',
+  });
+  assert.deepEqual(streamingTarget, {
+    mode: {
+      phase: 'catching-up',
+      segmentId: 'user-1',
+      conversationId: 'conversation',
+      type: 'sent-message-anchor',
+      turnId: 'turn-1',
+    },
     scrollTop: 120,
   });
   assert.deepEqual(resolveInitialTranscriptScrollTarget({
+    maxScrollTop: 80,
+    target: streamingTarget,
+  }), {
+    mode: streamingTarget?.mode,
+    scrollTop: 80,
+  });
+  assert.deepEqual(resolveInitialTranscriptScrollTarget({
     maxScrollTop: 500,
-    target: initialTranscriptScrollTarget({ anchors, streamingTurnId: null }),
+    target: initialTranscriptScrollTarget({
+      anchors,
+      conversationId: 'conversation',
+      streamingTurnId: null,
+    }),
   }), {
     mode: { type: 'bottom' },
     scrollTop: 500,
@@ -259,6 +404,26 @@ function frame(id: string, segments: AgentTurnSegment[]): AgentTurnRenderFrame {
 
 function user(id: string, text: string): AgentTurnSegment {
   return { id, type: 'userMessage', clientMessageId: null, revision: '1', text };
+}
+
+function imageUser(id: string, text: string): AgentTurnSegment {
+  return {
+    id,
+    type: 'userMessage',
+    clientMessageId: null,
+    revision: '1',
+    text,
+    parts: [
+      ...(text ? [{ text, type: 'text' as const }] : []),
+      {
+        artifactHash: 'a'.repeat(64),
+        mimeType: 'image/png',
+        name: 'fixture.png',
+        sizeBytes: 1,
+        type: 'image' as const,
+      },
+    ],
+  };
 }
 
 function assistant(id: string, text: string): AgentTurnSegment {

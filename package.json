@@ -7,7 +7,6 @@
     "packages/*"
   ],
   "scripts": {
-    "postinstall": "node scripts/install-pi-provider-preflight.mjs",
     "dev": "cargo run -p remux -- start --foreground",
     "build:runtime": "cargo build --release -p remux",
     "app:typecheck": "npm --workspace @remux/app run typecheck",

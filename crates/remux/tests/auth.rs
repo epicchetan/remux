@@ -52,11 +52,13 @@ fn fixture_extension(root: &std::path::Path) -> ExtensionManifest {
             title: "Fixture".to_string(),
         },
         server: None,
+        gateway: None,
         views: vec![(
             "main".to_string(),
             View {
                 cache: Default::default(),
                 entry: dist.join("index.html"),
+                host_chrome: Default::default(),
                 route: "/viewers/fixture".to_string(),
                 build: None,
                 watch: None,
@@ -80,6 +82,9 @@ async fn serve(root: &std::path::Path, require: bool) -> Harness {
     let journal = Journal::new(root, 1, Arc::new(StdTerminal)).unwrap();
     let viewer_bundles = ViewerBundleRegistry::new(root, &[extension.clone()], journal);
     viewer_bundles.publish_all().await;
+    let extension_gateways =
+        remux::http::extension_gateways::ExtensionGatewayRegistry::new(root, &[extension.clone()])
+            .unwrap();
     let state = Arc::new(HttpState {
         viewer_providers: ViewerProvider::for_extension(&extension, viewer_bundles.clone()),
         viewer_bundles,
@@ -87,6 +92,7 @@ async fn serve(root: &std::path::Path, require: bool) -> Harness {
         extensions: vec![extension],
         invalid_extensions: Vec::new(),
         media_root: root.join(".remux/cache/media"),
+        extension_gateways,
     });
     let router = Arc::new(RpcRouter::new(
         Vec::new(),

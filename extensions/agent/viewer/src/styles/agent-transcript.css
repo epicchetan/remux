@@ -1,0 +1,341 @@
+/* Transcript presentation. The measured virtualizer remains the layout owner. */
+
+.codex-transcript-content {
+  color: color-mix(in srgb, var(--agent-text) 90%, transparent);
+}
+
+.codex-transcript-row-userMessage,
+.codex-transcript-row-assistantMessage {
+  padding-bottom: var(--remux-block-gap);
+}
+
+.codex-user-bubble {
+  max-width: 80%;
+  gap: 8px;
+  border: 0;
+  border-radius: 16px;
+  background: var(--agent-message-surface);
+  color: var(--agent-text);
+  font-size: var(--agent-prose-size);
+  line-height: var(--agent-prose-line);
+  padding: 12px 14px;
+}
+
+.codex-user-message-work .codex-user-bubble,
+.codex-user-message-work .codex-user-bubble-with-rail {
+  max-width: 80%;
+  width: auto;
+}
+
+.codex-user-bubble-with-rail {
+  width: min(100%, 640px);
+}
+
+.codex-user-actions,
+.codex-assistant-actions {
+  height: 40px;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.codex-user-action-button {
+  width: 40px;
+  height: 40px;
+  color: color-mix(in srgb, var(--agent-text-muted) 90%, transparent);
+}
+
+.codex-assistant-message .codex-markdown,
+.codex-user-bubble .codex-markdown {
+  color: color-mix(in srgb, var(--agent-text) 90%, transparent);
+  font-size: var(--agent-prose-size);
+  line-height: var(--agent-prose-line);
+}
+
+.codex-assistant-message .codex-md-paragraph,
+.codex-user-bubble .codex-md-paragraph {
+  font-size: var(--agent-prose-size);
+  line-height: var(--agent-prose-line);
+}
+
+.codex-markdown-work,
+.codex-markdown-work .codex-md-paragraph {
+  font-size: var(--agent-work-size);
+  line-height: var(--agent-work-line);
+}
+
+.codex-md-heading {
+  color: var(--agent-text);
+  font-weight: 600;
+}
+
+.codex-md-heading[data-depth="1"] {
+  font-size: 16px;
+  line-height: 22px;
+}
+
+.codex-md-heading[data-depth="2"] {
+  font-size: 15px;
+  line-height: 21px;
+}
+
+.codex-md-heading[data-depth="3"] {
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.codex-markdown-work .codex-md-heading[data-depth="1"] {
+  font-size: 16px;
+  line-height: 22px;
+}
+
+.codex-markdown-work .codex-md-heading[data-depth="2"] {
+  font-size: 15px;
+  line-height: 21px;
+}
+
+.codex-markdown-work .codex-md-heading[data-depth="3"] {
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.codex-md-blockquote {
+  border-left-width: 2px;
+  border-left-color: color-mix(in srgb, var(--agent-text-muted) 44%, transparent);
+  color: var(--agent-text-muted);
+  padding-left: 13px;
+}
+
+.codex-md-inline-code {
+  border-color: var(--agent-border-strong);
+  background: var(--agent-surface-raised);
+  color: var(--agent-text);
+}
+
+.codex-md-code-block,
+.codex-work-output {
+  border-color: var(--agent-border-strong);
+  background: var(--agent-code-surface);
+}
+
+.codex-md-table {
+  border-color: var(--agent-border-strong);
+  border-radius: 12px;
+}
+
+.codex-md-table-cell:not(:last-child),
+.codex-md-table-row:not(:last-child) .codex-md-table-cell {
+  border-color: var(--agent-border-strong);
+}
+
+.codex-md-table-row[data-header="true"] .codex-md-table-cell {
+  background: var(--agent-surface-raised);
+}
+
+.codex-md-line-link,
+.codex-markdown a {
+  color: var(--link);
+  font-weight: 500;
+}
+
+.codex-work-header {
+  height: 28px;
+  gap: 6px;
+  color: var(--agent-text-muted);
+  font-size: var(--agent-work-size);
+  font-weight: 400;
+  line-height: var(--agent-work-line);
+  padding-inline: 0 2px;
+}
+
+.codex-work-header-chevron {
+  order: 3;
+  width: 20px;
+  color: color-mix(in srgb, var(--agent-text-muted) 80%, transparent);
+}
+
+.codex-work-separator {
+  margin-top: 4px;
+  background: color-mix(in srgb, var(--agent-text) 7%, transparent);
+}
+
+.codex-work-content {
+  gap: 8px;
+  padding-top: 8px;
+}
+
+.agent-execution-scope,
+.agent-inference-list {
+  gap: 8px;
+}
+
+.agent-inference {
+  gap: 6px;
+}
+
+.agent-commentary-block {
+  color: color-mix(in srgb, var(--agent-text) 88%, transparent);
+}
+
+.agent-reasoning-block {
+  color: var(--agent-text-muted);
+}
+
+.agent-reasoning-parts {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.agent-reasoning-part {
+  min-width: 0;
+}
+
+.agent-notice-block {
+  color: var(--agent-text-secondary);
+}
+
+.agent-work-compaction-divider {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  color: var(--agent-text-muted);
+  font-size: var(--agent-work-size);
+  line-height: var(--agent-work-line);
+  padding-block: 4px;
+}
+
+.agent-work-compaction-divider[data-state='failed'] {
+  color: var(--destructive);
+}
+
+.agent-work-compaction-divider-transcript {
+  min-height: 32px;
+  padding-block: 4px;
+}
+
+.agent-work-compaction-rule {
+  height: 1px;
+  min-width: 12px;
+  flex: 1 1 auto;
+  background: var(--border);
+}
+
+.agent-work-compaction-label {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.agent-reasoning-block .codex-markdown,
+.agent-reasoning-block .codex-md-paragraph,
+.agent-reasoning-block .codex-md-heading,
+.agent-reasoning-block .codex-md-inline-strong {
+  color: inherit;
+}
+
+.agent-reasoning-block .codex-md-inline-strong {
+  font-weight: 500;
+}
+
+.agent-action-run-header,
+.codex-work-row {
+  min-height: 28px;
+  gap: 7px;
+  border-radius: 7px;
+  color: var(--agent-text-muted);
+  font-size: var(--agent-work-size);
+  line-height: var(--agent-work-line);
+  padding: 3px 4px 3px 0;
+}
+
+.codex-work-row:not(:disabled):hover {
+  background: color-mix(in srgb, var(--agent-text) 4%, transparent);
+}
+
+.codex-work-row-title {
+  color: color-mix(in srgb, var(--agent-text) 82%, transparent);
+  font-size: var(--agent-work-size);
+  line-height: var(--agent-work-line);
+}
+
+.codex-work-row-meta {
+  color: var(--agent-text-muted);
+  font-size: var(--agent-meta-size);
+  line-height: var(--agent-meta-line);
+}
+
+.codex-work-row-icon {
+  width: 20px;
+  color: var(--agent-text-muted);
+  justify-items: start;
+}
+
+.agent-tool-call[data-state="completed"] .codex-work-row-icon {
+  color: var(--agent-text-muted);
+}
+
+.codex-work-row-detail {
+  margin-left: 8px;
+  border-left: 1px solid var(--agent-border-strong);
+  padding: 6px 6px 10px 20px;
+}
+
+.agent-tool-call-header[aria-expanded="true"] > svg:last-child {
+  transform: none;
+}
+
+.agent-child-execution-header {
+  min-height: 40px;
+  gap: 8px;
+  border-radius: 8px;
+  color: var(--agent-text-muted);
+  padding: 4px 4px 4px 0;
+}
+
+.agent-child-execution-header:hover {
+  background: color-mix(in srgb, var(--agent-text) 4%, transparent);
+}
+
+.agent-child-execution-boundary {
+  color: color-mix(in srgb, var(--agent-text) 88%, transparent);
+  font-size: var(--agent-work-size);
+  line-height: var(--agent-work-line);
+}
+
+.agent-child-execution-meta {
+  color: var(--agent-text-muted);
+  font-size: var(--agent-meta-size);
+  line-height: var(--agent-meta-line);
+  padding-left: 27px;
+}
+
+.agent-child-execution-content {
+  margin-left: 8px;
+  border-left: 1px solid var(--agent-border-strong);
+  padding: 6px 0 10px 20px;
+}
+
+.agent-scope-empty,
+.codex-work-loading {
+  min-height: 28px;
+  margin: 0;
+  color: var(--agent-text-muted);
+  font-size: var(--agent-work-size);
+  line-height: var(--agent-work-line);
+}
+
+@media (max-width: 639px) {
+  .codex-user-bubble,
+  .codex-user-message-work .codex-user-bubble,
+  .codex-user-message-work .codex-user-bubble-with-rail {
+    max-width: 88%;
+  }
+
+  .codex-user-action-button {
+    width: 40px;
+    height: 40px;
+  }
+}

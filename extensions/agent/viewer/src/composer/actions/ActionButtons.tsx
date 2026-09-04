@@ -1,9 +1,13 @@
 import { ArrowDown, ArrowLeft, ArrowUp, Check, History, Loader2, PanelRightOpen, Send, Square } from 'lucide-react';
 import { openHostOverview } from '@remux/viewer-kit/host';
 
+import type { AgentProvidersResource, AgentRuntimeResource } from '../../../../shared/native-agent-protocol.ts';
+import type { ProviderAccess } from '../../../../shared/provider-runtime.ts';
+import type { ReasoningLevel } from '../../../../shared/protocol.ts';
 import { parentDirectory } from '../../conversation/format.ts';
 import { useAgentSidebarStore } from '../../conversation/sidebarStore.ts';
 import { useConversationStore } from '../../conversation/store.ts';
+import { useComposerStore } from '../store.ts';
 import { useTranscriptViewportControls } from '../../transcript/index.ts';
 import { ComposerAttachmentButton } from '../attachments/AttachmentButton.tsx';
 import { ComposerConfigButton } from '../config/ConfigButton.tsx';
@@ -13,29 +17,41 @@ import type { ComposerEditTarget, ComposerForkTarget } from '../store.ts';
 
 export function ComposerActionButtons({
   canStart,
-  contextOpen,
   conversationExists,
   isWorking,
   onInterrupt,
+  onCompact,
   onEdit,
   onFork,
   onSend,
-  onSignOut,
-  onToggleContext,
+  onProviderLogin,
+  onProviderLogout,
+  onPreferenceChange,
+  onAccessChange,
+  providers,
+  runtime,
 }: {
   canStart: boolean;
-  contextOpen: boolean;
   conversationExists: boolean;
   isWorking: boolean;
   onInterrupt: () => Promise<void>;
+  onCompact: () => Promise<void>;
   onEdit: ComposerBranchCallback<ComposerEditTarget>;
   onFork: ComposerBranchCallback<ComposerForkTarget>;
   onSend: (
     input: TurnSubmissionInput,
     setPhase: (phase: 'sending' | 'updating-transcript') => void,
   ) => Promise<void>;
-  onSignOut: () => void;
-  onToggleContext: () => void;
+  onProviderLogin: (providerInstanceId: string, mode: 'device-code' | 'browser') => void;
+  onProviderLogout: (providerInstanceId: string) => void;
+  onPreferenceChange: (input: {
+    providerInstanceId: string;
+    modelId: string;
+    reasoning: ReasoningLevel;
+  }) => Promise<void>;
+  onAccessChange: (access: ProviderAccess) => Promise<void>;
+  providers: AgentProvidersResource | null;
+  runtime: AgentRuntimeResource | null;
 }) {
   const { canScrollDown, canScrollUp, scrollDown, scrollUp } = useTranscriptViewportControls();
   const openMobileSidebar = useAgentSidebarStore((state) => state.openMobile);
@@ -43,7 +59,31 @@ export function ComposerActionButtons({
   const pickerPath = useConversationStore((state) => state.directoryPickerPath);
   const setPickerPath = useConversationStore((state) => state.setDirectoryPickerPath);
   const selectPickerPath = useConversationStore((state) => state.selectDirectoryPickerPath);
-  const turn = useComposerTurnAction({ canStart, conversationExists, isWorking, onEdit, onFork, onInterrupt, onSend });
+  const selectedProviderInstanceId = useComposerStore((state) => state.providerInstanceId);
+  const providerCapabilities = runtime?.capabilities
+    ?? providers?.providers.find(({ providerInstanceId }) =>
+      providerInstanceId === selectedProviderInstanceId)?.capabilities;
+  const canSteerCurrentConfiguration = Boolean(
+    isWorking && runtime?.capabilities.turns.steer &&
+    runtime.composer.nextTurn.model === runtime.activeConfiguration.model &&
+    runtime.composer.nextTurn.effort === runtime.activeConfiguration.effort,
+  );
+  const canSubmitAtCurrentBoundary = !isWorking || Boolean(
+    runtime && (runtime.capabilities.turns.queue || canSteerCurrentConfiguration),
+  );
+  const turn = useComposerTurnAction({
+    canStart: canStart && canSubmitAtCurrentBoundary,
+    conversationExists,
+    isWorking,
+    onEdit,
+    onFork,
+    onInterrupt,
+    onSend,
+    runtime,
+    imagesEnabled: providerCapabilities?.content.images === true,
+    fileReferencesEnabled: providerCapabilities?.content.fileReferences === true,
+    branchEnabled: runtime?.capabilities.session.forkNative === true,
+  });
   const parent = parentDirectory(pickerPath);
 
   const left: ComposerAction[] = [{
@@ -70,17 +110,23 @@ export function ComposerActionButtons({
       <div className="remux-composer-action-group">
         {left.map((action) => <ComposerActionKey action={action} key={action.label} />)}
         <ComposerConfigButton
-          contextOpen={contextOpen}
-          conversationExists={conversationExists}
           disabled={pickerOpen}
-          onSignOut={onSignOut}
-          onToggleContext={onToggleContext}
+          onProviderLogin={onProviderLogin}
+          onProviderLogout={onProviderLogout}
+          onCompact={onCompact}
+          onPreferenceChange={onPreferenceChange}
+          onAccessChange={onAccessChange}
+          conversationExists={conversationExists}
+          providers={providers}
+          runtime={runtime}
         />
       </div>
       <div className="remux-composer-action-group remux-composer-action-group-right">
         {navigation.map((action) => <ComposerActionKey action={action} key={action.label} />)}
-        {!pickerOpen ? <ComposerAttachmentButton /> : null}
-        {!pickerOpen && isWorking ? <ComposerActionKey action={{
+        {!pickerOpen ? <ComposerAttachmentButton
+          imagesEnabled={providerCapabilities?.content.images === true}
+        /> : null}
+        {!pickerOpen && isWorking && runtime?.capabilities.turns.interrupt ? <ComposerActionKey action={{
           busy: turn.isStopping,
           disabled: turn.isStopping,
           icon: turn.isStopping ? <Loader2 className="size-4 animate-spin" /> : <Square className="size-4 fill-current" />,
@@ -97,7 +143,7 @@ export function ComposerActionButtons({
               ? 'Save edited message'
               : turn.forkTarget
                 ? 'Send forked message'
-                : isWorking ? 'Queue message' : 'Send message',
+              : isWorking && !canSteerCurrentConfiguration ? 'Queue message' : 'Send message',
           onClick: turn.handleSend,
           tone: 'send',
         }} /> : null}

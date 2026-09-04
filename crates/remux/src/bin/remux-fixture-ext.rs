@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::os::unix::fs::PermissionsExt;
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
@@ -98,6 +99,24 @@ fn main() {
         });
     }
 
+    let _gateway_listener = if env_flag("FIXTURE_GATEWAY_READY") {
+        let path = std::env::var("REMUX_EXTENSION_GATEWAY_SOCKET")
+            .expect("gateway fixture requires REMUX_EXTENSION_GATEWAY_SOCKET");
+        let listener = std::os::unix::net::UnixListener::bind(&path)
+            .expect("gateway fixture failed to bind its Unix socket");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("gateway fixture failed to permission its Unix socket");
+        emit(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "fixture-gateway-ready",
+            "method": "remux/extension/gatewayReady",
+            "params": { "gatewayReady": true },
+        }));
+        Some(listener)
+    } else {
+        None
+    };
+
     let stdin = std::io::stdin();
     let mut outbound = HashMap::<String, serde_json::Value>::new();
     let mut outbound_sequence = 1u64;
@@ -116,6 +135,12 @@ fn main() {
             .unwrap_or_default()
             .to_string();
         let params = message.get("params").cloned();
+
+        if method.is_empty()
+            && id.as_ref().and_then(|id| id.as_str()) == Some("fixture-gateway-ready")
+        {
+            continue;
+        }
 
         if method.is_empty() {
             if let Some(original_id) = message

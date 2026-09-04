@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 
-import type { ModelsValue, ReasoningLevel, TurnContextPlan } from '../../../shared/protocol.ts';
-import { createDefaultTurnContextPlan } from './context/contextPlan.ts';
+import type { ModelsValue, ReasoningLevel } from '../../../shared/protocol.ts';
+import type { ProviderAccess } from '../../../shared/provider-runtime.ts';
 import { preferredReasoning, resolveModel } from './config/modelSelection.ts';
 import {
   createEmptyComposerSnapshot,
@@ -17,6 +17,9 @@ export type ComposerAttachmentPickerKind = 'photo-library' | 'files';
 export type ComposerEditTarget = {
   conversationId: string;
   turnId: string;
+  strandId: string;
+  pathEntryId: string;
+  headRevision: number;
   userMessageId: string;
 };
 
@@ -24,6 +27,9 @@ export type ComposerForkTarget = {
   assistantMessageId: string;
   conversationId: string;
   turnId: string;
+  strandId: string;
+  pathEntryId: string;
+  headRevision: number;
 };
 
 export type ComposerSubmissionKind = 'edit' | 'fork' | 'new-chat' | 'send';
@@ -40,7 +46,6 @@ export type ComposerSubmission = {
   modelId: string;
   phase: ComposerSubmissionPhase;
   snapshot: ComposerSnapshot;
-  contextPlan: TurnContextPlan;
   reasoning: ReasoningLevel;
   turnId: string | null;
 };
@@ -65,7 +70,6 @@ type ComposerStoreState = {
     modelId?: string;
     phase: ComposerSubmissionPhase;
     snapshot?: ComposerSnapshot;
-    contextPlan?: TurnContextPlan;
     reasoning?: ReasoningLevel;
     turnId?: string | null;
   }) => ComposerSubmission;
@@ -76,27 +80,27 @@ type ComposerStoreState = {
   clearMode: () => void;
   clearSubmission: (id?: number) => void;
   composerPresentationRequest: ComposerPresentationRequest;
-  contextPlan: TurnContextPlan;
   editTarget: ComposerEditTarget | null;
   failSubmission: (id: number, message: string) => void;
   focusComposer: () => void;
   forkTarget: ComposerForkTarget | null;
   isSubmitting: boolean;
   mentionSession: ComposerMentionSession | null;
+  access: ProviderAccess;
   modelId: string;
   models: ModelsValue | null;
   openAttachmentPicker: (kind?: ComposerAttachmentPickerKind) => void;
   preEditSnapshot: ComposerSnapshot | null;
-  preserveContextPlan: boolean;
   reasoning: ReasoningLevel;
+  providerInstanceId: string;
+  setAccess: (access: ProviderAccess) => void;
   setComposerDocument: (document: ComposerDocument, resources?: ComposerAttachmentResource[]) => void;
-  setContextPlan: (contextPlan: TurnContextPlan) => void;
   setDocument: (document: ComposerDocument, resources?: ComposerAttachmentResource[]) => void;
   setEditorController: (controller: ComposerEditorController | null) => void;
   setMentionSession: (session: ComposerMentionSession | null) => void;
   setModelId: (modelId: string) => void;
+  setProviderInstanceId: (providerInstanceId: string) => void;
   setModels: (models: ModelsValue) => void;
-  setPreserveContextPlan: (preserve: boolean) => void;
   setReasoning: (reasoning: ReasoningLevel) => void;
   setSnapshot: (snapshot: ComposerSnapshot) => void;
   setSubmissionConversation: (id: number, conversationId: string) => void;
@@ -116,7 +120,6 @@ let submissionId = 0;
 export const useComposerStore = create<ComposerStoreState>((set, get) => ({
   beginSubmission: ({
     conversationId = null,
-    contextPlan = get().contextPlan,
     kind,
     modelId = get().modelId,
     phase,
@@ -131,7 +134,6 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
       modelId,
       phase,
       snapshot,
-      contextPlan,
       reasoning,
       turnId,
     };
@@ -165,7 +167,6 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
       : { isSubmitting: false, submission: null }
   )),
   composerPresentationRequest: { id: 0, reason: 'edit' },
-  contextPlan: createDefaultTurnContextPlan(),
   editTarget: null,
   failSubmission: (id, message) => set((state) => state.submission?.id === id
     ? {
@@ -178,14 +179,15 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
   forkTarget: null,
   isSubmitting: false,
   mentionSession: null,
+  access: 'workspace-write',
   modelId: '',
   models: null,
   openAttachmentPicker: noop,
   preEditSnapshot: null,
-  preserveContextPlan: false,
   reasoning: 'high',
+  providerInstanceId: '',
+  setAccess: (access) => set({ access }),
   setComposerDocument: noopSetDocument,
-  setContextPlan: (contextPlan) => set({ contextPlan }),
   setDocument: noopSetDocument,
   setEditorController: (controller) => set({
     blurComposer: controller?.blurComposer ?? noop,
@@ -205,18 +207,8 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
         : selected ? preferredReasoning(selected) : state.reasoning,
     };
   }),
-  setModels: (models) => set((state) => {
-    const selected = resolveModel(models, state.modelId);
-    if (!selected) return { models };
-    return {
-      modelId: selected.id,
-      models,
-      reasoning: selected.supportedReasoning.includes(state.reasoning)
-        ? state.reasoning
-        : preferredReasoning(selected),
-    };
-  }),
-  setPreserveContextPlan: (preserveContextPlan) => set({ preserveContextPlan }),
+  setProviderInstanceId: (providerInstanceId) => set({ providerInstanceId }),
+  setModels: (models) => set({ models }),
   setReasoning: (reasoning) => set({ reasoning }),
   setSnapshot: (snapshot) => set({ snapshot, submissionError: null }),
   setSubmissionConversation: (id, conversationId) => set((state) => state.submission?.id === id

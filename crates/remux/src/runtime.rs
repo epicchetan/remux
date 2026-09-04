@@ -98,6 +98,8 @@ struct RuntimeCtx {
     shared: Arc<Shared>,
     viewer_bundles: Arc<ViewerBundleRegistry>,
     media_root: std::path::PathBuf,
+    extension_gateways: crate::http::extension_gateways::ExtensionGatewayRegistry,
+    root_dir: std::path::PathBuf,
 }
 
 impl ExtensionCtx for RuntimeCtx {
@@ -219,12 +221,55 @@ impl ExtensionCtx for RuntimeCtx {
         });
     }
 
-    fn publish_view_bundle(&self, extension_id: &str, view_id: &str) {
-        self.viewer_bundles.schedule_publish(extension_id, view_id);
+    fn publish_view_bundle(
+        &self,
+        extension_id: &str,
+        view_id: &str,
+    ) -> BoxFuture<'_, Result<(), String>> {
+        let extension_id = extension_id.to_string();
+        let view_id = view_id.to_string();
+        Box::pin(async move {
+            self.viewer_bundles
+                .publish_now(&extension_id, &view_id)
+                .await
+                .map(|_| ())
+        })
     }
 
     fn media_dir(&self) -> Option<std::path::PathBuf> {
         Some(self.media_root.clone())
+    }
+
+    fn prepare_extension_gateway(
+        &self,
+        extension_id: &str,
+        generation: u64,
+    ) -> Result<Option<std::path::PathBuf>, String> {
+        self.extension_gateways
+            .prepare_generation(extension_id, generation)
+    }
+
+    fn activate_extension_gateway(
+        &self,
+        extension_id: &str,
+        generation: u64,
+    ) -> Result<(), String> {
+        self.extension_gateways
+            .activate_generation(extension_id, generation)
+    }
+
+    fn retire_extension_gateway(&self, extension_id: &str, generation: u64) {
+        self.extension_gateways
+            .retire_generation(extension_id, generation);
+    }
+
+    fn cleanup_extension_gateway(&self, extension_id: &str, generation: u64) {
+        self.extension_gateways
+            .cleanup_generation(extension_id, generation);
+    }
+
+    fn extension_data_dir(&self, extension_id: &str) -> Option<std::path::PathBuf> {
+        Some(self.root_dir.join(".remux/extensions").join(extension_id))
     }
 }
 
@@ -378,6 +423,8 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
     if let Err(error) = viewer_bundles.start_watching() {
         journal.warn(&format!("viewer bundle watching unavailable: {error}"));
     }
+    let extension_gateways =
+        crate::http::extension_gateways::ExtensionGatewayRegistry::new(&root_dir, &extensions)?;
 
     // Notifications + logs.
     let notifications = NotificationManager::new(&root_dir, production_fetch(), journal.clone());
@@ -390,6 +437,8 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
         shared: shared.clone(),
         viewer_bundles: viewer_bundles.clone(),
         media_root: media_root.clone(),
+        extension_gateways: extension_gateways.clone(),
+        root_dir: root_dir.clone(),
     });
     let run_state = RunState::new(&root_dir);
     let mut servers: Vec<(String, Arc<dyn ExtensionServer>)> = Vec::new();
@@ -567,6 +616,7 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
         viewer_providers,
         viewer_bundles: viewer_bundles.clone(),
         media_root,
+        extension_gateways,
     });
     let ws = WsServer::new(
         router.clone(),

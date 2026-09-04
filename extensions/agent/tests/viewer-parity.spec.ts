@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 
 import { FIXTURE_CONVERSATION_ID, installAgentHost } from './viewer-fixture';
 
@@ -32,39 +32,29 @@ test('keeps long user and assistant content inside the mobile transcript rail', 
     const scroller = document.querySelector<HTMLElement>('[data-testid="agent-transcript-scroll"]');
     const content = document.querySelector<HTMLElement>('[data-testid="agent-transcript-content"]');
     if (!scroller || !content) throw new Error('Transcript containment elements are missing.');
-
     const contentRect = content.getBoundingClientRect();
     const candidates = Array.from(document.querySelectorAll<HTMLElement>([
-      '.codex-user-bubble',
-      '.codex-markdown',
-      '.codex-md-block-frame',
-      '.codex-md-text-line',
+      '.codex-user-bubble', '.codex-markdown', '.codex-md-block-frame', '.codex-md-text-line',
     ].join(',')));
     return {
-      content: { left: contentRect.left, right: contentRect.right, width: contentRect.width },
+      contentWidth: contentRect.width,
       layoutWidth: Number(content.dataset.layoutWidth),
       offenders: candidates.flatMap((element) => {
         const rect = element.getBoundingClientRect();
-        const exceedsRail = rect.left < contentRect.left - 1 || rect.right > contentRect.right + 1;
-        const hasIntrinsicOverflow = element.scrollWidth > element.clientWidth + 1;
-        return exceedsRail || hasIntrinsicOverflow
-          ? [{
-              className: element.className,
-              clientWidth: element.clientWidth,
-              left: rect.left,
-              right: rect.right,
-              scrollWidth: element.scrollWidth,
-            }]
+        return rect.left < contentRect.left - 1 || rect.right > contentRect.right + 1 ||
+          element.scrollWidth > element.clientWidth + 1
+          ? [{ className: element.className, left: rect.left, right: rect.right }]
           : [];
       }),
-      scroller: { clientWidth: scroller.clientWidth, scrollWidth: scroller.scrollWidth },
+      scrollerWidth: scroller.clientWidth,
+      scrollerScrollWidth: scroller.scrollWidth,
     };
   });
 
-  expect(containment.content.width).toBeGreaterThan(0);
-  expect(containment.layoutWidth).toBeGreaterThanOrEqual(containment.content.width - 1);
+  expect(containment.contentWidth).toBeGreaterThan(0);
+  expect(containment.layoutWidth).toBeGreaterThanOrEqual(containment.contentWidth - 1);
   expect(containment.offenders).toEqual([]);
-  expect(containment.scroller.scrollWidth).toBeLessThanOrEqual(containment.scroller.clientWidth + 1);
+  expect(containment.scrollerScrollWidth).toBeLessThanOrEqual(containment.scrollerWidth + 1);
 });
 
 test('loads oversized exact content only after an explicit viewer action', async ({ page }) => {
@@ -82,190 +72,130 @@ test('loads oversized exact content only after an explicit viewer action', async
   await expect.poll(() => artifactRequestCount(page)).toBe(1);
 });
 
-test('loads semantic inference traces and child scopes only after disclosure', async ({ page }) => {
-  await page.goto('/viewers/agent/');
-  await page.getByRole('textbox', { name: 'Message', exact: true }).fill('Inspect work details');
+test('renders conversation compaction boundaries as virtualized transcript rows', async ({ page }) => {
+  await page.goto(conversationUrl('&fixtureCompaction=1'));
+  const dividers = page.locator('.agent-work-compaction-divider-transcript');
+  await expect(dividers).toHaveCount(2);
+  await expect(dividers.nth(0)).toContainText('Compacted');
+  await expect(dividers.nth(0)).toHaveAttribute('data-state', 'compacted');
+  await expect(dividers.nth(1)).toContainText('Compacting');
+  await expect(dividers.nth(1)).toHaveAttribute('data-state', 'compacting');
+  await expect.poll(() => page.locator('[data-row-kind]').evaluateAll((rows) =>
+    rows.map((row) => row.getAttribute('data-row-kind')))).toEqual([
+    'compaction', 'userMessage', 'assistantMessage', 'compaction',
+  ]);
+});
+
+test('loads normalized native activity and operation details only after disclosure', async ({ page }) => {
+  await page.goto('/viewers/agent/?fixtureDiff=1');
+  await page.getByRole('textbox', { name: 'Message', exact: true }).fill('Inspect native work details');
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
   await expect(page.getByText('The fixture stream completed.')).toBeVisible();
 
   const workHeader = page.locator('.codex-work-header');
   await expect(workHeader).toHaveAttribute('aria-expanded', 'false');
-  expect(await transcriptRequestTypes(page)).not.toContain('executionScope');
+  const readsBeforeOpen = await nativeTurnReadCount(page);
+  expect(readsBeforeOpen).toBeGreaterThan(0);
   await workHeader.click();
+  const reasoning = page.locator('.agent-reasoning-block');
+  await expect(reasoning).toContainText('Checking context.');
+  await expect(reasoning).toContainText('Reviewing workspace state.');
+  await expect(reasoning.locator('.agent-reasoning-part')).toHaveCount(2);
+  const reasoningLines = reasoning.locator('.codex-md-text-line');
+  await expect(reasoningLines).toHaveCount(2);
+  const reasoningLineTops = await reasoningLines.evaluateAll((lines) =>
+    lines.map((line) => line.getBoundingClientRect().top));
+  expect(reasoningLineTops[1] - reasoningLineTops[0]).toBeGreaterThanOrEqual(17);
+  await expect(reasoning.locator('.agent-reasoning-parts')).toHaveCSS('gap', '4px');
   await expect(page.locator('.agent-commentary-block')).toContainText(
     'Grounding the change in the current workspace.',
   );
-  const reasoning = page.locator('.agent-reasoning-block');
-  await expect(reasoning.first()).toContainText('Checking context.');
-  const parentInference = page.locator('.agent-inference').first();
-  await expect(parentInference.locator(':scope > .agent-reasoning-block')).toHaveCount(1);
-  await expect(parentInference.locator(':scope > .agent-commentary-block')).toHaveCount(1);
-  const parentSurfaceOrder = await parentInference.locator(':scope > *').evaluateAll((elements) =>
-    elements.map((element) => element.classList.contains('agent-reasoning-block')
-      ? 'reasoning'
-      : element.classList.contains('agent-commentary-block')
-        ? 'commentary'
-        : element.classList.contains('agent-action-sequence')
-          ? 'actions'
-          : 'unknown'));
-  expect(parentSurfaceOrder).toEqual(['reasoning', 'commentary', 'actions']);
-  await expect(parentInference.locator(':scope > .agent-commentary-block')).toHaveCSS(
-    'font-weight',
-    '400',
-  );
-  await expect(reasoning.first().locator('.codex-md-inline-strong')).toHaveCSS(
-    'font-weight',
-    '400',
-  );
-  await expect(page.locator('.agent-inference-list').first()).toHaveCSS('row-gap', '8px');
-  await expect(parentInference).toHaveCSS('row-gap', '4px');
-  await expect(parentInference).toHaveCSS('padding-top', '0px');
-  await expect(reasoning.first()).toHaveCSS('padding-top', '0px');
-  const parentActions = page.getByRole('button', { name: /Edited index\.ts · Read 1 file/u });
-  await expect(parentActions).toBeVisible();
-  await expect(parentActions).toHaveCSS('font-size', '13px');
-  await expect(parentActions).toHaveCSS('line-height', '18px');
-  expect(await transcriptRequestTypes(page)).toContain('executionScope');
-  expect((await transcriptRequestTypes(page) as string[])
-    .filter((type) => type === 'executionScope')).toHaveLength(1);
-
-  const focusedUnit = page.getByRole('button', { name: /Verify the focused seam/u });
-  await expect(focusedUnit).toBeVisible();
-  expect(await focusedUnit.locator(':scope > span').evaluateAll((elements) =>
-    elements.map((element) => element.className))).toEqual([
-    'agent-work-unit-state',
-    'agent-work-unit-copy',
-    'agent-work-unit-chevron',
-  ]);
-  await expect(page.locator('.codex-work-separator')).toHaveCount(1);
-  await expect(page.locator('.agent-work-unit')).toHaveCSS('border-left-width', '0px');
-  await expect(reasoning.first()).toHaveCSS('border-left-width', '0px');
-  await focusedUnit.hover();
-  await expect(focusedUnit).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
-  await focusedUnit.click();
-  await expect(page.getByRole('heading', { name: 'Verified' })).toBeVisible();
-  await expect(page.getByText('Result', { exact: true })).toBeVisible();
-  await expect(page.getByText(
-    'The focused seam matches its exact contract without changing unrelated runtime behavior.',
-  )).toBeVisible();
-  await expect(page.getByText('Artifacts', { exact: true })).toBeVisible();
-  await expect(page.locator('.agent-work-unit-outcome').getByText('src/index.ts')).toBeVisible();
-  expect((await transcriptRequestTypes(page) as string[])
-    .filter((type) => type === 'executionScope')).toHaveLength(2);
-  expect(await transcriptRequestTypes(page)).not.toContain('operationDetail');
-  const childReasoning = reasoning.filter({ hasText: 'Compared the implementation with its contract.' });
-  await expect(childReasoning).toContainText(
-    'Compared the implementation with its contract.',
-  );
-  const childActions = page.getByRole('button', { name: /Ran 1 command/u });
-  await childActions.click();
-  const childActionBody = childActions.locator('xpath=..').locator('.agent-action-run-body');
-  await expect(childActionBody).toHaveCSS('row-gap', '4px');
-  await expect(childActionBody).toHaveCSS('padding-top', '4px');
-  await expect(childActionBody).toHaveCSS('padding-left', '0px');
-  await expect(page.locator('.agent-work-unit-content')).toHaveCSS('padding-left', '24px');
-  const childTool = page.locator('.agent-tool-call').filter({ hasText: 'bash' });
-  await expect(childTool).toHaveCSS('border-left-width', '0px');
-  await expect(page.locator('.agent-work-unit-outcome')).toHaveCSS('border-top-width', '0px');
-  await childTool.locator('> button').click();
-  await expect(childTool).toContainText('1 test passed');
-  expect(await transcriptRequestTypes(page)).toContain('operationDetail');
-
-  await parentActions.click();
+  const actionRuns = page.locator('.agent-action-run > button');
+  await expect(actionRuns).toHaveCount(1);
+  const toolActions = actionRuns.first();
+  await expect(toolActions).toContainText('Read 1 file');
+  await expect(toolActions).toContainText('edited index.ts');
+  await toolActions.click();
   const readRow = page.locator('.agent-tool-call').filter({ hasText: 'workspace.read' });
+  const diffRow = page.locator('.agent-tool-call[data-has-diff="true"]');
+  await expect(readRow).toBeVisible();
+  await expect(diffRow).toBeVisible();
+  await expect(diffRow).toContainText('Edited index.ts');
+  await expect(diffRow).toContainText('file_change');
+  await expect(page.getByText('native subagent', { exact: false })).toBeVisible();
+
+  const workAlignment = await page.evaluate(() => {
+    const left = (selector: string) =>
+      document.querySelector(selector)?.getBoundingClientRect().left ?? Number.NaN;
+    const right = (selector: string) =>
+      document.querySelector(selector)?.getBoundingClientRect().right ?? Number.NaN;
+    return {
+      proseLeft: left('.agent-reasoning-block'),
+      summaryIconLeft: left('.agent-action-run-header .agent-live-activity-icon svg'),
+      detailIconLefts: Array.from(document.querySelectorAll('.codex-work-row-icon svg'))
+        .map((icon) => icon.getBoundingClientRect().left),
+      workChevronRight: right('.codex-work-header-chevron svg'),
+      summaryChevronRight: right('.agent-action-run-header > svg:last-child'),
+      detailChevronRights: Array.from(document.querySelectorAll('.agent-tool-call-header > svg:last-child'))
+        .map((icon) => icon.getBoundingClientRect().right),
+    };
+  });
+  expect(workAlignment.summaryIconLeft).toBeCloseTo(workAlignment.proseLeft, 5);
+  for (const iconLeft of workAlignment.detailIconLefts) {
+    expect(iconLeft).toBeCloseTo(workAlignment.proseLeft, 5);
+  }
+  expect(workAlignment.summaryChevronRight).toBeCloseTo(workAlignment.workChevronRight, 5);
+  for (const chevronRight of workAlignment.detailChevronRights) {
+    expect(chevronRight).toBeCloseTo(workAlignment.workChevronRight, 5);
+  }
+
+  const readsBeforeDetail = await nativeTurnReadCount(page);
   await readRow.locator('> button').click();
-  await expect(page.getByText('Read the workspace overview before editing.')).toBeVisible();
-  await expect(page.getByText(/Fixture file output/u)).toBeVisible();
+  await expect(readRow).toContainText('Fixture file output.');
+  await expect.poll(() => nativeTurnReadCount(page)).toBeGreaterThan(readsBeforeDetail);
+  const artifactReadsBeforeDiff = await artifactRequestCount(page);
+  await diffRow.locator('> button').click();
+  const expandedChevron = diffRow.locator('> button > svg:last-child');
+  await expect(expandedChevron).toHaveClass(/lucide-chevron-down/u);
+  expect(await expandedChevron.evaluate((icon) => getComputedStyle(icon).transform)).toBe('none');
+  await expect(diffRow.locator('.codex-diff-block')).toBeVisible();
+  await expect(diffRow.locator('.codex-diff-line-added')).toContainText('export const value = 1;');
+  await expect.poll(() => artifactRequestCount(page)).toBeGreaterThan(artifactReadsBeforeDiff);
 
-  const editRow = page.locator('.agent-tool-call').filter({ hasText: 'workspace.edit' });
-  await editRow.locator('> button').click();
-  await expect(editRow).toContainText('+export const value = 1;');
-
-  const workContainment = await page.evaluate(() => {
+  const containment = await page.evaluate(() => {
     const scroller = document.querySelector<HTMLElement>('[data-testid="agent-transcript-scroll"]');
     const content = document.querySelector<HTMLElement>('[data-testid="agent-transcript-content"]');
     if (!scroller || !content) throw new Error('Transcript containment elements are missing.');
     const rail = content.getBoundingClientRect();
     const offenders = Array.from(document.querySelectorAll<HTMLElement>([
-      '.agent-execution-scope',
-      '.agent-action-run',
-      '.agent-work-unit',
-      '.agent-tool-call',
-      '.agent-work-unit .codex-markdown',
-      '.agent-work-unit .codex-md-text-line',
-      '.agent-reasoning-block .codex-md-text-line',
-    ].join(','))).flatMap((element) => {
+      '.agent-execution-scope', '.agent-action-run', '.agent-tool-call', '.agent-reasoning-block',
+    ].join(','))).filter((element) => {
       const rect = element.getBoundingClientRect();
-      const exceedsRail = rect.left < rail.left - 1 || rect.right > rail.right + 1;
-      const hasIntrinsicOverflow = element.scrollWidth > element.clientWidth + 1;
-      return exceedsRail || hasIntrinsicOverflow
-        ? [{
-            className: element.className,
-            clientWidth: element.clientWidth,
-            left: rect.left,
-            right: rect.right,
-            scrollWidth: element.scrollWidth,
-          }]
-        : [];
-    });
-    return {
-      offenders,
-      scrollerClientWidth: scroller.clientWidth,
-      scrollerScrollWidth: scroller.scrollWidth,
-    };
+      return rect.left < rail.left - 1 || rect.right > rail.right + 1 ||
+        element.scrollWidth > element.clientWidth + 1;
+    }).map((element) => element.className);
+    return { offenders, clientWidth: scroller.clientWidth, scrollWidth: scroller.scrollWidth };
   });
-  expect(workContainment.offenders).toEqual([]);
-  expect(workContainment.scrollerScrollWidth).toBeLessThanOrEqual(
-    workContainment.scrollerClientWidth + 1,
-  );
+  expect(containment.offenders).toEqual([]);
+  expect(containment.scrollWidth).toBeLessThanOrEqual(containment.clientWidth + 1);
 
   await workHeader.click();
   await expect(workHeader).toHaveAttribute('aria-expanded', 'false');
 });
 
-test('opens work traces while the running server still serves the prior inference shape', async ({ page }) => {
-  await page.goto('/viewers/agent/?fixtureLegacyInferenceTrace=1');
-  await page.getByRole('textbox', { name: 'Message', exact: true }).fill('Inspect work details');
-  await page.getByRole('button', { name: 'Send message', exact: true }).click();
-  await expect(page.getByText('The fixture stream completed.')).toBeVisible();
-
-  await page.locator('.codex-work-header').click();
-  const parentInference = page.locator('.agent-inference').first();
-  await expect(parentInference.locator(':scope > .agent-reasoning-block')).toContainText(
-    'Checking context.',
-  );
-  await expect(parentInference.locator(':scope > .agent-commentary-block')).toContainText(
-    'Grounding the change in the current workspace.',
-  );
-  await expect(page.getByRole('button', { name: /Edited index\.ts · Read 1 file/u })).toBeVisible();
-
-  await page.getByRole('button', { name: /Verify the focused seam/u }).click();
-  await expect(page.getByText('Compared the implementation with its contract.')).toBeVisible();
-  await expect(page.getByRole('button', { name: /Ran 1 command/u })).toBeVisible();
-  await expect(page.locator('.agent-work-unit-outcome .codex-markdown strong').first()).toHaveCSS(
-    'text-transform',
-    'none',
-  );
-  await expect(page.getByRole('button', { name: 'Send message', exact: true })).toBeVisible();
-});
-
-test('refreshes an open execution scope as one semantic revision', async ({ page }) => {
+test('refreshes an open normalized activity frame without flattening its new inference', async ({ page }) => {
   await page.goto('/viewers/agent/');
-  await page.getByRole('textbox', { name: 'Message', exact: true }).fill('Create paged work');
+  await page.getByRole('textbox', { name: 'Message', exact: true }).fill('Create refreshable work');
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
   await expect(page.getByText('The fixture stream completed.')).toBeVisible();
   await page.locator('.codex-work-header').click();
   await expect(page.locator('.agent-inference')).toHaveCount(1);
-  const readsBefore = (await transcriptRequestTypes(page) as string[])
-    .filter((type) => type === 'executionScope').length;
+  const readsBefore = await nativeTurnReadCount(page);
   await page.evaluate(() => (window as any).__agentFixture.reviseLatestExecutionScope());
-  await expect(page.locator('.agent-inference')).toHaveCount(2);
-  await expect(page.getByText('Validated the refreshed execution-scope revision.', { exact: true }).first())
+  await expect(page.getByText('Validated the refreshed execution-scope revision.', { exact: false }))
     .toBeVisible();
-  const readsAfter = (await transcriptRequestTypes(page) as string[])
-    .filter((type) => type === 'executionScope').length;
-  expect(readsAfter).toBeGreaterThan(readsBefore);
-  await expect(page.locator('.agent-inference').filter({ hasText: 'Checking context.' })).toHaveCount(1);
+  await expect(page.locator('.agent-inference')).toHaveCount(2);
+  await expect.poll(() => nativeTurnReadCount(page)).toBeGreaterThan(readsBefore);
 });
 
 test('pages only after a user scroll and preserves the mounted row anchor', async ({ page }) => {
@@ -275,9 +205,7 @@ test('pages only after a user scroll and preserves the mounted row anchor', asyn
   const mountedBefore = await page.locator('.codex-transcript-turn').count();
   expect(mountedBefore).toBeGreaterThan(0);
   expect(mountedBefore).toBeLessThan(24);
-
-  const syncCount = () => transcriptSyncCount(page);
-  await expect.poll(syncCount).toBe(1);
+  await expect.poll(() => transcriptSyncCount(page)).toBe(1);
 
   const viewport = page.getByTestId('agent-transcript-scroll');
   await viewport.evaluate((node) => {
@@ -285,7 +213,7 @@ test('pages only after a user scroll and preserves the mounted row anchor', asyn
     node.dispatchEvent(new Event('scrollend'));
   });
   await page.waitForTimeout(250);
-  expect(await syncCount()).toBe(1);
+  expect(await transcriptSyncCount(page)).toBe(1);
 
   const anchor = page.locator('[data-transcript-row-id^="turn-49:"]').first();
   await expect(anchor).toBeVisible();
@@ -294,17 +222,11 @@ test('pages only after a user scroll and preserves the mounted row anchor', asyn
     node.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -12 }));
     node.dispatchEvent(new Event('scrollend'));
   });
-  await expect.poll(syncCount).toBe(2);
-  expect(await latestTranscriptSyncWindow(page)).toMatchObject({
-    before: 16,
-    kind: 'around',
-    turnId: 'turn-49',
-  });
+  await expect.poll(() => transcriptSyncCount(page)).toBe(2);
+  expect(await latestTranscriptWindowKey(page)).toContain(':around:turn-49:16:');
   const afterTop = await anchor.evaluate((node) => node.getBoundingClientRect().top);
   expect(Math.abs(afterTop - beforeTop)).toBeLessThanOrEqual(1);
-
-  const mountedAfter = await page.locator('.codex-transcript-turn').count();
-  expect(mountedAfter).toBeLessThanOrEqual(32);
+  expect(await page.locator('.codex-transcript-turn').count()).toBeLessThanOrEqual(32);
 });
 
 test('keeps a sent message visible while work and assistant output settle', async ({ page }) => {
@@ -313,39 +235,244 @@ test('keeps a sent message visible while work and assistant output settle', asyn
   await page.getByRole('textbox', { name: 'Message' }).fill('Anchor this user request');
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
 
-  await expect(page.getByTestId('agent-transcript-scroll').getByText('Anchor this user request')).toBeVisible();
+  const transcript = page.getByTestId('agent-transcript-scroll');
+  await expect(transcript.getByText('Anchor this user request')).toBeVisible();
   await expect(page.getByText('The fixture stream completed.')).toBeVisible();
-  await expect(page.getByTestId('agent-transcript-scroll').getByText('Anchor this user request')).toBeVisible();
+  await expect(transcript.getByText('Anchor this user request')).toBeVisible();
+});
+
+test('pins streamed work before paint and holds the user message through content collapse', async ({ page }) => {
+  await page.goto(conversationUrl('&fixtureLong=1'));
+  await expect(page.getByText('Historical answer 72.')).toBeVisible();
+  await page.getByRole('textbox', { name: 'Message' }).fill('interrupt anchor frame probe');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+
+  const sentRow = page.locator('[data-row-kind="userMessage"]')
+    .filter({ hasText: 'interrupt anchor frame probe' });
+  await expect(sentRow).toBeVisible();
+  await expect(page.locator('.codex-work-content').last()).toBeVisible();
+
+  const samples = await page.evaluate(async () => {
+    const viewport = document.querySelector<HTMLElement>('[data-testid="agent-transcript-scroll"]')!;
+    const content = document.querySelector<HTMLElement>('[data-testid="agent-transcript-content"]')!;
+    const work = document.querySelector<HTMLElement>('.codex-work-content')!;
+    const row = Array.from(document.querySelectorAll<HTMLElement>('[data-row-kind="userMessage"]'))
+      .find((candidate) => candidate.textContent?.includes('interrupt anchor frame probe'))!;
+    const anchorTop = Math.max(24, Number.parseFloat(getComputedStyle(content).paddingTop));
+    const sample = () => row.getBoundingClientRect().top - viewport.getBoundingClientRect().top;
+    const afterFrames = async (count: number) => {
+      const values: number[] = [];
+      for (let frame = 0; frame < count; frame += 1) {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+        values.push(sample());
+      }
+      return values;
+    };
+
+    const filler = document.createElement('div');
+    filler.dataset.anchorProbe = 'true';
+    filler.style.height = '700px';
+    work.appendChild(filler);
+    const growth = await afterFrames(4);
+    filler.style.height = '0px';
+    // Force layout before ResizeObserver or requestAnimationFrame can repair
+    // the position. This is the browser-clamp seam that a native compositor
+    // can expose even when every post-frame sample looks correct.
+    const collapseImmediate = sample();
+    const collapse = await afterFrames(4);
+    return { anchorTop, collapse, collapseImmediate, growth };
+  });
+
+  expect(Math.abs(samples.growth.at(-1)! - samples.anchorTop)).toBeLessThanOrEqual(2);
+  expect(Math.abs(samples.collapseImmediate - samples.anchorTop)).toBeLessThanOrEqual(2);
+  for (const offset of samples.collapse) {
+    expect(Math.abs(offset - samples.anchorTop)).toBeLessThanOrEqual(2);
+  }
+  await expect(page.getByTestId('agent-transcript-anchor-runway')).not.toHaveCSS('height', '0px');
+});
+
+test('keeps the sent message pinned while the first assistant chunk auto-closes work', async ({ page }) => {
+  await page.goto(conversationUrl('&fixtureLong=1'));
+  await expect(page.getByText('Historical answer 72.')).toBeVisible();
+  await page.getByRole('textbox', { name: 'Message' }).fill('interrupt work collapse probe');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+
+  const sentRow = page.locator('[data-row-kind="userMessage"]')
+    .filter({ hasText: 'interrupt work collapse probe' });
+  await expect(sentRow).toBeVisible();
+  await expect(page.locator('.codex-work-content').last()).toBeVisible();
+
+  const samples = await page.evaluate(async () => {
+    const viewport = document.querySelector<HTMLElement>('[data-testid="agent-transcript-scroll"]')!;
+    const content = document.querySelector<HTMLElement>('[data-testid="agent-transcript-content"]')!;
+    const work = Array.from(document.querySelectorAll<HTMLElement>('.codex-work-content')).at(-1)!;
+    const row = Array.from(document.querySelectorAll<HTMLElement>('[data-row-kind="userMessage"]'))
+      .find((candidate) => candidate.textContent?.includes('interrupt work collapse probe'))!;
+    const anchorTop = Math.max(24, Number.parseFloat(getComputedStyle(content).paddingTop));
+    const sample = () => row.getBoundingClientRect().top - viewport.getBoundingClientRect().top;
+
+    const filler = document.createElement('div');
+    filler.dataset.workCollapseProbe = 'true';
+    filler.style.height = '700px';
+    work.appendChild(filler);
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+    const before = sample();
+
+    const collapse = new Promise<{ frame: number; immediate: number }>((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        observer.disconnect();
+        reject(new Error('Work did not auto-close after assistant output started.'));
+      }, 2_000);
+      const observer = new MutationObserver(() => {
+        if (work.isConnected) return;
+        observer.disconnect();
+        window.clearTimeout(timeout);
+        const immediate = sample();
+        requestAnimationFrame(() => resolve({ frame: sample(), immediate }));
+      });
+      observer.observe(document.querySelector('[data-testid="agent-transcript-body"]')!, {
+        childList: true,
+        subtree: true,
+      });
+      (window as any).__agentFixture.streamLatestAssistantText(
+        'The streamed response has started while the turn is still running.',
+      );
+    });
+
+    return { anchorTop, before, ...(await collapse) };
+  });
+
+  expect(Math.abs(samples.before - samples.anchorTop)).toBeLessThanOrEqual(2);
+  expect(Math.abs(samples.immediate - samples.anchorTop)).toBeLessThanOrEqual(2);
+  expect(Math.abs(samples.frame - samples.anchorTop)).toBeLessThanOrEqual(2);
+  await expect(page.getByText('The streamed response has started while the turn is still running.')).toBeVisible();
+  await expect(page.locator('.codex-work-content').last()).toBeHidden();
+});
+
+test('restores a running user-message anchor before streamed work grows', async ({ page }) => {
+  await page.goto(conversationUrl('&fixtureRunning=1'));
+  const sentRow = page.locator('[data-row-kind="userMessage"]')
+    .filter({ hasText: 'Resume this running turn' });
+  await expect(sentRow).toBeVisible();
+  await expect(page.locator('.codex-work-content')).toBeVisible();
+
+  const offsets = await page.evaluate(async () => {
+    const viewport = document.querySelector<HTMLElement>('[data-testid="agent-transcript-scroll"]')!;
+    const work = document.querySelector<HTMLElement>('.codex-work-content')!;
+    const row = Array.from(document.querySelectorAll<HTMLElement>('[data-row-kind="userMessage"]'))
+      .find((candidate) => candidate.textContent?.includes('Resume this running turn'))!;
+    const sample = () => row.getBoundingClientRect().top - viewport.getBoundingClientRect().top;
+    const initial = sample();
+    const filler = document.createElement('div');
+    work.appendChild(filler);
+    const growth: number[] = [];
+    for (const height of [300, 600, 900, 1_200]) {
+      filler.style.height = `${height}px`;
+      await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+      growth.push(sample());
+    }
+    return { growth, initial };
+  });
+
+  for (const offset of offsets.growth) {
+    expect(Math.abs(offset - offsets.initial)).toBeLessThanOrEqual(2);
+  }
+});
+
+test('keeps an anchored message fixed when an attachment resizes the composer', async ({ page }) => {
+  await page.goto(conversationUrl('&fixtureLong=1'));
+  await expect(page.getByText('Historical answer 72.')).toBeVisible();
+  await page.getByRole('textbox', { name: 'Message' }).fill('interrupt composer resize anchor');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+
+  const sentRow = page.locator('[data-row-kind="userMessage"]')
+    .filter({ hasText: 'interrupt composer resize anchor' });
+  await expect(sentRow).toBeVisible();
+  await expect(page.locator('.codex-work-content').last()).toBeVisible();
+  await page.evaluate(async () => {
+    const viewport = document.querySelector<HTMLElement>('[data-testid="agent-transcript-scroll"]')!;
+    const content = document.querySelector<HTMLElement>('[data-testid="agent-transcript-content"]')!;
+    const work = Array.from(document.querySelectorAll<HTMLElement>('.codex-work-content')).at(-1)!;
+    const row = Array.from(document.querySelectorAll<HTMLElement>('[data-row-kind="userMessage"]'))
+      .find((candidate) => candidate.textContent?.includes('interrupt composer resize anchor'))!;
+    const anchorTop = Math.max(24, Number.parseFloat(getComputedStyle(content).paddingTop));
+    const desiredScrollTop = viewport.scrollTop +
+      row.getBoundingClientRect().top - viewport.getBoundingClientRect().top - anchorTop;
+    const naturalMax = viewport.scrollHeight - viewport.clientHeight;
+    const filler = document.createElement('div');
+    filler.dataset.composerResizeProbe = 'true';
+    filler.style.height = `${Math.max(100, Math.ceil(desiredScrollTop - naturalMax + 50))}px`;
+    work.appendChild(filler);
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+  });
+
+  const content = page.getByTestId('agent-transcript-content');
+  const viewport = page.getByTestId('agent-transcript-scroll');
+  const anchoredOffset = () => sentRow.evaluate((row) => {
+    const viewport = document.querySelector<HTMLElement>('[data-testid="agent-transcript-scroll"]')!;
+    return row.getBoundingClientRect().top - viewport.getBoundingClientRect().top;
+  });
+  const anchorTop = () => content.evaluate((node) =>
+    Math.max(24, Number.parseFloat(getComputedStyle(node).paddingTop)));
+  await expect.poll(async () => Math.abs(await anchoredOffset() - await anchorTop())).toBeLessThanOrEqual(2);
+
+  await page.evaluate(async () => {
+    const filler = document.querySelector<HTMLElement>('[data-composer-resize-probe="true"]')!;
+    filler.style.height = `${Math.max(0, Number.parseFloat(filler.style.height) - 100)}px`;
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+  });
+  await expect.poll(async () => Math.abs(await anchoredOffset() - await anchorTop())).toBeLessThanOrEqual(2);
+  await expect(page.getByTestId('agent-transcript-anchor-runway')).not.toHaveCSS('height', '0px');
+
+  await page.getByRole('button', { name: 'Attach', exact: true }).click();
+  await page.getByText('Photo Library', { exact: true }).click();
+  await expect(page.locator('.remux-composer-attachment-card')).toBeVisible();
+  await expect.poll(async () => Math.abs(await anchoredOffset() - await anchorTop())).toBeLessThanOrEqual(2);
+
+  const samples = await page.evaluate(async () => {
+    const viewport = document.querySelector<HTMLElement>('[data-testid="agent-transcript-scroll"]')!;
+    const row = Array.from(document.querySelectorAll<HTMLElement>('[data-row-kind="userMessage"]'))
+      .find((candidate) => candidate.textContent?.includes('interrupt composer resize anchor'))!;
+    const values: number[] = [];
+    document.querySelector<HTMLButtonElement>('[aria-label="Remove picked.png"]')!.click();
+    values.push(row.getBoundingClientRect().top - viewport.getBoundingClientRect().top);
+    for (let frame = 0; frame < 5; frame += 1) {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      values.push(row.getBoundingClientRect().top - viewport.getBoundingClientRect().top);
+    }
+    return values;
+  });
+
+  for (const offset of samples) {
+    expect(Math.abs(offset - await anchorTop())).toBeLessThanOrEqual(2);
+  }
+  await expect(viewport).toBeVisible();
 });
 
 function conversationUrl(extra = '') {
   return `/viewers/agent/?remuxResourceKind=agentConversation&remuxResourceId=${FIXTURE_CONVERSATION_ID}${extra}`;
 }
 
-async function transcriptRequestTypes(page: import('@playwright/test').Page) {
+async function transcriptKeys(page: Page) {
   return page.evaluate(() => (window as any).__agentFixture.requestLog
     .filter((entry: { method: string }) => entry.method === 'remux/agent/transcript/resources/read')
-    .flatMap((entry: { summary: string }) => JSON.parse(entry.summary).map((request: { type: string }) => request.type)));
+    .flatMap((entry: { summary: string }) => JSON.parse(entry.summary)
+      .map((request: { key: string }) => request.key)) as string[]);
 }
 
-async function artifactRequestCount(page: import('@playwright/test').Page) {
+async function nativeTurnReadCount(page: Page) {
+  return (await transcriptKeys(page)).filter((key) => key.startsWith('agent/turn:')).length;
+}
+
+async function artifactRequestCount(page: Page) {
   return page.evaluate(() => (window as any).__agentFixture.requestLog
     .filter((entry: { method: string }) => entry.method === 'remux/agent/artifact/read').length);
 }
 
-async function transcriptSyncCount(page: import('@playwright/test').Page) {
-  return page.evaluate(() => (window as any).__agentFixture.requestLog
-    .filter((entry: { method: string; summary: string }) => {
-      if (entry.method !== 'remux/agent/transcript/resources/read') return false;
-      return JSON.parse(entry.summary).some((request: { type?: string }) => request.type === 'transcriptSync');
-    }).length);
+async function transcriptSyncCount(page: Page) {
+  return (await transcriptKeys(page)).filter((key) => key.startsWith('agent/transcript:')).length;
 }
 
-async function latestTranscriptSyncWindow(page: import('@playwright/test').Page) {
-  return page.evaluate(() => {
-    const entries = (window as any).__agentFixture.requestLog
-      .filter((entry: { method: string }) => entry.method === 'remux/agent/transcript/resources/read');
-    const requests = JSON.parse(entries.at(-1)?.summary ?? '[]');
-    return requests.find((request: { type?: string }) => request.type === 'transcriptSync')?.window;
-  });
+async function latestTranscriptWindowKey(page: Page) {
+  return (await transcriptKeys(page)).filter((key) => key.startsWith('agent/transcript:')).at(-1) ?? '';
 }

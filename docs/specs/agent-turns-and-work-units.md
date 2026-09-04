@@ -1,6 +1,8 @@
-Status: Active Spec
+Status: Archived
 Last verified: 2026-08-09
 Canonical code: schema-v1 execution scopes and H4 sequential work-unit execution are implemented in `extensions/agent/server/src/storage/` and `extensions/agent/server/src/pi-runtime.ts`; work units remain opt-in and absent from the default model contract
+Superseded by: `agent-native-provider-runtime-v1.md`. Work-unit evidence remains
+historical; provider-native and federated children replace the custom runtime.
 
 # Agent turns and internal work units
 

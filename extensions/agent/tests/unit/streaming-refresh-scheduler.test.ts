@@ -32,37 +32,38 @@ test('partitions structural and cadence-limited transcript invalidations', () =>
   );
 });
 
-test('accepts only basis-fenced transcript invalidations', () => {
-  const invalidation = transcriptInvalidation('runtimeEvent', false);
+test('accepts only versioned native resource invalidations', () => {
   assert.deepEqual(parseAgentInvalidationEnvelope({
-    invalidations: [invalidation],
+    protocolVersion: 6,
+    basisSequence: 4,
+    keys: ['agent/transcript:conversation:tail-24'],
     serverGeneration: 'generation-v2',
   }), {
-    invalidations: [invalidation],
+    protocolVersion: 6,
+    basisSequence: 4,
+    keys: ['agent/transcript:conversation:tail-24'],
     serverGeneration: 'generation-v2',
   });
-  const { basisSequence: _basisSequence, ...unfenced } = invalidation;
   assert.deepEqual(parseAgentInvalidationEnvelope({
-    invalidations: [unfenced],
+    protocolVersion: 6,
+    keys: ['agent/transcript:conversation:tail-24'],
     serverGeneration: 'generation-v2',
-  }).invalidations, []);
+  }).keys, []);
+  assert.deepEqual(parseAgentInvalidationEnvelope({
+    protocolVersion: 1,
+    basisSequence: 4,
+    keys: ['agent/transcript:conversation:tail-24'],
+    serverGeneration: 'generation-v1',
+  }).keys, [], 'the V5 hard cut rejects legacy invalidations');
 });
 
-test('accepts durable execution-scope invalidations', () => {
-  const invalidation: AgentResourceInvalidation = {
-    type: 'executionScope',
-    key: 'executionScope:conversation:turn:scope',
-    conversationId: 'conversation',
-    turnId: 'turn',
-    scopeId: 'scope',
-    reason: 'runtimeEvent',
-    affectsLayout: true,
-    basisSequence: 7,
-  };
+test('accepts native execution resource invalidations', () => {
   assert.deepEqual(parseAgentInvalidationEnvelope({
-    invalidations: [invalidation],
+    protocolVersion: 6,
+    basisSequence: 7,
+    keys: ['agent/execution:execution-1'],
     serverGeneration: 'generation-v2',
-  }).invalidations, [invalidation]);
+  }).keys, ['agent/execution:execution-1']);
 });
 
 test('publishes the leading refresh immediately and coalesces latest revisions', async () => {

@@ -1,9 +1,11 @@
 # Agent explicit turn context v1
 
-Status: Implemented
+Status: Archived
 Last verified: 2026-08-17
 Canonical code: `extensions/agent/{shared/protocol.ts,server/src/context/,server/src/storage/,server/src/providers/openai-codex/,viewer/src/composer/context/}`
 Supersedes: `agent-thread-runtime-v2.md` and `agent-living-thread-canvas-v1.md`
+Superseded by: `agent-native-provider-runtime-v1.md`. This document describes
+the Pi-based experimental runtime that will be deleted at native Codex cutover.
 
 ## Outcome
 

@@ -5,9 +5,21 @@ import type { TranscriptExpandedRow } from './virtualizerRange';
 export const sentMessageAnchorTopOffsetPx = 24;
 
 export type TranscriptScrollAnchor = {
+  /** Measured user-row bounds in the transcript scroll coordinate space. */
+  contentBottom: number;
+  contentTop: number;
   segmentId: string;
   scrollTop: number;
   turnId: string;
+};
+
+export type TranscriptScrollAnchorSelection = {
+  anchors: TranscriptScrollAnchor[];
+  atBottom: boolean;
+  currentSegmentId?: string | null;
+  maxScrollTop?: number;
+  scrollTop: number;
+  threshold?: number;
 };
 
 export type SentMessageScrollResolution = {
@@ -115,6 +127,8 @@ export function userMessageScrollAnchors({
     for (const row of turn.rows) {
       if (row.segment.type === 'userMessage') {
         anchors.push({
+          contentBottom: topPadding + rowTop + row.height,
+          contentTop: topPadding + rowTop,
           segmentId: row.segmentId,
           scrollTop: userMessageAnchorScrollTop(rowTop, topPadding),
           turnId: turn.turnId,
@@ -126,23 +140,72 @@ export function userMessageScrollAnchors({
   return anchors;
 }
 
+export function previousUserMessageScrollAnchor({
+  anchors,
+  currentSegmentId = null,
+  scrollTop,
+}: TranscriptScrollAnchorSelection) {
+  const currentIndex = currentSegmentId
+    ? anchors.findIndex((anchor) => anchor.segmentId === currentSegmentId)
+    : -1;
+  if (currentIndex >= 0) {
+    return currentIndex > 0 ? anchors[currentIndex - 1] ?? null : null;
+  }
+
+  // Without an explicit navigation anchor, Up means "show me the preceding
+  // user message I cannot currently see." Comparing preferred anchor tops
+  // made a partially or fully visible tail message eligible. Pinning that row
+  // then created artificial runway beneath a short transcript. Use the whole
+  // measured user row instead and select only a row already above the viewport.
+  const viewportTop = Math.max(0, scrollTop) + 1;
+  for (let index = anchors.length - 1; index >= 0; index -= 1) {
+    const anchor = anchors[index];
+    if (anchor && anchor.contentBottom <= viewportTop) return anchor;
+  }
+  return null;
+}
+
+export function nextUserMessageScrollAnchor({
+  anchors,
+  atBottom,
+  currentSegmentId = null,
+  maxScrollTop,
+  scrollTop,
+  threshold = 12,
+}: TranscriptScrollAnchorSelection) {
+  const isReachable = (anchor: TranscriptScrollAnchor | undefined) => Boolean(
+    anchor && (maxScrollTop === undefined || anchor.scrollTop <= Math.max(0, maxScrollTop)),
+  );
+  const currentIndex = currentSegmentId
+    ? anchors.findIndex((anchor) => anchor.segmentId === currentSegmentId)
+    : -1;
+  if (currentIndex >= 0) {
+    const next = anchors[currentIndex + 1];
+    return isReachable(next) ? next ?? null : null;
+  }
+  if (atBottom) return null;
+
+  const target = scrollTop + Math.max(0, threshold);
+  return anchors.find((anchor) => anchor.scrollTop > target && isReachable(anchor)) ?? null;
+}
+
 const anchorPinTolerancePx = 2;
 
 export function resolveSentMessageScroll({
+  anchorActivationAllowed = true,
   currentScrollTop,
   desiredScrollTop,
   naturalMaxScrollTop,
   phase,
   runwayHeight,
-  viewportGrew,
   wasPinned,
 }: {
+  anchorActivationAllowed?: boolean;
   currentScrollTop: number;
   desiredScrollTop: number;
   naturalMaxScrollTop: number;
   phase: 'anchored' | 'catching-up';
   runwayHeight: number;
-  viewportGrew: boolean;
   /**
    * Whether the previous resolution ended pinned. Content collapse clamps the
    * DOM scroll position before the next managed scroll runs, so pinned-ness
@@ -153,6 +216,13 @@ export function resolveSentMessageScroll({
   const desired = Math.max(0, desiredScrollTop);
   const naturalMax = Math.max(0, naturalMaxScrollTop);
   if (desired <= naturalMax + 1) {
+    if (phase === 'catching-up' && !anchorActivationAllowed) {
+      return {
+        phase: 'catching-up',
+        runwayHeight: 0,
+        scrollTop: Math.min(Math.max(0, currentScrollTop), naturalMax),
+      };
+    }
     return {
       phase: 'anchored',
       runwayHeight: 0,
@@ -160,16 +230,14 @@ export function resolveSentMessageScroll({
     };
   }
 
-  // The anchor lies beyond the natural scroll range. Hold it with a runway
-  // spacer only when the message is already pinned and the shortfall comes
-  // from content collapsing under it — never from the viewport growing back
-  // (keyboard dismissal). A viewport measured while shrunken can satisfy the
-  // anchor condition far too early; once it grows, the honest position is to
-  // resume following the bottom until real content fills the screen.
+  // Once a message has reached its anchor, layout changes must not revoke that
+  // user-visible state. Work collapse, attachment trays, and keyboard changes
+  // can all reduce the natural scroll range; runway preserves the established
+  // position until explicit user navigation releases it.
   const pinned =
     phase === 'anchored' &&
     (runwayHeight > 0 || wasPinned || Math.abs(currentScrollTop - desired) <= anchorPinTolerancePx);
-  if (pinned && !viewportGrew) {
+  if (pinned) {
     return {
       phase: 'anchored',
       runwayHeight: desired - naturalMax,
@@ -186,9 +254,11 @@ export function resolveSentMessageScroll({
 
 export function initialTranscriptScrollTarget({
   anchors,
+  conversationId,
   streamingTurnId,
 }: {
   anchors: TranscriptScrollAnchor[];
+  conversationId: string;
   streamingTurnId: string | null;
 }): TranscriptInitialScrollTarget | null {
   const streamingAnchor = streamingTurnId
@@ -196,7 +266,13 @@ export function initialTranscriptScrollTarget({
     : null;
   if (streamingAnchor && streamingTurnId) {
     return {
-      mode: { type: 'off' },
+      mode: {
+        phase: 'catching-up',
+        segmentId: streamingAnchor.segmentId,
+        conversationId,
+        type: 'sent-message-anchor',
+        turnId: streamingTurnId,
+      },
       scrollTop: streamingAnchor.scrollTop,
     };
   }
@@ -222,7 +298,9 @@ export function resolveInitialTranscriptScrollTarget({
 
   const targetWasClampedToBottom = target.scrollTop > normalizedMaxScrollTop;
   return {
-    mode: targetWasClampedToBottom ? { type: 'bottom' } : target.mode,
+    mode: targetWasClampedToBottom && target.mode.type !== 'sent-message-anchor'
+      ? { type: 'bottom' }
+      : target.mode,
     scrollTop: Math.max(0, Math.min(target.scrollTop, normalizedMaxScrollTop)),
   };
 }

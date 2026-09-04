@@ -1,7 +1,7 @@
 # Codex Extension Architecture
 
 Status: Current
-Last verified: 2026-06-28
+Last verified: 2026-08-19
 
 The Codex integration is a Remux extension with a React/Vite viewer and a Rust stdio JSON-RPC server. The extension manifest is `extensions/codex/remux-extension.json`.
 
@@ -44,6 +44,47 @@ The viewer does not apply app-server text deltas directly. Streaming is resource
 6. The transcript layout layer remeasures only the affected rows where possible.
 
 After a server restart, durable state comes from Codex history on disk and app-server state; the live overlay is process-local.
+
+## Assistant Math Rendering
+
+Assistant Markdown supports display math with `\\[...\\]` and `$$...$$`, plus
+inline math with `\\(...\\)` and a conservative `$...$` form. Backslash
+delimiters are preferred; the dollar scanner deliberately leaves currency,
+shell syntax, URLs, code, raw HTML, and Markdown link destinations alone.
+
+Math remains a viewer projection of the authoritative assistant text. Every
+streaming resource refresh reparses the complete accumulated message; the Rust
+server does not buffer delimiters or add rendered HTML to transcript resources.
+The Markdown model first parses the unmodified source to identify protected
+Markdown ranges, then replaces recognized formulas with equal-length private
+markers before its normal MDAST projection. The equal-length mask preserves
+UTF-16 source offsets and exact literal recovery without changing the existing
+Markdown parser.
+
+KaTeX is called only through the local bounded adapter with `trust: false`,
+`throwOnError: true`, expansion/size limits, generated HTML+MathML, and no
+shared macros. Invalid, unsafe, incomplete, or over-limit expressions render as
+their exact source. Valid expressions are measured in one hidden browser-owned
+surface; formula ascent/depth participates in prose line height and display
+geometry participates in collapsed transcript measurement. KaTeX font events
+invalidate the math metrics revision and trigger the layout store's normal
+authoritative remeasurement.
+
+Mutable streaming messages have segment-scoped raw, prepared, layout, markup,
+and metric caches. Completion reparses the authoritative final text under the
+bounded durable cache tier and drops the transient tier. Display formulas wrap
+at the outer relation/binary-operator chunks emitted by KaTeX; constructs inside
+fractions, braces, and tables stay atomic. Short displays remain centered,
+constrained displays align to the readable leading edge, expressions with no
+safe break retain local horizontal scrolling, and tall displays use a capped
+local vertical scroller. None can widen the transcript. Inline narration
+exposes the delimiter-free TeX as its logical text and paints the entire
+rendered formula when a cue overlaps it; display formulas use structural block
+narration.
+
+The detailed syntax, recovery, geometry, accessibility, and validation contract
+is recorded in
+[assistant-math-rendering.md](../specs/codex/assistant-math-rendering.md).
 
 ## Viewer State Ownership
 

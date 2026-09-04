@@ -56,6 +56,8 @@ pub fn spawn_extension(
     spec: &ServerSpec,
     placement: &ResourcePlacement,
     media_dir: Option<&std::path::Path>,
+    gateway_socket: Option<&std::path::Path>,
+    extension_data_dir: Option<&std::path::Path>,
     on_write_error: impl Fn(String) + Send + 'static,
 ) -> std::io::Result<SpawnedChild> {
     let mut command =
@@ -67,6 +69,12 @@ pub fn spawn_extension(
         .kill_on_drop(true);
     if let Some(media_dir) = media_dir {
         command.env("REMUX_MEDIA_DIR", media_dir);
+    }
+    if let Some(gateway_socket) = gateway_socket {
+        command.env("REMUX_EXTENSION_GATEWAY_SOCKET", gateway_socket);
+    }
+    if let Some(extension_data_dir) = extension_data_dir {
+        command.env("REMUX_EXTENSION_DATA_DIR", extension_data_dir);
     }
     let mut child = harden_command(&mut command).spawn()?;
 

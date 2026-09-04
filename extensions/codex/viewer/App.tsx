@@ -6,7 +6,12 @@ import { composerResourcesFromSnapshot } from './composer/model/userInputInterop
 import { ComposerMentionPicker } from './composer/mentions/MentionPicker';
 import { parseComposerMentionQuery } from './composer/mentions/mentionSearch';
 import { useComposerStore } from './composer/store';
-import { subscribeHostNavigate, updateHostTab } from '@remux/viewer-kit/host';
+import {
+  getHostLifecycleSnapshot,
+  subscribeHostLifecycle,
+  subscribeHostNavigate,
+  updateHostTab,
+} from '@remux/viewer-kit/host';
 import { useHostStore } from './ipc/hostStore';
 import type { RemuxHostViewportMetrics } from './ipc/types';
 import { useThreadHistoryStore } from './threads/historyStore';
@@ -61,6 +66,7 @@ export function App() {
   const saveActiveDraftSnapshot = useThreadsStore((state) => state.saveActiveDraftSnapshot);
   const setDefaultCwd = useThreadsStore((state) => state.setDefaultCwd);
   const composerPresentationRequest = useComposerStore((state) => state.composerPresentationRequest);
+  const blurComposer = useComposerStore((state) => state.blurComposer);
   const editTarget = useComposerStore((state) => state.editTarget);
   const focusComposer = useComposerStore((state) => state.focusComposer);
   const forkTarget = useComposerStore((state) => state.forkTarget);
@@ -96,6 +102,13 @@ export function App() {
     loadComposerConfig,
     loadThreadHistory,
   });
+
+  useEffect(() => subscribeHostLifecycle((lifecycle) => {
+    if (lifecycle.state !== 'active') {
+      blurComposer();
+      setComposerDomFocused(false);
+    }
+  }), [blurComposer]);
 
   const updateMentionOverlayGeometry = useCallback(() => {
     if (!pickerOverlayVisible) {
@@ -239,6 +252,9 @@ export function App() {
     let cancelled = false;
     const rafs: number[] = [];
     const timers: number[] = [];
+    const canPresent = () => (
+      getHostLifecycleSnapshot().state === 'active' && document.visibilityState !== 'hidden'
+    );
     const scheduleRaf = (callback: FrameRequestCallback) => {
       const raf = window.requestAnimationFrame(callback);
       rafs.push(raf);
@@ -247,14 +263,14 @@ export function App() {
     const focusAfterLayout = () => {
       scheduleRaf(() => {
         scheduleRaf(() => {
-          if (!cancelled) {
+          if (!cancelled && canPresent()) {
             focusComposer();
           }
         });
       });
     };
     const presentComposer = () => {
-      if (cancelled) {
+      if (cancelled || !canPresent()) {
         return;
       }
 

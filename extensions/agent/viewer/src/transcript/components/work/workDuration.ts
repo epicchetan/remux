@@ -4,7 +4,7 @@ export function formatWorkDuration(durationMs: number) {
 
 export function formatRunningWorkDuration(elapsedMs: number) {
   const elapsedSeconds = Math.floor(Math.max(0, elapsedMs) / 1000);
-  return elapsedSeconds > 0 ? formatWorkDurationSeconds(elapsedSeconds) : null;
+  return formatWorkDurationSeconds(elapsedSeconds);
 }
 
 export function nextRunningWorkDurationUpdateMs(elapsedMs: number) {

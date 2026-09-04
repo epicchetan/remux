@@ -1,4 +1,4 @@
-import { AppState, type View } from 'react-native';
+import { AppState, InteractionManager, type View } from 'react-native';
 import { captureRef } from 'react-native-view-shot';
 
 import { useBrowserStore } from './browserStore';
@@ -20,6 +20,9 @@ let captureQueue: Promise<void> = Promise.resolve();
 
 export function setTabPreviewCaptureTarget(tabId: string, target: View | null) {
   if (target) {
+    if (!captureTargets.has(tabId)) {
+      dirtyTabIds.add(tabId);
+    }
     captureTargets.set(tabId, target);
     return;
   }
@@ -44,6 +47,9 @@ export function markAllTabPreviewsDirty() {
 }
 
 export function requestTabPreviewCapture(tabId: string) {
+  if (!dirtyTabIds.has(tabId)) {
+    return;
+  }
   const throttle = captureThrottles.get(tabId) ?? { lastRequestedAt: 0, timer: null };
   captureThrottles.set(tabId, throttle);
   if (throttle.timer) {
@@ -72,6 +78,10 @@ export function noteTabPreviewContentChanged(tabId: string) {
   }
 }
 
+export function tabPreviewNeedsCapture(tabId: string) {
+  return dirtyTabIds.has(tabId);
+}
+
 export function flushDirtyTabPreviews(skipTabId?: string | null) {
   for (const tabId of [...dirtyTabIds]) {
     if (tabId !== skipTabId) {
@@ -88,6 +98,7 @@ function enqueueCapture(tabId: string, throttle: TabCaptureThrottle) {
 }
 
 async function captureTabPreview(tabId: string) {
+  await waitForNativeInteractions();
   if (AppState.currentState !== 'active') {
     // Leave the tab dirty; the next overview entry retries the capture.
     return;
@@ -116,4 +127,12 @@ async function captureTabPreview(tabId: string) {
     // Snapshot support can vary by native view type; the tab card keeps its
     // previous preview (or the icon fallback).
   }
+}
+
+function waitForNativeInteractions() {
+  return new Promise<void>((resolve) => {
+    InteractionManager.runAfterInteractions(() => {
+      requestAnimationFrame(() => resolve());
+    });
+  });
 }

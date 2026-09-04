@@ -1,6 +1,8 @@
-Status: Active Spec
+Status: Archived
 Last verified: 2026-08-08
 Canonical code: The stable comparison UI remains in `extensions/codex/viewer/`; the Agent transcript/history/context foundation and applicable interaction-parity port are implemented and automated/live-validated, with native owner review and the durable-process phase still outstanding
+Superseded by: `agent-native-provider-runtime-v1.md`, which keeps the proven UI
+and virtualizer contract while replacing the provider/runtime boundary.
 
 # Agent UI parity and phased delivery alignment
 

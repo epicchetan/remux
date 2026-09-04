@@ -10,6 +10,9 @@ use serde_json::Value;
 use crate::paths::resolve_manifest_path;
 
 pub const MANIFEST_FILENAME: &str = "remux-extension.json";
+pub const DEFAULT_GATEWAY_MAX_REQUEST_BODY_BYTES: u64 = 16 * 1024 * 1024;
+pub const MIN_GATEWAY_MAX_REQUEST_BODY_BYTES: u64 = 1024 * 1024;
+pub const MAX_GATEWAY_MAX_REQUEST_BODY_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExtensionManifest {
@@ -18,6 +21,7 @@ pub struct ExtensionManifest {
     pub root_dir: PathBuf,
     pub display: Display,
     pub server: Option<ServerSpec>,
+    pub gateway: Option<GatewaySpec>,
     /// Views in manifest declaration order (`main` is guaranteed present).
     pub views: Vec<(String, View)>,
     pub launchers: Vec<Launcher>,
@@ -64,6 +68,12 @@ pub struct ServerSpec {
     pub build: Option<BuildSpec>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewaySpec {
+    pub transport: String,
+    pub max_request_body_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BuildSpec {
     pub command: String,
@@ -78,10 +88,27 @@ pub enum ViewCachePolicy {
     Revalidate,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ViewHostChrome {
+    #[default]
+    None,
+    Minimal,
+}
+
+impl ViewHostChrome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct View {
     pub cache: ViewCachePolicy,
     pub entry: PathBuf,
+    pub host_chrome: ViewHostChrome,
     pub route: String,
     /// Optional build phase: when present, `entry` legitimately may not
     /// exist until the build has run (fresh checkout, wiped dist).
@@ -194,12 +221,27 @@ fn parse_manifest(raw: &Value, root_dir: &Path) -> ExtensionManifest {
         launchers: parse_launchers(raw.get("launchers"), display, &id, root_dir, &views),
         file_handlers: parse_file_handlers(raw.get("fileHandlers"), display, root_dir, &views),
         server: parse_server(raw.get("server"), root_dir),
+        gateway: parse_gateway(raw.get("gateway")),
         id,
         name,
         root_dir: root_dir.to_path_buf(),
         views,
         workloads: parse_workloads(raw.get("resources")),
     }
+}
+
+fn parse_gateway(raw_gateway: Option<&Value>) -> Option<GatewaySpec> {
+    let gateway = raw_gateway?.as_object().expect("validated");
+    Some(GatewaySpec {
+        transport: gateway["transport"]
+            .as_str()
+            .expect("validated")
+            .to_string(),
+        max_request_body_bytes: gateway
+            .get("maxRequestBodyBytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_GATEWAY_MAX_REQUEST_BODY_BYTES),
+    })
 }
 
 fn parse_workloads(resources: Option<&Value>) -> BTreeMap<String, WorkloadSpec> {
@@ -265,6 +307,11 @@ fn parse_views(extension_id: &str, raw_views: &Value, root_dir: &Path) -> Vec<(S
                     root_dir,
                     raw_view["entry"].as_str().expect("validated"),
                 ),
+                host_chrome: match raw_view.get("hostChrome").and_then(Value::as_str) {
+                    None | Some("none") => ViewHostChrome::None,
+                    Some("minimal") => ViewHostChrome::Minimal,
+                    _ => unreachable!("validated"),
+                },
                 route: normalize_route(&route),
                 build: parse_view_job(raw_view.get("build"), root_dir),
                 watch: parse_view_job(raw_view.get("watch"), root_dir),
@@ -490,8 +537,8 @@ pub fn validate_manifest(manifest: &Value, manifest_path: &str) -> Result<(), St
     let invalid = |detail: &str| Err(format!("Invalid Remux extension {id}: {detail}"));
 
     let version = manifest.get("version").and_then(Value::as_u64);
-    if !matches!(version, Some(1 | 2)) {
-        return invalid("version must be 1 or 2");
+    if !matches!(version, Some(1 | 2 | 3)) {
+        return invalid("version must be 1, 2, or 3");
     }
 
     if let Some(name) = manifest.get("name") {
@@ -501,6 +548,7 @@ pub fn validate_manifest(manifest: &Value, manifest_path: &str) -> Result<(), St
     }
 
     validate_server(manifest, id)?;
+    validate_gateway(manifest, id, version.expect("validated"))?;
     validate_main_view(manifest, id)?;
     validate_display(manifest, id)?;
     validate_launchers(manifest, id)?;
@@ -514,8 +562,8 @@ fn validate_resources(manifest: &Value, id: &str, version: u64) -> Result<(), St
         return Ok(());
     };
     let invalid = |detail: &str| Err(format!("Invalid Remux extension {id}: {detail}"));
-    if version != 2 {
-        return invalid("resources requires version 2");
+    if !matches!(version, 2 | 3) {
+        return invalid("resources requires version 2 or 3");
     }
     let Some(resources) = resources.as_object() else {
         return invalid("resources must be an object");
@@ -561,6 +609,43 @@ fn validate_resources(manifest: &Value, id: &str, version: u64) -> Result<(), St
             if !valid {
                 return invalid("workload.threads must be auto or a logical CPU count");
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_gateway(manifest: &Value, id: &str, version: u64) -> Result<(), String> {
+    let Some(gateway) = manifest.get("gateway") else {
+        return Ok(());
+    };
+    let invalid = |detail: &str| Err(format!("Invalid Remux extension {id}: {detail}"));
+    if version != 3 {
+        return invalid("gateway requires version 3");
+    }
+    let Some(gateway) = gateway.as_object() else {
+        return invalid("gateway must be an object");
+    };
+    if manifest.get("server").is_none() {
+        return invalid("gateway requires server");
+    }
+    if !id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return invalid("gateway extension id must contain only ASCII letters, numbers, dot, dash, or underscore");
+    }
+    if gateway.get("transport").and_then(Value::as_str) != Some("http+websocket") {
+        return invalid("gateway.transport must be http+websocket");
+    }
+    if let Some(max_bytes) = gateway.get("maxRequestBodyBytes") {
+        let valid = max_bytes.as_u64().is_some_and(|max_bytes| {
+            (MIN_GATEWAY_MAX_REQUEST_BODY_BYTES..=MAX_GATEWAY_MAX_REQUEST_BODY_BYTES)
+                .contains(&max_bytes)
+        });
+        if !valid {
+            return invalid(
+                "gateway.maxRequestBodyBytes must be an integer from 1048576 through 67108864",
+            );
         }
     }
     Ok(())
@@ -651,6 +736,13 @@ fn validate_main_view(manifest: &Value, id: &str) -> Result<(), String> {
             if !matches!(cache.as_str(), Some("immutable" | "revalidate")) {
                 return invalid(format!(
                     "views.{view_id}.cache must be immutable or revalidate"
+                ));
+            }
+        }
+        if let Some(host_chrome) = view.get("hostChrome") {
+            if !matches!(host_chrome.as_str(), Some("none" | "minimal")) {
+                return invalid(format!(
+                    "views.{view_id}.hostChrome must be none or minimal"
                 ));
             }
         }
@@ -941,7 +1033,7 @@ mod tests {
         );
         assert_invalid(
             json!({ "id": "bad", "views": { "main": { "entry": "index.html" } } }),
-            "version must be 1 or 2",
+            "version must be 1, 2, or 3",
         );
         assert_invalid(
             json!({
@@ -1003,6 +1095,13 @@ mod tests {
                 "views": { "main": { "entry": "index.html", "cache": "forever" } }
             }),
             "views.main.cache must be immutable or revalidate",
+        );
+        assert_invalid(
+            json!({
+                "version": 1, "id": "bad",
+                "views": { "main": { "entry": "index.html", "hostChrome": "immersive" } }
+            }),
+            "views.main.hostChrome must be none or minimal",
         );
         assert_invalid(
             json!({
@@ -1112,6 +1211,98 @@ mod tests {
                 "views": { "main": { "entry": "index.html" } }
             }),
             "launchers.route.kind must be launch",
+        );
+    }
+
+    #[test]
+    fn parses_minimal_view_host_chrome() {
+        let raw = json!({
+            "version": 1,
+            "id": "fixture",
+            "views": {
+                "main": { "entry": "index.html", "hostChrome": "minimal" }
+            }
+        });
+        validate_manifest(&raw, "fixture.json").unwrap();
+        let manifest = parse_manifest(&raw, Path::new("/tmp/fixture"));
+        assert_eq!(manifest.main_view().host_chrome, ViewHostChrome::Minimal);
+    }
+
+    #[test]
+    fn parses_and_validates_version_three_gateway() {
+        let raw = json!({
+            "version": 3,
+            "id": "fixture",
+            "server": { "transport": "stdio", "command": "node" },
+            "gateway": { "transport": "http+websocket" },
+            "views": { "main": { "entry": "index.html" } },
+            "resources": {
+                "workloads": {
+                    "runtime": { "class": "interactive", "lifetime": "extension" }
+                }
+            }
+        });
+        validate_manifest(&raw, "fixture.json").unwrap();
+        let manifest = parse_manifest(&raw, Path::new("/tmp/fixture"));
+        assert_eq!(
+            manifest.gateway,
+            Some(GatewaySpec {
+                transport: "http+websocket".to_string(),
+                max_request_body_bytes: DEFAULT_GATEWAY_MAX_REQUEST_BODY_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_version_three_gateways() {
+        let manifest = |version, gateway: Value, server: Value| {
+            json!({
+                "version": version,
+                "id": "bad",
+                "server": server,
+                "gateway": gateway,
+                "views": { "main": { "entry": "index.html" } }
+            })
+        };
+        assert_invalid(
+            manifest(
+                2,
+                json!({ "transport": "http+websocket" }),
+                json!({ "transport": "stdio", "command": "node" }),
+            ),
+            "gateway requires version 3",
+        );
+        assert_invalid(
+            manifest(3, json!({ "transport": "http+websocket" }), Value::Null),
+            "server must be an object",
+        );
+        assert_invalid(
+            manifest(
+                3,
+                json!({ "transport": "http" }),
+                json!({ "transport": "stdio", "command": "node" }),
+            ),
+            "gateway.transport must be http+websocket",
+        );
+        assert_invalid(
+            manifest(
+                3,
+                json!({
+                    "transport": "http+websocket",
+                    "maxRequestBodyBytes": MIN_GATEWAY_MAX_REQUEST_BODY_BYTES - 1
+                }),
+                json!({ "transport": "stdio", "command": "node" }),
+            ),
+            "gateway.maxRequestBodyBytes",
+        );
+        assert_invalid(
+            json!({
+                "version": 3,
+                "id": "bad",
+                "gateway": { "transport": "http+websocket" },
+                "views": { "main": { "entry": "index.html" } }
+            }),
+            "gateway requires server",
         );
     }
 

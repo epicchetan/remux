@@ -1,17 +1,18 @@
-import { subscribeHostStatus } from '@remux/viewer-kit';
+import { getHostStatusSnapshot, subscribeHostStatus } from '@remux/viewer-kit';
 import { useCallback, useEffect, useRef, useState, type RefObject } from 'react';
 
 import {
-  AGENT_RESOURCE_KEYS,
-  contextResourceKey,
-  isContextInspectorValue,
-  queueResourceKey,
-  type AgentPendingQueueValue,
-  type AgentResourceKey,
-  type AgentRuntimeValue,
-  type AuthValue,
-  type ContextInspectorValue,
-  type ModelsValue,
+  NATIVE_AGENT_RESOURCE_KEYS,
+  type AgentModelsResource,
+  type AgentProvidersResource,
+  type AgentQueueResource,
+  type AgentRuntimeResource,
+  type NativeAgentResourceKey,
+} from '../../../shared/native-agent-protocol.ts';
+import type {
+  AgentPendingQueueValue,
+  AgentRuntimeValue,
+  AuthValue,
 } from '../../../shared/protocol.ts';
 import { useComposerStore } from '../composer/store.ts';
 import { useConversationHistoryStore } from '../conversation/historyStore.ts';
@@ -20,63 +21,174 @@ import { useConversationStore } from '../conversation/store.ts';
 import { useHostStore } from '../ipc/hostStore.ts';
 import { subscribeAgentResourceInvalidations } from '../ipc/resourceInvalidations.ts';
 import { AgentResourceReader } from '../ipc/resources.ts';
+import {
+  projectNativeAuth,
+  projectNativeModels,
+  projectNativeQueue,
+  projectNativeRuntime,
+} from '../nativeViewModel.ts';
 import { useAgentResumeSync } from '../resumeSync.ts';
 import { observeTranscriptServerGeneration } from '../transcript/resourceStore.ts';
+import { ResourceRefreshQueue } from './resourceRefreshQueue.ts';
+
+const RESOURCE_READ_TIMEOUT_MS = 15_000;
 
 export function useAgentResources(
   activeConversationId: string | null,
   activeConversationIdRef: RefObject<string | null>,
 ) {
   const [auth, setAuth] = useState<AuthValue | null>(null);
+  const [providers, setProviders] = useState<AgentProvidersResource | null>(null);
+  const [nativeRuntime, setNativeRuntime] = useState<AgentRuntimeResource | null>(null);
   const [runtime, setRuntime] = useState<AgentRuntimeValue | null>(null);
-  const [contextInspector, setContextInspector] = useState<ContextInspectorValue | null>(null);
   const [queue, setQueue] = useState<AgentPendingQueueValue | null>(null);
   const [error, setError] = useState<string | null>(null);
   const setModels = useComposerStore((state) => state.setModels);
   const ensureConversation = useConversationHistoryStore((state) => state.ensureConversation);
   const invalidateHistory = useConversationHistoryStore((state) => state.invalidate);
   const loadHistory = useConversationHistoryStore((state) => state.load);
-  const resetHistoryReader = useConversationHistoryStore((state) => state.resetReader);
   const connectionStatus = useHostStore((state) => state.connectionStatus);
   const initializeHost = useHostStore((state) => state.initialize);
   const initializeCwd = useConversationStore((state) => state.initializeCwd);
   const resourceReader = useRef(new AgentResourceReader());
+  const providersRef = useRef<AgentProvidersResource | null>(null);
+  const modelsByProvider = useRef(new Map<string, AgentModelsResource>());
+  const runtimeByConversation = useRef(new Map<string, AgentRuntimeResource>());
+  const queueByConversation = useRef(new Map<string, AgentQueueResource>());
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pendingRefreshKeys = useRef(new Set<AgentResourceKey>());
+  const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const retryAttempt = useRef(0);
+  const activeReadController = useRef<AbortController | null>(null);
+  const pendingRefreshKeys = useRef(new Set<NativeAgentResourceKey>());
+  const performRefreshRef = useRef<(keys?: NativeAgentResourceKey[]) => Promise<void>>(
+    async () => undefined,
+  );
+  const refreshQueue = useRef(
+    new ResourceRefreshQueue<NativeAgentResourceKey>((keys) => performRefreshRef.current(keys)),
+  );
 
-  const refresh = useCallback(async (keys?: AgentResourceKey[]) => {
-    const requestedKeys = keys ?? baseResourceKeys();
-    try {
-      const update = await resourceReader.current.read(requestedKeys);
-      observeTranscriptServerGeneration(update.serverGeneration);
-      if (update.generationChanged) {
-        setRuntime(null);
-        setContextInspector(null);
-        setQueue(null);
-      }
-      for (const key of update.missing) {
-        if (key === AGENT_RESOURCE_KEYS.runtime) setRuntime(null);
-        if (key.startsWith('context:')) setContextInspector(null);
-        if (key.startsWith('queue:')) setQueue(null);
-      }
-      for (const [key, value] of update.values) {
-        if (key === AGENT_RESOURCE_KEYS.auth) setAuth(value as AuthValue);
-        if (key === AGENT_RESOURCE_KEYS.models) setModels(value as ModelsValue);
-        if (key === AGENT_RESOURCE_KEYS.runtime) setRuntime(value as AgentRuntimeValue);
-        if (key.startsWith('context:')) {
-          setContextInspector(isContextInspectorValue(value) ? value : null);
+  const applyUpdate = useCallback((update: Awaited<ReturnType<AgentResourceReader['read']>>) => {
+    const currentConversationId = activeConversationIdRef.current;
+    observeTranscriptServerGeneration(update.serverGeneration);
+    if (update.generationChanged) {
+      setRuntime(null);
+      setNativeRuntime(null);
+      setQueue(null);
+      modelsByProvider.current.clear();
+      runtimeByConversation.current.clear();
+      queueByConversation.current.clear();
+    }
+    let nextProviders = providersRef.current;
+    for (const key of update.missing) {
+      if (key === NATIVE_AGENT_RESOURCE_KEYS.providers) nextProviders = null;
+      if (key.startsWith('agent/models:')) modelsByProvider.current.delete(key.slice('agent/models:'.length));
+      if (key.startsWith('agent/runtime:')) {
+        const conversationId = key.slice('agent/runtime:'.length);
+        runtimeByConversation.current.delete(conversationId);
+        if (conversationId === currentConversationId) {
+          setNativeRuntime(null);
+          setRuntime(null);
         }
-        if (key.startsWith('queue:')) setQueue(value as AgentPendingQueueValue);
+      }
+      if (key.startsWith('agent/queue:')) {
+        const conversationId = key.slice('agent/queue:'.length);
+        queueByConversation.current.delete(conversationId);
+        if (conversationId === currentConversationId) setQueue(null);
+      }
+    }
+    for (const [key, value] of update.values) {
+      if (key === NATIVE_AGENT_RESOURCE_KEYS.providers && 'providers' in value) {
+        nextProviders = value as AgentProvidersResource;
+      } else if (key.startsWith('agent/models:') && 'models' in value) {
+        modelsByProvider.current.set(key.slice('agent/models:'.length), value as AgentModelsResource);
+      } else if (key.startsWith('agent/runtime:')) {
+        const conversationId = key.slice('agent/runtime:'.length);
+        const nextRuntime = value as AgentRuntimeResource;
+        if (nextRuntime.conversationId !== conversationId) continue;
+        runtimeByConversation.current.set(conversationId, nextRuntime);
+        if (conversationId === currentConversationId) {
+          setNativeRuntime(nextRuntime);
+          setRuntime(projectNativeRuntime(nextRuntime));
+        }
+      } else if (key.startsWith('agent/queue:')) {
+        const conversationId = key.slice('agent/queue:'.length);
+        const nextQueue = value as AgentQueueResource;
+        if (nextQueue.conversationId !== conversationId) continue;
+        queueByConversation.current.set(conversationId, nextQueue);
+        if (conversationId === currentConversationId) setQueue(projectNativeQueue(nextQueue));
+      }
+    }
+    if (nextProviders !== providersRef.current) {
+      providersRef.current = nextProviders;
+      setProviders(nextProviders);
+    }
+    if (nextProviders) setAuth(projectNativeAuth(nextProviders));
+    setModels(projectNativeModels([...modelsByProvider.current.values()]));
+  }, [activeConversationIdRef, setModels]);
+
+  const performRefresh = useCallback(async (keys?: NativeAgentResourceKey[]) => {
+    const controller = new AbortController();
+    activeReadController.current = controller;
+    const timeout = setTimeout(() => {
+      controller.abort('agent-resource-timeout');
+    }, RESOURCE_READ_TIMEOUT_MS);
+    try {
+      const currentConversationId = activeConversationIdRef.current;
+      const requestedKeys = keys ?? baseResourceKeys(providersRef.current, currentConversationId);
+      const update = await resourceReader.current.read(requestedKeys, {
+        ...(currentConversationId ? { focusedConversationId: currentConversationId } : {}),
+        signal: controller.signal,
+        visibility: 'foreground',
+      });
+      applyUpdate(update);
+      const catalog = update.values.get(NATIVE_AGENT_RESOURCE_KEYS.providers) as
+        | AgentProvidersResource
+        | undefined;
+      const missingModelKeys = (catalog ?? providersRef.current)?.providers.flatMap(({ providerInstanceId }) => {
+        const key = `agent/models:${providerInstanceId}` as const;
+        return requestedKeys.includes(key) || modelsByProvider.current.has(providerInstanceId) ? [] : [key];
+      }) ?? [];
+      if (missingModelKeys.length > 0) {
+        applyUpdate(await resourceReader.current.read(missingModelKeys, {
+          signal: controller.signal,
+          visibility: 'foreground',
+        }));
+      }
+      retryAttempt.current = 0;
+      if (retryTimer.current) {
+        clearTimeout(retryTimer.current);
+        retryTimer.current = null;
       }
       setError(null);
     } catch (refreshError) {
-      setError(messageOf(refreshError));
+      if (controller.signal.aborted && controller.signal.reason !== 'agent-resource-timeout') {
+        return;
+      }
+      setError(controller.signal.reason === 'agent-resource-timeout'
+        ? 'Agent runtime did not respond. Retry the connection.'
+        : messageOf(refreshError));
+      if (getHostStatusSnapshot().status.type === 'connected' && !retryTimer.current) {
+        const delay = Math.min(1_000 * (2 ** retryAttempt.current), 10_000);
+        retryAttempt.current += 1;
+        retryTimer.current = setTimeout(() => {
+          retryTimer.current = null;
+          void refreshQueue.current.enqueue();
+        }, delay);
+      }
+    } finally {
+      clearTimeout(timeout);
+      if (activeReadController.current === controller) activeReadController.current = null;
     }
-  }, [setModels]);
+  }, [activeConversationIdRef, applyUpdate]);
+  performRefreshRef.current = performRefresh;
+
+  const refresh = useCallback((keys?: NativeAgentResourceKey[]) => (
+    refreshQueue.current.enqueue(keys)
+  ), []);
 
   useEffect(() => setConversationRuntime(runtime), [runtime]);
 
-  const scheduleRefresh = useCallback((keys: AgentResourceKey[]) => {
+  const scheduleRefresh = useCallback((keys: NativeAgentResourceKey[]) => {
     for (const key of keys) pendingRefreshKeys.current.add(key);
     if (refreshTimer.current) return;
     refreshTimer.current = setTimeout(() => {
@@ -89,21 +201,19 @@ export function useAgentResources(
 
   useEffect(() => {
     initializeHost();
-    void refresh();
     void loadHistory().then(() => {
       const conversationId = activeConversationIdRef.current;
       return conversationId ? ensureConversation(conversationId) : null;
     });
-    const unsubscribeEvents = subscribeAgentResourceInvalidations((invalidations) => {
-      const resources = invalidations.filter((invalidation) => invalidation.type === 'resource');
-      void invalidateHistory(resources);
+    const unsubscribeEvents = subscribeAgentResourceInvalidations((keys) => {
+      void invalidateHistory(keys);
       const conversationId = activeConversationIdRef.current ?? '';
-      const keys = resources
-        .map((invalidation) => invalidation.key as AgentResourceKey)
-        .filter((key) => key === AGENT_RESOURCE_KEYS.auth ||
-          key === AGENT_RESOURCE_KEYS.models || key === AGENT_RESOURCE_KEYS.runtime ||
-          key === contextResourceKey(conversationId) || key === queueResourceKey(conversationId));
-      if (keys.length > 0) scheduleRefresh(keys);
+      const relevant = keys.filter((key) =>
+        key === NATIVE_AGENT_RESOURCE_KEYS.providers ||
+        key.startsWith('agent/models:') ||
+        key === `agent/runtime:${conversationId}` ||
+        key === `agent/queue:${conversationId}`);
+      if (relevant.length > 0) scheduleRefresh(relevant);
     });
     const unsubscribeStatus = subscribeHostStatus((status) => {
       if (status.status.type === 'connected' && status.status.cwd) initializeCwd(status.status.cwd);
@@ -112,6 +222,8 @@ export function useAgentResources(
       unsubscribeEvents();
       unsubscribeStatus();
       if (refreshTimer.current) clearTimeout(refreshTimer.current);
+      if (retryTimer.current) clearTimeout(retryTimer.current);
+      activeReadController.current?.abort('agent-view-unmounted');
     };
   }, [
     activeConversationIdRef,
@@ -128,27 +240,45 @@ export function useAgentResources(
     if (connectionStatus.type === 'connected' && connectionStatus.cwd) {
       initializeCwd(connectionStatus.cwd);
     }
-  }, [connectionStatus, initializeCwd]);
+    if (connectionStatus.type === 'connected') {
+      void refresh();
+    }
+  }, [connectionStatus, initializeCwd, refresh]);
 
-  useAgentResumeSync(useCallback(async () => {
-    resourceReader.current.clear();
-    resetHistoryReader();
+  useAgentResumeSync(useCallback(async (reason) => {
+    const conversationId = activeConversationIdRef.current;
+    if (reason === 'tab-active') {
+      if (!conversationId) return;
+      await refresh([
+        `agent/runtime:${conversationId}`,
+        `agent/queue:${conversationId}`,
+      ]);
+      return;
+    }
+
     await Promise.all([
       refresh(),
       loadHistory({ preserveReady: true }),
-      ...(activeConversationIdRef.current
-        ? [ensureConversation(activeConversationIdRef.current, true)]
+      ...(conversationId
+        ? [ensureConversation(conversationId, true)]
         : []),
     ]);
-  }, [activeConversationIdRef, ensureConversation, loadHistory, refresh, resetHistoryReader]));
+  }, [activeConversationIdRef, ensureConversation, loadHistory, refresh]));
 
   useEffect(() => {
-    setContextInspector(null);
-    setQueue(null);
+    const cachedRuntime = activeConversationId
+      ? runtimeByConversation.current.get(activeConversationId) ?? null
+      : null;
+    const cachedQueue = activeConversationId
+      ? queueByConversation.current.get(activeConversationId) ?? null
+      : null;
+    setNativeRuntime(cachedRuntime);
+    setRuntime(projectNativeRuntime(cachedRuntime));
+    setQueue(projectNativeQueue(cachedQueue));
     if (activeConversationId) {
       void refresh([
-        contextResourceKey(activeConversationId),
-        queueResourceKey(activeConversationId),
+        `agent/runtime:${activeConversationId}`,
+        `agent/queue:${activeConversationId}`,
       ]);
     }
   }, [activeConversationId, refresh]);
@@ -156,8 +286,9 @@ export function useAgentResources(
   return {
     auth,
     connectionStatus,
-    contextInspector,
     error,
+    providers,
+    nativeRuntime,
     queue,
     refresh,
     runtime,
@@ -165,11 +296,20 @@ export function useAgentResources(
   };
 }
 
-function baseResourceKeys(): AgentResourceKey[] {
+function baseResourceKeys(
+  providers: AgentProvidersResource | null,
+  activeConversationId: string | null,
+): NativeAgentResourceKey[] {
   return [
-    AGENT_RESOURCE_KEYS.auth,
-    AGENT_RESOURCE_KEYS.models,
-    AGENT_RESOURCE_KEYS.runtime,
+    NATIVE_AGENT_RESOURCE_KEYS.providers,
+    ...(providers?.providers.map(({ providerInstanceId }) =>
+      `agent/models:${providerInstanceId}` as const) ?? []),
+    ...(activeConversationId
+      ? [
+          `agent/runtime:${activeConversationId}` as const,
+          `agent/queue:${activeConversationId}` as const,
+        ]
+      : []),
   ];
 }
 

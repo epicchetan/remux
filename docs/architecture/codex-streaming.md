@@ -1,7 +1,7 @@
 # Codex App Server, Remux Backend, and Viewer Streaming Current State
 
 Status: Current
-Last verified: 2026-07-11
+Last verified: 2026-08-19
 Canonical code: `extensions/codex/server/src/main.rs`, `extensions/codex/server/src/history/`, `extensions/codex/server/src/projection/render.rs`, `extensions/codex/server/src/resources/mod.rs`, `extensions/codex/viewer/transcript/resourceStore.ts`, `packages/viewer-kit/src/ipc.ts`, `app/src/surfaces/viewer/ExtensionWebView.tsx`
 
 ## Purpose
@@ -123,6 +123,14 @@ History indexing is incremental. The server retains file identity, scanned and n
 The active presentation window is contiguous. Only a settled user touch/wheel gesture near its top or bottom may slide the window by up to 16 turns; programmatic scroll settlement and resize cannot page. The virtualizer consumes turn order and measured rows from one layout snapshot and preserves prepend position against an actual mounted row when possible. Direct turn and narration navigation request a 12-before/12-after window when the target is not loaded.
 
 The transcript uses one width-contained flex scroller. Safe-area top padding remains in its measured lane and is tracked separately from turn heights. Code blocks, tables, diffs, and detail panels own their local horizontal scrolling; their min-content width cannot enlarge the transcript or document.
+
+Assistant math follows the same snapshot rule. Delimiters split across app-server
+deltas stay literal while incomplete; once a reread contains the complete pair,
+the viewer's Markdown projection can produce a measured KaTeX node. Completion
+is reparsed from the authoritative final item rather than from delimiter state
+carried across deltas. Mutable math/Markdown prefixes use assistant-segment
+cache scopes and cannot evict completed transcript entries. See
+[Codex extension architecture](codex-extension.md#assistant-math-rendering).
 
 Native lifecycle state is explicit. React Native sends an epoch-tagged `active`, `inactive`, or `background` state derived from both `AppState` and active-tab state. Backgrounded viewers preserve ready content, cancel/defer reads, and mark matching invalidations dirty. On activation, transcript and runtime verification start immediately and in parallel; history, summary, queue, and composer refreshes do not block transcript hydration.
 

@@ -1,43 +1,51 @@
 export const transcriptLayout = {
   exactContentHeight: 27,
   assistant: {
-    actionHeight: 28,
-    actionTopGap: 8,
+    actionHeight: 40,
+    actionTopGap: 6,
+  },
+  compaction: {
+    height: 32,
   },
   row: {
-    defaultGap: 20,
+    defaultGap: 22,
     workBoundaryGap: 14,
   },
   user: {
-    actionHeight: 28,
-    actionTopGap: 8,
+    actionHeight: 40,
+    actionTopGap: 6,
     bubbleGap: 8,
-    bubbleBorderWidth: 1,
-    bubbleMaxWidthRatio: 0.86,
-    bubblePaddingX: 16,
-    bubblePaddingY: 10,
+    bubbleBorderWidth: 0,
+    bubbleMaxWidthRatio: 0.8,
+    bubbleMobileMaxWidthRatio: 0.88,
+    bubbleMobileBreakpoint: 640,
+    bubblePaddingX: 14,
+    bubblePaddingY: 12,
+    bubbleTextMeasureGuard: 8,
     collapsedBodyLines: 8,
     disclosureHeight: 22,
+    railCardHeight: 62,
   },
   viewport: {
     padY: 20,
   },
   work: {
-    headerHeight: 24,
+    headerHeight: 28,
     separatorHeight: 1,
     separatorMarginTop: 4,
   },
 } as const;
 
-export function userBubbleContentWidth(contentWidth: number, placement: 'topLevel' | 'work' = 'topLevel') {
-  const bubbleWidth = Math.max(
-    1,
-    placement === 'work' ? contentWidth * transcriptLayout.user.bubbleMaxWidthRatio : contentWidth,
-  );
+export function userBubbleContentWidth(contentWidth: number, _placement: 'topLevel' | 'work' = 'topLevel') {
+  const ratio = contentWidth < transcriptLayout.user.bubbleMobileBreakpoint
+    ? transcriptLayout.user.bubbleMobileMaxWidthRatio
+    : transcriptLayout.user.bubbleMaxWidthRatio;
+  const bubbleWidth = Math.max(1, contentWidth * ratio);
   return Math.max(
     1,
     bubbleWidth -
       transcriptLayout.user.bubblePaddingX * 2 -
-      transcriptLayout.user.bubbleBorderWidth * 2,
+      transcriptLayout.user.bubbleBorderWidth * 2 -
+      transcriptLayout.user.bubbleTextMeasureGuard,
   );
 }

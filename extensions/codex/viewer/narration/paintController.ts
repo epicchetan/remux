@@ -8,8 +8,12 @@ import {
   resolveNarrationTextPaint,
   subscribeNarrationTextLeaves,
 } from './textLeafRegistry';
+import {
+  resolveNarrationElementPaint,
+  subscribeNarrationElementLeaves,
+} from './elementLeafRegistry';
 
-export const NARRATION_PAINT_RENDERER_VERSION = '5';
+export const NARRATION_PAINT_RENDERER_VERSION = '6';
 
 type OverlayPaint = {
   kind: 'context' | 'word';
@@ -75,14 +79,22 @@ class NarrationPaintController {
     const rects: DOMRect[] = [];
 
     if (sentenceHasWords) {
-      const context = resolveNarrationTextPaint(target.assistantMessageId, sentence);
+      const context = {
+        elements: resolveNarrationElementPaint(target.assistantMessageId, sentence),
+        ranges: resolveNarrationTextPaint(target.assistantMessageId, sentence).ranges,
+      };
       const foreground = word && word.sentenceId === sentence.id
-        ? resolveNarrationTextPaint(target.assistantMessageId, word)
-        : { ranges: [] };
-      this.paintTextOverlays(context.ranges, foreground.ranges);
+        ? {
+            elements: resolveNarrationElementPaint(target.assistantMessageId, word),
+            ranges: resolveNarrationTextPaint(target.assistantMessageId, word).ranges,
+          }
+        : { elements: [], ranges: [] };
+      this.paintTextOverlays(context, foreground);
       rects.push(...foreground.ranges.flatMap((range) => [...range.getClientRects()]));
+      rects.push(...foreground.elements.map((element) => element.getBoundingClientRect()));
       if (rects.length === 0) {
         rects.push(...context.ranges.flatMap((range) => [...range.getClientRects()]));
+        rects.push(...context.elements.map((element) => element.getBoundingClientRect()));
       }
     } else {
       for (const frame of resolveNarrationBlockElements(target.assistantMessageId, [sentence.blockId])) {
@@ -124,9 +136,12 @@ class NarrationPaintController {
     }
   }
 
-  private paintTextOverlays(contextRanges: Range[], wordRanges: Range[]) {
+  private paintTextOverlays(
+    context: { elements: HTMLElement[]; ranges: Range[] },
+    word: { elements: HTMLElement[]; ranges: Range[] },
+  ) {
     const paintsByFrame = new Map<HTMLElement, OverlayPaint[]>();
-    for (const range of contextRanges) {
+    for (const range of context.ranges) {
       const frame = blockFrameForRange(range);
       if (!frame) continue;
       for (const rect of range.getClientRects()) {
@@ -134,11 +149,25 @@ class NarrationPaintController {
         addOverlayPaint(paintsByFrame, frame, { kind: 'context', rect });
       }
     }
-    for (const range of wordRanges) {
+    for (const element of context.elements) {
+      const frame = blockFrameForElement(element);
+      const rect = element.getBoundingClientRect();
+      if (frame && rect.width > 0 && rect.height > 0) {
+        addOverlayPaint(paintsByFrame, frame, { kind: 'context', rect });
+      }
+    }
+    for (const range of word.ranges) {
       const frame = blockFrameForRange(range);
       if (!frame) continue;
       for (const rect of range.getClientRects()) {
         if (rect.width <= 0 || rect.height <= 0) continue;
+        addOverlayPaint(paintsByFrame, frame, { kind: 'word', rect });
+      }
+    }
+    for (const element of word.elements) {
+      const frame = blockFrameForElement(element);
+      const rect = element.getBoundingClientRect();
+      if (frame && rect.width > 0 && rect.height > 0) {
         addOverlayPaint(paintsByFrame, frame, { kind: 'word', rect });
       }
     }
@@ -186,11 +215,13 @@ export function installNarrationPaintController() {
   const controller = new NarrationPaintController();
   const unsubscribeStore = useNarrationStore.subscribe(() => controller.sync());
   const unsubscribeBlocks = subscribeNarrationBlocks(() => controller.scheduleRetry());
+  const unsubscribeElements = subscribeNarrationElementLeaves(() => controller.scheduleRetry());
   const unsubscribeLeaves = subscribeNarrationTextLeaves(() => controller.scheduleRetry());
   controller.sync();
   return () => {
     unsubscribeStore();
     unsubscribeBlocks();
+    unsubscribeElements();
     unsubscribeLeaves();
     controller.destroy();
   };
@@ -205,6 +236,10 @@ function blockFrameForRange(range: Range) {
   const common = range.commonAncestorContainer;
   const element = common instanceof HTMLElement ? common : common.parentElement;
   return element?.closest<HTMLElement>('.codex-md-block-frame') ?? null;
+}
+
+function blockFrameForElement(element: HTMLElement) {
+  return element.closest<HTMLElement>('.codex-md-block-frame');
 }
 
 function narrationPaintLayer(frame: HTMLElement) {

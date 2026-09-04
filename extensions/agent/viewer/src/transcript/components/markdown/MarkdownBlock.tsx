@@ -16,24 +16,35 @@ import { FileTypeIcon } from '../file/fileTypeIcons';
 import { cn } from '@remux/viewer-kit/shadcn';
 import { openHostHref, openHostTarget } from '@remux/viewer-kit/links';
 
-const fallbackMarkdownWidth = 868;
+const fallbackMarkdownWidth = 728;
 
 export function MarkdownBlock({
   children,
   density = 'default',
   maxLines,
+  messageCacheKey = null,
+  preserveSoftBreaks = false,
   streaming = false,
   width = fallbackMarkdownWidth,
 }: {
   children: string;
   density?: MarkdownDensity;
   maxLines?: number;
+  messageCacheKey?: string | null;
+  preserveSoftBreaks?: boolean;
   streaming?: boolean;
   width?: number;
 }) {
+  const cacheScope = streaming && messageCacheKey
+    ? { key: messageCacheKey, kind: 'streaming' as const }
+    : { kind: 'complete' as const };
   const document = useMemo(
-    () => getMarkdownLayoutDocument(children, density, width, { richFileLinks: !streaming }),
-    [children, density, streaming, width],
+    () => getMarkdownLayoutDocument(children, density, width, {
+      cacheScope,
+      preserveSoftBreaks,
+      richFileLinks: !streaming,
+    }),
+    [children, density, messageCacheKey, preserveSoftBreaks, streaming, width],
   );
   const height = maxLines === undefined
     ? document.height

@@ -1,15 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent } from 'react';
 
 import {
-  queueResourceKey,
   type AgentRuntimeValue,
   type ConversationSummary,
   type ConversationValue,
+  type ModelsValue,
+  type ReasoningLevel,
 } from '../../shared/protocol.ts';
+import type { AgentProvidersResource, AgentRuntimeResource } from '../../shared/native-agent-protocol.ts';
+import type { ProviderAccess } from '../../shared/provider-runtime.ts';
 import { ComposerContent } from './composer/content.tsx';
 import { AgentAuthScreen } from './auth/AgentAuthScreen.tsx';
 import { createEmptyComposerSnapshot } from './composer/model/composerModel.ts';
-import { createDefaultTurnContextPlan } from './composer/context/contextPlan.ts';
 import { composerResourcesFromSnapshot } from './composer/model/userInputInterop.ts';
 import { ComposerMentionPicker } from './composer/mentions/MentionPicker.tsx';
 import { parseComposerMentionQuery } from './composer/mentions/mentionSearch.ts';
@@ -34,12 +36,16 @@ import {
 } from './identity.ts';
 import { useHostStore } from './ipc/hostStore.ts';
 import { agentCommands } from './ipc/agentCommands.ts';
+import { viewerModelId } from './nativeViewModel.ts';
 import { useComposerViewport } from './app/useComposerViewport.ts';
 import { useAgentResources } from './app/useAgentResources.ts';
 import { readInitialTarget, useAgentNavigation } from './app/useAgentNavigation.ts';
 import { useConversationActions } from './app/useConversationActions.ts';
 import { AgentTranscript } from './transcript/index.ts';
-import { getTranscriptResourceState } from './transcript/resourceStore.ts';
+import {
+  getTranscriptResourceState,
+  retryActiveTranscriptHistorySync,
+} from './transcript/resourceStore.ts';
 import {
   requestTranscriptTurnScroll,
 } from './transcript/viewportStore.ts';
@@ -70,13 +76,18 @@ export function App() {
   const {
     auth,
     connectionStatus,
-    contextInspector,
     error,
+    nativeRuntime,
+    providers,
     queue,
     refresh,
     runtime,
     setError,
   } = useAgentResources(activeConversationId, activeConversationIdRef);
+  const authProvider = providers?.providers.find(({ state }) => state === 'ready')
+    ?? providers?.providers.find(({ provider }) => provider === 'codex')
+    ?? providers?.providers[0]
+    ?? null;
   const conversation = useMemo(
     () => conversationSummary ? projectConversation(conversationSummary, runtime) : null,
     [conversationSummary, runtime],
@@ -89,21 +100,24 @@ export function App() {
   const setCwd = useConversationStore((state) => state.setCwd);
   const modelId = useComposerStore((state) => state.modelId);
   const reasoning = useComposerStore((state) => state.reasoning);
+  const providerInstanceId = useComposerStore((state) => state.providerInstanceId);
+  const access = useComposerStore((state) => state.access);
+  const composerModels = useComposerStore((state) => state.models);
   const composerSnapshot = useComposerStore((state) => state.snapshot);
-  const contextPlan = useComposerStore((state) => state.contextPlan);
-  const preserveContextPlan = useComposerStore((state) => state.preserveContextPlan);
   const composerPresentationRequest = useComposerStore((state) => state.composerPresentationRequest);
+  const blurComposer = useComposerStore((state) => state.blurComposer);
+  const clearComposerMode = useComposerStore((state) => state.clearMode);
   const editTarget = useComposerStore((state) => state.editTarget);
   const focusComposer = useComposerStore((state) => state.focusComposer);
   const forkTarget = useComposerStore((state) => state.forkTarget);
   const mentionSession = useComposerStore((state) => state.mentionSession);
   const setComposerDocument = useComposerStore((state) => state.setComposerDocument);
-  const setContextPlan = useComposerStore((state) => state.setContextPlan);
   const setModelId = useComposerStore((state) => state.setModelId);
-  const setPreserveContextPlan = useComposerStore((state) => state.setPreserveContextPlan);
   const setReasoning = useComposerStore((state) => state.setReasoning);
+  const setProviderInstanceId = useComposerStore((state) => state.setProviderInstanceId);
+  const setAccess = useComposerStore((state) => state.setAccess);
   const composerRestorePendingRef = useRef<string | null>(null);
-  const conversationSettingsTargetRef = useRef<string | null>(null);
+  const draftConfigurationsRef = useRef(new Map<string, DraftComposerConfiguration>());
   const mainPaneRef = useRef<HTMLElement | null>(null);
   const bottomBarSlotRef = useRef<HTMLDivElement | null>(null);
   const mentionQuery = mentionSession
@@ -116,6 +130,7 @@ export function App() {
     pickerOverlayStyle,
     pickerOverlayVisible,
   } = useComposerViewport({
+    blurComposer,
     bottomBarSlotRef,
     composerPresentationRequestId: composerPresentationRequest.id,
     directoryPickerOpen,
@@ -140,35 +155,59 @@ export function App() {
 
   useEffect(() => {
     if (activeDraftId) {
-      conversationSettingsTargetRef.current = null;
       const currentDraft = draftRef.current?.id === activeDraftId
         ? draftRef.current
         : loadNewChatDraft(activeDraftId);
       if (!currentDraft) return;
       if (currentDraft.cwd) setCwd(currentDraft.cwd);
-      if (currentDraft.modelId) setModelId(currentDraft.modelId);
-      setReasoning(currentDraft.reasoning);
-      setContextPlan(currentDraft.contextPlan);
-      setPreserveContextPlan(currentDraft.preserveContextPlan);
+      const configuration = draftConfigurationsRef.current.get(activeDraftId);
+      if (configuration) {
+        setProviderInstanceId(configuration.providerInstanceId);
+        setModelId(configuration.modelId);
+        setReasoning(configuration.reasoning);
+        setAccess(configuration.access);
+      }
       restoreComposerSnapshot(currentDraft.snapshot);
     } else if (activeConversationId) {
       const currentDraft = loadConversationDraft(activeConversationId);
-      if (currentDraft.modelId) setModelId(currentDraft.modelId);
-      if (currentDraft.reasoning) {
-        setReasoning(currentDraft.reasoning);
-      }
-      conversationSettingsTargetRef.current = currentDraft.modelId || currentDraft.reasoning
-        ? activeConversationId
-        : null;
-      setContextPlan(currentDraft.contextPlan);
-      setPreserveContextPlan(currentDraft.preserveContextPlan);
       restoreComposerSnapshot(currentDraft.snapshot);
-    } else {
-      conversationSettingsTargetRef.current = null;
-      setContextPlan(createDefaultTurnContextPlan());
-      setPreserveContextPlan(false);
     }
-  }, [activeConversationId, activeDraftId, restoreComposerSnapshot, setContextPlan, setCwd, setModelId, setPreserveContextPlan, setReasoning]);
+  }, [
+    activeConversationId,
+    activeDraftId,
+    restoreComposerSnapshot,
+    setAccess,
+    setCwd,
+    setModelId,
+    setProviderInstanceId,
+    setReasoning,
+  ]);
+
+  useEffect(() => {
+    if (!activeDraftId || activeConversationId || !providers || !composerModels) return;
+    const current = draftConfigurationsRef.current.get(activeDraftId);
+    const configuration = current
+      && providers.providers.some(({ providerInstanceId: id, state }) =>
+        id === current.providerInstanceId && state === 'ready')
+      && composerModels.models.some(({ id }) => id === current.modelId)
+      ? current
+      : defaultDraftConfiguration(providers, composerModels);
+    if (!configuration) return;
+    draftConfigurationsRef.current.set(activeDraftId, configuration);
+    setProviderInstanceId(configuration.providerInstanceId);
+    setModelId(configuration.modelId);
+    setReasoning(configuration.reasoning);
+    setAccess(configuration.access);
+  }, [
+    activeConversationId,
+    activeDraftId,
+    composerModels,
+    providers,
+    setAccess,
+    setModelId,
+    setProviderInstanceId,
+    setReasoning,
+  ]);
 
   useEffect(() => {
     const pendingRestore = composerRestorePendingRef.current;
@@ -178,56 +217,70 @@ export function App() {
     }
     if (!activeDraftId || draft?.id !== activeDraftId) {
       if (activeConversationId) {
-        if (conversationSettingsTargetRef.current !== activeConversationId) return;
-        persistConversationDraft(
-          activeConversationId,
-          composerSnapshot,
-          contextPlan,
-          modelId,
-          preserveContextPlan,
-          reasoning,
-        );
+        persistConversationDraft(activeConversationId, composerSnapshot);
       }
       return;
     }
+    draftConfigurationsRef.current.set(activeDraftId, {
+      access,
+      modelId,
+      providerInstanceId,
+      reasoning,
+    });
     if (
       draft.cwd === cwd &&
-      draft.modelId === modelId &&
-      draft.preserveContextPlan === preserveContextPlan &&
-      draft.reasoning === reasoning &&
-      sameContextPlan(draft.contextPlan, contextPlan) &&
       draft.snapshot.contentKey === composerSnapshot.contentKey
     ) return;
     const next = {
       ...draft,
       cwd,
-      modelId,
-      preserveContextPlan,
-      reasoning,
-      contextPlan,
       snapshot: composerSnapshot,
       updatedAt: Date.now(),
     };
     draftRef.current = next;
     setDraft(next);
     persistNewChatDraft(next);
-  }, [activeConversationId, activeDraftId, composerSnapshot, contextPlan, cwd, draft, modelId, preserveContextPlan, reasoning]);
+  }, [
+    access,
+    activeConversationId,
+    activeDraftId,
+    composerSnapshot,
+    cwd,
+    draft,
+    modelId,
+    providerInstanceId,
+    reasoning,
+  ]);
 
   useEffect(() => {
     if (!activeConversationId || !conversationSummary) return;
     setCwd(conversationSummary.cwd);
-    if (conversationSettingsTargetRef.current !== activeConversationId) {
-      const currentDraft = loadConversationDraft(activeConversationId);
-      const composer = useComposerStore.getState();
-      const selected = resolveModel(composer.models, currentDraft.modelId ?? composer.modelId);
-      if (selected) setModelId(selected.id);
-      const requested = currentDraft.reasoning ?? composer.reasoning;
-      setReasoning(selected && !selected.supportedReasoning.includes(requested)
-        ? preferredReasoning(selected)
-        : requested);
-      conversationSettingsTargetRef.current = activeConversationId;
+    if (nativeRuntime?.conversationId === activeConversationId) {
+      setProviderInstanceId(nativeRuntime.providerInstanceId);
+      setModelId(viewerModelId(
+        nativeRuntime.providerInstanceId,
+        nativeRuntime.composer.nextTurn.model,
+      ));
+      setReasoning(asReasoning(nativeRuntime.composer.nextTurn.effort));
+      setAccess(nativeRuntime.composer.nextTurn.access);
+      return;
     }
-  }, [activeConversationId, conversationSummary, setCwd, setModelId, setReasoning]);
+    if (conversationSummary.providerInstanceId) {
+      setProviderInstanceId(conversationSummary.providerInstanceId);
+    }
+    setModelId(conversationSummary.modelId);
+    setReasoning(conversationSummary.reasoning);
+    if (conversationSummary.access) setAccess(conversationSummary.access);
+  }, [
+    activeConversationId,
+    conversationSummary,
+    nativeRuntime,
+    setAccess,
+    setCwd,
+    setModelId,
+    setProviderInstanceId,
+    setReasoning,
+  ]);
 
   const saveCurrentTargetDraft = useCallback(() => {
     const snapshot = useComposerStore.getState().snapshot;
@@ -237,13 +290,16 @@ export function App() {
       const next: AgentNewChatDraft = {
         ...current,
         cwd: useConversationStore.getState().cwd,
-        modelId: useComposerStore.getState().modelId,
-        preserveContextPlan: useComposerStore.getState().preserveContextPlan,
-        reasoning: useComposerStore.getState().reasoning,
-        contextPlan: useComposerStore.getState().contextPlan,
         snapshot,
         updatedAt: Date.now(),
       };
+      const composer = useComposerStore.getState();
+      draftConfigurationsRef.current.set(currentDraftId, {
+        access: composer.access,
+        modelId: composer.modelId,
+        providerInstanceId: composer.providerInstanceId,
+        reasoning: composer.reasoning,
+      });
       draftRef.current = next;
       setDraft(next);
       persistNewChatDraft(next);
@@ -251,20 +307,13 @@ export function App() {
     }
     const currentConversationId = activeConversationIdRef.current;
     if (currentConversationId) {
-      const composer = useComposerStore.getState();
-      persistConversationDraft(
-        currentConversationId,
-        snapshot,
-        composer.contextPlan,
-        composer.modelId,
-        composer.preserveContextPlan,
-        composer.reasoning,
-      );
+      persistConversationDraft(currentConversationId, snapshot);
     }
   }, []);
 
   const activateDraft = useCallback((nextDraft: AgentNewChatDraft) => {
-    conversationSettingsTargetRef.current = null;
+    blurComposer();
+    clearComposerMode();
     activeConversationIdRef.current = null;
     activeDraftIdRef.current = nextDraft.id;
     draftRef.current = nextDraft;
@@ -272,14 +321,30 @@ export function App() {
     setActiveDraftId(nextDraft.id);
     setDraft(nextDraft);
     setCwd(nextDraft.cwd);
-    if (nextDraft.modelId) setModelId(nextDraft.modelId);
-    setReasoning(nextDraft.reasoning);
-    setContextPlan(nextDraft.contextPlan);
-    setPreserveContextPlan(nextDraft.preserveContextPlan);
+    const configuration = draftConfigurationsRef.current.get(nextDraft.id)
+      ?? (providers && composerModels ? defaultDraftConfiguration(providers, composerModels) : null);
+    if (configuration) {
+      draftConfigurationsRef.current.set(nextDraft.id, configuration);
+      setProviderInstanceId(configuration.providerInstanceId);
+      setModelId(configuration.modelId);
+      setReasoning(configuration.reasoning);
+      setAccess(configuration.access);
+    }
     restoreComposerSnapshot(nextDraft.snapshot);
     setError(null);
     void getTranscriptResourceState().setActiveConversationId(null);
-  }, [restoreComposerSnapshot, setContextPlan, setCwd, setModelId, setPreserveContextPlan, setReasoning]);
+  }, [
+    blurComposer,
+    clearComposerMode,
+    composerModels,
+    providers,
+    restoreComposerSnapshot,
+    setAccess,
+    setCwd,
+    setModelId,
+    setProviderInstanceId,
+    setReasoning,
+  ]);
 
   const selectDraft = useCallback(() => {
     const nextDraft = draftRef.current;
@@ -306,10 +371,6 @@ export function App() {
     const nextDraft: AgentNewChatDraft = {
       cwd: selected?.cwd ?? useConversationStore.getState().cwd,
       id,
-      modelId: useComposerStore.getState().modelId,
-      preserveContextPlan: false,
-      reasoning: useComposerStore.getState().reasoning,
-      contextPlan: createDefaultTurnContextPlan(),
       snapshot: createEmptyComposerSnapshot(),
       updatedAt: Date.now(),
     };
@@ -322,27 +383,26 @@ export function App() {
     if (!normalized) return;
     if (activeConversationIdRef.current !== normalized || activeDraftIdRef.current) {
       saveCurrentTargetDraft();
+      blurComposer();
+      clearComposerMode();
       activeConversationIdRef.current = normalized;
       activeDraftIdRef.current = null;
       setActiveConversationId(normalized);
       setActiveDraftId(null);
       const currentDraft = loadConversationDraft(normalized);
-      if (currentDraft.modelId) setModelId(currentDraft.modelId);
-      if (currentDraft.reasoning) {
-        setReasoning(currentDraft.reasoning);
-      }
-      conversationSettingsTargetRef.current = currentDraft.modelId || currentDraft.reasoning
-        ? normalized
-        : null;
-      setContextPlan(currentDraft.contextPlan);
-      setPreserveContextPlan(currentDraft.preserveContextPlan);
       restoreComposerSnapshot(currentDraft.snapshot);
       setError(null);
       void getTranscriptResourceState().setActiveConversationId(normalized);
       void ensureConversation(normalized);
     }
     if (focusTurnId) requestTranscriptTurnScroll(normalized, focusTurnId);
-  }, [ensureConversation, restoreComposerSnapshot, saveCurrentTargetDraft, setContextPlan, setModelId, setPreserveContextPlan, setReasoning]);
+  }, [
+    blurComposer,
+    clearComposerMode,
+    ensureConversation,
+    restoreComposerSnapshot,
+    saveCurrentTargetDraft,
+  ]);
 
   useAgentNavigation({
     activeConversationId,
@@ -367,10 +427,127 @@ export function App() {
     }
   }, [refresh]);
 
-  const { branchMessage, interrupt, send } = useConversationActions({
+  const retryHistorySync = useCallback(async () => {
+    const conversationId = activeConversationIdRef.current;
+    if (!conversationId) return;
+    setError(null);
+    try {
+      await retryActiveTranscriptHistorySync();
+      await refresh([
+        `agent/conversation:${conversationId}`,
+        `agent/runtime:${conversationId}`,
+      ]);
+    } catch (reason) {
+      setError(messageOf(reason));
+    }
+  }, [refresh, setError]);
+
+  const updateComposerPreference = useCallback(async (input: {
+    providerInstanceId: string;
+    modelId: string;
+    reasoning: ReasoningLevel;
+  }) => {
+    const selected = resolveModel(composerModels, input.modelId);
+    if (!selected?.nativeId || selected.providerInstanceId !== input.providerInstanceId) {
+      setError('The selected native provider model is unavailable.');
+      return;
+    }
+    setError(null);
+    try {
+      if (activeConversationId) {
+        if (!nativeRuntime || nativeRuntime.conversationId !== activeConversationId) {
+          throw new Error('Conversation configuration is still loading.');
+        }
+        await agentCommands.setConversationPreference({
+          conversationId: activeConversationId,
+          expectedRevision: nativeRuntime.composer.revision,
+          nativeModelId: selected.nativeId,
+          reasoning: input.reasoning,
+        });
+        await refresh([
+          'agent/providers',
+          `agent/runtime:${activeConversationId}`,
+        ]);
+        return;
+      }
+      setProviderInstanceId(input.providerInstanceId);
+      setModelId(input.modelId);
+      setReasoning(input.reasoning);
+      if (activeDraftId) {
+        draftConfigurationsRef.current.set(activeDraftId, {
+          access,
+          modelId: input.modelId,
+          providerInstanceId: input.providerInstanceId,
+          reasoning: input.reasoning,
+        });
+      }
+      if (!providers) throw new Error('Provider catalog is still loading.');
+      await agentCommands.setProviderPreference({
+        providerInstanceId: input.providerInstanceId,
+        expectedProvidersRevision: providers.preferenceRevision,
+        nativeModelId: selected.nativeId,
+        reasoning: input.reasoning,
+      });
+      await refresh([
+        'agent/providers',
+        `agent/models:${input.providerInstanceId}`,
+      ]);
+    } catch (reason) {
+      setError(messageOf(reason));
+      await refresh(activeConversationId
+        ? ['agent/providers', `agent/runtime:${activeConversationId}`]
+        : ['agent/providers']);
+    }
+  }, [
+    access,
+    activeConversationId,
+    activeDraftId,
+    composerModels,
+    nativeRuntime,
+    providers,
+    refresh,
+    setError,
+    setModelId,
+    setProviderInstanceId,
+    setReasoning,
+  ]);
+
+  const updateComposerAccess = useCallback(async (nextAccess: ProviderAccess) => {
+    if (activeConversationId) {
+      if (!nativeRuntime || nativeRuntime.conversationId !== activeConversationId) {
+        setError('Conversation configuration is still loading.');
+        return;
+      }
+      setError(null);
+      try {
+        await agentCommands.setConversationAccess({
+          conversationId: activeConversationId,
+          expectedRevision: nativeRuntime.composer.revision,
+          access: nextAccess,
+        });
+        setAccess(nextAccess);
+        await refresh([`agent/runtime:${activeConversationId}`]);
+      } catch (reason) {
+        setError(messageOf(reason));
+      }
+      return;
+    }
+    setAccess(nextAccess);
+    if (!activeDraftId) return;
+    const composer = useComposerStore.getState();
+    draftConfigurationsRef.current.set(activeDraftId, {
+      access: nextAccess,
+      modelId: composer.modelId,
+      providerInstanceId: composer.providerInstanceId,
+      reasoning: composer.reasoning,
+    });
+  }, [activeConversationId, activeDraftId, nativeRuntime, refresh, setAccess, setError]);
+
+  const { branchMessage, compact, interrupt, send } = useConversationActions({
     activeConversationIdRef,
     activeDraftIdRef,
     conversation,
+    nativeRuntime,
     cwd,
     draftRef,
     refresh,
@@ -382,11 +559,49 @@ export function App() {
   });
 
   if (!auth) {
-    return <main className="agent-app agent-center"><p>Connecting to agent runtime…</p></main>;
+    if (error) {
+      return (
+        <main className="agent-app agent-center">
+          <section className="agent-auth-card" aria-live="polite">
+            <div className="agent-auth-kicker">Remux Agent</div>
+            <h1>Agent runtime unavailable</h1>
+            <p className="agent-error" role="alert">{error}</p>
+            <p>Your conversation is safe. Retry will reconnect and reload its current resources.</p>
+            <div className="agent-auth-actions">
+              <button
+                type="button"
+                onClick={() => {
+                  setError(null);
+                  void refresh();
+                }}
+              >
+                Retry
+              </button>
+            </div>
+          </section>
+        </main>
+      );
+    }
+    return (
+      <main className="agent-app agent-center" aria-live="polite">
+        <p>{connectionStatus.type === 'connected'
+          ? 'Connecting to agent runtime…'
+          : 'Reconnecting to Remux…'}</p>
+      </main>
+    );
   }
 
   if (auth.state !== 'signed-in') {
-    return <AgentAuthScreen auth={auth} busy={authBusy} error={error} run={(action) => void runAuth(action)} />;
+    return (
+      <AgentAuthScreen
+        auth={auth}
+        busy={authBusy}
+        error={error}
+        loginMode={authProvider?.capabilities?.authentication.login ?? 'none'}
+        providerInstanceId={authProvider?.providerInstanceId ?? null}
+        run={(action) => void runAuth(action)}
+      />
+    );
   }
 
   return (
@@ -429,16 +644,26 @@ export function App() {
         <div className="remux-bottom-bar-slot" ref={bottomBarSlotRef}>
           <ComposerContent
             conversation={conversation}
-            contextInspector={contextInspector}
             conversationSelected={Boolean(activeConversationId)}
             onInterrupt={interrupt}
+            onCompact={compact}
             onEdit={(target, input, setPhase) => branchMessage('edit', target, input, setPhase)}
             onFork={(target, input, setPhase) => branchMessage('fork', target, input, setPhase)}
             onQueueChanged={() => activeConversationId
-              ? refresh([queueResourceKey(activeConversationId)])
+              ? refresh([`agent/queue:${activeConversationId}`])
               : Promise.resolve()}
+            onRetryHistory={retryHistorySync}
             onSend={send}
-            onSignOut={() => void runAuth(() => agentCommands.logout())}
+            onProviderLogin={(providerInstanceId, mode) => {
+              void runAuth(() => agentCommands.login(providerInstanceId, mode));
+            }}
+            onProviderLogout={(providerInstanceId) => {
+              void runAuth(() => agentCommands.logout(providerInstanceId));
+            }}
+            onPreferenceChange={updateComposerPreference}
+            onAccessChange={updateComposerAccess}
+            providers={providers}
+            runtime={nativeRuntime}
             runtimeError={error ?? conversation?.error ?? null}
             queue={queue}
           />
@@ -459,25 +684,50 @@ function initialDraft(id: string): AgentNewChatDraft {
   return loadNewChatDraft(id) ?? {
     cwd: '',
     id,
-    modelId: '',
-    preserveContextPlan: false,
-    reasoning: 'high',
-    contextPlan: createDefaultTurnContextPlan(),
     snapshot: createEmptyComposerSnapshot(),
     updatedAt: Date.now(),
   };
 }
 
-function sameContextPlan(
-  left: AgentNewChatDraft['contextPlan'],
-  right: AgentNewChatDraft['contextPlan'],
-) {
-  return left.automaticDialogueTurns === right.automaticDialogueTurns &&
-    left.overrides.length === right.overrides.length &&
-    left.overrides.every((override, index) => {
-      const candidate = right.overrides[index];
-      return candidate?.turnId === override.turnId && candidate.resolution === override.resolution;
-    });
+type DraftComposerConfiguration = {
+  access: ProviderAccess;
+  modelId: string;
+  providerInstanceId: string;
+  reasoning: ReasoningLevel;
+};
+
+function defaultDraftConfiguration(
+  providers: AgentProvidersResource,
+  models: ModelsValue,
+): DraftComposerConfiguration | null {
+  const providerInstanceId = providers.defaultProviderInstanceId
+    ?? providers.providers.find(({ state }) => state === 'ready')?.providerInstanceId;
+  if (!providerInstanceId) return null;
+  const provider = providers.providers.find((entry) => entry.providerInstanceId === providerInstanceId);
+  const providerModels = models.models.filter((model) => model.providerInstanceId === providerInstanceId);
+  const sticky = provider?.stickyPreference
+    ? providerModels.find(({ nativeId }) => nativeId === provider.stickyPreference?.model)
+    : undefined;
+  const selected = sticky
+    ?? providerModels.find(({ id }) => id === models.defaultModelId)
+    ?? providerModels[0];
+  if (!selected) return null;
+  const stickyReasoning = asReasoning(provider?.stickyPreference?.effort ?? null);
+  return {
+    access: 'workspace-write',
+    modelId: selected.id,
+    providerInstanceId,
+    reasoning: selected.supportedReasoning.includes(stickyReasoning)
+      ? stickyReasoning
+      : preferredReasoning(selected),
+  };
+}
+
+function asReasoning(value: string | null | undefined): ReasoningLevel {
+  return value === 'minimal' || value === 'low' || value === 'medium' || value === 'high'
+      || value === 'xhigh' || value === 'max'
+    ? value
+    : 'off' as const;
 }
 
 function projectConversation(summary: ConversationSummary, runtime: AgentRuntimeValue | null): ConversationValue {
@@ -488,22 +738,8 @@ function projectConversation(summary: ConversationSummary, runtime: AgentRuntime
     status: liveStatus ?? summary.status,
     activeTurnId: loaded ? runtime.activeTurnId : null,
     activeTurnElapsedMs: loaded ? runtime.activeTurnElapsedMs : null,
-    contextProbe: loaded && runtime.contextProbe ? runtime.contextProbe : emptyContextProbe(summary.modelId),
     error: loaded ? runtime.error : null,
-  };
-}
-
-function emptyContextProbe(modelId: string): ConversationValue['contextProbe'] {
-  return {
-    hookVersion: 'agent-durable-v1',
-    modelCallCount: 0,
-    messageCount: 0,
-    messageHash: null,
-    orderedMessageHashes: [],
-    estimatedBytes: 0,
-    provider: 'openai-codex',
-    modelId,
-    providerRequestMode: 'none',
+    capabilities: loaded ? runtime.capabilities : null,
   };
 }
 

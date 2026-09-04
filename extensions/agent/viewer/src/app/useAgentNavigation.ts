@@ -6,6 +6,7 @@ import {
 import { useEffect } from 'react';
 
 import type { ConversationSummary, ConversationValue } from '../../../shared/protocol.ts';
+import { conversationHistoryTitle } from '../conversation/historyPresentation.ts';
 import {
   activateDraftOperationId,
   isViewerUuid,
@@ -82,9 +83,11 @@ export function useAgentNavigation(options: {
       resourceId: activeConversationId,
       resourceKind: 'agentConversation',
       status: conversation ? conversationStatusLabel(conversation.status) : null,
-      title: conversationSummary?.title || (conversationMissing ? 'Conversation unavailable' : 'Agent'),
+      title: conversationSummary
+        ? conversationHistoryTitle(conversationSummary)
+        : (conversationMissing ? 'Conversation unavailable' : 'Agent'),
     }).catch(() => undefined);
-  }, [activeConversationId, conversation, conversationMissing, conversationSummary?.title]);
+  }, [activeConversationId, conversation, conversationMissing, conversationSummary]);
 }
 
 type AgentTabLocation = {

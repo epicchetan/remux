@@ -1,5 +1,5 @@
-export const AGENT_TRANSCRIPT_PROTOCOL_VERSION = 4 as const;
-export const AGENT_TRANSCRIPT_PROJECTION_VERSION = 'agent-turn-render-v4' as const;
+export const AGENT_TRANSCRIPT_PROTOCOL_VERSION = 5 as const;
+export const AGENT_TRANSCRIPT_PROJECTION_VERSION = 'agent-turn-render-v6' as const;
 
 export const DEFAULT_TRANSCRIPT_TAIL_TURNS = 24;
 export const DEFAULT_TRANSCRIPT_PREPEND_TURNS = 16;
@@ -74,7 +74,7 @@ export type AgentAssistantMessageSegment = {
   content?: AgentTextContentReference;
 };
 
-export type AgentWorkUnitStatus =
+export type AgentChildExecutionStatus =
   | 'running'
   | 'completed'
   | 'partial'
@@ -91,16 +91,31 @@ export type AgentWorkRenderSegment = {
   durationMs: number | null;
   inferenceCount: number;
   operationCount: number;
-  workUnitCount: number;
+  childExecutionCount: number;
+};
+
+export type AgentCompactionSegment = {
+  id: string;
+  type: 'compaction';
+  revision: string;
+  status: 'compacting' | 'compacted' | 'failed';
+  trigger: 'manual' | 'automatic';
+  beforeTokens: number | null;
+  afterTokens: number | null;
+  error?: string;
 };
 
 export type AgentTurnSegment =
   | AgentUserMessageSegment
   | AgentWorkRenderSegment
-  | AgentAssistantMessageSegment;
+  | AgentAssistantMessageSegment
+  | AgentCompactionSegment;
 
 export type AgentTurnRenderFrame = {
   id: string;
+  pathEntryId?: string;
+  strandId?: string;
+  ordinal?: number;
   status: AgentTurnStatus;
   startedAt: number | null;
   completedAt: number | null;
@@ -117,6 +132,7 @@ export type AgentTranscriptSyncRequest = {
   protocolVersion: typeof AGENT_TRANSCRIPT_PROTOCOL_VERSION;
   projectionVersion: typeof AGENT_TRANSCRIPT_PROJECTION_VERSION;
   knownConversationRevision?: string;
+  knownNativeRevision?: number;
   knownTurns?: Array<{
     turnId: string;
     renderRevision: string;
@@ -191,7 +207,7 @@ export type AgentExecutionScopeRequest = {
     | { kind: 'range'; startInferenceId: string; endInferenceId: string };
 };
 
-export type AgentWorkUnitArtifactReference = {
+export type AgentExecutionArtifactReference = {
   ref: string;
   snapshotRef: string;
   byteLength: number;
@@ -221,7 +237,29 @@ export type AgentToolCallSummary = {
   childOperationCount: number;
   childArtifactCount: number;
   hasDetail: boolean;
+  diffArtifactId?: string;
 };
+
+export type AgentInferenceBlock =
+  | {
+      id: string;
+      type: 'reasoning' | 'commentary' | 'assistantText' | 'notice';
+      state: 'streaming' | 'final' | 'partial';
+      revision: string;
+      text: string;
+      /** Stable semantic marker for provider/runtime notices. */
+      code?: string;
+      /** Native reasoning-summary boundaries, when this is a reasoning block. */
+      parts?: string[];
+      content?: AgentTextContentReference;
+    }
+  | {
+      id: string;
+      type: 'action';
+      state: 'running' | 'completed' | 'failed' | 'interrupted';
+      revision: string;
+      call: AgentToolCallSummary;
+    };
 
 export type AgentOperationDetailRequest = {
   type: 'operationDetail';
@@ -259,26 +297,16 @@ export type AgentInferenceTrace = {
   startedAt: number;
   completedAt: number | null;
   durationMs: number | null;
-  /** Provider content order. Absent only during a viewer/server rolling reload. */
-  contentOrder?: Array<'reasoning' | 'commentary' | 'actions'>;
-  commentary: null | {
-    kind: 'assistantCommentary';
-    state: 'streaming' | 'final' | 'partial';
-    text: string;
-    content?: AgentTextContentReference;
-  };
-  reasoning: null | {
-    kind: 'providerSummary';
-    state: 'streaming' | 'final' | 'partial';
-    text: string;
-    content?: AgentTextContentReference;
-  };
-  actionGroup: null | {
-    id: string;
-    status: 'running' | 'completed' | 'failed' | 'interrupted';
-    callCount: number;
-    calls: AgentToolCallSummary[];
-  };
+  /** Exact provider order. Repeated block kinds are intentional. */
+  blocks: AgentInferenceBlock[];
+};
+
+export type AgentTurnRenderRequest = {
+  type: 'turn';
+  protocolVersion: typeof AGENT_TRANSCRIPT_PROTOCOL_VERSION;
+  turnId: string;
+  knownRevision?: string;
+  knownNativeRevision?: number;
 };
 
 export type AgentExecutionScopeResource = {
@@ -287,7 +315,7 @@ export type AgentExecutionScopeResource = {
   scopeId: string;
   parentScopeId: string | null;
   parentOperationId: string | null;
-  kind: 'turn' | 'workUnit';
+  kind: 'turn' | 'childExecution';
   state: 'running' | 'completed' | 'partial' | 'blocked' | 'failed' |
     'interrupted' | 'abandoned';
   revision: string;
@@ -305,11 +333,12 @@ export type AgentExecutionScopeResource = {
     hasLater: boolean;
   };
   result: string | null;
-  artifacts: AgentWorkUnitArtifactReference[];
+  artifacts: AgentExecutionArtifactReference[];
 };
 
 export type AgentTranscriptResourceRequest =
   | AgentTranscriptSyncRequest
+  | AgentTurnRenderRequest
   | AgentExecutionScopeRequest
   | AgentOperationDetailRequest;
 
@@ -322,10 +351,12 @@ export type AgentTranscriptResourceResult = {
   requestIndex: number;
   key: string;
   status: 'ok' | 'notModified' | 'missing' | 'error';
+  basisSequence?: number;
   code?: 'staleCursor' | 'resourceUnavailable';
   revision?: string;
+  nativeRevision?: number;
   reason?: string;
-  value?: AgentTranscriptSyncResource | AgentExecutionScopeResource | AgentOperationDetailResource;
+  value?: AgentTranscriptSyncResource | AgentTurnRenderFrame | AgentExecutionScopeResource | AgentOperationDetailResource;
 };
 
 export type AgentTranscriptResourcesReadResult = {

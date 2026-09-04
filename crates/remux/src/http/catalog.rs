@@ -95,6 +95,7 @@ pub fn extension_catalog(
                     view_id.clone(),
                     serde_json::json!({
                         "entryUrl": entry_url,
+                        "hostChrome": view.host_chrome.as_str(),
                         "revision": published.map(|bundle| bundle.revision),
                         "route": view.route,
                     }),

@@ -1,38 +1,63 @@
 import { subscribeIpcEvents } from '@remux/viewer-kit/ipc';
 
-import { AGENT_METHODS } from '../../../shared/protocol';
-import type { AgentResourceInvalidation } from '../../../shared/transcript';
-import { invalidateTranscriptResources } from '../transcript/resourceStore';
+import {
+  NATIVE_AGENT_METHODS,
+  NATIVE_AGENT_PROTOCOL_VERSION,
+  type NativeAgentResourceKey,
+  type NativeAgentResourcesInvalidated,
+} from '../../../shared/native-agent-protocol.ts';
+import type { AgentResourceInvalidation } from '../../../shared/transcript.ts';
+import {
+  invalidateTranscriptResources,
+  revalidateNativeExecutionResources,
+} from '../transcript/resourceStore.ts';
 
-export type AgentInvalidationEnvelope = {
-  invalidations: AgentResourceInvalidation[];
-  serverGeneration: string | null;
-};
-
-type GenericInvalidationListener = (invalidations: AgentResourceInvalidation[]) => void;
+export type AgentInvalidationEnvelope = NativeAgentResourcesInvalidated;
+type GenericInvalidationListener = (keys: NativeAgentResourceKey[]) => void;
 
 const genericListeners = new Set<GenericInvalidationListener>();
-const pendingGenericInvalidations = new Map<string, AgentResourceInvalidation>();
+const pendingKeys = new Set<NativeAgentResourceKey>();
 let stopBridge: (() => void) | null = null;
 
 export function startAgentResourceInvalidationBridge() {
   if (stopBridge) return stopBridge;
   const unsubscribe = subscribeIpcEvents((events) => {
     const envelopes = events
-      .filter((event) => event.method === AGENT_METHODS.resourcesInvalidated)
+      .filter((event) => event.method === NATIVE_AGENT_METHODS.resourcesInvalidated)
       .map((event) => parseAgentInvalidationEnvelope(event.params));
     for (const envelope of envelopes) {
-      const invalidations = dedupeInvalidations(envelope.invalidations);
-      if (invalidations.length === 0) continue;
-      const generic = invalidations.filter((value) => value.type === 'resource');
+      if (envelope.keys.length === 0) continue;
       if (genericListeners.size === 0) {
-        for (const invalidation of generic) {
-          pendingGenericInvalidations.set(`${invalidation.type}:${invalidation.key}`, invalidation);
-        }
+        for (const key of envelope.keys) pendingKeys.add(key);
       } else {
-        for (const listener of genericListeners) listener(generic);
+        for (const listener of genericListeners) listener([...envelope.keys]);
       }
-      void invalidateTranscriptResources(invalidations, envelope.serverGeneration);
+      const turnIds = envelope.keys.flatMap((key) =>
+        key.startsWith('agent/turn:') ? [key.slice('agent/turn:'.length)] : []);
+      const transcriptInvalidations = envelope.keys.flatMap((key): AgentResourceInvalidation[] => {
+        const match = /^agent\/transcript:([^:]+):/u.exec(key);
+        if (!match) return [];
+        return [{
+          type: 'transcript',
+          key: `transcript:${match[1]!}`,
+          conversationId: match[1]!,
+          ...(turnIds.length === 1 ? { turnId: turnIds[0] } : {}),
+          reason: 'runtimeEvent',
+          affectsOrder: false,
+          affectsLayout: true,
+          basisSequence: envelope.basisSequence,
+        }];
+      });
+      if (transcriptInvalidations.length > 0) {
+        void invalidateTranscriptResources(transcriptInvalidations, envelope.serverGeneration);
+      }
+      const executionIds = envelope.keys.flatMap((key) => {
+        const match = /^agent\/(?:execution|execution-transcript):([^:]+)/u.exec(key);
+        return match ? [match[1]!] : [];
+      });
+      if (executionIds.length > 0) {
+        void revalidateNativeExecutionResources(executionIds, envelope.serverGeneration);
+      }
     }
   });
   stopBridge = () => {
@@ -42,77 +67,48 @@ export function startAgentResourceInvalidationBridge() {
   return stopBridge;
 }
 
-export function subscribeAgentResourceInvalidations(
-  onGenericInvalidation: (invalidations: AgentResourceInvalidation[]) => void,
-) {
+export function subscribeAgentResourceInvalidations(onInvalidation: GenericInvalidationListener) {
   startAgentResourceInvalidationBridge();
-  genericListeners.add(onGenericInvalidation);
-  if (pendingGenericInvalidations.size > 0) {
-    const pending = [...pendingGenericInvalidations.values()];
-    pendingGenericInvalidations.clear();
-    onGenericInvalidation(pending);
+  genericListeners.add(onInvalidation);
+  if (pendingKeys.size > 0) {
+    const pending = [...pendingKeys];
+    pendingKeys.clear();
+    onInvalidation(pending);
   }
-  return () => genericListeners.delete(onGenericInvalidation);
+  return () => genericListeners.delete(onInvalidation);
 }
 
 export function parseAgentInvalidationEnvelope(params: unknown): AgentInvalidationEnvelope {
-  if (!params || typeof params !== 'object') {
-    return { invalidations: [], serverGeneration: null };
-  }
-  const value = params as { invalidations?: unknown; serverGeneration?: unknown };
+  if (!params || typeof params !== 'object') return emptyEnvelope();
+  const value = params as Partial<NativeAgentResourcesInvalidated>;
+  if (
+    value.protocolVersion !== NATIVE_AGENT_PROTOCOL_VERSION ||
+    typeof value.serverGeneration !== 'string' ||
+    !Number.isSafeInteger(value.basisSequence) ||
+    Number(value.basisSequence) < 0 ||
+    !Array.isArray(value.keys)
+  ) return emptyEnvelope();
   return {
-    invalidations: Array.isArray(value.invalidations)
-      ? value.invalidations.filter(isAgentResourceInvalidation)
-      : [],
-    serverGeneration: typeof value.serverGeneration === 'string'
-      ? value.serverGeneration
-      : null,
+    protocolVersion: NATIVE_AGENT_PROTOCOL_VERSION,
+    serverGeneration: value.serverGeneration,
+    basisSequence: Number(value.basisSequence),
+    keys: [...new Set(value.keys.filter(isNativeResourceKey))],
   };
 }
 
-function dedupeInvalidations(invalidations: AgentResourceInvalidation[]) {
-  const byKey = new Map<string, AgentResourceInvalidation>();
-  for (const invalidation of invalidations) {
-    const key = `${invalidation.type}:${invalidation.key}`;
-    const previous = byKey.get(key);
-    if (
-      previous &&
-      previous.type !== 'resource' &&
-      invalidation.type !== 'resource' &&
-      previous.basisSequence > invalidation.basisSequence
-    ) continue;
-    byKey.set(key, invalidation);
-  }
-  return [...byKey.values()];
+function emptyEnvelope(): AgentInvalidationEnvelope {
+  return {
+    protocolVersion: NATIVE_AGENT_PROTOCOL_VERSION,
+    serverGeneration: '',
+    basisSequence: 0,
+    keys: [],
+  };
 }
 
-function isAgentResourceInvalidation(value: unknown): value is AgentResourceInvalidation {
-  if (!value || typeof value !== 'object') return false;
-  const invalidation = value as Partial<AgentResourceInvalidation>;
-  if (typeof invalidation.type !== 'string' || typeof invalidation.key !== 'string') return false;
-  if (invalidation.type === 'resource') {
-    return invalidation.reason === 'created' ||
-      invalidation.reason === 'updated' ||
-      invalidation.reason === 'deleted';
-  }
-  const scoped = invalidation as Partial<Exclude<AgentResourceInvalidation, { type: 'resource' }>>;
-  if (
-    typeof scoped.conversationId !== 'string' ||
-    !Number.isSafeInteger(scoped.basisSequence) ||
-    Number(scoped.basisSequence) < 0
-  ) return false;
-  if (invalidation.type === 'transcript') {
-    return (invalidation.reason === 'sendAccepted' ||
-      invalidation.reason === 'runtimeEvent' ||
-      invalidation.reason === 'terminal') &&
-      typeof invalidation.affectsOrder === 'boolean' &&
-      typeof invalidation.affectsLayout === 'boolean';
-  }
-  if (invalidation.type === 'executionScope') {
-    return typeof invalidation.turnId === 'string' &&
-      typeof invalidation.scopeId === 'string' &&
-      typeof invalidation.affectsLayout === 'boolean' &&
-      (invalidation.reason === 'runtimeEvent' || invalidation.reason === 'terminal');
-  }
-  return false;
+function isNativeResourceKey(value: unknown): value is NativeAgentResourceKey {
+  return typeof value === 'string' && (
+    value === 'agent/providers' ||
+    value === 'agent/conversations' ||
+    /^agent\/(?:models|conversation|runtime|queue|turn|execution|transcript|execution-transcript|artifact):/u.test(value)
+  );
 }

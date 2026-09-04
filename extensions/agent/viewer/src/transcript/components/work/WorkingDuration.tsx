@@ -44,11 +44,9 @@ export const WorkingDuration = memo(function WorkingDuration({
 
   const duration = formatRunningWorkDuration(elapsedMs);
   const label = completed ? 'Worked' : 'Working';
-  return duration ? (
+  return (
     <span>
       {label} for <span className="tabular-nums">{duration}</span>
     </span>
-  ) : (
-    <span>{label}</span>
   );
 });

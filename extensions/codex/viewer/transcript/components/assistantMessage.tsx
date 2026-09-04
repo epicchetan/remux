@@ -5,8 +5,13 @@ import type { CodexAssistantMessageSegment, CodexTranscriptTurn } from '../../..
 import { useComposerStore } from '../../composer/store';
 import { MarkdownBlock } from './markdown/MarkdownBlock';
 import { useOperationQueueStore } from '../../threads/operationQueueStore';
-import { narrationSourceDocument } from './markdown/markdownModel';
+import {
+  narrationSourceDocument,
+  releaseStreamingMarkdownCaches,
+} from './markdown/markdownModel';
 import { narrationSourceHash, useNarrationStore } from '../../narration/client';
+import { releaseStreamingKatexCache } from './markdown/katexAdapter';
+import { releaseStreamingMathMetrics } from './markdown/mathMetricsStore';
 
 export function AssistantMessage({
   segment,
@@ -26,11 +31,23 @@ export function AssistantMessage({
   const narrationTargetMessageId = useNarrationStore((state) => state.target?.assistantMessageId ?? null);
   const narrationPhase = useNarrationStore((state) => state.phase);
   const seekNarrationToBlock = useNarrationStore((state) => state.seekToBlock);
+  const streaming = turnStatus === 'inProgress';
+  useEffect(() => {
+    if (!streaming) {
+      releaseStreamingKatexCache(segment.id);
+      releaseStreamingMarkdownCaches(segment.id);
+      releaseStreamingMathMetrics(segment.id);
+      return;
+    }
+    return () => {
+      releaseStreamingKatexCache(segment.id);
+      releaseStreamingMarkdownCaches(segment.id);
+      releaseStreamingMathMetrics(segment.id);
+    };
+  }, [segment.id, streaming]);
   if (!segment.text.trim()) {
     return null;
   }
-
-  const streaming = turnStatus === 'inProgress';
   // Tap-to-seek is narration-only and block-level: while this message is the
   // playback target, tapping a narrated block seeks the audio to its start.
   const narrationSeekable = narrationTargetMessageId === segment.id &&
@@ -52,6 +69,7 @@ export function AssistantMessage({
       onClick={narrationSeekable ? seekToTappedBlock : undefined}
     >
       <MarkdownBlock
+        messageCacheKey={segment.id}
         narrationAssistantMessageId={narrationTargetMessageId === segment.id ? segment.id : null}
         streaming={streaming}
         width={width}

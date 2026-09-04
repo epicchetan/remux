@@ -256,6 +256,8 @@ function measureCollapsedSegment({
         transcriptLayout.work.separatorHeight +
         transcriptLayout.row.workBoundaryGap
       );
+    case 'compaction':
+      return transcriptLayout.compaction.height + transcriptLayout.row.defaultGap;
   }
 }
 
@@ -327,13 +329,17 @@ function measureUserMessageBubble(
   placement: 'topLevel' | 'work',
   userMessageDisclosure?: TranscriptUserMessageDisclosure,
 ) {
+  const hasRail = layout.railItems.length > 0;
   const hasBody = Boolean(layout.bodyMarkdown);
   const hasDisclosure = Boolean(userMessageDisclosure?.collapsible);
-  if (!hasBody) {
+  if (!hasRail && !hasBody) {
     return 0;
   }
 
   const childHeights: number[] = [];
+  if (hasRail) {
+    childHeights.push(transcriptLayout.user.railCardHeight);
+  }
   const bodyHeight = layout.bodyMarkdown
     ? measureUserMessageBodyHeight({
         contentWidth,
@@ -422,6 +428,11 @@ function measureAssistantMessage({
     return 0;
   }
 
-  return measureMarkdownDocumentHeight(segment.text, 'default', contentWidth, { richFileLinks: !streaming }) +
+  return measureMarkdownDocumentHeight(segment.text, 'default', contentWidth, {
+    cacheScope: streaming
+      ? { key: segment.id, kind: 'streaming' }
+      : { kind: 'complete' },
+    richFileLinks: !streaming,
+  }) +
     (segment.content ? transcriptLayout.exactContentHeight : 0);
 }

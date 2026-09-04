@@ -54,6 +54,16 @@ pub struct ServerStatus {
     /// View-build-watch additive: watch sidecar facet — NOT the extension
     /// lifecycle; states are `stopped | running | failed`.
     pub watch: WatchFacet,
+    /// Manifest-v3 gateway facet. `generation` is exposed only after the
+    /// private listener completes its stdio readiness handshake.
+    pub gateway: GatewayFacet,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GatewayFacet {
+    pub declared: bool,
+    pub ready: bool,
+    pub generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -188,6 +198,19 @@ impl ServerStatus {
             );
         }
         target.insert("watch".to_string(), Value::Object(watch));
+        let mut gateway = Map::new();
+        gateway.insert("declared".to_string(), Value::from(self.gateway.declared));
+        if self.gateway.declared {
+            gateway.insert("ready".to_string(), Value::from(self.gateway.ready));
+            gateway.insert(
+                "generation".to_string(),
+                self.gateway
+                    .generation
+                    .map(Value::from)
+                    .unwrap_or(Value::Null),
+            );
+        }
+        target.insert("gateway".to_string(), Value::Object(gateway));
     }
 }
 
@@ -648,6 +671,7 @@ mod tests {
                     state: if watching { "running" } else { "stopped" }.to_string(),
                     ..WatchFacet::default()
                 },
+                gateway: GatewayFacet::default(),
             }
         }
     }
@@ -1057,6 +1081,11 @@ mod tests {
                 started_at_ms: Some(7),
                 restart_count: 2,
             },
+            gateway: GatewayFacet {
+                declared: true,
+                ready: true,
+                generation: Some(3),
+            },
         };
         let mut target = Map::new();
         status.append_to(&mut target);
@@ -1076,6 +1105,7 @@ mod tests {
                 "hasServerBuild",
                 "views",
                 "watch",
+                "gateway",
             ]
         );
         assert_eq!(
@@ -1092,6 +1122,10 @@ mod tests {
                 "restartCount": 2,
             })
         );
+        assert_eq!(
+            target["gateway"],
+            json!({ "declared": true, "ready": true, "generation": 3 })
+        );
 
         // Undeclared watch is `{ declared: false }` and nothing else.
         let undeclared = ServerStatus {
@@ -1101,6 +1135,7 @@ mod tests {
         let mut target = Map::new();
         undeclared.append_to(&mut target);
         assert_eq!(target["watch"], json!({ "declared": false }));
+        assert_eq!(target["gateway"]["ready"], true);
     }
 
     #[tokio::test]

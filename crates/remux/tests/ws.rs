@@ -94,6 +94,7 @@ impl ExtensionServer for EchoServer {
             has_server_build: false,
             views: remux::rpc::router::ViewsFacet::default(),
             watch: remux::rpc::router::WatchFacet::default(),
+            gateway: remux::rpc::router::GatewayFacet::default(),
         }
     }
     fn logs(&self, _lines: usize) -> Value {

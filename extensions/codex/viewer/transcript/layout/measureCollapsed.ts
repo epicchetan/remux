@@ -3,6 +3,7 @@ import {
   measureMarkdownDocumentCappedHeight,
   measureMarkdownDocumentHeight,
 } from '../components/markdown/markdownModel';
+import { mathMetricsRevision } from '../components/markdown/mathMetricsStore';
 import { transcriptUserMessageDisclosureKey } from '../disclosureKeys';
 import { buildUserMessageLayout } from '../model/userMessageContent';
 import { transcriptLayout, userBubbleContentWidth } from './constants';
@@ -90,6 +91,7 @@ export function measureCollapsedTurnWithCache({
   const lookup = threadId
     ? {
         contentWidth,
+        mathMetricsRevision: mathMetricsRevision(),
         threadId,
         turnId: turn.id,
         turnRevision: turn.revision,
@@ -443,5 +445,10 @@ function measureAssistantMessage({
     return 0;
   }
 
-  return measureMarkdownDocumentHeight(segment.text, 'default', contentWidth, { richFileLinks: !streaming });
+  return measureMarkdownDocumentHeight(segment.text, 'default', contentWidth, {
+    cacheScope: streaming
+      ? { key: segment.id, kind: 'streaming' }
+      : { kind: 'complete' },
+    richFileLinks: !streaming,
+  });
 }

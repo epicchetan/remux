@@ -13,7 +13,7 @@ const attachmentActions: Array<{
   { icon: <Folder className="size-4" />, kind: 'files', label: 'Choose Files' },
 ];
 
-export function ComposerAttachmentButton() {
+export function ComposerAttachmentButton({ imagesEnabled }: { imagesEnabled: boolean }) {
   const isSubmitting = useComposerStore((state) => state.isSubmitting);
   const openAttachmentPicker = useComposerStore((state) => state.openAttachmentPicker);
   const [open, setOpen] = useState(false);
@@ -61,7 +61,7 @@ export function ComposerAttachmentButton() {
         aria-expanded={open}
         aria-label="Attach"
         className="remux-composer-action-button"
-        disabled={isSubmitting}
+        disabled={isSubmitting || !imagesEnabled}
         onClick={(event) => {
           event.currentTarget.blur();
           setOpen((current) => !current);

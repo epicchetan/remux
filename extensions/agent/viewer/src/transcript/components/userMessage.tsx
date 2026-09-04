@@ -18,6 +18,7 @@ import { ExactContent } from './ExactContent';
 import { composerDocumentFromUserInput } from '../../composer/model/userInputInterop.ts';
 import { useComposerStore } from '../../composer/store.ts';
 import { useConversationRuntimeStore } from '../../conversation/runtimeStore.ts';
+import { useConversationHistoryStore } from '../../conversation/historyStore.ts';
 
 export function UserMessage({
   conversationId,
@@ -27,6 +28,8 @@ export function UserMessage({
   segment,
   showActions = false,
   turnId,
+  pathEntryId,
+  strandId,
 }: {
   conversationId?: string | null;
   disclosure?: TranscriptUserMessageDisclosure;
@@ -35,6 +38,8 @@ export function UserMessage({
   segment: AgentUserMessageSegment;
   showActions?: boolean;
   turnId?: string;
+  pathEntryId?: string;
+  strandId?: string;
 }) {
   const layout = buildUserMessageLayout(segment, placement);
   const toggleDisclosure = useTranscriptLayoutStore((state) => state.toggleUserMessageDisclosure);
@@ -77,7 +82,13 @@ export function UserMessage({
         </div>
       ) : null}
       {showActions && conversationId && turnId ? (
-        <UserActions conversationId={conversationId} segment={segment} turnId={turnId} />
+        <UserActions
+          conversationId={conversationId}
+          pathEntryId={pathEntryId}
+          segment={segment}
+          strandId={strandId}
+          turnId={turnId}
+        />
       ) : null}
     </div>
   );
@@ -123,9 +134,11 @@ function fileExtension(name: string) {
   return /\.([a-z0-9]+)$/iu.exec(name)?.[1]?.toLowerCase() ?? null;
 }
 
-function UserActions({ conversationId, segment, turnId }: {
+function UserActions({ conversationId, pathEntryId, segment, strandId, turnId }: {
   conversationId: string;
+  pathEntryId?: string;
   segment: AgentUserMessageSegment;
+  strandId?: string;
   turnId: string;
 }) {
   const timeout = useRef<number | null>(null);
@@ -134,6 +147,8 @@ function UserActions({ conversationId, segment, turnId }: {
   const startEdit = useComposerStore((state) => state.startEdit);
   const runtimeConversationId = useConversationRuntimeStore((state) => state.activeConversationId);
   const runtimeStatus = useConversationRuntimeStore((state) => state.status);
+  const canForkNative = useConversationRuntimeStore((state) => state.canForkNative);
+  const summary = useConversationHistoryStore((state) => state.conversationsById[conversationId]);
   const working = runtimeConversationId === conversationId &&
     (runtimeStatus === 'running' || runtimeStatus === 'interrupting');
   const text = plainTextFromUserMessage(segment);
@@ -159,14 +174,21 @@ function UserActions({ conversationId, segment, turnId }: {
       <button
         aria-label="Edit message"
         className="codex-user-action-button"
-        disabled={working || loadingEdit}
+        disabled={working || loadingEdit || !canForkNative || !summary}
         onClick={() => {
-          if (working || loadingEdit) return;
+          if (working || loadingEdit || !canForkNative || !summary) return;
           setLoadingEdit(true);
           void hydrateUserInput(segment)
             .then((parts) => {
               const load = composerDocumentFromUserInput(parts);
-              startEdit({ conversationId, turnId, userMessageId: segment.id }, load.document, load.resources);
+              startEdit({
+                conversationId,
+                turnId,
+                userMessageId: segment.id,
+                pathEntryId: pathEntryId ?? `legacy-path:${turnId}`,
+                strandId: strandId ?? summary.activeStrandId,
+                headRevision: summary.headRevision,
+              }, load.document, load.resources);
             })
             .finally(() => setLoadingEdit(false));
         }}
