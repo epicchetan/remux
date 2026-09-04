@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 
 import {
   PROVIDER_RUNTIME_CONTRACT_VERSION,
+  PROVIDER_RUNTIME_LIMITS,
   parseProviderEventEnvelope,
   type ProviderFileChange,
   type ChildExecutionDisplay,
@@ -30,6 +31,7 @@ type CodexMapperOptions = {
 };
 
 type MapperEvent = ProviderEvent | ({ type: string } & Record<string, unknown>);
+type AgentMessageStreamKind = 'assistant' | 'commentary';
 
 type BlockState = {
   structure: TurnStructure;
@@ -46,6 +48,8 @@ export class CodexEventMapper {
   private readonly observedAt: () => number;
   private readonly remuxTurnByNative = new Map<string, string>();
   private readonly deltaOffsets = new Map<string, number>();
+  private readonly agentMessageKinds = new Map<string, AgentMessageStreamKind>();
+  private readonly pendingAgentMessageDeltas = new Map<string, string>();
   private readonly blocks = new Map<string, BlockState>();
   private readonly nextOrdinalByTurn = new Map<string, number>();
   private pendingRemuxTurnId: string | null = null;
@@ -150,7 +154,7 @@ export class CodexEventMapper {
           }, 'turn/compaction-failed', nativeTurnId)];
         }
         if (!this.remuxTurnByNative.has(nativeTurnId)) return [];
-        return [
+        const events = [
           this.snapshotEnvelope({
             type: 'turn.completed',
             outcome,
@@ -165,9 +169,11 @@ export class CodexEventMapper {
           }, 'turn/completed', nativeTurnId),
           this.snapshotEnvelope({ type: 'turn.status', state: 'idle' }, 'turn/status', nativeTurnId),
         ];
+        this.clearAgentMessageState(nativeTurnId);
+        return events;
       }
       case 'item/agentMessage/delta':
-        return this.mapTextDelta(params, 'assistant');
+        return this.mapAgentMessageDelta(params);
       case 'item/plan/delta':
         return this.mapTextDelta(params, 'commentary');
       case 'item/reasoning/summaryPartAdded':
@@ -429,6 +435,7 @@ export class CodexEventMapper {
             ? { error: { code: 'codex_turn_failed', message: string(error?.message) ?? 'Codex turn failed.' } }
             : {}),
         }, 'turn/completed', nativeTurnId));
+        this.clearAgentMessageState(nativeTurnId);
       } else {
         envelopes.push(this.snapshotEnvelope(
           { type: 'turn.status', state: 'running' },
@@ -438,6 +445,32 @@ export class CodexEventMapper {
       }
     }
     return dedupe(envelopes);
+  }
+
+  private mapAgentMessageDelta(params: Record<string, unknown>) {
+    const nativeTurnId = string(params.turnId);
+    const itemId = string(params.itemId);
+    const delta = string(params.delta);
+    if (!nativeTurnId || !itemId || !delta ||
+        !this.remuxTurnByNative.has(nativeTurnId) ||
+        this.compactionNativeTurns.has(nativeTurnId)) return [];
+    const identity = agentMessageIdentity(nativeTurnId, itemId);
+    const kind = this.agentMessageKinds.get(identity);
+    if (kind) return this.mapTextDelta(params, kind);
+
+    // Agent-message deltas omit the item's phase, so emitting an unknown one
+    // as final text makes commentary briefly appear as the answer. Current
+    // App Server versions send item/started first; retain a bounded fallback
+    // for reordered or legacy streams and flush it once an item supplies the
+    // authoritative phase.
+    const pending = `${this.pendingAgentMessageDeltas.get(identity) ?? ''}${delta}`;
+    if (pending.length > PROVIDER_RUNTIME_LIMITS.finalTextChars) {
+      throw new Error(
+        `Buffered Codex agent message exceeds ${PROVIDER_RUNTIME_LIMITS.finalTextChars} characters.`,
+      );
+    }
+    this.pendingAgentMessageDeltas.set(identity, pending);
+    return [];
   }
 
   private mapTextDelta(
@@ -570,17 +603,27 @@ export class CodexEventMapper {
         return content.length > 0 ? [make({ type: 'user.message', content })] : [];
       }
       case 'agentMessage': {
+        const identity = agentMessageIdentity(nativeTurnId, itemId);
+        const declaredKind = agentMessageStreamKind(item.phase);
+        if (declaredKind) this.agentMessageKinds.set(identity, declaredKind);
+        const kind = declaredKind ?? this.agentMessageKinds.get(identity);
         const text = string(item.text);
-        if (!text) return [];
+        if (!text) {
+          if (!completed && kind) return this.flushPendingAgentMessage(nativeTurnId, itemId, kind);
+          if (completed) this.pendingAgentMessageDeltas.delete(identity);
+          return [];
+        }
+        this.pendingAgentMessageDeltas.delete(identity);
+        const authoritativeKind = kind ?? 'assistant';
         this.seedDeltaOffset(
           nativeTurnId,
           itemId,
-          item.phase === 'commentary' ? 'commentary' : 'assistant',
+          authoritativeKind,
           text.length,
         );
         return [make({
           type: 'assistant.text',
-          phase: item.phase === 'commentary' ? 'commentary' : 'final',
+          phase: authoritativeKind === 'commentary' ? 'commentary' : 'final',
           text,
         })];
       }
@@ -977,6 +1020,28 @@ export class CodexEventMapper {
     this.deltaOffsets.set(key, Math.max(this.deltaOffsets.get(key) ?? 0, offset));
   }
 
+  private flushPendingAgentMessage(
+    nativeTurnId: string,
+    itemId: string,
+    kind: AgentMessageStreamKind,
+  ) {
+    const identity = agentMessageIdentity(nativeTurnId, itemId);
+    const delta = this.pendingAgentMessageDeltas.get(identity);
+    if (!delta) return [];
+    this.pendingAgentMessageDeltas.delete(identity);
+    return this.mapTextDelta({ turnId: nativeTurnId, itemId, delta }, kind);
+  }
+
+  private clearAgentMessageState(nativeTurnId: string) {
+    const prefix = `${nativeTurnId}\0`;
+    for (const identity of this.agentMessageKinds.keys()) {
+      if (identity.startsWith(prefix)) this.agentMessageKinds.delete(identity);
+    }
+    for (const identity of this.pendingAgentMessageDeltas.keys()) {
+      if (identity.startsWith(prefix)) this.pendingAgentMessageDeltas.delete(identity);
+    }
+  }
+
   private snapshotEnvelope(
     event: MapperEvent,
     kind: string,
@@ -1324,13 +1389,21 @@ export class CodexEventMapper {
 }
 
 function codexBlockIdentityKind(kind: TurnBlockKind) {
-  // App Server deltas do not carry the agentMessage phase. The completed item
-  // may therefore correct a provisional final-message to commentary. Both are
-  // the same native item and must reconcile in place instead of becoming two
-  // visible blocks.
+  // Keep both text phases on one native identity so an authoritative snapshot
+  // can still repair malformed, legacy, or reordered provider streams in place.
   return kind === 'commentary' || kind === 'final-message'
     ? 'assistant-text'
     : kind;
+}
+
+function agentMessageIdentity(nativeTurnId: string, itemId: string) {
+  return `${nativeTurnId}\0${itemId}`;
+}
+
+function agentMessageStreamKind(value: unknown): AgentMessageStreamKind | undefined {
+  if (value === 'commentary') return 'commentary';
+  if (value === 'final_answer') return 'assistant';
+  return undefined;
 }
 
 function threadIdFromNotification(method: string, params: Record<string, unknown>) {

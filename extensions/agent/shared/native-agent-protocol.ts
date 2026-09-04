@@ -56,6 +56,7 @@ export const NATIVE_AGENT_METHODS = {
   conversationPreferenceSet: 'remux/agent/composer/conversation-preference/set',
   conversationAccessSet: 'remux/agent/composer/conversation-access/set',
   providerPreferenceSet: 'remux/agent/composer/provider-preference/set',
+  runtimesRead: 'remux/agent/runtimes/read',
   resourcesInvalidated: 'remux/agent/resources/invalidated',
 } as const;
 
@@ -125,6 +126,30 @@ export type AgentProvidersResource = {
   providers: readonly ProviderCatalogEntry[];
   defaultProviderInstanceId: string | null;
   preferenceRevision: string;
+};
+
+export type AgentHarnessRuntime = {
+  providerInstanceId: string;
+  provider: ProviderKind;
+  label: string;
+  readiness: ProviderProbeState;
+  readinessMessage: string | null;
+  topology: 'shared-daemon' | 'session-process' | 'fixture';
+  runtimeState: 'running' | 'idle' | 'stopped' | 'starting' | 'stopping' | 'failed' | 'unknown';
+  configuredExecutable: string | null;
+  resolvedExecutable: string | null;
+  installedVersion: string | null;
+  runningVersion: string | null;
+  adapterVersion: string | null;
+  sdkVersion: string | null;
+  restartRequired: boolean;
+  activeSessions: number;
+  lastError: string | null;
+};
+
+export type AgentHarnessRuntimesResource = {
+  runtimes: readonly AgentHarnessRuntime[];
+  observedAt: number;
 };
 
 export type AgentModelsResource = {

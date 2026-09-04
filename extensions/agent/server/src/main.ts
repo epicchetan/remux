@@ -12,12 +12,14 @@ import { ClaudeNativeAdapter } from './providers/claude/claude-adapter.ts';
 import { agentDataPaths } from './storage/data-root.ts';
 import { FederationCredentialRegistry } from './federation/credential-registry.ts';
 import { RemuxFederationServer } from './federation/mcp-server.ts';
+import { NativeSessionOwnershipRegistry } from './native-runtime/native-session-ownership.ts';
 
 const output = new JsonRpcOutput();
 const dataRoot = resolveNativeAgentDataRoot();
 const journal = await openNativeAgentJournal({ dataRoot });
 const artifacts = new NativeAgentArtifacts({ journal, paths: agentDataPaths(dataRoot) });
 const fixtureMode = process.env.REMUX_AGENT_FIXTURE === '1';
+const sessionOwnership = new NativeSessionOwnershipRegistry();
 const providers = fixtureMode
   ? [{
       providerInstanceId: 'fixture-local',
@@ -31,6 +33,7 @@ const providers = fixtureMode
       label: 'Codex',
       adapter: new CodexNativeAdapter({
         providerInstanceId: 'codex-local',
+        ownership: sessionOwnership,
         resolveImageArtifact: async (artifactId, mimeType) => ({
           type: 'localImage',
           path: artifacts.resolveLocalImage(artifactId, mimeType),
@@ -43,6 +46,7 @@ const providers = fixtureMode
       label: 'Claude',
       adapter: new ClaudeNativeAdapter({
         providerInstanceId: 'claude-local',
+        ownership: sessionOwnership,
         resolveImageArtifact: async (artifactId, mimeType) => ({
           path: artifacts.resolveLocalImage(artifactId, mimeType),
         }),

@@ -52,6 +52,7 @@ import type {
   ProviderAdapter,
   ProviderLoginOperation,
   ProviderSession,
+  ProviderRuntimeView,
 } from '../provider-adapter.ts';
 import {
   NativeAgentJournal,
@@ -110,6 +111,7 @@ export type NativeCoordinatorDiagnostic = {
   eventId?: string;
   eventType?: string;
   nativeKind?: string;
+  policy?: 'initial' | 'if-stale' | 'required-fresh';
   activeSessions: number;
   pendingHydrations: number;
   error?: string;
@@ -368,6 +370,58 @@ export class NativeAgentCoordinator {
           .sort((left, right) => left.id.localeCompare(right.id)),
       }))
       .sort((left, right) => left.providerInstanceId.localeCompare(right.providerInstanceId));
+  }
+
+  async readRuntimeStatuses(): Promise<{ runtimes: readonly ProviderRuntimeView[]; observedAt: number }> {
+    const runtimes = await Promise.all([...this.providers.values()].map(async (registration) => {
+      const instance = this.journal.providerInstance(registration.providerInstanceId);
+      const readiness: ProviderRuntimeView['readiness'] = instance?.probe.state ?? 'error';
+      const base = {
+        provider: registration.provider,
+        providerInstanceId: registration.providerInstanceId,
+        label: registration.label,
+        readiness,
+        readinessMessage: instance?.probe.message ?? null,
+      };
+      if (!registration.adapter.readRuntimeStatus) {
+        return {
+          ...base,
+          topology: 'fixture' as const,
+          runtimeState: 'unknown' as const,
+          configuredExecutable: null,
+          resolvedExecutable: null,
+          installedVersion: instance?.probe.capabilities?.providerVersion ?? null,
+          runningVersion: null,
+          adapterVersion: instance?.probe.capabilities?.adapterVersion ?? null,
+          sdkVersion: null,
+          restartRequired: false,
+          activeSessions: 0,
+          lastError: null,
+        };
+      }
+      try {
+        return {
+          ...base,
+          ...await registration.adapter.readRuntimeStatus(registration.providerInstanceId),
+        };
+      } catch (error) {
+        return {
+          ...base,
+          topology: registration.provider === 'codex' ? 'shared-daemon' as const : 'session-process' as const,
+          runtimeState: 'failed' as const,
+          configuredExecutable: null,
+          resolvedExecutable: null,
+          installedVersion: instance?.probe.capabilities?.providerVersion ?? null,
+          runningVersion: null,
+          adapterVersion: instance?.probe.capabilities?.adapterVersion ?? null,
+          sdkVersion: null,
+          restartRequired: false,
+          activeSessions: 0,
+          lastError: safeMessage(error),
+        };
+      }
+    }));
+    return { runtimes, observedAt: this.now() };
   }
 
   prepareResourceRead(unparsed: NativeAgentResourceReadParams) {

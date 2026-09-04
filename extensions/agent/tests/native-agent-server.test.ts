@@ -35,6 +35,34 @@ test('native Agent JSON-RPC surface serves versioned resources and commands only
     assert.equal(providers.protocolVersion, 6);
     assert.ok(providers.resources.every(({ status }) => status === 'ok'));
 
+    const harnesses = await server.handle(NATIVE_AGENT_METHODS.runtimesRead, undefined) as {
+      observedAt: number;
+      runtimes: Array<{
+        providerInstanceId: string;
+        topology: string;
+        runtimeState: string;
+      }>;
+    };
+    assert.ok(Number.isFinite(harnesses.observedAt));
+    assert.deepEqual(harnesses.runtimes, [{
+      providerInstanceId: 'fixture-local',
+      provider: 'fixture',
+      label: 'Fixture',
+      readiness: 'ready',
+      readinessMessage: null,
+      topology: 'fixture',
+      runtimeState: 'unknown',
+      configuredExecutable: null,
+      resolvedExecutable: null,
+      installedVersion: 'native-fixture-1',
+      runningVersion: null,
+      adapterVersion: 'provider-runtime-v1',
+      sdkVersion: null,
+      restartRequired: false,
+      activeSessions: 0,
+      lastError: null,
+    }]);
+
     const created = await server.handle(NATIVE_AGENT_METHODS.conversationCreate, {
       commandId: 'create-1',
       providerInstanceId: 'fixture-local',

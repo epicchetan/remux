@@ -64,6 +64,11 @@ import {
   unsubscribeSystemResources,
   type SystemResourcesSample,
 } from './systemResourcesApi';
+import {
+  readAgentHarnessRuntimes,
+  type AgentHarnessRuntime,
+  type AgentHarnessRuntimes,
+} from './agentRuntimeApi';
 
 export function SettingsOverview() {
   const catalogError = useBrowserStore((state) => state.catalogError);
@@ -76,6 +81,9 @@ export function SettingsOverview() {
   const [detailExtensionId, setDetailExtensionId] = useState<string | null>(null);
   const [detailBusyAction, setDetailBusyAction] = useState<ExtensionDetailAction | null>(null);
   const [codexAppServerStatus, setCodexAppServerStatus] = useState<CodexAppServerStatus | null>(null);
+  const [agentRuntimes, setAgentRuntimes] = useState<AgentHarnessRuntimes | null>(null);
+  const [agentRuntimesError, setAgentRuntimesError] = useState<string | null>(null);
+  const [agentRuntimesLoading, setAgentRuntimesLoading] = useState(false);
   const resources = useSystemResources(connection);
   const nowMinuteMs = useMinuteTick();
   const bottomPadding = getBottomBarHeight(insets.bottom) + tabGridGap;
@@ -133,7 +141,7 @@ export function SettingsOverview() {
     // Warm the facet once when Codex becomes available so opening the sheet
     // does not insert a whole section after its presentation animation.
     void refreshCodexAppServerStatus();
-    if (detailExtensionId !== 'codex' || extensionStatuses.codex?.running !== true) {
+    if (extensionStatuses.codex?.running !== true) {
       return undefined;
     }
     const timer = setInterval(() => {
@@ -141,6 +149,33 @@ export function SettingsOverview() {
     }, 5_000);
     return () => clearInterval(timer);
   }, [refreshCodexAppServerStatus]);
+
+  const refreshAgentRuntimes = useCallback(async () => {
+    if (
+      connection.status.type !== 'connected'
+      || extensionStatuses.agent?.running !== true
+    ) {
+      setAgentRuntimes(null);
+      setAgentRuntimesError(null);
+      return;
+    }
+    setAgentRuntimesLoading(true);
+    try {
+      setAgentRuntimes(await readAgentHarnessRuntimes(connection.query));
+      setAgentRuntimesError(null);
+    } catch (error) {
+      setAgentRuntimesError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setAgentRuntimesLoading(false);
+    }
+  }, [connection.query, connection.status.type, extensionStatuses.agent?.running]);
+
+  useEffect(() => {
+    void refreshAgentRuntimes();
+    if (extensionStatuses.agent?.running !== true) return undefined;
+    const timer = setInterval(() => void refreshAgentRuntimes(), 10_000);
+    return () => clearInterval(timer);
+  }, [extensionStatuses.agent?.running, refreshAgentRuntimes]);
 
   // Live states: merge `didChangeStatus` broadcasts so crash → backingOff →
   // running is visible without a manual refresh.
@@ -189,6 +224,20 @@ export function SettingsOverview() {
             : await setExtensionServerRunning(connection.startJob, extensionId, action === 'start'));
     } catch (error) {
       setExtensionStatusError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDetailBusyAction(null);
+    }
+  };
+
+  const runRuntimeAction = async (action: 'start' | 'restart' | 'update') => {
+    setAgentRuntimesError(null);
+    const detailAction = `app-server-${action}` as ExtensionDetailAction;
+    setDetailBusyAction(detailAction);
+    try {
+      await runCodexAppServerAction(connection.startJob, action);
+      await Promise.all([refreshCodexAppServerStatus(), refreshAgentRuntimes()]);
+    } catch (error) {
+      setAgentRuntimesError(error instanceof Error ? error.message : String(error));
     } finally {
       setDetailBusyAction(null);
     }
@@ -272,6 +321,19 @@ export function SettingsOverview() {
             ) : null}
           </View>
         </Section>
+
+        {extensionStatuses.agent?.running === true ? (
+          <AgentRuntimesSection
+            busyAction={detailBusyAction}
+            codexManagementAvailable={extensionStatuses.codex?.running === true}
+            codexStatus={codexAppServerStatus}
+            error={agentRuntimesError}
+            loading={agentRuntimesLoading}
+            onCodexAction={runRuntimeAction}
+            onRefresh={refreshAgentRuntimes}
+            runtimes={agentRuntimes}
+          />
+        ) : null}
 
         {resources ? <SystemSection sample={resources} /> : null}
 
@@ -566,6 +628,180 @@ function codexAppServerStatusesEqual(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function AgentRuntimesSection({
+  busyAction,
+  codexManagementAvailable,
+  codexStatus,
+  error,
+  loading,
+  onCodexAction,
+  onRefresh,
+  runtimes,
+}: {
+  busyAction: ExtensionDetailAction | null;
+  codexManagementAvailable: boolean;
+  codexStatus: CodexAppServerStatus | null;
+  error: string | null;
+  loading: boolean;
+  onCodexAction: (action: 'start' | 'restart' | 'update') => Promise<void>;
+  onRefresh: () => Promise<void>;
+  runtimes: AgentHarnessRuntimes | null;
+}) {
+  const { styles } = useSettingsTheme();
+  return (
+    <Section title="Agent Runtimes">
+      {loading && !runtimes ? (
+        <View style={styles.extensionLoadingRow}>
+          <ActivityIndicator size="small" />
+          <Text style={styles.extensionMeta}>Checking native harnesses</Text>
+        </View>
+      ) : null}
+      <View style={styles.runtimeList}>
+        {runtimes?.runtimes.map((runtime) => (
+          <AgentRuntimeCard
+            busyAction={busyAction}
+            codexManagementAvailable={codexManagementAvailable}
+            codexStatus={runtime.provider === 'codex' ? codexStatus : null}
+            key={runtime.providerInstanceId}
+            onCodexAction={onCodexAction}
+            runtime={runtime}
+          />
+        ))}
+      </View>
+      {!loading && runtimes?.runtimes.length === 0 ? (
+        <Text style={styles.extensionMeta}>No native Agent runtimes configured.</Text>
+      ) : null}
+      {!loading && !runtimes && !error ? (
+        <Text style={styles.extensionMeta}>Native runtime status is unavailable.</Text>
+      ) : null}
+      {error ? <Text style={styles.errorText}>{error}</Text> : null}
+      <View style={styles.actionRow}>
+        <SettingsButton
+          disabled={loading}
+          label={loading ? 'Checking' : 'Check runtimes'}
+          loading={loading}
+          onPress={onRefresh}
+        />
+      </View>
+    </Section>
+  );
+}
+
+function AgentRuntimeCard({
+  busyAction,
+  codexManagementAvailable,
+  codexStatus,
+  onCodexAction,
+  runtime,
+}: {
+  busyAction: ExtensionDetailAction | null;
+  codexManagementAvailable: boolean;
+  codexStatus: CodexAppServerStatus | null;
+  onCodexAction: (action: 'start' | 'restart' | 'update') => Promise<void>;
+  runtime: AgentHarnessRuntime;
+}) {
+  const { styles } = useSettingsTheme();
+  const busy = busyAction?.startsWith('app-server-') === true;
+  const activeTurns = codexStatus?.activeTurnIds.length ?? 0;
+  const executable = runtime.resolvedExecutable ?? runtime.configuredExecutable ?? 'Unavailable';
+  const version = runtime.runningVersion && runtime.installedVersion !== runtime.runningVersion
+    ? `${runtime.runningVersion} running · ${runtime.installedVersion} installed`
+    : runtime.installedVersion ?? runtime.runningVersion ?? 'Unknown';
+  return (
+    <View style={styles.runtimeCard}>
+      <View style={styles.runtimeHeader}>
+        <View style={styles.extensionMetaRow}>
+          <StateDot tone={runtimeTone(runtime)} />
+          <Text style={styles.extensionName}>{runtime.label}</Text>
+        </View>
+        <Text style={styles.runtimeTopology}>{runtimeTopologyLabel(runtime.topology)}</Text>
+      </View>
+      <Text style={styles.runtimeSummary}>{runtimeSummary(runtime)}</Text>
+      <View style={styles.infoList}>
+        <InfoRow label="Executable" value={executable} />
+        <InfoRow label="Version" value={version} />
+        <InfoRow label="Adapter" value={runtime.adapterVersion ?? 'Unknown'} />
+        {runtime.sdkVersion ? <InfoRow label="SDK" value={runtime.sdkVersion} /> : null}
+      </View>
+      {runtime.restartRequired ? (
+        <Text style={styles.updateStatusText}>Restart required to apply the installed Codex version.</Text>
+      ) : null}
+      {runtime.readinessMessage ? <Text style={styles.updateStatusText}>{runtime.readinessMessage}</Text> : null}
+      {runtime.lastError ? <Text style={styles.errorText}>{runtime.lastError}</Text> : null}
+      {runtime.provider === 'codex' ? (
+        <View style={styles.runtimeActionRow}>
+          {runtime.runtimeState === 'stopped' ? (
+            <SettingsButton
+              disabled={busy || !codexManagementAvailable}
+              label="Start"
+              loading={busyAction === 'app-server-start'}
+              onPress={() => onCodexAction('start')}
+            />
+          ) : (
+            <SettingsButton
+              disabled={busy || !codexManagementAvailable || activeTurns > 0}
+              label="Restart"
+              loading={busyAction === 'app-server-restart'}
+              onPress={() => onCodexAction('restart')}
+            />
+          )}
+          <SettingsButton
+            disabled={busy || !codexManagementAvailable}
+            label="Update Codex"
+            loading={busyAction === 'app-server-update'}
+            onPress={() => onCodexAction('update')}
+          />
+        </View>
+      ) : null}
+      {runtime.provider === 'codex' && !codexManagementAvailable ? (
+        <Text style={styles.updateStatusText}>
+          Start the Codex extension server to use managed update and restart actions.
+        </Text>
+      ) : null}
+    </View>
+  );
+}
+
+function runtimeTone(runtime: AgentHarnessRuntime): ServerStateTone {
+  if (runtime.runtimeState === 'failed' || runtime.readiness === 'error' ||
+      runtime.readiness === 'incompatible' || runtime.readiness === 'missing') return 'bad';
+  if (runtime.runtimeState === 'starting' || runtime.runtimeState === 'stopping') return 'busy';
+  if (runtime.readiness === 'ready' &&
+      (runtime.runtimeState === 'running' || runtime.runtimeState === 'idle')) return 'ok';
+  return 'idle';
+}
+
+function runtimeSummary(runtime: AgentHarnessRuntime) {
+  const state = runtime.readiness === 'ready'
+    ? runtimeStateLabel(runtime.runtimeState)
+    : runtime.readiness === 'signed-out' ? 'Signed out'
+      : runtime.readiness === 'missing' ? 'Missing'
+        : runtime.readiness === 'incompatible' ? 'Incompatible'
+          : 'Unavailable';
+  const sessions = runtime.activeSessions === 0
+    ? null
+    : `${runtime.activeSessions} active ${runtime.activeSessions === 1 ? 'session' : 'sessions'}`;
+  return [state, sessions].filter(Boolean).join(' · ');
+}
+
+function runtimeStateLabel(state: AgentHarnessRuntime['runtimeState']) {
+  switch (state) {
+    case 'running': return 'Running';
+    case 'idle': return 'Ready';
+    case 'stopped': return 'Stopped';
+    case 'starting': return 'Starting';
+    case 'stopping': return 'Stopping';
+    case 'failed': return 'Failed';
+    case 'unknown': return 'Unknown';
+  }
+}
+
+function runtimeTopologyLabel(topology: AgentHarnessRuntime['topology']) {
+  return topology === 'shared-daemon' ? 'Shared daemon'
+    : topology === 'session-process' ? 'Per session'
+      : 'Fixture';
 }
 
 function SystemSection({ sample }: { sample: SystemResourcesSample }) {
@@ -1135,6 +1371,42 @@ function createStyles(theme: RemuxTheme) {
   primaryButton: {
     backgroundColor: alpha(theme.focusRing, 0.16),
     borderColor: theme.focusRing,
+  },
+  runtimeActionRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+    marginTop: 2,
+  },
+  runtimeCard: {
+    backgroundColor: theme.surfaceHover,
+    borderColor: theme.border,
+    borderRadius: 14,
+    borderWidth: 1,
+    gap: 10,
+    padding: 12,
+  },
+  runtimeHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 12,
+    justifyContent: 'space-between',
+  },
+  runtimeList: {
+    gap: 12,
+  },
+  runtimeSummary: {
+    color: theme.textMuted,
+    fontSize: 12,
+    lineHeight: 16,
+  },
+  runtimeTopology: {
+    color: theme.textMuted,
+    fontSize: 11,
+    fontWeight: '700',
+    lineHeight: 15,
+    textTransform: 'uppercase',
   },
   section: {
     gap: 8,

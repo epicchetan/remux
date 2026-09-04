@@ -3,10 +3,6 @@ import { ChevronDown, ChevronRight } from 'lucide-react';
 
 import { Separator } from '@remux/viewer-kit/shadcn';
 import type { AgentWorkRenderSegment } from '../../../../../shared/transcript.ts';
-import {
-  transcriptWorkDisclosureKey,
-  useTranscriptLayoutStore,
-} from '../../layoutStore.ts';
 import { useTranscriptResourceStore } from '../../resourceStore.ts';
 import { ExecutionScopeContent } from './ExecutionScope.tsx';
 import { WorkingDuration } from './WorkingDuration.tsx';
@@ -14,28 +10,31 @@ import { formatWorkDuration } from './workDuration.ts';
 
 export function WorkSection({
   conversationId,
+  isOpen,
   laneWidth,
+  onAdditionalHeight,
+  onToggle,
   responseStarted,
   rowId,
   segment,
   turnId,
+  workKey,
 }: {
   conversationId: string;
+  isOpen: boolean;
   laneWidth: number;
+  onAdditionalHeight: (workKey: string, rowId: string, height: number) => void;
+  onToggle: (input: { rowId: string; segmentId: string; turnId: string }) => void;
   responseStarted: boolean;
   rowId: string;
   segment: AgentWorkRenderSegment;
   turnId: string;
+  workKey: string;
 }) {
-  const workKey = transcriptWorkDisclosureKey(turnId, segment.id);
-  const openWork = useTranscriptLayoutStore((state) => state.disclosure.openWorkByKey[workKey]);
-  const toggleWork = useTranscriptLayoutStore((state) => state.toggleWorkDisclosure);
-  const setAdditionalHeight = useTranscriptLayoutStore((state) => state.setOpenWorkAdditionalHeight);
   const ensureExecutionScope = useTranscriptResourceStore((state) => state.ensureExecutionScope);
   const contentRef = useRef<HTMLDivElement | null>(null);
   const heightRafRef = useRef<number | null>(null);
   const pendingHeightRef = useRef<number | null>(null);
-  const isOpen = Boolean(openWork);
   const completed = segment.state !== 'running';
 
   useEffect(() => {
@@ -54,7 +53,7 @@ export function WorkSection({
         heightRafRef.current = null;
         const pendingHeight = pendingHeightRef.current;
         pendingHeightRef.current = null;
-        if (pendingHeight !== null) setAdditionalHeight(workKey, rowId, pendingHeight);
+        if (pendingHeight !== null) onAdditionalHeight(workKey, rowId, pendingHeight);
       });
     };
 
@@ -69,7 +68,7 @@ export function WorkSection({
       }
       pendingHeightRef.current = null;
     };
-  }, [isOpen, rowId, setAdditionalHeight, workKey]);
+  }, [isOpen, onAdditionalHeight, rowId, workKey]);
 
   return (
     <section className="codex-work-section" data-state={segment.state}>
@@ -79,7 +78,7 @@ export function WorkSection({
         data-remux-no-composer-focus
         onClick={(event) => {
           event.currentTarget.blur();
-          toggleWork({ rowId, segmentId: segment.id, turnId });
+          onToggle({ rowId, segmentId: segment.id, turnId });
         }}
         type="button"
       >

@@ -6,20 +6,30 @@ import { transcriptLayout } from '../../viewer/src/transcript/layout/constants.t
 import { TranscriptMeasureCache } from '../../viewer/src/transcript/layout/measureCache.ts';
 import { measureCollapsedTranscript } from '../../viewer/src/transcript/layout/measureCollapsed.ts';
 import { reconcileMeasuredTranscript } from '../../viewer/src/transcript/layout/reconcileMeasured.ts';
+import { TranscriptGeometryIndex } from '../../viewer/src/transcript/geometry/geometryIndex.ts';
+import {
+  emptyTranscriptDisclosureState,
+  reconcileTranscriptDisclosure,
+  toggleWorkDisclosure,
+} from '../../viewer/src/transcript/disclosure/disclosureReducer.ts';
 import { resolveTranscriptContentWidth } from '../../viewer/src/transcript/measureWidth.ts';
 import {
-  autoScrollModeAfterNativeScrollSettles,
-  autoScrollModeForStreamingTurn,
+  viewportIntentAfterNativeScrollSettles,
+  viewportIntentForStreamingTurn,
+  historicalMessageNavigationDestination,
   initialTranscriptScrollTarget,
-  nativeScrollOwnsTranscriptViewport,
   nextUserMessageScrollAnchor,
   previousUserMessageScrollAnchor,
   resolveInitialTranscriptScrollTarget,
-  resolveSentMessageScroll,
+  resolveMessageAnchorScroll,
   transcriptMessageAnchorTopOffset,
-  transcriptNativeScrollPhaseAfterEvent,
+  transcriptViewportAnchorScrollTop,
   userMessageRowMatchesId,
 } from '../../viewer/src/transcript/virtualizerScroll.ts';
+import {
+  nativeScrollOwnsViewport,
+  transcriptScrollOwnerAfterNativeEvent,
+} from '../../viewer/src/transcript/viewport/viewportTypes.ts';
 import {
   computeTranscriptSpacerRange,
   computeTranscriptVirtualRange,
@@ -117,18 +127,18 @@ test('virtualizes a long measured window with top and bottom spacers', () => {
   assert.ok(range.bottomSpacerHeight > 0);
 });
 
-test('preserves sent-message identity and never steals manual scroll during streaming', () => {
+test('preserves message-anchor identity and never steals manual scroll during streaming', () => {
   assert.equal(userMessageRowMatchesId('segment', 'client-message', 'client-message'), true);
-  assert.deepEqual(autoScrollModeForStreamingTurn({
-    currentMode: { type: 'off' },
+  assert.deepEqual(viewportIntentForStreamingTurn({
+    currentIntent: { kind: 'free' },
     nearBottom: false,
     streamingTurnId: 'turn',
-  }), { type: 'off' });
-  assert.deepEqual(autoScrollModeForStreamingTurn({
-    currentMode: { type: 'bottom' },
+  }), { kind: 'free' });
+  assert.deepEqual(viewportIntentForStreamingTurn({
+    currentIntent: { kind: 'bottom-follow' },
     nearBottom: true,
     streamingTurnId: 'turn',
-  }), { type: 'bottom' });
+  }), { kind: 'bottom-follow' });
 });
 
 test('navigates compact transcript tails by user-message identity instead of clamped scroll position', () => {
@@ -153,32 +163,50 @@ test('navigates compact transcript tails by user-message identity instead of cla
     anchors,
     atBottom: false,
     currentSegmentId: 'user-2',
-    maxScrollTop: 400,
     scrollTop: 220,
   }), anchors[2]);
   assert.equal(nextUserMessageScrollAnchor({
     anchors,
     atBottom: false,
     currentSegmentId: 'user-3',
-    maxScrollTop: 400,
     scrollTop: 340,
   }), null);
 });
 
-test('next-turn navigation does not manufacture runway for an unreachable message anchor', () => {
+test('next-turn navigation selects identity before resolving live reachability', () => {
   const anchors = [
     { contentBottom: 120, contentTop: 60, segmentId: 'user-1', scrollTop: 36, turnId: 'turn-1' },
     { contentBottom: 250, contentTop: 190, segmentId: 'user-2', scrollTop: 166, turnId: 'turn-2' },
     { contentBottom: 380, contentTop: 320, segmentId: 'user-3', scrollTop: 296, turnId: 'turn-3' },
   ];
 
-  assert.equal(nextUserMessageScrollAnchor({
+  assert.deepEqual(nextUserMessageScrollAnchor({
     anchors,
     atBottom: false,
     currentSegmentId: 'user-1',
-    maxScrollTop: 150,
     scrollTop: 36,
-  }), null, 'an anchor beyond the natural bottom is represented by the bottom destination instead');
+  }), anchors[1]);
+  assert.deepEqual(historicalMessageNavigationDestination({
+    bottomIfUnreachable: true,
+    desiredScrollTop: 166,
+    naturalMaxScrollTop: 150,
+  }), { kind: 'bottom', scrollTop: 150 });
+});
+
+test('restores a compaction viewport anchor after the segment moves to the next turn', () => {
+  const segmentId = 'compaction:compact-between';
+  const anchor = {
+    offset: 7,
+    rowId: `turn-1:${segmentId}`,
+    segmentId,
+    turnId: 'turn-1',
+  };
+
+  assert.equal(transcriptViewportAnchorScrollTop(anchor, [
+    { rowId: 'turn-1:user:turn-1', scrollTop: 40, segmentId: 'user:turn-1', turnId: 'turn-1' },
+    { rowId: `turn-2:${segmentId}`, scrollTop: 320, segmentId, turnId: 'turn-2' },
+    { rowId: 'turn-2:user:turn-2', scrollTop: 374, segmentId: 'user:turn-2', turnId: 'turn-2' },
+  ]), 327);
 });
 
 test('previous-turn navigation skips every user message already visible at the compact tail', () => {
@@ -236,39 +264,39 @@ test('rejects collapsed WebView samples and recovers width from the transcript l
 });
 
 test('keeps native scroll ownership from touch through momentum settlement', () => {
-  let phase = transcriptNativeScrollPhaseAfterEvent('idle', 'touch-start');
-  assert.equal(phase, 'touch');
-  assert.equal(nativeScrollOwnsTranscriptViewport(phase), true);
+  let owner = transcriptScrollOwnerAfterNativeEvent('idle', 'touch-start');
+  assert.equal(owner, 'native-touch');
+  assert.equal(nativeScrollOwnsViewport(owner), true);
 
-  phase = transcriptNativeScrollPhaseAfterEvent(phase, 'touch-end');
-  assert.equal(phase, 'momentum');
-  assert.equal(nativeScrollOwnsTranscriptViewport(phase), true);
+  owner = transcriptScrollOwnerAfterNativeEvent(owner, 'touch-end');
+  assert.equal(owner, 'native-momentum');
+  assert.equal(nativeScrollOwnsViewport(owner), true);
 
-  phase = transcriptNativeScrollPhaseAfterEvent(phase, 'settle');
-  assert.equal(phase, 'idle');
-  assert.equal(nativeScrollOwnsTranscriptViewport(phase), false);
+  owner = transcriptScrollOwnerAfterNativeEvent(owner, 'settle');
+  assert.equal(owner, 'idle');
+  assert.equal(nativeScrollOwnsViewport(owner), false);
 });
 
 test('restores bottom stickiness only after native scrolling settles at the bottom', () => {
-  assert.deepEqual(autoScrollModeAfterNativeScrollSettles({
-    currentMode: { type: 'off' },
+  assert.deepEqual(viewportIntentAfterNativeScrollSettles({
+    currentIntent: { kind: 'free' },
     nearBottom: true,
     userInitiated: true,
-  }), { type: 'bottom' });
-  assert.deepEqual(autoScrollModeAfterNativeScrollSettles({
-    currentMode: { type: 'bottom' },
+  }), { kind: 'bottom-follow' });
+  assert.deepEqual(viewportIntentAfterNativeScrollSettles({
+    currentIntent: { kind: 'bottom-follow' },
     nearBottom: false,
     userInitiated: true,
-  }), { type: 'off' });
-  assert.deepEqual(autoScrollModeAfterNativeScrollSettles({
-    currentMode: { type: 'bottom' },
+  }), { kind: 'free' });
+  assert.deepEqual(viewportIntentAfterNativeScrollSettles({
+    currentIntent: { kind: 'bottom-follow' },
     nearBottom: false,
     userInitiated: false,
-  }), { type: 'bottom' });
+  }), { kind: 'bottom-follow' });
 });
 
-test('holds a pinned sent-message anchor with runway after content collapses', () => {
-  assert.deepEqual(resolveSentMessageScroll({
+test('holds a pinned message anchor with runway after content collapses', () => {
+  assert.deepEqual(resolveMessageAnchorScroll({
     currentScrollTop: 500,
     desiredScrollTop: 500,
     naturalMaxScrollTop: 420,
@@ -282,8 +310,8 @@ test('holds a pinned sent-message anchor with runway after content collapses', (
   });
 });
 
-test('keeps an established sent-message anchor pinned when the viewport grows', () => {
-  assert.deepEqual(resolveSentMessageScroll({
+test('keeps an established message anchor pinned when the viewport grows', () => {
+  assert.deepEqual(resolveMessageAnchorScroll({
     currentScrollTop: 500,
     desiredScrollTop: 500,
     naturalMaxScrollTop: 420,
@@ -298,7 +326,7 @@ test('keeps an established sent-message anchor pinned when the viewport grows', 
 });
 
 test('does not establish a new message pin during a transient viewport resize', () => {
-  assert.deepEqual(resolveSentMessageScroll({
+  assert.deepEqual(resolveMessageAnchorScroll({
     anchorActivationAllowed: false,
     currentScrollTop: 560,
     desiredScrollTop: 500,
@@ -311,7 +339,7 @@ test('does not establish a new message pin during a transient viewport resize', 
     runwayHeight: 0,
     scrollTop: 560,
   });
-  assert.deepEqual(resolveSentMessageScroll({
+  assert.deepEqual(resolveMessageAnchorScroll({
     anchorActivationAllowed: true,
     currentScrollTop: 560,
     desiredScrollTop: 500,
@@ -337,11 +365,12 @@ test('resolves initial transcript placement to an exact message anchor or sticky
     streamingTurnId: 'turn-1',
   });
   assert.deepEqual(streamingTarget, {
-    mode: {
+    intent: {
+      kind: 'message-anchor',
       phase: 'catching-up',
+      reason: 'restore',
       segmentId: 'user-1',
       conversationId: 'conversation',
-      type: 'sent-message-anchor',
       turnId: 'turn-1',
     },
     scrollTop: 120,
@@ -350,7 +379,7 @@ test('resolves initial transcript placement to an exact message anchor or sticky
     maxScrollTop: 80,
     target: streamingTarget,
   }), {
-    mode: streamingTarget?.mode,
+    intent: streamingTarget?.intent,
     scrollTop: 80,
   });
   assert.deepEqual(resolveInitialTranscriptScrollTarget({
@@ -361,11 +390,11 @@ test('resolves initial transcript placement to an exact message anchor or sticky
       streamingTurnId: null,
     }),
   }), {
-    mode: { type: 'bottom' },
+    intent: { kind: 'bottom-follow' },
     scrollTop: 500,
   });
   assert.deepEqual(resolveInitialTranscriptScrollTarget({ maxScrollTop: 500, target: null }), {
-    mode: { type: 'bottom' },
+    intent: { kind: 'bottom-follow' },
     scrollTop: 500,
   });
 });
@@ -388,6 +417,214 @@ test('uses a safe-area-aware offset and accounts for expanded rows outside the r
   assert.equal(withExpansion.bottomSpacerHeight, withoutExpansion.bottomSpacerHeight);
 });
 
+test('uses one geometry index for expanded row, turn, range, and spacer positions', () => {
+  const layout = measureCollapsedTranscript({
+    turns: [
+      frame('turn-1', [user('user-1', 'First'), work('work-1', 'completed')]),
+      frame('turn-2', [user('user-2', 'Second'), assistant('assistant-2', 'Done')]),
+    ],
+    width: 600,
+  });
+  const workRow = layout.turns[0]?.rows.find((row) => row.segmentId === 'work-1');
+  assert.ok(workRow);
+
+  const expandedHeight = 137;
+  const geometry = new TranscriptGeometryIndex(layout.turns, [{
+    additionalHeight: expandedHeight,
+    rowId: workRow.id,
+    turnId: 'turn-1',
+  }]);
+  const secondTurnTop = (layout.turns[1]?.collapsedTop ?? 0) + expandedHeight;
+
+  assert.equal(geometry.heightAfterRow('turn-1', workRow.id), expandedHeight);
+  assert.equal(geometry.turnTop(1), secondTurnTop);
+  assert.equal(geometry.totalHeight, layout.totalCollapsedHeight + expandedHeight);
+  assert.equal(
+    geometry.rowPositions().find((row) => row.turnId === 'turn-2')?.scrollTop,
+    secondTurnTop,
+  );
+
+  const range = computeTranscriptSpacerRange({
+    activeTurnIds: ['turn-2'],
+    geometry,
+    turns: layout.turns,
+  });
+  assert.equal(range.topSpacerHeight, secondTurnTop);
+  assert.equal(range.bottomSpacerHeight, 0);
+});
+
+test('opens running work from the authoritative active turn', () => {
+  const turn = inProgressFrame('turn-1', [
+    user('user-1', 'Please investigate'),
+    work('work-1', 'running'),
+  ]);
+  const layout = measureCollapsedTranscript({ turns: [turn], width: 600 });
+
+  const disclosure = reconcileTranscriptDisclosure(
+    emptyTranscriptDisclosureState(),
+    layout.turns,
+    turn.id,
+  );
+
+  assert.equal(disclosure.autoOpenWorkKey, 'turn-1:work-1');
+  assert.equal(disclosure.openWorkByKey['turn-1:work-1']?.source, 'auto');
+});
+
+test('does not infer an active turn from an in-progress frame', () => {
+  const turn = inProgressFrame('turn-1', [
+    user('user-1', 'Please investigate'),
+    work('work-1', 'running'),
+  ]);
+  const layout = measureCollapsedTranscript({ turns: [turn], width: 600 });
+
+  const disclosure = reconcileTranscriptDisclosure(
+    emptyTranscriptDisclosureState(),
+    layout.turns,
+    null,
+  );
+
+  assert.equal(disclosure.autoOpenWorkKey, null);
+  assert.deepEqual(disclosure.openWorkByKey, {});
+});
+
+test('a manual close veto prevents streaming deltas from reopening work', () => {
+  const turn = inProgressFrame('turn-1', [
+    user('user-1', 'Please investigate'),
+    work('work-1', 'running'),
+  ]);
+  const firstLayout = measureCollapsedTranscript({ turns: [turn], width: 600 });
+  const autoOpened = reconcileTranscriptDisclosure(
+    emptyTranscriptDisclosureState(),
+    firstLayout.turns,
+    turn.id,
+  );
+  const closed = toggleWorkDisclosure({
+    activeTurnId: turn.id,
+    disclosure: autoOpened,
+    input: {
+      rowId: 'turn-1:work-1',
+      segmentId: 'work-1',
+      turnId: turn.id,
+    },
+    turnsById: firstLayout.turnsById,
+  });
+
+  const updatedTurn = {
+    ...turn,
+    renderRevision: 'turn-1:2',
+    segments: [turn.segments[0]!, { ...turn.segments[1]!, revision: '2' }],
+  };
+  const updatedLayout = measureCollapsedTranscript({ turns: [updatedTurn], width: 600 });
+  const reconciled = reconcileTranscriptDisclosure(closed, updatedLayout.turns, turn.id);
+
+  assert.equal(reconciled.manuallyClosedAutoWorkByTurnId[turn.id], true);
+  assert.equal(reconciled.autoOpenWorkKey, null);
+  assert.deepEqual(reconciled.openWorkByKey, {});
+});
+
+test('auto-open transfers to replacement running work in the same turn', () => {
+  const firstTurn = inProgressFrame('turn-1', [
+    user('user-1', 'Please investigate'),
+    work('work-1', 'running'),
+  ]);
+  const firstLayout = measureCollapsedTranscript({ turns: [firstTurn], width: 600 });
+  const firstDisclosure = reconcileTranscriptDisclosure(
+    emptyTranscriptDisclosureState(),
+    firstLayout.turns,
+    firstTurn.id,
+  );
+  const replacementTurn = inProgressFrame('turn-1', [
+    user('user-1', 'Please investigate'),
+    work('work-1', 'completed'),
+    work('work-2', 'running'),
+  ]);
+  const replacementLayout = measureCollapsedTranscript({ turns: [replacementTurn], width: 600 });
+
+  const disclosure = reconcileTranscriptDisclosure(
+    firstDisclosure,
+    replacementLayout.turns,
+    replacementTurn.id,
+  );
+
+  assert.equal(disclosure.autoOpenWorkKey, 'turn-1:work-2');
+  assert.equal(disclosure.openWorkByKey['turn-1:work-1'], undefined);
+  assert.equal(disclosure.openWorkByKey['turn-1:work-2']?.source, 'auto');
+});
+
+test('assistant response closes automatic work but preserves work reopened afterward', () => {
+  const workingTurn = inProgressFrame('turn-1', [
+    user('user-1', 'Please investigate'),
+    work('work-1', 'running'),
+  ]);
+  const workingLayout = measureCollapsedTranscript({ turns: [workingTurn], width: 600 });
+  const autoOpened = reconcileTranscriptDisclosure(
+    emptyTranscriptDisclosureState(),
+    workingLayout.turns,
+    workingTurn.id,
+  );
+  const respondingTurn = inProgressFrame('turn-1', [
+    user('user-1', 'Please investigate'),
+    work('work-1', 'completed'),
+    assistant('assistant-1', 'Here is what I found.'),
+  ]);
+  const respondingLayout = measureCollapsedTranscript({ turns: [respondingTurn], width: 600 });
+  const closedAtResponse = reconcileTranscriptDisclosure(
+    autoOpened,
+    respondingLayout.turns,
+    respondingTurn.id,
+  );
+  assert.deepEqual(closedAtResponse.openWorkByKey, {});
+
+  const reopened = toggleWorkDisclosure({
+    activeTurnId: respondingTurn.id,
+    disclosure: closedAtResponse,
+    input: {
+      rowId: 'turn-1:work-1',
+      segmentId: 'work-1',
+      turnId: respondingTurn.id,
+    },
+    turnsById: respondingLayout.turnsById,
+  });
+  const refreshed = reconcileTranscriptDisclosure(
+    reopened,
+    respondingLayout.turns,
+    respondingTurn.id,
+  );
+
+  assert.equal(refreshed.openWorkByKey['turn-1:work-1']?.source, 'user');
+  assert.equal(refreshed.openWorkByKey['turn-1:work-1']?.openedAfterAssistantStarted, true);
+});
+
+test('a completed manual-close veto does not suppress work in the next turn', () => {
+  const firstTurn = inProgressFrame('turn-1', [user('user-1', 'First'), work('work-1', 'running')]);
+  const firstLayout = measureCollapsedTranscript({ turns: [firstTurn], width: 600 });
+  const autoOpened = reconcileTranscriptDisclosure(
+    emptyTranscriptDisclosureState(),
+    firstLayout.turns,
+    firstTurn.id,
+  );
+  const closed = toggleWorkDisclosure({
+    activeTurnId: firstTurn.id,
+    disclosure: autoOpened,
+    input: { rowId: 'turn-1:work-1', segmentId: 'work-1', turnId: firstTurn.id },
+    turnsById: firstLayout.turnsById,
+  });
+  const completedFirstTurn = {
+    ...frame('turn-1', [user('user-1', 'First'), work('work-1', 'completed')]),
+    renderRevision: 'turn-1:completed',
+  };
+  const secondTurn = inProgressFrame('turn-2', [user('user-2', 'Second'), work('work-2', 'running')]);
+  const nextLayout = measureCollapsedTranscript({
+    turns: [completedFirstTurn, secondTurn],
+    width: 600,
+  });
+
+  const disclosure = reconcileTranscriptDisclosure(closed, nextLayout.turns, secondTurn.id);
+
+  assert.equal(disclosure.manuallyClosedAutoWorkByTurnId['turn-1'], undefined);
+  assert.equal(disclosure.autoOpenWorkKey, 'turn-2:work-2');
+});
+
 function frame(id: string, segments: AgentTurnSegment[]): AgentTurnRenderFrame {
   return {
     id,
@@ -399,6 +636,15 @@ function frame(id: string, segments: AgentTurnSegment[]): AgentTurnRenderFrame {
     renderRevision: `${id}:1`,
     layoutRevision: `${id}:1`,
     segments,
+  };
+}
+
+function inProgressFrame(id: string, segments: AgentTurnSegment[]): AgentTurnRenderFrame {
+  return {
+    ...frame(id, segments),
+    completedAt: null,
+    durationMs: null,
+    status: 'inProgress',
   };
 }
 
@@ -428,4 +674,22 @@ function imageUser(id: string, text: string): AgentTurnSegment {
 
 function assistant(id: string, text: string): AgentTurnSegment {
   return { id, type: 'assistantMessage', revision: '1', text };
+}
+
+function work(
+  id: string,
+  state: 'running' | 'completed' | 'failed' | 'interrupted',
+): AgentTurnSegment {
+  return {
+    childExecutionCount: 0,
+    durationMs: state === 'running' ? null : 1_000,
+    id,
+    inferenceCount: 1,
+    layoutRevision: '1',
+    operationCount: 1,
+    revision: '1',
+    scopeId: `scope:${id}`,
+    state,
+    type: 'work',
+  };
 }

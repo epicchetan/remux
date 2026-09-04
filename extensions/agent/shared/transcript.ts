@@ -1,4 +1,4 @@
-export const AGENT_TRANSCRIPT_PROTOCOL_VERSION = 5 as const;
+export const AGENT_TRANSCRIPT_PROTOCOL_VERSION = 6 as const;
 export const AGENT_TRANSCRIPT_PROJECTION_VERSION = 'agent-turn-render-v6' as const;
 
 export const DEFAULT_TRANSCRIPT_TAIL_TURNS = 24;

@@ -53,9 +53,14 @@ import {
 import type {
   ProviderAdapter,
   ProviderCommandAcceptance,
+  ProviderRuntimeStatus,
   ProviderSession,
 } from '../../provider-adapter.ts';
 import { ProviderEventStream } from '../../provider-adapter.ts';
+import {
+  NativeSessionOwnershipRegistry,
+  type NativeSessionLease,
+} from '../../native-runtime/native-session-ownership.ts';
 import {
   FEDERATION_SERVER_NAME,
   FEDERATION_TOOLS,
@@ -65,6 +70,7 @@ import { fitJsonPreview as jsonPreview } from '../preview.ts';
 
 const execFile = promisify(execFileCallback);
 const ADAPTER_VERSION = 'remux-claude-agent-sdk-v1';
+const CLAUDE_AGENT_SDK_VERSION = '0.3.258';
 const DEFAULT_INSTANCE_ID = 'claude-local';
 const DEFAULT_BINARY = 'claude';
 const FEDERATION_ALLOWED_TOOLS = FEDERATION_TOOLS
@@ -125,6 +131,7 @@ export type ClaudeNativeAdapterOptions = {
     mimeType: string,
   ) => Promise<{ path: string }>;
   now?: () => number;
+  ownership?: NativeSessionOwnershipRegistry;
 };
 
 /**
@@ -140,6 +147,7 @@ export class ClaudeNativeAdapter implements ProviderAdapter {
   private readonly runCli: (args: readonly string[]) => Promise<string>;
   private readonly resolveImageArtifact?: ClaudeNativeAdapterOptions['resolveImageArtifact'];
   private readonly now: () => number;
+  private readonly ownership: NativeSessionOwnershipRegistry;
   private providerVersion = 'unknown';
 
   constructor(options: ClaudeNativeAdapterOptions = {}) {
@@ -149,6 +157,7 @@ export class ClaudeNativeAdapter implements ProviderAdapter {
     this.createQuery = options.createQuery ?? claudeQuery;
     this.resolveImageArtifact = options.resolveImageArtifact;
     this.now = options.now ?? Date.now;
+    this.ownership = options.ownership ?? new NativeSessionOwnershipRegistry(this.now);
     this.runCli = options.runCli ?? (async (args) => {
       try {
         const result = await execFile(this.binaryPath, [...args], {
@@ -220,6 +229,26 @@ export class ClaudeNativeAdapter implements ProviderAdapter {
     }
   }
 
+  async readRuntimeStatus(providerInstanceId: string): Promise<ProviderRuntimeStatus> {
+    this.assertInstance(providerInstanceId);
+    const activeSessions = this.ownership.snapshot().filter((entry) =>
+      entry.provider === 'claude-code' && entry.providerInstanceId === providerInstanceId).length;
+    const version = this.providerVersion === 'unknown' ? null : this.providerVersion;
+    return {
+      topology: 'session-process',
+      runtimeState: activeSessions > 0 ? 'running' : 'idle',
+      configuredExecutable: this.binaryPath,
+      resolvedExecutable: null,
+      installedVersion: version,
+      runningVersion: activeSessions > 0 ? version : null,
+      adapterVersion: ADAPTER_VERSION,
+      sdkVersion: CLAUDE_AGENT_SDK_VERSION,
+      restartRequired: false,
+      activeSessions,
+      lastError: null,
+    };
+  }
+
   async listModels(providerInstanceId: string): Promise<readonly ProviderModelDescriptor[]> {
     this.assertInstance(providerInstanceId);
     const input = new ClaudeInputQueue();
@@ -266,6 +295,12 @@ export class ClaudeNativeAdapter implements ProviderAdapter {
       throw new Error(`Claude adapter cannot open ${input.nativeSession.provider} sessions.`);
     }
     const sessionId = input.nativeSession?.sessionId ?? randomUUID();
+    const lease = this.ownership.acquire({
+      provider: 'claude-code',
+      providerInstanceId: input.providerInstanceId,
+      sessionId,
+      executionId: input.executionId,
+    });
     const prompt = new ClaudeInputQueue();
     const diagnostics: string[] = [];
     let session: ClaudeProviderSession | undefined;
@@ -277,19 +312,28 @@ export class ClaudeNativeAdapter implements ProviderAdapter {
       onFileChanged: (change) => session?.recordFileChange(change),
       onStderr: (chunk) => recordClaudeDiagnostic(diagnostics, chunk),
     });
-    const query = this.createQuery({ prompt, options });
-    session = new ClaudeProviderSession({
-      input,
-      sessionId,
-      prompt,
-      query,
-      resolveImageArtifact: this.resolveImageArtifact,
-      diagnostics,
-      now: this.now,
-      forkNative: (request) => this.materializeFork(input, sessionId, request),
-    });
-    session.start(input.mode !== 'create');
-    return session;
+    let query: ClaudeQuery | undefined;
+    try {
+      query = this.createQuery({ prompt, options });
+      session = new ClaudeProviderSession({
+        input,
+        sessionId,
+        prompt,
+        query,
+        resolveImageArtifact: this.resolveImageArtifact,
+        diagnostics,
+        now: this.now,
+        lease,
+        forkNative: (request) => this.materializeFork(input, sessionId, request),
+      });
+      session.start(input.mode !== 'create');
+      return session;
+    } catch (error) {
+      prompt.close();
+      query?.close();
+      lease.release();
+      throw error;
+    }
   }
 
   private async materializeFork(
@@ -405,6 +449,7 @@ type ClaudeProviderSessionOptions = {
   diagnostics: string[];
   now: () => number;
   forkNative?: (request: NativeForkRequest) => Promise<NativeSessionRef>;
+  lease: NativeSessionLease;
 };
 
 export class ClaudeProviderSession implements ProviderSession {
@@ -418,6 +463,7 @@ export class ClaudeProviderSession implements ProviderSession {
   private readonly diagnostics: string[];
   private readonly now: () => number;
   private readonly forkNative: (request: NativeForkRequest) => Promise<NativeSessionRef>;
+  private readonly lease: NativeSessionLease;
   private readonly receipts = new Map<
     string,
     { hash: string; result: Promise<ProviderCommandAcceptance> }
@@ -471,6 +517,7 @@ export class ClaudeProviderSession implements ProviderSession {
     this.forkNative = options.forkNative ?? (async () => {
       throw new Error('Claude native fork is unavailable for this session.');
     });
+    this.lease = options.lease;
     this.nativeSession = {
       provider: 'claude-code',
       providerInstanceId: options.input.providerInstanceId,
@@ -626,10 +673,14 @@ export class ClaudeProviderSession implements ProviderSession {
   async close() {
     if (this.closed) return;
     this.closed = true;
-    this.prompt.close();
-    this.query.close();
-    await this.consumeTask?.catch(() => undefined);
-    this.events.close();
+    try {
+      this.prompt.close();
+      this.query.close();
+      await this.consumeTask?.catch(() => undefined);
+      this.events.close();
+    } finally {
+      this.lease.release();
+    }
   }
 
   recordFileChange(change: ClaudeFileChange) {

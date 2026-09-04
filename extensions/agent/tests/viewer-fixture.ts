@@ -38,12 +38,14 @@ export async function installAgentHost(page: Page) {
     const routedConversation = route.get('remuxResourceKind') === 'agentConversation'
       && route.get('remuxResourceId') === conversationId;
     const longTranscript = route.get('fixtureLong') === '1';
+    const longFinalResponse = route.get('fixtureLongFinal') === '1';
     const markdownTranscript = route.get('fixtureMarkdown') === '1';
     const overflowTranscript = route.get('fixtureOverflow') === '1';
     const exactTranscript = route.get('fixtureExact') === '1';
     const contextTurns = route.get('fixtureContextTurns') === '1';
     const diffTranscript = route.get('fixtureDiff') === '1';
     const runningTranscript = route.get('fixtureRunning') === '1';
+    const tallRunningWork = route.get('fixtureTallWork') === '1';
     const compactionTranscript = route.get('fixtureCompaction') === '1';
     let historyState: 'failed' | 'ready' = route.get('fixtureHistoryFailed') === '1'
       ? 'failed'
@@ -137,10 +139,28 @@ export async function installAgentHost(page: Page) {
       });
       resources.set('runtime', { revision: 2, value: runtimeValue('idle') });
       if (runningTranscript) {
+        if (longTranscript) {
+          for (let index = 1; index <= 48; index += 1) {
+            turns.push(completedTurn(`turn-${index}`, `Historical request ${index}`, `Historical answer ${index}.`));
+          }
+          sequence = 48;
+          turnCounter = 48;
+        }
         const running = createRunningTurn(
           'Resume this running turn',
           'fixture-running-client-message',
         );
+        if (compactionTranscript) {
+          running.segments.unshift({
+            id: 'compaction:before-running',
+            type: 'compaction',
+            revision: 'before-running:completed',
+            status: 'compacted',
+            trigger: 'manual',
+            beforeTokens: 82_000,
+            afterTokens: 9_000,
+          });
+        }
         const storedStartedAt = Number(
           window.sessionStorage.getItem('remux.agent.fixture.running-started-at'),
         );
@@ -160,7 +180,13 @@ export async function installAgentHost(page: Page) {
         resources.set('runtime', { revision: 3, value: runtime });
       } else if (longTranscript) {
         for (let index = 1; index <= 72; index += 1) {
-          turns.push(completedTurn(`turn-${index}`, `Historical request ${index}`, `Historical answer ${index}.`));
+          const response = index === 72 && longFinalResponse
+            ? Array.from(
+                { length: 56 },
+                (_, paragraph) => `Historical answer 72, paragraph ${paragraph + 1}. This is intentionally long enough to keep the final user message reachable at its modeled anchor.`,
+              ).join('\n\n')
+            : `Historical answer ${index}.`;
+          turns.push(completedTurn(`turn-${index}`, `Historical request ${index}`, response));
         }
         sequence = 72;
         turnCounter = 72;
@@ -464,6 +490,12 @@ export async function installAgentHost(page: Page) {
       const scopeId = `00000000-0000-4000-8000-${String(turnCounter).padStart(12, '0')}`;
       const rootScopeId = `10000000-0000-4000-8000-${String(turnCounter).padStart(12, '0')}`;
       const startedAt = Date.now();
+      const reasoningParts = tallRunningWork
+        ? Array.from(
+            { length: 36 },
+            (_, index) => `**Reviewing expanded work item ${index + 1}.**`,
+          )
+        : ['**Checking context.**', '**Reviewing workspace state.**'];
       const turn: Turn = {
         id,
         status: 'inProgress',
@@ -499,8 +531,8 @@ export async function installAgentHost(page: Page) {
             {
               id: `${id}:reasoning`, type: 'reasoning', state: 'final',
               revision: 'reasoning:1',
-              text: '**Checking context.**\n**Reviewing workspace state.**',
-              parts: ['**Checking context.**', '**Reviewing workspace state.**'],
+              text: reasoningParts.join('\n'),
+              parts: reasoningParts,
             },
             {
               id: `${id}:commentary`, type: 'commentary', state: 'final',
@@ -2220,6 +2252,14 @@ export async function installAgentHost(page: Page) {
             scopeId: work.scopeId, reason: 'runtimeEvent', affectsLayout: true,
             basisSequence: sequence,
           }]);
+        },
+        refreshLatestRunningTurn() {
+          const turn = turns.at(-1);
+          if (!turn || turn.status !== 'inProgress') {
+            throw new Error('No running fixture turn is available.');
+          }
+          touchTurn(turn);
+          invalidateTranscript(turn.id, 'runtimeEvent', true);
         },
         streamLatestAssistantText(text: string) {
           const turn = turns.at(-1);

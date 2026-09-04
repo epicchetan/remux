@@ -1,5 +1,6 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Locator, type Page } from '@playwright/test';
 
+import { transcriptLayout } from '../viewer/src/transcript/layout/constants';
 import { FIXTURE_CONVERSATION_ID, installAgentHost } from './viewer-fixture';
 
 test.beforeEach(async ({ page }) => {
@@ -61,8 +62,17 @@ test('loads oversized exact content only after an explicit viewer action', async
   await page.goto(conversationUrl('&fixtureExact=1'));
 
   await expect(page.getByText('Exact preview.', { exact: true })).toBeVisible();
+  const exactControl = page.getByRole('button', { name: /Open exact response/u });
+  await expect(exactControl).toHaveCSS('height', `${transcriptLayout.exactContentHeight}px`);
+  const collapsedGeometry = await page.locator('[data-row-kind]').evaluateAll((rows) => rows.map((row) => ({
+    actual: row.getBoundingClientRect().height,
+    modeled: Number((row as HTMLElement).dataset.collapsedHeight),
+  })));
+  for (const row of collapsedGeometry) {
+    expect(Math.abs(row.actual - row.modeled)).toBeLessThanOrEqual(0.5);
+  }
   expect(await artifactRequestCount(page)).toBe(0);
-  await page.getByRole('button', { name: /Open exact response/u }).click();
+  await exactControl.click();
   await expect(page.getByRole('dialog', { name: 'Exact response' })).toBeVisible();
   expect(await artifactRequestCount(page)).toBe(0);
   await page.getByRole('button', { name: 'Load next chunk' }).click();
@@ -84,6 +94,20 @@ test('renders conversation compaction boundaries as virtualized transcript rows'
     rows.map((row) => row.getAttribute('data-row-kind')))).toEqual([
     'compaction', 'userMessage', 'assistantMessage', 'compaction',
   ]);
+  const dimensions = await page.locator('[data-row-kind="compaction"]').first().evaluate((row) => {
+    const divider = row.firstElementChild;
+    if (!(divider instanceof HTMLElement)) throw new Error('Compaction divider is missing.');
+    return {
+      dividerHeight: divider.getBoundingClientRect().height,
+      paddingBottom: Number.parseFloat(getComputedStyle(row).paddingBottom),
+      rowHeight: row.getBoundingClientRect().height,
+    };
+  });
+  expect(dimensions.dividerHeight).toBe(transcriptLayout.compaction.height);
+  expect(dimensions.paddingBottom).toBe(transcriptLayout.row.defaultGap);
+  expect(dimensions.rowHeight).toBe(
+    transcriptLayout.compaction.height + transcriptLayout.row.defaultGap,
+  );
 });
 
 test('loads normalized native activity and operation details only after disclosure', async ({ page }) => {
@@ -94,6 +118,8 @@ test('loads normalized native activity and operation details only after disclosu
 
   const workHeader = page.locator('.codex-work-header');
   await expect(workHeader).toHaveAttribute('aria-expanded', 'false');
+  const workRow = page.locator('[data-row-kind="workSection"]');
+  await expect.poll(() => collapsedRowGeometryError(workRow)).toBeLessThanOrEqual(0.5);
   const readsBeforeOpen = await nativeTurnReadCount(page);
   expect(readsBeforeOpen).toBeGreaterThan(0);
   await workHeader.click();
@@ -123,6 +149,14 @@ test('loads normalized native activity and operation details only after disclosu
   await expect(diffRow).toContainText('Edited index.ts');
   await expect(diffRow).toContainText('file_change');
   await expect(page.getByText('native subagent', { exact: false })).toBeVisible();
+  await expect.poll(() => workRow.evaluate((row) => {
+    const content = row.querySelector<HTMLElement>('.codex-work-content');
+    const collapsedHeight = Number((row as HTMLElement).dataset.collapsedHeight);
+    if (!content || !Number.isFinite(collapsedHeight)) return Number.POSITIVE_INFINITY;
+    return Math.abs(
+      row.getBoundingClientRect().height - collapsedHeight - content.getBoundingClientRect().height,
+    );
+  })).toBeLessThanOrEqual(0.5);
 
   const workAlignment = await page.evaluate(() => {
     const left = (selector: string) =>
@@ -181,6 +215,7 @@ test('loads normalized native activity and operation details only after disclosu
 
   await workHeader.click();
   await expect(workHeader).toHaveAttribute('aria-expanded', 'false');
+  await expect.poll(() => collapsedRowGeometryError(workRow)).toBeLessThanOrEqual(0.5);
 });
 
 test('refreshes an open normalized activity frame without flattening its new inference', async ({ page }) => {
@@ -206,6 +241,15 @@ test('pages only after a user scroll and preserves the mounted row anchor', asyn
   expect(mountedBefore).toBeGreaterThan(0);
   expect(mountedBefore).toBeLessThan(24);
   await expect.poll(() => transcriptSyncCount(page)).toBe(1);
+  await expect.poll(() => page.getByTestId('agent-transcript-scroll').evaluate((node) =>
+    Math.abs(node.scrollHeight - node.clientHeight - node.scrollTop))).toBeLessThanOrEqual(2);
+  // Let the two-frame initial placement lifecycle release before the test
+  // synthesizes a scrollTop write. A real wheel/touch gesture cannot precede
+  // the first painted transcript, but the direct DOM write otherwise can.
+  await page.evaluate(async () => {
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  });
 
   const viewport = page.getByTestId('agent-transcript-scroll');
   await viewport.evaluate((node) => {
@@ -213,6 +257,7 @@ test('pages only after a user scroll and preserves the mounted row anchor', asyn
     node.dispatchEvent(new Event('scrollend'));
   });
   await page.waitForTimeout(250);
+  await expect.poll(() => viewport.evaluate((node) => node.scrollTop)).toBeLessThanOrEqual(1);
   expect(await transcriptSyncCount(page)).toBe(1);
 
   const anchor = page.locator('[data-transcript-row-id^="turn-49:"]').first();
@@ -241,7 +286,7 @@ test('keeps a sent message visible while work and assistant output settle', asyn
   await expect(transcript.getByText('Anchor this user request')).toBeVisible();
 });
 
-test('pins streamed work before paint and holds the user message through content collapse', async ({ page }) => {
+test('pins streamed work through collapse and retains exact message anchors until returning to bottom', async ({ page }) => {
   await page.goto(conversationUrl('&fixtureLong=1'));
   await expect(page.getByText('Historical answer 72.')).toBeVisible();
   await page.getByRole('textbox', { name: 'Message' }).fill('interrupt anchor frame probe');
@@ -289,6 +334,49 @@ test('pins streamed work before paint and holds the user message through content
     expect(Math.abs(offset - samples.anchorTop)).toBeLessThanOrEqual(2);
   }
   await expect(page.getByTestId('agent-transcript-anchor-runway')).not.toHaveCSS('height', '0px');
+
+  const navigationFrames = await page.evaluate(async () => {
+    const viewport = document.querySelector<HTMLElement>('[data-testid="agent-transcript-scroll"]')!;
+    const runway = document.querySelector<HTMLElement>('[data-testid="agent-transcript-anchor-runway"]')!;
+    const initialScrollTop = viewport.scrollTop;
+    const frames: Array<{ runwayHeight: number; scrollTop: number }> = [];
+    (window as any).__agentNavigationExtentFrames = frames;
+    (window as any).__agentNavigationExtentSampling = true;
+    const sample = () => {
+      frames.push({
+        runwayHeight: runway.getBoundingClientRect().height,
+        scrollTop: viewport.scrollTop,
+      });
+      if ((window as any).__agentNavigationExtentSampling) requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+    return { initialScrollTop };
+  });
+
+  await page.getByRole('button', { name: 'Previous turn' }).click();
+  await page.waitForTimeout(400);
+  const navigation = await page.evaluate(() => {
+    (window as any).__agentNavigationExtentSampling = false;
+    return (window as any).__agentNavigationExtentFrames as Array<{
+      runwayHeight: number;
+      scrollTop: number;
+    }>;
+  });
+  const firstMovingFrame = navigation.find(({ scrollTop }) =>
+    Math.abs(scrollTop - navigationFrames.initialScrollTop) > 1);
+  expect(firstMovingFrame).toBeTruthy();
+  expect(firstMovingFrame!.runwayHeight).toBeGreaterThan(1);
+  await expect.poll(() => userMessageAnchorError(page, 'turn-72')).toBeLessThanOrEqual(2);
+  await expect(page.getByTestId('agent-transcript-anchor-runway')).not.toHaveCSS('height', '0px');
+
+  const sentTurnId = await sentRow.getAttribute('data-turn-id');
+  expect(sentTurnId).toBeTruthy();
+  await page.getByRole('button', { name: 'Next turn or bottom' }).click();
+  await expect.poll(() => userMessageAnchorError(page, sentTurnId!)).toBeLessThanOrEqual(2);
+  await page.getByRole('button', { name: 'Next turn or bottom' }).click();
+  await expect(page.getByTestId('agent-transcript-anchor-runway')).toHaveCSS('height', '0px');
+  await expect.poll(() => page.getByTestId('agent-transcript-scroll').evaluate((node) =>
+    Math.abs(node.scrollHeight - node.clientHeight - node.scrollTop))).toBeLessThanOrEqual(2);
 });
 
 test('keeps the sent message pinned while the first assistant chunk auto-closes work', async ({ page }) => {
@@ -379,6 +467,19 @@ test('restores a running user-message anchor before streamed work grows', async 
   }
 });
 
+test('keeps running work manually closed across later transcript deltas', async ({ page }) => {
+  await page.goto(conversationUrl('&fixtureRunning=1'));
+  const workHeader = page.locator('.codex-work-header').last();
+  await expect(workHeader).toHaveAttribute('aria-expanded', 'true');
+
+  await workHeader.click();
+  await expect(workHeader).toHaveAttribute('aria-expanded', 'false');
+  await page.evaluate(() => (window as any).__agentFixture.refreshLatestRunningTurn());
+
+  await expect(workHeader).toHaveAttribute('aria-expanded', 'false');
+  await expect(page.locator('.codex-work-content').last()).toBeHidden();
+});
+
 test('keeps an anchored message fixed when an attachment resizes the composer', async ({ page }) => {
   await page.goto(conversationUrl('&fixtureLong=1'));
   await expect(page.getByText('Historical answer 72.')).toBeVisible();
@@ -451,6 +552,24 @@ test('keeps an anchored message fixed when an attachment resizes the composer', 
 
 function conversationUrl(extra = '') {
   return `/viewers/agent/?remuxResourceKind=agentConversation&remuxResourceId=${FIXTURE_CONVERSATION_ID}${extra}`;
+}
+
+async function userMessageAnchorError(page: Page, turnId: string) {
+  return page.locator(`[data-row-kind="userMessage"][data-turn-id="${turnId}"]`).evaluate((row) => {
+    const viewport = document.querySelector<HTMLElement>('[data-testid="agent-transcript-scroll"]')!;
+    const content = document.querySelector<HTMLElement>('[data-testid="agent-transcript-content"]')!;
+    const anchorTop = Math.max(24, Number.parseFloat(getComputedStyle(content).paddingTop));
+    return Math.abs(row.getBoundingClientRect().top - viewport.getBoundingClientRect().top - anchorTop);
+  });
+}
+
+async function collapsedRowGeometryError(row: Locator) {
+  return row.evaluate((element) => {
+    const modeled = Number((element as HTMLElement).dataset.collapsedHeight);
+    return Number.isFinite(modeled)
+      ? Math.abs(element.getBoundingClientRect().height - modeled)
+      : Number.POSITIVE_INFINITY;
+  });
 }
 
 async function transcriptKeys(page: Page) {

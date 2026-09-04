@@ -1,7 +1,11 @@
 import type { TranscriptMeasuredTurn } from './layout/types';
 import { createExternalStore } from './externalStore';
 import { initialTranscriptActiveTurnIds, sameTurnIds } from './virtualizerRange';
-import { userMessageRowMatchesId } from './virtualizerScroll';
+import { userMessageRowMatchesId } from './viewport/viewportReducer';
+import {
+  sameTranscriptViewportIntent,
+  type TranscriptViewportIntent,
+} from './viewport/viewportTypes';
 
 type TranscriptScrollNavigationController = {
   scrollDown: () => void;
@@ -10,20 +14,9 @@ type TranscriptScrollNavigationController = {
 
 type TranscriptViewportCapture = (conversationId: string) => void;
 
-export type TranscriptAutoScrollMode =
-  | { type: 'bottom' }
-  | {
-      phase: 'anchored' | 'catching-up';
-      segmentId: string;
-      conversationId: string;
-      type: 'sent-message-anchor';
-      turnId: string;
-    }
-  | { type: 'off' };
-
 type TranscriptViewportStoreState = {
   activeTurnIds: string[];
-  autoScrollMode: TranscriptAutoScrollMode;
+  viewportIntent: TranscriptViewportIntent;
   canScrollDown: boolean;
   canScrollUp: boolean;
   lifecycleState: 'active' | 'background' | 'inactive';
@@ -38,7 +31,7 @@ type TranscriptViewportStoreState = {
   scrollDown: () => void;
   scrollUp: () => void;
   setActiveTurnIds: (activeTurnIds: string[]) => void;
-  setAutoScrollMode: (mode: TranscriptAutoScrollMode) => void;
+  setViewportIntent: (intent: TranscriptViewportIntent) => void;
   setScrollAvailability: (availability: { canScrollDown: boolean; canScrollUp: boolean }) => void;
   setScrollNavigationController: (controller: TranscriptScrollNavigationController | null) => void;
   setLifecycleState: (state: 'active' | 'background' | 'inactive') => void;
@@ -62,7 +55,7 @@ const actions: Pick<
   | 'requestTurnScroll'
   | 'resolveTurnScroll'
   | 'setActiveTurnIds'
-  | 'setAutoScrollMode'
+  | 'setViewportIntent'
   | 'setScrollAvailability'
   | 'setScrollNavigationController'
   | 'setLifecycleState'
@@ -119,11 +112,12 @@ const actions: Pick<
     }
 
     viewportStore.setState({
-      autoScrollMode: {
+      viewportIntent: {
+        kind: 'message-anchor',
         phase: 'catching-up',
+        reason: 'send',
         segmentId: normalizedMessageId,
         conversationId: normalizedConversationId,
-        type: 'sent-message-anchor',
         turnId: normalizedTurnId,
       },
       pendingUserMessageIds,
@@ -140,12 +134,12 @@ const actions: Pick<
     if (viewportStore.getState().lifecycleState === lifecycleState) return;
     viewportStore.setState({ lifecycleState });
   },
-  setAutoScrollMode(autoScrollMode) {
-    if (sameAutoScrollMode(viewportStore.getState().autoScrollMode, autoScrollMode)) {
+  setViewportIntent(viewportIntent) {
+    if (sameTranscriptViewportIntent(viewportStore.getState().viewportIntent, viewportIntent)) {
       return;
     }
 
-    viewportStore.setState({ autoScrollMode });
+    viewportStore.setState({ viewportIntent });
   },
   setScrollAvailability(availability) {
     const state = viewportStore.getState();
@@ -171,7 +165,7 @@ const actions: Pick<
 
 const viewportStore = createExternalStore<TranscriptViewportStoreState>({
   activeTurnIds: [],
-  autoScrollMode: { type: 'off' },
+  viewportIntent: { kind: 'free' },
   canScrollDown: false,
   canScrollUp: false,
   lifecycleState: 'active',
@@ -213,16 +207,16 @@ export function resetTranscriptViewportForConversation(conversationId?: string |
   const normalizedConversationId = conversationId?.trim() || null;
   const state = viewportStore.getState();
   const requestedTurnScroll = state.requestedTurnScroll;
-  const autoScrollMode =
+  const viewportIntent =
     normalizedConversationId &&
-    state.autoScrollMode.type === 'sent-message-anchor' &&
-    state.autoScrollMode.conversationId === normalizedConversationId
-      ? state.autoScrollMode
-      : { type: 'off' as const };
+    state.viewportIntent.kind === 'message-anchor' &&
+    state.viewportIntent.conversationId === normalizedConversationId
+      ? state.viewportIntent
+      : { kind: 'free' as const };
 
   viewportStore.setState({
     activeTurnIds: [],
-    autoScrollMode,
+    viewportIntent,
     canScrollDown: false,
     canScrollUp: false,
     pendingUserMessageIds: [],
@@ -255,15 +249,15 @@ export function discardTranscriptUserMessage(messageId: string) {
   if (!normalized) return;
   const state = viewportStore.getState();
   const pendingUserMessageIds = state.pendingUserMessageIds.filter((id) => id !== normalized);
-  const autoScrollMode = state.autoScrollMode.type === 'sent-message-anchor' &&
-    state.autoScrollMode.segmentId === normalized
-    ? { type: 'off' as const }
-    : state.autoScrollMode;
+  const viewportIntent = state.viewportIntent.kind === 'message-anchor' &&
+    state.viewportIntent.segmentId === normalized
+    ? { kind: 'free' as const }
+    : state.viewportIntent;
   if (
     sameStrings(state.pendingUserMessageIds, pendingUserMessageIds) &&
-    sameAutoScrollMode(state.autoScrollMode, autoScrollMode)
+    sameTranscriptViewportIntent(state.viewportIntent, viewportIntent)
   ) return;
-  viewportStore.setState({ autoScrollMode, pendingUserMessageIds });
+  viewportStore.setState({ viewportIntent, pendingUserMessageIds });
 }
 
 export function setTranscriptViewportLifecycleState(
@@ -282,7 +276,7 @@ export function reconcileTranscriptViewportForLayout(
     ? nextActiveTurnIds
     : initialTranscriptActiveTurnIds(turns);
 
-  let autoScrollMode = state.autoScrollMode;
+  let viewportIntent = state.viewportIntent;
   let pendingUserMessageIds = state.pendingUserMessageIds;
   if (pendingUserMessageIds.length > 0) {
     // Resolve a composer clientMessageId to the authoritative Agent segment.
@@ -303,11 +297,12 @@ export function reconcileTranscriptViewportForLayout(
     const latestResolvedId = [...pendingUserMessageIds].reverse().find((id) => resolvedMessages.has(id));
     if (latestResolvedId) {
       const resolved = resolvedMessages.get(latestResolvedId)!;
-      autoScrollMode = {
+      viewportIntent = {
+        kind: 'message-anchor',
         phase: 'catching-up',
+        reason: 'send',
         segmentId: resolved.segmentId,
         conversationId: state.conversationId ?? '',
-        type: 'sent-message-anchor',
         turnId: resolved.turnId,
       };
       pendingUserMessageIds = pendingUserMessageIds.filter((id) => !resolvedMessages.has(id));
@@ -316,13 +311,13 @@ export function reconcileTranscriptViewportForLayout(
 
   if (
     sameTurnIds(state.activeTurnIds, resolvedActiveTurnIds) &&
-    sameAutoScrollMode(state.autoScrollMode, autoScrollMode) &&
+    sameTranscriptViewportIntent(state.viewportIntent, viewportIntent) &&
     sameStrings(state.pendingUserMessageIds, pendingUserMessageIds)
   ) {
     return;
   }
 
-  viewportStore.setState({ activeTurnIds: resolvedActiveTurnIds, autoScrollMode, pendingUserMessageIds });
+  viewportStore.setState({ activeTurnIds: resolvedActiveTurnIds, viewportIntent, pendingUserMessageIds });
 }
 
 export function useTranscriptViewportControls() {
@@ -355,19 +350,8 @@ function viewportControlsSnapshot(state: TranscriptViewportStoreState) {
   };
 }
 
-function sameAutoScrollMode(left: TranscriptAutoScrollMode, right: TranscriptAutoScrollMode) {
-  return left.type === right.type && (
-    left.type !== 'sent-message-anchor' ||
-    (
-      right.type === 'sent-message-anchor' &&
-      left.phase === right.phase &&
-      left.segmentId === right.segmentId &&
-      left.conversationId === right.conversationId &&
-      left.turnId === right.turnId
-    )
-  );
-}
-
 function sameStrings(left: string[], right: string[]) {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
+
+export type { TranscriptViewportIntent } from './viewport/viewportTypes';

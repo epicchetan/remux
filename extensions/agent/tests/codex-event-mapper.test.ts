@@ -81,6 +81,14 @@ test('Codex live item events reconcile by native identity with a later thread sn
 test('Codex deltas remain ordered and resume from the authoritative snapshot offset', () => {
   const subject = mapper();
   subject.bindTurn('remux-turn-1', NATIVE_TURN);
+  assert.deepEqual(subject.mapNotification({
+    method: 'item/started',
+    params: {
+      threadId: ROOT_THREAD,
+      turnId: NATIVE_TURN,
+      item: { id: 'assistant-1', type: 'agentMessage', phase: 'final_answer', text: '' },
+    },
+  }), []);
   const first = subject.mapNotification({
     method: 'item/agentMessage/delta',
     params: { threadId: ROOT_THREAD, turnId: NATIVE_TURN, itemId: 'assistant-1', delta: 'Hel' },
@@ -103,6 +111,9 @@ test('Codex deltas remain ordered and resume from the authoritative snapshot off
   assert.notEqual(second.eventId, completed.eventId);
   assert.equal(first.event.type, 'turn.block.started');
   assert.equal(second.event.type, 'turn.block.revised');
+  if (first.event.type === 'turn.block.started') {
+    assert.equal(first.event.block.payload.kind, 'final-message');
+  }
   if (first.event.type === 'turn.block.started' && first.event.block.payload.kind === 'final-message') {
     assert.equal(first.event.block.payload.text, 'Hel');
   }
@@ -247,9 +258,22 @@ test('Codex command output remains byte-bounded without poisoning mapper block s
     'a rejected block revision must not be committed to mapper state');
 });
 
-test('Codex reconciles an unphased agent delta with its completed commentary item', () => {
+test('Codex streams an agent message with its lifecycle commentary phase', () => {
   const subject = mapper();
   subject.bindTurn('remux-turn-1', NATIVE_TURN);
+  assert.deepEqual(subject.mapNotification({
+    method: 'item/started',
+    params: {
+      threadId: ROOT_THREAD,
+      turnId: NATIVE_TURN,
+      item: {
+        id: 'assistant-progress-1',
+        type: 'agentMessage',
+        phase: 'commentary',
+        text: '',
+      },
+    },
+  }), []);
   const [streamed] = subject.mapNotification({
     method: 'item/agentMessage/delta',
     params: {
@@ -277,10 +301,116 @@ test('Codex reconciles an unphased agent delta with its completed commentary ite
   assert.ok(completed?.event.type === 'turn.block.completed');
   if (streamed?.event.type !== 'turn.block.started' ||
       completed?.event.type !== 'turn.block.completed') return;
+  assert.equal(streamed.event.block.payload.kind, 'commentary');
   assert.equal(streamed.event.structure.blockId, completed.event.structure.blockId);
   assert.equal(completed.event.block.payload.kind, 'commentary');
   assert.deepEqual(completed.native.position, {
     kind: 'native-sequence', sequence: 2, subIndex: 0,
+  });
+});
+
+test('Codex buffers an agent delta until a reordered lifecycle item supplies its phase', () => {
+  const subject = mapper();
+  subject.bindTurn('remux-turn-1', NATIVE_TURN);
+  assert.deepEqual(subject.mapNotification({
+    method: 'item/agentMessage/delta',
+    params: {
+      threadId: ROOT_THREAD,
+      turnId: NATIVE_TURN,
+      itemId: 'assistant-progress-1',
+      delta: 'Inspecting the workspace.',
+    },
+  }), []);
+
+  const [streamed] = subject.mapNotification({
+    method: 'item/started',
+    params: {
+      threadId: ROOT_THREAD,
+      turnId: NATIVE_TURN,
+      item: {
+        id: 'assistant-progress-1',
+        type: 'agentMessage',
+        phase: 'commentary',
+        text: '',
+      },
+    },
+  });
+  assert.equal(streamed?.event.type, 'turn.block.started');
+  if (streamed?.event.type !== 'turn.block.started') return;
+  assert.deepEqual(streamed.event.block.payload, {
+    kind: 'commentary',
+    text: 'Inspecting the workspace.',
+  });
+});
+
+test('Codex completes buffered commentary without ever projecting a provisional final answer', () => {
+  const subject = mapper();
+  subject.bindTurn('remux-turn-1', NATIVE_TURN);
+  const streamed = subject.mapNotification({
+    method: 'item/agentMessage/delta',
+    params: {
+      threadId: ROOT_THREAD,
+      turnId: NATIVE_TURN,
+      itemId: 'assistant-progress-1',
+      delta: 'Inspecting the workspace.',
+    },
+  });
+  const completed = subject.mapNotification({
+    method: 'item/completed',
+    params: {
+      threadId: ROOT_THREAD,
+      turnId: NATIVE_TURN,
+      item: {
+        id: 'assistant-progress-1',
+        type: 'agentMessage',
+        phase: 'commentary',
+        text: 'Inspecting the workspace.',
+      },
+    },
+  });
+
+  assert.deepEqual(streamed, []);
+  assert.equal(completed.length, 1);
+  assert.equal(completed[0]?.event.type, 'turn.block.completed');
+  if (completed[0]?.event.type !== 'turn.block.completed') return;
+  assert.deepEqual(completed[0].event.block.payload, {
+    kind: 'commentary',
+    text: 'Inspecting the workspace.',
+  });
+});
+
+test('Codex restores an active commentary phase from a thread snapshot before later deltas', () => {
+  const subject = mapper();
+  subject.bindTurn('remux-turn-1', NATIVE_TURN);
+  subject.mapThreadSnapshot({
+    id: ROOT_THREAD,
+    status: { type: 'active' },
+    turns: [{
+      id: NATIVE_TURN,
+      status: 'inProgress',
+      items: [{
+        id: 'assistant-progress-1',
+        type: 'agentMessage',
+        phase: 'commentary',
+        text: 'Inspecting',
+      }],
+    }],
+  });
+
+  const [continued] = subject.mapNotification({
+    method: 'item/agentMessage/delta',
+    params: {
+      threadId: ROOT_THREAD,
+      turnId: NATIVE_TURN,
+      itemId: 'assistant-progress-1',
+      delta: ' the workspace.',
+    },
+  });
+  assert.equal(continued?.event.type, 'turn.block.revised');
+  if (continued?.event.type !== 'turn.block.revised') return;
+  assert.deepEqual(continued.event.block.payload, {
+    kind: 'commentary',
+    text: 'Inspecting the workspace.',
   });
 });
 

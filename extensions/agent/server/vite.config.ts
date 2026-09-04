@@ -13,6 +13,7 @@ export default defineConfig({
         /^@anthropic-ai\/claude-agent-sdk$/,
         /^@modelcontextprotocol\/sdk(?:\/.*)?$/,
         /^typebox$/,
+        /^ws$/,
         /^zod(?:\/.*)?$/,
       ],
       output: {

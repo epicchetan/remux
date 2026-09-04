@@ -94,6 +94,8 @@ export class NativeAgentServer {
           context.signal,
         );
         return this.coordinator.projector.read(params as NativeAgentResourceReadParams);
+      case NATIVE_AGENT_METHODS.runtimesRead:
+        return this.coordinator.readRuntimeStatuses();
       case NATIVE_AGENT_METHODS.providerLoginStart:
         return this.coordinator.startProviderLogin(params as NativeProviderLoginStartCommand);
       case NATIVE_AGENT_METHODS.providerLoginCancel:

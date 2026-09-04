@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "id": "agent",
   "name": "Agent",
   "display": {
@@ -31,6 +31,15 @@
         "command": "npm",
         "args": ["run", "watch"],
         "cwd": "."
+      }
+    }
+  },
+  "resources": {
+    "workloads": {
+      "research": {
+        "class": "research",
+        "lifetime": "operation",
+        "threads": "auto"
       }
     }
   },

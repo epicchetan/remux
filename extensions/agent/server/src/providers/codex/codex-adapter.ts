@@ -43,17 +43,22 @@ import type {
   ProviderAdapter,
   ProviderCommandAcceptance,
   ProviderLoginOperation,
+  ProviderRuntimeStatus,
   ProviderSession,
 } from '../../provider-adapter.ts';
 import { AsyncEventStream, ProviderEventStream } from '../../provider-adapter.ts';
 import {
-  launchCodexAppServer,
+  NativeSessionOwnershipRegistry,
+  type NativeSessionLease,
+} from '../../native-runtime/native-session-ownership.ts';
+import {
   type CodexAppServerConnection,
   type CodexAppServerConnectionFactory,
   type CodexConnectionHandlers,
   type CodexServerNotification,
   type CodexServerRequest,
 } from './codex-app-server-process.ts';
+import { CodexRuntimeHost, type CodexRuntimeStatus } from './codex-runtime-host.ts';
 import { CodexEventMapper, normalizeCodexAccountUsage } from './codex-event-mapper.ts';
 import {
   FEDERATION_SERVER_NAME,
@@ -86,6 +91,8 @@ export type CodexNativeAdapterOptions = {
   environment?: Readonly<Record<string, string | undefined>>;
   appServerArgs?: readonly string[];
   createConnection?: CodexAppServerConnectionFactory;
+  runtimeHost?: Pick<CodexRuntimeHost, 'connectionFactory' | 'readStatus'>;
+  ownership?: NativeSessionOwnershipRegistry;
   resolveImageArtifact?: (artifactId: string, mimeType: string) => Promise<ResolvedCodexImage>;
   importHistoricalImage?: (dataUrl: string) => Promise<{
     artifactId: string;
@@ -101,6 +108,8 @@ export class CodexNativeAdapter implements ProviderAdapter {
   private readonly environment?: Readonly<Record<string, string | undefined>>;
   private readonly appServerArgs: readonly string[];
   private readonly createConnection: CodexAppServerConnectionFactory;
+  private readonly runtimeHost?: Pick<CodexRuntimeHost, 'connectionFactory' | 'readStatus'>;
+  private readonly ownership: NativeSessionOwnershipRegistry;
   private readonly resolveImageArtifact?: CodexNativeAdapterOptions['resolveImageArtifact'];
   private readonly importHistoricalImage?: CodexNativeAdapterOptions['importHistoricalImage'];
   private readonly now: () => number;
@@ -110,10 +119,37 @@ export class CodexNativeAdapter implements ProviderAdapter {
     this.providerInstanceId = options.providerInstanceId ?? DEFAULT_INSTANCE_ID;
     this.environment = options.environment;
     this.appServerArgs = options.appServerArgs ?? [];
-    this.createConnection = options.createConnection ?? launchCodexAppServer;
+    this.now = options.now ?? Date.now;
+    this.runtimeHost = options.createConnection
+      ? options.runtimeHost
+      : options.runtimeHost ?? new CodexRuntimeHost({
+          binaryPath: this.binaryPath,
+          environment: this.environment,
+        });
+    this.createConnection = options.createConnection ?? this.runtimeHost!.connectionFactory;
+    this.ownership = options.ownership ?? new NativeSessionOwnershipRegistry(this.now);
     this.resolveImageArtifact = options.resolveImageArtifact;
     this.importHistoricalImage = options.importHistoricalImage;
-    this.now = options.now ?? Date.now;
+  }
+
+  async readRuntimeStatus(providerInstanceId: string): Promise<ProviderRuntimeStatus> {
+    this.assertInstance(providerInstanceId);
+    const status: CodexRuntimeStatus | null = await (this.runtimeHost?.readStatus() ?? Promise.resolve(null));
+    const activeSessions = this.ownership.snapshot().filter((entry) =>
+      entry.provider === 'codex' && entry.providerInstanceId === providerInstanceId).length;
+    return {
+      topology: 'shared-daemon',
+      runtimeState: status?.state ?? 'unknown',
+      configuredExecutable: this.binaryPath,
+      resolvedExecutable: status?.managedCodexPath ?? null,
+      installedVersion: status?.installedVersion ?? null,
+      runningVersion: status?.runningVersion ?? null,
+      adapterVersion: ADAPTER_VERSION,
+      sdkVersion: null,
+      restartRequired: status?.restartRequired ?? false,
+      activeSessions,
+      lastError: status?.lastError ?? null,
+    };
   }
 
   async probe(providerInstanceId: string): Promise<ProviderProbe> {
@@ -332,7 +368,16 @@ export class CodexNativeAdapter implements ProviderAdapter {
 
     const launch = codexLaunch(this.environment, this.appServerArgs);
     let connection: CodexAppServerConnection | undefined;
+    let lease: NativeSessionLease | undefined;
     try {
+      if (input.nativeSession) {
+        lease = this.ownership.acquire({
+          provider: 'codex',
+          providerInstanceId: input.providerInstanceId,
+          sessionId: input.nativeSession.sessionId,
+          executionId: input.executionId,
+        });
+      }
       connection = await this.createConnection({
         binaryPath: this.binaryPath,
         cwd: input.cwd,
@@ -356,6 +401,12 @@ export class CodexNativeAdapter implements ProviderAdapter {
       if (input.mode !== 'create' && nativeSessionId !== input.nativeSession!.sessionId) {
         throw new Error('Codex resumed a different native thread than requested.');
       }
+      lease ??= this.ownership.acquire({
+        provider: 'codex',
+        providerInstanceId: input.providerInstanceId,
+        sessionId: nativeSessionId,
+        executionId: input.executionId,
+      });
       session = new CodexProviderSession({
         input,
         connection,
@@ -363,6 +414,7 @@ export class CodexNativeAdapter implements ProviderAdapter {
         resolveImageArtifact: this.resolveImageArtifact,
         importHistoricalImage: this.importHistoricalImage,
         now: this.now,
+        lease,
       });
       if (input.mode !== 'create') {
         const restoredUsage = await readPersistedCodexUsage(nonempty(thread?.path)).catch(() => undefined);
@@ -377,6 +429,7 @@ export class CodexNativeAdapter implements ProviderAdapter {
       return session;
     } catch (error) {
       await connection?.close().catch(() => undefined);
+      lease?.release();
       throw error;
     }
   }
@@ -475,6 +528,7 @@ type CodexProviderSessionOptions = {
   resolveImageArtifact?: CodexNativeAdapterOptions['resolveImageArtifact'];
   importHistoricalImage?: CodexNativeAdapterOptions['importHistoricalImage'];
   now: () => number;
+  lease: NativeSessionLease;
 };
 
 export class CodexProviderSession implements ProviderSession {
@@ -487,6 +541,7 @@ export class CodexProviderSession implements ProviderSession {
   private readonly resolveImageArtifact?: CodexNativeAdapterOptions['resolveImageArtifact'];
   private readonly importHistoricalImage?: CodexNativeAdapterOptions['importHistoricalImage'];
   private readonly now: () => number;
+  private readonly lease: NativeSessionLease;
   private readonly receipts = new Map<string, { hash: string; result: Promise<unknown> }>();
   private readonly eventLog = new Map<string, ProviderEventEnvelope>();
   private readonly nativeTurnByRemux = new Map<string, string>();
@@ -507,6 +562,7 @@ export class CodexProviderSession implements ProviderSession {
     this.resolveImageArtifact = options.resolveImageArtifact;
     this.importHistoricalImage = options.importHistoricalImage;
     this.now = options.now;
+    this.lease = options.lease;
     this.nativeSession = {
       provider: 'codex',
       providerInstanceId: options.input.providerInstanceId,
@@ -723,8 +779,12 @@ export class CodexProviderSession implements ProviderSession {
   async close() {
     if (this.closed) return;
     this.closed = true;
-    await this.connection.close();
-    this.events.close();
+    try {
+      await this.connection.close();
+      this.events.close();
+    } finally {
+      this.lease.release();
+    }
   }
 
   handleNotification(notification: CodexServerNotification) {

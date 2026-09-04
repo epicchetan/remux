@@ -1199,12 +1199,15 @@ product work begins.
 - Inject `remux-federation` through Codex's supported MCP configuration with a
   provider-session-scoped bearer token.
 
-The reference Version 1 topology gives each active root or federated Codex
-execution a dedicated app-server runtime/process and MCP credential, as the
-pinned T3 Code adapter does. This provides unambiguous federation invocation
-scope for both new and resumed threads. A future shared daemon is allowed only
-if it proves equivalent per-session MCP identity, event routing, cancellation,
-and credential revocation; process sharing is not worth ambiguous parentage.
+The original Version 1 topology gave each active root or federated Codex
+execution a dedicated app-server runtime/process and MCP credential. The
+runtime-management amendment replaces that topology with independent client
+connections to one persistent daemon per Codex home. Federation transport
+configuration and bearer credentials remain thread-local on native
+start/resume/fork requests; a provider-neutral control lease prevents two
+logical executions from mutating one native session. See
+`agent-runtime-management-v1.md` for daemon lifecycle, extension coexistence,
+update, and cross-client handoff requirements.
 
 The existing Rust Codex implementation is the preferred source for connection,
 history discovery, canonical item identity, projection, and lifecycle lessons.

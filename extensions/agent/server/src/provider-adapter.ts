@@ -16,11 +16,37 @@ import type {
   ProviderProbe,
   ProviderSnapshot,
   ProviderSnapshotRequest,
+  ProviderKind,
+  ProviderProbeState,
   StartProviderTurnInput,
   SteerProviderTurnInput,
 } from '../../shared/provider-runtime.ts';
 
 export type ProviderCommandAcceptance = { accepted: true };
+
+export type ProviderRuntimeTopology = 'shared-daemon' | 'session-process' | 'fixture';
+
+export type ProviderRuntimeStatus = {
+  topology: ProviderRuntimeTopology;
+  runtimeState: 'running' | 'idle' | 'stopped' | 'starting' | 'stopping' | 'failed' | 'unknown';
+  configuredExecutable: string | null;
+  resolvedExecutable: string | null;
+  installedVersion: string | null;
+  runningVersion: string | null;
+  adapterVersion: string | null;
+  sdkVersion: string | null;
+  restartRequired: boolean;
+  activeSessions: number;
+  lastError: string | null;
+};
+
+export type ProviderRuntimeView = ProviderRuntimeStatus & {
+  provider: ProviderKind;
+  providerInstanceId: string;
+  label: string;
+  readiness: ProviderProbeState;
+  readinessMessage: string | null;
+};
 
 /**
  * The provider-native boundary. Implementations control a native harness;
@@ -35,6 +61,7 @@ export interface ProviderAdapter {
    * return null when their native harness does not expose plan usage.
    */
   readAccountUsage?(providerInstanceId: string): Promise<ProviderAccountUsage | null>;
+  readRuntimeStatus?(providerInstanceId: string): Promise<ProviderRuntimeStatus>;
   discoverSessions?(
     input: DiscoverProviderSessionsInput,
   ): Promise<readonly NativeSessionSummary[]>;

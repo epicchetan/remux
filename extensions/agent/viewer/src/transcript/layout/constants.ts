@@ -1,5 +1,5 @@
 export const transcriptLayout = {
-  exactContentHeight: 27,
+  exactContentHeight: 28,
   assistant: {
     actionHeight: 40,
     actionTopGap: 6,

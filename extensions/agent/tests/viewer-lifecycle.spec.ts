@@ -293,7 +293,6 @@ test('offers retry and dismiss when a requested turn cannot be focused', async (
 });
 
 test('reloads a short final response at the live transcript bottom', async ({ page }) => {
-  await installTranscriptGeometrySkew(page, false);
   await page.goto(conversationUrl('&fixtureLong=1'));
   await expect(page.getByText('Historical answer 72.')).toBeVisible();
   await expect.poll(() => distanceFromTranscriptBottom(page)).toBeLessThanOrEqual(2);
@@ -306,16 +305,39 @@ test('reloads a short final response at the live transcript bottom', async ({ pa
 });
 
 test('reloads a long final response with the last user message at the live anchor', async ({ page }) => {
-  await installTranscriptGeometrySkew(page, true);
-  await page.goto(conversationUrl('&fixtureLong=1'));
-  await expect(page.getByText('Historical answer 72.')).toBeVisible();
+  await page.goto(conversationUrl('&fixtureLong=1&fixtureLongFinal=1'));
+  await expect(page.getByText('Historical answer 72, paragraph 56.', { exact: false })).toBeVisible();
   await expect.poll(() => lastUserMessageAnchorError(page)).toBeLessThanOrEqual(2);
 
   await page.reload();
-  await expect(page.getByText('Historical answer 72.')).toBeVisible();
+  await expect(page.getByText('Historical answer 72, paragraph 56.', { exact: false })).toBeVisible();
   await expect.poll(() => lastUserMessageAnchorError(page)).toBeLessThanOrEqual(2);
   const samples = await sampleTranscriptPlacement(page, 'user-message');
   expect(Math.max(...samples)).toBeLessThanOrEqual(2);
+});
+
+test('navigates a compacted running transcript by modeled user rows', async ({ page }) => {
+  await page.goto(conversationUrl(
+    '&fixtureLong=1&fixtureRunning=1&fixtureCompaction=1&fixtureTallWork=1',
+  ));
+  await expect(page.getByText('Resume this running turn')).toBeVisible();
+  await expect(page.getByText('Reviewing expanded work item 36.')).toBeVisible();
+  await expect.poll(() => userMessageAnchorError(page, 'fixture-turn-49')).toBeLessThanOrEqual(2);
+
+  const previous = page.getByRole('button', { name: 'Previous turn' });
+  for (let index = 48; index >= 29; index -= 1) {
+    await expect(previous).toBeEnabled();
+    await previous.click();
+    await expect.poll(
+      () => userMessageAnchorError(page, `turn-${index}`),
+      { message: `turn-${index} should remain on the modeled user-message anchor` },
+    ).toBeLessThanOrEqual(2);
+  }
+
+  // turn-29 began outside the initial 20-turn render window. Reaching its
+  // exact row verifies that navigation materialized the semantic target while
+  // retaining the modeled coordinate used by the virtual spacers.
+  await expect(page.locator('[data-row-kind="userMessage"][data-turn-id="turn-29"]')).toBeVisible();
 });
 
 test('navigates loaded turn anchors by identity after skipping the visible tail', async ({ page }) => {
@@ -358,7 +380,7 @@ test('navigates loaded turn anchors by identity after skipping the visible tail'
   await expect.poll(async () => Math.abs(await rowTop(targets.first!) - await anchorTop())).toBeLessThanOrEqual(2);
 });
 
-test('navigates to mounted user-message geometry without a corrective snap', async ({ page }) => {
+test('keeps modeled user-message navigation stable after the virtual range settles', async ({ page }) => {
   await page.goto(conversationUrl('&fixtureLong=1'));
   await expect(page.getByText('Historical answer 72.')).toBeVisible();
   const previous = page.getByRole('button', { name: 'Previous turn' });
@@ -371,51 +393,65 @@ test('navigates to mounted user-message geometry without a corrective snap', asy
   });
   expect(targetTurnId).toBeTruthy();
 
-  await page.evaluate((turnId) => {
-    const row = document.querySelector<HTMLElement>(
-      `[data-row-kind="userMessage"][data-turn-id="${turnId}"]`,
-    )!;
-    // Deliberately create a rendered-vs-modeled geometry difference. The
-    // navigation target must come from the mounted row, not scroll there using
-    // the model and correct itself after the animation.
-    row.style.transform = 'translateY(64px)';
-    (window as any).__navigationFrames = [];
-    const startedAt = performance.now();
-    const sample = () => {
-      const viewport = document.querySelector<HTMLElement>('[data-testid="agent-transcript-scroll"]')!;
-      const target = document.querySelector<HTMLElement>(
-        `[data-row-kind="userMessage"][data-turn-id="${turnId}"]`,
-      );
-      if (target) {
-        (window as any).__navigationFrames.push({
-          top: target.getBoundingClientRect().top - viewport.getBoundingClientRect().top,
-          t: performance.now() - startedAt,
-        });
-      }
-      if (performance.now() - startedAt < 450) requestAnimationFrame(sample);
-    };
-    requestAnimationFrame(sample);
-  }, targetTurnId);
-
   await expect(previous).toBeEnabled();
   await previous.click();
-  await page.waitForTimeout(500);
-  const result = await page.evaluate(() => {
+  await expect.poll(() => userMessageAnchorError(page, targetTurnId!)).toBeLessThanOrEqual(2);
+  const errors = await page.evaluate(async (turnId) => {
     const content = document.querySelector<HTMLElement>('[data-testid="agent-transcript-content"]')!;
+    const viewport = document.querySelector<HTMLElement>('[data-testid="agent-transcript-scroll"]')!;
     const anchorTop = Math.max(24, Number.parseFloat(getComputedStyle(content).paddingTop));
-    const frames = (window as any).__navigationFrames as Array<{ top: number; t: number }>;
-    return {
-      anchorTop,
-      finalTop: frames.at(-1)?.top ?? Number.NaN,
-      maxTop: Math.max(...frames.map(({ top }) => top)),
-      sampleCount: frames.length,
+    const samples: number[] = [];
+    for (let frame = 0; frame < 12; frame += 1) {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      const row = document.querySelector<HTMLElement>(
+        `[data-row-kind="userMessage"][data-turn-id="${turnId}"]`,
+      );
+      samples.push(row
+        ? Math.abs(row.getBoundingClientRect().top - viewport.getBoundingClientRect().top - anchorTop)
+        : Number.POSITIVE_INFINITY);
+    }
+    return samples;
+  }, targetTurnId);
+
+  expect(Math.max(...errors)).toBeLessThanOrEqual(2);
+  await expect(page.getByTestId('agent-transcript-anchor-runway')).toHaveCSS('height', '0px');
+});
+
+test('starts message navigation before replacing the viewport-derived turn range', async ({ page }) => {
+  await page.goto(conversationUrl('&fixtureLong=1'));
+  await expect(page.getByText('Historical answer 72.')).toBeVisible();
+  const previous = page.getByRole('button', { name: 'Previous turn' });
+  await expect(previous).toBeEnabled();
+
+  await page.evaluate(() => {
+    const viewport = document.querySelector<HTMLElement>('[data-testid="agent-transcript-scroll"]')!;
+    const body = document.querySelector<HTMLElement>('[data-testid="agent-transcript-body"]')!;
+    const boundary = () => {
+      const turns = Array.from(body.querySelectorAll<HTMLElement>(':scope > .codex-transcript-turn'));
+      return `${turns.at(0)?.dataset.turnId ?? ''}:${turns.at(-1)?.dataset.turnId ?? ''}`;
     };
+    const initialBoundary = boundary();
+    const initialScrollTop = viewport.scrollTop;
+    (window as any).__agentNavigationRangeProbe = null;
+    const observer = new MutationObserver(() => {
+      const nextBoundary = boundary();
+      if (nextBoundary === initialBoundary) return;
+      observer.disconnect();
+      (window as any).__agentNavigationRangeProbe = {
+        initialScrollTop,
+        scrollTopAtRangeChange: viewport.scrollTop,
+      };
+    });
+    observer.observe(body, { childList: true });
   });
 
-  expect(result.sampleCount).toBeGreaterThan(8);
-  expect(result.maxTop).toBeLessThanOrEqual(result.anchorTop + 3);
-  expect(Math.abs(result.finalTop - result.anchorTop)).toBeLessThanOrEqual(2);
-  await expect(page.getByTestId('agent-transcript-anchor-runway')).toHaveCSS('height', '0px');
+  await previous.click();
+  await expect.poll(() => page.evaluate(() => (window as any).__agentNavigationRangeProbe)).not.toBeNull();
+  const probe = await page.evaluate(() => (window as any).__agentNavigationRangeProbe as {
+    initialScrollTop: number;
+    scrollTopAtRangeChange: number;
+  });
+  expect(probe.scrollTopAtRangeChange).toBeLessThan(probe.initialScrollTop - 1);
 });
 
 test('previous-turn navigation skips user messages already visible in a short mobile tail', async ({
@@ -517,32 +553,6 @@ function transcript(page: Page) {
   return page.getByTestId('agent-transcript-scroll');
 }
 
-async function installTranscriptGeometrySkew(page: Page, longFinalResponse: boolean) {
-  await page.addInitScript((longTail) => {
-    const install = () => {
-      if (!document.head || document.querySelector('[data-transcript-geometry-skew]')) {
-        return Boolean(document.head);
-      }
-      const style = document.createElement('style');
-      style.dataset.transcriptGeometrySkew = 'true';
-      style.textContent = `
-        .codex-transcript-row-assistantMessage { padding-bottom: 40px !important; }
-        ${longTail
-          ? '.codex-transcript-turn:last-child .codex-transcript-row-assistantMessage { min-height: 900px !important; }'
-          : ''}
-      `;
-      document.head.append(style);
-      return true;
-    };
-    if (install()) return;
-    const observer = new MutationObserver(() => {
-      if (!install()) return;
-      observer.disconnect();
-    });
-    observer.observe(document, { childList: true, subtree: true });
-  }, longFinalResponse);
-}
-
 async function distanceFromTranscriptBottom(page: Page) {
   return transcript(page).evaluate((viewport) =>
     Math.abs(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop));
@@ -553,6 +563,15 @@ async function lastUserMessageAnchorError(page: Page) {
     const viewport = document.querySelector<HTMLElement>('[data-testid="agent-transcript-scroll"]')!;
     const content = document.querySelector<HTMLElement>('[data-testid="agent-transcript-content"]')!;
     const row = Array.from(viewport.querySelectorAll<HTMLElement>('[data-row-kind="userMessage"]')).at(-1)!;
+    const anchorTop = Math.max(24, Number.parseFloat(getComputedStyle(content).paddingTop));
+    return Math.abs(row.getBoundingClientRect().top - viewport.getBoundingClientRect().top - anchorTop);
+  });
+}
+
+async function userMessageAnchorError(page: Page, turnId: string) {
+  return page.locator(`[data-row-kind="userMessage"][data-turn-id="${turnId}"]`).evaluate((row) => {
+    const viewport = document.querySelector<HTMLElement>('[data-testid="agent-transcript-scroll"]')!;
+    const content = document.querySelector<HTMLElement>('[data-testid="agent-transcript-content"]')!;
     const anchorTop = Math.max(24, Number.parseFloat(getComputedStyle(content).paddingTop));
     return Math.abs(row.getBoundingClientRect().top - viewport.getBoundingClientRect().top - anchorTop);
   });

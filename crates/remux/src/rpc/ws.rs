@@ -1427,6 +1427,7 @@ fn dispatch_lane(client: &WsClient, method: &str, work: &DispatchWork) -> (Strin
             method,
             "remux/agent/resources/read"
                 | "remux/agent/transcript/resources/read"
+                | "remux/agent/runtimes/read"
                 | "remux/agent/models/read"
                 | "remux/agent/artifact/read"
                 | "remux/agent/turn/read"

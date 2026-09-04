@@ -1346,6 +1346,7 @@ function layoutSnapshot() {
   const state = resourceStore.getState();
   return {
     activeConversationId: state.activeConversationId,
+    activeTurnId: state.workingTurnId,
     status: state.status,
     turnOrder: state.turnOrder,
     turnsById: state.turnResourcesById,

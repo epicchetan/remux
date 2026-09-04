@@ -5,7 +5,8 @@
 }
 
 .codex-transcript-row-userMessage,
-.codex-transcript-row-assistantMessage {
+.codex-transcript-row-assistantMessage,
+.codex-transcript-row-compaction {
   padding-bottom: var(--remux-block-gap);
 }
 

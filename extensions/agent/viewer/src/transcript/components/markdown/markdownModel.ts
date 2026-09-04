@@ -1454,6 +1454,7 @@ function phrasingToInlineLines(
   const lines: MarkdownInline[][] = [[]];
   const inlineOptions: MarkdownInlineParseOptions = {
     autolink: options.autolink ?? true,
+    cacheScope: options.cacheScope ?? completeMarkdownCacheScope,
     preserveSoftBreaks: options.preserveSoftBreaks ?? false,
     richFileLinks: options.richFileLinks ?? true,
   };
