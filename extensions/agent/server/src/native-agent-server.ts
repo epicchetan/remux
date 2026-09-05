@@ -68,7 +68,8 @@ export class NativeAgentServer {
       ...(options.artifacts ? {
         sealTurnOutput: ({ turnId, text }) => options.artifacts!.sealAssistantText(turnId, text)
           .then(() => undefined),
-        sealFileDiff: ({ diff }) => options.artifacts!.sealDiffText(diff),
+        sealFileDiff: ({ conversationId, executionId, turnId, diff }) =>
+          options.artifacts!.sealDiffText({ conversationId, executionId, ...(turnId ? { turnId } : {}) }, diff),
       } : {}),
       onResourcesInvalidated: (keys) => this.invalidate(keys),
     });

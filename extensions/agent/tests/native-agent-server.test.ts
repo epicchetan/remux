@@ -83,7 +83,20 @@ test('native Agent JSON-RPC surface serves versioned resources and commands only
     };
     const runtime = runtimeRead.resources[0]?.value;
     assert.ok(runtime);
-    const sent = await server.handle(NATIVE_AGENT_METHODS.messageSend, {
+    const coordinatorInternals = server.coordinator as unknown as {
+      synchronizeConversationHistory(conversationId: string, freshness: string): Promise<void>;
+    };
+    let releaseSend!: () => void;
+    let enteredSend!: () => void;
+    const sendBarrier = new Promise<void>((resolve) => { releaseSend = resolve; });
+    const sendEntered = new Promise<void>((resolve) => { enteredSend = resolve; });
+    let syncCalls = 0;
+    coordinatorInternals.synchronizeConversationHistory = async () => {
+      syncCalls += 1;
+      enteredSend();
+      await sendBarrier;
+    };
+    const sendCommand = {
       commandId: 'send-1',
       conversationId: created.conversationId,
       clientMessageId: 'message-1',
@@ -94,7 +107,23 @@ test('native Agent JSON-RPC surface serves versioned resources and commands only
       access: 'workspace-write',
       configurationRevision: runtime.composer.revision,
       delivery: 'auto',
-    }) as { turnId: string };
+    };
+    const disconnected = new AbortController();
+    const sentPending = server.handle(
+      NATIVE_AGENT_METHODS.messageSend,
+      sendCommand,
+      { signal: disconnected.signal },
+    ) as Promise<{ turnId: string }>;
+    await sendEntered;
+    disconnected.abort();
+    const duplicatePending = server.handle(
+      NATIVE_AGENT_METHODS.messageSend,
+      structuredClone(sendCommand),
+    ) as Promise<{ turnId: string }>;
+    releaseSend();
+    const [sent, duplicate] = await Promise.all([sentPending, duplicatePending]);
+    assert.deepEqual(duplicate, sent);
+    assert.equal(syncCalls, 1);
     assert.ok(sent.turnId);
     await new Promise((resolve) => setTimeout(resolve, 10));
     assert.ok(notifications.some(({ method }) => method === NATIVE_AGENT_METHODS.resourcesInvalidated));

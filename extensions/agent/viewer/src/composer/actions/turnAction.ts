@@ -2,7 +2,7 @@ import { useState } from 'react';
 
 import type {
   AgentComposerMessagePart,
-  ReasoningLevel,
+  ReasoningEffort,
 } from '../../../../shared/protocol.ts';
 import type { AgentRuntimeResource } from '../../../../shared/native-agent-protocol.ts';
 import type { ProviderAccess } from '../../../../shared/provider-runtime.ts';
@@ -46,6 +46,7 @@ export function useComposerTurnAction({
   const forkTarget = useComposerStore((state) => state.forkTarget);
   const modelId = useComposerStore((state) => state.modelId);
   const reasoning = useComposerStore((state) => state.reasoning);
+  const serviceTier = useComposerStore((state) => state.serviceTier);
   const providerInstanceId = useComposerStore((state) => state.providerInstanceId);
   const access = useComposerStore((state) => state.access);
   const submission = useComposerStore((state) => state.submission);
@@ -73,6 +74,7 @@ export function useComposerTurnAction({
       phase: conversationExists ? 'sending' : 'starting-conversation',
       snapshot,
       reasoning,
+      serviceTier,
     });
     const input = {
       access: runtime?.composer.nextTurn.access ?? access,
@@ -85,6 +87,7 @@ export function useComposerTurnAction({
       parts: projection.parts,
       providerInstanceId: runtime?.providerInstanceId ?? providerInstanceId,
       reasoning,
+      serviceTier: runtime?.composer.nextTurn.serviceTier ?? serviceTier,
     };
     const setPhase = (phase: 'sending' | 'updating-transcript') => setSubmissionPhase(next.id, phase);
     const request = editTarget
@@ -144,5 +147,6 @@ export type TurnSubmissionInput = {
   modelId: string;
   parts: AgentComposerMessagePart[];
   providerInstanceId: string;
-  reasoning: ReasoningLevel;
+  reasoning: ReasoningEffort;
+  serviceTier: string | null;
 };

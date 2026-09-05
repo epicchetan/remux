@@ -3,6 +3,7 @@ import { memo } from 'react';
 
 import type { AgentTurnSegment } from '../../../../shared/transcript';
 import type { TranscriptMeasuredRow, TranscriptMeasuredTurn } from '../layout/types';
+import { transcriptLayout } from '../layout/constants';
 import { transcriptWorkDisclosureKey, useTranscriptLayoutStore } from '../layoutStore';
 import { useTranscriptResourceStore, type TranscriptStatus } from '../resourceStore';
 import { AssistantMessage } from './assistantMessage';
@@ -59,9 +60,6 @@ const TranscriptTurn = memo(function TranscriptTurn({
   turn: TranscriptMeasuredTurn;
   width: number;
 }) {
-  const projectionError = useTranscriptResourceStore(
-    (state) => state.turnResourcesById[turn.turnId]?.projectionError ?? null,
-  );
   const refreshTranscript = useTranscriptResourceStore((state) => state.refreshActiveTranscriptResources);
 
   return (
@@ -73,17 +71,35 @@ const TranscriptTurn = memo(function TranscriptTurn({
       {turn.rows.map((row) => (
         <TranscriptRow conversationId={conversationId} key={row.id} row={row} width={width} />
       ))}
-      {turn.turn.error ? (
-        <div className="codex-turn-error" role="alert">{turn.turn.error.message}</div>
-      ) : null}
-      {projectionError ? (
-        <button
-          className="agent-transcript-retry"
-          onClick={() => void refreshTranscript({ preserveReady: true, windowPolicy: 'preserve' })}
-          type="button"
+      {turn.displayFooter.rows.length > 0 ? (
+        <div
+          className="codex-turn-footer"
+          data-collapsed-height={turn.collapsedHeight - turn.rows.reduce((sum, row) => sum + row.height, 0)}
+          style={{
+            '--codex-turn-footer-gap': `${transcriptLayout.footer.rowGap}px`,
+            '--codex-turn-footer-padding-bottom': `${transcriptLayout.footer.turnGap}px`,
+            '--codex-turn-error-border': `${transcriptLayout.footer.borderWidth}px`,
+            '--codex-turn-error-font-size': `${transcriptLayout.footer.errorFontSize}px`,
+            '--codex-turn-error-line-height': `${transcriptLayout.footer.errorLineHeight}px`,
+            '--codex-turn-error-padding-x': `${transcriptLayout.footer.errorPaddingX}px`,
+            '--codex-turn-error-padding-y': `${transcriptLayout.footer.errorPaddingY}px`,
+            '--codex-turn-retry-height': `${transcriptLayout.footer.retryHeight}px`,
+          } as React.CSSProperties}
         >
-          <RotateCcw className="size-3" /> Retry turn projection
-        </button>
+          {turn.displayFooter.rows.map((row) => row.kind === 'terminal-error' ? (
+            <div className="codex-turn-error" key={row.id} role="alert">{row.message}</div>
+          ) : (
+            <button
+              className="agent-transcript-retry"
+              key={row.id}
+              onClick={() => void refreshTranscript({ preserveReady: true, windowPolicy: 'preserve' })}
+              title={row.message}
+              type="button"
+            >
+              <RotateCcw className="size-3" /> Retry turn projection
+            </button>
+          ))}
+        </div>
       ) : null}
     </article>
   );
@@ -107,6 +123,7 @@ const TranscriptRow = memo(function TranscriptRow({
       className={`codex-transcript-row codex-transcript-row-${row.segment.type}`}
       data-client-message-id={row.segment.type === 'userMessage' ? row.segment.clientMessageId ?? undefined : undefined}
       data-collapsed-height={row.height}
+      data-expanded-additional-height={openWork?.additionalHeight ?? 0}
       data-row-kind={row.segment.type === 'work' ? 'workSection' : row.segment.type}
       data-segment-id={row.segmentId}
       data-transcript-row-id={row.id}
@@ -132,7 +149,7 @@ function areTranscriptTurnPropsEqual(
   return previous.conversationId === next.conversationId &&
     previous.width === next.width &&
     previous.turn.rows === next.turn.rows &&
-    previous.turn.turn.error === next.turn.turn.error;
+    previous.turn.displayFooter.revision === next.turn.displayFooter.revision;
 }
 
 function areTranscriptRowPropsEqual(

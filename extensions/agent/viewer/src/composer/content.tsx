@@ -5,7 +5,7 @@ import type {
 } from '../../../shared/protocol.ts';
 import type { AgentProvidersResource, AgentRuntimeResource } from '../../../shared/native-agent-protocol.ts';
 import type { ProviderAccess } from '../../../shared/provider-runtime.ts';
-import type { ReasoningLevel } from '../../../shared/protocol.ts';
+import type { ReasoningEffort } from '../../../shared/protocol.ts';
 import { useConversationStore } from '../conversation/store.ts';
 import { ComposerActionButtons } from './actions/ActionButtons.tsx';
 import type { TurnSubmissionInput } from './actions/turnAction.ts';
@@ -16,6 +16,7 @@ import { ComposerEditBar } from './edit/EditBar.tsx';
 import { NewChatBar } from './newChat/NewChatBar.tsx';
 import { OperationQueueTray } from './queue/OperationQueueTray.tsx';
 import { ComposerUsageTray } from './usage/UsageTray.tsx';
+import { canManuallyCompact } from './usage/compactEligibility.ts';
 import { useComposerStore } from './store.ts';
 import type { ComposerEditTarget, ComposerForkTarget } from './store.ts';
 
@@ -59,7 +60,8 @@ export function ComposerContent({
   onPreferenceChange: (input: {
     providerInstanceId: string;
     modelId: string;
-    reasoning: ReasoningLevel;
+    reasoning: ReasoningEffort;
+    serviceTier: string | null;
   }) => Promise<void>;
   onAccessChange: (access: ProviderAccess) => Promise<void>;
   providers: AgentProvidersResource | null;
@@ -102,7 +104,7 @@ export function ComposerContent({
       {!pickerOpen ? (
         <div className="remux-composer-context-strip">
           {usageExpanded ? (
-            <ComposerUsageTray onCompact={onCompact} providers={providers} runtime={runtime} />
+            <ComposerUsageTray conversation={conversation} onCompact={onCompact} providers={providers} queue={queue} runtime={runtime} />
           ) : null}
           <ComposerEditBar />
           <OperationQueueTray onChanged={onQueueChanged} queue={queue} />
@@ -125,6 +127,7 @@ export function ComposerContent({
           onInterrupt={onInterrupt}
           onOpenAgents={onOpenAgents}
           onCompact={onCompact}
+          compactEnabled={canManuallyCompact(conversation, runtime, queue)}
           onSend={(input, setPhase) => {
             setUsageExpanded(false);
             return onSend(input, setPhase);

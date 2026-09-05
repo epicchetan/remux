@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 
-export const NATIVE_AGENT_SCHEMA_VERSION = 11;
+export const NATIVE_AGENT_SCHEMA_VERSION = 15;
 export const NATIVE_AGENT_APPLICATION_ID = 0x524d584e; // RMXN
 export const NATIVE_AGENT_SCHEMA_ID = 'remux-agent-native-v1';
 
@@ -17,6 +17,7 @@ export const NATIVE_AGENT_TABLES = [
   'native_child_handles',
   'turns',
   'executions',
+  'federation_checkout_reservations',
   'events',
   'legacy_events',
   'turn_passes',
@@ -28,9 +29,12 @@ export const NATIVE_AGENT_TABLES = [
   'composer_preferences',
   'compaction_operations',
   'command_receipts',
+  'delivery_attempts',
+  'delivery_attempt_staging',
   'queued_messages',
   'queued_compactions',
   'artifacts',
+  'artifact_grants',
   'notification_state',
 ] as const;
 
@@ -64,6 +68,7 @@ CREATE TABLE conversations (
   cwd TEXT NOT NULL,
   model TEXT NOT NULL,
   effort TEXT,
+  service_tier TEXT,
   access TEXT NOT NULL CHECK (access IN ('read-only', 'workspace-write', 'full-access')),
   state TEXT NOT NULL CHECK (state IN ('running', 'recovering', 'idle', 'failed', 'interrupted')),
   active_turn_id TEXT,
@@ -88,6 +93,8 @@ CREATE TABLE conversations (
   FOREIGN KEY (parent_conversation_id) REFERENCES conversations(conversation_id)
 ) STRICT;
 
+
+
 CREATE TABLE executions (
   execution_id TEXT PRIMARY KEY NOT NULL,
   conversation_id TEXT NOT NULL,
@@ -99,6 +106,8 @@ CREATE TABLE executions (
   provider_instance_id TEXT NOT NULL,
   model TEXT,
   effort TEXT,
+  service_tier TEXT,
+  checkout_key TEXT,
   access TEXT CHECK (access IS NULL OR access IN ('read-only', 'workspace-write', 'full-access')),
   federation_scheduling TEXT CHECK (
     federation_scheduling IS NULL OR federation_scheduling IN ('background', 'foreground')
@@ -119,6 +128,38 @@ CREATE TABLE executions (
   FOREIGN KEY (strand_id) REFERENCES conversation_strands(strand_id)
     DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
+
+CREATE INDEX executions_checkout_key_idx ON executions(checkout_key)
+  WHERE checkout_key IS NOT NULL;
+
+CREATE TABLE federation_checkout_reservations (
+  execution_id TEXT PRIMARY KEY NOT NULL,
+  checkout_key TEXT,
+  command_id TEXT,
+  expected_turn_id TEXT,
+  access TEXT NOT NULL CHECK (access IN ('read-only', 'workspace-write', 'full-access')),
+  scheduling TEXT NOT NULL CHECK (scheduling IN ('foreground', 'background')),
+  state TEXT NOT NULL CHECK (state IN ('held', 'unknown', 'released')),
+  terminal_evidence_json TEXT CHECK (terminal_evidence_json IS NULL OR json_valid(terminal_evidence_json)),
+  release_reason TEXT CHECK (release_reason IS NULL OR release_reason IN ('pre-dispatch-failure', 'native-terminal')),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+  released_at INTEGER CHECK (released_at IS NULL OR released_at >= created_at),
+  CHECK ((command_id IS NULL) = (expected_turn_id IS NULL)),
+  CHECK (state <> 'held' OR (checkout_key IS NOT NULL AND command_id IS NOT NULL AND expected_turn_id IS NOT NULL)),
+  CHECK ((state = 'released') = (released_at IS NOT NULL)),
+  CHECK ((state = 'released') = (release_reason IS NOT NULL)),
+  CHECK (state = 'released' OR release_reason IS NULL),
+  UNIQUE (command_id),
+  FOREIGN KEY (execution_id) REFERENCES executions(execution_id) ON DELETE RESTRICT,
+  FOREIGN KEY (command_id) REFERENCES command_receipts(command_id) ON DELETE RESTRICT
+) STRICT;
+CREATE INDEX federation_checkout_reservations_capacity_idx
+  ON federation_checkout_reservations(checkout_key, state, access, scheduling)
+  WHERE state IN ('held', 'unknown');
+CREATE INDEX federation_checkout_reservations_global_unknown_idx
+  ON federation_checkout_reservations(state)
+  WHERE state = 'unknown' AND checkout_key IS NULL;
 
 CREATE TABLE native_sessions (
   execution_id TEXT PRIMARY KEY NOT NULL,
@@ -153,6 +194,7 @@ CREATE TABLE turns (
   user_content_json TEXT NOT NULL CHECK (json_valid(user_content_json)),
   model TEXT,
   effort TEXT,
+  service_tier TEXT,
   native_turn_id TEXT,
   assistant_artifact_id TEXT,
   ordering TEXT NOT NULL DEFAULT 'native-exact' CHECK (ordering IN ('native-exact', 'live-provisional', 'legacy-grouped')),
@@ -410,11 +452,12 @@ CREATE TABLE composer_preferences (
   provider_instance_id TEXT NOT NULL,
   model TEXT,
   effort TEXT,
+  service_tier TEXT,
   revision INTEGER NOT NULL CHECK (revision >= 1),
   updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
   PRIMARY KEY (scope, scope_id),
   CHECK (
-    (scope = 'default-provider' AND model IS NULL AND effort IS NULL) OR
+    (scope = 'default-provider' AND model IS NULL AND effort IS NULL AND service_tier IS NULL) OR
     (scope != 'default-provider' AND model IS NOT NULL)
   ),
   FOREIGN KEY (provider_instance_id) REFERENCES provider_instances(provider_instance_id)
@@ -466,6 +509,7 @@ CREATE TABLE queued_messages (
   content_json TEXT NOT NULL CHECK (json_valid(content_json)),
   model TEXT,
   effort TEXT,
+  service_tier TEXT,
   access TEXT NOT NULL CHECK (access IN ('read-only', 'workspace-write', 'full-access')),
   state TEXT NOT NULL DEFAULT 'queued'
     CHECK (state IN ('queued', 'dispatching', 'blocked', 'delivery_unknown')),
@@ -499,11 +543,99 @@ CREATE TABLE artifacts (
   created_at INTEGER NOT NULL CHECK (created_at >= 0)
 ) STRICT;
 
+CREATE TABLE artifact_grants (
+  grant_id INTEGER PRIMARY KEY,
+  artifact_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  execution_id TEXT,
+  provenance TEXT NOT NULL CHECK (provenance IN (
+    'viewer-message', 'viewer-queue', 'provider-history',
+    'execution-output', 'federation-delegation'
+  )),
+  source_turn_id TEXT,
+  source_execution_id TEXT,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  FOREIGN KEY (artifact_id) REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+  FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+  FOREIGN KEY (conversation_id, execution_id)
+    REFERENCES executions(conversation_id, execution_id) ON DELETE CASCADE,
+  FOREIGN KEY (conversation_id, source_execution_id)
+    REFERENCES executions(conversation_id, execution_id),
+  FOREIGN KEY (conversation_id, source_turn_id)
+    REFERENCES turns(conversation_id, turn_id),
+  CHECK (execution_id IS NOT NULL OR source_execution_id IS NULL)
+) STRICT;
+
+CREATE UNIQUE INDEX artifact_grants_conversation
+  ON artifact_grants(artifact_id, conversation_id) WHERE execution_id IS NULL;
+CREATE UNIQUE INDEX artifact_grants_execution
+  ON artifact_grants(artifact_id, conversation_id, execution_id) WHERE execution_id IS NOT NULL;
+CREATE INDEX artifact_grants_scope
+  ON artifact_grants(conversation_id, execution_id, artifact_id);
+
 CREATE TABLE notification_state (
   conversation_id TEXT PRIMARY KEY NOT NULL,
   last_terminal_turn_id TEXT,
   updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
   FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE
+) STRICT;
+
+CREATE TABLE delivery_attempts (
+  attempt_id TEXT PRIMARY KEY NOT NULL,
+  command_id TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL CHECK (kind IN ('root-turn', 'steer', 'manual-compact')),
+  provider TEXT NOT NULL CHECK (provider IN ('codex', 'claude-code', 'fixture')),
+  provider_instance_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  execution_id TEXT NOT NULL,
+  intended_turn_id TEXT,
+  client_message_id TEXT,
+  native_client_message_id TEXT,
+  compact_operation_id TEXT,
+  recovery_payload_hash TEXT NOT NULL CHECK (length(recovery_payload_hash) = 64 AND recovery_payload_hash NOT GLOB '*[^0-9a-f]*'),
+  recovery_payload_json TEXT NOT NULL CHECK (json_valid(recovery_payload_json) AND length(CAST(recovery_payload_json AS BLOB)) <= 67108864),
+  native_session_id TEXT NOT NULL,
+  process_generation TEXT,
+  native_turn_id TEXT,
+  native_operation_id TEXT,
+  owner_instance_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('preparing', 'dispatching', 'accepted', 'rejected', 'unknown')),
+  crossed_at INTEGER, accepted_at INTEGER, rejected_at INTEGER, unknown_at INTEGER,
+  acceptance_evidence_json TEXT CHECK (acceptance_evidence_json IS NULL OR (json_valid(acceptance_evidence_json) AND length(CAST(acceptance_evidence_json AS BLOB)) <= 65536)),
+  rejection_json TEXT CHECK (rejection_json IS NULL OR (json_valid(rejection_json) AND length(CAST(rejection_json AS BLOB)) <= 65536)),
+  recovery_json TEXT CHECK (recovery_json IS NULL OR (json_valid(recovery_json) AND length(CAST(recovery_json AS BLOB)) <= 65536)),
+  transcript_gap INTEGER NOT NULL DEFAULT 0 CHECK (transcript_gap IN (0, 1)),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+  CHECK ((kind = 'root-turn' AND intended_turn_id IS NOT NULL AND client_message_id IS NOT NULL AND native_client_message_id IS NOT NULL AND compact_operation_id IS NULL) OR (kind = 'steer' AND intended_turn_id IS NOT NULL AND client_message_id IS NOT NULL AND native_client_message_id IS NOT NULL AND compact_operation_id IS NULL) OR (kind = 'manual-compact' AND intended_turn_id IS NULL AND client_message_id IS NULL AND compact_operation_id IS NOT NULL)),
+  CHECK ((state IN ('preparing', 'rejected') AND crossed_at IS NULL) OR (state IN ('dispatching', 'accepted', 'unknown') AND crossed_at IS NOT NULL)),
+  CHECK ((state = 'accepted') = (accepted_at IS NOT NULL)),
+  CHECK ((state = 'rejected') = (rejected_at IS NOT NULL)),
+  CHECK ((state = 'unknown') = (unknown_at IS NOT NULL)),
+  CHECK (state != 'accepted' OR acceptance_evidence_json IS NOT NULL),
+  CHECK (acceptance_evidence_json IS NULL OR state IN ('dispatching', 'unknown', 'accepted')),
+  CHECK ((state = 'rejected') = (rejection_json IS NOT NULL)),
+  CHECK (crossed_at IS NULL OR (crossed_at >= created_at AND updated_at >= crossed_at)),
+  CHECK (accepted_at IS NULL OR (accepted_at >= created_at AND updated_at >= accepted_at)),
+  CHECK (rejected_at IS NULL OR (rejected_at >= created_at AND updated_at >= rejected_at)),
+  CHECK (unknown_at IS NULL OR (unknown_at >= created_at AND updated_at >= unknown_at)),
+  FOREIGN KEY (command_id) REFERENCES command_receipts(command_id) ON DELETE RESTRICT,
+  FOREIGN KEY (provider_instance_id) REFERENCES provider_instances(provider_instance_id) ON DELETE RESTRICT,
+  FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE RESTRICT,
+  FOREIGN KEY (execution_id) REFERENCES executions(execution_id) ON DELETE RESTRICT,
+  FOREIGN KEY (compact_operation_id) REFERENCES compaction_operations(operation_id) ON DELETE RESTRICT
+) STRICT;
+CREATE INDEX delivery_attempts_lane ON delivery_attempts(conversation_id, state, created_at);
+CREATE INDEX delivery_attempts_execution ON delivery_attempts(execution_id, state, created_at);
+CREATE TABLE delivery_attempt_staging (
+  attempt_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0 AND ordinal < 256),
+  observation_id TEXT NOT NULL,
+  envelope_json TEXT NOT NULL CHECK (json_valid(envelope_json) AND length(CAST(envelope_json AS BLOB)) <= 33554432),
+  byte_length INTEGER NOT NULL CHECK (byte_length = length(CAST(envelope_json AS BLOB)) AND byte_length <= 33554432),
+  observed_at INTEGER NOT NULL CHECK (observed_at >= 0),
+  PRIMARY KEY (attempt_id, ordinal), UNIQUE (attempt_id, observation_id),
+  FOREIGN KEY (attempt_id) REFERENCES delivery_attempts(attempt_id) ON DELETE RESTRICT
 ) STRICT;
 `;
 
@@ -522,8 +654,15 @@ export function migrateNativeAgentSchema(
   fromVersion: number,
   repairContext?: { backupPath?: string; migratedAt?: number },
 ) {
-  if (fromVersion < 1 || fromVersion > 10) {
+  if (fromVersion < 1 || fromVersion > 14) {
     throw new NativeAgentSchemaError(`No Native Agent migration exists from schema ${fromVersion}.`);
+  }
+  for (const name of ['delivery_attempts', 'delivery_attempts_lane',
+    'delivery_attempts_execution', 'delivery_attempt_staging']) {
+    if (database.prepare('SELECT 1 FROM sqlite_schema WHERE name = ?').get(name) &&
+        !schemaObjectMatchesDefinition(database, name)) {
+      throw new NativeAgentSchemaError(`Version 15 found conflicting preexisting object ${name}.`);
+    }
   }
   if (fromVersion === 1) {
     database.exec(`
@@ -632,7 +771,273 @@ export function migrateNativeAgentSchema(
     `);
   }
   if (fromVersion <= 10) migrateVersionEleven(database, fromVersion, repairContext);
+  if (fromVersion <= 11) migrateVersionTwelve(database);
+  if (fromVersion <= 12) migrateVersionThirteen(database, fromVersion, repairContext);
+  if (fromVersion <= 13) migrateVersionFourteen(database);
+  if (fromVersion <= 14) migrateVersionFifteen(database);
   database.exec(`PRAGMA user_version = ${NATIVE_AGENT_SCHEMA_VERSION}`);
+}
+
+function schemaObjectMatchesDefinition(database: DatabaseSync, name: string) {
+  const actual = database.prepare('SELECT sql FROM sqlite_schema WHERE name = ?').get(name) as
+    { sql: string | null } | undefined;
+  const expected = SCHEMA_SQL.split(';').map((statement) => statement.trim()).find((statement) =>
+    new RegExp(`^CREATE\\s+(?:TABLE|(?:UNIQUE\\s+)?INDEX)\\s+${name}\\b`, 'iu').test(statement));
+  const normalize = (sql: string) => sql.replace(/\s+/gu, ' ').trim().replace(/;$/u, '');
+  return Boolean(actual?.sql && expected && normalize(actual.sql) === normalize(expected));
+}
+
+function migrateVersionFifteen(database: DatabaseSync) {
+  for (const table of ['command_receipts', 'provider_instances', 'conversations', 'executions', 'compaction_operations']) {
+    if (!schemaObjectExists(database, 'table', table)) throw new NativeAgentSchemaError(`Version 15 requires ${table}.`);
+  }
+  createObjectsFromSchema(database, ['delivery_attempts', 'delivery_attempts_lane',
+    'delivery_attempts_execution', 'delivery_attempt_staging'], 'Version 15');
+}
+
+function migrateVersionFourteen(database: DatabaseSync) {
+  if (!schemaObjectExists(database, 'table', 'executions') ||
+      !schemaObjectExists(database, 'table', 'command_receipts')) {
+    throw new NativeAgentSchemaError('Version 14 requires executions and command_receipts.');
+  }
+  if (!schemaColumnExists(database, 'executions', 'checkout_key')) {
+    database.exec('ALTER TABLE executions ADD COLUMN checkout_key TEXT;');
+  }
+  createObjectsFromSchema(database, [
+    'executions_checkout_key_idx',
+    'federation_checkout_reservations',
+    'federation_checkout_reservations_capacity_idx',
+    'federation_checkout_reservations_global_unknown_idx',
+  ], 'Version 14');
+}
+
+function migrateVersionThirteen(
+  database: DatabaseSync,
+  sourceVersion: number,
+  context?: { backupPath?: string; migratedAt?: number },
+) {
+  for (const table of ['artifacts', 'conversations', 'executions', 'turns']) {
+    if (!schemaObjectExists(database, 'table', table)) {
+      throw new NativeAgentSchemaError(`Version 13 requires historical table ${table}.`);
+    }
+  }
+  ensureCompositeGrantParent(database, 'executions', ['conversation_id', 'execution_id']);
+  ensureCompositeGrantParent(database, 'turns', ['conversation_id', 'turn_id']);
+  createObjectsFromSchema(database, [
+    'artifact_grants', 'artifact_grants_conversation',
+    'artifact_grants_execution', 'artifact_grants_scope',
+  ], 'Version 13');
+  const report = {
+    sourceVersion,
+    targetVersion: 13,
+    backupPath: context?.backupPath ?? null,
+    migratedAt: context?.migratedAt ?? Date.now(),
+    message: { candidates: 0, inserted: 0, excluded: {} as Record<string, number> },
+    queue: { candidates: 0, inserted: 0, excluded: {} as Record<string, number> },
+    assistant: { candidates: 0, inserted: 0, excluded: {} as Record<string, number> },
+  };
+  const exclude = (group: 'message' | 'queue' | 'assistant', reason: string) => {
+    const excluded = report[group].excluded;
+    excluded[reason] = (excluded[reason] ?? 0) + 1;
+  };
+  const insert = database.prepare(`
+    INSERT OR IGNORE INTO artifact_grants(
+      artifact_id, conversation_id, execution_id, provenance,
+      source_turn_id, source_execution_id, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  if (['turns', 'command_receipts', 'executions', 'conversation_strands', 'artifacts']
+    .every((name) => schemaObjectExists(database, 'table', name))) {
+    const rows = database.prepare(`
+      SELECT t.turn_id, t.conversation_id, t.execution_id, t.command_id,
+        t.user_content_json, t.origin_strand_id, t.created_at,
+        r.kind, r.state AS receipt_state, r.result_json,
+        e.ownership, s.root_execution_id AS strand_root_execution_id
+      FROM turns t
+      LEFT JOIN command_receipts r USING(command_id)
+      LEFT JOIN executions e ON e.execution_id = t.execution_id
+      LEFT JOIN conversation_strands s ON s.strand_id = t.origin_strand_id
+    `).all() as Array<Record<string, unknown>>;
+    for (const row of rows) for (const image of imageReferences(row.user_content_json)) {
+      report.message.candidates += 1;
+      const kind = row.kind === null ? null : String(row.kind);
+      if (row.receipt_state !== 'accepted') { exclude('message', 'missing-or-nonaccepted-receipt'); continue; }
+      if (!['turn.send', 'conversation.edit', 'conversation.fork'].includes(kind ?? '')) {
+        exclude('message', 'untrusted-command-kind'); continue;
+      }
+      const result = parseObject(row.result_json);
+      if (result?.turnId !== row.turn_id ||
+          (result?.conversationId !== undefined && result.conversationId !== row.conversation_id)) {
+        exclude('message', 'receipt-destination-mismatch'); continue;
+      }
+      if (row.ownership !== 'root' || row.strand_root_execution_id !== row.execution_id) {
+        exclude('message', 'strand-root-mismatch'); continue;
+      }
+      if (!artifactImageMatches(database, image.artifactId, image.mimeType)) {
+        exclude('message', 'missing-or-mime-mismatch'); continue;
+      }
+      const changed = insert.run(image.artifactId, String(row.conversation_id), null,
+        'viewer-message', String(row.turn_id), null, Number(row.created_at)).changes;
+      report.message.inserted += Number(changed);
+    }
+  }
+  if (schemaObjectExists(database, 'table', 'queued_messages')) {
+    const rows = database.prepare(`
+      SELECT q.*, r.kind, r.state AS receipt_state, r.result_json,
+        c.root_execution_id
+      FROM queued_messages q
+      LEFT JOIN command_receipts r USING(command_id)
+      JOIN conversations c USING(conversation_id)
+    `).all() as Array<Record<string, unknown>>;
+    for (const row of rows) for (const image of imageReferences(row.content_json)) {
+      report.queue.candidates += 1;
+      const result = parseObject(row.result_json);
+      if (row.kind !== 'turn.send' || row.receipt_state !== 'accepted' ||
+          result?.turnId !== row.turn_id) {
+        exclude('queue', 'unproven-receipt-destination'); continue;
+      }
+      if (!artifactImageMatches(database, image.artifactId, image.mimeType)) {
+        exclude('queue', 'missing-or-mime-mismatch'); continue;
+      }
+      report.queue.inserted += Number(insert.run(image.artifactId, String(row.conversation_id),
+        null, 'viewer-queue', null, null, Number(row.created_at)).changes);
+    }
+  }
+  const assistants = ['turns', 'artifacts'].every((name) => schemaObjectExists(database, 'table', name)) &&
+      schemaColumnExists(database, 'turns', 'assistant_artifact_id') ? database.prepare(`
+    SELECT t.turn_id, t.conversation_id, t.execution_id, t.assistant_artifact_id,
+      t.updated_at, a.media_type, a.visibility
+    FROM turns t LEFT JOIN artifacts a ON a.artifact_id = t.assistant_artifact_id
+    WHERE t.assistant_artifact_id IS NOT NULL
+  `).all() as Array<Record<string, unknown>> : [];
+  for (const row of assistants) {
+    report.assistant.candidates += 1;
+    if (row.visibility !== 'viewer' || !String(row.media_type ?? '').startsWith('text/')) {
+      exclude('assistant', 'missing-or-nontext-artifact'); continue;
+    }
+    report.assistant.inserted += Number(insert.run(String(row.assistant_artifact_id),
+      String(row.conversation_id), String(row.execution_id), 'execution-output', String(row.turn_id),
+      String(row.execution_id), Number(row.updated_at)).changes);
+  }
+  database.prepare(`
+    INSERT INTO meta(key, value_json) VALUES ('schema_v13_artifact_grants', ?)
+    ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
+  `).run(JSON.stringify(report));
+}
+
+function hasUniqueColumns(database: DatabaseSync, table: string, columns: readonly string[]) {
+  const indexes = database.prepare(`PRAGMA index_list(${table})`).all() as
+    Array<{ name: string; unique: number; partial: number }>;
+  return indexes.some((index) => index.unique === 1 && index.partial === 0 &&
+    (database.prepare(`PRAGMA index_info(${index.name})`).all() as Array<{ name: string }>)
+      .map(({ name }) => name).join('\0') === columns.join('\0'));
+}
+
+function ensureCompositeGrantParent(
+  database: DatabaseSync,
+  table: 'executions' | 'turns',
+  columns: readonly ['conversation_id', 'execution_id' | 'turn_id'],
+) {
+  const available = new Set((database.prepare(`PRAGMA table_info(${table})`).all() as
+    Array<{ name: string }>).map(({ name }) => name));
+  for (const column of columns) if (!available.has(column)) {
+    throw new NativeAgentSchemaError(`Version 13 requires ${table}.${column}.`);
+  }
+  if (hasUniqueColumns(database, table, columns)) return;
+  const suffix = columns.join('_');
+  database.exec(`CREATE UNIQUE INDEX ${table}_${suffix}_v13 ON ${table}(${columns.join(', ')})`);
+}
+
+function imageReferences(value: unknown): Array<{ artifactId: string; mimeType: string }> {
+  try {
+    const parsed = JSON.parse(String(value));
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((part) => part && typeof part === 'object' &&
+      (part as Record<string, unknown>).type === 'image-artifact' &&
+      typeof (part as Record<string, unknown>).artifactId === 'string' &&
+      typeof (part as Record<string, unknown>).mimeType === 'string'
+      ? [{ artifactId: String((part as Record<string, unknown>).artifactId),
+          mimeType: String((part as Record<string, unknown>).mimeType) }]
+      : []);
+  } catch { return []; }
+}
+
+function parseObject(value: unknown): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(String(value));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown> : undefined;
+  } catch { return undefined; }
+}
+
+function artifactImageMatches(database: DatabaseSync, artifactId: string, mimeType: string) {
+  const row = database.prepare(`
+    SELECT 1 AS matched FROM artifacts
+    WHERE artifact_id = ? AND visibility = 'viewer' AND media_type = ? AND media_type LIKE 'image/%'
+  `).get(artifactId, mimeType) as { matched: number } | undefined;
+  return row?.matched === 1;
+}
+
+/**
+ * Version 12 makes provider service tier part of the durable inference
+ * profile. Historical turns remain unknown; resumable Codex sessions and
+ * pending work are intentionally pinned to the standard tier.
+ */
+function migrateVersionTwelve(database: DatabaseSync) {
+  for (const table of [
+    'conversations', 'executions', 'turns', 'composer_preferences', 'queued_messages',
+  ]) {
+    if (schemaObjectExists(database, 'table', table) &&
+        !schemaColumnExists(database, table, 'service_tier')) {
+      database.exec(`ALTER TABLE ${table} ADD COLUMN service_tier TEXT;`);
+    }
+  }
+  if (schemaObjectExists(database, 'table', 'conversations') &&
+      schemaObjectExists(database, 'table', 'provider_instances') &&
+      schemaColumnExists(database, 'conversations', 'provider_instance_id') &&
+      schemaColumnExists(database, 'provider_instances', 'provider')) {
+    database.exec(`
+      UPDATE conversations
+      SET service_tier = 'default'
+      WHERE provider_instance_id IN (
+        SELECT provider_instance_id FROM provider_instances WHERE provider = 'codex'
+      );
+    `);
+  }
+  if (schemaObjectExists(database, 'table', 'executions') &&
+      schemaColumnExists(database, 'executions', 'provider')) {
+    database.exec("UPDATE executions SET service_tier = 'default' WHERE provider = 'codex';");
+  }
+  if (schemaObjectExists(database, 'table', 'composer_preferences') &&
+      schemaObjectExists(database, 'table', 'provider_instances') &&
+      schemaColumnExists(database, 'composer_preferences', 'provider_instance_id') &&
+      schemaColumnExists(database, 'provider_instances', 'provider')) {
+    database.exec(`
+      UPDATE composer_preferences
+      SET service_tier = 'default'
+      WHERE scope != 'default-provider'
+        AND provider_instance_id IN (
+          SELECT provider_instance_id FROM provider_instances WHERE provider = 'codex'
+        );
+    `);
+  }
+  if (schemaObjectExists(database, 'table', 'queued_messages') &&
+      schemaObjectExists(database, 'table', 'conversations') &&
+      schemaObjectExists(database, 'table', 'provider_instances') &&
+      schemaColumnExists(database, 'queued_messages', 'conversation_id') &&
+      schemaColumnExists(database, 'conversations', 'provider_instance_id') &&
+      schemaColumnExists(database, 'provider_instances', 'provider')) {
+    database.exec(`
+      UPDATE queued_messages
+      SET service_tier = 'default'
+      WHERE conversation_id IN (
+        SELECT c.conversation_id
+        FROM conversations c
+        JOIN provider_instances p USING(provider_instance_id)
+        WHERE p.provider = 'codex'
+      );
+    `);
+  }
 }
 
 type VersionElevenControlRow = {
@@ -1026,13 +1431,13 @@ function createObjectsFromSchema(
     .map((statement) => statement.trim())
     .filter(Boolean)
     .filter((statement) => {
-      const match = /^CREATE\s+(?:TABLE|INDEX)\s+([A-Za-z0-9_]+)/iu.exec(statement);
+      const match = /^CREATE\s+(?:TABLE|(?:UNIQUE\s+)?INDEX)\s+([A-Za-z0-9_]+)/iu.exec(statement);
       if (!match || !wanted.has(match[1]!)) return false;
       const type = /^CREATE\s+TABLE/iu.test(statement) ? 'table' : 'index';
       return !schemaObjectExists(database, type, match[1]!);
     });
   const found = new Set(statements.flatMap((statement) => {
-    const match = /^CREATE\s+(?:TABLE|INDEX)\s+([A-Za-z0-9_]+)/iu.exec(statement);
+    const match = /^CREATE\s+(?:TABLE|(?:UNIQUE\s+)?INDEX)\s+([A-Za-z0-9_]+)/iu.exec(statement);
     return match ? [match[1]!] : [];
   }));
   for (const object of wanted) {
@@ -1046,7 +1451,7 @@ function createObjectsFromSchema(
     try {
       database.exec(`${statement};`);
     } catch (error) {
-      const name = /^CREATE\s+(?:TABLE|INDEX)\s+([A-Za-z0-9_]+)/iu.exec(statement)?.[1] ?? 'unknown';
+      const name = /^CREATE\s+(?:TABLE|(?:UNIQUE\s+)?INDEX)\s+([A-Za-z0-9_]+)/iu.exec(statement)?.[1] ?? 'unknown';
       throw new NativeAgentSchemaError(
         `Could not create ${label} schema object ${name}: ${error instanceof Error ? error.message : String(error)}`,
       );

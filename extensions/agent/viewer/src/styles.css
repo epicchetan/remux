@@ -2377,6 +2377,7 @@
 .codex-transcript-content { width: 100%; min-width: 0; }
 
 .codex-transcript-turn { min-width: 0; }
+.codex-turn-footer { display: flex; min-width: 0; flex-direction: column; gap: var(--codex-turn-footer-gap); padding-bottom: var(--codex-turn-footer-padding-bottom); }
 .codex-transcript-row { min-width: 0; }
 .codex-transcript-row-userMessage,
 .codex-transcript-row-assistantMessage { padding-bottom: var(--remux-block-gap); }
@@ -2391,13 +2392,16 @@
   font-size: 12px;
 }
 .codex-turn-error {
-  margin: 0 0 var(--remux-block-gap);
-  border: 1px solid color-mix(in srgb, var(--destructive) 45%, var(--border));
+  margin: 0;
+  border: var(--codex-turn-error-border) solid color-mix(in srgb, var(--destructive) 45%, var(--border));
   border-radius: 8px;
   background: color-mix(in srgb, var(--destructive) 8%, transparent);
-  padding: 10px 12px;
-  font-size: 13px;
+  padding: var(--codex-turn-error-padding-y) var(--codex-turn-error-padding-x);
+  font-size: var(--codex-turn-error-font-size);
+  line-height: var(--codex-turn-error-line-height);
+  overflow-wrap: anywhere;
 }
+.codex-turn-footer .agent-transcript-retry { align-self: flex-start; height: var(--codex-turn-retry-height); margin-top: 0; white-space: nowrap; }
 .codex-work-header {
   display: flex;
   width: 100%;

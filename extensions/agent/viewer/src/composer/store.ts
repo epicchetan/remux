@@ -1,8 +1,8 @@
 import { create } from 'zustand';
 
-import type { ModelsValue, ReasoningLevel } from '../../../shared/protocol.ts';
+import type { ModelsValue, ReasoningEffort } from '../../../shared/protocol.ts';
 import type { ProviderAccess } from '../../../shared/provider-runtime.ts';
-import { preferredReasoning, resolveModel } from './config/modelSelection.ts';
+import { preferredReasoning, preferredServiceTier, resolveModel } from './config/modelSelection.ts';
 import {
   createEmptyComposerSnapshot,
   type ComposerAttachmentResource,
@@ -46,7 +46,8 @@ export type ComposerSubmission = {
   modelId: string;
   phase: ComposerSubmissionPhase;
   snapshot: ComposerSnapshot;
-  reasoning: ReasoningLevel;
+  reasoning: ReasoningEffort;
+  serviceTier: string | null;
   turnId: string | null;
 };
 
@@ -70,7 +71,8 @@ type ComposerStoreState = {
     modelId?: string;
     phase: ComposerSubmissionPhase;
     snapshot?: ComposerSnapshot;
-    reasoning?: ReasoningLevel;
+    reasoning?: ReasoningEffort;
+    serviceTier?: string | null;
     turnId?: string | null;
   }) => ComposerSubmission;
   blurComposer: () => void;
@@ -91,7 +93,8 @@ type ComposerStoreState = {
   models: ModelsValue | null;
   openAttachmentPicker: (kind?: ComposerAttachmentPickerKind) => void;
   preEditSnapshot: ComposerSnapshot | null;
-  reasoning: ReasoningLevel;
+  reasoning: ReasoningEffort;
+  serviceTier: string | null;
   providerInstanceId: string;
   setAccess: (access: ProviderAccess) => void;
   setComposerDocument: (document: ComposerDocument, resources?: ComposerAttachmentResource[]) => void;
@@ -101,7 +104,8 @@ type ComposerStoreState = {
   setModelId: (modelId: string) => void;
   setProviderInstanceId: (providerInstanceId: string) => void;
   setModels: (models: ModelsValue) => void;
-  setReasoning: (reasoning: ReasoningLevel) => void;
+  setReasoning: (reasoning: ReasoningEffort) => void;
+  setServiceTier: (serviceTier: string | null) => void;
   setSnapshot: (snapshot: ComposerSnapshot) => void;
   setSubmissionConversation: (id: number, conversationId: string) => void;
   setSubmissionPhase: (id: number, phase: ComposerSubmissionPhase) => void;
@@ -124,6 +128,7 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
     modelId = get().modelId,
     phase,
     reasoning = get().reasoning,
+    serviceTier = get().serviceTier,
     snapshot = get().snapshot,
     turnId = null,
   }) => {
@@ -135,6 +140,7 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
       phase,
       snapshot,
       reasoning,
+      serviceTier,
       turnId,
     };
     set({ isSubmitting: true, submission, submissionError: null });
@@ -185,6 +191,7 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
   openAttachmentPicker: noop,
   preEditSnapshot: null,
   reasoning: 'high',
+  serviceTier: null,
   providerInstanceId: '',
   setAccess: (access) => set({ access }),
   setComposerDocument: noopSetDocument,
@@ -202,14 +209,16 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
     const selected = resolveModel(state.models, modelId);
     return {
       modelId,
-      reasoning: selected?.supportedReasoning.includes(state.reasoning)
+      reasoning: state.reasoning !== null && selected?.supportedReasoning.includes(state.reasoning)
         ? state.reasoning
         : selected ? preferredReasoning(selected) : state.reasoning,
+      serviceTier: selected ? preferredServiceTier(selected, state.serviceTier) : null,
     };
   }),
   setProviderInstanceId: (providerInstanceId) => set({ providerInstanceId }),
   setModels: (models) => set({ models }),
   setReasoning: (reasoning) => set({ reasoning }),
+  setServiceTier: (serviceTier) => set({ serviceTier }),
   setSnapshot: (snapshot) => set({ snapshot, submissionError: null }),
   setSubmissionConversation: (id, conversationId) => set((state) => state.submission?.id === id
     ? { submission: { ...state.submission, conversationId } }

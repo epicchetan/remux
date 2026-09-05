@@ -1,16 +1,17 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { Boxes, Check, ChevronDown, LogIn, LogOut, Minimize2, Play, RefreshCw, Server, Shield, Sparkles, Wrench } from 'lucide-react';
+import { Boxes, Check, ChevronDown, Gauge, LogIn, LogOut, Minimize2, Play, RefreshCw, Server, Shield, Sparkles, Wrench } from 'lucide-react';
 import { reloadHostView } from '@remux/viewer-kit/host';
 
 import type { AgentProvidersResource, AgentRuntimeResource } from '../../../../shared/native-agent-protocol.ts';
 import type { ProviderAccess } from '../../../../shared/provider-runtime.ts';
-import type { ReasoningLevel } from '../../../../shared/protocol.ts';
-import { preferredReasoning, reasoningLabel } from './modelSelection.ts';
+import type { ModelInfo, ReasoningEffort } from '../../../../shared/protocol.ts';
+import { preferredReasoning, preferredServiceTier, reasoningLabel } from './modelSelection.ts';
 import { useComposerStore } from '../store.ts';
 
-type ConfigSection = 'providers' | 'model' | 'reasoning' | 'access';
+type ConfigSection = 'providers' | 'model' | 'speed' | 'reasoning' | 'access';
 
 export function ComposerConfigButton({
+  compactEnabled,
   disabled = false,
   conversationExists,
   onAccessChange,
@@ -22,13 +23,15 @@ export function ComposerConfigButton({
   runtime,
 }: {
   disabled?: boolean;
+  compactEnabled: boolean;
   conversationExists: boolean;
   onAccessChange: (access: ProviderAccess) => Promise<void>;
   onCompact: () => Promise<void>;
   onPreferenceChange: (input: {
     providerInstanceId: string;
     modelId: string;
-    reasoning: ReasoningLevel;
+    reasoning: ReasoningEffort;
+    serviceTier: string | null;
   }) => Promise<void>;
   onProviderLogin: (providerInstanceId: string, mode: 'device-code' | 'browser') => void;
   onProviderLogout: (providerInstanceId: string) => void;
@@ -38,6 +41,7 @@ export function ComposerConfigButton({
   const modelId = useComposerStore((state) => state.modelId);
   const models = useComposerStore((state) => state.models);
   const reasoning = useComposerStore((state) => state.reasoning);
+  const serviceTier = useComposerStore((state) => state.serviceTier);
   const providerInstanceId = useComposerStore((state) => state.providerInstanceId);
   const access = useComposerStore((state) => state.access);
   const [open, setOpen] = useState(false);
@@ -55,6 +59,8 @@ export function ComposerConfigButton({
     ?? availableModels[0];
   const modelLocked = busy || (conversationExists && (!runtime || !runtime.composer.editable.model));
   const reasoningLocked = busy || (conversationExists && (!runtime || !runtime.composer.editable.effort));
+  const serviceTierLocked = busy || (conversationExists &&
+    (!runtime || !runtime.composer.editable.serviceTier));
   const accessLocked = busy || (conversationExists && (!runtime || !runtime.composer.editable.access));
   const providerLocked = conversationExists || busy;
   const selectedProvider = providers?.providers.find(({ providerInstanceId: id }) =>
@@ -64,12 +70,18 @@ export function ComposerConfigButton({
     : selectedProvider?.capabilities?.access.presets ?? [];
   const compacting = runtime?.compaction.operation.state === 'running';
 
-  const selectPreference = (nextProviderInstanceId: string, nextModelId: string, nextReasoning: ReasoningLevel) => {
+  const selectPreference = (
+    nextProviderInstanceId: string,
+    nextModelId: string,
+    nextReasoning: ReasoningEffort,
+    nextServiceTier: string | null,
+  ) => {
     setBusy(true);
     void onPreferenceChange({
       providerInstanceId: nextProviderInstanceId,
       modelId: nextModelId,
       reasoning: nextReasoning,
+      serviceTier: nextServiceTier,
     }).finally(() => setBusy(false));
   };
 
@@ -135,7 +147,7 @@ export function ComposerConfigButton({
           />
           {runtime?.capabilities.compaction.manualNative ? (
             <ConfigAction
-              disabled={busy || compacting}
+              disabled={busy || compacting || !compactEnabled}
               icon={<Minimize2 className="size-4" />}
               label={compacting ? 'Compacting…' : 'Compact context'}
               onClick={() => {
@@ -165,13 +177,14 @@ export function ComposerConfigButton({
                         : undefined;
                       const nextModel = sticky ?? providerModels[0];
                       if (!nextModel) return;
-                      const stickyReasoning = asReasoning(provider.stickyPreference?.effort);
+                      const stickyReasoning = provider.stickyPreference?.effort ?? null;
                       selectPreference(
                         provider.providerInstanceId,
                         nextModel.id,
-                        nextModel.supportedReasoning.includes(stickyReasoning)
+                        stickyReasoning !== null && nextModel.supportedReasoning.includes(stickyReasoning)
                           ? stickyReasoning
                           : preferredReasoning(nextModel),
+                        preferredServiceTier(nextModel, provider.stickyPreference?.serviceTier),
                       );
                     }}
                     onAction={() => {
@@ -208,9 +221,10 @@ export function ComposerConfigButton({
                   selectPreference(
                     selectedProviderInstanceId,
                     nextModel.id,
-                    nextModel.supportedReasoning.includes(reasoning)
+                    reasoning !== null && nextModel.supportedReasoning.includes(reasoning)
                       ? reasoning
                       : preferredReasoning(nextModel),
+                    preferredServiceTier(nextModel, serviceTier),
                   );
                   setExpanded(null);
                 }}
@@ -225,24 +239,56 @@ export function ComposerConfigButton({
               />
             </ConfigRow>
           ) : null}
-          {selectedModel ? (
+          {selectedModel && selectedModel.serviceTiers.length > 1 ? (
             <ConfigRow
+              disabled={serviceTierLocked}
+              expanded={expanded === 'speed'}
+              icon={<Gauge className="size-4" />}
+              label={serviceTierLabel(selectedModel, serviceTier)}
+              onToggle={() => setExpanded((value) => value === 'speed' ? null : 'speed')}
+            >
+              <ConfigOptions
+                onSelect={(value) => {
+                  selectPreference(
+                    selectedProviderInstanceId,
+                    selectedModel.id,
+                    reasoning,
+                    value,
+                  );
+                  setExpanded(null);
+                }}
+                options={selectedModel.serviceTiers.map((tier) => ({
+                  ...(tier.description ? { detail: tier.description } : {}),
+                  label: tier.id === 'default' ? 'Standard' : tier.name,
+                  value: tier.id,
+                }))}
+                value={preferredServiceTier(selectedModel, serviceTier)!}
+              />
+            </ConfigRow>
+          ) : null}
+          {selectedModel && selectedModel.supportedReasoning.length > 0 ? (
+            <ConfigRow
+              groupLabel="Reasoning effort"
               disabled={reasoningLocked}
               expanded={expanded === 'reasoning'}
               icon={<Sparkles className="size-4" />}
-              label={reasoningLabel(reasoning)}
+              label={reasoning === null ? 'Reasoning' : reasoningLabel(reasoning)}
               onToggle={() => setExpanded((value) => value === 'reasoning' ? null : 'reasoning')}
             >
               <ConfigOptions
                 onSelect={(value) => {
                   if (!selectedModel) return;
-                  selectPreference(selectedProviderInstanceId, selectedModel.id, value);
+                  selectPreference(
+                    selectedProviderInstanceId,
+                    selectedModel.id,
+                    value,
+                    preferredServiceTier(selectedModel, serviceTier),
+                  );
                   setExpanded(null);
                 }}
-                options={['off' as const, ...selectedModel.supportedReasoning
-                  .filter((value) => value !== 'off')]
+                options={selectedModel.supportedReasoning
                   .map((value) => ({ label: reasoningLabel(value), value }))}
-                value={reasoning}
+                value={reasoning ?? ''}
               />
             </ConfigRow>
           ) : null}
@@ -292,16 +338,17 @@ function ConfigAction({ active = false, disabled = false, icon, label, onClick }
   );
 }
 
-function ConfigRow({ children, disabled, expanded, icon, label, onToggle }: {
+function ConfigRow({ children, disabled, expanded, groupLabel, icon, label, onToggle }: {
   children: ReactNode;
   disabled?: boolean;
   expanded: boolean;
+  groupLabel?: string;
   icon: ReactNode;
   label: string;
   onToggle: () => void;
 }) {
   return (
-    <div className="remux-composer-config-section">
+    <div aria-label={groupLabel} className="remux-composer-config-section" role={groupLabel ? 'group' : undefined}>
       {expanded ? <div className="remux-composer-config-options">{children}</div> : null}
       <button
         aria-expanded={expanded}
@@ -383,17 +430,16 @@ function ProviderStatus({ onAction, onSelect, provider, selectable, selected }: 
   );
 }
 
-function asReasoning(value: string | null | undefined): ReasoningLevel {
-  return value === 'minimal' || value === 'low' || value === 'medium' || value === 'high'
-      || value === 'xhigh' || value === 'max'
-    ? value
-    : 'off';
-}
-
 function accessLabel(access: ProviderAccess) {
   if (access === 'read-only') return 'Read only';
   if (access === 'full-access') return 'Full access';
   return 'Workspace write';
+}
+
+function serviceTierLabel(model: ModelInfo, requested: string | null) {
+  const selected = model.serviceTiers.find(({ id }) => id === preferredServiceTier(model, requested));
+  if (selected?.id === 'default') return 'Standard';
+  return selected?.name ?? 'Speed';
 }
 
 function providerLabel(providers: AgentProvidersResource | null, providerInstanceId?: string) {

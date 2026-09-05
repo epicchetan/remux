@@ -97,12 +97,12 @@ test('native provider blocks retain exact pass and block order while the termina
     ordinal: 0,
     state: 'completed',
     blocks: [
-      block('thinking-1', 0, 'reasoning-summary', { kind: 'reasoning-summary', text: 'First thought.' }),
+      block('thinking-1', 0, 'reasoning-summary', { kind: 'reasoning-summary', text: 'First thought.' , truncated: false}),
       block('tool-1', 1, 'tool', {
         kind: 'tool',
         tool: { callId: 'call-1', name: 'Read', category: 'file', title: 'Read file' },
       }),
-      block('thinking-2', 2, 'reasoning-summary', { kind: 'reasoning-summary', text: 'Second thought.' }),
+      block('thinking-2', 2, 'reasoning-summary', { kind: 'reasoning-summary', text: 'Second thought.' , truncated: false}),
       block('tool-2', 3, 'tool', {
         kind: 'tool',
         tool: { callId: 'call-2', name: 'Bash', category: 'shell', title: 'Run tests' },
@@ -172,13 +172,13 @@ test('an ordered context-compaction notice remains inside the work trace', () =>
     state: 'completed',
     blocks: [
       block('reasoning-before', 0, 'reasoning-summary', {
-        kind: 'reasoning-summary', text: 'Before.',
+        kind: 'reasoning-summary', text: 'Before.', truncated: false,
       }),
       block('compaction-marker', 1, 'compatibility-notice', {
         kind: 'compatibility-notice', code: 'context-compaction', message: 'Compacted',
       }),
       block('reasoning-after', 2, 'reasoning-summary', {
-        kind: 'reasoning-summary', text: 'After.',
+        kind: 'reasoning-summary', text: 'After.', truncated: false,
       }),
     ],
   }];
@@ -211,10 +211,12 @@ test('reasoning projection preserves native parts and recovers bold boundaries f
         kind: 'reasoning-summary',
         text: '**Inspecting**\nExplaining the finding.',
         parts: ['**Inspecting**', 'Explaining the finding.'],
+        truncated: false,
       }),
       block('legacy-thinking', 1, 'reasoning-summary', {
         kind: 'reasoning-summary',
         text: '**Testing**\nA paragraph about the test.\n**Reviewing results**',
+        truncated: false,
       }),
     ],
   }];
@@ -265,7 +267,7 @@ test('linked file changes render at their provider block instead of a trailing c
     state: 'completed',
     blocks: [
       block('thinking-before', 0, 'reasoning-summary', {
-        kind: 'reasoning-summary', text: 'Planning the edit.',
+        kind: 'reasoning-summary', text: 'Planning the edit.', truncated: false,
       }),
       block('file-block', 1, 'tool', {
         kind: 'tool',

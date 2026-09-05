@@ -1,10 +1,11 @@
-export const transcriptMeasureCacheVersion = 9;
+export const transcriptMeasureCacheVersion = 10;
 
 export type TranscriptMeasureCacheLookup = {
   contentWidth: number;
   conversationId: string;
   turnId: string;
   turnRevision: string;
+  displayFooterRevision: string;
   userActionRowId: string | null;
   userMessageDisclosureRevision: string;
 };
@@ -186,6 +187,7 @@ function cacheKey(lookup: TranscriptMeasureCacheLookup) {
     lookup.conversationId,
     lookup.turnId,
     lookup.turnRevision,
+    lookup.displayFooterRevision,
     normalizedWidth(lookup.contentWidth),
     lookup.userActionRowId ?? '',
     lookup.userMessageDisclosureRevision,

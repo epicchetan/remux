@@ -7,6 +7,7 @@ import {
   AsyncEventStream,
   type ProviderAdapter,
   type ProviderLoginOperation,
+  type ProviderSession,
 } from '../server/src/provider-adapter.ts';
 import { NativeAgentCoordinator } from '../server/src/native-runtime/native-coordinator.ts';
 import { NativeAgentJournal } from '../server/src/native-runtime/native-journal.ts';
@@ -19,6 +20,7 @@ import type {
   ProviderEventEnvelope,
   ProviderLoginEvent,
   ProviderLoginStartInput,
+  UserContentPart,
 } from '../shared/provider-runtime.ts';
 import { PROVIDER_RUNTIME_CONTRACT_VERSION } from '../shared/provider-runtime.ts';
 
@@ -105,6 +107,161 @@ test('native coordinator creates one native session, queues FIFO, and dispatches
       assert.ok(value.turns.every((turn) => turn.state === 'completed'));
       assert.ok(value.turns[0]?.activity.children.some((child) => child.ownership === 'native'));
     }
+  } finally {
+    await coordinator.close();
+    journal.close();
+  }
+});
+
+test('async send and Compact commands coalesce while their receipts are received', async () => {
+  const journal = createJournal();
+  const adapter = new NativeFixtureAdapter({ manualCompaction: true, delayMs: 2 });
+  const coordinator = new NativeAgentCoordinator({
+    journal,
+    providers: [{ providerInstanceId: 'fixture-local', provider: 'fixture', label: 'Fixture', adapter }],
+  });
+  try {
+    await coordinator.initialize();
+    const created = await coordinator.createConversation({
+      commandId: 'coalesce-create', providerInstanceId: 'fixture-local', cwd: '/workspace/remux',
+      model: 'fixture-native-v1', access: 'workspace-write',
+    });
+    const internals = coordinator as unknown as {
+      synchronizeConversationHistory(conversationId: string, freshness: string): Promise<void>;
+    };
+    const originalSync = internals.synchronizeConversationHistory.bind(coordinator);
+    let release!: () => void;
+    let entered!: () => void;
+    const enteredBarrier = new Promise<void>((resolve) => { entered = resolve; });
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    let syncCalls = 0;
+    internals.synchronizeConversationHistory = async () => {
+      syncCalls += 1;
+      entered();
+      await barrier;
+    };
+    const sendInput = configuredMessage(coordinator, {
+      commandId: 'coalesce-send', conversationId: created.conversationId,
+      clientMessageId: 'coalesce-message', content: [{ type: 'text', text: 'One dispatch.' }],
+    });
+    const first = coordinator.sendMessage(sendInput);
+    await enteredBarrier;
+    assert.equal(journal.commandReceipt(sendInput.commandId)?.state, 'received');
+    const duplicate = coordinator.sendMessage(structuredClone(sendInput));
+    release();
+    const [left, right] = await Promise.all([first, duplicate]);
+    assert.deepEqual(right, left);
+    assert.equal(syncCalls, 1);
+    await waitFor(() => journal.turn(left.turnId)?.state === 'completed');
+
+    internals.synchronizeConversationHistory = originalSync;
+    let releaseCompact!: () => void;
+    let compactEntered!: () => void;
+    const compactEnteredBarrier = new Promise<void>((resolve) => { compactEntered = resolve; });
+    const compactBarrier = new Promise<void>((resolve) => { releaseCompact = resolve; });
+    syncCalls = 0;
+    internals.synchronizeConversationHistory = async () => {
+      syncCalls += 1;
+      compactEntered();
+      await compactBarrier;
+    };
+    const compactInput = { commandId: 'coalesce-compact', conversationId: created.conversationId };
+    const compactFirst = coordinator.compactConversation(compactInput);
+    await compactEnteredBarrier;
+    assert.equal(journal.commandReceipt(compactInput.commandId)?.state, 'received');
+    const compactDuplicate = coordinator.compactConversation(structuredClone(compactInput));
+    releaseCompact();
+    const [compactLeft, compactRight] = await Promise.all([compactFirst, compactDuplicate]);
+    assert.deepEqual(compactRight, compactLeft);
+    assert.equal(syncCalls, 1);
+    assert.equal(adapter.opened[0]?.providerCompactCount, 1);
+  } finally {
+    await coordinator.close();
+    journal.close();
+  }
+});
+
+test('trusted image admission grants direct, queued, and steer inputs before provider use', async () => {
+  const journal = createJournal();
+  const providerBoundaries: string[] = [];
+  const baseAdapter = new NativeFixtureAdapter({ delayMs: 60_000, afterTurnAccepted: (input) => {
+    const artifactId = imageArtifactId(input.content);
+    if (!artifactId) return;
+    assert.equal(journal.turn(input.turnId), undefined, 'grant exists before canonical turn admission');
+    assert.equal(journal.artifactGrantedTo({ conversationId: input.conversationId,
+      executionId: input.executionId }, artifactId), true);
+    providerBoundaries.push(`turn:${artifactId}`);
+  } });
+  const adapter: ProviderAdapter = {
+    probe: async (providerInstanceId) => {
+      const probe = await baseAdapter.probe(providerInstanceId);
+      assert.ok(probe.capabilities);
+      return { ...probe, capabilities: { ...probe.capabilities,
+        turns: { ...probe.capabilities.turns, steer: true } } };
+    },
+    listModels: (providerInstanceId) => baseAdapter.listModels(providerInstanceId),
+    openSession: async (input) => {
+      const session = await baseAdapter.openSession(input);
+      const providerSession: ProviderSession = session;
+      providerSession.steer = async (steerInput) => {
+        const artifactId = imageArtifactId(steerInput.content);
+        assert.ok(artifactId);
+        assert.equal(journal.artifactGrantedTo({ conversationId: input.conversationId,
+          executionId: input.executionId }, artifactId), true);
+        providerBoundaries.push(`steer:${artifactId}`);
+        return { accepted: true };
+      };
+      return providerSession;
+    },
+  };
+  const coordinator = new NativeAgentCoordinator({ journal, providers: [{
+    providerInstanceId: 'fixture-local', provider: 'fixture', label: 'Fixture', adapter,
+  }] });
+  try {
+    await coordinator.initialize();
+    const created = await coordinator.createConversation({ commandId: 'create-images',
+      providerInstanceId: 'fixture-local', cwd: '/workspace/remux', model: 'fixture-native-v1',
+      access: 'workspace-write' });
+    for (const [artifactId, nibble] of [['direct-image', 'd'], ['queued-image', 'e'],
+      ['steer-image', 'f']] as const) journal.registerArtifact({ artifactId,
+        sha256: nibble.repeat(64), byteLength: 4, mediaType: 'image/png', visibility: 'viewer',
+        storagePath: `${nibble}/${artifactId}`, createdAt: 2 });
+    const image = (artifactId: string, mimeType = 'image/png') =>
+      ({ type: 'image-artifact' as const, artifactId, mimeType });
+    const direct = await coordinator.sendMessage(configuredMessage(coordinator, {
+      commandId: 'send-direct-image', conversationId: created.conversationId,
+      clientMessageId: 'message-direct-image', content: [image('direct-image')] as UserContentPart[],
+    }));
+    assert.equal(direct.delivery, 'sent');
+    assert.equal(journal.artifactGrantedTo({ conversationId: created.conversationId,
+      executionId: journal.conversation(created.conversationId)!.rootExecutionId }, 'direct-image'), true);
+    const queued = await coordinator.sendMessage(configuredMessage(coordinator, {
+      commandId: 'send-queued-image', conversationId: created.conversationId,
+      clientMessageId: 'message-queued-image', content: [image('queued-image')] as UserContentPart[],
+    }));
+    assert.equal(queued.delivery, 'queued');
+    assert.equal(journal.turn(queued.turnId), undefined, 'grant precedes queued turn admission');
+    assert.equal(journal.artifactGrantedTo({ conversationId: created.conversationId,
+      executionId: journal.conversation(created.conversationId)!.rootExecutionId }, 'queued-image'), true);
+    const steered = await coordinator.sendMessage({ ...configuredMessage(coordinator, {
+      commandId: 'steer-image', conversationId: created.conversationId,
+      clientMessageId: 'message-steer-image', content: [image('steer-image')] as UserContentPart[],
+    }), delivery: 'steer' });
+    assert.equal(steered.delivery, 'steered');
+    assert.equal(journal.artifactGrantedTo({ conversationId: created.conversationId,
+      executionId: journal.conversation(created.conversationId)!.rootExecutionId }, 'steer-image'), true);
+    await assert.rejects(() => coordinator.sendMessage(configuredMessage(coordinator, {
+      commandId: 'send-invalid-image', conversationId: created.conversationId,
+      clientMessageId: 'message-invalid-image',
+      content: [image('direct-image', 'image/jpeg')] as UserContentPart[],
+    })), /does not match its attachment metadata/u);
+    assert.equal(journal.commandReceipt('send-invalid-image')?.state, 'rejected');
+    assert.equal(journal.queuedMessages(created.conversationId)
+      .some(({ commandId }) => commandId === 'send-invalid-image'), false);
+    await coordinator.interruptTurn({ commandId: 'interrupt-direct-image',
+      conversationId: created.conversationId, turnId: direct.turnId });
+    await waitFor(() => providerBoundaries.includes('turn:queued-image'), 1_000);
+    assert.deepEqual(providerBoundaries, ['turn:direct-image', 'steer:steer-image', 'turn:queued-image']);
   } finally {
     await coordinator.close();
     journal.close();
@@ -409,6 +566,7 @@ test('native coordinator immediately reconciles a lost stream without rerunning 
     clientMessageId: 'message-recovery',
     content: [{ type: 'text', text: 'Long work.' }],
   }));
+  await waitFor(() => Boolean(journal.turn(sent.turnId)));
   firstAdapter.opened[0]?.simulateTransportFailure(new Error('fixture process disappeared'));
   await waitFor(() => journal.turn(sent.turnId)?.outcome === 'recovery_failed');
   assert.equal(firstAdapter.opened.length, 2, 'stream loss immediately reopens the native session');
@@ -477,6 +635,7 @@ test('session-local recovery snapshots preserve an accepted turn until the adapt
       clientMessageId: 'message-session-local-recovery',
       content: [{ type: 'text', text: 'Long work.' }],
     }));
+    await waitFor(() => Boolean(journal.turn(sent.turnId)));
     adapter.opened[0]?.simulateTransportFailure(new Error('fixture process disappeared'));
     await waitFor(() => adapter.opened.length === 2);
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -552,7 +711,7 @@ test('native coordinator bounds repeated automatic stream-loss recovery', async 
   }
 });
 
-test('a rejected provider event is quarantined without turning projection failure into stream loss', async () => {
+test('a colliding provider pass is appended without turning projection failure into stream loss', async () => {
   const journal = createJournal();
   const adapter = new NativeFixtureAdapter({ delayMs: 5, emitPassCollision: true });
   const diagnostics: Array<{ stage: string; status: string }> = [];
@@ -569,7 +728,7 @@ test('a rejected provider event is quarantined without turning projection failur
   try {
     await coordinator.initialize();
     const created = await coordinator.createConversation({
-      commandId: 'create-event-quarantine',
+      commandId: 'create-pass-collision',
       providerInstanceId: 'fixture-local',
       cwd: '/workspace/remux',
       model: 'fixture-native-v1',
@@ -577,18 +736,24 @@ test('a rejected provider event is quarantined without turning projection failur
       access: 'workspace-write',
     });
     const sent = await coordinator.sendMessage(configuredMessage(coordinator, {
-      commandId: 'send-event-quarantine',
+      commandId: 'send-pass-collision',
       conversationId: created.conversationId,
-      clientMessageId: 'message-event-quarantine',
-      content: [{ type: 'text', text: 'Keep going after one rejected event.' }],
+      clientMessageId: 'message-pass-collision',
+      content: [{ type: 'text', text: 'Keep streaming after a pass collision.' }],
     }));
 
     await waitFor(() => journal.turn(sent.turnId)?.state === 'completed');
-    assert.equal(adapter.opened.length, 1, 'projection rejection must not reopen the provider session');
+    assert.equal(adapter.opened.length, 1, 'pass canonicalization must not reopen the provider session');
     assert.equal(journal.conversation(created.conversationId)?.state, 'idle');
     assert.equal(journal.conversation(created.conversationId)?.resumable, true);
-    assert.ok(diagnostics.some(({ stage, status }) =>
-      stage === 'session.event-ingest' && status === 'failed'));
+    assert.equal(diagnostics.some(({ stage, status }) =>
+      stage === 'session.event-ingest' && status === 'failed'), false);
+    const passes = journal.orderedPasses(sent.turnId);
+    assert.deepEqual(passes.map(({ passId, ordinal }) => [passId, ordinal]), [
+      [`fixture-pass-${sent.turnId}`, 0],
+      [`fixture-colliding-pass-${sent.turnId}`, 1],
+    ]);
+    assert.equal(passes[1]?.blocks[0]?.payload.kind, 'reasoning-summary');
     assert.equal(diagnostics.some(({ stage }) => stage === 'session.events'), false,
       'only iterator failure is provider stream loss');
   } finally {
@@ -809,6 +974,117 @@ test('native Compact is idempotent, invisible to turns, and projects its termina
     assert.equal(runtime?.compaction.operation.state, 'idle');
     assert.equal(runtime?.compaction.operation.lastResult?.beforeTokens, 90_000);
     assert.equal(runtime?.compaction.operation.lastResult?.afterTokens, 12_000);
+  } finally {
+    await coordinator.close();
+    journal.close();
+  }
+});
+
+test('native Compact provider failure settles durably and dispatches the queued next turn', async () => {
+  const journal = createJournal();
+  const fixture = new NativeFixtureAdapter({
+    manualCompaction: true,
+    omitCompactionCompletion: true,
+  });
+  let failCompaction: (() => void) | undefined;
+  const adapter: ProviderAdapter = {
+    probe: (providerInstanceId) => fixture.probe(providerInstanceId),
+    listModels: (providerInstanceId) => fixture.listModels(providerInstanceId),
+    openSession: async (input) => {
+      const native = await fixture.openSession(input);
+      const events = new AsyncEventStream<ProviderEventEnvelope>();
+      void (async () => {
+        try {
+          for await (const event of native.events) events.emit(event);
+          events.close();
+        } catch (error) {
+          events.fail(error);
+        }
+      })();
+      const session: ProviderSession = {
+        nativeSession: native.nativeSession,
+        events,
+        startTurn: (request, boundary) => native.startTurn(request, boundary),
+        interrupt: (request) => native.interrupt(request),
+        snapshot: (request) => native.snapshot(request),
+        compact: async (request) => {
+          const acceptance = await native.compact!(request);
+          failCompaction = () => events.emit({
+            contractVersion: PROVIDER_RUNTIME_CONTRACT_VERSION,
+            eventId: `fixture:compact-failed:${request.commandId}`,
+            provider: 'fixture',
+            scope: {
+              kind: 'conversation',
+              providerInstanceId: input.providerInstanceId,
+              conversationId: input.conversationId,
+              executionId: input.executionId,
+            },
+            native: {
+              sessionId: native.nativeSession.sessionId,
+              position: { kind: 'native-sequence', sequence: 1_000_000, subIndex: 0 },
+              kind: 'context/compact/failed',
+            },
+            observedAt: Date.now(),
+            event: {
+              type: 'context.compaction.failed',
+              trigger: 'manual',
+              operationId: request.commandId,
+              error: {
+                code: 'fixture_compaction_failed',
+                message: 'Fixture provider rejected Compact.',
+                retryable: true,
+              },
+            },
+          });
+          return acceptance;
+        },
+        close: () => native.close(),
+      };
+      return session;
+    },
+  };
+  const coordinator = new NativeAgentCoordinator({
+    journal,
+    providers: [{
+      providerInstanceId: 'fixture-local',
+      provider: 'fixture',
+      label: 'Fixture',
+      adapter,
+    }],
+  });
+  try {
+    await coordinator.initialize();
+    const created = await coordinator.createConversation({
+      commandId: 'create-compact-provider-failure',
+      providerInstanceId: 'fixture-local',
+      cwd: '/workspace/remux',
+      model: 'fixture-native-v1',
+      access: 'workspace-write',
+    });
+    const compact = await coordinator.compactConversation({
+      commandId: 'compact-provider-failure',
+      conversationId: created.conversationId,
+    });
+    assert.equal(journal.compactionOperation(compact.operationId)?.state, 'running');
+    const next = await coordinator.sendMessage(configuredMessage(coordinator, {
+      commandId: 'send-after-compact-provider-failure',
+      conversationId: created.conversationId,
+      clientMessageId: 'message-after-compact-provider-failure',
+      content: [{ type: 'text', text: 'Continue after Compact fails.' }],
+    }));
+    assert.equal(next.delivery, 'queued');
+    assert.ok(failCompaction);
+    failCompaction();
+
+    await waitFor(() => journal.compactionOperation(compact.operationId)?.state === 'failed');
+    const failed = journal.compactionOperation(compact.operationId);
+    assert.equal(failed?.error?.code, 'fixture_compaction_failed');
+    assert.equal(failed?.error?.message, 'Fixture provider rejected Compact.');
+    await waitFor(() => journal.turn(next.turnId)?.state === 'completed');
+    assert.deepEqual(fixture.opened[0]?.dispatchLog, [
+      `compact:${compact.operationId}`,
+      `turn:${next.turnId}`,
+    ]);
   } finally {
     await coordinator.close();
     journal.close();
@@ -1644,6 +1920,65 @@ test('cached native history revalidates in the background and mutations wait for
   }
 });
 
+test('events emitted before admission remain durable through a forced history refresh', async () => {
+  const journal = createJournal();
+  const native = new NativeFixtureAdapter({ delayMs: 20, snapshotAuthority: 'session-local' });
+  let clockFloor = Date.now();
+  let initialEvents: readonly ProviderEventEnvelope[] = [];
+  const adapter: ProviderAdapter = {
+    probe: (id) => native.probe(id),
+    listModels: (id) => native.listModels(id),
+    openSession: async (input) => {
+      const session = await native.openSession(input);
+      const start = session.startTurn.bind(session);
+      session.startTurn = async (request, boundary) => {
+        const accepted = await start(request, boundary);
+        initialEvents = (await session.snapshot({ commandId: 'inspect-before-admission' })).events;
+        clockFloor = Math.max(...initialEvents.map(({ observedAt }) => observedAt)) + 1;
+        return accepted;
+      };
+      return session;
+    },
+  };
+  const coordinator = new NativeAgentCoordinator({
+    journal,
+    providers: [{ providerInstanceId: 'fixture-local', provider: 'fixture', label: 'Fixture', adapter }],
+    now: () => Math.max(clockFloor, Date.now()),
+  });
+  try {
+    await coordinator.initialize();
+    const conversation = await coordinator.createConversation({
+      commandId: 'create-early-events', providerInstanceId: 'fixture-local',
+      cwd: '/workspace/remux', model: 'fixture-native-v1', access: 'workspace-write',
+    });
+    const sent = await coordinator.sendMessage(configuredMessage(coordinator, {
+      commandId: 'send-early-events', conversationId: conversation.conversationId,
+      clientMessageId: 'early-message', content: [{ type: 'text', text: 'Complete this turn.' }],
+    }));
+    await waitFor(() => journal.turn(sent.turnId)?.state === 'completed');
+    const initialTurnEvents = initialEvents.filter(({ scope }) => scope.kind === 'turn');
+    assert.ok(initialTurnEvents.some(({ event }) => event.type === 'turn.started'));
+    const turn = journal.turn(sent.turnId)!;
+    const savedIds = new Set(journal.eventsForTurn(sent.turnId).map(({ eventId }) => eventId));
+    for (const early of initialTurnEvents) {
+      assert.ok(early.observedAt < turn.createdAt);
+      assert.ok(savedIds.has(early.eventId), `early ${early.event.type} must be durable`);
+    }
+    await coordinator.prepareTranscriptRead({
+      focusedConversationId: conversation.conversationId,
+      requests: [{ key: `agent/transcript:${conversation.conversationId}:tail-24` }],
+      historySync: 'force',
+    });
+    assert.equal(journal.conversation(conversation.conversationId)?.history.state, 'ready');
+    assert.equal(journal.turn(sent.turnId)?.state, 'completed');
+    assert.equal(journal.turn(sent.turnId)?.updatedAt, turn.updatedAt);
+    assert.equal(native.opened[0]?.providerDispatchCount, 1);
+  } finally {
+    await coordinator.close();
+    journal.close();
+  }
+});
+
 test('a failed required history sync blocks send until an explicit transcript retry succeeds', async () => {
   const journal = createJournal();
   let historyRevision = 'history-r1';
@@ -1782,7 +2117,15 @@ test('native history hydration cancels when its last transcript reader leaves', 
 
 test('edit creates a new strand in place while fork creates a child conversation', async () => {
   const journal = createJournal();
-  const adapter = new NativeFixtureAdapter({ nativeFork: true, finalText: 'Done.' });
+  const branchImageBoundaries: string[] = [];
+  const adapter = new NativeFixtureAdapter({ nativeFork: true, finalText: 'Done.',
+    afterTurnAccepted: (input) => {
+      const artifactId = imageArtifactId(input.content);
+      if (!artifactId) return;
+      assert.equal(journal.artifactGrantedTo({ conversationId: input.conversationId,
+        executionId: input.executionId }, artifactId), true);
+      branchImageBoundaries.push(artifactId);
+    } });
   const coordinator = new NativeAgentCoordinator({
     journal,
     providers: [{
@@ -1812,6 +2155,10 @@ test('edit creates a new strand in place while fork creates a child conversation
     const originalTurn = journal.turn(original.turnId)!;
     const originalHead = journal.conversationHead(created.conversationId)!;
     const runtime = coordinator.projector.runtimeResource(created.conversationId)!;
+    journal.registerArtifact({ artifactId: 'edit-image', sha256: '1'.repeat(64), byteLength: 4,
+      mediaType: 'image/png', visibility: 'viewer', storagePath: '1/edit-image', createdAt: 2 });
+    journal.registerArtifact({ artifactId: 'fork-image', sha256: '2'.repeat(64), byteLength: 4,
+      mediaType: 'image/png', visibility: 'viewer', storagePath: '2/fork-image', createdAt: 2 });
     const edited = await coordinator.branchConversation({
       commandId: 'edit-lineage',
       clientMessageId: 'message-lineage-edited',
@@ -1819,7 +2166,8 @@ test('edit creates a new strand in place while fork creates a child conversation
       sourceStrandId: originalHead.strandId,
       sourcePathEntryId: originalTurn.pathEntryId!,
       expectedHeadRevision: originalHead.revision,
-      content: [{ type: 'text', text: 'Edited prompt.' }],
+      content: [{ type: 'text', text: 'Edited prompt.' },
+        { type: 'image-artifact', artifactId: 'edit-image', mimeType: 'image/png' }],
       mode: 'edit',
       providerInstanceId: runtime.providerInstanceId,
       model: runtime.composer.nextTurn.model,
@@ -1830,6 +2178,8 @@ test('edit creates a new strand in place while fork creates a child conversation
     assert.equal(edited.conversationId, created.conversationId);
     assert.equal(journal.conversationHead(created.conversationId)?.revision, 2);
     assert.equal(journal.conversationVersions(created.conversationId).length, 2);
+    assert.equal(journal.artifactGrantedTo({ conversationId: created.conversationId,
+      executionId: journal.turn(edited.turnId)!.executionId }, 'edit-image'), true);
     assert.deepEqual(
       journal.turns(created.conversationId).map(({ userContent }) => userContent[0]),
       [{ type: 'text', text: 'Edited prompt.' }],
@@ -1846,7 +2196,8 @@ test('edit creates a new strand in place while fork creates a child conversation
       sourceStrandId: editedHead.strandId,
       sourcePathEntryId: editedTurn.pathEntryId!,
       expectedHeadRevision: editedHead.revision,
-      content: [{ type: 'text', text: 'Continue on the fork.' }],
+      content: [{ type: 'text', text: 'Continue on the fork.' },
+        { type: 'image-artifact', artifactId: 'fork-image', mimeType: 'image/png' }],
       mode: 'fork',
       providerInstanceId: editedRuntime.providerInstanceId,
       model: editedRuntime.composer.nextTurn.model,
@@ -1855,6 +2206,9 @@ test('edit creates a new strand in place while fork creates a child conversation
       configurationRevision: editedRuntime.composer.revision,
     });
     assert.notEqual(forked.conversationId, created.conversationId);
+    assert.equal(journal.artifactGrantedTo({ conversationId: forked.conversationId,
+      executionId: journal.turn(forked.turnId)!.executionId }, 'fork-image'), true);
+    assert.deepEqual(branchImageBoundaries, ['edit-image', 'fork-image']);
     assert.equal(journal.conversation(forked.conversationId)?.parentConversationId, created.conversationId);
     assert.deepEqual(
       journal.turns(forked.conversationId).map(({ userContent }) => userContent[0]),
@@ -1960,11 +2314,74 @@ test('provider-accepted edit fails closed when the conversation head changes bef
   }
 });
 
+test('an unknown durable root delivery fences later work after its queue card is removed', async () => {
+  const journal = createJournal();
+  const fixture = new NativeFixtureAdapter();
+  let providerWrites = 0;
+  const adapter: ProviderAdapter = {
+    probe: (id) => fixture.probe(id),
+    listModels: (id) => fixture.listModels(id),
+    openSession: async (input) => {
+      const session = await fixture.openSession(input);
+      session.startTurn = async (_request, boundary) => {
+        boundary?.markPossiblySent(session.nativeSession.sessionId, 'unknown-fixture-generation');
+        providerWrites += 1;
+        return { accepted: false, outcome: 'unknown',
+          crossing: { phase: 'possibly-sent', detail: 'response-lost' },
+          error: { code: 'fixture_response_lost', message: 'Controlled response loss.' } };
+      };
+      return session;
+    },
+  };
+  const coordinator = new NativeAgentCoordinator({ journal, providers: [{
+    providerInstanceId: 'fixture-local', provider: 'fixture', label: 'Fixture', adapter,
+  }] });
+  try {
+    await coordinator.initialize();
+    const created = await coordinator.createConversation({ commandId: 'create-unknown-owner',
+      providerInstanceId: 'fixture-local', cwd: '/workspace/remux', model: 'fixture-native-v1',
+      access: 'workspace-write' });
+    const first = await coordinator.sendMessage(configuredMessage(coordinator, {
+      commandId: 'unknown-root-1', conversationId: created.conversationId,
+      clientMessageId: 'unknown-client-1', content: [{ type: 'text', text: 'First.' }],
+    }));
+    await waitFor(() => (journal.database.prepare(`SELECT state FROM delivery_attempts
+      WHERE command_id='unknown-root-1'`).get() as { state: string } | undefined)?.state === 'unknown');
+    assert.equal(journal.commandReceipt('unknown-root-1')?.state, 'accepted');
+    journal.removeQueuedTurnById(created.conversationId, first.turnId, Date.now());
+    const heldRuntime = coordinator.projector.runtimeResource(created.conversationId)!;
+    assert.equal(heldRuntime.composer.editable.access, false);
+    await assert.rejects(() => coordinator.setConversationAccess({
+      commandId: 'unknown-access-change', conversationId: created.conversationId,
+      expectedRevision: heldRuntime.composer.revision, access: 'read-only',
+    }), /delivery is unresolved/u);
+    await assert.rejects(() => coordinator.compactConversation({
+      commandId: 'unknown-compact', conversationId: created.conversationId,
+    }), /delivery is unresolved/u);
+    await coordinator.sendMessage(configuredMessage(coordinator, {
+      commandId: 'unknown-root-2', conversationId: created.conversationId,
+      clientMessageId: 'unknown-client-2', content: [{ type: 'text', text: 'Second.' }],
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(providerWrites, 1);
+    assert.equal((journal.database.prepare(`SELECT state FROM queued_messages
+      WHERE command_id='unknown-root-2'`).get() as { state: string }).state, 'queued');
+  } finally {
+    await coordinator.close();
+    journal.close();
+  }
+});
+
 function createJournal() {
   const database = new DatabaseSync(':memory:');
   database.exec('PRAGMA foreign_keys = ON');
   createNativeAgentSchema(database);
   return new NativeAgentJournal(database);
+}
+
+function imageArtifactId(content: readonly UserContentPart[]) {
+  for (const part of content) if (part.type === 'image-artifact') return part.artifactId;
+  return undefined;
 }
 
 function fixtureHistoryEvents(
@@ -2016,7 +2433,7 @@ function configuredMessage(
     commandId: string;
     conversationId: string;
     clientMessageId: string;
-    content: readonly ({ type: 'text'; text: string })[];
+    content: readonly UserContentPart[];
   },
 ) {
   const runtime = coordinator.projector.runtimeResource(input.conversationId);

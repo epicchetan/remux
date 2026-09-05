@@ -19,6 +19,17 @@ import { createNativeAgentSchema } from '../server/src/native-runtime/schema.ts'
 import { prepareAgentDataPaths } from '../server/src/storage/data-root.ts';
 import type { NativeTranscriptWindow } from '../shared/native-agent-protocol.ts';
 
+const declaredCheckoutPaths = new Set([
+  '/workspace/artifact-failure', '/workspace/artifact-scope', '/workspace/deadline',
+  '/workspace/orphan', '/workspace/other', '/workspace/progress',
+  '/workspace/progress/src/runtime.ts', '/workspace/remux', '/workspace/request-id',
+  '/workspace/restart', '/workspace/shared-checkout', '/workspace/shared-limits',
+]);
+const declaredCheckoutResolver = async (cwd: string) => declaredCheckoutPaths.has(cwd)
+  ? { state: 'resolved' as const,
+      value: { checkoutKey: `test-checkout:${cwd}`, launchCwd: cwd } }
+  : { state: 'indeterminate' as const, reason: `Undeclared fixture cwd: ${cwd}` };
+
 test('federation credentials are generation-bound, native-session-bound, and expire when abandoned', () => {
   let now = 1_000;
   const credentials = new FederationCredentialRegistry({ now: () => now });
@@ -66,7 +77,9 @@ test('federation MCP scopes identity, access, provider boundary, and child proje
   const journal = createJournal();
   const credentials = new FederationCredentialRegistry();
   const rootAdapter = new NativeFixtureAdapter({ provider: 'codex', delayMs: 60_000 });
-  const childAdapter = new NativeFixtureAdapter({ provider: 'claude-code', delayMs: 2 });
+  const childAdapter = new NativeFixtureAdapter({ provider: 'claude-code', delayMs: 2,
+    emitNativeChild: true });
+  const newlyReadyAdapter = new NativeFixtureAdapter({ provider: 'claude-code', delayMs: 2 });
   const issued = new Map<string, Awaited<ReturnType<RemuxFederationServer['issueForSession']>>>();
   let coordinator!: NativeAgentCoordinator;
   const federation = new RemuxFederationServer({
@@ -77,6 +90,7 @@ test('federation MCP scopes identity, access, provider boundary, and child proje
   });
   coordinator = new NativeAgentCoordinator({
     journal,
+    checkoutResolver: declaredCheckoutResolver,
     providers: [{
       providerInstanceId: 'codex-local',
       provider: 'codex',
@@ -87,6 +101,11 @@ test('federation MCP scopes identity, access, provider boundary, and child proje
       provider: 'claude-code',
       label: 'Claude fixture',
       adapter: childAdapter,
+    }, {
+      providerInstanceId: 'missing',
+      provider: 'claude-code',
+      label: 'Newly ready fixture',
+      adapter: newlyReadyAdapter,
     }],
     federationForSession: async (input) => {
       const config = federation.issueForSession(input);
@@ -97,6 +116,11 @@ test('federation MCP scopes identity, access, provider boundary, and child proje
   let client: Client | undefined;
   try {
     await federation.start();
+    await assert.rejects(coordinator.spawnFederatedAgent({ commandId: 'before-ready',
+      parentConversationId: 'missing', parentExecutionId: 'missing', rootTurnId: 'missing',
+      targetProviderInstanceId: 'claude-local', task: 'must wait', access: 'read-only',
+      scheduling: 'background', depth: 1 }), /temporarily unavailable during initialization/u);
+    assert.equal(journal.commandReceipt('before-ready'), undefined);
     await coordinator.initialize();
     const created = await coordinator.createConversation({
       commandId: 'create-federation-root',
@@ -141,6 +165,52 @@ test('federation MCP scopes identity, access, provider boundary, and child proje
       /same native provider session continues with its full context/iu,
     );
 
+    const frozenModels = coordinator.projector.listModels('claude-local');
+    assert.equal(frozenModels.length, 1);
+    const futureModel = {
+      ...frozenModels[0]!,
+      id: 'fixture-native-v2',
+      name: 'Native Fixture v2',
+      isDefault: true,
+      supportedEffort: ['ultra'],
+    };
+    coordinator.projector.setModels('claude-local', [
+      futureModel,
+      {
+        ...frozenModels[0]!,
+        isDefault: false,
+        supportedEffort: [...frozenModels[0]!.supportedEffort, 'ultra'],
+      },
+    ]);
+    const readyProbe = journal.providerInstance('claude-local')!.probe;
+    const unavailableProbe = journal.providerInstance('missing')!.probe;
+    journal.upsertProviderInstance({
+      providerInstanceId: 'missing',
+      provider: 'claude-code',
+      label: 'Newly ready fixture',
+      probe: readyProbe,
+      now: Date.now(),
+    });
+    coordinator.projector.setModels('missing', frozenModels);
+
+    for (const [target, expected] of [
+      [{ providerInstanceId: 'missing' }, /outside this credential scope/iu],
+      [{ providerInstanceId: 'claude-local', model: 'fixture-native-v2' }, /model .* outside/iu],
+      [{ providerInstanceId: 'claude-local', effort: 'ultra' }, /effort .* outside/iu],
+    ] as const) {
+      const rejected = await client.callTool({
+        name: 'remux_spawn_agent',
+        arguments: {
+          task: 'This target was not granted by the frozen catalog.',
+          target,
+          access: 'read-only',
+          scheduling: 'background',
+        },
+      });
+      assert.equal(rejected.isError, true);
+      assert.match(toolText(rejected), expected);
+    }
+
     const malformed = await client.callTool({
       name: 'remux_spawn_agent',
       arguments: {
@@ -163,7 +233,7 @@ test('federation MCP scopes identity, access, provider boundary, and child proje
       },
     });
     assert.equal(sameProvider.isError, true);
-    assert.match(toolText(sameProvider), /use_native_collaboration/iu);
+    assert.match(toolText(sameProvider), /outside this credential scope/iu);
 
     const escalation = await client.callTool({
       name: 'remux_spawn_agent',
@@ -181,7 +251,7 @@ test('federation MCP scopes identity, access, provider boundary, and child proje
       name: 'remux_spawn_agent',
       arguments: {
         task: 'Review the runtime boundary and report one concise result.',
-        target: { providerInstanceId: 'claude-local' },
+        target: { providerInstanceId: 'claude-local', effort: 'high' },
         access: 'read-only',
         scheduling: 'background',
       },
@@ -189,6 +259,50 @@ test('federation MCP scopes identity, access, provider boundary, and child proje
     assert.equal(spawnedCall.isError, undefined);
     const spawned = JSON.parse(toolText(spawnedCall)) as { executionId: string };
     assert.ok(spawned.executionId);
+    assert.equal(journal.execution(spawned.executionId)?.model, 'fixture-native-v1',
+      'an omitted model resolves to the frozen default after the current default changes');
+    assert.equal(journal.execution(spawned.executionId)?.effort, 'high',
+      'an effort advertised by the frozen model remains allowed');
+
+    coordinator.projector.setModels('claude-local', [futureModel]);
+    const removedModel = await client.callTool({
+      name: 'remux_spawn_agent',
+      arguments: {
+        task: 'The frozen model has since been removed.',
+        target: { providerInstanceId: 'claude-local', model: 'fixture-native-v1' },
+        access: 'read-only',
+        scheduling: 'background',
+      },
+    });
+    assert.equal(removedModel.isError, true);
+    assert.match(toolText(removedModel), /model is unavailable/iu);
+
+    coordinator.projector.setModels('claude-local', frozenModels);
+    journal.upsertProviderInstance({
+      providerInstanceId: 'claude-local',
+      provider: 'claude-code',
+      label: 'Claude fixture',
+      probe: unavailableProbe,
+      now: Date.now(),
+    });
+    const unavailableTarget = await client.callTool({
+      name: 'remux_spawn_agent',
+      arguments: {
+        task: 'The frozen target has since become unavailable.',
+        target: { providerInstanceId: 'claude-local' },
+        access: 'read-only',
+        scheduling: 'background',
+      },
+    });
+    assert.equal(unavailableTarget.isError, true);
+    assert.match(toolText(unavailableTarget), /missing|not ready/iu);
+    journal.upsertProviderInstance({
+      providerInstanceId: 'claude-local',
+      provider: 'claude-code',
+      label: 'Claude fixture',
+      probe: readyProbe,
+      now: Date.now(),
+    });
 
     const waitedCall = await client.callTool({
       name: 'remux_wait_agent',
@@ -210,6 +324,9 @@ test('federation MCP scopes identity, access, provider boundary, and child proje
     assert.equal(result?.finalAnswer.kind, 'inline');
     assert.match(result?.finalAnswer.text ?? '', /Native fixture response/);
     assert.deepEqual(result?.changedFiles, []);
+    assert.equal((result as { changedFilesTruncated?: number }).changedFilesTruncated, 0);
+    assert.equal((journal.database.prepare(`SELECT state FROM federation_checkout_reservations
+      WHERE execution_id=?`).get(spawned.executionId) as { state: string }).state, 'released');
     const listedCall = await client.callTool({
       name: 'remux_list_agents',
       arguments: { state: 'idle', limit: 8 },
@@ -249,7 +366,7 @@ test('federation MCP scopes identity, access, provider boundary, and child proje
         message: 'Check one focused detail in the same native session.',
       },
     });
-    assert.equal(followUp.isError, undefined);
+    assert.equal(followUp.isError, undefined, toolText(followUp));
     const followUpResult = JSON.parse(toolText(followUp)) as {
       status: string;
       finalAnswer: { kind: string; text: string };
@@ -336,12 +453,21 @@ test('foreground federation stays alive with progress and exposes exact overflow
     'the exact artifact path must remain lossless beyond the former provider-event ceiling');
   const childAdapter = new NativeFixtureAdapter({
     provider: 'claude-code',
-    delayMs: 80,
+    delayMs: 1_000,
     finalText,
     fileChanges: [
-      { path: '/workspace/progress/src/runtime.ts', kind: 'update' },
+      {
+        path: '/workspace/progress/src/runtime.ts',
+        kind: 'add',
+        diffArtifactId: 'd'.repeat(64),
+      },
       { path: 'tests/runtime.test.ts', kind: 'add' },
       { path: '/etc/remux-outside.ts', kind: 'update' },
+      { path: '/workspace/progress/src/runtime.ts', kind: 'update' },
+      ...Array.from({ length: 500 }, (_, index) => ({
+        path: `/workspace/progress/generated/file-${String(index).padStart(3, '0')}.ts`,
+        kind: 'add' as const,
+      })),
     ],
   });
   const credentials = new FederationCredentialRegistry();
@@ -351,11 +477,14 @@ test('foreground federation stays alive with progress and exposes exact overflow
     credentials,
     coordinator: () => coordinator,
     generation: () => coordinator.projector.serverGeneration,
-    progressIntervalMs: 5,
-    readTextArtifact: (artifactId) => artifacts.readTextArtifact(artifactId),
+    progressIntervalMs: 50,
+    waitTimeoutMs: 5_000,
+    readTextArtifact: (scope, artifactId, turnId) =>
+      artifacts.readTextArtifactForScope(scope, artifactId, turnId),
   });
   coordinator = new NativeAgentCoordinator({
     journal,
+    checkoutResolver: declaredCheckoutResolver,
     providers: fixtureProviders(rootAdapter, childAdapter),
     sealTurnOutput: ({ turnId, text }) => artifacts.sealAssistantText(turnId, text)
       .then(() => undefined),
@@ -391,6 +520,17 @@ test('foreground federation stays alive with progress and exposes exact overflow
     await client.connect(new StreamableHTTPClientTransport(new URL(federation.endpoint), {
       requestInit: { headers: { Authorization: credential.authorizationHeader } },
     }));
+    journal.registerArtifact({ artifactId: 'mcp-guessed-image', sha256: '9'.repeat(64), byteLength: 4,
+      mediaType: 'image/png', visibility: 'viewer', storagePath: '9/mcp-guessed-image', createdAt: 1 });
+    const guessedAttachment = await client.callTool({ name: 'remux_spawn_agent', arguments: {
+      task: 'Do not allocate this guessed attachment.', target: { providerInstanceId: 'claude-local' },
+      access: 'read-only', scheduling: 'background',
+      attachments: [{ artifactId: 'mcp-guessed-image', mimeType: 'image/png' }],
+    } });
+    assert.equal(guessedAttachment.isError, true);
+    assert.match(toolText(guessedAttachment), /outside the provider execution scope/iu);
+    assert.equal(journal.executionsForConversation(created.conversationId)
+      .filter(({ ownership }) => ownership === 'federated').length, 0);
     const backgroundWriter = await client.callTool({
       name: 'remux_spawn_agent',
       arguments: {
@@ -412,13 +552,14 @@ test('foreground federation stays alive with progress and exposes exact overflow
         scheduling: 'foreground',
       },
     }, undefined, {
-      timeout: 20,
+      timeout: 250,
       resetTimeoutOnProgress: true,
-      maxTotalTimeout: 2_000,
+      maxTotalTimeout: 5_000,
       onprogress: (update) => progress.push(update),
     });
     assert.equal(result.isError, undefined);
     assert.ok(progress.length >= 3, JSON.stringify(progress));
+    assert.ok(progress.length < 100, 'the total MCP deadline remains bounded');
     assert.deepEqual(progress.map(({ progress: value }) => value),
       progress.map((_, index) => index + 1));
     assert.match(progress.at(-1)?.message ?? '', /terminal boundary/iu);
@@ -433,15 +574,34 @@ test('foreground federation stays alive with progress and exposes exact overflow
         artifact: { uri: string; byteLength: number; sha256: string };
       };
       changedFiles: Array<{ path: string; kind: string }>;
+      changedFilesTruncated: number;
     };
     assert.equal(parsed.status, 'completed');
     assert.equal(parsed.finalAnswer.kind, 'artifact');
     assert.ok(parsed.finalAnswer.artifact.byteLength > NATIVE_ASSISTANT_PREVIEW_BYTES);
     assert.doesNotMatch(parsed.finalAnswer.preview, new RegExp(marker));
-    assert.deepEqual(parsed.changedFiles, [
-      { path: 'src/runtime.ts', kind: 'update' },
+    assert.equal(parsed.changedFiles.length, 500);
+    assert.deepEqual(parsed.changedFiles.slice(0, 2), [
       { path: 'tests/runtime.test.ts', kind: 'add' },
+      { path: 'src/runtime.ts', kind: 'update', diffArtifactId: 'd'.repeat(64) },
     ]);
+    assert.deepEqual(parsed.changedFiles.at(-1), {
+      path: 'generated/file-497.ts',
+      kind: 'add',
+    });
+    assert.equal(parsed.changedFilesTruncated, 2);
+    journal.registerArtifact({ artifactId: 'child-private-image', sha256: '8'.repeat(64), byteLength: 4,
+      mediaType: 'image/png', visibility: 'viewer', storagePath: '8/child-private-image', createdAt: 2 });
+    journal.grantArtifact({ artifactId: 'child-private-image', conversationId: created.conversationId,
+      executionId: parsed.executionId, provenance: 'execution-output',
+      sourceExecutionId: parsed.executionId, createdAt: 2 });
+    const siblingGuess = await client.callTool({ name: 'remux_spawn_agent', arguments: {
+      task: 'Do not inherit a sibling private output.', target: { providerInstanceId: 'claude-local' },
+      access: 'read-only', scheduling: 'background',
+      attachments: [{ artifactId: 'child-private-image', mimeType: 'image/png' }],
+    } });
+    assert.equal(siblingGuess.isError, true);
+    assert.match(toolText(siblingGuess), /outside the provider execution scope/iu);
     assert.deepEqual(childAdapter.opened[0]?.turnInputs[0]?.content, [{
       type: 'text',
       text: 'Implement the exact bounded change and report every verification step.',
@@ -485,6 +645,13 @@ test('foreground federation stays alive with progress and exposes exact overflow
     await otherClient.connect(new StreamableHTTPClientTransport(new URL(federation.endpoint), {
       requestInit: { headers: { Authorization: otherCredential.authorizationHeader } },
     }));
+    const crossConversationGuess = await otherClient.callTool({ name: 'remux_spawn_agent', arguments: {
+      task: 'Do not cross conversation artifact scope.', target: { providerInstanceId: 'claude-local' },
+      access: 'read-only', scheduling: 'background',
+      attachments: [{ artifactId: 'child-private-image', mimeType: 'image/png' }],
+    } });
+    assert.equal(crossConversationGuess.isError, true);
+    assert.match(toolText(crossConversationGuess), /outside the provider execution scope/iu);
     await assert.rejects(
       () => otherClient!.readResource({ uri: parsed.finalAnswer.artifact.uri }),
       /outside this credential scope/iu,
@@ -517,6 +684,7 @@ test('federation HTTP wait deadline leaves the accepted child running and discov
   });
   coordinator = new NativeAgentCoordinator({
     journal,
+    checkoutResolver: declaredCheckoutResolver,
     providers: fixtureProviders(rootAdapter, childAdapter),
     federationForSession: async (input) => federation.issueForSession(input),
   });
@@ -573,6 +741,7 @@ test('federation result fails boundedly when a large final answer cannot be seal
   });
   const coordinator = new NativeAgentCoordinator({
     journal,
+    checkoutResolver: declaredCheckoutResolver,
     providers: fixtureProviders(rootAdapter, childAdapter),
     sealTurnOutput: async () => { throw new Error('simulated artifact failure'); },
   });
@@ -602,12 +771,64 @@ test('federation result fails boundedly when a large final answer cannot be seal
   }
 });
 
+test('coordinator retains a writable parent checkout until a later native-child summary terminal', async () => {
+  const journal = createJournal();
+  const rootAdapter = new NativeFixtureAdapter({ provider: 'codex', delayMs: 60_000 });
+  const childAdapter = new NativeFixtureAdapter({ provider: 'claude-code', delayMs: 2,
+    emitNativeChild: true, nativeChildCompletionDelayMs: 100 });
+  const coordinator = new NativeAgentCoordinator({
+    journal,
+    checkoutResolver: declaredCheckoutResolver,
+    providers: fixtureProviders(rootAdapter, childAdapter),
+  });
+  try {
+    await coordinator.initialize();
+    const created = await coordinator.createConversation({
+      commandId: 'create-native-child-lifetime-root', providerInstanceId: 'codex-local',
+      cwd: '/workspace/remux', model: 'fixture-native-v1', access: 'workspace-write',
+    });
+    const root = journal.conversation(created.conversationId)!;
+    const rootTurn = await coordinator.sendMessage(configuredMessage(coordinator, {
+      commandId: 'start-native-child-lifetime-root', conversationId: created.conversationId,
+      clientMessageId: 'native-child-lifetime-root-message',
+      content: [{ type: 'text', text: 'Delegate writable work.' }],
+    }));
+    const parent = await coordinator.spawnFederatedAgent({
+      commandId: 'spawn-native-child-lifetime-parent', parentConversationId: created.conversationId,
+      parentExecutionId: root.rootExecutionId, rootTurnId: rootTurn.turnId,
+      targetProviderInstanceId: 'claude-local', task: 'Run a native child.',
+      access: 'workspace-write', scheduling: 'foreground', depth: 1,
+    });
+    assert.equal((await coordinator.waitForFederatedExecution(parent.executionId)).status, 'completed');
+    const nativeChild = journal.database.prepare(`SELECT e.execution_id FROM executions e
+      JOIN native_child_handles h USING(execution_id) WHERE e.parent_execution_id=?`)
+      .get(parent.executionId) as { execution_id: string } | undefined;
+    assert.ok(nativeChild, 'provider ingestion materializes a durable native child handle');
+    const held = journal.database.prepare(`SELECT state,terminal_evidence_json
+      FROM federation_checkout_reservations WHERE execution_id=?`).get(parent.executionId) as {
+      state: string; terminal_evidence_json: string | null };
+    assert.equal(held.state, 'held');
+    assert.equal((JSON.parse(held.terminal_evidence_json ?? '{}') as { outcome?: string }).outcome, 'completed');
+    await waitUntil(() => (journal.database.prepare(`SELECT state FROM federation_checkout_reservations
+      WHERE execution_id=?`).get(parent.executionId) as { state: string }).state === 'released');
+    const [parentTurn] = journal.turnsForExecution(parent.executionId);
+    assert.ok(parentTurn);
+    assert.equal(journal.eventsForTurn(parentTurn.turnId).filter(
+      ({ event }) => event.type === 'turn.completed').length, 1,
+    'the later summary releases stored evidence without a second parent turn terminal');
+  } finally {
+    await coordinator.close();
+    journal.close();
+  }
+});
+
 test('federation coordinator makes spawn idempotent and serializes checkout writers', async () => {
   const journal = createJournal();
   const rootAdapter = new NativeFixtureAdapter({ provider: 'codex', delayMs: 60_000 });
   const childAdapter = new NativeFixtureAdapter({ provider: 'claude-code', delayMs: 60_000 });
   const coordinator = new NativeAgentCoordinator({
     journal,
+    checkoutResolver: declaredCheckoutResolver,
     providers: [{
       providerInstanceId: 'codex-local',
       provider: 'codex',
@@ -647,7 +868,15 @@ test('federation coordinator makes spawn idempotent and serializes checkout writ
       scheduling: 'foreground' as const,
       depth: 1,
     };
-    const first = await coordinator.spawnFederatedAgent(input);
+    await assert.rejects(() => coordinator.spawnFederatedAgent({
+      ...input,
+      commandId: 'spawn-same-provider',
+      targetProviderInstanceId: 'codex-local',
+    }), /use_native_collaboration/iu);
+    const firstPending = coordinator.spawnFederatedAgent(input);
+    const overlapping = coordinator.spawnFederatedAgent(structuredClone(input));
+    const [first, overlappingResult] = await Promise.all([firstPending, overlapping]);
+    assert.deepEqual(overlappingResult, first);
     const disconnected = new AbortController();
     const foregroundWait = coordinator.waitForFederatedExecution(first.executionId, disconnected.signal);
     disconnected.abort();
@@ -702,6 +931,7 @@ test('federation coordinator enforces depth, active, total, and checkout reader 
   const childAdapter = new NativeFixtureAdapter({ provider: 'claude-code', delayMs: 60_000 });
   const coordinator = new NativeAgentCoordinator({
     journal,
+    checkoutResolver: declaredCheckoutResolver,
     providers: [{
       providerInstanceId: 'codex-local',
       provider: 'codex',
@@ -789,6 +1019,7 @@ test('federated stream loss immediately reconciles and never reruns an accepted 
   const childAdapter = new NativeFixtureAdapter({ provider: 'claude-code', delayMs: 60_000 });
   const first = new NativeAgentCoordinator({
     journal,
+    checkoutResolver: declaredCheckoutResolver,
     providers: fixtureProviders(rootAdapter, childAdapter),
   });
   await first.initialize();
@@ -815,13 +1046,17 @@ test('federated stream loss immediately reconciles and never reruns an accepted 
   });
   assert.equal(childAdapter.opened.length, 2);
   assert.equal(childAdapter.opened[1]?.providerDispatchCount, 0);
-  assert.equal(journal.activeFederatedExecutionsForCwd('/workspace/restart').length, 0);
+  assert.deepEqual({ ...journal.database.prepare(`SELECT state,checkout_key FROM
+    federation_checkout_reservations WHERE execution_id=?`).get(child.executionId) }, {
+    state: 'held', checkout_key: 'test-checkout:/workspace/restart',
+  });
   await first.close();
 
   const replacementRoot = new NativeFixtureAdapter({ provider: 'codex' });
   const replacementChild = new NativeFixtureAdapter({ provider: 'claude-code' });
   const replacement = new NativeAgentCoordinator({
     journal,
+    checkoutResolver: declaredCheckoutResolver,
     providers: fixtureProviders(replacementRoot, replacementChild),
   });
   try {
@@ -847,6 +1082,7 @@ test('federation command identity scopes request retries to the active caller tu
   const childAdapter = new NativeFixtureAdapter({ provider: 'claude-code', delayMs: 60_000 });
   const coordinator = new NativeAgentCoordinator({
     journal,
+    checkoutResolver: declaredCheckoutResolver,
     providers: fixtureProviders(rootAdapter, childAdapter),
   });
   try {
@@ -893,12 +1129,56 @@ test('federation command identity scopes request retries to the active caller tu
   }
 });
 
+test('federation attachments require a preexisting caller grant before child allocation', async () => {
+  const journal = createJournal();
+  const coordinator = new NativeAgentCoordinator({
+    journal,
+    checkoutResolver: declaredCheckoutResolver,
+    providers: fixtureProviders(
+      new NativeFixtureAdapter({ provider: 'codex', delayMs: 60_000 }),
+      new NativeFixtureAdapter({ provider: 'claude-code', delayMs: 60_000 }),
+    ),
+  });
+  try {
+    await coordinator.initialize();
+    const root = await activeRoot(coordinator, journal, 'artifact-scope', '/workspace/artifact-scope');
+    journal.registerArtifact({ artifactId: 'image-guessed', sha256: 'a'.repeat(64), byteLength: 4,
+      mediaType: 'image/png', visibility: 'viewer', storagePath: 'aa/image-guessed', createdAt: 1 });
+    const base = {
+      parentConversationId: root.conversationId,
+      parentExecutionId: root.executionId,
+      rootTurnId: root.turnId,
+      targetProviderInstanceId: 'claude-local',
+      task: 'Inspect the attached image.',
+      attachments: [{ type: 'image-artifact' as const, artifactId: 'image-guessed',
+        mimeType: 'image/png' }],
+      access: 'read-only' as const,
+      scheduling: 'background' as const,
+      depth: 1,
+    };
+    await assert.rejects(() => coordinator.spawnFederatedAgent({ commandId: 'guessed-image', ...base }),
+      /outside the provider execution scope/iu);
+    assert.equal(journal.executionsForConversation(root.conversationId)
+      .filter(({ ownership }) => ownership === 'federated').length, 0);
+    journal.grantArtifact({ artifactId: 'image-guessed', conversationId: root.conversationId,
+      provenance: 'viewer-message', createdAt: 2 });
+    const admitted = await coordinator.spawnFederatedAgent({ commandId: 'granted-image', ...base });
+    assert.equal(journal.artifactGrantedTo({ conversationId: root.conversationId,
+      executionId: admitted.executionId }, 'image-guessed'), true);
+    await coordinator.interruptFederatedExecution('interrupt-granted-image', admitted.executionId);
+  } finally {
+    await coordinator.close();
+    journal.close();
+  }
+});
+
 test('restart fails federated spawns interrupted before or after native-session binding', async () => {
   const journal = createJournal();
   const originalRoot = new NativeFixtureAdapter({ provider: 'codex', delayMs: 60_000 });
   const originalChild = new NativeFixtureAdapter({ provider: 'claude-code' });
   const original = new NativeAgentCoordinator({
     journal,
+    checkoutResolver: declaredCheckoutResolver,
     providers: fixtureProviders(originalRoot, originalChild),
   });
   await original.initialize();
@@ -954,6 +1234,7 @@ test('restart fails federated spawns interrupted before or after native-session 
   const replacementChild = new NativeFixtureAdapter({ provider: 'claude-code' });
   const replacement = new NativeAgentCoordinator({
     journal,
+    checkoutResolver: declaredCheckoutResolver,
     providers: fixtureProviders(new NativeFixtureAdapter({ provider: 'codex' }), replacementChild),
   });
   try {
@@ -962,7 +1243,11 @@ test('restart fails federated spawns interrupted before or after native-session 
     assert.equal(journal.execution(executionId)?.outcome, 'recovery_failed');
     assert.equal(journal.execution(unboundExecutionId)?.outcome, 'recovery_failed');
     assert.equal(journal.commandReceipt(commandId)?.state, 'recovery_failed');
-    assert.equal(journal.activeFederatedExecutionsForCwd('/workspace/orphan').length, 0);
+    assert.deepEqual(journal.database.prepare(`SELECT execution_id,state,checkout_key
+      FROM federation_checkout_reservations WHERE execution_id=?`).all(unboundExecutionId)
+      .map((row) => ({ ...row })), [
+      { execution_id: unboundExecutionId, state: 'unknown', checkout_key: 'test-checkout:/workspace/orphan' },
+    ], 'a no-handle/no-turn local recovery failure retains its scoped checkout fence');
   } finally {
     await replacement.close();
     journal.close();

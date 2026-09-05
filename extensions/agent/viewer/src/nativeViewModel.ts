@@ -13,12 +13,7 @@ import type {
   ConversationSummary,
   ModelInfo,
   ModelsValue,
-  ReasoningLevel,
 } from '../../shared/protocol.ts';
-
-const REASONING_LEVELS = new Set<ReasoningLevel>([
-  'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max',
-]);
 
 export function projectNativeAuth(resource: AgentProvidersResource): AuthValue {
   const provider = resource.providers.find(({ state }) => state === 'ready')
@@ -68,7 +63,9 @@ export function projectNativeModels(resources: readonly AgentModelsResource[]): 
     provider: model.provider,
     providerInstanceId: resource.providerInstanceId,
     contextWindow: model.contextWindow ?? 0,
-    supportedReasoning: model.supportedEffort.filter(isReasoningLevel),
+    supportedReasoning: [...model.supportedEffort],
+    serviceTiers: [...(model.serviceTiers ?? [])],
+    defaultServiceTier: model.defaultServiceTier ?? null,
   })));
   const defaultResource = resources.find((resource) => resource.defaultModelId) ?? resources[0];
   return {
@@ -95,10 +92,12 @@ export function projectNativeConversation(
     preview: conversation.preview,
     cwd: conversation.cwd,
     modelId: viewerModelId(conversation.providerInstanceId, conversation.model),
-    reasoning: isReasoningLevel(conversation.effort) ? conversation.effort : 'off',
+    reasoning: conversation.effort ?? null,
+    serviceTier: conversation.serviceTier ?? null,
     provider: conversation.provider,
     providerInstanceId: conversation.providerInstanceId,
     access: conversation.access,
+    resumable: conversation.resumable,
     status: conversation.state === 'idle'
       ? 'idle'
       : conversation.state === 'failed' || conversation.state === 'interrupted'
@@ -129,7 +128,8 @@ export function projectNativeRuntime(resource: AgentRuntimeResource | null): Age
     conversationId: resource.conversationId,
     providerInstanceId: resource.providerInstanceId,
     modelId: viewerModelId(resource.providerInstanceId, resource.composer.nextTurn.model),
-    effort: isReasoningLevel(resource.composer.nextTurn.effort) ? resource.composer.nextTurn.effort : 'off',
+    effort: resource.composer.nextTurn.effort ?? null,
+    serviceTier: resource.composer.nextTurn.serviceTier,
     capabilities: resource.capabilities,
     state: resource.state === 'idle'
       ? 'idle'
@@ -150,6 +150,7 @@ export function projectNativeQueue(resource: AgentQueueResource | null): AgentPe
   return {
     conversationId: resource.conversationId,
     entries: resource.entries.map((entry) => ({
+      kind: entry.kind,
       id: entry.kind === 'message' ? entry.turnId : entry.operationId,
       createdAt: entry.createdAt,
       ...(entry.kind === 'message' ? { state: entry.state } : {}),
@@ -162,8 +163,4 @@ export function projectNativeQueue(resource: AgentQueueResource | null): AgentPe
         ? entry.content.filter((part) => part.type === 'file-reference').length : 0,
     })),
   };
-}
-
-function isReasoningLevel(value: unknown): value is ReasoningLevel {
-  return typeof value === 'string' && REASONING_LEVELS.has(value as ReasoningLevel);
 }

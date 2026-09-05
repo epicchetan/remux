@@ -22,6 +22,7 @@ import {
   FEDERATION_TOOLS,
   FederationAuthorizationError,
   FederationCredentialRegistry,
+  resolveFederationTarget,
   type FederationCredentialScope,
   type FederationToolName,
 } from './credential-registry.ts';
@@ -76,7 +77,7 @@ export type RemuxFederationServerOptions = {
   credentials: FederationCredentialRegistry;
   coordinator: () => NativeAgentCoordinator;
   generation: () => string;
-  readTextArtifact?: (artifactId: string) => Promise<{
+  readTextArtifact?: (scope: { conversationId: string; executionId: string }, artifactId: string, turnId: string) => Promise<{
     text: string;
     mimeType: string;
     byteLength: number;
@@ -253,7 +254,10 @@ export class RemuxFederationServer {
           throw new Error('Federated final-answer artifact is unavailable.');
         }
         if (!this.readTextArtifact) throw new Error('Federated artifact storage is unavailable.');
-        const artifact = await this.readTextArtifact(turn.assistantArtifactId);
+        const artifact = await this.readTextArtifact({
+          conversationId: turn.conversationId,
+          executionId,
+        }, turn.assistantArtifactId, turnId);
         return {
           contents: [{
             uri: uri.href,
@@ -296,7 +300,7 @@ export class RemuxFederationServer {
               model: execution.model ?? null,
               state: execution.state,
               scheduling: execution.federationScheduling ?? 'background',
-              access: execution.access === 'workspace-write' ? 'workspace-write' as const : 'read-only' as const,
+              access: execution.access ?? 'read-only',
               summary: execution.summary ? boundedDescriptor(execution.summary, 4_096) : null,
               canSendMessage: !active && !closed,
               canWait: active,
@@ -327,19 +331,20 @@ export class RemuxFederationServer {
       const input = spawnSchema.parse(unparsed);
       this.requireTool(scope, 'remux_spawn_agent');
       const context = this.activeContext(scope);
+      const target = resolveFederationTarget(scope, input.target);
       const commandId = commandIdentity(token, context.callerTurnId, 'spawn', extra.requestId);
       const spawned = await this.coordinator().spawnFederatedAgent({
         commandId,
         parentConversationId: scope.conversationId,
         parentExecutionId: scope.executionId,
         rootTurnId: context.rootTurnId,
-        targetProviderInstanceId: input.target.providerInstanceId,
+        targetProviderInstanceId: target.providerInstanceId,
         task: input.task,
         access: input.access,
         scheduling: input.scheduling,
         depth: scope.depth + 1,
-        ...(input.target.model ? { model: input.target.model } : {}),
-        ...(input.target.effort ? { effort: input.target.effort } : {}),
+        model: target.model,
+        ...(target.effort ? { effort: target.effort } : {}),
         ...(input.attachments ? {
           attachments: input.attachments.map((artifact) => ({
             type: 'image-artifact' as const,

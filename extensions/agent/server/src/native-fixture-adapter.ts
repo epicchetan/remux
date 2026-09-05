@@ -32,6 +32,7 @@ import type {
   ProviderSession,
 } from './provider-adapter.ts';
 import { ProviderEventStream } from './provider-adapter.ts';
+import type { DispatchBoundary, ProviderDispatchResult } from './native-runtime/delivery-contract.ts';
 
 const FIXTURE_CAPABILITIES: ProviderCapabilities = {
   protocolVersion: PROVIDER_RUNTIME_CONTRACT_VERSION,
@@ -91,6 +92,7 @@ const FIXTURE_MODELS: readonly ProviderModelDescriptor[] = [{
 
 export type NativeFixtureScenario = {
   emitNativeChild?: boolean;
+  nativeChildCompletionDelayMs?: number;
   failTurn?: boolean;
   delayMs?: number;
   provider?: ProviderKind;
@@ -107,7 +109,7 @@ export type NativeFixtureScenario = {
   ) => readonly ProviderEventEnvelope[];
   omitCompactionCompletion?: boolean;
   nativeFork?: boolean;
-  /** Emits a structurally valid block whose pass ordinal collides in SQLite. */
+  /** Emits a structurally valid block whose proposed pass ordinal is occupied. */
   emitPassCollision?: boolean;
   afterTurnAccepted?: (input: StartProviderTurnInput) => void;
 };
@@ -203,6 +205,7 @@ export class FixtureProviderSession implements ProviderSession {
   } | null = null;
   private closed = false;
   private snapshotController: AbortController | null = null;
+  private readonly pendingChildCompletions = new Set<ReturnType<typeof setTimeout>>();
   private streamFailed = false;
   private state: ProviderSnapshot['state'] = 'idle';
   readonly openedWith: OpenProviderSessionInput;
@@ -235,7 +238,7 @@ export class FixtureProviderSession implements ProviderSession {
     this.emit({ type: 'session.health', state: 'ready' }, 'session/health');
   }
 
-  async startTurn(unparsed: StartProviderTurnInput): Promise<ProviderCommandAcceptance> {
+  async startTurn(unparsed: StartProviderTurnInput, boundary?: DispatchBoundary): Promise<ProviderDispatchResult> {
     this.assertOpen();
     const input = parseStartProviderTurnInput(unparsed);
     if (input.conversationId !== this.openedWith.conversationId) {
@@ -248,9 +251,10 @@ export class FixtureProviderSession implements ProviderSession {
     const previous = this.receipts.get(input.commandId);
     if (previous) {
       if (previous !== requestHash) throw new Error('Provider command ID was reused with different input.');
-      return { accepted: true, nativeTurnId: input.turnId };
+      return { accepted: true, outcome: 'accepted', evidence: this.startEvidence(input), nativeTurnId: input.turnId };
     }
     if (this.activeTurn) throw new Error('Fixture provider session already has an active turn.');
+    boundary?.markPossiblySent(this.nativeSession.sessionId, 'fixture-stream-1');
     this.receipts.set(input.commandId, requestHash);
     this.providerDispatchCount += 1;
     this.dispatchLog.push(`turn:${input.turnId}`);
@@ -267,7 +271,19 @@ export class FixtureProviderSession implements ProviderSession {
     this.emit({ type: 'turn.status', state: 'running' }, 'turn/status', input.turnId);
     active.task = this.runTurn(input, controller.signal);
     this.scenario.afterTurnAccepted?.(structuredClone(input));
-    return { accepted: true, nativeTurnId: input.turnId };
+    return { accepted: true, outcome: 'accepted', evidence: this.startEvidence(input), nativeTurnId: input.turnId };
+  }
+
+  private startEvidence(input: StartProviderTurnInput) {
+    if (this.provider === 'codex') return { kind: 'codex-turn-start-response' as const,
+      threadId: this.nativeSession.sessionId, turnId: input.turnId,
+      nativeClientMessageId: input.turnId };
+    if (this.provider === 'claude-code') return { kind: 'claude-root-processing' as const,
+      sessionId: this.nativeSession.sessionId,
+      userMessageUuid: stableUuid(`claude-user\0${input.commandId}`),
+      observationUuid: stableUuid(`fixture-claude-proof\0${input.commandId}`) };
+    return { kind: 'fixture-correlated-acceptance' as const, sessionId: this.nativeSession.sessionId,
+      commandId: input.commandId, nativeTurnId: input.turnId };
   }
 
   async interrupt(input: InterruptProviderTurnInput): Promise<ProviderCommandAcceptance> {
@@ -400,6 +416,7 @@ export class FixtureProviderSession implements ProviderSession {
     if (this.closed) return;
     this.closed = true;
     this.snapshotController?.abort(new DOMException('Session closed.', 'AbortError'));
+    this.cancelPendingChildCompletions();
     const active = this.activeTurn;
     active?.controller.abort();
     await active?.task.catch(() => undefined);
@@ -411,6 +428,7 @@ export class FixtureProviderSession implements ProviderSession {
     if (this.closed) return;
     this.closed = true;
     this.streamFailed = true;
+    this.cancelPendingChildCompletions();
     this.activeTurn?.controller.abort(error);
     this.events.fail(error);
   }
@@ -420,7 +438,7 @@ export class FixtureProviderSession implements ProviderSession {
       await delay(this.scenario.delayMs ?? 2, signal);
       this.emit(
         blockCompleted(input.turnId, 'reasoning-1', 0, {
-          kind: 'reasoning-summary', text: 'Inspecting the native fixture workspace.',
+          kind: 'reasoning-summary', text: 'Inspecting the native fixture workspace.', truncated: false,
         }),
         'item/reasoning',
         input.turnId,
@@ -428,7 +446,7 @@ export class FixtureProviderSession implements ProviderSession {
       );
       if (this.scenario.emitPassCollision) {
         const collision = blockCompleted(input.turnId, 'collision-1', 1, {
-          kind: 'reasoning-summary', text: 'This fixture event must be quarantined.',
+          kind: 'reasoning-summary', text: 'This fixture pass must be appended safely.', truncated: false,
         });
         if (collision.type === 'turn.block.completed') {
           this.emit({
@@ -466,7 +484,10 @@ export class FixtureProviderSession implements ProviderSession {
           `fixture-file-${index + 1}`,
         );
       }
-      if (this.scenario.emitNativeChild) this.emitNativeChild(input.turnId);
+      if (this.scenario.emitNativeChild) this.emitNativeChild(
+        input.turnId,
+        this.scenario.nativeChildCompletionDelayMs,
+      );
       const text = input.content.flatMap((part) => part.type === 'text' ? [part.text] : []).join('\n');
       this.emit(
         {
@@ -509,7 +530,7 @@ export class FixtureProviderSession implements ProviderSession {
     }
   }
 
-  private emitNativeChild(turnId: string) {
+  private emitNativeChild(turnId: string, completionDelayMs?: number) {
     const childExecutionId = `${this.openedWith.executionId}:native-child-1`;
     this.emit({
       type: 'turn.block.started',
@@ -530,7 +551,7 @@ export class FixtureProviderSession implements ProviderSession {
         },
       },
     }, 'child/started', turnId, 'native-child-1');
-    this.emit({
+    const complete = () => this.emit({
       ...blockCompleted(turnId, 'native-child-1', 2, {
         kind: 'native-child',
         child: {
@@ -545,6 +566,20 @@ export class FixtureProviderSession implements ProviderSession {
         summary: 'The fixture native child completed its bounded task.',
       }),
     }, 'child/completed', turnId, 'native-child-1');
+    if (completionDelayMs === undefined) complete();
+    else {
+      const timeout = setTimeout(() => {
+        this.pendingChildCompletions.delete(timeout);
+        if (!this.closed) complete();
+      }, completionDelayMs);
+      timeout.unref();
+      this.pendingChildCompletions.add(timeout);
+    }
+  }
+
+  private cancelPendingChildCompletions() {
+    for (const timeout of this.pendingChildCompletions) clearTimeout(timeout);
+    this.pendingChildCompletions.clear();
   }
 
   private emit(event: ProviderEvent, nativeKind: string, turnId?: string, itemId?: string) {
@@ -611,6 +646,13 @@ function blockCompleted(
 
 function hashJson(value: unknown) {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
+
+function stableUuid(value: string) {
+  const hex = createHash('sha256').update(value).digest('hex').slice(0, 32).split('');
+  hex[12] = '4';
+  hex[16] = ['8', '9', 'a', 'b'][Number.parseInt(hex[16]!, 16) % 4]!;
+  return `${hex.slice(0, 8).join('')}-${hex.slice(8, 12).join('')}-${hex.slice(12, 16).join('')}-${hex.slice(16, 20).join('')}-${hex.slice(20).join('')}`;
 }
 
 function delay(milliseconds: number, signal: AbortSignal) {

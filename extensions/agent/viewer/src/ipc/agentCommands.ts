@@ -10,7 +10,7 @@ import type {
   AgentComposerMessagePart,
   MessageBranchResult,
   MessageSendResult,
-  ReasoningLevel,
+  ReasoningEffort,
 } from '../../../shared/protocol.ts';
 import type { UserContentPart } from '../../../shared/provider-runtime.ts';
 import type { ProviderAccess } from '../../../shared/provider-runtime.ts';
@@ -28,7 +28,8 @@ export const agentCommands = {
     providerInstanceId: string;
     cwd: string;
     nativeModelId: string;
-    reasoning: ReasoningLevel;
+    reasoning: ReasoningEffort;
+    serviceTier: string | null;
     access: ProviderAccess;
   }) {
     return rpc.command<{ accepted: true; conversationId: string }>(
@@ -38,7 +39,8 @@ export const agentCommands = {
         providerInstanceId: input.providerInstanceId,
         cwd: input.cwd,
         model: input.nativeModelId,
-        ...(input.reasoning === 'off' ? {} : { effort: input.reasoning }),
+        ...(input.reasoning === null ? {} : { effort: input.reasoning }),
+        serviceTier: input.serviceTier,
         access: input.access,
       },
     );
@@ -104,7 +106,8 @@ export const agentCommands = {
     clientMessageId: string;
     parts: AgentComposerMessagePart[];
     nativeModelId: string;
-    reasoning: ReasoningLevel;
+    reasoning: ReasoningEffort;
+    serviceTier: string | null;
     providerInstanceId: string;
     access: ProviderAccess;
     configurationRevision: string;
@@ -123,7 +126,8 @@ export const agentCommands = {
       content,
       providerInstanceId: input.providerInstanceId,
       model: input.nativeModelId,
-      effort: input.reasoning === 'off' ? null : input.reasoning,
+      effort: input.reasoning,
+      serviceTier: input.serviceTier,
       access: input.access,
       configurationRevision: input.configurationRevision,
       delivery: input.delivery,
@@ -146,7 +150,8 @@ export const agentCommands = {
     expectedHeadRevision: number;
     providerInstanceId: string;
     nativeModelId: string;
-    reasoning: ReasoningLevel;
+    reasoning: ReasoningEffort;
+    serviceTier: string | null;
     access: ProviderAccess;
     configurationRevision: string;
   }): Promise<MessageBranchResult> {
@@ -167,7 +172,8 @@ export const agentCommands = {
       content,
       providerInstanceId: input.providerInstanceId,
       model: input.nativeModelId,
-      effort: input.reasoning === 'off' ? null : input.reasoning,
+      effort: input.reasoning,
+      serviceTier: input.serviceTier,
       access: input.access,
       configurationRevision: input.configurationRevision,
     });
@@ -213,7 +219,8 @@ export const agentCommands = {
     conversationId: string;
     expectedRevision: string;
     nativeModelId: string;
-    reasoning: ReasoningLevel;
+    reasoning: ReasoningEffort;
+    serviceTier: string | null;
   }) {
     return rpc.command<{ accepted: true; revision: string }>(
       NATIVE_AGENT_METHODS.conversationPreferenceSet,
@@ -222,7 +229,8 @@ export const agentCommands = {
         conversationId: input.conversationId,
         expectedRevision: input.expectedRevision,
         model: input.nativeModelId,
-        effort: input.reasoning === 'off' ? null : input.reasoning,
+        effort: input.reasoning,
+        serviceTier: input.serviceTier,
       },
     );
   },
@@ -245,7 +253,8 @@ export const agentCommands = {
     providerInstanceId: string;
     expectedProvidersRevision: string;
     nativeModelId: string;
-    reasoning: ReasoningLevel;
+    reasoning: ReasoningEffort;
+    serviceTier: string | null;
   }) {
     return rpc.command<{ accepted: true; revision: string }>(
       NATIVE_AGENT_METHODS.providerPreferenceSet,
@@ -254,7 +263,8 @@ export const agentCommands = {
         providerInstanceId: input.providerInstanceId,
         expectedProvidersRevision: input.expectedProvidersRevision,
         model: input.nativeModelId,
-        effort: input.reasoning === 'off' ? null : input.reasoning,
+        effort: input.reasoning,
+        serviceTier: input.serviceTier,
         makeDefaultProvider: true,
       },
     );

@@ -22,6 +22,7 @@ import type {
   StartProviderTurnInput,
   SteerProviderTurnInput,
 } from '../../shared/provider-runtime.ts';
+import type { DispatchBoundary, ProviderDispatchResult, ProviderPresenceRead } from './native-runtime/delivery-contract.ts';
 
 export type ProviderCommandAcceptance = { accepted: true; nativeTurnId?: string };
 
@@ -63,6 +64,8 @@ export interface ProviderAdapter {
    */
   readAccountUsage?(providerInstanceId: string): Promise<ProviderAccountUsage | null>;
   readRuntimeStatus?(providerInstanceId: string): Promise<ProviderRuntimeStatus>;
+  readTurnPresence?(input: { providerInstanceId: string; cwd: string;
+    nativeSessionId: string; nativeClientMessageId: string }): Promise<ProviderPresenceRead>;
   discoverSessions?(
     input: DiscoverProviderSessionsInput,
   ): Promise<readonly NativeSessionSummary[]>;
@@ -82,7 +85,8 @@ export interface ProviderSession {
   readonly nativeSession: NativeSessionRef;
   readonly events: AsyncIterable<ProviderEventEnvelope>;
 
-  startTurn(input: StartProviderTurnInput): Promise<ProviderCommandAcceptance>;
+  startTurn(input: StartProviderTurnInput, boundary?: DispatchBoundary): Promise<ProviderDispatchResult>;
+  readTurnPresence?(nativeClientMessageId: string): Promise<ProviderPresenceRead>;
   steer?(input: SteerProviderTurnInput): Promise<ProviderCommandAcceptance>;
   interrupt(input: InterruptProviderTurnInput): Promise<ProviderCommandAcceptance>;
   interruptChild?(input: InterruptProviderChildInput): Promise<ProviderCommandAcceptance>;

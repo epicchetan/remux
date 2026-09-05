@@ -6,7 +6,11 @@ import {
   normalizeCodexAccountUsage,
 } from '../server/src/providers/codex/codex-event-mapper.ts';
 import { jsonPreviewByteLength } from '../server/src/providers/preview.ts';
-import { PROVIDER_RUNTIME_LIMITS } from '../shared/provider-runtime.ts';
+import { CodexChildRegistry } from '../server/src/providers/codex/codex-child-registry.ts';
+import {
+  PROVIDER_RUNTIME_LIMITS,
+  type ProviderEventEnvelope,
+} from '../shared/provider-runtime.ts';
 
 const ROOT_THREAD = 'codex-thread-root';
 const NATIVE_TURN = 'codex-turn-native-1';
@@ -272,7 +276,7 @@ test('Codex command output remains byte-bounded without poisoning mapper block s
       'the authoritative aggregate replaces, rather than duplicates, streamed output');
   }
 
-  assert.throws(() => subject.mapNotification({
+  const fittedReasoning = subject.mapNotification({
     method: 'item/reasoning/summaryTextDelta',
     params: {
       threadId: ROOT_THREAD,
@@ -281,7 +285,13 @@ test('Codex command output remains byte-bounded without poisoning mapper block s
       summaryIndex: 0,
       delta: 'r'.repeat(300_000),
     },
-  }), /exceeds 262144 (?:characters|bytes)/u);
+  });
+  assert.equal(fittedReasoning[0]?.event.type, 'turn.block.started');
+  if (fittedReasoning[0]?.event.type === 'turn.block.started' &&
+      fittedReasoning[0].event.block.payload.kind === 'reasoning-summary') {
+    assert.equal(fittedReasoning[0].event.block.payload.truncated, true);
+    assert.ok(Buffer.byteLength(JSON.stringify(fittedReasoning[0])) <= PROVIDER_RUNTIME_LIMITS.eventBytes);
+  }
   const [recovered] = subject.mapNotification({
     method: 'item/reasoning/summaryTextDelta',
     params: {
@@ -292,8 +302,12 @@ test('Codex command output remains byte-bounded without poisoning mapper block s
       delta: 'Recovered.',
     },
   });
-  assert.equal(recovered?.event.type, 'turn.block.started',
-    'a rejected block revision must not be committed to mapper state');
+  assert.equal(recovered?.event.type, 'turn.block.revised');
+  if (recovered?.event.type === 'turn.block.revised' &&
+      recovered.event.block.payload.kind === 'reasoning-summary') {
+    assert.equal(recovered.event.block.payload.truncated, true,
+      'later deltas retain the bounded display and sticky truncation state');
+  }
 });
 
 test('Codex streams an agent message with its lifecycle commentary phase', () => {
@@ -470,8 +484,8 @@ test('Codex preserves native reasoning summary parts while streaming and on comp
       threadId: ROOT_THREAD,
       turnId: NATIVE_TURN,
       itemId: 'reasoning-1',
-      summaryIndex: 0,
-      delta: '**Inspecting files**',
+      summaryIndex: 1,
+      delta: 'B',
     },
   });
   const [second] = subject.mapNotification({
@@ -481,7 +495,27 @@ test('Codex preserves native reasoning summary parts while streaming and on comp
       turnId: NATIVE_TURN,
       itemId: 'reasoning-1',
       summaryIndex: 1,
-      delta: 'Comparing the implementation with its contract.',
+      delta: 'C',
+    },
+  });
+  const [interleaved] = subject.mapNotification({
+    method: 'item/reasoning/summaryTextDelta',
+    params: {
+      threadId: ROOT_THREAD,
+      turnId: NATIVE_TURN,
+      itemId: 'reasoning-1',
+      summaryIndex: 0,
+      delta: 'A',
+    },
+  });
+  const [finalDelta] = subject.mapNotification({
+    method: 'item/reasoning/summaryTextDelta',
+    params: {
+      threadId: ROOT_THREAD,
+      turnId: NATIVE_TURN,
+      itemId: 'reasoning-1',
+      summaryIndex: 1,
+      delta: 'D',
     },
   });
   const [completed] = subject.mapNotification({
@@ -492,7 +526,7 @@ test('Codex preserves native reasoning summary parts while streaming and on comp
       item: {
         id: 'reasoning-1',
         type: 'reasoning',
-        summary: ['**Inspecting files**', 'Comparing the implementation with its contract.'],
+        summary: ['A', 'BCD'],
       },
     },
   });
@@ -502,14 +536,88 @@ test('Codex preserves native reasoning summary parts while streaming and on comp
       envelope?.event.type === 'turn.block.revised' ||
       envelope?.event.type === 'turn.block.completed');
   }
-  if (second?.event.type !== 'turn.block.revised' ||
+  if (second?.event.type !== 'turn.block.revised' || interleaved?.event.type !== 'turn.block.revised' ||
+      finalDelta?.event.type !== 'turn.block.revised' ||
       completed?.event.type !== 'turn.block.completed') return;
   assert.deepEqual(second.event.block.payload, {
     kind: 'reasoning-summary',
-    text: '**Inspecting files**\nComparing the implementation with its contract.',
-    parts: ['**Inspecting files**', 'Comparing the implementation with its contract.'],
+    text: 'BC',
+    parts: ['BC'],
+    truncated: false,
   });
-  assert.deepEqual(completed.event.block.payload, second.event.block.payload);
+  assert.deepEqual(interleaved.event.block.payload, {
+    kind: 'reasoning-summary',
+    text: 'A\nBC',
+    parts: ['A', 'BC'],
+    truncated: false,
+  });
+  assert.deepEqual(finalDelta.event.block.payload, {
+    kind: 'reasoning-summary',
+    text: 'A\nBCD',
+    parts: ['A', 'BCD'],
+    truncated: false,
+  });
+  assert.deepEqual(completed.event.block.payload, finalDelta.event.block.payload);
+});
+
+test('Codex bounds sparse native reasoning indexes without renumbering accepted parts', () => {
+  const subject = mapper();
+  subject.bindTurn('remux-turn-1', NATIVE_TURN);
+  const [event] = subject.mapNotification({
+    method: 'item/reasoning/summaryTextDelta',
+    params: {
+      threadId: ROOT_THREAD,
+      turnId: NATIVE_TURN,
+      itemId: 'sparse-reasoning',
+      summaryIndex: 1_000_000,
+      delta: 'must remain bounded',
+    },
+  });
+  assert.equal(event?.event.type, 'turn.block.started');
+  if (event?.event.type === 'turn.block.started' &&
+      event.event.block.payload.kind === 'reasoning-summary') {
+    assert.equal(event.event.block.payload.truncated, true);
+    assert.ok((event.event.block.payload.parts?.length ?? 0) <= 256);
+    assert.ok(Buffer.byteLength(JSON.stringify(event)) <= PROVIDER_RUNTIME_LIMITS.eventBytes);
+  }
+});
+
+test('Codex fits native child summaries without changing child identity or completion', () => {
+  const subject = mapper();
+  subject.bindTurn('remux-turn-1', NATIVE_TURN);
+  const internal = subject as unknown as {
+    envelope(event: Record<string, unknown>, kind: string, nativeTurnId: string, itemId: string): ProviderEventEnvelope;
+  };
+  const childExecutionId = 'child-summary-execution';
+  const started = internal.envelope({
+    type: 'child.started',
+    child: {
+      executionId: childExecutionId,
+      ownership: 'native',
+      provider: 'codex',
+      providerInstanceId: 'codex-local',
+      title: 'Child',
+      nativeSessionId: 'child-summary-thread',
+      transcriptAvailable: true,
+    },
+  }, 'child/started', NATIVE_TURN, childExecutionId);
+  const revised = internal.envelope({
+    type: 'child.summary', childExecutionId,
+    summary: `${'"\\😀'.repeat(100_000)} CHILD-SUMMARY-TAIL`,
+  }, 'child/summary', NATIVE_TURN, childExecutionId);
+  const completed = internal.envelope({
+    type: 'child.completed', childExecutionId, outcome: 'completed',
+  }, 'child/completed', NATIVE_TURN, childExecutionId);
+  const blocks = [started, revised, completed].map(({ event }) => {
+    assert.ok('block' in event && event.block.payload.kind === 'native-child');
+    return 'block' in event ? event : null;
+  }).filter(Boolean);
+  assert.equal(new Set(blocks.map((event) => event!.structure.blockId)).size, 1);
+  assert.ok(Buffer.byteLength(JSON.stringify(revised)) <= PROVIDER_RUNTIME_LIMITS.eventBytes);
+  if ('block' in completed.event && completed.event.block.payload.kind === 'native-child') {
+    assert.equal(completed.event.block.payload.child.executionId, childExecutionId);
+    assert.equal(completed.event.block.state, 'completed');
+  }
 });
 
 test('Codex exposes exact file patches on live and snapshot file changes', () => {
@@ -1244,5 +1352,223 @@ test('Codex native subagents remain native child executions under the owning tur
       completed[0].event.block.payload.child.executionId,
       activity[0].event.block.payload.child.executionId,
     );
+    assert.equal(completed[0].event.structure.blockId, activity[0].event.structure.blockId);
+    assert.equal(completed[0].event.structure.passId, activity[0].event.structure.passId);
   }
+});
+
+test('Codex child ownership survives event reordering, late starts, parent turns, and interactions', () => {
+  const subject = mapper();
+  subject.bindTurn('remux-owner', NATIVE_TURN);
+  const childThreadId = 'codex-child-owned';
+
+  // A foreign notification cannot establish ownership on its own.
+  assert.deepEqual(subject.mapNotification({
+    method: 'turn/started',
+    params: { threadId: childThreadId, turn: { id: 'child-attempt-1' } },
+  }), []);
+
+  const spawned = subject.mapNotification({
+    method: 'item/completed',
+    params: { threadId: ROOT_THREAD, turnId: NATIVE_TURN, item: {
+      id: 'spawn-1', type: 'subAgentActivity', kind: 'started',
+      agentThreadId: childThreadId, agentPath: '/root/reviewer',
+    } },
+  });
+  const started = subject.mapNotification({
+    method: 'turn/started',
+    params: { threadId: childThreadId, turn: { id: 'child-attempt-1' } },
+  });
+  subject.bindTurn('remux-new-parent-turn', 'native-parent-turn-2');
+  const completed = subject.mapNotification({
+    method: 'turn/completed',
+    params: { threadId: childThreadId, turn: { id: 'child-attempt-1', status: 'completed' } },
+  });
+  for (const envelope of [...spawned, ...started, ...completed]) {
+    assert.equal(envelope.scope.kind, 'turn');
+    if (envelope.scope.kind === 'turn') assert.equal(envelope.scope.turnId, 'remux-owner');
+  }
+  const structures = [...spawned, ...started, ...completed].flatMap(({ event }) =>
+    event.type === 'turn.block.started' || event.type === 'turn.block.revised' ||
+      event.type === 'turn.block.completed' ? [event.structure] : []);
+  assert.equal(new Set(structures.map(({ blockId }) => blockId)).size, 1);
+  assert.equal(new Set(structures.map(({ passId }) => passId)).size, 1);
+
+  // Duplicate terminal observations and replayed activity cannot reopen the attempt.
+  const duplicate = subject.mapNotification({
+    method: 'turn/completed',
+    params: { threadId: childThreadId, turn: { id: 'child-attempt-1', status: 'completed' } },
+  });
+  assert.ok(duplicate.every(({ event }) => event.type === 'turn.block.completed'));
+  assert.deepEqual(subject.mapNotification({
+    method: 'item/completed',
+    params: { threadId: ROOT_THREAD, turnId: NATIVE_TURN, item: {
+      id: 'spawn-replayed', type: 'subAgentActivity', kind: 'started',
+      agentThreadId: childThreadId,
+    } },
+  }), []);
+
+  for (const agentThreadId of [ROOT_THREAD, 'known-sibling']) {
+    assert.deepEqual(subject.mapNotification({
+      method: 'item/completed',
+      params: { threadId: childThreadId, turnId: 'child-attempt-1', item: {
+        id: `interaction-${agentThreadId}`, type: 'subAgentActivity', kind: 'interacted',
+        agentThreadId,
+      } },
+    }), []);
+  }
+
+  // A proven new native turn is a genuine follow-up and can reopen the same child execution.
+  const followup = subject.mapNotification({
+    method: 'turn/started',
+    params: { threadId: childThreadId, turn: { id: 'child-attempt-2' } },
+  });
+  assert.ok(followup.some(({ event }) => event.type === 'turn.block.revised'));
+  assert.deepEqual(subject.mapNotification({ method: 'item/completed', params: {
+    threadId: ROOT_THREAD, turnId: NATIVE_TURN, item: {
+      id: 'subagent-completed-child-attempt-1', type: 'subAgentActivity', kind: 'completed',
+      agentThreadId: childThreadId,
+    },
+  } }), [], 'activity completion for attempt A cannot terminate active attempt B');
+  const followupCompleted = subject.mapNotification({
+    method: 'turn/completed',
+    params: { threadId: childThreadId, turn: { id: 'child-attempt-2', status: 'completed' } },
+  });
+  assert.ok(followupCompleted.some(({ event }) => event.type === 'turn.block.completed'));
+  assert.deepEqual(subject.mapNotification({
+    method: 'turn/completed',
+    params: { threadId: childThreadId, turn: { id: 'child-attempt-1', status: 'failed' } },
+  }), [], 'an old attempt cannot overwrite the latest terminal outcome');
+  assert.deepEqual(subject.mapNotification({ method: 'thread/started', params: {
+    thread: { id: childThreadId, parentThreadId: ROOT_THREAD },
+  } }), [], 'thread existence replay cannot reopen a terminal child attempt');
+});
+
+test('Codex replayed collab spawn keeps its original owner and terminal block', () => {
+  const subject = mapper();
+  subject.bindTurn('owner-a', NATIVE_TURN);
+  const spawn = (nativeTurnId: string) => subject.mapNotification({ method: 'item/completed', params: {
+    threadId: ROOT_THREAD, turnId: nativeTurnId, item: { id: `spawn-${nativeTurnId}`,
+      type: 'collabAgentToolCall', tool: 'spawnAgent', receiverThreadIds: ['collab-child'] },
+  } });
+  const first = spawn(NATIVE_TURN);
+  subject.mapNotification({ method: 'turn/started', params: {
+    threadId: 'collab-child', turn: { id: 'collab-attempt' },
+  } });
+  subject.mapNotification({ method: 'turn/completed', params: {
+    threadId: 'collab-child', turn: { id: 'collab-attempt', status: 'completed' },
+  } });
+  subject.bindTurn('owner-b', 'native-owner-b');
+  assert.deepEqual(spawn('native-owner-b'), []);
+  assert.equal(first[0]?.scope.kind, 'turn');
+  if (first[0]?.scope.kind === 'turn') assert.equal(first[0].scope.turnId, 'owner-a');
+  const cached = subject.mapNotification({ method: 'item/completed', params: {
+    threadId: ROOT_THREAD, turnId: NATIVE_TURN, item: { id: 'cached-terminal',
+      type: 'collabAgentToolCall', tool: 'spawnAgent', receiverThreadIds: ['cached-child'],
+      agentsStates: { 'cached-child': { status: 'completed' } } },
+  } });
+  assert.ok(cached.some(({ event }) => event.type === 'turn.block.completed'));
+  assert.deepEqual(subject.mapNotification({ method: 'item/completed', params: {
+    threadId: ROOT_THREAD, turnId: 'native-owner-b', item: { id: 'cached-terminal-replay',
+      type: 'collabAgentToolCall', tool: 'spawnAgent', receiverThreadIds: ['cached-child'],
+      agentsStates: { 'cached-child': { status: 'completed' } } },
+  } }), []);
+});
+
+test('Codex shared child registry preserves genuine grandchildren without parent-message phantoms', () => {
+  const registry = new CodexChildRegistry();
+  const root = new CodexEventMapper({
+    providerInstanceId: 'codex-local', conversationId: 'conversation-1', executionId: 'execution-1',
+    nativeSessionId: ROOT_THREAD, childRegistry: registry, observedAt: () => 42,
+  });
+  root.bindTurn('remux-owner', NATIVE_TURN);
+  const childThreadId = 'child-thread';
+  root.mapNotification({ method: 'item/completed', params: {
+    threadId: ROOT_THREAD, turnId: NATIVE_TURN, item: {
+      id: 'spawn-child', type: 'subAgentActivity', kind: 'started', agentThreadId: childThreadId,
+    },
+  } });
+  const childExecutionId = registry.get(childThreadId)!.executionId;
+  const child = new CodexEventMapper({
+    providerInstanceId: 'codex-local', conversationId: 'conversation-1', executionId: childExecutionId,
+    nativeSessionId: childThreadId,
+    childRegistry: registry, observedAt: () => 42,
+  });
+  child.bindTurn('remux-child-turn', 'child-native-turn');
+  assert.deepEqual(child.mapNotification({ method: 'item/completed', params: {
+    threadId: childThreadId, turnId: 'child-native-turn', item: {
+      id: 'message-parent', type: 'subAgentActivity', kind: 'interacted', agentThreadId: ROOT_THREAD,
+    },
+  } }), []);
+  const grandchild = child.mapNotification({ method: 'item/completed', params: {
+    threadId: childThreadId, turnId: 'child-native-turn', item: {
+      id: 'spawn-grandchild', type: 'subAgentActivity', kind: 'started', agentThreadId: 'grandchild-thread',
+    },
+  } });
+  assert.equal(grandchild[0]?.scope.kind, 'turn');
+  if (grandchild[0]?.scope.kind === 'turn') assert.equal(grandchild[0].scope.turnId, 'remux-child-turn');
+  assert.equal(registry.get('grandchild-thread')?.parentExecutionId, childExecutionId);
+});
+
+test('Codex restored child bindings retain canonical blocks and terminal attempt history', () => {
+  const registry = new CodexChildRegistry();
+  const binding = {
+    nativeThreadId: 'restored-child', executionId: 'execution-child-restored',
+    parentExecutionId: 'execution-1', nativeParentThreadId: ROOT_THREAD,
+    ownerTurnId: 'remux-owner', ownerNativeTurnId: NATIVE_TURN,
+    nativeTurnBindings: [], terminalNativeTurnIds: ['child-attempt-completed'],
+    canonicalBlock: {
+      structure: { passId: 'durable-pass', blockId: 'durable-block', passOrdinal: 4, blockOrdinal: 9 },
+      revision: 3,
+      block: { kind: 'native-child' as const, state: 'completed' as const, payload: {
+        kind: 'native-child' as const,
+        child: { executionId: 'execution-child-restored', ownership: 'native' as const,
+          provider: 'codex' as const, title: 'Restored child', transcriptAvailable: true },
+        executionState: 'idle' as const, outcome: 'completed' as const, summary: 'Preserved summary',
+      } },
+    },
+    outcome: 'completed' as const,
+  };
+  registry.restore([binding]);
+  const subject = new CodexEventMapper({
+    providerInstanceId: 'codex-local', conversationId: 'conversation-1', executionId: 'execution-1',
+    nativeSessionId: ROOT_THREAD, childRegistry: registry, observedAt: () => 42,
+  });
+  subject.bindTurn('remux-owner', NATIVE_TURN);
+  subject.restoreChildBlocks([binding]);
+  assert.deepEqual(subject.mapNotification({ method: 'turn/started', params: {
+    threadId: 'restored-child', turn: { id: 'child-attempt-completed' },
+  } }), []);
+  const followup = subject.mapNotification({ method: 'turn/started', params: {
+    threadId: 'restored-child', turn: { id: 'child-attempt-followup' },
+  } });
+  assert.equal(followup[0]?.event.type, 'turn.block.revised');
+  if (followup[0]?.event.type === 'turn.block.revised') {
+    assert.deepEqual(followup[0].event.structure, binding.canonicalBlock.structure);
+    assert.equal(followup[0].event.revision, 4);
+  }
+});
+
+test('Codex snapshot completion can settle a child when its thread stream was missed', () => {
+  const subject = mapper();
+  subject.bindTurn('remux-owner', NATIVE_TURN);
+  const events = subject.mapThreadSnapshot({ id: ROOT_THREAD, status: { type: 'idle' }, turns: [{
+    id: NATIVE_TURN, status: 'completed', items: [
+      { id: 'spawn-missed-stream', type: 'subAgentActivity', kind: 'started',
+        agentThreadId: 'missed-stream-child' },
+      { id: 'subagent-completed-missed-child-turn', type: 'subAgentActivity', kind: 'completed',
+        agentThreadId: 'missed-stream-child' },
+    ],
+  }] });
+  assert.ok(events.some(({ event }) => event.type === 'turn.block.completed' &&
+    event.block.payload.kind === 'native-child' && event.block.payload.outcome === 'completed'));
+  subject.mapNotification({ method: 'turn/started', params: {
+    threadId: 'missed-stream-child', turn: { id: 'new-child-turn' },
+  } });
+  assert.deepEqual(subject.mapNotification({ method: 'item/completed', params: {
+    threadId: ROOT_THREAD, turnId: NATIVE_TURN, item: {
+      id: 'subagent-completed-missed-child-turn', type: 'subAgentActivity', kind: 'completed',
+      agentThreadId: 'missed-stream-child',
+    },
+  } }), []);
 });

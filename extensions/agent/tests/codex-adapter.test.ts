@@ -66,6 +66,16 @@ test('Codex probe and model discovery use native subscription state and native c
     name: 'GPT Test',
     provider: 'codex',
     supportedEffort: ['low', 'high'],
+    serviceTiers: [{
+      id: 'default',
+      name: 'Standard',
+      description: 'Standard speed and usage',
+    }, {
+      id: 'priority',
+      name: 'Fast',
+      description: 'Faster responses with higher usage',
+    }],
+    defaultServiceTier: 'default',
     isDefault: true,
   }]);
   assert.equal(peers.length, 2);
@@ -75,16 +85,17 @@ test('Codex probe and model discovery use native subscription state and native c
 test('Codex session launch scopes federation credentials and dispatches each turn command once', async () => {
   let peer: FakeCodexConnection | undefined;
   let launch: CodexAppServerLaunchOptions | undefined;
+  const resolvedScopes: Array<{ conversationId: string; executionId: string }> = [];
   const adapter = new CodexNativeAdapter({
     environment: {
       REMUX_TEST_ENV: 'yes',
       REMUX_FEDERATION_MCP_BEARER_TOKEN: 'ambient-must-not-leak',
     },
     appServerArgs: ['-c', 'features.example=true'],
-    resolveImageArtifact: async (artifactId) => ({
-      type: 'localImage',
-      path: `/server-artifacts/${artifactId}.png`,
-    }),
+    resolveImageArtifact: async (scope, artifactId) => {
+      resolvedScopes.push(scope);
+      return { type: 'localImage', path: `/server-artifacts/${artifactId}.png` };
+    },
     createConnection: async (options) => {
       launch = options;
       peer = new FakeCodexConnection(options, { autoCompleteTurns: true });
@@ -100,6 +111,9 @@ test('Codex session launch scopes federation credentials and dispatches each tur
   });
   assert.ok(peer && launch);
   assert.equal(session.nativeSession.sessionId, 'thread-created-1');
+  assert.equal((peer.requests.find(({ method }) => method === 'thread/start')?.params as {
+    serviceTier?: string;
+  }).serviceTier, 'default');
   assert.equal(launch.environment?.REMUX_FEDERATION_MCP_BEARER_TOKEN, undefined);
   assert.deepEqual(launch.args, ['-c', 'features.example=true'],
     'scoped federation credentials must not be exposed through process arguments');
@@ -120,18 +134,18 @@ test('Codex session launch scopes federation credentials and dispatches each tur
 
   const seen: ProviderEventEnvelope[] = [];
   const terminal = collectUntil(session.events, seen, ({ event }) => event.type === 'turn.completed');
-  assert.deepEqual(await session.startTurn(turnInput), {
-    accepted: true,
-    nativeTurnId: 'native-turn-1',
-  });
-  assert.deepEqual(await session.startTurn(structuredClone(turnInput)), {
-    accepted: true,
-    nativeTurnId: 'native-turn-1',
-  });
+  const firstAcceptance = await session.startTurn(turnInput);
+  assert.equal(firstAcceptance.outcome, 'accepted');
+  assert.equal(firstAcceptance.nativeTurnId, 'native-turn-1');
+  const replayedAcceptance = await session.startTurn(structuredClone(turnInput));
+  assert.equal(replayedAcceptance.outcome, 'accepted');
+  assert.equal(replayedAcceptance.nativeTurnId, 'native-turn-1');
+  assert.deepEqual(resolvedScopes, [{ conversationId: 'conversation-1', executionId: 'execution-1' }]);
   await terminal;
 
   const starts = peer.requests.filter(({ method }) => method === 'turn/start');
   assert.equal(starts.length, 1);
+  assert.equal((starts[0]?.params as { serviceTier?: string }).serviceTier, 'default');
   assert.deepEqual((starts[0]?.params as { input: unknown }).input, [
     { type: 'text', text: 'Implement it.', text_elements: [] },
     { type: 'mention', name: 'README.md', path: '/workspace/remux/README.md' },
@@ -149,9 +163,13 @@ test('Codex session launch scopes federation credentials and dispatches each tur
     ...turnInput,
     commandId: 'turn-command-2',
     turnId: 'remux-turn-2',
+    serviceTier: 'priority',
     content: [{ type: 'text', text: 'Follow up.' }],
   });
   assert.equal(peer.requests.filter(({ method }) => method === 'turn/start').length, 2);
+  assert.equal((peer.requests.filter(({ method }) => method === 'turn/start')[1]?.params as {
+    serviceTier?: string;
+  }).serviceTier, 'priority');
   const compactEvents: ProviderEventEnvelope[] = [];
   const compactTerminal = collectUntil(session.events, compactEvents, ({ event }) =>
     event.type === 'context.compaction.completed');
@@ -262,7 +280,12 @@ test('Codex child controls and transcript snapshots stay on the native child thr
   let peer: FakeCodexConnection | undefined;
   const childThreadId = 'child-thread-transcript';
   const childExecutionId = codexStableChildExecutionId(openInput.executionId, childThreadId);
+  const childImportScopes: Array<{ conversationId: string; executionId: string }> = [];
   const adapter = new CodexNativeAdapter({
+    importHistoricalImage: async (scope) => {
+      childImportScopes.push(scope);
+      return { artifactId: 'child-history-image', mimeType: 'image/png', byteLength: 4 };
+    },
     createConnection: async (options) => {
       peer = new FakeCodexConnection(options, {
         childSnapshotTurns: {
@@ -270,7 +293,10 @@ test('Codex child controls and transcript snapshots stay on the native child thr
             id: 'child-turn-transcript',
             status: 'completed',
             items: [
-              { id: 'child-user', type: 'userMessage', content: [{ type: 'text', text: 'Inspect it.' }] },
+              { id: 'child-user', type: 'userMessage', content: [
+                { type: 'text', text: 'Inspect it.' },
+                { type: 'image', detail: 'auto', url: 'data:image/png;base64,aGVsbG8=' },
+              ] },
               { id: 'child-answer', type: 'agentMessage', phase: 'final_answer', text: 'Child result.' },
             ],
           }],
@@ -309,6 +335,12 @@ test('Codex child controls and transcript snapshots stay on the native child thr
     turnId: 'child-turn-transcript',
     item: { id: 'child-answer', type: 'agentMessage', phase: 'final_answer', text: 'Child result.' },
   });
+  peer.emitNotification('item/completed', {
+    threadId: 'thread-resumed-child',
+    turnId: 'native-turn-1',
+    item: { id: 'subagent-completed-child-turn-transcript', type: 'subAgentActivity',
+      kind: 'completed', agentThreadId: childThreadId },
+  });
   peer.emitNotification('turn/completed', {
     threadId: childThreadId,
     turn: { id: 'child-turn-transcript', status: 'completed', items: [] },
@@ -325,6 +357,8 @@ test('Codex child controls and transcript snapshots stay on the native child thr
     scope.kind === 'turn' && scope.executionId === childExecutionId &&
     event.type === 'turn.block.completed' && event.block.payload.kind === 'final-message' &&
     event.block.payload.text === 'Child result.'));
+  assert.ok(seen.some(({ scope, event }) => scope.kind === 'turn' &&
+    scope.executionId === childExecutionId && event.type === 'turn.completed'));
 
   const snapshot = await session.snapshotChild!({
     commandId: 'snapshot-child-command',
@@ -336,6 +370,150 @@ test('Codex child controls and transcript snapshots stay on the native child thr
   assert.ok(snapshot.events.every(({ scope }) =>
     scope.kind === 'account' || scope.executionId === childExecutionId));
   assert.ok(snapshot.events.some(({ event }) => event.type === 'user.message'));
+  assert.deepEqual(childImportScopes, [{
+    conversationId: openInput.conversationId, executionId: childExecutionId,
+  }]);
+  await session.close();
+});
+
+test('Codex resume restores durable child ownership and child turn ordinal floors', async () => {
+  let peer: FakeCodexConnection | undefined;
+  const childThreadId = 'child-thread-restored';
+  const childExecutionId = codexStableChildExecutionId(openInput.executionId, childThreadId);
+  const adapter = new CodexNativeAdapter({
+    createConnection: async (options) => {
+      peer = new FakeCodexConnection(options, { childSnapshotTurns: {
+        [childThreadId]: [{ id: 'native-child-turn-restored', status: 'completed', items: [{
+          id: 'restored-answer', type: 'agentMessage', phase: 'final_answer', text: 'Restored.',
+        }] }],
+      } });
+      return peer;
+    },
+  });
+  const session = await adapter.openSession({
+    ...openInput,
+    commandId: 'open-restored-child',
+    mode: 'resume',
+    nativeSession: { provider: 'codex', providerInstanceId: 'codex-local', sessionId: 'root-restored' },
+    nativeTurnBindings: [{ turnId: 'remux-owner-restored', nativeTurnId: 'native-owner-restored' }],
+    nativeChildBindings: [{
+      nativeThreadId: childThreadId,
+      executionId: childExecutionId,
+      parentExecutionId: openInput.executionId,
+      nativeParentThreadId: 'root-restored',
+      ownerTurnId: 'remux-owner-restored',
+      ownerNativeTurnId: 'native-owner-restored',
+      nativeTurnBindings: [{
+        turnId: 'remux-child-turn-restored',
+        nativeTurnId: 'native-child-turn-restored',
+        nextBlockOrdinal: 7,
+      }],
+      outcome: 'completed',
+    }],
+  });
+  assert.ok(peer);
+  const snapshot = await session.snapshotChild!({
+    commandId: 'snapshot-restored-child', childExecutionId, nativeSessionId: childThreadId,
+  });
+  const answer = snapshot.events.find(({ event }) =>
+    event.type === 'turn.block.completed' && event.block.payload.kind === 'final-message');
+  assert.equal(answer?.scope.kind, 'turn');
+  if (answer?.scope.kind === 'turn') assert.equal(answer.scope.turnId, 'remux-child-turn-restored');
+  const liveEvents: ProviderEventEnvelope[] = [];
+  const liveTool = collectUntil(session.events, liveEvents, ({ scope, event }) =>
+    scope.kind === 'turn' && scope.executionId === childExecutionId &&
+    event.type === 'turn.block.started' && event.block.payload.kind === 'tool');
+  peer.emitNotification('item/started', {
+    threadId: childThreadId,
+    turnId: 'native-child-turn-restored',
+    item: { id: 'restored-live-command', type: 'commandExecution', command: 'pwd', status: 'inProgress' },
+  });
+  await liveTool;
+  const tool = liveEvents.find(({ event }) =>
+    event.type === 'turn.block.started' && event.block.payload.kind === 'tool');
+  if (tool?.event.type === 'turn.block.started') assert.equal(tool.event.structure.blockOrdinal, 7);
+  await session.close();
+});
+
+test('Codex buffers thread-first children under their spawn turn and routes nested terminals once', async () => {
+  let peer: FakeCodexConnection | undefined;
+  const adapter = new CodexNativeAdapter({ createConnection: async (options) => {
+    peer = new FakeCodexConnection(options); return peer;
+  } });
+  const session = await adapter.openSession(openInput);
+  assert.ok(peer);
+  await session.startTurn(turnInputWithText());
+  const ownerNativeTurn = 'native-turn-1';
+  peer.completeActiveTurn();
+  await session.startTurn({ ...turnInputWithText(), commandId: 'turn-command-later', turnId: 'remux-turn-later' });
+  peer.emitNotification('turn/started', {
+    threadId: 'thread-first-child', turn: { id: 'thread-first-attempt', status: 'inProgress' },
+  });
+  peer.emitNotification('item/completed', { threadId: 'thread-created-1', turnId: ownerNativeTurn,
+    item: { id: 'spawn-thread-first', type: 'subAgentActivity', kind: 'started',
+      agentThreadId: 'thread-first-child' } });
+  peer.emitNotification('turn/completed', {
+    threadId: 'thread-first-child', turn: { id: 'thread-first-attempt', status: 'completed' },
+  });
+  peer.emitNotification('turn/started', {
+    threadId: 'thread-first-child', turn: { id: 'thread-first-followup', status: 'inProgress' },
+  });
+  peer.emitNotification('turn/started', {
+    threadId: 'thread-first-child', turn: { id: 'thread-first-attempt', status: 'inProgress' },
+  });
+  peer.emitNotification('item/completed', { threadId: 'thread-first-child', turnId: 'thread-first-followup',
+    item: { id: 'spawn-grandchild', type: 'subAgentActivity', kind: 'started',
+      agentThreadId: 'nested-grandchild' } });
+  peer.emitNotification('turn/started', {
+    threadId: 'nested-grandchild', turn: { id: 'grandchild-attempt', status: 'inProgress' },
+  });
+  peer.emitNotification('turn/completed', {
+    threadId: 'nested-grandchild', turn: { id: 'grandchild-attempt', status: 'completed' },
+  });
+  const seen: ProviderEventEnvelope[] = [];
+  await collectUntil(session.events, seen, ({ event }) => event.type === 'turn.block.completed' &&
+    event.block.payload.kind === 'native-child' &&
+    event.block.payload.child.nativeSessionId === 'nested-grandchild');
+  const direct = seen.find(({ event }) =>
+    (event.type === 'turn.block.started' || event.type === 'turn.block.revised' ||
+      event.type === 'turn.block.completed') &&
+    event.block.payload.kind === 'native-child' &&
+    event.block.payload.child.nativeSessionId === 'thread-first-child');
+  assert.equal(direct?.scope.kind, 'turn');
+  if (direct?.scope.kind === 'turn') assert.equal(direct.scope.turnId, 'remux-turn-1');
+  const nestedTerminal = seen.filter(({ event }) => event.type === 'turn.block.completed' &&
+    event.block.payload.kind === 'native-child' &&
+    event.block.payload.child.nativeSessionId === 'nested-grandchild');
+  assert.equal(nestedTerminal.length, 1);
+  assert.equal(nestedTerminal[0]?.scope.kind, 'turn');
+  if (nestedTerminal[0]?.scope.kind === 'turn') {
+    assert.equal(nestedTerminal[0].scope.executionId,
+      codexStableChildExecutionId(openInput.executionId, 'thread-first-child'));
+  }
+  await session.interruptChild!({ commandId: 'interrupt-followup-child',
+    childExecutionId: codexStableChildExecutionId(openInput.executionId, 'thread-first-child'),
+    nativeSessionId: 'thread-first-child' });
+  assert.deepEqual(peer.requests.filter(({ method }) => method === 'turn/interrupt').at(-1)?.params, {
+    threadId: 'thread-first-child', turnId: 'thread-first-followup',
+  });
+  await session.close();
+});
+
+test('Codex pending child admission is aggregate-bounded and triggers authoritative recovery', async () => {
+  let peer: FakeCodexConnection | undefined;
+  const adapter = new CodexNativeAdapter({ createConnection: async (options) => {
+    peer = new FakeCodexConnection(options); return peer;
+  } });
+  const session = await adapter.openSession(openInput);
+  assert.ok(peer);
+  for (let index = 0; index <= 256; index += 1) {
+    peer.emitNotification('turn/started', {
+      threadId: `unknown-child-${index}`, turn: { id: `unknown-turn-${index}` },
+    });
+  }
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.ok(peer.requests.some(({ method, params }) => method === 'thread/read' &&
+    (params as { threadId?: string }).threadId === 'thread-created-1'));
   await session.close();
 });
 
@@ -441,8 +619,10 @@ test('Codex snapshots materialize embedded historical images as bounded Remux ar
   const dataUrl = `data:image/png;base64,${'a'.repeat(400_000)}`;
   let peer: FakeCodexConnection | undefined;
   const imported: string[] = [];
+  const importedScopes: Array<{ conversationId: string; executionId: string }> = [];
   const adapter = new CodexNativeAdapter({
-    importHistoricalImage: async (value) => {
+    importHistoricalImage: async (scope, value) => {
+      importedScopes.push(scope);
       imported.push(value);
       return { artifactId: 'historical-image-1', mimeType: 'image/png', byteLength: 300_000 };
     },
@@ -477,6 +657,7 @@ test('Codex snapshots materialize embedded historical images as bounded Remux ar
   const snapshot = await session.snapshot({ commandId: 'snapshot-image-history' });
   const message = snapshot.events.find(({ event }) => event.type === 'user.message');
   assert.deepEqual(imported, [dataUrl]);
+  assert.deepEqual(importedScopes, [{ conversationId: 'conversation-1', executionId: 'execution-1' }]);
   assert.ok(message?.event.type === 'user.message');
   if (message?.event.type === 'user.message') {
     assert.deepEqual(message.event.content, [
@@ -610,10 +791,16 @@ test('Codex projection failures are isolated from the native turn and later even
   peer.completeActiveTurn();
   await terminal;
 
-  const recovered = seen.find(({ event }) => event.type === 'turn.block.started' &&
+  const fitted = seen.find(({ event }) => event.type === 'turn.block.started' &&
     event.block.payload.kind === 'tool' && event.block.payload.tool.callId === 'projection-tool');
-  assert.ok(recovered?.event.type === 'turn.block.started');
-  if (recovered?.event.type === 'turn.block.started' && recovered.event.block.payload.kind === 'tool') {
+  assert.ok(fitted?.event.type === 'turn.block.started');
+  if (fitted?.event.type === 'turn.block.started' && fitted.event.block.payload.kind === 'tool') {
+    assert.match(fitted.event.block.payload.tool.title ?? '', /truncated/u);
+  }
+  const recovered = seen.find(({ event }) => event.type === 'turn.block.revised' &&
+    event.block.payload.kind === 'tool' && event.block.payload.tool.callId === 'projection-tool');
+  assert.ok(recovered?.event.type === 'turn.block.revised');
+  if (recovered?.event.type === 'turn.block.revised' && recovered.event.block.payload.kind === 'tool') {
     assert.equal(recovered.event.block.payload.tool.title, 'printf recovered');
   }
   assert.ok(seen.some(({ event }) => event.type === 'turn.completed' && event.outcome === 'completed'));
@@ -627,6 +814,7 @@ type FakeOptions = {
   emitForkStarted?: boolean;
   rolloutPath?: string;
   snapshotTurns?: unknown[];
+  threadReadResponse?: unknown;
 };
 
 class FakeCodexConnection implements CodexAppServerConnection {
@@ -640,6 +828,7 @@ class FakeCodexConnection implements CodexAppServerConnection {
   private readonly childSnapshotTurns?: Record<string, unknown[]>;
   private readonly emitForkStarted: boolean;
   private readonly rolloutPath?: string;
+  private readonly threadReadResponse?: unknown;
   private threadId = 'thread-created-1';
   private turnCounter = 0;
   private updatedAt = 1_700_000_000;
@@ -652,6 +841,7 @@ class FakeCodexConnection implements CodexAppServerConnection {
     this.configuredSnapshotTurns = options.snapshotTurns;
     this.childSnapshotTurns = options.childSnapshotTurns;
     this.rolloutPath = options.rolloutPath;
+    this.threadReadResponse = options.threadReadResponse;
   }
 
   async request(method: string, params: unknown): Promise<unknown> {
@@ -675,6 +865,11 @@ class FakeCodexConnection implements CodexAppServerConnection {
           displayName: 'GPT Test',
           hidden: false,
           isDefault: true,
+          serviceTiers: [
+            { id: 'default', name: 'Default' },
+            { id: 'priority', name: 'Priority', description: 'Faster responses with higher usage' },
+          ],
+          additionalSpeedTiers: ['fast'],
           supportedReasoningEfforts: [
             { reasoningEffort: 'low' },
             { reasoningEffort: 'high' },
@@ -705,6 +900,7 @@ class FakeCodexConnection implements CodexAppServerConnection {
       return {};
     }
     if (method === 'thread/read') {
+      if (this.threadReadResponse !== undefined) return structuredClone(this.threadReadResponse);
       const requestedThreadId = (params as { threadId: string }).threadId;
       const turns = this.childSnapshotTurns?.[requestedThreadId]
         ?? this.configuredSnapshotTurns
@@ -750,6 +946,19 @@ class FakeCodexConnection implements CodexAppServerConnection {
   }
 
   startChildTurn(threadId: string, turnId: string) {
+    const parentTurnId = this.activeNativeTurnId;
+    if (!parentTurnId) throw new Error('Fake has no active parent turn.');
+    this.emit('item/completed', {
+      threadId: this.threadId,
+      turnId: parentTurnId,
+      item: {
+        id: `spawn-${threadId}`,
+        type: 'subAgentActivity',
+        kind: 'started',
+        agentThreadId: threadId,
+        agentPath: `/root/${threadId}`,
+      },
+    });
     this.emit('turn/started', {
       threadId,
       turn: { id: turnId, status: 'inProgress', items: [] },
@@ -825,3 +1034,57 @@ async function readCount(events: AsyncIterable<ProviderEventEnvelope>, count: nu
   }
   throw new Error('Provider stream closed before enough events were emitted.');
 }
+
+test('Codex ownership-free delivery read requires exact frozen thread and client identity', async () => {
+  let peer!: FakeCodexConnection;
+  const adapter = new CodexNativeAdapter({ createConnection: async (options) => {
+    peer = new FakeCodexConnection(options, { snapshotTurns: [{ id: 'native-turn-proof',
+      status: 'completed', items: [{ id: 'user-proof', type: 'userMessage',
+        clientId: 'native-client-proof', content: [{ type: 'text', text: 'hello' }] }] }] });
+    return peer;
+  } });
+  const present = await adapter.readTurnPresence!({ providerInstanceId: 'codex-local',
+    cwd: '/workspace/remux', nativeSessionId: 'thread-proof',
+    nativeClientMessageId: 'native-client-proof' });
+  assert.equal(present.presence, 'present');
+  if (present.presence === 'present') {
+    assert.equal(present.evidence.kind, 'codex-history-client-id');
+    assert.equal(present.evidence.nativeTurnId, 'native-turn-proof');
+  }
+  assert.deepEqual(peer.requests.map(({ method }) => method), ['initialize', 'thread/read']);
+  assert.equal(peer.closed, true);
+
+  const absent = await adapter.readTurnPresence!({ providerInstanceId: 'codex-local',
+    cwd: '/workspace/remux', nativeSessionId: 'thread-proof',
+    nativeClientMessageId: 'wrong-client' });
+  assert.equal(absent.presence, 'unknown');
+  assert.deepEqual(peer.requests.map(({ method }) => method), ['initialize', 'thread/read']);
+  assert.equal(peer.closed, true);
+
+  const cases: Array<{ name: string; response: unknown }> = [
+    { name: 'wrong thread', response: { thread: { id: 'another-thread', turns: [{
+      id: 'native-turn-proof', items: [{ type: 'userMessage', clientId: 'native-client-proof' }],
+    }] } } },
+    { name: 'missing turns', response: { thread: { id: 'thread-proof' } } },
+    { name: 'partial turns', response: { thread: { id: 'thread-proof', turns: 'partial' } } },
+    { name: 'empty history', response: { thread: { id: 'thread-proof', turns: [] } } },
+    { name: 'missing native turn ID', response: { thread: { id: 'thread-proof', turns: [{
+      items: [{ type: 'userMessage', clientId: 'native-client-proof' }],
+    }] } } },
+  ];
+  for (const item of cases) {
+    let readPeer!: FakeCodexConnection;
+    const readAdapter = new CodexNativeAdapter({ createConnection: async (options) => {
+      readPeer = new FakeCodexConnection(options, { threadReadResponse: item.response });
+      return readPeer;
+    } });
+    const result = await readAdapter.readTurnPresence!({ providerInstanceId: 'codex-local',
+      cwd: '/workspace/remux', nativeSessionId: 'thread-proof',
+      nativeClientMessageId: 'native-client-proof' });
+    assert.equal(result.presence, 'unknown', item.name);
+    assert.deepEqual(readPeer.requests.map(({ method }) => method), ['initialize', 'thread/read'], item.name);
+    assert.equal(readPeer.requests.some(({ method }) =>
+      method === 'thread/start' || method === 'thread/resume'), false, item.name);
+    assert.equal(readPeer.closed, true, item.name);
+  }
+});

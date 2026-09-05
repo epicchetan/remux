@@ -39,8 +39,10 @@ export function ComposerInlineStatus({ expanded, onToggle, providers, runtime }:
           </span>
         ) : null}
         <span className="truncate">{model?.name ?? (configuredModel || 'Loading models')}</span>
-        <span className="remux-composer-status-separator" aria-hidden="true">/</span>
-        <span className="truncate">{reasoningLabel(configuredReasoning)} reasoning</span>
+        {configuredReasoning !== null ? <>
+          <span className="remux-composer-status-separator" aria-hidden="true">/</span>
+          <span className="truncate">{reasoningLabel(configuredReasoning)} reasoning</span>
+        </> : null}
       </div>
       {context ? (
         <span className="remux-composer-status-group remux-composer-status-group-right">

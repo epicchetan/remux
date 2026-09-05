@@ -48,6 +48,41 @@ export type FederationCredential = {
   revoke(): void;
 };
 
+export type ResolvedFederationTarget = {
+  providerInstanceId: string;
+  model: string;
+  effort?: string;
+};
+
+/** Resolve a spawn target only from the immutable catalog captured at issuance. */
+export function resolveFederationTarget(
+  scope: FederationCredentialScope,
+  requested: { providerInstanceId: string; model?: string; effort?: string },
+): ResolvedFederationTarget {
+  const target = scope.targetCatalog.find(({ providerInstanceId }) =>
+    providerInstanceId === requested.providerInstanceId);
+  if (!target) {
+    throw new Error(`Federation target ${requested.providerInstanceId} is outside this credential scope.`);
+  }
+  const model = requested.model
+    ? target.models.find(({ id }) => id === requested.model)
+    : target.models.find(({ isDefault }) => isDefault) ?? target.models[0];
+  if (requested.model && !model) {
+    throw new Error(`Federation model ${requested.model} is outside this credential scope.`);
+  }
+  if (!model) {
+    throw new Error(`Federation target ${requested.providerInstanceId} has no model in this credential scope.`);
+  }
+  if (requested.effort && !model.supportedEffort.includes(requested.effort)) {
+    throw new Error(`Effort ${requested.effort} is outside the credential scope for federation model ${model.id}.`);
+  }
+  return {
+    providerInstanceId: target.providerInstanceId,
+    model: model.id,
+    ...(requested.effort ? { effort: requested.effort } : {}),
+  };
+}
+
 /** In-memory bearer credentials. Tokens are never persisted or exposed as resources. */
 export class FederationCredentialRegistry {
   private static readonly MAX_IDLE_MS = 24 * 60 * 60 * 1_000;

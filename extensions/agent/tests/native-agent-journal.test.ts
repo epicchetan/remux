@@ -9,11 +9,14 @@ import {
   NativeAgentJournal,
   openNativeAgentJournal,
 } from '../server/src/native-runtime/native-journal.ts';
+import { FederationCheckoutOwner } from '../server/src/native-runtime/federation-checkout-owner.ts';
 import {
   createNativeAgentSchema,
   migrateNativeAgentSchema,
 } from '../server/src/native-runtime/schema.ts';
 import { prepareAgentDataPaths } from '../server/src/storage/data-root.ts';
+import { CodexEventMapper, codexStableChildExecutionId, codexStableNativeTurnId } from '../server/src/providers/codex/codex-event-mapper.ts';
+import { CodexChildRegistry } from '../server/src/providers/codex/codex-child-registry.ts';
 import {
   PROVIDER_RUNTIME_CONTRACT_VERSION,
   type ProviderCapabilities,
@@ -510,7 +513,7 @@ test('native journal appends a new live block when its proposed ordinal is occup
       block: {
         kind: 'reasoning-summary',
         state: 'completed',
-        payload: { kind: 'reasoning-summary', text: 'Already projected.' },
+        payload: { kind: 'reasoning-summary', text: 'Already projected.' , truncated: false},
       },
     })), true);
     assert.equal(journal.appendProviderEvent(event('racing-block-started', 4, {
@@ -544,6 +547,88 @@ test('native journal appends a new live block when its proposed ordinal is occup
       'Recovered safely.');
     assert.equal(journal.eventsForTurn('turn-1').length, 3,
       'the append-only event log retains both lifecycle events');
+  } finally {
+    journal.close();
+  }
+});
+
+test('native journal gives interleaved native and federated passes stable canonical ordinals', () => {
+  const journal = createJournal();
+  try {
+    seedConversation(journal);
+    journal.createTurn({
+      turnId: 'turn-1',
+      conversationId: 'conversation-1',
+      executionId: 'execution-1',
+      clientMessageId: 'message-1',
+      commandId: 'send-1',
+      content: [{ type: 'text', text: 'Interleave native output and reviewers.' }],
+      model: 'fixture-native-v1',
+      state: 'running',
+      now: 2,
+    });
+    const completedBlock = (
+      eventId: string,
+      observedAt: number,
+      passId: string,
+      blockId: string,
+      passOrdinal: number,
+      text: string,
+      revision = 1,
+    ) => event(eventId, observedAt, {
+      type: 'turn.block.completed',
+      structure: { passId, blockId, passOrdinal, blockOrdinal: 0 },
+      revision,
+      contentHash: 'a'.repeat(64),
+      block: {
+        kind: 'reasoning-summary',
+        state: 'completed',
+        payload: { kind: 'reasoning-summary', text, truncated: false },
+      },
+    });
+
+    const federatedPasses = Array.from({ length: 10 }, (_, index) => completedBlock(
+      `federated-pass-${index + 1}`,
+      index + 4,
+      `federated-pass-${index + 1}`,
+      `federated-block-${index + 1}`,
+      index + 1,
+      `Reviewer ${index + 1}.`,
+    ));
+    assert.equal(journal.appendProviderEvents([
+      completedBlock('native-pass-zero', 3, 'native-pass-0', 'native-block-0', 0, 'First.'),
+      ...federatedPasses,
+      completedBlock('native-pass-one', 14, 'native-pass-1', 'native-block-1', 1, 'Continued.'),
+      completedBlock('native-pass-one-revised', 15, 'native-pass-1', 'native-block-1', 1,
+        'Continued safely.', 2),
+    ]).length, 13);
+    assert.equal(journal.appendProviderEvent(event('turn-terminal', 16, {
+      type: 'turn.completed', outcome: 'completed',
+    })), true);
+    assert.equal(journal.appendProviderEvent(completedBlock(
+      'late-native-pass', 17, 'native-pass-2', 'native-block-2', 2, 'Recovered after completion.',
+    )), true);
+
+    assert.deepEqual(journal.orderedPasses('turn-1').map(({ passId, ordinal }) => [passId, ordinal]), [
+      ['native-pass-0', 0],
+      ...Array.from({ length: 10 }, (_, index) =>
+        [`federated-pass-${index + 1}`, index + 1]),
+      ['native-pass-1', 11],
+      ['native-pass-2', 12],
+    ]);
+    assert.equal(journal.orderedPasses('turn-1').at(-1)?.state, 'completed');
+    assert.deepEqual(journal.eventsForTurn('turn-1').flatMap(({ event: stored }) =>
+      stored.type === 'turn.block.started' || stored.type === 'turn.block.revised' ||
+      stored.type === 'turn.block.completed'
+        ? [[stored.structure.passId, stored.structure.passOrdinal]]
+        : []), [
+      ['native-pass-0', 0],
+      ...Array.from({ length: 10 }, (_, index) =>
+        [`federated-pass-${index + 1}`, index + 1]),
+      ['native-pass-1', 11],
+      ['native-pass-1', 11],
+      ['native-pass-2', 12],
+    ]);
   } finally {
     journal.close();
   }
@@ -587,6 +672,27 @@ test('native journal projects native child identity without exposing a resume cu
       },
     }));
     assert.equal(journal.execution('execution-child-1')?.transcriptAvailable, true);
+    assert.deepEqual(journal.nativeChildBindings('execution-1', 'native-root-thread'), [{
+      nativeThreadId: 'private-child-thread',
+      executionId: 'execution-child-1',
+      parentExecutionId: 'execution-1',
+      nativeParentThreadId: 'native-root-thread',
+      ownerTurnId: 'turn-1',
+      ownerNativeTurnId: 'fixture-native-turn-1',
+      nativeTurnBindings: [],
+      terminalNativeTurnIds: [],
+      canonicalBlock: {
+        structure: blockStructure('native-child-1', 0),
+        revision: 0,
+        block: { kind: 'native-child', state: 'running', payload: {
+          kind: 'native-child',
+          child: { executionId: 'execution-child-1', ownership: 'native', provider: 'fixture',
+            providerInstanceId: 'fixture-local', title: 'Native reviewer',
+            nativeSessionId: 'private-child-thread', transcriptAvailable: true },
+          executionState: 'running',
+        } },
+      },
+    }]);
     assert.deepEqual(journal.nativeChildHandle('execution-child-1'), {
       nativeSessionId: 'private-child-thread',
     });
@@ -637,6 +743,22 @@ test('native journal projects native child identity without exposing a resume cu
         },
       },
     }));
+    journal.appendProviderEvent({ ...event('later-observed-child-started', 10, {
+      type: 'execution.started', child: { executionId: 'execution-child-1', ownership: 'native',
+        provider: 'fixture', providerInstanceId: 'fixture-local', title: 'Native reviewer',
+        nativeSessionId: 'private-child-thread', transcriptAvailable: true },
+    }), scope: { kind: 'execution', providerInstanceId: 'fixture-local',
+      conversationId: 'conversation-1', executionId: 'execution-1', rootTurnId: 'turn-1' } });
+    journal.appendProviderEvent(childEvent('grandchild-started', 11, {
+      type: 'turn.block.started', structure: {
+        passId: 'child-pass-1', blockId: 'grandchild-block', passOrdinal: 0, blockOrdinal: 1,
+      }, block: { kind: 'native-child', state: 'running', payload: {
+        kind: 'native-child', child: { executionId: 'execution-grandchild-1', ownership: 'native',
+          provider: 'fixture', providerInstanceId: 'fixture-local', title: 'Nested reviewer',
+          nativeSessionId: 'private-grandchild-thread', transcriptAvailable: true },
+        executionState: 'running',
+      } },
+    }));
     journal.appendProviderEvent(event('late-child-started', 3, {
       type: 'turn.block.started',
       structure: blockStructure('native-child-1', 0),
@@ -667,6 +789,12 @@ test('native journal projects native child identity without exposing a resume cu
       { type: 'text', text: 'Inspect the native child.' },
     ]);
     assert.doesNotMatch(JSON.stringify(child), /private-child-thread/u);
+    const restoredTree = journal.nativeChildBindings('execution-1', 'native-root-thread');
+    assert.deepEqual(restoredTree.map(({ executionId, parentExecutionId, nativeParentThreadId }) =>
+      [executionId, parentExecutionId, nativeParentThreadId]), [
+      ['execution-child-1', 'execution-1', 'native-root-thread'],
+      ['execution-grandchild-1', 'execution-child-1', 'private-child-thread'],
+    ]);
   } finally {
     journal.close();
   }
@@ -687,6 +815,7 @@ test('native journal queue is durable FIFO and retains a claim until provider ac
         clientMessageId: `message-${index}`,
         content: [{ type: 'text', text: `Message ${index}` }],
         model: 'fixture-native-v1',
+        serviceTier: index === 1 ? 'priority' : 'default',
         access: 'workspace-write',
         now: index + 2,
       });
@@ -704,8 +833,12 @@ test('native journal queue is durable FIFO and retains a claim until provider ac
     );
     assert.equal(journal.claimQueuedTurn('conversation-1', 11), undefined,
       'a dispatching head blocks later FIFO entries');
+    assert.equal(journal.queuedMessages('conversation-1')[0]?.serviceTier, 'priority');
     assert.equal(journal.admitQueuedTurn('turn-1', 11, 'fixture-native-turn-1')?.turnId, 'turn-1');
     assert.equal(journal.turn('turn-1')?.state, 'running');
+    assert.equal(journal.turn('turn-1')?.serviceTier, 'priority',
+      'queue admission snapshots the inference tier into transcript history');
+    assert.equal(journal.conversation('conversation-1')?.serviceTier, 'priority');
     assert.equal(journal.turn('turn-1')?.nativeTurnId, 'fixture-native-turn-1',
       'provider acceptance binds native identity in the transcript-admission transaction');
     assert.equal(journal.claimQueuedTurn('conversation-1', 12)?.turnId, 'turn-2');
@@ -799,7 +932,7 @@ test('authoritative snapshots replace stale live block ordinals after native com
       contentHash: 'a'.repeat(64),
       block: {
         kind: 'reasoning-summary', state: 'completed',
-        payload: { kind: 'reasoning-summary', text: 'Pre-compaction detail.' },
+        payload: { kind: 'reasoning-summary', text: 'Pre-compaction detail.' , truncated: false},
       },
     });
     journal.appendProviderEvent(staleLive);
@@ -856,7 +989,7 @@ test('authoritative snapshots replace stale live block ordinals after native com
       contentHash: 'b'.repeat(64),
       block: {
         kind: 'reasoning-summary', state: 'completed',
-        payload: { kind: 'reasoning-summary', text: 'Compacted summary.' },
+        payload: { kind: 'reasoning-summary', text: 'Compacted summary.' , truncated: false},
       },
     });
     summary.native.position = { kind: 'snapshot-index', itemIndex: 1, subIndex: 0 };
@@ -981,7 +1114,7 @@ test('snapshot coverage preserves journal-only tool blocks until the provider cl
       contentHash: 'b'.repeat(64),
       block: {
         kind: 'reasoning-summary', state: 'completed',
-        payload: { kind: 'reasoning-summary', text: 'Inspecting the file.' },
+        payload: { kind: 'reasoning-summary', text: 'Inspecting the file.' , truncated: false},
       },
     });
     reasoning.native.position = { kind: 'snapshot-index', itemIndex: 0, subIndex: 0 };
@@ -1533,6 +1666,318 @@ test('schema v11 repairs only a proven command-backed compaction replay and reco
   }
 });
 
+test('context usage is scoped to the active root while child reads remain available', () => {
+  const journal = createJournal();
+  try {
+    seedConversation(journal);
+    journal.createFederatedExecution({
+      executionId: 'execution-child-1', conversationId: 'conversation-1',
+      parentExecutionId: 'execution-1', rootTurnId: 'turn-1', provider: 'fixture',
+      providerInstanceId: 'fixture-local', model: 'fixture-native-v1', access: 'read-only',
+      scheduling: 'background', depth: 1, title: 'Child', now: 2,
+    });
+    for (const [turnId, executionId] of [['turn-1', 'execution-1'], ['turn-child-1', 'execution-child-1']]) {
+      journal.createTurn({
+        turnId, conversationId: 'conversation-1', executionId,
+        clientMessageId: `message-${turnId}`, commandId: `send-${turnId}`,
+        content: [{ type: 'text', text: 'Work.' }], model: 'fixture-native-v1', state: 'running', now: 3,
+      });
+    }
+    journal.appendProviderEvent(event('root-usage', 4, contextUsageEvent(210934, 4)));
+    journal.appendProviderEvent(childEvent('child-usage', 5, contextUsageEvent(900000, 5)));
+    assert.equal(journal.latestUsage('conversation-1')?.context?.usedTokens, 210934);
+    assert.equal(journal.latestUsage('conversation-1', 'turn-child-1')?.context?.usedTokens, 900000);
+    journal.appendProviderEvent({
+      ...childEvent('child-compact', 6, { type: 'context.compaction.completed', trigger: 'automatic',
+        operationId: 'child-compact', beforeTokens: 900000, afterTokens: null }),
+      scope: { kind: 'conversation', providerInstanceId: 'fixture-local', conversationId: 'conversation-1', executionId: 'execution-child-1' },
+    });
+    assert.equal(journal.latestUsage('conversation-1')?.context?.usedTokens, 210934);
+    assert.equal(journal.latestUsage('conversation-1', 'turn-child-1')?.context, null);
+    journal.appendProviderEvent(event('root-compact', 7, {
+      type: 'context.compaction.completed', trigger: 'manual', operationId: 'root-compact',
+      beforeTokens: 210934, afterTokens: null,
+    }));
+    assert.equal(journal.latestUsage('conversation-1')?.context, null);
+    journal.appendProviderEvent(event('root-after-compact', 7, contextUsageEvent(40000, 7)));
+    assert.equal(journal.latestUsage('conversation-1')?.context?.usedTokens, 40000);
+    // A different active strand must never reuse the preceding root's meter.
+    journal.database.prepare('UPDATE conversations SET root_execution_id = ? WHERE conversation_id = ?')
+      .run('execution-child-1', 'conversation-1');
+    assert.equal(journal.latestUsage('conversation-1')?.context, null);
+  } finally { journal.close(); }
+});
+
+test('legacy Claude context is invalidated on read without rewriting historical usage or cost', () => {
+  const journal = createJournal();
+  try {
+    seedConversation(journal);
+    journal.createTurn({
+      turnId: 'turn-1', conversationId: 'conversation-1', executionId: 'execution-1',
+      clientMessageId: 'message-1', commandId: 'send-1', content: [{ type: 'text', text: 'Work.' }],
+      model: 'fixture-native-v1', state: 'running', now: 2,
+    });
+    const original = event('legacy-claude-usage', 3, contextUsageEvent(1000000, 3));
+    original.native.kind = 'result/usage';
+    journal.appendProviderEvent(original);
+    journal.database.prepare("UPDATE executions SET provider = 'claude-code' WHERE execution_id = 'execution-1'").run();
+    assert.equal(journal.latestUsage('conversation-1')?.context, null);
+    assert.equal(journal.latestUsage('conversation-1', 'turn-1')?.context, null);
+    assert.equal(journal.latestUsage('conversation-1')?.estimatedCost?.usd, 6.22);
+    const stored = journal.database.prepare('SELECT usage_json FROM usage_snapshots WHERE event_id = ?')
+      .get(original.eventId) as { usage_json: string };
+    assert.equal(JSON.parse(stored.usage_json).context.usedTokens, 1000000);
+    const fixed = event('fixed-claude-usage', 4, contextUsageEvent(210934, 4));
+    fixed.native.kind = 'result/usage-v2';
+    journal.appendProviderEvent(fixed);
+    assert.equal(journal.latestUsage('conversation-1')?.context?.usedTokens, 210934);
+  } finally { journal.close(); }
+});
+
+function contextUsageEvent(usedTokens: number, observedAt: number): ProviderEvent {
+  return { type: 'turn.usage-updated', usage: {
+    turn: null, cumulative: null,
+    context: { usedTokens, windowTokens: 1000000, percent: usedTokens / 1000000 * 100,
+      measurement: 'derived', freshness: 'live', observedAt, turnId: 'turn-1' },
+    estimatedCost: { usd: 6.22, scope: 'runtime-epoch', epochId: 'epoch' },
+  } };
+}
+
+test('Codex child followup lifecycle survives journal event dedup on one canonical card', () => {
+  const journal = createJournal();
+  try {
+    seedConversation(journal);
+    journal.createTurn({ turnId: 'turn-1', conversationId: 'conversation-1', executionId: 'execution-1',
+      clientMessageId: 'message-1', commandId: 'send-1', content: [], model: 'fixture-native-v1',
+      state: 'running', now: 1 });
+    const registry = new CodexChildRegistry();
+    const mapper = new CodexEventMapper({ providerInstanceId: 'fixture-local',
+      conversationId: 'conversation-1', executionId: 'execution-1', nativeSessionId: 'root-thread',
+      childRegistry: registry,
+      observedAt: (() => { let now = 2; return () => now++; })() });
+    mapper.bindTurn('turn-1', 'native-owner');
+    const map = (method: string, params: Record<string, unknown>) =>
+      mapper.mapNotification({ method, params });
+    journal.appendProviderEvents(map('item/completed', { threadId: 'root-thread', turnId: 'native-owner',
+      item: { id: 'spawn-child', type: 'subAgentActivity', kind: 'started', agentThreadId: 'child-thread' } }));
+    const childMapper = new CodexEventMapper({ providerInstanceId: 'fixture-local',
+      conversationId: 'conversation-1',
+      executionId: codexStableChildExecutionId('execution-1', 'child-thread'),
+      nativeSessionId: 'child-thread', childRegistry: registry,
+      observedAt: (() => { let now = 20; return () => now++; })() });
+    childMapper.expectTurn(codexStableNativeTurnId('attempt-a'));
+    const startA = map('turn/started', { threadId: 'child-thread', turn: { id: 'attempt-a' } });
+    journal.appendProviderEvents(startA);
+    journal.appendProviderEvents(childMapper.mapNotification({ method: 'turn/started',
+      params: { threadId: 'child-thread', turn: { id: 'attempt-a' } } }));
+    journal.appendProviderEvents(map('item/completed', { threadId: 'root-thread', turnId: 'native-owner',
+      item: { id: 'subagent-completed-attempt-a', type: 'subAgentActivity', kind: 'completed',
+        agentThreadId: 'child-thread' } }));
+    assert.deepEqual(map('turn/completed', { threadId: 'child-thread',
+      turn: { id: 'attempt-a', status: 'completed' } }), []);
+    journal.appendProviderEvents(childMapper.mapNotification({ method: 'turn/completed',
+      params: { threadId: 'child-thread', turn: { id: 'attempt-a', status: 'completed' } } }));
+    assert.equal(journal.turn(codexStableNativeTurnId('attempt-a'))?.outcome, 'completed');
+    const startB = map('turn/started', { threadId: 'child-thread', turn: { id: 'attempt-b' } });
+    assert.notEqual(startA[0]?.eventId, startB[0]?.eventId);
+    journal.appendProviderEvents(startB);
+    const running = journal.orderedPasses('turn-1').flatMap(({ blocks }) => blocks)
+      .find(({ kind }) => kind === 'native-child');
+    assert.equal(running?.state, 'running');
+    assert.deepEqual(map('turn/started', { threadId: 'child-thread', turn: { id: 'attempt-a' } }), []);
+    journal.appendProviderEvents(map('turn/completed', { threadId: 'child-thread',
+      turn: { id: 'attempt-b', status: 'completed' } }));
+    const completed = journal.orderedPasses('turn-1').flatMap(({ blocks }) => blocks)
+      .find(({ kind }) => kind === 'native-child');
+    assert.equal(completed?.state, 'completed');
+    assert.equal(journal.childExecutions('execution-1').length, 1);
+  } finally { journal.close(); }
+});
+
+test('I3 repair directives suppress proven phantom blocks during partial snapshot replay', () => {
+  const journal = createJournal();
+  try {
+    seedConversation(journal);
+    journal.createTurn({ turnId: 'turn-1', conversationId: 'conversation-1', executionId: 'execution-1',
+      clientMessageId: 'message-1', commandId: 'send-1', content: [], model: 'fixture-native-v1',
+      state: 'running', now: 1 });
+    const phantom = event('historical-phantom', 2, { type: 'turn.block.started',
+      structure: blockStructure('phantom-block', 0), block: { kind: 'native-child', state: 'running',
+        payload: { kind: 'native-child', child: { executionId: 'phantom-execution', ownership: 'native',
+          provider: 'fixture' }, executionState: 'running' } } });
+    journal.appendProviderEvent(phantom);
+    const canonical = event('historical-canonical-running', 2, { type: 'turn.block.started',
+      structure: { passId: 'canonical-pass', blockId: 'canonical-child', passOrdinal: 1, blockOrdinal: 0 },
+      block: { kind: 'native-child', state: 'running', payload: { kind: 'native-child',
+        child: { executionId: 'canonical-execution', ownership: 'native', provider: 'fixture' },
+        executionState: 'running' } } });
+    journal.appendProviderEvent(canonical);
+    journal.database.prepare('DELETE FROM turn_blocks WHERE block_id = ?').run('phantom-block');
+    journal.database.prepare('DELETE FROM turn_passes WHERE pass_id = ?').run('pass-1');
+    journal.database.prepare('DELETE FROM executions WHERE execution_id = ?').run('phantom-execution');
+    const canonicalOverride = structuredClone(canonical);
+    canonicalOverride.eventId = 'repair-canonical-terminal';
+    if (canonicalOverride.event.type === 'turn.block.started') {
+      assert.equal(canonicalOverride.event.block.payload.kind, 'native-child');
+      if (canonicalOverride.event.block.payload.kind !== 'native-child') throw new Error('fixture mismatch');
+      canonicalOverride.event = { type: 'turn.block.completed', structure: canonicalOverride.event.structure,
+        revision: 1, contentHash: 'b'.repeat(64), block: { kind: 'native-child', state: 'completed',
+          payload: { ...canonicalOverride.event.block.payload, executionState: 'idle', outcome: 'completed' } } };
+    }
+    journal.database.prepare('INSERT INTO meta(key,value_json) VALUES (?,?)').run(
+      'repair_i3_native_child_identity_v1', JSON.stringify({ directives: {
+        suppressedBlockIds: ['phantom-block'],
+        terminalSequence: 2,
+        canonicalEnvelope: canonicalOverride,
+      } }),
+    );
+    const assistant = event('snapshot-assistant', 3, { type: 'turn.block.completed',
+      structure: { passId: 'canonical-pass', blockId: 'assistant-block', passOrdinal: 0, blockOrdinal: 1 },
+      revision: 1, contentHash: 'a'.repeat(64),
+      block: { kind: 'final-message', state: 'completed', payload: {
+        kind: 'final-message', text: 'Still here.',
+      } } });
+    assistant.native.position = { kind: 'snapshot-index', itemIndex: 0, subIndex: 0 };
+    const replayedPhantom = structuredClone(phantom);
+    replayedPhantom.native.position = { kind: 'snapshot-index', itemIndex: 1, subIndex: 0 };
+    journal.replaceSnapshot([assistant, replayedPhantom], { turnBlocks: { completeKinds: ['final-message'] } });
+    assert.equal(journal.execution('phantom-execution'), undefined);
+    assert.equal(journal.orderedPasses('turn-1').flatMap(({ blocks }) => blocks)
+      .some(({ blockId }) => blockId === 'phantom-block'), false);
+    assert.ok(journal.eventsForTurn('turn-1').some(({ eventId }) => eventId === 'historical-phantom'));
+    assert.equal(journal.orderedPasses('turn-1').flatMap(({ blocks }) => blocks)
+      .find(({ blockId }) => blockId === 'canonical-child')?.state, 'completed');
+    const followup = event('genuine-followup', 10, { type: 'turn.block.revised',
+      structure: { passId: 'canonical-pass', blockId: 'canonical-child', passOrdinal: 0, blockOrdinal: 0 },
+      revision: 2, contentHash: 'c'.repeat(64), block: { kind: 'native-child', state: 'running',
+        payload: { kind: 'native-child', child: { executionId: 'canonical-execution',
+          ownership: 'native', provider: 'fixture' }, executionState: 'running' } } });
+    journal.appendProviderEvent(followup);
+    journal.replaceSnapshot([assistant], { turnBlocks: { completeKinds: ['final-message'] } });
+    assert.equal(journal.orderedPasses('turn-1').flatMap(({ blocks }) => blocks)
+      .find(({ blockId }) => blockId === 'canonical-child')?.state, 'running');
+  } finally { journal.close(); }
+});
+
+test('events before durable admission survive live ingestion and replay after completion', () => {
+  for (const replayOnly of [false, true]) {
+    const journal = createJournal();
+    try {
+      seedConversation(journal);
+      journal.createTurn({
+        turnId: 'turn-1', conversationId: 'conversation-1', executionId: 'execution-1',
+        clientMessageId: 'message-1', commandId: 'send-1',
+        content: [{ type: 'text', text: 'Continue.' }], model: 'fixture-native-v1',
+        state: 'running', now: 100,
+      });
+      const early = [
+        event('early-user', 99, { type: 'user.message', content: [{ type: 'text', text: 'Continue.' }] }),
+        event('early-start', 99, { type: 'turn.started' }),
+        event('early-status', 99, { type: 'turn.status', state: 'running' }),
+      ];
+      if (!replayOnly) {
+        assert.equal(journal.appendProviderEvents(early).length, 3);
+        assert.equal(journal.turn('turn-1')?.updatedAt, 100);
+      }
+      const completed = event('completed', 200, { type: 'turn.completed', outcome: 'completed' });
+      journal.appendProviderEvent(completed);
+      // Also models repair of the original incident: the initial observations
+      // were rejected live, but remain in the provider's session-local snapshot.
+      assert.equal(journal.appendProviderEvents([...early, completed]).length, replayOnly ? 3 : 0);
+      assert.equal(journal.appendProviderEvents([...early, completed]).length, 0);
+      assert.equal(journal.turn('turn-1')?.state, 'completed');
+      assert.equal(journal.turn('turn-1')?.updatedAt, 200);
+      assert.equal(journal.execution('execution-1')?.state, 'idle');
+      assert.equal(journal.execution('execution-1')?.updatedAt, 200);
+      assert.equal(journal.conversation('conversation-1')?.activeTurnId, null);
+      assert.equal(journal.conversation('conversation-1')?.updatedAt, 200);
+      assert.equal(journal.eventsForTurn('turn-1').find(({ eventId }) => eventId === 'early-user')?.observedAt, 99);
+    } finally {
+      journal.close();
+    }
+  }
+});
+
+test('stale running status cannot overwrite a newer recovering turn', () => {
+  const journal = createJournal();
+  try {
+    seedConversation(journal);
+    journal.createTurn({
+      turnId: 'turn-1', conversationId: 'conversation-1', executionId: 'execution-1',
+      clientMessageId: 'message-1', commandId: 'send-1', content: [],
+      model: 'fixture-native-v1', state: 'running', now: 100,
+    });
+    journal.appendProviderEvent(event('recovering', 200, { type: 'turn.status', state: 'recovering' }));
+    journal.appendProviderEvent(event('stale-running', 150, { type: 'turn.status', state: 'running' }));
+    assert.equal(journal.turn('turn-1')?.state, 'recovering');
+    assert.equal(journal.turn('turn-1')?.updatedAt, 200);
+    assert.equal(journal.execution('execution-1')?.state, 'recovering');
+    assert.equal(journal.conversation('conversation-1')?.state, 'recovering');
+  } finally {
+    journal.close();
+  }
+});
+
+test('completion and compaction observations can precede durable admission', () => {
+  const journal = createJournal();
+  try {
+    seedConversation(journal);
+    journal.createTurn({
+      turnId: 'turn-1', conversationId: 'conversation-1', executionId: 'execution-1',
+      clientMessageId: 'message-1', commandId: 'send-1', content: [],
+      model: 'fixture-native-v1', state: 'running', now: 100,
+    });
+    journal.appendProviderEvent(event('early-completed', 99, { type: 'turn.completed', outcome: 'completed' }));
+    assert.equal(journal.turn('turn-1')?.state, 'completed');
+    assert.equal(journal.turn('turn-1')?.completedAt, 99);
+    assert.equal(journal.turn('turn-1')?.updatedAt, 100);
+    assert.equal(journal.execution('execution-1')?.updatedAt, 100);
+    assert.equal(journal.conversation('conversation-1')?.updatedAt, 100);
+
+    journal.claimCommand('compact-command', 'conversation.compact', {}, 100);
+    journal.createManualCompaction({
+      operationId: 'compact-1', commandId: 'compact-command',
+      conversationId: 'conversation-1', state: 'running', now: 100,
+    });
+    journal.appendProviderEvent(event('compact-started', 98, {
+      type: 'context.compaction.started', operationId: 'compact-1', trigger: 'manual', beforeTokens: 90_000,
+    }));
+    journal.appendProviderEvent(event('compact-completed', 99, {
+      type: 'context.compaction.completed', operationId: 'compact-1', trigger: 'manual',
+      beforeTokens: 90_000, afterTokens: 10_000,
+    }));
+    assert.equal(journal.compactionOperation('compact-1')?.state, 'completed');
+    assert.equal(journal.compactionOperation('compact-1')?.updatedAt, 100);
+  } finally {
+    journal.close();
+  }
+});
+
+test('historical imports can predate the conversation and execution records', () => {
+  const journal = createJournal();
+  try {
+    seedConversation(journal);
+    const history = [
+      event('historical-user', 0, { type: 'user.message', content: [{ type: 'text', text: 'Original prompt.' }] }),
+      event('historical-start', 0, { type: 'turn.started' }),
+      event('historical-completed', 0, { type: 'turn.completed', outcome: 'completed' }),
+    ];
+    journal.replaceSnapshot(history);
+    journal.replaceSnapshot(history);
+    assert.equal(journal.turn('turn-1')?.createdAt, 0);
+    assert.equal(journal.turn('turn-1')?.state, 'completed');
+    assert.equal(journal.conversation('conversation-1')?.updatedAt, 1);
+    assert.equal(journal.execution('execution-1')?.updatedAt, 1);
+    journal.appendProviderEvent(event('historical-health', 0, { type: 'session.health', state: 'ready' }));
+    assert.equal(journal.conversation('conversation-1')?.state, 'idle');
+    assert.equal(journal.execution('execution-1')?.state, 'idle');
+    assert.equal(journal.conversation('conversation-1')?.updatedAt, 1);
+    assert.equal(journal.execution('execution-1')?.updatedAt, 1);
+  } finally {
+    journal.close();
+  }
+});
+
 function createJournal() {
   const database = new DatabaseSync(':memory:');
   database.exec('PRAGMA foreign_keys = ON');
@@ -1666,3 +2111,274 @@ function accountUsageEvent(
 function blockStructure(blockId: string, blockOrdinal: number) {
   return { passId: 'pass-1', blockId, passOrdinal: 0, blockOrdinal };
 }
+
+test('journal in-flight owner joins received and dispatching commands and cleans up', async () => {
+  const journal = createJournal();
+  let releaseReceived!: () => void;
+  let releaseDispatching!: () => void;
+  const receivedBarrier = new Promise<void>((resolve) => { releaseReceived = resolve; });
+  const dispatchingBarrier = new Promise<void>((resolve) => { releaseDispatching = resolve; });
+  let owners = 0;
+  const request = { commandId: 'async-owner', value: 1 };
+  const run = () => journal.runAsyncCommand(request.commandId, 'test.async', request, async () => {
+    owners += 1;
+    const claim = journal.claimCommand(request.commandId, 'test.async', request, 1);
+    if (claim.receipt.state === 'accepted') return claim.receipt.result as { accepted: true; owner: number };
+    await receivedBarrier;
+    journal.markCommandDispatching(request.commandId, 2);
+    await dispatchingBarrier;
+    const result = { accepted: true as const, owner: owners };
+    journal.acceptCommand(request.commandId, result, 3);
+    return result;
+  });
+  try {
+    const first = run();
+    assert.equal(journal.commandReceipt(request.commandId)?.state, 'received');
+    const duringReceived = run();
+    await assert.rejects(() => journal.runAsyncCommand(
+      request.commandId, 'test.async', { ...request, value: 2 }, async () => 'wrong'),
+    /reused with different input/u);
+    await assert.rejects(() => journal.runAsyncCommand(
+      request.commandId, 'test.other', request, async () => 'wrong'),
+    /reused with different input/u);
+    releaseReceived();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(journal.commandReceipt(request.commandId)?.state, 'dispatching');
+    const duringDispatching = run();
+    releaseDispatching();
+    const values = await Promise.all([first, duringReceived, duringDispatching]);
+    assert.deepEqual(values, [values[0], values[0], values[0]]);
+    assert.equal(owners, 1);
+
+    assert.deepEqual(await run(), values[0]);
+    await assert.rejects(() => journal.runAsyncCommand(
+      'sync-failure', 'test.async', { commandId: 'sync-failure' }, () => {
+        throw new Error('synchronous owner failure');
+      }), /synchronous owner failure/u);
+    const recovered = await journal.runAsyncCommand(
+      'sync-failure', 'test.async', { commandId: 'sync-failure' }, async () => 'clean');
+    assert.equal(recovered, 'clean');
+    const [one, two] = await Promise.all([
+      journal.runAsyncCommand('independent-1', 'test.async', { id: 1 }, async () => 1),
+      journal.runAsyncCommand('independent-2', 'test.async', { id: 2 }, async () => 2),
+    ]);
+    assert.deepEqual([one, two], [1, 2]);
+    let rejectOwner!: () => void;
+    const rejectBarrier = new Promise<void>((resolve) => { rejectOwner = resolve; });
+    const failureRequest = { commandId: 'async-failure' };
+    const failingBody = async () => {
+      const claim = journal.claimCommand(
+        failureRequest.commandId, 'test.async', failureRequest, 4);
+      if (claim.receipt.state === 'rejected') {
+        throw new Error(claim.receipt.errorMessage ?? 'missing durable failure');
+      }
+      await rejectBarrier;
+      journal.rejectCommand(failureRequest.commandId, 'shared asynchronous failure', 5);
+      throw new Error('shared asynchronous failure');
+    };
+    const failureOne = journal.runAsyncCommand(
+      failureRequest.commandId, 'test.async', failureRequest, failingBody);
+    const failureTwo = journal.runAsyncCommand(
+      failureRequest.commandId, 'test.async', failureRequest, failingBody);
+    rejectOwner();
+    await Promise.all([
+      assert.rejects(failureOne, /shared asynchronous failure/u),
+      assert.rejects(failureTwo, /shared asynchronous failure/u),
+    ]);
+    await assert.rejects(() => journal.runAsyncCommand(
+      failureRequest.commandId, 'test.async', failureRequest, failingBody),
+    /shared asynchronous failure/u);
+  } finally {
+    journal.close();
+  }
+});
+
+test('a synchronous claim cannot collide with an async owner before its receipt exists', async () => {
+  const journal = createJournal();
+  let release!: () => void;
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  const request = { commandId: 'future-claim', value: 'owned' };
+  try {
+    const owner = journal.runAsyncCommand(request.commandId, 'future.async', request, async () => {
+      await barrier;
+      journal.claimCommand(request.commandId, 'future.async', request, 2);
+      const result = { accepted: true as const };
+      journal.acceptCommand(request.commandId, result, 3);
+      return result;
+    });
+    assert.equal(journal.commandReceipt(request.commandId), undefined);
+    assert.throws(() => journal.claimCommand(
+      request.commandId,
+      'queue.remove',
+      { commandId: request.commandId, value: 'sync-collision' },
+      1,
+    ), /reused with different input/u);
+    assert.equal(journal.commandReceipt(request.commandId), undefined);
+    release();
+    assert.deepEqual(await owner, { accepted: true });
+    assert.equal(journal.commandReceipt(request.commandId)?.state, 'accepted');
+  } finally {
+    journal.close();
+  }
+});
+
+test('checkout reservations preserve writer conflicts and scope null-key unknown fencing', () => {
+  const journal = createJournal();
+  seedConversation(journal);
+  const create = (executionId: string, commandId: string, access: 'read-only' | 'workspace-write' | 'full-access',
+    scheduling: 'background' | 'foreground') => {
+    journal.claimCommand(commandId, 'federation.spawn', { commandId }, 2);
+    journal.createFederatedExecution({ executionId, conversationId: 'conversation-1',
+      parentExecutionId: 'execution-1', rootTurnId: 'root-turn', provider: 'fixture',
+      providerInstanceId: 'fixture-local', model: 'fixture-native-v1', checkoutKey: 'test:one',
+      access: access === 'full-access' ? 'workspace-write' : access,
+      scheduling, depth: 1, title: executionId, now: 2 });
+    if (access === 'full-access') journal.database.prepare(
+      `UPDATE executions SET access='full-access' WHERE execution_id=?`).run(executionId);
+  };
+  try {
+    create('writer-1', 'reserve-1', 'full-access', 'foreground');
+    journal.reserveFederatedCheckout({ executionId: 'writer-1', checkoutKey: 'test:one',
+      commandId: 'reserve-1', expectedTurnId: 'future-1', access: 'full-access',
+      scheduling: 'foreground', now: 3 });
+    create('writer-2', 'reserve-2', 'workspace-write', 'foreground');
+    assert.throws(() => journal.reserveFederatedCheckout({ executionId: 'writer-2',
+      checkoutKey: 'test:one', commandId: 'reserve-2', expectedTurnId: 'future-2',
+      access: 'workspace-write', scheduling: 'foreground', now: 3 }), /writer is already active/u);
+    journal.createFederatedExecution({ executionId: 'legacy', conversationId: 'conversation-1',
+      parentExecutionId: 'execution-1', rootTurnId: 'root-turn', provider: 'fixture',
+      providerInstanceId: 'fixture-local', model: 'fixture-native-v1', access: 'read-only',
+      scheduling: 'background', depth: 1, title: 'legacy', now: 4 });
+    journal.database.prepare(`INSERT INTO federation_checkout_reservations(
+      execution_id,checkout_key,command_id,expected_turn_id,access,scheduling,state,created_at,updated_at
+    ) VALUES ('legacy',NULL,NULL,NULL,'read-only','background','unknown',4,4)`).run();
+    create('foreground-reader', 'reserve-3', 'read-only', 'foreground');
+    journal.reserveFederatedCheckout({ executionId: 'foreground-reader', checkoutKey: 'test:two',
+      commandId: 'reserve-3', expectedTurnId: 'future-3', access: 'read-only',
+      scheduling: 'foreground', now: 5 });
+    create('background-reader', 'reserve-4', 'read-only', 'background');
+    assert.throws(() => journal.reserveFederatedCheckout({ executionId: 'background-reader',
+      checkoutKey: 'test:two', commandId: 'reserve-4', expectedTurnId: 'future-4',
+      access: 'read-only', scheduling: 'background', now: 5 }), /reader limit exceeded/u);
+  } finally {
+    journal.close();
+  }
+});
+
+test('startup checkout capture reactivates a released failed owner with a known writable native descendant', () => {
+  const journal = createJournal();
+  seedConversation(journal);
+  try {
+    journal.claimCommand('parent-command', 'federation.spawn', { id: 'parent' }, 2);
+    journal.createFederatedExecution({ executionId: 'federated-parent', conversationId: 'conversation-1',
+      parentExecutionId: 'execution-1', rootTurnId: 'root-turn', provider: 'fixture',
+      providerInstanceId: 'fixture-local', model: 'fixture-native-v1', checkoutKey: 'test:stable',
+      access: 'workspace-write', scheduling: 'foreground', depth: 1, title: 'parent', now: 2 });
+    journal.reserveFederatedCheckout({ executionId: 'federated-parent', checkoutKey: 'test:stable',
+      commandId: 'parent-command', expectedTurnId: 'parent-turn', access: 'workspace-write',
+      scheduling: 'foreground', now: 3 });
+    assert.equal(journal.releaseFederatedCheckout({ executionId: 'federated-parent',
+      commandId: 'parent-command', expectedTurnId: 'parent-turn', reason: 'native-terminal', now: 4 }), true);
+    journal.database.prepare(`UPDATE executions SET state='failed' WHERE execution_id='federated-parent'`).run();
+    journal.claimCommand('child-command', 'federation.spawn', { id: 'child' }, 4);
+    journal.createFederatedExecution({ executionId: 'native-child', conversationId: 'conversation-1',
+      parentExecutionId: 'federated-parent', rootTurnId: 'parent-turn', provider: 'fixture',
+      providerInstanceId: 'fixture-local', model: 'fixture-native-v1', checkoutKey: 'test:stable',
+      access: 'workspace-write', scheduling: 'foreground', depth: 2, title: 'child', now: 4 });
+    journal.database.prepare(`UPDATE executions SET ownership='native', federation_scheduling=NULL,
+      state='running' WHERE execution_id='native-child'`).run();
+    const owner = new FederationCheckoutOwner(journal, async () => ({
+      state: 'resolved', value: { checkoutKey: 'test:stable', launchCwd: '/workspace/remux' },
+    }));
+    const captured = owner.captureStartupOwners(5);
+    assert.ok(captured.some(({ executionId }) => executionId === 'federated-parent'));
+    assert.deepEqual({ ...journal.database.prepare(`SELECT state,checkout_key,command_id,expected_turn_id,
+        release_reason,released_at FROM federation_checkout_reservations
+      WHERE execution_id='federated-parent'`).get() }, {
+      state: 'unknown', checkout_key: 'test:stable', command_id: 'parent-command',
+      expected_turn_id: 'parent-turn', release_reason: null, released_at: null,
+    });
+    journal.database.prepare(`UPDATE executions SET state='failed', outcome='recovery_failed'
+      WHERE execution_id='native-child'`).run();
+    assert.ok(owner.captureStartupOwners(6).some(({ executionId }) => executionId === 'federated-parent'),
+      'a session-local recovery failure must retain the ancestor fence');
+    journal.createFederatedExecution({ executionId: 'unscoped-legacy', conversationId: 'conversation-1',
+      parentExecutionId: 'execution-1', rootTurnId: 'root-turn', provider: 'fixture',
+      providerInstanceId: 'fixture-local', model: 'fixture-native-v1', access: 'read-only',
+      scheduling: 'foreground', depth: 1, title: 'unscoped', now: 7 });
+    const unscoped = owner.captureStartupOwners(7).find(({ executionId }) => executionId === 'unscoped-legacy')!;
+    journal.database.prepare(`UPDATE federation_checkout_reservations SET state='released',
+      release_reason='native-terminal',released_at=8,updated_at=8 WHERE execution_id='unscoped-legacy'`).run();
+    assert.equal(owner.scopeCapturedStartupOwner(unscoped, 'test:retargeted', 9), false);
+    assert.equal(journal.execution('unscoped-legacy')?.checkoutKey, undefined,
+      'a lost reservation CAS must not re-key the execution');
+  } finally {
+    journal.close();
+  }
+});
+
+test('two journal owners preserve the winning receipt across checkout resolution and stale failure callbacks', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'remux-federation-owner-'));
+  const path = join(directory, 'agent.sqlite3');
+  const seed = new DatabaseSync(path);
+  seed.exec('PRAGMA foreign_keys=ON');
+  createNativeAgentSchema(seed);
+  seed.close();
+  const first = new NativeAgentJournal(new DatabaseSync(path, { timeout: 5_000 }));
+  const second = new NativeAgentJournal(new DatabaseSync(path, { timeout: 5_000 }));
+  seedConversation(first);
+  const resolver = async () => ({ state: 'resolved' as const,
+    value: { checkoutKey: 'test:shared', launchCwd: '/workspace/remux' } });
+  const firstOwner = new FederationCheckoutOwner(first, resolver);
+  const secondOwner = new FederationCheckoutOwner(second, resolver);
+  const request = { commandId: 'shared-command' };
+  try {
+    const [firstCheckout, secondCheckout] = await Promise.all([
+      firstOwner.resolveNew('shared-command', 'federation.spawn', request, '/workspace/remux', 2),
+      secondOwner.resolveNew('shared-command', 'federation.spawn', request, '/workspace/remux', 2),
+    ]);
+    const create = () => first.createFederatedExecution({ executionId: 'shared-execution',
+      conversationId: 'conversation-1', parentExecutionId: 'execution-1', rootTurnId: 'root-turn',
+      provider: 'fixture', providerInstanceId: 'fixture-local', model: 'fixture-native-v1',
+      checkoutKey: 'test:shared', access: 'workspace-write', scheduling: 'foreground', depth: 1,
+      title: 'shared', now: 2 });
+    assert.ok('value' in firstOwner.claimAndReserve({ commandId: 'shared-command', kind: 'federation.spawn',
+      request, executionId: 'shared-execution', expectedTurnId: 'turn-a', checkout: firstCheckout,
+      access: 'workspace-write', scheduling: 'foreground', now: 2, validateAndCreate: create }));
+    const losing = secondOwner.claimAndReserve({ commandId: 'shared-command', kind: 'federation.spawn',
+      request, executionId: 'shared-execution', expectedTurnId: 'turn-a', checkout: secondCheckout,
+      access: 'workspace-write', scheduling: 'foreground', now: 3,
+      validateAndCreate: () => { throw new Error('loser callback must not run'); } });
+    assert.ok('receipt' in losing && losing.receipt.state === 'received');
+    first.markCommandDispatching('shared-command', 3);
+    assert.equal(secondOwner.beforeDispatchFailure('shared-execution', 'shared-command', 'stale-turn',
+      'stale failure', 4), false);
+    assert.equal(second.commandReceipt('shared-command')?.state, 'dispatching');
+    const conflictingRequest = { commandId: 'conflicting-writer' };
+    const conflictingCheckout = await secondOwner.resolveNew('conflicting-writer', 'federation.spawn',
+      conflictingRequest, '/workspace/remux', 4);
+    assert.throws(() => secondOwner.claimAndReserve({ commandId: 'conflicting-writer',
+      kind: 'federation.spawn', request: conflictingRequest, executionId: 'rolled-back-child',
+      expectedTurnId: 'rolled-back-turn', checkout: conflictingCheckout, access: 'workspace-write',
+      scheduling: 'foreground', now: 4, validateAndCreate: () => second.createFederatedExecution({
+        executionId: 'rolled-back-child', conversationId: 'conversation-1',
+        parentExecutionId: 'execution-1', rootTurnId: 'root-turn', provider: 'fixture',
+        providerInstanceId: 'fixture-local', model: 'fixture-native-v1', checkoutKey: 'test:shared',
+        access: 'workspace-write', scheduling: 'foreground', depth: 1, title: 'loser', now: 4,
+      }) }), /writer is already active/u);
+    assert.equal(second.execution('rolled-back-child'), undefined);
+    assert.equal(second.commandReceipt('conflicting-writer')?.state, 'rejected');
+    first.acceptCommand('shared-command', { accepted: true, executionId: 'shared-execution' }, 5);
+    const failingOwner = new FederationCheckoutOwner(second, async () => ({
+      state: 'indeterminate', reason: 'cwd disappeared',
+    }));
+    await assert.rejects(
+      failingOwner.resolveNew('shared-command', 'federation.spawn', request, '/deleted', 6),
+      (error: unknown) => error instanceof Error &&
+        'receipt' in error && (error as { receipt: { state: string } }).receipt.state === 'accepted');
+  } finally {
+    first.close();
+    second.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});

@@ -283,20 +283,39 @@ export async function connectCodexDaemon(
   }
 }
 
-async function closeSocket(socket: WebSocket) {
+export async function closeSocket(socket: WebSocket, timeoutMs = 2_000) {
   if (socket.readyState === WebSocket.CLOSED) return;
   if (socket.readyState === WebSocket.CONNECTING) {
     socket.terminate();
     return;
   }
-  const closed = new Promise<void>((resolve) => socket.once('close', () => resolve()));
-  socket.close(1000, 'client closing');
-  await Promise.race([
-    closed,
-    delay(2_000).then(() => {
-      if (socket.readyState !== WebSocket.CLOSED) socket.terminate();
-    }),
-  ]);
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      socket.off('close', onClose);
+      if (error === undefined) resolve();
+      else reject(error);
+    };
+    const onClose = () => finish();
+    const timeout = setTimeout(() => {
+      try {
+        if (socket.readyState !== WebSocket.CLOSED) socket.terminate();
+        finish();
+      } catch (error) {
+        finish(error);
+      }
+    }, timeoutMs);
+    timeout.unref();
+    socket.once('close', onClose);
+    try {
+      socket.close(1000, 'client closing');
+    } catch (error) {
+      finish(error);
+    }
+  });
 }
 
 async function runCodexCommand(input: {

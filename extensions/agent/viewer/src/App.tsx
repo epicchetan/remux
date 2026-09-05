@@ -5,7 +5,7 @@ import {
   type ConversationSummary,
   type ConversationValue,
   type ModelsValue,
-  type ReasoningLevel,
+  type ReasoningEffort,
 } from '../../shared/protocol.ts';
 import type { AgentProvidersResource, AgentRuntimeResource } from '../../shared/native-agent-protocol.ts';
 import type { ProviderAccess } from '../../shared/provider-runtime.ts';
@@ -15,7 +15,7 @@ import { createEmptyComposerSnapshot } from './composer/model/composerModel.ts';
 import { composerResourcesFromSnapshot } from './composer/model/userInputInterop.ts';
 import { ComposerMentionPicker } from './composer/mentions/MentionPicker.tsx';
 import { parseComposerMentionQuery } from './composer/mentions/mentionSearch.ts';
-import { preferredReasoning, resolveModel } from './composer/config/modelSelection.ts';
+import { preferredReasoning, preferredServiceTier, resolveModel } from './composer/config/modelSelection.ts';
 import { useComposerStore } from './composer/store.ts';
 import { AgentDirectoryPicker } from './conversation/DirectoryPicker.tsx';
 import {
@@ -108,6 +108,7 @@ export function App() {
   const setCwd = useConversationStore((state) => state.setCwd);
   const modelId = useComposerStore((state) => state.modelId);
   const reasoning = useComposerStore((state) => state.reasoning);
+  const serviceTier = useComposerStore((state) => state.serviceTier);
   const providerInstanceId = useComposerStore((state) => state.providerInstanceId);
   const access = useComposerStore((state) => state.access);
   const composerModels = useComposerStore((state) => state.models);
@@ -122,6 +123,7 @@ export function App() {
   const setComposerDocument = useComposerStore((state) => state.setComposerDocument);
   const setModelId = useComposerStore((state) => state.setModelId);
   const setReasoning = useComposerStore((state) => state.setReasoning);
+  const setServiceTier = useComposerStore((state) => state.setServiceTier);
   const setProviderInstanceId = useComposerStore((state) => state.setProviderInstanceId);
   const setAccess = useComposerStore((state) => state.setAccess);
   const composerRestorePendingRef = useRef<string | null>(null);
@@ -173,11 +175,13 @@ export function App() {
         : loadNewChatDraft(activeDraftId);
       if (!currentDraft) return;
       if (currentDraft.cwd) setCwd(currentDraft.cwd);
+      setAccess(currentDraft.access);
       const configuration = draftConfigurationsRef.current.get(activeDraftId);
       if (configuration) {
         setProviderInstanceId(configuration.providerInstanceId);
         setModelId(configuration.modelId);
         setReasoning(configuration.reasoning);
+        setServiceTier(configuration.serviceTier);
         setAccess(configuration.access);
       }
       restoreComposerSnapshot(currentDraft.snapshot);
@@ -194,6 +198,7 @@ export function App() {
     setModelId,
     setProviderInstanceId,
     setReasoning,
+    setServiceTier,
   ]);
 
   useEffect(() => {
@@ -204,12 +209,19 @@ export function App() {
         id === current.providerInstanceId && state === 'ready')
       && composerModels.models.some(({ id }) => id === current.modelId)
       ? current
-      : defaultDraftConfiguration(providers, composerModels);
+      : (() => {
+          const fallback = defaultDraftConfiguration(providers, composerModels);
+          const persisted = draftRef.current?.id === activeDraftId
+            ? draftRef.current
+            : loadNewChatDraft(activeDraftId);
+          return fallback && persisted ? { ...fallback, access: persisted.access } : fallback;
+        })();
     if (!configuration) return;
     draftConfigurationsRef.current.set(activeDraftId, configuration);
     setProviderInstanceId(configuration.providerInstanceId);
     setModelId(configuration.modelId);
     setReasoning(configuration.reasoning);
+    setServiceTier(configuration.serviceTier);
     setAccess(configuration.access);
   }, [
     activeConversationId,
@@ -220,6 +232,7 @@ export function App() {
     setModelId,
     setProviderInstanceId,
     setReasoning,
+    setServiceTier,
   ]);
 
   useEffect(() => {
@@ -227,6 +240,7 @@ export function App() {
     if (pendingRestore !== null) {
       if (composerSnapshot.contentKey !== pendingRestore) return;
       composerRestorePendingRef.current = null;
+      return;
     }
     if (!activeDraftId || draft?.id !== activeDraftId) {
       if (activeConversationId) {
@@ -239,13 +253,16 @@ export function App() {
       modelId,
       providerInstanceId,
       reasoning,
+      serviceTier,
     });
     if (
+      draft.access === access &&
       draft.cwd === cwd &&
       draft.snapshot.contentKey === composerSnapshot.contentKey
     ) return;
     const next = {
       ...draft,
+      access,
       cwd,
       snapshot: composerSnapshot,
       updatedAt: Date.now(),
@@ -263,6 +280,7 @@ export function App() {
     modelId,
     providerInstanceId,
     reasoning,
+    serviceTier,
   ]);
 
   useEffect(() => {
@@ -274,7 +292,8 @@ export function App() {
         nativeRuntime.providerInstanceId,
         nativeRuntime.composer.nextTurn.model,
       ));
-      setReasoning(asReasoning(nativeRuntime.composer.nextTurn.effort));
+      setReasoning(nativeRuntime.composer.nextTurn.effort ?? null);
+      setServiceTier(nativeRuntime.composer.nextTurn.serviceTier);
       setAccess(nativeRuntime.composer.nextTurn.access);
       return;
     }
@@ -283,6 +302,7 @@ export function App() {
     }
     setModelId(conversationSummary.modelId);
     setReasoning(conversationSummary.reasoning);
+    setServiceTier(conversationSummary.serviceTier);
     if (conversationSummary.access) setAccess(conversationSummary.access);
   }, [
     activeConversationId,
@@ -293,6 +313,7 @@ export function App() {
     setModelId,
     setProviderInstanceId,
     setReasoning,
+    setServiceTier,
   ]);
 
   const saveCurrentTargetDraft = useCallback(() => {
@@ -302,6 +323,7 @@ export function App() {
       const current = draftRef.current ?? initialDraft(currentDraftId);
       const next: AgentNewChatDraft = {
         ...current,
+        access: useComposerStore.getState().access,
         cwd: useConversationStore.getState().cwd,
         snapshot,
         updatedAt: Date.now(),
@@ -312,6 +334,7 @@ export function App() {
         modelId: composer.modelId,
         providerInstanceId: composer.providerInstanceId,
         reasoning: composer.reasoning,
+        serviceTier: composer.serviceTier,
       });
       draftRef.current = next;
       setDraft(next);
@@ -335,12 +358,18 @@ export function App() {
     setDraft(nextDraft);
     setCwd(nextDraft.cwd);
     const configuration = draftConfigurationsRef.current.get(nextDraft.id)
-      ?? (providers && composerModels ? defaultDraftConfiguration(providers, composerModels) : null);
+      ?? (providers && composerModels
+        ? (() => {
+            const fallback = defaultDraftConfiguration(providers, composerModels);
+            return fallback ? { ...fallback, access: nextDraft.access } : null;
+          })()
+        : null);
     if (configuration) {
       draftConfigurationsRef.current.set(nextDraft.id, configuration);
       setProviderInstanceId(configuration.providerInstanceId);
       setModelId(configuration.modelId);
       setReasoning(configuration.reasoning);
+      setServiceTier(configuration.serviceTier);
       setAccess(configuration.access);
     }
     restoreComposerSnapshot(nextDraft.snapshot);
@@ -357,6 +386,7 @@ export function App() {
     setModelId,
     setProviderInstanceId,
     setReasoning,
+    setServiceTier,
   ]);
 
   const selectDraft = useCallback(() => {
@@ -382,6 +412,7 @@ export function App() {
       ? useConversationHistoryStore.getState().conversationsById[activeConversationIdRef.current]
       : null;
     const nextDraft: AgentNewChatDraft = {
+      access: useComposerStore.getState().access,
       cwd: selected?.cwd ?? useConversationStore.getState().cwd,
       id,
       snapshot: createEmptyComposerSnapshot(),
@@ -458,7 +489,8 @@ export function App() {
   const updateComposerPreference = useCallback(async (input: {
     providerInstanceId: string;
     modelId: string;
-    reasoning: ReasoningLevel;
+    reasoning: ReasoningEffort;
+    serviceTier: string | null;
   }) => {
     const selected = resolveModel(composerModels, input.modelId);
     if (!selected?.nativeId || selected.providerInstanceId !== input.providerInstanceId) {
@@ -476,6 +508,7 @@ export function App() {
           expectedRevision: nativeRuntime.composer.revision,
           nativeModelId: selected.nativeId,
           reasoning: input.reasoning,
+          serviceTier: input.serviceTier,
         });
         await refresh([
           'agent/providers',
@@ -486,12 +519,14 @@ export function App() {
       setProviderInstanceId(input.providerInstanceId);
       setModelId(input.modelId);
       setReasoning(input.reasoning);
+      setServiceTier(input.serviceTier);
       if (activeDraftId) {
         draftConfigurationsRef.current.set(activeDraftId, {
           access,
           modelId: input.modelId,
           providerInstanceId: input.providerInstanceId,
           reasoning: input.reasoning,
+          serviceTier: input.serviceTier,
         });
       }
       if (!providers) throw new Error('Provider catalog is still loading.');
@@ -500,6 +535,7 @@ export function App() {
         expectedProvidersRevision: providers.preferenceRevision,
         nativeModelId: selected.nativeId,
         reasoning: input.reasoning,
+        serviceTier: input.serviceTier,
       });
       await refresh([
         'agent/providers',
@@ -523,6 +559,7 @@ export function App() {
     setModelId,
     setProviderInstanceId,
     setReasoning,
+    setServiceTier,
   ]);
 
   const updateComposerAccess = useCallback(async (nextAccess: ProviderAccess) => {
@@ -553,6 +590,7 @@ export function App() {
       modelId: composer.modelId,
       providerInstanceId: composer.providerInstanceId,
       reasoning: composer.reasoning,
+      serviceTier: composer.serviceTier,
     });
   }, [activeConversationId, activeDraftId, nativeRuntime, refresh, setAccess, setError]);
 
@@ -713,6 +751,7 @@ export function App() {
 
 function initialDraft(id: string): AgentNewChatDraft {
   return loadNewChatDraft(id) ?? {
+    access: 'workspace-write',
     cwd: '',
     id,
     snapshot: createEmptyComposerSnapshot(),
@@ -724,7 +763,8 @@ type DraftComposerConfiguration = {
   access: ProviderAccess;
   modelId: string;
   providerInstanceId: string;
-  reasoning: ReasoningLevel;
+  reasoning: ReasoningEffort;
+  serviceTier: string | null;
 };
 
 function defaultDraftConfiguration(
@@ -743,22 +783,16 @@ function defaultDraftConfiguration(
     ?? providerModels.find(({ id }) => id === models.defaultModelId)
     ?? providerModels[0];
   if (!selected) return null;
-  const stickyReasoning = asReasoning(provider?.stickyPreference?.effort ?? null);
+  const stickyReasoning = provider?.stickyPreference?.effort ?? null;
   return {
     access: 'workspace-write',
     modelId: selected.id,
     providerInstanceId,
-    reasoning: selected.supportedReasoning.includes(stickyReasoning)
+    reasoning: stickyReasoning !== null && selected.supportedReasoning.includes(stickyReasoning)
       ? stickyReasoning
       : preferredReasoning(selected),
+    serviceTier: preferredServiceTier(selected, provider?.stickyPreference?.serviceTier),
   };
-}
-
-function asReasoning(value: string | null | undefined): ReasoningLevel {
-  return value === 'minimal' || value === 'low' || value === 'medium' || value === 'high'
-      || value === 'xhigh' || value === 'max'
-    ? value
-    : 'off' as const;
 }
 
 function projectConversation(summary: ConversationSummary, runtime: AgentRuntimeValue | null): ConversationValue {

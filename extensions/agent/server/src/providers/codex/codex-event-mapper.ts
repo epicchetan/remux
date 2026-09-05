@@ -21,6 +21,9 @@ import {
 } from '../../../../shared/provider-runtime.ts';
 import type { CodexServerNotification } from './codex-app-server-process.ts';
 import { fitJsonPreview, mergeJsonPreview } from '../preview.ts';
+import { DISPLAY_TRUNCATION_MARKER, fitProviderEventDisplay } from '../display-fitting.ts';
+import { CodexChildRegistry, type CodexChildBinding } from './codex-child-registry.ts';
+import type { NativeChildBinding } from '../../../../shared/provider-runtime.ts';
 
 type CodexMapperOptions = {
   providerInstanceId: string;
@@ -29,6 +32,7 @@ type CodexMapperOptions = {
   nativeSessionId: string;
   inheritedNativeTurnIds?: readonly string[];
   observedAt?: () => number;
+  childRegistry?: CodexChildRegistry;
 };
 
 type MapperEvent = ProviderEvent | ({ type: string } & Record<string, unknown>);
@@ -47,11 +51,13 @@ export class CodexEventMapper {
   private readonly nativeSessionId: string;
   private readonly inheritedNativeTurnIds: ReadonlySet<string>;
   private readonly observedAt: () => number;
+  private readonly childRegistry: CodexChildRegistry;
   private readonly remuxTurnByNative = new Map<string, string>();
   private readonly deltaOffsets = new Map<string, number>();
   private readonly agentMessageKinds = new Map<string, AgentMessageStreamKind>();
   private readonly pendingAgentMessageDeltas = new Map<string, string>();
   private readonly blocks = new Map<string, BlockState>();
+  private readonly reasoningParts = new Map<string, string[]>();
   private readonly nextOrdinalByTurn = new Map<string, number>();
   private pendingRemuxTurnId: string | null = null;
   private pendingManualCompactionId: string | null = null;
@@ -75,6 +81,7 @@ export class CodexEventMapper {
     this.nativeSessionId = options.nativeSessionId;
     this.inheritedNativeTurnIds = new Set(options.inheritedNativeTurnIds ?? []);
     this.observedAt = options.observedAt ?? Date.now;
+    this.childRegistry = options.childRegistry ?? new CodexChildRegistry();
   }
 
   expectTurn(remuxTurnId: string) {
@@ -89,6 +96,19 @@ export class CodexEventMapper {
     );
     this.usageAnchorNativeTurnId = nativeTurnId;
     if (this.pendingRemuxTurnId === remuxTurnId) this.pendingRemuxTurnId = null;
+  }
+
+  restoreChildBlocks(bindings: readonly NativeChildBinding[]) {
+    for (const binding of bindings) {
+      const durable = binding.canonicalBlock;
+      if (!durable) continue;
+      if (durable.block.kind !== 'native-child' || durable.block.payload.kind !== 'native-child') continue;
+      this.blocks.set(this.blockKey(binding.ownerNativeTurnId, binding.executionId, 'native-child'), {
+        structure: durable.structure,
+        revision: durable.revision,
+        block: durable.block,
+      });
+    }
   }
 
   remuxTurnId(nativeTurnId: string) {
@@ -764,10 +784,14 @@ export class CodexEventMapper {
     nativeTurnId: string,
     itemIndex?: number,
   ) {
+    const tool = string(item.tool);
+    if (tool !== 'spawn_agent' && tool !== 'spawnAgent') return [];
     const receiverIds = arrayOfStrings(item.receiverThreadIds);
     const envelopes: ProviderEventEnvelope[] = [];
     for (const childThreadId of receiverIds) {
-      const childExecutionId = codexStableChildExecutionId(this.executionId, childThreadId);
+      const binding = this.bindChild(childThreadId, nativeTurnId);
+      if (binding.outcome) continue;
+      const childExecutionId = binding.executionId;
       const event: MapperEvent = {
         type: 'child.started',
         child: {
@@ -784,8 +808,8 @@ export class CodexEventMapper {
       envelopes.push(this.snapshotEnvelope(
         event,
         'child/started',
-        nativeTurnId,
-        childThreadId,
+        binding.ownerNativeTurnId,
+        childExecutionId,
         itemIndex,
       ));
       const states = record(item.agentsStates);
@@ -793,6 +817,12 @@ export class CodexEventMapper {
       const status = string(state?.status);
       if (status) {
         const mapped = childStatus(status);
+        const terminalOutcome = mapped === 'idle' ? 'completed' as const
+          : mapped === 'interrupted' ? 'interrupted' as const
+            : mapped === 'failed' ? 'failed' as const : undefined;
+        if (terminalOutcome && !this.childRegistry.settleCachedOutcome(childThreadId, terminalOutcome)) {
+          continue;
+        }
         const statusEvent: MapperEvent = {
           type: 'child.status',
           childExecutionId,
@@ -801,8 +831,8 @@ export class CodexEventMapper {
         envelopes.push(this.snapshotEnvelope(
           statusEvent,
           'child/status',
-          nativeTurnId,
-          childThreadId,
+          binding.ownerNativeTurnId,
+          childExecutionId,
           itemIndex,
         ));
         if (mapped !== 'running' && mapped !== 'recovering') {
@@ -814,8 +844,8 @@ export class CodexEventMapper {
           envelopes.push(this.snapshotEnvelope(
             completedEvent,
             'child/completed',
-            nativeTurnId,
-            childThreadId,
+            binding.ownerNativeTurnId,
+            childExecutionId,
             itemIndex,
           ));
         }
@@ -832,8 +862,24 @@ export class CodexEventMapper {
   ) {
     const childThreadId = string(item.agentThreadId);
     if (!childThreadId) return [];
-    const childExecutionId = codexStableChildExecutionId(this.executionId, childThreadId);
     const kind = string(item.kind);
+    // Interactions are messages between already-related agents. They never
+    // prove a new parent/child edge (notably a child's message to its parent).
+    if (kind === 'interacted') return [];
+    const binding = kind === 'started'
+      ? this.bindChild(childThreadId, nativeTurnId)
+      : this.childRegistry.get(childThreadId);
+    if (!binding || binding.parentExecutionId !== this.executionId) return [];
+    if (kind === 'started' && binding.outcome) return [];
+    const childExecutionId = binding.executionId;
+    const terminalOutcome = kind === 'completed' ? 'completed' as const
+      : kind === 'interrupted' ? 'interrupted' as const : undefined;
+    if (terminalOutcome) {
+      const nativeChildTurnId = itemId.startsWith('subagent-completed-')
+        ? itemId.slice('subagent-completed-'.length) : undefined;
+      if (!nativeChildTurnId ||
+          !this.childRegistry.completeAttempt(childThreadId, nativeChildTurnId, terminalOutcome)) return [];
+    }
     const event: MapperEvent = kind === 'started'
       ? {
           type: 'child.started',
@@ -848,15 +894,18 @@ export class CodexEventMapper {
           },
         }
       : {
-          type: 'child.status',
+          type: kind === 'completed' || kind === 'interrupted'
+            ? 'child.completed' : 'child.status',
           childExecutionId,
-          state: kind === 'interrupted' ? 'interrupted' : 'running',
+          ...(kind === 'completed' ? { outcome: 'completed' as const }
+            : kind === 'interrupted' ? { outcome: 'interrupted' as const }
+              : { state: 'running' as const }),
         };
     return [this.snapshotEnvelope(
       event,
       `child/${kind ?? 'activity'}`,
-      nativeTurnId,
-      itemId,
+      binding.ownerNativeTurnId,
+      childExecutionId,
       itemIndex,
     )];
   }
@@ -866,20 +915,28 @@ export class CodexEventMapper {
     params: Record<string, unknown>,
     childThreadId: string,
   ) {
-    const childExecutionId = codexStableChildExecutionId(this.executionId, childThreadId);
-    const parentTurnId = this.pendingRemuxTurnId ?? [...this.remuxTurnByNative.values()].at(-1);
-    if (!parentTurnId) return [];
+    const binding = this.childRegistry.get(childThreadId);
+    if (!binding || binding.parentExecutionId !== this.executionId) return [];
+    const childExecutionId = binding.executionId;
     if (method === 'turn/completed') {
       const turn = record(params.turn);
+      const nativeChildTurnId = string(turn?.id);
+      if (!nativeChildTurnId) return [];
       const outcome = turnOutcome(turn?.status);
+      const completed = this.childRegistry.completeAttempt(childThreadId, nativeChildTurnId, outcome);
+      if (completed?.terminalNativeTurnId !== nativeChildTurnId || completed.outcome !== outcome) return [];
       return [this.envelope({
         type: 'child.completed',
         childExecutionId,
         outcome,
-      }, 'child/completed', parentTurnId, childThreadId, `child-turn-${string(turn?.id) ?? 'unknown'}`, ++this.liveSequence,
-      true)];
+      }, 'child/completed', binding.ownerNativeTurnId, childExecutionId,
+      `child-turn-${nativeChildTurnId}`, ++this.liveSequence)];
     }
-    if (method === 'thread/started' || method === 'turn/started') {
+    if (method === 'thread/started') return [];
+    if (method === 'turn/started') {
+      const nativeChildTurnId = string(record(params.turn)?.id);
+      if (!nativeChildTurnId) return [];
+      if (!this.childRegistry.beginAttempt(childThreadId, nativeChildTurnId)) return [];
       return [this.envelope({
         type: 'child.started',
         child: {
@@ -891,9 +948,21 @@ export class CodexEventMapper {
           nativeSessionId: childThreadId,
           transcriptAvailable: true,
         },
-      }, 'child/started', parentTurnId, childThreadId, method, ++this.liveSequence, true)];
+      }, 'child/started', binding.ownerNativeTurnId, childExecutionId,
+      `turn-started-${nativeChildTurnId}`, ++this.liveSequence)];
     }
     return [];
+  }
+
+  private bindChild(childThreadId: string, ownerNativeTurnId: string): CodexChildBinding {
+    return this.childRegistry.bindSpawn({
+      nativeThreadId: childThreadId,
+      executionId: codexStableChildExecutionId(this.executionId, childThreadId),
+      parentExecutionId: this.executionId,
+      nativeParentThreadId: this.nativeSessionId,
+      ownerTurnId: this.remuxTurnId(ownerNativeTurnId),
+      ownerNativeTurnId,
+    });
   }
 
   private liveEnvelope(
@@ -967,7 +1036,8 @@ export class CodexEventMapper {
     const subject = nativeTurnId && compactionOrdinal !== undefined
       ? this.compactionSubject(nativeTurnId, compactionOrdinal)
       : undefined;
-    return parseProviderEventEnvelope({
+    const observedAt = this.observedAt();
+    const buildEnvelope = (candidate: ProviderEvent) => ({
       contractVersion: PROVIDER_RUNTIME_CONTRACT_VERSION,
       // App Server item ids are not durable: the live stream reports a UUID,
       // while thread/read synthesizes positional ids such as `item-43`. Key
@@ -1000,9 +1070,16 @@ export class CodexEventMapper {
         ...(timeline ? { timeline } : {}),
         kind,
       },
-      observedAt: this.observedAt(),
-      event,
+      observedAt,
+      event: candidate,
     });
+    const fitted = fitProviderEventDisplay({
+      event,
+      maxBytes: PROVIDER_RUNTIME_LIMITS.eventBytes,
+      buildEnvelope,
+      hashJson,
+    });
+    return parseProviderEventEnvelope(buildEnvelope(fitted));
   }
 
   private compactionOrdinal(
@@ -1117,7 +1194,8 @@ export class CodexEventMapper {
       ? (turnAlreadyRemux ? nativeTurnId : this.remuxTurnId(nativeTurnId))
       : undefined;
     const normalized = this.normalizeEvent(event, nativeTurnId, itemId, itemIndex);
-    const envelope = parseProviderEventEnvelope({
+    const observedAt = this.observedAt();
+    const buildEnvelope = (candidate: ProviderEvent) => ({
       contractVersion: PROVIDER_RUNTIME_CONTRACT_VERSION,
       eventId: stableEventId(
         this.nativeSessionId,
@@ -1150,9 +1228,17 @@ export class CodexEventMapper {
         }),
         kind,
       },
-      observedAt: this.observedAt(),
-      event: normalized,
+      observedAt,
+      event: candidate,
     });
+    const fitted = fitProviderEventDisplay({
+      event: normalized,
+      maxBytes: PROVIDER_RUNTIME_LIMITS.eventBytes,
+      buildEnvelope,
+      hashJson,
+    });
+    const envelope = parseProviderEventEnvelope(buildEnvelope(fitted));
+    this.commitReasoningParts(event, nativeTurnId, itemId);
     this.commitBlockEvent(envelope.event, nativeTurnId, itemId);
     return envelope;
   }
@@ -1167,27 +1253,44 @@ export class CodexEventMapper {
     switch (event.type) {
       case 'assistant.reasoning': {
         const completed = event.summary !== undefined;
+        const reasoningKey = this.blockKey(nativeTurnId, itemId, 'reasoning-summary');
         const previous = this.blocks.get(this.blockKey(nativeTurnId, itemId, 'reasoning-summary'));
         const previousPayload = previous?.block.payload.kind === 'reasoning-summary'
           ? previous.block.payload
           : undefined;
         const completedParts = arrayOfStrings(event.parts);
+        if (!completed && previousPayload?.truncated) {
+          return this.blockEvent(
+            nativeTurnId, itemId, itemIndex, 'reasoning-summary', previousPayload, 'streaming', false,
+          );
+        }
         const parts = completed
           ? (completedParts.length > 0
               ? completedParts
               : [string(event.summary) ?? ''])
-          : [...(previousPayload?.parts ?? (previousPayload?.text ? [previousPayload.text] : []))];
+          : [...(this.reasoningParts.get(reasoningKey) ?? [])];
         if (!completed) {
           const partIndex = nonnegative(event.partIndex) ?? 0;
+          if (partIndex >= 256) {
+            const boundedParts = (previousPayload?.parts ?? []).slice(0, 256);
+            if (boundedParts.length === 0) boundedParts.push(DISPLAY_TRUNCATION_MARKER);
+            else boundedParts[boundedParts.length - 1] = `${boundedParts.at(-1)}${DISPLAY_TRUNCATION_MARKER}`;
+            return this.blockEvent(nativeTurnId, itemId, itemIndex, 'reasoning-summary', {
+              kind: 'reasoning-summary',
+              text: boundedParts.join('\n'),
+              parts: boundedParts,
+              truncated: true,
+            }, 'streaming', false);
+          }
           while (parts.length <= partIndex) parts.push('');
           parts[partIndex] = `${parts[partIndex] ?? ''}${string(event.delta) ?? ''}`;
         }
         const visibleParts = parts.filter((part) => part.length > 0);
-        const text = visibleParts.join('\n');
         return this.blockEvent(nativeTurnId, itemId, itemIndex, 'reasoning-summary', {
           kind: 'reasoning-summary',
-          text,
+          text: visibleParts.join('\n'),
           ...(visibleParts.length > 0 ? { parts: visibleParts } : {}),
+          truncated: completed ? false : previousPayload?.truncated ?? false,
         }, completed ? 'completed' : 'streaming', completed);
       }
       case 'assistant.text': {
@@ -1326,6 +1429,26 @@ export class CodexEventMapper {
     }
   }
 
+  private commitReasoningParts(event: MapperEvent, nativeTurnId?: string, itemId?: string) {
+    if (event.type !== 'assistant.reasoning') return;
+    const source = event as Record<string, unknown>;
+    const key = this.blockKey(nativeTurnId, itemId, 'reasoning-summary');
+    if (source.summary !== undefined) {
+      this.reasoningParts.delete(key);
+      return;
+    }
+    const committed = this.blocks.get(key);
+    if (committed?.block.payload.kind === 'reasoning-summary' && committed.block.payload.truncated) return;
+    const parts = [...(this.reasoningParts.get(key) ?? [])];
+    const partIndex = nonnegative(source.partIndex) ?? 0;
+    if (partIndex >= 256) return;
+    while (parts.length <= partIndex) parts.push('');
+    const retainedChars = parts.reduce((sum, part) => sum + [...part].length, 0);
+    const available = Math.max(0, PROVIDER_RUNTIME_LIMITS.messageChars - retainedChars);
+    parts[partIndex] = `${parts[partIndex] ?? ''}${[...(string(source.delta) ?? '')].slice(0, available).join('')}`;
+    this.reasoningParts.set(key, parts);
+  }
+
   private textBlockEvent(
     nativeTurnId: string | undefined,
     itemId: string | undefined,
@@ -1341,7 +1464,9 @@ export class CodexEventMapper {
       itemId,
       itemIndex,
       kind,
-      { kind, text: completed ? text : `${previousText}${text}` },
+      kind === 'reasoning-summary'
+        ? { kind, text: completed ? text : `${previousText}${text}`, truncated: false }
+        : { kind, text: completed ? text : `${previousText}${text}` },
       completed ? 'completed' : 'streaming',
       completed,
     );
@@ -1528,6 +1653,7 @@ function displayShellCommand(command: string) {
   if (!match?.[2]) return trimmed;
   return match[1] === "'" ? match[2].replace(/'\\''/gu, "'") : match[2];
 }
+
 
 function fileName(path: string) {
   return path.replace(/\\/gu, '/').split('/').filter(Boolean).at(-1) ?? path;

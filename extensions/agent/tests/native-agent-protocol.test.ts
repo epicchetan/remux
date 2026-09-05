@@ -214,6 +214,7 @@ test('viewer-safe resources reject provider cursors, native envelopes, and crede
     activeConfiguration: {
       model: 'gpt-test',
       effort: 'high',
+      serviceTier: null,
       access: 'workspace-write',
     },
     capabilities: {
@@ -268,11 +269,12 @@ test('viewer-safe resources reject provider cursors, native envelopes, and crede
       nextTurn: {
         model: 'gpt-test',
         effort: 'high',
+        serviceTier: null,
         access: 'workspace-write',
         origin: 'conversation-explicit',
       },
       lastUsed: null,
-      editable: { model: true, effort: true, access: true },
+      editable: { model: true, effort: true, serviceTier: false, access: true },
     },
     usage: { turn: null, cumulative: null, context: null, estimatedCost: null },
     compaction: { policy: 'native-auto', operation: { state: 'idle', lastResult: null } },

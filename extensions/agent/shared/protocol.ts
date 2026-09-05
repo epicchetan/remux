@@ -7,7 +7,8 @@
 import type { ViewerProviderCapabilities } from './native-agent-protocol.ts';
 import type { ProviderAccess, ProviderKind } from './provider-runtime.ts';
 
-export type ReasoningLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+export type ReasoningLevel = string;
+export type ReasoningEffort = ReasoningLevel | null;
 
 export type AgentFileSearchResult = {
   absolutePath: string;
@@ -48,6 +49,8 @@ export type ModelInfo = {
   providerInstanceId?: string;
   contextWindow: number;
   supportedReasoning: ReasoningLevel[];
+  serviceTiers: Array<{ id: string; name: string; description?: string }>;
+  defaultServiceTier: string | null;
 };
 
 export type ModelsValue = {
@@ -62,10 +65,12 @@ export type ConversationSummary = {
   preview: string;
   cwd: string;
   modelId: string;
-  reasoning: ReasoningLevel;
+  reasoning: ReasoningEffort;
+  serviceTier: string | null;
   provider: ProviderKind;
   providerInstanceId?: string;
   access?: ProviderAccess;
+  resumable: boolean;
   status: 'idle' | 'running' | 'error';
   latestTurnId: string | null;
   parentConversationId: string | null;
@@ -93,7 +98,8 @@ export type AgentRuntimeValue = {
   conversationId: string | null;
   providerInstanceId: string;
   modelId: string;
-  effort: ReasoningLevel;
+  effort: ReasoningEffort;
+  serviceTier: string | null;
   capabilities: ViewerProviderCapabilities;
   state: 'unloaded' | 'loading' | 'idle' | 'running' | 'interrupting' | 'error';
   activeTurnId: string | null;
@@ -106,6 +112,7 @@ export type AgentPendingQueueEntry = {
   createdAt: number;
   id: string;
   mentionCount: number;
+  kind: 'message' | 'compact';
   state?: 'queued' | 'dispatching' | 'blocked' | 'delivery-unknown';
   text: string;
 };

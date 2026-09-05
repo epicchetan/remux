@@ -33,8 +33,34 @@ test('starts with the authoritative model and sends the first message once', asy
   )).effort).toBe('high');
   await expect.poll(async () => (await lastCommandParams(
     page,
+    'remux/agent/conversation/create',
+  )).serviceTier).toBe('default');
+  await expect.poll(async () => (await lastCommandParams(
+    page,
     'remux/agent/conversation/message/send',
   )).content).toEqual([{ type: 'text', text: 'Inspect the workspace' }]);
+});
+
+test('selects Fast explicitly and snapshots it into the new conversation and turn', async ({ page }) => {
+  await page.getByRole('button', { name: 'Preferences' }).click();
+  await page.getByRole('button', { name: 'Standard', exact: true }).click();
+  await page.getByRole('button', { name: /^Fast/u }).click();
+  await expect.poll(async () => (await lastCommandParams(
+    page,
+    'remux/agent/composer/provider-preference/set',
+  )).serviceTier).toBe('priority');
+
+  await page.keyboard.press('Escape');
+  await messageBox(page).fill('Use fast mode for this turn');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect.poll(async () => (await lastCommandParams(
+    page,
+    'remux/agent/conversation/create',
+  )).serviceTier).toBe('priority');
+  await expect.poll(async () => (await lastCommandParams(
+    page,
+    'remux/agent/conversation/message/send',
+  )).serviceTier).toBe('priority');
 });
 
 test('sends with a portable UUID when crypto.randomUUID is unavailable', async ({ page }) => {
@@ -110,6 +136,34 @@ test('opens a native subagent transcript and stops the child without a child com
   await page.getByRole('button', { name: 'Back to chat' }).click();
   await expect(messageBox(page)).toBeVisible();
   await expect(page.getByRole('button', { name: 'Stop turn', exact: true })).toBeVisible();
+});
+
+test('keeps one completed native child disclosure and one execution entry', async ({ page }) => {
+  await messageBox(page).fill('Complete the focused child review');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect(page.getByText('The fixture stream completed.')).toBeVisible();
+  await page.locator('.codex-work-header').click();
+
+  const child = page.locator('.agent-child-execution');
+  const disclosure = child.locator('.agent-child-execution-header');
+  await expect(child).toHaveCount(1);
+  await expect(child).toHaveAttribute('data-state', 'completed');
+  await disclosure.click();
+  await expect(disclosure).toHaveAttribute('aria-expanded', 'true');
+  await expect(child.getByText('Compared the implementation with its contract.')).toBeVisible();
+  await disclosure.click();
+  await expect(disclosure).toHaveAttribute('aria-expanded', 'false');
+  await expect(child).toHaveCount(1);
+
+  await page.getByRole('button', { name: 'View 1 subagent', exact: true }).click();
+  await expect(page.getByText('1 subagent', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: /Native subagent/u })).toHaveCount(1);
+  await page.getByRole('button', { name: /Native subagent/u }).click();
+  await expect(page.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Back to agents' }).click();
+  await page.getByRole('button', { name: 'Back to chat' }).click();
+  await expect(child).toHaveCount(1);
+  await expect(child).toHaveAttribute('data-state', 'completed');
 });
 
 test('renders signed-out device-code login and cancel state', async ({ page }) => {
@@ -461,7 +515,7 @@ test('blocks mutations after a history sync failure and exposes an explicit retr
   await page.goto(conversationUrl('&fixtureHistoryFailed=1'));
 
   await expect(transcript(page).getByText('Recovered from authoritative resources.')).toBeVisible();
-  await expect(page.getByRole('alert')).toContainText('Fixture history read failed.');
+  await expect(page.getByRole('alert')).toContainText('Conversation history couldn’t sync: Fixture history read failed.');
   await messageBox(page).fill('Wait for provider truth');
   await expect(page.getByRole('button', { name: 'Send message', exact: true })).toBeDisabled();
 
@@ -560,7 +614,7 @@ test('pins the selected native provider model and effort when creating a convers
 });
 
 test('shows context and subscription usage and invokes native Compact without touching the draft', async ({ page }) => {
-  await page.goto(conversationUrl());
+  await page.goto(conversationUrl('&fixtureAutoCompactWindow=1'));
   const usageRail = page.getByRole('button', { name: 'Show usage details' });
   await expect(usageRail.locator('.remux-composer-provider-mark')).toHaveText('A');
   await expect(usageRail.locator('.remux-composer-provider-mark'))
@@ -573,6 +627,7 @@ test('shows context and subscription usage and invokes native Compact without to
   const tray = page.getByRole('region', { name: 'Usage details' });
   await expect(tray).toBeVisible();
   await expect(tray.getByText('36,000 / 100,000 · 36%')).toBeVisible();
+  await expect(tray.getByText('Auto-compact window: 80,000')).toBeVisible();
   await expect(tray.getByRole('progressbar', { name: 'Context window used' })).toHaveAttribute('aria-valuenow', '36');
   await expect(tray.getByText('Fixture subscription')).toBeVisible();
   await expect(tray.getByText('5 hours', { exact: true })).toBeVisible();

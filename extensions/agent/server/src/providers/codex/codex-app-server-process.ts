@@ -8,6 +8,7 @@ import {
   type CodexAppServerConnection,
   type CodexAppServerConnectionFactory,
   type CodexConnectionHandlers,
+  type CodexRequestBeforeWrite,
 } from './codex-app-server-connection.ts';
 
 export type {
@@ -15,9 +16,12 @@ export type {
   CodexAppServerConnectionFactory,
   CodexAppServerLaunchOptions,
   CodexConnectionHandlers,
+  CodexRequestBeforeWrite,
+  CodexRequestErrorPhase,
   CodexServerNotification,
   CodexServerRequest,
 } from './codex-app-server-connection.ts';
+export { CodexRequestError } from './codex-app-server-connection.ts';
 
 export const launchCodexAppServer: CodexAppServerConnectionFactory = async (options) => {
   const child = spawn(options.binaryPath, ['app-server', '--stdio', ...(options.args ?? [])], {
@@ -68,8 +72,8 @@ class ProcessCodexAppServerConnection implements CodexAppServerConnection {
     return this.spawnPromise;
   }
 
-  request(method: string, params: unknown, timeoutMs?: number) {
-    return this.peer.request(method, params, timeoutMs);
+  request(method: string, params: unknown, timeoutMs?: number, beforeWrite?: CodexRequestBeforeWrite) {
+    return this.peer.request(method, params, timeoutMs, beforeWrite);
   }
 
   notify(method: string, params: unknown) {

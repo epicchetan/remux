@@ -23,8 +23,30 @@ export type CodexConnectionHandlers = {
   onStderr?(line: string): void;
 };
 
+export type CodexRequestBeforeWrite = (method: string, requestId: number) => void;
+
+export type CodexRequestErrorPhase = 'not-sent' | 'possibly-sent';
+
+export class CodexRequestError extends Error {
+  readonly phase: CodexRequestErrorPhase;
+  readonly method: string;
+  readonly requestId: number;
+  readonly nativeCode?: number;
+
+  constructor(input: { phase: CodexRequestErrorPhase; method: string; requestId: number;
+    message: string; nativeCode?: number; cause?: unknown }) {
+    super(input.message, input.cause === undefined ? undefined : { cause: input.cause });
+    this.name = 'CodexRequestError';
+    this.phase = input.phase;
+    this.method = input.method;
+    this.requestId = input.requestId;
+    if (input.nativeCode !== undefined) this.nativeCode = input.nativeCode;
+  }
+}
+
 export interface CodexAppServerConnection {
-  request(method: string, params: unknown, timeoutMs?: number): Promise<unknown>;
+  request(method: string, params: unknown, timeoutMs?: number,
+    beforeWrite?: CodexRequestBeforeWrite): Promise<unknown>;
   notify(method: string, params: unknown): void;
   close(): Promise<void>;
 }
@@ -54,7 +76,9 @@ export class CodexJsonRpcPeer implements CodexAppServerConnection {
   private readonly handlers: CodexConnectionHandlers;
   private readonly transport: CodexJsonRpcTransport;
   private readonly pending = new Map<number, {
+    requestId: number;
     method: string;
+    enteredWrite: boolean;
     resolve: (value: unknown) => void;
     reject: (reason: unknown) => void;
     timeout: ReturnType<typeof setTimeout>;
@@ -68,21 +92,43 @@ export class CodexJsonRpcPeer implements CodexAppServerConnection {
     this.transport = transport;
   }
 
-  request(method: string, params: unknown, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
-    if (this.closed) return Promise.reject(this.exitError ?? new Error('Codex App Server is closed.'));
+  request(method: string, params: unknown, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+    beforeWrite?: CodexRequestBeforeWrite) {
     const id = this.nextId++;
+    if (this.closed) return Promise.reject(requestError('not-sent', method, id,
+      this.exitError ?? new Error('Codex App Server is closed.')));
+    let encoded: string;
+    try {
+      encoded = JSON.stringify({ jsonrpc: '2.0', id, method, params });
+    } catch (error) {
+      return Promise.reject(requestError('not-sent', method, id, error));
+    }
+    if (this.closed) return Promise.reject(requestError('not-sent', method, id,
+      this.exitError ?? new Error('Codex App Server is closed.')));
     return new Promise<unknown>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`Codex App Server request ${method} timed out after ${timeoutMs} ms.`));
+        reject(new CodexRequestError({ phase: 'possibly-sent', method, requestId: id,
+          message: `Codex App Server request ${method} timed out after ${timeoutMs} ms.` }));
       }, timeoutMs);
-      this.pending.set(id, { method, resolve, reject, timeout });
+      const pending = { requestId: id, method, resolve, reject, timeout, enteredWrite: false };
+      this.pending.set(id, pending);
       try {
-        this.write({ id, method, params });
+        beforeWrite?.(method, id);
       } catch (error) {
         clearTimeout(timeout);
         this.pending.delete(id);
-        reject(error);
+        reject(requestError('not-sent', method, id, error));
+        return;
+      }
+      if (this.closed) return;
+      try {
+        pending.enteredWrite = true;
+        this.transport.write(encoded);
+      } catch (error) {
+        clearTimeout(timeout);
+        this.pending.delete(id);
+        reject(requestError('possibly-sent', method, id, error));
       }
     });
   }
@@ -152,7 +198,7 @@ export class CodexJsonRpcPeer implements CodexAppServerConnection {
     clearTimeout(pending.timeout);
     this.pending.delete(id);
     if ('error' in value && value.error !== undefined && value.error !== null) {
-      pending.reject(protocolError(pending.method, value.error));
+      pending.reject(protocolError(pending.method, pending.requestId, value.error));
     } else {
       pending.resolve(value.result);
     }
@@ -173,7 +219,8 @@ export class CodexJsonRpcPeer implements CodexAppServerConnection {
   private rejectPending(error: Error) {
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timeout);
-      pending.reject(error);
+      pending.reject(requestError(pending.enteredWrite ? 'possibly-sent' : 'not-sent',
+        pending.method, pending.requestId, error));
     }
     this.pending.clear();
   }
@@ -187,11 +234,22 @@ export class CodexJsonRpcPeer implements CodexAppServerConnection {
   }
 }
 
-function protocolError(method: string, value: unknown) {
-  if (!isRecord(value)) return new Error(`Codex App Server ${method} failed.`);
-  const code = typeof value.code === 'number' ? ` (${value.code})` : '';
-  const message = typeof value.message === 'string' ? value.message : 'Unknown protocol error.';
-  return new Error(`Codex App Server ${method} failed${code}: ${message}`);
+function protocolError(method: string, requestId: number, value: unknown) {
+  if (!isRecord(value)) return new CodexRequestError({ phase: 'possibly-sent', method, requestId,
+    message: `Codex App Server ${method} failed.` });
+  const nativeCode = typeof value.code === 'number' && Number.isFinite(value.code) ? value.code : undefined;
+  const code = nativeCode === undefined ? '' : ` (${nativeCode})`;
+  const detail = typeof value.message === 'string'
+    ? value.message.slice(0, MAX_CODEX_DIAGNOSTIC_CHARS)
+    : 'Unknown protocol error.';
+  return new CodexRequestError({ phase: 'possibly-sent', method, requestId, nativeCode,
+    message: `Codex App Server ${method} failed${code}: ${detail}` });
+}
+
+function requestError(phase: CodexRequestErrorPhase, method: string, requestId: number, error: unknown) {
+  const cause = asCodexError(error);
+  return new CodexRequestError({ phase, method, requestId, cause,
+    message: cause.message || `Codex App Server ${method} request failed.` });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

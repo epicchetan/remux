@@ -5,8 +5,10 @@ import {
   type ComposerDocumentPart,
   type ComposerSnapshot,
 } from '../composer/model/composerModel.ts';
+import type { ProviderAccess } from '../../../shared/provider-runtime.ts';
 
 export type AgentNewChatDraft = {
+  access: ProviderAccess;
   cwd: string;
   id: string;
   snapshot: ComposerSnapshot;
@@ -24,11 +26,18 @@ export function loadNewChatDraft(id: string): AgentNewChatDraft | null {
   const snapshot = parseSnapshot(parsed.snapshot);
   if (!snapshot) return null;
   return {
+    access: parseAccess(parsed.access),
     cwd: parsed.cwd,
     id,
     snapshot,
     updatedAt: typeof parsed.updatedAt === 'number' ? parsed.updatedAt : Date.now(),
   };
+}
+
+function parseAccess(value: unknown): ProviderAccess {
+  return value === 'read-only' || value === 'full-access' || value === 'workspace-write'
+    ? value
+    : 'workspace-write';
 }
 
 export function persistNewChatDraft(draft: AgentNewChatDraft) {

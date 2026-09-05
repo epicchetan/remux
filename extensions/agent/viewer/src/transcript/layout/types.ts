@@ -13,10 +13,20 @@ export type TranscriptMeasuredTurn = {
   collapsedTop: number;
   revision: string;
   rows: TranscriptMeasuredRow[];
+  displayFooter: TranscriptTurnDisplayFooter;
   turn: AgentTurnRenderFrame;
   turnId: string;
   userMessageDisclosureRevision: string;
 };
+
+export type TranscriptTurnDisplayFooter = {
+  revision: string;
+  rows: TranscriptTurnDisplayFooterRow[];
+};
+
+export type TranscriptTurnDisplayFooterRow =
+  | { id: string; kind: 'terminal-error'; message: string }
+  | { id: string; kind: 'projection-retry'; message: string };
 
 export type TranscriptMeasuredRow = {
   height: number;

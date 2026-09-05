@@ -26,7 +26,10 @@ test('Codex stdio transport routes responses, notifications, and server requests
       onExit: (error) => exits.push(error),
     },
   });
-  assert.deepEqual(await connection.request('test/roundtrip', {}), { ok: true });
+  const beforeWrites: Array<[string, number]> = [];
+  assert.deepEqual(await connection.request('test/roundtrip', {}, undefined,
+    (method, requestId) => beforeWrites.push([method, requestId])), { ok: true });
+  assert.deepEqual(beforeWrites, [['test/roundtrip', 1]]);
   assert.deepEqual(notifications, [{
     method: 'test/notification',
     params: { accepted: true },

@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 
 import {
   query as claudeQuery,
+  type AccountInfo as ClaudeAccountInfo,
   type HookCallback,
   type ModelInfo as ClaudeModelInfo,
   type Options as ClaudeQueryOptions,
@@ -17,6 +18,7 @@ import {
 
 import {
   PROVIDER_RUNTIME_CONTRACT_VERSION,
+  PROVIDER_RUNTIME_LIMITS,
   ProviderContractError,
   parseCompactProviderSessionInput,
   parseInterruptProviderChildInput,
@@ -51,6 +53,7 @@ import {
   type TurnBlockSnapshot,
   type TurnStructure,
   type UserContentPart,
+  type UsageDisplay,
 } from '../../../../shared/provider-runtime.ts';
 import type {
   ProviderAdapter,
@@ -59,6 +62,7 @@ import type {
   ProviderSession,
 } from '../../provider-adapter.ts';
 import { ProviderEventStream } from '../../provider-adapter.ts';
+import type { DispatchBoundary, ProviderDispatchResult } from '../../native-runtime/delivery-contract.ts';
 import {
   NativeSessionOwnershipRegistry,
   type NativeSessionLease,
@@ -69,6 +73,8 @@ import {
   FEDERATION_TOOL_TIMEOUT_MS,
 } from '../../federation/constants.ts';
 import { fitJsonPreview as jsonPreview } from '../preview.ts';
+import { fitDisplayText, fitProviderEventDisplay } from '../display-fitting.ts';
+import { ClaudeContextUsage, claudeCompactWindow, DEFAULT_CLAUDE_COMPACT_WINDOW } from './claude-context-usage.ts';
 
 const execFile = promisify(execFileCallback);
 const ADAPTER_VERSION = 'remux-claude-agent-sdk-v1';
@@ -78,6 +84,33 @@ const DEFAULT_BINARY = 'claude';
 const FEDERATION_ALLOWED_TOOLS = FEDERATION_TOOLS
   .map((tool) => `mcp__${FEDERATION_SERVER_NAME}__${tool}`);
 const PROBE_TIMEOUT_MS = 15_000;
+const COMPACTION_STATUS_REPLAY_LIMIT = 1_024;
+const COMPACTION_FAILURE_FALLBACK = 'Claude Code reported that context compaction failed.';
+
+const CLAUDE_API_KEY_SOURCES = new Set([
+  'ANTHROPIC_API_KEY',
+  'apiKeyHelper',
+  '/login managed key',
+]);
+const CLAUDE_AUTH_SOURCE_LABELS = new Set([
+  ...CLAUDE_API_KEY_SOURCES,
+  'none',
+  'oauth',
+  'user',
+  'project',
+  'org',
+  'temporary',
+]);
+const CLAUDE_API_PROVIDER_LABELS = new Set([
+  'firstParty',
+  'bedrock',
+  'vertex',
+  'foundry',
+  'anthropicAws',
+  'anthropicGoogleCloud',
+  'mantle',
+  'gateway',
+]);
 
 type ClaudeQueryFactory = (input: {
   prompt: string | AsyncIterable<SDKUserMessage>;
@@ -88,7 +121,21 @@ type ClaudeAuthStatus = {
   loggedIn?: boolean;
   authMethod?: string;
   apiProvider?: string;
+  subscriptionType?: string;
 };
+
+type ClaudeSubscriptionAuth = {
+  apiProvider: 'firstParty';
+};
+
+class ClaudeProviderAuthError extends Error {
+  readonly code = 'provider_auth';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'ClaudeProviderAuthError';
+  }
+}
 
 type ClaudeBranchCursor = {
   version: 1;
@@ -129,10 +176,12 @@ export type ClaudeNativeAdapterOptions = {
   createQuery?: ClaudeQueryFactory;
   runCli?: (args: readonly string[]) => Promise<string>;
   resolveImageArtifact?: (
+    scope: { conversationId: string; executionId: string },
     artifactId: string,
     mimeType: string,
   ) => Promise<{ path: string }>;
   now?: () => number;
+  acceptanceTimeoutMs?: number;
   ownership?: NativeSessionOwnershipRegistry;
 };
 
@@ -150,6 +199,7 @@ export class ClaudeNativeAdapter implements ProviderAdapter {
   private readonly resolveImageArtifact?: ClaudeNativeAdapterOptions['resolveImageArtifact'];
   private readonly now: () => number;
   private readonly ownership: NativeSessionOwnershipRegistry;
+  private readonly acceptanceTimeoutMs: number;
   private providerVersion = 'unknown';
 
   constructor(options: ClaudeNativeAdapterOptions = {}) {
@@ -159,6 +209,7 @@ export class ClaudeNativeAdapter implements ProviderAdapter {
     this.createQuery = options.createQuery ?? claudeQuery;
     this.resolveImageArtifact = options.resolveImageArtifact;
     this.now = options.now ?? Date.now;
+    this.acceptanceTimeoutMs = options.acceptanceTimeoutMs ?? 30_000;
     this.ownership = options.ownership ?? new NativeSessionOwnershipRegistry(this.now);
     this.runCli = options.runCli ?? (async (args) => {
       try {
@@ -203,6 +254,15 @@ export class ClaudeNativeAdapter implements ProviderAdapter {
           displayLabel: 'Claude',
           diagnosticCode: 'claude_subscription_required',
           message: 'Claude is authenticated with an API key. Remux Agent requires the native Claude subscription session.',
+          capabilities: claudeCapabilities(this.providerVersion, false),
+        };
+      }
+      if (!isNativeSubscriptionAuth(status)) {
+        return {
+          state: 'incompatible',
+          displayLabel: 'Claude',
+          diagnosticCode: 'claude_subscription_required',
+          message: 'Claude authentication could not be verified as a native Claude subscription session.',
           capabilities: claudeCapabilities(this.providerVersion, false),
         };
       }
@@ -317,15 +377,19 @@ export class ClaudeNativeAdapter implements ProviderAdapter {
     let query: ClaudeQuery | undefined;
     try {
       query = this.createQuery({ prompt, options });
+      const auth = requireClaudeSubscription(await query.accountInfo());
       session = new ClaudeProviderSession({
         input,
         sessionId,
         prompt,
         query,
+        auth,
         resolveImageArtifact: this.resolveImageArtifact,
         diagnostics,
         now: this.now,
+        acceptanceTimeoutMs: this.acceptanceTimeoutMs,
         lease,
+        compactWindow: claudeCompactWindow(options.env ?? {}),
         forkNative: (request) => this.materializeFork(input, sessionId, request),
       });
       session.start(input.mode !== 'create');
@@ -391,10 +455,12 @@ export class ClaudeNativeAdapter implements ProviderAdapter {
           },
     });
     try {
+      const auth = requireClaudeSubscription(await query.accountInfo());
       let materialized = false;
       for await (const message of query) {
         const record = message as unknown as Record<string, unknown>;
         if (record.type === 'system' && record.subtype === 'init') {
+          requireClaudeInitSubscription(record.apiKeySource, auth);
           materialized = true;
           break;
         }
@@ -443,13 +509,16 @@ export class ClaudeNativeAdapter implements ProviderAdapter {
 }
 
 type ClaudeProviderSessionOptions = {
+  compactWindow?: number;
   input: OpenProviderSessionInput;
   sessionId: string;
   prompt: ClaudeInputQueue;
   query: ClaudeQuery;
+  auth: ClaudeSubscriptionAuth;
   resolveImageArtifact?: ClaudeNativeAdapterOptions['resolveImageArtifact'];
   diagnostics: string[];
   now: () => number;
+  acceptanceTimeoutMs: number;
   forkNative?: (request: NativeForkRequest) => Promise<NativeSessionRef>;
   lease: NativeSessionLease;
 };
@@ -461,6 +530,9 @@ export class ClaudeProviderSession implements ProviderSession {
   private readonly openedWith: OpenProviderSessionInput;
   private readonly prompt: ClaudeInputQueue;
   private readonly query: ClaudeQuery;
+  private readonly auth: ClaudeSubscriptionAuth;
+  private readonly contextUsage: ClaudeContextUsage;
+  private latestUsage: UsageDisplay = { turn: null, cumulative: null, context: null, estimatedCost: null };
   private readonly resolveImageArtifact?: ClaudeNativeAdapterOptions['resolveImageArtifact'];
   private readonly diagnostics: string[];
   private readonly now: () => number;
@@ -468,7 +540,7 @@ export class ClaudeProviderSession implements ProviderSession {
   private readonly lease: NativeSessionLease;
   private readonly receipts = new Map<
     string,
-    { hash: string; result: Promise<ProviderCommandAcceptance> }
+    { hash: string; result: Promise<ProviderCommandAcceptance | ProviderDispatchResult> }
   >();
   private readonly eventLog: ProviderEventEnvelope[] = [];
   private readonly tools = new Map<string, ClaudeToolState>();
@@ -506,16 +578,25 @@ export class ClaudeProviderSession implements ProviderSession {
   private interruptRequested = false;
   private consumeTask: Promise<void> | undefined;
   private manualCompactionOperationId: string | undefined;
+  private readonly settledCompactionStatuses = new Set<string>();
   private recoveringAcceptedTurn = false;
+  private readonly processGeneration = randomUUID();
+  private rootAcceptance?: { promptUuid: string; resolve: (result: ProviderDispatchResult) => void;
+    timeout: ReturnType<typeof setTimeout> };
+  private readonly processingEvidence = new Map<string, import('../../native-runtime/delivery-contract.ts').ProviderAcceptanceEvidence>();
+  private readonly acceptanceTimeoutMs: number;
   private closed = false;
 
   constructor(options: ClaudeProviderSessionOptions) {
     this.openedWith = options.input;
     this.prompt = options.prompt;
     this.query = options.query;
+    this.auth = options.auth;
+    this.contextUsage = new ClaudeContextUsage(options.compactWindow);
     this.resolveImageArtifact = options.resolveImageArtifact;
     this.diagnostics = options.diagnostics;
     this.now = options.now;
+    this.acceptanceTimeoutMs = options.acceptanceTimeoutMs;
     this.forkNative = options.forkNative ?? (async () => {
       throw new Error('Claude native fork is unavailable for this session.');
     });
@@ -562,7 +643,7 @@ export class ClaudeProviderSession implements ProviderSession {
     this.consumeTask = this.consume();
   }
 
-  async startTurn(unparsed: StartProviderTurnInput): Promise<ProviderCommandAcceptance> {
+  async startTurn(unparsed: StartProviderTurnInput, boundary?: DispatchBoundary): Promise<ProviderDispatchResult> {
     this.assertOpen();
     const input = parseStartProviderTurnInput(unparsed);
     if (input.conversationId !== this.openedWith.conversationId ||
@@ -571,11 +652,13 @@ export class ClaudeProviderSession implements ProviderSession {
     }
     return this.onceCommand(input.commandId, input, async () => {
       if (this.activeTurn) throw new Error('Claude provider session already has an active turn.');
-      const content = await mapClaudeUserContent(input.content, this.resolveImageArtifact);
-      if (input.model && input.model !== this.openedWith.model) await this.query.setModel(input.model);
-      if (input.effort && input.effort !== this.openedWith.effort) {
-        await this.query.applyFlagSettings({ effortLevel: claudeEffort(input.effort) });
-      }
+      const content = await mapClaudeUserContent(input.content, this.resolveImageArtifact
+        ? (artifactId, mimeType) => this.resolveImageArtifact!({
+            conversationId: this.openedWith.conversationId,
+            executionId: this.openedWith.executionId,
+          }, artifactId, mimeType)
+        : undefined);
+      await this.prepareTurnConfiguration(input);
       this.assertOpen();
       if (this.activeTurn) throw new Error('Claude provider session already has an active turn.');
 
@@ -593,9 +676,20 @@ export class ClaudeProviderSession implements ProviderSession {
       };
       this.currentMessageId = undefined;
       this.lastAssistantMessageId = undefined;
+      this.contextUsage.startTurn();
+      this.latestUsage = { ...this.latestUsage, turn: null, context: null };
       this.interruptRequested = false;
       this.state = 'running';
+      let acceptance: Promise<ProviderDispatchResult>;
       try {
+        acceptance = new Promise<ProviderDispatchResult>((resolve) => {
+          const timeout = setTimeout(() => resolve({ accepted: false, outcome: 'unknown',
+            crossing: { phase: 'possibly-sent', detail: 'response-lost' },
+            error: { code: 'claude_acceptance_timeout', message: 'Claude did not provide correlated processing evidence before the delivery timeout.', retryable: true } }), this.acceptanceTimeoutMs);
+          timeout.unref?.();
+          this.rootAcceptance = { promptUuid, resolve, timeout };
+        });
+        boundary?.markPossiblySent(this.nativeSession.sessionId, this.processGeneration);
         this.prompt.push({
           type: 'user',
           message: { role: 'user', content },
@@ -603,15 +697,19 @@ export class ClaudeProviderSession implements ProviderSession {
           uuid: promptUuid as `${string}-${string}-${string}-${string}-${string}`,
         });
       } catch (error) {
+        if (this.rootAcceptance) clearTimeout(this.rootAcceptance.timeout);
+        this.rootAcceptance = undefined;
         this.activeTurn = undefined;
         this.state = 'idle';
-        throw error;
+        return boundary
+          ? { accepted: false, outcome: 'unknown', crossing: { phase: 'possibly-sent', detail: 'stdin-yielded' }, error: { code: 'claude_prompt_failed', message: error instanceof Error ? error.message : String(error) } }
+          : { accepted: false, outcome: 'rejected', crossing: { phase: 'not-sent', detail: 'preparation' }, error: { code: 'claude_prompt_failed', message: error instanceof Error ? error.message : String(error) } };
       }
       this.emit({ type: 'user.message', content: input.content }, 'user/message', input.turnId, nativeTurnId);
       this.emit({ type: 'turn.started' }, 'turn/started', input.turnId, nativeTurnId);
       this.emit({ type: 'turn.status', state: 'running' }, 'turn/status', input.turnId, nativeTurnId);
-      return { accepted: true, nativeTurnId };
-    });
+      return acceptance;
+    }) as Promise<ProviderDispatchResult>;
   }
 
   async interrupt(unparsed: InterruptProviderTurnInput): Promise<ProviderCommandAcceptance> {
@@ -623,6 +721,13 @@ export class ClaudeProviderSession implements ProviderSession {
       await this.query.interrupt();
       return { accepted: true };
     });
+  }
+
+  async readTurnPresence(nativeClientMessageId: string) {
+    const evidence = this.processingEvidence.get(nativeClientMessageId);
+    return evidence
+      ? { presence: 'present' as const, evidence }
+      : { presence: 'unknown' as const, reason: 'Claude history does not prove root processing.' };
   }
 
   async interruptChild(unparsed: InterruptProviderChildInput): Promise<ProviderCommandAcceptance> {
@@ -691,6 +796,13 @@ export class ClaudeProviderSession implements ProviderSession {
   async close() {
     if (this.closed) return;
     this.closed = true;
+    if (this.rootAcceptance) {
+      clearTimeout(this.rootAcceptance.timeout);
+      this.rootAcceptance.resolve({ accepted: false, outcome: 'unknown',
+        crossing: { phase: 'possibly-sent', detail: 'response-lost' },
+        error: { code: 'claude_session_closed', message: 'Claude session closed before correlated processing evidence.', retryable: true } });
+      this.rootAcceptance = undefined;
+    }
     try {
       this.prompt.close();
       this.query.close();
@@ -727,6 +839,8 @@ export class ClaudeProviderSession implements ProviderSession {
         }
       }
       if (!this.closed) {
+        this.resolvePendingAcceptance('claude_stream_ended',
+          'Claude event stream ended before correlated processing evidence.');
         this.state = 'lost';
         const diagnostic = this.diagnostics.at(-1);
         this.emit({
@@ -740,6 +854,15 @@ export class ClaudeProviderSession implements ProviderSession {
       }
     } catch (error) {
       if (this.closed) return;
+      this.resolvePendingAcceptance('claude_stream_failed',
+        'Claude event stream failed before correlated processing evidence.');
+      if (error instanceof ClaudeProviderAuthError) {
+        // This runs inside consumeTask, so close only the native transport
+        // here. Public close() remains the lease owner and may safely await
+        // consumeTask after this catch returns.
+        this.prompt.close();
+        this.query.close();
+      }
       this.state = 'lost';
       const diagnostic = this.diagnostics.at(-1);
       const message = diagnostic
@@ -775,6 +898,33 @@ export class ClaudeProviderSession implements ProviderSession {
       throw new Error('Claude emitted a different native session ID than requested.');
     }
     this.currentEnvelopeUuid = stringValue(record.uuid);
+    const correlatedUserUuid = stringValue(record.user_message_uuid);
+    const streamType = stringValue(objectValue(record.event)?.type);
+    const partialKinds = new Set(['message_start', 'message_delta', 'message_stop',
+      'content_block_start', 'content_block_delta', 'content_block_stop']);
+    const exactRootOutput =
+      ((record.type === 'assistant' || record.type === 'stream_event') &&
+        record.parent_tool_use_id === null) ||
+      (record.type === 'result' && record.subtype === 'success');
+    const exactOutputKind = record.type === 'assistant' ||
+      (record.type === 'stream_event' && streamType !== undefined && partialKinds.has(streamType)) ||
+      (record.type === 'result' && record.subtype === 'success');
+    if (this.rootAcceptance && sessionId === this.nativeSession.sessionId &&
+        correlatedUserUuid === this.rootAcceptance.promptUuid && this.currentEnvelopeUuid &&
+        exactRootOutput && exactOutputKind) {
+      const pending = this.rootAcceptance;
+      this.rootAcceptance = undefined;
+      clearTimeout(pending.timeout);
+      const evidence = {
+        kind: 'claude-root-processing', sessionId: this.nativeSession.sessionId,
+        userMessageUuid: correlatedUserUuid, observationUuid: this.currentEnvelopeUuid,
+      } as const;
+      this.processingEvidence.set(correlatedUserUuid, evidence);
+      while (this.processingEvidence.size > 32) {
+        this.processingEvidence.delete(this.processingEvidence.keys().next().value!);
+      }
+      pending.resolve({ accepted: true, outcome: 'accepted', evidence, nativeTurnId: this.activeTurn?.nativeTurnId });
+    }
     if (record.type === 'system') this.handleSystemMessage(record);
     else if (record.type === 'stream_event') await this.handleStreamEvent(record);
     else if (record.type === 'assistant') await this.handleAssistantMessage(record);
@@ -782,16 +932,27 @@ export class ClaudeProviderSession implements ProviderSession {
     else if (record.type === 'tool_progress') this.handleToolProgress(record);
     else if (record.type === 'result') this.handleResult(record);
     else if (record.type === 'rate_limit_event') this.handleRateLimitEvent(record);
-    if (this.activeTurn && this.currentEnvelopeUuid &&
+    if (this.activeTurn && this.currentEnvelopeUuid && !record.parent_tool_use_id &&
         (record.type === 'system' || record.type === 'assistant' || record.type === 'user')) {
       this.activeTurn.lastChainEntryUuid = this.currentEnvelopeUuid;
       this.lastChainEntryUuid = this.currentEnvelopeUuid;
     }
   }
 
+  private resolvePendingAcceptance(code: string, message: string) {
+    if (!this.rootAcceptance) return;
+    const pending = this.rootAcceptance;
+    this.rootAcceptance = undefined;
+    clearTimeout(pending.timeout);
+    pending.resolve({ accepted: false, outcome: 'unknown',
+      crossing: { phase: 'possibly-sent', detail: 'response-lost' },
+      error: { code, message, retryable: true } });
+  }
+
   private handleSystemMessage(message: Record<string, unknown>) {
     const subtype = stringValue(message.subtype);
     if (subtype === 'init') {
+      requireClaudeInitSubscription(message.apiKeySource, this.auth);
       this.emit({ type: 'session.materialized' }, 'session/materialized');
       this.emit({
         type: 'session.health',
@@ -802,7 +963,38 @@ export class ClaudeProviderSession implements ProviderSession {
       }, 'system/init');
       return;
     }
+    if (subtype === 'status' && message.compact_result === 'failed') {
+      if (message.parent_tool_use_id) return;
+      // SDK status UUIDs are the only replay identity. A malformed UUID-less
+      // status is a distinct observation because its content cannot prove replay.
+      const statusIdentity = this.currentEnvelopeUuid ?? `missing-uuid-observation:${this.sequence + 1}`;
+      if (this.settledCompactionStatuses.has(statusIdentity)) return;
+      this.rememberSettledCompactionStatus(statusIdentity);
+      const operationId = this.manualCompactionOperationId
+        ?? `claude-auto-compact-${hashJson({
+          sessionId: this.nativeSession.sessionId,
+          statusIdentity,
+        }).slice(0, 24)}`;
+      this.emit({
+        type: 'context.compaction.failed',
+        trigger: this.manualCompactionOperationId ? 'manual' : 'automatic',
+        operationId,
+        error: {
+          code: 'claude_compaction_failed',
+          message: fitContractString(
+            stringValue(message.compact_error) ?? COMPACTION_FAILURE_FALLBACK,
+            PROVIDER_RUNTIME_LIMITS.stringChars,
+          ),
+          retryable: true,
+        },
+      }, 'system/status/compact-failed');
+      this.manualCompactionOperationId = undefined;
+      return;
+    }
     if (subtype === 'compact_boundary') {
+      if (message.parent_tool_use_id) return;
+      this.contextUsage.compact();
+      this.emitContextUsage('system/context-invalidated');
       const metadata = objectValue(message.compact_metadata);
       const trigger = metadata?.trigger === 'manual' ? 'manual' : 'automatic';
       const operationId = trigger === 'manual' && this.manualCompactionOperationId
@@ -893,6 +1085,13 @@ export class ClaudeProviderSession implements ProviderSession {
     }
   }
 
+  private rememberSettledCompactionStatus(identity: string) {
+    this.settledCompactionStatuses.add(identity);
+    if (this.settledCompactionStatuses.size <= COMPACTION_STATUS_REPLAY_LIMIT) return;
+    const oldest = this.settledCompactionStatuses.values().next().value;
+    if (oldest) this.settledCompactionStatuses.delete(oldest);
+  }
+
   private async handleStreamEvent(message: Record<string, unknown>) {
     const active = this.activeTurn;
     if (!active || message.parent_tool_use_id) return;
@@ -902,7 +1101,8 @@ export class ClaudeProviderSession implements ProviderSession {
     // none of that handshake may be projected as output of the accepted turn.
     if (this.recoveringAcceptedTurn) return;
     if (event?.type === 'message_start') {
-      const nativeMessageId = stringValue(objectValue(event.message)?.id);
+      const body = objectValue(event.message);
+      const nativeMessageId = stringValue(body?.id);
       if (nativeMessageId) {
         this.currentMessageId = nativeMessageId;
         this.lastAssistantMessageId = nativeMessageId;
@@ -911,6 +1111,7 @@ export class ClaudeProviderSession implements ProviderSession {
         }
         active.assistantText = '';
       }
+      if (body && this.contextUsage.observe(body, this.now())) this.emitContextUsage('stream/context-usage');
       return;
     }
     if (event?.type === 'message_stop') {
@@ -1016,6 +1217,9 @@ export class ClaudeProviderSession implements ProviderSession {
     if (nativeMessageId) {
       this.currentMessageId = nativeMessageId;
       this.lastAssistantMessageId = nativeMessageId;
+    }
+    if (!message.parent_tool_use_id && body && this.contextUsage.observe(body, this.now())) {
+      this.emitContextUsage('assistant/context-usage');
     }
     const semanticOrdinals = new Map<ClaudeAssistantBlockKind, number>();
     const assistantTexts: string[] = [];
@@ -1233,6 +1437,14 @@ export class ClaudeProviderSession implements ProviderSession {
     }, 'tool/progress', active.turnId, active.nativeTurnId, callId);
   }
 
+  private emitContextUsage(nativeKind: string) {
+    const active = this.activeTurn;
+    if (!active) return;
+    this.latestUsage = { ...this.latestUsage, context: this.contextUsage.snapshot(active.turnId) };
+    this.emit({ type: 'usage.updated', usage: this.latestUsage },
+      nativeKind, active.turnId, active.nativeTurnId);
+  }
+
   private handleResult(message: Record<string, unknown>) {
     const active = this.activeTurn;
     if (!active) return;
@@ -1258,45 +1470,35 @@ export class ClaudeProviderSession implements ProviderSession {
         return sample ? [sample] : [];
       });
       const cumulative = aggregateClaudeModelUsage(modelSamples);
-      const currentModelUsage = objectValue(modelUsage?.[this.openedWith.model]) ?? modelSamples[0];
-      const windowTokens = nonnegativeInteger(currentModelUsage?.contextWindow);
-      const contextUsed = (inputTokens ?? 0) + (cacheRead ?? 0) + (cacheCreate ?? 0);
-      const observedAt = this.now();
-      this.emit({
-        type: 'usage.updated',
-        usage: {
-          turn: {
-            inputTokens: inputTokens ?? null,
-            cachedInputTokens: cacheRead ?? null,
-            cacheWriteInputTokens: cacheCreate ?? null,
-            outputTokens: outputTokens ?? null,
-            reasoningOutputTokens: null,
-            // Claude does not report an authoritative total for this shape.
-            // Cached/thinking accounting differs from a naive input + output
-            // sum, so preserve unknown rather than inventing a provider total.
-            totalTokens: null,
-          },
-          cumulative: cumulative ? {
-            tokens: cumulative,
-            scope: 'runtime-epoch',
-            epochId: this.nativeSession.sessionId,
-          } : null,
-          context: windowTokens && contextUsed > 0 ? {
-            usedTokens: Math.min(contextUsed, windowTokens),
-            windowTokens,
-            percent: Math.min(100, Math.max(0, contextUsed / windowTokens * 100)),
-            measurement: 'derived',
-            freshness: 'live',
-            observedAt,
-            turnId: active.turnId,
-          } : null,
-          estimatedCost: nonnegativeNumber(message.total_cost_usd) === undefined ? null : {
-            usd: nonnegativeNumber(message.total_cost_usd)!,
-            scope: 'runtime-epoch',
-            epochId: this.nativeSession.sessionId,
-          },
+      this.contextUsage.updateWindows(modelUsage);
+      this.latestUsage = {
+        turn: {
+          inputTokens: inputTokens ?? null,
+          cachedInputTokens: cacheRead ?? null,
+          cacheWriteInputTokens: cacheCreate ?? null,
+          outputTokens: outputTokens ?? null,
+          reasoningOutputTokens: null,
+          // Claude does not report an authoritative total for this shape.
+          // Cached/thinking accounting differs from a naive input + output
+          // sum, so preserve unknown rather than inventing a provider total.
+          totalTokens: null,
         },
-      }, 'result/usage', active.turnId, active.nativeTurnId);
+        cumulative: cumulative ? {
+          tokens: cumulative,
+          scope: 'runtime-epoch',
+          epochId: this.nativeSession.sessionId,
+        } : null,
+        context: this.contextUsage.snapshot(active.turnId),
+        estimatedCost: nonnegativeNumber(message.total_cost_usd) === undefined ? null : {
+          usd: nonnegativeNumber(message.total_cost_usd)!,
+          scope: 'runtime-epoch',
+          epochId: this.nativeSession.sessionId,
+        },
+      };
+      // Version the native kind so persisted readings from the old accumulated
+      // calculation can be invalidated without rewriting historical events.
+      this.emit({ type: 'usage.updated', usage: this.latestUsage },
+        'result/usage-v2', active.turnId, active.nativeTurnId);
     }
     const isError = message.is_error === true || message.subtype !== 'success';
     const outcome = this.interruptRequested ? 'interrupted' : isError ? 'failed' : 'completed';
@@ -1390,8 +1592,9 @@ export class ClaudeProviderSession implements ProviderSession {
     const nativeItemId = itemId
       ? stableUuid(`claude-item\0${this.nativeSession.sessionId}\0${itemId}`)
       : undefined;
-    const event = this.normalizeEvent(input, turnId, nativeTurnId, itemId, blockIndex);
-    const envelope = parseProviderEventEnvelope({
+    const normalized = this.normalizeEvent(input, turnId, nativeTurnId, itemId, blockIndex);
+    const observedAt = this.now();
+    const buildEnvelope = (event: ProviderEvent) => ({
       contractVersion: PROVIDER_RUNTIME_CONTRACT_VERSION,
       eventId: `claude:${hashJson({
         sessionId: this.nativeSession.sessionId,
@@ -1429,9 +1632,16 @@ export class ClaudeProviderSession implements ProviderSession {
         position: { kind: 'native-sequence', sequence, subIndex: blockIndex ?? 0 },
         kind: nativeKind,
       },
-      observedAt: this.now(),
+      observedAt,
       event,
     });
+    const event = fitProviderEventDisplay({
+      event: normalized,
+      maxBytes: PROVIDER_RUNTIME_LIMITS.eventBytes,
+      buildEnvelope,
+      hashJson,
+    });
+    const envelope = parseProviderEventEnvelope(buildEnvelope(event));
     this.sequence = sequence;
     this.commitBlockEvent(envelope.event, turnId, itemId);
     this.eventLog.push(envelope);
@@ -1452,6 +1662,13 @@ export class ClaudeProviderSession implements ProviderSession {
         const previousText = previous?.block.payload.kind === 'reasoning-summary'
           ? previous.block.payload.text : '';
         const completed = event.summary !== undefined;
+        if (!completed && previous?.block.payload.kind === 'reasoning-summary' &&
+            previous.block.payload.truncated) {
+          return this.blockEvent(
+            turnId, nativeTurnId, itemId, blockIndex, 'reasoning-summary',
+            previous.block.payload, 'streaming', false,
+          );
+        }
         const text = completed ? stringValue(event.summary) ?? ''
           : `${previousText}${stringValue(event.delta) ?? ''}`;
         return this.blockEvent(
@@ -1459,6 +1676,8 @@ export class ClaudeProviderSession implements ProviderSession {
             kind: 'reasoning-summary',
             text,
             ...(text ? { parts: [text] } : {}),
+            truncated: completed ? false : previous?.block.payload.kind === 'reasoning-summary'
+              ? previous.block.payload.truncated : false,
           }, completed ? 'completed' : 'streaming', completed,
         );
       }
@@ -1671,10 +1890,10 @@ export class ClaudeProviderSession implements ProviderSession {
     this.passOrdinals.set(passKey, event.structure.passOrdinal);
   }
 
-  private onceCommand(
+  private onceCommand<T extends ProviderCommandAcceptance | ProviderDispatchResult>(
     commandId: string,
     input: unknown,
-    run: () => Promise<ProviderCommandAcceptance>,
+    run: () => Promise<T>,
   ) {
     const hash = hashJson(input);
     const previous = this.receipts.get(commandId);
@@ -1682,11 +1901,19 @@ export class ClaudeProviderSession implements ProviderSession {
       if (previous.hash !== hash) {
         return Promise.reject(new Error('Claude command ID was reused with different input.'));
       }
-      return previous.result;
+      return previous.result as Promise<T>;
     }
     const result = run();
     this.receipts.set(commandId, { hash, result });
     return result;
+  }
+
+  private async prepareTurnConfiguration(input: StartProviderTurnInput) {
+    const model = input.model ?? this.openedWith.model;
+    if (model) await this.query.setModel(model);
+    await this.query.applyFlagSettings({
+      effortLevel: input.effort === undefined ? null : claudeEffort(input.effort),
+    });
   }
 
   private assertOpen() {
@@ -1785,7 +2012,7 @@ function claudeCapabilities(providerVersion: string, manualCompact = true): Prov
     usage: {
       turn: true,
       cumulative: true,
-      context: 'provider',
+      context: 'derived',
       plan: 'read-and-push',
       estimatedCost: true,
     },
@@ -1834,7 +2061,8 @@ function sessionQueryOptions(input: {
     settingSources: ['user', 'project', 'local'],
     settings: {
       disableAllHooks: false,
-      autoCompactEnabled: false,
+      autoCompactEnabled: true,
+      autoCompactWindow: DEFAULT_CLAUDE_COMPACT_WINDOW,
       precomputeCompactionEnabled: false,
     },
     hooks: claudeSessionHooks(input.input.access, input.input.cwd, input.onFileChanged),
@@ -2088,7 +2316,7 @@ function toolDenial(access: ProviderAccess, cwd: string, toolName: string, toolI
 
 async function mapClaudeUserContent(
   content: readonly UserContentPart[],
-  resolveImageArtifact?: ClaudeNativeAdapterOptions['resolveImageArtifact'],
+  resolveImageArtifact?: (artifactId: string, mimeType: string) => Promise<{ path: string }>,
 ): Promise<SDKUserMessage['message']['content']> {
   const blocks: Array<Record<string, unknown>> = [];
   for (const part of content) {
@@ -2132,6 +2360,12 @@ function subscriptionEnvironment(
 function isApiKeyAuth(status: ClaudeAuthStatus) {
   const auth = status.authMethod?.toLowerCase().replaceAll(/[^a-z]/gu, '') ?? '';
   return auth.includes('apikey') || status.apiProvider && status.apiProvider !== 'firstParty';
+}
+
+function isNativeSubscriptionAuth(status: ClaudeAuthStatus) {
+  return status.authMethod === 'claude.ai' &&
+    status.apiProvider === 'firstParty' &&
+    Boolean(status.subscriptionType?.trim());
 }
 
 function claudeEffort(value: string): 'low' | 'medium' | 'high' | 'xhigh' | 'max' {
@@ -2190,6 +2424,17 @@ function objectValue(value: unknown): Record<string, unknown> | undefined {
 function stringValue(value: unknown) {
   return typeof value === 'string' && value ? value : undefined;
 }
+
+function fitContractString(value: string, limit: number) {
+  return fitDisplayText({
+    value,
+    maxChars: limit,
+    maxBytes: Number.MAX_SAFE_INTEGER,
+    marker: '\n… error truncated …',
+    build: (text) => text,
+  }).text;
+}
+
 
 function numberValue(value: unknown) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
@@ -2305,6 +2550,49 @@ function safeMessage(error: unknown) {
     .replace(/Bearer\s+\S+/giu, 'Bearer [redacted]')
     .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/gu, '[redacted]')
     .slice(0, 1_000);
+}
+
+function requireClaudeSubscription(account: ClaudeAccountInfo): ClaudeSubscriptionAuth {
+  const source = knownAuthLabel(account.apiKeySource, CLAUDE_AUTH_SOURCE_LABELS);
+  const provider = knownAuthLabel(account.apiProvider, CLAUDE_API_PROVIDER_LABELS);
+  if (CLAUDE_API_KEY_SOURCES.has(account.apiKeySource ?? '')) {
+    throw new ClaudeProviderAuthError(
+      `Claude native subscription authentication is required; credential source ${JSON.stringify(source)} is incompatible.`,
+    );
+  }
+  if (account.apiProvider !== 'firstParty') {
+    throw new ClaudeProviderAuthError(
+      `Claude native subscription authentication is required; API backend ${JSON.stringify(provider)} is incompatible.`,
+    );
+  }
+  if (!account.subscriptionType?.trim()) {
+    throw new ClaudeProviderAuthError(
+      `Claude native subscription authentication could not be verified for credential source ${JSON.stringify(source)}.`,
+    );
+  }
+  if (account.apiKeySource !== undefined &&
+      account.apiKeySource !== 'none' && account.apiKeySource !== 'oauth') {
+    throw new ClaudeProviderAuthError(
+      `Claude native subscription authentication is required; credential source ${JSON.stringify(source)} is incompatible.`,
+    );
+  }
+  return { apiProvider: 'firstParty' };
+}
+
+function requireClaudeInitSubscription(
+  apiKeySource: unknown,
+  auth: ClaudeSubscriptionAuth,
+) {
+  const source = typeof apiKeySource === 'string' ? apiKeySource : undefined;
+  if ((source === 'none' || source === 'oauth') && auth.apiProvider === 'firstParty') return;
+  throw new ClaudeProviderAuthError(
+    `Claude native subscription authentication is required; credential source ${JSON.stringify(knownAuthLabel(source, CLAUDE_AUTH_SOURCE_LABELS))} is incompatible.`,
+  );
+}
+
+function knownAuthLabel(value: unknown, allowed: ReadonlySet<string>) {
+  if (typeof value !== 'string' || !value.trim()) return 'missing';
+  return allowed.has(value) ? value : 'unknown';
 }
 
 function isMissingExecutable(error: unknown) {

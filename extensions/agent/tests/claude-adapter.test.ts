@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import type {
+  AccountInfo as ClaudeAccountInfo,
   Options as ClaudeQueryOptions,
   Query as ClaudeQuery,
   SDKMessage,
@@ -22,9 +23,15 @@ import {
 
 test('Claude probe accepts native subscription auth and refuses API-key fallback', async () => {
   const subscription = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
     runCli: async (args) => args[0] === '--version'
       ? '2.1.223 (Claude Code)'
-      : JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty' }),
+      : JSON.stringify({
+          loggedIn: true,
+          authMethod: 'claude.ai',
+          apiProvider: 'firstParty',
+          subscriptionType: 'max',
+        }),
   });
   const ready = await subscription.probe('claude-local');
   assert.equal(ready.state, 'ready');
@@ -35,12 +42,14 @@ test('Claude probe accepts native subscription auth and refuses API-key fallback
   assert.equal(ready.capabilities?.turns.steer, false);
   assert.equal(ready.capabilities?.content.diffs, true);
   assert.equal(ready.capabilities?.usage.plan, 'read-and-push');
+  assert.equal(ready.capabilities?.usage.context, 'derived');
   assert.deepEqual(ready.capabilities?.interaction, {
     blockingApprovals: false,
     structuredUserInput: false,
   });
 
   const apiKey = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
     runCli: async (args) => args[0] === '--version'
       ? '2.1.223 (Claude Code)'
       : JSON.stringify({ loggedIn: true, authMethod: 'apiKey', apiProvider: 'anthropic' }),
@@ -48,6 +57,149 @@ test('Claude probe accepts native subscription auth and refuses API-key fallback
   const incompatible = await apiKey.probe('claude-local');
   assert.equal(incompatible.state, 'incompatible');
   assert.equal(incompatible.diagnosticCode, 'claude_subscription_required');
+
+  const unknown = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
+    runCli: async (args) => args[0] === '--version'
+      ? '2.1.223 (Claude Code)'
+      : JSON.stringify({ loggedIn: true }),
+  });
+  const unverified = await unknown.probe('claude-local');
+  assert.equal(unverified.state, 'incompatible');
+  assert.equal(unverified.diagnosticCode, 'claude_subscription_required');
+});
+
+test('Claude session initialization requires first-party subscription authentication', async () => {
+  const openInput = {
+    commandId: 'open-claude-auth',
+    providerInstanceId: 'claude-local',
+    conversationId: 'conversation-claude-auth',
+    executionId: 'execution-claude-auth',
+    mode: 'resume' as const,
+    cwd: '/workspace/remux',
+    model: 'claude-sonnet-4-6',
+    access: 'read-only' as const,
+    developerInstructions: [],
+    nativeSession: {
+      provider: 'claude-code' as const,
+      providerInstanceId: 'claude-local',
+      sessionId: 'native-claude-auth',
+    },
+  };
+  const rejectedAccounts: Array<[string, ClaudeAccountInfo, RegExp]> = [
+    ['environment key', {
+      apiProvider: 'firstParty', apiKeySource: 'ANTHROPIC_API_KEY', subscriptionType: 'max',
+    }, /ANTHROPIC_API_KEY/u],
+    ['key helper', {
+      apiProvider: 'firstParty', apiKeySource: 'apiKeyHelper', subscriptionType: 'max',
+    }, /apiKeyHelper/u],
+    ['managed key', {
+      apiProvider: 'firstParty', apiKeySource: '/login managed key', subscriptionType: 'max',
+    }, /\/login managed key/u],
+    ['external backend', {
+      apiProvider: 'bedrock', apiKeySource: 'none', tokenSource: 'secret-must-not-appear',
+    }, /bedrock/u],
+    ['unknown evidence', {
+      apiProvider: 'firstParty', apiKeySource: 'future-source',
+    }, /unknown/u],
+    ['missing evidence', {}, /missing/u],
+  ];
+
+  for (const [label, account, expected] of rejectedAccounts) {
+    const query = new FakeClaudeQuery(undefined, account);
+    const adapter = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
+      createQuery: () => query as unknown as ClaudeQuery,
+    });
+    await assert.rejects(
+      () => adapter.openSession({
+        ...openInput,
+        commandId: `open-${label.replaceAll(' ', '-')}`,
+      }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'provider_auth');
+        assert.match(String((error as Error).message), expected);
+        assert.doesNotMatch(String((error as Error).message), /secret-must-not-appear/u);
+        return true;
+      },
+    );
+    assert.equal(query.isClosed, true, `${label} rejection closes its query`);
+  }
+
+  const rejectedForReopen = new FakeClaudeQuery(undefined, {});
+  const accepted = new FakeClaudeQuery(undefined, {
+    apiProvider: 'firstParty',
+    subscriptionType: 'pro',
+  });
+  const reopenQueries = [rejectedForReopen, accepted];
+  const reopened = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
+    createQuery: () => reopenQueries.shift() as unknown as ClaudeQuery,
+  });
+  await assert.rejects(
+    () => reopened.openSession({ ...openInput, commandId: 'open-before-reopen' }),
+    (error: unknown) => (error as { code?: unknown }).code === 'provider_auth',
+  );
+  const session = await reopened.openSession({ ...openInput, commandId: 'open-after-rejection' });
+  await session.close();
+  assert.equal(accepted.isClosed, true, 'a rejected open releases the native-session lease for reopen');
+});
+
+test('Claude session rejects a later incompatible initialization source', async () => {
+  const query = new FakeClaudeQuery();
+  let prompt: AsyncIterable<SDKUserMessage> | undefined;
+  const adapter = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
+    createQuery: (input) => {
+      prompt = input.prompt as AsyncIterable<SDKUserMessage>;
+      return query as unknown as ClaudeQuery;
+    },
+  });
+  const session = await adapter.openSession({
+    commandId: 'open-claude-source-change',
+    providerInstanceId: 'claude-local',
+    conversationId: 'conversation-claude-source-change',
+    executionId: 'execution-claude-source-change',
+    mode: 'create',
+    cwd: '/workspace/remux',
+    model: 'claude-sonnet-4-6',
+    access: 'read-only',
+    developerInstructions: [],
+  });
+  try {
+    const events = session.events[Symbol.asyncIterator]();
+    const event = events.next();
+    query.emit({
+      type: 'system',
+      subtype: 'init',
+      session_id: session.nativeSession.sessionId,
+      apiKeySource: 'apiKeyHelper',
+    });
+    assert.equal((await event).value?.event.type, 'session.bound');
+    const lost = await events.next();
+    assert.equal(lost.value?.event.type, 'session.health');
+    await assert.rejects(
+      () => events.next(),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'provider_auth');
+        assert.match(String((error as Error).message), /apiKeyHelper/u);
+        return true;
+      },
+    );
+    assert.equal(query.isClosed, true,
+      'an incompatible initialization closes the native query immediately');
+    await assert.rejects(() => session.startTurn({
+      commandId: 'turn-after-source-change',
+      conversationId: 'conversation-claude-source-change',
+      executionId: 'execution-claude-source-change',
+      turnId: 'turn-after-source-change',
+      content: [{ type: 'text', text: 'Must not dispatch.' }],
+    }), /unavailable/u);
+    assert.equal((await prompt![Symbol.asyncIterator]().next()).done, true,
+      'the rejected source closes input without dispatching another native prompt');
+  } finally {
+    await session.close();
+  }
 });
 
 test('Claude account usage read exposes subscription windows and closes its control query', async () => {
@@ -71,6 +223,7 @@ test('Claude account usage read exposes subscription windows and closes its cont
     },
   });
   const adapter = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
     createQuery: () => query as unknown as ClaudeQuery,
     now: () => 1_700_000_000_000,
   });
@@ -110,7 +263,9 @@ test('Claude Agent SDK session preserves the native harness, MCP scope, and sema
     options?: ClaudeQueryOptions;
     query: FakeClaudeQuery;
   }> = [];
+  const resolvedImageScopes: Array<{ conversationId: string; executionId: string }> = [];
   const adapter = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
     environment: {
       ANTHROPIC_API_KEY: 'must-not-leak',
       ANTHROPIC_AUTH_TOKEN: 'must-not-leak',
@@ -122,6 +277,10 @@ test('Claude Agent SDK session preserves the native harness, MCP scope, and sema
       const query = new FakeClaudeQuery();
       created.push({ prompt: prompt as AsyncIterable<SDKUserMessage>, options, query });
       return query as unknown as ClaudeQuery;
+    },
+    resolveImageArtifact: async (scope) => {
+      resolvedImageScopes.push(scope);
+      return { path: import.meta.filename };
     },
     now: monotonicClock(),
   });
@@ -154,7 +313,8 @@ test('Claude Agent SDK session preserves the native harness, MCP scope, and sema
     assert.deepEqual(options.settingSources, ['user', 'project', 'local']);
     assert.deepEqual(options.settings, {
       disableAllHooks: false,
-      autoCompactEnabled: false,
+      autoCompactEnabled: true,
+      autoCompactWindow: 300_000,
       precomputeCompactionEnabled: false,
     });
     const preToolUseHook = options.hooks?.PreToolUse?.[0]?.hooks[0];
@@ -274,15 +434,16 @@ test('Claude Agent SDK session preserves the native harness, MCP scope, and sema
       conversationId: 'conversation-claude',
       executionId: 'execution-claude',
       turnId: 'turn-claude',
-      content: [{ type: 'text' as const, text: 'Inspect this workspace.' }],
+      content: [
+        { type: 'text' as const, text: 'Inspect this workspace.' },
+        { type: 'image-artifact' as const, artifactId: 'claude-image-1', mimeType: 'image/png' },
+      ],
     };
     const acceptances = await Promise.all([
       session.startTurn(turnInput),
       session.startTurn(structuredClone(turnInput)),
     ]);
-    assert.deepEqual(acceptances.map(({ accepted }) => accepted), [true, true]);
-    assert.ok(acceptances[0]?.nativeTurnId);
-    assert.equal(acceptances[1]?.nativeTurnId, acceptances[0]?.nativeTurnId);
+    assert.deepEqual(acceptances.map(({ outcome }) => outcome), ['unknown', 'unknown']);
     await assert.rejects(() => session.startTurn({
       ...turnInput,
       content: [{ type: 'text', text: 'Changed input under the same command.' }],
@@ -291,10 +452,13 @@ test('Claude Agent SDK session preserves the native harness, MCP scope, and sema
     assert.equal(userMessage.done, false);
     assert.equal(userMessage.value?.type, 'user');
     assert.equal(userMessage.value?.session_id, undefined);
-    assert.deepEqual(userMessage.value?.message.content, [{
-      type: 'text',
-      text: 'Inspect this workspace.',
+    assert.deepEqual(resolvedImageScopes, [{
+      conversationId: 'conversation-claude', executionId: 'execution-claude',
     }]);
+    const sentContent = userMessage.value?.message.content;
+    assert.ok(Array.isArray(sentContent));
+    assert.deepEqual(sentContent?.[0], { type: 'text', text: 'Inspect this workspace.' });
+    assert.equal(sentContent?.[1]?.type, 'image');
     await fileChangedHook({
       hook_event_name: 'FileChanged',
       session_id: session.nativeSession.sessionId,
@@ -496,10 +660,9 @@ test('Claude Agent SDK session preserves the native harness, MCP scope, and sema
       event.change.path === '/workspace/remux/src/must-not-be-reported.ts'));
     const recoveredReasoning = events.filter(({ event }) => event.type.startsWith('turn.block.') &&
       'block' in event && event.block.payload.kind === 'reasoning-summary');
-    assert.ok(events.some(({ event }) => event.type === 'turn.block.started' &&
-      event.block.payload.kind === 'reasoning-summary' &&
-      event.block.payload.text === 'Recovered projection.'),
-    `a rejected Claude projection must not poison the block or end the native session: ${JSON.stringify(recoveredReasoning)}`);
+    assert.ok(recoveredReasoning.some(({ event }) => 'block' in event &&
+      event.block.payload.kind === 'reasoning-summary' && event.block.payload.truncated),
+    `oversized Claude reasoning must arrive fitted: ${JSON.stringify(recoveredReasoning)}`);
     const largeOutput = events.find(({ event }) => event.type === 'turn.block.completed' &&
       event.block.payload.kind === 'tool' &&
       event.block.payload.tool.callId === 'large-output-tool');
@@ -551,6 +714,7 @@ test('Claude Agent SDK session preserves the native harness, MCP scope, and sema
 test('Claude workspace-write sessions require the native filesystem sandbox', async () => {
   let options: ClaudeQueryOptions | undefined;
   const adapter = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
     createQuery: (input) => {
       options = input.options;
       return new FakeClaudeQuery() as unknown as ClaudeQuery;
@@ -581,12 +745,229 @@ test('Claude workspace-write sessions require the native filesystem sandbox', as
   }
 });
 
+test('Claude compact failure settles once, preserves later operations, and fits provider errors', async () => {
+  const query = new FakeClaudeQuery();
+  const adapter = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
+    createQuery: () => query as unknown as ClaudeQuery,
+    now: monotonicClock(),
+  });
+  const session = await adapter.openSession({
+    commandId: 'open-claude-compact-failure',
+    providerInstanceId: 'claude-local',
+    conversationId: 'conversation-claude-compact-failure',
+    executionId: 'execution-claude-compact-failure',
+    mode: 'create',
+    cwd: '/workspace/remux',
+    model: 'claude-sonnet-4-6',
+    access: 'read-only',
+    developerInstructions: [],
+  });
+  const compact = (commandId: string) => session.compact!({
+    commandId,
+    conversationId: 'conversation-claude-compact-failure',
+    executionId: 'execution-claude-compact-failure',
+  });
+  const emit = (value: Record<string, unknown>) => query.emit({
+    type: 'system',
+    session_id: session.nativeSession.sessionId,
+    ...value,
+  });
+  try {
+    const calibrationTerminal = collectThroughTerminal(session.events);
+    await session.startTurn({
+      commandId: 'turn-before-context-measurement',
+      conversationId: 'conversation-claude-compact-failure',
+      executionId: 'execution-claude-compact-failure',
+      turnId: 'turn-before-context-measurement',
+      content: [{ type: 'text', text: 'Calibrate the model context window.' }],
+    });
+    query.emit({
+      type: 'assistant',
+      session_id: session.nativeSession.sessionId,
+      parent_tool_use_id: null,
+      uuid: 'calibration-context',
+      message: {
+        id: 'calibration-context-message',
+        model: 'claude-sonnet-4-6',
+        role: 'assistant',
+        content: [],
+        usage: {
+          input_tokens: 20,
+          cache_read_input_tokens: 30,
+          cache_creation_input_tokens: 0,
+        },
+      },
+    });
+    query.emit({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      session_id: session.nativeSession.sessionId,
+      usage: { input_tokens: 20, cache_read_input_tokens: 30, output_tokens: 5 },
+      modelUsage: {
+        'claude-sonnet-4-6': { contextWindow: 200_000, inputTokens: 20 },
+      },
+    });
+    await calibrationTerminal;
+
+    const terminal = collectThroughTerminal(session.events);
+    await session.startTurn({
+      commandId: 'turn-before-compact-failure',
+      conversationId: 'conversation-claude-compact-failure',
+      executionId: 'execution-claude-compact-failure',
+      turnId: 'turn-before-compact-failure',
+      content: [{ type: 'text', text: 'Measure context before Compact fails.' }],
+    });
+    query.emit({
+      type: 'assistant',
+      session_id: session.nativeSession.sessionId,
+      parent_tool_use_id: null,
+      uuid: 'context-before-failure',
+      message: {
+        id: 'context-before-failure-message',
+        model: 'claude-sonnet-4-6',
+        role: 'assistant',
+        content: [],
+        usage: {
+          input_tokens: 25,
+          cache_read_input_tokens: 75,
+          cache_creation_input_tokens: 0,
+        },
+      },
+    });
+    await waitForClaudeEvent(session, ({ event }) =>
+      event.type === 'turn.usage-updated' && event.usage.context?.usedTokens === 100);
+    emit({
+      subtype: 'status',
+      status: null,
+      uuid: 'automatic-failure-during-turn',
+      compact_result: 'failed',
+      compact_error: 'Automatic Compact failed during the turn.',
+    });
+    const automaticFailure = await waitForClaudeEvent(session, ({ event }) =>
+      event.type === 'context.compaction.failed' && event.trigger === 'automatic');
+    assert.ok(automaticFailure.event.type === 'context.compaction.failed');
+    assert.match(automaticFailure.event.operationId, /^claude-auto-compact-/u);
+    query.emit({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      session_id: session.nativeSession.sessionId,
+      usage: { input_tokens: 25, cache_read_input_tokens: 75, output_tokens: 10 },
+      modelUsage: {
+        'claude-sonnet-4-6': { contextWindow: 200_000, inputTokens: 25 },
+      },
+    });
+    const turnEvents = await terminal;
+    const contextAfterFailure = turnEvents
+      .filter(({ event }) => event.type === 'turn.usage-updated')
+      .at(-1)?.event;
+    assert.ok(contextAfterFailure?.type === 'turn.usage-updated');
+    assert.equal(contextAfterFailure.usage.context?.usedTokens, 100,
+      'failed compaction preserves the measured root request context');
+    assert.equal(turnEvents.some(({ native }) => native.kind === 'system/context-invalidated'), false);
+
+    await compact('compact-failure-long');
+    emit({
+      subtype: 'status',
+      status: null,
+      uuid: 'compact-child-failure',
+      parent_tool_use_id: 'child-tool',
+      compact_result: 'failed',
+      compact_error: 'A child compact failed.',
+    });
+    emit({ subtype: 'init', uuid: 'after-child-failure' });
+    await waitForClaudeEvent(session, ({ native }) => native.messageId === 'after-child-failure');
+    assert.equal((await session.snapshot({ commandId: 'after-child-snapshot' })).events
+      .some(({ event }) => event.type === 'context.compaction.failed' &&
+        event.operationId === 'compact-failure-long'), false,
+    'a child status cannot settle the root manual compaction');
+
+    emit({
+      subtype: 'status',
+      status: null,
+      uuid: 'compact-root-failure',
+      compact_result: 'failed',
+      compact_error: `provider prefix: ${'🚀'.repeat(PROVIDER_RUNTIME_LIMITS.stringChars)}`,
+    });
+    const firstFailure = await waitForClaudeEvent(session, ({ event }) =>
+      event.type === 'context.compaction.failed' && event.operationId === 'compact-failure-long');
+    assert.ok(firstFailure.event.type === 'context.compaction.failed');
+    assert.equal([...firstFailure.event.error.message].length, PROVIDER_RUNTIME_LIMITS.stringChars);
+    assert.match(firstFailure.event.error.message, /error truncated/u);
+    assert.equal(firstFailure.event.error.code, 'claude_compaction_failed');
+    assert.equal(firstFailure.event.error.retryable, true);
+    await compact('compact-failure-fallback');
+    emit({
+      subtype: 'status',
+      status: null,
+      uuid: 'compact-root-failure',
+      compact_result: 'failed',
+      compact_error: 'replayed old error',
+    });
+    emit({ subtype: 'init', uuid: 'after-duplicate-failure' });
+    await waitForClaudeEvent(session, ({ native }) => native.messageId === 'after-duplicate-failure');
+    let failures = (await session.snapshot({ commandId: 'after-duplicate-snapshot' })).events
+      .filter(({ event }) => event.type === 'context.compaction.failed');
+    assert.equal(failures.filter(({ event }) => event.type === 'context.compaction.failed' &&
+      event.trigger === 'manual').length, 1,
+    'a replayed status UUID cannot settle a later operation');
+
+    emit({
+      subtype: 'status',
+      status: null,
+      uuid: 'compact-root-fallback',
+      compact_result: 'failed',
+    });
+    const fallback = await waitForClaudeEvent(session, ({ event }) =>
+      event.type === 'context.compaction.failed' && event.operationId === 'compact-failure-fallback');
+    assert.ok(fallback.event.type === 'context.compaction.failed');
+    assert.equal(fallback.event.error.message, 'Claude Code reported that context compaction failed.');
+
+    await compact('compact-missing-uuid-repeat-one');
+    emit({
+      subtype: 'status',
+      status: null,
+      compact_result: 'failed',
+      compact_error: 'Repeated malformed status.',
+    });
+    await waitForClaudeEvent(session, ({ event }) =>
+      event.type === 'context.compaction.failed' && event.operationId === 'compact-missing-uuid-repeat-one');
+    await compact('compact-missing-uuid-repeat-two');
+    emit({
+      subtype: 'status',
+      status: null,
+      compact_result: 'failed',
+      compact_error: 'Repeated malformed status.',
+    });
+    await waitForClaudeEvent(session, ({ event }) =>
+      event.type === 'context.compaction.failed' && event.operationId === 'compact-missing-uuid-repeat-two');
+
+    await compact('compact-after-failures');
+    emit({
+      subtype: 'compact_boundary',
+      uuid: 'compact-success',
+      compact_metadata: { trigger: 'manual', pre_tokens: 80_000, post_tokens: 10_000 },
+    });
+    const success = await waitForClaudeEvent(session, ({ event }) =>
+      event.type === 'context.compaction.completed' && event.operationId === 'compact-after-failures');
+    assert.ok(success.event.type === 'context.compaction.completed');
+    assert.equal(success.event.beforeTokens, 80_000);
+    assert.equal(success.event.afterTokens, 10_000);
+
+  } finally {
+    await session.close();
+  }
+});
+
 test('Claude native file tools emit an exact unified diff from their before and after images', async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'remux-claude-diff-'));
   const path = join(cwd, 'example.ts');
   await writeFile(path, 'export const value = 1;\n');
   const query = new FakeClaudeQuery();
   const adapter = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
     createQuery: () => query as unknown as ClaudeQuery,
     now: monotonicClock(),
   });
@@ -662,6 +1043,7 @@ test('Claude native file tools emit an exact unified diff from their before and 
 test('Claude stream wrapper UUIDs do not split one native assistant message into reordered blocks', async () => {
   const query = new FakeClaudeQuery();
   const adapter = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
     createQuery: () => query as unknown as ClaudeQuery,
     now: monotonicClock(),
   });
@@ -797,6 +1179,7 @@ test('Claude stream wrapper UUIDs do not split one native assistant message into
 test('Claude finalized snapshots reconcile text by semantic position when thinking is omitted', async () => {
   const query = new FakeClaudeQuery();
   const adapter = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
     createQuery: () => query as unknown as ClaudeQuery,
     now: monotonicClock(),
   });
@@ -873,6 +1256,7 @@ test('Claude finalized snapshots reconcile text by semantic position when thinki
 test('Claude streamed tool JSON backfills one durable tool block with its real presentation', async () => {
   const query = new FakeClaudeQuery();
   const adapter = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
     createQuery: () => query as unknown as ClaudeQuery,
     now: monotonicClock(),
   });
@@ -960,6 +1344,7 @@ test('Claude streamed tool JSON backfills one durable tool block with its real p
 test('Claude background tasks never collide with tool ordinals in the same native pass', async () => {
   const query = new FakeClaudeQuery();
   const adapter = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
     createQuery: () => query as unknown as ClaudeQuery,
     now: monotonicClock(),
   });
@@ -1028,6 +1413,7 @@ test('Claude background tasks never collide with tool ordinals in the same nativ
 test('Claude child interruption uses the SDK task control without interrupting the root turn', async () => {
   const query = new FakeClaudeQuery();
   const adapter = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
     createQuery: () => query as unknown as ClaudeQuery,
     now: monotonicClock(),
   });
@@ -1076,6 +1462,7 @@ test('Claude child interruption uses the SDK task control without interrupting t
 test('Claude background Bash lifecycle stays folded into its command block', async () => {
   const query = new FakeClaudeQuery();
   const adapter = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
     createQuery: () => query as unknown as ClaudeQuery,
     now: monotonicClock(),
   });
@@ -1149,6 +1536,7 @@ test('Claude background Bash lifecycle stays folded into its command block', asy
 test('Claude resume keeps a lost turn bound until native handshake evidence closes only that turn', async () => {
   const query = new FakeClaudeQuery();
   const adapter = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
     createQuery: () => query as unknown as ClaudeQuery,
     now: monotonicClock(),
   });
@@ -1216,8 +1604,7 @@ test('Claude resume keeps a lost turn bound until native handshake evidence clos
       turnId: 'turn-after-claude-recovery',
       content: [{ type: 'text', text: 'Continue from the last durable boundary.' }],
     });
-    assert.equal(acceptance.accepted, true);
-    assert.ok(acceptance.nativeTurnId);
+    assert.equal(acceptance.outcome, 'unknown');
   } finally {
     await session.close();
   }
@@ -1227,6 +1614,7 @@ test('Claude event identity is stable for replay and distinct for a later turn a
   const sessionId = '11111111-1111-4111-8111-111111111111';
   const eventIds = async (commandId: string, turnId: string) => {
     const adapter = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
       createQuery: () => new FakeClaudeQuery() as unknown as ClaudeQuery,
       now: monotonicClock(),
     });
@@ -1302,6 +1690,7 @@ function latestTurnBlocks(events: readonly ProviderEventEnvelope[]) {
 test('Claude native fork uses the persisted chain boundary and guarded dropped turn', async () => {
   const invocations: Array<{ options?: ClaudeQueryOptions; query: FakeClaudeQuery }> = [];
   const adapter = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
     createQuery: ({ options }) => {
       const query = new FakeClaudeQuery();
       invocations.push({ options, query });
@@ -1348,6 +1737,310 @@ test('Claude native fork uses the persisted chain boundary and guarded dropped t
   }
 });
 
+test('Claude native fork rejects incompatible account and initialization authentication', async () => {
+  const queries: FakeClaudeQuery[] = [];
+  const adapter = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
+    createQuery: ({ options }) => {
+      const index = queries.length;
+      const query = index === 1
+        ? new FakeClaudeQuery(undefined, { apiProvider: 'bedrock', apiKeySource: 'none' })
+        : new FakeClaudeQuery();
+      queries.push(query);
+      if (index === 2) {
+        query.emit({
+          type: 'system',
+          subtype: 'init',
+          session_id: options?.sessionId,
+          apiKeySource: '/login managed key',
+        });
+      }
+      return query as unknown as ClaudeQuery;
+    },
+  });
+  const session = await adapter.openSession({
+    commandId: 'open-fork-auth-source',
+    providerInstanceId: 'claude-local',
+    conversationId: 'conversation-fork-auth-source',
+    executionId: 'execution-fork-auth-source',
+    mode: 'create',
+    cwd: '/workspace/remux',
+    model: 'claude-sonnet-4-6',
+    access: 'read-only',
+    developerInstructions: [],
+  });
+  const fork = (commandId: string) => session.fork!({
+    commandId,
+    destinationSessionId: `${commandId}-destination`,
+    branchCursor: {
+      version: 1,
+      promptUuid: '33333333-3333-4333-8333-333333333333',
+      previousChainEntryUuid: '44444444-4444-4444-8444-444444444444',
+      lastChainEntryUuid: '55555555-5555-4555-8555-555555555555',
+    },
+  });
+  try {
+    await assert.rejects(
+      () => fork('fork-incompatible-account'),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'provider_auth');
+        assert.match(String((error as Error).message), /bedrock/u);
+        return true;
+      },
+    );
+    assert.equal(queries[1]?.isClosed, true);
+
+    await assert.rejects(
+      () => fork('fork-incompatible-init'),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'provider_auth');
+        assert.match(String((error as Error).message), /\/login managed key/u);
+        return true;
+      },
+    );
+    assert.equal(queries[2]?.isClosed, true);
+  } finally {
+    await session.close();
+  }
+});
+
+test('Claude reports root request context independently of result totals and child messages', async () => {
+  const query = new FakeClaudeQuery();
+  const adapter = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
+    createQuery: () => query as unknown as ClaudeQuery,
+    now: monotonicClock(),
+  });
+  const session = await adapter.openSession({
+    commandId: 'open-context', providerInstanceId: 'claude-local',
+    conversationId: 'context-conversation', executionId: 'context-root',
+    mode: 'create', cwd: '/workspace/remux', model: 'fable[1m]',
+    access: 'read-only', developerInstructions: [],
+  });
+  const emit = (value: Record<string, unknown>) => query.emit({
+    session_id: session.nativeSession.sessionId, ...value,
+  });
+  const assistant = (id: string, input: number, parent: string | null = null) => emit({
+    type: 'assistant', parent_tool_use_id: parent,
+    message: { id, model: 'claude-fable-5-1', role: 'assistant', content: [],
+      usage: { input_tokens: 56, cache_read_input_tokens: input - 56, cache_creation_input_tokens: 0 } },
+  });
+  const result = () => emit({
+    type: 'result', subtype: 'success', is_error: false,
+    usage: { input_tokens: 394, cache_read_input_tokens: 1282004, cache_creation_input_tokens: 210878, output_tokens: 33621 },
+    modelUsage: {
+      'claude-haiku-4-5': { contextWindow: 200000, inputTokens: 700000 },
+      'claude-fable-5-1': { contextWindow: 1000000, inputTokens: 394 },
+    },
+  });
+  const start = async (id: string) => {
+    await session.startTurn({
+      commandId: `send-${id}`, turnId: id, conversationId: 'context-conversation',
+      executionId: 'context-root', content: [{ type: 'text', text: 'Continue.' }],
+    });
+    return { terminal: collectThroughTerminal(session.events) };
+  };
+  try {
+    const first = await start('first');
+    assistant('request-1', 180000);
+    assistant('request-2', 210934);
+    assistant('request-2', 210934);
+    assistant('child-request', 900000, 'child-tool');
+    emit({ type: 'stream_event', parent_tool_use_id: 'child-tool', event: {
+      type: 'message_start', message: { id: 'child-stream', model: 'claude-fable-5-1', usage: { input_tokens: 999999 } },
+    } });
+    result();
+    const firstEvents = await first.terminal;
+    const firstUsage = firstEvents.filter(({ event }) => event.type === 'turn.usage-updated').at(-1)?.event;
+    assert.ok(firstUsage?.type === 'turn.usage-updated');
+    assert.equal(firstUsage.usage.context?.usedTokens, 210934);
+    assert.equal(firstUsage.usage.context?.windowTokens, 1000000);
+    assert.equal(firstUsage.usage.context?.autoCompactWindowTokens, 300000);
+    assert.equal(firstUsage.usage.turn?.cachedInputTokens, 1282004);
+
+    const second = await start('second');
+    emit({ type: 'stream_event', parent_tool_use_id: null, event: {
+      type: 'message_start', message: { id: 'request-3', model: 'claude-fable-5-1', usage: { input_tokens: 310000 } },
+    } });
+    emit({ type: 'system', subtype: 'compact_boundary', parent_tool_use_id: 'child-tool',
+      compact_metadata: { trigger: 'auto', pre_tokens: 950000 } });
+    assistant('request-4', 320000);
+    emit({ type: 'system', subtype: 'compact_boundary',
+      compact_metadata: { trigger: 'auto', pre_tokens: 320000 } });
+    assistant('request-4', 320000); // delayed snapshot from before compaction
+    assistant('request-5', 45000);
+    result();
+    const secondEvents = await second.terminal;
+    const usages = secondEvents.flatMap(({ event }) => event.type === 'turn.usage-updated' ? [event.usage] : []);
+    assert.deepEqual(usages.map(({ context }) => context?.usedTokens ?? null), [310000, 320000, null, 45000, 45000]);
+    assert.equal(secondEvents.filter(({ event }) => event.type === 'context.compaction.completed').length, 1);
+    assert.equal(usages[0]?.turn, null, 'a live context update cannot report the preceding turn totals');
+
+    const third = await start('no-measurement');
+    result();
+    const thirdEvents = await third.terminal;
+    const last = thirdEvents.filter(({ event }) => event.type === 'turn.usage-updated').at(-1)?.event;
+    assert.ok(last?.type === 'turn.usage-updated');
+    assert.equal(last.usage.context, null, 'result totals alone cannot establish context');
+  } finally {
+    await session.close();
+  }
+});
+
+test('Claude reapplies each turn configuration across A-B-A and clears unspecified effort', async () => {
+  const query = new FakeClaudeQuery();
+  let prompt!: AsyncIterable<SDKUserMessage>;
+  const adapter = new ClaudeNativeAdapter({ acceptanceTimeoutMs: 5, createQuery: (input) => {
+    prompt = input.prompt as AsyncIterable<SDKUserMessage>;
+    return query as unknown as ClaudeQuery;
+  } });
+  const session = await adapter.openSession({ commandId: 'open-config-transitions',
+    providerInstanceId: 'claude-local', conversationId: 'config-transitions',
+    executionId: 'config-transitions-execution', mode: 'create', cwd: '/workspace/remux',
+    model: 'claude-sonnet-4-6', effort: 'high', access: 'read-only', developerInstructions: [] });
+  try {
+    const configurations = [
+      { model: 'claude-fable-5-1', effort: 'low' },
+      { model: 'claude-sonnet-4-6', effort: 'high' },
+      {},
+    ] as const;
+    const prompts = prompt[Symbol.asyncIterator]();
+    for (const [index, configuration] of configurations.entries()) {
+      await session.startTurn({ commandId: `config-transition-${index}`, conversationId: 'config-transitions',
+        executionId: 'config-transitions-execution', turnId: `config-transition-turn-${index}`,
+        ...configuration, content: [{ type: 'text', text: `configuration ${index}` }] });
+      assert.equal((await prompts.next()).done, false);
+      const terminal = collectThroughTerminal(session.events);
+      query.emit({ type: 'result', subtype: 'success', is_error: false, num_turns: 1,
+        session_id: session.nativeSession.sessionId, uuid: `config-result-${index}`, result: 'done' });
+      await terminal;
+    }
+    assert.deepEqual(query.modelChanges,
+      ['claude-fable-5-1', 'claude-sonnet-4-6', 'claude-sonnet-4-6']);
+    assert.deepEqual(query.flags,
+      [{ effortLevel: 'low' }, { effortLevel: 'high' }, { effortLevel: null }]);
+  } finally { await session.close(); }
+});
+
+test('Claude root delivery accepts only exact correlated native processing evidence', async () => {
+  const run = async (message: (sessionId: string, promptUuid: string) => Record<string, unknown>,
+    expectAccepted: boolean) => {
+    const query = new FakeClaudeQuery();
+    let prompt!: AsyncIterable<SDKUserMessage>;
+    const adapter = new ClaudeNativeAdapter({
+      acceptanceTimeoutMs: 10,
+      createQuery: (input) => {
+        prompt = input.prompt as AsyncIterable<SDKUserMessage>;
+        return query as unknown as ClaudeQuery;
+      },
+    });
+    const session = await adapter.openSession({ commandId: 'open-proof',
+      providerInstanceId: 'claude-local', conversationId: 'proof-conversation',
+      executionId: 'proof-execution', mode: 'create', cwd: '/workspace/remux',
+      model: 'claude-sonnet-4-6', access: 'read-only', developerInstructions: [] });
+    try {
+      const acceptance = session.startTurn({ commandId: 'send-proof', turnId: 'proof-turn',
+        conversationId: 'proof-conversation', executionId: 'proof-execution',
+        content: [{ type: 'text', text: 'Prove processing.' }] });
+      const sent = await prompt[Symbol.asyncIterator]().next();
+      const promptUuid = sent.value!.uuid;
+      query.emit(message(session.nativeSession.sessionId, promptUuid));
+      const result = await acceptance;
+      assert.equal(result.outcome, expectAccepted ? 'accepted' : 'unknown');
+      return { session, query, promptUuid, result };
+    } catch (error) {
+      await session.close();
+      throw error;
+    }
+  };
+
+  const positive = await run((sessionId, promptUuid) => ({ type: 'assistant',
+    session_id: sessionId, parent_tool_use_id: null, uuid: 'native-output-1',
+    user_message_uuid: promptUuid,
+    message: { id: 'assistant-proof', role: 'assistant', content: [] } }), true);
+  await positive.session.close();
+
+  const partialPositive = await run((sessionId, promptUuid) => ({ type: 'stream_event',
+    session_id: sessionId, parent_tool_use_id: null, uuid: 'native-partial-1',
+    user_message_uuid: promptUuid,
+    event: { type: 'message_delta', delta: { stop_reason: null, stop_sequence: null },
+      usage: { output_tokens: 1 } } }), true);
+  await partialPositive.session.close();
+
+  const resultPositive = await run((sessionId, promptUuid) => ({ type: 'result',
+    subtype: 'success', is_error: false, session_id: sessionId, uuid: 'native-result-1',
+    user_message_uuid: promptUuid, num_turns: 1, result: 'done' }), true);
+  await resultPositive.session.close();
+
+  const malformed = await run((_sessionId, promptUuid) => ({ type: 'stream_event',
+    parent_tool_use_id: null, uuid: 'native-output-2', user_message_uuid: promptUuid,
+    event: { unexpected: true } }), false);
+  malformed.query.emit({ type: 'assistant', session_id: malformed.session.nativeSession.sessionId,
+    parent_tool_use_id: null, uuid: 'native-output-late', user_message_uuid: malformed.promptUuid,
+    message: { id: 'assistant-late', role: 'assistant', content: [] } });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal((await malformed.session.readTurnPresence!(malformed.promptUuid)).presence, 'present');
+  await malformed.session.close();
+
+  for (const invalid of [
+    (sessionId: string, promptUuid: string) => ({ type: 'assistant', session_id: sessionId,
+      parent_tool_use_id: 'child', uuid: 'child-output', user_message_uuid: promptUuid,
+      message: { id: 'child', role: 'assistant', content: [] } }),
+    (sessionId: string, promptUuid: string) => ({ type: 'result', subtype: 'error_during_execution',
+      session_id: sessionId, uuid: 'error-result', user_message_uuid: promptUuid }),
+    (_sessionId: string, promptUuid: string) => ({ type: 'assistant', parent_tool_use_id: null,
+      uuid: 'missing-session', user_message_uuid: promptUuid,
+      message: { id: 'missing-session', role: 'assistant', content: [] } }),
+    (sessionId: string, _promptUuid: string) => ({ type: 'assistant', session_id: sessionId,
+      parent_tool_use_id: null, uuid: 'wrong-input', user_message_uuid: 'another-input-uuid',
+      message: { id: 'wrong-input', role: 'assistant', content: [] } }),
+    (sessionId: string, promptUuid: string) => ({ type: 'stream_event', session_id: sessionId,
+      parent_tool_use_id: null, uuid: 'missing-event', user_message_uuid: promptUuid }),
+    (sessionId: string, promptUuid: string) => ({ type: 'stream_event', session_id: sessionId,
+      parent_tool_use_id: null, uuid: 'unsupported-partial', user_message_uuid: promptUuid,
+      event: { type: 'ping' } }),
+    (_sessionId: string, promptUuid: string) => ({ type: 'result', subtype: 'success',
+      is_error: false, session_id: 'different-native-session', uuid: 'wrong-session',
+      user_message_uuid: promptUuid, num_turns: 1, result: 'done' }),
+  ]) {
+    const negative = await run(invalid, false);
+    await negative.session.close();
+  }
+});
+
+test('Claude preparation failure dispatches no prompt and the next command reasserts frozen configuration', async () => {
+  const query = new FakeClaudeQuery();
+  query.nextFlagError = new Error('simulated flag preparation failure');
+  let prompt!: AsyncIterable<SDKUserMessage>;
+  const adapter = new ClaudeNativeAdapter({ acceptanceTimeoutMs: 5, createQuery: (input) => {
+    prompt = input.prompt as AsyncIterable<SDKUserMessage>;
+    return query as unknown as ClaudeQuery;
+  } });
+  const session = await adapter.openSession({ commandId: 'open-config-retry',
+    providerInstanceId: 'claude-local', conversationId: 'config-retry',
+    executionId: 'config-retry-execution', mode: 'create', cwd: '/workspace/remux',
+    model: 'claude-sonnet-4-6', effort: 'high', access: 'read-only', developerInstructions: [] });
+  try {
+    const configured = { model: 'claude-fable-5-1', effort: 'low' } as const;
+    await assert.rejects(() => session.startTurn({ commandId: 'config-fails',
+      conversationId: 'config-retry', executionId: 'config-retry-execution', turnId: 'config-failed-turn',
+      ...configured, content: [{ type: 'text', text: 'must not cross' }] }),
+    /simulated flag preparation failure/u);
+    const nextPrompt = prompt[Symbol.asyncIterator]().next();
+    assert.deepEqual(query.modelChanges, ['claude-fable-5-1']);
+    assert.deepEqual(query.flags, [{ effortLevel: 'low' }]);
+
+    await session.startTurn({ commandId: 'config-retry-succeeds', conversationId: 'config-retry',
+      executionId: 'config-retry-execution', turnId: 'config-retry-turn', ...configured,
+      content: [{ type: 'text', text: 'only this prompt crosses' }] });
+    const delivered = await nextPrompt;
+    assert.equal(delivered.done, false);
+    assert.deepEqual(delivered.value?.message.content, [{ type: 'text', text: 'only this prompt crosses' }]);
+    assert.deepEqual(query.modelChanges, ['claude-fable-5-1', 'claude-fable-5-1']);
+    assert.deepEqual(query.flags, [{ effortLevel: 'low' }, { effortLevel: 'low' }]);
+  } finally { await session.close(); }
+});
+
 class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
   private readonly values: SDKMessage[] = [];
   private readonly waiters: Array<(result: IteratorResult<SDKMessage>) => void> = [];
@@ -1356,14 +2049,30 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
   readonly modelChanges: string[] = [];
   readonly flags: unknown[] = [];
   readonly stoppedTasks: string[] = [];
+  readonly account: ClaudeAccountInfo;
   interrupts = 0;
+  nextModelError: Error | undefined;
+  nextFlagError: Error | undefined;
 
-  constructor(usageResult: unknown = { rate_limits_available: true, rate_limits: {} }) {
+  constructor(
+    usageResult: unknown = { rate_limits_available: true, rate_limits: {} },
+    account: ClaudeAccountInfo = {
+      apiProvider: 'firstParty',
+      apiKeySource: 'none',
+      subscriptionType: 'max',
+      tokenSource: 'oauth',
+    },
+  ) {
     this.usageResult = usageResult;
+    this.account = account;
   }
 
   emit(value: unknown) {
-    const message = value as SDKMessage;
+    const record = value as Record<string, unknown>;
+    const message = (record.type === 'system' && record.subtype === 'init' &&
+        !Object.hasOwn(record, 'apiKeySource')
+      ? { ...record, apiKeySource: 'none' }
+      : record) as SDKMessage;
     const waiter = this.waiters.shift();
     if (waiter) waiter({ done: false, value: message });
     else this.values.push(message);
@@ -1371,6 +2080,10 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
 
   async supportedModels() {
     return [];
+  }
+
+  async accountInfo() {
+    return this.account;
   }
 
   async supportedCommands() {
@@ -1387,10 +2100,16 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
 
   async setModel(model: string) {
     this.modelChanges.push(model);
+    const error = this.nextModelError;
+    this.nextModelError = undefined;
+    if (error) throw error;
   }
 
   async applyFlagSettings(flags: unknown) {
     this.flags.push(flags);
+    const error = this.nextFlagError;
+    this.nextFlagError = undefined;
+    if (error) throw error;
   }
 
   async interrupt() {

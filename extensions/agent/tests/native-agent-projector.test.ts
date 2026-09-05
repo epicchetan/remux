@@ -287,6 +287,54 @@ test('native runtime projects a durable elapsed anchor without revision churn', 
   }
 });
 
+test('native runtime projects the selected default compaction policy by provider', () => {
+  const cases = [
+    ['claude-code', 'claude-local', 'native-auto'],
+    ['codex', 'codex-local', 'native-auto'],
+    ['fixture', 'fixture-local', 'manual'],
+  ] as const;
+  for (const [provider, providerInstanceId, expectedPolicy] of cases) {
+    const journal = createJournal();
+    try {
+      const providerCapabilities = capabilities();
+      providerCapabilities.provider = provider;
+      providerCapabilities.compaction.automaticNative = false;
+      journal.upsertProviderInstance({
+        providerInstanceId,
+        provider,
+        label: provider,
+        probe: { state: 'ready', capabilities: providerCapabilities },
+        now: 1,
+      });
+      journal.createConversation({
+        conversationId: `conversation-${provider}`,
+        rootExecutionId: `execution-${provider}`,
+        provider,
+        providerInstanceId,
+        title: 'Compaction policy',
+        cwd: '/workspace/remux',
+        model: `model-${provider}`,
+        access: 'workspace-write',
+        now: 1,
+      });
+      const projector = new NativeAgentProjector(journal);
+      projector.setModels(providerInstanceId, [{
+        id: `model-${provider}`,
+        name: provider,
+        provider,
+        supportedEffort: [],
+        isDefault: true,
+      }]);
+      assert.equal(
+        projector.runtimeResource(`conversation-${provider}`)?.compaction.policy,
+        expectedPolicy,
+      );
+    } finally {
+      journal.close();
+    }
+  }
+});
+
 test('native projector answers clean conditional reads without rebuilding the resource', () => {
   const journal = createJournal();
   try {
@@ -577,7 +625,8 @@ test('composer selection follows conversation, last-used, provider, default prec
       },
     ]);
     assert.deepEqual(projector.runtimeResource('conversation-precedence')?.composer.nextTurn, {
-      model: 'model-a', effort: 'high', access: 'workspace-write', origin: 'provider-default',
+      model: 'model-a', effort: 'high', serviceTier: null,
+      access: 'workspace-write', origin: 'provider-default',
     });
 
     journal.setComposerPreference({
@@ -602,7 +651,8 @@ test('composer selection follows conversation, last-used, provider, default prec
       now: 3,
     });
     assert.deepEqual(projector.runtimeResource('conversation-precedence')?.composer.nextTurn, {
-      model: 'model-a', effort: 'low', access: 'workspace-write', origin: 'last-used',
+      model: 'model-a', effort: 'low', serviceTier: null,
+      access: 'workspace-write', origin: 'last-used',
     });
 
     journal.setComposerPreference({
@@ -610,7 +660,8 @@ test('composer selection follows conversation, last-used, provider, default prec
       model: 'model-b', effort: 'medium', now: 4,
     });
     assert.deepEqual(projector.runtimeResource('conversation-precedence')?.composer.nextTurn, {
-      model: 'model-b', effort: 'medium', access: 'workspace-write', origin: 'conversation-explicit',
+      model: 'model-b', effort: 'medium', serviceTier: null,
+      access: 'workspace-write', origin: 'conversation-explicit',
     });
 
     const revisionBeforeRemoval = journal.composerPreference(
@@ -621,7 +672,8 @@ test('composer selection follows conversation, last-used, provider, default prec
       id: 'model-a', name: 'Model A', provider: 'fixture', supportedEffort: ['low', 'high'], isDefault: true,
     }]);
     assert.deepEqual(projector.runtimeResource('conversation-precedence')?.composer.nextTurn, {
-      model: 'model-a', effort: 'high', access: 'workspace-write', origin: 'conversation-explicit',
+      model: 'model-a', effort: 'high', serviceTier: null,
+      access: 'workspace-write', origin: 'conversation-explicit',
     });
     const repaired = journal.composerPreference('conversation', 'conversation-precedence');
     assert.equal(repaired?.model, 'model-a');

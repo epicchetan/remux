@@ -56,14 +56,21 @@ export async function installAgentHost(page: Page) {
     const runningTranscript = route.get('fixtureRunning') === '1';
     const tallRunningWork = route.get('fixtureTallWork') === '1';
     const compactionTranscript = route.get('fixtureCompaction') === '1';
+    const errorGeometryTranscript = route.get('fixtureErrorGeometry') === '1';
+    const effortFixture = route.get('fixtureEffort');
+    const compactEligibility = route.get('fixtureCompactEligibility');
+    const delayModels = route.get('fixtureDelayModels') === '1';
+    const currentEffortNull = route.get('fixtureCurrentEffortNull') === '1';
+    let modelsDelayed = false;
     let historyState: 'failed' | 'ready' = route.get('fixtureHistoryFailed') === '1'
       ? 'failed'
       : 'ready';
     const persistedNativeConfig = JSON.parse(
       window.sessionStorage.getItem('remux.agent.fixture.native-config') ?? 'null',
-    ) as { modelId?: string; reasoning?: string } | null;
+    ) as { modelId?: string; reasoning?: string | null; serviceTier?: string } | null;
     let nativeModelId = persistedNativeConfig?.modelId ?? 'gpt-5.6-sol';
-    let nativeReasoning = persistedNativeConfig?.reasoning ?? 'high';
+    let nativeReasoning: string | null = persistedNativeConfig?.reasoning ?? 'high';
+    let nativeServiceTier = persistedNativeConfig?.serviceTier ?? 'default';
     let preferenceRevision = 'fixture-preference-v1';
     let usageObservedAt = 1_700_000_000_000;
     let contextUsedTokens = 36_000;
@@ -92,14 +99,25 @@ export async function installAgentHost(page: Page) {
       } }],
       ['models', { revision: 1, value: {
         defaultModelId: signedOut ? null : 'gpt-5.6-sol', error: null,
-        models: signedOut ? [] : [
+        models: signedOut ? [] : effortFixture ? [{
+          id: `fixture-${effortFixture}`, name: `Fixture ${effortFixture}`, provider: 'openai-codex',
+          contextWindow: 100000, supportedReasoning: effortFixture === 'none' ? [] : [effortFixture],
+          serviceTiers: [{ id: 'default', name: 'Standard' }], defaultServiceTier: 'default',
+        }] : [
           {
             id: 'gpt-5.4-fixture', name: 'GPT-5.4 Fixture', provider: 'openai-codex',
             contextWindow: 400000, supportedReasoning: ['low', 'medium', 'high', 'xhigh'],
+            serviceTiers: [{ id: 'default', name: 'Standard', description: 'Standard speed and usage' }],
+            defaultServiceTier: 'default',
           },
           {
             id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', provider: 'openai-codex',
             contextWindow: 1000000, supportedReasoning: ['low', 'medium', 'high', 'xhigh'],
+            serviceTiers: [
+              { id: 'default', name: 'Standard', description: 'Standard speed and usage' },
+              { id: 'priority', name: 'Fast', description: 'Faster responses with higher usage' },
+            ],
+            defaultServiceTier: 'default',
           },
         ],
       } }],
@@ -120,7 +138,7 @@ export async function installAgentHost(page: Page) {
       modelId: string;
       operationId: string;
       parts?: any[];
-      reasoning: string;
+      reasoning: string | null;
       text: string;
     }> = [];
     const executionScopes = new Map<string, any>();
@@ -147,7 +165,56 @@ export async function installAgentHost(page: Page) {
         value: conversationSummary('/tmp/remux-fixture', 'idle'),
       });
       resources.set('runtime', { revision: 2, value: runtimeValue('idle') });
-      if (runningTranscript) {
+      if (errorGeometryTranscript) {
+        for (let index = 1; index <= 48; index += 1) {
+          const turn = completedTurn(
+            `turn-${index}`,
+            `Geometry request ${index}`,
+            `Geometry answer ${index}.`,
+          );
+          if (index === 24) {
+            turn.status = 'failed';
+            turn.error = { code: 'provider_error', message: '   ' };
+          }
+          if (index === 25) {
+            turn.status = 'failed';
+            turn.error = { code: 'provider_error', message: 'CapacityErrorToken'.repeat(30) };
+          }
+          if (index === 26) {
+            turn.status = 'failed';
+            turn.error = { code: 'provider_error', message: 'Short capacity error.' };
+          }
+          if (index === 27) {
+            turn.status = 'failed';
+            turn.error = {
+              code: 'provider_error',
+              message: 'Selected model is at capacity. Please try a different model or wait briefly before retrying this request. '.repeat(4),
+            };
+          }
+          turns.push(turn);
+        }
+        sequence = 48;
+        turnCounter = 48;
+        const workError = createRunningTurn('Expanded error request', 'expanded-error-client', undefined, 'turn-work-error');
+        workError.status = 'failed';
+        workError.completedAt = Date.now();
+        workError.durationMs = 1_000;
+        workError.error = { code: 'provider_error', message: 'Failure after expanded work.' };
+        const work = workError.segments.find((segment) => segment.type === 'work');
+        if (work) {
+          work.state = 'failed';
+          work.durationMs = 1_000;
+          const scope = executionScopes.get(executionScopeKey(workError.id, work.scopeId));
+          if (scope) {
+            scope.state = 'failed';
+            scope.completedAt = workError.completedAt;
+            scope.durationMs = workError.durationMs;
+          }
+        }
+        touchTurn(workError);
+        turns.push(completedTurn('turn-after-work-error', 'Healthy request after work', 'Healthy answer after work.'));
+        turnCounter = 50;
+      } else if (runningTranscript) {
         if (longTranscript) {
           for (let index = 1; index <= 48; index += 1) {
             turns.push(completedTurn(`turn-${index}`, `Historical request ${index}`, `Historical answer ${index}.`));
@@ -296,6 +363,7 @@ export async function installAgentHost(page: Page) {
         cwd,
         modelId: nativeModelId,
         reasoning: nativeReasoning,
+        serviceTier: nativeServiceTier,
         access: 'workspace-write',
         status,
         latestTurnId: targetTurns.at(-1)?.id ?? null,
@@ -794,7 +862,7 @@ export async function installAgentHost(page: Page) {
       modelId: string;
       operationId?: string;
       parts?: any[];
-      reasoning: string;
+      reasoning: string | null;
       text: string;
     }) {
       const turn = createRunningTurn(
@@ -1004,7 +1072,11 @@ export async function installAgentHost(page: Page) {
           capabilities: fixtureCapabilities(),
           ...(loginOperation ? { loginOperation } : {}),
           ...(auth.state === 'signed-in' ? {
-            stickyPreference: { model: nativeModelId, effort: nativeReasoning },
+            stickyPreference: {
+              model: nativeModelId,
+              effort: nativeReasoning,
+              serviceTier: nativeServiceTier,
+            },
           } : {}),
           accountUsage: {
             availability: 'available',
@@ -1031,6 +1103,8 @@ export async function installAgentHost(page: Page) {
           name: model.name,
           provider: 'fixture',
           supportedEffort: model.supportedReasoning,
+          serviceTiers: model.serviceTiers ?? [],
+          defaultServiceTier: model.defaultServiceTier ?? null,
           contextWindow: model.contextWindow,
           isDefault: model.id === models.defaultModelId,
         })),
@@ -1055,6 +1129,7 @@ export async function installAgentHost(page: Page) {
         cwd: String(summary.cwd ?? '/tmp/remux-fixture'),
         model: String(summary.modelId ?? 'gpt-5.6-sol'),
         effort: String(summary.reasoning ?? 'high'),
+        serviceTier: String(summary.serviceTier ?? nativeServiceTier),
         access: String(summary.access ?? 'workspace-write'),
         state,
         rootExecutionId: `root:${targetConversationId}`,
@@ -1076,7 +1151,7 @@ export async function installAgentHost(page: Page) {
         history: historyState === 'failed'
           ? { state: 'failed', error: 'Fixture history read failed.' }
           : { state: 'ready' },
-        resumable: true,
+        resumable: compactEligibility !== 'unresumable',
         createdAt: Number(summary.createdAt ?? Date.now()),
         updatedAt: Number(summary.updatedAt ?? Date.now()),
       };
@@ -1118,6 +1193,7 @@ export async function installAgentHost(page: Page) {
         activeConfiguration: {
           model: String(summary.modelId ?? 'gpt-5.6-sol'),
           effort: String(summary.reasoning ?? 'high'),
+          serviceTier: String(summary.serviceTier ?? nativeServiceTier),
           access: String(summary.access ?? 'workspace-write'),
         },
         composer: {
@@ -1125,12 +1201,13 @@ export async function installAgentHost(page: Page) {
           providerInstanceId,
           nextTurn: {
             model: String(summary.modelId ?? 'gpt-5.6-sol'),
-            effort: String(summary.reasoning ?? 'high'),
+            ...(currentEffortNull ? {} : { effort: String(summary.reasoning ?? 'high') }),
+            serviceTier: String(summary.serviceTier ?? nativeServiceTier),
             access: String(summary.access ?? 'workspace-write'),
             origin: 'last-used',
           },
           lastUsed: null,
-          editable: { model: true, effort: true, access: true },
+          editable: { model: true, effort: true, serviceTier: true, access: true },
         },
         capabilities: fixtureCapabilities(),
         usage: {
@@ -1138,11 +1215,17 @@ export async function installAgentHost(page: Page) {
           cumulative: null,
           context: {
             usedTokens: contextUsedTokens, windowTokens: 100_000, percent: contextUsedTokens / 1_000,
+            ...(route.has('fixtureAutoCompactWindow') ? { autoCompactWindowTokens: 80_000 } : {}),
             measurement: 'provider', freshness: 'live', observedAt: usageObservedAt, turnId: null,
           },
           estimatedCost: null,
         },
-        compaction: { policy: 'native-auto', operation: { state: 'idle', lastResult: null } },
+        compaction: {
+          policy: 'native-auto',
+          operation: compactEligibility === 'running'
+            ? { state: 'running', operationId: 'fixture-compact', startedAt: Date.now(), lastResult: null }
+            : { state: 'idle', lastResult: null },
+        },
         ...(activeRuntime?.error ? { healthMessage: String(activeRuntime.error) } : {}),
       };
     }
@@ -1152,7 +1235,9 @@ export async function installAgentHost(page: Page) {
       const queue = resources.get(`queue:${targetConversationId}`)?.value;
       return {
         conversationId: targetConversationId,
-        entries: (queue?.entries ?? []).map((entry: any) => ({
+        entries: compactEligibility === 'queued' ? [{
+          kind: 'compact', commandId: 'queued-compact', operationId: 'queued-compact', createdAt: Date.now(),
+        }] : (queue?.entries ?? []).map((entry: any) => ({
           kind: 'message',
           commandId: String(entry.id),
           turnId: String(entry.id),
@@ -1825,17 +1910,20 @@ export async function installAgentHost(page: Page) {
       }
       if (request.method === 'remux/agent/conversation/create') {
         nativeModelId = String(params.model);
-        nativeReasoning = String(params.effort ?? 'off');
+        nativeReasoning = typeof params.effort === 'string' ? params.effort : null;
+        nativeServiceTier = String(params.serviceTier ?? 'default');
         window.sessionStorage.setItem('remux.agent.fixture.native-config', JSON.stringify({
           modelId: nativeModelId,
           reasoning: nativeReasoning,
+          serviceTier: nativeServiceTier,
         }));
         resources.set(conversationKey, {
           revision: 1,
           value: {
             ...conversationSummary(params.cwd, 'idle'),
             modelId: params.model,
-            reasoning: params.effort ?? 'off',
+            reasoning: typeof params.effort === 'string' ? params.effort : null,
+            serviceTier: params.serviceTier ?? 'default',
             access: params.access,
           },
         });
@@ -1850,11 +1938,13 @@ export async function installAgentHost(page: Page) {
       }
       if (request.method === 'remux/agent/composer/provider-preference/set') {
         nativeModelId = String(params.model);
-        nativeReasoning = String(params.effort ?? 'off');
+        nativeReasoning = typeof params.effort === 'string' ? params.effort : null;
+        nativeServiceTier = String(params.serviceTier ?? 'default');
         preferenceRevision = `fixture-preference-v${Number(preferenceRevision.split('v').at(-1) ?? 1) + 1}`;
         window.sessionStorage.setItem('remux.agent.fixture.native-config', JSON.stringify({
           modelId: nativeModelId,
           reasoning: nativeReasoning,
+          serviceTier: nativeServiceTier,
         }));
         const auth = resources.get('auth')!;
         auth.revision += 1;
@@ -1863,11 +1953,13 @@ export async function installAgentHost(page: Page) {
       }
       if (request.method === 'remux/agent/composer/conversation-preference/set') {
         nativeModelId = String(params.model);
-        nativeReasoning = String(params.effort ?? 'off');
+        nativeReasoning = typeof params.effort === 'string' ? params.effort : null;
+        nativeServiceTier = String(params.serviceTier ?? 'default');
         preferenceRevision = `fixture-preference-v${Number(preferenceRevision.split('v').at(-1) ?? 1) + 1}`;
         window.sessionStorage.setItem('remux.agent.fixture.native-config', JSON.stringify({
           modelId: nativeModelId,
           reasoning: nativeReasoning,
+          serviceTier: nativeServiceTier,
         }));
         const targetConversationKey = `conversation:${String(params.conversationId)}`;
         const targetConversation = resources.get(targetConversationKey);
@@ -1875,6 +1967,7 @@ export async function installAgentHost(page: Page) {
           targetConversation.revision += 1;
           targetConversation.value.modelId = nativeModelId;
           targetConversation.value.reasoning = nativeReasoning;
+          targetConversation.value.serviceTier = nativeServiceTier;
           targetConversation.value.updatedAt = Date.now();
         }
         const runtime = resources.get('runtime')!;
@@ -2288,6 +2381,13 @@ export async function installAgentHost(page: Page) {
           }
           if (request.id !== undefined && request.method) {
             try {
+              if (delayModels && !modelsDelayed && request.method === 'remux/agent/resources/read'
+                  && request.params?.requests?.some((entry: any) => String(entry.key).startsWith('agent/models:'))) {
+                modelsDelayed = true;
+                const result = JSON.parse(JSON.stringify(resultFor(request)));
+                setTimeout(() => dispatch({ type: 'remux/response', id: request.id, result }), 250);
+                return;
+              }
               if (request.method === 'remux/agent/transcript/resources/read' && nextTranscriptDelayMs > 0) {
                 // The native bridge crosses a JSON boundary. Snapshot delayed results now so
                 // later fixture mutations cannot retroactively alter an in-flight response.
@@ -2360,6 +2460,14 @@ export async function installAgentHost(page: Page) {
           assistant.text = assistantText;
           touchTurn(turn);
           invalidateTranscript(turn.id, 'runtimeEvent', false, targetConversationId);
+        },
+        setTurnError(turnId: string, message: string | null) {
+          const turn = turns.find((candidate) => candidate.id === turnId);
+          if (!turn) throw new Error(`Unknown fixture turn ${turnId}.`);
+          turn.error = message ? { code: 'provider_error', message } : null;
+          turn.status = message ? 'failed' : 'completed';
+          touchTurn(turn);
+          invalidateTranscript(turn.id, 'runtimeEvent', true);
         },
         addConversation(input: {
           archivedAt?: number;

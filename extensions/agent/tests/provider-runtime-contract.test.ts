@@ -129,6 +129,11 @@ test('open-session parsing binds an explicit provider instance and native resume
     nativeTurnBindings: [{ turnId: 'turn-1', nativeTurnId: 'native-turn-1' }],
     inheritedNativeTurnIds: ['native-turn-inherited-1'],
     activeTurnBinding: { turnId: 'turn-1', nativeTurnId: 'native-turn-1' },
+    nativeChildBindings: [{
+      nativeThreadId: 'native-child-1', executionId: 'execution-child-1',
+      parentExecutionId: 'execution-1', nativeParentThreadId: 'fixture-session',
+      ownerTurnId: 'turn-1', ownerNativeTurnId: 'native-turn-1', outcome: 'completed',
+    }],
   };
   assert.deepEqual(parseOpenProviderSessionInput(structuredClone(resumed)), resumed);
   assert.throws(
@@ -289,10 +294,32 @@ test('provider event parsing accepts semantic events and refuses raw or ambiguou
         kind: 'reasoning-summary',
         text: '**Inspecting**\nExplaining.',
         parts: ['**Inspecting**', 'Explaining.'],
+        truncated: false,
       },
     },
   });
   assert.deepEqual(parseProviderEventEnvelope(reasoning), reasoning);
+  for (const contractVersion of [2, 3, 4, 5]) {
+    const legacyReasoning = structuredClone(reasoning) as unknown as Record<string, unknown>;
+    legacyReasoning.contractVersion = contractVersion;
+    const legacyEvent = legacyReasoning.event as Record<string, unknown>;
+    const legacyBlock = legacyEvent.block as Record<string, unknown>;
+    delete (legacyBlock.payload as Record<string, unknown>).truncated;
+    const normalizedLegacy = parseProviderEventEnvelope(legacyReasoning);
+    assert.equal(normalizedLegacy.contractVersion, PROVIDER_RUNTIME_CONTRACT_VERSION);
+    assert.equal(normalizedLegacy.event.type, 'turn.block.completed');
+    if (normalizedLegacy.event.type === 'turn.block.completed' &&
+        normalizedLegacy.event.block.payload.kind === 'reasoning-summary') {
+      assert.equal(normalizedLegacy.event.block.payload.truncated, false);
+      assert.equal(normalizedLegacy.event.contentHash, 'b'.repeat(64));
+      assert.equal(normalizedLegacy.event.structure.blockId, 'block-1');
+    }
+  }
+  const missingCurrentFlag = structuredClone(reasoning) as unknown as Record<string, unknown>;
+  const currentEvent = missingCurrentFlag.event as Record<string, unknown>;
+  const currentBlock = currentEvent.block as Record<string, unknown>;
+  delete (currentBlock.payload as Record<string, unknown>).truncated;
+  assert.throws(() => parseProviderEventEnvelope(missingCurrentFlag), /truncated.*is required/u);
   const invalidReasoning = structuredClone(reasoning) as unknown as {
     event: { block: { payload: { parts: string[] } } };
   };
@@ -347,14 +374,12 @@ test('native fixture sessions dispatch a command once and expose replayable nati
   const collecting = collectUntil(session.events, collected, (event) =>
     event.event.type === 'turn.completed');
 
-  assert.deepEqual(await session.startTurn(turnInput), {
-    accepted: true,
-    nativeTurnId: 'turn-1',
-  });
-  assert.deepEqual(await session.startTurn(structuredClone(turnInput)), {
-    accepted: true,
-    nativeTurnId: 'turn-1',
-  });
+  const accepted = await session.startTurn(turnInput);
+  assert.equal(accepted.outcome, 'accepted');
+  assert.equal(accepted.nativeTurnId, 'turn-1');
+  const replayed = await session.startTurn(structuredClone(turnInput));
+  assert.equal(replayed.outcome, 'accepted');
+  assert.equal(replayed.nativeTurnId, 'turn-1');
   await collecting;
 
   assert.equal(session.providerDispatchCount, 1);

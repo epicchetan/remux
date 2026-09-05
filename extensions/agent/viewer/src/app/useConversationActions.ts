@@ -79,6 +79,7 @@ export function useConversationActions(options: {
       cwd,
       nativeModelId: selected.nativeId,
       reasoning: input.reasoning,
+      serviceTier: input.serviceTier,
       access: input.access,
     });
     persistConversationDraft(
@@ -152,6 +153,9 @@ export function useConversationActions(options: {
         parts: input.parts,
         nativeModelId: selected.nativeId,
         reasoning: input.reasoning,
+        serviceTier: created
+          ? submissionRuntime.composer.nextTurn.serviceTier
+          : input.serviceTier,
         providerInstanceId: submittedProviderInstanceId,
         access: submittedAccess,
         configurationRevision: submittedConfigurationRevision,
@@ -216,6 +220,7 @@ export function useConversationActions(options: {
       providerInstanceId: input.providerInstanceId,
       nativeModelId: selected.nativeId,
       reasoning: input.reasoning,
+      serviceTier: input.serviceTier,
       access: input.access,
       configurationRevision: input.configurationRevision,
     });

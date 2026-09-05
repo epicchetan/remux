@@ -2,10 +2,11 @@ import type { AgentTurnRenderFrame } from '../../../../shared/transcript';
 import {
   latestUserMessageActionRowId,
   measureCollapsedTurnWithCache,
+  emptyDisplayFooter,
   userMessageDisclosureRevisionForTurn,
 } from './measureCollapsed';
 import type { TranscriptMeasureCache } from './measureCache';
-import type { TranscriptMeasuredLayout, TranscriptMeasuredTurn } from './types';
+import type { TranscriptMeasuredLayout, TranscriptMeasuredTurn, TranscriptTurnDisplayFooter } from './types';
 
 export function reconcileMeasuredTranscript({
   cache,
@@ -16,6 +17,7 @@ export function reconcileMeasuredTranscript({
   previousTurnsById,
   conversationId,
   turns,
+  displayFootersByTurnId = {},
   width,
 }: {
   cache?: TranscriptMeasureCache;
@@ -26,6 +28,7 @@ export function reconcileMeasuredTranscript({
   previousTurnsById: Record<string, TranscriptMeasuredTurn>;
   conversationId?: string;
   turns: AgentTurnRenderFrame[];
+  displayFootersByTurnId?: Record<string, TranscriptTurnDisplayFooter>;
   width: number;
 }): TranscriptMeasuredLayout {
   const contentWidth = Math.max(1, width);
@@ -44,10 +47,12 @@ export function reconcileMeasuredTranscript({
     const previousTurnUserActionRowId = actionRowIdForTurn(previousUserActionRowId, turn.id);
     const turnUserMessageDisclosureRevision = userMessageDisclosureRevisionForTurn(turn, expandedUserMessageByKey);
     const previousTurn = previousTurnsById[turn.id];
+    const displayFooter = displayFootersByTurnId[turn.id] ?? emptyDisplayFooter;
     const canReusePreviousTurn =
       !forceFullMeasure &&
       !dirtyTurnIds?.has(turn.id) &&
       previousTurn?.revision === turn.renderRevision &&
+      previousTurn.displayFooter.revision === displayFooter.revision &&
       previousTurn.userMessageDisclosureRevision === turnUserMessageDisclosureRevision &&
       previousTurnUserActionRowId === turnUserActionRowId &&
       previousTurn.rows.length === turn.segments.length &&
@@ -63,6 +68,7 @@ export function reconcileMeasuredTranscript({
           turn,
         })),
         turn,
+        displayFooter,
       };
       top += measuredTurn.collapsedHeight;
       measuredTurns.push(measuredTurn);
@@ -75,6 +81,7 @@ export function reconcileMeasuredTranscript({
       expandedUserMessageByKey,
       conversationId,
       turn,
+      displayFooter,
       userActionRowId: turnUserActionRowId,
       userMessageDisclosureRevision: turnUserMessageDisclosureRevision,
     });
@@ -85,6 +92,7 @@ export function reconcileMeasuredTranscript({
       collapsedTop: turnTop,
       revision: turn.renderRevision,
       rows: measuredTurn.rows,
+      displayFooter,
       turn,
       turnId: turn.id,
       userMessageDisclosureRevision: turnUserMessageDisclosureRevision,

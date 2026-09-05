@@ -11,7 +11,7 @@ import {
 } from '../../../shared/native-agent-protocol.ts';
 import { AgentArtifactStore } from '../storage/artifact-store.ts';
 import type { AgentDataPaths } from '../storage/data-root.ts';
-import { NativeAgentJournal } from './native-journal.ts';
+import { NativeAgentJournal, type ArtifactGrantScope } from './native-journal.ts';
 import { NATIVE_ASSISTANT_PREVIEW_BYTES } from './native-output.ts';
 
 export class NativeAgentArtifacts {
@@ -33,6 +33,11 @@ export class NativeAgentArtifacts {
 
   async put(unparsed: NativeArtifactPutCommand): Promise<NativeArtifactPutResult> {
     const input = parseNativeArtifactPutCommand(unparsed);
+    return this.journal.runAsyncCommand(input.commandId, 'artifact.put', input, () =>
+      this.putOwned(input));
+  }
+
+  private async putOwned(input: NativeArtifactPutCommand): Promise<NativeArtifactPutResult> {
     const claim = this.journal.claimCommand(input.commandId, 'artifact.put', input, this.now());
     if (claim.receipt.state === 'accepted') {
       return structuredClone(claim.receipt.result) as NativeArtifactPutResult;
@@ -75,20 +80,22 @@ export class NativeAgentArtifacts {
   }
 
   /** Imports a provider-native historical image into Remux's bounded artifact store. */
-  async importImageDataUrl(dataUrl: string) {
+  async importImageDataUrl(scope: ArtifactGrantScope, dataUrl: string) {
     const decoded = decodeImageDataUrl(dataUrl);
     if (decoded.bytes.byteLength > NATIVE_AGENT_LIMITS.artifactBytes) {
       throw new Error(`Image exceeds ${NATIVE_AGENT_LIMITS.artifactBytes} bytes.`);
     }
     const staged = await this.store.put(decoded.bytes, decoded.mimeType);
-    const artifact = this.journal.registerArtifact({
-      artifactId: staged.hash,
-      sha256: staged.hash,
-      byteLength: staged.byteLength,
-      mediaType: staged.mediaType,
-      visibility: 'viewer',
-      storagePath: staged.storagePath,
-      createdAt: this.now(),
+    const createdAt = this.now();
+    let artifact!: ReturnType<NativeAgentJournal['registerArtifact']>;
+    this.journal.transaction(() => {
+      artifact = this.journal.registerArtifact({
+        artifactId: staged.hash, sha256: staged.hash, byteLength: staged.byteLength,
+        mediaType: staged.mediaType, visibility: 'viewer', storagePath: staged.storagePath,
+        createdAt,
+      });
+      this.journal.grantArtifact({ artifactId: staged.hash, ...scope,
+        provenance: 'provider-history', sourceExecutionId: scope.executionId, createdAt });
     });
     return {
       artifactId: artifact.artifactId,
@@ -126,40 +133,50 @@ export class NativeAgentArtifacts {
       return undefined;
     }
     const staged = await this.store.put(bytes, 'text/plain; charset=utf-8');
-    const artifact = this.journal.registerArtifact({
-      artifactId: staged.hash,
-      sha256: staged.hash,
-      byteLength: staged.byteLength,
-      mediaType: staged.mediaType,
-      visibility: 'viewer',
-      storagePath: staged.storagePath,
-      createdAt: this.now(),
+    const turn = this.journal.turn(turnId);
+    if (!turn) throw new Error(`Turn ${turnId} does not exist for assistant sealing.`);
+    const createdAt = this.now();
+    let artifact!: ReturnType<NativeAgentJournal['registerArtifact']>;
+    this.journal.transaction(() => {
+      artifact = this.journal.registerArtifact({ artifactId: staged.hash, sha256: staged.hash,
+        byteLength: staged.byteLength, mediaType: staged.mediaType, visibility: 'viewer',
+        storagePath: staged.storagePath, createdAt });
+      this.journal.setTurnAssistantArtifact(turnId, artifact.artifactId, createdAt);
+      this.journal.grantArtifact({ artifactId: artifact.artifactId,
+        conversationId: turn.conversationId, executionId: turn.executionId,
+        provenance: 'execution-output', sourceTurnId: turnId,
+        sourceExecutionId: turn.executionId, createdAt });
     });
-    this.journal.setTurnAssistantArtifact(turnId, artifact.artifactId, this.now());
     return artifact;
   }
 
   /** Stores an exact provider patch without embedding it in the event journal. */
-  async sealDiffText(diff: string) {
+  async sealDiffText(scope: ArtifactGrantScope & { turnId?: string }, diff: string) {
     const bytes = Buffer.from(diff, 'utf8');
     if (bytes.byteLength === 0) throw new Error('Cannot seal an empty diff artifact.');
     if (bytes.byteLength > NATIVE_AGENT_LIMITS.artifactBytes) {
       throw new Error(`Diff exceeds ${NATIVE_AGENT_LIMITS.artifactBytes} bytes.`);
     }
     const staged = await this.store.put(bytes, 'text/x-diff; charset=utf-8');
-    return this.journal.registerArtifact({
-      artifactId: staged.hash,
-      sha256: staged.hash,
-      byteLength: staged.byteLength,
-      mediaType: staged.mediaType,
-      visibility: 'viewer',
-      storagePath: staged.storagePath,
-      createdAt: this.now(),
+    const createdAt = this.now();
+    const sourceTurn = scope.turnId ? this.journal.turn(scope.turnId) : undefined;
+    const validTurnId = sourceTurn?.conversationId === scope.conversationId &&
+      sourceTurn.executionId === scope.executionId ? scope.turnId : undefined;
+    let artifact!: ReturnType<NativeAgentJournal['registerArtifact']>;
+    this.journal.transaction(() => {
+      artifact = this.journal.registerArtifact({ artifactId: staged.hash, sha256: staged.hash,
+        byteLength: staged.byteLength, mediaType: staged.mediaType, visibility: 'viewer',
+        storagePath: staged.storagePath, createdAt });
+      this.journal.grantArtifact({ artifactId: staged.hash, conversationId: scope.conversationId,
+        executionId: scope.executionId, provenance: 'execution-output',
+        ...(validTurnId ? { sourceTurnId: validTurnId } : {}),
+        sourceExecutionId: scope.executionId, createdAt });
     });
+    return artifact;
   }
 
   /** Reads an already-authorized text artifact after validating its immutable object. */
-  async readTextArtifact(artifactId: string) {
+  private async readTextArtifact(artifactId: string) {
     const artifact = this.requireViewerArtifact(artifactId);
     if (!artifact.mediaType.startsWith('text/')) {
       throw new Error(`Artifact ${artifactId} is not text.`);
@@ -177,8 +194,25 @@ export class NativeAgentArtifacts {
     };
   }
 
-  resolveLocalImage(artifactId: string, expectedMimeType: string) {
+  async readTextArtifactForScope(
+    scope: ArtifactGrantScope,
+    artifactId: string,
+    exactOwnedTurnId?: string,
+  ) {
+    const exactTurn = exactOwnedTurnId ? this.journal.turn(exactOwnedTurnId) : undefined;
+    const legacyAssistant = exactTurn?.conversationId === scope.conversationId &&
+      exactTurn.executionId === scope.executionId && exactTurn.assistantArtifactId === artifactId;
+    if (!legacyAssistant && !this.journal.artifactGrantedTo(scope, artifactId)) {
+      throw new Error(`Artifact ${artifactId} is outside the provider execution scope.`);
+    }
+    return this.readTextArtifact(artifactId);
+  }
+
+  resolveLocalImage(scope: ArtifactGrantScope, artifactId: string, expectedMimeType: string) {
     const artifact = this.requireViewerArtifact(artifactId);
+    if (!this.journal.artifactGrantedTo(scope, artifactId)) {
+      throw new Error(`Image artifact ${artifactId} is outside the provider execution scope.`);
+    }
     if (artifact.mediaType !== expectedMimeType || !artifact.mediaType.startsWith('image/')) {
       throw new Error(`Artifact ${artifactId} is not the expected image type.`);
     }

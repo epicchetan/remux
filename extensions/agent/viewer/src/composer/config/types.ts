@@ -1,8 +1,8 @@
-import type { ModelInfo, ReasoningLevel } from '../../../../shared/protocol.ts';
+import type { ModelInfo, ReasoningEffort } from '../../../../shared/protocol.ts';
 
 export type AgentComposerConfig = {
   modelId: string;
-  reasoning: ReasoningLevel;
+  reasoning: ReasoningEffort;
 };
 
 export type AgentModelOption = ModelInfo;

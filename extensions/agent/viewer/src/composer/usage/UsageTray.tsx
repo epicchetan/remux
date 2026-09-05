@@ -2,16 +2,23 @@ import { useState, type CSSProperties } from 'react';
 import { Loader2, Minimize2 } from 'lucide-react';
 
 import type {
+  AgentPendingQueueValue,
+  ConversationValue,
+} from '../../../../shared/protocol.ts';
+import type {
   AgentProvidersResource,
   AgentRuntimeResource,
 } from '../../../../shared/native-agent-protocol.ts';
 import type { AccountUsageWindow } from '../../../../shared/provider-runtime.ts';
 import { useComposerStore } from '../store.ts';
 import { visibleAccountUsageWindows } from './usageWindows.ts';
+import { canManuallyCompact } from './compactEligibility.ts';
 
-export function ComposerUsageTray({ onCompact, providers, runtime }: {
+export function ComposerUsageTray({ conversation, onCompact, providers, queue, runtime }: {
+  conversation: ConversationValue | null;
   onCompact: () => Promise<void>;
   providers: AgentProvidersResource | null;
+  queue: AgentPendingQueueValue | null;
   runtime: AgentRuntimeResource | null;
 }) {
   const configuredProviderInstanceId = useComposerStore((state) => state.providerInstanceId);
@@ -21,12 +28,18 @@ export function ComposerUsageTray({ onCompact, providers, runtime }: {
   const plan = provider?.accountUsage ?? null;
   const planWindows = visibleAccountUsageWindows(provider?.provider, plan?.windows ?? []);
   const compacting = runtime?.compaction.operation.state === 'running';
-  const canCompact = runtime?.capabilities.compaction.manualNative === true;
-  const [compactPending, setCompactPending] = useState(false);
+  const supportsCompact = runtime?.capabilities.compaction.manualNative === true;
+  const canCompact = canManuallyCompact(conversation, runtime, queue);
+  const [pendingConversationId, setPendingConversationId] = useState<string | null>(null);
+  const compactPending = pendingConversationId === conversation?.id;
 
   const compact = () => {
-    setCompactPending(true);
-    void onCompact().finally(() => setCompactPending(false));
+    if (!conversation) return;
+    const conversationId = conversation.id;
+    setPendingConversationId(conversationId);
+    void onCompact().finally(() => {
+      setPendingConversationId((pending) => pending === conversationId ? null : pending);
+    });
   };
 
   return (
@@ -49,11 +62,15 @@ export function ComposerUsageTray({ onCompact, providers, runtime }: {
           <UsageMeter label="Context window used" percent={context.percent} />
         ) : null}
         <div className="remux-composer-usage-footer">
-          <span>{context?.freshness === 'cached' ? 'Restored from the latest native snapshot' : ''}</span>
-          {canCompact ? (
+          <span>
+            {context?.autoCompactWindowTokens
+              ? `Auto-compact window: ${formatTokenCount(context.autoCompactWindowTokens)}`
+              : context?.freshness === 'cached' ? 'Restored from the latest native snapshot' : ''}
+          </span>
+          {supportsCompact ? (
             <button
               className="remux-composer-usage-compact"
-              disabled={compactPending || compacting}
+              disabled={compactPending || compacting || !canCompact}
               onClick={compact}
               type="button"
             >

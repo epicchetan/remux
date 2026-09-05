@@ -2,6 +2,8 @@ import type { AgentTurnSegment, AgentTurnRenderFrame } from '../../../../shared/
 import {
   measureMarkdownDocumentCappedHeight,
   measureMarkdownDocumentHeight,
+  fontForPlainText,
+  measurePlainTextHeight,
 } from '../components/markdown/markdownModel';
 import { transcriptUserMessageDisclosureKey } from '../disclosureKeys';
 import { buildUserMessageLayout } from '../model/userMessageContent';
@@ -14,6 +16,7 @@ import type {
   TranscriptMeasuredLayout,
   TranscriptMeasuredRow,
   TranscriptMeasuredTurn,
+  TranscriptTurnDisplayFooter,
   TranscriptUserMessageDisclosure,
 } from './types';
 
@@ -22,12 +25,14 @@ export function measureCollapsedTranscript({
   expandedUserMessageByKey = {},
   conversationId,
   turns,
+  displayFootersByTurnId = {},
   width,
 }: {
   cache?: TranscriptMeasureCache;
   expandedUserMessageByKey?: Record<string, true>;
   conversationId?: string;
   turns: AgentTurnRenderFrame[];
+  displayFootersByTurnId?: Record<string, TranscriptTurnDisplayFooter>;
   width: number;
 }): TranscriptMeasuredLayout {
   const contentWidth = Math.max(1, width);
@@ -45,6 +50,7 @@ export function measureCollapsedTranscript({
       expandedUserMessageByKey,
       conversationId,
       turn,
+      displayFooter: displayFootersByTurnId[turn.id] ?? emptyDisplayFooter,
       userActionRowId: turnUserActionRowId,
       userMessageDisclosureRevision: turnUserMessageDisclosureRevision,
     });
@@ -55,6 +61,7 @@ export function measureCollapsedTranscript({
       collapsedTop: turnTop,
       revision: turn.renderRevision,
       rows: measuredTurn.rows,
+      displayFooter: displayFootersByTurnId[turn.id] ?? emptyDisplayFooter,
       turn,
       turnId: turn.id,
       userMessageDisclosureRevision: turnUserMessageDisclosureRevision,
@@ -76,6 +83,7 @@ export function measureCollapsedTurnWithCache({
   expandedUserMessageByKey = {},
   conversationId,
   turn,
+  displayFooter = emptyDisplayFooter,
   userActionRowId,
   userMessageDisclosureRevision = userMessageDisclosureRevisionForTurn(turn, expandedUserMessageByKey),
 }: {
@@ -84,6 +92,7 @@ export function measureCollapsedTurnWithCache({
   expandedUserMessageByKey?: Record<string, true>;
   conversationId: string | undefined;
   turn: AgentTurnRenderFrame;
+  displayFooter?: TranscriptTurnDisplayFooter;
   userActionRowId: string | null;
   userMessageDisclosureRevision?: string;
 }): Pick<TranscriptMeasuredTurn, 'collapsedHeight' | 'rows'> {
@@ -93,6 +102,7 @@ export function measureCollapsedTurnWithCache({
         conversationId,
         turnId: turn.id,
         turnRevision: turn.renderRevision,
+        displayFooterRevision: displayFooter.revision,
         userActionRowId,
         userMessageDisclosureRevision,
       }
@@ -106,6 +116,7 @@ export function measureCollapsedTurnWithCache({
     contentWidth,
     expandedUserMessageByKey,
     turn,
+    displayFooter,
     userActionRowId,
   });
   if (lookup && cache) {
@@ -118,11 +129,13 @@ export function measureCollapsedTurn({
   contentWidth,
   expandedUserMessageByKey = {},
   turn,
+  displayFooter = emptyDisplayFooter,
   userActionRowId,
 }: {
   contentWidth: number;
   expandedUserMessageByKey?: Record<string, true>;
   turn: AgentTurnRenderFrame;
+  displayFooter?: TranscriptTurnDisplayFooter;
   userActionRowId: string | null;
 }): Pick<TranscriptMeasuredTurn, 'collapsedHeight' | 'rows'> {
   const rows: TranscriptMeasuredRow[] = [];
@@ -161,9 +174,27 @@ export function measureCollapsedTurn({
   }
 
   return {
-    collapsedHeight: rows.reduce((total, row) => total + row.height, 0),
+    collapsedHeight: rows.reduce((total, row) => total + row.height, 0) + measureTurnDisplayFooter(displayFooter, contentWidth),
     rows,
   };
+}
+
+export const emptyDisplayFooter: TranscriptTurnDisplayFooter = { revision: '[]', rows: [] };
+
+export function measureTurnDisplayFooter(footer: TranscriptTurnDisplayFooter, contentWidth: number) {
+  if (footer.rows.length === 0) return 0;
+  const rowsHeight = footer.rows.reduce((height, row) => {
+    if (row.kind === 'projection-retry') return height + transcriptLayout.footer.retryHeight;
+    const textWidth = Math.max(1, contentWidth -
+      transcriptLayout.footer.errorPaddingX * 2 - transcriptLayout.footer.borderWidth * 2);
+    return height + measurePlainTextHeight({
+      font: fontForPlainText({ density: 'default', size: transcriptLayout.footer.errorFontSize }),
+      lineHeight: transcriptLayout.footer.errorLineHeight,
+      text: row.message.trim() ? row.message : '',
+      width: textWidth,
+    }) + transcriptLayout.footer.errorPaddingY * 2 + transcriptLayout.footer.borderWidth * 2;
+  }, 0);
+  return rowsHeight + transcriptLayout.footer.rowGap * (footer.rows.length - 1) + transcriptLayout.footer.turnGap;
 }
 
 function rowsFromCache(

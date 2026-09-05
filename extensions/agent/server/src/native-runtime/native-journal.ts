@@ -16,6 +16,7 @@ import type {
 } from '../../../shared/native-agent-protocol.ts';
 import {
   parseProviderEventEnvelope,
+  normalizeLegacyReasoningSummaryPayload,
   type ChildExecutionDisplay,
   type NativeSessionRef,
   type ProviderCapabilities,
@@ -71,6 +72,7 @@ export type JournalTurn = {
   userContent: readonly UserContentPart[];
   model: string;
   effort?: string;
+  serviceTier?: string;
   nativeTurnId?: string;
   assistantArtifactId?: string;
   ordering: 'native-exact' | 'live-provisional' | 'legacy-grouped';
@@ -89,6 +91,7 @@ export type JournalComposerPreference = {
   providerInstanceId: string;
   model: string | null;
   effort: string | null;
+  serviceTier: string | null;
   revision: number;
   updatedAt: number;
 };
@@ -172,6 +175,8 @@ export type JournalExecution = {
   providerInstanceId: string;
   model?: string;
   effort?: string;
+  serviceTier?: string;
+  checkoutKey?: string;
   access?: 'read-only' | 'workspace-write' | 'full-access';
   federationScheduling?: 'background' | 'foreground';
   federationDepth: number;
@@ -184,6 +189,11 @@ export type JournalExecution = {
   completedAt?: number;
   updatedAt: number;
 };
+
+export type ArtifactGrantScope = { conversationId: string; executionId: string };
+export type ArtifactGrantProvenance =
+  | 'viewer-message' | 'viewer-queue' | 'provider-history'
+  | 'execution-output' | 'federation-delegation';
 
 export type JournalConversationHead = {
   conversationId: string;
@@ -250,6 +260,11 @@ export class NativeAgentJournal {
   readonly database: DatabaseSync;
   readonly databasePath?: string;
   private closed = false;
+  private readonly inFlightCommands = new Map<string, {
+    kind: string;
+    requestHash: string;
+    promise: Promise<unknown>;
+  }>();
   private savepointSequence = 0;
 
   constructor(database: DatabaseSync, databasePath?: string) {
@@ -275,6 +290,52 @@ export class NativeAgentJournal {
       }
       throw error;
     }
+  }
+
+  runAsyncCommand<T>(
+    commandId: string,
+    kind: string,
+    request: unknown,
+    body: () => Promise<T>,
+  ): Promise<T> {
+    this.assertOpen();
+    const requestHash = hashJson(request);
+    const existing = this.inFlightCommands.get(commandId);
+    if (existing) {
+      if (existing.kind !== kind || existing.requestHash !== requestHash) {
+        return Promise.reject(new CommandReceiptConflictError(commandId));
+      }
+      return existing.promise as Promise<T>;
+    }
+
+    let resolveOwner!: (value: T | PromiseLike<T>) => void;
+    let rejectOwner!: (reason?: unknown) => void;
+    const promise = new Promise<T>((resolve, reject) => {
+      resolveOwner = resolve;
+      rejectOwner = reject;
+    });
+    this.inFlightCommands.set(commandId, { kind, requestHash, promise });
+    const cleanup = () => {
+      if (this.inFlightCommands.get(commandId)?.promise === promise) {
+        this.inFlightCommands.delete(commandId);
+      }
+    };
+    promise.then(cleanup, cleanup);
+    try {
+      body().then(resolveOwner, rejectOwner);
+    } catch (error) {
+      rejectOwner(error);
+    }
+    return promise;
+  }
+
+  hasUnresolvedRootDelivery(conversationId: string) {
+    const row = this.database.prepare(`SELECT 1 AS matched FROM delivery_attempts a
+      WHERE a.conversation_id=? AND (a.state IN ('preparing','dispatching','unknown') OR
+        (a.state='accepted' AND EXISTS(
+          SELECT 1 FROM delivery_attempt_staging s WHERE s.attempt_id=a.attempt_id)))
+      LIMIT 1`).get(conversationId) as { matched: number } | undefined;
+    return row?.matched === 1;
   }
 
   upsertProviderInstance(input: {
@@ -359,6 +420,123 @@ export class NativeAgentJournal {
     return row ? artifactRow(row) : undefined;
   }
 
+  grantArtifact(input: {
+    artifactId: string;
+    conversationId: string;
+    executionId?: string;
+    provenance: ArtifactGrantProvenance;
+    sourceTurnId?: string;
+    sourceExecutionId?: string;
+    createdAt: number;
+  }) {
+    const conversation = this.conversation(input.conversationId);
+    if (!conversation) throw new Error('Artifact grant conversation does not exist.');
+    if (input.executionId) this.requireGrantExecution(input.conversationId, input.executionId);
+    if (input.sourceExecutionId) {
+      this.requireGrantExecution(input.conversationId, input.sourceExecutionId);
+    }
+    if (input.sourceTurnId) {
+      const turn = this.turn(input.sourceTurnId);
+      if (!turn || turn.conversationId !== input.conversationId ||
+          (input.sourceExecutionId && turn.executionId !== input.sourceExecutionId)) {
+        throw new Error('Artifact grant source turn does not match its source execution.');
+      }
+    }
+    const artifact = this.artifact(input.artifactId);
+    if (!artifact || artifact.visibility !== 'viewer') {
+      throw new Error(`Viewer artifact ${input.artifactId} does not exist.`);
+    }
+    this.database.prepare(`
+      INSERT OR IGNORE INTO artifact_grants(
+        artifact_id, conversation_id, execution_id, provenance,
+        source_turn_id, source_execution_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(input.artifactId, input.conversationId, input.executionId ?? null,
+      input.provenance, input.sourceTurnId ?? null, input.sourceExecutionId ?? null,
+      input.createdAt);
+  }
+
+  grantImageContent(input: {
+    scope: ArtifactGrantScope;
+    content: readonly UserContentPart[];
+    provenance: ArtifactGrantProvenance;
+    sourceTurnId?: string;
+    sourceExecutionId?: string;
+    createdAt: number;
+  }) {
+    this.requireGrantExecution(input.scope.conversationId, input.scope.executionId);
+    this.assertImageContentMetadata(input.content);
+    const viewerShared = input.provenance === 'viewer-message' || input.provenance === 'viewer-queue';
+    for (const part of input.content) if (part.type === 'image-artifact') this.grantArtifact({
+      artifactId: part.artifactId,
+      conversationId: input.scope.conversationId,
+      ...(viewerShared ? {} : { executionId: input.scope.executionId }),
+      provenance: input.provenance,
+      ...(input.sourceTurnId ? { sourceTurnId: input.sourceTurnId } : {}),
+      ...(!viewerShared && input.sourceExecutionId
+        ? { sourceExecutionId: input.sourceExecutionId } : {}),
+      createdAt: input.createdAt,
+    });
+  }
+
+  assertImageContentMetadata(content: readonly UserContentPart[]) {
+    for (const part of content) {
+      if (part.type !== 'image-artifact') continue;
+      const artifact = this.artifact(part.artifactId);
+      if (!artifact || artifact.visibility !== 'viewer' ||
+          artifact.mediaType !== part.mimeType || !artifact.mediaType.startsWith('image/')) {
+        throw new Error(`Image artifact ${part.artifactId} does not match its attachment metadata.`);
+      }
+    }
+  }
+
+  artifactGrantedTo(scope: ArtifactGrantScope, artifactId: string) {
+    this.requireGrantExecution(scope.conversationId, scope.executionId);
+    const seen = new Set<string>();
+    const lineage: string[] = [];
+    let executionId: string | null = scope.executionId;
+    for (let depth = 0; executionId && depth < 256; depth += 1) {
+      if (seen.has(executionId)) throw new Error('Artifact grant execution lineage is cyclic.');
+      seen.add(executionId);
+      lineage.push(executionId);
+      const row = this.database.prepare(`
+        SELECT parent_execution_id FROM executions
+        WHERE conversation_id = ? AND execution_id = ?
+      `).get(scope.conversationId, executionId) as { parent_execution_id: string | null } | undefined;
+      if (!row) throw new Error('Artifact grant execution lineage is invalid.');
+      executionId = row.parent_execution_id;
+    }
+    if (executionId) throw new Error('Artifact grant execution lineage exceeds the safety bound.');
+    if (this.database.prepare(`
+      SELECT 1 AS granted FROM artifact_grants
+      WHERE artifact_id = ? AND conversation_id = ? AND execution_id IS NULL
+    `).get(artifactId, scope.conversationId)) return true;
+    return lineage.some((candidate) => Boolean(this.database.prepare(`
+      SELECT 1 AS granted FROM artifact_grants
+      WHERE artifact_id = ? AND conversation_id = ? AND execution_id = ?
+    `).get(artifactId, scope.conversationId, candidate)));
+  }
+
+  assertImageContentAuthorized(scope: ArtifactGrantScope, content: readonly UserContentPart[]) {
+    this.requireGrantExecution(scope.conversationId, scope.executionId);
+    for (const part of content) {
+      if (part.type !== 'image-artifact') continue;
+      const artifact = this.artifact(part.artifactId);
+      if (!artifact || artifact.visibility !== 'viewer' || artifact.mediaType !== part.mimeType ||
+          !artifact.mediaType.startsWith('image/') || !this.artifactGrantedTo(scope, part.artifactId)) {
+        throw new Error(`Image artifact ${part.artifactId} is outside the provider execution scope.`);
+      }
+    }
+  }
+
+  private requireGrantExecution(conversationId: string, executionId: string) {
+    const execution = this.execution(executionId);
+    if (!execution || execution.conversationId !== conversationId) {
+      throw new Error('Artifact grant execution does not belong to its conversation.');
+    }
+    return execution;
+  }
+
   setTurnAssistantArtifact(turnId: string, artifactId: string | null, now: number) {
     this.database.prepare(`
       UPDATE turns SET assistant_artifact_id = ?, updated_at = ? WHERE turn_id = ?
@@ -367,6 +545,10 @@ export class NativeAgentJournal {
 
   claimCommand(commandId: string, kind: string, request: unknown, now: number) {
     const requestHash = hashJson(request);
+    const inFlight = this.inFlightCommands.get(commandId);
+    if (inFlight && (inFlight.kind !== kind || inFlight.requestHash !== requestHash)) {
+      throw new CommandReceiptConflictError(commandId);
+    }
     const existing = this.commandReceipt(commandId);
     if (existing) {
       if (existing.kind !== kind || existing.requestHash !== requestHash) {
@@ -380,6 +562,15 @@ export class NativeAgentJournal {
       ) VALUES (?, ?, ?, 'received', ?, ?)
     `).run(commandId, kind, requestHash, now, now);
     return { created: true, receipt: this.commandReceipt(commandId)! } as const;
+  }
+
+  inspectCommand(commandId: string, kind: string, request: unknown) {
+    const requestHash = hashJson(request);
+    const receipt = this.commandReceipt(commandId);
+    if (receipt && (receipt.kind !== kind || receipt.requestHash !== requestHash)) {
+      throw new CommandReceiptConflictError(commandId);
+    }
+    return receipt;
   }
 
   commandReceipt(commandId: string): CommandReceipt | undefined {
@@ -421,13 +612,11 @@ export class NativeAgentJournal {
   }
 
   markAmbiguousCommandsForRecovery(now: number) {
-    return this.database.prepare(`
-      UPDATE command_receipts
-      SET state = 'recovery_failed',
-          error_message = 'Provider dispatch was interrupted before acceptance could be recorded.',
-          updated_at = ?
-      WHERE state = 'dispatching'
-    `).run(now).changes;
+    // Delivery-capable commands are reconciled by their per-kind durable owner.
+    // Other provider-effecting commands have no sound negative proof after a
+    // restart, so retain their unresolved receipt instead of reporting failure.
+    void now;
+    return 0;
   }
 
   createConversation(input: {
@@ -440,6 +629,7 @@ export class NativeAgentJournal {
     cwd: string;
     model: string;
     effort?: string;
+    serviceTier?: string;
     access: 'read-only' | 'workspace-write' | 'full-access';
     parentConversationId?: string;
     rootConversationId?: string;
@@ -456,10 +646,10 @@ export class NativeAgentJournal {
       INSERT INTO conversations(
         conversation_id, provider_instance_id, root_execution_id,
         parent_conversation_id, root_conversation_id, forked_from_path_entry_id,
-        title, title_source, preview, cwd, model, effort, access, state,
+        title, title_source, preview, cwd, model, effort, service_tier, access, state,
         history_state, history_synced_at, resumable, metadata_revision, subtree_updated_at,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, 'recovering',
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, 'recovering',
         'ready', ?, 0, 1, ?, ?, ?)
       `).run(
         input.conversationId,
@@ -473,6 +663,7 @@ export class NativeAgentJournal {
         input.cwd,
         input.model,
         input.effort ?? null,
+        input.serviceTier ?? null,
         input.access,
         input.now,
         input.now,
@@ -482,10 +673,10 @@ export class NativeAgentJournal {
       this.database.prepare(`
       INSERT INTO executions(
         execution_id, conversation_id, strand_id, parent_execution_id, root_turn_id,
-        ownership, provider, provider_instance_id, model, effort, access,
+        ownership, provider, provider_instance_id, model, effort, service_tier, access,
         federation_scheduling, federation_depth, title, state,
         transcript_available, created_at, updated_at
-      ) VALUES (?, ?, ?, NULL, NULL, 'root', ?, ?, ?, ?, ?, NULL, 0, ?, 'recovering', 1, ?, ?)
+      ) VALUES (?, ?, ?, NULL, NULL, 'root', ?, ?, ?, ?, ?, ?, NULL, 0, ?, 'recovering', 1, ?, ?)
       `).run(
         input.rootExecutionId,
         input.conversationId,
@@ -494,6 +685,7 @@ export class NativeAgentJournal {
         input.providerInstanceId,
         input.model,
         input.effort ?? null,
+        input.serviceTier ?? null,
         input.access,
         input.title,
         input.now,
@@ -535,6 +727,7 @@ export class NativeAgentJournal {
     providerInstanceId: string;
     model: string;
     effort?: string;
+    serviceTier?: string;
     access: 'read-only' | 'workspace-write' | 'full-access';
     title: string;
     now: number;
@@ -549,10 +742,10 @@ export class NativeAgentJournal {
       this.database.prepare(`
         INSERT INTO executions(
           execution_id, conversation_id, strand_id, parent_execution_id, root_turn_id,
-          ownership, provider, provider_instance_id, model, effort, access,
+          ownership, provider, provider_instance_id, model, effort, service_tier, access,
           federation_scheduling, federation_depth, title, state,
           transcript_available, created_at, updated_at
-        ) VALUES (?, ?, ?, NULL, NULL, 'root', ?, ?, ?, ?, ?, NULL, 0, ?,
+        ) VALUES (?, ?, ?, NULL, NULL, 'root', ?, ?, ?, ?, ?, ?, NULL, 0, ?,
           'recovering', 1, ?, ?)
       `).run(
         input.rootExecutionId,
@@ -562,6 +755,7 @@ export class NativeAgentJournal {
         input.providerInstanceId,
         input.model,
         input.effort ?? null,
+        input.serviceTier ?? null,
         input.access,
         input.title,
         input.now,
@@ -982,6 +1176,7 @@ export class NativeAgentJournal {
     cwd: string;
     model: string;
     effort?: string;
+    serviceTier?: string;
     access: 'read-only' | 'workspace-write' | 'full-access';
     historyRevision?: string;
     createdAt: number;
@@ -1055,6 +1250,7 @@ export class NativeAgentJournal {
         cwd: input.cwd,
         model: input.model,
         ...(input.effort ? { effort: input.effort } : {}),
+        ...(input.serviceTier ? { serviceTier: input.serviceTier } : {}),
         access: input.access,
         now: input.createdAt,
       });
@@ -1165,6 +1361,8 @@ export class NativeAgentJournal {
     providerInstanceId: string;
     model: string;
     effort?: string;
+    serviceTier?: string;
+    checkoutKey?: string;
     access: 'read-only' | 'workspace-write';
     scheduling: 'background' | 'foreground';
     depth: number;
@@ -1175,10 +1373,10 @@ export class NativeAgentJournal {
     this.database.prepare(`
       INSERT INTO executions(
         execution_id, conversation_id, strand_id, parent_execution_id, root_turn_id,
-        ownership, provider, provider_instance_id, model, effort, access,
+        ownership, provider, provider_instance_id, model, effort, service_tier, checkout_key, access,
         federation_scheduling, federation_depth, title, state,
         transcript_available, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, 'federated', ?, ?, ?, ?, ?, ?, ?, ?, 'recovering', 1, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, 'federated', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'recovering', 1, ?, ?)
     `).run(
       input.executionId,
       input.conversationId,
@@ -1189,6 +1387,8 @@ export class NativeAgentJournal {
       input.providerInstanceId,
       input.model,
       input.effort ?? null,
+      input.serviceTier ?? null,
+      input.checkoutKey ?? null,
       input.access,
       input.scheduling,
       input.depth,
@@ -1196,6 +1396,78 @@ export class NativeAgentJournal {
       input.now,
       input.now,
     );
+  }
+
+  reserveFederatedCheckout(input: {
+    executionId: string;
+    checkoutKey: string;
+    commandId: string;
+    expectedTurnId: string;
+    access: 'read-only' | 'workspace-write' | 'full-access';
+    scheduling: 'background' | 'foreground';
+    now: number;
+  }) {
+    const active = this.database.prepare(`
+      SELECT checkout_key, access, scheduling FROM federation_checkout_reservations
+      WHERE state IN ('held', 'unknown')
+    `).all() as Array<{ checkout_key: string | null; access: string; scheduling: string }>;
+    const writer = input.access === 'workspace-write' || input.access === 'full-access';
+    if (active.some((row) => row.checkout_key === null) &&
+        (writer || input.scheduling === 'background')) {
+      if (!writer) throw new Error('Background federated reader limit exceeded for this checkout.');
+      throw new Error('A federated workspace writer is already active for this checkout.');
+    }
+    if (writer && active.some((row) => row.checkout_key === input.checkoutKey &&
+          (row.access === 'workspace-write' || row.access === 'full-access'))) {
+      throw new Error('A federated workspace writer is already active for this checkout.');
+    }
+    if (!writer && input.scheduling === 'background' && active.filter((row) =>
+      row.checkout_key === input.checkoutKey && row.access === 'read-only' &&
+      row.scheduling === 'background').length >= 4) {
+      throw new Error('Background federated reader limit exceeded for this checkout.');
+    }
+    this.database.prepare(`
+      INSERT INTO federation_checkout_reservations(
+        execution_id, checkout_key, command_id, expected_turn_id, access, scheduling,
+        state, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'held', ?, ?)
+      ON CONFLICT(execution_id) DO UPDATE SET
+        checkout_key=excluded.checkout_key, command_id=excluded.command_id,
+        expected_turn_id=excluded.expected_turn_id, access=excluded.access,
+        scheduling=excluded.scheduling, state='held', terminal_evidence_json=NULL,
+        release_reason=NULL, released_at=NULL,
+        updated_at=MAX(federation_checkout_reservations.updated_at, excluded.updated_at)
+      WHERE federation_checkout_reservations.state='released'
+    `).run(input.executionId, input.checkoutKey, input.commandId, input.expectedTurnId,
+      input.access, input.scheduling, input.now, input.now);
+    const row = this.database.prepare(`SELECT command_id FROM federation_checkout_reservations
+      WHERE execution_id=?`).get(input.executionId) as { command_id: string | null } | undefined;
+    if (row?.command_id !== input.commandId) throw new Error('Federated execution already owns checkout capacity.');
+  }
+
+  releaseFederatedCheckout(input: { executionId: string; commandId: string; expectedTurnId: string;
+    reason: 'pre-dispatch-failure' | 'native-terminal'; now: number; evidence?: unknown }) {
+    return this.database.prepare(`UPDATE federation_checkout_reservations SET state='released',
+      terminal_evidence_json=?, release_reason=?,
+      released_at=MAX(created_at, updated_at, ?), updated_at=MAX(updated_at, ?)
+      WHERE execution_id=? AND command_id=? AND expected_turn_id=? AND state IN ('held','unknown')
+    `).run(input.evidence === undefined ? null : JSON.stringify(input.evidence), input.reason,
+      input.now, input.now, input.executionId, input.commandId, input.expectedTurnId).changes === 1;
+  }
+
+  recordFederatedTerminalEvidence(input: { executionId: string; commandId: string;
+    expectedTurnId: string; evidence: unknown; now: number }) {
+    return this.database.prepare(`UPDATE federation_checkout_reservations
+      SET terminal_evidence_json=?, updated_at=MAX(updated_at, ?)
+      WHERE execution_id=? AND command_id=? AND expected_turn_id=? AND state IN ('held','unknown')
+    `).run(JSON.stringify(input.evidence), input.now, input.executionId, input.commandId,
+      input.expectedTurnId).changes === 1;
+  }
+
+  markFederatedCheckoutUnknown(executionId: string, commandId: string, expectedTurnId: string, now: number) {
+    return this.database.prepare(`UPDATE federation_checkout_reservations SET state='unknown', updated_at=MAX(updated_at, ?)
+      WHERE execution_id=? AND command_id=? AND expected_turn_id=? AND state='held'
+    `).run(now, executionId, commandId, expectedTurnId).changes === 1;
   }
 
   markNativeSessionClosed(executionId: string, now: number) {
@@ -1268,6 +1540,7 @@ export class NativeAgentJournal {
     content: readonly UserContentPart[];
     model: string;
     effort?: string;
+    serviceTier?: string;
     state: 'queued' | 'running';
     now: number;
   }) {
@@ -1281,8 +1554,8 @@ export class NativeAgentJournal {
       this.database.prepare(`
       INSERT INTO turns(
         turn_id, conversation_id, origin_strand_id, execution_id, client_message_id, command_id,
-        user_content_json, model, effort, ordering, state, created_at, started_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'native-exact', ?, ?, ?, ?)
+        user_content_json, model, effort, service_tier, ordering, state, created_at, started_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'native-exact', ?, ?, ?, ?)
       `).run(
         input.turnId,
         input.conversationId,
@@ -1293,6 +1566,7 @@ export class NativeAgentJournal {
         JSON.stringify(input.content),
         input.model,
         input.effort ?? null,
+        input.serviceTier ?? null,
         input.state,
         input.now,
         input.state === 'running' ? input.now : null,
@@ -1315,7 +1589,7 @@ export class NativeAgentJournal {
       SET latest_turn_id = ?, active_turn_id = CASE WHEN ? = 'running' THEN ? ELSE active_turn_id END,
           state = CASE WHEN ? = 'running' THEN 'running' ELSE state END,
           preview = CASE WHEN preview = '' THEN ? ELSE preview END,
-          updated_at = ?
+          updated_at = MAX(updated_at, ?)
       WHERE conversation_id = ?
         AND root_execution_id = ?
       `).run(
@@ -1331,7 +1605,7 @@ export class NativeAgentJournal {
       if (input.state === 'running') {
         this.database.prepare(`
         UPDATE executions
-        SET state = 'running', outcome = NULL, completed_at = NULL, updated_at = ?
+        SET state = 'running', outcome = NULL, completed_at = NULL, updated_at = MAX(updated_at, ?)
         WHERE execution_id = ?
         `).run(input.now, input.executionId);
       }
@@ -1351,6 +1625,7 @@ export class NativeAgentJournal {
     content: readonly UserContentPart[];
     model: string;
     effort?: string;
+    serviceTier?: string;
     access: 'read-only' | 'workspace-write' | 'full-access';
     now: number;
   }) {
@@ -1358,8 +1633,8 @@ export class NativeAgentJournal {
     this.database.prepare(`
       INSERT INTO queued_messages(
         command_id, conversation_id, turn_id, client_message_id, content_json,
-        model, effort, access, state, ordinal, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+        model, effort, service_tier, access, state, ordinal, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
     `).run(
       input.commandId,
       input.conversationId,
@@ -1368,6 +1643,7 @@ export class NativeAgentJournal {
       JSON.stringify(input.content),
       input.model,
       input.effort ?? null,
+      input.serviceTier ?? null,
       input.access,
       ordinal,
       input.now,
@@ -1407,6 +1683,7 @@ export class NativeAgentJournal {
         content: queued.content,
         model: queued.model,
         ...(queued.effort ? { effort: queued.effort } : {}),
+        ...(queued.serviceTier ? { serviceTier: queued.serviceTier } : {}),
         state: 'running',
         now,
       });
@@ -1422,21 +1699,23 @@ export class NativeAgentJournal {
         });
       }
       this.database.prepare(`
-        UPDATE conversations SET model = ?, effort = ?, access = ?, health_message = NULL,
+        UPDATE conversations SET model = ?, effort = ?, service_tier = ?, access = ?, health_message = NULL,
           updated_at = ? WHERE conversation_id = ?
       `).run(
         queued.model,
         queued.effort ?? null,
+        queued.serviceTier ?? null,
         queued.access,
         now,
         conversation.conversationId,
       );
       this.database.prepare(`
-        UPDATE executions SET model = ?, effort = ?, access = ?, updated_at = ?
+        UPDATE executions SET model = ?, effort = ?, service_tier = ?, access = ?, updated_at = ?
         WHERE execution_id = ?
       `).run(
         queued.model,
         queued.effort ?? null,
+        queued.serviceTier ?? null,
         queued.access,
         now,
         conversation.rootExecutionId,
@@ -1494,15 +1773,16 @@ export class NativeAgentJournal {
     model: string,
     effort: string | undefined,
     now: number,
+    serviceTier?: string,
   ) {
     this.transaction(() => {
       this.database.prepare(`
-        UPDATE conversations SET model = ?, effort = ?, updated_at = ? WHERE conversation_id = ?
-      `).run(model, effort ?? null, now, conversationId);
+        UPDATE conversations SET model = ?, effort = ?, service_tier = ?, updated_at = ? WHERE conversation_id = ?
+      `).run(model, effort ?? null, serviceTier ?? null, now, conversationId);
       this.database.prepare(`
-        UPDATE executions SET model = ?, effort = ?, updated_at = ?
+        UPDATE executions SET model = ?, effort = ?, service_tier = ?, updated_at = ?
         WHERE execution_id = (SELECT root_execution_id FROM conversations WHERE conversation_id = ?)
-      `).run(model, effort ?? null, now, conversationId);
+      `).run(model, effort ?? null, serviceTier ?? null, now, conversationId);
     });
   }
 
@@ -1844,7 +2124,18 @@ export class NativeAgentJournal {
     snapshotEvents: readonly TurnScopedBlockEnvelope[],
     coverage?: ProviderSnapshotCoverage,
   ): TurnScopedBlockEnvelope[] {
-    const snapshotGroups = groupBlockLifecycles(snapshotEvents.map((envelope, index) => ({
+    const i3Repair = this.database.prepare(`SELECT value_json FROM meta WHERE key = ?`)
+      .get('repair_i3_native_child_identity_v1') as { value_json: string } | undefined;
+    const directives = i3Repair
+      ? (JSON.parse(i3Repair.value_json) as { directives?: {
+          suppressedBlockIds?: string[]; canonicalEnvelope?: TurnScopedBlockEnvelope;
+          terminalSequence?: number;
+        } }).directives
+      : undefined;
+    const suppressedBlockIds = new Set<string>(directives?.suppressedBlockIds ?? []);
+    const snapshotGroups = groupBlockLifecycles(snapshotEvents
+      .filter(({ event }) => !suppressedBlockIds.has(event.structure.blockId))
+      .map((envelope, index) => ({
       sequence: index,
       envelope,
     })));
@@ -1864,13 +2155,19 @@ export class NativeAgentJournal {
     const storedRows = this.database.prepare(`
       SELECT sequence, envelope_json FROM events WHERE turn_id = ? ORDER BY sequence
     `).all(turnId) as Array<{ sequence: number; envelope_json: string }>;
-    const liveGroups = groupBlockLifecycles(storedRows.flatMap((row) => {
+    const repairOverride = directives?.canonicalEnvelope;
+    const liveRows = storedRows.flatMap((row) => {
       const envelope = parseProviderEventEnvelope(JSON.parse(row.envelope_json));
       return isTurnScopedBlockEnvelope(envelope) &&
+        !suppressedBlockIds.has(envelope.event.structure.blockId) &&
         envelope.native.position?.kind !== 'snapshot-index'
         ? [{ sequence: Number(row.sequence), envelope }]
         : [];
-    }));
+    });
+    if (repairOverride?.scope.turnId === turnId) {
+      liveRows.push({ sequence: directives?.terminalSequence ?? 0, envelope: repairOverride });
+    }
+    const liveGroups = groupBlockLifecycles(liveRows);
 
     const snapshotBlockIds = new Set(snapshotBlocks.map(({ latest }) =>
       latest.event.structure.blockId));
@@ -1984,7 +2281,9 @@ export class NativeAgentJournal {
   }
 
   private appendProviderEventInTransaction(candidate: ProviderEventEnvelope) {
-    const envelope = this.canonicalizeCompactionEnvelope(candidate);
+    const envelope = this.canonicalizeTurnBlockPlacement(
+      this.canonicalizeCompactionEnvelope(candidate),
+    );
     this.ensureNativeChildTurn(envelope);
     if (this.hasCanonicalCompactionState(envelope)) {
       this.reconcileCompactionPath(envelope);
@@ -1997,6 +2296,66 @@ export class NativeAgentJournal {
     this.reduceEvent(envelope);
     this.reconcileCompactionPath(envelope);
     return true;
+  }
+
+  private canonicalizeTurnBlockPlacement(envelope: ProviderEventEnvelope) {
+    if (!isTurnScopedBlockEnvelope(envelope)) return envelope;
+    // Provider-native and Remux-federated streams both propose ordinals within
+    // one root turn. Preserve a known identity, but append a new identity whose
+    // proposed pass or block slot is already occupied. Canonicalize before the
+    // event row is written so replay, terminal-output sealing, and the
+    // materialized projection all observe the same durable order.
+    const { structure } = envelope.event;
+    const existingBlock = this.database.prepare(`
+      SELECT b.pass_id, b.ordinal AS block_ordinal, p.ordinal AS pass_ordinal
+      FROM turn_blocks b JOIN turn_passes p USING(pass_id)
+      WHERE b.block_id = ?
+    `).get(structure.blockId) as {
+      pass_id: string;
+      block_ordinal: number;
+      pass_ordinal: number;
+    } | undefined;
+    const canonicalPassId = existingBlock?.pass_id ?? structure.passId;
+    const existingPass = this.database.prepare(`
+      SELECT turn_id, ordinal FROM turn_passes WHERE pass_id = ?
+    `).get(canonicalPassId) as { turn_id: string; ordinal: number } | undefined;
+
+    let canonicalPassOrdinal = existingBlock?.pass_ordinal ??
+      existingPass?.ordinal ?? structure.passOrdinal;
+    if (!existingPass) {
+      const ordinalOccupied = this.database.prepare(`
+        SELECT 1 FROM turn_passes WHERE turn_id = ? AND ordinal = ?
+      `).get(envelope.scope.turnId, canonicalPassOrdinal);
+      if (ordinalOccupied) {
+        canonicalPassOrdinal = (this.database.prepare(`
+          SELECT COALESCE(MAX(ordinal), -1) + 1 AS next_ordinal
+          FROM turn_passes WHERE turn_id = ?
+        `).get(envelope.scope.turnId) as { next_ordinal: number }).next_ordinal;
+      }
+    }
+
+    let canonicalBlockOrdinal = existingBlock?.block_ordinal ?? structure.blockOrdinal;
+    if (!existingBlock) {
+      const ordinalOccupied = this.database.prepare(`
+        SELECT 1 FROM turn_blocks WHERE pass_id = ? AND ordinal = ?
+      `).get(canonicalPassId, canonicalBlockOrdinal);
+      if (ordinalOccupied) {
+        canonicalBlockOrdinal = (this.database.prepare(`
+          SELECT COALESCE(MAX(ordinal), -1) + 1 AS next_ordinal
+          FROM turn_blocks WHERE pass_id = ?
+        `).get(canonicalPassId) as { next_ordinal: number }).next_ordinal;
+      }
+    }
+
+    if (canonicalPassId === structure.passId &&
+        canonicalPassOrdinal === structure.passOrdinal &&
+        canonicalBlockOrdinal === structure.blockOrdinal) return envelope;
+    return withBlockStructure(
+      envelope,
+      canonicalPassId,
+      canonicalPassOrdinal,
+      canonicalBlockOrdinal,
+    );
   }
 
   private canonicalizeCompactionEnvelope(envelope: ProviderEventEnvelope) {
@@ -2451,20 +2810,76 @@ export class NativeAgentJournal {
     `).all(parentExecutionId) as Record<string, unknown>[]).map(executionRow);
   }
 
+  nativeChildBindings(parentExecutionId: string, nativeParentThreadId: string) {
+    const descendants: JournalExecution[] = [];
+    const queue = [parentExecutionId];
+    const visited = new Set(queue);
+    while (queue.length > 0) {
+      const parentId = queue.shift()!;
+      for (const child of this.childExecutions(parentId)) {
+        if (child.ownership !== 'native') continue;
+        if (visited.has(child.executionId)) continue;
+        visited.add(child.executionId);
+        descendants.push(child);
+        queue.push(child.executionId);
+      }
+    }
+    const nativeThreadByExecution = new Map<string, string>([[parentExecutionId, nativeParentThreadId]]);
+    for (const execution of descendants) {
+      const handle = this.nativeChildHandle(execution.executionId);
+      if (handle) nativeThreadByExecution.set(execution.executionId, handle.nativeSessionId);
+    }
+    return descendants.flatMap((execution) => {
+      if (execution.ownership !== 'native' || !execution.rootTurnId) return [];
+      const handle = this.nativeChildHandle(execution.executionId);
+      const owner = this.turn(execution.rootTurnId);
+      if (!handle || !owner?.nativeTurnId) return [];
+      const nativeTurnBindings = this.turnsForExecution(execution.executionId)
+        .filter((turn) => turn.nativeTurnId)
+        .map((turn) => ({
+          turnId: turn.turnId,
+          nativeTurnId: turn.nativeTurnId!,
+          nextBlockOrdinal: this.nextTurnBlockOrdinal(turn.turnId),
+        }));
+      const canonical = this.orderedPasses(execution.rootTurnId).flatMap((pass) =>
+        pass.blocks.map((block) => ({ pass, block })))
+        .find(({ block }) => block.kind === 'native-child' &&
+          block.payload.kind === 'native-child' &&
+          block.payload.child.executionId === execution.executionId);
+      return [{
+        nativeThreadId: handle.nativeSessionId,
+        executionId: execution.executionId,
+        parentExecutionId: execution.parentExecutionId!,
+        nativeParentThreadId: nativeThreadByExecution.get(execution.parentExecutionId!)!,
+        ownerTurnId: execution.rootTurnId,
+        ownerNativeTurnId: owner.nativeTurnId,
+        nativeTurnBindings,
+        terminalNativeTurnIds: this.turnsForExecution(execution.executionId)
+          .filter((turn) => turn.nativeTurnId && turn.outcome)
+          .map((turn) => turn.nativeTurnId!),
+        ...(canonical ? { canonicalBlock: {
+          structure: {
+            passId: canonical.pass.passId,
+            blockId: canonical.block.blockId,
+            passOrdinal: canonical.pass.ordinal,
+            blockOrdinal: canonical.block.ordinal,
+          },
+          revision: canonical.block.revision,
+          block: {
+            kind: canonical.block.kind,
+            state: canonical.block.state,
+            payload: canonical.block.payload,
+          },
+        } } : {}),
+        ...(execution.outcome ? { outcome: execution.outcome } : {}),
+      }];
+    });
+  }
+
   executionsForConversation(conversationId: string): JournalExecution[] {
     return (this.database.prepare(`
       SELECT * FROM executions WHERE conversation_id = ? ORDER BY created_at, execution_id
     `).all(conversationId) as Record<string, unknown>[]).map(executionRow);
-  }
-
-  activeFederatedExecutionsForCwd(cwd: string): JournalExecution[] {
-    return (this.database.prepare(`
-      SELECT e.* FROM executions e
-      JOIN conversations c USING(conversation_id)
-      WHERE c.cwd = ? AND e.ownership = 'federated'
-        AND e.state IN ('running', 'recovering')
-      ORDER BY e.created_at, e.execution_id
-    `).all(cwd) as Record<string, unknown>[]).map(executionRow);
   }
 
   federatedExecutionsNeedingRecovery(): JournalExecution[] {
@@ -2753,6 +3168,7 @@ export class NativeAgentJournal {
     for (const row of blocks) {
       const passId = String(row.pass_id);
       const list = byPass.get(passId) ?? [];
+      const persistedPayload = JSON.parse(String(row.projected_payload_json)) as unknown;
       list.push({
         blockId: String(row.block_id),
         passId,
@@ -2760,7 +3176,9 @@ export class NativeAgentJournal {
         kind: row.kind as NativeOrderedTurnBlock['kind'],
         state: row.state as NativeOrderedTurnBlock['state'],
         revision: Number(row.revision),
-        payload: JSON.parse(String(row.projected_payload_json)) as NativeOrderedTurnBlock['payload'],
+        payload: row.kind === 'reasoning-summary'
+          ? normalizeLegacyReasoningSummaryPayload(persistedPayload)
+          : persistedPayload as NativeOrderedTurnBlock['payload'],
         startedAt: row.started_at === null ? null : Number(row.started_at),
         completedAt: row.completed_at === null ? null : Number(row.completed_at),
       });
@@ -2776,11 +3194,37 @@ export class NativeAgentJournal {
 
   latestUsage(conversationId: string, turnId?: string): UsageDisplay | null {
     const row = this.database.prepare(`
-      SELECT usage_json FROM usage_snapshots
-      WHERE conversation_id = ? AND (? IS NULL OR turn_id = ?)
-      ORDER BY observed_at DESC, event_id DESC LIMIT 1
-    `).get(conversationId, turnId ?? null, turnId ?? null) as { usage_json: string } | undefined;
-    return row ? JSON.parse(row.usage_json) as UsageDisplay : null;
+      SELECT u.usage_json, t.execution_id, x.provider, e.native_kind, e.sequence
+      FROM usage_snapshots u
+      JOIN turns t ON t.turn_id = u.turn_id
+      JOIN executions x ON x.execution_id = t.execution_id
+      JOIN conversations c ON c.conversation_id = u.conversation_id
+      LEFT JOIN events e ON e.event_id = u.event_id
+      WHERE u.conversation_id = ? AND (
+        (? IS NULL AND t.execution_id = c.root_execution_id) OR u.turn_id = ?
+      )
+      ORDER BY u.observed_at DESC, u.event_id DESC LIMIT 1
+    `).get(conversationId, turnId ?? null, turnId ?? null) as {
+      usage_json: string; execution_id: string; provider: ProviderKind;
+      native_kind: string | null; sequence: number | null;
+    } | undefined;
+    if (!row) return null;
+    const usage = JSON.parse(row.usage_json) as UsageDisplay;
+    // The old Claude result mapper persisted accumulated turn usage as context.
+    // Keep its accounting, but never replay that invalid measurement. This also
+    // covers legacy snapshots without a matching event, without mutating history.
+    if (row.provider === 'claude-code' &&
+        (row.native_kind === 'result/usage' || row.native_kind === null)) {
+      return { ...usage, context: null };
+    }
+    if (usage.context && this.database.prepare(`
+      SELECT 1 FROM events
+      WHERE execution_id = ? AND event_type = 'context.compaction.completed'
+        AND (observed_at > ? OR (observed_at = ? AND sequence > ?)) LIMIT 1
+    `).get(row.execution_id, usage.context.observedAt, usage.context.observedAt, row.sequence ?? -1)) {
+      return { ...usage, context: null };
+    }
+    return usage;
   }
 
   providerAccountUsage(providerInstanceId: string): ProviderAccountUsage | null {
@@ -2827,18 +3271,20 @@ export class NativeAgentJournal {
     providerInstanceId: string;
     model: string | null;
     effort: string | null;
+    serviceTier?: string | null;
     now: number;
   }) {
     const current = this.composerPreference(input.scope, input.scopeId);
     const revision = (current?.revision ?? 0) + 1;
     this.database.prepare(`
       INSERT INTO composer_preferences(
-        scope, scope_id, provider_instance_id, model, effort, revision, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        scope, scope_id, provider_instance_id, model, effort, service_tier, revision, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(scope, scope_id) DO UPDATE SET
         provider_instance_id = excluded.provider_instance_id,
         model = excluded.model,
         effort = excluded.effort,
+        service_tier = excluded.service_tier,
         revision = excluded.revision,
         updated_at = excluded.updated_at
     `).run(
@@ -2847,6 +3293,7 @@ export class NativeAgentJournal {
       input.providerInstanceId,
       input.model,
       input.effort,
+      input.serviceTier ?? null,
       revision,
       input.now,
     );
@@ -2955,6 +3402,9 @@ export class NativeAgentJournal {
 
   private reduceEvent(envelope: ProviderEventEnvelope) {
     const event = envelope.event;
+    // Provider events may precede durable admission or arrive again in history
+    // snapshots. Preserve their observation time, but never move a materialized
+    // row's updated_at backward (including before its created_at).
     const now = envelope.observedAt;
     const scope = envelope.scope;
     if (scope.kind === 'account') {
@@ -2991,7 +3441,7 @@ export class NativeAgentJournal {
     const rootExecution = this.isRootExecution(conversationId, executionId);
     if (turnId && envelope.native.turnId) {
       this.database.prepare(`
-        UPDATE turns SET native_turn_id = COALESCE(native_turn_id, ?), updated_at = ?
+        UPDATE turns SET native_turn_id = COALESCE(native_turn_id, ?), updated_at = MAX(updated_at, ?)
         WHERE turn_id = ?
       `).run(envelope.native.turnId, now, turnId);
       this.upsertNativeTurnBinding({
@@ -3028,11 +3478,11 @@ export class NativeAgentJournal {
           WHERE execution_id = ?
         `).run(event.state, now, executionId);
         this.database.prepare(`
-          UPDATE executions SET state = ?, updated_at = ? WHERE execution_id = ?
+          UPDATE executions SET state = ?, updated_at = MAX(updated_at, ?) WHERE execution_id = ?
         `).run(executionState, now, executionId);
         if (rootExecution) {
           this.database.prepare(`
-            UPDATE conversations SET state = ?, health_message = ?, updated_at = ?
+            UPDATE conversations SET state = ?, health_message = ?, updated_at = MAX(updated_at, ?)
             WHERE conversation_id = ?
           `).run(executionState, event.state === 'ready' ? null : event.message ?? null,
             now, conversationId);
@@ -3047,19 +3497,19 @@ export class NativeAgentJournal {
           ? 'running'
           : event.state;
         const updated = this.database.prepare(`
-          UPDATE turns SET state = ?, started_at = COALESCE(started_at, ?), updated_at = ?
+          UPDATE turns SET state = ?, started_at = COALESCE(started_at, ?), updated_at = MAX(updated_at, ?)
           WHERE turn_id = ? AND state NOT IN ('completed', 'failed', 'interrupted')
             AND updated_at <= ?
         `).run(state, now, now, scope.turnId, now);
         if (updated.changes === 0) break;
         if (rootExecution) {
           this.database.prepare(`
-            UPDATE conversations SET state = ?, active_turn_id = ?, updated_at = ?
+            UPDATE conversations SET state = ?, active_turn_id = ?, updated_at = MAX(updated_at, ?)
             WHERE conversation_id = ?
           `).run(state, scope.turnId, now, conversationId);
         }
         this.database.prepare(`
-          UPDATE executions SET state = ?, outcome = NULL, completed_at = NULL, updated_at = ?
+          UPDATE executions SET state = ?, outcome = NULL, completed_at = NULL, updated_at = MAX(updated_at, ?)
           WHERE execution_id = ?
         `).run(state, now, executionId);
         break;
@@ -3073,7 +3523,7 @@ export class NativeAgentJournal {
           ? 'completed'
           : event.outcome === 'interrupted' ? 'interrupted' : 'failed';
         const completed = this.database.prepare(`
-          UPDATE turns SET state = ?, outcome = ?, error_json = ?, completed_at = ?, updated_at = ?
+          UPDATE turns SET state = ?, outcome = ?, error_json = ?, completed_at = ?, updated_at = MAX(updated_at, ?)
           WHERE turn_id = ? AND (
             state NOT IN ('completed', 'failed', 'interrupted') OR
             (outcome = 'recovery_failed' AND completed_at < ?)
@@ -3092,14 +3542,14 @@ export class NativeAgentJournal {
           this.database.prepare(`
             UPDATE conversations SET state = 'idle', active_turn_id = NULL,
               health_message = NULL, resumable = CASE WHEN ? THEN 1 ELSE resumable END,
-              updated_at = ? WHERE conversation_id = ?
+              updated_at = MAX(updated_at, ?) WHERE conversation_id = ?
           `).run(repairsRecoveryFailure ? 1 : 0, now, conversationId);
         }
         const executionState = event.outcome === 'completed'
           ? 'idle'
           : event.outcome === 'interrupted' ? 'interrupted' : 'failed';
         this.database.prepare(`
-          UPDATE executions SET state = ?, outcome = ?, completed_at = ?, updated_at = ?
+          UPDATE executions SET state = ?, outcome = ?, completed_at = ?, updated_at = MAX(updated_at, ?)
           WHERE execution_id = ?
         `).run(executionState, event.outcome, now, now, executionId);
         this.database.prepare(`
@@ -3113,43 +3563,23 @@ export class NativeAgentJournal {
       case 'turn.block.completed': {
         if (scope.kind !== 'turn') break;
         const { structure, block } = event;
-        // A native snapshot and the live notification stream can race across
-        // process recovery. In particular, Codex may compact the native item
-        // list while Remux deliberately retains journal-only tool activity,
-        // so a newly observed item can propose an ordinal that is already in
-        // use. The journal owns the durable projection: preserve a known
-        // block's placement, and append an unknown colliding block. A later
-        // authoritative replaceSnapshot() can still rebuild exact native
-        // order after it has merged retained and snapshot-backed blocks.
-        const existingPlacement = this.database.prepare(`
-          SELECT pass_id, ordinal FROM turn_blocks WHERE block_id = ?
-        `).get(structure.blockId) as { pass_id: string; ordinal: number } | undefined;
-        const canonicalPassId = existingPlacement?.pass_id ?? structure.passId;
-        let canonicalBlockOrdinal = existingPlacement?.ordinal ?? structure.blockOrdinal;
-        if (!existingPlacement) {
-          const ordinalOccupied = this.database.prepare(`
-            SELECT 1 FROM turn_blocks WHERE pass_id = ? AND ordinal = ?
-          `).get(canonicalPassId, canonicalBlockOrdinal);
-          if (ordinalOccupied) {
-            canonicalBlockOrdinal = (this.database.prepare(`
-              SELECT COALESCE(MAX(ordinal), -1) + 1 AS next_ordinal
-              FROM turn_blocks WHERE pass_id = ?
-            `).get(canonicalPassId) as { next_ordinal: number }).next_ordinal;
-          }
-        }
         this.database.prepare(`
           INSERT INTO turn_passes(
             pass_id, turn_id, native_message_id, ordinal, state, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, 'streaming', ?, ?)
+          ) VALUES (?, ?, ?, ?, CASE WHEN (
+              SELECT state FROM turns WHERE turn_id = ?
+            ) IN ('completed', 'failed', 'interrupted')
+            THEN 'completed' ELSE 'streaming' END, ?, ?)
           ON CONFLICT(pass_id) DO UPDATE SET
             native_message_id = COALESCE(excluded.native_message_id, native_message_id),
             ordinal = excluded.ordinal,
             updated_at = MAX(turn_passes.updated_at, excluded.updated_at)
         `).run(
-          canonicalPassId,
+          structure.passId,
           scope.turnId,
           envelope.native.messageId ?? null,
           structure.passOrdinal,
+          scope.turnId,
           now,
           now,
         );
@@ -3177,9 +3607,9 @@ export class NativeAgentJournal {
         `).run(
           structure.blockId,
           scope.turnId,
-          canonicalPassId,
+          structure.passId,
           block.kind,
-          canonicalBlockOrdinal,
+          structure.blockOrdinal,
           block.state,
           revision,
           JSON.stringify(block.payload),
@@ -3359,13 +3789,13 @@ export class NativeAgentJournal {
       }
       case 'execution.status':
         this.database.prepare(`
-          UPDATE executions SET state = ?, updated_at = ?
+          UPDATE executions SET state = ?, updated_at = MAX(updated_at, ?)
           WHERE execution_id = ? AND outcome IS NULL AND updated_at <= ?
         `).run(event.state, now, event.childExecutionId, now);
         break;
       case 'execution.summary':
         this.database.prepare(`
-          UPDATE executions SET summary = ?, updated_at = ? WHERE execution_id = ?
+          UPDATE executions SET summary = ?, updated_at = MAX(updated_at, ?) WHERE execution_id = ?
         `).run(event.summary, now, event.childExecutionId);
         break;
       case 'execution.completed': {
@@ -3373,7 +3803,7 @@ export class NativeAgentJournal {
           ? 'idle'
           : event.outcome === 'interrupted' ? 'interrupted' : 'failed';
         this.database.prepare(`
-          UPDATE executions SET state = ?, outcome = ?, completed_at = ?, updated_at = ?
+          UPDATE executions SET state = ?, outcome = ?, completed_at = ?, updated_at = MAX(updated_at, ?)
           WHERE execution_id = ? AND outcome IS NULL
         `).run(state, event.outcome, now, now, event.childExecutionId);
         break;
@@ -3460,7 +3890,7 @@ export class NativeAgentJournal {
           UPDATE compaction_operations
           SET state = 'running', before_tokens = COALESCE(before_tokens, ?),
             provider_subject_key = COALESCE(provider_subject_key, ?),
-            started_at = COALESCE(started_at, ?), updated_at = ?
+            started_at = COALESCE(started_at, ?), updated_at = MAX(updated_at, ?)
           WHERE operation_id = ? AND state IN ('queued', 'running')
         `).run(event.beforeTokens, providerSubjectKey ?? null, now, now, event.operationId);
       }
@@ -3494,7 +3924,7 @@ export class NativeAgentJournal {
     this.database.prepare(`
       UPDATE compaction_operations
       SET state = ?, disposition = ?, before_tokens = COALESCE(before_tokens, ?),
-        after_tokens = ?, error_json = ?, completed_at = ?, updated_at = ?,
+        after_tokens = ?, error_json = ?, completed_at = ?, updated_at = MAX(updated_at, ?),
         provider_subject_key = COALESCE(provider_subject_key, ?)
       WHERE operation_id = ?
     `).run(
@@ -3716,6 +4146,7 @@ function conversationRow(row: Record<string, unknown>): JournalConversation {
     cwd: String(row.cwd),
     model: String(row.model),
     ...(row.effort === null ? {} : { effort: String(row.effort) }),
+    serviceTier: row.service_tier === null ? null : String(row.service_tier),
     access: row.access as JournalConversation['access'],
     state: row.state as JournalConversation['state'],
     rootExecutionId: String(row.root_execution_id),
@@ -3830,6 +4261,7 @@ function turnRow(row: Record<string, unknown>): JournalTurn {
     userContent: JSON.parse(String(row.user_content_json)) as UserContentPart[],
     model: String(row.model),
     ...(row.effort === null ? {} : { effort: String(row.effort) }),
+    ...(row.service_tier === null ? {} : { serviceTier: String(row.service_tier) }),
     ...(row.native_turn_id === null ? {} : { nativeTurnId: String(row.native_turn_id) }),
     ...(row.assistant_artifact_id === null
       ? {}
@@ -3861,6 +4293,10 @@ function executionRow(row: Record<string, unknown>): JournalExecution {
     providerInstanceId: String(row.provider_instance_id),
     ...(row.model === null ? {} : { model: String(row.model) }),
     ...(row.effort === null ? {} : { effort: String(row.effort) }),
+    ...(row.service_tier === null ? {} : { serviceTier: String(row.service_tier) }),
+    ...(row.checkout_key === null || row.checkout_key === undefined
+      ? {}
+      : { checkoutKey: String(row.checkout_key) }),
     ...(row.access === null
       ? {}
       : { access: row.access as NonNullable<JournalExecution['access']> }),
@@ -3885,9 +4321,11 @@ function queueRow(row: Record<string, unknown>): NativeQueuedMessage {
     commandId: String(row.command_id),
     conversationId: String(row.conversation_id),
     turnId: String(row.turn_id),
+    clientMessageId: String(row.client_message_id),
     content: JSON.parse(String(row.content_json)) as UserContentPart[],
     model: String(row.model),
     ...(row.effort === null ? {} : { effort: String(row.effort) }),
+    serviceTier: row.service_tier === null ? null : String(row.service_tier),
     access: row.access as NativeQueuedMessage['access'],
     state: row.state === 'delivery_unknown'
       ? 'delivery-unknown'
@@ -3903,6 +4341,7 @@ function composerPreferenceRow(row: Record<string, unknown>): JournalComposerPre
     providerInstanceId: String(row.provider_instance_id),
     model: row.model === null ? null : String(row.model),
     effort: row.effort === null ? null : String(row.effort),
+    serviceTier: row.service_tier === null ? null : String(row.service_tier),
     revision: Number(row.revision),
     updatedAt: Number(row.updated_at),
   };

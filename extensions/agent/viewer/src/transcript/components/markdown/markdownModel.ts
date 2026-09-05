@@ -1010,19 +1010,21 @@ export function fontForPlainText({
   density,
   family = 'sans',
   italic = false,
+  size,
   strong = false,
   variant = 'body',
 }: {
   density: MarkdownDensity;
   family?: keyof typeof markdownMetrics.fontFamily;
   italic?: boolean;
+  size?: number;
   strong?: boolean;
   variant?: InlineVariant;
 }) {
   const style = italic ? 'italic ' : '';
   const weight = strong ? 700 : family === 'mono' ? 500 : 400;
-  const size = fontSizeForVariant(density, variant, family);
-  return `${style}${weight} ${size}px ${markdownMetrics.fontFamily[family]}`;
+  const resolvedSize = size ?? fontSizeForVariant(density, variant, family);
+  return `${style}${weight} ${resolvedSize}px ${markdownMetrics.fontFamily[family]}`;
 }
 
 function prepareMarkdownBlock(block: RawMarkdownBlock, density: MarkdownDensity): PreparedMarkdownBlock {

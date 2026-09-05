@@ -3,7 +3,7 @@ import { openHostOverview } from '@remux/viewer-kit/host';
 
 import type { AgentProvidersResource, AgentRuntimeResource } from '../../../../shared/native-agent-protocol.ts';
 import type { ProviderAccess } from '../../../../shared/provider-runtime.ts';
-import type { ReasoningLevel } from '../../../../shared/protocol.ts';
+import type { ReasoningEffort } from '../../../../shared/protocol.ts';
 import { parentDirectory } from '../../conversation/format.ts';
 import { useAgentSidebarStore } from '../../conversation/sidebarStore.ts';
 import { useConversationStore } from '../../conversation/store.ts';
@@ -17,6 +17,7 @@ import type { ComposerEditTarget, ComposerForkTarget } from '../store.ts';
 
 export function ComposerActionButtons({
   canStart,
+  compactEnabled,
   childExecutionCount,
   conversationExists,
   isWorking,
@@ -34,6 +35,7 @@ export function ComposerActionButtons({
   runtime,
 }: {
   canStart: boolean;
+  compactEnabled: boolean;
   childExecutionCount: number;
   conversationExists: boolean;
   isWorking: boolean;
@@ -51,7 +53,8 @@ export function ComposerActionButtons({
   onPreferenceChange: (input: {
     providerInstanceId: string;
     modelId: string;
-    reasoning: ReasoningLevel;
+    reasoning: ReasoningEffort;
+    serviceTier: string | null;
   }) => Promise<void>;
   onAccessChange: (access: ProviderAccess) => Promise<void>;
   providers: AgentProvidersResource | null;
@@ -106,7 +109,8 @@ export function ComposerActionButtons({
     <div className="remux-composer-actions">
       <div className="remux-composer-action-group">
         {left.map((action) => <ComposerActionKey action={action} key={action.label} />)}
-        <ComposerConfigButton
+    <ComposerConfigButton
+      compactEnabled={compactEnabled}
           disabled={pickerOpen}
           onProviderLogin={onProviderLogin}
           onProviderLogout={onProviderLogout}

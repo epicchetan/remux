@@ -1,6 +1,6 @@
-Status: Implemented in working tree — automated, Codex live, and Claude live
-composer acceptance pass; physical-device suspend/restore acceptance pending
-Last verified: 2026-09-02
+Status: Implemented in working tree — audit amendments verified locally;
+live/device acceptance pending
+Last verified: 2026-09-05
 Canonical code: `extensions/agent/shared/provider-runtime.ts`,
 `extensions/agent/shared/native-agent-protocol.ts`,
 `extensions/agent/server/src/native-runtime/`,
@@ -11,6 +11,8 @@ Depends on: `agent-canonical-turn-journal-v2.md`
 Amended by: `agent-state-authority-and-synchronization-v1.md` for message queue
 admission, dispatch acceptance, pre-accept failure, projection fences, and
 client convergence.
+Amended by: `agent-audit-remediation-pass-1.md` for staged implementation,
+current context/compaction policy, and reviewed acceptance evidence.
 
 # Agent composer control plane v2
 
@@ -192,12 +194,12 @@ Initial provider mapping is:
 
 | Capability | Codex app-server | Claude Agent SDK 0.3.258 |
 | --- | --- | --- |
-| Context | Derived from native last-turn usage and context window | Provider read with a result-derived fallback |
-| Plan | Stable read plus push | Push; experimental read is optional enrichment |
+| Context | Derived from native last-turn usage and context window | Derived from the latest root request's input/cache counts and native model capacity |
+| Plan | Stable read plus push | Read and push; the experimental read is optional enrichment |
 | Estimated cost | Unavailable | Available, scoped to the current SDK query epoch |
-| Native automatic compaction | Supported and retained | Supported but disabled for Remux root sessions |
+| Native automatic compaction | Supported and retained | Enabled with the default 300,000-token native policy window |
 | Native manual compaction | `thread/compact/start` | Native `/compact` command only when advertised by `supportedCommands()` |
-| Remux session policy | `native-auto` | `manual` |
+| Remux session policy | `native-auto` | `native-auto` |
 
 The Claude experimental usage pull is never required for readiness, send, or
 render. Its failure is diagnostic-only. The `rate_limit_event` push is the
@@ -217,20 +219,21 @@ The initial policy is provider-specific and deliberate:
   thresholds, prompts, models, or execution path. Native local or remote
   compaction remains Codex's decision. Manual Compact, when invoked, still uses
   the native app-server RPC.
-- Claude uses `manual`. Session query options set
-  `settings.autoCompactEnabled = false` and
-  `settings.precomputeCompactionEnabled = false`. Manual Compact still uses
-  Claude Code's native `/compact` command and native compact summary path.
+- Claude uses `native-auto`. Session query options enable native automatic
+  compaction with a default 300,000-token window, honoring the supported native
+  environment override and actual model capacity. Precomputed compaction remains
+  disabled. Manual Compact still uses Claude Code's native `/compact` command
+  and native compact summary path.
 
 This does not make Remux the compactor. It selects a supported native harness
 policy and then observes native status. Remux never starts Claude compaction
 from a percentage threshold. A future provider setting may expose the Claude
 policy, but no composer toggle is part of this pass.
 
-The adapter continues to map unexpected automatic Claude compact boundaries.
-They can still occur after provider-side policy enforcement, a version change,
-or recovery of an older session. Observing such an event does not change the
-stored `manual` policy.
+The adapter maps automatic and manual boundaries. The context meter reports
+actual model capacity separately from the native compaction policy window;
+observing a boundary invalidates the prior request measurement until new usage
+arrives. Failed compaction retains that measurement and records its failure.
 
 ## Usage contracts
 
@@ -252,6 +255,7 @@ type TokenUsageBreakdown = {
 type ContextUsageSnapshot = {
   usedTokens: number;
   windowTokens: number;
+  autoCompactWindowTokens?: number;
   percent: number; // finite, clamped to 0..100
   measurement: 'provider' | 'derived';
   freshness: 'live' | 'cached';
@@ -530,7 +534,10 @@ the provider sticky survives a WebView recreation.
 
 Access resolves independently:
 
-- a new draft starts at `workspace-write`;
+- a new draft starts at `workspace-write`; its selected access persists with
+  that draft's text through switching and WebView reload, including an empty
+  draft and access-only changes. Legacy or invalid persisted access falls back
+  to `workspace-write`; asynchronous model defaults do not replace saved access;
 - all three presets are shown only if the provider advertises them;
 - `full-access` requires a deliberate selection for that draft and is never
   sticky across new conversations; and
@@ -549,7 +556,14 @@ catalog before it is returned or persisted:
 1. retain the requested effort if the model supports it;
 2. otherwise choose the first supported value from `high`, `medium`, `low`,
    `off`; and
-3. otherwise choose the model's first advertised effort value.
+3. otherwise choose the model's first advertised effort value; and
+4. if the model advertises no efforts, use `null` and omit the effort row.
+
+The viewer preserves advertised effort strings without a fixed enum filter.
+Only advertised choices appear; a literal native `off` remains distinct from
+`null`. Supported-effort models retain the row even when the current value is
+null. Nullable Remux configuration commands transmit null for absence, while
+optional create/native-provider parameters are omitted.
 
 This deliberately retains the useful ladder from the previous Agent composer.
 An explicitly selected `xhigh`, `max`, or another provider-native value remains
@@ -746,7 +760,7 @@ the same pair to `ProviderSession.startTurn`.
 | Queue while running | `turns.queue` | Do not silently queue when false. |
 | Edit-and-regenerate | `session.forkNative` | Validate source native turn identity and content/configuration. |
 | Fork | `session.forkNative` | Validate source native turn identity and content/configuration. |
-| Manual Compact | `compaction.manualNative` and a resumable native session | Dispatch at an idle root boundary or enqueue a durable Compact control entry; never create a normal Agent turn. |
+| Manual Compact | `compaction.manualNative`, a resumable native session, and no queued/running compact; viewer runtime and queue belong to the selected conversation | Dispatch at an idle root boundary or enqueue a durable Compact control entry; never create a normal Agent turn. The supported control remains disabled while ineligible or awaiting submission. |
 
 The viewer and coordinator both enforce this table. Adapter methods perform a
 final native-state check and return `capability_unavailable` when the advertised
@@ -1075,7 +1089,7 @@ adapter begins emitting Version 2 events.
 - map Claude content-block starts/deltas/stops and snapshots, removing the late
   tool-start defect;
 - map Claude model usage, context, cost, rate-limit, and compact data;
-- configure the Claude root-session manual-compaction policy and probe native
+- configure the Claude root-session native-auto policy and probe native
   `/compact` support;
 - extend capability probes;
 - project context on runtime and plan usage on providers, including cached and
@@ -1172,10 +1186,11 @@ layout.
 - Claude manual Compact sends exactly one native `/compact`, applies no effort
   prefix, produces no ordinary Agent turn, and terminates from compact status
   or boundary events.
-- Claude Remux root-session options explicitly disable automatic and
-  precomputed compaction while retaining the native manual command.
-- An unexpected automatic Claude boundary is still projected accurately and
-  does not silently change the selected manual policy.
+- Claude Remux root-session options enable automatic compaction with the default
+  300k native policy window and disable precomputed compaction, while retaining
+  the native manual command. A live threshold-crossing run remains pending.
+- Automatic Claude boundaries are projected accurately; root context counts
+  exclude child requests and cumulative result totals.
 - Missing `/compact` in `supportedCommands()` narrows the runtime capability
   and returns `native_command_unavailable` to a racing stale client.
 

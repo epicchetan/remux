@@ -21,7 +21,7 @@ export function ComposerStatusMessageRow({
     ? submissionLabel(submission.phase)
     : submissionError
       ?? (historyLoading ? 'Syncing conversation history' : null)
-      ?? (historyFailed ? history.error ?? 'Conversation history could not be synced' : null)
+      ?? (historyFailed ? `Conversation history couldn’t sync${history.error ? `: ${history.error}` : '.'}` : null)
       ?? runtimeError;
   const actionable = !submission && !submissionError && historyFailed && !retrying;
 

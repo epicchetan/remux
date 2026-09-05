@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 
 import {
@@ -72,6 +72,11 @@ import {
   terminalAssistantText,
 } from './native-output.ts';
 import type { FederationTargetCatalogEntry } from '../federation/credential-registry.ts';
+import { resolveCheckout, type CheckoutResolver } from './checkout-resolver.ts';
+import { FederationCheckoutOwner, FederationCommandInProgressError,
+  FederationCommandSettledError } from './federation-checkout-owner.ts';
+import { DeliveryAttemptOwner } from './delivery-attempt-owner.ts';
+import { requireLegacyAcceptance, type StagedProviderEnvelope } from './delivery-contract.ts';
 
 export type NativeProviderRegistration = {
   providerInstanceId: string;
@@ -91,7 +96,7 @@ export type NativeCoordinatorOptions = {
     outcome: 'completed' | 'failed' | 'interrupted' | 'recovery_failed';
   }) => void;
   sealTurnOutput?: (input: { turnId: string; text: string }) => Promise<void>;
-  sealFileDiff?: (input: { diff: string }) => Promise<{ artifactId: string }>;
+  sealFileDiff?: (input: { conversationId: string; executionId: string; turnId?: string; diff: string }) => Promise<{ artifactId: string }>;
   federationForSession?: (input: {
     conversationId: string;
     executionId: string;
@@ -104,6 +109,7 @@ export type NativeCoordinatorOptions = {
     revoke?: () => void;
   } | undefined>;
   onDiagnostic?: (event: NativeCoordinatorDiagnostic) => void;
+  checkoutResolver?: CheckoutResolver;
 };
 
 export type NativeCoordinatorDiagnostic = {
@@ -195,6 +201,7 @@ export type FederatedExecutionResult = {
         };
       };
   changedFiles: readonly FileChangeDisplay[];
+  changedFilesTruncated: number;
 };
 
 type ActiveProviderLogin = {
@@ -215,13 +222,6 @@ type HistoryHydrationJob = {
 };
 
 type HistorySyncPolicy = 'initial' | 'if-stale' | 'required-fresh';
-
-type PendingTurnAdmission = {
-  conversationId: string;
-  executionId: string;
-  queued: NativeQueuedMessage;
-  events: ProviderEventEnvelope[];
-};
 
 const BASE_DEVELOPER_INSTRUCTIONS = [
   'Remux uses ordinary chat for all user interaction. Do not request a blocking approval form or structured multiple-choice input; explain what is needed in your response instead.',
@@ -257,7 +257,8 @@ export class NativeAgentCoordinator {
   private readonly loginConsumers = new Set<Promise<void>>();
   private readonly dispatchingConversations = new Set<string>();
   private readonly pendingDispatchConversations = new Set<string>();
-  private readonly pendingTurnAdmissions = new Map<string, PendingTurnAdmission>();
+  private readonly deliveryOwner: DeliveryAttemptOwner;
+  private readonly deliveryOwnerInstanceId = randomUUID();
   private readonly executionWaiters = new Map<string, Set<(result: FederatedExecutionResult) => void>>();
   private readonly federationBindings = new Map<string, { touch?: () => void; revoke?: () => void }>();
   private readonly hydrationJobs = new Map<string, HistoryHydrationJob>();
@@ -274,10 +275,13 @@ export class NativeAgentCoordinator {
   private readonly sealFileDiff?: NativeCoordinatorOptions['sealFileDiff'];
   private readonly federationForSession?: NativeCoordinatorOptions['federationForSession'];
   private readonly onDiagnostic?: NativeCoordinatorOptions['onDiagnostic'];
+  private readonly checkoutResolver: CheckoutResolver;
+  private readonly checkoutOwner: FederationCheckoutOwner;
   private readonly sessionSweep: ReturnType<typeof setInterval>;
   private readonly queueSweep: ReturnType<typeof setInterval>;
   private initializePromise?: Promise<void>;
   private initialized = false;
+  private checkoutReconciled = false;
   private closed = false;
 
   constructor(options: NativeCoordinatorOptions) {
@@ -296,6 +300,9 @@ export class NativeAgentCoordinator {
     this.sealFileDiff = options.sealFileDiff;
     this.federationForSession = options.federationForSession;
     this.onDiagnostic = options.onDiagnostic;
+    this.checkoutResolver = options.checkoutResolver ?? resolveCheckout;
+    this.checkoutOwner = new FederationCheckoutOwner(this.journal, this.checkoutResolver);
+    this.deliveryOwner = new DeliveryAttemptOwner(this.journal, this.now, this.deliveryOwnerInstanceId);
     this.sessionSweep = setInterval(() => void this.evictIdleSessions(), IDLE_PROVIDER_SESSION_SWEEP_MS);
     this.sessionSweep.unref?.();
     this.queueSweep = setInterval(
@@ -312,6 +319,22 @@ export class NativeAgentCoordinator {
 
   private async initializeOnce() {
     this.assertOpen();
+    const checkoutOwners = this.checkoutOwner.captureStartupOwners(this.now());
+    this.deliveryOwner.recover();
+    await this.recoverAcceptedDeliveryStages();
+    const resolutions = new Map<string, Awaited<ReturnType<CheckoutResolver>>>();
+    const uniqueCwds = [...new Set(checkoutOwners.map(({ cwd }) => cwd))];
+    for (let offset = 0; offset < uniqueCwds.length; offset += 4) {
+      const batch = uniqueCwds.slice(offset, offset + 4);
+      const values = await Promise.all(batch.map((cwd) => this.checkoutResolver(cwd)));
+      batch.forEach((cwd, index) => resolutions.set(cwd, values[index]!));
+    }
+    for (const owner of checkoutOwners) {
+      const resolution = resolutions.get(owner.cwd);
+      if (resolution?.state !== 'resolved') continue;
+      this.checkoutOwner.scopeCapturedStartupOwner(owner, resolution.value.checkoutKey, this.now());
+    }
+    this.checkoutReconciled = true;
     this.journal.resetInterruptedHistoryLoads();
     this.journal.markPersistedUsageCached();
     this.journal.repairRecoveryFailuresWithLaterNativeTerminalEvents();
@@ -340,6 +363,7 @@ export class NativeAgentCoordinator {
         await this.discoverProviderHistory(registration, probe.capabilities);
       }
     }));
+    await this.reconcileRootDeliveryAttempts();
     this.journal.markAmbiguousCommandsForRecovery(this.now());
     this.journal.markInterruptedQueueDispatchesDeliveryUnknown();
     this.journal.failInterruptedBranchOperations(this.now());
@@ -516,11 +540,20 @@ export class NativeAgentCoordinator {
   ): Promise<NativeConversationCreateResult> {
     this.assertOpen();
     const input = parseNativeConversationCreateCommand(unparsed);
+    return this.journal.runAsyncCommand(input.commandId, 'conversation.create', input, () =>
+      this.createConversationOwned(input));
+  }
+
+  private async createConversationOwned(
+    input: NativeConversationCreateCommand,
+  ): Promise<NativeConversationCreateResult> {
+    this.assertOpen();
     const replay = this.replay<NativeConversationCreateResult>(
       this.journal.claimCommand(input.commandId, 'conversation.create', input, this.now()).receipt,
     );
     if (replay) return replay;
     let registration: NativeProviderRegistration;
+    let serviceTier: string | null;
     try {
       registration = this.requireReadyProvider(input.providerInstanceId);
       const capabilities = this.requireCapabilities(input.providerInstanceId);
@@ -534,6 +567,14 @@ export class NativeAgentCoordinator {
       if (!model || model.id !== input.model) throw new Error('Selected model is unavailable.');
       if (input.effort && !model.supportedEffort.includes(input.effort)) {
         throw new Error(`Effort ${input.effort} is unavailable for model ${input.model}.`);
+      }
+      serviceTier = this.projector.resolveServiceTier(
+        input.providerInstanceId,
+        model.id,
+        input.serviceTier,
+      );
+      if (input.serviceTier !== undefined && serviceTier !== input.serviceTier) {
+        throw new Error(`Service tier ${input.serviceTier ?? 'none'} is unavailable for model ${input.model}.`);
       }
     } catch (error) {
       this.journal.rejectCommand(input.commandId, safeMessage(error), this.now());
@@ -551,6 +592,7 @@ export class NativeAgentCoordinator {
         cwd: input.cwd,
         model: input.model,
         ...(input.effort ? { effort: input.effort } : {}),
+        ...(serviceTier ? { serviceTier } : {}),
         access: input.access,
         now: this.now(),
       });
@@ -560,6 +602,7 @@ export class NativeAgentCoordinator {
         providerInstanceId: input.providerInstanceId,
         model: input.model,
         effort: input.effort ?? null,
+        serviceTier,
         now: this.now(),
       });
       this.journal.setComposerPreference({
@@ -568,6 +611,7 @@ export class NativeAgentCoordinator {
         providerInstanceId: input.providerInstanceId,
         model: input.model,
         effort: input.effort ?? null,
+        serviceTier,
         now: this.now(),
       });
       this.journal.setComposerPreference({
@@ -576,6 +620,7 @@ export class NativeAgentCoordinator {
         providerInstanceId: input.providerInstanceId,
         model: null,
         effort: null,
+        serviceTier: null,
         now: this.now(),
       });
       this.journal.markCommandDispatching(input.commandId, this.now());
@@ -604,6 +649,14 @@ export class NativeAgentCoordinator {
   ): Promise<NativeProviderLoginResult> {
     this.assertOpen();
     const input = parseNativeProviderLoginStartCommand(unparsed);
+    return this.journal.runAsyncCommand(input.commandId, 'provider.login.start', input, () =>
+      this.startProviderLoginOwned(input));
+  }
+
+  private async startProviderLoginOwned(
+    input: NativeProviderLoginStartCommand,
+  ): Promise<NativeProviderLoginResult> {
+    this.assertOpen();
     const claim = this.journal.claimCommand(input.commandId, 'provider.login.start', input, this.now());
     const replay = this.replay<NativeProviderLoginResult>(claim.receipt);
     if (replay) return replay;
@@ -674,6 +727,12 @@ export class NativeAgentCoordinator {
   async cancelProviderLogin(unparsed: NativeProviderAuthMutationCommand) {
     this.assertOpen();
     const input = parseNativeProviderAuthMutationCommand(unparsed);
+    return this.journal.runAsyncCommand(input.commandId, 'provider.login.cancel', input, () =>
+      this.cancelProviderLoginOwned(input));
+  }
+
+  private async cancelProviderLoginOwned(input: NativeProviderAuthMutationCommand) {
+    this.assertOpen();
     const claim = this.journal.claimCommand(input.commandId, 'provider.login.cancel', input, this.now());
     const replay = this.replay<{ accepted: true }>(claim.receipt);
     if (replay) return replay;
@@ -706,6 +765,12 @@ export class NativeAgentCoordinator {
   async logoutProvider(unparsed: NativeProviderAuthMutationCommand) {
     this.assertOpen();
     const input = parseNativeProviderAuthMutationCommand(unparsed);
+    return this.journal.runAsyncCommand(input.commandId, 'provider.logout', input, () =>
+      this.logoutProviderOwned(input));
+  }
+
+  private async logoutProviderOwned(input: NativeProviderAuthMutationCommand) {
+    this.assertOpen();
     const claim = this.journal.claimCommand(input.commandId, 'provider.logout', input, this.now());
     const replay = this.replay<{ accepted: true }>(claim.receipt);
     if (replay) return replay;
@@ -749,6 +814,12 @@ export class NativeAgentCoordinator {
   async sendMessage(unparsed: NativeMessageSendCommand): Promise<NativeMessageSendResult> {
     this.assertOpen();
     const input = parseNativeMessageSendCommand(unparsed);
+    return this.journal.runAsyncCommand(input.commandId, 'turn.send', input, () =>
+      this.sendMessageOwned(input));
+  }
+
+  private async sendMessageOwned(input: NativeMessageSendCommand): Promise<NativeMessageSendResult> {
+    this.assertOpen();
     const claim = this.journal.claimCommand(input.commandId, 'turn.send', input, this.now());
     const replay = this.replay<NativeMessageSendResult>(claim.receipt);
     if (replay) return replay;
@@ -776,6 +847,7 @@ export class NativeAgentCoordinator {
     const runtime = this.projector.runtimeResource(conversation.conversationId);
     const model = input.model;
     const effort = input.effort ?? undefined;
+    const serviceTier = input.serviceTier ?? runtime?.composer.nextTurn.serviceTier ?? null;
     try {
       if (!runtime) throw coordinatorError('session_unavailable', 'Conversation runtime is unavailable.');
       if (conversation.state === 'recovering') {
@@ -797,8 +869,12 @@ export class NativeAgentCoordinator {
           input.configurationRevision !== configurationRevisionBeforeSync) {
         throw coordinatorError('configuration_conflict', 'Composer configuration changed; refresh and retry.');
       }
-      if (model !== runtime.composer.nextTurn.model || input.effort !== runtime.composer.nextTurn.effort) {
-        throw coordinatorError('configuration_conflict', 'Submitted model or effort is no longer current.');
+      if (model !== runtime.composer.nextTurn.model || input.effort !== runtime.composer.nextTurn.effort ||
+          serviceTier !== runtime.composer.nextTurn.serviceTier) {
+        throw coordinatorError(
+          'configuration_conflict',
+          'Submitted model, effort, or speed is no longer current.',
+        );
       }
       if (!this.projector.hasModel(conversation.providerInstanceId, model)) {
         throw coordinatorError(
@@ -818,10 +894,22 @@ export class NativeAgentCoordinator {
           'Provider does not support changing effort on an existing session.',
         );
       }
+      if (this.projector.resolveServiceTier(
+        conversation.providerInstanceId,
+        model,
+        serviceTier,
+      ) !== serviceTier) {
+        throw coordinatorError('configuration_conflict', 'Submitted speed is unavailable for this model.');
+      }
       this.assertContentCapabilities(input.content, capabilities);
+      this.journal.assertImageContentMetadata(input.content);
       if (input.delivery === 'steer' &&
-          (model !== runtime.activeConfiguration.model || input.effort !== runtime.activeConfiguration.effort)) {
-        throw coordinatorError('configuration_conflict', 'Model or effort cannot change in a steering message.');
+          (model !== runtime.activeConfiguration.model || input.effort !== runtime.activeConfiguration.effort ||
+            serviceTier !== runtime.activeConfiguration.serviceTier)) {
+        throw coordinatorError(
+          'configuration_conflict',
+          'Model, effort, or speed cannot change in a steering message.',
+        );
       }
     } catch (error) {
       this.journal.rejectCommand(input.commandId, safeMessage(error), this.now());
@@ -830,7 +918,8 @@ export class NativeAgentCoordinator {
     const compaction = this.journal.latestCompactionOperation(conversation.conversationId);
     const compactionRunning = compaction?.state === 'running';
     const hasQueuedWork = this.journal.queuedEntries(conversation.conversationId).length > 0;
-    const laneBusy = Boolean(conversation.activeTurnId) || compactionRunning || hasQueuedWork;
+    const laneBusy = Boolean(conversation.activeTurnId) || compactionRunning || hasQueuedWork ||
+      this.journal.hasUnresolvedRootDelivery(conversation.conversationId);
     const shouldSteer = Boolean(conversation.activeTurnId) && input.delivery === 'steer';
     if (input.delivery === 'steer' && !conversation.activeTurnId) {
       const error = coordinatorError('conversation_busy', 'There is no active turn to steer.');
@@ -856,6 +945,12 @@ export class NativeAgentCoordinator {
     // boundary. The dispatcher may claim an idle lane right away, but the RPC
     // acknowledgment never depends on the WebView remaining connected.
     this.journal.transaction(() => {
+      this.journal.grantImageContent({
+        scope: { conversationId: conversation.conversationId, executionId: conversation.rootExecutionId },
+        content: input.content,
+        provenance: 'viewer-queue',
+        createdAt: this.now(),
+      });
       this.journal.enqueueTurn({
         commandId: input.commandId,
         conversationId: conversation.conversationId,
@@ -864,6 +959,7 @@ export class NativeAgentCoordinator {
         content: input.content,
         model,
         ...(effort ? { effort } : {}),
+        ...(serviceTier ? { serviceTier } : {}),
         access: input.access,
         now: this.now(),
       });
@@ -878,6 +974,12 @@ export class NativeAgentCoordinator {
   async interruptTurn(unparsed: NativeTurnMutationCommand) {
     this.assertOpen();
     const input = parseNativeTurnMutationCommand(unparsed);
+    return this.journal.runAsyncCommand(input.commandId, 'turn.interrupt', input, () =>
+      this.interruptTurnOwned(input));
+  }
+
+  private async interruptTurnOwned(input: NativeTurnMutationCommand) {
+    this.assertOpen();
     const claim = this.journal.claimCommand(input.commandId, 'turn.interrupt', input, this.now());
     const replay = this.replay<{ accepted: true }>(claim.receipt);
     if (replay) return replay;
@@ -925,6 +1027,14 @@ export class NativeAgentCoordinator {
     if (execution.ownership === 'federated') {
       return this.interruptFederatedExecution(input.commandId, input.executionId);
     }
+    return this.journal.runAsyncCommand(input.commandId, 'execution.interrupt', input, () =>
+      this.interruptExecutionOwned(input, execution));
+  }
+
+  private async interruptExecutionOwned(
+    input: NativeExecutionMutationCommand,
+    execution: NonNullable<ReturnType<NativeAgentJournal['execution']>>,
+  ) {
     const claim = this.journal.claimCommand(input.commandId, 'execution.interrupt', input, this.now());
     const replay = this.replay<{ accepted: true }>(claim.receipt);
     if (replay) return replay;
@@ -1034,6 +1144,12 @@ export class NativeAgentCoordinator {
   async activateConversationStrand(unparsed: NativeConversationStrandActivateCommand) {
     this.assertOpen();
     const input = parseNativeConversationStrandActivateCommand(unparsed);
+    return this.journal.runAsyncCommand(input.commandId, 'conversation.strand.activate', input, () =>
+      this.activateConversationStrandOwned(input));
+  }
+
+  private async activateConversationStrandOwned(input: NativeConversationStrandActivateCommand) {
+    this.assertOpen();
     const claim = this.journal.claimCommand(input.commandId, 'conversation.strand.activate', input, this.now());
     const replay = this.replay<{ accepted: true; strandId: string; headRevision: number }>(claim.receipt);
     if (replay) return replay;
@@ -1043,6 +1159,7 @@ export class NativeAgentCoordinator {
     let branchOperationCreated = false;
     try {
       const conversation = this.requireConversation(input.conversationId);
+      this.assertRootDeliveryAvailable(conversation.conversationId);
       const head = this.journal.conversationHead(input.conversationId);
       if (!head || head.revision !== input.expectedHeadRevision) {
         throw coordinatorError('configuration_conflict', 'Conversation history changed; refresh and retry.');
@@ -1075,6 +1192,7 @@ export class NativeAgentCoordinator {
       if (!sourceExecution) throw new Error('The version native execution is missing.');
       const sourceSession = await this.ensureExecutionSession(sourceExecution);
       if (!sourceSession.fork) throw coordinatorError('capability_unavailable', 'Provider cannot restore versions.');
+      this.assertRootDeliveryAvailable(conversation.conversationId);
       this.journal.createBranchOperation({
         operationId: branchOperationId,
         commandId: input.commandId,
@@ -1118,6 +1236,7 @@ export class NativeAgentCoordinator {
           providerInstanceId: conversation.providerInstanceId,
           model: conversation.model,
           ...(conversation.effort ? { effort: conversation.effort } : {}),
+          ...(conversation.serviceTier ? { serviceTier: conversation.serviceTier } : {}),
           access: conversation.access,
           title: conversation.title,
           now: this.now(),
@@ -1140,6 +1259,7 @@ export class NativeAgentCoordinator {
           nativeSession: nativeFork,
           model: conversation.model,
           effort: conversation.effort,
+          serviceTier: conversation.serviceTier ?? undefined,
           access: conversation.access,
         }));
       let result!: { accepted: true; strandId: string; headRevision: number };
@@ -1198,6 +1318,19 @@ export class NativeAgentCoordinator {
         throw coordinatorError('configuration_conflict', 'Selected model is unavailable.');
       }
       const effort = repairRequestedEffort(model, input.effort);
+      const requestedServiceTier = input.serviceTier !== undefined
+        ? input.serviceTier
+        : model.id === runtime.composer.nextTurn.model
+          ? runtime.composer.nextTurn.serviceTier
+          : null;
+      const serviceTier = this.projector.resolveServiceTier(
+        conversation.providerInstanceId,
+        model.id,
+        requestedServiceTier,
+      );
+      if (input.serviceTier !== undefined && serviceTier !== input.serviceTier) {
+        throw coordinatorError('configuration_conflict', 'Selected speed is unavailable for this model.');
+      }
       if (input.model !== runtime.composer.nextTurn.model && !runtime.composer.editable.model) {
         throw coordinatorError('capability_unavailable', 'Model is locked for this native session.');
       }
@@ -1211,6 +1344,7 @@ export class NativeAgentCoordinator {
           providerInstanceId: conversation.providerInstanceId,
           model: model.id,
           effort,
+          serviceTier,
           now: this.now(),
         });
         this.journal.setComposerPreference({
@@ -1219,6 +1353,7 @@ export class NativeAgentCoordinator {
           providerInstanceId: conversation.providerInstanceId,
           model: model.id,
           effort,
+          serviceTier,
           now: this.now(),
         });
       });
@@ -1237,6 +1372,16 @@ export class NativeAgentCoordinator {
   async setConversationAccess(unparsed: NativeConversationAccessSetCommand) {
     this.assertOpen();
     const input = parseNativeConversationAccessSetCommand(unparsed);
+    return this.journal.runAsyncCommand(
+      input.commandId,
+      'composer.conversation-access.set',
+      input,
+      () => this.setConversationAccessOwned(input),
+    );
+  }
+
+  private async setConversationAccessOwned(input: NativeConversationAccessSetCommand) {
+    this.assertOpen();
     const claim = this.journal.claimCommand(
       input.commandId,
       'composer.conversation-access.set',
@@ -1248,6 +1393,7 @@ export class NativeAgentCoordinator {
     let conversation: JournalConversation;
     try {
       conversation = this.requireConversation(input.conversationId);
+      this.assertRootDeliveryAvailable(conversation.conversationId);
       const runtime = this.projector.runtimeResource(input.conversationId);
       if (!runtime) throw coordinatorError('session_unavailable', 'Conversation runtime is unavailable.');
       if (runtime.composer.revision !== input.expectedRevision) {
@@ -1322,6 +1468,21 @@ export class NativeAgentCoordinator {
         throw coordinatorError('configuration_conflict', 'Selected model is unavailable.');
       }
       const effort = repairRequestedEffort(model, input.effort);
+      const sticky = providers.providers.find(({ providerInstanceId }) =>
+        providerInstanceId === input.providerInstanceId)?.stickyPreference;
+      const requestedServiceTier = input.serviceTier !== undefined
+        ? input.serviceTier
+        : sticky?.model === model.id
+          ? sticky.serviceTier ?? null
+          : null;
+      const serviceTier = this.projector.resolveServiceTier(
+        input.providerInstanceId,
+        model.id,
+        requestedServiceTier,
+      );
+      if (input.serviceTier !== undefined && serviceTier !== input.serviceTier) {
+        throw coordinatorError('configuration_conflict', 'Selected speed is unavailable for this model.');
+      }
       this.journal.transaction(() => {
         this.journal.setComposerPreference({
           scope: 'provider',
@@ -1329,6 +1490,7 @@ export class NativeAgentCoordinator {
           providerInstanceId: input.providerInstanceId,
           model: model.id,
           effort,
+          serviceTier,
           now: this.now(),
         });
         this.journal.setComposerPreference({
@@ -1337,6 +1499,7 @@ export class NativeAgentCoordinator {
           providerInstanceId: input.providerInstanceId,
           model: null,
           effort: null,
+          serviceTier: null,
           now: this.now(),
         });
       });
@@ -1356,6 +1519,14 @@ export class NativeAgentCoordinator {
   ): Promise<NativeCompactConversationResult> {
     this.assertOpen();
     const input = parseNativeCompactConversationCommand(unparsed);
+    return this.journal.runAsyncCommand(input.commandId, 'conversation.compact', input, () =>
+      this.compactConversationOwned(input));
+  }
+
+  private async compactConversationOwned(
+    input: NativeCompactConversationCommand,
+  ): Promise<NativeCompactConversationResult> {
+    this.assertOpen();
     const claim = this.journal.claimCommand(input.commandId, 'conversation.compact', input, this.now());
     const replay = this.replay<NativeCompactConversationResult>(claim.receipt);
     if (replay) return replay;
@@ -1363,6 +1534,7 @@ export class NativeAgentCoordinator {
     let session: ProviderSession;
     try {
       conversation = this.requireConversation(input.conversationId);
+      this.assertRootDeliveryAvailable(conversation.conversationId);
       await this.synchronizeConversationHistory(conversation.conversationId, 'required-fresh');
       conversation = this.requireConversation(input.conversationId);
       const capabilities = this.requireCapabilities(conversation.providerInstanceId);
@@ -1407,6 +1579,7 @@ export class NativeAgentCoordinator {
     if (queueOccupied) return result;
 
     try {
+      this.assertRootDeliveryAvailable(conversation.conversationId);
       await this.dispatchCompaction(conversation, session, operationId);
       this.journal.acceptCommand(input.commandId, result, this.now());
       return result;
@@ -1421,6 +1594,12 @@ export class NativeAgentCoordinator {
   async branchConversation(unparsed: NativeBranchCommand) {
     this.assertOpen();
     const input = parseNativeBranchCommand(unparsed);
+    return this.journal.runAsyncCommand(input.commandId, `conversation.${input.mode}`, input, () =>
+      this.branchConversationOwned(input));
+  }
+
+  private async branchConversationOwned(input: NativeBranchCommand) {
+    this.assertOpen();
     const claim = this.journal.claimCommand(input.commandId, `conversation.${input.mode}`, input, this.now());
     const replay = this.replay<NativeConversationBranchResult>(claim.receipt);
     if (replay) return replay;
@@ -1437,11 +1616,13 @@ export class NativeAgentCoordinator {
     let sourceSession: ProviderSession;
     let branchModel: ProviderModelDescriptor;
     let branchEffort: string | undefined;
+    let branchServiceTier: string | undefined;
     let branchTurnAccepted = false;
     let branchOperationCreated = false;
     let configurationRevisionBeforeSync: string | undefined;
     try {
       source = this.requireConversation(input.sourceConversationId);
+      this.assertRootDeliveryAvailable(source.conversationId);
       configurationRevisionBeforeSync = this.projector.runtimeResource(
         source.conversationId,
       )?.composer.revision;
@@ -1471,6 +1652,7 @@ export class NativeAgentCoordinator {
       sourceBinding = resolvedBinding;
       const runtime = this.projector.runtimeResource(source.conversationId);
       if (!runtime) throw coordinatorError('session_unavailable', 'Conversation runtime is unavailable.');
+      const requestedServiceTier = input.serviceTier ?? runtime.composer.nextTurn.serviceTier;
       const branching = runtime.capabilities.session.contextBranching;
       if (!runtime.capabilities.session.forkNative ||
           (branching && branching.strategy !== 'native')) {
@@ -1491,8 +1673,12 @@ export class NativeAgentCoordinator {
           input.configurationRevision !== configurationRevisionBeforeSync) {
         throw coordinatorError('configuration_conflict', 'Composer configuration changed; refresh and retry.');
       }
-      if (input.model !== runtime.composer.nextTurn.model || input.effort !== runtime.composer.nextTurn.effort) {
-        throw coordinatorError('configuration_conflict', 'Submitted model or effort is no longer current.');
+      if (input.model !== runtime.composer.nextTurn.model || input.effort !== runtime.composer.nextTurn.effort ||
+          requestedServiceTier !== runtime.composer.nextTurn.serviceTier) {
+        throw coordinatorError(
+          'configuration_conflict',
+          'Submitted model, effort, or speed is no longer current.',
+        );
       }
       const resolvedModel = this.projector.resolveModel(source.providerInstanceId, input.model);
       if (!resolvedModel || resolvedModel.id !== input.model) {
@@ -1500,7 +1686,18 @@ export class NativeAgentCoordinator {
       }
       branchModel = resolvedModel;
       branchEffort = repairRequestedEffort(resolvedModel, input.effort) ?? undefined;
+      const resolvedServiceTier = this.projector.resolveServiceTier(
+        source.providerInstanceId,
+        resolvedModel.id,
+        requestedServiceTier,
+      );
+      if (resolvedServiceTier !== requestedServiceTier) {
+        throw coordinatorError('configuration_conflict', 'Selected speed is unavailable for this model.');
+      }
+      branchServiceTier = resolvedServiceTier ?? undefined;
       this.assertContentCapabilities(input.content, this.requireCapabilities(source.providerInstanceId));
+      this.journal.assertImageContentMetadata(input.content);
+      this.assertRootDeliveryAvailable(source.conversationId);
       this.journal.createBranchOperation({
         operationId: branchOperationId,
         commandId: input.commandId,
@@ -1535,6 +1732,7 @@ export class NativeAgentCoordinator {
     }
     let nativeFork;
     try {
+      this.assertRootDeliveryAvailable(source.conversationId);
       nativeFork = await sourceSession.fork!({
         commandId: `${input.commandId}:fork`,
         destinationSessionId: stableUuid(`branch-native-session\0${input.commandId}`),
@@ -1576,6 +1774,7 @@ export class NativeAgentCoordinator {
             providerInstanceId: source.providerInstanceId,
             model: branchModel.id,
             ...(branchEffort ? { effort: branchEffort } : {}),
+            ...(branchServiceTier ? { serviceTier: branchServiceTier } : {}),
             access: source.access,
             title: source.title,
             now: this.now(),
@@ -1594,6 +1793,7 @@ export class NativeAgentCoordinator {
             cwd: source.cwd,
             model: branchModel.id,
             ...(branchEffort ? { effort: branchEffort } : {}),
+            ...(branchServiceTier ? { serviceTier: branchServiceTier } : {}),
             access: source.access,
             parentConversationId: source.conversationId,
             rootConversationId: source.rootConversationId,
@@ -1614,6 +1814,7 @@ export class NativeAgentCoordinator {
           providerInstanceId: source.providerInstanceId,
           model: branchModel.id,
           effort: branchEffort ?? null,
+          serviceTier: branchServiceTier ?? null,
           now: this.now(),
         });
         this.journal.setComposerPreference({
@@ -1622,7 +1823,14 @@ export class NativeAgentCoordinator {
           providerInstanceId: source.providerInstanceId,
           model: branchModel.id,
           effort: branchEffort ?? null,
+          serviceTier: branchServiceTier ?? null,
           now: this.now(),
+        });
+        this.journal.grantImageContent({
+          scope: { conversationId, executionId },
+          content: input.content,
+          provenance: 'viewer-message',
+          createdAt: this.now(),
         });
         this.journal.updateBranchOperation(branchOperationId, 'prefix-validated', this.now());
       });
@@ -1636,6 +1844,7 @@ export class NativeAgentCoordinator {
           nativeSession: nativeFork,
           model: branchModel.id,
           effort: branchEffort,
+          serviceTier: branchServiceTier,
           access: source.access,
         }));
       this.journal.createTurn({
@@ -1647,11 +1856,12 @@ export class NativeAgentCoordinator {
         content: input.content,
         model: branchModel.id,
         ...(branchEffort ? { effort: branchEffort } : {}),
+        ...(branchServiceTier ? { serviceTier: branchServiceTier } : {}),
         state: 'running',
         now: this.now(),
       });
       this.journal.updateBranchOperation(branchOperationId, 'turn-dispatching', this.now());
-      await session.startTurn({
+      requireLegacyAcceptance(await session.startTurn({
         commandId: `${input.commandId}:turn`,
         conversationId,
         executionId,
@@ -1659,7 +1869,8 @@ export class NativeAgentCoordinator {
         content: input.content,
         model: branchModel.id,
         ...(branchEffort ? { effort: branchEffort } : {}),
-      });
+        ...(branchServiceTier ? { serviceTier: branchServiceTier } : {}),
+      }, { markPossiblySent: () => undefined }));
       branchTurnAccepted = true;
       this.journal.updateBranchOperation(branchOperationId, 'accepted', this.now());
       let result!: NativeConversationBranchResult;
@@ -1725,217 +1936,257 @@ export class NativeAgentCoordinator {
 
   async spawnFederatedAgent(input: FederatedSpawnInput): Promise<{ accepted: true; executionId: string }> {
     this.assertOpen();
-    const claim = this.journal.claimCommand(input.commandId, 'federation.spawn', input, this.now());
-    const replay = this.replay<{ accepted: true; executionId: string }>(claim.receipt);
-    if (replay) return replay;
-    let conversation: JournalConversation;
-    let parent: NonNullable<ReturnType<NativeAgentJournal['execution']>>;
-    let target: NativeProviderRegistration;
-    let model: NonNullable<ReturnType<NativeAgentProjector['resolveModel']>>;
+    this.assertFederationReady();
+    return this.journal.runAsyncCommand(input.commandId, 'federation.spawn', input, () =>
+      this.spawnFederatedAgentOwned(input));
+  }
+
+  private async spawnFederatedAgentOwned(
+    input: FederatedSpawnInput,
+  ): Promise<{ accepted: true; executionId: string }> {
+    this.assertOpen();
+    const existing = this.checkoutOwner.settledOrUnresolved(
+      input.commandId, 'federation.spawn', input);
+    if (existing) {
+      const replay = this.replay<{ accepted: true; executionId: string }>(existing);
+      if (replay) return replay;
+      throw new FederationCommandInProgressError(input.commandId);
+    }
+    const initialConversation = this.requireConversation(input.parentConversationId);
+    let checkout: { checkoutKey: string; launchCwd: string };
     try {
-      conversation = this.requireConversation(input.parentConversationId);
-      parent = this.journal.execution(input.parentExecutionId)!;
-      if (!parent || parent.conversationId !== conversation.conversationId) {
-        throw new Error('Federation parent execution is unavailable.');
-      }
-      if (parent.providerInstanceId === input.targetProviderInstanceId) {
-        throw new Error('use_native_collaboration: same-provider delegation stays in the native harness.');
-      }
-      target = this.requireReadyProvider(input.targetProviderInstanceId);
-      if (target.provider === parent.provider) {
-        throw new Error('use_native_collaboration: Version 1 federation requires a different provider kind.');
-      }
-      if (input.depth !== parent.federationDepth + 1 || input.depth > 2) {
-        throw new Error('Federation depth limit exceeded.');
-      }
-      if (input.access === 'workspace-write' && input.scheduling !== 'foreground') {
-        throw new Error('Federated workspace writers must use foreground scheduling.');
-      }
-      if (!accessWithin(input.access, parent.access ?? conversation.access)) {
-        throw new Error('Federation cannot widen the parent access ceiling.');
-      }
-      const rootTurn = this.journal.turn(input.rootTurnId);
-      if (!rootTurn || rootTurn.conversationId !== conversation.conversationId ||
-          (rootTurn.state !== 'running' && rootTurn.state !== 'recovering')) {
-        throw new Error('Federation is only available while the owning root turn is active.');
-      }
-      const federated = this.journal.executionsForConversation(conversation.conversationId)
-        .filter((execution) => execution.ownership === 'federated' && execution.rootTurnId === input.rootTurnId);
-      if (federated.length >= 16) throw new Error('Federated execution limit exceeded for this root turn.');
-      if (federated.filter(({ state }) => state === 'running' || state === 'recovering').length >= 4) {
-        throw new Error('Active federated child limit exceeded for this root turn.');
-      }
-      const checkoutExecutions = this.journal.activeFederatedExecutionsForCwd(conversation.cwd);
-      if (input.access === 'workspace-write' &&
-          checkoutExecutions.some(({ access }) => access === 'workspace-write')) {
-        throw new Error('A federated workspace writer is already active for this checkout.');
-      }
-      if (input.access === 'read-only' && input.scheduling === 'background' &&
-          checkoutExecutions.filter(({ access, federationScheduling }) =>
-            access === 'read-only' && federationScheduling === 'background').length >= 4) {
-        throw new Error('Background federated reader limit exceeded for this checkout.');
-      }
-      const resolved = this.projector.resolveModel(input.targetProviderInstanceId, input.model);
-      if (!resolved || (input.model && resolved.id !== input.model)) {
-        throw new Error(`Requested federation model is unavailable from ${input.targetProviderInstanceId}.`);
-      }
-      if (input.effort && !resolved.supportedEffort.includes(input.effort)) {
-        throw new Error(`Effort ${input.effort} is unavailable for federation model ${resolved.id}.`);
-      }
-      model = resolved;
+      checkout = await this.checkoutOwner.resolveNew(
+        input.commandId, 'federation.spawn', input, initialConversation.cwd, this.now());
     } catch (error) {
-      this.journal.rejectCommand(input.commandId, safeMessage(error), this.now());
+      if (error instanceof FederationCommandSettledError) {
+        const replay = this.replay<{ accepted: true; executionId: string }>(error.receipt);
+        if (replay) return replay;
+      }
       throw error;
     }
-
     const executionId = stableUuid(`federated-execution\0${input.commandId}`);
     const turnId = stableUuid(`federated-turn\0${input.commandId}`);
     const title = boundedSummary(input.task, 96) || 'Federated agent';
-    this.journal.transaction(() => {
-      this.journal.createFederatedExecution({
-        executionId,
-        conversationId: conversation.conversationId,
-        parentExecutionId: parent.executionId,
-        rootTurnId: input.rootTurnId,
-        provider: target.provider,
-        providerInstanceId: target.providerInstanceId,
-        model: model.id,
-        ...(input.effort ? { effort: input.effort } : {}),
-        access: input.access,
-        scheduling: input.scheduling,
-        depth: input.depth,
-        title,
-        now: this.now(),
-      });
-      this.journal.markCommandDispatching(input.commandId, this.now());
-      this.appendFederationEvent(parent, input.rootTurnId, {
-        type: 'child.started',
-        child: {
-          executionId,
-          ownership: 'federated',
-          provider: target.provider,
-          providerInstanceId: target.providerInstanceId,
-          model: model.id,
-          title,
-        },
-      }, `spawn:${executionId}`);
+    const content: readonly UserContentPart[] = [
+      { type: 'text', text: input.task.trim() }, ...(input.attachments ?? []),
+    ];
+    let conversation!: JournalConversation;
+    let parent!: NonNullable<ReturnType<NativeAgentJournal['execution']>>;
+    let target!: NativeProviderRegistration;
+    let model!: NonNullable<ReturnType<NativeAgentProjector['resolveModel']>>;
+    let serviceTier: string | undefined;
+    const admitted = this.checkoutOwner.claimAndReserve({
+      commandId: input.commandId, kind: 'federation.spawn', request: input,
+      executionId, expectedTurnId: turnId, checkout, access: input.access,
+      scheduling: input.scheduling, now: this.now(),
+      validateAndCreate: () => {
+        conversation = this.requireConversation(input.parentConversationId);
+        parent = this.journal.execution(input.parentExecutionId)!;
+        if (!parent || parent.conversationId !== conversation.conversationId) {
+          throw new Error('Federation parent execution is unavailable.');
+        }
+        if (parent.providerInstanceId === input.targetProviderInstanceId) {
+          throw new Error('use_native_collaboration: same-provider delegation stays in the native harness.');
+        }
+        target = this.requireReadyProvider(input.targetProviderInstanceId);
+        if (target.provider === parent.provider) {
+          throw new Error('use_native_collaboration: Version 1 federation requires a different provider kind.');
+        }
+        if (input.depth !== parent.federationDepth + 1 || input.depth > 2) {
+          throw new Error('Federation depth limit exceeded.');
+        }
+        if (input.access === 'workspace-write' && input.scheduling !== 'foreground') {
+          throw new Error('Federated workspace writers must use foreground scheduling.');
+        }
+        if (!accessWithin(input.access, parent.access ?? conversation.access)) {
+          throw new Error('Federation cannot widen the parent access ceiling.');
+        }
+        const rootTurn = this.journal.turn(input.rootTurnId);
+        if (!rootTurn || rootTurn.conversationId !== conversation.conversationId ||
+            (rootTurn.state !== 'running' && rootTurn.state !== 'recovering')) {
+          throw new Error('Federation is only available while the owning root turn is active.');
+        }
+        const federated = this.journal.executionsForConversation(conversation.conversationId)
+          .filter((candidate) => candidate.ownership === 'federated' &&
+            candidate.rootTurnId === input.rootTurnId);
+        if (federated.length >= 16) throw new Error('Federated execution limit exceeded for this root turn.');
+        const unresolved = federated.filter((candidate) => {
+          const row = this.journal.database.prepare(`SELECT state FROM federation_checkout_reservations
+            WHERE execution_id=? AND state IN ('held','unknown')`).get(candidate.executionId);
+          return candidate.state === 'running' || candidate.state === 'recovering' || Boolean(row);
+        });
+        if (unresolved.length >= 4) throw new Error('Active federated child limit exceeded for this root turn.');
+        const resolved = this.projector.resolveModel(input.targetProviderInstanceId, input.model);
+        if (!resolved || (input.model && resolved.id !== input.model)) {
+          throw new Error(`Requested federation model is unavailable from ${input.targetProviderInstanceId}.`);
+        }
+        if (input.effort && !resolved.supportedEffort.includes(input.effort)) {
+          throw new Error(`Effort ${input.effort} is unavailable for federation model ${resolved.id}.`);
+        }
+        model = resolved;
+        serviceTier = this.projector.resolveServiceTier(target.providerInstanceId, resolved.id, null) ?? undefined;
+        this.journal.assertImageContentAuthorized({ conversationId: conversation.conversationId,
+          executionId: parent.executionId }, content);
+        this.journal.createFederatedExecution({
+          executionId, conversationId: conversation.conversationId,
+          parentExecutionId: parent.executionId, rootTurnId: input.rootTurnId,
+          provider: target.provider, providerInstanceId: target.providerInstanceId,
+          model: model.id, ...(input.effort ? { effort: input.effort } : {}),
+          ...(serviceTier ? { serviceTier } : {}), checkoutKey: checkout.checkoutKey,
+          access: input.access, scheduling: input.scheduling, depth: input.depth, title, now: this.now(),
+        });
+        this.journal.markCommandDispatching(input.commandId, this.now());
+        this.journal.grantImageContent({ scope: { conversationId: conversation.conversationId, executionId },
+          content, provenance: 'federation-delegation', sourceExecutionId: parent.executionId,
+          createdAt: this.now() });
+        this.appendFederationEvent(parent, input.rootTurnId, { type: 'child.started', child: {
+          executionId, ownership: 'federated', provider: target.provider,
+          providerInstanceId: target.providerInstanceId, model: model.id, title,
+        } }, `spawn:${executionId}`);
+      },
     });
-
+    if ('receipt' in admitted) {
+      const replay = this.replay<{ accepted: true; executionId: string }>(admitted.receipt);
+      if (replay) return replay;
+      throw new FederationCommandInProgressError(input.commandId);
+    }
+    let startTurnInvoked = false;
     try {
       const session = await this.openAttachedSession(conversation.conversationId, executionId, () =>
-        this.openExecutionSession({
-          conversation,
-          executionId,
-          registration: target,
-          mode: 'create',
-          model: model.id,
-          effort: input.effort,
-          access: input.access,
-        }));
-      const content: readonly UserContentPart[] = [
-        {
-          type: 'text',
-          text: input.task.trim(),
-        },
-        ...(input.attachments ?? []),
-      ];
-      this.journal.createTurn({
-        turnId,
-        conversationId: conversation.conversationId,
-        executionId,
-        clientMessageId: stableUuid(`federated-message\0${input.commandId}`),
-        commandId: input.commandId,
-        content,
-        model: model.id,
+        this.openExecutionSession({ conversation, executionId, registration: target, mode: 'create',
+          model: model.id, effort: input.effort, serviceTier, access: input.access,
+          launchCwd: checkout.launchCwd }));
+      this.journal.createTurn({ turnId, conversationId: conversation.conversationId, executionId,
+        clientMessageId: stableUuid(`federated-message\0${input.commandId}`), commandId: input.commandId,
+        content, model: model.id, ...(input.effort ? { effort: input.effort } : {}),
+        ...(serviceTier ? { serviceTier } : {}), state: 'running', now: this.now() });
+      startTurnInvoked = true;
+      requireLegacyAcceptance(await session.startTurn({ commandId: input.commandId, conversationId: conversation.conversationId,
+        executionId, turnId, content, model: model.id,
         ...(input.effort ? { effort: input.effort } : {}),
-        state: 'running',
-        now: this.now(),
-      });
-      await session.startTurn({
-        commandId: input.commandId,
-        conversationId: conversation.conversationId,
-        executionId,
-        turnId,
-        content,
-        model: model.id,
-        ...(input.effort ? { effort: input.effort } : {}),
-      });
+        ...(serviceTier ? { serviceTier } : {}) }, { markPossiblySent: () => undefined }));
       const result = { accepted: true as const, executionId };
       this.journal.acceptCommand(input.commandId, result, this.now());
       this.invalidateConversation(conversation.conversationId, executionId, turnId);
       return result;
     } catch (error) {
+      if (startTurnInvoked) this.checkoutOwner.dispatchUnknown(executionId, input.commandId, turnId, this.now());
       const message = safeMessage(error);
-      this.journal.rejectCommand(input.commandId, message, this.now());
+      if (startTurnInvoked) this.journal.rejectCommand(input.commandId, message, this.now());
+      else this.checkoutOwner.beforeDispatchFailure(
+        executionId, input.commandId, turnId, message, this.now());
       this.journal.failExecution(executionId, message, this.now());
-      this.appendFederationEvent(parent, input.rootTurnId, {
-        type: 'child.summary', childExecutionId: executionId, summary: message,
-      }, `spawn-failed-summary:${executionId}`);
-      this.appendFederationEvent(parent, input.rootTurnId, {
-        type: 'child.completed', childExecutionId: executionId, outcome: 'failed',
-      }, `spawn-failed:${executionId}`);
+      this.appendFederationEvent(parent, input.rootTurnId,
+        { type: 'child.summary', childExecutionId: executionId, summary: message },
+        `spawn-failed-summary:${executionId}`);
+      this.appendFederationEvent(parent, input.rootTurnId,
+        { type: 'child.completed', childExecutionId: executionId, outcome: 'failed' },
+        `spawn-failed:${executionId}`);
       throw error;
     }
   }
 
   async sendFederatedMessage(input: FederatedFollowUpInput) {
     this.assertOpen();
-    const claim = this.journal.claimCommand(input.commandId, 'federation.send', input, this.now());
-    const replay = this.replay<{ accepted: true; executionId: string; turnId: string }>(claim.receipt);
-    if (replay) return replay;
-    const execution = this.requireFederatedExecution(input.executionId);
-    const conversation = this.requireConversation(execution.conversationId);
-    if (this.journal.nativeSessionState(execution.executionId) === 'closed') {
-      const error = new Error('Federated child is closed and cannot receive follow-ups.');
-      this.journal.rejectCommand(input.commandId, error.message, this.now());
+    this.assertFederationReady();
+    return this.journal.runAsyncCommand(input.commandId, 'federation.send', input, () =>
+      this.sendFederatedMessageOwned(input));
+  }
+
+  private async sendFederatedMessageOwned(input: FederatedFollowUpInput) {
+    this.assertOpen();
+    const existing = this.checkoutOwner.settledOrUnresolved(input.commandId, 'federation.send', input);
+    if (existing) {
+      const replay = this.replay<{ accepted: true; executionId: string; turnId: string }>(existing);
+      if (replay) return replay;
+      throw new FederationCommandInProgressError(input.commandId);
+    }
+    let execution = this.requireFederatedExecution(input.executionId);
+    let conversation = this.requireConversation(execution.conversationId);
+    let checkout: { checkoutKey: string; launchCwd: string };
+    try {
+      checkout = await this.checkoutOwner.resolveNew(
+        input.commandId, 'federation.send', input, conversation.cwd, this.now());
+    } catch (error) {
+      if (error instanceof FederationCommandSettledError) {
+        const replay = this.replay<{ accepted: true; executionId: string; turnId: string }>(error.receipt);
+        if (replay) return replay;
+      }
       throw error;
     }
-    if (this.executionResult(execution.executionId).status === 'running') {
-      const error = new Error('Federated child is already running.');
-      this.journal.rejectCommand(input.commandId, error.message, this.now());
-      throw error;
-    }
-    this.assertFederationCheckoutAvailable(execution, conversation.cwd);
     const turnId = stableUuid(`federated-follow-up-turn\0${input.commandId}`);
     const content: readonly UserContentPart[] = [{ type: 'text', text: input.message }];
-    this.journal.transaction(() => {
-      this.journal.createTurn({
-        turnId,
-        conversationId: conversation.conversationId,
-        executionId: execution.executionId,
-        clientMessageId: stableUuid(`federated-follow-up-message\0${input.commandId}`),
-        commandId: input.commandId,
-        content,
-        model: execution.model ?? conversation.model,
-        ...(execution.effort ? { effort: execution.effort } : {}),
-        state: 'running',
-        now: this.now(),
-      });
-      this.journal.markCommandDispatching(input.commandId, this.now());
+    const admitted = this.checkoutOwner.claimAndReserve({
+      commandId: input.commandId, kind: 'federation.send', request: input,
+      executionId: input.executionId, expectedTurnId: turnId, checkout,
+      access: execution.access ?? 'read-only',
+      scheduling: execution.federationScheduling ?? 'background', now: this.now(),
+      validateAndCreate: () => {
+        execution = this.requireFederatedExecution(input.executionId);
+        conversation = this.requireConversation(execution.conversationId);
+        if (!execution.checkoutKey || execution.checkoutKey !== checkout.checkoutKey) {
+          throw new Error('Federated checkout is unavailable or changed.');
+        }
+        if (!execution.parentExecutionId || !execution.rootTurnId ||
+            this.journal.execution(execution.parentExecutionId)?.conversationId !== conversation.conversationId ||
+            this.journal.turn(execution.rootTurnId)?.conversationId !== conversation.conversationId) {
+          throw new Error('Federated execution ownership is invalid.');
+        }
+        if (this.journal.nativeSessionState(execution.executionId) === 'closed') {
+          throw new Error('Federated child is closed and cannot receive follow-ups.');
+        }
+        if (this.executionResult(execution.executionId).status === 'running') {
+          throw new Error('Federated child is already running.');
+        }
+        const activeForRoot = this.journal.executionsForConversation(conversation.conversationId)
+          .filter((candidate) => candidate.ownership === 'federated' &&
+            candidate.rootTurnId === execution.rootTurnId && candidate.executionId !== execution.executionId)
+          .filter((candidate) => {
+            const reservation = this.journal.database.prepare(`SELECT 1 FROM federation_checkout_reservations
+              WHERE execution_id=? AND state IN ('held','unknown')`).get(candidate.executionId);
+            return candidate.state === 'running' || candidate.state === 'recovering' || Boolean(reservation);
+          });
+        if (activeForRoot.length >= 4) {
+          throw new Error('Active federated child limit exceeded for this root turn.');
+        }
+        this.journal.createTurn({ turnId, conversationId: conversation.conversationId,
+          executionId: execution.executionId,
+          clientMessageId: stableUuid(`federated-follow-up-message\0${input.commandId}`),
+          commandId: input.commandId, content, model: execution.model ?? conversation.model,
+          ...(execution.effort ? { effort: execution.effort } : {}),
+          ...(execution.serviceTier ? { serviceTier: execution.serviceTier } : {}),
+          state: 'running', now: this.now() });
+        this.journal.markCommandDispatching(input.commandId, this.now());
+      },
     });
+    if ('receipt' in admitted) {
+      const replay = this.replay<{ accepted: true; executionId: string; turnId: string }>(admitted.receipt);
+      if (replay) return replay;
+      throw new FederationCommandInProgressError(input.commandId);
+    }
+    let startTurnInvoked = false;
     try {
-      const session = await this.ensureExecutionSession(execution);
-      await session.startTurn({
-        commandId: input.commandId,
-        conversationId: conversation.conversationId,
-        executionId: execution.executionId,
-        turnId,
-        content,
+      const session = await this.ensureExecutionSession(execution, checkout.launchCwd);
+      startTurnInvoked = true;
+      requireLegacyAcceptance(await session.startTurn({ commandId: input.commandId, conversationId: conversation.conversationId,
+        executionId: execution.executionId, turnId, content,
         ...(execution.model ? { model: execution.model } : {}),
         ...(execution.effort ? { effort: execution.effort } : {}),
-      });
-      this.appendFederationEvent(
-        this.journal.execution(execution.parentExecutionId!)!,
-        execution.rootTurnId!,
+        ...(execution.serviceTier ? { serviceTier: execution.serviceTier } : {}) },
+      { markPossiblySent: () => undefined }));
+      this.appendFederationEvent(this.journal.execution(execution.parentExecutionId!)!, execution.rootTurnId!,
         { type: 'child.status', childExecutionId: execution.executionId, state: 'running' },
-        `follow-up:${turnId}`,
-      );
+        `follow-up:${turnId}`);
       const result = { accepted: true as const, executionId: execution.executionId, turnId };
       this.journal.acceptCommand(input.commandId, result, this.now());
       this.invalidateConversation(conversation.conversationId, execution.executionId, turnId);
       return result;
     } catch (error) {
-      this.journal.rejectCommand(input.commandId, safeMessage(error), this.now());
+      if (startTurnInvoked) this.checkoutOwner.dispatchUnknown(
+        execution.executionId, input.commandId, turnId, this.now());
+      else this.checkoutOwner.beforeDispatchFailure(
+        execution.executionId, input.commandId, turnId, safeMessage(error), this.now());
+      if (startTurnInvoked) this.journal.rejectCommand(input.commandId, safeMessage(error), this.now());
       this.journal.failTurnDispatch(turnId, safeMessage(error), this.now());
       this.finalizeFederatedExecution(execution.executionId);
       throw error;
@@ -1975,6 +2226,14 @@ export class NativeAgentCoordinator {
   }
 
   async interruptFederatedExecution(commandId: string, executionId: string) {
+    this.assertOpen();
+    this.assertFederationReady();
+    const input = { executionId };
+    return this.journal.runAsyncCommand(commandId, 'federation.interrupt', input, () =>
+      this.interruptFederatedExecutionOwned(commandId, executionId));
+  }
+
+  private async interruptFederatedExecutionOwned(commandId: string, executionId: string) {
     const claim = this.journal.claimCommand(commandId, 'federation.interrupt', { executionId }, this.now());
     const replay = this.replay<{ accepted: true }>(claim.receipt);
     if (replay) return replay;
@@ -2001,6 +2260,14 @@ export class NativeAgentCoordinator {
   }
 
   async closeFederatedExecution(commandId: string, executionId: string) {
+    this.assertOpen();
+    this.assertFederationReady();
+    const input = { executionId };
+    return this.journal.runAsyncCommand(commandId, 'federation.close', input, () =>
+      this.closeFederatedExecutionOwned(commandId, executionId));
+  }
+
+  private async closeFederatedExecutionOwned(commandId: string, executionId: string) {
     const claim = this.journal.claimCommand(commandId, 'federation.close', { executionId }, this.now());
     const replay = this.replay<{ closed: true }>(claim.receipt);
     if (replay) return replay;
@@ -2043,6 +2310,7 @@ export class NativeAgentCoordinator {
     const prepared = await this.prepareProviderEvents(conversationId, snapshot.events);
     if (snapshot.authority === 'session-local') this.journal.appendProviderEvents(prepared);
     else this.journal.replaceSnapshot(prepared, snapshot.coverage);
+    this.observePersistedTerminals(prepared, snapshot.authority);
     // Snapshot lifecycle envelopes are replay-stable and can already exist in
     // the event log. Reassert the authoritative running state even when event
     // deduplication correctly suppresses their reducer side effects.
@@ -2369,6 +2637,17 @@ export class NativeAgentCoordinator {
         cwd: summary.cwd?.trim() || process.cwd(),
         model: model.id,
         ...(model.supportedEffort[0] ? { effort: model.supportedEffort[0] } : {}),
+        ...(this.projector.resolveServiceTier(
+          registration.providerInstanceId,
+          model.id,
+          null,
+        ) ? {
+          serviceTier: this.projector.resolveServiceTier(
+            registration.providerInstanceId,
+            model.id,
+            null,
+          )!,
+        } : {}),
         access: 'workspace-write',
         ...(historyRevision ? { historyRevision } : {}),
         createdAt,
@@ -2439,6 +2718,7 @@ export class NativeAgentCoordinator {
     });
     throwIfAborted(signal);
     this.journal.replaceSnapshot(snapshot.events, snapshot.coverage);
+    this.observePersistedTerminals(snapshot.events, snapshot.authority);
     this.invalidateConversation(execution.conversationId, executionId);
   }
 
@@ -2560,6 +2840,7 @@ export class NativeAgentCoordinator {
           ? this.journal.appendProviderEvents(preparedSnapshotEvents).length
           : this.journal.replaceSnapshot(preparedSnapshotEvents, snapshot.coverage),
       );
+      this.observePersistedTerminals(preparedSnapshotEvents, snapshot.authority);
       await this.measure(
         'history.artifacts',
         {
@@ -2611,9 +2892,100 @@ export class NativeAgentCoordinator {
     await Promise.allSettled(closing.map((session) => session.close()));
   }
 
+  private async recoverAcceptedDeliveryStages() {
+    let cursor = '';
+    while (true) {
+      const rows = this.journal.database.prepare(`SELECT attempt_id,execution_id FROM delivery_attempts a
+        WHERE state='accepted' AND attempt_id>? AND EXISTS(
+          SELECT 1 FROM delivery_attempt_staging s WHERE s.attempt_id=a.attempt_id)
+        ORDER BY attempt_id LIMIT 256`).all(cursor) as Array<{ attempt_id: string; execution_id: string }>;
+      if (rows.length === 0) break;
+      for (const { attempt_id: attemptId, execution_id: executionId } of rows) {
+      const attempt = this.deliveryOwner.acceptedWithStage(executionId);
+      if (!attempt || attempt.attemptId !== attemptId) continue;
+      const source = this.deliveryOwner.staged(attempt.attemptId);
+      const prepared = await this.prepareStagedProviderEvents(attempt.conversationId, source);
+      let inserted: readonly ProviderEventEnvelope[] = [];
+      this.deliveryOwner.drainAccepted(
+        attempt.attemptId,
+        prepared.staged,
+        prepared.sourceObservationIds,
+        (events) => { inserted = this.journal.appendProviderEvents(events); },
+      );
+      await this.applyProviderEventEffects(attempt.conversationId, executionId, inserted);
+      if (!this.journal.hasUnresolvedRootDelivery(attempt.conversationId)) {
+        queueMicrotask(() => void this.dispatchNext(attempt.conversationId));
+      }
+      }
+      cursor = rows.at(-1)!.attempt_id;
+    }
+  }
+
+  private async reconcileRootDeliveryAttempts() {
+    let cursorCreatedAt = -1;
+    let cursorAttemptId = '';
+    while (true) {
+      const rows = this.journal.database.prepare(`SELECT attempt_id,created_at FROM delivery_attempts
+        WHERE kind='root-turn' AND state='unknown'
+          AND (created_at>? OR (created_at=? AND attempt_id>?))
+        ORDER BY created_at,attempt_id LIMIT 256`).all(
+          cursorCreatedAt, cursorCreatedAt, cursorAttemptId,
+        ) as Array<{ attempt_id: string; created_at: number }>;
+      if (rows.length === 0) break;
+      for (const { attempt_id: attemptId } of rows) {
+      const attempt = this.deliveryOwner.get(attemptId);
+      if (!attempt) continue;
+      const registration = this.providers.get(attempt.providerInstanceId);
+      if (!attempt.acceptanceEvidence && !registration?.adapter.readTurnPresence) continue;
+      const conversation = this.journal.conversation(attempt.conversationId);
+      if (!conversation) continue;
+      let inserted: readonly ProviderEventEnvelope[] = [];
+      const result = await this.deliveryOwner.reconcile(
+        attemptId,
+        attempt.acceptanceEvidence
+          ? async () => ({ presence: 'unknown' as const, reason: 'Durable positive evidence already exists.' })
+          : () => registration!.adapter.readTurnPresence!({
+              providerInstanceId: attempt.providerInstanceId,
+              cwd: conversation.cwd,
+              nativeSessionId: attempt.nativeSessionId,
+              nativeClientMessageId: attempt.nativeClientMessageId!,
+            }),
+        (accepted, staged) => {
+          const admitted = this.journal.admitQueuedTurn(
+            accepted.intendedTurnId!,
+            this.now(),
+            accepted.nativeTurnId,
+          );
+          if (!admitted && !this.journal.turn(accepted.intendedTurnId!)) {
+            throw new Error('Queued message disappeared before recovered acceptance was admitted.');
+          }
+          inserted = this.journal.appendProviderEvents(staged.map(({ envelope }) => envelope));
+          return admitted;
+        },
+        (staged) => this.prepareStagedProviderEvents(attempt.conversationId, staged),
+      );
+      if (result.outcome === 'accepted') {
+        await this.applyProviderEventEffects(attempt.conversationId, attempt.executionId, inserted);
+      }
+      }
+      const last = rows.at(-1)!;
+      cursorCreatedAt = last.created_at;
+      cursorAttemptId = last.attempt_id;
+    }
+  }
+
   private async steer(input: NativeMessageSendCommand, conversation: JournalConversation) {
     const activeTurnId = conversation.activeTurnId!;
-    this.journal.markCommandDispatching(input.commandId, this.now());
+    this.journal.transaction(() => {
+      this.journal.grantImageContent({
+        scope: { conversationId: conversation.conversationId, executionId: conversation.rootExecutionId },
+        content: input.content,
+        provenance: 'viewer-message',
+        sourceTurnId: activeTurnId,
+        createdAt: this.now(),
+      });
+      this.journal.markCommandDispatching(input.commandId, this.now());
+    });
     try {
       const session = await this.ensureSession(conversation);
       await session.steer!({
@@ -2633,26 +3005,6 @@ export class NativeAgentCoordinator {
       this.journal.rejectCommand(input.commandId, safeMessage(error), this.now());
       throw error;
     }
-  }
-
-  private async dispatchTurn(
-    conversation: JournalConversation,
-    turnId: string,
-    commandId: string,
-    content: readonly UserContentPart[],
-    model = conversation.model,
-    effort = conversation.effort,
-  ) {
-    const session = await this.ensureSession(conversation);
-    return session.startTurn({
-      commandId,
-      conversationId: conversation.conversationId,
-      turnId,
-      executionId: conversation.rootExecutionId,
-      content,
-      model,
-      ...(effort ? { effort } : {}),
-    });
   }
 
   private async dispatchCompaction(
@@ -2730,7 +3082,7 @@ export class NativeAgentCoordinator {
   }
 
   private async dispatchNext(conversationId: string) {
-    if (this.closed) return;
+    if (this.closed || !this.initialized) return;
     if (this.dispatchingConversations.has(conversationId)) {
       this.pendingDispatchConversations.add(conversationId);
       return;
@@ -2748,6 +3100,7 @@ export class NativeAgentCoordinator {
         }
         return;
       }
+      if (this.journal.hasUnresolvedRootDelivery(conversationId)) return;
       this.journal.releaseBlockedMessages(conversationId);
       const queued = this.journal.claimNext(conversationId, this.now());
       if (!queued) return;
@@ -2768,60 +3121,51 @@ export class NativeAgentCoordinator {
         }
         return;
       }
+      let deliveryAccepted = false;
       try {
         const refreshed = this.requireConversation(conversationId);
-        const admission: PendingTurnAdmission = {
-          conversationId,
-          executionId: refreshed.rootExecutionId,
-          queued,
-          events: [],
-        };
-        this.pendingTurnAdmissions.set(refreshed.rootExecutionId, admission);
-        let dispatchError: unknown;
-        let acceptance: { nativeTurnId?: string } | undefined;
-        try {
-          acceptance = await this.dispatchTurn(
-            refreshed,
-            queued.turnId,
-            queued.commandId,
-            queued.content,
-            queued.model,
-            queued.effort,
-          );
-        } catch (error) {
-          dispatchError = error;
-        }
-        const staged = this.pendingTurnAdmissions.get(refreshed.rootExecutionId)?.events ?? [];
-        const providerProvedAcceptance = staged.some((event) =>
-          event.scope.kind === 'turn' && event.scope.turnId === queued.turnId &&
-          (event.event.type === 'turn.started' || event.event.type === 'user.message'));
-        if (dispatchError && !providerProvedAcceptance) throw dispatchError;
-        const nativeTurnId = acceptance?.nativeTurnId ?? staged.find((event) =>
-          event.scope.kind === 'turn' && event.scope.turnId === queued.turnId &&
-          event.native.turnId)?.native.turnId;
-        const admitted = this.journal.admitQueuedTurn(queued.turnId, this.now(), nativeTurnId);
-        if (!admitted) throw new Error('Queued message disappeared before provider acceptance was admitted.');
-        this.pendingTurnAdmissions.delete(refreshed.rootExecutionId);
-        if (staged.length > 0) {
-          // Admission is the RPC's durability boundary. Replay the provider's
-          // staged observations immediately afterward, without keeping the
-          // originating send call open while those observations are reduced.
-          // This also preserves a real FIFO window for a follow-up submitted
-          // as soon as the first send is acknowledged.
-          queueMicrotask(() => void this.consumeEventBatchResilient(
+        const session = await this.ensureSession(refreshed);
+        const nativeSession = session.nativeSession;
+        const nativeClientMessageId = refreshed.provider === 'claude-code'
+          ? stableUuid(`claude-user\0${queued.commandId}`) : queued.turnId;
+        const attempt = this.journal.transaction(() => this.deliveryOwner.prepare({
+          commandId: queued.commandId, kind: 'root-turn', provider: refreshed.provider,
+          providerInstanceId: refreshed.providerInstanceId, conversationId,
+          executionId: refreshed.rootExecutionId, intendedTurnId: queued.turnId,
+          clientMessageId: queued.clientMessageId, nativeClientMessageId,
+          recoveryPayload: { turnId: queued.turnId, clientMessageId: queued.clientMessageId,
+            nativeClientMessageId, content: queued.content, model: queued.model,
+            ...(queued.effort ? { effort: queued.effort } : {}),
+            ...(queued.serviceTier ? { serviceTier: queued.serviceTier } : {}), access: queued.access },
+          nativeSessionId: nativeSession.sessionId, ownerInstanceId: this.deliveryOwnerInstanceId,
+          now: this.now(),
+        }));
+        let admittedEvents: readonly ProviderEventEnvelope[] = [];
+        const outcome = await this.deliveryOwner.dispatch(attempt.attemptId, (boundary) =>
+          session.startTurn({
+            commandId: queued.commandId,
             conversationId,
-            refreshed.rootExecutionId,
-            staged,
-          ));
-        }
+            turnId: queued.turnId,
+            executionId: refreshed.rootExecutionId,
+            content: queued.content,
+            model: queued.model,
+            ...(queued.effort ? { effort: queued.effort } : {}),
+            ...(queued.serviceTier ? { serviceTier: queued.serviceTier } : {}),
+          }, boundary), (accepted, staged) => {
+            const admitted = this.journal.admitQueuedTurn(queued.turnId, this.now(), accepted.nativeTurnId);
+            if (!admitted && !this.journal.turn(queued.turnId)) throw new Error('Queued message disappeared before provider acceptance was admitted.');
+            admittedEvents = this.journal.appendProviderEvents(staged.map(({ envelope }) => envelope));
+            return admitted;
+          }, (staged) => this.prepareStagedProviderEvents(conversationId, staged));
+        if (outcome.outcome !== 'accepted') throw new Error(`Provider delivery ${outcome.outcome}.`);
+        deliveryAccepted = true;
+        await this.applyProviderEventEffects(conversationId, refreshed.rootExecutionId, admittedEvents);
       } catch (error) {
-        const executionId = this.journal.conversation(conversationId)?.rootExecutionId;
-        if (executionId) this.pendingTurnAdmissions.delete(executionId);
         // Once native dispatch begins, a transport failure may have happened
         // after provider acceptance. Keep an explicit blocking record instead
         // of silently retrying a coding action or advancing the FIFO.
-        this.journal.markQueuedTurnDeliveryUnknown(queued.turnId);
-        if (this.journal.turn(queued.turnId)) {
+        if (!deliveryAccepted) this.journal.markQueuedTurnDeliveryUnknown(queued.turnId);
+        if (!deliveryAccepted && this.journal.turn(queued.turnId)) {
           this.journal.failTurnDispatch(queued.turnId, safeMessage(error), this.now());
         }
       } finally {
@@ -2836,6 +3180,10 @@ export class NativeAgentCoordinator {
   }
 
   private async recoverConversation(conversation: JournalConversation) {
+    // Delivery recovery owns this lane until an ownership-free positive read
+    // proves native acceptance. Opening or resuming a writer here would cross
+    // the same root boundary a second time merely to inspect it.
+    if (this.journal.hasUnresolvedRootDelivery(conversation.conversationId)) return;
     const executionId = conversation.rootExecutionId;
     if (!this.journal.markConversationRecovering(
       conversation.conversationId,
@@ -2902,6 +3250,7 @@ export class NativeAgentCoordinator {
       const prepared = await this.prepareProviderEvents(execution.conversationId, snapshot.events);
       if (snapshot.authority === 'session-local') this.journal.appendProviderEvents(prepared);
       else this.journal.replaceSnapshot(prepared, snapshot.coverage);
+      this.observePersistedTerminals(prepared, snapshot.authority);
       if (snapshot.state === 'running') {
         this.journal.confirmExecutionRunning(execution.executionId, this.now());
       }
@@ -2949,7 +3298,7 @@ export class NativeAgentCoordinator {
     );
   }
 
-  private async ensureExecutionSession(execution: JournalExecution) {
+  private async ensureExecutionSession(execution: JournalExecution, launchCwd?: string) {
     const existing = this.sessions.get(execution.executionId);
     if (existing) {
       this.touchSession(execution.executionId);
@@ -2972,7 +3321,9 @@ export class NativeAgentCoordinator {
         ...(mode === 'resume' ? { nativeSession } : {}),
         model: execution.model ?? conversation.model,
         effort: execution.effort,
+        serviceTier: execution.serviceTier ?? conversation.serviceTier ?? undefined,
         access: execution.access ?? conversation.access,
+        ...(launchCwd ? { launchCwd } : {}),
       }));
   }
 
@@ -3008,6 +3359,7 @@ export class NativeAgentCoordinator {
       ...(nativeSession ? { nativeSession } : {}),
       model: conversation.model,
       effort: conversation.effort,
+      serviceTier: conversation.serviceTier ?? undefined,
       access: conversation.access,
     });
   }
@@ -3020,8 +3372,13 @@ export class NativeAgentCoordinator {
     nativeSession?: NativeSessionRef;
     model: string;
     effort?: string;
+    serviceTier?: string;
     access: ProviderAccess;
+    launchCwd?: string;
   }) {
+    if (!this.checkoutReconciled) {
+      throw new Error('Federation credentials are unavailable until checkout reconciliation completes.');
+    }
     const binding = await this.federationForSession?.({
       conversationId: input.conversation.conversationId,
       executionId: input.executionId,
@@ -3053,6 +3410,9 @@ export class NativeAgentCoordinator {
           (turn.state === 'running' || turn.state === 'recovering'))
         .map((turn) => ({ turnId: turn.turnId, nativeTurnId: turn.nativeTurnId! }))
         .at(-1);
+      const nativeChildBindings = input.nativeSession
+        ? this.journal.nativeChildBindings(input.executionId, input.nativeSession.sessionId)
+        : [];
       const session = await this.measure(
         'session.open',
         {
@@ -3067,15 +3427,19 @@ export class NativeAgentCoordinator {
           executionId: input.executionId,
           mode: input.mode,
           ...(input.nativeSession ? { nativeSession: input.nativeSession } : {}),
-          cwd: input.conversation.cwd,
+          cwd: input.launchCwd ?? input.conversation.cwd,
           model: input.model,
           ...(input.effort ? { effort: input.effort } : {}),
+          ...(input.serviceTier ? { serviceTier: input.serviceTier } : {}),
           access: input.access,
           developerInstructions: developerInstructionsForExecution(
             this.journal.execution(input.executionId),
           ),
           ...(input.mode !== 'create' && nativeTurnBindings.length > 0
             ? { nativeTurnBindings }
+            : {}),
+          ...(input.mode !== 'create' && nativeChildBindings.length > 0
+            ? { nativeChildBindings }
             : {}),
           ...(input.mode !== 'create' && inheritedNativeTurnIds.length > 0
             ? { inheritedNativeTurnIds }
@@ -3186,6 +3550,11 @@ export class NativeAgentCoordinator {
     if (existing) {
       this.touchSession(executionId);
       return existing;
+    }
+    const conversation = this.journal.conversation(conversationId);
+    if (conversation?.rootExecutionId === executionId &&
+        this.journal.hasUnresolvedRootDelivery(conversationId)) {
+      throw new Error('Native writer opening is fenced by unresolved root delivery.');
     }
     const pending = this.openingSessions.get(executionId);
     if (pending) {
@@ -3364,17 +3733,81 @@ export class NativeAgentCoordinator {
     events: readonly ProviderEventEnvelope[],
   ): Promise<void> {
     this.touchSession(executionId);
-    const pendingAdmission = this.pendingTurnAdmissions.get(executionId);
-    if (pendingAdmission) {
-      const staged = events.filter((event) =>
-        event.scope.kind === 'turn' && event.scope.executionId === executionId &&
-        event.scope.turnId === pendingAdmission.queued.turnId);
-      if (staged.length > 0) {
-        pendingAdmission.events.push(...staged);
-        const immediate = events.filter((event) => !staged.includes(event));
-        if (immediate.length === 0) return;
-        return this.consumeEventBatch(conversationId, executionId, immediate);
+    const acceptedSuffix = this.deliveryOwner.acceptedWithStage(executionId);
+    if (acceptedSuffix) {
+      const declaredChildren = new Set(events.flatMap((event) => {
+        if (event.scope.kind !== 'turn' || event.scope.executionId !== acceptedSuffix.executionId ||
+            event.scope.turnId !== acceptedSuffix.intendedTurnId ||
+            (event.event.type !== 'turn.block.started' && event.event.type !== 'turn.block.revised' &&
+              event.event.type !== 'turn.block.completed')) return [];
+        const payload = event.event.block.payload;
+        return payload.kind === 'native-child' ? [payload.child.executionId] : [];
+      }));
+      const dependent = events.filter((event) => event.scope.kind !== 'account' &&
+        event.scope.conversationId === acceptedSuffix.conversationId &&
+        ((event.scope.executionId === acceptedSuffix.executionId &&
+          (event.scope.kind !== 'turn' || event.scope.turnId === acceptedSuffix.intendedTurnId)) ||
+          declaredChildren.has(event.scope.executionId) ||
+          this.deliveryOwner.ownsObservation(acceptedSuffix.attemptId, event)));
+      for (const event of dependent) this.deliveryOwner.observe(acceptedSuffix.attemptId, event);
+      events = events.filter((event) => !dependent.includes(event));
+      const source = this.deliveryOwner.staged(acceptedSuffix.attemptId);
+      const prepared = await this.prepareStagedProviderEvents(conversationId, source);
+      let inserted: readonly ProviderEventEnvelope[] = [];
+      this.deliveryOwner.drainAccepted(
+        acceptedSuffix.attemptId,
+        prepared.staged,
+        prepared.sourceObservationIds,
+        (suffix) => { inserted = this.journal.appendProviderEvents(suffix); },
+      );
+      await this.applyProviderEventEffects(conversationId, executionId, inserted);
+      if (!this.journal.hasUnresolvedRootDelivery(conversationId)) {
+        queueMicrotask(() => void this.dispatchNext(conversationId));
       }
+      if (events.length === 0) return;
+    }
+    const unresolved = this.deliveryOwner.unresolvedLane(conversationId);
+    if (unresolved?.kind === 'root-turn' && unresolved.executionId === executionId) {
+      const declaredChildren = new Set(events.flatMap((event) => {
+        if (event.scope.kind !== 'turn' || event.scope.turnId !== unresolved.intendedTurnId ||
+            (event.event.type !== 'turn.block.started' && event.event.type !== 'turn.block.revised' &&
+              event.event.type !== 'turn.block.completed')) return [];
+        const payload = event.event.block.payload;
+        return payload.kind === 'native-child' ? [payload.child.executionId] : [];
+      }));
+      const dependent = events.filter((event) => event.scope.kind !== 'account' &&
+        ((event.scope.executionId === unresolved.executionId &&
+          (event.scope.kind !== 'turn' || event.scope.turnId === unresolved.intendedTurnId)) ||
+          declaredChildren.has(event.scope.executionId) ||
+          this.deliveryOwner.ownsObservation(unresolved.attemptId, event)));
+      for (const event of dependent) this.deliveryOwner.observe(unresolved.attemptId, event);
+      const session = this.sessions.get(executionId);
+      if (session?.readTurnPresence && unresolved.nativeClientMessageId) {
+        let admittedEvents: readonly ProviderEventEnvelope[] = [];
+        const result = await this.deliveryOwner.reconcile(
+          unresolved.attemptId,
+          () => session.readTurnPresence!(unresolved.nativeClientMessageId!),
+          (accepted, staged) => {
+            const admitted = this.journal.admitQueuedTurn(
+              accepted.intendedTurnId!,
+              this.now(),
+              accepted.nativeTurnId,
+            );
+            if (!admitted && !this.journal.turn(accepted.intendedTurnId!)) {
+              throw new Error('Queued message disappeared before late acceptance was admitted.');
+            }
+            admittedEvents = this.journal.appendProviderEvents(staged.map(({ envelope }) => envelope));
+            return admitted;
+          },
+          (staged) => this.prepareStagedProviderEvents(conversationId, staged),
+        );
+        if (result.outcome === 'accepted') {
+          await this.applyProviderEventEffects(conversationId, executionId, admittedEvents);
+          this.invalidateConversation(conversationId, executionId);
+        }
+      }
+      events = events.filter((event) => !dependent.includes(event));
+      if (events.length === 0) return;
     }
     const declaredNativeChildren = new Set(events.flatMap((event) => {
       if (event.scope.kind !== 'turn' || event.scope.executionId !== executionId ||
@@ -3429,10 +3862,19 @@ export class NativeAgentCoordinator {
     });
     this.federationBindings.get(executionId)?.touch?.();
     const inserted = this.journal.appendProviderEvents(safeEvents);
+    await this.applyProviderEventEffects(conversationId, executionId, inserted);
+  }
+
+  private async applyProviderEventEffects(
+    conversationId: string,
+    executionId: string,
+    inserted: readonly ProviderEventEnvelope[],
+  ) {
     let accountResourcesChanged = false;
     let rootTurnCompleted = false;
     const changedTurnsByExecution = new Map<string, Set<string>>();
     for (const event of inserted) {
+      this.checkoutOwner.terminal(event, 'live-provider', this.now());
       if (event.event.type === 'turn.completed' ||
           (event.event.type === 'session.health' && event.event.state === 'ready' &&
             !this.automaticRecoveryProbation.has(executionId))) {
@@ -3449,7 +3891,9 @@ export class NativeAgentCoordinator {
             turnId: event.scope.turnId,
             outcome: event.event.outcome,
           });
-          queueMicrotask(() => void this.dispatchNext(conversationId));
+          if (!this.deliveryOwner.acceptedWithStage(executionId)) {
+            queueMicrotask(() => void this.dispatchNext(conversationId));
+          }
         } else if (this.journal.execution(executionId)?.ownership === 'federated') {
           this.finalizeFederatedExecution(executionId);
         }
@@ -3463,7 +3907,9 @@ export class NativeAgentCoordinator {
             this.now(),
           );
         }
-        queueMicrotask(() => void this.dispatchNext(conversationId));
+        if (!this.deliveryOwner.acceptedWithStage(executionId)) {
+          queueMicrotask(() => void this.dispatchNext(conversationId));
+        }
       } else if (event.event.type === 'context.compaction.failed') {
         queueMicrotask(() => void this.dispatchNext(conversationId));
       }
@@ -3521,9 +3967,17 @@ export class NativeAgentCoordinator {
       const { diff, ...displayChange } = normalized.event.change;
       let diffArtifactId = displayChange.diffArtifactId;
       if (this.sealFileDiff) {
-        diffArtifactId = await this.sealFileDiff({ diff })
-          .then(({ artifactId }) => artifactId)
-          .catch(() => diffArtifactId);
+        const eventScope = normalized.scope;
+        if (eventScope.kind === 'account') {
+          prepared.push(normalized);
+          continue;
+        }
+        diffArtifactId = (await this.sealFileDiff({
+          conversationId: eventScope.conversationId,
+          executionId: eventScope.executionId,
+          ...(eventScope.kind === 'turn' ? { turnId: eventScope.turnId } : {}),
+          diff,
+        })).artifactId;
       }
       prepared.push(parseProviderEventEnvelope({
         ...normalized,
@@ -3537,6 +3991,33 @@ export class NativeAgentCoordinator {
       }));
     }
     return prepared;
+  }
+
+  private async prepareStagedProviderEvents(
+    conversationId: string,
+    source: readonly StagedProviderEnvelope[],
+  ) {
+    const staged: StagedProviderEnvelope[] = [];
+    const sourceObservationIds: string[] = [];
+    for (const item of source) {
+      let prepared: readonly ProviderEventEnvelope[];
+      try {
+        prepared = await this.prepareProviderEvents(conversationId, [item.envelope]);
+      } catch {
+        // Stop at the first source envelope that cannot yet be transformed.
+        // The owner admits only the completed prefix and retains this envelope
+        // and every later envelope durably for an ordered retry.
+        break;
+      }
+      sourceObservationIds.push(item.observationId);
+      for (const envelope of prepared) {
+        if (envelope.eventId !== item.observationId) {
+          throw new Error('Prepared provider event changed its durable observation identity.');
+        }
+        staged.push({ ...item, envelope });
+      }
+    }
+    return { staged, sourceObservationIds };
   }
 
   private async sealTerminalOutputs(conversationId: string, executionId?: string) {
@@ -3741,6 +4222,7 @@ export class NativeAgentCoordinator {
               preview: finalPreview.text,
               error: 'The complete child answer could not be sealed into artifact storage.',
             };
+    const changedFiles = changedFilesForTurn(events);
     return {
       executionId,
       status,
@@ -3750,7 +4232,7 @@ export class NativeAgentCoordinator {
       ...(execution.summary ? { summary: execution.summary } : {}),
       ...(latestTurn ? { turnId: latestTurn.turnId } : {}),
       ...(finalAnswer ? { finalAnswer } : {}),
-      changedFiles: changedFilesForTurn(events),
+      ...changedFiles,
     };
   }
 
@@ -3762,6 +4244,20 @@ export class NativeAgentCoordinator {
     return execution;
   }
 
+  private assertFederationReady() {
+    if (!this.initialized) throw new Error('Federation is temporarily unavailable during initialization.');
+  }
+
+  private observePersistedTerminals(
+    events: readonly ProviderEventEnvelope[],
+    authority: 'authoritative' | 'session-local' | undefined,
+  ) {
+    if (authority !== 'authoritative') return;
+    for (const event of events) {
+      this.checkoutOwner.terminal(event, 'authoritative-snapshot', this.now());
+    }
+  }
+
   private activeExecutionTurn(executionId: string) {
     const execution = this.journal.execution(executionId);
     if (!execution) return undefined;
@@ -3769,19 +4265,6 @@ export class NativeAgentCoordinator {
       .filter((turn) =>
         (turn.state === 'running' || turn.state === 'recovering'))
       .at(-1);
-  }
-
-  private assertFederationCheckoutAvailable(execution: JournalExecution, cwd: string) {
-    const active = this.journal.activeFederatedExecutionsForCwd(cwd)
-      .filter(({ executionId }) => executionId !== execution.executionId);
-    if (execution.access === 'workspace-write' && active.some(({ access }) => access === 'workspace-write')) {
-      throw new Error('A federated workspace writer is already active for this checkout.');
-    }
-    if (execution.access === 'read-only' && execution.federationScheduling === 'background' &&
-        active.filter(({ access, federationScheduling }) =>
-          access === 'read-only' && federationScheduling === 'background').length >= 4) {
-      throw new Error('Background federated reader limit exceeded for this checkout.');
-    }
   }
 
   private requireReadyProvider(providerInstanceId: string) {
@@ -3809,6 +4292,13 @@ export class NativeAgentCoordinator {
     const conversation = this.journal.conversation(conversationId);
     if (!conversation) throw new Error(`Conversation ${conversationId} does not exist.`);
     return conversation;
+  }
+
+  private assertRootDeliveryAvailable(conversationId: string) {
+    if (this.journal.hasUnresolvedRootDelivery(conversationId)) {
+      throw coordinatorError('operation_in_progress',
+        'The previous native message delivery is unresolved; provider writer controls remain fenced.');
+    }
   }
 
   private assertContentCapabilities(
@@ -4062,7 +4552,10 @@ export function federatedResultUri(executionId: string, turnId: string) {
   return `remux-federation://result/${encodeURIComponent(executionId)}/${encodeURIComponent(turnId)}`;
 }
 
-function changedFilesForTurn(events: readonly ProviderEventEnvelope[]) {
+function changedFilesForTurn(events: readonly ProviderEventEnvelope[]): {
+  changedFiles: readonly FileChangeDisplay[];
+  changedFilesTruncated: number;
+} {
   const changes = new Map<string, FileChangeDisplay>();
   for (const envelope of events) {
     if (envelope.event.type !== 'turn.file-changed') continue;
@@ -4077,7 +4570,13 @@ function changedFilesForTurn(events: readonly ProviderEventEnvelope[]) {
     changes.delete(change.path);
     changes.set(change.path, change);
   }
-  return [...changes.values()];
+  const ordered = [...changes.values()];
+  return {
+    // Map reinsertion keeps the existing latest-update order. Retain its first
+    // 500 entries so ordinary results preserve their historical ordering.
+    changedFiles: ordered.slice(0, 500),
+    changedFilesTruncated: Math.max(0, ordered.length - 500),
+  };
 }
 
 function normalizeProviderFileChange(

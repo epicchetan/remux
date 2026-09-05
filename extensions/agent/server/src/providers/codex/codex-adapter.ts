@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { open } from 'node:fs/promises';
 import { basename } from 'node:path';
 
@@ -48,6 +48,8 @@ import type {
   ProviderRuntimeStatus,
   ProviderSession,
 } from '../../provider-adapter.ts';
+import type { DispatchBoundary, ProviderDispatchResult } from '../../native-runtime/delivery-contract.ts';
+import { CodexRequestError } from './codex-app-server-connection.ts';
 import { AsyncEventStream, ProviderEventStream } from '../../provider-adapter.ts';
 import {
   NativeSessionOwnershipRegistry,
@@ -67,6 +69,7 @@ import {
   codexStableNativeTurnId,
   normalizeCodexAccountUsage,
 } from './codex-event-mapper.ts';
+import { CodexChildRegistry } from './codex-child-registry.ts';
 import {
   FEDERATION_SERVER_NAME,
   FEDERATION_TOOL_TIMEOUT_MS,
@@ -100,8 +103,8 @@ export type CodexNativeAdapterOptions = {
   createConnection?: CodexAppServerConnectionFactory;
   runtimeHost?: Pick<CodexRuntimeHost, 'connectionFactory' | 'readStatus'>;
   ownership?: NativeSessionOwnershipRegistry;
-  resolveImageArtifact?: (artifactId: string, mimeType: string) => Promise<ResolvedCodexImage>;
-  importHistoricalImage?: (dataUrl: string) => Promise<{
+  resolveImageArtifact?: (scope: { conversationId: string; executionId: string }, artifactId: string, mimeType: string) => Promise<ResolvedCodexImage>;
+  importHistoricalImage?: (scope: { conversationId: string; executionId: string }, dataUrl: string) => Promise<{
     artifactId: string;
     mimeType: string;
     byteLength: number;
@@ -210,11 +213,51 @@ export class CodexNativeAdapter implements ProviderAdapter {
                 return value ? [value] : [];
               })
             : [];
+          const advertisedTiers = Array.isArray(model.serviceTiers)
+            ? model.serviceTiers.flatMap((entry) => {
+                const tier = object(entry);
+                const advertisedTierId = nonempty(tier?.id);
+                const tierId = advertisedTierId === 'fast' ? 'priority' : advertisedTierId;
+                return tierId ? [{
+                  id: tierId,
+                  name: tierId === 'priority' ? 'Fast' : nonempty(tier?.name) ?? tierId,
+                  ...(nonempty(tier?.description)
+                    ? { description: nonempty(tier?.description)! }
+                    : tierId === 'priority'
+                      ? { description: 'Faster responses with higher subscription usage' }
+                      : {}),
+                }] : [];
+              })
+            : [];
+          // App Server may populate both the current serviceTiers field and
+          // its deprecated additionalSpeedTiers predecessor. The latter uses
+          // `fast` as a UI-facing alias for the `priority` service tier, so it
+          // is a compatibility fallback rather than another selectable tier.
+          const legacyTiers = advertisedTiers.length === 0 && Array.isArray(model.additionalSpeedTiers)
+            ? model.additionalSpeedTiers.flatMap((entry) => {
+                const legacyTierId = nonempty(entry);
+                const tierId = legacyTierId === 'fast' ? 'priority' : legacyTierId;
+                return tierId ? [{
+                  id: tierId,
+                  name: tierId === 'priority' ? 'Fast' : tierId,
+                  ...(tierId === 'priority'
+                    ? { description: 'Faster responses with higher subscription usage' }
+                    : {}),
+                }] : [];
+              })
+            : [];
+          const serviceTiers = [
+            { id: 'default', name: 'Standard', description: 'Standard speed and usage' },
+            ...advertisedTiers,
+            ...legacyTiers,
+          ].filter((tier, index, tiers) => tiers.findIndex(({ id }) => id === tier.id) === index);
           models.push({
             id,
             name: nonempty(model.displayName) ?? id,
             provider: 'codex',
             supportedEffort: effort,
+            serviceTiers,
+            defaultServiceTier: 'default',
             ...(model.isDefault === true ? { isDefault: true } : {}),
           });
         }
@@ -277,6 +320,50 @@ export class CodexNativeAdapter implements ProviderAdapter {
             : { updatedAt: unixSeconds(thread.updatedAt)! }),
         }];
       });
+    } finally {
+      await connection?.close().catch(() => undefined);
+    }
+  }
+
+  async readTurnPresence(input: { providerInstanceId: string; cwd: string;
+    nativeSessionId: string; nativeClientMessageId: string }) {
+    this.assertInstance(input.providerInstanceId);
+    let connection: CodexAppServerConnection | undefined;
+    try {
+      const opened = await this.openConnection(input.cwd);
+      connection = opened.connection;
+      const response = object(await connection.request('thread/read', {
+        threadId: input.nativeSessionId,
+        includeTurns: true,
+      }));
+      const thread = object(response?.thread);
+      if (!thread || nonempty(thread.id) !== input.nativeSessionId) {
+        return { presence: 'unknown' as const, reason: 'Codex thread/read did not return the frozen thread.' };
+      }
+      let inspectedItems = 0;
+      for (const value of (Array.isArray(thread.turns) ? thread.turns : []).slice(0, 2_048)) {
+        const turn = object(value);
+        const nativeTurnId = nonempty(turn?.id);
+        for (const itemValue of Array.isArray(turn?.items) ? turn.items : []) {
+          if (++inspectedItems > 8_192) return { presence: 'unknown' as const,
+            reason: 'Codex history scan reached its bounded item limit.' };
+          const item = object(itemValue);
+          if (item?.type !== 'userMessage' || nonempty(item.clientId) !== input.nativeClientMessageId) continue;
+          if (!nativeTurnId) return { presence: 'unknown' as const,
+            reason: 'Codex history matched the client identity without a valid native turn identity.' };
+          return { presence: 'present' as const, evidence: {
+            kind: 'codex-history-client-id' as const,
+            threadId: input.nativeSessionId,
+            nativeClientMessageId: input.nativeClientMessageId,
+            nativeTurnId,
+          } };
+        }
+      }
+      return { presence: 'unknown' as const,
+        reason: 'Codex thread/read is partial and cannot prove delivery absence.' };
+    } catch (error) {
+      return { presence: 'unknown' as const,
+        reason: `Codex ownership-free history read failed: ${error instanceof Error ? error.message : String(error)}` };
     } finally {
       await connection?.close().catch(() => undefined);
     }
@@ -549,14 +636,18 @@ export class CodexProviderSession implements ProviderSession {
   private readonly importHistoricalImage?: CodexNativeAdapterOptions['importHistoricalImage'];
   private readonly now: () => number;
   private readonly lease: NativeSessionLease;
+  private readonly processGeneration = randomUUID();
   private readonly receipts = new Map<string, { hash: string; result: Promise<unknown> }>();
   private readonly eventLog = new Map<string, ProviderEventEnvelope>();
   private readonly nativeTurnByRemux = new Map<string, string>();
   private readonly completedNativeTurns = new Set<string>();
-  private readonly childThreadIds = new Set<string>();
   private readonly forkThreadIds = new Set<string>();
-  private readonly activeChildTurnByThread = new Map<string, string>();
   private readonly childMappers = new Map<string, CodexEventMapper>();
+  private readonly childRegistry = new CodexChildRegistry();
+  private readonly pendingChildNotifications = new Map<string, CodexServerNotification[]>();
+  private pendingChildReconciliation = false;
+  private pendingChildNotificationCount = 0;
+  private pendingChildNotificationBytes = 0;
   private pendingForkNotifications: CodexServerNotification[] | undefined;
   private mutationTail: Promise<unknown> = Promise.resolve();
   private activeTurn: { remuxTurnId: string; nativeTurnId?: string } | undefined;
@@ -577,14 +668,18 @@ export class CodexProviderSession implements ProviderSession {
       sessionId: options.nativeSessionId,
       resumeCursor: { threadId: options.nativeSessionId },
     };
+    this.childRegistry.restore(options.input.nativeChildBindings ?? []);
     this.mapper = new CodexEventMapper({
       providerInstanceId: options.input.providerInstanceId,
       conversationId: options.input.conversationId,
       executionId: options.input.executionId,
       nativeSessionId: options.nativeSessionId,
       inheritedNativeTurnIds: options.input.inheritedNativeTurnIds,
+      childRegistry: this.childRegistry,
       observedAt: options.now,
     });
+    this.mapper.restoreChildBlocks((options.input.nativeChildBindings ?? [])
+      .filter(({ parentExecutionId }) => parentExecutionId === options.input.executionId));
     for (const binding of options.input.nativeTurnBindings ?? []) {
       this.mapper.bindTurn(binding.turnId, binding.nativeTurnId, binding.nextBlockOrdinal);
       this.nativeTurnByRemux.set(binding.turnId, binding.nativeTurnId);
@@ -597,13 +692,15 @@ export class CodexProviderSession implements ProviderSession {
     this.emitSynthetic({ type: 'session.health', state: 'ready' }, 'session/health/ready');
   }
 
-  async startTurn(unparsed: StartProviderTurnInput): Promise<ProviderCommandAcceptance> {
-    const input = parseStartProviderTurnInput(unparsed);
+  async startTurn(unparsed: StartProviderTurnInput, boundary?: DispatchBoundary): Promise<ProviderDispatchResult> {
+    let input: StartProviderTurnInput;
+    try { input = parseStartProviderTurnInput(unparsed); }
+    catch (error) { return { accepted: false, outcome: 'rejected', crossing: { phase: 'not-sent', detail: 'validation' }, error: { code: 'validation', message: error instanceof Error ? error.message : String(error) } }; }
     this.assertTurnScope(input);
     return this.onceCommand(input.commandId, input, async () => this.mutate(async () => {
       this.assertOpen();
       if (this.activeTurn) throw new Error('Codex provider session already has an active turn.');
-      const providerInput = await mapUserContent(input.content, this.resolveImageArtifact);
+      const providerInput = await mapUserContent(input.content, this.scopedImageResolver());
       this.activeTurn = { remuxTurnId: input.turnId };
       this.mapper.expectTurn(input.turnId);
       try {
@@ -612,9 +709,10 @@ export class CodexProviderSession implements ProviderSession {
           clientUserMessageId: input.turnId,
           input: providerInput,
           approvalPolicy: 'never',
+          serviceTier: input.serviceTier ?? this.openedWith.serviceTier ?? 'default',
           ...(input.model ? { model: input.model } : {}),
           ...(input.effort ? { effort: input.effort } : {}),
-        }));
+        }, undefined, () => boundary?.markPossiblySent(this.nativeSession.sessionId, this.processGeneration)));
         const turn = object(response?.turn);
         const nativeTurnId = nonempty(turn?.id);
         if (!nativeTurnId) throw new Error('Codex turn/start response did not include turn.id.');
@@ -623,12 +721,14 @@ export class CodexProviderSession implements ProviderSession {
         if (!this.completedNativeTurns.has(nativeTurnId)) {
           this.activeTurn = { remuxTurnId: input.turnId, nativeTurnId };
         }
-        return { accepted: true, nativeTurnId } as const;
+        return { accepted: true, outcome: 'accepted', evidence: { kind: 'codex-turn-start-response', threadId: this.nativeSession.sessionId, turnId: nativeTurnId, nativeClientMessageId: input.turnId }, nativeTurnId } as const;
       } catch (error) {
         this.activeTurn = undefined;
-        throw error;
+        return error instanceof CodexRequestError && error.phase === 'not-sent'
+          ? { accepted: false, outcome: 'rejected', crossing: { phase: 'not-sent', detail: 'closed-before-write' }, error: { code: 'codex_request_failed', message: error.message } }
+          : { accepted: false, outcome: 'unknown', crossing: { phase: 'possibly-sent', detail: 'response-lost' }, error: { code: 'codex_request_failed', message: error instanceof Error ? error.message : String(error) } };
       }
-    })) as Promise<ProviderCommandAcceptance>;
+    })) as Promise<ProviderDispatchResult>;
   }
 
   async steer(unparsed: SteerProviderTurnInput): Promise<ProviderCommandAcceptance> {
@@ -639,7 +739,7 @@ export class CodexProviderSession implements ProviderSession {
         ? this.activeTurn.nativeTurnId
         : undefined;
       if (!nativeTurnId) throw new Error('Cannot steer a turn before Codex has bound its native turn ID.');
-      const providerInput = await mapUserContent(input.content, this.resolveImageArtifact);
+      const providerInput = await mapUserContent(input.content, this.scopedImageResolver());
       await this.connection.request('turn/steer', {
         threadId: this.nativeSession.sessionId,
         expectedTurnId: nativeTurnId,
@@ -657,7 +757,7 @@ export class CodexProviderSession implements ProviderSession {
         ? this.activeTurn.nativeTurnId
         : undefined;
       if (!nativeTurnId) throw new Error('Cannot interrupt a turn before Codex has bound its native turn ID.');
-      const childTurns = [...this.activeChildTurnByThread.entries()].slice(0, 32);
+      const childTurns = this.childRegistry.activeAttempts().slice(0, 32);
       await Promise.allSettled(childTurns.map(([threadId, turnId]) =>
         this.connection.request('turn/interrupt', { threadId, turnId }, 3_000)));
       await this.connection.request('turn/interrupt', {
@@ -670,16 +770,13 @@ export class CodexProviderSession implements ProviderSession {
 
   async interruptChild(unparsed: InterruptProviderChildInput): Promise<ProviderCommandAcceptance> {
     const input = parseInterruptProviderChildInput(unparsed);
-    const expectedExecutionId = codexStableChildExecutionId(
-      this.openedWith.executionId,
-      input.nativeSessionId,
-    );
-    if (input.childExecutionId !== expectedExecutionId) {
+    const binding = this.childRegistry.get(input.nativeSessionId);
+    if (input.childExecutionId !== binding?.executionId) {
       throw new Error('Codex child interruption does not match the opened parent session.');
     }
     return this.onceCommand(input.commandId, input, async () => this.mutate(async () => {
       this.assertOpen();
-      let nativeTurnId = this.activeChildTurnByThread.get(input.nativeSessionId);
+      let nativeTurnId = this.childRegistry.get(input.nativeSessionId)?.activeNativeTurnId;
       if (!nativeTurnId) {
         const response = object(await this.connection.request('thread/read', {
           threadId: input.nativeSessionId,
@@ -747,8 +844,9 @@ export class CodexProviderSession implements ProviderSession {
     if (!thread || nonempty(thread.id) !== this.nativeSession.sessionId) {
       throw new Error('Codex thread/read returned a different native thread.');
     }
-    await materializeHistoricalImages(thread, this.importHistoricalImage);
+    await materializeHistoricalImages(thread, this.scopedHistoricalImporter());
     const authoritative = this.mapper.mapThreadSnapshot(thread);
+    for (const threadId of [...this.pendingChildNotifications.keys()]) this.drainPendingChild(threadId);
     this.emitRestoredUsage();
     const events = new Map(this.eventLog);
     for (const event of authoritative) events.set(event.eventId, event);
@@ -775,11 +873,8 @@ export class CodexProviderSession implements ProviderSession {
         : { afterNativeSequence: unparsed.afterNativeSequence }),
     });
     this.assertOpenOrLost();
-    const expectedExecutionId = codexStableChildExecutionId(
-      this.openedWith.executionId,
-      unparsed.nativeSessionId,
-    );
-    if (unparsed.childExecutionId !== expectedExecutionId) {
+    const binding = this.childRegistry.get(unparsed.nativeSessionId);
+    if (unparsed.childExecutionId !== binding?.executionId) {
       throw new Error('Codex child snapshot does not match the opened parent session.');
     }
     const response = object(await this.connection.request('thread/read', {
@@ -790,8 +885,8 @@ export class CodexProviderSession implements ProviderSession {
     if (!thread || nonempty(thread.id) !== unparsed.nativeSessionId) {
       throw new Error('Codex child thread/read returned a different native thread.');
     }
-    await materializeHistoricalImages(thread, this.importHistoricalImage);
-    const mapper = this.childMapper(unparsed.nativeSessionId);
+    await materializeHistoricalImages(thread, this.scopedHistoricalImporter({ executionId: binding.executionId }));
+    const mapper = this.childMapper(unparsed.nativeSessionId, binding.executionId);
     const events = mapper.mapThreadSnapshot(thread);
     const status = nonempty(object(thread.status)?.type);
     return parseProviderSnapshot({
@@ -807,6 +902,24 @@ export class CodexProviderSession implements ProviderSession {
       coverage: CODEX_SNAPSHOT_COVERAGE,
       events,
     });
+  }
+
+  private scopedImageResolver() {
+    return this.resolveImageArtifact
+      ? (artifactId: string, mimeType: string) => this.resolveImageArtifact!({
+          conversationId: this.openedWith.conversationId,
+          executionId: this.openedWith.executionId,
+        }, artifactId, mimeType)
+      : undefined;
+  }
+
+  private scopedHistoricalImporter(override?: { executionId: string }) {
+    return this.importHistoricalImage
+      ? (dataUrl: string) => this.importHistoricalImage!({
+          conversationId: this.openedWith.conversationId,
+          executionId: override?.executionId ?? this.openedWith.executionId,
+        }, dataUrl)
+      : undefined;
   }
 
   async readHistoryRevision(): Promise<string | null> {
@@ -886,24 +999,23 @@ export class CodexProviderSession implements ProviderSession {
         this.pendingForkNotifications.push(notification);
         return;
       }
-    }
-    if (notificationThreadId && notificationThreadId !== this.nativeSession.sessionId) {
-      this.childThreadIds.add(notificationThreadId);
-      if (notification.method === 'turn/started') {
-        const nativeChildTurnId = nonempty(object(params?.turn)?.id);
-        if (nativeChildTurnId) this.activeChildTurnByThread.set(notificationThreadId, nativeChildTurnId);
-      } else if (notification.method === 'turn/completed') {
-        const nativeChildTurnId = nonempty(object(params?.turn)?.id);
-        if (this.activeChildTurnByThread.get(notificationThreadId) === nativeChildTurnId) {
-          this.activeChildTurnByThread.delete(notificationThreadId);
+      if (!this.childRegistry.get(notificationThreadId)) {
+        const pending = this.pendingChildNotifications.get(notificationThreadId) ?? [];
+        const notificationBytes = Buffer.byteLength(JSON.stringify(notification), 'utf8');
+        if (pending.length >= 64 || this.pendingChildNotificationCount >= 1024 ||
+            this.pendingChildNotificationBytes + notificationBytes > 4 * 1024 * 1024 ||
+            (!this.pendingChildNotifications.has(notificationThreadId) &&
+              this.pendingChildNotifications.size >= 256)) {
+          this.reportProjectionError(notification.method,
+            new Error(`Pending child notification overflow for ${notificationThreadId}; authoritative reconciliation required.`));
+          void this.reconcilePendingChildOwnership(notificationThreadId);
+          return;
         }
-      }
-    }
-    if (notification.method === 'item/completed' || notification.method === 'item/started') {
-      const item = object(params?.item);
-      if (item?.type === 'subAgentActivity') {
-        const childThreadId = nonempty(item.agentThreadId);
-        if (childThreadId) this.childThreadIds.add(childThreadId);
+        pending.push(notification);
+        this.pendingChildNotifications.set(notificationThreadId, pending);
+        this.pendingChildNotificationCount += 1;
+        this.pendingChildNotificationBytes += notificationBytes;
+        return;
       }
     }
     if (notification.method === 'turn/started'
@@ -916,19 +1028,42 @@ export class CodexProviderSession implements ProviderSession {
     }
     let events: ProviderEventEnvelope[] = [];
     try {
-      events = this.mapper.mapNotification(notification);
       if (notificationThreadId && notificationThreadId !== this.nativeSession.sessionId) {
-        const childMapper = this.childMapper(notificationThreadId);
+        const binding = this.childRegistry.get(notificationThreadId)!;
+        const ownerMapper = binding.parentExecutionId === this.openedWith.executionId
+          ? this.mapper
+          : this.childMapper(binding.nativeParentThreadId, binding.parentExecutionId);
+        events = ownerMapper.mapNotification(notification);
+        const childMapper = this.childMapper(notificationThreadId, binding.executionId);
         if (notification.method === 'turn/started') {
           const nativeChildTurnId = nonempty(object(params?.turn)?.id);
-          if (nativeChildTurnId) childMapper.expectTurn(codexStableNativeTurnId(nativeChildTurnId));
+          if (!nativeChildTurnId || binding.activeNativeTurnId !== nativeChildTurnId) {
+            for (const event of events) this.emit(event);
+            return;
+          }
+          childMapper.expectTurn(codexStableNativeTurnId(nativeChildTurnId));
+        } else if (notification.method === 'turn/completed') {
+          const nativeChildTurnId = nonempty(object(params?.turn)?.id);
+          if (events.length === 0 && binding.terminalNativeTurnId !== nativeChildTurnId) return;
         }
         events.push(...childMapper.mapNotification(notification));
+      } else {
+        events = this.mapper.mapNotification(notification);
       }
     } catch (error) {
       this.reportProjectionError(notification.method, error);
     }
     for (const event of events) this.emit(event);
+    const activity = object(params?.item);
+    const spawnedThreadIds = activity?.type === 'subAgentActivity' && activity.kind === 'started'
+      ? [nonempty(activity.agentThreadId)].filter(Boolean) as string[]
+      : activity?.type === 'collabAgentToolCall' &&
+        (activity.tool === 'spawnAgent' || activity.tool === 'spawn_agent')
+        ? (Array.isArray(activity.receiverThreadIds) ? activity.receiverThreadIds.filter(nonempty) as string[] : [])
+        : [];
+    for (const spawnedThreadId of spawnedThreadIds) {
+      this.drainPendingChild(spawnedThreadId);
+    }
     if (notification.method === 'turn/completed'
       && notificationThreadId === this.nativeSession.sessionId) {
       const nativeTurnId = nonempty(object(params?.turn)?.id);
@@ -939,16 +1074,68 @@ export class CodexProviderSession implements ProviderSession {
     }
   }
 
-  private childMapper(nativeSessionId: string) {
+  private drainPendingChild(nativeThreadId: string) {
+    if (!this.childRegistry.get(nativeThreadId)) return;
+    const pending = this.pendingChildNotifications.get(nativeThreadId) ?? [];
+    this.pendingChildNotifications.delete(nativeThreadId);
+    this.pendingChildNotificationCount -= pending.length;
+    this.pendingChildNotificationBytes -= pending.reduce((sum, notification) =>
+      sum + Buffer.byteLength(JSON.stringify(notification), 'utf8'), 0);
+    for (const delayed of pending) this.handleNotification(delayed);
+  }
+
+  private async reconcilePendingChildOwnership(evictedThreadId?: string) {
+    if (this.pendingChildReconciliation || this.closed) return;
+    this.pendingChildReconciliation = true;
+    try {
+      const response = object(await this.connection.request('thread/read', {
+        threadId: this.nativeSession.sessionId, includeTurns: true,
+      }));
+      const thread = object(response?.thread);
+      if (thread && nonempty(thread.id) === this.nativeSession.sessionId) {
+        for (const event of this.mapper.mapThreadSnapshot(thread)) this.emit(event);
+        for (const threadId of [...this.pendingChildNotifications.keys()]) this.drainPendingChild(threadId);
+        const binding = evictedThreadId ? this.childRegistry.get(evictedThreadId) : undefined;
+        if (binding) {
+          const childResponse = object(await this.connection.request('thread/read', {
+            threadId: binding.nativeThreadId, includeTurns: true,
+          }));
+          const childThread = object(childResponse?.thread);
+          if (childThread && nonempty(childThread.id) === binding.nativeThreadId) {
+            for (const event of this.childMapper(binding.nativeThreadId, binding.executionId)
+              .mapThreadSnapshot(childThread)) this.emit(event);
+          }
+        }
+      }
+    } catch (error) {
+      this.reportProjectionError('child/reconcile', error);
+    } finally {
+      this.pendingChildReconciliation = false;
+    }
+  }
+
+  private childMapper(nativeSessionId: string, executionId: string) {
     let mapper = this.childMappers.get(nativeSessionId);
     if (!mapper) {
       mapper = new CodexEventMapper({
         providerInstanceId: this.nativeSession.providerInstanceId,
         conversationId: this.openedWith.conversationId,
-        executionId: codexStableChildExecutionId(this.openedWith.executionId, nativeSessionId),
+        executionId,
         nativeSessionId,
+        childRegistry: this.childRegistry,
         observedAt: this.now,
       });
+      const binding = this.openedWith.nativeChildBindings
+        ?.find(({ nativeThreadId }) => nativeThreadId === nativeSessionId);
+      for (const turnBinding of binding?.nativeTurnBindings ?? []) {
+        mapper.bindTurn(
+          turnBinding.turnId,
+          turnBinding.nativeTurnId,
+          turnBinding.nextBlockOrdinal,
+        );
+      }
+      mapper.restoreChildBlocks((this.openedWith.nativeChildBindings ?? [])
+        .filter(({ parentExecutionId }) => parentExecutionId === executionId));
       this.childMappers.set(nativeSessionId, mapper);
     }
     return mapper;
@@ -1109,6 +1296,7 @@ function threadConfiguration(input: OpenProviderSessionInput) {
     cwd: input.cwd,
     model: input.model,
     approvalPolicy: 'never',
+    serviceTier: input.serviceTier ?? 'default',
     sandbox: sandboxMode(input.access),
     ...(input.federation ? {
       config: {
@@ -1139,7 +1327,7 @@ function sandboxMode(access: ProviderAccess) {
 
 async function mapUserContent(
   content: readonly UserContentPart[],
-  resolveImageArtifact?: CodexNativeAdapterOptions['resolveImageArtifact'],
+  resolveImageArtifact?: (artifactId: string, mimeType: string) => Promise<ResolvedCodexImage>,
 ) {
   const mapped: unknown[] = [];
   for (const part of content) {
@@ -1159,7 +1347,7 @@ async function mapUserContent(
 
 async function materializeHistoricalImages(
   thread: Record<string, unknown>,
-  importImage: CodexNativeAdapterOptions['importHistoricalImage'],
+  importImage?: (dataUrl: string) => Promise<{ artifactId: string; mimeType: string; byteLength: number }>,
 ) {
   if (!importImage || !Array.isArray(thread.turns)) return;
   for (const turnValue of thread.turns) {

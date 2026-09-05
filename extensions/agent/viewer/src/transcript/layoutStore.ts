@@ -12,7 +12,7 @@ import {
 import { createExternalStore } from './externalStore';
 import { TranscriptMeasureCache } from './layout/measureCache';
 import { reconcileMeasuredTranscript } from './layout/reconcileMeasured';
-import type { TranscriptMeasuredTurn } from './layout/types';
+import type { TranscriptMeasuredTurn, TranscriptTurnDisplayFooter } from './layout/types';
 import {
   reconcileTranscriptViewportForLayout,
   resetTranscriptViewportForConversation,
@@ -23,7 +23,7 @@ export type TranscriptLayoutResourceSnapshot = {
   activeTurnId: string | null;
   status: 'idle' | 'loading' | 'ready' | 'failed';
   turnOrder: string[];
-  turnsById: Record<string, { turn: AgentTurnRenderFrame } | undefined>;
+  turnsById: Record<string, { turn: AgentTurnRenderFrame; displayFooter: TranscriptTurnDisplayFooter } | undefined>;
 };
 
 type TranscriptLayoutResourceAdapter = {
@@ -186,6 +186,10 @@ export function reconcileTranscriptLayoutFromResources(
   const turns = resourceSnapshot.turnOrder
     .map((turnId) => resourceSnapshot.turnsById[turnId]?.turn)
     .filter((turn): turn is AgentTurnRenderFrame => Boolean(turn));
+  const displayFootersByTurnId = Object.fromEntries(resourceSnapshot.turnOrder.flatMap((turnId) => {
+    const footer = resourceSnapshot.turnsById[turnId]?.displayFooter;
+    return footer ? [[turnId, footer]] : [];
+  }));
   const previousState = layoutStore.getState();
   const layout = reconcileMeasuredTranscript({
     cache: transcriptMeasureCache,
@@ -196,6 +200,7 @@ export function reconcileTranscriptLayoutFromResources(
     expandedUserMessageByKey: previousState.disclosure.expandedUserMessageByKey,
     conversationId: resourceSnapshot.activeConversationId,
     turns,
+    displayFootersByTurnId,
     width,
   });
 

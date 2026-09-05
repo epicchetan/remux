@@ -26,6 +26,7 @@ import {
 } from './layoutStore';
 import { StreamingRefreshScheduler } from './streamingRefreshScheduler';
 import { captureActiveTranscriptViewport } from './viewportStore';
+import type { TranscriptTurnDisplayFooter } from './layout/types';
 
 export type TranscriptStatus = 'idle' | 'loading' | 'ready' | 'failed';
 
@@ -1352,8 +1353,41 @@ function layoutSnapshot() {
     activeTurnId: state.workingTurnId,
     status: state.status,
     turnOrder: state.turnOrder,
-    turnsById: state.turnResourcesById,
+    turnsById: Object.fromEntries(Object.entries(state.turnResourcesById).map(([turnId, entry]) => [turnId, {
+      turn: entry.turn,
+      displayFooter: displayFooterForTurn(entry.turn, entry.projectionError),
+    }])),
   };
+}
+
+function displayFooterForTurn(
+  turn: AgentTurnRenderFrame,
+  projectionError: TranscriptTurnResourceEntry['projectionError'],
+): TranscriptTurnDisplayFooter {
+  const rows: TranscriptTurnDisplayFooter['rows'] = [];
+  if (turn.error) rows.push({ id: `${turn.id}:terminal-error`, kind: 'terminal-error', message: turn.error.message });
+  if (projectionError) rows.push({ id: `${turn.id}:projection-retry`, kind: 'projection-retry', message: projectionError.message });
+  return {
+    rows,
+    revision: JSON.stringify(rows),
+  };
+}
+
+export function setTranscriptProjectionErrorForTest(
+  turnId: string,
+  projectionError: TranscriptTurnResourceEntry['projectionError'],
+) {
+  if (!import.meta.env.DEV) throw new Error('Transcript test controls are only available in development.');
+  const state = resourceStore.getState();
+  const entry = state.turnResourcesById[turnId];
+  if (!entry) throw new Error(`Unknown transcript turn ${turnId}.`);
+  resourceStore.setState({
+    turnResourcesById: {
+      ...state.turnResourcesById,
+      [turnId]: { ...entry, projectionError },
+    },
+  });
+  reconcileTranscriptLayoutFromResources(layoutSnapshot());
 }
 
 function setExecutionScope(key: string, resource: AgentExecutionScopeResource) {

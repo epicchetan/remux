@@ -6,8 +6,11 @@
  * output here before the coordinator can persist or project it.
  */
 
-export const PROVIDER_RUNTIME_CONTRACT_VERSION = 4 as const;
-const LEGACY_PROVIDER_RUNTIME_CONTRACT_VERSIONS = [2, 3] as const;
+export const PROVIDER_RUNTIME_CONTRACT_VERSION = 6 as const;
+const LEGACY_PROVIDER_RUNTIME_CONTRACT_VERSIONS = [2, 3, 4, 5] as const;
+type ProviderRuntimeContractVersion =
+  | typeof PROVIDER_RUNTIME_CONTRACT_VERSION
+  | (typeof LEGACY_PROVIDER_RUNTIME_CONTRACT_VERSIONS)[number];
 export const PROVIDER_RUNTIME_LIMITS = {
   eventBytes: 256 * 1024,
   finalEventBytes: 32 * 1024 * 1024,
@@ -136,8 +139,16 @@ export type ProviderModelDescriptor = {
   name: string;
   provider: ProviderKind;
   supportedEffort: readonly string[];
+  serviceTiers?: readonly ProviderServiceTierDescriptor[];
+  defaultServiceTier?: string;
   contextWindow?: number;
   isDefault?: boolean;
+};
+
+export type ProviderServiceTierDescriptor = {
+  id: string;
+  name: string;
+  description?: string;
 };
 
 export type NativeSessionSummary = {
@@ -176,6 +187,23 @@ export type NativeTurnBinding = {
   branchCursor?: JsonValue;
 };
 
+export type NativeChildBinding = {
+  nativeThreadId: string;
+  executionId: string;
+  parentExecutionId: string;
+  nativeParentThreadId: string;
+  ownerTurnId: string;
+  ownerNativeTurnId: string;
+  nativeTurnBindings?: readonly NativeTurnBinding[];
+  terminalNativeTurnIds?: readonly string[];
+  canonicalBlock?: {
+    structure: TurnStructure;
+    revision: number;
+    block: TurnBlockSnapshot;
+  };
+  outcome?: ProviderTurnOutcome;
+};
+
 export type OpenProviderSessionInput = {
   commandId: string;
   providerInstanceId: string;
@@ -186,11 +214,14 @@ export type OpenProviderSessionInput = {
   cwd: string;
   model: string;
   effort?: string;
+  serviceTier?: string;
   access: ProviderAccess;
   developerInstructions: readonly string[];
   federation?: FederationSessionConfig;
   /** Durable server-only identity bindings used to reconcile a resumed native snapshot. */
   nativeTurnBindings?: readonly NativeTurnBinding[];
+  /** Verified child edges retained for late lifecycle events after restart. */
+  nativeChildBindings?: readonly NativeChildBinding[];
   /**
    * Native turns inherited from an ancestor strand. They already exist in the
    * canonical Remux path and must not be imported as turns owned by this
@@ -209,6 +240,7 @@ export type StartProviderTurnInput = {
   content: readonly UserContentPart[];
   model?: string;
   effort?: string;
+  serviceTier?: string;
 };
 
 export type SteerProviderTurnInput = {
@@ -307,6 +339,8 @@ export type TokenUsageBreakdown = {
 export type ContextUsageSnapshot = {
   usedTokens: number;
   windowTokens: number;
+  /** Native compaction policy window; model capacity remains windowTokens. */
+  autoCompactWindowTokens?: number;
   percent: number;
   measurement: 'provider' | 'derived';
   freshness: 'live' | 'cached';
@@ -449,7 +483,7 @@ export type ProviderSnapshotCoverage = {
 export type TurnBlockState = 'streaming' | 'running' | 'completed' | 'failed' | 'interrupted';
 
 export type TurnBlockPayload =
-  | { kind: 'reasoning-summary'; text: string; parts?: readonly string[] }
+  | { kind: 'reasoning-summary'; text: string; parts?: readonly string[]; truncated: boolean }
   | { kind: 'commentary'; text: string }
   | { kind: 'final-message'; text: string }
   | {
@@ -741,11 +775,11 @@ export function parseOpenProviderSessionInput(value: unknown): OpenProviderSessi
   assertEncodedSize(value, PROVIDER_RUNTIME_LIMITS.eventBytes, '$');
   const record = strictRecord(value, '$', [
     'commandId', 'providerInstanceId', 'conversationId', 'executionId', 'mode', 'nativeSession', 'cwd',
-    'model', 'effort', 'access', 'developerInstructions', 'federation', 'nativeTurnBindings',
-    'inheritedNativeTurnIds', 'activeTurnBinding',
+    'model', 'effort', 'serviceTier', 'access', 'developerInstructions', 'federation', 'nativeTurnBindings',
+    'inheritedNativeTurnIds', 'activeTurnBinding', 'nativeChildBindings',
   ], [
-    'nativeSession', 'effort', 'federation', 'nativeTurnBindings',
-    'inheritedNativeTurnIds', 'activeTurnBinding',
+    'nativeSession', 'effort', 'serviceTier', 'federation', 'nativeTurnBindings',
+    'inheritedNativeTurnIds', 'activeTurnBinding', 'nativeChildBindings',
   ]);
   const mode = oneOf(record.mode, ['create', 'resume', 'attach'], '$.mode');
   const nativeSession = record.nativeSession === undefined
@@ -758,6 +792,7 @@ export function parseOpenProviderSessionInput(value: unknown): OpenProviderSessi
     throw new ProviderContractError('$.nativeSession', 'create cannot include a native session');
   }
   const providerInstanceId = identifier(record.providerInstanceId, '$.providerInstanceId');
+  const executionId = identifier(record.executionId, '$.executionId');
   if (nativeSession && nativeSession.providerInstanceId !== providerInstanceId) {
     throw new ProviderContractError(
       '$.nativeSession.providerInstanceId',
@@ -816,6 +851,97 @@ export function parseOpenProviderSessionInput(value: unknown): OpenProviderSessi
   const activeTurnBinding = record.activeTurnBinding === undefined
     ? undefined
     : parseNativeTurnBinding(record.activeTurnBinding, '$.activeTurnBinding');
+  const childValues = record.nativeChildBindings === undefined
+    ? [] : array(record.nativeChildBindings, '$.nativeChildBindings');
+  const seenChildThreads = new Set<string>();
+  const nativeChildBindings = childValues.map((value, index) => {
+    const path = `$.nativeChildBindings[${index}]`;
+    const binding = strictRecord(value, path, [
+      'nativeThreadId', 'executionId', 'parentExecutionId', 'nativeParentThreadId',
+      'ownerTurnId', 'ownerNativeTurnId', 'outcome',
+      'nativeTurnBindings',
+      'terminalNativeTurnIds', 'canonicalBlock',
+    ], ['outcome', 'nativeTurnBindings', 'terminalNativeTurnIds', 'canonicalBlock']);
+    const nativeThreadId = identifier(binding.nativeThreadId, `${path}.nativeThreadId`);
+    if (seenChildThreads.has(nativeThreadId)) {
+      throw new ProviderContractError(path, 'must not duplicate native child thread identity');
+    }
+    seenChildThreads.add(nativeThreadId);
+    return {
+      nativeThreadId,
+      executionId: identifier(binding.executionId, `${path}.executionId`),
+      parentExecutionId: identifier(binding.parentExecutionId, `${path}.parentExecutionId`),
+      nativeParentThreadId: identifier(binding.nativeParentThreadId, `${path}.nativeParentThreadId`),
+      ownerTurnId: identifier(binding.ownerTurnId, `${path}.ownerTurnId`),
+      ownerNativeTurnId: identifier(binding.ownerNativeTurnId, `${path}.ownerNativeTurnId`),
+      ...(binding.nativeTurnBindings === undefined ? {} : {
+        nativeTurnBindings: array(binding.nativeTurnBindings, `${path}.nativeTurnBindings`)
+          .map((entry, childTurnIndex) => parseNativeTurnBinding(
+            entry, `${path}.nativeTurnBindings[${childTurnIndex}]`,
+          )),
+      }),
+      ...(binding.terminalNativeTurnIds === undefined ? {} : {
+        terminalNativeTurnIds: array(binding.terminalNativeTurnIds, `${path}.terminalNativeTurnIds`)
+          .map((entry, terminalIndex) => identifier(
+            entry, `${path}.terminalNativeTurnIds[${terminalIndex}]`,
+          )),
+      }),
+      ...(binding.canonicalBlock === undefined ? {} : {
+        canonicalBlock: parseNativeChildCanonicalBlock(binding.canonicalBlock, `${path}.canonicalBlock`),
+      }),
+      ...(binding.outcome === undefined ? {} : {
+        outcome: oneOf(binding.outcome, ['completed', 'failed', 'interrupted', 'recovery_failed'], `${path}.outcome`),
+      }),
+    };
+  });
+  if (mode === 'create' && nativeChildBindings.length > 0) {
+    throw new ProviderContractError('$.nativeChildBindings', 'create cannot restore child bindings');
+  }
+  const childExecutionIds = new Set<string>();
+  for (const binding of nativeChildBindings) {
+    if (binding.executionId === executionId || childExecutionIds.has(binding.executionId)) {
+      throw new ProviderContractError('$.nativeChildBindings', 'must contain distinct non-self child executions');
+    }
+    childExecutionIds.add(binding.executionId);
+    if (new Set(binding.terminalNativeTurnIds ?? []).size !== (binding.terminalNativeTurnIds ?? []).length) {
+      throw new ProviderContractError('$.nativeChildBindings', 'terminal native turn identities must be unique');
+    }
+    const childTurnIds = binding.nativeTurnBindings ?? [];
+    if (new Set(childTurnIds.map(({ turnId }) => turnId)).size !== childTurnIds.length ||
+        new Set(childTurnIds.map(({ nativeTurnId }) => nativeTurnId)).size !== childTurnIds.length) {
+      throw new ProviderContractError('$.nativeChildBindings', 'child turn bindings must have unique identities');
+    }
+  }
+  const childByExecution = new Map(nativeChildBindings.map((binding) => [binding.executionId, binding]));
+  for (const binding of nativeChildBindings) {
+    const expectedParentThread = binding.parentExecutionId === executionId
+      ? nativeSession?.sessionId : childByExecution.get(binding.parentExecutionId)?.nativeThreadId;
+    if (!expectedParentThread || binding.nativeParentThreadId !== expectedParentThread) {
+      throw new ProviderContractError('$.nativeChildBindings', 'must form a verified native parent graph');
+    }
+    const ownerTurns = binding.parentExecutionId === executionId
+      ? nativeTurnBindings : childByExecution.get(binding.parentExecutionId)?.nativeTurnBindings ?? [];
+    if (!ownerTurns.some(({ turnId, nativeTurnId }) =>
+      turnId === binding.ownerTurnId && nativeTurnId === binding.ownerNativeTurnId)) {
+      throw new ProviderContractError('$.nativeChildBindings', 'owner turn must belong to the recorded parent execution');
+    }
+    const canonical = binding.canonicalBlock?.block;
+    if (canonical && (canonical.kind !== 'native-child' || canonical.payload.kind !== 'native-child' ||
+        canonical.payload.child.executionId !== binding.executionId ||
+        canonical.payload.child.ownership !== 'native' ||
+        canonical.payload.child.nativeSessionId !== binding.nativeThreadId)) {
+      throw new ProviderContractError('$.nativeChildBindings', 'canonical block must describe the bound native child');
+    }
+    const visited = new Set([binding.executionId]);
+    let parent = binding.parentExecutionId;
+    while (parent !== executionId) {
+      if (visited.has(parent)) throw new ProviderContractError('$.nativeChildBindings', 'must not contain cycles');
+      visited.add(parent);
+      const ancestor = childByExecution.get(parent);
+      if (!ancestor) throw new ProviderContractError('$.nativeChildBindings', 'must have reachable parents');
+      parent = ancestor.parentExecutionId;
+    }
+  }
   const inheritedIds = record.inheritedNativeTurnIds === undefined
     ? []
     : array(record.inheritedNativeTurnIds, '$.inheritedNativeTurnIds');
@@ -851,7 +977,7 @@ export function parseOpenProviderSessionInput(value: unknown): OpenProviderSessi
     commandId: identifier(record.commandId, '$.commandId'),
     providerInstanceId,
     conversationId: identifier(record.conversationId, '$.conversationId'),
-    executionId: identifier(record.executionId, '$.executionId'),
+    executionId,
     mode,
     ...(nativeSession ? { nativeSession } : {}),
     cwd: boundedString(record.cwd, '$.cwd', 32 * 1024),
@@ -859,13 +985,28 @@ export function parseOpenProviderSessionInput(value: unknown): OpenProviderSessi
     ...(record.effort === undefined
       ? {}
       : { effort: boundedString(record.effort, '$.effort') }),
+    ...(record.serviceTier === undefined
+      ? {}
+      : { serviceTier: boundedString(record.serviceTier, '$.serviceTier') }),
     access: oneOf(record.access, ['read-only', 'workspace-write', 'full-access'], '$.access'),
     developerInstructions: instructions.map((entry, index) =>
       boundedString(entry, `$.developerInstructions[${index}]`, 32 * 1024)),
     ...(federation ? { federation } : {}),
     ...(nativeTurnBindings.length > 0 ? { nativeTurnBindings } : {}),
+    ...(nativeChildBindings.length > 0 ? { nativeChildBindings } : {}),
     ...(inheritedNativeTurnIds.length > 0 ? { inheritedNativeTurnIds } : {}),
     ...(activeTurnBinding ? { activeTurnBinding } : {}),
+  };
+}
+
+function parseNativeChildCanonicalBlock(value: unknown, path: string) {
+  const block = strictRecord(value, path, [
+    'structure', 'revision', 'block',
+  ]);
+  return {
+    structure: parseTurnStructure(block.structure, `${path}.structure`),
+    revision: nonnegativeInteger(block.revision, `${path}.revision`),
+    block: parseTurnBlockSnapshot(block.block, `${path}.block`),
   };
 }
 
@@ -892,7 +1033,8 @@ export function parseStartProviderTurnInput(value: unknown): StartProviderTurnIn
   assertEncodedSize(value, PROVIDER_RUNTIME_LIMITS.eventBytes, '$');
   const record = strictRecord(value, '$', [
     'commandId', 'conversationId', 'turnId', 'executionId', 'content', 'model', 'effort',
-  ], ['model', 'effort']);
+    'serviceTier',
+  ], ['model', 'effort', 'serviceTier']);
   const content = parseUserContentParts(record.content);
   return {
     commandId: identifier(record.commandId, '$.commandId'),
@@ -902,6 +1044,9 @@ export function parseStartProviderTurnInput(value: unknown): StartProviderTurnIn
     content,
     ...(record.model === undefined ? {} : { model: boundedString(record.model, '$.model') }),
     ...(record.effort === undefined ? {} : { effort: boundedString(record.effort, '$.effort') }),
+    ...(record.serviceTier === undefined
+      ? {}
+      : { serviceTier: boundedString(record.serviceTier, '$.serviceTier') }),
   };
 }
 
@@ -1052,7 +1197,7 @@ export function parseProviderEventEnvelope(value: unknown): ProviderEventEnvelop
     'contractVersion', 'eventId', 'provider', 'scope', 'native', 'observedAt', 'event',
     'rawArtifactRef',
   ], ['rawArtifactRef']);
-  providerRuntimeContractVersion(record.contractVersion, '$.contractVersion');
+  const sourceVersion = providerRuntimeContractVersion(record.contractVersion, '$.contractVersion');
   const native = strictRecord(record.native, '$.native', [
     'sessionId', 'turnId', 'messageId', 'itemId', 'toolCallId', 'position',
     'subject', 'timeline', 'kind',
@@ -1060,7 +1205,7 @@ export function parseProviderEventEnvelope(value: unknown): ProviderEventEnvelop
     'sessionId', 'turnId', 'messageId', 'itemId', 'toolCallId', 'position',
     'subject', 'timeline',
   ]);
-  const event = parseProviderEvent(record.event, '$.event');
+  const event = parseProviderEvent(record.event, '$.event', sourceVersion);
   const scope = parseProviderEventScope(record.scope, '$.scope');
   assertEventScope(event, scope);
   const envelope: ProviderEventEnvelope = {
@@ -1259,7 +1404,11 @@ function parseContentPart(value: unknown, index: number, basePath = '$.content')
   return { type, path: boundedString(base.path, `${path}.path`, 32 * 1024) };
 }
 
-function parseProviderEvent(value: unknown, path: string): ProviderEvent {
+function parseProviderEvent(
+  value: unknown,
+  path: string,
+  sourceVersion: ProviderRuntimeContractVersion = PROVIDER_RUNTIME_CONTRACT_VERSION,
+): ProviderEvent {
   const record = recordValue(value, path);
   const type = boundedString(record.type, `${path}.type`, 128);
   switch (type) {
@@ -1314,7 +1463,7 @@ function parseProviderEvent(value: unknown, path: string): ProviderEvent {
       return {
         type,
         structure: parseTurnStructure(record.structure, `${path}.structure`),
-        block: parseTurnBlockSnapshot(record.block, `${path}.block`),
+        block: parseTurnBlockSnapshot(record.block, `${path}.block`, sourceVersion),
       };
     case 'turn.block.revised':
     case 'turn.block.completed':
@@ -1324,7 +1473,7 @@ function parseProviderEvent(value: unknown, path: string): ProviderEvent {
         structure: parseTurnStructure(record.structure, `${path}.structure`),
         revision: nonnegativeInteger(record.revision, `${path}.revision`),
         contentHash: sha256(record.contentHash, `${path}.contentHash`),
-        block: parseTurnBlockSnapshot(record.block, `${path}.block`),
+        block: parseTurnBlockSnapshot(record.block, `${path}.block`, sourceVersion),
       };
     case 'turn.file-changed':
       assertAllowedKeys(record, path, ['type', 'change', 'blockId']);
@@ -1510,7 +1659,11 @@ function parseTurnStructure(value: unknown, path: string): TurnStructure {
   };
 }
 
-function parseTurnBlockSnapshot(value: unknown, path: string): TurnBlockSnapshot {
+function parseTurnBlockSnapshot(
+  value: unknown,
+  path: string,
+  sourceVersion: ProviderRuntimeContractVersion = PROVIDER_RUNTIME_CONTRACT_VERSION,
+): TurnBlockSnapshot {
   const record = strictRecord(value, path, ['kind', 'state', 'payload']);
   const kind = oneOf(record.kind, PROVIDER_TURN_BLOCK_KINDS, `${path}.kind`);
   const state = oneOf(
@@ -1518,21 +1671,30 @@ function parseTurnBlockSnapshot(value: unknown, path: string): TurnBlockSnapshot
     ['streaming', 'running', 'completed', 'failed', 'interrupted'],
     `${path}.state`,
   );
-  const payload = parseTurnBlockPayload(record.payload, `${path}.payload`);
+  const payload = parseTurnBlockPayload(record.payload, `${path}.payload`, sourceVersion);
   if (payload.kind !== kind) {
     throw new ProviderContractError(`${path}.payload.kind`, 'must match block kind');
   }
   return { kind, state, payload };
 }
 
-function parseTurnBlockPayload(value: unknown, path: string): TurnBlockPayload {
+function parseTurnBlockPayload(
+  value: unknown,
+  path: string,
+  sourceVersion: ProviderRuntimeContractVersion = PROVIDER_RUNTIME_CONTRACT_VERSION,
+): TurnBlockPayload {
   const record = recordValue(value, path);
   const kind = oneOf(record.kind, PROVIDER_TURN_BLOCK_KINDS, `${path}.kind`);
   if (kind === 'reasoning-summary') {
-    assertAllowedKeys(record, path, ['kind', 'text', 'parts']);
+    const legacy = sourceVersion < PROVIDER_RUNTIME_CONTRACT_VERSION;
+    assertAllowedKeys(record, path, legacy ? ['kind', 'text', 'parts'] : ['kind', 'text', 'parts', 'truncated']);
     if (!('text' in record)) throw new ProviderContractError(`${path}.text`, 'is required');
+    if (!legacy && !('truncated' in record)) {
+      throw new ProviderContractError(`${path}.truncated`, 'is required');
+    }
     const text = boundedString(record.text, `${path}.text`, PROVIDER_RUNTIME_LIMITS.messageChars);
-    if (record.parts === undefined) return { kind, text };
+    const truncated = legacy ? false : bool(record.truncated, `${path}.truncated`);
+    if (record.parts === undefined) return { kind, text, truncated };
     const values = array(record.parts, `${path}.parts`);
     if (values.length === 0 || values.length > 256) {
       throw new ProviderContractError(`${path}.parts`, 'must contain 1-256 summary parts');
@@ -1545,7 +1707,7 @@ function parseTurnBlockPayload(value: unknown, path: string): TurnBlockPayload {
     if (parts.join('\n') !== text) {
       throw new ProviderContractError(`${path}.parts`, 'must join to the compatibility text');
     }
-    return { kind, text, parts };
+    return { kind, text, parts, truncated };
   }
   if (kind === 'commentary' || kind === 'final-message') {
     assertExactKeys(record, path, ['kind', 'text']);
@@ -1622,6 +1784,19 @@ function parseTurnBlockPayload(value: unknown, path: string): TurnBlockPayload {
     code: identifier(record.code, `${path}.code`),
     message: boundedString(record.message, `${path}.message`),
   };
+}
+
+/** Normalizes only the v2-v5 reasoning payload shape read from persisted block rows. */
+export function normalizeLegacyReasoningSummaryPayload(value: unknown): TurnBlockPayload {
+  const record = recordValue(value, '$');
+  if (record.kind !== 'reasoning-summary') {
+    throw new ProviderContractError('$.kind', 'must equal reasoning-summary');
+  }
+  return parseTurnBlockPayload(
+    value,
+    '$',
+    'truncated' in record ? PROVIDER_RUNTIME_CONTRACT_VERSION : 5,
+  );
 }
 
 function assertEventScope(event: ProviderEvent, scope: ProviderEventScope) {
@@ -1748,12 +1923,15 @@ function parseCumulativeUsage(value: unknown, path: string): CumulativeUsage {
 
 function parseContextUsage(value: unknown, path: string): ContextUsageSnapshot {
   const record = strictRecord(value, path, [
-    'usedTokens', 'windowTokens', 'percent', 'measurement', 'freshness', 'observedAt', 'turnId',
-  ]);
+    'usedTokens', 'windowTokens', 'autoCompactWindowTokens', 'percent', 'measurement', 'freshness', 'observedAt', 'turnId',
+  ], ['autoCompactWindowTokens']);
   const windowTokens = positiveInteger(record.windowTokens, `${path}.windowTokens`);
   return {
     usedTokens: nonnegativeInteger(record.usedTokens, `${path}.usedTokens`),
     windowTokens,
+    ...(record.autoCompactWindowTokens === undefined ? {} : {
+      autoCompactWindowTokens: positiveInteger(record.autoCompactWindowTokens, `${path}.autoCompactWindowTokens`),
+    }),
     percent: percentage(record.percent, `${path}.percent`),
     measurement: oneOf(record.measurement, ['provider', 'derived'], `${path}.measurement`),
     freshness: oneOf(record.freshness, ['live', 'cached'], `${path}.freshness`),
@@ -2001,7 +2179,7 @@ function exactLiteral<T extends string | number | boolean>(value: unknown, liter
   return literal;
 }
 
-function providerRuntimeContractVersion(value: unknown, path: string) {
+function providerRuntimeContractVersion(value: unknown, path: string): ProviderRuntimeContractVersion {
   if (value !== PROVIDER_RUNTIME_CONTRACT_VERSION &&
       !(LEGACY_PROVIDER_RUNTIME_CONTRACT_VERSIONS as readonly unknown[]).includes(value)) {
     throw new ProviderContractError(
@@ -2010,6 +2188,7 @@ function providerRuntimeContractVersion(value: unknown, path: string) {
         `(${LEGACY_PROVIDER_RUNTIME_CONTRACT_VERSIONS.join(', ')})`,
     );
   }
+  return value as ProviderRuntimeContractVersion;
 }
 
 function oneOf<const T extends readonly string[]>(value: unknown, values: T, path: string): T[number] {

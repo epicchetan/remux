@@ -11,6 +11,16 @@ export const transcriptLayout = {
     defaultGap: 22,
     workBoundaryGap: 14,
   },
+  footer: {
+    borderWidth: 1,
+    errorFontSize: 13,
+    errorLineHeight: 20,
+    errorPaddingX: 12,
+    errorPaddingY: 10,
+    rowGap: 8,
+    turnGap: 22,
+    retryHeight: 30,
+  },
   user: {
     actionHeight: 40,
     actionTopGap: 6,

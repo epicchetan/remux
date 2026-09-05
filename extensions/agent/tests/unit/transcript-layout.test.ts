@@ -111,6 +111,83 @@ test('reuses cached measurements for an unchanged frame revision', () => {
   assert.equal(cache.stats().entries, 1);
 });
 
+test('measures terminal error and projection retry footers exactly once and invalidates unchanged frames', () => {
+  const cache = new TranscriptMeasureCache();
+  const failed = frame('turn-failed', [user('user-failed', 'Please try this')]);
+  const healthy = frame('turn-healthy', [user('user-healthy', 'Next'), assistant('assistant-healthy', 'Done')]);
+  const terminalError = 'Selected model is at capacity. Please try a different model. '.repeat(4);
+  const errorRows = [{ id: 'turn-failed:terminal-error', kind: 'terminal-error' as const, message: terminalError }];
+  const withError = { revision: JSON.stringify(errorRows), rows: errorRows };
+  const first = measureCollapsedTranscript({
+    cache,
+    conversationId: 'conversation',
+    displayFootersByTurnId: { 'turn-failed': withError },
+    turns: [failed, healthy],
+    width: 320,
+  });
+  const withoutFooter = measureCollapsedTranscript({ turns: [failed, healthy], width: 320 });
+  const errorHeight = first.turns[0]!.collapsedHeight - withoutFooter.turns[0]!.collapsedHeight;
+
+  assert.ok(errorHeight > transcriptLayout.footer.errorPaddingY * 2);
+  assert.equal(first.turns[1]!.collapsedTop - withoutFooter.turns[1]!.collapsedTop, errorHeight);
+  assert.equal(first.totalCollapsedHeight - withoutFooter.totalCollapsedHeight, errorHeight);
+
+  const retryRows = [
+      ...withError.rows,
+      { id: 'turn-failed:projection-retry', kind: 'projection-retry' as const, message: 'projection failed' },
+    ];
+  const withRetry = { revision: JSON.stringify(retryRows), rows: retryRows };
+  const retried = reconcileMeasuredTranscript({
+    cache,
+    conversationId: 'conversation',
+    displayFootersByTurnId: { 'turn-failed': withRetry },
+    previousTurnOrder: first.turns.map((turn) => turn.turnId),
+    previousTurnsById: first.turnsById,
+    turns: [failed, healthy],
+    width: 320,
+  });
+  assert.equal(
+    retried.turns[0]!.collapsedHeight - first.turns[0]!.collapsedHeight,
+    transcriptLayout.footer.rowGap + transcriptLayout.footer.retryHeight,
+  );
+  assert.equal(retried.turns[1]!.collapsedTop, retried.turns[0]!.collapsedHeight);
+
+  const cleared = reconcileMeasuredTranscript({
+    cache,
+    conversationId: 'conversation',
+    previousTurnOrder: retried.turns.map((turn) => turn.turnId),
+    previousTurnsById: retried.turnsById,
+    turns: [failed, healthy],
+    width: 320,
+  });
+  assert.equal(cleared.turns[0]!.collapsedHeight, withoutFooter.turns[0]!.collapsedHeight);
+  assert.equal(cleared.turns[1]!.collapsedTop, withoutFooter.turns[1]!.collapsedTop);
+  assert.equal(cache.stats().entries, 4);
+});
+
+test('matches empty-line footer flow for whitespace-only terminal errors', () => {
+  const turn = frame('turn-whitespace-error', [user('user-whitespace-error', 'Try')]);
+  const rows = [{
+    id: 'turn-whitespace-error:terminal-error',
+    kind: 'terminal-error' as const,
+    message: '   ',
+  }];
+  const base = measureCollapsedTranscript({ turns: [turn], width: 320 }).turns[0]!.collapsedHeight;
+  const measured = measureCollapsedTranscript({
+    displayFootersByTurnId: {
+      [turn.id]: { revision: JSON.stringify(rows), rows },
+    },
+    turns: [turn],
+    width: 320,
+  }).turns[0]!.collapsedHeight;
+  assert.equal(
+    measured - base,
+    transcriptLayout.footer.errorPaddingY * 2 +
+      transcriptLayout.footer.borderWidth * 2 +
+      transcriptLayout.footer.turnGap,
+  );
+});
+
 test('virtualizes a long measured window with top and bottom spacers', () => {
   const turns = Array.from({ length: 60 }, (_, index) =>
     frame(`turn-${index}`, [user(`user-${index}`, `Request ${index}`), assistant(`assistant-${index}`, `Answer ${index}`)]));

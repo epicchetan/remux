@@ -34,11 +34,11 @@ const providers = fixtureMode
       adapter: new CodexNativeAdapter({
         providerInstanceId: 'codex-local',
         ownership: sessionOwnership,
-        resolveImageArtifact: async (artifactId, mimeType) => ({
+        resolveImageArtifact: async (scope, artifactId, mimeType) => ({
           type: 'localImage',
-          path: artifacts.resolveLocalImage(artifactId, mimeType),
+          path: artifacts.resolveLocalImage(scope, artifactId, mimeType),
         }),
-        importHistoricalImage: (dataUrl) => artifacts.importImageDataUrl(dataUrl),
+        importHistoricalImage: (scope, dataUrl) => artifacts.importImageDataUrl(scope, dataUrl),
       }),
     }, {
       providerInstanceId: 'claude-local',
@@ -47,8 +47,8 @@ const providers = fixtureMode
       adapter: new ClaudeNativeAdapter({
         providerInstanceId: 'claude-local',
         ownership: sessionOwnership,
-        resolveImageArtifact: async (artifactId, mimeType) => ({
-          path: artifacts.resolveLocalImage(artifactId, mimeType),
+        resolveImageArtifact: async (scope, artifactId, mimeType) => ({
+          path: artifacts.resolveLocalImage(scope, artifactId, mimeType),
         }),
       }),
     }];
@@ -59,7 +59,8 @@ const federation = new RemuxFederationServer({
   credentials,
   coordinator: () => nativeServer.coordinator,
   generation: () => nativeServer.coordinator.projector.serverGeneration,
-  readTextArtifact: (artifactId) => artifacts.readTextArtifact(artifactId),
+  readTextArtifact: (scope, artifactId, turnId) =>
+    artifacts.readTextArtifactForScope(scope, artifactId, turnId),
 });
 nativeServer = new NativeAgentServer({
   journal,

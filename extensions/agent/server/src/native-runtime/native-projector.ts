@@ -89,6 +89,19 @@ export class NativeAgentProjector {
       ?? models[0];
   }
 
+  resolveServiceTier(providerInstanceId: string, modelId: string, requested?: string | null) {
+    const model = (this.modelsByInstance.get(providerInstanceId) ?? [])
+      .find(({ id }) => id === modelId);
+    const tiers = model?.serviceTiers ?? [];
+    if (tiers.length === 0) return null;
+    if (requested && tiers.some(({ id }) => id === requested)) return requested;
+    if (tiers.some(({ id }) => id === 'default')) return 'default';
+    if (model?.defaultServiceTier && tiers.some(({ id }) => id === model.defaultServiceTier)) {
+      return model.defaultServiceTier;
+    }
+    return tiers[0]!.id;
+  }
+
   runtimeResource(conversationId: string) {
     return this.runtime(conversationId);
   }
@@ -248,7 +261,11 @@ export class NativeAgentProjector {
           ? { loginOperation: structuredClone(this.loginByInstance.get(instance.providerInstanceId)!) }
           : {}),
         ...(sticky?.model ? {
-          stickyPreference: { model: sticky.model, effort: sticky.effort },
+          stickyPreference: {
+            model: sticky.model,
+            effort: sticky.effort,
+            serviceTier: sticky.serviceTier,
+          },
         } : {}),
         accountUsage: instance.probe.state === 'ready'
           ? this.journal.providerAccountUsage(instance.providerInstanceId)
@@ -326,6 +343,7 @@ export class NativeAgentProjector {
     const canChangeAccess = conversation.resumable &&
       conversation.state === 'idle' &&
       conversation.activeTurnId === null &&
+      !this.journal.hasUnresolvedRootDelivery(conversationId) &&
       this.journal.queuedEntries(conversationId).length === 0 &&
       capabilities.session.resume &&
       capabilities.access.presets.length > 1;
@@ -348,6 +366,7 @@ export class NativeAgentProjector {
       activeConfiguration: {
         model: conversation.model,
         effort: conversation.effort ?? null,
+        serviceTier: conversation.serviceTier ?? null,
         access: conversation.access,
       },
       composer: {
@@ -356,7 +375,13 @@ export class NativeAgentProjector {
           conversationPreference: conversationPreference?.revision ?? null,
           providerPreference: providerPreference?.revision ?? null,
           lastUsed: lastUsed
-            ? [lastUsed.turnId, lastUsed.model, lastUsed.effort ?? null, lastUsed.startedAt]
+            ? [
+                lastUsed.turnId,
+                lastUsed.model,
+                lastUsed.effort ?? null,
+                lastUsed.serviceTier ?? null,
+                lastUsed.startedAt,
+              ]
             : null,
           models: this.modelsByInstance.get(conversation.providerInstanceId) ?? [],
           capabilities: [
@@ -370,6 +395,7 @@ export class NativeAgentProjector {
         nextTurn: {
           model: resolved.model,
           effort: resolved.effort,
+          serviceTier: resolved.serviceTier,
           access: conversation.access,
           origin: resolved.origin,
         },
@@ -377,10 +403,15 @@ export class NativeAgentProjector {
           turnId: lastUsed.turnId,
           model: lastUsed.model,
           effort: lastUsed.effort ?? null,
+          serviceTier: lastUsed.serviceTier ?? null,
         } : null,
         editable: {
           model: capabilities.turns.changeModelOnExistingSession,
           effort: capabilities.turns.changeEffortOnExistingSession,
+          serviceTier: Boolean(this.resolveModel(
+            conversation.providerInstanceId,
+            resolved.model,
+          )?.serviceTiers?.length),
           access: canChangeAccess,
         },
       },
@@ -388,7 +419,7 @@ export class NativeAgentProjector {
       usage,
       compaction: this.journal.runtimeCompaction(
         conversationId,
-        conversation.provider === 'codex' ? 'native-auto' : 'manual',
+        selectedCompactionPolicy(conversation.provider),
       ),
       ...(conversation.healthMessage ? { healthMessage: conversation.healthMessage } : {}),
     };
@@ -396,8 +427,8 @@ export class NativeAgentProjector {
 
   private resolveComposerConfiguration(input: {
     conversation: JournalConversation;
-    conversationPreference?: { model: string | null; effort: string | null };
-    providerPreference?: { model: string | null; effort: string | null };
+    conversationPreference?: { model: string | null; effort: string | null; serviceTier: string | null };
+    providerPreference?: { model: string | null; effort: string | null; serviceTier: string | null };
     lastUsed: JournalTurn | null;
     canChangeModel: boolean;
     canChangeEffort: boolean;
@@ -407,7 +438,12 @@ export class NativeAgentProjector {
         ? { ...input.conversationPreference, origin: 'conversation-explicit' as const }
         : null,
       input.lastUsed
-        ? { model: input.lastUsed.model, effort: input.lastUsed.effort ?? null, origin: 'last-used' as const }
+        ? {
+            model: input.lastUsed.model,
+            effort: input.lastUsed.effort ?? null,
+            serviceTier: input.lastUsed.serviceTier ?? null,
+            origin: 'last-used' as const,
+          }
         : null,
       input.providerPreference?.model
         ? { ...input.providerPreference, origin: 'provider-sticky' as const }
@@ -424,6 +460,11 @@ export class NativeAgentProjector {
         effort: input.canChangeEffort
           ? repairEffort(model, effortCandidate?.effort ?? input.conversation.effort ?? null)
           : input.conversation.effort ?? null,
+        serviceTier: this.resolveServiceTier(
+          input.conversation.providerInstanceId,
+          input.conversation.model,
+          effortCandidate?.serviceTier ?? input.conversation.serviceTier,
+        ),
         origin: effortCandidate?.origin ?? 'last-used' as const,
       };
     }
@@ -436,6 +477,11 @@ export class NativeAgentProjector {
         effort: input.canChangeEffort
           ? repairEffort(model, candidate.effort)
           : input.conversation.effort ?? null,
+        serviceTier: this.resolveServiceTier(
+          input.conversation.providerInstanceId,
+          model.id,
+          candidate.serviceTier,
+        ),
         origin: candidate.origin,
       };
     }
@@ -445,6 +491,11 @@ export class NativeAgentProjector {
       effort: input.canChangeEffort
         ? repairEffort(model, null)
         : input.conversation.effort ?? null,
+      serviceTier: this.resolveServiceTier(
+        input.conversation.providerInstanceId,
+        model?.id ?? input.conversation.model,
+        null,
+      ),
       origin: 'provider-default' as const,
     };
   }
@@ -461,13 +512,20 @@ export class NativeAgentProjector {
     }
     if (!model) return preference;
     const effort = repairEffort(model, preference.effort);
-    if (model.id === preference.model && effort === preference.effort) return preference;
+    const serviceTier = this.resolveServiceTier(
+      preference.providerInstanceId,
+      model.id,
+      preference.serviceTier,
+    );
+    if (model.id === preference.model && effort === preference.effort &&
+        serviceTier === preference.serviceTier) return preference;
     return this.journal.setComposerPreference({
       scope: preference.scope,
       scopeId: preference.scopeId,
       providerInstanceId: preference.providerInstanceId,
       model: model.id,
       effort,
+      serviceTier,
       now: Math.max(Date.now(), preference.updatedAt + 1),
     });
   }
@@ -667,6 +725,10 @@ export class NativeAgentProjector {
   }
 }
 
+function selectedCompactionPolicy(provider: 'codex' | 'claude-code' | 'fixture') {
+  return provider === 'codex' || provider === 'claude-code' ? 'native-auto' : 'manual';
+}
+
 function projectTurn(
   turn: JournalTurn,
   allEvents: readonly ProviderEventEnvelope[],
@@ -688,7 +750,7 @@ function projectTurn(
     ? withoutToolOutputPreviews(completePasses)
     : completePasses;
   const compatibility = flattenCompatibilityActivity(passes);
-  let usage = journal.latestUsage(turn.conversationId, turn.turnId) ?? undefined;
+  const usage = journal.latestUsage(turn.conversationId, turn.turnId) ?? undefined;
   let compacted = false;
   const fileChangesByPath = new Map<
     string,
@@ -712,9 +774,6 @@ function projectTurn(
             : {}),
           ...(event.blockId ? { blockId: event.blockId } : {}),
         });
-        break;
-      case 'turn.usage-updated':
-        usage = event.usage;
         break;
       case 'context.compaction.completed':
         compacted = true;
@@ -1152,7 +1211,7 @@ function projectLegacyPass(turn: JournalTurn, events: readonly LegacyJournalEven
       blocks.length,
       kind,
       'completed',
-      { kind, text },
+      kind === 'reasoning-summary' ? { kind, text, truncated: false } : { kind, text },
       start,
       turn.completedAt ?? events.at(-1)?.observedAt ?? start,
     ));

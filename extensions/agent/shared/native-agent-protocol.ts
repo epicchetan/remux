@@ -22,7 +22,7 @@ import type {
 import { parseUserContentParts, ProviderContractError } from './provider-runtime.ts';
 
 /** Viewer-safe resource and command contract for the provider-native runtime. */
-export const NATIVE_AGENT_PROTOCOL_VERSION = 8 as const;
+export const NATIVE_AGENT_PROTOCOL_VERSION = 9 as const;
 export const NATIVE_AGENT_LIMITS = {
   resourceBytes: 8 * 1024 * 1024,
   resourceReads: 64,
@@ -123,6 +123,7 @@ export type ViewerProviderCapabilities = {
 export type ProviderModelPreferenceView = {
   model: string;
   effort: string | null;
+  serviceTier?: string | null;
 };
 
 export type ProviderCatalogEntry = {
@@ -195,6 +196,7 @@ export type NativeConversationSummary = {
   cwd: string;
   model: string;
   effort?: string;
+  serviceTier?: string | null;
   access: ProviderAccess;
   state: ProviderExecutionState;
   rootExecutionId: string;
@@ -265,6 +267,7 @@ export type AgentRuntimeResource = {
   activeConfiguration: {
     model: string;
     effort: string | null;
+    serviceTier: string | null;
     access: ProviderAccess;
   };
   composer: ComposerConfigurationView;
@@ -286,6 +289,7 @@ export type ComposerConfigurationView = {
   nextTurn: {
     model: string;
     effort: string | null;
+    serviceTier: string | null;
     access: ProviderAccess;
     origin: ComposerConfigurationOrigin;
   };
@@ -293,10 +297,12 @@ export type ComposerConfigurationView = {
     turnId: string;
     model: string;
     effort: string | null;
+    serviceTier: string | null;
   } | null;
   editable: {
     model: boolean;
     effort: boolean;
+    serviceTier: boolean;
     access: boolean;
   };
 };
@@ -336,9 +342,11 @@ export type NativeQueuedMessage = {
   kind: 'message';
   commandId: string;
   turnId: string;
+  clientMessageId: string;
   content: readonly UserContentPart[];
   model: string;
   effort?: string;
+  serviceTier?: string | null;
   access: ProviderAccess;
   state: 'queued' | 'dispatching' | 'blocked' | 'delivery-unknown';
   createdAt: number;
@@ -556,6 +564,7 @@ export type NativeConversationCreateCommand = {
   cwd: string;
   model: string;
   effort?: string;
+  serviceTier?: string | null;
   access: ProviderAccess;
 };
 
@@ -607,6 +616,7 @@ export type NativeMessageSendCommand = {
   providerInstanceId: string;
   model: string;
   effort: string | null;
+  serviceTier?: string | null;
   access: ProviderAccess;
   configurationRevision: string;
   delivery: 'auto' | 'queue' | 'steer';
@@ -636,6 +646,7 @@ export type NativeBranchCommand = {
   providerInstanceId: string;
   model: string;
   effort: string | null;
+  serviceTier?: string | null;
   access: ProviderAccess;
   configurationRevision: string;
 };
@@ -672,6 +683,7 @@ export type NativeComposerPreferenceSetCommand = {
   expectedRevision: string;
   model: string;
   effort: string | null;
+  serviceTier?: string | null;
 };
 
 export type NativeConversationAccessSetCommand = {
@@ -687,6 +699,7 @@ export type NativeProviderPreferenceSetCommand = {
   expectedProvidersRevision: string;
   model: string;
   effort: string | null;
+  serviceTier?: string | null;
   makeDefaultProvider: true;
 };
 
@@ -735,14 +748,17 @@ export function parseNativeArtifactReadCommand(value: unknown): NativeArtifactRe
 
 export function parseNativeConversationCreateCommand(value: unknown): NativeConversationCreateCommand {
   const record = strict(value, '$', [
-    'commandId', 'providerInstanceId', 'cwd', 'model', 'effort', 'access',
-  ], ['effort']);
+    'commandId', 'providerInstanceId', 'cwd', 'model', 'effort', 'serviceTier', 'access',
+  ], ['effort', 'serviceTier']);
   return {
     commandId: identifier(record.commandId, '$.commandId'),
     providerInstanceId: identifier(record.providerInstanceId, '$.providerInstanceId'),
     cwd: string(record.cwd, '$.cwd', 32 * 1024),
     model: string(record.model, '$.model'),
     ...(record.effort === undefined ? {} : { effort: string(record.effort, '$.effort') }),
+    ...(record.serviceTier === undefined ? {} : {
+      serviceTier: record.serviceTier === null ? null : string(record.serviceTier, '$.serviceTier'),
+    }),
     access: choice(record.access, ['read-only', 'workspace-write', 'full-access'], '$.access'),
   };
 }
@@ -750,8 +766,8 @@ export function parseNativeConversationCreateCommand(value: unknown): NativeConv
 export function parseNativeMessageSendCommand(value: unknown): NativeMessageSendCommand {
   const record = strict(value, '$', [
     'commandId', 'conversationId', 'clientMessageId', 'content', 'providerInstanceId',
-    'model', 'effort', 'access', 'configurationRevision', 'delivery',
-  ]);
+    'model', 'effort', 'serviceTier', 'access', 'configurationRevision', 'delivery',
+  ], ['serviceTier']);
   return {
     commandId: identifier(record.commandId, '$.commandId'),
     conversationId: identifier(record.conversationId, '$.conversationId'),
@@ -760,6 +776,9 @@ export function parseNativeMessageSendCommand(value: unknown): NativeMessageSend
     providerInstanceId: identifier(record.providerInstanceId, '$.providerInstanceId'),
     model: string(record.model, '$.model'),
     effort: record.effort === null ? null : string(record.effort, '$.effort'),
+    ...(record.serviceTier === undefined ? {} : {
+      serviceTier: record.serviceTier === null ? null : string(record.serviceTier, '$.serviceTier'),
+    }),
     access: choice(record.access, ['read-only', 'workspace-write', 'full-access'], '$.access'),
     configurationRevision: identifier(record.configurationRevision, '$.configurationRevision'),
     delivery: choice(record.delivery, ['auto', 'queue', 'steer'], '$.delivery'),
@@ -788,8 +807,8 @@ export function parseNativeBranchCommand(value: unknown): NativeBranchCommand {
   const record = strict(value, '$', [
     'commandId', 'clientMessageId', 'sourceConversationId', 'sourceStrandId',
     'sourcePathEntryId', 'expectedHeadRevision', 'content', 'mode',
-    'providerInstanceId', 'model', 'effort', 'access', 'configurationRevision',
-  ]);
+    'providerInstanceId', 'model', 'effort', 'serviceTier', 'access', 'configurationRevision',
+  ], ['serviceTier']);
   return {
     commandId: identifier(record.commandId, '$.commandId'),
     clientMessageId: identifier(record.clientMessageId, '$.clientMessageId'),
@@ -802,6 +821,9 @@ export function parseNativeBranchCommand(value: unknown): NativeBranchCommand {
     providerInstanceId: identifier(record.providerInstanceId, '$.providerInstanceId'),
     model: string(record.model, '$.model'),
     effort: record.effort === null ? null : string(record.effort, '$.effort'),
+    ...(record.serviceTier === undefined ? {} : {
+      serviceTier: record.serviceTier === null ? null : string(record.serviceTier, '$.serviceTier'),
+    }),
     access: choice(record.access, ['read-only', 'workspace-write', 'full-access'], '$.access'),
     configurationRevision: identifier(record.configurationRevision, '$.configurationRevision'),
   };
@@ -874,14 +896,17 @@ export function parseNativeComposerPreferenceSetCommand(
   value: unknown,
 ): NativeComposerPreferenceSetCommand {
   const record = strict(value, '$', [
-    'commandId', 'conversationId', 'expectedRevision', 'model', 'effort',
-  ]);
+    'commandId', 'conversationId', 'expectedRevision', 'model', 'effort', 'serviceTier',
+  ], ['serviceTier']);
   return {
     commandId: identifier(record.commandId, '$.commandId'),
     conversationId: identifier(record.conversationId, '$.conversationId'),
     expectedRevision: identifier(record.expectedRevision, '$.expectedRevision'),
     model: string(record.model, '$.model'),
     effort: record.effort === null ? null : string(record.effort, '$.effort'),
+    ...(record.serviceTier === undefined ? {} : {
+      serviceTier: record.serviceTier === null ? null : string(record.serviceTier, '$.serviceTier'),
+    }),
   };
 }
 
@@ -903,9 +928,9 @@ export function parseNativeProviderPreferenceSetCommand(
   value: unknown,
 ): NativeProviderPreferenceSetCommand {
   const record = strict(value, '$', [
-    'commandId', 'providerInstanceId', 'expectedProvidersRevision', 'model', 'effort',
+    'commandId', 'providerInstanceId', 'expectedProvidersRevision', 'model', 'effort', 'serviceTier',
     'makeDefaultProvider',
-  ]);
+  ], ['serviceTier']);
   if (record.makeDefaultProvider !== true) {
     throw new ProviderContractError('$.makeDefaultProvider', 'must equal true');
   }
@@ -918,6 +943,9 @@ export function parseNativeProviderPreferenceSetCommand(
     ),
     model: string(record.model, '$.model'),
     effort: record.effort === null ? null : string(record.effort, '$.effort'),
+    ...(record.serviceTier === undefined ? {} : {
+      serviceTier: record.serviceTier === null ? null : string(record.serviceTier, '$.serviceTier'),
+    }),
     makeDefaultProvider: true,
   };
 }

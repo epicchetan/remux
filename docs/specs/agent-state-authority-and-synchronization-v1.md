@@ -14,6 +14,14 @@ Coordinates with: `agent-conversation-lineage-and-sidebar-tree-v1.md` and
 
 # Agent state authority and synchronization v1
 
+Implementation sequencing and progress are maintained in
+[agent-audit-remediation-pass-1.md](agent-audit-remediation-pass-1.md).
+That amendment governs the current staged work: focused ownership extraction
+occurs with each relevant slice; existing canonical IDs are retained through
+aliases and only proven duplicates are repaired. The module map and numbered
+passes below remain architectural direction rather than a required all-at-once
+migration or a reason to defer every extraction until the end.
+
 ## Outcome
 
 Remux Agent has one explicit admission boundary between commands/provider
