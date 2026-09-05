@@ -232,8 +232,13 @@ export function useConversationActions(options: {
       ]),
       recoverActiveTranscriptResources({
         attempts: 4,
-        forceFullMeasure: true,
-        preserveReady: false,
+        // Editing replaces the active strand inside the same conversation. Keep
+        // the previous revision mounted until the replacement topology arrives,
+        // then let the layout reconciler reuse every inherited turn measurement.
+        // A fork selects a new conversation with no destination cache, so its
+        // first transcript read remains a cold/full layout initialization.
+        forceFullMeasure: mode === 'fork',
+        preserveReady: mode === 'edit',
         requiredTurnId: result.turnId,
         windowPolicy: 'tail',
       }),

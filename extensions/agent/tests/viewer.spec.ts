@@ -800,6 +800,23 @@ test('edits a completed user message as a new version of the same conversation',
   await expect(history.locator('[title="Conversation versions"]')).toHaveCount(0);
 });
 
+test('keeps the previous transcript visible while an edited strand is loading', async ({ page }) => {
+  await page.goto(conversationUrl());
+  await expect(transcript(page).getByText('Resume this conversation', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Edit message', exact: true }).click();
+  await messageBox(page).fill('Replacement prompt after a delayed read');
+  await page.evaluate(() => {
+    (window as any).__agentFixture.delayNextTranscript(750);
+  });
+  await page.getByRole('button', { name: 'Save edited message', exact: true }).click();
+
+  await expect(transcript(page).getByText('Resume this conversation', { exact: true })).toBeVisible();
+  await expect(transcript(page).getByText('Loading transcript', { exact: true })).toHaveCount(0);
+  await expect(
+    transcript(page).getByText('Replacement prompt after a delayed read', { exact: true }),
+  ).toBeVisible();
+});
+
 test('forks a completed response with its visible prefix intact', async ({ page, isMobile }) => {
   await page.goto(conversationUrl());
   await page.getByRole('button', { name: 'Fork from response', exact: true }).click();
