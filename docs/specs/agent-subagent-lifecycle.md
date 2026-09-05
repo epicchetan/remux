@@ -96,3 +96,15 @@ all other tables except the intended execution/block/audit changes retain exact
 ordered-row hashes; foreign-key check empty and quick_check ok. Evidence under
 `/tmp/remux-audit-implementation/subagent-validation/`. Live application waits
 for A's replay suppression integration and reviewed build/restart.
+
+A reviewed: protocol 10 exposes runtime and execution lifecycle; schema 16 adds
+Stop intents/assignment targets and nullable executions.lifecycle_error. Accepted
+interrupts retain acceptance when verification expires; explicit retry rechecks
+without another native interrupt. Existing intents retain frozen targets across
+repeated requests. Old native outcomes do not settle newer work; recovery_failed
+is not native terminal proof. Child reads and Stop processing are coalesced;
+resource invalidations cover timer outcomes. Stop's queue pause survives settlement
+until the next deliberate send. The full server suite passed 277/277 and typecheck
+passed; the dropped-terminal test additionally covers retry during a newer child
+assignment with only one native interrupt. Full browser acceptance and live
+deployment remain pending. Server/viewer protocol changes ship together.

@@ -232,9 +232,10 @@ test('Codex resume, steer, interrupt, snapshot, and fork preserve native identit
   }).expectedTurnId, 'native-turn-1');
   const interrupts = peer.requests.filter(({ method }) => method === 'turn/interrupt');
   assert.deepEqual(interrupts[0]?.params, {
-    threadId: 'child-thread-1',
-    turnId: 'child-turn-1',
+    threadId: 'thread-resumed-1',
+    turnId: 'native-turn-1',
   });
+  assert.equal(interrupts.length, 1, 'root interrupt leaves child cascade to the lifecycle owner');
   assert.equal((interrupts.at(-1)?.params as {
     turnId: string;
   }).turnId, 'native-turn-1');
@@ -432,6 +433,69 @@ test('Codex resume restores durable child ownership and child turn ordinal floor
   const tool = liveEvents.find(({ event }) =>
     event.type === 'turn.block.started' && event.block.payload.kind === 'tool');
   if (tool?.event.type === 'turn.block.started') assert.equal(tool.event.structure.blockOrdinal, 7);
+  await session.close();
+});
+
+test('Codex resume restores the exact active root turn for immediate steer and interrupt', async () => {
+  let peer: FakeCodexConnection | undefined;
+  const adapter = new CodexNativeAdapter({ createConnection: async (options) => {
+    peer = new FakeCodexConnection(options); return peer;
+  } });
+  const session = await adapter.openSession({
+    ...openInput,
+    commandId: 'open-active-root',
+    mode: 'resume',
+    nativeSession: { provider: 'codex', providerInstanceId: 'codex-local', sessionId: 'root-active' },
+    nativeTurnBindings: [{ turnId: 'remux-active', nativeTurnId: 'native-active' }],
+    activeTurnBinding: { turnId: 'remux-active', nativeTurnId: 'native-active' },
+  });
+  assert.ok(peer);
+  await session.steer({
+    commandId: 'steer-active-root', turnId: 'remux-active',
+    content: [{ type: 'text', text: 'Continue.' }],
+  });
+  await session.interrupt({ commandId: 'interrupt-active-root', turnId: 'remux-active' });
+  assert.deepEqual(peer.requests.filter(({ method }) => method === 'turn/steer').at(-1)?.params, {
+    threadId: 'root-active', expectedTurnId: 'native-active',
+    input: [{ type: 'text', text: 'Continue.', text_elements: [] }],
+  });
+  assert.deepEqual(peer.requests.filter(({ method }) => method === 'turn/interrupt').at(-1)?.params, {
+    threadId: 'root-active', turnId: 'native-active',
+  });
+  await session.close();
+});
+
+test('Codex resume interrupts the restored exact child assignment', async () => {
+  let peer: FakeCodexConnection | undefined;
+  const adapter = new CodexNativeAdapter({ createConnection: async (options) => {
+    peer = new FakeCodexConnection(options); return peer;
+  } });
+  const childThreadId = 'restored-active-child';
+  const childExecutionId = codexStableChildExecutionId(openInput.executionId, childThreadId);
+  const session = await adapter.openSession({
+    ...openInput, commandId: 'open-active-child', mode: 'resume',
+    nativeSession: { provider: 'codex', providerInstanceId: 'codex-local', sessionId: 'root-active-child' },
+    nativeTurnBindings: [{ turnId: 'owner-remux', nativeTurnId: 'owner-native' }],
+    nativeChildBindings: [{
+      nativeThreadId: childThreadId, executionId: childExecutionId,
+      parentExecutionId: openInput.executionId, nativeParentThreadId: 'root-active-child',
+      ownerTurnId: 'owner-remux', ownerNativeTurnId: 'owner-native',
+      activeNativeTurnId: 'child-native-active',
+      nativeTurnBindings: [{ turnId: 'child-remux-active', nativeTurnId: 'child-native-active' }],
+    }],
+  });
+  assert.ok(peer);
+  await session.interruptChild!({
+    commandId: 'interrupt-restored-child', childExecutionId, nativeSessionId: childThreadId,
+    expectedNativeTurnId: 'child-native-active',
+  });
+  assert.deepEqual(peer.requests.filter(({ method }) => method === 'turn/interrupt').at(-1)?.params, {
+    threadId: childThreadId, turnId: 'child-native-active',
+  });
+  await assert.rejects(() => session.interruptChild!({
+    commandId: 'interrupt-old-child', childExecutionId, nativeSessionId: childThreadId,
+    expectedNativeTurnId: 'child-native-old',
+  }), /no longer matches/u);
   await session.close();
 });
 

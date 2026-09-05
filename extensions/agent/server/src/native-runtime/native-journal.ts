@@ -184,6 +184,7 @@ export type JournalExecution = {
   state: 'running' | 'recovering' | 'idle' | 'failed' | 'interrupted';
   outcome?: ProviderTurnOutcome;
   summary?: string;
+  lifecycleError?: string;
   transcriptAvailable: boolean;
   createdAt: number;
   completedAt?: number;
@@ -2133,6 +2134,16 @@ export class NativeAgentJournal {
         } }).directives
       : undefined;
     const suppressedBlockIds = new Set<string>(directives?.suppressedBlockIds ?? []);
+    const phantomRepair = this.database.prepare(`SELECT value_json FROM meta WHERE key = ?`)
+      .get('repair_i3_phantom_grandchildren_v2') as { value_json: string } | undefined;
+    if (phantomRepair) {
+      const audit = JSON.parse(phantomRepair.value_json) as { suppressedBlockIds?: unknown };
+      if (Array.isArray(audit.suppressedBlockIds)) {
+        for (const blockId of audit.suppressedBlockIds.slice(0, 10_000)) {
+          if (typeof blockId === 'string') suppressedBlockIds.add(blockId);
+        }
+      }
+    }
     const snapshotGroups = groupBlockLifecycles(snapshotEvents
       .filter(({ event }) => !suppressedBlockIds.has(event.structure.blockId))
       .map((envelope, index) => ({
@@ -2841,6 +2852,11 @@ export class NativeAgentJournal {
           nativeTurnId: turn.nativeTurnId!,
           nextBlockOrdinal: this.nextTurnBlockOrdinal(turn.turnId),
         }));
+      const activeNativeTurnId = this.turnsForExecution(execution.executionId)
+        .filter((turn) => turn.nativeTurnId &&
+          (turn.state === 'running' || turn.state === 'recovering'))
+        .map((turn) => turn.nativeTurnId!)
+        .at(-1);
       const canonical = this.orderedPasses(execution.rootTurnId).flatMap((pass) =>
         pass.blocks.map((block) => ({ pass, block })))
         .find(({ block }) => block.kind === 'native-child' &&
@@ -2853,6 +2869,7 @@ export class NativeAgentJournal {
         nativeParentThreadId: nativeThreadByExecution.get(execution.parentExecutionId!)!,
         ownerTurnId: execution.rootTurnId,
         ownerNativeTurnId: owner.nativeTurnId,
+        ...(activeNativeTurnId ? { activeNativeTurnId } : {}),
         nativeTurnBindings,
         terminalNativeTurnIds: this.turnsForExecution(execution.executionId)
           .filter((turn) => turn.nativeTurnId && turn.outcome)
@@ -2880,6 +2897,112 @@ export class NativeAgentJournal {
     return (this.database.prepare(`
       SELECT * FROM executions WHERE conversation_id = ? ORDER BY created_at, execution_id
     `).all(conversationId) as Record<string, unknown>[]).map(executionRow);
+  }
+
+  executionsForAllConversations(): JournalExecution[] {
+    return (this.database.prepare(`
+      SELECT * FROM executions ORDER BY created_at, execution_id
+    `).all() as Record<string, unknown>[]).map(executionRow);
+  }
+
+  outstandingStopIntent(conversationId: string, scopeExecutionId: string | null) {
+    return this.database.prepare(`
+      SELECT * FROM stop_intents
+      WHERE conversation_id = ? AND COALESCE(scope_execution_id, '') = COALESCE(?, '')
+        AND state = 'outstanding'
+    `).get(conversationId, scopeExecutionId) as Record<string, unknown> | undefined;
+  }
+
+  outstandingStopIntents() {
+    return this.database.prepare(`
+      SELECT * FROM stop_intents WHERE state = 'outstanding' ORDER BY created_at, intent_id
+    `).all() as Record<string, unknown>[];
+  }
+
+  createStopIntent(input: {
+    intentId: string; conversationId: string; rootExecutionId: string;
+    scopeExecutionId: string | null; queuePaused: boolean; now: number;
+  }) {
+    this.database.prepare(`
+      INSERT OR IGNORE INTO stop_intents(
+        intent_id, conversation_id, root_execution_id, scope_execution_id, state,
+        queue_paused, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'outstanding', ?, ?, ?)
+    `).run(input.intentId, input.conversationId, input.rootExecutionId,
+      input.scopeExecutionId, input.queuePaused ? 1 : 0, input.now, input.now);
+  }
+
+  addStopTarget(input: {
+    intentId: string; executionId: string; assignmentTurnId: string;
+    nativeTurnId?: string; now: number;
+  }) {
+    this.database.prepare(`
+      INSERT OR IGNORE INTO stop_intent_targets(
+        intent_id, execution_id, assignment_turn_id, native_turn_id, state, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'pending', ?, ?)
+    `).run(input.intentId, input.executionId, input.assignmentTurnId,
+      input.nativeTurnId ?? null, input.now, input.now);
+  }
+
+  stopTargets(intentId: string) {
+    return this.database.prepare(`
+      SELECT * FROM stop_intent_targets WHERE intent_id = ?
+      ORDER BY created_at, execution_id, assignment_turn_id
+    `).all(intentId) as Record<string, unknown>[];
+  }
+
+  updateStopTarget(intentId: string, executionId: string, assignmentTurnId: string,
+    state: 'pending' | 'accepted' | 'terminal' | 'failed', error: string | null, now: number) {
+    this.database.prepare(`
+      UPDATE stop_intent_targets SET state = ?, error = ?, updated_at = MAX(updated_at, ?)
+      WHERE intent_id = ? AND execution_id = ? AND assignment_turn_id = ?
+    `).run(state, error, now, intentId, executionId, assignmentTurnId);
+  }
+
+  settleStopIntent(intentId: string, now: number) {
+    this.database.prepare(`
+      UPDATE stop_intents SET state = 'settled', updated_at = MAX(updated_at, ?)
+      WHERE intent_id = ? AND state = 'outstanding'
+        AND NOT EXISTS (
+          SELECT 1 FROM stop_intent_targets
+          WHERE stop_intent_targets.intent_id = stop_intents.intent_id
+            AND state != 'terminal'
+        )
+    `).run(now, intentId);
+  }
+
+  hasOutstandingConversationStop(conversationId: string) {
+    return Boolean(this.database.prepare(`
+      SELECT 1 FROM stop_intents WHERE conversation_id = ? AND state = 'outstanding'
+        AND scope_execution_id IS NULL
+    `).get(conversationId));
+  }
+
+  hasConversationQueuePause(conversationId: string) {
+    return Boolean(this.database.prepare(`
+      SELECT 1 FROM stop_intents WHERE conversation_id = ? AND queue_paused = 1
+    `).get(conversationId));
+  }
+
+  stopLifecycle(conversationId: string) {
+    const intents = this.database.prepare(`
+      SELECT * FROM stop_intents WHERE conversation_id = ? AND state = 'outstanding'
+    `).all(conversationId) as Record<string, unknown>[];
+    const targets = this.database.prepare(`
+      SELECT t.*, CASE WHEN turns.outcome IS NOT NULL THEN 'terminal' ELSE t.state END AS state
+      FROM stop_intent_targets t
+      JOIN stop_intents i USING(intent_id)
+      LEFT JOIN turns ON turns.turn_id = t.assignment_turn_id
+      WHERE i.conversation_id = ? AND i.state = 'outstanding'
+    `).all(conversationId) as Record<string, unknown>[];
+    return { intents, targets };
+  }
+
+  clearSettledConversationQueuePause(conversationId: string, now: number) {
+    this.database.prepare(`
+      UPDATE stop_intents SET queue_paused = 0, updated_at = MAX(updated_at, ?)
+      WHERE conversation_id = ? AND state = 'settled' AND queue_paused = 1
+    `).run(now, conversationId);
   }
 
   federatedExecutionsNeedingRecovery(): JournalExecution[] {
@@ -3026,6 +3149,13 @@ export class NativeAgentJournal {
       }
       return active.turn_id;
     });
+  }
+
+  setExecutionLifecycleError(executionId: string, message: string | null, now: number) {
+    this.database.prepare(`
+      UPDATE executions SET lifecycle_error = ?, updated_at = MAX(updated_at, ?)
+      WHERE execution_id = ?
+    `).run(message, now, executionId);
   }
 
   failTurnDispatch(turnId: string, message: string, now: number) {
@@ -3542,16 +3672,24 @@ export class NativeAgentJournal {
           this.database.prepare(`
             UPDATE conversations SET state = 'idle', active_turn_id = NULL,
               health_message = NULL, resumable = CASE WHEN ? THEN 1 ELSE resumable END,
-              updated_at = MAX(updated_at, ?) WHERE conversation_id = ?
-          `).run(repairsRecoveryFailure ? 1 : 0, now, conversationId);
+              updated_at = MAX(updated_at, ?) WHERE conversation_id = ? AND (
+                active_turn_id = ? OR (? = 1 AND active_turn_id IS NULL AND latest_turn_id = ?)
+              )
+          `).run(repairsRecoveryFailure ? 1 : 0, now, conversationId, scope.turnId,
+            repairsRecoveryFailure ? 1 : 0, scope.turnId);
         }
         const executionState = event.outcome === 'completed'
           ? 'idle'
           : event.outcome === 'interrupted' ? 'interrupted' : 'failed';
         this.database.prepare(`
           UPDATE executions SET state = ?, outcome = ?, completed_at = ?, updated_at = MAX(updated_at, ?)
-          WHERE execution_id = ?
-        `).run(executionState, event.outcome, now, now, executionId);
+          WHERE execution_id = ? AND NOT EXISTS (
+            SELECT 1 FROM turns newer
+            WHERE newer.execution_id = executions.execution_id
+              AND newer.turn_id != ?
+              AND newer.state IN ('running', 'recovering')
+          )
+        `).run(executionState, event.outcome, now, now, executionId, scope.turnId);
         this.database.prepare(`
           UPDATE turn_passes SET state = 'completed', updated_at = MAX(updated_at, ?)
           WHERE turn_id = ?
@@ -4308,6 +4446,8 @@ function executionRow(row: Record<string, unknown>): JournalExecution {
     state: row.state as JournalExecution['state'],
     ...(row.outcome === null ? {} : { outcome: row.outcome as ProviderTurnOutcome }),
     ...(row.summary === null ? {} : { summary: String(row.summary) }),
+    ...(row.lifecycle_error === null || row.lifecycle_error === undefined
+      ? {} : { lifecycleError: String(row.lifecycle_error) }),
     transcriptAvailable: row.transcript_available === 1,
     createdAt: Number(row.created_at),
     ...(row.completed_at === null ? {} : { completedAt: Number(row.completed_at) }),

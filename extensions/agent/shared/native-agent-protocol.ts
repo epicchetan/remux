@@ -22,7 +22,7 @@ import type {
 import { parseUserContentParts, ProviderContractError } from './provider-runtime.ts';
 
 /** Viewer-safe resource and command contract for the provider-native runtime. */
-export const NATIVE_AGENT_PROTOCOL_VERSION = 9 as const;
+export const NATIVE_AGENT_PROTOCOL_VERSION = 10 as const;
 export const NATIVE_AGENT_LIMITS = {
   resourceBytes: 8 * 1024 * 1024,
   resourceReads: 64,
@@ -52,6 +52,7 @@ export const NATIVE_AGENT_METHODS = {
   conversationArchiveSet: 'remux/agent/conversation/archive/set',
   conversationStrandActivate: 'remux/agent/conversation/strand/activate',
   turnInterrupt: 'remux/agent/conversation/turn/interrupt',
+  conversationInterrupt: 'remux/agent/conversation/interrupt',
   executionInterrupt: 'remux/agent/conversation/execution/interrupt',
   conversationCompact: 'remux/agent/conversation/compact',
   conversationPreferenceSet: 'remux/agent/composer/conversation-preference/set',
@@ -261,6 +262,15 @@ export type AgentRuntimeResource = {
   state: ProviderExecutionState;
   activeTurnId: string | null;
   activeTurnElapsedMs: number | null;
+  lifecycle: {
+    state: 'idle' | 'running' | 'checking' | 'stopping' | 'unavailable';
+    runningCount: number;
+    checkingCount: number;
+    stoppingCount: number;
+    stopErrorCount: number;
+    stopRequested: boolean;
+    stopError?: string;
+  };
   history: NativeConversationSummary['history'];
   provider: ProviderKind;
   providerInstanceId: string;
@@ -504,6 +514,11 @@ export type AgentExecutionResource = {
   summary?: string;
   childExecutionIds: readonly string[];
   transcriptAvailable: boolean;
+  lifecycle: {
+    state: 'running' | 'checking' | 'stopping' | 'completed' | 'failed' | 'interrupted' | 'unavailable';
+    activeAssignmentTurnId?: string;
+    stopError?: string;
+  };
   startedAt: number;
   completedAt?: number;
 };
@@ -626,6 +641,11 @@ export type NativeTurnMutationCommand = {
   commandId: string;
   conversationId: string;
   turnId: string;
+};
+
+export type NativeConversationInterruptCommand = {
+  commandId: string;
+  conversationId: string;
 };
 
 export type NativeExecutionMutationCommand = {
@@ -791,6 +811,14 @@ export function parseNativeTurnMutationCommand(value: unknown): NativeTurnMutati
     commandId: identifier(record.commandId, '$.commandId'),
     conversationId: identifier(record.conversationId, '$.conversationId'),
     turnId: identifier(record.turnId, '$.turnId'),
+  };
+}
+
+export function parseNativeConversationInterruptCommand(value: unknown): NativeConversationInterruptCommand {
+  const record = strict(value, '$', ['commandId', 'conversationId']);
+  return {
+    commandId: identifier(record.commandId, '$.commandId'),
+    conversationId: identifier(record.conversationId, '$.conversationId'),
   };
 }
 

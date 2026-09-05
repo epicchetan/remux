@@ -354,12 +354,46 @@ export class NativeAgentProjector {
     const activeTurnElapsedMs = activeTurn?.startedAt === undefined
       ? null
       : Math.max(0, this.now() - activeTurn.startedAt);
+    const activeChildren = this.journal.executionsForConversation(conversationId)
+      .filter(({ ownership }) => ownership !== 'root')
+      .filter(({ state }) => state === 'running' || state === 'recovering');
+    const stop = this.journal.stopLifecycle(conversationId);
+    const rootExecutionId = conversation.rootExecutionId;
+    const stoppedAgentIds = new Set(stop.targets
+      .filter(({ state, execution_id }) => state !== 'terminal' && execution_id !== rootExecutionId)
+      .map(({ execution_id }) => String(execution_id)));
+    const stoppingAgentIds = new Set(stop.targets
+      .filter(({ state, execution_id, error }) => state !== 'terminal' && !error && execution_id !== rootExecutionId)
+      .map(({ execution_id }) => String(execution_id)));
+    const stopErrorCount = new Set(stop.targets
+      .filter(({ state, execution_id, error }) => state !== 'terminal' && Boolean(error) && execution_id !== rootExecutionId)
+      .map(({ execution_id }) => String(execution_id))).size;
+    const stopRequested = stop.intents.length > 0;
+    const classifiedChildren = activeChildren.filter(({ executionId }) => !stoppedAgentIds.has(executionId));
+    const checkingCount = classifiedChildren.filter(({ state, ownership, executionId }) =>
+      state === 'recovering' || (ownership === 'native' && !this.journal.nativeChildHandle(executionId))).length;
+    const runningCount = classifiedChildren.length - checkingCount;
+    const rootStopError = stop.targets.find(({ state, execution_id, error }) =>
+      state !== 'terminal' && Boolean(error) && execution_id === rootExecutionId)?.error;
+    const reconciliationUnavailable = classifiedChildren.some(({ lifecycleError }) => Boolean(lifecycleError));
     return {
       conversationId,
       executionId: conversation.rootExecutionId,
       state: conversation.state,
       activeTurnId: conversation.activeTurnId,
       activeTurnElapsedMs,
+      lifecycle: {
+        state: stopErrorCount > 0 || typeof rootStopError === 'string' || reconciliationUnavailable
+          ? 'unavailable' : stopRequested ? 'stopping' : checkingCount > 0
+          ? (runningCount > 0 ? 'running' : 'checking')
+          : runningCount > 0 ? 'running' : 'idle',
+        runningCount,
+        checkingCount,
+        stoppingCount: stoppingAgentIds.size,
+        stopErrorCount,
+        stopRequested,
+        ...(typeof rootStopError === 'string' ? { stopError: rootStopError } : {}),
+      },
       history: conversation.history,
       provider: conversation.provider,
       providerInstanceId: conversation.providerInstanceId,
@@ -671,6 +705,19 @@ export class NativeAgentProjector {
   private execution(executionId: string): AgentExecutionResource | undefined {
     const execution = this.journal.execution(executionId);
     if (!execution) return undefined;
+    const activeAssignmentTurnId = this.journal.turnsForExecution(executionId)
+      .find(({ state }) => state === 'running' || state === 'recovering')?.turnId;
+    const lifecycleState = execution.lifecycleError
+      ? 'unavailable'
+      : execution.state === 'recovering'
+      ? 'checking'
+      : execution.state === 'running' && execution.ownership === 'native' &&
+          !this.journal.nativeChildHandle(executionId)
+        ? 'unavailable'
+        : execution.state === 'idle' ? 'completed' : execution.state;
+    const stopTarget = this.journal.stopLifecycle(execution.conversationId).targets
+      .filter(({ execution_id }) => execution_id === executionId)
+      .at(-1);
     return {
       executionId,
       conversationId: execution.conversationId,
@@ -692,6 +739,13 @@ export class NativeAgentProjector {
       ...(execution.summary ? { summary: execution.summary } : {}),
       childExecutionIds: this.journal.childExecutions(executionId).map(({ executionId }) => executionId),
       transcriptAvailable: execution.transcriptAvailable,
+      lifecycle: {
+        state: stopTarget?.error ? 'unavailable'
+          : stopTarget && stopTarget.state !== 'terminal' ? 'stopping' : lifecycleState,
+        ...(activeAssignmentTurnId ? { activeAssignmentTurnId } : {}),
+        ...(typeof stopTarget?.error === 'string'
+          ? { stopError: stopTarget.error } : {}),
+      },
       startedAt: execution.createdAt,
       ...(execution.completedAt === undefined ? {} : { completedAt: execution.completedAt }),
     };

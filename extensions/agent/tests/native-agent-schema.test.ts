@@ -489,7 +489,7 @@ test('faithful schema v12 migrates grants, exclusions, constraints, and rollback
     rollback.close();
     const reopened = await openNativeAgentJournal({ dataRoot: rollbackRoot });
     assert.equal((reopened.database.prepare('PRAGMA user_version').get() as { user_version: number })
-      .user_version, 15);
+      .user_version, 16);
     reopened.close();
   } finally {
     await rm(rollbackRoot, { recursive: true, force: true });
@@ -514,7 +514,7 @@ test('incomplete historical parent schema cannot commit version 13', () => {
   }
 });
 
-test('faithful committed schema v8 upgrades through v15', async () => {
+test('faithful committed schema v8 upgrades through v16', async () => {
   const fixtureSql = await readFile(new URL('./fixtures/native-agent-schema-v8.sql', import.meta.url), 'utf8');
   const database = new DatabaseSync(':memory:');
   try {
@@ -526,7 +526,7 @@ test('faithful committed schema v8 upgrades through v15', async () => {
     migrateNativeAgentSchema(database, 8);
     database.exec('COMMIT');
     validateNativeAgentSchema(database);
-    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15);
+    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16);
     assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
     assert.ok(listNativeAgentTables(database).includes('artifact_grants'));
   } finally {
@@ -534,7 +534,7 @@ test('faithful committed schema v8 upgrades through v15', async () => {
   }
 });
 
-test('faithful accepted schema v13 upgrades to the fresh v15 shape', async () => {
+test('faithful accepted schema v13 upgrades to the fresh v16 shape', async () => {
   const fixtureSql = await readFile(new URL('./fixtures/native-agent-schema-v13.sql', import.meta.url), 'utf8');
   const database = new DatabaseSync(':memory:');
   try {
@@ -545,7 +545,7 @@ test('faithful accepted schema v13 upgrades to the fresh v15 shape', async () =>
     migrateNativeAgentSchema(database, 13);
     database.exec('COMMIT');
     validateNativeAgentSchema(database);
-    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15);
+    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16);
     assert.ok(listNativeAgentTables(database).includes('federation_checkout_reservations'));
     assert.ok((database.prepare('PRAGMA table_info(executions)').all() as Array<{ name: string }>)
       .some(({ name }) => name === 'checkout_key'));
@@ -593,7 +593,7 @@ test('schema v15 opener rolls back a mid-migration failure and reopens cleanly',
       rolledBack.close();
     }
     const reopened = await openNativeAgentJournal({ dataRoot });
-    assert.equal((reopened.database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15);
+    assert.equal((reopened.database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16);
     reopened.close();
   } finally {
     await rm(dataRoot, { recursive: true, force: true });
@@ -653,6 +653,24 @@ test('schema v15 migration rejects and rolls back a conflicting delivery object'
   }
 });
 
+test('schema v16 migration rejects a malformed future Stop owner table before stamping', () => {
+  const database = new DatabaseSync(':memory:');
+  try {
+    createNativeAgentSchema(database);
+    database.exec(`DROP INDEX stop_intents_outstanding_scope;
+      DROP TABLE stop_intent_targets;
+      DROP TABLE stop_intents;
+      CREATE TABLE stop_intents(intent_id TEXT PRIMARY KEY) STRICT;
+      PRAGMA user_version = 15;
+      BEGIN IMMEDIATE;`);
+    assert.throws(() => migrateNativeAgentSchema(database, 15), /conflicting preexisting object/u);
+    database.exec('ROLLBACK');
+    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15);
+  } finally {
+    database.close();
+  }
+});
+
 test('schema v15 opener preserves a v14 database after a delivery-object collision', async () => {
   const dataRoot = await mkdtemp(join(tmpdir(), 'remux-schema-v15-delivery-rollback-'));
   const path = join(dataRoot, 'agent.sqlite3');
@@ -685,7 +703,7 @@ test('schema v15 opener preserves a v14 database after a delivery-object collisi
     }
     const reopened = await openNativeAgentJournal({ dataRoot });
     assert.equal((reopened.database.prepare('PRAGMA user_version').get() as
-      { user_version: number }).user_version, 15);
+      { user_version: number }).user_version, 16);
     reopened.close();
   } finally {
     await rm(dataRoot, { recursive: true, force: true });

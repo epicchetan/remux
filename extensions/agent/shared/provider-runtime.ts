@@ -194,6 +194,8 @@ export type NativeChildBinding = {
   nativeParentThreadId: string;
   ownerTurnId: string;
   ownerNativeTurnId: string;
+  /** Exact accepted native turn currently owned by this child, if unresolved. */
+  activeNativeTurnId?: string;
   nativeTurnBindings?: readonly NativeTurnBinding[];
   terminalNativeTurnIds?: readonly string[];
   canonicalBlock?: {
@@ -258,6 +260,8 @@ export type InterruptProviderChildInput = {
   commandId: string;
   childExecutionId: string;
   nativeSessionId: string;
+  /** Exact assignment target; providers must not substitute a later active turn. */
+  expectedNativeTurnId?: string;
 };
 
 export type CompactProviderSessionInput = {
@@ -858,10 +862,10 @@ export function parseOpenProviderSessionInput(value: unknown): OpenProviderSessi
     const path = `$.nativeChildBindings[${index}]`;
     const binding = strictRecord(value, path, [
       'nativeThreadId', 'executionId', 'parentExecutionId', 'nativeParentThreadId',
-      'ownerTurnId', 'ownerNativeTurnId', 'outcome',
+      'ownerTurnId', 'ownerNativeTurnId', 'activeNativeTurnId', 'outcome',
       'nativeTurnBindings',
       'terminalNativeTurnIds', 'canonicalBlock',
-    ], ['outcome', 'nativeTurnBindings', 'terminalNativeTurnIds', 'canonicalBlock']);
+    ], ['activeNativeTurnId', 'outcome', 'nativeTurnBindings', 'terminalNativeTurnIds', 'canonicalBlock']);
     const nativeThreadId = identifier(binding.nativeThreadId, `${path}.nativeThreadId`);
     if (seenChildThreads.has(nativeThreadId)) {
       throw new ProviderContractError(path, 'must not duplicate native child thread identity');
@@ -874,6 +878,9 @@ export function parseOpenProviderSessionInput(value: unknown): OpenProviderSessi
       nativeParentThreadId: identifier(binding.nativeParentThreadId, `${path}.nativeParentThreadId`),
       ownerTurnId: identifier(binding.ownerTurnId, `${path}.ownerTurnId`),
       ownerNativeTurnId: identifier(binding.ownerNativeTurnId, `${path}.ownerNativeTurnId`),
+      ...(binding.activeNativeTurnId === undefined ? {} : {
+        activeNativeTurnId: identifier(binding.activeNativeTurnId, `${path}.activeNativeTurnId`),
+      }),
       ...(binding.nativeTurnBindings === undefined ? {} : {
         nativeTurnBindings: array(binding.nativeTurnBindings, `${path}.nativeTurnBindings`)
           .map((entry, childTurnIndex) => parseNativeTurnBinding(
@@ -910,6 +917,13 @@ export function parseOpenProviderSessionInput(value: unknown): OpenProviderSessi
     if (new Set(childTurnIds.map(({ turnId }) => turnId)).size !== childTurnIds.length ||
         new Set(childTurnIds.map(({ nativeTurnId }) => nativeTurnId)).size !== childTurnIds.length) {
       throw new ProviderContractError('$.nativeChildBindings', 'child turn bindings must have unique identities');
+    }
+    if (binding.activeNativeTurnId &&
+        !childTurnIds.some(({ nativeTurnId }) => nativeTurnId === binding.activeNativeTurnId)) {
+      throw new ProviderContractError('$.nativeChildBindings', 'active child turn must have a durable binding');
+    }
+    if (binding.activeNativeTurnId && binding.terminalNativeTurnIds?.includes(binding.activeNativeTurnId)) {
+      throw new ProviderContractError('$.nativeChildBindings', 'active child turn must not be terminal');
     }
   }
   const childByExecution = new Map(nativeChildBindings.map((binding) => [binding.executionId, binding]));
@@ -1083,12 +1097,15 @@ export function parseInterruptProviderTurnInput(value: unknown): InterruptProvid
 
 export function parseInterruptProviderChildInput(value: unknown): InterruptProviderChildInput {
   const record = strictRecord(value, '$', [
-    'commandId', 'childExecutionId', 'nativeSessionId',
-  ]);
+    'commandId', 'childExecutionId', 'nativeSessionId', 'expectedNativeTurnId',
+  ], ['expectedNativeTurnId']);
   return {
     commandId: identifier(record.commandId, '$.commandId'),
     childExecutionId: identifier(record.childExecutionId, '$.childExecutionId'),
     nativeSessionId: identifier(record.nativeSessionId, '$.nativeSessionId'),
+    ...(record.expectedNativeTurnId === undefined ? {} : {
+      expectedNativeTurnId: identifier(record.expectedNativeTurnId, '$.expectedNativeTurnId'),
+    }),
   };
 }
 

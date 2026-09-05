@@ -684,6 +684,12 @@ export class CodexProviderSession implements ProviderSession {
       this.mapper.bindTurn(binding.turnId, binding.nativeTurnId, binding.nextBlockOrdinal);
       this.nativeTurnByRemux.set(binding.turnId, binding.nativeTurnId);
     }
+    if (options.input.activeTurnBinding) {
+      this.activeTurn = {
+        remuxTurnId: options.input.activeTurnBinding.turnId,
+        nativeTurnId: options.input.activeTurnBinding.nativeTurnId,
+      };
+    }
   }
 
   bind(resumed: boolean) {
@@ -757,9 +763,6 @@ export class CodexProviderSession implements ProviderSession {
         ? this.activeTurn.nativeTurnId
         : undefined;
       if (!nativeTurnId) throw new Error('Cannot interrupt a turn before Codex has bound its native turn ID.');
-      const childTurns = this.childRegistry.activeAttempts().slice(0, 32);
-      await Promise.allSettled(childTurns.map(([threadId, turnId]) =>
-        this.connection.request('turn/interrupt', { threadId, turnId }, 3_000)));
       await this.connection.request('turn/interrupt', {
         threadId: this.nativeSession.sessionId,
         turnId: nativeTurnId,
@@ -777,6 +780,10 @@ export class CodexProviderSession implements ProviderSession {
     return this.onceCommand(input.commandId, input, async () => this.mutate(async () => {
       this.assertOpen();
       let nativeTurnId = this.childRegistry.get(input.nativeSessionId)?.activeNativeTurnId;
+      if (input.expectedNativeTurnId && nativeTurnId && nativeTurnId !== input.expectedNativeTurnId) {
+        throw new Error('Codex child active turn no longer matches the requested assignment.');
+      }
+      if (input.expectedNativeTurnId) nativeTurnId = input.expectedNativeTurnId;
       if (!nativeTurnId) {
         const response = object(await this.connection.request('thread/read', {
           threadId: input.nativeSessionId,

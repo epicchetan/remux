@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 
-export const NATIVE_AGENT_SCHEMA_VERSION = 15;
+export const NATIVE_AGENT_SCHEMA_VERSION = 16;
 export const NATIVE_AGENT_APPLICATION_ID = 0x524d584e; // RMXN
 export const NATIVE_AGENT_SCHEMA_ID = 'remux-agent-native-v1';
 
@@ -31,6 +31,8 @@ export const NATIVE_AGENT_TABLES = [
   'command_receipts',
   'delivery_attempts',
   'delivery_attempt_staging',
+  'stop_intents',
+  'stop_intent_targets',
   'queued_messages',
   'queued_compactions',
   'artifacts',
@@ -117,6 +119,7 @@ CREATE TABLE executions (
   state TEXT NOT NULL CHECK (state IN ('running', 'recovering', 'idle', 'failed', 'interrupted')),
   outcome TEXT CHECK (outcome IS NULL OR outcome IN ('completed', 'failed', 'interrupted', 'recovery_failed')),
   summary TEXT,
+  lifecycle_error TEXT,
   transcript_available INTEGER NOT NULL CHECK (transcript_available IN (0, 1)),
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   completed_at INTEGER,
@@ -637,6 +640,33 @@ CREATE TABLE delivery_attempt_staging (
   PRIMARY KEY (attempt_id, ordinal), UNIQUE (attempt_id, observation_id),
   FOREIGN KEY (attempt_id) REFERENCES delivery_attempts(attempt_id) ON DELETE RESTRICT
 ) STRICT;
+CREATE TABLE stop_intents (
+  intent_id TEXT PRIMARY KEY NOT NULL,
+  conversation_id TEXT NOT NULL,
+  root_execution_id TEXT NOT NULL,
+  scope_execution_id TEXT,
+  state TEXT NOT NULL CHECK (state IN ('outstanding', 'settled')),
+  queue_paused INTEGER NOT NULL CHECK (queue_paused IN (0, 1)),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+  FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE RESTRICT
+) STRICT;
+CREATE UNIQUE INDEX stop_intents_outstanding_scope
+  ON stop_intents(conversation_id, COALESCE(scope_execution_id, '')) WHERE state = 'outstanding';
+CREATE TABLE stop_intent_targets (
+  intent_id TEXT NOT NULL,
+  execution_id TEXT NOT NULL,
+  assignment_turn_id TEXT NOT NULL,
+  native_turn_id TEXT,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'accepted', 'terminal', 'failed')),
+  error TEXT,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+  PRIMARY KEY (intent_id, execution_id, assignment_turn_id),
+  FOREIGN KEY (intent_id) REFERENCES stop_intents(intent_id) ON DELETE RESTRICT,
+  FOREIGN KEY (execution_id) REFERENCES executions(execution_id) ON DELETE RESTRICT,
+  FOREIGN KEY (assignment_turn_id) REFERENCES turns(turn_id) ON DELETE RESTRICT
+) STRICT;
 `;
 
 export function createNativeAgentSchema(database: DatabaseSync) {
@@ -654,7 +684,7 @@ export function migrateNativeAgentSchema(
   fromVersion: number,
   repairContext?: { backupPath?: string; migratedAt?: number },
 ) {
-  if (fromVersion < 1 || fromVersion > 14) {
+  if (fromVersion < 1 || fromVersion > 15) {
     throw new NativeAgentSchemaError(`No Native Agent migration exists from schema ${fromVersion}.`);
   }
   for (const name of ['delivery_attempts', 'delivery_attempts_lane',
@@ -662,6 +692,12 @@ export function migrateNativeAgentSchema(
     if (database.prepare('SELECT 1 FROM sqlite_schema WHERE name = ?').get(name) &&
         !schemaObjectMatchesDefinition(database, name)) {
       throw new NativeAgentSchemaError(`Version 15 found conflicting preexisting object ${name}.`);
+    }
+  }
+  for (const name of ['stop_intents', 'stop_intents_outstanding_scope', 'stop_intent_targets']) {
+    if (database.prepare('SELECT 1 FROM sqlite_schema WHERE name = ?').get(name) &&
+        !schemaObjectMatchesDefinition(database, name)) {
+      throw new NativeAgentSchemaError(`Version 16 found conflicting preexisting object ${name}.`);
     }
   }
   if (fromVersion === 1) {
@@ -775,7 +811,21 @@ export function migrateNativeAgentSchema(
   if (fromVersion <= 12) migrateVersionThirteen(database, fromVersion, repairContext);
   if (fromVersion <= 13) migrateVersionFourteen(database);
   if (fromVersion <= 14) migrateVersionFifteen(database);
+  if (fromVersion <= 15) migrateVersionSixteen(database);
   database.exec(`PRAGMA user_version = ${NATIVE_AGENT_SCHEMA_VERSION}`);
+}
+
+function migrateVersionSixteen(database: DatabaseSync) {
+  if (!schemaColumnExists(database, 'executions', 'lifecycle_error')) {
+    database.exec('ALTER TABLE executions ADD COLUMN lifecycle_error TEXT;');
+  }
+  for (const name of ['stop_intents', 'stop_intents_outstanding_scope', 'stop_intent_targets']) {
+    if (schemaObjectExists(database, name === 'stop_intents_outstanding_scope' ? 'index' : 'table', name)) continue;
+    const statement = SCHEMA_SQL.split(';').map((value) => value.trim()).find((value) =>
+      new RegExp(`^CREATE\\s+(?:TABLE|UNIQUE\\s+INDEX)\\s+${name}\\b`, 'iu').test(value));
+    if (!statement) throw new NativeAgentSchemaError(`Version 16 definition missing for ${name}.`);
+    database.exec(`${statement};`);
+  }
 }
 
 function schemaObjectMatchesDefinition(database: DatabaseSync, name: string) {

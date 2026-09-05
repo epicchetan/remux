@@ -9,6 +9,7 @@ import {
   parseNativeAgentResourceReadParams,
   parseNativeBranchCommand,
   parseNativeConversationCreateCommand,
+  parseNativeConversationInterruptCommand,
   parseNativeConversationRenameCommand,
   parseNativeConversationArchiveSetCommand,
   parseNativeConversationStrandActivateCommand,
@@ -25,6 +26,7 @@ import {
   type NativeAgentResourceReadParams,
   type NativeBranchCommand,
   type NativeConversationCreateCommand,
+  type NativeConversationInterruptCommand,
   type NativeConversationRenameCommand,
   type NativeConversationArchiveSetCommand,
   type NativeConversationStrandActivateCommand,
@@ -267,6 +269,10 @@ export class NativeAgentCoordinator {
   private readonly accessReconfigurations = new Set<string>();
   private readonly automaticRecoveryAttempts = new Map<string, number>();
   private readonly automaticRecoveryProbation = new Set<string>();
+  private readonly stopJobs = new Map<string, Promise<void>>();
+  private readonly childReconciliationJobs = new Map<string, Promise<void>>();
+  private readonly stopReconcileAttempts = new Map<string, number>();
+  private readonly stopReconcileTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly federationBlockRevision = new Map<string, number>();
   private readonly now: () => number;
   private readonly onResourcesInvalidated: NonNullable<NativeCoordinatorOptions['onResourcesInvalidated']>;
@@ -395,6 +401,19 @@ export class NativeAgentCoordinator {
     }
     for (const execution of this.journal.federatedExecutionsNeedingRecovery()) {
       await this.recoverFederatedExecution(execution);
+    }
+    // Native children share their root provider session. Reconcile every
+    // unfinished child after root recovery so missed terminal notifications do
+    // not depend on opening the Agents view.
+    const unresolvedNativeChildren = this.journal.executionsForAllConversations()
+      .filter((execution) => execution.ownership === 'native' &&
+        (execution.state === 'running' || execution.state === 'recovering'));
+    for (let offset = 0; offset < unresolvedNativeChildren.length; offset += 4) {
+      await Promise.allSettled(unresolvedNativeChildren.slice(offset, offset + 4)
+        .map((execution) => this.synchronizeNativeChildHistory(execution.executionId)));
+    }
+    for (const intent of this.journal.outstandingStopIntents()) {
+      if (typeof intent.intent_id === 'string') await this.processStopIntent(intent.intent_id);
     }
     // The durable queue is a server-owned command lane. A process may stop
     // after committing a follow-up but before its dispatch microtask runs, so
@@ -919,7 +938,8 @@ export class NativeAgentCoordinator {
     const compactionRunning = compaction?.state === 'running';
     const hasQueuedWork = this.journal.queuedEntries(conversation.conversationId).length > 0;
     const laneBusy = Boolean(conversation.activeTurnId) || compactionRunning || hasQueuedWork ||
-      this.journal.hasUnresolvedRootDelivery(conversation.conversationId);
+      this.journal.hasUnresolvedRootDelivery(conversation.conversationId) ||
+      this.journal.hasConversationQueuePause(conversation.conversationId);
     const shouldSteer = Boolean(conversation.activeTurnId) && input.delivery === 'steer';
     if (input.delivery === 'steer' && !conversation.activeTurnId) {
       const error = coordinatorError('conversation_busy', 'There is no active turn to steer.');
@@ -945,6 +965,9 @@ export class NativeAgentCoordinator {
     // boundary. The dispatcher may claim an idle lane right away, but the RPC
     // acknowledgment never depends on the WebView remaining connected.
     this.journal.transaction(() => {
+      if (!this.journal.hasOutstandingConversationStop(conversation.conversationId)) {
+        this.journal.clearSettledConversationQueuePause(conversation.conversationId, this.now());
+      }
       this.journal.grantImageContent({
         scope: { conversationId: conversation.conversationId, executionId: conversation.rootExecutionId },
         content: input.content,
@@ -978,38 +1001,273 @@ export class NativeAgentCoordinator {
       this.interruptTurnOwned(input));
   }
 
+  async interruptConversation(unparsed: NativeConversationInterruptCommand) {
+    this.assertOpen();
+    const input = parseNativeConversationInterruptCommand(unparsed);
+    const current = this.requireConversation(input.conversationId);
+    if (current.activeTurnId &&
+        !this.requireCapabilities(current.providerInstanceId).turns.interrupt) {
+      throw coordinatorError('capability_unavailable', 'Provider does not support native turn interruption.');
+    }
+    return this.journal.runAsyncCommand(input.commandId, 'conversation.interrupt', input, async () => {
+      const claim = this.journal.claimCommand(input.commandId, 'conversation.interrupt', input, this.now());
+      const replay = this.replay<{ accepted: true; intentId: string }>(claim.receipt);
+      if (replay) return replay;
+      const conversation = this.requireConversation(input.conversationId);
+      const existing = this.journal.outstandingStopIntent(input.conversationId, null);
+      const intentId = typeof existing?.intent_id === 'string'
+        ? existing.intent_id : stableUuid(`conversation-stop\0${input.conversationId}\0${input.commandId}`);
+      this.journal.transaction(() => {
+        this.journal.createStopIntent({
+          intentId,
+          conversationId: input.conversationId,
+          rootExecutionId: conversation.rootExecutionId,
+          scopeExecutionId: null,
+          queuePaused: true,
+          now: this.now(),
+        });
+        if (!existing) this.captureStopTargets(intentId, conversation, null);
+        this.journal.markCommandDispatching(input.commandId, this.now());
+      });
+      const result = { accepted: true as const, intentId };
+      this.journal.acceptCommand(input.commandId, result, this.now());
+      this.retryStopTargets(intentId);
+      await this.processStopIntent(intentId);
+      this.invalidateConversation(input.conversationId);
+      return result;
+    });
+  }
+
+  private captureStopTargets(
+    intentId: string,
+    conversation: JournalConversation,
+    scopeExecutionId: string | null,
+  ) {
+    const executions = this.journal.executionsForConversation(conversation.conversationId);
+    const byId = new Map(executions.map((execution) => [execution.executionId, execution]));
+    const belongs = (execution: JournalExecution) => {
+      if (!scopeExecutionId) return true;
+      let candidate: JournalExecution | undefined = execution;
+      const visited = new Set<string>();
+      while (candidate && !visited.has(candidate.executionId)) {
+        if (candidate.executionId === scopeExecutionId) return true;
+        visited.add(candidate.executionId);
+        candidate = candidate.parentExecutionId ? byId.get(candidate.parentExecutionId) : undefined;
+      }
+      return false;
+    };
+    for (const execution of executions.filter(belongs)) {
+      const active = this.journal.turnsForExecution(execution.executionId)
+        .filter(({ state }) => state === 'running' || state === 'recovering').at(-1);
+      if (!active) continue;
+      this.journal.addStopTarget({
+        intentId,
+        executionId: execution.executionId,
+        assignmentTurnId: active.turnId,
+        ...(active.nativeTurnId ? { nativeTurnId: active.nativeTurnId } : {}),
+        now: this.now(),
+      });
+    }
+  }
+
+  private processStopIntent(intentId: string) {
+    if (this.closed) return Promise.resolve();
+    const existing = this.stopJobs.get(intentId);
+    if (existing) return existing;
+    const job = this.processStopIntentOwned(intentId).finally(() => {
+      if (this.stopJobs.get(intentId) === job) this.stopJobs.delete(intentId);
+      if (!this.closed) this.invalidateStopIntent(intentId);
+    });
+    this.stopJobs.set(intentId, job);
+    return job;
+  }
+
+  private invalidateStopIntent(intentId: string) {
+    const intent = this.journal.outstandingStopIntents().find(({ intent_id }) => intent_id === intentId);
+    const targets = this.journal.stopTargets(intentId);
+    const conversationId = typeof intent?.conversation_id === 'string' ? intent.conversation_id
+      : targets.length ? this.journal.execution(String(targets[0]!.execution_id))?.conversationId : undefined;
+    if (!conversationId) return;
+    this.invalidateConversation(conversationId);
+    for (const executionId of new Set(targets.map(({ execution_id }) => String(execution_id)))) {
+      this.invalidateConversation(conversationId, executionId);
+    }
+  }
+
+  private retryStopTargets(intentId: string) {
+    for (const target of this.journal.stopTargets(intentId)) {
+      if (!target.error && target.state !== 'failed') continue;
+      const executionId = String(target.execution_id), turnId = String(target.assignment_turn_id);
+      const key = `${intentId}\0${executionId}\0${turnId}`;
+      this.stopReconcileAttempts.delete(key);
+      this.journal.updateStopTarget(intentId, executionId, turnId,
+        target.state === 'accepted' ? 'accepted' : 'pending', null, this.now());
+    }
+  }
+
+  private async processStopIntentOwned(intentId: string) {
+    const intent = this.journal.outstandingStopIntents().find(({ intent_id }) => intent_id === intentId);
+    if (!intent || typeof intent.conversation_id !== 'string') return;
+    const conversation = this.requireConversation(intent.conversation_id);
+    if (this.journal.stopTargets(intentId).length === 0 && intent.queue_paused === 1) {
+      this.captureStopTargets(intentId, conversation, null);
+    }
+    this.captureLateStopDescendants(intentId, conversation);
+    const targets = this.journal.stopTargets(intentId);
+    for (let offset = 0; offset < targets.length; offset += 4) {
+      await Promise.allSettled(targets.slice(offset, offset + 4).map(async (target) => {
+      const executionId = String(target.execution_id);
+      const turnId = String(target.assignment_turn_id);
+      const turn = this.journal.turn(turnId);
+      if (!turn || turn.executionId !== executionId) {
+        this.journal.updateStopTarget(intentId, executionId, turnId, 'failed',
+          'Stop target assignment is unavailable.', this.now());
+        return;
+      }
+      if (turn.outcome && turn.outcome !== 'recovery_failed') {
+        this.journal.updateStopTarget(intentId, executionId, turnId, 'terminal', null, this.now());
+        return;
+      }
+      if (target.state === 'accepted') {
+        if (!target.error) this.scheduleStoppedTargetReconciliation(intentId, executionId, turnId);
+        return;
+      }
+      if (target.state === 'failed') return;
+      // A later assignment fences this old target. Its eventual terminal is
+      // still observed, but Stop must never be redirected to the newer turn.
+      const newerActive = this.journal.turnsForExecution(executionId).some((candidate) =>
+        candidate.turnId !== turnId &&
+        (candidate.state === 'running' || candidate.state === 'recovering'));
+      if (newerActive) return;
+      try {
+        const execution = this.journal.execution(executionId);
+        if (!execution) throw new Error('Stop target execution is unavailable.');
+        if (execution.ownership === 'root') {
+          const session = await this.ensureSession(conversation);
+          await session.interrupt({
+            commandId: stableUuid(`stop-target\0${intentId}\0${executionId}\0${turnId}\0${target.updated_at}`),
+            turnId,
+          });
+        } else if (execution.ownership === 'federated') {
+          await this.interruptFederatedExecution(
+            stableUuid(`stop-target\0${intentId}\0${executionId}\0${turnId}\0${target.updated_at}`), executionId);
+        } else {
+          const handle = this.journal.nativeChildHandle(executionId);
+          if (!handle) throw new Error('Native child handle is unavailable.');
+          const session = await this.ensureSession(conversation);
+          if (!session.interruptChild) throw new Error('Native child interruption is unavailable.');
+          await session.interruptChild({
+            commandId: stableUuid(`stop-target\0${intentId}\0${executionId}\0${turnId}\0${target.updated_at}`),
+            childExecutionId: executionId,
+            nativeSessionId: handle.nativeSessionId,
+            ...(typeof target.native_turn_id === 'string'
+              ? { expectedNativeTurnId: target.native_turn_id } : {}),
+          });
+        }
+        this.journal.updateStopTarget(intentId, executionId, turnId, 'accepted', null, this.now());
+        this.scheduleStoppedTargetReconciliation(intentId, executionId, turnId);
+      } catch (error) {
+        this.journal.updateStopTarget(
+          intentId, executionId, turnId, 'failed', safeMessage(error), this.now(),
+        );
+      }
+      }));
+    }
+    for (const target of this.journal.stopTargets(intentId)) {
+      const turn = this.journal.turn(String(target.assignment_turn_id));
+      if (turn?.outcome && turn.outcome !== 'recovery_failed') this.journal.updateStopTarget(intentId, String(target.execution_id),
+        String(target.assignment_turn_id), 'terminal', null, this.now());
+    }
+    if (this.journal.stopTargets(intentId).length === 0 &&
+        (this.dispatchingConversations.has(conversation.conversationId) ||
+          this.journal.hasUnresolvedRootDelivery(conversation.conversationId))) return;
+    this.journal.settleStopIntent(intentId, this.now());
+  }
+
+  private scheduleStoppedTargetReconciliation(intentId: string, executionId: string, turnId: string) {
+    if (this.closed) return;
+    const key = `${intentId}\0${executionId}\0${turnId}`;
+    if (this.stopReconcileTimers.has(key)) return;
+    const attempt = this.stopReconcileAttempts.get(key) ?? 0;
+    if (attempt >= 4) {
+      this.journal.updateStopTarget(intentId, executionId, turnId, 'accepted',
+        'Stop was accepted, but terminal status could not be verified.', this.now());
+      this.invalidateStopIntent(intentId);
+      return;
+    }
+    this.stopReconcileAttempts.set(key, attempt + 1);
+    const timer = setTimeout(() => void (async () => {
+      this.stopReconcileTimers.delete(key);
+      if (this.closed) return;
+      try {
+        const execution = this.journal.execution(executionId);
+        if (!execution) throw new Error('Stop target execution is unavailable.');
+        if (execution.ownership === 'native') await this.synchronizeNativeChildHistory(executionId);
+        else await this.reconcile(execution.conversationId, executionId);
+        await this.processStopIntent(intentId);
+      } catch { /* the bounded retry retains visible uncertainty */ }
+      if (this.closed) return;
+      const target = this.journal.stopTargets(intentId).find((candidate) =>
+        candidate.execution_id === executionId && candidate.assignment_turn_id === turnId);
+      if (target && target.state !== 'terminal') {
+        this.scheduleStoppedTargetReconciliation(intentId, executionId, turnId);
+      } else {
+        this.stopReconcileAttempts.delete(key);
+      }
+    })().catch(() => undefined), [250, 1_000, 3_000, 5_000][attempt]!);
+    this.stopReconcileTimers.set(key, timer);
+    timer.unref?.();
+  }
+
+  private captureLateStopDescendants(intentId: string, conversation: JournalConversation) {
+    const targets = this.journal.stopTargets(intentId);
+    const capturedAssignments = new Set(targets.map(({ assignment_turn_id }) => String(assignment_turn_id)));
+    const capturedExecutions = new Set(targets.map(({ execution_id }) => String(execution_id)));
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const execution of this.journal.executionsForConversation(conversation.conversationId)) {
+        if (capturedExecutions.has(execution.executionId) || !execution.rootTurnId ||
+            !capturedAssignments.has(execution.rootTurnId)) continue;
+        const active = this.journal.turnsForExecution(execution.executionId)
+          .filter(({ state }) => state === 'running' || state === 'recovering').at(-1);
+        if (!active) continue;
+        this.journal.addStopTarget({
+          intentId, executionId: execution.executionId, assignmentTurnId: active.turnId,
+          ...(active.nativeTurnId ? { nativeTurnId: active.nativeTurnId } : {}), now: this.now(),
+        });
+        capturedExecutions.add(execution.executionId);
+        capturedAssignments.add(active.turnId);
+        changed = true;
+      }
+    }
+  }
+
   private async interruptTurnOwned(input: NativeTurnMutationCommand) {
     this.assertOpen();
     const claim = this.journal.claimCommand(input.commandId, 'turn.interrupt', input, this.now());
     const replay = this.replay<{ accepted: true }>(claim.receipt);
     if (replay) return replay;
-    let conversation: JournalConversation;
-    let session: ProviderSession;
     try {
-      conversation = this.requireConversation(input.conversationId);
+      const conversation = this.requireConversation(input.conversationId);
       if (conversation.activeTurnId !== input.turnId) throw new Error('Turn is not active.');
       if (!this.requireCapabilities(conversation.providerInstanceId).turns.interrupt) {
         throw coordinatorError('capability_unavailable', 'Provider does not support native turn interruption.');
       }
-      this.journal.markCommandDispatching(input.commandId, this.now());
-      session = await this.ensureSession(conversation);
-    } catch (error) {
-      this.journal.rejectCommand(input.commandId, safeMessage(error), this.now());
-      throw error;
-    }
-    try {
-      const foregroundChildren = this.journal.executionsForConversation(conversation.conversationId)
-        .filter((execution) => execution.ownership === 'federated' &&
-          execution.rootTurnId === input.turnId &&
-          execution.federationScheduling === 'foreground' &&
-          (execution.state === 'running' || execution.state === 'recovering'));
-      await Promise.allSettled(foregroundChildren.map((execution) =>
-        this.interruptFederatedExecution(
-          stableUuid(`parent-interrupt\0${input.commandId}\0${execution.executionId}`),
-          execution.executionId,
-        )));
-      const result = await session.interrupt({ commandId: input.commandId, turnId: input.turnId });
+      const existing = this.journal.outstandingStopIntent(input.conversationId, null);
+      const intentId = typeof existing?.intent_id === 'string' ? existing.intent_id
+        : stableUuid(`turn-stop\0${input.conversationId}\0${input.turnId}\0${input.commandId}`);
+      this.journal.transaction(() => {
+        this.journal.createStopIntent({ intentId, conversationId: input.conversationId,
+          rootExecutionId: conversation.rootExecutionId, scopeExecutionId: null,
+          queuePaused: true, now: this.now() });
+        if (!existing) this.captureStopTargets(intentId, conversation, null);
+        this.journal.markCommandDispatching(input.commandId, this.now());
+      });
+      const result = { accepted: true as const };
       this.journal.acceptCommand(input.commandId, result, this.now());
+      this.retryStopTargets(intentId);
+      await this.processStopIntent(intentId);
       return result;
     } catch (error) {
       this.journal.rejectCommand(input.commandId, safeMessage(error), this.now());
@@ -1023,9 +1281,6 @@ export class NativeAgentCoordinator {
     const execution = this.journal.execution(input.executionId);
     if (!execution || execution.conversationId !== input.conversationId || execution.ownership === 'root') {
       throw new Error('Child execution does not exist in this conversation.');
-    }
-    if (execution.ownership === 'federated') {
-      return this.interruptFederatedExecution(input.commandId, input.executionId);
     }
     return this.journal.runAsyncCommand(input.commandId, 'execution.interrupt', input, () =>
       this.interruptExecutionOwned(input, execution));
@@ -1042,29 +1297,28 @@ export class NativeAgentCoordinator {
       if (execution.state !== 'running' && execution.state !== 'recovering') {
         throw new Error('Child execution is not running.');
       }
-      const capabilities = this.requireCapabilities(execution.providerInstanceId);
-      if (!capabilities.collaboration.childInterrupt) {
-        throw coordinatorError('capability_unavailable', 'Provider does not support child interruption.');
-      }
-      const handle = this.journal.nativeChildHandle(execution.executionId);
-      if (!handle) throw coordinatorError('session_unavailable', 'Native child handle is unavailable.');
       const conversation = this.requireConversation(input.conversationId);
-      if (execution.parentExecutionId !== conversation.rootExecutionId) {
-        throw coordinatorError('session_unavailable', 'Native child is not attached to the active conversation session.');
-      }
-      const session = await this.ensureSession(conversation);
-      if (!session.interruptChild) {
-        throw coordinatorError('native_command_unavailable', 'Native child interruption is unavailable.');
-      }
-      this.journal.markCommandDispatching(input.commandId, this.now());
-      const result = await session.interruptChild({
-        commandId: input.commandId,
-        childExecutionId: execution.executionId,
-        nativeSessionId: handle.nativeSessionId,
+      const existing = this.journal.outstandingStopIntent(input.conversationId, execution.executionId);
+      const intentId = typeof existing?.intent_id === 'string'
+        ? existing.intent_id
+        : stableUuid(`execution-stop\0${input.conversationId}\0${execution.executionId}\0${input.commandId}`);
+      this.journal.transaction(() => {
+        this.journal.createStopIntent({
+          intentId,
+          conversationId: input.conversationId,
+          rootExecutionId: conversation.rootExecutionId,
+          scopeExecutionId: execution.executionId,
+          queuePaused: false,
+          now: this.now(),
+        });
+        if (!existing) this.captureStopTargets(intentId, conversation, execution.executionId);
+        this.journal.markCommandDispatching(input.commandId, this.now());
       });
+      const result = { accepted: true as const };
       this.journal.acceptCommand(input.commandId, result, this.now());
-      this.invalidateConversation(input.conversationId, conversation.rootExecutionId, execution.rootTurnId ?? undefined);
-      this.invalidateConversation(input.conversationId, execution.executionId);
+      this.retryStopTargets(intentId);
+      await this.processStopIntent(intentId);
+      this.invalidateConversation(input.conversationId, conversation.rootExecutionId);
       return result;
     } catch (error) {
       this.journal.rejectCommand(input.commandId, safeMessage(error), this.now());
@@ -2359,6 +2613,8 @@ export class NativeAgentCoordinator {
     this.closed = true;
     clearInterval(this.sessionSweep);
     clearInterval(this.queueSweep);
+    for (const timer of this.stopReconcileTimers.values()) clearTimeout(timer);
+    this.stopReconcileTimers.clear();
     for (const job of this.hydrationJobs.values()) {
       job.controller.abort(new Error('Native Agent coordinator is closing.'));
     }
@@ -2383,6 +2639,8 @@ export class NativeAgentCoordinator {
       ...sessions.map((session) => session.close()),
       ...openingSessions,
       ...hydrationJobs,
+      ...this.childReconciliationJobs.values(),
+      ...this.stopJobs.values(),
       ...providerRefreshes,
       ...accountUsageRefreshes,
       ...logins.map(({ operation }) => operation.close()),
@@ -2700,26 +2958,50 @@ export class NativeAgentCoordinator {
   }
 
   private async synchronizeNativeChildHistory(executionId: string, signal?: AbortSignal) {
+    if (this.closed) return;
+    const existing = this.childReconciliationJobs.get(executionId);
+    if (existing) return abortable(existing, signal);
+    const job = Promise.resolve().then(() => this.synchronizeNativeChildHistoryOwned(executionId))
+      .finally(() => {
+        if (this.childReconciliationJobs.get(executionId) === job) this.childReconciliationJobs.delete(executionId);
+      });
+    this.childReconciliationJobs.set(executionId, job);
+    return abortable(job, signal);
+  }
+
+  private async synchronizeNativeChildHistoryOwned(executionId: string) {
+    if (this.closed) return;
     const execution = this.journal.execution(executionId);
-    if (!execution || execution.ownership !== 'native' ||
-        this.journal.turnsForExecution(executionId).length > 0) return;
+    if (!execution || execution.ownership !== 'native') return;
+    const unfinished = execution.state === 'running' || execution.state === 'recovering';
+    if (!unfinished && this.journal.turnsForExecution(executionId).length > 0) return;
     const capabilities = this.requireCapabilities(execution.providerInstanceId);
     if (capabilities.collaboration.childTranscript === 'none') return;
     const handle = this.journal.nativeChildHandle(executionId);
     const conversation = this.journal.conversation(execution.conversationId);
-    if (!handle || !conversation || execution.parentExecutionId !== conversation.rootExecutionId) return;
-    throwIfAborted(signal);
-    const session = await this.ensureSession(conversation);
-    if (!session.snapshotChild) return;
-    const snapshot = await session.snapshotChild({
+    if (!handle || !conversation) return;
+    if (unfinished) this.journal.markExecutionRecovering(executionId, this.now());
+    this.journal.setExecutionLifecycleError(executionId, null, this.now());
+    this.invalidateConversation(execution.conversationId, executionId);
+    try {
+      const session = await this.ensureSession(conversation);
+      if (!session.snapshotChild) throw new Error('Native child reconciliation is unavailable.');
+      const snapshot = await session.snapshotChild({
       commandId: stableUuid(`child-snapshot\0${executionId}\0${this.now()}`),
       childExecutionId: executionId,
       nativeSessionId: handle.nativeSessionId,
-    });
-    throwIfAborted(signal);
-    this.journal.replaceSnapshot(snapshot.events, snapshot.coverage);
-    this.observePersistedTerminals(snapshot.events, snapshot.authority);
-    this.invalidateConversation(execution.conversationId, executionId);
+      });
+      if (this.closed) return;
+      this.journal.replaceSnapshot(snapshot.events, snapshot.coverage);
+      this.observePersistedTerminals(snapshot.events, snapshot.authority);
+      if (snapshot.state === 'running') this.journal.confirmExecutionRunning(executionId, this.now());
+      this.journal.setExecutionLifecycleError(executionId, null, this.now());
+      this.invalidateConversation(execution.conversationId, executionId);
+    } catch (error) {
+      this.journal.setExecutionLifecycleError(executionId, safeMessage(error), this.now());
+      this.invalidateConversation(execution.conversationId, executionId);
+      throw error;
+    }
   }
 
   private historySynchronizationRequired(
@@ -3091,6 +3373,7 @@ export class NativeAgentCoordinator {
     try {
       const conversation = this.requireConversation(conversationId);
       if (conversation.activeTurnId) return;
+      if (this.journal.hasConversationQueuePause(conversationId)) return;
       const compaction = this.journal.latestCompactionOperation(conversationId);
       if (compaction?.state === 'running') return;
       const provider = this.journal.providerInstance(conversation.providerInstanceId);
@@ -3173,6 +3456,11 @@ export class NativeAgentCoordinator {
       }
     } finally {
       this.dispatchingConversations.delete(conversationId);
+      for (const intent of this.journal.outstandingStopIntents()) {
+        if (intent.conversation_id === conversationId && typeof intent.intent_id === 'string') {
+          void this.processStopIntent(intent.intent_id);
+        }
+      }
       if (this.pendingDispatchConversations.delete(conversationId)) {
         queueMicrotask(() => void this.dispatchNext(conversationId));
       }
@@ -3934,6 +4222,13 @@ export class NativeAgentCoordinator {
         changedExecutionId,
         changedTurnIds.has('') || turnIds.length !== 1 ? undefined : turnIds[0],
       );
+    }
+    if (inserted.length > 0) {
+      for (const intent of this.journal.outstandingStopIntents()) {
+        if (intent.conversation_id === conversationId && typeof intent.intent_id === 'string') {
+          void this.processStopIntent(intent.intent_id);
+        }
+      }
     }
   }
 

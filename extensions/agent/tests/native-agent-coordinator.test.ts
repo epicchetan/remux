@@ -23,6 +23,7 @@ import type {
   UserContentPart,
 } from '../shared/provider-runtime.ts';
 import { PROVIDER_RUNTIME_CONTRACT_VERSION } from '../shared/provider-runtime.ts';
+import { parseProviderEventEnvelope } from '../shared/provider-runtime.ts';
 
 test('native coordinator creates one native session, queues FIFO, and dispatches retry IDs once', async () => {
   const journal = createJournal();
@@ -107,6 +108,139 @@ test('native coordinator creates one native session, queues FIFO, and dispatches
       assert.ok(value.turns.every((turn) => turn.state === 'completed'));
       assert.ok(value.turns[0]?.activity.children.some((child) => child.ownership === 'native'));
     }
+  } finally {
+    await coordinator.close();
+    journal.close();
+  }
+});
+
+test('conversation Stop is durable, interrupts active work, and preserves the paused queue', async () => {
+  const journal = createJournal();
+  const adapter = new NativeFixtureAdapter({ delayMs: 200, emitNativeChild: true });
+  const coordinator = new NativeAgentCoordinator({
+    journal,
+    providers: [{ providerInstanceId: 'fixture-local', provider: 'fixture', label: 'Fixture', adapter }],
+  });
+  try {
+    await coordinator.initialize();
+    const created = await coordinator.createConversation({
+      commandId: 'stop-create', providerInstanceId: 'fixture-local', cwd: '/workspace/remux',
+      model: 'fixture-native-v1', access: 'workspace-write',
+    });
+    const first = await coordinator.sendMessage(configuredMessage(coordinator, {
+      commandId: 'stop-first', conversationId: created.conversationId,
+      clientMessageId: 'stop-first-message', content: [{ type: 'text', text: 'Keep working.' }],
+    }));
+    const queued = await coordinator.sendMessage(configuredMessage(coordinator, {
+      commandId: 'stop-queued', conversationId: created.conversationId,
+      clientMessageId: 'stop-queued-message', content: [{ type: 'text', text: 'Queued work.' }],
+    }));
+    assert.equal(queued.delivery, 'queued');
+    const stopped = await coordinator.interruptConversation({
+      commandId: 'stop-command', conversationId: created.conversationId,
+    });
+    assert.equal(stopped.accepted, true);
+    await waitFor(() => journal.turn(first.turnId)?.outcome === 'interrupted');
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(journal.queuedMessages(created.conversationId).map(({ turnId }) => turnId), [queued.turnId]);
+    assert.equal(adapter.opened[0]?.providerDispatchCount, 1);
+    const runtime = coordinator.projector.runtimeResource(created.conversationId);
+    assert.equal(runtime?.lifecycle.stopRequested, false);
+    assert.equal(journal.hasConversationQueuePause(created.conversationId), true);
+
+    await coordinator.sendMessage(configuredMessage(coordinator, {
+      commandId: 'stop-resume', conversationId: created.conversationId,
+      clientMessageId: 'stop-resume-message', content: [{ type: 'text', text: 'Resume.' }],
+    }));
+    await waitFor(() => adapter.opened[0]?.providerDispatchCount === 3);
+  } finally {
+    await coordinator.close();
+    journal.close();
+  }
+});
+
+test('accepted child Stop settles from its snapshot when every live terminal is missed', async () => {
+  const journal = createJournal();
+  const adapter = new NativeFixtureAdapter({ delayMs: 1, emitNativeChild: true,
+    nativeChildCompletionDelayMs: 10_000 });
+  const coordinator = new NativeAgentCoordinator({
+    journal,
+    providers: [{ providerInstanceId: 'fixture-local', provider: 'fixture', label: 'Fixture', adapter }],
+  });
+  try {
+    await coordinator.initialize();
+    const created = await coordinator.createConversation({
+      commandId: 'missed-child-create', providerInstanceId: 'fixture-local', cwd: '/workspace/remux',
+      model: 'fixture-native-v1', access: 'workspace-write',
+    });
+    await coordinator.sendMessage(configuredMessage(coordinator, {
+      commandId: 'missed-child-send', conversationId: created.conversationId,
+      clientMessageId: 'missed-child-message', content: [{ type: 'text', text: 'Spawn child.' }],
+    }));
+    const rootExecutionId = journal.conversation(created.conversationId)!.rootExecutionId;
+    const childExecutionId = `${rootExecutionId}:native-child-1`;
+    await waitFor(() => journal.execution(childExecutionId)?.state === 'running');
+    const childSessionId = `${adapter.opened[0]!.nativeSession.sessionId}:child-1`;
+    const childTurnId = 'missed-child-remux-turn';
+    const childNativeTurnId = 'missed-child-native-turn';
+    const envelope = (terminal: boolean) => parseProviderEventEnvelope({
+      contractVersion: PROVIDER_RUNTIME_CONTRACT_VERSION,
+      eventId: `missed-child-${terminal ? 'terminal' : 'started'}`,
+      provider: 'fixture',
+      scope: { kind: 'turn', providerInstanceId: 'fixture-local',
+        conversationId: created.conversationId, executionId: childExecutionId, turnId: childTurnId },
+      native: { sessionId: childSessionId, turnId: childNativeTurnId,
+        kind: terminal ? 'turn/completed' : 'turn/started' },
+      observedAt: Date.now(),
+      event: terminal
+        ? { type: 'turn.completed', outcome: 'interrupted' }
+        : { type: 'turn.started' },
+    });
+    journal.appendProviderEvent(envelope(false));
+    const session = adapter.opened[0]! as typeof adapter.opened[0] & {
+      snapshotChild?: (input: unknown) => Promise<unknown>;
+    };
+    let snapshotCalls = 0;
+    session.snapshotChild = async () => {
+      snapshotCalls += 1;
+      if (snapshotCalls === 1) throw new Error('Authoritative child read temporarily unavailable.');
+      return {
+        nativeSession: { provider: 'fixture', providerInstanceId: 'fixture-local', sessionId: childSessionId },
+        state: 'idle', authority: 'authoritative', events: [envelope(true)],
+        coverage: { turnBlocks: { completeKinds: [] } },
+      };
+    };
+    await coordinator.interruptExecution({
+      commandId: 'missed-child-stop', conversationId: created.conversationId, executionId: childExecutionId,
+    });
+    const intent = journal.stopLifecycle(created.conversationId).intents[0]!;
+    journal.updateStopTarget(String(intent.intent_id), childExecutionId, childTurnId, 'accepted',
+      'Stop was accepted, but terminal status could not be verified.', Date.now());
+    const followupTurnId = 'missed-child-followup-turn';
+    journal.appendProviderEvent(parseProviderEventEnvelope({
+      contractVersion: PROVIDER_RUNTIME_CONTRACT_VERSION,
+      eventId: 'missed-child-followup-started', provider: 'fixture',
+      scope: { kind: 'turn', providerInstanceId: 'fixture-local',
+        conversationId: created.conversationId, executionId: childExecutionId, turnId: followupTurnId },
+      native: { sessionId: childSessionId, turnId: 'missed-child-followup-native', kind: 'turn/started' },
+      observedAt: Date.now(), event: { type: 'turn.started' },
+    }));
+    await coordinator.interruptExecution({
+      commandId: 'missed-child-stop-retry', conversationId: created.conversationId,
+      executionId: childExecutionId,
+    });
+    assert.deepEqual(journal.stopTargets(String(intent.intent_id)).map(({ assignment_turn_id }) =>
+      assignment_turn_id), [childTurnId],
+    'a repeated Stop does not enroll a newer assignment on the same agent');
+    await waitFor(() => journal.turn(childTurnId)?.outcome === 'interrupted', 2_000);
+    await waitFor(() => coordinator.projector.runtimeResource(created.conversationId)
+      ?.lifecycle.stopRequested === false, 2_000);
+    assert.equal(journal.stopLifecycle(created.conversationId).intents.length, 0);
+    assert.equal(journal.turn(followupTurnId)?.outcome, undefined);
+    assert.notEqual(journal.execution(childExecutionId)?.state, 'interrupted');
+    assert.equal(session.childInterrupts.length, 1,
+      'an accepted Stop retry reconciles without interrupting the assignment twice');
+    assert.equal(snapshotCalls, 2);
   } finally {
     await coordinator.close();
     journal.close();
@@ -260,6 +394,11 @@ test('trusted image admission grants direct, queued, and steer inputs before pro
       .some(({ commandId }) => commandId === 'send-invalid-image'), false);
     await coordinator.interruptTurn({ commandId: 'interrupt-direct-image',
       conversationId: created.conversationId, turnId: direct.turnId });
+    await coordinator.sendMessage(configuredMessage(coordinator, {
+      commandId: 'resume-after-image-stop', conversationId: created.conversationId,
+      clientMessageId: 'resume-after-image-stop-message',
+      content: [{ type: 'text', text: 'Resume the preserved queue.' }],
+    }));
     await waitFor(() => providerBoundaries.includes('turn:queued-image'), 1_000);
     assert.deepEqual(providerBoundaries, ['turn:direct-image', 'steer:steer-image', 'turn:queued-image']);
   } finally {
