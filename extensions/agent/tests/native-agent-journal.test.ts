@@ -1081,6 +1081,36 @@ test('authoritative snapshots replace stale live block ordinals after native com
   }
 });
 
+test('authoritative snapshot replay canonicalizes duplicate block ordinals within a pass', () => {
+  const journal = createJournal();
+  try {
+    seedConversation(journal);
+    journal.createTurn({
+      turnId: 'turn-1', conversationId: 'conversation-1', executionId: 'execution-1',
+      clientMessageId: 'message-1', commandId: 'send-1', content: [{ type: 'text', text: 'Recover.' }],
+      model: 'fixture-native-v1', state: 'recovering', now: 2,
+    });
+    const snapshotBlock = (id: string, itemIndex: number, text: string) => {
+      const envelope = event(id, 3 + itemIndex, {
+        type: 'turn.block.completed', structure: blockStructure(`block-${id}`, 0),
+        revision: 1, contentHash: id.repeat(64).slice(0, 64),
+        block: { kind: 'reasoning-summary', state: 'completed',
+          payload: { kind: 'reasoning-summary', text, truncated: false } },
+      });
+      envelope.native.position = { kind: 'snapshot-index', itemIndex, subIndex: 0 };
+      return envelope;
+    };
+    journal.replaceSnapshot([
+      snapshotBlock('a', 0, 'First snapshot block.'),
+      snapshotBlock('b', 1, 'Second snapshot block with the same proposed ordinal.'),
+    ]);
+    assert.deepEqual(journal.orderedPasses('turn-1')[0]?.blocks.map(({ blockId, ordinal }) =>
+      [blockId, ordinal]), [['block-a', 0], ['block-b', 1]]);
+  } finally {
+    journal.close();
+  }
+});
+
 test('snapshot coverage preserves journal-only tool blocks until the provider claims completeness', () => {
   const journal = createJournal();
   try {

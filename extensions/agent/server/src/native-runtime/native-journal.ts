@@ -2158,7 +2158,7 @@ export class NativeAgentJournal {
       ? new Set(coverage.turnBlocks.completeKinds)
       : undefined;
     if (compactionMarkers.length === 0 && completeKinds === undefined) {
-      return snapshotBlocks.flatMap(({ lifecycles }) => lifecycles.map(({ envelope }) => envelope));
+      return mergeSnapshotAndRetainedBlocksByOrdinal(snapshotBlocks, []);
     }
 
     const snapshotPassIds = new Set(snapshotBlocks.map(({ latest }) =>
@@ -2219,7 +2219,7 @@ export class NativeAgentJournal {
       return false;
     });
     if (retained.length === 0) {
-      return snapshotBlocks.flatMap(({ lifecycles }) => lifecycles.map(({ envelope }) => envelope));
+      return mergeSnapshotAndRetainedBlocksByOrdinal(snapshotBlocks, []);
     }
 
     if (compactionMarkers.length === 0) {
