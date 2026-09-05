@@ -1,4 +1,4 @@
-Status: Audit record — 84 original findings, 4 incident follow-ups, 1 implementation finding; implementation tracked
+Status: Audit record — 84 original findings, 6 incident follow-ups, 1 implementation finding; implementation tracked
 Last verified: 2026-09-05
 Canonical code: `extensions/agent/`, `crates/remux/`, `app/src/`
 Remediation: [agent-audit-remediation-pass-1.md](agent-audit-remediation-pass-1.md)
@@ -8,7 +8,7 @@ Remediation: [agent-audit-remediation-pass-1.md](agent-audit-remediation-pass-1.
 Nine independent read-only reviews (GPT-5.6-Sol, xhigh) covered the four
 commits that made native Agent the product path, one slice each, followed by
 spot checks and a verification pass over the remediation spec. This file is
-the original 84-row list; I1–I4 below add incidents from the subsequent
+the original 84-row list; I1–I6 below add incidents from the subsequent
 conversation, and A13 records a reproduced implementation-stage finding.
 Every row retains its finding ID and a planned disposition.
 Pass references identify coverage, not completed fixes. The remediation spec's

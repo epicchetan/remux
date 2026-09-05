@@ -88,3 +88,11 @@ evidence and no native handles/own turns. Real child implement_s2a1_acceptance
 is interrupted in native history but running in Remux. Root activeTurnBinding
 is passed by coordinator but ignored by CodexProviderSession; child history
 sync returns early whenever any turn exists. Checkpoints A/B/C pending.
+
+Repair helper review: four focused tests pass. Applied v2 repair to a consistent
+live schema-15 copy: ten proven phantom executions and 22 projected blocks
+removed, 22 archived block IDs suppressed for replay. All event/turn rows and
+all other tables except the intended execution/block/audit changes retain exact
+ordered-row hashes; foreign-key check empty and quick_check ok. Evidence under
+`/tmp/remux-audit-implementation/subagent-validation/`. Live application waits
+for A's replay suppression integration and reviewed build/restart.
