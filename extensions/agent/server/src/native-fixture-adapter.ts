@@ -3,12 +3,14 @@ import { createHash, randomUUID } from 'node:crypto';
 import {
   PROVIDER_RUNTIME_CONTRACT_VERSION,
   parseCompactProviderSessionInput,
+  parseInterruptProviderChildInput,
   parseNativeForkRequest,
   parseOpenProviderSessionInput,
   parseProviderEventEnvelope,
   parseStartProviderTurnInput,
   type CompactProviderSessionInput,
   type InterruptProviderTurnInput,
+  type InterruptProviderChildInput,
   type NativeSessionRef,
   type NativeForkRequest,
   type OpenProviderSessionInput,
@@ -186,6 +188,7 @@ export class FixtureProviderSession implements ProviderSession {
   providerSnapshotCount = 0;
   readonly dispatchLog: string[] = [];
   readonly turnInputs: StartProviderTurnInput[] = [];
+  readonly childInterrupts: InterruptProviderChildInput[] = [];
 
   get isClosed() {
     return this.closed;
@@ -245,7 +248,7 @@ export class FixtureProviderSession implements ProviderSession {
     const previous = this.receipts.get(input.commandId);
     if (previous) {
       if (previous !== requestHash) throw new Error('Provider command ID was reused with different input.');
-      return { accepted: true };
+      return { accepted: true, nativeTurnId: input.turnId };
     }
     if (this.activeTurn) throw new Error('Fixture provider session already has an active turn.');
     this.receipts.set(input.commandId, requestHash);
@@ -264,7 +267,7 @@ export class FixtureProviderSession implements ProviderSession {
     this.emit({ type: 'turn.status', state: 'running' }, 'turn/status', input.turnId);
     active.task = this.runTurn(input, controller.signal);
     this.scenario.afterTurnAccepted?.(structuredClone(input));
-    return { accepted: true };
+    return { accepted: true, nativeTurnId: input.turnId };
   }
 
   async interrupt(input: InterruptProviderTurnInput): Promise<ProviderCommandAcceptance> {
@@ -277,6 +280,25 @@ export class FixtureProviderSession implements ProviderSession {
     }
     this.receipts.set(input.commandId, requestHash);
     if (this.activeTurn?.turnId === input.turnId) this.activeTurn.controller.abort();
+    return { accepted: true };
+  }
+
+  async interruptChild(unparsed: InterruptProviderChildInput): Promise<ProviderCommandAcceptance> {
+    this.assertOpen();
+    const input = parseInterruptProviderChildInput(unparsed);
+    const childExecutionId = `${this.openedWith.executionId}:native-child-1`;
+    const nativeSessionId = `${this.nativeSession.sessionId}:child-1`;
+    if (input.childExecutionId !== childExecutionId || input.nativeSessionId !== nativeSessionId) {
+      throw new Error('Fixture child interruption does not match this session.');
+    }
+    const requestHash = hashJson(input);
+    const previous = this.receipts.get(input.commandId);
+    if (previous) {
+      if (previous !== requestHash) throw new Error('Provider command ID was reused with different input.');
+      return { accepted: true };
+    }
+    this.receipts.set(input.commandId, requestHash);
+    this.childInterrupts.push(structuredClone(input));
     return { accepted: true };
   }
 

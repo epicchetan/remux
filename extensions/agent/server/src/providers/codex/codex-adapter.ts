@@ -6,6 +6,7 @@ import {
   PROVIDER_RUNTIME_CONTRACT_VERSION,
   parseCompactProviderSessionInput,
   parseDiscoverProviderSessionsInput,
+  parseInterruptProviderChildInput,
   parseInterruptProviderTurnInput,
   parseNativeForkRequest,
   parseOpenProviderSessionInput,
@@ -37,6 +38,7 @@ import {
   type StartProviderTurnInput,
   type SteerProviderTurnInput,
   type InterruptProviderTurnInput,
+  type InterruptProviderChildInput,
   type UserContentPart,
 } from '../../../../shared/provider-runtime.ts';
 import type {
@@ -59,7 +61,12 @@ import {
   type CodexServerRequest,
 } from './codex-app-server-process.ts';
 import { CodexRuntimeHost, type CodexRuntimeStatus } from './codex-runtime-host.ts';
-import { CodexEventMapper, normalizeCodexAccountUsage } from './codex-event-mapper.ts';
+import {
+  CodexEventMapper,
+  codexStableChildExecutionId,
+  codexStableNativeTurnId,
+  normalizeCodexAccountUsage,
+} from './codex-event-mapper.ts';
 import {
   FEDERATION_SERVER_NAME,
   FEDERATION_TOOL_TIMEOUT_MS,
@@ -549,6 +556,7 @@ export class CodexProviderSession implements ProviderSession {
   private readonly childThreadIds = new Set<string>();
   private readonly forkThreadIds = new Set<string>();
   private readonly activeChildTurnByThread = new Map<string, string>();
+  private readonly childMappers = new Map<string, CodexEventMapper>();
   private pendingForkNotifications: CodexServerNotification[] | undefined;
   private mutationTail: Promise<unknown> = Promise.resolve();
   private activeTurn: { remuxTurnId: string; nativeTurnId?: string } | undefined;
@@ -578,7 +586,7 @@ export class CodexProviderSession implements ProviderSession {
       observedAt: options.now,
     });
     for (const binding of options.input.nativeTurnBindings ?? []) {
-      this.mapper.bindTurn(binding.turnId, binding.nativeTurnId);
+      this.mapper.bindTurn(binding.turnId, binding.nativeTurnId, binding.nextBlockOrdinal);
       this.nativeTurnByRemux.set(binding.turnId, binding.nativeTurnId);
     }
   }
@@ -615,7 +623,7 @@ export class CodexProviderSession implements ProviderSession {
         if (!this.completedNativeTurns.has(nativeTurnId)) {
           this.activeTurn = { remuxTurnId: input.turnId, nativeTurnId };
         }
-        return { accepted: true } as const;
+        return { accepted: true, nativeTurnId } as const;
       } catch (error) {
         this.activeTurn = undefined;
         throw error;
@@ -654,6 +662,41 @@ export class CodexProviderSession implements ProviderSession {
         this.connection.request('turn/interrupt', { threadId, turnId }, 3_000)));
       await this.connection.request('turn/interrupt', {
         threadId: this.nativeSession.sessionId,
+        turnId: nativeTurnId,
+      });
+      return { accepted: true } as const;
+    })) as Promise<ProviderCommandAcceptance>;
+  }
+
+  async interruptChild(unparsed: InterruptProviderChildInput): Promise<ProviderCommandAcceptance> {
+    const input = parseInterruptProviderChildInput(unparsed);
+    const expectedExecutionId = codexStableChildExecutionId(
+      this.openedWith.executionId,
+      input.nativeSessionId,
+    );
+    if (input.childExecutionId !== expectedExecutionId) {
+      throw new Error('Codex child interruption does not match the opened parent session.');
+    }
+    return this.onceCommand(input.commandId, input, async () => this.mutate(async () => {
+      this.assertOpen();
+      let nativeTurnId = this.activeChildTurnByThread.get(input.nativeSessionId);
+      if (!nativeTurnId) {
+        const response = object(await this.connection.request('thread/read', {
+          threadId: input.nativeSessionId,
+          includeTurns: true,
+        }));
+        const thread = object(response?.thread);
+        const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+        nativeTurnId = turns.flatMap((value) => {
+          const turn = object(value);
+          return nonempty(turn?.status) === 'inProgress' && nonempty(turn?.id)
+            ? [nonempty(turn?.id)!]
+            : [];
+        }).at(-1);
+      }
+      if (!nativeTurnId) throw new Error('Codex child has no active turn to interrupt.');
+      await this.connection.request('turn/interrupt', {
+        threadId: input.nativeSessionId,
         turnId: nativeTurnId,
       });
       return { accepted: true } as const;
@@ -719,6 +762,50 @@ export class CodexProviderSession implements ProviderSession {
       coverage: CODEX_SNAPSHOT_COVERAGE,
       ...(historyRevision ? { historyRevision } : {}),
       events: [...events.values()],
+    });
+  }
+
+  async snapshotChild(
+    unparsed: ProviderSnapshotRequest & { childExecutionId: string; nativeSessionId: string },
+  ): Promise<ProviderSnapshot> {
+    parseProviderSnapshotRequest({
+      commandId: unparsed.commandId,
+      ...(unparsed.afterNativeSequence === undefined
+        ? {}
+        : { afterNativeSequence: unparsed.afterNativeSequence }),
+    });
+    this.assertOpenOrLost();
+    const expectedExecutionId = codexStableChildExecutionId(
+      this.openedWith.executionId,
+      unparsed.nativeSessionId,
+    );
+    if (unparsed.childExecutionId !== expectedExecutionId) {
+      throw new Error('Codex child snapshot does not match the opened parent session.');
+    }
+    const response = object(await this.connection.request('thread/read', {
+      threadId: unparsed.nativeSessionId,
+      includeTurns: true,
+    }));
+    const thread = object(response?.thread);
+    if (!thread || nonempty(thread.id) !== unparsed.nativeSessionId) {
+      throw new Error('Codex child thread/read returned a different native thread.');
+    }
+    await materializeHistoricalImages(thread, this.importHistoricalImage);
+    const mapper = this.childMapper(unparsed.nativeSessionId);
+    const events = mapper.mapThreadSnapshot(thread);
+    const status = nonempty(object(thread.status)?.type);
+    return parseProviderSnapshot({
+      contractVersion: PROVIDER_RUNTIME_CONTRACT_VERSION,
+      nativeSession: {
+        provider: 'codex',
+        providerInstanceId: this.nativeSession.providerInstanceId,
+        sessionId: unparsed.nativeSessionId,
+        resumeCursor: { threadId: unparsed.nativeSessionId },
+      },
+      state: status === 'active' ? 'running' : 'idle',
+      authority: 'authoritative',
+      coverage: CODEX_SNAPSHOT_COVERAGE,
+      events,
     });
   }
 
@@ -830,6 +917,14 @@ export class CodexProviderSession implements ProviderSession {
     let events: ProviderEventEnvelope[] = [];
     try {
       events = this.mapper.mapNotification(notification);
+      if (notificationThreadId && notificationThreadId !== this.nativeSession.sessionId) {
+        const childMapper = this.childMapper(notificationThreadId);
+        if (notification.method === 'turn/started') {
+          const nativeChildTurnId = nonempty(object(params?.turn)?.id);
+          if (nativeChildTurnId) childMapper.expectTurn(codexStableNativeTurnId(nativeChildTurnId));
+        }
+        events.push(...childMapper.mapNotification(notification));
+      }
     } catch (error) {
       this.reportProjectionError(notification.method, error);
     }
@@ -842,6 +937,21 @@ export class CodexProviderSession implements ProviderSession {
         if (this.activeTurn?.nativeTurnId === nativeTurnId) this.activeTurn = undefined;
       }
     }
+  }
+
+  private childMapper(nativeSessionId: string) {
+    let mapper = this.childMappers.get(nativeSessionId);
+    if (!mapper) {
+      mapper = new CodexEventMapper({
+        providerInstanceId: this.nativeSession.providerInstanceId,
+        conversationId: this.openedWith.conversationId,
+        executionId: codexStableChildExecutionId(this.openedWith.executionId, nativeSessionId),
+        nativeSessionId,
+        observedAt: this.now,
+      });
+      this.childMappers.set(nativeSessionId, mapper);
+    }
+    return mapper;
   }
 
   private reportProjectionError(nativeKind: string, error: unknown) {
@@ -1202,7 +1312,7 @@ function codexCapabilities(providerVersion: string): ProviderCapabilities {
     },
     collaboration: {
       nativeSubagents: true,
-      childTranscript: 'none',
+      childTranscript: 'full',
       childSteer: false,
       childInterrupt: true,
     },

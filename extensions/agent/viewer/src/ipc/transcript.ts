@@ -2,6 +2,7 @@ import { rpc } from '@remux/viewer-kit/ipc';
 
 import {
   NATIVE_AGENT_METHODS,
+  agentExecutionTranscriptResourceKey,
   type NativeAgentResourceKey,
   type NativeAgentResourceReadResult,
   type NativeAgentTurnFrame,
@@ -23,7 +24,7 @@ import {
   projectNativeOperationDetail,
   projectNativeTranscript,
   projectNativeTurn,
-  nativeFederatedExecutionId,
+  nativeExecutionId,
 } from '../nativeTranscriptViewModel.ts';
 
 export async function readTranscriptResources(
@@ -104,17 +105,17 @@ export async function readTranscriptResources(
         };
       }
       if (request.type === 'executionScope') {
-        const federatedExecutionId = nativeFederatedExecutionId(request.scopeId);
+        const childExecutionId = nativeExecutionId(request.scopeId);
         return {
           requestIndex,
           key,
           status: 'ok' as const,
           basisSequence: resource.basisSequence,
           nativeRevision: resource.revision,
-          revision: federatedExecutionId
+          revision: childExecutionId
             ? String(resource.revision)
             : frame.renderRevision,
-          value: federatedExecutionId
+          value: childExecutionId
             ? projectNativeChildExecutionScope(
                 conversationId,
                 resource.value as NativeTranscriptWindow,
@@ -142,8 +143,8 @@ function nativeKey(
   request: AgentTranscriptResourceRequest,
 ): NativeAgentResourceKey {
   if (request.type === 'executionScope') {
-    const executionId = nativeFederatedExecutionId(request.scopeId);
-    if (executionId) return `agent/execution-transcript:${executionId}:tail-24`;
+    const executionId = nativeExecutionId(request.scopeId);
+    if (executionId) return agentExecutionTranscriptResourceKey(executionId);
   }
   if (request.type === 'turn') return `agent/turn:${request.turnId}:summary`;
   if (request.type !== 'transcriptSync') return `agent/turn:${request.turnId}`;

@@ -143,7 +143,6 @@ export function useConversationActions(options: {
     if (!selected?.nativeId || selected.providerInstanceId !== submittedProviderInstanceId) {
       throw new Error('The selected native provider model is unavailable.');
     }
-    trackTranscriptUserMessage(activeId, clientMessageId);
     let sent;
     try {
       sent = await agentCommands.sendMessage({
@@ -159,18 +158,20 @@ export function useConversationActions(options: {
         delivery: input.delivery,
       });
     } catch (reason) {
-      discardTranscriptUserMessage(clientMessageId);
       throw reason;
     }
     const transcriptFence = 'transcriptFence' in sent ? sent.transcriptFence : undefined;
-    if (sent.turnId) trackTranscriptUserMessage(activeId, clientMessageId, sent.turnId);
-    else discardTranscriptUserMessage(clientMessageId);
+    if (sent.delivery === 'sent' && sent.turnId) {
+      trackTranscriptUserMessage(activeId, clientMessageId, sent.turnId);
+    } else {
+      discardTranscriptUserMessage(clientMessageId);
+    }
     setPhase('updating-transcript');
     clearConversationDraftContent(activeId);
     await Promise.all([
       refresh([`agent/runtime:${activeId}`, `agent/queue:${activeId}`]),
       ensureConversation(activeId, true),
-      ...(activeConversationIdRef.current === activeId
+      ...(activeConversationIdRef.current === activeId && sent.delivery !== 'queued'
         ? [recoverActiveTranscriptResources({
             attempts: 4,
             forceFullMeasure: false,

@@ -2,6 +2,7 @@ import type {
   CompactProviderSessionInput,
   DiscoverProviderSessionsInput,
   InterruptProviderTurnInput,
+  InterruptProviderChildInput,
   NativeForkRequest,
   NativeRollbackRequest,
   NativeSessionRef,
@@ -22,7 +23,7 @@ import type {
   SteerProviderTurnInput,
 } from '../../shared/provider-runtime.ts';
 
-export type ProviderCommandAcceptance = { accepted: true };
+export type ProviderCommandAcceptance = { accepted: true; nativeTurnId?: string };
 
 export type ProviderRuntimeTopology = 'shared-daemon' | 'session-process' | 'fixture';
 
@@ -84,6 +85,10 @@ export interface ProviderSession {
   startTurn(input: StartProviderTurnInput): Promise<ProviderCommandAcceptance>;
   steer?(input: SteerProviderTurnInput): Promise<ProviderCommandAcceptance>;
   interrupt(input: InterruptProviderTurnInput): Promise<ProviderCommandAcceptance>;
+  interruptChild?(input: InterruptProviderChildInput): Promise<ProviderCommandAcceptance>;
+  snapshotChild?(
+    input: ProviderSnapshotRequest & { childExecutionId: string; nativeSessionId: string },
+  ): Promise<ProviderSnapshot>;
   compact?(input: CompactProviderSessionInput): Promise<ProviderCommandAcceptance & {
     nativeOperationId?: string;
   }>;

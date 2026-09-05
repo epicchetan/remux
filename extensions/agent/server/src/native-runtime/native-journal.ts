@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { chmod, mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
@@ -15,6 +16,7 @@ import type {
 } from '../../../shared/native-agent-protocol.ts';
 import {
   parseProviderEventEnvelope,
+  type ChildExecutionDisplay,
   type NativeSessionRef,
   type ProviderCapabilities,
   type ProviderEventEnvelope,
@@ -102,6 +104,7 @@ export type JournalCompactionOperation = {
   beforeTokens: number | null;
   afterTokens: number | null;
   nativeOperationId?: string;
+  providerSubjectKey?: string;
   error?: { code: string; message: string; retryable?: boolean };
   createdAt: number;
   startedAt?: number;
@@ -119,6 +122,8 @@ export type JournalCompactionBoundary =
   | {
       kind: 'between-turns';
       nativeTurnId?: string;
+      previousNativeTurnId?: string;
+      nextNativeTurnId?: string;
     }
   | {
       kind: 'native-unresolved' | 'native-unknown';
@@ -132,6 +137,10 @@ export type JournalCompactionControlEvent = {
   boundary: JournalCompactionBoundary;
   state: 'started' | 'completed' | 'failed';
   operationId: string;
+  providerSubjectKey: string | null;
+  strandId: string | null;
+  previousTurnId: string | null;
+  nextTurnId: string | null;
   nativeIdentity: string | null;
   trigger: 'manual' | 'automatic';
   beforeTokens: number | null;
@@ -853,6 +862,13 @@ export class NativeAgentJournal {
       input.state ?? 'authoritative',
       input.now,
     );
+    if (input.nativeTurnId) {
+      this.database.prepare(`
+        UPDATE turns SET native_turn_id = COALESCE(native_turn_id, ?),
+          updated_at = MAX(updated_at, ?)
+        WHERE turn_id = ?
+      `).run(input.nativeTurnId, input.now, input.turnId);
+    }
     this.database.prepare(`
       UPDATE strand_turn_path SET branch_binding_id = ?
       WHERE turn_id = ? AND branch_binding_id IS NULL
@@ -1099,11 +1115,25 @@ export class NativeAgentJournal {
         input.now,
         input.now,
       );
+      // Binding settles a newly materialized session that has never admitted
+      // a turn, but it says nothing about an accepted turn's lifecycle. Keep
+      // an active recovery intact so session health/snapshot authority can
+      // move it to running without a later idle write racing that decision.
       this.database.prepare(`
-      UPDATE executions SET state = 'idle', updated_at = ? WHERE execution_id = ?
+      UPDATE executions SET state = CASE
+        WHEN state = 'recovering' AND NOT EXISTS (
+          SELECT 1 FROM turns
+          WHERE turns.execution_id = executions.execution_id
+            AND turns.state IN ('running', 'recovering')
+        ) THEN 'idle'
+        ELSE state
+      END, updated_at = ? WHERE execution_id = ?
       `).run(input.now, input.executionId);
       this.database.prepare(`
-      UPDATE conversations SET state = 'idle', resumable = 1, updated_at = ?
+      UPDATE conversations SET state = CASE
+        WHEN state = 'recovering' AND active_turn_id IS NULL THEN 'idle'
+        ELSE state
+      END, resumable = 1, updated_at = ?
       WHERE root_execution_id = ?
       `).run(input.now, input.executionId);
     });
@@ -1204,6 +1234,13 @@ export class NativeAgentJournal {
       SELECT private_ref_json FROM native_sessions WHERE execution_id = ?
     `).get(executionId) as { private_ref_json: string } | undefined;
     return row ? JSON.parse(row.private_ref_json) as NativeSessionRef : undefined;
+  }
+
+  nativeChildHandle(executionId: string): { nativeSessionId: string } | undefined {
+    const row = this.database.prepare(`
+      SELECT native_session_id FROM native_child_handles WHERE execution_id = ?
+    `).get(executionId) as { native_session_id: string } | undefined;
+    return row ? { nativeSessionId: row.native_session_id } : undefined;
   }
 
   nativeSessionState(executionId: string) {
@@ -1337,7 +1374,7 @@ export class NativeAgentJournal {
     );
   }
 
-  claimQueuedTurn(conversationId: string, now: number): NativeQueuedMessage | undefined {
+  claimQueuedTurn(conversationId: string, _now: number): NativeQueuedMessage | undefined {
     return this.transaction(() => {
       const row = this.database.prepare(`
         SELECT * FROM queued_messages WHERE conversation_id = ? ORDER BY ordinal LIMIT 1
@@ -1348,27 +1385,64 @@ export class NativeAgentJournal {
       this.database.prepare(`
         UPDATE queued_messages SET state = 'dispatching' WHERE command_id = ?
       `).run(queued.commandId);
+      return { ...queued, state: 'dispatching' };
+    });
+  }
+
+  admitQueuedTurn(turnId: string, now: number, nativeTurnId?: string) {
+    return this.transaction(() => {
+      const row = this.database.prepare(`
+        SELECT * FROM queued_messages WHERE turn_id = ? AND state = 'dispatching'
+      `).get(turnId) as Record<string, unknown> | undefined;
+      if (!row) return undefined;
+      const queued = queueRow(row);
+      const conversation = this.conversation(String(row.conversation_id));
+      if (!conversation) throw new Error('Queued message conversation does not exist.');
+      this.createTurn({
+        turnId: queued.turnId,
+        conversationId: conversation.conversationId,
+        executionId: conversation.rootExecutionId,
+        clientMessageId: String(row.client_message_id),
+        commandId: queued.commandId,
+        content: queued.content,
+        model: queued.model,
+        ...(queued.effort ? { effort: queued.effort } : {}),
+        state: 'running',
+        now,
+      });
+      if (nativeTurnId) {
+        this.upsertNativeTurnBinding({
+          providerInstanceId: conversation.providerInstanceId,
+          executionId: conversation.rootExecutionId,
+          turnId: queued.turnId,
+          nativeTurnId,
+          branchCursor: { version: 1, nativeTurnId },
+          cursorVersion: 1,
+          now,
+        });
+      }
       this.database.prepare(`
-        UPDATE turns SET state = 'running', started_at = ?, updated_at = ? WHERE turn_id = ?
-      `).run(now, now, queued.turnId);
-      this.database.prepare(`
-        UPDATE conversations SET state = 'running', active_turn_id = ?,
-          model = ?, effort = ?, access = ?, health_message = NULL, updated_at = ?
-        WHERE conversation_id = ?
+        UPDATE conversations SET model = ?, effort = ?, access = ?, health_message = NULL,
+          updated_at = ? WHERE conversation_id = ?
       `).run(
-        queued.turnId,
         queued.model,
         queued.effort ?? null,
         queued.access,
         now,
-        conversationId,
+        conversation.conversationId,
       );
       this.database.prepare(`
-        UPDATE executions SET state = 'running', outcome = NULL, completed_at = NULL,
-          model = ?, effort = ?, access = ?, updated_at = ?
-        WHERE execution_id = (SELECT root_execution_id FROM conversations WHERE conversation_id = ?)
-      `).run(queued.model, queued.effort ?? null, queued.access, now, conversationId);
-      return { ...queued, state: 'dispatching' };
+        UPDATE executions SET model = ?, effort = ?, access = ?, updated_at = ?
+        WHERE execution_id = ?
+      `).run(
+        queued.model,
+        queued.effort ?? null,
+        queued.access,
+        now,
+        conversation.rootExecutionId,
+      );
+      this.database.prepare('DELETE FROM queued_messages WHERE turn_id = ?').run(turnId);
+      return queued;
     });
   }
 
@@ -1383,6 +1457,13 @@ export class NativeAgentJournal {
       UPDATE queued_messages SET state = 'delivery_unknown'
       WHERE turn_id = ? AND state = 'dispatching'
     `).run(turnId).changes > 0;
+  }
+
+  markInterruptedQueueDispatchesDeliveryUnknown() {
+    return this.database.prepare(`
+      UPDATE queued_messages SET state = 'delivery_unknown'
+      WHERE state = 'dispatching'
+    `).run().changes;
   }
 
   blockQueuedMessages(conversationId: string) {
@@ -1441,7 +1522,7 @@ export class NativeAgentJournal {
     });
   }
 
-  removeQueuedTurn(conversationId: string, commandId: string, now: number) {
+  removeQueuedTurn(conversationId: string, commandId: string, _now: number) {
     return this.transaction(() => {
       const row = this.database.prepare(`
         SELECT turn_id FROM queued_messages
@@ -1449,10 +1530,6 @@ export class NativeAgentJournal {
       `).get(conversationId, commandId) as { turn_id: string } | undefined;
       if (!row) return false;
       this.database.prepare('DELETE FROM queued_messages WHERE command_id = ?').run(commandId);
-      this.database.prepare(`
-        UPDATE turns SET state = 'interrupted', outcome = 'interrupted', completed_at = ?, updated_at = ?
-        WHERE turn_id = ?
-      `).run(now, now, row.turn_id);
       return true;
     });
   }
@@ -1467,7 +1544,7 @@ export class NativeAgentJournal {
   queuedMessages(conversationId: string): NativeQueuedMessage[] {
     return (this.database.prepare(`
       SELECT * FROM queued_messages
-      WHERE conversation_id = ? AND state != 'dispatching'
+      WHERE conversation_id = ?
       ORDER BY ordinal
     `).all(conversationId) as Record<string, unknown>[]).map(queueRow);
   }
@@ -1524,7 +1601,7 @@ export class NativeAgentJournal {
     const entries = this.database.prepare(`
       SELECT 'message' AS queue_kind, ordinal, command_id, turn_id, client_message_id,
         content_json, model, effort, access, state, created_at, NULL AS operation_id
-      FROM queued_messages WHERE conversation_id = ? AND state != 'dispatching'
+      FROM queued_messages WHERE conversation_id = ?
       UNION ALL
       SELECT 'compact' AS queue_kind, ordinal, command_id, NULL, NULL, NULL, NULL, NULL,
         NULL, NULL, created_at, operation_id
@@ -1906,10 +1983,141 @@ export class NativeAgentJournal {
     return output;
   }
 
-  private appendProviderEventInTransaction(envelope: ProviderEventEnvelope) {
-    if (!this.insertProviderEventRow(envelope)) return false;
+  private appendProviderEventInTransaction(candidate: ProviderEventEnvelope) {
+    const envelope = this.canonicalizeCompactionEnvelope(candidate);
+    this.ensureNativeChildTurn(envelope);
+    if (this.hasCanonicalCompactionState(envelope)) {
+      this.reconcileCompactionPath(envelope);
+      return false;
+    }
+    if (!this.insertProviderEventRow(envelope)) {
+      this.reconcileCompactionPath(envelope);
+      return false;
+    }
     this.reduceEvent(envelope);
+    this.reconcileCompactionPath(envelope);
     return true;
+  }
+
+  private canonicalizeCompactionEnvelope(envelope: ProviderEventEnvelope) {
+    if (!isContextCompactionEvent(envelope.event) || envelope.scope.kind === 'account') return envelope;
+    const subjectKey = envelope.native.subject?.kind === 'context-compaction'
+      ? envelope.native.subject.key
+      : undefined;
+    if (!subjectKey) return envelope;
+    const canonical = this.database.prepare(`
+      SELECT operation_id, trigger FROM compaction_operations
+      WHERE conversation_id = ? AND provider_subject_key = ?
+    `).get(envelope.scope.conversationId, subjectKey) as {
+      operation_id: string;
+      trigger: 'manual' | 'automatic';
+    } | undefined;
+    if (canonical) {
+      this.database.prepare(`
+        UPDATE conversation_control_events
+        SET provider_subject_key = COALESCE(provider_subject_key, ?)
+        WHERE conversation_id = ? AND operation_id = ?
+      `).run(subjectKey, envelope.scope.conversationId, canonical.operation_id);
+      if (canonical.operation_id === envelope.event.operationId &&
+          canonical.trigger === envelope.event.trigger) return envelope;
+      return parseProviderEventEnvelope({
+        ...envelope,
+        event: {
+          ...envelope.event,
+          operationId: canonical.operation_id,
+          trigger: canonical.trigger,
+        },
+      });
+    }
+    const matchingOperation = this.compactionOperation(envelope.event.operationId);
+    if (matchingOperation?.conversationId === envelope.scope.conversationId) {
+      this.database.prepare(`
+        UPDATE compaction_operations SET provider_subject_key = ?
+        WHERE operation_id = ? AND provider_subject_key IS NULL
+      `).run(subjectKey, envelope.event.operationId);
+      this.database.prepare(`
+        UPDATE conversation_control_events SET provider_subject_key = ?
+        WHERE conversation_id = ? AND operation_id = ? AND provider_subject_key IS NULL
+      `).run(subjectKey, envelope.scope.conversationId, envelope.event.operationId);
+    }
+    return envelope;
+  }
+
+  private hasCanonicalCompactionState(envelope: ProviderEventEnvelope) {
+    if (!isContextCompactionEvent(envelope.event) || envelope.scope.kind === 'account' ||
+        envelope.native.subject?.kind !== 'context-compaction') return false;
+    const state = envelope.event.type === 'context.compaction.started'
+      ? 'started'
+      : envelope.event.type === 'context.compaction.completed' ? 'completed' : 'failed';
+    const row = this.database.prepare(`
+      SELECT 1 AS present FROM conversation_control_events
+      WHERE conversation_id = ? AND provider_subject_key = ? AND state = ?
+    `).get(envelope.scope.conversationId, envelope.native.subject.key, state) as
+      | { present: number }
+      | undefined;
+    return row?.present === 1;
+  }
+
+  private reconcileCompactionPath(envelope: ProviderEventEnvelope) {
+    if (!isContextCompactionEvent(envelope.event) || envelope.scope.kind === 'account' ||
+        envelope.native.subject?.kind !== 'context-compaction' ||
+        !envelope.native.timeline) return;
+    const execution = this.execution(envelope.scope.executionId);
+    if (!execution?.strandId) return;
+    const strandId = execution.strandId;
+    const resolveTurn = (nativeTurnId: string | undefined) => {
+      if (!nativeTurnId) return null;
+      const row = this.database.prepare(`
+        SELECT t.turn_id FROM strand_turn_path p
+        JOIN turns t USING(turn_id)
+        WHERE p.strand_id = ? AND t.native_turn_id = ?
+        LIMIT 1
+      `).get(strandId, nativeTurnId) as { turn_id: string } | undefined;
+      return row?.turn_id ?? null;
+    };
+    const previousTurnId = resolveTurn(envelope.native.timeline.previousTurnId);
+    const nextTurnId = resolveTurn(envelope.native.timeline.nextTurnId);
+    if ((envelope.native.timeline.previousTurnId && !previousTurnId) ||
+        (envelope.native.timeline.nextTurnId && !nextTurnId) ||
+        (!previousTurnId && !nextTurnId)) return;
+    const operation = this.database.prepare(`
+      SELECT operation_id FROM compaction_operations
+      WHERE conversation_id = ? AND provider_subject_key = ?
+    `).get(envelope.scope.conversationId, envelope.native.subject.key) as
+      | { operation_id: string }
+      | undefined;
+    if (!operation) return;
+    const local = this.database.prepare(`
+      SELECT 1 AS present FROM conversation_control_events c
+      JOIN events e ON e.event_id = c.control_event_id
+      WHERE c.conversation_id = ? AND c.operation_id = ? AND e.execution_id = ?
+      LIMIT 1
+    `).get(envelope.scope.conversationId, operation.operation_id, envelope.scope.executionId) as
+      | { present: number }
+      | undefined;
+    const ordinal = Number(envelope.native.subject.key.match(/:(\d+)$/u)?.[1] ?? 0);
+    this.database.prepare(`
+      INSERT INTO strand_control_path(
+        path_entry_id, strand_id, operation_id, previous_turn_id, next_turn_id,
+        native_ordinal, relation
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(strand_id, operation_id) DO UPDATE SET
+        previous_turn_id = excluded.previous_turn_id,
+        next_turn_id = excluded.next_turn_id,
+        native_ordinal = excluded.native_ordinal,
+        relation = CASE
+          WHEN strand_control_path.relation = 'local' THEN 'local'
+          ELSE excluded.relation
+        END
+    `).run(
+      `path:${strandId}:control:${operation.operation_id}`,
+      strandId,
+      operation.operation_id,
+      previousTurnId,
+      nextTurnId,
+      ordinal,
+      local ? 'local' : 'inherited',
+    );
   }
 
   private insertProviderEventRow(envelope: ProviderEventEnvelope) {
@@ -1979,14 +2187,19 @@ export class NativeAgentJournal {
       parseProviderEventEnvelope(JSON.parse(envelope_json)));
   }
 
-  compactionControlEvents(conversationId: string): JournalCompactionControlEvent[] {
+  compactionControlEvents(
+    conversationId: string,
+    strandId = this.conversationHead(conversationId)?.strandId,
+  ): JournalCompactionControlEvent[] {
     const rows = this.database.prepare(`
-      SELECT c.*, e.execution_id
+      SELECT c.*, e.execution_id, p.strand_id, p.previous_turn_id, p.next_turn_id
       FROM conversation_control_events c
       JOIN events e ON e.event_id = c.control_event_id
+      LEFT JOIN strand_control_path p ON p.operation_id = c.operation_id
+        AND p.strand_id = ?
       WHERE c.conversation_id = ? AND c.kind = 'compaction'
       ORDER BY c.created_at, c.control_event_id
-    `).all(conversationId) as Record<string, unknown>[];
+    `).all(strandId ?? null, conversationId) as Record<string, unknown>[];
     return rows.map((row) => {
       const payload = JSON.parse(String(row.payload_json)) as {
         trigger: 'manual' | 'automatic';
@@ -2001,6 +2214,12 @@ export class NativeAgentJournal {
         boundary: JSON.parse(String(row.boundary_json)) as JournalCompactionBoundary,
         state: row.state as JournalCompactionControlEvent['state'],
         operationId: String(row.operation_id),
+        providerSubjectKey: row.provider_subject_key === null
+          ? null
+          : String(row.provider_subject_key),
+        strandId: row.strand_id === null ? null : String(row.strand_id),
+        previousTurnId: row.previous_turn_id === null ? null : String(row.previous_turn_id),
+        nextTurnId: row.next_turn_id === null ? null : String(row.next_turn_id),
         nativeIdentity: row.native_identity === null ? null : String(row.native_identity),
         trigger: payload.trigger,
         beforeTokens: payload.beforeTokens ?? null,
@@ -2367,6 +2586,33 @@ export class NativeAgentJournal {
     });
   }
 
+  confirmExecutionRunning(executionId: string, now: number) {
+    return this.transaction(() => {
+      const active = this.database.prepare(`
+        SELECT turn_id, conversation_id FROM turns
+        WHERE execution_id = ? AND state IN ('running', 'recovering')
+        ORDER BY created_at DESC, rowid DESC LIMIT 1
+      `).get(executionId) as { turn_id: string; conversation_id: string } | undefined;
+      if (!active) return undefined;
+      this.database.prepare(`
+        UPDATE turns SET state = 'running', started_at = COALESCE(started_at, ?), updated_at = ?
+        WHERE turn_id = ? AND state IN ('running', 'recovering')
+      `).run(now, now, active.turn_id);
+      this.database.prepare(`
+        UPDATE executions SET state = 'running', outcome = NULL, completed_at = NULL, updated_at = ?
+        WHERE execution_id = ?
+      `).run(now, executionId);
+      if (this.isRootExecution(active.conversation_id, executionId)) {
+        this.database.prepare(`
+          UPDATE conversations SET state = 'running', active_turn_id = ?,
+            health_message = NULL, updated_at = ?
+          WHERE conversation_id = ? AND root_execution_id = ?
+        `).run(active.turn_id, now, active.conversation_id, executionId);
+      }
+      return active.turn_id;
+    });
+  }
+
   failTurnDispatch(turnId: string, message: string, now: number) {
     const turn = this.turn(turnId);
     if (!turn) return;
@@ -2477,6 +2723,14 @@ export class NativeAgentJournal {
           completed_at = ?, updated_at = ? WHERE execution_id = ?
       `).run(message, now, now, executionId);
     });
+  }
+
+  nextTurnBlockOrdinal(turnId: string) {
+    const row = this.database.prepare(`
+      SELECT COALESCE(MAX(ordinal), -1) + 1 AS next_ordinal
+      FROM turn_blocks WHERE turn_id = ?
+    `).get(turnId) as { next_ordinal: number };
+    return row.next_ordinal;
   }
 
   orderedPasses(
@@ -2751,6 +3005,14 @@ export class NativeAgentJournal {
       });
     }
     switch (event.type) {
+      case 'user.message': {
+        if (scope.kind !== 'turn' || rootExecution) break;
+        this.database.prepare(`
+          UPDATE turns SET user_content_json = ?, updated_at = MAX(updated_at, ?)
+          WHERE turn_id = ?
+        `).run(JSON.stringify(event.content), now, scope.turnId);
+        break;
+      }
       case 'session.health': {
         const active = this.database.prepare(`
           SELECT turn_id FROM turns
@@ -2851,6 +3113,30 @@ export class NativeAgentJournal {
       case 'turn.block.completed': {
         if (scope.kind !== 'turn') break;
         const { structure, block } = event;
+        // A native snapshot and the live notification stream can race across
+        // process recovery. In particular, Codex may compact the native item
+        // list while Remux deliberately retains journal-only tool activity,
+        // so a newly observed item can propose an ordinal that is already in
+        // use. The journal owns the durable projection: preserve a known
+        // block's placement, and append an unknown colliding block. A later
+        // authoritative replaceSnapshot() can still rebuild exact native
+        // order after it has merged retained and snapshot-backed blocks.
+        const existingPlacement = this.database.prepare(`
+          SELECT pass_id, ordinal FROM turn_blocks WHERE block_id = ?
+        `).get(structure.blockId) as { pass_id: string; ordinal: number } | undefined;
+        const canonicalPassId = existingPlacement?.pass_id ?? structure.passId;
+        let canonicalBlockOrdinal = existingPlacement?.ordinal ?? structure.blockOrdinal;
+        if (!existingPlacement) {
+          const ordinalOccupied = this.database.prepare(`
+            SELECT 1 FROM turn_blocks WHERE pass_id = ? AND ordinal = ?
+          `).get(canonicalPassId, canonicalBlockOrdinal);
+          if (ordinalOccupied) {
+            canonicalBlockOrdinal = (this.database.prepare(`
+              SELECT COALESCE(MAX(ordinal), -1) + 1 AS next_ordinal
+              FROM turn_blocks WHERE pass_id = ?
+            `).get(canonicalPassId) as { next_ordinal: number }).next_ordinal;
+          }
+        }
         this.database.prepare(`
           INSERT INTO turn_passes(
             pass_id, turn_id, native_message_id, ordinal, state, created_at, updated_at
@@ -2860,7 +3146,7 @@ export class NativeAgentJournal {
             ordinal = excluded.ordinal,
             updated_at = MAX(turn_passes.updated_at, excluded.updated_at)
         `).run(
-          structure.passId,
+          canonicalPassId,
           scope.turnId,
           envelope.native.messageId ?? null,
           structure.passOrdinal,
@@ -2891,9 +3177,9 @@ export class NativeAgentJournal {
         `).run(
           structure.blockId,
           scope.turnId,
-          structure.passId,
+          canonicalPassId,
           block.kind,
-          structure.blockOrdinal,
+          canonicalBlockOrdinal,
           block.state,
           revision,
           JSON.stringify(block.payload),
@@ -2908,10 +3194,11 @@ export class NativeAgentJournal {
           const { child } = block.payload;
           this.database.prepare(`
             INSERT INTO executions(
-              execution_id, conversation_id, parent_execution_id, root_turn_id,
+              execution_id, conversation_id, strand_id, parent_execution_id, root_turn_id,
               ownership, provider, provider_instance_id, model, title, state,
               outcome, summary, transcript_available, created_at, completed_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, (SELECT strand_id FROM executions WHERE execution_id = ?),
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(execution_id) DO UPDATE SET
               state = CASE
                 WHEN executions.outcome IS NULL THEN excluded.state
@@ -2921,11 +3208,16 @@ export class NativeAgentJournal {
               summary = COALESCE(excluded.summary, executions.summary),
               model = COALESCE(excluded.model, executions.model),
               title = COALESCE(excluded.title, executions.title),
+              transcript_available = MAX(
+                executions.transcript_available,
+                excluded.transcript_available
+              ),
               completed_at = COALESCE(excluded.completed_at, executions.completed_at),
               updated_at = MAX(executions.updated_at, excluded.updated_at)
           `).run(
             child.executionId,
             conversationId,
+            executionId,
             executionId,
             scope.turnId,
             child.ownership,
@@ -2936,11 +3228,12 @@ export class NativeAgentJournal {
             block.payload.executionState,
             block.payload.outcome ?? null,
             block.payload.summary ?? null,
-            child.ownership === 'federated' ? 1 : 0,
+            child.ownership === 'federated' || child.transcriptAvailable === true ? 1 : 0,
             now,
             event.type === 'turn.block.completed' ? now : null,
             now,
           );
+          this.bindNativeChildHandle(child, now);
         }
         if (!envelope.native.position) {
           this.database.prepare(`
@@ -2997,30 +3290,42 @@ export class NativeAgentJournal {
         this.database.prepare(`
           INSERT OR IGNORE INTO conversation_control_events(
             control_event_id, conversation_id, kind, boundary_json, state,
-            operation_id, native_identity, payload_json, created_at, completed_at
-          ) VALUES (?, ?, 'compaction', ?, ?, ?, ?, ?, ?, ?)
+            operation_id, provider_subject_key, native_identity, payload_json,
+            created_at, completed_at
+          ) VALUES (?, ?, 'compaction', ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           envelope.eventId,
           conversationId,
           JSON.stringify(this.compactionBoundary(executionId, envelope)),
           state,
           event.operationId,
+          envelope.native.subject?.kind === 'context-compaction'
+            ? envelope.native.subject.key
+            : null,
           envelope.native.itemId ?? null,
           JSON.stringify(event),
           now,
           state === 'started' ? null : now,
         );
-        this.reduceCompactionEvent(conversationId, event, now);
+        this.reduceCompactionEvent(
+          conversationId,
+          event,
+          now,
+          envelope.native.subject?.kind === 'context-compaction'
+            ? envelope.native.subject.key
+            : undefined,
+        );
         break;
       }
       case 'execution.started': {
         const child = event.child;
         this.database.prepare(`
           INSERT INTO executions(
-            execution_id, conversation_id, parent_execution_id, root_turn_id,
+            execution_id, conversation_id, strand_id, parent_execution_id, root_turn_id,
             ownership, provider, provider_instance_id, model, title, state,
             transcript_available, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
+          ) VALUES (?, ?, (SELECT strand_id FROM executions WHERE execution_id = ?),
+            ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
           ON CONFLICT(execution_id) DO UPDATE SET
             state = CASE
               WHEN executions.outcome IS NULL AND excluded.updated_at >= executions.updated_at
@@ -3029,10 +3334,15 @@ export class NativeAgentJournal {
             END,
             model = COALESCE(excluded.model, model),
             title = COALESCE(excluded.title, title),
+            transcript_available = MAX(
+              executions.transcript_available,
+              excluded.transcript_available
+            ),
             updated_at = MAX(executions.updated_at, excluded.updated_at)
         `).run(
           child.executionId,
           conversationId,
+          executionId,
           executionId,
           scope.kind === 'execution' ? scope.rootTurnId ?? null : null,
           child.ownership,
@@ -3040,10 +3350,11 @@ export class NativeAgentJournal {
           child.providerInstanceId ?? scope.providerInstanceId,
           child.model ?? null,
           child.title ?? null,
-          child.ownership === 'federated' ? 1 : 0,
+          child.ownership === 'federated' || child.transcriptAvailable === true ? 1 : 0,
           now,
           now,
         );
+        this.bindNativeChildHandle(child, now);
         break;
       }
       case 'execution.status':
@@ -3072,10 +3383,57 @@ export class NativeAgentJournal {
     if (conversation) this.touchConversationFamily(conversation.rootConversationId, now);
   }
 
+  private bindNativeChildHandle(child: ChildExecutionDisplay, now: number) {
+    if (child.ownership !== 'native' || !child.nativeSessionId) return;
+    this.database.prepare(`
+      INSERT INTO native_child_handles(
+        execution_id, native_session_id, private_ref_json, updated_at
+      ) VALUES (?, ?, ?, ?)
+      ON CONFLICT(execution_id) DO UPDATE SET
+        native_session_id = excluded.native_session_id,
+        private_ref_json = excluded.private_ref_json,
+        updated_at = MAX(native_child_handles.updated_at, excluded.updated_at)
+    `).run(
+      child.executionId,
+      child.nativeSessionId,
+      JSON.stringify({ nativeSessionId: child.nativeSessionId }),
+      now,
+    );
+  }
+
+  private ensureNativeChildTurn(envelope: ProviderEventEnvelope) {
+    if (envelope.scope.kind !== 'turn' || this.turn(envelope.scope.turnId)) return;
+    const execution = this.execution(envelope.scope.executionId);
+    if (!execution || execution.ownership !== 'native' ||
+        execution.conversationId !== envelope.scope.conversationId) return;
+    const conversation = this.conversation(execution.conversationId);
+    if (!conversation) return;
+    const content = envelope.event.type === 'user.message'
+      ? envelope.event.content
+      : execution.title ? [{ type: 'text' as const, text: execution.title }] : [];
+    this.createTurn({
+      turnId: envelope.scope.turnId,
+      conversationId: execution.conversationId,
+      executionId: execution.executionId,
+      clientMessageId: `native-child-message:${envelope.scope.turnId}`,
+      commandId: `native-child-command:${envelope.scope.turnId}`,
+      content,
+      model: execution.model ?? conversation.model,
+      ...(execution.effort ? { effort: execution.effort } : {}),
+      state: 'running',
+      now: envelope.observedAt,
+    });
+    this.database.prepare(`
+      UPDATE executions SET transcript_available = 1, updated_at = MAX(updated_at, ?)
+      WHERE execution_id = ?
+    `).run(envelope.observedAt, execution.executionId);
+  }
+
   private reduceCompactionEvent(
     conversationId: string,
     event: Extract<ProviderEventEnvelope['event'], { type: `context.compaction.${string}` }>,
     now: number,
+    providerSubjectKey?: string,
   ) {
     const existing = this.compactionOperation(event.operationId);
     if (event.type === 'context.compaction.started') {
@@ -3084,14 +3442,15 @@ export class NativeAgentJournal {
         this.database.prepare(`
           INSERT INTO compaction_operations(
             operation_id, command_id, conversation_id, trigger, state, generation,
-            before_tokens, after_tokens, created_at, started_at, updated_at
-          ) VALUES (?, NULL, ?, ?, 'running', ?, ?, NULL, ?, ?, ?)
+            before_tokens, after_tokens, provider_subject_key, created_at, started_at, updated_at
+          ) VALUES (?, NULL, ?, ?, 'running', ?, ?, NULL, ?, ?, ?, ?)
         `).run(
           event.operationId,
           conversationId,
           event.trigger,
           generation,
           event.beforeTokens,
+          providerSubjectKey ?? null,
           now,
           now,
           now,
@@ -3100,9 +3459,10 @@ export class NativeAgentJournal {
         this.database.prepare(`
           UPDATE compaction_operations
           SET state = 'running', before_tokens = COALESCE(before_tokens, ?),
+            provider_subject_key = COALESCE(provider_subject_key, ?),
             started_at = COALESCE(started_at, ?), updated_at = ?
           WHERE operation_id = ? AND state IN ('queued', 'running')
-        `).run(event.beforeTokens, now, now, event.operationId);
+        `).run(event.beforeTokens, providerSubjectKey ?? null, now, now, event.operationId);
       }
       return;
     }
@@ -3112,8 +3472,8 @@ export class NativeAgentJournal {
         INSERT INTO compaction_operations(
           operation_id, command_id, conversation_id, trigger, state, disposition,
           generation, before_tokens, after_tokens, error_json, created_at,
-          completed_at, updated_at
-        ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          completed_at, updated_at, provider_subject_key
+        ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         event.operationId,
         conversationId,
@@ -3127,13 +3487,15 @@ export class NativeAgentJournal {
         now,
         now,
         now,
+        providerSubjectKey ?? null,
       );
       return;
     }
     this.database.prepare(`
       UPDATE compaction_operations
       SET state = ?, disposition = ?, before_tokens = COALESCE(before_tokens, ?),
-        after_tokens = ?, error_json = ?, completed_at = ?, updated_at = ?
+        after_tokens = ?, error_json = ?, completed_at = ?, updated_at = ?,
+        provider_subject_key = COALESCE(provider_subject_key, ?)
       WHERE operation_id = ?
     `).run(
       event.type === 'context.compaction.completed' ? 'completed' : 'failed',
@@ -3143,6 +3505,7 @@ export class NativeAgentJournal {
       event.type === 'context.compaction.failed' ? JSON.stringify(event.error) : null,
       now,
       now,
+      providerSubjectKey ?? null,
       event.operationId,
     );
   }
@@ -3158,7 +3521,16 @@ export class NativeAgentJournal {
     const nativeTurnId = envelope.native.turnId;
     if (!nativeTurnId) return { kind: 'between-turns' };
     if (envelope.native.kind.startsWith('control/')) {
-      return { kind: 'between-turns', nativeTurnId };
+      return {
+        kind: 'between-turns',
+        nativeTurnId,
+        ...(envelope.native.timeline?.previousTurnId
+          ? { previousNativeTurnId: envelope.native.timeline.previousTurnId }
+          : {}),
+        ...(envelope.native.timeline?.nextTurnId
+          ? { nextNativeTurnId: envelope.native.timeline.nextTurnId }
+          : {}),
+      };
     }
     const binding = this.database.prepare(`
       SELECT turn_id FROM native_turn_bindings
@@ -3251,9 +3623,16 @@ export async function openNativeAgentJournal(options: NativeAgentJournalOptions 
       }
     } else if (version >= 1 && version < NATIVE_AGENT_SCHEMA_VERSION &&
         applicationId === NATIVE_AGENT_APPLICATION_ID) {
+      const migratedAt = Date.now();
+      const backupDirectory = join(root, 'backups');
+      await mkdir(backupDirectory, { recursive: true, mode: 0o700 });
+      if (process.platform !== 'win32') await chmod(backupDirectory, 0o700);
+      const backupPath = join(backupDirectory, `before-schema-v${NATIVE_AGENT_SCHEMA_VERSION}-${migratedAt}.sqlite3`);
+      database.exec(`VACUUM INTO '${backupPath.replaceAll("'", "''")}'`);
+      if (process.platform !== 'win32') await chmod(backupPath, 0o600);
       database.exec('BEGIN IMMEDIATE');
       try {
-        migrateNativeAgentSchema(database, version);
+        migrateNativeAgentSchema(database, version, { backupPath, migratedAt });
         database.exec('COMMIT');
       } catch (error) {
         database.exec('ROLLBACK');
@@ -3543,6 +3922,9 @@ function compactionOperationRow(row: Record<string, unknown>): JournalCompaction
     beforeTokens: row.before_tokens === null ? null : Number(row.before_tokens),
     afterTokens: row.after_tokens === null ? null : Number(row.after_tokens),
     ...(row.native_operation_id === null ? {} : { nativeOperationId: String(row.native_operation_id) }),
+    ...(row.provider_subject_key === null
+      ? {}
+      : { providerSubjectKey: String(row.provider_subject_key) }),
     ...(row.error_json === null
       ? {}
       : { error: JSON.parse(String(row.error_json)) as NonNullable<JournalCompactionOperation['error']> }),
@@ -3681,6 +4063,14 @@ function snapshotBlockOrder(left: BlockLifecycleGroup, right: BlockLifecycleGrou
 function isCompactionMarker(event: TurnBlockLifecycleEvent) {
   return event.block.payload.kind === 'compatibility-notice' &&
     event.block.payload.code === 'context-compaction';
+}
+
+function isContextCompactionEvent(
+  event: ProviderEventEnvelope['event'],
+): event is Extract<ProviderEventEnvelope['event'], { type: `context.compaction.${string}` }> {
+  return event.type === 'context.compaction.started' ||
+    event.type === 'context.compaction.completed' ||
+    event.type === 'context.compaction.failed';
 }
 
 function isRetainableAction(event: TurnBlockLifecycleEvent) {

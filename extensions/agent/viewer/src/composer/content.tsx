@@ -22,7 +22,9 @@ import type { ComposerEditTarget, ComposerForkTarget } from './store.ts';
 export function ComposerContent({
   conversation,
   conversationSelected,
+  childExecutionCount,
   onInterrupt,
+  onOpenAgents,
   onCompact,
   onEdit,
   onFork,
@@ -40,7 +42,9 @@ export function ComposerContent({
 }: {
   conversation: ConversationValue | null;
   conversationSelected: boolean;
+  childExecutionCount: number;
   onInterrupt: () => Promise<void>;
+  onOpenAgents: () => void;
   onCompact: () => Promise<void>;
   onEdit: ComposerBranchCallback<ComposerEditTarget>;
   onFork: ComposerBranchCallback<ComposerForkTarget>;
@@ -114,10 +118,12 @@ export function ComposerContent({
             ? runtime?.conversationId === conversation.id
             : !conversationSelected && cwd && modelId && providerInstanceId) && !loading && historyReady)}
           conversationExists={conversationSelected}
+          childExecutionCount={childExecutionCount}
           isWorking={working}
           onEdit={onEdit}
           onFork={onFork}
           onInterrupt={onInterrupt}
+          onOpenAgents={onOpenAgents}
           onCompact={onCompact}
           onSend={(input, setPhase) => {
             setUsageExpanded(false);

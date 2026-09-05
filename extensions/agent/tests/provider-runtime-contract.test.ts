@@ -347,8 +347,14 @@ test('native fixture sessions dispatch a command once and expose replayable nati
   const collecting = collectUntil(session.events, collected, (event) =>
     event.event.type === 'turn.completed');
 
-  assert.deepEqual(await session.startTurn(turnInput), { accepted: true });
-  assert.deepEqual(await session.startTurn(structuredClone(turnInput)), { accepted: true });
+  assert.deepEqual(await session.startTurn(turnInput), {
+    accepted: true,
+    nativeTurnId: 'turn-1',
+  });
+  assert.deepEqual(await session.startTurn(structuredClone(turnInput)), {
+    accepted: true,
+    nativeTurnId: 'turn-1',
+  });
   await collecting;
 
   assert.equal(session.providerDispatchCount, 1);

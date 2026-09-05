@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 
-export const NATIVE_AGENT_SCHEMA_VERSION = 9;
+export const NATIVE_AGENT_SCHEMA_VERSION = 11;
 export const NATIVE_AGENT_APPLICATION_ID = 0x524d584e; // RMXN
 export const NATIVE_AGENT_SCHEMA_ID = 'remux-agent-native-v1';
 
@@ -14,6 +14,7 @@ export const NATIVE_AGENT_TABLES = [
   'native_turn_bindings',
   'branch_operations',
   'native_sessions',
+  'native_child_handles',
   'turns',
   'executions',
   'events',
@@ -21,6 +22,7 @@ export const NATIVE_AGENT_TABLES = [
   'turn_passes',
   'turn_blocks',
   'conversation_control_events',
+  'strand_control_path',
   'usage_snapshots',
   'provider_account_usage',
   'composer_preferences',
@@ -131,6 +133,14 @@ CREATE TABLE native_sessions (
   UNIQUE (provider_instance_id, native_session_id),
   FOREIGN KEY (execution_id) REFERENCES executions(execution_id) ON DELETE CASCADE,
   FOREIGN KEY (provider_instance_id) REFERENCES provider_instances(provider_instance_id)
+) STRICT;
+
+CREATE TABLE native_child_handles (
+  execution_id TEXT PRIMARY KEY NOT NULL,
+  native_session_id TEXT NOT NULL,
+  private_ref_json TEXT NOT NULL CHECK (json_valid(private_ref_json)),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+  FOREIGN KEY (execution_id) REFERENCES executions(execution_id) ON DELETE CASCADE
 ) STRICT;
 
 CREATE TABLE turns (
@@ -342,12 +352,33 @@ CREATE TABLE conversation_control_events (
   boundary_json TEXT NOT NULL CHECK (json_valid(boundary_json)),
   state TEXT NOT NULL CHECK (state IN ('started', 'completed', 'failed')),
   operation_id TEXT NOT NULL,
+  provider_subject_key TEXT,
   native_identity TEXT,
   payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   completed_at INTEGER,
   UNIQUE (conversation_id, operation_id, state),
   FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE
+) STRICT;
+
+CREATE UNIQUE INDEX conversation_control_subject_state
+  ON conversation_control_events(conversation_id, provider_subject_key, state)
+  WHERE provider_subject_key IS NOT NULL;
+
+CREATE TABLE strand_control_path (
+  path_entry_id TEXT PRIMARY KEY NOT NULL,
+  strand_id TEXT NOT NULL,
+  operation_id TEXT NOT NULL,
+  previous_turn_id TEXT,
+  next_turn_id TEXT,
+  native_ordinal INTEGER NOT NULL DEFAULT 0 CHECK (native_ordinal >= 0),
+  relation TEXT NOT NULL CHECK (relation IN ('local', 'inherited')),
+  UNIQUE(strand_id, operation_id),
+  FOREIGN KEY (strand_id) REFERENCES conversation_strands(strand_id) ON DELETE CASCADE,
+  FOREIGN KEY (operation_id) REFERENCES compaction_operations(operation_id) ON DELETE CASCADE,
+  FOREIGN KEY (previous_turn_id) REFERENCES turns(turn_id),
+  FOREIGN KEY (next_turn_id) REFERENCES turns(turn_id),
+  CHECK (previous_turn_id IS NOT NULL OR next_turn_id IS NOT NULL)
 ) STRICT;
 
 CREATE TABLE usage_snapshots (
@@ -402,6 +433,7 @@ CREATE TABLE compaction_operations (
   before_tokens INTEGER CHECK (before_tokens IS NULL OR before_tokens >= 0),
   after_tokens INTEGER CHECK (after_tokens IS NULL OR after_tokens >= 0),
   native_operation_id TEXT,
+  provider_subject_key TEXT,
   error_json TEXT CHECK (error_json IS NULL OR json_valid(error_json)),
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   started_at INTEGER,
@@ -410,6 +442,10 @@ CREATE TABLE compaction_operations (
   FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE,
   FOREIGN KEY (command_id) REFERENCES command_receipts(command_id) ON DELETE CASCADE
 ) STRICT;
+
+CREATE UNIQUE INDEX compaction_operation_subject
+  ON compaction_operations(conversation_id, provider_subject_key)
+  WHERE provider_subject_key IS NOT NULL;
 
 CREATE TABLE command_receipts (
   command_id TEXT PRIMARY KEY NOT NULL,
@@ -438,7 +474,6 @@ CREATE TABLE queued_messages (
   UNIQUE (conversation_id, ordinal),
   UNIQUE (conversation_id, client_message_id),
   FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE,
-  FOREIGN KEY (turn_id) REFERENCES turns(turn_id) ON DELETE CASCADE,
   FOREIGN KEY (command_id) REFERENCES command_receipts(command_id) ON DELETE CASCADE
 ) STRICT;
 
@@ -482,8 +517,12 @@ export function createNativeAgentSchema(database: DatabaseSync) {
   database.exec(`PRAGMA user_version = ${NATIVE_AGENT_SCHEMA_VERSION}`);
 }
 
-export function migrateNativeAgentSchema(database: DatabaseSync, fromVersion: number) {
-  if (fromVersion < 1 || fromVersion > 8) {
+export function migrateNativeAgentSchema(
+  database: DatabaseSync,
+  fromVersion: number,
+  repairContext?: { backupPath?: string; migratedAt?: number },
+) {
+  if (fromVersion < 1 || fromVersion > 10) {
     throw new NativeAgentSchemaError(`No Native Agent migration exists from schema ${fromVersion}.`);
   }
   if (fromVersion === 1) {
@@ -581,7 +620,286 @@ export function migrateNativeAgentSchema(database: DatabaseSync, fromVersion: nu
       );
     `);
   }
+  if (fromVersion <= 9 && !schemaObjectExists(database, 'table', 'native_child_handles')) {
+    database.exec(`
+      CREATE TABLE native_child_handles (
+        execution_id TEXT PRIMARY KEY NOT NULL,
+        native_session_id TEXT NOT NULL,
+        private_ref_json TEXT NOT NULL CHECK (json_valid(private_ref_json)),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+        FOREIGN KEY (execution_id) REFERENCES executions(execution_id) ON DELETE CASCADE
+      ) STRICT;
+    `);
+  }
+  if (fromVersion <= 10) migrateVersionEleven(database, fromVersion, repairContext);
   database.exec(`PRAGMA user_version = ${NATIVE_AGENT_SCHEMA_VERSION}`);
+}
+
+type VersionElevenControlRow = {
+  control_event_id: string;
+  conversation_id: string;
+  operation_id: string;
+  state: 'started' | 'completed' | 'failed';
+  boundary_json: string;
+  payload_json: string;
+  created_at: number;
+  native_kind: string;
+  command_id: string | null;
+  trigger: 'manual' | 'automatic';
+  operation_created_at: number;
+};
+
+/**
+ * Version 11 is the authority-boundary migration. It deliberately repairs only
+ * rows for which provider identity is provable: a Codex compaction-only native
+ * turn has exactly one semantic occurrence at ordinal zero. Inline historical
+ * compactions remain unkeyed unless the v4 adapter supplies their occurrence.
+ */
+function migrateVersionEleven(
+  database: DatabaseSync,
+  sourceVersion: number,
+  context?: { backupPath?: string; migratedAt?: number },
+) {
+  const canMigrateControls = [
+    'conversation_control_events', 'compaction_operations', 'events', 'provider_instances',
+  ].every((table) => schemaObjectExists(database, 'table', table));
+  if (canMigrateControls &&
+      !schemaColumnExists(database, 'conversation_control_events', 'provider_subject_key')) {
+    database.exec('ALTER TABLE conversation_control_events ADD COLUMN provider_subject_key TEXT;');
+  }
+  if (canMigrateControls &&
+      !schemaColumnExists(database, 'compaction_operations', 'provider_subject_key')) {
+    database.exec('ALTER TABLE compaction_operations ADD COLUMN provider_subject_key TEXT;');
+  }
+
+  const canCreateControlPath = canMigrateControls && [
+    'conversation_strands', 'turns',
+  ].every((table) => schemaObjectExists(database, 'table', table));
+  if (canCreateControlPath && !schemaObjectExists(database, 'table', 'strand_control_path')) {
+    database.exec(`
+      CREATE TABLE strand_control_path (
+        path_entry_id TEXT PRIMARY KEY NOT NULL,
+        strand_id TEXT NOT NULL,
+        operation_id TEXT NOT NULL,
+        previous_turn_id TEXT,
+        next_turn_id TEXT,
+        native_ordinal INTEGER NOT NULL DEFAULT 0 CHECK (native_ordinal >= 0),
+        relation TEXT NOT NULL CHECK (relation IN ('local', 'inherited')),
+        UNIQUE(strand_id, operation_id),
+        FOREIGN KEY (strand_id) REFERENCES conversation_strands(strand_id) ON DELETE CASCADE,
+        FOREIGN KEY (operation_id) REFERENCES compaction_operations(operation_id) ON DELETE CASCADE,
+        FOREIGN KEY (previous_turn_id) REFERENCES turns(turn_id),
+        FOREIGN KEY (next_turn_id) REFERENCES turns(turn_id),
+        CHECK (previous_turn_id IS NOT NULL OR next_turn_id IS NOT NULL)
+      ) STRICT;
+    `);
+  }
+
+  // A queue turn ID is an idempotency reservation, not canonical history.
+  // Rebuild the table without the old turn foreign key before deleting safe
+  // pre-accept materializations, otherwise ON DELETE CASCADE would erase the
+  // queue record that owns the pending work.
+  let safeQueueTurnIds: string[] = [];
+  const canMigrateQueue = [
+    'queued_messages', 'conversations', 'command_receipts', 'turns',
+    'native_turn_bindings', 'events', 'turn_passes', 'executions',
+    'strand_turn_path', 'branch_operations', 'conversation_heads',
+  ].every((table) => schemaObjectExists(database, 'table', table));
+  if (canMigrateQueue) database.exec(`
+    CREATE TABLE queued_messages_v11 (
+      command_id TEXT PRIMARY KEY NOT NULL,
+      conversation_id TEXT NOT NULL,
+      turn_id TEXT NOT NULL UNIQUE,
+      client_message_id TEXT NOT NULL,
+      content_json TEXT NOT NULL CHECK (json_valid(content_json)),
+      model TEXT,
+      effort TEXT,
+      access TEXT NOT NULL CHECK (access IN ('read-only', 'workspace-write', 'full-access')),
+      state TEXT NOT NULL DEFAULT 'queued'
+        CHECK (state IN ('queued', 'dispatching', 'blocked', 'delivery_unknown')),
+      ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+      created_at INTEGER NOT NULL CHECK (created_at >= 0),
+      UNIQUE (conversation_id, ordinal),
+      UNIQUE (conversation_id, client_message_id),
+      FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      FOREIGN KEY (command_id) REFERENCES command_receipts(command_id) ON DELETE CASCADE
+    ) STRICT;
+    INSERT INTO queued_messages_v11(
+      command_id, conversation_id, turn_id, client_message_id, content_json,
+      model, effort, access, state, ordinal, created_at
+    )
+    SELECT command_id, conversation_id, turn_id, client_message_id, content_json,
+      model, effort, access, state, ordinal, created_at
+    FROM queued_messages;
+    DROP TABLE queued_messages;
+    ALTER TABLE queued_messages_v11 RENAME TO queued_messages;
+
+    CREATE TEMP TABLE remux_v11_safe_queue_turns(turn_id TEXT PRIMARY KEY) WITHOUT ROWID;
+    INSERT INTO remux_v11_safe_queue_turns(turn_id)
+    SELECT t.turn_id
+    FROM turns t
+    JOIN queued_messages q ON q.turn_id = t.turn_id
+    WHERE q.state IN ('queued', 'blocked')
+      AND t.state = 'queued'
+      AND t.started_at IS NULL
+      AND t.native_turn_id IS NULL
+      AND NOT EXISTS (SELECT 1 FROM native_turn_bindings b WHERE b.turn_id = t.turn_id)
+      AND NOT EXISTS (SELECT 1 FROM events e WHERE e.turn_id = t.turn_id)
+      AND NOT EXISTS (SELECT 1 FROM turn_passes p WHERE p.turn_id = t.turn_id)
+      AND NOT EXISTS (SELECT 1 FROM executions e WHERE e.root_turn_id = t.turn_id)
+      AND NOT EXISTS (
+        SELECT 1 FROM strand_turn_path child
+        JOIN strand_turn_path parent ON parent.path_entry_id = child.source_path_entry_id
+        WHERE parent.turn_id = t.turn_id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM branch_operations b
+        JOIN strand_turn_path p ON p.path_entry_id = b.source_path_entry_id
+        WHERE p.turn_id = t.turn_id
+      );
+  `);
+  if (canMigrateQueue) safeQueueTurnIds = (database.prepare(`
+    SELECT turn_id FROM remux_v11_safe_queue_turns ORDER BY turn_id
+  `).all() as Array<{ turn_id: string }>).map(({ turn_id }) => turn_id);
+  if (canMigrateQueue) database.exec(`
+    DELETE FROM strand_turn_path
+    WHERE turn_id IN (SELECT turn_id FROM remux_v11_safe_queue_turns);
+    DELETE FROM turns
+    WHERE turn_id IN (SELECT turn_id FROM remux_v11_safe_queue_turns);
+    UPDATE conversations
+    SET latest_turn_id = (
+      SELECT p.turn_id FROM conversation_heads h
+      JOIN strand_turn_path p ON p.strand_id = h.strand_id
+      WHERE h.conversation_id = conversations.conversation_id
+      ORDER BY p.ordinal DESC LIMIT 1
+    )
+    WHERE latest_turn_id IN (SELECT turn_id FROM remux_v11_safe_queue_turns);
+    DROP TABLE remux_v11_safe_queue_turns;
+  `);
+
+  const controls = canMigrateControls ? database.prepare(`
+    SELECT c.control_event_id, c.conversation_id, c.operation_id, c.state,
+      c.boundary_json, c.payload_json, c.created_at, e.native_kind,
+      o.command_id, o.trigger, o.created_at AS operation_created_at
+    FROM conversation_control_events c
+    JOIN events e ON e.event_id = c.control_event_id
+    JOIN compaction_operations o ON o.operation_id = c.operation_id
+    JOIN provider_instances p ON p.provider_instance_id = e.provider_instance_id
+    WHERE c.kind = 'compaction'
+      AND p.provider = 'codex'
+      AND e.native_kind LIKE 'control/%'
+      AND json_extract(c.boundary_json, '$.kind') = 'between-turns'
+      AND json_type(c.boundary_json, '$.nativeTurnId') = 'text'
+    ORDER BY c.conversation_id, c.created_at, c.control_event_id
+  `).all() as VersionElevenControlRow[] : [];
+  const bySubject = new Map<string, VersionElevenControlRow[]>();
+  for (const row of controls) {
+    const boundary = JSON.parse(row.boundary_json) as { nativeTurnId: string };
+    const subject = `codex:context-compaction:${boundary.nativeTurnId}:0`;
+    const key = `${row.conversation_id}\0${subject}`;
+    const rows = bySubject.get(key) ?? [];
+    rows.push(row);
+    bySubject.set(key, rows);
+  }
+
+  const repairedCompactions: Array<{
+    conversationId: string;
+    providerSubject: string;
+    canonicalOperationId: string;
+    removedOperationIds: string[];
+  }> = [];
+  const ambiguousCompactions: Array<{ conversationId: string; providerSubject: string }> = [];
+  for (const [key, rows] of bySubject) {
+    const separator = key.indexOf('\0');
+    const conversationId = key.slice(0, separator);
+    const subject = key.slice(separator + 1);
+    const operations = [...new Map(rows.map((row) => [row.operation_id, row])).values()]
+      .sort((left, right) => left.operation_created_at - right.operation_created_at ||
+        left.operation_id.localeCompare(right.operation_id));
+    const commandBackedManual = operations.filter((row) =>
+      row.command_id !== null && row.trigger === 'manual');
+    const mergeIsProven = commandBackedManual.length === 1 ||
+      (commandBackedManual.length === 0 && operations.every((row) =>
+        row.command_id === null && row.trigger === 'automatic'));
+    if (!mergeIsProven) {
+      ambiguousCompactions.push({ conversationId, providerSubject: subject });
+      continue;
+    }
+    const canonical = commandBackedManual[0] ?? operations[0]!;
+    const canonicalTrigger = canonical.trigger;
+    database.prepare(`
+      UPDATE compaction_operations SET provider_subject_key = ? WHERE operation_id = ?
+    `).run(subject, canonical.operation_id);
+    for (const row of rows) {
+      const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+      payload.trigger = canonicalTrigger;
+      const stateExists = database.prepare(`
+        SELECT 1 AS present FROM conversation_control_events
+        WHERE conversation_id = ? AND operation_id = ? AND state = ?
+      `).get(conversationId, canonical.operation_id, row.state) as { present: number } | undefined;
+      if (row.operation_id !== canonical.operation_id && stateExists) {
+        database.prepare('DELETE FROM conversation_control_events WHERE control_event_id = ?')
+          .run(row.control_event_id);
+        database.prepare('DELETE FROM events WHERE event_id = ?').run(row.control_event_id);
+      } else {
+        database.prepare(`
+          UPDATE conversation_control_events
+          SET operation_id = ?, provider_subject_key = ?, payload_json = ?
+          WHERE control_event_id = ?
+        `).run(canonical.operation_id, subject, JSON.stringify(payload), row.control_event_id);
+      }
+    }
+    const removedOperationIds = operations
+      .map(({ operation_id }) => operation_id)
+      .filter((operationId) => operationId !== canonical.operation_id);
+    for (const operationId of removedOperationIds) {
+      database.prepare(`
+        DELETE FROM compaction_operations
+        WHERE operation_id = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM conversation_control_events c WHERE c.operation_id = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM queued_compactions q WHERE q.operation_id = ?
+          )
+      `).run(operationId, operationId, operationId);
+    }
+    if (removedOperationIds.length > 0) {
+      repairedCompactions.push({
+        conversationId,
+        providerSubject: subject,
+        canonicalOperationId: canonical.operation_id,
+        removedOperationIds,
+      });
+    }
+  }
+
+  if (canMigrateControls) database.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS conversation_control_subject_state
+      ON conversation_control_events(conversation_id, provider_subject_key, state)
+      WHERE provider_subject_key IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS compaction_operation_subject
+      ON compaction_operations(conversation_id, provider_subject_key)
+      WHERE provider_subject_key IS NOT NULL;
+  `);
+  const audit = {
+    sourceVersion,
+    targetVersion: 11,
+    backupPath: context?.backupPath ?? null,
+    migratedAt: context?.migratedAt ?? Date.now(),
+    queue: { safeTurnCandidates: safeQueueTurnIds.length, removedTurnIds: safeQueueTurnIds },
+    compaction: {
+      candidateSubjects: bySubject.size,
+      repairedSubjects: repairedCompactions.length,
+      repairs: repairedCompactions.slice(0, 100),
+      ambiguousSubjects: ambiguousCompactions.length,
+      ambiguous: ambiguousCompactions.slice(0, 100),
+    },
+  };
+  if (schemaObjectExists(database, 'table', 'meta')) database.prepare(`
+    INSERT INTO meta(key, value_json) VALUES ('schema_v11_repair', ?)
+    ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json
+  `).run(JSON.stringify(audit));
 }
 
 const VERSION_SEVEN_OBJECTS = [

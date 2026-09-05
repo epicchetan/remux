@@ -31,6 +31,9 @@ Its composer, usage, and native Compact amendment is
 Its conversation identity, edit/fork lineage, native branch, and sidebar-tree
 amendment is
 [agent-conversation-lineage-and-sidebar-tree-v1.md](agent-conversation-lineage-and-sidebar-tree-v1.md).
+Its command/queue admission, provider snapshot reconciliation, canonical
+timeline, projection-revision, and client synchronization amendment is
+[agent-state-authority-and-synchronization-v1.md](agent-state-authority-and-synchronization-v1.md).
 
 ## Codex Specs
 
@@ -85,6 +88,7 @@ amendment is
 | [agent-conversation-lineage-and-sidebar-tree-v1.md](agent-conversation-lineage-and-sidebar-tree-v1.md) | Active Spec — implementation landed; live provider/physical-phone acceptance pending | Stable chats with immutable edit strands, explicit-fork child conversations, native Codex/Claude context branching, deterministic strand paths, historical transcript reads, and a virtualized mobile-safe sidebar tree. |
 | [agent-runtime-management-v1.md](agent-runtime-management-v1.md) | Active Spec — daemon transport, local ownership, and runtime status UI implemented; shared host management pending | Host-owned harness installations and lifecycle, one persistent Codex daemon, per-session Claude processes, provider-neutral controller leases, safe upgrades, and Codex-extension fallback coexistence. |
 | [agent-transcript-ui-controller-v1.md](agent-transcript-ui-controller-v1.md) | Active Spec — implementation pending | Cleanup of the working Agent transcript around one authoritative snapshot, pure disclosure/geometry/viewport policy, and a single DOM driver while preserving virtualizer and UI parity. |
+| [agent-state-authority-and-synchronization-v1.md](agent-state-authority-and-synchronization-v1.md) | Active Spec — implementation pending | Strict separation of commands, queue entries, provider observations, canonical timeline facts, and projections; coverage-aware history reconciliation; branch-stable control identity; projection revisions; typed invalidations; and one client synchronization controller. |
 | [agent-runtime-and-epoch-context.md](agent-runtime-and-epoch-context.md) | Archived | Original single-provider harness and phased epoch plan. Provider/auth/UI foundations remain historical rationale; current provider/runtime behavior is governed by `agent-native-provider-runtime-v1.md`. |
 | [agent-durable-epoch-core.md](agent-durable-epoch-core.md) | Archived | Historical durable-journal, shadow-compiler, and rollover plan. The journal survived; epoch and shadow-context semantics did not. |
 | [agent-turns-and-work-units.md](agent-turns-and-work-units.md) | Archived | Historical custom work-unit design, superseded by provider-native children and MCP-federated cross-provider executions. |

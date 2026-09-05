@@ -9,7 +9,10 @@ import {
   NativeAgentJournal,
   openNativeAgentJournal,
 } from '../server/src/native-runtime/native-journal.ts';
-import { createNativeAgentSchema } from '../server/src/native-runtime/schema.ts';
+import {
+  createNativeAgentSchema,
+  migrateNativeAgentSchema,
+} from '../server/src/native-runtime/schema.ts';
 import { prepareAgentDataPaths } from '../server/src/storage/data-root.ts';
 import {
   PROVIDER_RUNTIME_CONTRACT_VERSION,
@@ -261,6 +264,72 @@ test('native journal recovers an active turn even when a session bind left its c
   }
 });
 
+test('binding a native session does not reset an active turn to idle', () => {
+  const journal = createJournal();
+  try {
+    seedConversation(journal);
+    journal.createTurn({
+      turnId: 'turn-1',
+      conversationId: 'conversation-1',
+      executionId: 'execution-1',
+      clientMessageId: 'message-1',
+      commandId: 'send-1',
+      content: [{ type: 'text', text: 'Keep the lifecycle authoritative.' }],
+      model: 'fixture-native-v1',
+      state: 'running',
+      now: 2,
+    });
+
+    journal.bindNativeSession({
+      executionId: 'execution-1',
+      nativeSession: {
+        provider: 'fixture',
+        providerInstanceId: 'fixture-local',
+        sessionId: 'fixture-session-1',
+        resumeCursor: { sequence: 1 },
+      },
+      adapterVersion: 'adapter-2',
+      now: 3,
+    });
+
+    assert.equal(journal.turn('turn-1')?.state, 'running');
+    assert.equal(journal.execution('execution-1')?.state, 'running');
+    assert.equal(journal.conversation('conversation-1')?.state, 'running');
+    assert.equal(journal.conversation('conversation-1')?.activeTurnId, 'turn-1');
+    assert.equal(journal.conversation('conversation-1')?.resumable, true);
+  } finally {
+    journal.close();
+  }
+});
+
+test('an authoritative running snapshot reasserts lifecycle state after recovery', () => {
+  const journal = createJournal();
+  try {
+    seedConversation(journal);
+    journal.createTurn({
+      turnId: 'turn-1',
+      conversationId: 'conversation-1',
+      executionId: 'execution-1',
+      clientMessageId: 'message-1',
+      commandId: 'send-1',
+      content: [{ type: 'text', text: 'Recover this accepted turn.' }],
+      model: 'fixture-native-v1',
+      state: 'running',
+      now: 2,
+    });
+    journal.markConversationRecovering('conversation-1', 'Reconnecting', 3);
+
+    assert.equal(journal.confirmExecutionRunning('execution-1', 4), 'turn-1');
+    assert.equal(journal.turn('turn-1')?.state, 'running');
+    assert.equal(journal.execution('execution-1')?.state, 'running');
+    assert.equal(journal.conversation('conversation-1')?.state, 'running');
+    assert.equal(journal.conversation('conversation-1')?.activeTurnId, 'turn-1');
+    assert.equal(journal.conversation('conversation-1')?.healthMessage, undefined);
+  } finally {
+    journal.close();
+  }
+});
+
 test('later native terminal evidence repairs a false recovery failure from an older journal', () => {
   const journal = createJournal();
   try {
@@ -418,6 +487,68 @@ test('native journal appends and deduplicates a provider event batch atomically'
   }
 });
 
+test('native journal appends a new live block when its proposed ordinal is occupied', () => {
+  const journal = createJournal();
+  try {
+    seedConversation(journal);
+    journal.createTurn({
+      turnId: 'turn-1',
+      conversationId: 'conversation-1',
+      executionId: 'execution-1',
+      clientMessageId: 'message-1',
+      commandId: 'send-1',
+      content: [{ type: 'text', text: 'Keep the recovered stream ordered.' }],
+      model: 'fixture-native-v1',
+      state: 'running',
+      now: 2,
+    });
+    assert.equal(journal.appendProviderEvent(event('first-block', 3, {
+      type: 'turn.block.completed',
+      structure: blockStructure('first-block', 0),
+      revision: 1,
+      contentHash: 'a'.repeat(64),
+      block: {
+        kind: 'reasoning-summary',
+        state: 'completed',
+        payload: { kind: 'reasoning-summary', text: 'Already projected.' },
+      },
+    })), true);
+    assert.equal(journal.appendProviderEvent(event('racing-block-started', 4, {
+      type: 'turn.block.started',
+      structure: blockStructure('racing-block', 0),
+      block: {
+        kind: 'commentary',
+        state: 'streaming',
+        payload: { kind: 'commentary', text: 'Recovered' },
+      },
+    })), true);
+    assert.equal(journal.appendProviderEvent(event('racing-block-completed', 5, {
+      type: 'turn.block.completed',
+      structure: blockStructure('racing-block', 0),
+      revision: 1,
+      contentHash: 'b'.repeat(64),
+      block: {
+        kind: 'commentary',
+        state: 'completed',
+        payload: { kind: 'commentary', text: 'Recovered safely.' },
+      },
+    })), true);
+
+    const blocks = journal.orderedPasses('turn-1').flatMap((pass) => pass.blocks);
+    assert.deepEqual(blocks.map(({ blockId, ordinal }) => [blockId, ordinal]), [
+      ['first-block', 0],
+      ['racing-block', 1],
+    ]);
+    assert.equal(blocks[1]?.payload.kind, 'commentary');
+    assert.equal(blocks[1]?.payload.kind === 'commentary' ? blocks[1].payload.text : '',
+      'Recovered safely.');
+    assert.equal(journal.eventsForTurn('turn-1').length, 3,
+      'the append-only event log retains both lifecycle events');
+  } finally {
+    journal.close();
+  }
+});
+
 test('native journal projects native child identity without exposing a resume cursor', () => {
   const journal = createJournal();
   try {
@@ -449,12 +580,41 @@ test('native journal projects native child identity without exposing a resume cu
             providerInstanceId: 'fixture-local',
             title: 'Native reviewer',
             nativeSessionId: 'private-child-thread',
+            transcriptAvailable: true,
           },
           executionState: 'running',
         },
       },
     }));
-    journal.appendProviderEvent(event('child-completed', 5, {
+    assert.equal(journal.execution('execution-child-1')?.transcriptAvailable, true);
+    assert.deepEqual(journal.nativeChildHandle('execution-child-1'), {
+      nativeSessionId: 'private-child-thread',
+    });
+    journal.appendProviderEvents([
+      childEvent('child-turn-started', 5, { type: 'turn.started' }),
+      childEvent('child-user', 6, {
+        type: 'user.message',
+        content: [{ type: 'text', text: 'Inspect the native child.' }],
+      }),
+      childEvent('child-final', 7, {
+        type: 'turn.block.completed',
+        structure: {
+          passId: 'child-pass-1',
+          blockId: 'child-final-block',
+          passOrdinal: 0,
+          blockOrdinal: 0,
+        },
+        revision: 1,
+        contentHash: 'c'.repeat(64),
+        block: {
+          kind: 'final-message',
+          state: 'completed',
+          payload: { kind: 'final-message', text: 'Native child result.' },
+        },
+      }),
+      childEvent('child-turn-completed', 8, { type: 'turn.completed', outcome: 'completed' }),
+    ]);
+    journal.appendProviderEvent(event('child-completed', 9, {
       type: 'turn.block.completed',
       structure: blockStructure('native-child-1', 0),
       revision: 1,
@@ -501,6 +661,11 @@ test('native journal projects native child identity without exposing a resume cu
     assert.equal(child?.ownership, 'native');
     assert.equal(child?.state, 'idle');
     assert.equal(child?.outcome, 'completed');
+    assert.equal(child?.transcriptAvailable, true);
+    assert.equal(journal.turn('turn-child-1')?.executionId, 'execution-child-1');
+    assert.deepEqual(journal.turn('turn-child-1')?.userContent, [
+      { type: 'text', text: 'Inspect the native child.' },
+    ]);
     assert.doesNotMatch(JSON.stringify(child), /private-child-thread/u);
   } finally {
     journal.close();
@@ -515,17 +680,6 @@ test('native journal queue is durable FIFO and retains a claim until provider ac
       const commandId = `send-${index}`;
       const turnId = `turn-${index}`;
       journal.claimCommand(commandId, 'turn.send', { index }, index + 1);
-      journal.createTurn({
-        turnId,
-        conversationId: 'conversation-1',
-        executionId: 'execution-1',
-        clientMessageId: `message-${index}`,
-        commandId,
-        content: [{ type: 'text', text: `Message ${index}` }],
-        model: 'fixture-native-v1',
-        state: 'queued',
-        now: index + 2,
-      });
       journal.enqueueTurn({
         commandId,
         conversationId: 'conversation-1',
@@ -541,19 +695,26 @@ test('native journal queue is durable FIFO and retains a claim until provider ac
       'turn-1',
       'turn-2',
     ]);
+    assert.equal(journal.turn('turn-1'), undefined, 'queued intent is not transcript history');
     assert.equal(journal.claimQueuedTurn('conversation-1', 10)?.turnId, 'turn-1');
-    assert.deepEqual(journal.queuedMessages('conversation-1').map(({ turnId }) => turnId), [
-      'turn-2',
-    ]);
+    assert.deepEqual(
+      journal.queuedMessages('conversation-1').map(({ turnId, state }) => [turnId, state]),
+      [['turn-1', 'dispatching'], ['turn-2', 'queued']],
+      'the composer owns the proposal until provider acceptance',
+    );
     assert.equal(journal.claimQueuedTurn('conversation-1', 11), undefined,
       'a dispatching head blocks later FIFO entries');
-    assert.equal(journal.acknowledgeQueuedTurnDispatch('turn-1'), true);
+    assert.equal(journal.admitQueuedTurn('turn-1', 11, 'fixture-native-turn-1')?.turnId, 'turn-1');
+    assert.equal(journal.turn('turn-1')?.state, 'running');
+    assert.equal(journal.turn('turn-1')?.nativeTurnId, 'fixture-native-turn-1',
+      'provider acceptance binds native identity in the transcript-admission transaction');
     assert.equal(journal.claimQueuedTurn('conversation-1', 12)?.turnId, 'turn-2');
     assert.equal(journal.markQueuedTurnDeliveryUnknown('turn-2'), true);
     assert.equal(journal.queuedMessages('conversation-1')[0]?.state, 'delivery-unknown');
     assert.equal(journal.claimQueuedTurn('conversation-1', 13), undefined,
       'an ambiguous provider delivery is never retried');
     assert.equal(journal.removeQueuedTurnById('conversation-1', 'turn-2', 14), true);
+    assert.equal(journal.turn('turn-2'), undefined, 'deleting queued intent creates no history');
   } finally {
     journal.close();
   }
@@ -1162,6 +1323,216 @@ test('dedicated native compaction controls remain between turns', () => {
   }
 });
 
+test('compaction replay resolves one canonical subject and one structural strand path', () => {
+  const journal = createJournal();
+  try {
+    seedConversation(journal);
+    journal.createTurn({
+      turnId: 'turn-before', conversationId: 'conversation-1', executionId: 'execution-1',
+      clientMessageId: 'message-before', commandId: 'send-before',
+      content: [{ type: 'text', text: 'Before.' }], model: 'fixture-native-v1',
+      state: 'running', now: 2,
+    });
+    journal.upsertNativeTurnBinding({
+      providerInstanceId: 'fixture-local', executionId: 'execution-1', turnId: 'turn-before',
+      nativeTurnId: 'native-before', now: 2,
+    });
+    journal.createTurn({
+      turnId: 'turn-after', conversationId: 'conversation-1', executionId: 'execution-1',
+      clientMessageId: 'message-after', commandId: 'send-after',
+      content: [{ type: 'text', text: 'After.' }], model: 'fixture-native-v1',
+      state: 'running', now: 4,
+    });
+    journal.upsertNativeTurnBinding({
+      providerInstanceId: 'fixture-local', executionId: 'execution-1', turnId: 'turn-after',
+      nativeTurnId: 'native-after', now: 4,
+    });
+    journal.claimCommand('manual-compact-command', 'conversation.compact', {}, 3);
+    journal.createManualCompaction({
+      operationId: 'manual-compact-operation', commandId: 'manual-compact-command',
+      conversationId: 'conversation-1', state: 'running', now: 3,
+    });
+    const original = event('manual-compact-event', 3, {
+      type: 'context.compaction.completed', trigger: 'manual',
+      operationId: 'manual-compact-operation', beforeTokens: 80_000, afterTokens: 10_000,
+    });
+    original.native.kind = 'control/contextCompaction/completed';
+    original.native.turnId = 'native-control';
+    original.native.subject = {
+      kind: 'context-compaction', key: 'fixture:context-compaction:native-control:0',
+    };
+    original.native.timeline = { previousTurnId: 'native-before', nextTurnId: 'native-after' };
+    assert.equal(journal.appendProviderEvent(original), true);
+
+    const replay = structuredClone(original);
+    replay.eventId = 'snapshot-replay-event';
+    replay.native.sessionId = 'fixture-session-resumed';
+    replay.native.itemId = 'rewritten-item-99';
+    replay.event = {
+      type: 'context.compaction.completed', trigger: 'automatic',
+      operationId: 'synthetic-replay-operation', beforeTokens: null, afterTokens: null,
+    };
+    assert.equal(journal.appendProviderEvent(replay), false);
+    const controls = journal.compactionControlEvents('conversation-1');
+    assert.equal(controls.length, 1);
+    assert.equal(controls[0]?.operationId, 'manual-compact-operation');
+    assert.equal(controls[0]?.trigger, 'manual');
+    assert.equal(controls[0]?.previousTurnId, 'turn-before');
+    assert.equal(controls[0]?.nextTurnId, 'turn-after');
+    assert.equal(journal.compactionOperation('synthetic-replay-operation'), undefined);
+  } finally {
+    journal.close();
+  }
+});
+
+test('three inherited compaction replays retain their canonical positions instead of moving to the tail', () => {
+  const journal = createJournal();
+  try {
+    seedConversation(journal);
+    for (let index = 0; index < 4; index += 1) {
+      const turnId = `turn-${index}`;
+      journal.createTurn({
+        turnId, conversationId: 'conversation-1', executionId: 'execution-1',
+        clientMessageId: `message-${index}`, commandId: `send-${index}`,
+        content: [{ type: 'text', text: `Turn ${index}.` }], model: 'fixture-native-v1',
+        state: 'running', now: 10 + index * 10,
+      });
+      journal.upsertNativeTurnBinding({
+        providerInstanceId: 'fixture-local', executionId: 'execution-1', turnId,
+        nativeTurnId: `native-turn-${index}`, now: 10 + index * 10,
+      });
+    }
+
+    for (let index = 0; index < 3; index += 1) {
+      const commandId = `manual-compact-command-${index}`;
+      const operationId = `manual-compact-operation-${index}`;
+      const subjectKey = `fixture:context-compaction:native-control-${index}:0`;
+      journal.claimCommand(commandId, 'conversation.compact', {}, 15 + index * 10);
+      journal.createManualCompaction({
+        operationId, commandId, conversationId: 'conversation-1',
+        state: 'running', now: 15 + index * 10,
+      });
+      const original = event(`manual-compact-event-${index}`, 15 + index * 10, {
+        type: 'context.compaction.completed', trigger: 'manual', operationId,
+        beforeTokens: 80_000, afterTokens: 10_000,
+      });
+      original.native.kind = 'control/contextCompaction/completed';
+      original.native.turnId = `native-control-${index}`;
+      original.native.subject = { kind: 'context-compaction', key: subjectKey };
+      original.native.timeline = {
+        previousTurnId: `native-turn-${index}`,
+        nextTurnId: `native-turn-${index + 1}`,
+      };
+      assert.equal(journal.appendProviderEvent(original), true);
+
+      const replay = structuredClone(original);
+      replay.eventId = `snapshot-replay-event-${index}`;
+      replay.native.sessionId = 'fixture-session-resumed';
+      replay.native.itemId = `rewritten-item-${index}`;
+      replay.event = {
+        type: 'context.compaction.completed', trigger: 'automatic',
+        operationId: `synthetic-replay-operation-${index}`,
+        beforeTokens: null, afterTokens: null,
+      };
+      assert.equal(journal.appendProviderEvent(replay), false);
+    }
+
+    const controls = journal.compactionControlEvents('conversation-1');
+    assert.equal(controls.length, 3);
+    assert.deepEqual(controls.map((control) => ({
+      operationId: control.operationId,
+      trigger: control.trigger,
+      previousTurnId: control.previousTurnId,
+      nextTurnId: control.nextTurnId,
+    })), [0, 1, 2].map((index) => ({
+      operationId: `manual-compact-operation-${index}`,
+      trigger: 'manual',
+      previousTurnId: `turn-${index}`,
+      nextTurnId: `turn-${index + 1}`,
+    })));
+    for (let index = 0; index < 3; index += 1) {
+      assert.equal(journal.compactionOperation(`synthetic-replay-operation-${index}`), undefined);
+    }
+  } finally {
+    journal.close();
+  }
+});
+
+test('schema v11 repairs only a proven command-backed compaction replay and records its audit', () => {
+  const database = new DatabaseSync(':memory:');
+  database.exec('PRAGMA foreign_keys = ON');
+  createNativeAgentSchema(database);
+  const journal = new NativeAgentJournal(database);
+  try {
+    seedConversation(journal);
+    journal.claimCommand('manual-command', 'conversation.compact', {}, 3);
+    journal.createManualCompaction({
+      operationId: 'manual-operation', commandId: 'manual-command',
+      conversationId: 'conversation-1', state: 'running', now: 3,
+    });
+    const manual = event('manual-control', 4, {
+      type: 'context.compaction.completed', trigger: 'manual',
+      operationId: 'manual-operation', beforeTokens: 80_000, afterTokens: 9_000,
+    });
+    manual.native.kind = 'control/contextCompaction/completed';
+    manual.native.turnId = 'native-control-turn';
+    journal.appendProviderEvent(manual);
+
+    const replay = event('snapshot-replay-control', 50, {
+      type: 'context.compaction.completed', trigger: 'automatic',
+      operationId: 'synthetic-operation', beforeTokens: null, afterTokens: null,
+    });
+    replay.native.kind = 'control/contextCompaction/completed';
+    replay.native.turnId = 'native-control-turn';
+    journal.appendProviderEvent(replay);
+    assert.equal(journal.compactionControlEvents('conversation-1').length, 2);
+
+    database.prepare(`
+      UPDATE provider_instances SET provider = 'codex'
+      WHERE provider_instance_id = 'fixture-local'
+    `).run();
+    database.exec(`
+      DROP INDEX conversation_control_subject_state;
+      DROP INDEX compaction_operation_subject;
+      DROP TABLE strand_control_path;
+      PRAGMA user_version = 10;
+    `);
+    migrateNativeAgentSchema(database, 10, {
+      backupPath: '/audit/before-schema-v11.sqlite3', migratedAt: 100,
+    });
+
+    const controls = journal.compactionControlEvents('conversation-1');
+    assert.equal(controls.length, 1);
+    assert.equal(controls[0]?.operationId, 'manual-operation');
+    assert.equal(controls[0]?.trigger, 'manual');
+    assert.equal(controls[0]?.providerSubjectKey,
+      'codex:context-compaction:native-control-turn:0');
+    assert.equal(journal.compactionOperation('synthetic-operation'), undefined);
+    const auditRow = database.prepare(`
+      SELECT value_json FROM meta WHERE key = 'schema_v11_repair'
+    `).get() as { value_json: string };
+    const audit = JSON.parse(auditRow.value_json) as {
+      backupPath: string;
+      compaction: { candidateSubjects: number; repairedSubjects: number };
+    };
+    assert.equal(audit.backupPath, '/audit/before-schema-v11.sqlite3');
+    assert.deepEqual(audit.compaction, {
+      candidateSubjects: 1,
+      repairedSubjects: 1,
+      repairs: [{
+        conversationId: 'conversation-1',
+        providerSubject: 'codex:context-compaction:native-control-turn:0',
+        canonicalOperationId: 'manual-operation',
+        removedOperationIds: ['synthetic-operation'],
+      }],
+      ambiguousSubjects: 0,
+      ambiguous: [],
+    });
+  } finally {
+    journal.close();
+  }
+});
+
 function createJournal() {
   const database = new DatabaseSync(':memory:');
   database.exec('PRAGMA foreign_keys = ON');
@@ -1224,6 +1595,33 @@ function event(eventId: string, observedAt: number, providerEvent: ProviderEvent
     native: {
       sessionId: 'fixture-session-1',
       turnId: 'fixture-native-turn-1',
+      position: { kind: 'native-sequence', sequence: observedAt, subIndex: 0 },
+      kind: providerEvent.type,
+    },
+    observedAt,
+    event: providerEvent,
+  };
+}
+
+function childEvent(
+  eventId: string,
+  observedAt: number,
+  providerEvent: ProviderEvent,
+): ProviderEventEnvelope {
+  return {
+    contractVersion: PROVIDER_RUNTIME_CONTRACT_VERSION,
+    eventId,
+    provider: 'fixture',
+    scope: {
+      kind: 'turn',
+      providerInstanceId: 'fixture-local',
+      conversationId: 'conversation-1',
+      executionId: 'execution-child-1',
+      turnId: 'turn-child-1',
+    },
+    native: {
+      sessionId: 'private-child-thread',
+      turnId: 'private-child-turn',
       position: { kind: 'native-sequence', sequence: observedAt, subIndex: 0 },
       kind: providerEvent.type,
     },

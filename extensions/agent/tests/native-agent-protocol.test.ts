@@ -3,7 +3,11 @@ import test from 'node:test';
 
 import {
   NATIVE_AGENT_RESOURCE_KEYS,
+  agentExecutionResourceKey,
+  agentExecutionTranscriptResourceKey,
   assertViewerSafeNativeResource,
+  parseAgentExecutionResourceKey,
+  parseAgentExecutionTranscriptResourceKey,
   parseNativeAgentResourceReadParams,
   parseNativeBranchCommand,
   parseNativeConversationCreateCommand,
@@ -15,6 +19,21 @@ import {
   type AgentRuntimeResource,
 } from '../shared/native-agent-protocol.ts';
 import { ProviderContractError } from '../shared/provider-runtime.ts';
+
+test('execution resource keys preserve colon-bearing provider identities', () => {
+  const executionId = 'root:conversation-1:codex-child-a';
+  const executionKey = agentExecutionResourceKey(executionId);
+  const transcriptKey = agentExecutionTranscriptResourceKey(executionId);
+  assert.equal(executionKey, 'agent/execution:root%3Aconversation-1%3Acodex-child-a');
+  assert.equal(parseAgentExecutionResourceKey(executionKey), executionId);
+  assert.deepEqual(parseAgentExecutionTranscriptResourceKey(transcriptKey), {
+    executionId,
+    window: 'tail-24',
+  });
+  assert.equal(parseNativeAgentResourceReadParams({
+    requests: [{ key: executionKey }, { key: transcriptKey }],
+  }).requests.length, 2);
+});
 
 test('native Agent commands are chat-based, strict, and provider explicit', () => {
   assert.deepEqual(parseNativeProviderLoginStartCommand({

@@ -1,5 +1,5 @@
-export const AGENT_TRANSCRIPT_PROTOCOL_VERSION = 6 as const;
-export const AGENT_TRANSCRIPT_PROJECTION_VERSION = 'agent-turn-render-v6' as const;
+export const AGENT_TRANSCRIPT_PROTOCOL_VERSION = 7 as const;
+export const AGENT_TRANSCRIPT_PROJECTION_VERSION = 'agent-turn-render-v7' as const;
 
 export const DEFAULT_TRANSCRIPT_TAIL_TURNS = 24;
 export const DEFAULT_TRANSCRIPT_PREPEND_TURNS = 16;

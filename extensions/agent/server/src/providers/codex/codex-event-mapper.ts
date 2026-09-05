@@ -17,6 +17,7 @@ import {
   type TurnBlockSnapshot,
   type TurnStructure,
   type UserContentPart,
+  type NativeTimelineBoundary,
 } from '../../../../shared/provider-runtime.ts';
 import type { CodexServerNotification } from './codex-app-server-process.ts';
 import { fitJsonPreview, mergeJsonPreview } from '../preview.ts';
@@ -80,14 +81,18 @@ export class CodexEventMapper {
     this.pendingRemuxTurnId = remuxTurnId;
   }
 
-  bindTurn(remuxTurnId: string, nativeTurnId: string) {
+  bindTurn(remuxTurnId: string, nativeTurnId: string, nextBlockOrdinal = 0) {
     this.remuxTurnByNative.set(nativeTurnId, remuxTurnId);
+    this.nextOrdinalByTurn.set(
+      nativeTurnId,
+      Math.max(this.nextOrdinalByTurn.get(nativeTurnId) ?? 0, nextBlockOrdinal),
+    );
     this.usageAnchorNativeTurnId = nativeTurnId;
     if (this.pendingRemuxTurnId === remuxTurnId) this.pendingRemuxTurnId = null;
   }
 
   remuxTurnId(nativeTurnId: string) {
-    return this.remuxTurnByNative.get(nativeTurnId) ?? stableNativeTurnId(nativeTurnId);
+    return this.remuxTurnByNative.get(nativeTurnId) ?? codexStableNativeTurnId(nativeTurnId);
   }
 
   expectManualCompaction(operationId: string) {
@@ -367,30 +372,44 @@ export class CodexEventMapper {
     const thread = record(threadValue);
     if (!thread || string(thread.id) !== this.nativeSessionId || !Array.isArray(thread.turns)) return [];
     const envelopes: ProviderEventEnvelope[] = [];
-    const latestCompactionIdentity = thread.turns.flatMap((value) => {
+    const snapshotTurns = thread.turns.flatMap((value) => {
       const turn = record(value);
       const nativeTurnId = string(turn?.id);
-      if (!nativeTurnId || !Array.isArray(turn?.items)) return [];
-      return turn.items.flatMap((item) => {
+      if (!turn || !nativeTurnId) return [];
+      const items = Array.isArray(turn.items) ? turn.items : [];
+      const control = items.length > 0 &&
+        items.every((item) => record(item)?.type === 'contextCompaction') &&
+        !this.remuxTurnByNative.has(nativeTurnId);
+      return [{ turn, nativeTurnId, items, control }];
+    });
+    const latestCompactionIdentity = snapshotTurns.flatMap(({ nativeTurnId, items }) =>
+      items.flatMap((item) => {
         const candidate = record(item);
         const itemId = string(candidate?.id);
         return candidate?.type === 'contextCompaction' && itemId
           ? [`${nativeTurnId}\0${itemId}`]
           : [];
-      });
-    }).at(-1);
-    for (const value of thread.turns) {
-      const turn = record(value);
-      const nativeTurnId = string(turn?.id);
-      if (!turn || !nativeTurnId) continue;
+      })).at(-1);
+    const visibleNativeTurn = ({ nativeTurnId, items, control }: typeof snapshotTurns[number]) =>
+      !control && (items.length > 0 || this.remuxTurnByNative.has(nativeTurnId) ||
+        this.inheritedNativeTurnIds.has(nativeTurnId));
+    for (const [turnIndex, snapshotTurn] of snapshotTurns.entries()) {
+      const { turn, nativeTurnId, items } = snapshotTurn;
       if (this.inheritedNativeTurnIds.has(nativeTurnId)) continue;
-      const items = Array.isArray(turn.items) ? turn.items : [];
       let compactionOrdinal = 0;
-      const isCompactionControlTurn = items.length > 0 &&
-        items.every((item) => record(item)?.type === 'contextCompaction') &&
-        !this.remuxTurnByNative.has(nativeTurnId);
+      const isCompactionControlTurn = snapshotTurn.control;
       if (isCompactionControlTurn) {
         this.compactionNativeTurns.add(nativeTurnId);
+        const previousTurnId = snapshotTurns.slice(0, turnIndex)
+          .filter(visibleNativeTurn).at(-1)?.nativeTurnId;
+        const nextTurnId = snapshotTurns.slice(turnIndex + 1)
+          .find(visibleNativeTurn)?.nativeTurnId;
+        const timeline = previousTurnId || nextTurnId
+          ? {
+              ...(previousTurnId ? { previousTurnId } : {}),
+              ...(nextTurnId ? { nextTurnId } : {}),
+            }
+          : undefined;
         for (const [itemIndex, item] of items.entries()) {
           if (record(item)?.type === 'contextCompaction') {
             const itemId = string(record(item)?.id);
@@ -401,6 +420,7 @@ export class CodexEventMapper {
               itemIndex,
               `${nativeTurnId}\0${itemId ?? ''}` === latestCompactionIdentity,
               compactionOrdinal++,
+              timeline,
             ));
           }
         }
@@ -408,7 +428,7 @@ export class CodexEventMapper {
       }
       if (items.length === 0 && !this.remuxTurnByNative.has(nativeTurnId)) continue;
       if (!this.remuxTurnByNative.has(nativeTurnId)) {
-        this.bindTurn(stableNativeTurnId(nativeTurnId), nativeTurnId);
+        this.bindTurn(codexStableNativeTurnId(nativeTurnId), nativeTurnId);
       }
       envelopes.push(this.snapshotEnvelope({ type: 'turn.started' }, 'turn/started', nativeTurnId));
       if (items.length > 0) {
@@ -510,6 +530,7 @@ export class CodexEventMapper {
     itemIndex?: number,
     claimPendingManual = true,
     compactionOrdinalHint?: number,
+    timeline?: NativeTimelineBoundary,
   ): ProviderEventEnvelope[] {
     const item = record(value);
     const itemId = string(item?.id);
@@ -562,6 +583,7 @@ export class CodexEventMapper {
         itemId,
         itemIndex,
         compactionOrdinal,
+        timeline,
       )];
       if (!controlTurn && this.remuxTurnByNative.has(nativeTurnId)) {
         const marker = this.blockEvent(
@@ -745,7 +767,7 @@ export class CodexEventMapper {
     const receiverIds = arrayOfStrings(item.receiverThreadIds);
     const envelopes: ProviderEventEnvelope[] = [];
     for (const childThreadId of receiverIds) {
-      const childExecutionId = stableChildExecutionId(this.executionId, childThreadId);
+      const childExecutionId = codexStableChildExecutionId(this.executionId, childThreadId);
       const event: MapperEvent = {
         type: 'child.started',
         child: {
@@ -756,6 +778,7 @@ export class CodexEventMapper {
           ...(string(item.model) ? { model: string(item.model)! } : {}),
           title: string(item.prompt) ?? `Codex ${string(item.tool) ?? 'subagent'}`,
           nativeSessionId: childThreadId,
+          transcriptAvailable: true,
         },
       };
       envelopes.push(this.snapshotEnvelope(
@@ -809,7 +832,7 @@ export class CodexEventMapper {
   ) {
     const childThreadId = string(item.agentThreadId);
     if (!childThreadId) return [];
-    const childExecutionId = stableChildExecutionId(this.executionId, childThreadId);
+    const childExecutionId = codexStableChildExecutionId(this.executionId, childThreadId);
     const kind = string(item.kind);
     const event: MapperEvent = kind === 'started'
       ? {
@@ -821,6 +844,7 @@ export class CodexEventMapper {
             providerInstanceId: this.providerInstanceId,
             title: string(item.agentPath) ?? 'Codex subagent',
             nativeSessionId: childThreadId,
+            transcriptAvailable: true,
           },
         }
       : {
@@ -842,7 +866,7 @@ export class CodexEventMapper {
     params: Record<string, unknown>,
     childThreadId: string,
   ) {
-    const childExecutionId = stableChildExecutionId(this.executionId, childThreadId);
+    const childExecutionId = codexStableChildExecutionId(this.executionId, childThreadId);
     const parentTurnId = this.pendingRemuxTurnId ?? [...this.remuxTurnByNative.values()].at(-1);
     if (!parentTurnId) return [];
     if (method === 'turn/completed') {
@@ -855,7 +879,7 @@ export class CodexEventMapper {
       }, 'child/completed', parentTurnId, childThreadId, `child-turn-${string(turn?.id) ?? 'unknown'}`, ++this.liveSequence,
       true)];
     }
-    if (method === 'thread/started') {
+    if (method === 'thread/started' || method === 'turn/started') {
       return [this.envelope({
         type: 'child.started',
         child: {
@@ -865,8 +889,9 @@ export class CodexEventMapper {
           providerInstanceId: this.providerInstanceId,
           title: 'Codex subagent',
           nativeSessionId: childThreadId,
+          transcriptAvailable: true,
         },
-      }, 'child/started', parentTurnId, childThreadId, 'thread-started', ++this.liveSequence, true)];
+      }, 'child/started', parentTurnId, childThreadId, method, ++this.liveSequence, true)];
     }
     return [];
   }
@@ -936,8 +961,12 @@ export class CodexEventMapper {
     itemId?: string,
     itemIndex?: number,
     compactionOrdinal?: number,
+    timeline?: NativeTimelineBoundary,
   ) {
     const phase = event.type.slice('context.compaction.'.length);
+    const subject = nativeTurnId && compactionOrdinal !== undefined
+      ? this.compactionSubject(nativeTurnId, compactionOrdinal)
+      : undefined;
     return parseProviderEventEnvelope({
       contractVersion: PROVIDER_RUNTIME_CONTRACT_VERSION,
       // App Server item ids are not durable: the live stream reports a UUID,
@@ -947,7 +976,7 @@ export class CodexEventMapper {
       eventId: compactionOrdinal === undefined
         ? stableEventId(this.nativeSessionId, nativeTurnId, itemId, kind, '')
         : stableEventId(
-            this.nativeSessionId,
+            this.conversationId,
             nativeTurnId,
             undefined,
             `context/compaction/${phase}`,
@@ -967,6 +996,8 @@ export class CodexEventMapper {
         ...(itemIndex === undefined
           ? {}
           : { position: { kind: 'snapshot-index', itemIndex, subIndex: 0 } }),
+        ...(subject ? { subject: { kind: 'context-compaction', key: subject } } : {}),
+        ...(timeline ? { timeline } : {}),
         kind,
       },
       observedAt: this.observedAt(),
@@ -1002,12 +1033,16 @@ export class CodexEventMapper {
       ? { operationId: pendingManualCompactionId, trigger: 'manual' as const }
       : {
           operationId: `codex-auto-compact-${digest([
-            this.nativeSessionId, nativeTurnId, `occurrence-${ordinal}`,
+            this.conversationId, nativeTurnId, `occurrence-${ordinal}`,
           ].join('\0')).slice(0, 24)}`,
           trigger: 'automatic' as const,
         };
     this.compactionOperationByOccurrence.set(occurrenceIdentity, operation);
     return operation;
+  }
+
+  private compactionSubject(nativeTurnId: string, ordinal: number) {
+    return `codex:context-compaction:${nativeTurnId}:${ordinal}`;
   }
 
   private seedDeltaOffset(
@@ -1267,7 +1302,7 @@ export class CodexEventMapper {
       }
       case 'context.compacted': {
         const operationId = `codex-auto-compact-${digest([
-          this.nativeSessionId, nativeTurnId, itemId ?? 'thread',
+          this.conversationId, nativeTurnId, itemId ?? 'thread',
         ].join('\0')).slice(0, 24)}`;
         return {
           type: 'context.compaction.completed',
@@ -1514,11 +1549,11 @@ function childStatus(value: string): 'running' | 'recovering' | 'idle' | 'failed
   return 'running';
 }
 
-function stableNativeTurnId(nativeTurnId: string) {
+export function codexStableNativeTurnId(nativeTurnId: string) {
   return `codex-turn-${digest(nativeTurnId).slice(0, 24)}`;
 }
 
-function stableChildExecutionId(parentExecutionId: string, nativeThreadId: string) {
+export function codexStableChildExecutionId(parentExecutionId: string, nativeThreadId: string) {
   return `${parentExecutionId}:codex-child-${digest(nativeThreadId).slice(0, 20)}`;
 }
 

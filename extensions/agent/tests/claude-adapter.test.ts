@@ -276,10 +276,13 @@ test('Claude Agent SDK session preserves the native harness, MCP scope, and sema
       turnId: 'turn-claude',
       content: [{ type: 'text' as const, text: 'Inspect this workspace.' }],
     };
-    assert.deepEqual(await Promise.all([
+    const acceptances = await Promise.all([
       session.startTurn(turnInput),
       session.startTurn(structuredClone(turnInput)),
-    ]), [{ accepted: true }, { accepted: true }]);
+    ]);
+    assert.deepEqual(acceptances.map(({ accepted }) => accepted), [true, true]);
+    assert.ok(acceptances[0]?.nativeTurnId);
+    assert.equal(acceptances[1]?.nativeTurnId, acceptances[0]?.nativeTurnId);
     await assert.rejects(() => session.startTurn({
       ...turnInput,
       content: [{ type: 'text', text: 'Changed input under the same command.' }],
@@ -1022,6 +1025,54 @@ test('Claude background tasks never collide with tool ordinals in the same nativ
   }
 });
 
+test('Claude child interruption uses the SDK task control without interrupting the root turn', async () => {
+  const query = new FakeClaudeQuery();
+  const adapter = new ClaudeNativeAdapter({
+    createQuery: () => query as unknown as ClaudeQuery,
+    now: monotonicClock(),
+  });
+  const session = await adapter.openSession({
+    commandId: 'open-claude-child-stop',
+    providerInstanceId: 'claude-local',
+    conversationId: 'conversation-claude-child-stop',
+    executionId: 'execution-claude-child-stop',
+    mode: 'create',
+    cwd: '/workspace/remux',
+    model: 'claude-fable-5-1',
+    access: 'workspace-write',
+    developerInstructions: [],
+  });
+  try {
+    await session.startTurn({
+      commandId: 'turn-command-child-stop',
+      conversationId: 'conversation-claude-child-stop',
+      executionId: 'execution-claude-child-stop',
+      turnId: 'turn-claude-child-stop',
+      content: [{ type: 'text', text: 'Delegate a review.' }],
+    });
+    query.emit({
+      type: 'system',
+      subtype: 'task_started',
+      session_id: session.nativeSession.sessionId,
+      task_id: 'native-task-stop',
+      description: 'Review the implementation',
+    });
+    const started = await waitForClaudeEvent(session, ({ event }) =>
+      event.type === 'turn.block.started' && event.block.payload.kind === 'native-child');
+    assert.ok(started.event.type === 'turn.block.started' &&
+      started.event.block.payload.kind === 'native-child');
+    await session.interruptChild!({
+      commandId: 'interrupt-claude-child',
+      childExecutionId: started.event.block.payload.child.executionId,
+      nativeSessionId: 'native-task-stop',
+    });
+    assert.deepEqual(query.stoppedTasks, ['native-task-stop']);
+    assert.equal(query.interrupts, 0);
+  } finally {
+    await session.close();
+  }
+});
+
 test('Claude background Bash lifecycle stays folded into its command block', async () => {
   const query = new FakeClaudeQuery();
   const adapter = new ClaudeNativeAdapter({
@@ -1158,13 +1209,15 @@ test('Claude resume keeps a lost turn bound until native handshake evidence clos
       event.type === 'session.health' && event.state === 'ready');
     assert.equal((await session.snapshot({ commandId: 'snapshot-claude-recovery-ready' })).state, 'idle');
 
-    assert.deepEqual(await session.startTurn({
+    const acceptance = await session.startTurn({
       commandId: 'turn-after-claude-recovery',
       conversationId: 'conversation-claude-recovery',
       executionId: 'execution-claude-recovery',
       turnId: 'turn-after-claude-recovery',
       content: [{ type: 'text', text: 'Continue from the last durable boundary.' }],
-    }), { accepted: true });
+    });
+    assert.equal(acceptance.accepted, true);
+    assert.ok(acceptance.nativeTurnId);
   } finally {
     await session.close();
   }
@@ -1225,7 +1278,8 @@ async function waitForClaudeEvent(
 ) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const snapshot = await session.snapshot({ commandId: `wait-for-event-${attempt}` });
-    if (snapshot.events.some(predicate)) return;
+    const event = snapshot.events.find(predicate);
+    if (event) return event;
     await new Promise<void>((resolve) => setTimeout(resolve, 1));
   }
   throw new Error('Timed out waiting for the Claude fixture event.');
@@ -1301,6 +1355,7 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
   readonly usageResult: unknown;
   readonly modelChanges: string[] = [];
   readonly flags: unknown[] = [];
+  readonly stoppedTasks: string[] = [];
   interrupts = 0;
 
   constructor(usageResult: unknown = { rate_limits_available: true, rate_limits: {} }) {
@@ -1340,6 +1395,10 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
 
   async interrupt() {
     this.interrupts += 1;
+  }
+
+  async stopTask(taskId: string) {
+    this.stoppedTasks.push(taskId);
   }
 
   close() {

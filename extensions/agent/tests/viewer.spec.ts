@@ -84,6 +84,34 @@ test('interrupts an active turn through the server command', async ({ page }) =>
   await expect(page.getByRole('button', { name: 'Send message', exact: true })).toBeVisible();
 });
 
+test('opens a native subagent transcript and stops the child without a child composer', async ({ page }) => {
+  await messageBox(page).fill('Please interrupt after showing live activity');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+
+  await page.getByRole('button', { name: 'View 1 subagent', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Agents', exact: true })).toBeVisible();
+  await expect(page.getByText('1 subagent', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: /Native subagent/u }).click();
+
+  await expect(page.getByRole('heading', { name: 'Native subagent', exact: true })).toBeVisible();
+  await expect(page.getByText('Compared the implementation with its contract.')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Ran 1 command', exact: true })).toBeVisible();
+  await expect(messageBox(page)).toHaveCount(0);
+  await page.getByRole('button', { name: 'Stop', exact: true }).click();
+
+  await expect.poll(() => commandCount(
+    page,
+    'remux/agent/conversation/execution/interrupt',
+  )).toBe(1);
+  await expect(page.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0);
+  await expect(page.getByText(/Interrupted$/u)).toBeVisible();
+
+  await page.getByRole('button', { name: 'Back to agents' }).click();
+  await page.getByRole('button', { name: 'Back to chat' }).click();
+  await expect(messageBox(page)).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Stop turn', exact: true })).toBeVisible();
+});
+
 test('renders signed-out device-code login and cancel state', async ({ page }) => {
   await page.goto('/viewers/agent/?fixtureSignedOut=1');
   await page.getByRole('button', { name: 'Sign in with device code' }).click();
@@ -617,7 +645,7 @@ test('keeps duration in the work header and live rows stable while their shimmer
   const workHeader = page.locator('.codex-work-header');
   await expect(workHeader).toContainText(/^Working for \S+$/u);
   await expect(workHeader.getByRole('status')).toHaveCount(0);
-  const actionHeader = page.locator('.agent-action-run-header');
+  const actionHeader = page.locator('.agent-child-execution-header');
   const activity = actionHeader.getByRole('status');
   await expect(activity).toBeVisible();
   await expect(activity.locator('.agent-live-activity-focus')).toHaveCSS(
@@ -728,6 +756,7 @@ test('queues a follow-up during active work and dispatches it after stop', async
   await messageBox(page).fill('Continue after the stop');
   await page.getByRole('button', { name: 'Queue message', exact: true }).click();
   await expect(page.getByText('Queued 1', { exact: true })).toBeVisible();
+  await expect(transcript(page).getByText('Continue after the stop', { exact: true })).toHaveCount(0);
   const queuedParams = await lastCommandParams(page, 'remux/agent/conversation/message/send');
   expect(queuedParams.delivery).toBe('queue');
   await page.getByRole('button', { name: 'Stop turn', exact: true }).click();

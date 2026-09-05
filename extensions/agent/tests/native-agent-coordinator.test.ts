@@ -747,6 +747,8 @@ test('queued-message removal records its original result atomically for retries'
       clientMessageId: 'message-queue-remove',
       content: [{ type: 'text', text: 'Remove me.' }],
     }));
+    assert.equal(journal.turn(queued.turnId), undefined,
+      'pending queue intent is absent from canonical transcript');
     const command = {
       commandId: 'remove-queued-once',
       conversationId: created.conversationId,
@@ -756,6 +758,8 @@ test('queued-message removal records its original result atomically for retries'
     assert.deepEqual(removed, { accepted: true, removed: true });
     assert.deepEqual(coordinator.removeQueuedMessage(structuredClone(command)), removed);
     assert.equal(journal.queuedMessages(created.conversationId).length, 0);
+    assert.equal(journal.turn(queued.turnId), undefined,
+      'queue deletion cannot leave a transcript ghost');
   } finally {
     await coordinator.close();
     journal.close();
@@ -1169,17 +1173,6 @@ test('initialization wakes a durable idle queue without a connected viewer', asy
   const content = [{ type: 'text' as const, text: 'Run after the Agent server restarts.' }];
   journal.claimCommand(commandId, 'turn.send', { commandId }, Date.now());
   journal.transaction(() => {
-    journal.createTurn({
-      turnId,
-      conversationId: created.conversationId,
-      executionId: journal.conversation(created.conversationId)!.rootExecutionId,
-      clientMessageId: 'message-committed-before-restart',
-      commandId,
-      content,
-      model: 'fixture-native-v1',
-      state: 'queued',
-      now: Date.now(),
-    });
     journal.enqueueTurn({
       commandId,
       conversationId: created.conversationId,
@@ -1272,6 +1265,7 @@ test('native session resume receives durable Remux-to-provider turn bindings', a
     assert.deepEqual(resumedAdapter.opened[0]?.openedWith.nativeTurnBindings, [{
       turnId: first.turnId,
       nativeTurnId,
+      nextBlockOrdinal: journal.nextTurnBlockOrdinal(first.turnId),
       branchCursor: { version: 1, nativeTurnId },
     }]);
     assert.equal(journal.turns(created.conversationId).length, 2);

@@ -1,4 +1,4 @@
-import { ArrowDown, ArrowLeft, ArrowUp, Check, History, Loader2, PanelRightOpen, Send, Square } from 'lucide-react';
+import { ArrowDown, ArrowLeft, ArrowUp, Bot, Check, History, Loader2, PanelRightOpen, Send, Square } from 'lucide-react';
 import { openHostOverview } from '@remux/viewer-kit/host';
 
 import type { AgentProvidersResource, AgentRuntimeResource } from '../../../../shared/native-agent-protocol.ts';
@@ -17,9 +17,11 @@ import type { ComposerEditTarget, ComposerForkTarget } from '../store.ts';
 
 export function ComposerActionButtons({
   canStart,
+  childExecutionCount,
   conversationExists,
   isWorking,
   onInterrupt,
+  onOpenAgents,
   onCompact,
   onEdit,
   onFork,
@@ -32,9 +34,11 @@ export function ComposerActionButtons({
   runtime,
 }: {
   canStart: boolean;
+  childExecutionCount: number;
   conversationExists: boolean;
   isWorking: boolean;
   onInterrupt: () => Promise<void>;
+  onOpenAgents: () => void;
   onCompact: () => Promise<void>;
   onEdit: ComposerBranchCallback<ComposerEditTarget>;
   onFork: ComposerBranchCallback<ComposerForkTarget>;
@@ -113,6 +117,12 @@ export function ComposerActionButtons({
           providers={providers}
           runtime={runtime}
         />
+        {!pickerOpen && childExecutionCount > 0 ? <ComposerActionKey action={{
+          className: 'remux-composer-agents-button',
+          icon: <Bot className="size-4" />,
+          label: childExecutionCount === 1 ? 'View 1 subagent' : `View ${childExecutionCount} subagents`,
+          onClick: onOpenAgents,
+        }} /> : null}
       </div>
       <div className="remux-composer-action-group remux-composer-action-group-right">
         {navigation.map((action) => <ComposerActionKey action={action} key={action.label} />)}

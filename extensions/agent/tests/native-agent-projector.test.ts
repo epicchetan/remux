@@ -8,6 +8,7 @@ import { createNativeAgentSchema } from '../server/src/native-runtime/schema.ts'
 import { projectNativeRuntime } from '../viewer/src/nativeViewModel.ts';
 import {
   NATIVE_AGENT_LIMITS,
+  agentExecutionResourceKey,
   type AgentRuntimeResource,
   type NativeAgentResourceKey,
   type NativeAgentTurnFrame,
@@ -92,7 +93,7 @@ test('native projector turns normalized events into provider-private-free virtua
         payload: {
           kind: 'native-child',
           child: {
-            executionId: 'child-1',
+            executionId: 'execution-1:child-1',
             ownership: 'native',
             provider: 'fixture',
             providerInstanceId: 'fixture-local',
@@ -144,7 +145,7 @@ test('native projector turns normalized events into provider-private-free virtua
         { key: 'agent/runtime:conversation-1' },
         { key: 'agent/transcript:conversation-1:tail-24' },
         { key: strandTranscriptKey },
-        { key: 'agent/execution:child-1' },
+        { key: agentExecutionResourceKey('execution-1:child-1') },
       ],
     });
     assert.ok(first.resources.every(({ status }) => status === 'ok'));

@@ -646,7 +646,10 @@ export async function revalidateNativeExecutionResources(
   serverGeneration?: string | null,
 ) {
   if (lifecycleState !== 'active' || executionIds.length === 0) return;
-  const selected = new Set(executionIds.map((executionId) => `federated:${executionId}`));
+  const selected = new Set(executionIds.flatMap((executionId) => [
+    `execution:${executionId}`,
+    `federated:${executionId}`,
+  ]));
   const state = resourceStore.getState();
   if (serverGeneration && state.serverGeneration !== null && state.serverGeneration !== serverGeneration) return;
   const refreshes = Object.values(state.executionScopesByKey).flatMap((entry) =>

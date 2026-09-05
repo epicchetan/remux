@@ -301,6 +301,25 @@ test('native Agent schema migrates version 8 queued execution envelopes', () => 
   }
 });
 
+test('native Agent schema migrates version 9 native child handles', () => {
+  const database = new DatabaseSync(':memory:');
+  try {
+    createNativeAgentSchema(database);
+    database.exec(`
+      DROP TABLE native_child_handles;
+      PRAGMA user_version = 9;
+    `);
+
+    migrateNativeAgentSchema(database, 9);
+
+    assert.ok(listNativeAgentTables(database).includes('native_child_handles'));
+    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+      NATIVE_AGENT_SCHEMA_VERSION);
+  } finally {
+    database.close();
+  }
+});
+
 test('native Agent schema rejects another application identity', () => {
   const database = new DatabaseSync(':memory:');
   try {

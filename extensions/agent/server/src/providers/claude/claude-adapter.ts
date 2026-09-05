@@ -19,6 +19,7 @@ import {
   PROVIDER_RUNTIME_CONTRACT_VERSION,
   ProviderContractError,
   parseCompactProviderSessionInput,
+  parseInterruptProviderChildInput,
   parseInterruptProviderTurnInput,
   parseNativeForkRequest,
   parseOpenProviderSessionInput,
@@ -28,6 +29,7 @@ import {
   parseProviderSnapshotRequest,
   parseStartProviderTurnInput,
   type InterruptProviderTurnInput,
+  type InterruptProviderChildInput,
   type ChildExecutionDisplay,
   type CompactProviderSessionInput,
   type JsonValue,
@@ -608,7 +610,7 @@ export class ClaudeProviderSession implements ProviderSession {
       this.emit({ type: 'user.message', content: input.content }, 'user/message', input.turnId, nativeTurnId);
       this.emit({ type: 'turn.started' }, 'turn/started', input.turnId, nativeTurnId);
       this.emit({ type: 'turn.status', state: 'running' }, 'turn/status', input.turnId, nativeTurnId);
-      return { accepted: true };
+      return { accepted: true, nativeTurnId };
     });
   }
 
@@ -619,6 +621,22 @@ export class ClaudeProviderSession implements ProviderSession {
       if (this.activeTurn?.turnId !== input.turnId) throw new Error('Claude turn is not active.');
       this.interruptRequested = true;
       await this.query.interrupt();
+      return { accepted: true };
+    });
+  }
+
+  async interruptChild(unparsed: InterruptProviderChildInput): Promise<ProviderCommandAcceptance> {
+    this.assertOpen();
+    const input = parseInterruptProviderChildInput(unparsed);
+    const expectedExecutionId = stableUuid(
+      `claude-child\0${this.nativeSession.sessionId}\0${input.nativeSessionId}`,
+    );
+    if (input.childExecutionId !== expectedExecutionId ||
+        this.childByTask.get(input.nativeSessionId) !== input.childExecutionId) {
+      throw new Error('Claude child interruption does not match an active task in this session.');
+    }
+    return this.onceCommand(input.commandId, input, async () => {
+      await this.query.stopTask(input.nativeSessionId);
       return { accepted: true };
     });
   }

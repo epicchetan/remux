@@ -243,7 +243,7 @@ function InferenceTrace({
           return (
             <ExecutionScopeDisclosure
               conversationId={conversationId}
-              fallbackTitle={item.call.childBoundary ?? 'Agent task'}
+              fallbackTitle={item.call.presentation.label || item.call.childBoundary || 'Agent task'}
               fallbackDurationMs={item.call.childDurationMs}
               fallbackOperationCount={item.call.childOperationCount}
               fallbackArtifactCount={item.call.childArtifactCount}

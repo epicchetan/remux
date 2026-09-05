@@ -4,6 +4,8 @@ import {
   NATIVE_AGENT_LIMITS,
   NATIVE_AGENT_PROTOCOL_VERSION,
   NATIVE_AGENT_RESOURCE_KEYS,
+  parseAgentExecutionResourceKey,
+  parseAgentExecutionTranscriptResourceKey,
   assertViewerSafeNativeResource,
   parseNativeAgentResourceReadParams,
   type AgentConversationResource,
@@ -176,6 +178,15 @@ export class NativeAgentProjector {
   project(key: NativeAgentResourceKey): NativeAgentResourceValue | undefined {
     if (key === NATIVE_AGENT_RESOURCE_KEYS.providers) return this.providers();
     if (key === NATIVE_AGENT_RESOURCE_KEYS.conversations) return this.conversations();
+    const executionTranscript = parseAgentExecutionTranscriptResourceKey(key);
+    if (executionTranscript) {
+      return this.executionTranscript(
+        executionTranscript.executionId,
+        executionTranscript.window,
+      );
+    }
+    const executionId = parseAgentExecutionResourceKey(key);
+    if (executionId) return this.execution(executionId);
     const strandTranscript = /^agent\/strand-transcript:([^:]+):([^:]+):(.+)$/u.exec(key);
     if (strandTranscript) {
       try {
@@ -204,12 +215,8 @@ export class NativeAgentProjector {
         return this.queue(id!);
       case 'turn':
         return this.turn(id!, window === 'summary');
-      case 'execution':
-        return this.execution(id!);
       case 'transcript':
         return this.transcript(id!, window ?? 'tail-24');
-      case 'execution-transcript':
-        return this.executionTranscript(id!, window ?? 'tail-24');
       default:
         return undefined;
     }
@@ -534,7 +541,7 @@ export class NativeAgentProjector {
     const range = transcriptRange(input.turns, input.window);
     let startIndex = range.startIndex;
     let endIndexExclusive = range.endIndexExclusive;
-    const compactions = this.journal.compactionControlEvents(input.conversationId);
+    const compactions = this.journal.compactionControlEvents(input.conversationId, input.strandId);
     const projectedTurns = input.turns.slice(startIndex, endIndexExclusive).map((turn) => projectTurn(
       turn,
       this.journal.eventsForTurn(turn.turnId, { includeToolOutputPreviews: false }),
@@ -597,7 +604,7 @@ export class NativeAgentProjector {
       boundaryCompactions(
         turn,
         pathTurns,
-        this.journal.compactionControlEvents(turn.conversationId),
+        this.journal.compactionControlEvents(turn.conversationId, turn.strandId),
       ),
       { includeToolOutputPreviews: !summary },
     );
@@ -849,26 +856,35 @@ function boundaryCompactions(
   const previousTurn = pathTurns[turnIndex - 1];
   const nextTurn = pathTurns[turnIndex + 1];
   const controls = latestBoundaryCompactions(events, turn.executionId);
+  const structuralBefore = controls.filter(({ event }) =>
+    event.strandId !== null && event.nextTurnId === turn.turnId);
+  const structuralAfter = controls.filter(({ event }) =>
+    event.strandId !== null && event.nextTurnId === null && event.previousTurnId === turn.turnId);
+  const legacy = controls.filter(({ event }) => event.strandId === null);
   return {
-    beforeUser: controls.filter((control) =>
-      control.createdAt <= turn.createdAt &&
-      (!previousTurn || control.createdAt > previousTurn.createdAt)),
-    afterTurn: nextTurn
+    beforeUser: [
+      ...structuralBefore,
+      ...legacy.filter((control) =>
+        control.createdAt <= turn.createdAt &&
+        (!previousTurn || control.createdAt > previousTurn.createdAt)),
+    ].map(({ view }) => view),
+    afterTurn: structuralAfter.map(({ view }) => view).concat(nextTurn
       ? []
-      : controls.filter((control) => control.createdAt > turn.createdAt),
+      : legacy.filter((control) => control.createdAt > turn.createdAt).map(({ view }) => view)),
   };
 }
 
 function latestBoundaryCompactions(
   events: readonly JournalCompactionControlEvent[],
   executionId: string,
-): NativeCompactionView[] {
+): Array<{ event: JournalCompactionControlEvent; createdAt: number; view: NativeCompactionView }> {
   const latestByOperation = new Map<string, {
     event: JournalCompactionControlEvent;
     createdAt: number;
   }>();
   for (const event of events) {
-    if (event.executionId !== executionId || event.boundary.kind !== 'between-turns') continue;
+    if (event.boundary.kind !== 'between-turns' ||
+        (event.strandId === null && event.executionId !== executionId)) continue;
     const current = latestByOperation.get(event.operationId);
     if (!current) {
       latestByOperation.set(event.operationId, { event, createdAt: event.createdAt });
@@ -883,14 +899,18 @@ function latestBoundaryCompactions(
     .sort((left, right) => left.createdAt - right.createdAt ||
       left.event.operationId.localeCompare(right.event.operationId))
     .map(({ event, createdAt }) => ({
-      operationId: event.operationId,
-      trigger: event.trigger,
-      state: event.state,
-      beforeTokens: event.beforeTokens,
-      afterTokens: event.afterTokens,
-      ...(event.error ? { error: event.error } : {}),
+      event,
       createdAt,
-      ...(event.completedAt === undefined ? {} : { completedAt: event.completedAt }),
+      view: {
+        operationId: event.operationId,
+        trigger: event.trigger,
+        state: event.state,
+        beforeTokens: event.beforeTokens,
+        afterTokens: event.afterTokens,
+        ...(event.error ? { error: event.error } : {}),
+        createdAt,
+        ...(event.completedAt === undefined ? {} : { completedAt: event.completedAt }),
+      },
     }));
 }
 

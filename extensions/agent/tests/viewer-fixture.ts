@@ -1,12 +1,19 @@
 import type { Page } from '@playwright/test';
 import { NATIVE_AGENT_PROTOCOL_VERSION } from '../shared/native-agent-protocol.ts';
-import { AGENT_TRANSCRIPT_PROTOCOL_VERSION } from '../shared/transcript.ts';
+import {
+  AGENT_TRANSCRIPT_PROJECTION_VERSION,
+  AGENT_TRANSCRIPT_PROTOCOL_VERSION,
+} from '../shared/transcript.ts';
 
 export const FIXTURE_CONVERSATION_ID = '11111111-1111-4111-8111-111111111111';
 export const FIXTURE_SECOND_CONVERSATION_ID = '22222222-2222-4222-8222-222222222222';
 
 export async function installAgentHost(page: Page) {
-  await page.addInitScript(({ nativeProtocolVersion, transcriptProtocolVersion }) => {
+  await page.addInitScript(({
+    nativeProtocolVersion,
+    transcriptProjectionVersion,
+    transcriptProtocolVersion,
+  }) => {
     type HostRequest = {
       id?: number | string;
       method?: string;
@@ -334,23 +341,6 @@ export async function installAgentHost(page: Page) {
       };
     }
 
-    function queuedTurn(id: string, clientMessageId: string, text: string, parts: any[]): Turn {
-      return {
-        id,
-        status: 'queued',
-        startedAt: Date.now(),
-        completedAt: null,
-        durationMs: null,
-        error: null,
-        renderRevision: `${id}:${sequence + 1}`,
-        layoutRevision: `${id}:${sequence + 1}`,
-        segments: [{
-          id: `${id}:user`, type: 'userMessage', clientMessageId,
-          revision: String(sequence + 1), text, parts,
-        }],
-      };
-    }
-
     function conversationSummaries() {
       return [...resources.entries()]
         .filter(([key]) => key.startsWith('conversation:'))
@@ -438,15 +428,23 @@ export async function installAgentHost(page: Page) {
         const targetConversationId = String(invalidation.conversationId ?? conversationId);
         return [
           `agent/transcript:${targetConversationId}:tail-24`,
+          `agent/execution:${encodeURIComponent(`root:${targetConversationId}`)}`,
           ...(invalidation.turnId ? [`agent/turn:${String(invalidation.turnId)}`] : []),
         ];
       }
       if (invalidation.type === 'executionScope') {
         if (!invalidation.turnId) return [];
         const targetConversationId = String(invalidation.conversationId ?? conversationId);
+        const scopeId = String(invalidation.scopeId ?? '');
+        const scope = executionScopes.get(executionScopeKey(String(invalidation.turnId), scopeId));
         return [
           `agent/transcript:${targetConversationId}:tail-24`,
           `agent/turn:${String(invalidation.turnId)}`,
+          ...(scope?.kind === 'childExecution' ? [
+            `agent/execution:${encodeURIComponent(scopeId)}`,
+            `agent/execution-transcript:${encodeURIComponent(scopeId)}:tail-24`,
+            `agent/execution:${encodeURIComponent(`root:${targetConversationId}`)}`,
+          ] : []),
         ];
       }
       const key = String(invalidation.key ?? '');
@@ -489,7 +487,7 @@ export async function installAgentHost(page: Page) {
       turnCounter += 1;
       const id = queuedTurnId ?? `fixture-turn-${turnCounter}`;
       const workId = `${id}:work`;
-      const scopeId = `00000000-0000-4000-8000-${String(turnCounter).padStart(12, '0')}`;
+      const scopeId = `root:${conversationId}:codex-child-${String(turnCounter).padStart(4, '0')}`;
       const rootScopeId = `10000000-0000-4000-8000-${String(turnCounter).padStart(12, '0')}`;
       const startedAt = Date.now();
       const reasoningParts = tallRunningWork
@@ -864,7 +862,7 @@ export async function installAgentHost(page: Page) {
       const known = new Map((request.knownTurns ?? []).map((entry: any) => [entry.turnId, entry.renderRevision]));
       return {
         protocolVersion: transcriptProtocolVersion,
-        projectionVersion: 'agent-turn-render-v6',
+        projectionVersion: transcriptProjectionVersion,
         conversationId: targetConversationId,
         conversationRevision: `conversation:${sequence}`,
         basisSequence: sequence,
@@ -1541,6 +1539,19 @@ export async function installAgentHost(page: Page) {
         const revision = resources.get(`queue:${targetConversationId}`)?.revision ?? 0;
         return value ? { revision, value } : undefined;
       }
+      if (key.startsWith('agent/execution:')) {
+        const executionId = decodeURIComponent(key.slice('agent/execution:'.length));
+        const value = nativeExecutionValue(executionId);
+        return value ? { revision: sequence, value } : undefined;
+      }
+      const executionTranscript = /^agent\/execution-transcript:([^:]+):(.+)$/u.exec(key);
+      if (executionTranscript) {
+        const value = nativeChildTranscriptValue(
+          decodeURIComponent(executionTranscript[1]!),
+          executionTranscript[2]!,
+        );
+        return value ? { revision: sequence, value } : undefined;
+      }
       const strandTranscript = /^agent\/strand-transcript:([^:]+):([^:]+):(.+)$/u.exec(key);
       if (strandTranscript) {
         const targetConversationId = decodeURIComponent(strandTranscript[1]!);
@@ -1566,6 +1577,161 @@ export async function installAgentHost(page: Page) {
         for (const targetTurns of turnsByConversation.values()) {
           const turn = targetTurns.find((candidate) => candidate.id === turnId);
           if (turn) return { revision: sequence, value: nativeTurnValue(turn) };
+        }
+      }
+      return undefined;
+    }
+
+    function nativeExecutionValue(executionId: string) {
+      if (executionId.startsWith('root:')) {
+        const targetConversationId = executionId.slice('root:'.length);
+        const summary = resources.get(`conversation:${targetConversationId}`)?.value;
+        if (summary) {
+          const targetTurns = turnsByConversation.get(targetConversationId) ?? [];
+          const childExecutionIds = targetTurns.flatMap((turn) => fixtureChildCalls(turn)
+            .map(({ call }) => String(call.childScopeId)));
+          const runtime = nativeRuntimeValue(targetConversationId);
+          return {
+            executionId,
+            conversationId: targetConversationId,
+            parentExecutionId: null,
+            rootTurnId: null,
+            ownership: 'root',
+            provider: 'fixture',
+            providerInstanceId,
+            model: String(summary.modelId ?? nativeModelId),
+            effort: String(summary.reasoning ?? nativeReasoning),
+            access: String(summary.access ?? 'workspace-write'),
+            federationDepth: 0,
+            state: runtime?.state ?? 'idle',
+            childExecutionIds: [...new Set(childExecutionIds)],
+            transcriptAvailable: true,
+            startedAt: Number(summary.createdAt ?? Date.now()),
+          };
+        }
+      }
+      const child = findFixtureChild(executionId);
+      if (!child) return undefined;
+      const state = nativeExecutionState(child.scope.state ?? child.call.childState);
+      return {
+        executionId,
+        conversationId: child.conversationId,
+        parentExecutionId: `root:${child.conversationId}`,
+        rootTurnId: child.turn.id,
+        ownership: 'native',
+        provider: 'fixture',
+        providerInstanceId,
+        model: nativeModelId,
+        effort: nativeReasoning,
+        access: 'workspace-write',
+        federationDepth: 1,
+        title: 'Native subagent',
+        state,
+        ...(state === 'idle' ? { outcome: 'completed' } :
+          state === 'failed' ? { outcome: 'failed' } :
+            state === 'interrupted' ? { outcome: 'interrupted' } : {}),
+        ...(child.scope.result || child.call.childBoundary ? {
+          summary: String(child.scope.result ?? child.call.childBoundary),
+        } : {}),
+        childExecutionIds: [],
+        transcriptAvailable: true,
+        startedAt: Number(child.scope.startedAt ?? child.turn.startedAt),
+        ...(child.scope.completedAt ? { completedAt: Number(child.scope.completedAt) } : {}),
+      };
+    }
+
+    function nativeChildTranscriptValue(executionId: string, _windowSpec: string) {
+      const child = findFixtureChild(executionId);
+      if (!child) return undefined;
+      const state = nativeExecutionState(child.scope.state ?? child.call.childState);
+      const turnState = state === 'idle' ? 'completed' : state;
+      const turnId = `child-turn:${executionId}`;
+      const inferences = child.scope.inferences ?? [];
+      const passes: any[] = inferences.map((inference: any, passOrdinal: number) => ({
+        passId: String(inference.id),
+        ordinal: passOrdinal,
+        state: inference.state === 'running' ? 'streaming' : 'completed',
+        blocks: (inference.blocks ?? []).map((block: any, blockOrdinal: number) =>
+          nativeBlockValue(child.turn, inference, block, blockOrdinal)),
+      }));
+      const assistantText = String(child.scope.result ?? '');
+      const finalBlockId = assistantText ? `child-final:${executionId}` : null;
+      if (finalBlockId) {
+        const pass: any = passes.at(-1) ?? {
+          passId: `child-pass:${executionId}`,
+          ordinal: 0,
+          state: 'completed',
+          blocks: [],
+        };
+        if (passes.length === 0) passes.push(pass);
+        pass.blocks.push({
+          blockId: finalBlockId,
+          passId: pass.passId,
+          ordinal: pass.blocks.length,
+          kind: 'final-message',
+          state: turnState === 'running' ? 'streaming' : 'completed',
+          revision: 1,
+          payload: { kind: 'final-message', text: assistantText },
+          startedAt: Number(child.scope.startedAt ?? child.turn.startedAt),
+          completedAt: child.scope.completedAt ?? null,
+        });
+      }
+      const frame = {
+        pathEntryId: `child-path:${executionId}`,
+        strandId: String(resources.get(`conversation:${child.conversationId}`)?.value.activeStrandId),
+        ordinal: 0,
+        turnId,
+        clientMessageId: `child-message:${executionId}`,
+        executionId,
+        state: turnState,
+        ...(turnState === 'running' ? {} : { outcome: turnState }),
+        userContent: [{
+          type: 'text',
+          text: String(child.call.detailPreview ?? child.call.childBoundary ?? 'Subagent task'),
+        }],
+        ordering: 'native-exact',
+        passes,
+        finalBlockId,
+        activity: {
+          reasoning: '', commentary: '', operations: [], fileChanges: [], web: [], children: [],
+          notices: [], compacted: false,
+        },
+        assistantText,
+        startedAt: Number(child.scope.startedAt ?? child.turn.startedAt),
+        ...(child.scope.completedAt ? { completedAt: Number(child.scope.completedAt) } : {}),
+        renderRevision: String(child.scope.revision),
+        layoutRevision: String(child.scope.revision),
+      };
+      return {
+        conversationId: child.conversationId,
+        strandId: frame.strandId,
+        executionId,
+        activeTurnId: turnState === 'running' ? turnId : null,
+        turnOrder: [turnId],
+        turns: [frame],
+        window: { startIndex: 0, endIndexExclusive: 1, hasEarlier: false, hasLater: false },
+      };
+    }
+
+    function fixtureChildCalls(turn: Turn): Array<{ call: any; scope: any }> {
+      const work = turn.segments.find((segment) => segment.type === 'work');
+      const root = work ? executionScopes.get(executionScopeKey(turn.id, work.scopeId)) : null;
+      return (root?.inferences ?? []).flatMap((inference: any) =>
+        (inference.blocks ?? []).flatMap((block: any) =>
+          block.type === 'action' && block.call.childScopeId
+            ? [{
+                call: block.call,
+                scope: executionScopes.get(executionScopeKey(turn.id, block.call.childScopeId)),
+              }]
+            : []));
+    }
+
+    function findFixtureChild(executionId: string) {
+      for (const [targetConversationId, targetTurns] of turnsByConversation) {
+        for (const turn of targetTurns) {
+          const child = fixtureChildCalls(turn).find(({ call }) =>
+            String(call.childScopeId) === executionId);
+          if (child?.scope) return { ...child, conversationId: targetConversationId, turn };
         }
       }
       return undefined;
@@ -1771,11 +1937,7 @@ export async function installAgentHost(page: Page) {
             reasoning: String(conversation?.reasoning ?? 'high'),
             text,
           });
-          const queued = queuedTurn(String(params.commandId), String(params.clientMessageId), text, parts);
-          turns.push(queued);
-          touchTurn(queued);
           syncFixtureQueue();
-          invalidateTranscript(queued.id, 'sendAccepted', true);
           return {
             accepted: true, commandId: params.commandId,
             delivery: 'queued', turnId: params.commandId,
@@ -2010,6 +2172,39 @@ export async function installAgentHost(page: Page) {
       if (request.method === 'remux/agent/conversation/turn/interrupt') {
         const turn = turns.find((candidate) => candidate.id === params.turnId);
         if (turn) finishTurn(turn, 'interrupted');
+        return { accepted: true, commandId: params.commandId };
+      }
+      if (request.method === 'remux/agent/conversation/execution/interrupt') {
+        const executionId = String(params.executionId);
+        const child = findFixtureChild(executionId);
+        if (!child) throw new Error('Fixture child execution was not found.');
+        const completedAt = Date.now();
+        touchTurn(child.turn);
+        Object.assign(child.scope, {
+          state: 'interrupted',
+          completedAt,
+          durationMs: Math.max(1, completedAt - Number(child.scope.startedAt)),
+          revision: `child:${sequence}`,
+          basisSequence: sequence,
+        });
+        Object.assign(child.call, {
+          status: 'interrupted',
+          childState: 'interrupted',
+          durationMs: Math.max(1, completedAt - Number(child.scope.startedAt)),
+          childDurationMs: Math.max(1, completedAt - Number(child.scope.startedAt)),
+          revision: `operation:child-agent:${sequence}`,
+        });
+        invalidateTranscript(child.turn.id, 'runtimeEvent', false, child.conversationId);
+        dispatchInvalidations([{
+          type: 'executionScope',
+          key: executionScopeKey(child.turn.id, executionId),
+          conversationId: child.conversationId,
+          turnId: child.turn.id,
+          scopeId: executionId,
+          reason: 'terminal',
+          affectsLayout: true,
+          basisSequence: sequence,
+        }]);
         return { accepted: true, commandId: params.commandId };
       }
       if (request.method === 'remux/agent/provider/login/start') {
@@ -2349,6 +2544,7 @@ export async function installAgentHost(page: Page) {
     });
   }, {
     nativeProtocolVersion: NATIVE_AGENT_PROTOCOL_VERSION,
+    transcriptProjectionVersion: AGENT_TRANSCRIPT_PROJECTION_VERSION,
     transcriptProtocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
   });
 }

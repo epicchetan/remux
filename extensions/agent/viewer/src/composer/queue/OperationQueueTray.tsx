@@ -45,9 +45,15 @@ export function OperationQueueTray({ onChanged, queue }: {
                 <span className="remux-operation-queue-row-title">{entryLabel(entry)}</span>
               </span>
               <span className="remux-operation-queue-row-actions">
-                <QueueIconButton disabled={pendingId === entry.id} label="Delete queued entry" onClick={() => {
-                  void remove(entry.id);
-                }}><Trash2 className="size-3.5" /></QueueIconButton>
+                <QueueIconButton
+                  disabled={pendingId === entry.id || entry.state === 'dispatching'}
+                  label="Delete queued entry"
+                  onClick={() => {
+                    void remove(entry.id);
+                  }}
+                >
+                  <Trash2 className="size-3.5" />
+                </QueueIconButton>
               </span>
             </div>
           ))}
@@ -79,6 +85,7 @@ function QueueIconButton({ children, disabled, label, onClick }: {
 
 function entryLabel(entry: AgentPendingQueueEntry) {
   const message = entry.text || (entry.attachmentCount ? 'Image message' : 'Message');
+  if (entry.state === 'dispatching') return `Sending — ${message}`;
   if (entry.state === 'delivery-unknown') return `Delivery uncertain — ${message}`;
   if (entry.state === 'blocked') return `Waiting for provider — ${message}`;
   return message;

@@ -8,6 +8,9 @@ Canonical code: `extensions/agent/shared/provider-runtime.ts`,
 `extensions/agent/viewer/src/composer/`
 Amends: `agent-native-provider-runtime-v1.md`
 Depends on: `agent-canonical-turn-journal-v2.md`
+Amended by: `agent-state-authority-and-synchronization-v1.md` for message queue
+admission, dispatch acceptance, pre-accept failure, projection fences, and
+client convergence.
 
 # Agent composer control plane v2
 

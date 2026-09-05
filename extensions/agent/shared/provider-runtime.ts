@@ -6,8 +6,8 @@
  * output here before the coordinator can persist or project it.
  */
 
-export const PROVIDER_RUNTIME_CONTRACT_VERSION = 3 as const;
-const LEGACY_PROVIDER_RUNTIME_CONTRACT_VERSION = 2 as const;
+export const PROVIDER_RUNTIME_CONTRACT_VERSION = 4 as const;
+const LEGACY_PROVIDER_RUNTIME_CONTRACT_VERSIONS = [2, 3] as const;
 export const PROVIDER_RUNTIME_LIMITS = {
   eventBytes: 256 * 1024,
   finalEventBytes: 32 * 1024 * 1024,
@@ -170,6 +170,8 @@ export type FederationSessionConfig = {
 export type NativeTurnBinding = {
   turnId: string;
   nativeTurnId: string;
+  /** First unoccupied canonical block ordinal when a live session resumes. */
+  nextBlockOrdinal?: number;
   /** Provider-private branch cursor, persisted server-side only. */
   branchCursor?: JsonValue;
 };
@@ -218,6 +220,12 @@ export type SteerProviderTurnInput = {
 export type InterruptProviderTurnInput = {
   commandId: string;
   turnId: string;
+};
+
+export type InterruptProviderChildInput = {
+  commandId: string;
+  childExecutionId: string;
+  nativeSessionId: string;
 };
 
 export type CompactProviderSessionInput = {
@@ -350,6 +358,7 @@ export type ChildExecutionDisplay = {
   model?: string;
   title?: string;
   nativeSessionId?: string;
+  transcriptAvailable?: boolean;
 };
 
 export type ProviderEventScope =
@@ -383,6 +392,21 @@ export type NativePosition =
   | { kind: 'native-sequence'; sequence: number; subIndex: number }
   | { kind: 'message-block'; messageId: string; blockIndex: number; subIndex: number }
   | { kind: 'snapshot-index'; itemIndex: number; subIndex: number };
+
+/**
+ * Stable semantic identity supplied by a provider adapter. Unlike item and
+ * session IDs, this identity must survive snapshot replay and session resume.
+ */
+export type NativeProviderSubject = {
+  kind: string;
+  key: string;
+};
+
+/** Structural neighbours in an authoritative provider snapshot. */
+export type NativeTimelineBoundary = {
+  previousTurnId?: string;
+  nextTurnId?: string;
+};
 
 export type TurnStructure = {
   passId: string;
@@ -519,6 +543,8 @@ export type ProviderEventEnvelope = {
     itemId?: string;
     toolCallId?: string;
     position?: NativePosition;
+    subject?: NativeProviderSubject;
+    timeline?: NativeTimelineBoundary;
     kind: string;
   };
   observedAt: number;
@@ -757,8 +783,8 @@ export function parseOpenProviderSessionInput(value: unknown): OpenProviderSessi
     const binding = strictRecord(
       value,
       `$.nativeTurnBindings[${index}]`,
-      ['turnId', 'nativeTurnId', 'branchCursor'],
-      ['branchCursor'],
+      ['turnId', 'nativeTurnId', 'nextBlockOrdinal', 'branchCursor'],
+      ['nextBlockOrdinal', 'branchCursor'],
     );
     const turnId = identifier(binding.turnId, `$.nativeTurnBindings[${index}].turnId`);
     const nativeTurnId = identifier(
@@ -776,6 +802,12 @@ export function parseOpenProviderSessionInput(value: unknown): OpenProviderSessi
     return {
       turnId,
       nativeTurnId,
+      ...(binding.nextBlockOrdinal === undefined
+        ? {}
+        : { nextBlockOrdinal: nonnegativeInteger(
+            binding.nextBlockOrdinal,
+            `$.nativeTurnBindings[${index}].nextBlockOrdinal`,
+          ) }),
       ...(binding.branchCursor === undefined
         ? {}
         : { branchCursor: jsonValue(binding.branchCursor, `$.nativeTurnBindings[${index}].branchCursor`) }),
@@ -838,10 +870,18 @@ export function parseOpenProviderSessionInput(value: unknown): OpenProviderSessi
 }
 
 function parseNativeTurnBinding(value: unknown, path: string): NativeTurnBinding {
-  const binding = strictRecord(value, path, ['turnId', 'nativeTurnId', 'branchCursor'], ['branchCursor']);
+  const binding = strictRecord(value, path, [
+    'turnId', 'nativeTurnId', 'nextBlockOrdinal', 'branchCursor',
+  ], ['nextBlockOrdinal', 'branchCursor']);
   return {
     turnId: identifier(binding.turnId, `${path}.turnId`),
     nativeTurnId: identifier(binding.nativeTurnId, `${path}.nativeTurnId`),
+    ...(binding.nextBlockOrdinal === undefined
+      ? {}
+      : { nextBlockOrdinal: nonnegativeInteger(
+          binding.nextBlockOrdinal,
+          `${path}.nextBlockOrdinal`,
+        ) }),
     ...(binding.branchCursor === undefined
       ? {}
       : { branchCursor: jsonValue(binding.branchCursor, `${path}.branchCursor`) }),
@@ -893,6 +933,17 @@ export function parseInterruptProviderTurnInput(value: unknown): InterruptProvid
   return {
     commandId: identifier(record.commandId, '$.commandId'),
     turnId: identifier(record.turnId, '$.turnId'),
+  };
+}
+
+export function parseInterruptProviderChildInput(value: unknown): InterruptProviderChildInput {
+  const record = strictRecord(value, '$', [
+    'commandId', 'childExecutionId', 'nativeSessionId',
+  ]);
+  return {
+    commandId: identifier(record.commandId, '$.commandId'),
+    childExecutionId: identifier(record.childExecutionId, '$.childExecutionId'),
+    nativeSessionId: identifier(record.nativeSessionId, '$.nativeSessionId'),
   };
 }
 
@@ -1003,8 +1054,12 @@ export function parseProviderEventEnvelope(value: unknown): ProviderEventEnvelop
   ], ['rawArtifactRef']);
   providerRuntimeContractVersion(record.contractVersion, '$.contractVersion');
   const native = strictRecord(record.native, '$.native', [
-    'sessionId', 'turnId', 'messageId', 'itemId', 'toolCallId', 'position', 'kind',
-  ], ['sessionId', 'turnId', 'messageId', 'itemId', 'toolCallId', 'position']);
+    'sessionId', 'turnId', 'messageId', 'itemId', 'toolCallId', 'position',
+    'subject', 'timeline', 'kind',
+  ], [
+    'sessionId', 'turnId', 'messageId', 'itemId', 'toolCallId', 'position',
+    'subject', 'timeline',
+  ]);
   const event = parseProviderEvent(record.event, '$.event');
   const scope = parseProviderEventScope(record.scope, '$.scope');
   assertEventScope(event, scope);
@@ -1028,6 +1083,12 @@ export function parseProviderEventEnvelope(value: unknown): ProviderEventEnvelop
       ...(native.position === undefined
         ? {}
         : { position: parseNativePosition(native.position, '$.native.position') }),
+      ...(native.subject === undefined
+        ? {}
+        : { subject: parseNativeProviderSubject(native.subject, '$.native.subject') }),
+      ...(native.timeline === undefined
+        ? {}
+        : { timeline: parseNativeTimelineBoundary(native.timeline, '$.native.timeline') }),
       kind: boundedString(native.kind, '$.native.kind'),
     },
     observedAt: nonnegativeInteger(record.observedAt, '$.observedAt'),
@@ -1097,6 +1158,31 @@ function parseProviderEventEnvelopeAt(value: unknown, path: string): ProviderEve
     }
     throw error;
   }
+}
+
+function parseNativeProviderSubject(value: unknown, path: string): NativeProviderSubject {
+  const record = strictRecord(value, path, ['kind', 'key']);
+  return {
+    kind: boundedString(record.kind, `${path}.kind`),
+    key: identifier(record.key, `${path}.key`),
+  };
+}
+
+function parseNativeTimelineBoundary(value: unknown, path: string): NativeTimelineBoundary {
+  const record = strictRecord(value, path, [
+    'previousTurnId', 'nextTurnId',
+  ], ['previousTurnId', 'nextTurnId']);
+  if (record.previousTurnId === undefined && record.nextTurnId === undefined) {
+    throw new ProviderContractError(path, 'must include previousTurnId or nextTurnId');
+  }
+  return {
+    ...(record.previousTurnId === undefined
+      ? {}
+      : { previousTurnId: identifier(record.previousTurnId, `${path}.previousTurnId`) }),
+    ...(record.nextTurnId === undefined
+      ? {}
+      : { nextTurnId: identifier(record.nextTurnId, `${path}.nextTurnId`) }),
+  };
 }
 
 function parseNativeSessionRef(value: unknown, path: string): NativeSessionRef {
@@ -1733,8 +1819,8 @@ function parseAccountUsageWindow(value: unknown, path: string): AccountUsageWind
 function parseChild(value: unknown, path: string): ChildExecutionDisplay {
   const record = strictRecord(value, path, [
     'executionId', 'ownership', 'provider', 'providerInstanceId', 'model', 'title',
-    'nativeSessionId',
-  ], ['providerInstanceId', 'model', 'title', 'nativeSessionId']);
+    'nativeSessionId', 'transcriptAvailable',
+  ], ['providerInstanceId', 'model', 'title', 'nativeSessionId', 'transcriptAvailable']);
   return {
     executionId: identifier(record.executionId, `${path}.executionId`),
     ownership: oneOf(record.ownership, ['native', 'federated'], `${path}.ownership`),
@@ -1747,6 +1833,9 @@ function parseChild(value: unknown, path: string): ChildExecutionDisplay {
     ...(record.nativeSessionId === undefined
       ? {}
       : { nativeSessionId: identifier(record.nativeSessionId, `${path}.nativeSessionId`) }),
+    ...(record.transcriptAvailable === undefined
+      ? {}
+      : { transcriptAvailable: bool(record.transcriptAvailable, `${path}.transcriptAvailable`) }),
   };
 }
 
@@ -1914,10 +2003,11 @@ function exactLiteral<T extends string | number | boolean>(value: unknown, liter
 
 function providerRuntimeContractVersion(value: unknown, path: string) {
   if (value !== PROVIDER_RUNTIME_CONTRACT_VERSION &&
-      value !== LEGACY_PROVIDER_RUNTIME_CONTRACT_VERSION) {
+      !(LEGACY_PROVIDER_RUNTIME_CONTRACT_VERSIONS as readonly unknown[]).includes(value)) {
     throw new ProviderContractError(
       path,
-      `must equal ${PROVIDER_RUNTIME_CONTRACT_VERSION} or ${LEGACY_PROVIDER_RUNTIME_CONTRACT_VERSION}`,
+      `must equal ${PROVIDER_RUNTIME_CONTRACT_VERSION} or a supported legacy version ` +
+        `(${LEGACY_PROVIDER_RUNTIME_CONTRACT_VERSIONS.join(', ')})`,
     );
   }
 }

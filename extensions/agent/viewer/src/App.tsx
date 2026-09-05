@@ -39,6 +39,8 @@ import { agentCommands } from './ipc/agentCommands.ts';
 import { viewerModelId } from './nativeViewModel.ts';
 import { useComposerViewport } from './app/useComposerViewport.ts';
 import { useAgentResources } from './app/useAgentResources.ts';
+import { AgentExecutionsView } from './agents/AgentExecutionsView.tsx';
+import { useAgentExecutions } from './agents/useAgentExecutions.ts';
 import { readInitialTarget, useAgentNavigation } from './app/useAgentNavigation.ts';
 import { useConversationActions } from './app/useConversationActions.ts';
 import { AgentTranscript } from './transcript/index.ts';
@@ -84,6 +86,12 @@ export function App() {
     runtime,
     setError,
   } = useAgentResources(activeConversationId, activeConversationIdRef);
+  const agentExecutions = useAgentExecutions(
+    activeConversationId,
+    nativeRuntime?.executionId ?? null,
+  );
+  const [agentsOpen, setAgentsOpen] = useState(false);
+  const [selectedAgentExecutionId, setSelectedAgentExecutionId] = useState<string | null>(null);
   const authProvider = providers?.providers.find(({ state }) => state === 'ready')
     ?? providers?.providers.find(({ provider }) => provider === 'codex')
     ?? providers?.providers[0]
@@ -147,6 +155,11 @@ export function App() {
     activeDraftIdRef.current = activeDraftId;
     draftRef.current = draft;
   }, [activeConversationId, activeDraftId, draft]);
+
+  useEffect(() => {
+    setAgentsOpen(false);
+    setSelectedAgentExecutionId(null);
+  }, [activeConversationId, activeDraftId]);
 
   const restoreComposerSnapshot = useCallback((snapshot: ReturnType<typeof createEmptyComposerSnapshot>) => {
     composerRestorePendingRef.current = snapshot.contentKey;
@@ -625,7 +638,20 @@ export function App() {
       <section className="remux-main-pane" ref={mainPaneRef} style={mainPaneStyle}>
         <div className="remux-transcript-slot">
           <div className="agent-chat-view">
-            {conversation ? <AgentTranscript conversationId={conversation.id} /> : (
+            {conversation && agentsOpen ? (
+              <AgentExecutionsView
+                conversationId={conversation.id}
+                {...agentExecutions}
+                onClose={() => {
+                  setAgentsOpen(false);
+                  setSelectedAgentExecutionId(null);
+                }}
+                onRefresh={agentExecutions.refresh}
+                onSelect={setSelectedAgentExecutionId}
+                providers={providers}
+                selectedExecutionId={selectedAgentExecutionId}
+              />
+            ) : conversation ? <AgentTranscript conversationId={conversation.id} /> : (
             <div className="remux-new-chat-empty">
               <div className="remux-new-chat-empty-card">
                 <div className="remux-new-chat-empty-title">
@@ -641,11 +667,16 @@ export function App() {
             )}
           </div>
         </div>
-        <div className="remux-bottom-bar-slot" ref={bottomBarSlotRef}>
+        {!agentsOpen ? <div className="remux-bottom-bar-slot" ref={bottomBarSlotRef}>
           <ComposerContent
+            childExecutionCount={agentExecutions.executions.length}
             conversation={conversation}
             conversationSelected={Boolean(activeConversationId)}
             onInterrupt={interrupt}
+            onOpenAgents={() => {
+              blurComposer();
+              setAgentsOpen(true);
+            }}
             onCompact={compact}
             onEdit={(target, input, setPhase) => branchMessage('edit', target, input, setPhase)}
             onFork={(target, input, setPhase) => branchMessage('fork', target, input, setPhase)}
@@ -667,8 +698,8 @@ export function App() {
             runtimeError={error ?? conversation?.error ?? null}
             queue={queue}
           />
-        </div>
-        {pickerOverlayVisible ? (
+        </div> : null}
+        {!agentsOpen && pickerOverlayVisible ? (
           <div className="remux-file-mention-overlay" data-remux-no-composer-focus style={pickerOverlayStyle ?? undefined}>
             {mentionPickerVisible && mentionSession
               ? <ComposerMentionPicker session={mentionSession} />

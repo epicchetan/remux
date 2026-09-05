@@ -3,6 +3,8 @@ import { subscribeIpcEvents } from '@remux/viewer-kit/ipc';
 import {
   NATIVE_AGENT_METHODS,
   NATIVE_AGENT_PROTOCOL_VERSION,
+  parseAgentExecutionResourceKey,
+  parseAgentExecutionTranscriptResourceKey,
   type NativeAgentResourceKey,
   type NativeAgentResourcesInvalidated,
 } from '../../../shared/native-agent-protocol.ts';
@@ -52,8 +54,9 @@ export function startAgentResourceInvalidationBridge() {
         void invalidateTranscriptResources(transcriptInvalidations, envelope.serverGeneration);
       }
       const executionIds = envelope.keys.flatMap((key) => {
-        const match = /^agent\/(?:execution|execution-transcript):([^:]+)/u.exec(key);
-        return match ? [match[1]!] : [];
+        const executionId = parseAgentExecutionResourceKey(key)
+          ?? parseAgentExecutionTranscriptResourceKey(key)?.executionId;
+        return executionId ? [executionId] : [];
       });
       if (executionIds.length > 0) {
         void revalidateNativeExecutionResources(executionIds, envelope.serverGeneration);

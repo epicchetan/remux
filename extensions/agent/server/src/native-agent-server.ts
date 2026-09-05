@@ -13,6 +13,7 @@ import {
   type NativeConversationRenameCommand,
   type NativeConversationArchiveSetCommand,
   type NativeConversationStrandActivateCommand,
+  type NativeExecutionMutationCommand,
   type NativeMessageSendCommand,
   type NativeProviderAuthMutationCommand,
   type NativeProviderLoginStartCommand,
@@ -136,6 +137,8 @@ export class NativeAgentServer {
         );
       case NATIVE_AGENT_METHODS.turnInterrupt:
         return this.coordinator.interruptTurn(params as NativeTurnMutationCommand);
+      case NATIVE_AGENT_METHODS.executionInterrupt:
+        return this.coordinator.interruptExecution(params as NativeExecutionMutationCommand);
       case NATIVE_AGENT_METHODS.conversationCompact:
         return this.coordinator.compactConversation(params as NativeCompactConversationCommand);
       case NATIVE_AGENT_METHODS.conversationPreferenceSet:

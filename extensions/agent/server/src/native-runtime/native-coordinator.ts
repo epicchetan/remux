@@ -3,12 +3,16 @@ import { isAbsolute, relative, resolve, sep } from 'node:path';
 
 import {
   NATIVE_AGENT_RESOURCE_KEYS,
+  agentExecutionResourceKey,
+  agentExecutionTranscriptResourceKey,
+  parseAgentExecutionTranscriptResourceKey,
   parseNativeAgentResourceReadParams,
   parseNativeBranchCommand,
   parseNativeConversationCreateCommand,
   parseNativeConversationRenameCommand,
   parseNativeConversationArchiveSetCommand,
   parseNativeConversationStrandActivateCommand,
+  parseNativeExecutionMutationCommand,
   parseNativeCompactConversationCommand,
   parseNativeComposerPreferenceSetCommand,
   parseNativeConversationAccessSetCommand,
@@ -24,6 +28,7 @@ import {
   type NativeConversationRenameCommand,
   type NativeConversationArchiveSetCommand,
   type NativeConversationStrandActivateCommand,
+  type NativeExecutionMutationCommand,
   type NativeCompactConversationCommand,
   type NativeComposerPreferenceSetCommand,
   type NativeConversationAccessSetCommand,
@@ -31,6 +36,7 @@ import {
   type NativeProviderAuthMutationCommand,
   type NativeProviderLoginStartCommand,
   type NativeProviderPreferenceSetCommand,
+  type NativeQueuedMessage,
   type ProviderLoginOperationView,
   type NativeTurnMutationCommand,
 } from '../../../shared/native-agent-protocol.ts';
@@ -210,6 +216,13 @@ type HistoryHydrationJob = {
 
 type HistorySyncPolicy = 'initial' | 'if-stale' | 'required-fresh';
 
+type PendingTurnAdmission = {
+  conversationId: string;
+  executionId: string;
+  queued: NativeQueuedMessage;
+  events: ProviderEventEnvelope[];
+};
+
 const BASE_DEVELOPER_INSTRUCTIONS = [
   'Remux uses ordinary chat for all user interaction. Do not request a blocking approval form or structured multiple-choice input; explain what is needed in your response instead.',
   'Use the provider\'s native same-provider collaboration tools for same-provider subagents. Use Remux federation tools only when delegating to a different provider.',
@@ -244,6 +257,7 @@ export class NativeAgentCoordinator {
   private readonly loginConsumers = new Set<Promise<void>>();
   private readonly dispatchingConversations = new Set<string>();
   private readonly pendingDispatchConversations = new Set<string>();
+  private readonly pendingTurnAdmissions = new Map<string, PendingTurnAdmission>();
   private readonly executionWaiters = new Map<string, Set<(result: FederatedExecutionResult) => void>>();
   private readonly federationBindings = new Map<string, { touch?: () => void; revoke?: () => void }>();
   private readonly hydrationJobs = new Map<string, HistoryHydrationJob>();
@@ -327,6 +341,7 @@ export class NativeAgentCoordinator {
       }
     }));
     this.journal.markAmbiguousCommandsForRecovery(this.now());
+    this.journal.markInterruptedQueueDispatchesDeliveryUnknown();
     this.journal.failInterruptedBranchOperations(this.now());
     for (const conversation of this.journal.conversationsWithoutRecoveryHandle()) {
       this.journal.failRecovery(
@@ -455,6 +470,7 @@ export class NativeAgentCoordinator {
   ) {
     const input = parseNativeAgentResourceReadParams(unparsed);
     const conversationIds = new Set<string>();
+    const executionIds = new Set<string>();
     for (const { key } of input.requests) {
       const transcript = /^agent\/transcript:([^:]+)/u.exec(key);
       if (transcript?.[1]) conversationIds.add(transcript[1]);
@@ -463,9 +479,10 @@ export class NativeAgentCoordinator {
         const conversationId = this.journal.turn(turn[1])?.conversationId;
         if (conversationId) conversationIds.add(conversationId);
       }
-      const execution = /^agent\/execution-transcript:([^:]+)/u.exec(key);
-      if (execution?.[1]) {
-        const conversationId = this.journal.execution(execution[1])?.conversationId;
+      const execution = parseAgentExecutionTranscriptResourceKey(key);
+      if (execution) {
+        executionIds.add(execution.executionId);
+        const conversationId = this.journal.execution(execution.executionId)?.conversationId;
         if (conversationId) conversationIds.add(conversationId);
       }
     }
@@ -488,6 +505,9 @@ export class NativeAgentCoordinator {
           .catch(() => undefined);
       }
       this.scheduleFocusedContextRefresh(conversationId);
+    }
+    for (const executionId of executionIds) {
+      await this.synchronizeNativeChildHistory(executionId, signal);
     }
   }
 
@@ -836,18 +856,6 @@ export class NativeAgentCoordinator {
     // boundary. The dispatcher may claim an idle lane right away, but the RPC
     // acknowledgment never depends on the WebView remaining connected.
     this.journal.transaction(() => {
-      this.journal.createTurn({
-        turnId,
-        conversationId: conversation.conversationId,
-        executionId: conversation.rootExecutionId,
-        clientMessageId: input.clientMessageId,
-        commandId: input.commandId,
-        content: input.content,
-        model,
-        ...(effort ? { effort } : {}),
-        state: 'queued',
-        now: this.now(),
-      });
       this.journal.enqueueTurn({
         commandId: input.commandId,
         conversationId: conversation.conversationId,
@@ -862,7 +870,8 @@ export class NativeAgentCoordinator {
       this.journal.acceptCommand(input.commandId, result, this.now());
     });
     this.invalidateConversation(conversation.conversationId);
-    void this.dispatchNext(conversation.conversationId);
+    if (laneBusy) void this.dispatchNext(conversation.conversationId);
+    else await this.dispatchNext(conversation.conversationId);
     return result;
   }
 
@@ -899,6 +908,53 @@ export class NativeAgentCoordinator {
         )));
       const result = await session.interrupt({ commandId: input.commandId, turnId: input.turnId });
       this.journal.acceptCommand(input.commandId, result, this.now());
+      return result;
+    } catch (error) {
+      this.journal.rejectCommand(input.commandId, safeMessage(error), this.now());
+      throw error;
+    }
+  }
+
+  async interruptExecution(unparsed: NativeExecutionMutationCommand) {
+    this.assertOpen();
+    const input = parseNativeExecutionMutationCommand(unparsed);
+    const execution = this.journal.execution(input.executionId);
+    if (!execution || execution.conversationId !== input.conversationId || execution.ownership === 'root') {
+      throw new Error('Child execution does not exist in this conversation.');
+    }
+    if (execution.ownership === 'federated') {
+      return this.interruptFederatedExecution(input.commandId, input.executionId);
+    }
+    const claim = this.journal.claimCommand(input.commandId, 'execution.interrupt', input, this.now());
+    const replay = this.replay<{ accepted: true }>(claim.receipt);
+    if (replay) return replay;
+    try {
+      if (execution.state !== 'running' && execution.state !== 'recovering') {
+        throw new Error('Child execution is not running.');
+      }
+      const capabilities = this.requireCapabilities(execution.providerInstanceId);
+      if (!capabilities.collaboration.childInterrupt) {
+        throw coordinatorError('capability_unavailable', 'Provider does not support child interruption.');
+      }
+      const handle = this.journal.nativeChildHandle(execution.executionId);
+      if (!handle) throw coordinatorError('session_unavailable', 'Native child handle is unavailable.');
+      const conversation = this.requireConversation(input.conversationId);
+      if (execution.parentExecutionId !== conversation.rootExecutionId) {
+        throw coordinatorError('session_unavailable', 'Native child is not attached to the active conversation session.');
+      }
+      const session = await this.ensureSession(conversation);
+      if (!session.interruptChild) {
+        throw coordinatorError('native_command_unavailable', 'Native child interruption is unavailable.');
+      }
+      this.journal.markCommandDispatching(input.commandId, this.now());
+      const result = await session.interruptChild({
+        commandId: input.commandId,
+        childExecutionId: execution.executionId,
+        nativeSessionId: handle.nativeSessionId,
+      });
+      this.journal.acceptCommand(input.commandId, result, this.now());
+      this.invalidateConversation(input.conversationId, conversation.rootExecutionId, execution.rootTurnId ?? undefined);
+      this.invalidateConversation(input.conversationId, execution.executionId);
       return result;
     } catch (error) {
       this.journal.rejectCommand(input.commandId, safeMessage(error), this.now());
@@ -1987,6 +2043,12 @@ export class NativeAgentCoordinator {
     const prepared = await this.prepareProviderEvents(conversationId, snapshot.events);
     if (snapshot.authority === 'session-local') this.journal.appendProviderEvents(prepared);
     else this.journal.replaceSnapshot(prepared, snapshot.coverage);
+    // Snapshot lifecycle envelopes are replay-stable and can already exist in
+    // the event log. Reassert the authoritative running state even when event
+    // deduplication correctly suppresses their reducer side effects.
+    if (snapshot.state === 'running') {
+      this.journal.confirmExecutionRunning(executionId, this.now());
+    }
     await this.sealTerminalOutputs(conversationId, executionId);
     const refreshed = this.requireConversation(conversationId);
     if (refreshed.rootExecutionId === executionId) {
@@ -2358,6 +2420,28 @@ export class NativeAgentCoordinator {
     }
   }
 
+  private async synchronizeNativeChildHistory(executionId: string, signal?: AbortSignal) {
+    const execution = this.journal.execution(executionId);
+    if (!execution || execution.ownership !== 'native' ||
+        this.journal.turnsForExecution(executionId).length > 0) return;
+    const capabilities = this.requireCapabilities(execution.providerInstanceId);
+    if (capabilities.collaboration.childTranscript === 'none') return;
+    const handle = this.journal.nativeChildHandle(executionId);
+    const conversation = this.journal.conversation(execution.conversationId);
+    if (!handle || !conversation || execution.parentExecutionId !== conversation.rootExecutionId) return;
+    throwIfAborted(signal);
+    const session = await this.ensureSession(conversation);
+    if (!session.snapshotChild) return;
+    const snapshot = await session.snapshotChild({
+      commandId: stableUuid(`child-snapshot\0${executionId}\0${this.now()}`),
+      childExecutionId: executionId,
+      nativeSessionId: handle.nativeSessionId,
+    });
+    throwIfAborted(signal);
+    this.journal.replaceSnapshot(snapshot.events, snapshot.coverage);
+    this.invalidateConversation(execution.conversationId, executionId);
+  }
+
   private historySynchronizationRequired(
     conversation: JournalConversation,
     policy: HistorySyncPolicy,
@@ -2560,7 +2644,7 @@ export class NativeAgentCoordinator {
     effort = conversation.effort,
   ) {
     const session = await this.ensureSession(conversation);
-    await session.startTurn({
+    return session.startTurn({
       commandId,
       conversationId: conversation.conversationId,
       turnId,
@@ -2685,21 +2769,61 @@ export class NativeAgentCoordinator {
         return;
       }
       try {
-        await this.dispatchTurn(
-          this.requireConversation(conversationId),
-          queued.turnId,
-          queued.commandId,
-          queued.content,
-          queued.model,
-          queued.effort,
-        );
-        this.journal.acknowledgeQueuedTurnDispatch(queued.turnId);
+        const refreshed = this.requireConversation(conversationId);
+        const admission: PendingTurnAdmission = {
+          conversationId,
+          executionId: refreshed.rootExecutionId,
+          queued,
+          events: [],
+        };
+        this.pendingTurnAdmissions.set(refreshed.rootExecutionId, admission);
+        let dispatchError: unknown;
+        let acceptance: { nativeTurnId?: string } | undefined;
+        try {
+          acceptance = await this.dispatchTurn(
+            refreshed,
+            queued.turnId,
+            queued.commandId,
+            queued.content,
+            queued.model,
+            queued.effort,
+          );
+        } catch (error) {
+          dispatchError = error;
+        }
+        const staged = this.pendingTurnAdmissions.get(refreshed.rootExecutionId)?.events ?? [];
+        const providerProvedAcceptance = staged.some((event) =>
+          event.scope.kind === 'turn' && event.scope.turnId === queued.turnId &&
+          (event.event.type === 'turn.started' || event.event.type === 'user.message'));
+        if (dispatchError && !providerProvedAcceptance) throw dispatchError;
+        const nativeTurnId = acceptance?.nativeTurnId ?? staged.find((event) =>
+          event.scope.kind === 'turn' && event.scope.turnId === queued.turnId &&
+          event.native.turnId)?.native.turnId;
+        const admitted = this.journal.admitQueuedTurn(queued.turnId, this.now(), nativeTurnId);
+        if (!admitted) throw new Error('Queued message disappeared before provider acceptance was admitted.');
+        this.pendingTurnAdmissions.delete(refreshed.rootExecutionId);
+        if (staged.length > 0) {
+          // Admission is the RPC's durability boundary. Replay the provider's
+          // staged observations immediately afterward, without keeping the
+          // originating send call open while those observations are reduced.
+          // This also preserves a real FIFO window for a follow-up submitted
+          // as soon as the first send is acknowledged.
+          queueMicrotask(() => void this.consumeEventBatchResilient(
+            conversationId,
+            refreshed.rootExecutionId,
+            staged,
+          ));
+        }
       } catch (error) {
+        const executionId = this.journal.conversation(conversationId)?.rootExecutionId;
+        if (executionId) this.pendingTurnAdmissions.delete(executionId);
         // Once native dispatch begins, a transport failure may have happened
         // after provider acceptance. Keep an explicit blocking record instead
         // of silently retrying a coding action or advancing the FIFO.
         this.journal.markQueuedTurnDeliveryUnknown(queued.turnId);
-        this.journal.failTurnDispatch(queued.turnId, safeMessage(error), this.now());
+        if (this.journal.turn(queued.turnId)) {
+          this.journal.failTurnDispatch(queued.turnId, safeMessage(error), this.now());
+        }
       } finally {
         this.invalidateConversation(conversationId);
       }
@@ -2778,6 +2902,9 @@ export class NativeAgentCoordinator {
       const prepared = await this.prepareProviderEvents(execution.conversationId, snapshot.events);
       if (snapshot.authority === 'session-local') this.journal.appendProviderEvents(prepared);
       else this.journal.replaceSnapshot(prepared, snapshot.coverage);
+      if (snapshot.state === 'running') {
+        this.journal.confirmExecutionRunning(execution.executionId, this.now());
+      }
       await this.sealTerminalOutputs(execution.conversationId, execution.executionId);
       const refreshed = this.requireFederatedExecution(execution.executionId);
       const activeTurn = this.activeExecutionTurn(execution.executionId);
@@ -2910,6 +3037,7 @@ export class NativeAgentCoordinator {
           return {
             turnId: turn.turnId,
             nativeTurnId: turn.nativeTurnId!,
+            nextBlockOrdinal: this.journal.nextTurnBlockOrdinal(turn.turnId),
             ...(binding?.branchCursor === null || binding?.branchCursor === undefined ? {} : {
               branchCursor: binding.branchCursor as import('../../../shared/provider-runtime.ts').JsonValue,
             }),
@@ -3234,8 +3362,28 @@ export class NativeAgentCoordinator {
     conversationId: string,
     executionId: string,
     events: readonly ProviderEventEnvelope[],
-  ) {
+  ): Promise<void> {
     this.touchSession(executionId);
+    const pendingAdmission = this.pendingTurnAdmissions.get(executionId);
+    if (pendingAdmission) {
+      const staged = events.filter((event) =>
+        event.scope.kind === 'turn' && event.scope.executionId === executionId &&
+        event.scope.turnId === pendingAdmission.queued.turnId);
+      if (staged.length > 0) {
+        pendingAdmission.events.push(...staged);
+        const immediate = events.filter((event) => !staged.includes(event));
+        if (immediate.length === 0) return;
+        return this.consumeEventBatch(conversationId, executionId, immediate);
+      }
+    }
+    const declaredNativeChildren = new Set(events.flatMap((event) => {
+      if (event.scope.kind !== 'turn' || event.scope.executionId !== executionId ||
+          (event.event.type !== 'turn.block.started' &&
+            event.event.type !== 'turn.block.revised' &&
+            event.event.type !== 'turn.block.completed')) return [];
+      const payload = event.event.block.payload;
+      return payload.kind === 'native-child' ? [payload.child.executionId] : [];
+    }));
     for (const event of events) {
       if (event.scope.kind === 'account') {
         if (!this.providers.has(event.scope.providerInstanceId)) {
@@ -3247,7 +3395,15 @@ export class NativeAgentCoordinator {
         throw new Error('Provider emitted an event for another conversation.');
       }
       if (event.scope.executionId !== executionId) {
-        throw new Error('Provider emitted an event for another execution.');
+        const child = this.journal.execution(event.scope.executionId);
+        const permittedNativeChild = declaredNativeChildren.has(event.scope.executionId) || (
+          child?.ownership === 'native' &&
+          child.parentExecutionId === executionId &&
+          child.providerInstanceId === event.scope.providerInstanceId
+        );
+        if (!permittedNativeChild) {
+          throw new Error('Provider emitted an event for another execution.');
+        }
       }
     }
     const safeEvents = (await this.prepareProviderEvents(conversationId, events)).map((event) => {
@@ -3705,8 +3861,8 @@ export class NativeAgentCoordinator {
       `agent/transcript:${conversationId}:tail-24`,
     ];
     if (executionId) {
-      keys.push(`agent/execution:${executionId}`);
-      keys.push(`agent/execution-transcript:${executionId}:tail-24`);
+      keys.push(agentExecutionResourceKey(executionId));
+      keys.push(agentExecutionTranscriptResourceKey(executionId));
     }
     if (turnId) keys.push(`agent/turn:${turnId}`);
     this.onResourcesInvalidated(keys);

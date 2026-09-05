@@ -10,6 +10,10 @@ Canonical code: `extensions/agent/shared/provider-runtime.ts`,
 `extensions/agent/viewer/src/nativeTranscriptViewModel.ts`
 Amends: `agent-native-provider-runtime-v1.md`
 Coordinates with: `agent-composer-control-plane-v2.md`
+Amended by: `agent-state-authority-and-synchronization-v1.md`, which supersedes
+the generic append-only admission model, timestamp-based control placement,
+and provider-event-sequence UI fencing while retaining ordered turns, passes,
+blocks, and bounded transcript resources.
 
 # Agent canonical turn journal v2
 

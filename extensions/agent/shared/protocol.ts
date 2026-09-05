@@ -106,7 +106,7 @@ export type AgentPendingQueueEntry = {
   createdAt: number;
   id: string;
   mentionCount: number;
-  state?: 'queued' | 'blocked' | 'delivery-unknown';
+  state?: 'queued' | 'dispatching' | 'blocked' | 'delivery-unknown';
   text: string;
 };
 

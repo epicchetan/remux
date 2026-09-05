@@ -22,7 +22,7 @@ import type {
 import { parseUserContentParts, ProviderContractError } from './provider-runtime.ts';
 
 /** Viewer-safe resource and command contract for the provider-native runtime. */
-export const NATIVE_AGENT_PROTOCOL_VERSION = 7 as const;
+export const NATIVE_AGENT_PROTOCOL_VERSION = 8 as const;
 export const NATIVE_AGENT_LIMITS = {
   resourceBytes: 8 * 1024 * 1024,
   resourceReads: 64,
@@ -52,6 +52,7 @@ export const NATIVE_AGENT_METHODS = {
   conversationArchiveSet: 'remux/agent/conversation/archive/set',
   conversationStrandActivate: 'remux/agent/conversation/strand/activate',
   turnInterrupt: 'remux/agent/conversation/turn/interrupt',
+  executionInterrupt: 'remux/agent/conversation/execution/interrupt',
   conversationCompact: 'remux/agent/conversation/compact',
   conversationPreferenceSet: 'remux/agent/composer/conversation-preference/set',
   conversationAccessSet: 'remux/agent/composer/conversation-access/set',
@@ -78,6 +79,32 @@ export type NativeAgentResourceKey =
   | `agent/execution:${string}`
   | `agent/execution-transcript:${string}:${string}`
   | `agent/artifact:${string}:${string}`;
+
+export function agentExecutionResourceKey(executionId: string): NativeAgentResourceKey {
+  return `agent/execution:${encodeURIComponent(executionId)}`;
+}
+
+export function agentExecutionTranscriptResourceKey(
+  executionId: string,
+  window = 'tail-24',
+): NativeAgentResourceKey {
+  return `agent/execution-transcript:${encodeURIComponent(executionId)}:${window}`;
+}
+
+export function parseAgentExecutionResourceKey(key: string): string | null {
+  const prefix = 'agent/execution:';
+  if (!key.startsWith(prefix)) return null;
+  return decodeResourceKeySegment(key.slice(prefix.length));
+}
+
+export function parseAgentExecutionTranscriptResourceKey(
+  key: string,
+): { executionId: string; window: string } | null {
+  const match = /^agent\/execution-transcript:([^:]+):(.+)$/u.exec(key);
+  if (!match) return null;
+  const executionId = decodeResourceKeySegment(match[1]!);
+  return executionId ? { executionId, window: match[2]! } : null;
+}
 
 export type ViewerProviderCapabilities = {
   provider: ProviderKind;
@@ -591,6 +618,12 @@ export type NativeTurnMutationCommand = {
   turnId: string;
 };
 
+export type NativeExecutionMutationCommand = {
+  commandId: string;
+  conversationId: string;
+  executionId: string;
+};
+
 export type NativeBranchCommand = {
   commandId: string;
   clientMessageId: string;
@@ -739,6 +772,15 @@ export function parseNativeTurnMutationCommand(value: unknown): NativeTurnMutati
     commandId: identifier(record.commandId, '$.commandId'),
     conversationId: identifier(record.conversationId, '$.conversationId'),
     turnId: identifier(record.turnId, '$.turnId'),
+  };
+}
+
+export function parseNativeExecutionMutationCommand(value: unknown): NativeExecutionMutationCommand {
+  const record = strict(value, '$', ['commandId', 'conversationId', 'executionId']);
+  return {
+    commandId: identifier(record.commandId, '$.commandId'),
+    conversationId: identifier(record.conversationId, '$.conversationId'),
+    executionId: identifier(record.executionId, '$.executionId'),
   };
 }
 
@@ -1036,14 +1078,29 @@ function resourceKey(value: unknown, path: string): NativeAgentResourceKey {
   if (key === NATIVE_AGENT_RESOURCE_KEYS.providers || key === NATIVE_AGENT_RESOURCE_KEYS.conversations) {
     return key;
   }
-  if (/^agent\/(?:models|conversation|conversation-versions|runtime|queue|turn|execution):[A-Za-z0-9][A-Za-z0-9._:@+/-]*$/u.test(key)) {
+  if (/^agent\/(?:models|conversation|conversation-versions|runtime|queue|turn):[A-Za-z0-9][A-Za-z0-9._:@+/-]*$/u.test(key)) {
     return key as NativeAgentResourceKey;
   }
-  if (/^agent\/(?:transcript|execution-transcript|artifact):[A-Za-z0-9][A-Za-z0-9._:@+/-]*:[A-Za-z0-9][A-Za-z0-9._:@+/-]*$/u.test(key)) {
+  if (/^agent\/execution:[A-Za-z0-9][A-Za-z0-9._%@+/-]*$/u.test(key)) {
+    return key as NativeAgentResourceKey;
+  }
+  if (/^agent\/(?:transcript|artifact):[A-Za-z0-9][A-Za-z0-9._:@+/-]*:[A-Za-z0-9][A-Za-z0-9._:@+/-]*$/u.test(key)) {
+    return key as NativeAgentResourceKey;
+  }
+  if (/^agent\/execution-transcript:[A-Za-z0-9][A-Za-z0-9._%@+/-]*:[A-Za-z0-9][A-Za-z0-9._:@+/-]*$/u.test(key)) {
     return key as NativeAgentResourceKey;
   }
   if (/^agent\/strand-transcript:[A-Za-z0-9][A-Za-z0-9._%+/-]*:[A-Za-z0-9][A-Za-z0-9._%+/-]*:[A-Za-z0-9][A-Za-z0-9._:@+/-]*$/u.test(key)) {
     return key as NativeAgentResourceKey;
   }
   throw new ProviderContractError(path, 'is not a Native Agent resource key');
+}
+
+function decodeResourceKeySegment(value: string) {
+  if (!value) return null;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return null;
+  }
 }

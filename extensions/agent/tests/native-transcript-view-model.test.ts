@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  nativeFederatedExecutionId,
-  nativeFederatedScopeId,
+  nativeExecutionId,
+  nativeExecutionScopeId,
   projectNativeChildExecutionScope,
+  projectNativeExecutionScope,
   projectNativeTurn,
 } from '../viewer/src/nativeTranscriptViewModel.ts';
 import type {
@@ -13,7 +14,7 @@ import type {
 } from '../shared/native-agent-protocol.ts';
 import { AGENT_TRANSCRIPT_PROTOCOL_VERSION } from '../shared/transcript.ts';
 
-test('federated children expose a lazy scope while native children stay provider-owned', () => {
+test('native and federated children expose provider-neutral lazy execution scopes', () => {
   const turn = frame('root-turn', 'root-execution', 'completed', 'Root result.');
   turn.activity.children = [{
     executionId: 'native-child',
@@ -32,6 +33,22 @@ test('federated children expose a lazy scope while native children stay provider
   const work = projectNativeTurn(turn).segments.find((segment) => segment.type === 'work');
   assert.ok(work && work.type === 'work');
   assert.equal(work.childExecutionCount, 2);
+  const rootScope = projectNativeExecutionScope('conversation-1', turn, {
+    type: 'executionScope',
+    protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
+    turnId: turn.turnId,
+    scopeId: 'root-execution',
+  }, 13);
+  const childCalls = rootScope.inferences.flatMap(({ blocks }) => blocks.flatMap((block) =>
+    block.type === 'action' ? [block.call] : []));
+  assert.equal(
+    childCalls.find(({ callId }) => callId === 'native-child')?.childScopeId,
+    nativeExecutionScopeId('native-child'),
+  );
+  assert.equal(
+    childCalls.find(({ callId }) => callId === 'federated-child')?.childScopeId,
+    nativeExecutionScopeId('federated-child'),
+  );
 
   const scope = projectNativeChildExecutionScope('conversation-1', {
     conversationId: 'conversation-1',
@@ -53,11 +70,11 @@ test('federated children expose a lazy scope while native children stay provider
     type: 'executionScope',
     protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
     turnId: 'root-turn',
-    scopeId: nativeFederatedScopeId('federated-child'),
+    scopeId: nativeExecutionScopeId('federated-child'),
   }, 14);
 
-  assert.equal(nativeFederatedExecutionId(scope.scopeId), 'federated-child');
-  assert.equal(nativeFederatedExecutionId('root-execution'), null);
+  assert.equal(nativeExecutionId(scope.scopeId), 'federated-child');
+  assert.equal(nativeExecutionId('root-execution'), null);
   assert.equal(scope.inferences.length, 2);
   assert.deepEqual(scope.inferences[0]?.blocks.map((block) =>
     block.type === 'action' ? block.call.name : block.text), [

@@ -14,6 +14,10 @@ Version 2 amendments: `agent-canonical-turn-journal-v2.md` replaces the
 Version 1 semantic-event projection with ordered turns/passes/blocks and adds
 bounded federated-child rediscovery; `agent-composer-control-plane-v2.md` adds
 provider-scoped composer state, normalized usage, and provider-native Compact.
+The command/queue admission boundary, provider-observation separation,
+coverage-aware snapshot reconciliation, canonical strand timeline, projection
+revision, and client synchronization rules are amended by
+`agent-state-authority-and-synchronization-v1.md`.
 
 # Agent native-provider runtime v1
 

@@ -11,12 +11,18 @@ import { PROVIDER_RUNTIME_LIMITS } from '../shared/provider-runtime.ts';
 const ROOT_THREAD = 'codex-thread-root';
 const NATIVE_TURN = 'codex-turn-native-1';
 
-function mapper(options: { observedAt?: () => number } = {}) {
+function mapper(options: {
+  observedAt?: () => number;
+  executionId?: string;
+  nativeSessionId?: string;
+  inheritedNativeTurnIds?: readonly string[];
+} = {}) {
   return new CodexEventMapper({
     providerInstanceId: 'codex-local',
     conversationId: 'conversation-1',
-    executionId: 'execution-1',
-    nativeSessionId: ROOT_THREAD,
+    executionId: options.executionId ?? 'execution-1',
+    nativeSessionId: options.nativeSessionId ?? ROOT_THREAD,
+    inheritedNativeTurnIds: options.inheritedNativeTurnIds,
     observedAt: options.observedAt ?? (() => 42),
   });
 }
@@ -76,6 +82,38 @@ test('Codex live item events reconcile by native identity with a later thread sn
   }
   assert.ok(snapshot.some(({ event }) =>
     event.type === 'turn.completed' && event.outcome === 'completed'));
+});
+
+test('Codex resumed live blocks start after the durable journal ordinal floor', () => {
+  const subject = mapper();
+  subject.bindTurn('remux-turn-1', NATIVE_TURN, 12);
+  subject.mapThreadSnapshot({
+    id: ROOT_THREAD,
+    status: { type: 'active' },
+    turns: [{
+      id: NATIVE_TURN,
+      status: 'inProgress',
+      items: [{
+        id: 'reasoning-before-restart', type: 'reasoning', summary: ['Before restart.'],
+      }],
+    }],
+  });
+
+  const [live] = subject.mapNotification({
+    method: 'item/started',
+    params: {
+      threadId: ROOT_THREAD,
+      turnId: NATIVE_TURN,
+      item: {
+        id: 'command-after-restart', type: 'commandExecution', status: 'inProgress',
+        command: 'git status --short', cwd: '/workspace/remux',
+      },
+    },
+  });
+  assert.equal(live?.event.type, 'turn.block.started');
+  if (live?.event.type === 'turn.block.started') {
+    assert.equal(live.event.structure.blockOrdinal, 12);
+  }
 });
 
 test('Codex deltas remain ordered and resume from the authoritative snapshot offset', () => {
@@ -951,10 +989,11 @@ test('Codex live and resumed compaction identities converge when App Server rewr
     },
   });
 
-  const resumedMapper = mapper();
+  const resumedSessionId = 'codex-thread-resumed';
+  const resumedMapper = mapper({ executionId: 'execution-2', nativeSessionId: resumedSessionId });
   resumedMapper.bindTurn('remux-turn-1', NATIVE_TURN);
   const resumed = resumedMapper.mapThreadSnapshot({
-    id: ROOT_THREAD,
+    id: resumedSessionId,
     status: { type: 'idle' },
     turns: [{
       id: NATIVE_TURN,
@@ -978,6 +1017,36 @@ test('Codex live and resumed compaction identities converge when App Server rewr
       resumedControl.event.type === 'context.compaction.completed') {
     assert.equal(liveControl.event.operationId, resumedControl.event.operationId);
   }
+});
+
+test('Codex snapshot controls expose stable subjects and structural neighbours across resume', () => {
+  const subject = mapper({
+    executionId: 'execution-resumed',
+    inheritedNativeTurnIds: ['native-before'],
+  });
+  const snapshot = subject.mapThreadSnapshot({
+    id: ROOT_THREAD,
+    status: { type: 'idle' },
+    turns: [{
+      id: 'native-before', status: 'completed',
+      items: [{ id: 'user-before', type: 'userMessage', content: [{ type: 'text', text: 'Before.' }] }],
+    }, {
+      id: 'native-control', status: 'completed',
+      items: [{ id: 'rewritten-item-77', type: 'contextCompaction' }],
+    }, {
+      id: 'native-after', status: 'completed',
+      items: [{ id: 'user-after', type: 'userMessage', content: [{ type: 'text', text: 'After.' }] }],
+    }],
+  });
+  const control = snapshot.find(({ event }) => event.type === 'context.compaction.completed');
+  assert.deepEqual(control?.native.subject, {
+    kind: 'context-compaction',
+    key: 'codex:context-compaction:native-control:0',
+  });
+  assert.deepEqual(control?.native.timeline, {
+    previousTurnId: 'native-before',
+    nextTurnId: 'native-after',
+  });
 });
 
 test('Codex snapshots preserve a same-id inline compaction marker after live completion', () => {
@@ -1157,6 +1226,7 @@ test('Codex native subagents remain native child executions under the owning tur
       activity[0].event.block.payload.kind !== 'native-child') return;
   assert.equal(activity[0].event.block.payload.child.ownership, 'native');
   assert.equal(activity[0].event.block.payload.child.nativeSessionId, childThreadId);
+  assert.equal(activity[0].event.block.payload.child.transcriptAvailable, true);
 
   const completed = subject.mapNotification({
     method: 'turn/completed',

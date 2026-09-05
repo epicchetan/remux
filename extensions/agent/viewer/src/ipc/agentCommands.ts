@@ -63,6 +63,13 @@ export const agentCommands = {
       turnId,
     });
   },
+  interruptExecution(conversationId: string, executionId: string) {
+    return rpc.command(NATIVE_AGENT_METHODS.executionInterrupt, {
+      commandId: createViewerUuid(),
+      conversationId,
+      executionId,
+    });
+  },
   renameConversation(conversationId: string, expectedMetadataRevision: number, title: string) {
     return rpc.command<{ accepted: true; metadataRevision: number }>(
       NATIVE_AGENT_METHODS.conversationRename,

@@ -229,7 +229,7 @@ export function projectNativeChildExecutionScope(
     startedAt,
     completedAt,
     durationMs: completedAt === null ? null : Math.max(0, completedAt - startedAt),
-    boundary: 'Federated provider session',
+    boundary: 'Subagent session',
     inferenceOrder: inferences.map(({ id }) => id),
     inferences,
     window: {
@@ -594,7 +594,7 @@ function projectOrderedChild(block: NativeOrderedTurnBlock): AgentToolCallSummar
     detailPreview: block.payload.summary ?? null,
     outputPreview: block.payload.summary ?? null,
     durationMs: blockDuration(block),
-    childScopeId: child.ownership === 'federated' ? nativeFederatedScopeId(child.executionId) : null,
+    childScopeId: nativeExecutionScopeId(child.executionId),
     childBoundary: child.ownership,
     childState,
     childDurationMs: blockDuration(block),
@@ -731,9 +731,7 @@ function nativeCalls(turn: NativeAgentTurnFrame): AgentToolCallSummary[] {
       detailPreview: child.summary ?? null,
       outputPreview: child.summary ?? null,
       durationMs: null,
-      childScopeId: child.ownership === 'federated'
-        ? nativeFederatedScopeId(child.executionId)
-        : null,
+      childScopeId: nativeExecutionScopeId(child.executionId),
       childBoundary: child.ownership,
       childState: child.state === 'running' || child.state === 'recovering'
         ? 'running'
@@ -747,11 +745,14 @@ function nativeCalls(turn: NativeAgentTurnFrame): AgentToolCallSummary[] {
   ];
 }
 
-export function nativeFederatedScopeId(executionId: string) {
-  return `federated:${executionId}`;
+export function nativeExecutionScopeId(executionId: string) {
+  return `execution:${executionId}`;
 }
 
-export function nativeFederatedExecutionId(scopeId: string) {
+export function nativeExecutionId(scopeId: string) {
+  if (scopeId.startsWith('execution:')) return scopeId.slice('execution:'.length);
+  // Read legacy in-memory/cache keys across a viewer-only reload. New
+  // projections always author the provider-neutral execution scope.
   return scopeId.startsWith('federated:') ? scopeId.slice('federated:'.length) : null;
 }
 

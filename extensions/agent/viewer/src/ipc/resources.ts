@@ -17,11 +17,13 @@ export type NativeAgentResourceReadUpdate = {
 
 export class AgentResourceReader {
   private readonly revisions = new Map<NativeAgentResourceKey, number>();
+  private readonly values = new Map<NativeAgentResourceKey, NativeAgentResourceValue>();
   private generation: string | null = null;
   private capabilityRevision: string | null = null;
 
   clear() {
     this.revisions.clear();
+    this.values.clear();
     this.generation = null;
     this.capabilityRevision = null;
   }
@@ -41,6 +43,7 @@ export class AgentResourceReader {
       this.capabilityRevision !== result.capabilityRevision;
     if (generationChanged || capabilitiesChanged) {
       this.revisions.clear();
+      this.values.clear();
       return this.apply(await this.request(keys, options, false), generationChanged);
     }
     return this.apply(result, false);
@@ -83,11 +86,14 @@ export class AgentResourceReader {
     for (const resource of result.resources) {
       if (resource.status === 'missing') {
         this.revisions.delete(resource.key);
+        this.values.delete(resource.key);
         missing.push(resource.key);
         continue;
       }
       this.revisions.set(resource.key, resource.revision);
-      if (resource.status === 'ok') values.set(resource.key, resource.value);
+      if (resource.status === 'ok') this.values.set(resource.key, resource.value);
+      const value = resource.status === 'ok' ? resource.value : this.values.get(resource.key);
+      if (value !== undefined) values.set(resource.key, value);
     }
     return {
       capabilityRevision: result.capabilityRevision,
