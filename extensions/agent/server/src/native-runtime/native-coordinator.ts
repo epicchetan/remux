@@ -407,7 +407,9 @@ export class NativeAgentCoordinator {
     // not depend on opening the Agents view.
     const unresolvedNativeChildren = this.journal.executionsForAllConversations()
       .filter((execution) => execution.ownership === 'native' &&
-        (execution.state === 'running' || execution.state === 'recovering'));
+        (execution.state === 'running' || execution.state === 'recovering' ||
+          this.journal.turnsForExecution(execution.executionId).some((turn) =>
+            turn.state === 'running' || turn.state === 'recovering')));
     for (let offset = 0; offset < unresolvedNativeChildren.length; offset += 4) {
       await Promise.allSettled(unresolvedNativeChildren.slice(offset, offset + 4)
         .map((execution) => this.synchronizeNativeChildHistory(execution.executionId)));
@@ -2973,7 +2975,9 @@ export class NativeAgentCoordinator {
     if (this.closed) return;
     const execution = this.journal.execution(executionId);
     if (!execution || execution.ownership !== 'native') return;
-    const unfinished = execution.state === 'running' || execution.state === 'recovering';
+    const unfinished = execution.state === 'running' || execution.state === 'recovering' ||
+      this.journal.turnsForExecution(executionId).some((turn) =>
+        turn.state === 'running' || turn.state === 'recovering');
     if (!unfinished && this.journal.turnsForExecution(executionId).length > 0) return;
     const capabilities = this.requireCapabilities(execution.providerInstanceId);
     if (capabilities.collaboration.childTranscript === 'none') return;

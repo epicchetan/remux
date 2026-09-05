@@ -197,6 +197,15 @@ test('accepted child Stop settles from its snapshot when every live terminal is 
         : { type: 'turn.started' },
     });
     journal.appendProviderEvent(envelope(false));
+    // A parent snapshot can settle its child card before the child's own
+    // terminal turn is observed. The unfinished assignment still requires
+    // recovery from the child thread.
+    journal.database.prepare(`
+      UPDATE executions SET state = 'idle', outcome = 'completed', completed_at = ?, updated_at = ?
+      WHERE execution_id = ?
+    `).run(Date.now(), Date.now(), childExecutionId);
+    assert.equal(journal.execution(childExecutionId)?.state, 'idle');
+    assert.equal(journal.turn(childTurnId)?.state, 'running');
     const session = adapter.opened[0]! as typeof adapter.opened[0] & {
       snapshotChild?: (input: unknown) => Promise<unknown>;
     };
@@ -210,6 +219,13 @@ test('accepted child Stop settles from its snapshot when every live terminal is 
         coverage: { turnBlocks: { completeKinds: [] } },
       };
     };
+    const internals = coordinator as unknown as {
+      synchronizeNativeChildHistory(executionId: string): Promise<void>;
+    };
+    await assert.rejects(() => internals.synchronizeNativeChildHistory(childExecutionId),
+      /temporarily unavailable/u);
+    assert.equal(journal.execution(childExecutionId)?.state, 'recovering',
+      'unfinished child turn overrides the completed parent-card projection');
     await coordinator.interruptExecution({
       commandId: 'missed-child-stop', conversationId: created.conversationId, executionId: childExecutionId,
     });
