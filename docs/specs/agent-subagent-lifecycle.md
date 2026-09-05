@@ -28,29 +28,28 @@ Queued messages survive and must not auto-start as a side effect of Stop.
 
 ## Presentation
 
-Replace child transcript dropdowns with one conversation activity row immediately
-above the composer, outside virtualized transcript content. The Agents button
-remains permanently available; the row opens the same Agents view. One agent
-entry contains successive assignments. Historical agents remain accessible.
+The existing Agents button beside the composer preferences/menu carries a small
+corner activity badge. It opens the Agents view and stays available for history
+when idle. There is no additional activity row above the composer and no child
+transcript dropdown in Work. One agent entry contains successive assignments.
 
-| Situation | Row |
+| Situation | Composer button |
 | --- | --- |
-| No active/unresolved agents | Hidden |
-| Confirmed active agents | N subagents running (singular for one) |
-| Some finish or an existing agent receives follow-up | Update same row/count; unique agent identities |
-| Parent finishes while children work | Remains visible |
-| Stop pending, including root already terminal | Stopping N subagents… |
-| All targets terminal | Hidden |
-| Reconnecting/unverified work | Checking subagents… |
-| Mixed visibility | N running · M checking |
-| Reconciliation/Stop fails | Status unavailable / Couldn't stop N subagents; detail in Agents view |
+| No active/unresolved agents | Normal Agents button, no badge |
+| Confirmed active agents | Subtle activity badge; accessible label/title reports N running |
+| Some finish or an existing agent receives follow-up | Update the same badge/label using unique agent identities |
+| Parent finishes while children work | Badge remains active |
+| Stop pending, including root already terminal | Stopping badge; label/title reports N stopping |
+| All targets terminal | Badge disappears; button remains |
+| Reconnecting/unverified work | Checking indicator, no claim that cached counts are confirmed running |
+| Mixed visibility | Label/title reports running/checking counts |
+| Reconciliation/Stop fails | Distinct warning indicator; explanation in label/title and Agents details |
 | Conversation switch | Only selected conversation state |
 
-One fixed-height slot prevents count/label changes resizing it. Narrow labels
-truncate. Appearance/disappearance preserves reading position or bottom-follow;
-no overlap with composer/keyboard/last message, no historical turn-height changes.
-Navigation preserves scroll; refresh does not flash the row or show stale counts
-from another conversation. Root-only activity remains existing Thinking behavior.
+The badge overlays the existing icon and never changes button, composer or
+transcript dimensions. It does not add a focus target or block navigation. Honor
+reduced-motion preferences. Opening Agents and returning preserves the reading
+anchor. Root-only activity remains the existing Thinking behavior.
 
 ## Checkpoints and ownership
 
@@ -72,14 +71,14 @@ single incident. Validate on a copy; idempotent audited repair; retain diagnosti
 events, genuine turns/descendants and ambiguous cases. Reconcile real stale work
 using native evidence, not age, naming or CPU usage.
 
-C. Viewer: after A's resource contract settles, Sol writer owns activity row,
+C. Viewer: after A's resource contract settles, Sol writer owns composer activity badge,
 Agents view integration and viewer tests. Remove subagent dropdown presentation;
 reuse existing navigation/transcript components. No virtualizer rewrite.
 
 Essential tests: spawn/message/follow-up identity; old terminal/replayed starts;
 restart root+child then Stop; missed terminal reconciles without Agents view;
 parent settles first; child interrupt error; Stop survives restart and preserves
-queue; bottom-row geometry/navigation/count/visibility desktop and mobile.
+queue; composer-badge geometry/navigation/state/visibility desktop and mobile.
 
 ## Evidence and progress
 
@@ -109,7 +108,7 @@ passed; the dropped-terminal test additionally covers retry during a newer child
 assignment with only one native interrupt. Browser and live acceptance are recorded below. Server/viewer protocol changes
 ship together.
 
-C reviewed: one fixed-height visible activity row; an empty slot collapses so
+Original C acceptance (superseded by the composer-badge revision below): one fixed-height visible activity row; an empty slot collapses so
 short mobile tails retain their geometry. Agents overlays the full main pane
 while the hidden transcript retains its reading anchor. Disconnected counts
 show Checking; connected unresolved reads show Status unavailable; root-only
@@ -183,3 +182,22 @@ replay regression), 7882bfc (unfinished assignment reconciliation). All are on
 main and pushed. These checkpoints complete this subagent slice, not S2a1 or
 the broader audit. Original-device testing and live Claude threshold crossing
 remain outside the acceptance claimed here.
+
+
+Composer-badge revision (user requested after initial deployment): replace the
+separate activity row with a small badge on the existing Agents button beside
+the composer menu. The lifecycle and Stop contracts are unchanged. Sol owns the
+bounded viewer/test update; primary reviews, updates this contract, commits,
+builds and verifies the deployed viewer. A 7px decorative corner dot pulses for
+running work, is gray while checking, amber while stopping, hollow amber when
+status is unavailable, and red for Stop errors. The button accessible name and
+native title carry the count/status; reduced-motion disables the pulse. Idle
+removes only the badge. The obsolete row/component/styles are removed.
+
+Revision acceptance: affected desktop/mobile navigation, lifecycle, duration and
+geometry checks passed 19 with one expected desktop skip. The updated lifecycle
+suite then passed 8/8 including reduced motion. Root typecheck and the viewer
+production build passed. Live desktop/mobile verification is recorded in
+`/tmp/remux-audit-implementation/subagent-validation/badge-live.json`. This is a
+viewer-only revision served by the running host; no database migration or agent
+session restart is required.

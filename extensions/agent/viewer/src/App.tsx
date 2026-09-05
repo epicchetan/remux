@@ -40,7 +40,6 @@ import { viewerModelId } from './nativeViewModel.ts';
 import { useComposerViewport } from './app/useComposerViewport.ts';
 import { useAgentResources } from './app/useAgentResources.ts';
 import { AgentExecutionsView } from './agents/AgentExecutionsView.tsx';
-import { SubagentActivityRow } from './agents/SubagentActivityRow.tsx';
 import { useAgentExecutions } from './agents/useAgentExecutions.ts';
 import { readInitialTarget, useAgentNavigation } from './app/useAgentNavigation.ts';
 import { useConversationActions } from './app/useConversationActions.ts';
@@ -710,18 +709,8 @@ export function App() {
           </div>
         </div>
         <div className={agentsOpen ? 'remux-bottom-bar-slot is-hidden' : 'remux-bottom-bar-slot'} ref={bottomBarSlotRef}>
-          {conversation ? <div className="remux-subagent-activity-slot">
-            <SubagentActivityRow
-              connected={connectionStatus.type === 'connected'}
-              lifecycle={nativeRuntime && nativeRuntime.conversationId === conversation.id
-                ? nativeRuntime.lifecycle ?? null : null}
-              onOpen={() => {
-                blurComposer();
-                setAgentsOpen(true);
-              }}
-            />
-          </div> : null}
           <ComposerContent
+            connected={connectionStatus.type === 'connected'}
             childExecutionCount={agentExecutions.executions.length}
             conversation={conversation}
             conversationSelected={Boolean(activeConversationId)}

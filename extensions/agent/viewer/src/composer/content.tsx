@@ -21,6 +21,7 @@ import { useComposerStore } from './store.ts';
 import type { ComposerEditTarget, ComposerForkTarget } from './store.ts';
 
 export function ComposerContent({
+  connected,
   conversation,
   conversationSelected,
   childExecutionCount,
@@ -41,6 +42,7 @@ export function ComposerContent({
   runtimeError,
   queue,
 }: {
+  connected: boolean;
   conversation: ConversationValue | null;
   conversationSelected: boolean;
   childExecutionCount: number;
@@ -120,10 +122,12 @@ export function ComposerContent({
         ) : null}
         <ComposerLexicalInput hidden={pickerOpen} />
         <ComposerActionButtons
+          connected={connected}
           canStart={Boolean((conversation
             ? runtime?.conversationId === conversation.id
             : !conversationSelected && cwd && modelId && providerInstanceId) && !loading && historyReady)}
           conversationExists={conversationSelected}
+          conversationId={conversation?.id ?? null}
           childExecutionCount={childExecutionCount}
           isWorking={working}
           interruptible={interruptible}

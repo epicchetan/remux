@@ -119,7 +119,7 @@ test('opens a native subagent transcript and stops the child without a child com
   await messageBox(page).fill('Please interrupt after showing live activity');
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
 
-  await page.getByRole('button', { name: 'View 1 subagent', exact: true }).click();
+  await page.getByRole('button', { name: /^View 1 subagent/u }).click();
   await expect(page.getByRole('heading', { name: 'Agents', exact: true })).toBeVisible();
   await expect(page.getByText('1 subagent', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: /Native subagent/u }).click();
@@ -689,16 +689,16 @@ test('keeps the compact Remux composer inside the Agent transcript material', as
   }
 });
 
-test('keeps duration in the work header and subagent activity row stable while work settles', async ({ page }) => {
+test('keeps duration in the work header and subagent activity badge stable while work settles', async ({ page }) => {
   await messageBox(page).fill('Please interrupt after showing live activity');
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
 
   const workHeader = page.locator('.codex-work-header');
   await expect(workHeader).toContainText(/^Working for \S+$/u);
   await expect(workHeader.getByRole('status')).toHaveCount(0);
-  const activity = page.locator('.remux-subagent-activity');
-  await expect(activity).toContainText('1 subagent running');
-  await expect(activity).toHaveCSS('height', '36px');
+  const activity = page.locator('.remux-subagent-badge');
+  await expect(page.locator('.remux-composer-agents-button')).toHaveAttribute('aria-label', /1 subagent running/u);
+  await expect(activity).toHaveCSS('height', '7px');
   const runningHeight = await workHeader.evaluate((element) => element.getBoundingClientRect().height);
   await expect(page.getByRole('status', { name: 'Thinking' })).toHaveCount(0);
 

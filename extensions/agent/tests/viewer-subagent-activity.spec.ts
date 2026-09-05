@@ -7,32 +7,37 @@ test.beforeEach(async ({ page }) => {
   await page.goto(conversationUrl('&fixtureLong=1'));
 });
 
-test('renders authoritative subagent lifecycle copy in one fixed-height row', async ({ page }) => {
-  const row = page.locator('.remux-subagent-activity');
+test('renders authoritative subagent lifecycle state in one fixed-size Agents badge', async ({ page }) => {
+  const badge = page.locator('.remux-subagent-badge');
   await setLifecycle(page, { state: 'running', runningCount: 1 });
-  await expect(row).toHaveText(/1 subagent running/u);
-  await expect.poll(() => row.evaluate((node) => node.getBoundingClientRect().height)).toBe(36);
+  await expect(page.locator('.remux-composer-agents-button')).toHaveAttribute('aria-label', /1 subagent running/u);
+  await expect(badge).toHaveCSS('height', '7px');
+  await expect(badge).toHaveCSS('animation-name', 'remux-subagent-badge-pulse');
+  await expect(page.locator('.remux-composer-agents-button')).toHaveAttribute('title', '1 subagent running');
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await expect(badge).toHaveCSS('animation-name', 'none');
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
 
   await setLifecycle(page, { state: 'running', runningCount: 2, checkingCount: 1 });
-  await expect(row).toContainText('2 subagents running · 1 checking');
-  await expect.poll(() => row.evaluate((node) => node.getBoundingClientRect().height)).toBe(36);
+  await expect(page.locator('.remux-composer-agents-button')).toHaveAttribute('aria-label', /2 subagents running · 1 checking/u);
+  await expect(badge).toHaveCSS('height', '7px');
 
   await setLifecycle(page, { state: 'checking', checkingCount: 1 });
-  await expect(row).toContainText('Checking subagents…');
+  await expect(page.locator('.remux-composer-agents-button')).toHaveAttribute('aria-label', /Checking subagents…/u);
   await setLifecycle(page, { state: 'stopping', stoppingCount: 2, stopRequested: true });
-  await expect(row).toContainText('Stopping 2 subagents…');
+  await expect(page.locator('.remux-composer-agents-button')).toHaveAttribute('aria-label', /Stopping 2 subagents…/u);
   await setLifecycle(page, { state: 'unavailable', checkingCount: 1 });
-  await expect(row).toContainText('Subagent status unavailable');
+  await expect(page.locator('.remux-composer-agents-button')).toHaveAttribute('aria-label', /Subagent status unavailable/u);
   await setLifecycle(page, { state: 'idle', stopErrorCount: 2 });
-  await expect(row).toContainText('Couldn’t stop 2 subagents');
+  await expect(page.locator('.remux-composer-agents-button')).toHaveAttribute('aria-label', /Couldn’t stop 2 subagents/u);
   await setLifecycle(page, { state: 'idle' });
-  await expect(row).toHaveCount(0);
+  await expect(badge).toHaveCount(0);
 });
 
 test('shows checking while disconnected and stops children when the root is idle', async ({ page }) => {
   await setLifecycle(page, { state: 'running', runningCount: 1 });
   await page.evaluate(() => (window as any).__agentFixture.connection('reconnecting'));
-  await expect(page.locator('.remux-subagent-activity')).toContainText('Checking subagents…');
+  await expect(page.locator('.remux-composer-agents-button')).toHaveAttribute('aria-label', /Checking subagents…/u);
   await page.evaluate(() => (window as any).__agentFixture.connection('connected'));
   await expect(page.getByRole('button', { name: 'Stop turn', exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Stop turn', exact: true }).click();
@@ -51,7 +56,7 @@ test('preserves reading anchors, bottom follow, and Agents return position', asy
   await setLifecycle(page, { state: 'running', runningCount: 1 });
   await expect.poll(async () => Math.abs(await anchorTop(page, before.id) - before.top)).toBeLessThanOrEqual(2);
 
-  await page.locator('.remux-subagent-activity').click();
+  await page.locator('.remux-composer-agents-button').click();
   await expect(page.getByRole('heading', { name: 'Agents', exact: true })).toBeVisible();
   await expect.poll(() => page.evaluate(() => {
     const main = document.querySelector<HTMLElement>('.remux-main-pane')!.getBoundingClientRect();
@@ -69,7 +74,7 @@ test('preserves reading anchors, bottom follow, and Agents return position', asy
 
 test('does not flash lifecycle counts across conversation switches', async ({ page }) => {
   await setLifecycle(page, { state: 'running', runningCount: 3 });
-  await expect(page.locator('.remux-subagent-activity')).toContainText('3 subagents running');
+  await expect(page.locator('.remux-composer-agents-button')).toHaveAttribute('aria-label', /3 subagents running/u);
   await page.evaluate((id) => {
     const fixture = (window as any).__agentFixture;
     fixture.addConversation({ id, title: 'Quiet conversation' });
@@ -78,7 +83,7 @@ test('does not flash lifecycle counts across conversation switches', async ({ pa
   }, FIXTURE_SECOND_CONVERSATION_ID);
   await expect.poll(() => new URL(page.url()).searchParams.get('remuxResourceId'))
     .toBe(FIXTURE_SECOND_CONVERSATION_ID);
-  await expect(page.locator('.remux-subagent-activity')).toHaveCount(0);
+  await expect(page.locator('.remux-subagent-badge')).toHaveCount(0);
 });
 
 async function setLifecycle(page: Page, lifecycle: Record<string, unknown>) {

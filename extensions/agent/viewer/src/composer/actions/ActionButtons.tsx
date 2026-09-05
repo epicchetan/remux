@@ -17,9 +17,11 @@ import type { ComposerEditTarget, ComposerForkTarget } from '../store.ts';
 
 export function ComposerActionButtons({
   canStart,
+  connected,
   compactEnabled,
   childExecutionCount,
   conversationExists,
+  conversationId,
   isWorking,
   interruptible,
   onInterrupt,
@@ -36,9 +38,11 @@ export function ComposerActionButtons({
   runtime,
 }: {
   canStart: boolean;
+  connected: boolean;
   compactEnabled: boolean;
   childExecutionCount: number;
   conversationExists: boolean;
+  conversationId: string | null;
   isWorking: boolean;
   interruptible: boolean;
   onInterrupt: () => Promise<void>;
@@ -88,6 +92,7 @@ export function ComposerActionButtons({
     branchEnabled: runtime?.capabilities.session.forkNative === true,
   });
   const parent = parentDirectory(pickerPath);
+  const badgeLabel = subagentBadgeLabel(runtime, connected, conversationId);
 
   const left: ComposerAction[] = [{
     className: 'remux-composer-overview-button',
@@ -126,11 +131,21 @@ export function ComposerActionButtons({
         />
         {!pickerOpen && conversationExists ? <ComposerActionKey action={{
           className: 'remux-composer-agents-button',
-          icon: <Bot className="size-4" />,
-          label: childExecutionCount > 0
+          icon: <span className="remux-agents-icon">
+            <Bot className="size-4" />
+            {badgeLabel ? (
+              <span
+                aria-hidden="true"
+                className="remux-subagent-badge"
+                data-state={subagentBadgeState(runtime, connected, conversationId)}
+              />
+            ) : null}
+          </span>,
+          label: `${childExecutionCount > 0
             ? childExecutionCount === 1 ? 'View 1 subagent' : `View ${childExecutionCount} subagents`
-            : 'View agents',
+            : 'View agents'}${badgeLabel ? ` · ${badgeLabel}` : ''}`,
           onClick: onOpenAgents,
+          title: badgeLabel ?? 'View agents',
         }} /> : null}
       </div>
       <div className="remux-composer-action-group remux-composer-action-group-right">
@@ -169,3 +184,41 @@ type ComposerBranchCallback<T> = (
   input: TurnSubmissionInput,
   setPhase: (phase: 'sending' | 'updating-transcript') => void,
 ) => Promise<void>;
+
+function subagentBadgeLabel(
+  runtime: AgentRuntimeResource | null,
+  connected: boolean,
+  conversationId: string | null,
+) {
+  if (!conversationId || runtime?.conversationId !== conversationId) return null;
+  const lifecycle = runtime?.lifecycle;
+  if (!lifecycle) return null;
+  const unresolved = lifecycle.runningCount + lifecycle.checkingCount + lifecycle.stoppingCount;
+  if (unresolved === 0 && lifecycle.stopErrorCount === 0) return null;
+  if (lifecycle.stopErrorCount > 0) {
+    return `Couldn’t stop ${lifecycle.stopErrorCount} ${lifecycle.stopErrorCount === 1 ? 'subagent' : 'subagents'}`;
+  }
+  if (!connected && unresolved > 0) return 'Checking subagents…';
+  if (lifecycle.state === 'unavailable') return 'Subagent status unavailable';
+  const parts = [
+    lifecycle.runningCount
+      ? `${lifecycle.runningCount} ${lifecycle.runningCount === 1 ? 'subagent' : 'subagents'} running` : '',
+    lifecycle.checkingCount
+      ? lifecycle.runningCount || lifecycle.stoppingCount
+        ? `${lifecycle.checkingCount} checking` : 'Checking subagents…' : '',
+    lifecycle.stoppingCount
+      ? `Stopping ${lifecycle.stoppingCount} ${lifecycle.stoppingCount === 1 ? 'subagent' : 'subagents'}…` : '',
+  ].filter(Boolean);
+  return parts.join(' · ');
+}
+
+function subagentBadgeState(
+  runtime: AgentRuntimeResource | null,
+  connected: boolean,
+  conversationId: string | null,
+) {
+  if (!conversationId || runtime?.conversationId !== conversationId || !runtime.lifecycle) return undefined;
+  if (runtime.lifecycle.stopErrorCount > 0) return 'error';
+  if (!connected) return 'checking';
+  return runtime.lifecycle.state;
+}

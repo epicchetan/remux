@@ -10,6 +10,7 @@ export type ComposerAction = {
   onClick?: () => void;
   preserveFocus?: boolean;
   tone?: 'default' | 'send';
+  title?: string;
 };
 
 export function ComposerActionKey({ action }: { action: ComposerAction }) {
@@ -49,6 +50,7 @@ export function ComposerActionKey({ action }: { action: ComposerAction }) {
         activateOnce();
       } : undefined}
       type="button"
+      title={action.title}
     >
       {action.icon}
     </button>

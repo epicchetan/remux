@@ -101,42 +101,49 @@
     margin-bottom: var(--remux-composer-lift, 0px);
   }
 
-  .remux-subagent-activity {
-    display: grid;
-    width: 100%;
-    height: 36px;
-    grid-template-columns: 18px minmax(0, 1fr) 18px;
-    align-items: center;
-    gap: 8px;
-    border: 0;
-    border-top: 1px solid var(--agent-border);
-    background: var(--agent-surface-raised);
-    color: var(--agent-text-muted);
-    padding: 0 max(var(--remux-feed-pad-x), 12px);
-    text-align: left;
+  .remux-agents-icon {
+    position: relative;
+    display: inline-flex;
   }
 
-  .remux-subagent-activity-slot {
-    width: 100%;
-    height: 36px;
+  .remux-subagent-badge {
+    position: absolute;
+    top: -3px;
+    right: -4px;
+    width: 7px;
+    height: 7px;
+    border: 1px solid var(--agent-canvas);
+    border-radius: 999px;
+    background: var(--agent-action);
   }
 
-  .remux-subagent-activity-slot:empty {
-    display: none;
+  .remux-subagent-badge[data-state='running'] {
+    animation: remux-subagent-badge-pulse 1.6s ease-in-out infinite;
   }
 
-  .remux-subagent-activity span {
-    overflow: hidden;
-    color: var(--agent-text);
-    font-size: 13px;
-    font-weight: 550;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+  .remux-subagent-badge[data-state='checking'] {
+    background: var(--agent-text-muted);
   }
 
-  .remux-subagent-activity[data-state='stopping'],
-  .remux-subagent-activity:has(.lucide-circle-alert) {
-    color: var(--destructive);
+  .remux-subagent-badge[data-state='unavailable'] {
+    background: transparent;
+    box-shadow: inset 0 0 0 1px var(--warning, #f59e0b);
+  }
+
+  .remux-subagent-badge[data-state='stopping'] {
+    background: var(--warning, #f59e0b);
+  }
+
+  .remux-subagent-badge[data-state='error'] {
+    background: var(--destructive);
+  }
+
+  @keyframes remux-subagent-badge-pulse {
+    50% { opacity: 0.38; transform: scale(0.82); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .remux-subagent-badge[data-state='running'] { animation: none; }
   }
 
   .remux-file-mention-overlay {
