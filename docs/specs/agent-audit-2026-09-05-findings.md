@@ -171,23 +171,23 @@ testing, but the earlier Node abort's attribution to that leak is unproven.
 
 ## Subsequent conversation incidents
 
-These rows supplement the audit and retain its original IDs unchanged. Evidence
-is recorded in remediation S0 and its reviewed slice records. I1–I4 fixes are in
-the shared working tree and verified locally. I3 includes copied-data repair
-acceptance; its live repair remains pending. I4 includes desktop/mobile browser
-geometry acceptance; the original device check remains pending. No manual live
-Claude threshold-crossing verification has been recorded. The later committed
-checkpoint was rebuilt/restarted with thread-preservation and desktop/mobile
-smoke checks; that did not establish Stop-after-recovery or child reconciliation.
+These rows supplement the audit and retain its original IDs unchanged. I1–I4
+were committed in the earlier checkpoint. No manual live Claude threshold-crossing
+verification has been recorded. The subagent lifecycle checkpoint applied I3's
+proven live repair and verified I5 with a real root+child restart/Stop canary.
+I6 includes proactive reconciliation and the replacement activity UI. I7 was
+found by that live canary and fixed before completing deployment. Evidence and
+remaining limits are in [the lifecycle spec](agent-subagent-lifecycle.md).
 
 | ID | Sev | Where | Finding | Planned disposition | Implementation status |
 | --- | --- | --- | --- | --- | --- |
 | I1 | P1 | `claude-adapter.ts`, `claude-context-usage.ts`, `native-journal.ts`, `native-projector.ts`, `UsageTray.tsx` | Summed per-turn input/cache counts overstated current context; child usage could overwrite the root meter. Native auto-compaction was disabled. User requested a default 300k native compaction policy with actual model capacity kept distinct. | S0 preserve/review current fix; A10 separately reassesses capability declarations. | verified locally; live check pending |
 | I2 | P1 | `native-journal.ts`, `StatusMessageRow.tsx` | Provider events before durable admission moved materialized timestamps before creation; ingestion and later history replay hit `updated_at >= created_at` even though the answer completed. | S0 preserve/review monotonic timestamps and history-error labeling; S2 retains admission-race scenarios. | verified locally; live check pending |
-| I3 | P1 | `codex-event-mapper.ts:828`, `:864`, `:1125`, `nativeTranscriptViewModel.ts:597`, `useAgentExecutions.ts:62` | Activity and child-thread notifications use different turn-ID forms and create two blocks for one child; completed activity remains running; a child's message to its parent creates a phantom descendant. Shared disclosure keys expose both duplicate blocks as the same dropdown. | S0a priority slice; overlaps C4/A1/A5, adds event-semantics/parentage regression coverage and scoped existing-data repair. | verified locally; runtime and copied-data repair reviewed, live application/device check pending |
+| I3 | P1 | `codex-event-mapper.ts:828`, `:864`, `:1125`, `nativeTranscriptViewModel.ts:597`, `useAgentExecutions.ts:62` | Activity and child-thread notifications use different turn-ID forms and create two blocks for one child; completed activity remains running; a child's message to its parent creates a phantom descendant. Shared disclosure keys expose both duplicate blocks as the same dropdown. | S0a priority slice; overlaps C4/A1/A5, adds event-semantics/parentage regression coverage and scoped existing-data repair. | committed and deployed; copied and live repair preserved turns/events; desktop/mobile browser navigation passed; original device check not repeated |
 | I4 | P1 | `TranscriptViewportBody.tsx:76`, `layout/measureCollapsed.ts:124`, `geometry/geometryIndex.ts:49`, `viewer.spec.ts:478` | Terminal error banner and per-turn projection-retry control render outside measured rows; virtual height and later turn positions omit their normal-flow height. Existing error test checks visibility, not geometry. | S0b priority slice; explicit measured client display rows/footer, cache invalidation, desktop/mobile navigation/anchor regression tests. Does not require deferred T5/T6 rewrite. | verified locally; primary review and full viewer integration, live/device check pending |
-| I5 | P1 | `codex-adapter.ts:683`, `:752`, `native-coordinator.ts:3408` | Resume passes a durable active-turn binding but the adapter does not restore its control field; Stop and steer reject while the native turn continues. Child active attempts also need restoration and exact-target Stop. | [Subagent lifecycle checkpoint A](agent-subagent-lifecycle.md); overlaps C2/R7. | implementation in progress |
-| I6 | P1 | `native-coordinator.ts:2702`, `codex-child-registry.ts`, `AgentExecutionsView.tsx` | Child history sync returns when any turn exists, so missed terminal evidence leaves real children running. Ten historical interaction-created phantoms also remain in the live journal. | [Subagent lifecycle A/B/C](agent-subagent-lifecycle.md): autonomous reconciliation, proven repair, shared lifecycle projection and stable bottom activity row. | implementation in progress |
+| I5 | P1 | `codex-adapter.ts:683`, `:752`, `native-coordinator.ts:3408` | Resume passes a durable active-turn binding but the adapter does not restore its control field; Stop and steer reject while the native turn continues. Child active attempts also need restoration and exact-target Stop. | [Subagent lifecycle checkpoint A](agent-subagent-lifecycle.md); overlaps C2/R7. | committed and deployed; root+child interrupted through conversation Stop after restart, native states confirmed |
+| I6 | P1 | `native-coordinator.ts:2702`, `codex-child-registry.ts`, `AgentExecutionsView.tsx` | Child history sync returns when any turn exists, so missed terminal evidence leaves real children running. Ten historical interaction-created phantoms also remain in the live journal. | [Subagent lifecycle A/B/C](agent-subagent-lifecycle.md): autonomous reconciliation, proven repair, shared lifecycle projection and stable bottom activity row. | committed and deployed; real stale child reconciled and ten proven phantoms repaired; assignment-level reconciliation acceptance in lifecycle spec |
+| I7 | P1 | `native-journal.ts:mergedSnapshotBlockEvents` | Two authoritative snapshot paths bypass ordinal normalization; replay can collide on a pass/block ordinal and fail recovery. | Lifecycle checkpoint A follow-up: use the existing deterministic allocator for every snapshot path; duplicate-ordinal regression. | committed and deployed; 278 server tests; repeated live restart and root+child Stop passed |
 
 I1 evidence: [request accounting tests](../../extensions/agent/tests/claude-context-usage.test.ts),
 Claude adapter root/child and compaction coverage, journal root/legacy-context
@@ -223,9 +223,9 @@ passes 159 tests with three existing platform skips. Live/device check pending.
 | Existing decisions retained; docs corrections planned | 3 (V5, V8, V9) |
 | Deferred with reason | 5 (J7, T5, T6, T8, H11) |
 | Original audit total | 84 |
-| Subsequent incident rows, locally verified; live acceptance pending | 4 (I1–I4) |
+| Subsequent incident rows; acceptance recorded individually | 7 (I1–I7) |
 | Reproduced implementation-stage findings | 1 (A13) |
-| Total tracked rows | 89 |
+| Total tracked rows | 92 |
 
 Deferral revisit conditions are in the remediation spec's Out of scope section.
 Update implementation statuses and evidence per reviewed slice, not by changing

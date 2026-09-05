@@ -1,6 +1,7 @@
 # Durable subagent lifecycle and activity
 
-Status: approved in chat; implementation in progress. Broader audit remediation remains paused.
+Status: implemented, committed and deployed; local and live acceptance recorded below.
+Broader audit remediation remains paused.
 
 ## Contract
 
@@ -87,15 +88,14 @@ checkpoint. Live read found ten old phantom grandchildren with child/interacted
 evidence and no native handles/own turns. Real child implement_s2a1_acceptance
 is interrupted in native history but running in Remux. Root activeTurnBinding
 is passed by coordinator but ignored by CodexProviderSession; child history
-sync returns early whenever any turn exists. Checkpoints A/B/C pending.
+sync returns early whenever any turn exists. This paragraph records the pre-implementation baseline.
 
 Repair helper review: four focused tests pass. Applied v2 repair to a consistent
 live schema-15 copy: ten proven phantom executions and 22 projected blocks
 removed, 22 archived block IDs suppressed for replay. All event/turn rows and
 all other tables except the intended execution/block/audit changes retain exact
 ordered-row hashes; foreign-key check empty and quick_check ok. Evidence under
-`/tmp/remux-audit-implementation/subagent-validation/`. Live application waits
-for A's replay suppression integration and reviewed build/restart.
+`/tmp/remux-audit-implementation/subagent-validation/`. Live application subsequently passed, as recorded below.
 
 A reviewed: protocol 10 exposes runtime and execution lifecycle; schema 16 adds
 Stop intents/assignment targets and nullable executions.lifecycle_error. Accepted
@@ -106,8 +106,8 @@ is not native terminal proof. Child reads and Stop processing are coalesced;
 resource invalidations cover timer outcomes. Stop's queue pause survives settlement
 until the next deliberate send. The full server suite passed 277/277 and typecheck
 passed; the dropped-terminal test additionally covers retry during a newer child
-assignment with only one native interrupt. Full browser acceptance and live
-deployment remain pending. Server/viewer protocol changes ship together.
+assignment with only one native interrupt. Browser and live acceptance are recorded below. Server/viewer protocol changes
+ship together.
 
 C reviewed: one fixed-height visible activity row; an empty slot collapses so
 short mobile tails retain their geometry. Agents overlays the full main pane
@@ -124,4 +124,62 @@ viewer-tests.log is the pre-fix failing run. Server and viewer builds passed.
 Final copied migration verification includes nullable executions.lifecycle_error;
 all original columns of all 31 preexisting tables retain exact ordered-row hashes,
 the two Stop tables are empty, foreign keys pass, and repaired block replay stays
-suppressed across 22 affected turns. Live deployment and canary checks pending.
+suppressed across 22 affected turns. Live migration subsequently passed, as recorded below.
+
+
+Live deployment, 2026-09-05: schema 16 and the v2 phantom repair applied while
+Agent was stopped, after the automatic pre-migration backup. Removed ten proven
+phantom executions and 22 projected blocks; retained all 587 turns and 127,222
+journal events. Foreign keys and quick_check passed. The native Codex daemon
+remained running. The current thread preserved all 67 baseline turn IDs and user
+content hashes, its native session, root, and active strand/revision; a later
+native child hydration accounts for the 68th turn. The historical real stale
+child implement_s2a1_acceptance now projects interrupted from native evidence.
+
+The first isolated canary exposed I7: authoritative snapshot replay skipped the
+existing ordinal allocator on two early-return paths. The reviewed fix always
+normalizes per-pass block ordinals; a regression starts with two blocks proposing
+ordinal zero. Server suite 278/278, typecheck and production builds passed. That
+test conversation was reopened with an audited, test-only projection reset after
+independent native reads proved both agents completed; no user thread was reset.
+
+The second live canary (conversation 010f3e50-e000-4cc0-b671-d2353d46d91b) had an
+active root and one child when Agent restarted. Conversation Stop, invoked while
+the root was recovering, interrupted both exact native turns. Intent
+227bfb16-aaeb-478b-9f43-b9b8543d0891 settled with two terminal targets and no errors;
+queue_paused remained 1. Independent daemon thread/read confirmed both native
+turns interrupted. Runtime returned idle with all child counts zero. Evidence:
+`/tmp/remux-audit-implementation/subagent-validation/live-canary-stop.json` and
+`live-canary-native.jsonl`. Desktop/mobile live browser checks passed without new
+alerts, JavaScript errors or horizontal overflow; Agents opens and returns to the
+retained transcript. Native phone interaction was not repeated.
+
+
+Final assignment reconciliation checkpoint: a completed parent-side child card
+can coexist with an unfinished child assignment. Startup and child-history reads
+now check both execution status and durable assignment status. The regression
+covers an unavailable initial read followed by authoritative completion through
+the Stop watchdog. The final server suite passed 278/278, typecheck and both
+production builds passed. The viewer remains at 187 passed / three platform
+skips; subsequent changes were server-only.
+
+After deploying 7882bfc, startup reconciled the first canary's child turn to
+completed and settled its previously failed Stop intent without an Agents read.
+The second canary remained interrupted/idle with its settled intent and paused
+queue across another restart. Both isolated test conversations were then archived
+through the normal API after confirming idle lifecycle, retaining their diagnostic
+history. Agent PID 1513481 started at 23:31:09 UTC. This
+thread remains healthy on the original native session, root and strand; all 67
+baseline user-content hashes/turn IDs remain unchanged. There are now 82 turns
+because startup hydrated additional previously unfinished child assignments.
+No historical user turn was replaced. Checkpoint evidence is under
+`/tmp/remux-audit-implementation/subagent-validation/`; pre-migration backups
+remain under the native data root and archived copied-validation backups retain
+verified uncompressed SHA-256 hashes.
+
+Implementation commits: 685c0be (contract), f122d26 (proven repair), b463931
+(durable lifecycle/Stop), 2ed4784 (activity UI), 0cc5b7b and 6e6a1c5 (snapshot
+replay regression), 7882bfc (unfinished assignment reconciliation). All are on
+main and pushed. These checkpoints complete this subagent slice, not S2a1 or
+the broader audit. Original-device testing and live Claude threshold crossing
+remain outside the acceptance claimed here.

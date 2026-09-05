@@ -14,10 +14,10 @@ Amends: [agent-state-authority-and-synchronization-v1.md](agent-state-authority-
 
 ## User-directed checkpoint and restart
 
-Current priority: the user has approved [durable subagent lifecycle and activity](agent-subagent-lifecycle.md).
-Implement its A/B/C checkpoints before resuming the broader audit. The pause and
-restart account below records the previous checkpoint, not a prohibition on this
-newly authorized work.
+Completed priority: [durable subagent lifecycle and activity](agent-subagent-lifecycle.md)
+A/B/C checkpoints are committed, pushed and deployed with live root+child
+restart/Stop acceptance. The broader audit remains paused. The account below
+records the previous checkpoint; it is not the current subagent implementation status.
 
 Implementation is paused at the user's request. Commit the accumulated work on
 main, push it, build the Agent server and viewer, and perform a controlled
