@@ -176,7 +176,9 @@ is recorded in remediation S0 and its reviewed slice records. I1–I4 fixes are 
 the shared working tree and verified locally. I3 includes copied-data repair
 acceptance; its live repair remains pending. I4 includes desktop/mobile browser
 geometry acceptance; the original device check remains pending. No manual live
-server restart or Claude threshold-crossing verification has been recorded.
+Claude threshold-crossing verification has been recorded. The later committed
+checkpoint was rebuilt/restarted with thread-preservation and desktop/mobile
+smoke checks; that did not establish Stop-after-recovery or child reconciliation.
 
 | ID | Sev | Where | Finding | Planned disposition | Implementation status |
 | --- | --- | --- | --- | --- | --- |
@@ -184,6 +186,8 @@ server restart or Claude threshold-crossing verification has been recorded.
 | I2 | P1 | `native-journal.ts`, `StatusMessageRow.tsx` | Provider events before durable admission moved materialized timestamps before creation; ingestion and later history replay hit `updated_at >= created_at` even though the answer completed. | S0 preserve/review monotonic timestamps and history-error labeling; S2 retains admission-race scenarios. | verified locally; live check pending |
 | I3 | P1 | `codex-event-mapper.ts:828`, `:864`, `:1125`, `nativeTranscriptViewModel.ts:597`, `useAgentExecutions.ts:62` | Activity and child-thread notifications use different turn-ID forms and create two blocks for one child; completed activity remains running; a child's message to its parent creates a phantom descendant. Shared disclosure keys expose both duplicate blocks as the same dropdown. | S0a priority slice; overlaps C4/A1/A5, adds event-semantics/parentage regression coverage and scoped existing-data repair. | verified locally; runtime and copied-data repair reviewed, live application/device check pending |
 | I4 | P1 | `TranscriptViewportBody.tsx:76`, `layout/measureCollapsed.ts:124`, `geometry/geometryIndex.ts:49`, `viewer.spec.ts:478` | Terminal error banner and per-turn projection-retry control render outside measured rows; virtual height and later turn positions omit their normal-flow height. Existing error test checks visibility, not geometry. | S0b priority slice; explicit measured client display rows/footer, cache invalidation, desktop/mobile navigation/anchor regression tests. Does not require deferred T5/T6 rewrite. | verified locally; primary review and full viewer integration, live/device check pending |
+| I5 | P1 | `codex-adapter.ts:683`, `:752`, `native-coordinator.ts:3408` | Resume passes a durable active-turn binding but the adapter does not restore its control field; Stop and steer reject while the native turn continues. Child active attempts also need restoration and exact-target Stop. | [Subagent lifecycle checkpoint A](agent-subagent-lifecycle.md); overlaps C2/R7. | implementation in progress |
+| I6 | P1 | `native-coordinator.ts:2702`, `codex-child-registry.ts`, `AgentExecutionsView.tsx` | Child history sync returns when any turn exists, so missed terminal evidence leaves real children running. Ten historical interaction-created phantoms also remain in the live journal. | [Subagent lifecycle A/B/C](agent-subagent-lifecycle.md): autonomous reconciliation, proven repair, shared lifecycle projection and stable bottom activity row. | implementation in progress |
 
 I1 evidence: [request accounting tests](../../extensions/agent/tests/claude-context-usage.test.ts),
 Claude adapter root/child and compaction coverage, journal root/legacy-context
