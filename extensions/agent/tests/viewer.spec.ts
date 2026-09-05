@@ -106,6 +106,11 @@ test('interrupts an active turn through the server command', async ({ page }) =>
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
   await page.getByRole('button', { name: 'Stop turn', exact: true }).click();
 
+  await expect.poll(() => commandCount(
+    page,
+    'remux/agent/conversation/interrupt',
+  )).toBe(1);
+
   await expect(page.locator('.codex-work-header')).toContainText(/^Worked for \S+$/u);
   await expect(page.getByRole('button', { name: 'Send message', exact: true })).toBeVisible();
 });
@@ -138,22 +143,14 @@ test('opens a native subagent transcript and stops the child without a child com
   await expect(page.getByRole('button', { name: 'Stop turn', exact: true })).toBeVisible();
 });
 
-test('keeps one completed native child disclosure and one execution entry', async ({ page }) => {
+test('keeps completed native children out of work and available in Agents', async ({ page }) => {
   await messageBox(page).fill('Complete the focused child review');
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
   await expect(page.getByText('The fixture stream completed.')).toBeVisible();
   await page.locator('.codex-work-header').click();
 
   const child = page.locator('.agent-child-execution');
-  const disclosure = child.locator('.agent-child-execution-header');
-  await expect(child).toHaveCount(1);
-  await expect(child).toHaveAttribute('data-state', 'completed');
-  await disclosure.click();
-  await expect(disclosure).toHaveAttribute('aria-expanded', 'true');
-  await expect(child.getByText('Compared the implementation with its contract.')).toBeVisible();
-  await disclosure.click();
-  await expect(disclosure).toHaveAttribute('aria-expanded', 'false');
-  await expect(child).toHaveCount(1);
+  await expect(child).toHaveCount(0);
 
   await page.getByRole('button', { name: 'View 1 subagent', exact: true }).click();
   await expect(page.getByText('1 subagent', { exact: true })).toBeVisible();
@@ -162,8 +159,7 @@ test('keeps one completed native child disclosure and one execution entry', asyn
   await expect(page.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: 'Back to agents' }).click();
   await page.getByRole('button', { name: 'Back to chat' }).click();
-  await expect(child).toHaveCount(1);
-  await expect(child).toHaveAttribute('data-state', 'completed');
+  await expect(child).toHaveCount(0);
 });
 
 test('renders signed-out device-code login and cancel state', async ({ page }) => {
@@ -693,43 +689,28 @@ test('keeps the compact Remux composer inside the Agent transcript material', as
   }
 });
 
-test('keeps duration in the work header and live rows stable while their shimmer settles', async ({ page }) => {
+test('keeps duration in the work header and subagent activity row stable while work settles', async ({ page }) => {
   await messageBox(page).fill('Please interrupt after showing live activity');
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
 
   const workHeader = page.locator('.codex-work-header');
   await expect(workHeader).toContainText(/^Working for \S+$/u);
   await expect(workHeader.getByRole('status')).toHaveCount(0);
-  const actionHeader = page.locator('.agent-child-execution-header');
-  const activity = actionHeader.getByRole('status');
-  await expect(activity).toBeVisible();
-  await expect(activity.locator('.agent-live-activity-focus')).toHaveCSS(
-    'animation-name',
-    'agent-live-activity-focus',
-  );
-  await expect(activity.locator('.agent-live-activity-focus-counter')).toHaveCSS('display', 'block');
-  await expect(activity.locator('.agent-live-activity-focus-aligned')).toHaveCSS('display', 'block');
+  const activity = page.locator('.remux-subagent-activity');
+  await expect(activity).toContainText('1 subagent running');
+  await expect(activity).toHaveCSS('height', '36px');
   const runningHeight = await workHeader.evaluate((element) => element.getBoundingClientRect().height);
-  const runningLabelLeft = await actionHeader.locator('.agent-live-activity-label').first()
-    .evaluate((element) => element.getBoundingClientRect().left);
   await expect(page.getByRole('status', { name: 'Thinking' })).toHaveCount(0);
 
   await page.evaluate(() => (window as any).__agentFixture.reviseLatestExecutionScope());
   await expect(page.getByText('Validated the refreshed execution-scope revision.')).toBeVisible();
   await expect(page.getByRole('status', { name: 'Thinking' })).toBeVisible();
 
-  await page.emulateMedia({ reducedMotion: 'reduce' });
-  await expect(activity.locator('.agent-live-activity-focus')).toHaveCSS('display', 'none');
-
   await page.getByRole('button', { name: 'Stop turn', exact: true }).click();
   await expect(workHeader).toContainText(/^Worked for \S+$/u);
   await expect(page.locator('.codex-work-header-status')).toHaveCount(0);
-  await workHeader.click();
-  await expect(actionHeader).toBeVisible();
-  await expect(actionHeader.getByRole('status')).toHaveCount(0);
-  const settledLabelLeft = await actionHeader.locator('.agent-live-activity-label').first()
-    .evaluate((element) => element.getBoundingClientRect().left);
-  expect(settledLabelLeft).toBe(runningLabelLeft);
+  await expect(activity).toHaveCount(0);
+  await expect(page.locator('.agent-child-execution')).toHaveCount(0);
   await expect.poll(() => workHeader.evaluate((element) => element.getBoundingClientRect().height))
     .toBe(runningHeight);
 });

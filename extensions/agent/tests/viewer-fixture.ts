@@ -142,6 +142,7 @@ export async function installAgentHost(page: Page) {
       text: string;
     }> = [];
     const executionScopes = new Map<string, any>();
+    const lifecycleByConversation = new Map<string, any>();
     const requestLog: Array<{ method: string; summary: string }> = [];
     let sequence = 1;
     let turnCounter = 0;
@@ -1177,6 +1178,17 @@ export async function installAgentHost(page: Page) {
         ? activeRuntime.state === 'running' || activeRuntime.state === 'interrupting' ? 'running'
           : activeRuntime.state === 'error' ? 'failed' : 'idle'
         : summary.status === 'running' ? 'running' : summary.status === 'error' ? 'failed' : 'idle';
+      const childStates = targetTurns.flatMap((turn) => fixtureChildCalls(turn))
+        .map(({ call, scope }) => nativeExecutionState(scope.state ?? call.childState));
+      const runningCount = childStates.filter((childState) => childState === 'running').length;
+      const lifecycle = lifecycleByConversation.get(targetConversationId) ?? {
+        state: runningCount > 0 ? 'running' : 'idle',
+        runningCount,
+        checkingCount: 0,
+        stoppingCount: 0,
+        stopErrorCount: 0,
+        stopRequested: false,
+      };
       return {
         conversationId: targetConversationId,
         executionId: `root:${targetConversationId}`,
@@ -1185,6 +1197,7 @@ export async function installAgentHost(page: Page) {
         activeTurnElapsedMs: activeTurn
           ? Math.max(0, Date.now() - activeTurn.startedAt)
           : null,
+        lifecycle,
         history: historyState === 'failed'
           ? { state: 'failed', error: 'Fixture history read failed.' }
           : { state: 'ready' },
@@ -1689,6 +1702,9 @@ export async function installAgentHost(page: Page) {
             access: String(summary.access ?? 'workspace-write'),
             federationDepth: 0,
             state: runtime?.state ?? 'idle',
+            lifecycle: {
+              state: runtime?.state === 'running' ? 'running' : 'completed',
+            },
             childExecutionIds: [...new Set(childExecutionIds)],
             transcriptAvailable: true,
             startedAt: Number(summary.createdAt ?? Date.now()),
@@ -1712,6 +1728,12 @@ export async function installAgentHost(page: Page) {
         federationDepth: 1,
         title: 'Native subagent',
         state,
+        lifecycle: {
+          state: state === 'running' ? 'running'
+            : state === 'failed' ? 'failed'
+              : state === 'interrupted' ? 'interrupted' : 'completed',
+          ...(state === 'running' ? { activeAssignmentTurnId: child.turn.id } : {}),
+        },
         ...(state === 'idle' ? { outcome: 'completed' } :
           state === 'failed' ? { outcome: 'failed' } :
             state === 'interrupted' ? { outcome: 'interrupted' } : {}),
@@ -2267,6 +2289,13 @@ export async function installAgentHost(page: Page) {
         if (turn) finishTurn(turn, 'interrupted');
         return { accepted: true, commandId: params.commandId };
       }
+      if (request.method === 'remux/agent/conversation/interrupt') {
+        const activeTurnId = resources.get('runtime')?.value.activeTurnId;
+        const turn = [...turnsByConversation.values()].flat()
+          .find((candidate) => candidate.id === activeTurnId);
+        if (turn) finishTurn(turn, 'interrupted');
+        return { accepted: true, commandId: params.commandId };
+      }
       if (request.method === 'remux/agent/conversation/execution/interrupt') {
         const executionId = String(params.executionId);
         const child = findFixtureChild(executionId);
@@ -2587,6 +2616,27 @@ export async function installAgentHost(page: Page) {
         },
         connection: dispatchStatus,
         lifecycle: dispatchLifecycle,
+        setRuntimeLifecycle(input: {
+          state: 'idle' | 'running' | 'checking' | 'stopping' | 'unavailable';
+          runningCount?: number;
+          checkingCount?: number;
+          stoppingCount?: number;
+          stopErrorCount?: number;
+          stopRequested?: boolean;
+        }, targetConversationId = conversationId) {
+          lifecycleByConversation.set(targetConversationId, {
+            runningCount: 0,
+            checkingCount: 0,
+            stoppingCount: 0,
+            stopErrorCount: 0,
+            stopRequested: false,
+            ...input,
+          });
+          sequence += 1;
+          const runtime = resources.get('runtime');
+          if (runtime) runtime.revision += 1;
+          if (activeFixtureConversationId() === targetConversationId) invalidateResource('runtime');
+        },
         navigate(resourceKind: string, resourceId: string, focusKind?: string, focusId?: string) {
           dispatch({
             type: 'remux/event',

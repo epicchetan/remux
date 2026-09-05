@@ -40,6 +40,7 @@ import { viewerModelId } from './nativeViewModel.ts';
 import { useComposerViewport } from './app/useComposerViewport.ts';
 import { useAgentResources } from './app/useAgentResources.ts';
 import { AgentExecutionsView } from './agents/AgentExecutionsView.tsx';
+import { SubagentActivityRow } from './agents/SubagentActivityRow.tsx';
 import { useAgentExecutions } from './agents/useAgentExecutions.ts';
 import { readInitialTarget, useAgentNavigation } from './app/useAgentNavigation.ts';
 import { useConversationActions } from './app/useConversationActions.ts';
@@ -676,6 +677,9 @@ export function App() {
       <section className="remux-main-pane" ref={mainPaneRef} style={mainPaneStyle}>
         <div className="remux-transcript-slot">
           <div className="agent-chat-view">
+            {conversation ? <div className={agentsOpen ? 'agent-chat-transcript is-hidden' : 'agent-chat-transcript'}>
+              <AgentTranscript conversationId={conversation.id} />
+            </div> : null}
             {conversation && agentsOpen ? (
               <AgentExecutionsView
                 conversationId={conversation.id}
@@ -689,7 +693,7 @@ export function App() {
                 providers={providers}
                 selectedExecutionId={selectedAgentExecutionId}
               />
-            ) : conversation ? <AgentTranscript conversationId={conversation.id} /> : (
+            ) : !conversation ? (
             <div className="remux-new-chat-empty">
               <div className="remux-new-chat-empty-card">
                 <div className="remux-new-chat-empty-title">
@@ -702,10 +706,21 @@ export function App() {
                 </div>
               </div>
             </div>
-            )}
+            ) : null}
           </div>
         </div>
-        {!agentsOpen ? <div className="remux-bottom-bar-slot" ref={bottomBarSlotRef}>
+        <div className={agentsOpen ? 'remux-bottom-bar-slot is-hidden' : 'remux-bottom-bar-slot'} ref={bottomBarSlotRef}>
+          {conversation ? <div className="remux-subagent-activity-slot">
+            <SubagentActivityRow
+              connected={connectionStatus.type === 'connected'}
+              lifecycle={nativeRuntime && nativeRuntime.conversationId === conversation.id
+                ? nativeRuntime.lifecycle ?? null : null}
+              onOpen={() => {
+                blurComposer();
+                setAgentsOpen(true);
+              }}
+            />
+          </div> : null}
           <ComposerContent
             childExecutionCount={agentExecutions.executions.length}
             conversation={conversation}
@@ -733,10 +748,10 @@ export function App() {
             onAccessChange={updateComposerAccess}
             providers={providers}
             runtime={nativeRuntime}
-            runtimeError={error ?? conversation?.error ?? null}
+            runtimeError={error ?? conversation?.error ?? nativeRuntime?.lifecycle.stopError ?? null}
             queue={queue}
           />
-        </div> : null}
+        </div>
         {!agentsOpen && pickerOverlayVisible ? (
           <div className="remux-file-mention-overlay" data-remux-no-composer-focus style={pickerOverlayStyle ?? undefined}>
             {mentionPickerVisible && mentionSession

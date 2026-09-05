@@ -148,7 +148,8 @@ test('loads normalized native activity and operation details only after disclosu
   await expect(diffRow).toBeVisible();
   await expect(diffRow).toContainText('Edited index.ts');
   await expect(diffRow).toContainText('file_change');
-  await expect(page.getByText('native subagent', { exact: false })).toBeVisible();
+  await expect(page.locator('.agent-child-execution')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'View 1 subagent', exact: true })).toBeVisible();
   await expect.poll(() => workRow.evaluate((row) => {
     const content = row.querySelector<HTMLElement>('.codex-work-content');
     const collapsedHeight = Number((row as HTMLElement).dataset.collapsedHeight);

@@ -65,6 +65,12 @@ export const agentCommands = {
       turnId,
     });
   },
+  interruptConversation(conversationId: string) {
+    return rpc.command(NATIVE_AGENT_METHODS.conversationInterrupt, {
+      commandId: createViewerUuid(),
+      conversationId,
+    });
+  },
   interruptExecution(conversationId: string, executionId: string) {
     return rpc.command(NATIVE_AGENT_METHODS.executionInterrupt, {
       commandId: createViewerUuid(),

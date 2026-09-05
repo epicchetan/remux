@@ -180,9 +180,6 @@ function InferenceTrace({
   workKey: string;
 }) {
   const items = inferenceTraceItems(scopeId, inference.blocks);
-  const childCalls = items.filter((item) => item.kind === 'scope').map((item) => item.call);
-  const childKeys = childCalls.map((call) =>
-    executionScopeResourceKey(conversationId, turnId, call.childScopeId!));
   const actionKeys = items.filter((item) => item.kind === 'actions').map((item) => item.key);
   return (
     <section className="agent-inference" data-state={inference.state}>
@@ -240,22 +237,7 @@ function InferenceTrace({
           );
         }
         if (item.kind === 'scope') {
-          return (
-            <ExecutionScopeDisclosure
-              conversationId={conversationId}
-              fallbackTitle={item.call.presentation.label || item.call.childBoundary || 'Agent task'}
-              fallbackDurationMs={item.call.childDurationMs}
-              fallbackOperationCount={item.call.childOperationCount}
-              fallbackArtifactCount={item.call.childArtifactCount}
-              fallbackState={item.call.childState ?? item.call.status}
-              key={item.call.id}
-              laneWidth={laneWidth}
-              scopeId={item.call.childScopeId!}
-              siblingKeys={childKeys}
-              turnId={turnId}
-              workKey={workKey}
-            />
-          );
+          return null;
         }
         return (
           <div className="agent-action-sequence" data-state={actionRunState(item.calls)} key={item.key}>

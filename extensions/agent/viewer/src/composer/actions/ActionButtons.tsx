@@ -21,6 +21,7 @@ export function ComposerActionButtons({
   childExecutionCount,
   conversationExists,
   isWorking,
+  interruptible,
   onInterrupt,
   onOpenAgents,
   onCompact,
@@ -39,6 +40,7 @@ export function ComposerActionButtons({
   childExecutionCount: number;
   conversationExists: boolean;
   isWorking: boolean;
+  interruptible: boolean;
   onInterrupt: () => Promise<void>;
   onOpenAgents: () => void;
   onCompact: () => Promise<void>;
@@ -75,6 +77,7 @@ export function ComposerActionButtons({
     canStart: canStart && canSubmitAtCurrentBoundary,
     conversationExists,
     isWorking,
+    interruptible,
     onEdit,
     onFork,
     onInterrupt,
@@ -121,10 +124,12 @@ export function ComposerActionButtons({
           providers={providers}
           runtime={runtime}
         />
-        {!pickerOpen && childExecutionCount > 0 ? <ComposerActionKey action={{
+        {!pickerOpen && conversationExists ? <ComposerActionKey action={{
           className: 'remux-composer-agents-button',
           icon: <Bot className="size-4" />,
-          label: childExecutionCount === 1 ? 'View 1 subagent' : `View ${childExecutionCount} subagents`,
+          label: childExecutionCount > 0
+            ? childExecutionCount === 1 ? 'View 1 subagent' : `View ${childExecutionCount} subagents`
+            : 'View agents',
           onClick: onOpenAgents,
         }} /> : null}
       </div>
@@ -133,7 +138,7 @@ export function ComposerActionButtons({
         {!pickerOpen ? <ComposerAttachmentButton
           imagesEnabled={providerCapabilities?.content.images === true}
         /> : null}
-        {!pickerOpen && isWorking && runtime?.capabilities.turns.interrupt ? <ComposerActionKey action={{
+        {!pickerOpen && interruptible && runtime?.capabilities.turns.interrupt ? <ComposerActionKey action={{
           busy: turn.isStopping,
           disabled: turn.isStopping,
           icon: turn.isStopping ? <Loader2 className="size-4 animate-spin" /> : <Square className="size-4 fill-current" />,

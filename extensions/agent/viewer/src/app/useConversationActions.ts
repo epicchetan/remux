@@ -251,16 +251,16 @@ export function useConversationActions(options: {
   }, [ensureConversation, nativeRuntime, refresh, selectConversation, setError]);
 
   const interrupt = useCallback(async () => {
-    if (!conversation?.activeTurnId) return;
+    if (!conversation?.id) return;
     setError(null);
     try {
-      await agentCommands.interrupt(conversation.id, conversation.activeTurnId);
+      await agentCommands.interruptConversation(conversation.id);
       await refresh([`agent/runtime:${conversation.id}`]);
     } catch (reason) {
       setError(messageOf(reason));
       throw reason;
     }
-  }, [conversation?.activeTurnId, conversation?.id, refresh, setError]);
+  }, [conversation?.id, refresh, setError]);
 
   const compact = useCallback(async () => {
     if (!conversation?.id || nativeRuntime?.conversationId !== conversation.id) return;

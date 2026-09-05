@@ -17,6 +17,7 @@ export function useComposerTurnAction({
   canStart,
   conversationExists,
   isWorking,
+  interruptible,
   onInterrupt,
   onEdit,
   onFork,
@@ -29,6 +30,7 @@ export function useComposerTurnAction({
   canStart: boolean;
   conversationExists: boolean;
   isWorking: boolean;
+  interruptible: boolean;
   onInterrupt: () => Promise<void>;
   onEdit: ComposerBranchCallback<ComposerEditTarget>;
   onFork: ComposerBranchCallback<ComposerForkTarget>;
@@ -113,7 +115,7 @@ export function useComposerTurnAction({
   };
 
   const handleInterrupt = () => {
-    if (!isWorking || isStopping) return;
+    if (!interruptible || isStopping) return;
     setStopping(true);
     void onInterrupt().finally(() => setStopping(false));
   };

@@ -75,6 +75,10 @@ export function ComposerContent({
   const modelId = useComposerStore((state) => state.modelId);
   const providerInstanceId = useComposerStore((state) => state.providerInstanceId);
   const working = conversation?.status === 'running' || conversation?.status === 'interrupting';
+  const interruptible = working || Boolean(runtime?.lifecycle && (
+    runtime.lifecycle.runningCount > 0 || runtime.lifecycle.checkingCount > 0 ||
+    runtime.lifecycle.stoppingCount > 0 || runtime.lifecycle.stopRequested
+  ));
   const loading = conversation?.status === 'loading';
   const historyReady = !conversation || runtime?.history?.state === 'ready';
   const [usageExpanded, setUsageExpanded] = useState(false);
@@ -122,6 +126,7 @@ export function ComposerContent({
           conversationExists={conversationSelected}
           childExecutionCount={childExecutionCount}
           isWorking={working}
+          interruptible={interruptible}
           onEdit={onEdit}
           onFork={onFork}
           onInterrupt={onInterrupt}

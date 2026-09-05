@@ -76,7 +76,7 @@ export function AgentExecutionsView({
                 {execution.summary ?? executionMeta(execution)}
               </span>
               <span className="agent-execution-row-meta">
-                {executionMeta(execution)} · {formatElapsed(execution.startedAt, execution.completedAt)}
+                {executionMeta(execution)} · {stateLabel(executionLifecycleState(execution))} · {formatElapsed(execution.startedAt, execution.completedAt)}
               </span>
             </span>
             <ChevronRight className="agent-execution-row-chevron size-4" />
@@ -119,7 +119,8 @@ function AgentExecutionDetail({
   const [laneWidth, setLaneWidth] = useState(0);
   const [stopping, setStopping] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const running = execution.state === 'running' || execution.state === 'recovering';
+  const lifecycleState = executionLifecycleState(execution);
+  const running = lifecycleState === 'running' || lifecycleState === 'checking';
   const canInterrupt = running && providers?.providers.some((provider) =>
     provider.providerInstanceId === execution.providerInstanceId &&
     provider.capabilities?.collaboration.childInterrupt === true) === true;
@@ -155,7 +156,7 @@ function AgentExecutionDetail({
         </button>
         <div className="agent-execution-detail-heading">
           <h1>{execution.title ?? 'Subagent'}</h1>
-          <p>{executionMeta(execution)} · {stateLabel(execution.state)}</p>
+          <p>{executionMeta(execution)} · {stateLabel(lifecycleState)}</p>
         </div>
         {canInterrupt ? (
           <button
@@ -195,6 +196,9 @@ function AgentExecutionDetail({
             </div>
           )}
           {error ? <div className="agent-executions-error" role="alert">{error}</div> : null}
+          {execution.lifecycle?.stopError ? (
+            <div className="agent-executions-error" role="alert">{execution.lifecycle.stopError}</div>
+          ) : null}
         </div>
       </div>
     </section>
@@ -202,10 +206,11 @@ function AgentExecutionDetail({
 }
 
 function ExecutionStateIcon({ execution }: { execution: AgentExecutionResource }) {
-  if (execution.state === 'running' || execution.state === 'recovering') {
+  const state = executionLifecycleState(execution);
+  if (state === 'running' || state === 'checking' || state === 'stopping') {
     return <Loader2 className="agent-execution-state is-running size-4 animate-spin" />;
   }
-  if (execution.state === 'idle') {
+  if (state === 'completed') {
     return <CheckCircle2 className="agent-execution-state is-complete size-4" />;
   }
   return <CircleDot className="agent-execution-state is-terminal size-4" />;
@@ -216,10 +221,21 @@ function executionMeta(execution: AgentExecutionResource) {
   return [provider, execution.model].filter(Boolean).join(' · ');
 }
 
-function stateLabel(state: AgentExecutionResource['state']) {
+function stateLabel(state: AgentExecutionResource['lifecycle']['state']) {
   if (state === 'running') return 'Working';
-  if (state === 'recovering') return 'Reconnecting';
+  if (state === 'checking') return 'Checking';
+  if (state === 'stopping') return 'Stopping';
   return state[0]!.toUpperCase() + state.slice(1);
+}
+
+function executionLifecycleState(
+  execution: AgentExecutionResource,
+): AgentExecutionResource['lifecycle']['state'] {
+  if (execution.lifecycle?.state) return execution.lifecycle.state;
+  if (execution.state === 'running' || execution.state === 'recovering') return 'running';
+  if (execution.state === 'failed') return 'failed';
+  if (execution.state === 'interrupted') return 'interrupted';
+  return 'completed';
 }
 
 function formatElapsed(startedAt: number, completedAt?: number) {

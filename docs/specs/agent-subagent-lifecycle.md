@@ -108,3 +108,20 @@ until the next deliberate send. The full server suite passed 277/277 and typeche
 passed; the dropped-terminal test additionally covers retry during a newer child
 assignment with only one native interrupt. Full browser acceptance and live
 deployment remain pending. Server/viewer protocol changes ship together.
+
+C reviewed: one fixed-height visible activity row; an empty slot collapses so
+short mobile tails retain their geometry. Agents overlays the full main pane
+while the hidden transcript retains its reading anchor. Disconnected counts
+show Checking; connected unresolved reads show Status unavailable; root-only
+Stop failures remain in the composer error surface. Child disclosures are removed
+from Work and the permanent Agents action retains access to historical agents.
+The full browser run passed 187 with three expected platform skips after updating
+four stale disclosure assertions and fixing the empty-slot mobile regression.
+Primary inspected the changes and passing test-results/agent/.last-run.json;
+Sol's full run was codex-rd:subagent-ui-full (1.2 minutes, exit 0). The earlier
+viewer-tests.log is the pre-fix failing run. Server and viewer builds passed.
+
+Final copied migration verification includes nullable executions.lifecycle_error;
+all original columns of all 31 preexisting tables retain exact ordered-row hashes,
+the two Stop tables are empty, foreign keys pass, and repaired block replay stays
+suppressed across 22 affected turns. Live deployment and canary checks pending.
