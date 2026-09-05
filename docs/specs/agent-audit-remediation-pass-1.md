@@ -38,6 +38,22 @@ The restart baseline records this conversation's 51 turn identities and user
 content hashes, native session identity, and active strand under
 `/tmp/remux-audit-implementation/checkpoint-thread-before.json`.
 
+Restart verification, 2026-09-05: build correction `0d4b8bd` was pushed before
+the Agent extension restarted through the host lifecycle API. The shared Codex
+daemon remained running. Agent PID changed from 514847 to 810323; resource reads
+after restart preserved all 51 baseline turn IDs and user-content hashes, the
+native session ID, root execution, and active strand/revision. One additional
+completed native-child turn was hydrated; no baseline turn was lost. This
+conversation continued running with no health error.
+
+The live viewer smoke passed at desktop and mobile widths with no JavaScript
+errors or horizontal document/transcript overflow. Its only alert was the
+preexisting capacity error on turn `f58192e3-f52d-45b3-b667-fd2353fe32ba`.
+Evidence is in `checkpoint-{restart,server-tests,build,typecheck}.log`,
+`checkpoint-thread-{before,after}.json`, and `checkpoint-live-viewer/` under
+`/tmp/remux-audit-implementation/`. This verifies the restart checkpoint; broader
+remediation and the newly reported subagent bugs remain paused.
+
 ## Purpose
 
 The commits in `9d01170..bdd6825`, landed on 2026-09-04 and 2026-09-05, made
