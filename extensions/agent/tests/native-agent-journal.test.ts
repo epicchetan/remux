@@ -1088,7 +1088,7 @@ test('authoritative snapshot replay canonicalizes duplicate block ordinals withi
     journal.createTurn({
       turnId: 'turn-1', conversationId: 'conversation-1', executionId: 'execution-1',
       clientMessageId: 'message-1', commandId: 'send-1', content: [{ type: 'text', text: 'Recover.' }],
-      model: 'fixture-native-v1', state: 'recovering', now: 2,
+      model: 'fixture-native-v1', state: 'running', now: 2,
     });
     const snapshotBlock = (id: string, itemIndex: number, text: string) => {
       const envelope = event(id, 3 + itemIndex, {
