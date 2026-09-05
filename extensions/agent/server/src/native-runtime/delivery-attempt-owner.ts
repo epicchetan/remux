@@ -22,6 +22,12 @@ export type PreparedDeliveryStage = {
   sourceObservationIds: readonly string[];
 };
 
+function isPreparedDeliveryStage(
+  value: readonly StagedProviderEnvelope[] | PreparedDeliveryStage,
+): value is PreparedDeliveryStage {
+  return !Array.isArray(value);
+}
+
 export class DeliveryAttemptOwner {
   private readonly journal: NativeAgentJournal;
   private readonly now: () => number;
@@ -143,11 +149,10 @@ export class DeliveryAttemptOwner {
     try {
       if (prepare) {
         const result = await prepare(staged);
-        if (Array.isArray(result)) prepared = [...result];
-        else {
+        if (isPreparedDeliveryStage(result)) {
           prepared = [...result.staged];
           sourceObservationIds = [...result.sourceObservationIds];
-        }
+        } else prepared = [...result];
       }
     } catch (error) {
       this.markGap(attemptId, `preparation:${deliveryError(error).message}`, this.now());
@@ -243,9 +248,9 @@ export class DeliveryAttemptOwner {
     if (attempt.acceptanceEvidence) {
       const staged = this.staged(attemptId);
       const result = prepare ? await prepare(staged) : staged;
-      const prepared = Array.isArray(result) ? result : result.staged;
-      const sourceIds = Array.isArray(result)
-        ? staged.map(({ observationId }) => observationId) : result.sourceObservationIds;
+      const prepared = isPreparedDeliveryStage(result) ? result.staged : result;
+      const sourceIds = isPreparedDeliveryStage(result)
+        ? result.sourceObservationIds : staged.map(({ observationId }) => observationId);
       return { outcome: 'accepted' as const, value: this.admit(attemptId, admit, prepared, sourceIds) };
     }
     const presence = await read(attempt);
@@ -256,9 +261,9 @@ export class DeliveryAttemptOwner {
     this.recordAcceptance(attemptId, presence.evidence, nativeTurnId); attempt = this.require(attemptId);
     const staged = this.staged(attemptId);
     const result = prepare ? await prepare(staged) : staged;
-    const prepared = Array.isArray(result) ? result : result.staged;
-    const sourceIds = Array.isArray(result)
-      ? staged.map(({ observationId }) => observationId) : result.sourceObservationIds;
+    const prepared = isPreparedDeliveryStage(result) ? result.staged : result;
+    const sourceIds = isPreparedDeliveryStage(result)
+      ? result.sourceObservationIds : staged.map(({ observationId }) => observationId);
     return { outcome: 'accepted' as const, value: this.admit(attemptId, admit, prepared, sourceIds) };
   }
 

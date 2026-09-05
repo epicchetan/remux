@@ -29,6 +29,15 @@ Going forward, use small committed milestones with builds and running-app
 checks. Parallelize independent ownership scopes; defer nonessential hardening
 instead of expanding every acceptance gate.
 
+Checkpoint `9e2d0e9` was committed and pushed on main. Pre-restart validation
+then fixed a readonly-union TypeScript narrowing issue and updated the stale
+legacy spawn-receipt assertion to the reviewed unresolved-receipt policy.
+The resulting tree passed typecheck, all 270 server tests, and the Agent server
+and viewer production builds. Broader S2a1 acceptance remains pending as above.
+The restart baseline records this conversation's 51 turn identities and user
+content hashes, native session identity, and active strand under
+`/tmp/remux-audit-implementation/checkpoint-thread-before.json`.
+
 ## Purpose
 
 The commits in `9d01170..bdd6825`, landed on 2026-09-04 and 2026-09-05, made

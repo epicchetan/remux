@@ -1172,7 +1172,7 @@ test('federation attachments require a preexisting caller grant before child all
   }
 });
 
-test('restart fails federated spawns interrupted before or after native-session binding', async () => {
+test('restart fails interrupted federated executions while preserving a possibly-sent spawn receipt', async () => {
   const journal = createJournal();
   const originalRoot = new NativeFixtureAdapter({ provider: 'codex', delayMs: 60_000 });
   const originalChild = new NativeFixtureAdapter({ provider: 'claude-code' });
@@ -1242,7 +1242,8 @@ test('restart fails federated spawns interrupted before or after native-session 
     assert.equal(replacementChild.opened.length, 0);
     assert.equal(journal.execution(executionId)?.outcome, 'recovery_failed');
     assert.equal(journal.execution(unboundExecutionId)?.outcome, 'recovery_failed');
-    assert.equal(journal.commandReceipt(commandId)?.state, 'recovery_failed');
+    // A legacy dispatching receipt has crossed the send boundary and remains unresolved for reconciliation.
+    assert.equal(journal.commandReceipt(commandId)?.state, 'dispatching');
     assert.deepEqual(journal.database.prepare(`SELECT execution_id,state,checkout_key
       FROM federation_checkout_reservations WHERE execution_id=?`).all(unboundExecutionId)
       .map((row) => ({ ...row })), [
