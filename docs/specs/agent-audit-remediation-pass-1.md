@@ -14,6 +14,16 @@ Amends: [agent-state-authority-and-synchronization-v1.md](agent-state-authority-
 
 ## Current checkpoint — 2026-09-06
 
+### Next bounded feature — HTML file preview
+
+[HTML file preview v1](html-file-preview-v1.md) owns the next requested feature,
+prompted by Ledger's interactive HTML report. It reuses file-tab routing with an
+app-owned, bridge-free browser surface; it does not change Agent transcript
+rendering or provider lifecycle. The spec records implementation slices,
+native-platform isolation gates, commit/build cadence and deployment needs.
+This is specification work only so far. The remaining audit slices below keep
+their current status and scope; this feature is not an audit completion claim.
+
 ### Deployed bounded follow-up — short active-turn Down navigation
 
 The Ledger screenshot exposed a viewer regression: Down could select an already
