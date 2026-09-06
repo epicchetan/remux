@@ -11,13 +11,14 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use serde_json::{Map, Value};
 use sha1::{Digest, Sha1};
+use tokio::io::AsyncReadExt;
 
 use crate::fs::git::{
-    git_repo_root, git_status_entries, index_git_status, is_path_within, relative_git_path,
-    summarize_git_statuses, GitStatus, IndexedGitStatus,
+    GitStatus, IndexedGitStatus, git_repo_root, git_status_entries, index_git_status,
+    is_path_within, relative_git_path, summarize_git_statuses,
 };
 use crate::paths;
-use crate::rpc::jsonrpc::{JsonRpcError, INVALID_PARAMS};
+use crate::rpc::jsonrpc::{INVALID_PARAMS, JsonRpcError};
 use crate::rpc::router::{BoxFuture, CoreRpc, RpcResult};
 
 pub const READ_DIRECTORY_METHOD: &str = "remux/fs/readDirectory";
@@ -360,9 +361,23 @@ impl FsCore {
                 .await;
         }
 
-        let buffer = tokio::fs::read(&target_path).await.map_err(|error| {
-            JsonRpcError::new(READ_FILE_ERROR, format!("File could not be read: {error}"))
-        })?;
+        // Metadata can become stale before the read completes. Bound the read
+        // itself to one byte over the advertised cap so a growing file cannot
+        // inflate either memory use or the encoded RPC response.
+        let buffer = read_file_bounded(&target_path, max_file_bytes)
+            .await
+            .map_err(|error| {
+                JsonRpcError::new(READ_FILE_ERROR, format!("File could not be read: {error}"))
+            })?;
+        let actual_size = buffer.len() as u64;
+        result.insert("sizeBytes".to_string(), Value::from(actual_size));
+        if actual_size > max_file_bytes {
+            result.insert("content".to_string(), Value::Null);
+            result.insert("tooLarge".to_string(), Value::from(true));
+            return self
+                .include_file_git(Value::Object(result), git_options.as_ref(), &target_path)
+                .await;
+        }
 
         if base64 {
             use base64_encode::encode as to_base64;
@@ -519,6 +534,13 @@ impl FsCore {
         );
         repo_root
     }
+}
+
+async fn read_file_bounded(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let file = tokio::fs::File::open(path).await?;
+    let mut buffer = Vec::new();
+    file.take(max_bytes + 1).read_to_end(&mut buffer).await?;
+    Ok(buffer)
 }
 
 impl CoreRpc for FsCore {
@@ -869,7 +891,7 @@ async fn read_git_file_base(
                 None,
                 Some(&repo_root_text),
                 Some(status.status),
-            )
+            );
         }
     };
     let Some(size_bytes) = size_bytes else {
@@ -1041,6 +1063,64 @@ mod tests {
             base64_encode::encode(&[0x89, 0x50, 0x4e, 0x47, 0x00, 0x01]),
             "iVBORwAB"
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_file_read_stops_at_limit_plus_one() {
+        let root = tempfile::tempdir().unwrap();
+        let exact_path = root.path().join("exact.html");
+        let over_path = root.path().join("over.html");
+        tokio::fs::write(&exact_path, b"12345").await.unwrap();
+        tokio::fs::write(&over_path, b"123456789").await.unwrap();
+
+        assert_eq!(read_file_bounded(&exact_path, 5).await.unwrap(), b"12345");
+        assert_eq!(read_file_bounded(&over_path, 5).await.unwrap(), b"123456");
+    }
+
+    #[tokio::test]
+    async fn read_file_reports_exact_actual_length_before_base64_encoding() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("report.html");
+        tokio::fs::write(&path, b"hello").await.unwrap();
+        let core = FsCore::new(root.path());
+
+        let result = core
+            .handle_rpc(
+                READ_FILE_METHOD,
+                Some(&serde_json::json!({ "format": "base64", "path": path })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["sizeBytes"], 5);
+        assert_eq!(result["tooLarge"], false);
+        assert_eq!(result["dataBase64"], "aGVsbG8=");
+    }
+
+    #[tokio::test]
+    async fn exact_binary_cap_fits_rpc_envelope_and_text_cap_is_unchanged() {
+        assert_eq!(MAX_TEXT_FILE_BYTES, 1024 * 1024);
+        assert_eq!(MAX_BINARY_FILE_BYTES, 5 * 1024 * 1024);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("exact-cap.html");
+        tokio::fs::write(&path, vec![b'a'; MAX_BINARY_FILE_BYTES as usize])
+            .await
+            .unwrap();
+        let core = FsCore::new(root.path());
+
+        let result = core
+            .handle_rpc(
+                READ_FILE_METHOD,
+                Some(&serde_json::json!({ "format": "base64", "path": path })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["sizeBytes"], MAX_BINARY_FILE_BYTES);
+        assert_eq!(result["tooLarge"], false);
+        assert_eq!(
+            result["dataBase64"].as_str().unwrap().len(),
+            (MAX_BINARY_FILE_BYTES as usize).div_ceil(3) * 4
+        );
+        assert!(serde_json::to_vec(&result).unwrap().len() < 8 * 1024 * 1024);
     }
 
     #[test]

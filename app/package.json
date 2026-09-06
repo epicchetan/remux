@@ -17,6 +17,7 @@
     "test:viewer-host-contract": "node --no-warnings scripts/test-viewer-host-contract.mjs",
     "test:viewer-lifecycle": "node --no-warnings scripts/test-viewer-lifecycle.mjs",
     "test:html-preview": "node --no-warnings scripts/test-html-preview.mjs",
+    "test:html-preview-load": "node --no-warnings scripts/test-html-preview-load.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

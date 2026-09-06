@@ -286,6 +286,15 @@ refactoring. No new agent/server protocol or journal migration is required.
   `htmlPreviewAvailability.ts`. Follow
   [native validation instructions](../../app/scripts/HTML_PREVIEW_NATIVE_VALIDATION.md)
   on a device/development build before production rollout.
-- P1/P2 are implementing against the frozen P0 interface behind that gate.
-  P3 integration and publication remain pending. No app update or host restart
-  has occurred for this feature. Update this checkpoint after each accepted slice.
+- P0 committed/pushed as `a72083a`; production availability remains closed.
+- P1 reviewed: host reads are bounded before encoding, loader validates canonical
+  base64 and UTF-8 using existing libraries, and one controller owns mode and
+  load generations. Seven focused Rust tests passed. The loader suite also
+  passed with Expo's actual TextDecoder installed for the full read path,
+  including 2.2 MB and exact 5 MiB inputs. Late retired reads skip preparation;
+  refresh failure retains the previous document. Evidence:
+  `/tmp/remux-html-preview/p1-review.log`. Host release build passed in 20.38 s
+  (`host-build.log`); the running worker has not been restarted.
+- P2 is frozen for integrated review behind the platform gate. P3 integration
+  and publication remain pending. No app update or host restart has occurred
+  for this feature. Update this checkpoint after each accepted slice.
