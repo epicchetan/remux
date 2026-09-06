@@ -1,4 +1,4 @@
-Status: Implemented — final Narrate retirement deployment in progress
+Status: Implemented — deployed; Narrate retired
 Date: 2026-09-06
 Owner: primary agent; bounded Sol implementation lanes with primary review
 Supersedes target architecture: [html-file-preview-v1.md](html-file-preview-v1.md)
@@ -391,3 +391,14 @@ host without React Native. Building the full future Remux web app is out of scop
   narration-client package, remux-tts crate, narration R&D, runtime dispatch
   special cases and build/workspace references. Historical specs remain archived;
   the app's persisted-tab migration remains to restore older saved tabs.
+- V4b/V5 completed: retirement committed and pushed as `6a0733a`; the stale
+  runtime test correction is `f2898d8`. Final removal commit changed 166 files
+  and deleted 24,764 lines. Guardian worker restart deployed the release runtime
+  (worker PID 1426540). Live catalog contains Agent, Codex, Viewer, Ledger and
+  Terminal; Narrate is absent from both catalog and runtime status. Served Codex
+  assets contain no Narrate client/RPC references; Editor retains its exact
+  Markdown/HTML document handler. Deployment proof:
+  `/tmp/remux-html-preview/narrate-retirement-deployed.json`.
+  Codex daemon PID 848265 retained its September 5 start time. The validated
+  iOS app migration update remains sufficient; no additional Expo release is
+  required for this server/web removal. All implementation slices are complete.
