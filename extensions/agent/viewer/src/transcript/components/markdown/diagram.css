@@ -2,11 +2,11 @@
   box-sizing: border-box;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  overflow: clip;
   min-width: 0;
   border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--background);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--secondary) 45%, var(--background));
   color: var(--foreground);
 }
 .agent-diagram-toolbar {
@@ -17,9 +17,9 @@
   align-items: center;
   gap: 4px;
   padding: 0 8px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 0;
   color: var(--muted-foreground);
-  font: 12px/1.2 system-ui, sans-serif;
+  font: 11px/1.2 ui-monospace, monospace;
 }
 .agent-diagram-toolbar > :first-child { margin-right: auto; }
 .agent-diagram-toolbar button {
@@ -49,3 +49,5 @@
 .agent-diagram-scroll img { display: block; max-width: 100%; height: auto; margin: 0 auto; }
 .agent-diagram-scroll pre { width: max-content; min-width: 100%; margin: 0; font: 12px/1.5 monospace; white-space: pre; }
 .agent-diagram-message { margin: 0 0 8px; font: 13px/1.5 system-ui, sans-serif; color: var(--muted-foreground); }
+
+.agent-diagram-preview { overflow: clip; }

@@ -3,6 +3,8 @@ import { Check, Code, Copy, Eye } from 'lucide-react';
 import { getHostTheme, subscribeHostTheme } from '@remux/viewer-kit/host';
 import { renderMermaid } from '@remux/viewer-kit/mermaid';
 import { markdownMetrics, type MarkdownLayoutBlock } from './markdownModel';
+import { DiagramViewport } from './DiagramViewport';
+import { publishDiagramMetrics } from './diagramMetrics';
 import './diagram.css';
 
 type RenderState = { status: 'loading' } | { status: 'error'; message: string }
@@ -12,6 +14,7 @@ export function DiagramBlock({ block, style }: {
   block: Extract<MarkdownLayoutBlock, { type: 'diagram' }>;
   style: CSSProperties;
 }) {
+  const controlsRef = useRef<HTMLSpanElement | null>(null);
   const [theme, setTheme] = useState(getHostTheme);
   const [state, setState] = useState<RenderState>({ status: 'loading' });
   const [source, setSource] = useState(false);
@@ -27,6 +30,7 @@ export function DiagramBlock({ block, style }: {
     void renderMermaid(block.text, { theme, signal: controller.signal }).then((result) => {
       if (controller.signal.aborted) return;
       url = URL.createObjectURL(new Blob([result.svg], { type: 'image/svg+xml' }));
+      publishDiagramMetrics(block.text, { width: result.width, height: result.height });
       setState({ status: 'ready', url, width: result.width, height: result.height });
     }, (error: unknown) => {
       if (!controller.signal.aborted) setState({ status: 'error', message: error instanceof Error ? error.message : String(error) });
@@ -44,9 +48,6 @@ export function DiagramBlock({ block, style }: {
     } catch { setCopyFailed(true); }
   }
   const imageError = () => setState({ status: 'error', message: 'The diagram image could not be displayed.' });
-  const scale = state.status === 'ready'
-    ? Math.min(1, (block.contentHeight - markdownMetrics.diagram.toolbarHeight - 2 * markdownMetrics.diagram.padding - 2) / state.height)
-    : 1;
   return (
     <div className="codex-md-block agent-diagram" data-diagram-state={state.status} style={{
       ...style,
@@ -55,15 +56,16 @@ export function DiagramBlock({ block, style }: {
     } as CSSProperties}>
       <div className="agent-diagram-toolbar">
         <span>{copyFailed ? 'Could not copy' : 'Diagram'}</span>
+        <span ref={controlsRef} />
         <button type="button" aria-label={source ? 'Show diagram' : 'Show diagram source'} aria-pressed={source} onClick={() => setSource(!source)}>{source ? <Eye /> : <Code />}</button>
         <button type="button" aria-label={copied ? 'Diagram source copied' : 'Copy diagram source'} onClick={() => void copy()}>{copied ? <Check /> : <Copy />}</button>
       </div>
-      <div className="agent-diagram-scroll" tabIndex={0} aria-label={source || state.status === 'error' ? 'Diagram source' : 'Diagram preview'}>
+      <div className={`agent-diagram-scroll${!source && state.status === 'ready' ? ' agent-diagram-preview' : ''}`} tabIndex={0} aria-label={source || state.status === 'error' ? 'Diagram source' : 'Diagram preview'}>
         {source || state.status === 'error' ? <>
           {state.status === 'error' && <p className="agent-diagram-message" role="status">{state.message}</p>}
           <pre><code>{block.text}</code></pre>
         </> : state.status === 'ready'
-          ? <img alt="Mermaid diagram" src={state.url} width={state.width * scale} height={state.height * scale} onError={imageError} />
+          ? <DiagramViewport controlsRef={controlsRef} src={state.url} imageWidth={state.width} imageHeight={state.height} identity={`${block.text}\0${theme}`} onImageError={imageError} />
           : <p className="agent-diagram-message" role="status">Rendering diagram…</p>}
       </div>
     </div>

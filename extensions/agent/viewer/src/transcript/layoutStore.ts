@@ -9,6 +9,7 @@ import {
   toggleWorkDisclosure as reduceWorkDisclosure,
   type TranscriptDisclosureState,
 } from './disclosure/disclosureReducer';
+import { getDiagramMetricsRevision, subscribeDiagramMetrics } from './components/markdown/diagramMetrics';
 import { createExternalStore } from './externalStore';
 import { TranscriptMeasureCache } from './layout/measureCache';
 import { reconcileMeasuredTranscript } from './layout/reconcileMeasured';
@@ -32,6 +33,7 @@ type TranscriptLayoutResourceAdapter = {
 };
 
 type TranscriptLayoutStoreState = {
+  diagramMetricsRevision: number;
   activeTurnId: string | null;
   disclosure: TranscriptDisclosureState;
   turnOrder: string[];
@@ -48,7 +50,7 @@ type TranscriptLayoutStoreState = {
 const transcriptMeasureCache = new TranscriptMeasureCache();
 const transcriptLayoutCache = new Map<string, Pick<
   TranscriptLayoutStoreState,
-  'disclosure' | 'turnOrder' | 'turnsById'
+  'disclosure' | 'turnOrder' | 'turnsById' | 'diagramMetricsRevision'
 >>();
 const MAX_CACHED_TRANSCRIPT_LAYOUTS = 5;
 let activeLayoutConversationId: string | null = null;
@@ -116,12 +118,25 @@ const actions: Pick<
 };
 
 const layoutStore = createExternalStore<TranscriptLayoutStoreState>({
+  diagramMetricsRevision: getDiagramMetricsRevision(),
   activeTurnId: null,
   disclosure: emptyTranscriptDisclosureState(),
   turnOrder: [],
   turnsById: {},
   width: null,
   ...actions,
+});
+
+subscribeDiagramMetrics(() => {
+  // Capture a visible block before changing both measured rows and their DOM.
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event('remux-diagram-layout-will-change'));
+  transcriptMeasureCache.clear();
+  const snapshot = resourceAdapter?.getSnapshot();
+  if (snapshot?.status === 'ready' && layoutStore.getState().width !== null) {
+    reconcileTranscriptLayoutFromResources(snapshot, { forceFullMeasure: true });
+  } else {
+    layoutStore.setState({ diagramMetricsRevision: getDiagramMetricsRevision() });
+  }
 });
 
 export const useTranscriptLayoutStore = layoutStore.useStore;
@@ -143,6 +158,7 @@ export function resetTranscriptLayoutForConversation(
     const state = layoutStore.getState();
     transcriptLayoutCache.delete(activeLayoutConversationId);
     transcriptLayoutCache.set(activeLayoutConversationId, {
+      diagramMetricsRevision: state.diagramMetricsRevision,
       disclosure: state.disclosure,
       turnOrder: state.turnOrder,
       turnsById: state.turnsById,
@@ -154,9 +170,10 @@ export function resetTranscriptLayoutForConversation(
     }
   }
 
-  const cached = normalizedConversationId && options.restoreCached !== false
+  const stored = normalizedConversationId && options.restoreCached !== false
     ? transcriptLayoutCache.get(normalizedConversationId)
     : undefined;
+  const cached = stored?.diagramMetricsRevision === getDiagramMetricsRevision() ? stored : undefined;
   if (normalizedConversationId && cached) {
     transcriptLayoutCache.delete(normalizedConversationId);
     transcriptLayoutCache.set(normalizedConversationId, cached);
@@ -165,7 +182,7 @@ export function resetTranscriptLayoutForConversation(
   layoutStore.setState({
     activeTurnId: null,
     ...(cached ?? {
-      disclosure: emptyTranscriptDisclosureState(),
+      disclosure: stored?.disclosure ?? emptyTranscriptDisclosureState(),
       turnOrder: [],
       turnsById: {},
     }),
@@ -209,6 +226,7 @@ export function reconcileTranscriptLayoutFromResources(
   // runtime resource or infers policy from the current viewport mode.
   reconcileTranscriptViewportForLayout(layout.turns, layout.turnsById);
   layoutStore.setState({
+    diagramMetricsRevision: getDiagramMetricsRevision(),
     activeTurnId: resourceSnapshot.activeTurnId,
     disclosure: reconcileTranscriptDisclosure(
       previousState.disclosure,

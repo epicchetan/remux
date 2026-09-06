@@ -7,6 +7,13 @@ import {
   markdownMetrics,
   parseMarkdownDocument,
 } from '../../viewer/src/transcript/components/markdown/markdownModel.ts';
+import {
+  getDiagramMetrics,
+  getDiagramMetricsRevision,
+  holdDiagramMetricsUpdates,
+  publishDiagramMetrics,
+  subscribeDiagramMetrics,
+} from '../../viewer/src/transcript/components/markdown/diagramMetrics.ts';
 
 if (typeof globalThis.OffscreenCanvas === 'undefined') {
   globalThis.OffscreenCanvas = class {
@@ -136,7 +143,9 @@ test('classifies only explicitly closed Mermaid fences as diagrams', () => {
 });
 
 test('uses stable bounded geometry and cached identity for Mermaid diagrams', () => {
-  const markdown = '```mermaid\ngraph TD\nA-->B\n```';
+  const source = 'graph TD\nA-->B';
+  const markdown = `\`\`\`mermaid\n${source}\n\`\`\``;
+  publishDiagramMetrics(source, { height: 100, width: 400 });
   const narrow = getMarkdownLayoutDocument(markdown, 'default', 300);
   const wide = getMarkdownLayoutDocument(markdown, 'default', 1000);
   const cached = getMarkdownLayoutDocument(markdown, 'default', 300);
@@ -148,8 +157,54 @@ test('uses stable bounded geometry and cached identity for Mermaid diagrams', ()
   assert.equal(wideDiagram?.type, 'diagram');
   if (narrowDiagram?.type !== 'diagram' || wideDiagram?.type !== 'diagram') return;
   assert.equal(narrowDiagram.renderId, 'md:0');
-  assert.equal(narrowDiagram.contentHeight, markdownMetrics.diagram.minHeight);
+  assert.equal(narrowDiagram.contentHeight, 126.5);
   assert.equal(narrowDiagram.height, narrowDiagram.topGap + narrowDiagram.contentHeight);
-  assert.equal(wideDiagram.contentHeight, markdownMetrics.diagram.maxHeight);
+  assert.equal(wideDiagram.contentHeight, 158);
   assert.equal(wideDiagram.height, wideDiagram.topGap + wideDiagram.contentHeight);
+});
+
+test('remeasures cached diagrams once per published or released metrics batch', () => {
+  const source = 'graph LR\nMetricsA-->MetricsB';
+  const markdown = `\`\`\`mermaid\n${source}\n\`\`\``;
+  const fallback = getMarkdownLayoutDocument(markdown, 'default', 400);
+  assert.equal(fallback.blocks[0]?.contentHeight, markdownMetrics.diagram.fallbackHeight);
+
+  let notifications = 0;
+  const unsubscribe = subscribeDiagramMetrics(() => { notifications += 1; });
+  const before = getDiagramMetricsRevision();
+  assert.equal(publishDiagramMetrics(source, { height: 80, width: 400 }), true);
+  assert.equal(publishDiagramMetrics(source, { height: 80, width: 400 }), false);
+  assert.equal(notifications, 1);
+  assert.equal(getDiagramMetricsRevision(), before + 1);
+  const measured = getMarkdownLayoutDocument(markdown, 'default', 400);
+  assert.notEqual(measured, fallback);
+  assert.equal(measured.blocks[0]?.contentHeight, 132.8);
+
+  const releaseOuter = holdDiagramMetricsUpdates();
+  const releaseInner = holdDiagramMetricsUpdates();
+  publishDiagramMetrics(source, { height: 100, width: 400 });
+  publishDiagramMetrics('graph TD\nHeldA-->HeldB', { height: 200, width: 100 });
+  assert.equal(getDiagramMetrics(source)?.height, 80);
+  assert.equal(notifications, 1);
+  releaseInner();
+  assert.equal(notifications, 1);
+  releaseOuter();
+  releaseOuter();
+  assert.equal(notifications, 2);
+  assert.equal(getDiagramMetricsRevision(), before + 2);
+  assert.equal(getDiagramMetrics(source)?.height, 100);
+  unsubscribe();
+});
+
+test('bounds the natural-dimension registry and rejects unusable publications', () => {
+  const revision = getDiagramMetricsRevision();
+  assert.equal(publishDiagramMetrics('invalid-zero', { height: 0, width: 100 }), false);
+  assert.equal(publishDiagramMetrics('invalid-infinite', { height: 100, width: Number.POSITIVE_INFINITY }), false);
+  assert.equal(getDiagramMetricsRevision(), revision);
+
+  for (let index = 0; index < 129; index += 1) {
+    publishDiagramMetrics(`lru-diagram-${index}`, { height: index + 1, width: 100 });
+  }
+  assert.equal(getDiagramMetrics('lru-diagram-0'), null);
+  assert.deepEqual(getDiagramMetrics('lru-diagram-128'), { height: 129, width: 100 });
 });

@@ -24,6 +24,11 @@ test('keeps diagram geometry fixed through loading, ready, source, and fitted re
     await route.continue();
   });
   await page.goto(viewerUrl);
+  await page.evaluate(async () => {
+    const modulePath = '/src/transcript/components/markdown/diagramMetrics.ts';
+    const metrics = await import(modulePath);
+    (window as any).__releaseDiagramMetrics = metrics.holdDiagramMetricsUpdates();
+  });
   await appendTurn(page, validDiagram);
 
   const diagram = page.locator('.agent-diagram').last();
@@ -55,12 +60,17 @@ test('keeps diagram geometry fixed through loading, ready, source, and fitted re
   }))).toMatchObject({ complete: true });
   expect((await image.evaluate((node) => (node as HTMLImageElement).naturalWidth))).toBeGreaterThan(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await expectFixedHeight(diagram, loadingHeight);
+  await page.evaluate(() => (window as any).__releaseDiagramMetrics());
+  await expect.poll(() => diagram.evaluate((node) => node.getBoundingClientRect().height)).toBeLessThan(loadingHeight);
+  const restingHeight = await diagram.evaluate((node) => node.getBoundingClientRect().height);
+  expect(restingHeight).toBeGreaterThanOrEqual(120);
+  expect(restingHeight).toBeLessThanOrEqual(240);
   if (testInfo.project.name === 'mobile') {
     await mkdir('/tmp/remux-html-preview', { recursive: true });
     await page.screenshot({ path: '/tmp/remux-html-preview/agent-mermaid-fit.png' });
   }
-  await expectFixedHeight(diagram, loadingHeight);
-  await expectFixedHeight(frame, loadingFrameHeight);
+  await expect.poll(() => frame.evaluate((node) => node.getBoundingClientRect().height)).toBeLessThan(loadingFrameHeight);
   await expect.poll(async () => Math.abs(await following.evaluate((node, input) =>
     node.getBoundingClientRect().top - (input.frameNode as HTMLElement).getBoundingClientRect().bottom - input.gap,
   { frameNode: await frame.elementHandle(), gap: followingGap })))
@@ -79,13 +89,14 @@ test('keeps diagram geometry fixed through loading, ready, source, and fitted re
   expect(await sourceControl.evaluate((node) => getComputedStyle(node).backgroundColor)).toBe('rgba(0, 0, 0, 0)');
   await copyControl.focus();
   expect(await copyControl.evaluate((node) => getComputedStyle(node).backgroundColor)).toBe('rgba(0, 0, 0, 0)');
-  await expectFixedHeight(diagram, loadingHeight);
+  await expectFixedHeight(diagram, restingHeight);
   await page.getByRole('button', { name: 'Show diagram' }).last().click();
   await expect(image).toBeVisible();
   await expect.poll(() => viewport.evaluate((node, expected) => Math.abs(node.scrollTop - expected), loadingScrollTop)).toBeLessThanOrEqual(2);
 
   await page.setViewportSize({ width: 390, height: 844 });
-  await expect.poll(() => diagram.evaluate((node) => node.getBoundingClientRect().height)).toBe(240);
+  await expect.poll(() => diagram.evaluate((node) => node.getBoundingClientRect().height)).toBeGreaterThanOrEqual(120);
+  await expect.poll(() => diagram.evaluate((node) => node.getBoundingClientRect().height)).toBeLessThanOrEqual(360);
   const preview = diagram.locator('.agent-diagram-scroll');
   await expect.poll(() => preview.evaluate((node) => node.scrollWidth <= node.clientWidth)).toBe(true);
   await expect.poll(async () => {

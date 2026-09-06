@@ -10,6 +10,7 @@ import {
   type MarkdownLayoutBlock,
   type MarkdownLayoutLineFragment,
 } from './markdownModel';
+import { useTranscriptLayoutStore } from '../../layoutStore';
 import { CodeBlock } from './CodeBlock';
 import { DiagramBlock } from './DiagramBlock';
 import { fileReferenceStyle } from '../file/FileReferenceChip';
@@ -36,6 +37,7 @@ export function MarkdownBlock({
   streaming?: boolean;
   width?: number;
 }) {
+  const diagramMetricsRevision = useTranscriptLayoutStore((state) => state.diagramMetricsRevision);
   const cacheScope = streaming && messageCacheKey
     ? { key: messageCacheKey, kind: 'streaming' as const }
     : { kind: 'complete' as const };
@@ -45,7 +47,7 @@ export function MarkdownBlock({
       preserveSoftBreaks,
       richFileLinks: !streaming,
     }),
-    [children, density, messageCacheKey, preserveSoftBreaks, streaming, width],
+    [children, density, messageCacheKey, preserveSoftBreaks, streaming, width, diagramMetricsRevision],
   );
   const height = maxLines === undefined
     ? document.height

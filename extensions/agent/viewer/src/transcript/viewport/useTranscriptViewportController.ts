@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
 import type { TranscriptRenderSnapshot } from '../controller/useTranscriptRenderSnapshot';
+import { holdDiagramMetricsUpdates } from '../components/markdown/diagramMetrics';
+import { captureDiagramLayoutAnchor, scrollTopForDiagramLayoutAnchor, type DiagramLayoutAnchor } from './diagramLayoutAnchor';
 import { transcriptLayout } from '../layout/constants';
 import type { TranscriptMeasuredTurn } from '../layout/types';
 import { useTranscriptLayoutStore } from '../layoutStore';
@@ -76,7 +78,8 @@ type TranscriptViewportModeChangeReason =
   | 'scroll-settled'
   | 'host-navigate'
   | 'streaming-turn'
-  | 'touch-start';
+  | 'touch-start'
+  | 'diagram-gesture';
 
 export function useTranscriptViewportController(
   conversationId: string,
@@ -151,6 +154,8 @@ export function useTranscriptViewportController(
   const navigationAnchorsRef = useRef(navigationAnchors);
   const geometryRef = useRef(geometry);
   const scrollOwnerRef = useRef<TranscriptScrollOwner>('idle');
+  const diagramGestureActiveRef = useRef(false);
+  const diagramLayoutAnchorRef = useRef<DiagramLayoutAnchor | null>(null);
   const scrollAnchorRef = useRef<TranscriptViewportAnchor | null>(null);
   const viewportIntentRef = useRef<TranscriptViewportIntent>(viewportIntent);
   const anchorExtentFloorHeightRef = useRef(0);
@@ -436,7 +441,7 @@ export function useTranscriptViewportController(
       return;
     }
 
-    if (nativeScrollOwnsViewport(scrollOwnerRef.current)) {
+    if (nativeScrollOwnsViewport(scrollOwnerRef.current) || diagramGestureActiveRef.current) {
       return;
     }
     if (scrollOwnerRef.current !== 'idle' || scrollAnimationRafRef.current !== null) {
@@ -535,7 +540,7 @@ export function useTranscriptViewportController(
   const scheduleAutoScroll = useCallback(() => {
     if (
       bottomScrollRafRef.current !== null ||
-      nativeScrollOwnsViewport(scrollOwnerRef.current)
+      (nativeScrollOwnsViewport(scrollOwnerRef.current) || diagramGestureActiveRef.current)
     ) {
       return;
     }
@@ -962,12 +967,21 @@ export function useTranscriptViewportController(
       return;
     }
 
+    if (viewportLifecycleState !== 'active') return;
+
     const updateScrollPosition = () => {
       const currentScrollTop = viewport.scrollTop;
       lastScrollTopRef.current = currentScrollTop;
     };
 
     let scrollSettleTimer: number | null = null;
+    let releaseDiagramMetrics: (() => void) | null = null;
+    const holdMetrics = () => { releaseDiagramMetrics ??= holdDiagramMetricsUpdates(); };
+    const releaseMetrics = () => {
+      const release = releaseDiagramMetrics;
+      releaseDiagramMetrics = null;
+      release?.();
+    };
     const clearScrollSettleTimer = () => {
       if (scrollSettleTimer === null) {
         return;
@@ -977,6 +991,7 @@ export function useTranscriptViewportController(
     };
     const finishUserScroll = () => {
       clearScrollSettleTimer();
+      if (diagramGestureActiveRef.current || scrollOwnerRef.current === 'native-touch') return;
       const userInitiated = userScrollArmedRef.current &&
         scrollOwnerRef.current !== 'programmatic-navigation' &&
         scrollOwnerRef.current !== 'initial-placement';
@@ -1000,6 +1015,7 @@ export function useTranscriptViewportController(
       }
 
       if (!userInitiated) {
+        releaseMetrics();
         return;
       }
       const mode = viewportIntentAfterNativeScrollSettles({
@@ -1009,6 +1025,7 @@ export function useTranscriptViewportController(
       });
       setTranscriptViewportIntent(mode, 'scroll-settled');
       if (mode.kind !== 'free') scheduleAutoScroll();
+      releaseMetrics();
     };
     const scheduleUserScrollSettleFallback = () => {
       clearScrollSettleTimer();
@@ -1022,6 +1039,8 @@ export function useTranscriptViewportController(
       }
     };
     const onTouchStart = () => {
+      if (diagramGestureActiveRef.current) return;
+      holdMetrics();
       clearScrollSettleTimer();
       userScrollArmedRef.current = true;
       navigationCursorSegmentIdRef.current = null;
@@ -1037,21 +1056,54 @@ export function useTranscriptViewportController(
       setTranscriptViewportIntent({ kind: 'free' }, 'touch-start');
     };
     const onWheel = () => {
+      if (diagramGestureActiveRef.current) return;
+      holdMetrics();
       navigationCursorSegmentIdRef.current = null;
       cancelScrollAnimation();
       userScrollArmedRef.current = true;
       setTranscriptViewportIntent({ kind: 'free' }, 'manual-scroll');
       scheduleUserScrollSettleFallback();
     };
-    const onTouchEnd = () => {
+    const onTouchEnd = (event: TouchEvent) => {
+      if (diagramGestureActiveRef.current || event.touches.length > 0) return;
       scrollOwnerRef.current = transcriptScrollOwnerAfterNativeEvent(
         scrollOwnerRef.current,
         'touch-end',
       );
       scheduleUserScrollSettleFallback();
     };
+    const onDiagramGesture = (event: Event) => {
+      const phase = (event as CustomEvent<{ phase: string }>).detail?.phase;
+      if (phase === 'start') {
+        diagramGestureActiveRef.current = true;
+        holdMetrics();
+        clearScrollSettleTimer();
+        cancelScrollAnimation();
+        if (bottomScrollRafRef.current !== null) {
+          window.cancelAnimationFrame(bottomScrollRafRef.current);
+          bottomScrollRafRef.current = null;
+        }
+        // A fitted first touch may have provisionally armed native scrolling.
+        // Once the diagram claims the gesture, retire that ownership explicitly.
+        userScrollArmedRef.current = false;
+        scrollOwnerRef.current = 'idle';
+        setTranscriptViewportIntent({ kind: 'free' }, 'diagram-gesture');
+      } else if (phase === 'end') {
+        diagramGestureActiveRef.current = false;
+        captureViewportAnchor();
+        releaseMetrics();
+        scheduleRangeUpdate();
+      }
+    };
+    const onDiagramLayout = () => {
+      diagramLayoutAnchorRef.current = viewportIntentRef.current.kind === 'free'
+        && !nativeScrollOwnsViewport(scrollOwnerRef.current) && !diagramGestureActiveRef.current
+        ? captureDiagramLayoutAnchor(viewport) : null;
+    };
     const onVisibilityChange = () => {
       if (document.visibilityState !== 'visible') {
+        diagramGestureActiveRef.current = false;
+        releaseMetrics();
         clearScrollSettleTimer();
         userScrollArmedRef.current = false;
         scrollOwnerRef.current = 'idle';
@@ -1067,6 +1119,8 @@ export function useTranscriptViewportController(
     };
     const observer = new ResizeObserver(scheduleRangeUpdate);
 
+    viewport.addEventListener('remux-diagram-gesture', onDiagramGesture);
+    window.addEventListener('remux-diagram-layout-will-change', onDiagramLayout);
     viewport.addEventListener('scroll', onScroll, { passive: true });
     viewport.addEventListener('touchstart', onTouchStart, { passive: true });
     viewport.addEventListener('touchcancel', onTouchEnd, { passive: true });
@@ -1085,7 +1139,15 @@ export function useTranscriptViewportController(
     scheduleRangeUpdate();
 
     return () => {
+      for (const diagram of viewport.querySelectorAll('.agent-diagram-viewport')) {
+        diagram.dispatchEvent(new Event('remux-diagram-gesture-cancel'));
+      }
       viewport.removeEventListener('scroll', onScroll);
+      viewport.removeEventListener('remux-diagram-gesture', onDiagramGesture);
+      window.removeEventListener('remux-diagram-layout-will-change', onDiagramLayout);
+      diagramGestureActiveRef.current = false;
+      diagramLayoutAnchorRef.current = null;
+      releaseMetrics();
       viewport.removeEventListener('touchstart', onTouchStart);
       viewport.removeEventListener('touchcancel', onTouchEnd);
       viewport.removeEventListener('touchend', onTouchEnd);
@@ -1112,6 +1174,7 @@ export function useTranscriptViewportController(
     hasLaterTurns,
     loadEarlierTranscriptResources,
     loadLaterTranscriptResources,
+    viewportLifecycleState,
     scheduleAutoScroll,
     scheduleRangeUpdate,
     setTranscriptViewportIntent,
@@ -1157,23 +1220,24 @@ export function useTranscriptViewportController(
       initialPlacementPendingRef.current ||
       viewportIntentRef.current.kind !== 'free' ||
       nativeScrollOwnsViewport(scrollOwnerRef.current) ||
+      diagramGestureActiveRef.current ||
       scrollOwnerRef.current === 'programmatic-navigation'
     ) {
+      diagramLayoutAnchorRef.current = null;
       captureViewportAnchor();
       return;
     }
 
+    const diagramAnchor = diagramLayoutAnchorRef.current;
+    diagramLayoutAnchorRef.current = null;
     const anchor = scrollAnchorRef.current;
-    if (!anchor) {
+    if (!anchor && !diagramAnchor) {
       captureViewportAnchor();
       return;
     }
 
-    const restoredScrollTop = scrollTopForViewportAnchor({
-      anchor,
-      geometry,
-      topPadding: viewportTopPadding,
-    });
+    const restoredScrollTop = (diagramAnchor ? scrollTopForDiagramLayoutAnchor(viewport, diagramAnchor) : null)
+      ?? (anchor ? scrollTopForViewportAnchor({ anchor, geometry, topPadding: viewportTopPadding }) : null);
     if (restoredScrollTop === null) {
       captureViewportAnchor();
       return;
@@ -1198,7 +1262,7 @@ export function useTranscriptViewportController(
 
   useEffect(() => {
     const viewport = viewportRef.current;
-    if (nativeScrollOwnsViewport(scrollOwnerRef.current)) {
+    if (nativeScrollOwnsViewport(scrollOwnerRef.current) || diagramGestureActiveRef.current) {
       return;
     }
 

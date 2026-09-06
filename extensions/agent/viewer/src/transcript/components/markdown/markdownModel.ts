@@ -23,6 +23,7 @@ import {
   completeMarkdownCacheScope,
   type MarkdownCacheScope,
 } from './markdownCache';
+import { getDiagramMetrics, getDiagramMetricsRevision } from './diagramMetrics';
 
 export type MarkdownDensity = 'default' | 'user' | 'work';
 
@@ -358,11 +359,12 @@ export const markdownMetrics = {
     paddingY: 12,
   },
   diagram: {
+    borderWidth: 1,
+    fallbackHeight: 240,
     maxHeight: 360,
-    minHeight: 240,
+    minHeight: 120,
     padding: 12,
     toolbarHeight: 32,
-    widthRatio: 0.65,
   },
   fontFamily: {
     mono: 'ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace',
@@ -505,7 +507,7 @@ export function getMarkdownLayoutDocument(
   const parseOptions = markdownParseOptions(options);
   const safeWidth = Math.max(1, width);
   const roundedWidth = Math.round(safeWidth * 100) / 100;
-  const key = `${density}\0${markdownParseCacheKey(parseOptions)}\0${roundedWidth}\0${markdown}`;
+  const key = `${density}\0${markdownParseCacheKey(parseOptions)}\0${roundedWidth}\0${getDiagramMetricsRevision()}\0${markdown}`;
   const cached = readScopedCache(
     layoutCache,
     streamingLayoutCache,
@@ -652,10 +654,7 @@ function layoutPreparedMarkdownBlock(
       };
     }
     case 'diagram': {
-      const contentHeight = Math.min(
-        markdownMetrics.diagram.maxHeight,
-        Math.max(markdownMetrics.diagram.minHeight, safeWidth * markdownMetrics.diagram.widthRatio),
-      );
+      const contentHeight = diagramContentHeight(block.text, safeWidth);
       return {
         contentHeight,
         height: topGap + contentHeight,
@@ -724,6 +723,21 @@ function layoutPreparedMarkdownBlock(
         type: 'rule',
       };
   }
+}
+
+function diagramContentHeight(source: string, availableWidth: number) {
+  const metrics = getDiagramMetrics(source);
+  if (!metrics) return markdownMetrics.diagram.fallbackHeight;
+  const chromeHeight = markdownMetrics.diagram.toolbarHeight
+    + markdownMetrics.diagram.padding * 2
+    + markdownMetrics.diagram.borderWidth * 2;
+  const imageWidth = Math.max(1,
+    availableWidth - markdownMetrics.diagram.padding * 2 - markdownMetrics.diagram.borderWidth * 2);
+  const fittedImageHeight = metrics.height * Math.min(1, imageWidth / metrics.width);
+  return Math.min(
+    markdownMetrics.diagram.maxHeight,
+    Math.max(markdownMetrics.diagram.minHeight, chromeHeight + fittedImageHeight),
+  );
 }
 
 function layoutPreparedMarkdownTable(
