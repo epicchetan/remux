@@ -75,6 +75,11 @@ stable. Omit the toggle for unsupported preview formats. Existing Diff and Close
 remain on the right. HTML preview has no additional floating controls.
 Reuse actual shared components and theme tokens, not lookalike native controls.
 
+Markdown owns one scroll container sized to the renderer viewport. Its document
+scrolls inside that container while the shared toolbar remains outside it.
+Browser coverage must exercise vertical wheel/touch scrolling and retention
+across mode switches, not just check for horizontal overflow.
+
 | Event | Result |
 | --- | --- |
 | First ordinary open of Markdown or HTML | Preview. |
@@ -362,3 +367,12 @@ host without React Native. Building the full future Remux web app is out of scop
 - Follow-up UI decision: remove the floating HTML Links button and its menu.
   Preview keeps the shared bottom toolbar; iframe isolation and interactions
   retain their existing behavior. This is a web viewer asset update.
+- Markdown scroll regression fixed after live feedback: the migrated Markdown
+  container retained `flex: 1` under a non-flex renderer and expanded to its
+  full document height. The outer viewer clipped content, leaving no internal
+  scroll range. Set the existing overflow container to `height: 100%`.
+  Browser reproduction failed before the fix (clientHeight/scrollHeight both
+  7,592px), then passed with a bounded viewport, real wheel and Chromium mobile
+  touch scrolling, bottom-marker geometry, fixed toolbar, retained scroll across
+  mode changes and one document read. This covers vertical scrolling explicitly;
+  earlier horizontal-overflow/parity checks did not catch it.

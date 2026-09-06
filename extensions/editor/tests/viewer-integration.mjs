@@ -25,8 +25,8 @@ function viewerUrl(path, line = null) {
   return url.href;
 }
 
-async function openViewer(path, line = null) {
-  const page = await browser.newPage();
+async function openViewer(path, line = null, pageOptions = {}) {
+  const page = await browser.newPage(pageOptions);
   await page.addInitScript(({ token }) => {
     if (window.top !== window) return;
     const fixtures = {
@@ -59,6 +59,7 @@ graph TD
 `,
       '/doc.html': '<!doctype html><button id="increment">Increment</button><output id="value">0</output><script>let value=0;document.querySelector("#increment").onclick=()=>document.querySelector("#value").textContent=String(++value)<\/script>',
       '/lines.txt': Array.from({ length: 100 }, (_, index) => `line ${index + 1}`).join('\n'),
+      '/scroll.md': `# Scroll regression\n\n${Array.from({ length: 180 }, (_, index) => `Paragraph ${index + 1}: enough text to occupy a visible line in the preview.`).join('\n\n')}\n\n## Bottom marker\n`,
     };
     window.__testHost = {
       copied: null,
@@ -205,6 +206,56 @@ try {
   assert.equal(await markdown.evaluate(() => window.__testHost.copied === window.__testHost.fixtures['/doc.md']), true);
   await markdown.close();
 
+  const scrolling = await openViewer('/scroll.md');
+  const markdownScroller = scrolling.locator('.remux-viewer-markdown');
+  await scrolling.getByRole('heading', { name: 'Bottom marker' }).waitFor({ state: 'attached' });
+  const desktopMetrics = await markdownScroller.evaluate(element => ({
+    clientHeight: element.clientHeight,
+    scrollHeight: element.scrollHeight,
+  }));
+  assert.ok(desktopMetrics.clientHeight < desktopMetrics.scrollHeight,
+    `Markdown scroller must be bounded (${desktopMetrics.clientHeight} < ${desktopMetrics.scrollHeight})`);
+  const toolbarTop = await scrolling.locator('.remux-extension-action-bar').evaluate(element => element.getBoundingClientRect().top);
+  assert.ok(toolbarTop >= 0 && toolbarTop < (await scrolling.evaluate(() => innerHeight)), 'toolbar must be inside the viewport');
+  await markdownScroller.hover();
+  await scrolling.mouse.wheel(0, 1600);
+  await scrolling.waitForFunction(() => document.querySelector('.remux-viewer-markdown')?.scrollTop > 0);
+  const retainedScrollTop = await markdownScroller.evaluate(element => element.scrollTop);
+  assert.equal(await scrolling.locator('.remux-extension-action-bar').evaluate(element => element.getBoundingClientRect().top), toolbarTop,
+    'toolbar must remain fixed while Markdown scrolls');
+  await scrolling.getByRole('button', { name: 'Show source' }).click();
+  await scrolling.getByRole('button', { name: 'Show preview' }).click();
+  assert.equal(await readCount(scrolling, '/scroll.md'), 1, 'scroll mode toggles must not reread Markdown');
+  assert.equal(await markdownScroller.evaluate(element => element.scrollTop), retainedScrollTop,
+    'Markdown scroll position must survive Source/Preview toggles');
+  await markdownScroller.evaluate(element => { element.scrollTop = element.scrollHeight; });
+  assert.equal(await scrolling.evaluate(() => {
+    const scroller = document.querySelector('.remux-viewer-markdown').getBoundingClientRect();
+    const marker = document.querySelector('#bottom-marker').getBoundingClientRect();
+    return marker.top >= scroller.top && marker.bottom <= scroller.bottom;
+  }), true, 'bottom marker must be inside the desktop scroller viewport');
+  await scrolling.close();
+
+  const touchScrolling = await openViewer('/scroll.md', null, {
+    hasTouch: true,
+    isMobile: true,
+    viewport: { width: 390, height: 844 },
+  });
+  const touchScroller = touchScrolling.locator('.remux-viewer-markdown');
+  await touchScrolling.getByRole('heading', { name: 'Bottom marker' }).waitFor({ state: 'attached' });
+  const cdp = await touchScrolling.context().newCDPSession(touchScrolling);
+  await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: 190, y: 700 }] });
+  await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: 190, y: 180 }] });
+  await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  await touchScrolling.waitForFunction(() => document.querySelector('.remux-viewer-markdown')?.scrollTop > 0);
+  await touchScroller.evaluate(element => { element.scrollTop = element.scrollHeight; });
+  assert.equal(await touchScrolling.evaluate(() => {
+    const scroller = document.querySelector('.remux-viewer-markdown').getBoundingClientRect();
+    const marker = document.querySelector('#bottom-marker').getBoundingClientRect();
+    return marker.top >= scroller.top && marker.bottom <= scroller.bottom;
+  }), true, 'bottom marker must be inside the touch scroller viewport');
+  await touchScrolling.close();
+
   const html = await openViewer('/doc.html');
   const frame = html.frameLocator('iframe[title="Interactive HTML document"]');
   await frame.locator('#increment').click();
@@ -260,6 +311,7 @@ try {
     lineFocus: true,
     markdownParityAndResponsiveLayout: true,
     markdownPreviewBudget: true,
+    markdownScrolling: true,
     noToggleReread: true,
     sameByteReloadResetsHtml: true,
     toolbarOrderAndPressed: true,

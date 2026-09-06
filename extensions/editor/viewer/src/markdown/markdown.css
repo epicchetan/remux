@@ -15,6 +15,7 @@
   --remux-viewer-markdown-alert-caution-border: var(--rmx-danger);
   --remux-viewer-markdown-alert-caution-bg: color-mix(in srgb, var(--rmx-danger) 9%, transparent);
   --remux-viewer-markdown-alert-caution-title: var(--rmx-danger);
+  height: 100%;
   min-height: 0;
   flex: 1;
   overflow-x: hidden;
