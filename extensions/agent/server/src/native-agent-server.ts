@@ -2,6 +2,7 @@ import {
   NATIVE_AGENT_METHODS,
   NATIVE_AGENT_PROTOCOL_VERSION,
   type NativeAgentResourceKey,
+  type NativeCommandReadParams,
   type NativeAgentResourceReadParams,
   type NativeArtifactPutCommand,
   type NativeArtifactReadCommand,
@@ -113,6 +114,8 @@ export class NativeAgentServer {
         return this.artifacts.read(params as NativeArtifactReadCommand);
       case NATIVE_AGENT_METHODS.filesSearch:
         return searchAgentFiles(params as Parameters<typeof searchAgentFiles>[0]);
+      case NATIVE_AGENT_METHODS.commandRead:
+        return this.coordinator.readCommand(params as NativeCommandReadParams);
       case NATIVE_AGENT_METHODS.conversationCreate:
         return this.coordinator.createConversation(params as NativeConversationCreateCommand);
       case NATIVE_AGENT_METHODS.messageSend:

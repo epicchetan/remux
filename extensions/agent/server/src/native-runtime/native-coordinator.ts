@@ -8,6 +8,7 @@ import {
   parseAgentExecutionTranscriptResourceKey,
   parseNativeAgentResourceReadParams,
   parseNativeBranchCommand,
+  parseNativeCommandReadParams,
   parseNativeConversationCreateCommand,
   parseNativeConversationInterruptCommand,
   parseNativeConversationRenameCommand,
@@ -25,6 +26,8 @@ import {
   type NativeAgentResourceKey,
   type NativeAgentResourceReadParams,
   type NativeBranchCommand,
+  type NativeCommandReadParams,
+  type NativeCommandReadResult,
   type NativeConversationCreateCommand,
   type NativeConversationInterruptCommand,
   type NativeConversationRenameCommand,
@@ -563,6 +566,55 @@ export class NativeAgentCoordinator {
     const input = parseNativeConversationCreateCommand(unparsed);
     return this.journal.runAsyncCommand(input.commandId, 'conversation.create', input, () =>
       this.createConversationOwned(input));
+  }
+
+  readCommand(unparsed: NativeCommandReadParams): NativeCommandReadResult {
+    this.assertOpen();
+    const input = parseNativeCommandReadParams(unparsed);
+    const receipt = this.journal.commandReceipt(input.commandId);
+    if (!receipt) return { state: 'missing' };
+    if (receipt.kind !== input.kind) {
+      throw new Error(`Command ${input.commandId} is not a ${input.kind} command.`);
+    }
+    const base = { commandId: receipt.commandId, kind: input.kind };
+    if (receipt.state === 'received' || receipt.state === 'dispatching') {
+      return { ...base, state: receipt.state };
+    }
+    if (receipt.state === 'rejected' || receipt.state === 'recovery_failed') {
+      return {
+        ...base,
+        state: receipt.state,
+        ...(receipt.errorMessage ? { errorMessage: receipt.errorMessage } : {}),
+      };
+    }
+    const result = receipt.result;
+    if (!result || typeof result !== 'object' || Array.isArray(result) ||
+        (result as { accepted?: unknown }).accepted !== true) {
+      throw new Error(`Accepted ${input.kind} command ${input.commandId} has no valid public result.`);
+    }
+    if (input.kind === 'conversation.create') {
+      const conversationId = (result as { conversationId?: unknown }).conversationId;
+      if (typeof conversationId !== 'string' || !conversationId) {
+        throw new Error(`Accepted conversation.create command ${input.commandId} has no conversation ID.`);
+      }
+      return { ...base, kind: input.kind, state: 'accepted', result: { accepted: true, conversationId } };
+    }
+    const send = result as { commandId?: unknown; turnId?: unknown; delivery?: unknown };
+    if (typeof send.commandId !== 'string' || typeof send.turnId !== 'string' ||
+        !['sent', 'queued', 'steered'].includes(String(send.delivery))) {
+      throw new Error(`Accepted turn.send command ${input.commandId} has no valid public result.`);
+    }
+    return {
+      ...base,
+      kind: input.kind,
+      state: 'accepted',
+      result: {
+        accepted: true,
+        commandId: send.commandId,
+        turnId: send.turnId,
+        delivery: send.delivery as 'sent' | 'queued' | 'steered',
+      },
+    };
   }
 
   private async createConversationOwned(

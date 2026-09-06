@@ -73,6 +73,31 @@ test('native Agent JSON-RPC surface serves versioned resources and commands only
       model: 'fixture-native-v1',
       access: 'workspace-write',
     }) as { conversationId: string };
+    const changesBeforeReceiptReads = database.prepare('SELECT total_changes() AS value')
+      .get() as { value: number };
+    assert.deepEqual(await server.handle(NATIVE_AGENT_METHODS.commandRead, {
+      commandId: 'create-1', kind: 'conversation.create',
+    }), {
+      commandId: 'create-1', kind: 'conversation.create', state: 'accepted',
+      result: { accepted: true, conversationId: created.conversationId },
+    });
+    assert.deepEqual(await server.handle(NATIVE_AGENT_METHODS.commandRead, {
+      commandId: 'missing-create', kind: 'conversation.create',
+    }), { state: 'missing' });
+    await assert.rejects(server.handle(NATIVE_AGENT_METHODS.commandRead, {
+      commandId: 'create-1', kind: 'turn.send',
+    }), /is not a turn\.send command/u);
+    journal.claimCommand('rejected-send', 'turn.send', { private: 'request' }, 1);
+    journal.rejectCommand('rejected-send', 'Provider unavailable.', 2);
+    assert.deepEqual(await server.handle(NATIVE_AGENT_METHODS.commandRead, {
+      commandId: 'rejected-send', kind: 'turn.send',
+    }), {
+      commandId: 'rejected-send', kind: 'turn.send', state: 'rejected',
+      errorMessage: 'Provider unavailable.',
+    });
+    assert.equal((database.prepare('SELECT total_changes() AS value').get() as { value: number }).value,
+      changesBeforeReceiptReads.value + 2,
+      'receipt reads have no journal or provider effects');
     const runtimeRead = await server.handle(NATIVE_AGENT_METHODS.resourcesRead, {
       requests: [{ key: `agent/runtime:${created.conversationId}` }],
     }) as {
@@ -123,6 +148,12 @@ test('native Agent JSON-RPC surface serves versioned resources and commands only
     releaseSend();
     const [sent, duplicate] = await Promise.all([sentPending, duplicatePending]);
     assert.deepEqual(duplicate, sent);
+    assert.deepEqual(await server.handle(NATIVE_AGENT_METHODS.commandRead, {
+      commandId: 'send-1', kind: 'turn.send',
+    }), {
+      commandId: 'send-1', kind: 'turn.send', state: 'accepted',
+      result: { accepted: true, commandId: 'send-1', turnId: sent.turnId, delivery: 'sent' },
+    });
     assert.equal(syncCalls, 1);
     assert.ok(sent.turnId);
     await new Promise((resolve) => setTimeout(resolve, 10));

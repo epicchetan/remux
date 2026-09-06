@@ -43,6 +43,7 @@ export const NATIVE_AGENT_METHODS = {
   artifactPut: 'remux/agent/artifact/put',
   artifactRead: 'remux/agent/artifact/read',
   filesSearch: 'remux/agent/files/search',
+  commandRead: 'remux/agent/command/read',
   conversationCreate: 'remux/agent/conversation/create',
   messageSend: 'remux/agent/conversation/message/send',
   queuedMessageRemove: 'remux/agent/conversation/message/queue/remove',
@@ -583,6 +584,42 @@ export type NativeConversationCreateCommand = {
   access: ProviderAccess;
 };
 
+export type NativeCommandReadParams = {
+  commandId: string;
+  kind: 'conversation.create' | 'turn.send';
+};
+
+export type NativeCommandReadResult =
+  | { state: 'missing' }
+  | {
+      commandId: string;
+      kind: NativeCommandReadParams['kind'];
+      state: 'received' | 'dispatching';
+    }
+  | {
+      commandId: string;
+      kind: 'conversation.create';
+      state: 'accepted';
+      result: { accepted: true; conversationId: string };
+    }
+  | {
+      commandId: string;
+      kind: 'turn.send';
+      state: 'accepted';
+      result: {
+        accepted: true;
+        commandId: string;
+        turnId: string;
+        delivery: 'sent' | 'queued' | 'steered';
+      };
+    }
+  | {
+      commandId: string;
+      kind: NativeCommandReadParams['kind'];
+      state: 'rejected' | 'recovery_failed';
+      errorMessage?: string;
+    };
+
 export type NativeProviderLoginStartCommand = {
   commandId: string;
   providerInstanceId: string;
@@ -780,6 +817,14 @@ export function parseNativeConversationCreateCommand(value: unknown): NativeConv
       serviceTier: record.serviceTier === null ? null : string(record.serviceTier, '$.serviceTier'),
     }),
     access: choice(record.access, ['read-only', 'workspace-write', 'full-access'], '$.access'),
+  };
+}
+
+export function parseNativeCommandReadParams(value: unknown): NativeCommandReadParams {
+  const record = strict(value, '$', ['commandId', 'kind']);
+  return {
+    commandId: identifier(record.commandId, '$.commandId'),
+    kind: choice(record.kind, ['conversation.create', 'turn.send'], '$.kind'),
   };
 }
 
