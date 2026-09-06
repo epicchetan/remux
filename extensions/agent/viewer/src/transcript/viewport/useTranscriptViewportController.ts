@@ -25,7 +25,7 @@ import {
 import {
   historicalMessageNavigationDestination,
   initialTranscriptScrollTarget,
-  nextUserMessageScrollAnchor,
+  nextTranscriptNavigationDestination,
   previousUserMessageScrollAnchor,
   resolveInitialTranscriptScrollTarget,
   resolveMessageAnchorScroll,
@@ -43,6 +43,7 @@ import {
   computeAnchorExtentFloorHeight,
   distanceFromBottom,
   maxScrollableTop,
+  naturalTranscriptContentMaxScrollableTop,
   naturalTranscriptMaxScrollableTop,
   parseCssPixels,
   scrollTopForViewportAnchor,
@@ -405,8 +406,8 @@ export function useTranscriptViewportController(
         viewport,
         navigationAnchorsRef.current,
         viewportIntentRef.current,
+        naturalTranscriptContentMaxScrollableTop(viewport, transcriptBodyRef.current),
         naturalTranscriptMaxScrollableTop(viewport, transcriptBodyRef.current, measureRef.current),
-        anchorRunwayHeightRef.current,
         navigationCursorSegmentIdRef.current,
       ));
 
@@ -751,19 +752,16 @@ export function useTranscriptViewportController(
 
     navigationCursorSegmentIdRef.current = anchor.segmentId;
     const desiredScrollTop = anchor.scrollTop;
-    const targetsStreamingTurn = anchor.turnId === streamingTurnId;
     const naturalMaxScrollTop = naturalTranscriptMaxScrollableTop(
       viewport,
       transcriptBodyRef.current,
       measureRef.current,
     );
-    const destination = targetsStreamingTurn
-      ? { kind: 'message' as const, scrollTop: desiredScrollTop }
-      : historicalMessageNavigationDestination({
-          bottomIfUnreachable,
-          desiredScrollTop,
-          naturalMaxScrollTop,
-        });
+    const destination = historicalMessageNavigationDestination({
+      bottomIfUnreachable,
+      desiredScrollTop,
+      naturalMaxScrollTop,
+    });
     const anchorsMessage = destination.kind === 'message';
     if (anchorsMessage) {
       // Navigation promises an exact user-message position, including for a
@@ -810,7 +808,6 @@ export function useTranscriptViewportController(
     scrollToPosition,
     setAnchorExtentFloor,
     setAnchorRunway,
-    streamingTurnId,
   ]);
 
   const scrollUp = useCallback(() => {
@@ -852,15 +849,23 @@ export function useTranscriptViewportController(
       transcriptBodyRef.current,
       measureRef.current,
     );
-    const anchor = nextUserMessageScrollAnchor({
+    const naturalContentMaxScrollTop = naturalTranscriptContentMaxScrollableTop(
+      viewport,
+      transcriptBodyRef.current,
+    );
+    const destination = nextTranscriptNavigationDestination({
       anchors: navigationAnchorsRef.current,
-      atBottom: mode.kind === 'bottom-follow' && isNearBottom(viewport),
+      atBottom: mode.kind === 'bottom-follow' &&
+        viewport.scrollTop >= naturalMaxScrollTop - bottomStickThresholdPx,
       currentSegmentId,
+      naturalContentMaxScrollTop,
+      naturalMaxScrollTop,
       scrollTop: viewport.scrollTop,
       threshold: scrollNavigationThresholdPx,
     });
-    if (anchor) {
-      scrollToMessageAnchor(anchor, true);
+    if (!destination) return;
+    if (destination.kind === 'message') {
+      scrollToMessageAnchor(destination.anchor, false);
       return;
     }
 
@@ -869,7 +874,7 @@ export function useTranscriptViewportController(
     // that lifts an already-visible tail row to the top.
     navigationCursorSegmentIdRef.current = null;
     scrollToPosition(
-      naturalMaxScrollTop,
+      destination.scrollTop,
       { kind: 'bottom-follow' },
       'scroll-navigation-bottom',
       true,
@@ -1394,8 +1399,8 @@ function scrollNavigationAvailability(
   node: HTMLElement,
   anchors: TranscriptScrollAnchor[],
   mode: TranscriptViewportIntent,
+  naturalContentMaxScrollTop: number,
   naturalMaxScrollTop: number,
-  anchorRunwayHeight: number,
   navigationCursorSegmentId: string | null,
 ) {
   const currentSegmentId = mode.kind === 'message-anchor'
@@ -1410,18 +1415,17 @@ function scrollNavigationAvailability(
     scrollTop: node.scrollTop,
     threshold: scrollNavigationThresholdPx,
   });
-  const nextAnchor = nextUserMessageScrollAnchor({
+  const downDestination = nextTranscriptNavigationDestination({
     anchors,
     atBottom,
     currentSegmentId,
+    naturalContentMaxScrollTop,
+    naturalMaxScrollTop,
     scrollTop: node.scrollTop,
     threshold: scrollNavigationThresholdPx,
   });
   return {
-    canScrollDown:
-      Boolean(nextAnchor) ||
-      node.scrollTop < naturalMaxScrollTop - scrollNavigationThresholdPx ||
-      anchorRunwayHeight > 1,
+    canScrollDown: Boolean(downDestination),
     canScrollUp: Boolean(previousAnchor),
   };
 }

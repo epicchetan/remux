@@ -33,6 +33,10 @@ export type TranscriptScrollAnchorSelection = {
   threshold?: number;
 };
 
+export type TranscriptDownNavigationDestination =
+  | { anchor: TranscriptScrollAnchor; kind: 'message'; scrollTop: number }
+  | { kind: 'bottom'; scrollTop: number };
+
 export type MessageAnchorScrollResolution = {
   phase: 'anchored' | 'catching-up';
   runwayHeight: number;

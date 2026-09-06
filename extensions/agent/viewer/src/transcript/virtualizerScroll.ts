@@ -112,6 +112,7 @@ export {
   historicalMessageNavigationDestination,
   initialTranscriptScrollTarget,
   nextUserMessageScrollAnchor,
+  nextTranscriptNavigationDestination,
   previousUserMessageScrollAnchor,
   resolveInitialTranscriptScrollTarget,
   resolveMessageAnchorScroll,
@@ -125,6 +126,7 @@ export type { TranscriptRowPosition } from './geometry/geometryIndex';
 export type {
   MessageAnchorScrollResolution,
   TranscriptInitialScrollTarget,
+  TranscriptDownNavigationDestination,
   TranscriptScrollAnchor,
   TranscriptScrollAnchorSelection,
   TranscriptViewportAnchor,

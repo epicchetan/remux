@@ -2708,6 +2708,13 @@ export async function installAgentHost(page: Page) {
           touchTurn(turn);
           invalidateTranscript(turn.id, 'runtimeEvent', true);
         },
+        completeLatestRunningTurn() {
+          const turn = turns.at(-1);
+          if (!turn || turn.status !== 'inProgress') {
+            throw new Error('No running fixture turn is available.');
+          }
+          finishTurn(turn, 'completed');
+        },
         streamLatestAssistantText(text: string) {
           const turn = turns.at(-1);
           const assistant = turn?.segments.find((segment) => segment.type === 'assistantMessage');

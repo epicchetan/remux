@@ -14,6 +14,39 @@ Amends: [agent-state-authority-and-synchronization-v1.md](agent-state-authority-
 
 ## Current checkpoint — 2026-09-06
 
+### Accepted bounded follow-up — short active-turn Down navigation
+
+The Ledger screenshot exposed a viewer regression: Down could select an already
+visible latest active turn and add synthetic runway to lift its user message.
+Eligibility and execution used separate decisions; streaming targets bypassed
+natural-bottom fallback, and bottom padding counted as content still to reveal. This is independent of the successful, slow native
+Compact recorded in the incident diagnostic.
+
+Sol `fix_short_turn_down` owns one shared Down-destination decision in the existing
+viewport code and focused unit/browser regressions. Primary owns review,
+integration, explicit-path commit/push and viewer publication. Latest content
+fully visible means Down disabled; content below remains navigable; short active
+turns gain no Down-created runway. Preserve Up/send anchoring, streaming growth
+and completion behavior. No server/provider or protocol changes are planned.
+Pause the automatic viewer build while editing, publish the reviewed viewer build,
+and restore watching. Refresh loads it; no server/daemon restart is required.
+Primary reviewed the resolver and required content-only eligibility after measured
+geometry showed 20px bottom padding enabling Down with the entire active turn
+visible. Normal padded bottom placement, Up/send anchoring and long-turn identity
+navigation remain intact. Tests require actual free-scroll movement and fully
+visible turn geometry before checking disabled state, then stream real fixture
+content, verify forward navigation without synthetic space, and await completion.
+
+Validation: typecheck and 28 transcript unit tests passed. The final browser
+integration passed 79 existing checks with three existing skips; the new two-case
+desktop/mobile test passed after correcting its growth setup and waiting for each
+navigation animation. Both cases fail at the disabled assertion against the old
+published bundle. Evidence under `/tmp/remux-audit-implementation/`:
+`short-tail-final-checks.log`, `short-tail-final-browser.log`,
+`short-tail-old-confirm.log`, and `short-tail-real-growth.log`.
+Viewer publication and production-bundle verification follow this accepted slice.
+
+
 Deployed code: `main` at `6c2162e`, pushed to origin. The host release and Agent
 server/viewer are built and deployed; native protocol is 11, schema remains 16.
 This section and the delivery rules below supersede the historical assignment/status prose later in this document. The user approved

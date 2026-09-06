@@ -19,6 +19,7 @@ import {
   historicalMessageNavigationDestination,
   initialTranscriptScrollTarget,
   nextUserMessageScrollAnchor,
+  nextTranscriptNavigationDestination,
   previousUserMessageScrollAnchor,
   resolveInitialTranscriptScrollTarget,
   resolveMessageAnchorScroll,
@@ -268,6 +269,70 @@ test('next-turn navigation selects identity before resolving live reachability',
     desiredScrollTop: 166,
     naturalMaxScrollTop: 150,
   }), { kind: 'bottom', scrollTop: 150 });
+});
+
+test('next-turn navigation uses only naturally reachable tail destinations', () => {
+  const anchors = [
+    { contentBottom: 120, contentTop: 60, segmentId: 'user-1', scrollTop: 36, turnId: 'turn-1' },
+    { contentBottom: 250, contentTop: 190, segmentId: 'user-2', scrollTop: 166, turnId: 'turn-2' },
+  ];
+
+  assert.deepEqual(nextTranscriptNavigationDestination({
+    anchors,
+    atBottom: false,
+    currentSegmentId: 'user-1',
+    naturalMaxScrollTop: 150,
+    scrollTop: 36,
+  }), { kind: 'bottom', scrollTop: 150 }, 'an unreachable later row returns to the natural bottom');
+  assert.equal(nextTranscriptNavigationDestination({
+    anchors,
+    atBottom: false,
+    currentSegmentId: 'user-2',
+    naturalMaxScrollTop: 150,
+    scrollTop: 166,
+  }), null, 'synthetic runway alone does not create a destination after the latest row');
+  assert.equal(nextTranscriptNavigationDestination({
+    anchors,
+    atBottom: false,
+    currentSegmentId: 'user-1',
+    naturalMaxScrollTop: 150,
+    scrollTop: 150,
+  }), null, 'a stale cursor cannot enable a no-op destination at the natural bottom');
+  assert.equal(nextTranscriptNavigationDestination({
+    anchors,
+    atBottom: false,
+    currentSegmentId: 'user-1',
+    naturalMaxScrollTop: 150,
+    scrollTop: 180,
+  }), null, 'a stale cursor beyond the natural bound cannot create a backward Down destination');
+  assert.equal(nextTranscriptNavigationDestination({
+    anchors,
+    atBottom: false,
+    naturalContentMaxScrollTop: 150,
+    naturalMaxScrollTop: 170,
+    scrollTop: 150,
+  }), null, 'a fully visible latest row does not turn bottom padding into a destination');
+  assert.deepEqual(nextTranscriptNavigationDestination({
+    anchors,
+    atBottom: false,
+    naturalContentMaxScrollTop: 500,
+    naturalMaxScrollTop: 520,
+    scrollTop: 150,
+  }), { anchor: anchors[1], kind: 'message', scrollTop: 166 },
+  'growth below an already-visible latest row restores normal forward anchoring');
+  assert.equal(nextTranscriptNavigationDestination({
+    anchors,
+    atBottom: false,
+    naturalMaxScrollTop: 150,
+    scrollTop: 180,
+  }), null, 'free scrolling beyond the natural bound cannot use synthetic extent as a destination');
+  assert.deepEqual(nextTranscriptNavigationDestination({
+    anchors,
+    atBottom: false,
+    currentSegmentId: 'user-1',
+    naturalMaxScrollTop: 220,
+    scrollTop: 36,
+  }), { anchor: anchors[1], kind: 'message', scrollTop: 166 }, 'a naturally reachable row keeps exact anchoring');
 });
 
 test('restores a compaction viewport anchor after the segment moves to the next turn', () => {

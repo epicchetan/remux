@@ -1,6 +1,7 @@
 import type { TranscriptRowPosition } from '../geometry/geometryIndex';
 import type {
   MessageAnchorScrollResolution,
+  TranscriptDownNavigationDestination,
   TranscriptInitialScrollTarget,
   TranscriptScrollAnchorSelection,
   TranscriptViewportAnchor,
@@ -84,6 +85,45 @@ export function historicalMessageNavigationDestination({
   return bottomIfUnreachable && desired > naturalMax + 1
     ? { kind: 'bottom', scrollTop: naturalMax }
     : { kind: 'message', scrollTop: desired };
+}
+
+export function nextTranscriptNavigationDestination({
+  anchors,
+  atBottom,
+  currentSegmentId = null,
+  naturalContentMaxScrollTop,
+  naturalMaxScrollTop,
+  scrollTop,
+  threshold = 12,
+}: TranscriptScrollAnchorSelection & {
+  naturalContentMaxScrollTop?: number;
+  naturalMaxScrollTop: number;
+}): TranscriptDownNavigationDestination | null {
+  const naturalMax = Math.max(0, naturalMaxScrollTop);
+  const naturalContentMax = Math.max(0, naturalContentMaxScrollTop ?? naturalMax);
+  if (scrollTop >= naturalContentMax - Math.max(0, threshold)) return null;
+  const anchor = nextUserMessageScrollAnchor({
+    anchors,
+    atBottom,
+    currentSegmentId,
+    scrollTop,
+    threshold,
+  });
+  if (anchor) {
+    const destination = historicalMessageNavigationDestination({
+      bottomIfUnreachable: true,
+      desiredScrollTop: anchor.scrollTop,
+      naturalMaxScrollTop: naturalMax,
+    });
+    if (
+      destination.kind === 'message' &&
+      destination.scrollTop > scrollTop + Math.max(0, threshold)
+    ) {
+      return { anchor, kind: 'message', scrollTop: destination.scrollTop };
+    }
+  }
+
+  return { kind: 'bottom', scrollTop: naturalMax };
 }
 
 export function transcriptViewportAnchorScrollTop(

@@ -173,7 +173,12 @@ type TranscriptViewportIntent =
   because content streamed elsewhere.
 - Up selects the previous semantic user-message identity.
 - Down selects the next semantic user-message identity, or natural bottom when
-  no later message can or should be anchored.
+  no later message can or should be anchored. Down eligibility and execution
+  resolve the same destination against natural transcript bounds. Eligibility
+  excludes trailing padding and synthetic runway; the bottom destination retains
+  normal transcript padding. A latest turn
+  that is already fully visible does not enable Down or gain synthetic runway,
+  including while streaming. Explicit Up and new-message anchoring remain separate.
 - Manual wheel/touch input enters `free`; reaching natural bottom enters
   `bottom-follow` after native scrolling settles.
 

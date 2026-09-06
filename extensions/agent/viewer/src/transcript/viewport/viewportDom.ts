@@ -37,6 +37,17 @@ export function naturalTranscriptMaxScrollableTop(
   );
 }
 
+export function naturalTranscriptContentMaxScrollableTop(
+  viewport: HTMLElement,
+  transcriptBody: HTMLElement | null,
+) {
+  if (!transcriptBody) return maxScrollableTop(viewport);
+  const viewportBounds = viewport.getBoundingClientRect();
+  const bodyBounds = transcriptBody.getBoundingClientRect();
+  const bodyBottom = viewport.scrollTop + bodyBounds.bottom - viewportBounds.top;
+  return Math.max(0, bodyBottom - viewport.clientHeight);
+}
+
 export function captureTranscriptViewportAnchor({
   geometry,
   scrollTop,

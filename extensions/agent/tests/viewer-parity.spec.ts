@@ -372,12 +372,14 @@ test('pins streamed work through collapse and retains exact message anchors unti
 
   const sentTurnId = await sentRow.getAttribute('data-turn-id');
   expect(sentTurnId).toBeTruthy();
-  await page.getByRole('button', { name: 'Next turn or bottom' }).click();
-  await expect.poll(() => userMessageAnchorError(page, sentTurnId!)).toBeLessThanOrEqual(2);
-  await page.getByRole('button', { name: 'Next turn or bottom' }).click();
+  const next = page.getByRole('button', { name: 'Next turn or bottom' });
+  await expect(next).toBeDisabled();
+  await page.getByTestId('agent-transcript-scroll').hover();
+  await page.mouse.wheel(0, 1_200);
   await expect(page.getByTestId('agent-transcript-anchor-runway')).toHaveCSS('height', '0px');
   await expect.poll(() => page.getByTestId('agent-transcript-scroll').evaluate((node) =>
     Math.abs(node.scrollHeight - node.clientHeight - node.scrollTop))).toBeLessThanOrEqual(2);
+  await expect(next).toBeDisabled();
 });
 
 test('keeps the sent message pinned while the first assistant chunk auto-closes work', async ({ page }) => {
@@ -466,6 +468,49 @@ test('restores a running user-message anchor before streamed work grows', async 
   for (const offset of offsets.growth) {
     expect(Math.abs(offset - offsets.initial)).toBeLessThanOrEqual(2);
   }
+});
+
+test('enables Down for natural running-turn growth and disables it at the bounded tail', async ({ page }) => {
+  await page.goto(conversationUrl('&fixtureLong=1&fixtureRunning=1'));
+  const viewport = page.getByTestId('agent-transcript-scroll');
+  const next = page.getByRole('button', { name: 'Next turn or bottom' });
+  const runningTurn = viewport.locator('.codex-transcript-turn').last();
+  await expect(runningTurn).toContainText('Resume this running turn');
+
+  const initialScrollTop = await viewport.evaluate((node) => node.scrollTop);
+  await viewport.hover();
+  await page.mouse.wheel(0, -20);
+  await expect.poll(() => viewport.evaluate((node, initial) => initial - node.scrollTop, initialScrollTop))
+    .toBeGreaterThanOrEqual(14);
+  await expect.poll(() => page.evaluate(() => {
+    const viewportElement = document.querySelector<HTMLElement>('[data-testid="agent-transcript-scroll"]')!;
+    const turn = Array.from(viewportElement.querySelectorAll<HTMLElement>('.codex-transcript-turn')).at(-1)!;
+    const viewportBounds = viewportElement.getBoundingClientRect();
+    const turnBounds = turn.getBoundingClientRect();
+    return turnBounds.top >= viewportBounds.top - 1 && turnBounds.bottom <= viewportBounds.bottom + 1;
+  })).toBe(true);
+  await expect(next).toBeDisabled();
+
+  await page.evaluate(() => (window as any).__agentFixture.streamLatestAssistantText(
+    Array.from({ length: 40 }, (_, index) => `Streaming paragraph ${index + 1}: more work is arriving.`).join('\n\n'),
+  ));
+  await expect(next).toBeEnabled();
+  // Free scrolling can leave several visible historical message anchors ahead.
+  // Every Down must make forward progress without adding synthetic space.
+  for (let step = 0; step < 8 && await next.isEnabled(); step += 1) {
+    const before = await viewport.evaluate((node) => node.scrollTop);
+    await next.click();
+    await expect.poll(() => viewport.evaluate((node) => node.scrollTop)).toBeGreaterThan(before + 1);
+    await page.waitForTimeout(250); // Let the 170ms navigation finish before the next click.
+    await expect(page.getByTestId('agent-transcript-anchor-runway')).toHaveCSS('height', '0px');
+  }
+  await expect.poll(() => viewport.evaluate((node) =>
+    Math.abs(node.scrollHeight - node.clientHeight - node.scrollTop))).toBeLessThanOrEqual(2);
+  await expect(next).toBeDisabled();
+
+  await page.evaluate(() => (window as any).__agentFixture.completeLatestRunningTurn());
+  await expect(page.locator('.codex-work-header').last()).toContainText(/^Worked for \S+$/u);
+  await expect(next).toBeDisabled();
 });
 
 test('keeps running work manually closed across later transcript deltas', async ({ page }) => {
