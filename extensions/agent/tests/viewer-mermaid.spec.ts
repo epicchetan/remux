@@ -16,7 +16,7 @@ test.beforeEach(async ({ page }) => {
   await installAgentHost(page);
 });
 
-test('keeps diagram geometry fixed through loading, ready, source, expansion, and resize', async ({ page }, testInfo) => {
+test('keeps diagram geometry fixed through loading, ready, source, and fitted resize', async ({ page }, testInfo) => {
   let releaseMermaid!: () => void;
   const mermaidGate = new Promise<void>((resolve) => { releaseMermaid = resolve; });
   await page.route(/\/node_modules\/\.vite\/deps\/mermaid(?:\.js)?(?:\?.*)?$/u, async (route) => {
@@ -57,7 +57,7 @@ test('keeps diagram geometry fixed through loading, ready, source, expansion, an
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   if (testInfo.project.name === 'mobile') {
     await mkdir('/tmp/remux-html-preview', { recursive: true });
-    await page.screenshot({ path: '/tmp/remux-html-preview/agent-mermaid-inline.png' });
+    await page.screenshot({ path: '/tmp/remux-html-preview/agent-mermaid-fit.png' });
   }
   await expectFixedHeight(diagram, loadingHeight);
   await expectFixedHeight(frame, loadingFrameHeight);
@@ -68,39 +68,37 @@ test('keeps diagram geometry fixed through loading, ready, source, expansion, an
   await expect.poll(() => viewport.evaluate((node, expected) => Math.abs(node.scrollTop - expected), loadingScrollTop)).toBeLessThanOrEqual(2);
   await expectRowGeometry(diagram);
 
-  await page.getByRole('button', { name: 'Show diagram source' }).last().click();
+  const toolbar = diagram.locator('.agent-diagram-toolbar');
+  await expect(toolbar.getByRole('button')).toHaveCount(2);
+  const sourceControl = toolbar.getByRole('button').first();
+  const copyControl = toolbar.getByRole('button').nth(1);
+  await expect(sourceControl).toHaveAccessibleName('Show diagram source');
+  await expect(copyControl).toHaveAccessibleName('Copy diagram source');
+  await sourceControl.click();
   await expect(diagram.getByText('History[History] --> Replay[Replay]', { exact: false })).toBeVisible();
+  expect(await sourceControl.evaluate((node) => getComputedStyle(node).backgroundColor)).toBe('rgba(0, 0, 0, 0)');
+  await copyControl.focus();
+  expect(await copyControl.evaluate((node) => getComputedStyle(node).backgroundColor)).toBe('rgba(0, 0, 0, 0)');
   await expectFixedHeight(diagram, loadingHeight);
   await page.getByRole('button', { name: 'Show diagram' }).last().click();
   await expect(image).toBeVisible();
   await expect.poll(() => viewport.evaluate((node, expected) => Math.abs(node.scrollTop - expected), loadingScrollTop)).toBeLessThanOrEqual(2);
 
-  await page.getByRole('button', { name: 'Expand diagram' }).last().click();
-  const expanded = page.locator('.agent-diagram-expanded .agent-diagram-scroll[aria-label="Expanded diagram"]');
-  await expect(expanded).toBeVisible();
-  await expect(expanded.getByRole('img', { name: 'Mermaid diagram' })).toHaveAttribute('src', /^blob:/u);
-  const expandedSheet = page.locator('.agent-diagram-expanded');
-  await expect.poll(() => expandedSheet.evaluate((node) => {
-    const rect = node.getBoundingClientRect();
-    return Math.max(
-      Math.abs(rect.height - innerHeight * 0.9),
-      Math.abs(rect.top - innerHeight * 0.1),
-    );
-  })).toBeLessThanOrEqual(1);
-  if (testInfo.project.name === 'mobile') {
-    await page.screenshot({ path: '/tmp/remux-html-preview/agent-mermaid-expanded.png' });
-  }
-  await page.getByRole('button', { name: 'Close diagram' }).click();
-  await expect(expanded).toHaveCount(0);
-  await expectFixedHeight(diagram, loadingHeight);
-  await expect.poll(() => viewport.evaluate((node, expected) => Math.abs(node.scrollTop - expected), loadingScrollTop)).toBeLessThanOrEqual(2);
-
   await page.setViewportSize({ width: 390, height: 844 });
   await expect.poll(() => diagram.evaluate((node) => node.getBoundingClientRect().height)).toBe(240);
-  await expect.poll(() => diagram.locator('.agent-diagram-scroll').evaluate((node) => node.scrollWidth > node.clientWidth)).toBe(true);
+  const preview = diagram.locator('.agent-diagram-scroll');
+  await expect.poll(() => preview.evaluate((node) => node.scrollWidth <= node.clientWidth)).toBe(true);
+  await expect.poll(async () => {
+    const [imageBox, previewBox] = await Promise.all([image.boundingBox(), preview.boundingBox()]);
+    return imageBox && previewBox
+      ? imageBox.x >= previewBox.x && imageBox.x + imageBox.width <= previewBox.x + previewBox.width + 1
+      : false;
+  }).toBe(true);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   await expectRowGeometry(diagram);
-
+  if (testInfo.project.name === 'mobile') {
+    await page.screenshot({ path: '/tmp/remux-html-preview/agent-mermaid-fit.png' });
+  }
 });
 
 test('shows source within fixed geometry for invalid and oversized diagrams', async ({ page }) => {

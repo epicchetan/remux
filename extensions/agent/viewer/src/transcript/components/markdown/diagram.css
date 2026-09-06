@@ -30,9 +30,10 @@
   flex-shrink: 0;
   border-radius: 5px;
   cursor: pointer;
+  background: transparent;
+  -webkit-tap-highlight-color: transparent;
 }
-.agent-diagram-toolbar button:hover { color: var(--foreground); background: var(--secondary); }
-.agent-diagram-toolbar button:disabled { opacity: .35; cursor: default; }
+.agent-diagram-toolbar button:hover { color: var(--foreground); }
 .agent-diagram-toolbar button:focus-visible, .agent-diagram-scroll:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
 .agent-diagram-toolbar svg { width: 16px; height: 16px; }
 .agent-diagram-scroll {
@@ -45,14 +46,6 @@
   overscroll-behavior-x: contain;
   -webkit-overflow-scrolling: touch;
 }
-.agent-diagram-scroll img { display: block; max-width: none; margin: 0 auto; }
+.agent-diagram-scroll img { display: block; max-width: 100%; height: auto; margin: 0 auto; }
 .agent-diagram-scroll pre { width: max-content; min-width: 100%; margin: 0; font: 12px/1.5 monospace; white-space: pre; }
 .agent-diagram-message { margin: 0 0 8px; font: 13px/1.5 system-ui, sans-serif; color: var(--muted-foreground); }
-.agent-diagram-expanded {
-  height: 90dvh;
-  max-height: 90dvh;
-  gap: 0;
-  padding-bottom: env(safe-area-inset-bottom, 0px);
-  background: var(--background);
-}
-.agent-diagram-expanded .agent-diagram-toolbar { height: 48px; min-height: 48px; }

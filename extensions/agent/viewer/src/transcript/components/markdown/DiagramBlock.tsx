@@ -1,8 +1,7 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react';
-import { Check, Code, Copy, Eye, Maximize2, X } from 'lucide-react';
+import { Check, Code, Copy, Eye } from 'lucide-react';
 import { getHostTheme, subscribeHostTheme } from '@remux/viewer-kit/host';
 import { renderMermaid } from '@remux/viewer-kit/mermaid';
-import { Sheet, SheetClose, SheetContent, SheetTitle, SheetTrigger } from '@remux/viewer-kit/shadcn';
 import { markdownMetrics, type MarkdownLayoutBlock } from './markdownModel';
 import './diagram.css';
 
@@ -58,18 +57,6 @@ export function DiagramBlock({ block, style }: {
         <span>{copyFailed ? 'Could not copy' : 'Diagram'}</span>
         <button type="button" aria-label={source ? 'Show diagram' : 'Show diagram source'} aria-pressed={source} onClick={() => setSource(!source)}>{source ? <Eye /> : <Code />}</button>
         <button type="button" aria-label={copied ? 'Diagram source copied' : 'Copy diagram source'} onClick={() => void copy()}>{copied ? <Check /> : <Copy />}</button>
-        <Sheet>
-          <SheetTrigger asChild><button type="button" aria-label="Expand diagram" disabled={state.status !== 'ready'}><Maximize2 /></button></SheetTrigger>
-          <SheetContent side="bottom" className="agent-diagram-expanded" aria-describedby={undefined}>
-            <div className="agent-diagram-toolbar">
-              <SheetTitle>Diagram</SheetTitle>
-              <SheetClose asChild><button type="button" aria-label="Close diagram"><X /></button></SheetClose>
-            </div>
-            <div className="agent-diagram-scroll" tabIndex={0} aria-label="Expanded diagram">
-              {state.status === 'ready' && <img alt="Mermaid diagram" src={state.url} width={state.width} height={state.height} onError={imageError} />}
-            </div>
-          </SheetContent>
-        </Sheet>
       </div>
       <div className="agent-diagram-scroll" tabIndex={0} aria-label={source || state.status === 'error' ? 'Diagram source' : 'Diagram preview'}>
         {source || state.status === 'error' ? <>
