@@ -1,4 +1,4 @@
-Status: Proposed — design grounded, implementation not started
+Status: Implementing — V0/V1 foundations in progress
 Date: 2026-09-06
 Owner: primary agent; bounded Sol implementation lanes with primary review
 Supersedes target architecture: [html-file-preview-v1.md](html-file-preview-v1.md)
@@ -15,7 +15,7 @@ HTML open in Preview by default; other text files open in Source. A shared web
 toolbar switches modes within the same file tab. Remove Narrate and the native
 HTML viewer after their replacements and migration are deployed.
 
-This spec records the next implementation agreement. The current native HTML
+This spec records the implementation agreement. The current native HTML
 release remains the deployed implementation until the staged replacement lands.
 Do not describe the new architecture or retirement as already implemented.
 
@@ -259,3 +259,28 @@ host without React Native. Building the full future Remux web app is out of scop
 - [Lucide Eye](https://lucide.dev/icons/eye)
 - [MDN iframe sandbox and lifecycle](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/iframe)
 - [Android native bridge frame exposure](https://developer.android.com/privacy-and-security/risks/insecure-webview-native-bridges)
+
+
+## Implementation record
+
+- V0/V1 started 2026-09-06. Sol owns the protected native transport and bounded
+  host Source windows in independent lanes; primary owns iframe policy proof.
+- Browser proof: blob-backed scripts-only iframe, parent `frame-src blob:` and
+  report CSP preserve inline execution and deny parent DOM access, remote/host/
+  data self-navigation, dynamic meta refresh, nested frames and blob navigation
+  network escapes in Chromium. Test: `extensions/editor/tests/iframe-boundary.mjs`.
+  This is browser evidence, not native-device proof. WebKit tooling downloaded
+  but this host lacks its system libraries; no WebKit result is claimed yet.
+- V1 contract frozen: `remux/fs/readFileWindow` accepts `path`, optional `offset`
+  or one-based `targetLine` (mutually exclusive), `limit` (4..524288, default
+  262144), and `expectedVersion`. Success returns UTF-8 `content`, `path`,
+  `version`, `totalSizeBytes`, half-open `range:{startByte,endByte}`,
+  `continuation:{startsMidLine,endsMidLine}`, `previousOffset`, `nextOffset`,
+  `eof`, and optional `targetLine:{lineNumber,byteOffset}`. Error -32012 carries
+  `data.kind` of changed/binary/invalidUtf8/targetLineNotFound/read; malformed
+  params use -32602. Scanning is cancellable chunked async work, not a detached
+  task or an accumulating prefix. Consumer code must use this exact contract.
+- V1 host windows reviewed and implemented. Filesystem unit/integration and
+  router tests passed; primary added a nonblocking regular-file check regression
+  so opening a FIFO cannot hang before validation. Final window tests: 6 passed
+  (`/tmp/remux-html-preview/source-window-review.log`). Host not deployed yet.

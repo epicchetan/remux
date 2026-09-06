@@ -13,17 +13,21 @@ use serde_json::{Map, Value};
 use sha1::{Digest, Sha1};
 use tokio::io::AsyncReadExt;
 
+use crate::fs::file_window::{
+    read_file_window, FileWindowRequest, DEFAULT_WINDOW_BYTES, MAX_WINDOW_BYTES, MIN_WINDOW_BYTES,
+};
 use crate::fs::git::{
-    GitStatus, IndexedGitStatus, git_repo_root, git_status_entries, index_git_status,
-    is_path_within, relative_git_path, summarize_git_statuses,
+    git_repo_root, git_status_entries, index_git_status, is_path_within, relative_git_path,
+    summarize_git_statuses, GitStatus, IndexedGitStatus,
 };
 use crate::paths;
-use crate::rpc::jsonrpc::{INVALID_PARAMS, JsonRpcError};
+use crate::rpc::jsonrpc::{JsonRpcError, INVALID_PARAMS};
 use crate::rpc::router::{BoxFuture, CoreRpc, RpcResult};
 
 pub const READ_DIRECTORY_METHOD: &str = "remux/fs/readDirectory";
 pub const READ_DIRECTORIES_METHOD: &str = "remux/fs/readDirectories";
 pub const READ_FILE_METHOD: &str = "remux/fs/readFile";
+pub const READ_FILE_WINDOW_METHOD: &str = "remux/fs/readFileWindow";
 
 pub const DIRECTORY_BATCH_CONCURRENCY: usize = 4;
 pub const DIRECTORY_CACHE_TTL_MS: u64 = 3_000;
@@ -36,6 +40,7 @@ pub const GIT_STATUS_CACHE_TTL_MS: u64 = 1_000;
 
 pub const READ_DIRECTORY_ERROR: i64 = -32010;
 pub const READ_FILE_ERROR: i64 = -32011;
+pub const READ_FILE_WINDOW_ERROR: i64 = -32012;
 
 /// Emitted for every fresh (uncached) directory read; the fs relay registers
 /// watchers from this feed.
@@ -90,6 +95,7 @@ impl FsCore {
             READ_DIRECTORY_METHOD => self.read_directory(params).await,
             READ_DIRECTORIES_METHOD => self.read_directories(params).await,
             READ_FILE_METHOD => self.read_file(params).await,
+            READ_FILE_WINDOW_METHOD => self.read_file_window(params).await,
             _ => Err(JsonRpcError::method_not_found(method)),
         }
     }
@@ -416,6 +422,68 @@ impl FsCore {
             .await
     }
 
+    async fn read_file_window(&self, params: Option<&Value>) -> RpcResult {
+        let target_path =
+            resolve_requested_path(&self.default_path, params, READ_FILE_WINDOW_METHOD)?;
+        let record = params.and_then(Value::as_object).ok_or_else(|| {
+            JsonRpcError::new(
+                INVALID_PARAMS,
+                format!("Invalid {READ_FILE_WINDOW_METHOD} params"),
+            )
+        })?;
+        if record.contains_key("offset") && record.contains_key("targetLine") {
+            return Err(JsonRpcError::new(
+                INVALID_PARAMS,
+                format!("Invalid {READ_FILE_WINDOW_METHOD} params: offset and targetLine are mutually exclusive"),
+            ));
+        }
+        let offset = optional_nonnegative_integer(record.get("offset"), "offset")?.unwrap_or(0);
+        let limit = optional_nonnegative_integer(record.get("limit"), "limit")?
+            .unwrap_or(DEFAULT_WINDOW_BYTES);
+        if !(MIN_WINDOW_BYTES..=MAX_WINDOW_BYTES).contains(&limit) {
+            return Err(JsonRpcError::new(
+                INVALID_PARAMS,
+                format!(
+                    "Invalid {READ_FILE_WINDOW_METHOD} limit: expected {MIN_WINDOW_BYTES} to {MAX_WINDOW_BYTES} bytes"
+                ),
+            ));
+        }
+        let target_line = optional_nonnegative_integer(record.get("targetLine"), "targetLine")?;
+        if target_line == Some(0) {
+            return Err(JsonRpcError::new(
+                INVALID_PARAMS,
+                format!(
+                    "Invalid {READ_FILE_WINDOW_METHOD} targetLine: expected a positive integer"
+                ),
+            ));
+        }
+        let expected_version = match record.get("expectedVersion") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) if !value.is_empty() => Some(value.clone()),
+            _ => {
+                return Err(JsonRpcError::new(
+                    INVALID_PARAMS,
+                    format!("Invalid {READ_FILE_WINDOW_METHOD} expectedVersion"),
+                ))
+            }
+        };
+        read_file_window(FileWindowRequest {
+            expected_version,
+            limit,
+            offset,
+            path: target_path,
+            target_line,
+        })
+        .await
+        .map_err(|error| {
+            JsonRpcError::with_data(
+                READ_FILE_WINDOW_ERROR,
+                error.message,
+                serde_json::json!({ "kind": error.kind.as_str() }),
+            )
+        })
+    }
+
     async fn include_file_git(
         &self,
         mut result: Value,
@@ -580,6 +648,27 @@ fn resolve_requested_path(
         Some(_) => Err(JsonRpcError::new(
             INVALID_PARAMS,
             format!("Invalid {method} path"),
+        )),
+    }
+}
+
+fn optional_nonnegative_integer(
+    value: Option<&Value>,
+    field: &str,
+) -> Result<Option<u64>, JsonRpcError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => number.as_u64().map(Some).ok_or_else(|| {
+            JsonRpcError::new(
+                INVALID_PARAMS,
+                format!(
+                    "Invalid {READ_FILE_WINDOW_METHOD} {field}: expected a nonnegative integer"
+                ),
+            )
+        }),
+        _ => Err(JsonRpcError::new(
+            INVALID_PARAMS,
+            format!("Invalid {READ_FILE_WINDOW_METHOD} {field}: expected a nonnegative integer"),
         )),
     }
 }
@@ -1121,6 +1210,56 @@ mod tests {
             (MAX_BINARY_FILE_BYTES as usize).div_ceil(3) * 4
         );
         assert!(serde_json::to_vec(&result).unwrap().len() < 8 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn read_file_window_rpc_validates_params_and_reports_version_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("paged.txt");
+        tokio::fs::write(&path, "first page\nsecond page\n")
+            .await
+            .unwrap();
+        let core = FsCore::new(root.path());
+        let first = core
+            .handle_rpc(
+                READ_FILE_WINDOW_METHOD,
+                Some(&serde_json::json!({ "limit": 8, "path": path })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first["range"],
+            serde_json::json!({ "endByte": 8, "startByte": 0 })
+        );
+        assert_eq!(first["nextOffset"], 8);
+        let version = first["version"].as_str().unwrap().to_string();
+
+        tokio::fs::write(&path, "replacement with another size\n")
+            .await
+            .unwrap();
+        let changed = core
+            .handle_rpc(
+                READ_FILE_WINDOW_METHOD,
+                Some(&serde_json::json!({
+                    "expectedVersion": version,
+                    "limit": 8,
+                    "offset": 8,
+                    "path": path,
+                })),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(changed.code, READ_FILE_WINDOW_ERROR);
+        assert_eq!(changed.data.unwrap()["kind"], "changed");
+
+        let invalid = core
+            .handle_rpc(
+                READ_FILE_WINDOW_METHOD,
+                Some(&serde_json::json!({ "limit": 3, "path": path })),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(invalid.code, INVALID_PARAMS);
     }
 
     #[test]

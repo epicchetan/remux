@@ -590,7 +590,10 @@ pub fn is_extension_management_method(method: &str) -> bool {
 pub fn is_core_method(method: &str) -> bool {
     matches!(
         method,
-        "remux/fs/readDirectory" | "remux/fs/readDirectories" | "remux/fs/readFile"
+        "remux/fs/readDirectory"
+            | "remux/fs/readDirectories"
+            | "remux/fs/readFile"
+            | "remux/fs/readFileWindow"
     )
 }
 
@@ -838,6 +841,7 @@ mod tests {
             "remux/fs/readDirectory",
             "remux/fs/readDirectories",
             "remux/fs/readFile",
+            "remux/fs/readFileWindow",
         ] {
             let result = router
                 .handle_request(method, Some(&json!({ "path": "/tmp" })))
