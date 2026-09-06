@@ -347,3 +347,9 @@ refactoring. No new agent/server protocol or journal migration is required.
   reviewed it. App typecheck, HTML integration/load checks, viewer-host contract
   and viewer lifecycle checks passed (`/tmp/remux-html-preview/ui-checks.log`).
   Device visual acceptance remains user-observed rather than claimed here.
+- Published UI polish 2026-09-06 16:37 UTC from `55cc7c1` to iOS preview,
+  message `HTML preview: Markdown-style controls`. Group:
+  `54ff7b14-7041-4c37-8b67-e9a74935e8ab`; update:
+  `01a07794-fe17-738a-982c-f3fbdd087c25`. Same compatible runtime as above.
+  Verified channel manifest, authenticated asset byte equality and updated UI
+  source map (`/tmp/remux-html-preview/expo-ui-proof.json`). No server restart.
