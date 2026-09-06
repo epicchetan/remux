@@ -14,7 +14,7 @@ Amends: [agent-state-authority-and-synchronization-v1.md](agent-state-authority-
 
 ## Current checkpoint — 2026-09-06
 
-### Accepted bounded follow-up — short active-turn Down navigation
+### Deployed bounded follow-up — short active-turn Down navigation
 
 The Ledger screenshot exposed a viewer regression: Down could select an already
 visible latest active turn and add synthetic runway to lift its user message.
@@ -44,7 +44,17 @@ navigation animation. Both cases fail at the disabled assertion against the old
 published bundle. Evidence under `/tmp/remux-audit-implementation/`:
 `short-tail-final-checks.log`, `short-tail-final-browser.log`,
 `short-tail-old-confirm.log`, and `short-tail-real-growth.log`.
-Viewer publication and production-bundle verification follow this accepted slice.
+Deployed 2026-09-06 15:00 UTC from `85df429`. Production viewer build passed;
+served index and JavaScript bytes match that build (`index-DgHA2zKJ.js`). Both
+new short-tail cases and the existing collapse/Up-anchor case pass against the
+actual published bundle: four checks across desktop/mobile. Watching is restored.
+Host worker 623189, Agent server 623382 and persistent Codex daemon 848265 retain
+their original PIDs/start times; no restart or live-conversation command occurred.
+Refresh/reopen the Agent view to load the new viewer. Evidence:
+`short-tail-viewer-build.log`, `short-tail-publication.json`,
+`short-tail-published-green.log`, `short-tail-watch-restored.json`, and
+`short-tail-processes-{before,after}.txt`. This follow-up is closed; the remaining
+audit slices below retain their previous scope.
 
 
 Deployed code: `main` at `6c2162e`, pushed to origin. The host release and Agent
