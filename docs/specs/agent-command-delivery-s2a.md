@@ -6,8 +6,10 @@ assignment order and acceptance status. F2/schema 14 and A13 are locally verifie
 S2a0 is locally verified. Root delivery is now committed and deployed, with
 S2a1 acceptance closure reviewed and deployed in the 2026-09-06 parallel batch. The shared
 server cutover proceeds serially: S2a1 adopts root
-start with the durable owner; S2a2 adopts steer and manual Compact after primary
-review. Both form S2a; neither alone completes C1/V1 or all of S2. This contract
+start with the durable owner; S2a2 steer and manual Compact are now primary-reviewed
+and deployed with protocol 11. The isolated live Codex steer/Compact check passed;
+Claude evidence remains covered by focused tests rather than a live canary.
+Both form S2a; neither alone completes C1/V1 or all of S2. This contract
 does not itself certify acceptance; the remediation spec records
 current evidence and permits independent viewer/host lanes alongside this cutover.
 

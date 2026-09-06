@@ -1,4 +1,4 @@
-Status: Active Spec — S2a2 and host watcher/publication batch in progress
+Status: Active Spec — S2a2 and H2/H4 deployed; remaining slices tracked
 Last verified: 2026-09-06
 Canonical code: `extensions/agent/server/src/native-runtime/`,
 `extensions/agent/server/src/providers/`,
@@ -14,9 +14,9 @@ Amends: [agent-state-authority-and-synchronization-v1.md](agent-state-authority-
 
 ## Current checkpoint — 2026-09-06
 
-Baseline: clean `main` at `812e95f`, pushed to origin. The Agent server and viewer
-are built and deployed. This section and the delivery rules below supersede the
-historical assignment/status prose later in this document. The user approved
+Deployed code: `main` at `6c2162e`, pushed to origin. The host release and Agent
+server/viewer are built and deployed; native protocol is 11, schema remains 16.
+This section and the delivery rules below supersede the historical assignment/status prose later in this document. The user approved
 resuming the next bounded batch after the reorientation checkpoint.
 
 - S0/S1 correctness work is committed and deployed. Its individual scenario/live
@@ -25,7 +25,8 @@ resuming the next bounded batch after the reorientation checkpoint.
 - S2a1 root-send delivery is implemented; the bounded closure review is now
   accepted and deployed with the batch evidence below. Two coordinator
   corrections close the demonstrated startup/child-terminal gaps. S2a2
-  steer/manual Compact and later queue/branch/spawn adoption are not done.
+  steer/manual Compact is now deployed through the same owner. Later
+  queue/branch/spawn adoption remains.
 - [Subagent lifecycle](agent-subagent-lifecycle.md) is shipped with live Codex
   root/child restart and Stop evidence. This covers substantial C2 work and the
   Codex portions of C4/A5/R7. Claude framing/resume, nested federation ownership,
@@ -35,8 +36,9 @@ resuming the next bounded batch after the reorientation checkpoint.
   to ordinary messages and is now deployed (`3a6780c`); server queue recovery
   remains separate.
 - The general viewer synchronization owner (S4), focused history integrity (S5),
-  and most host/app work (S6) remain ahead. The original 76-row planned coverage
-  count is not a completion count.
+  and remaining host/app work (S6) remain ahead. H2/H4 watcher/publication
+  fixes are deployed; H3 build-process lifetime is the next independent host slice.
+  The original 76-row planned coverage count is not a completion count.
 
 Previous deployed checkpoint evidence: typecheck and 285 server tests passed. Final browser
 run: 198 passed, three skips, one mobile geometry mount miss; isolated geometry
@@ -46,9 +48,9 @@ session/strand and all 67 baseline turn identities/content hashes; 90 turns are
 now hydrated, with no health error. Detailed evidence lives in the two incident
 specs. The transient geometry failure is recorded, not erased by the rerun.
 
-### Active next batch — S2a2 and H2/H4, 2026-09-06
+### Delivered batch — S2a2 and H2/H4, 2026-09-06
 
-Baseline is clean, pushed main at `c1bd341`. The user authorized continuation
+This batch started from clean, pushed main at `c1bd341`. The user authorized continuation
 with two disjoint Sol implementation lanes and primary integration/review.
 Earlier batch assignments and local acceptance headings below are historical.
 
@@ -71,14 +73,14 @@ Native protocol 10 already shipped for lifecycle, so this required shape moves t
 11 with server/viewer built together. No schema or provider-wire bump is needed.
 The delivery contract's earlier v9-to-v10 plan is amended accordingly.
 
-Automatic viewer builds are paused during source edits. The main-thread baseline
-captures 94 turn identities/content hashes and its unchanged native session and
+Automatic viewer builds were paused during source edits and restored after
+deployment. The main-thread baseline captures 94 turn identities/content hashes and its unchanged native session and
 strand under `/tmp/remux-audit-implementation/s2a2-host-thread-before.json`.
 The host change requires a host worker build/restart; use the existing supervisor
 worker-restart path, preserve the persistent native daemon, and verify thread
 identity/history afterward. Do not restart the full guardian/service unnecessarily.
 
-### H2/H4 accepted locally — 2026-09-06
+### H2/H4 accepted and deployed — 2026-09-06
 
 Primary accepted the bounded Rust host slice after reviewing watcher lifetime,
 first-publication locking, and cleanup scan cost. Startup watches an existing
@@ -91,15 +93,15 @@ current-publication protection is enforced by the per-view lock.
 
 Sol's focused `cargo test -p remux viewer_bundles` passed 11 tests, including
 external creation without explicit publication, delete/recreate observation and
-a retention-overflow publication/cleanup barrier. Host library integration,
-release build and live worker deployment remain pending below. H3 was not touched.
+a retention-overflow publication/cleanup barrier. All 138 host library tests and
+the release build passed; the worker deployment is recorded below. H3 was not touched.
 
-To shorten the remaining serial work, that Sol next owns only S2a2's runtime
-`deliveryHeld` projection, protocol 11 and Compact eligibility/strict fixtures.
-The server Sol retains provider/owner/coordinator implementation and tests;
-they do not edit the same files. Primary still reviews both before deployment.
+To shorten serial work, that Sol then took only S2a2's runtime `deliveryHeld`
+projection, protocol 11 and Compact eligibility/strict fixtures. The server Sol
+retained provider/owner/coordinator implementation and tests. Their file ownership
+was disjoint, and primary reviewed both before deployment.
 
-### S2a2 accepted locally — 2026-09-06
+### S2a2 accepted and deployed — 2026-09-06
 
 The server delivery slice now adopts steer and manual Compact through the existing
 `DeliveryAttemptOwner`; no second command/queue owner or schema was introduced.
@@ -128,11 +130,42 @@ separately as `215476d`; native protocol is 11 and schema remains 16.
 Final local integration: root typecheck passed, all 292 Agent server tests passed,
 and browser tests passed 213 with three existing skips. Focused provider tests
 passed 42, final owner/coordinator tests 49, and host library integration 138.
-The host release build passed. Production Agent build, coordinated worker restart
-and isolated live steer/Compact verification are the remaining deployment gate.
+The host release and production Agent server/viewer builds passed. The coordinated
+worker restart and isolated live steer/Compact verification passed as recorded below.
 Evidence: `/tmp/remux-audit-implementation/s2a2-final-server.log`,
 `s2a2-full-viewer.log`, `s2a2-claude-{typecheck,focused}.log`,
 `h2h4-lib-integration.log`, and `h2h4-release-build.log`.
+
+### Deployment checkpoint — 2026-09-06 12:14 UTC
+
+Accepted slices were pushed separately: H2/H4 `96079fd`, runtime hold/Compact
+eligibility `215476d`, and S2a2 delivery `6c2162e` (planning `de2367e`). A single
+supported guardian worker restart loaded the host release and Agent bundles.
+Worker PID changed from 923108 to 623189; Agent server PID is 623382. Guardian
+reports ready, no protection reasons and zero boot failures. The persistent
+Codex daemon remained PID 848265, started 2026-09-05 11:43:26 UTC. Automatic
+viewer watching was restored (PID 624489).
+
+This thread retained all 94 baseline turn IDs and user-content hashes, its root
+execution, native session and active strand/revision; health is clear. The live
+isolated read-only Codex/Sol canary used native protocol 11: root and steer
+receipts were accepted, the exact steer marker reached the canonical final
+answer, and only one turn existed. Manual Compact was accepted and reached its
+terminal result with `deliveryHeld: false`. The canary settled and was archived.
+This healthy-path check complements fault/restart tests; it does not certify a
+live Claude boundary or every unknown-operation recovery case.
+
+Evidence under `/tmp/remux-audit-implementation/`: `s2a2-agent-build.log`,
+`s2a2-host-guardian-{before,restart,status}.json`,
+`s2a2-host-thread-{before,after}.json`, `s2a2-host-resources-verify.json`,
+`s2a2-host-watch-restored.json`, and `s2a2-live-canary/{state,result}.json`.
+
+This is a stoppable, deployed checkpoint. Next work keeps the same bounded
+parallel cadence: one server lane for the next delivery adoption slice and one
+independent H3 host build-process lifetime lane, with explicit ownership, primary
+review, per-slice commits/pushes and one coordinated deployment. General queue
+recovery, branch/federation adoption, S4/S5 and remaining app work are still open;
+this batch does not mark the audit complete.
 
 ### Delivered batch scope
 
@@ -417,7 +450,7 @@ independent overlap. Split shared-server cutovers into smaller serial slices.
 | S0a — native Codex child identity | Fix I3's duplicate lifecycle blocks, completion mapping, and phantom descendants; establish explicit child ownership/identity for both native event paths. Reuse this boundary in S3. | S0; one bounded Sol assignment with primary review. Recorded-event regressions before live acceptance; repair existing incident from proven evidence. | Committed/deployed; copied/live repair and browser navigation verified; original-device check not repeated |
 | S0b — transcript error geometry | Include terminal error banners and per-turn projection retry in the shared layout/geometry model (I4); preserve navigation and scroll anchors through appearance, wrapping, clearing, and virtualization. | S0a; separate serial Sol assignment with primary review. Browser geometry assertions, not visibility alone. | Committed/deployed; geometry/browser evidence recorded; original-device check not repeated |
 | S1 — bounded correctness fixes | Serial slices for fitted bounds and compact failure (D, A7); auth/capability accuracy (A9/A10); draft/effort/compact gating (V6/V7/V10); attachment grants, checkout keys, catalog, result bounds (F1/F2/F5/F6); socket cleanup (R1). | S0b; affected scenario tests and source review per slice. Review any schema change before its implementation. | Committed/deployed; all S1 slices and C3a locally verified; scenario-specific live limits retained; S2 tightens Compact delivery evidence |
-| S2 — command delivery | First ledger deduplication and stable client retries (C3/V1); then safe queue failure/recovery plus ownership-free reads (C1/R2); then edit/fork/spawn acceptance using the same delivery component (C5/A2/F4). Introduce the minimal transaction revision helper needed by admission. | S1 except the small C3a coalescing prerequisite moved before F2; review delivery transitions and provider evidence contract first. No prompt-text or session-binding acceptance inference. | C3a/A13/S2a0 shipped; S2a1 closure and coordinator corrections deployed; V1 new-chat and ordinary-send client recovery shipped; S2a2 and server queue policy remain |
+| S2 — command delivery | First ledger deduplication and stable client retries (C3/V1); then safe queue failure/recovery plus ownership-free reads (C1/R2); then edit/fork/spawn acceptance using the same delivery component (C5/A2/F4). Introduce the minimal transaction revision helper needed by admission. | S1 except the small C3a coalescing prerequisite moved before F2; review delivery transitions and provider evidence contract first. No prompt-text or session-binding acceptance inference. | C3a/A13/S2a0 shipped; S2a1 closure and coordinator corrections deployed; V1 new-chat and ordinary-send client recovery and S2a2 steer/manual Compact deployed; later delivery adoption and server queue policy remain |
 | S3 — runtime and child lifecycle | Durable Stop and recovery (C2/A8/R3/R7); native child identity/ordinals/late completion and nested caller ownership (C4/A3/A4/A5/F3/F7). | Shared coordinator/provider changes follow delivery ownership; disjoint work may proceed now. | Partly shipped via lifecycle incident spec; remaining Claude/federation/lease work open |
 | S4 — viewer convergence | Projection revisions, one sync controller, edit/resume consistency, bounded detail caches, protocol mismatch (E excluding earlier V1/V6/V7/V10 slices). | S2–S3; prepare contracts and controller serially, then activate one refresh owner in an integrated cutover. | Planned |
 | S5 — history integrity | Identity aliases, coverage-aware reconciliation, consistent sealing, bounded final output, scoped repair and foreign-key parity (C excluding S3 child work). | S4; identity/coverage plan reviewed before migration; copied-data and replay checks before acceptance. | Planned |
