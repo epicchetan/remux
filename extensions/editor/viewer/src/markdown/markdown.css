@@ -476,7 +476,7 @@
   min-width: max-content;
 }
 
-.remux-viewer-markdown-mermaid-diagram svg {
+.remux-viewer-markdown-mermaid-diagram img {
   display: block;
   max-width: none;
 }

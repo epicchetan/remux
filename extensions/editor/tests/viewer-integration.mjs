@@ -12,6 +12,7 @@ await server.listen();
 const browser = await chromium.launch();
 const baseUrl = server.resolvedUrls.local[0];
 const token = 'b'.repeat(64);
+const mermaidModuleUrl = new URL(`/@fs${new URL('../../../packages/viewer-kit/src/mermaid.ts', import.meta.url).pathname}`, baseUrl).href;
 
 function viewerUrl(path, line = null) {
   const url = new URL(baseUrl);
@@ -155,6 +156,67 @@ function readCount(page, path = null) {
     request.method === 'remux/fs/readFile' && (path === null || request.params.path === path)).length, path);
 }
 
+async function checkSharedMermaidRenderer(page) {
+  return page.evaluate(async ({ mermaidModuleUrl }) => {
+    const { renderMermaid } = await import(mermaidModuleUrl);
+    const sharedSource = 'graph TD\n  shared_start --> shared_end';
+    const first = renderMermaid(sharedSource, { theme: 'light' });
+    const second = renderMermaid(sharedSource, { theme: 'light' });
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    if (firstResult !== secondResult) throw new Error('in-flight Mermaid renders were not deduplicated');
+    if (await renderMermaid(sharedSource, { theme: 'light' }) !== firstResult) {
+      throw new Error('successful Mermaid render was not reused from cache');
+    }
+    if (!(firstResult.width > 0 && firstResult.height > 0) || !firstResult.svg.startsWith('<svg')) {
+      throw new Error('Mermaid result did not contain a standalone sized SVG');
+    }
+
+    const abortController = new AbortController();
+    const abortSource = 'graph TD\n  abort_start --> abort_end';
+    const aborted = renderMermaid(abortSource, { signal: abortController.signal, theme: 'light' });
+    const survivor = renderMermaid(abortSource, { theme: 'light' });
+    abortController.abort();
+    const abortedOutcome = await aborted.then(() => 'resolved', error => error?.name);
+    if (abortedOutcome !== 'AbortError') throw new Error(`aborted subscriber ${abortedOutcome}`);
+    const survivorResult = await survivor;
+    if (!(survivorResult.width > 0 && survivorResult.height > 0)) {
+      throw new Error('shared render did not survive another subscriber aborting');
+    }
+
+    const invalidSource = 'this is not a mermaid diagram';
+    const invalidError = await renderMermaid(invalidSource, { theme: 'light' }).catch(error => error);
+    const cachedInvalidError = await renderMermaid(invalidSource, { theme: 'light' }).catch(error => error);
+    if (!(invalidError instanceof Error) || cachedInvalidError !== invalidError) {
+      throw new Error('failed Mermaid render was not reused from cache');
+    }
+
+    const rejectedInputs = [
+      '%%{init: {"securityLevel": "loose"}}%%\ngraph TD\n  A --> B',
+      '---\nconfig:\n  securityLevel: loose\n---\ngraph TD\n  A --> B',
+      `graph TD\n  A[${'x'.repeat(20_001)}]`,
+    ];
+    for (const source of rejectedInputs) {
+      const outcome = await renderMermaid(source, { theme: 'light' }).then(() => null, error => error);
+      if (!(outcome instanceof Error)) throw new Error('unsafe or oversized Mermaid input was accepted');
+    }
+
+    const [light, dark] = await Promise.all([
+      renderMermaid('graph TD\n  light_a --> light_b', { theme: 'light' }),
+      renderMermaid('graph TD\n  dark_a --> dark_b', { theme: 'dark' }),
+    ]);
+    if (light.svg === dark.svg || !light.svg.includes('light_a') || !dark.svg.includes('dark_a')) {
+      throw new Error('serialized themed Mermaid renders crossed results');
+    }
+    return {
+      abortIsolation: true,
+      cacheReuse: true,
+      configAndSizeRejection: true,
+      failureCacheReuse: true,
+      themeSerialization: true,
+    };
+  }, { mermaidModuleUrl });
+}
+
 try {
   const markdown = await openViewer('/doc.md');
   await markdown.getByRole('heading', { name: 'Heading' }).waitFor();
@@ -162,7 +224,14 @@ try {
   assert.equal(await markdown.locator('input[type="checkbox"]:checked').count(), 1);
   assert.equal(await markdown.getByText('Footnote detail.').count(), 1);
   assert.equal(await markdown.locator('.katex').count() > 0, true);
-  await markdown.locator('.remux-viewer-markdown-mermaid-diagram svg').waitFor();
+  const mermaidImage = markdown.locator('.remux-viewer-markdown-mermaid-diagram img');
+  await mermaidImage.waitFor();
+  await mermaidImage.evaluate(image => {
+    if (!(image instanceof HTMLImageElement) || !image.src.startsWith('blob:') || !image.complete || image.naturalWidth <= 0) {
+      throw new Error('Mermaid Blob image did not decode');
+    }
+  });
+  const mermaidHelper = await checkSharedMermaidRenderer(markdown);
   assert.equal(await markdown.locator('#unsafe-script').count(), 0);
   assert.equal(await markdown.locator('[onclick]').count(), 0);
   assert.equal(await markdown.evaluate(() => window.__unsafeMarkdown), undefined);
@@ -310,6 +379,7 @@ try {
     htmlStateRetainedOnToggle: true,
     lineFocus: true,
     markdownParityAndResponsiveLayout: true,
+    mermaidHelper,
     markdownPreviewBudget: true,
     markdownScrolling: true,
     noToggleReread: true,

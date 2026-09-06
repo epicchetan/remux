@@ -3,59 +3,37 @@ import {
   subscribeHostTheme,
   type RemuxHostTheme,
 } from '@remux/viewer-kit/host';
-import { useEffect, useId, useState } from 'react';
+import { renderMermaid } from '@remux/viewer-kit/mermaid';
+import { useEffect, useState } from 'react';
 
 type MermaidBlockProps = {
   source: string;
 };
 
-let mermaidModulePromise: Promise<typeof import('mermaid')> | null = null;
-const mermaidThemeConfigs = {
-  dark: {
-    darkMode: true,
-    theme: 'dark',
-  },
-  light: {
-    darkMode: false,
-    theme: 'default',
-  },
-} as const;
-
 type MermaidRenderState =
   | { status: 'loading' }
-  | { status: 'ready'; svg: string }
+  | { height: number; status: 'ready'; url: string; width: number }
   | { message: string; status: 'error' };
 
 export function MermaidBlock({ source }: MermaidBlockProps) {
   const [theme, setTheme] = useState<RemuxHostTheme>(() => getHostTheme());
   const [state, setState] = useState<MermaidRenderState>({ status: 'loading' });
-  const instanceId = useId().replace(/[^a-zA-Z0-9_-]/gu, '');
-  const id = `remux-mermaid-${instanceId}-${theme}`;
 
   useEffect(() => subscribeHostTheme(setTheme), []);
 
   useEffect(() => {
-    let cancelled = false;
-    if (source.length > 20_000) {
-      setState({ status: 'error', message: 'This diagram is too large to preview. Its source is shown below.' });
-      return;
-    }
+    const controller = new AbortController();
+    let url: string | null = null;
     setState({ status: 'loading' });
 
-    void loadMermaid()
-      .then((mermaidModule) => {
-        if (cancelled) return { svg: '' };
-        const mermaid = mermaidModule.default;
-        configureMermaid(mermaid, theme);
-        return mermaid.render(id, source);
-      })
-      .then(({ svg }) => {
-        if (!cancelled) {
-          setState({ status: 'ready', svg });
-        }
+    void renderMermaid(source, { signal: controller.signal, theme })
+      .then(({ height, svg, width }) => {
+        if (controller.signal.aborted) return;
+        url = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
+        setState({ height, status: 'ready', url, width });
       })
       .catch((error: unknown) => {
-        if (!cancelled) {
+        if (!controller.signal.aborted) {
           setState({
             message: error instanceof Error ? error.message : String(error),
             status: 'error',
@@ -64,9 +42,10 @@ export function MermaidBlock({ source }: MermaidBlockProps) {
       });
 
     return () => {
-      cancelled = true;
+      controller.abort();
+      if (url) URL.revokeObjectURL(url);
     };
-  }, [id, source, theme]);
+  }, [source, theme]);
 
   if (state.status === 'loading') {
     return (
@@ -97,24 +76,15 @@ export function MermaidBlock({ source }: MermaidBlockProps) {
     >
       <div
         className="remux-viewer-markdown-mermaid-diagram"
-        dangerouslySetInnerHTML={{ __html: state.svg }}
-      />
+      >
+        <img
+          alt="Mermaid diagram"
+          height={state.height}
+          onError={() => setState({ message: 'The rendered Mermaid image could not be displayed.', status: 'error' })}
+          src={state.url}
+          width={state.width}
+        />
+      </div>
     </div>
   );
-}
-
-function loadMermaid() {
-  mermaidModulePromise ??= import('mermaid');
-  return mermaidModulePromise;
-}
-
-function configureMermaid(mermaid: typeof import('mermaid').default, theme: RemuxHostTheme) {
-  mermaid.initialize({
-    fontFamily: 'Arial, "Helvetica Neue", sans-serif',
-    securityLevel: 'strict',
-    maxTextSize: 20_000,
-    maxEdges: 200,
-    startOnLoad: false,
-    ...mermaidThemeConfigs[theme],
-  });
 }
