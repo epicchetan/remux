@@ -9,6 +9,7 @@ export function canManuallyCompact(
   return Boolean(
     conversation?.resumable
     && runtime?.conversationId === conversation.id
+    && runtime.deliveryHeld === false
     && queue?.conversationId === conversation.id
     && runtime.capabilities.compaction.manualNative
     && runtime.compaction.operation.state !== 'running'

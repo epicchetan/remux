@@ -73,6 +73,7 @@ test('native model, conversation, and queue projections retain provider facts', 
   const conversation: any = { id: 'conversation', resumable: true };
   const runtime = {
     conversationId: 'conversation', capabilities: { compaction: { manualNative: true } },
+    deliveryHeld: false,
     compaction: { operation: { state: 'idle' } },
   } as any;
   const emptyQueue: any = { conversationId: 'conversation', entries: [] };
@@ -82,6 +83,7 @@ test('native model, conversation, and queue projections retain provider facts', 
   assert.equal(canManuallyCompact({ ...conversation, resumable: false }, runtime, emptyQueue), false);
   assert.equal(canManuallyCompact(conversation, { ...runtime, conversationId: 'other' }, emptyQueue), false);
   assert.equal(canManuallyCompact(conversation, runtime, queue), false);
+  assert.equal(canManuallyCompact(conversation, { ...runtime, deliveryHeld: true }, emptyQueue), false);
   assert.equal(canManuallyCompact(
     conversation,
     { ...runtime, compaction: { operation: { state: 'running' } } },

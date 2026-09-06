@@ -22,7 +22,7 @@ import type {
 import { parseUserContentParts, ProviderContractError } from './provider-runtime.ts';
 
 /** Viewer-safe resource and command contract for the provider-native runtime. */
-export const NATIVE_AGENT_PROTOCOL_VERSION = 10 as const;
+export const NATIVE_AGENT_PROTOCOL_VERSION = 11 as const;
 export const NATIVE_AGENT_LIMITS = {
   resourceBytes: 8 * 1024 * 1024,
   resourceReads: 64,
@@ -263,6 +263,7 @@ export type AgentRuntimeResource = {
   state: ProviderExecutionState;
   activeTurnId: string | null;
   activeTurnElapsedMs: number | null;
+  deliveryHeld: boolean;
   lifecycle: {
     state: 'idle' | 'running' | 'checking' | 'stopping' | 'unavailable';
     runningCount: number;

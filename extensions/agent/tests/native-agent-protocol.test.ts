@@ -208,6 +208,7 @@ test('viewer-safe resources reject provider cursors, native envelopes, and crede
     state: 'running',
     activeTurnId: 'turn-1',
     activeTurnElapsedMs: 1_500,
+    deliveryHeld: false,
     lifecycle: {
       state: 'idle', runningCount: 0, checkingCount: 0, stoppingCount: 0,
       stopErrorCount: 0, stopRequested: false,

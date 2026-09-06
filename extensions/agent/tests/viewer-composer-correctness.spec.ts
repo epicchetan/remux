@@ -97,7 +97,7 @@ test('persists an access-only draft change through reload', async ({ page }) => 
     .toBe('read-only');
 });
 
-for (const state of ['queued', 'running', 'unresumable']) {
+for (const state of ['queued', 'running', 'unresumable', 'held']) {
   test(`disables compact for a ${state} conversation`, async ({ page }) => {
     await page.goto(`/viewers/agent/?remuxResourceKind=agentConversation&remuxResourceId=11111111-1111-4111-8111-111111111111&fixtureCompactEligibility=${state}`);
     await page.getByRole('button', { name: 'Show usage details' }).click();

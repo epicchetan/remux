@@ -382,6 +382,7 @@ export class NativeAgentProjector {
       state: conversation.state,
       activeTurnId: conversation.activeTurnId,
       activeTurnElapsedMs,
+      deliveryHeld: this.journal.hasUnresolvedRootDelivery(conversationId),
       lifecycle: {
         state: stopErrorCount > 0 || typeof rootStopError === 'string' || reconciliationUnavailable
           ? 'unavailable' : stopRequested ? 'stopping' : checkingCount > 0

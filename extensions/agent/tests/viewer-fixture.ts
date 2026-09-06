@@ -1227,6 +1227,7 @@ export async function installAgentHost(page: Page) {
         activeTurnElapsedMs: activeTurn
           ? Math.max(0, Date.now() - activeTurn.startedAt)
           : null,
+        deliveryHeld: compactEligibility === 'held',
         lifecycle,
         history: historyState === 'failed'
           ? { state: 'failed', error: 'Fixture history read failed.' }
