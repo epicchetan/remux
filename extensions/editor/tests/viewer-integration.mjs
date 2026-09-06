@@ -123,6 +123,8 @@ graph TD
             encoding: 'base64', isBinary: true, mimeType: 'image/svg+xml', modifiedAtMs: 100,
             name: 'pixel.svg', path: '/assets/pixel.svg', sizeBytes: 232, tooLarge: false,
           });
+        } else if (message.params.path === '/long.txt') {
+          reply(message.id, fileResult('/long.txt', 'x'.repeat(5 * 1024 * 1024)));
         } else if (message.params.path === '/large.md') {
           reply(message.id, fileResult('/large.md', `# Large\n\n${'x'.repeat(512_001)}`));
         } else {
@@ -231,6 +233,15 @@ try {
   assert.equal(await windowed.getByText('window page').count() > 0, true);
   assert.equal(await windowed.evaluate(() => window.__testHost.requests.filter(request => request.method === 'remux/fs/readFileWindow').length), 1);
   await windowed.close();
+
+  const longLineStarted = performance.now();
+  const longLine = await openViewer('/long.txt');
+  await longLine.locator('.cm-content').waitFor();
+  assert.equal(await longLine.getByRole('button', { name: 'Diff is unavailable for large files or long lines.' }).isDisabled(), true);
+  assert.ok(await longLine.locator('.cm-content').evaluate(element => element.textContent.length) < 100_000,
+    'a multi-megabyte source line must not become a multi-megabyte DOM text node');
+  console.log(JSON.stringify({exactFiveMiBSourceReadyMs: Math.round(performance.now() - longLineStarted)}));
+  await longLine.close();
 
   const largeMarkdown = await openViewer('/large.md');
   await largeMarkdown.getByText('This document is too large to preview').waitFor();

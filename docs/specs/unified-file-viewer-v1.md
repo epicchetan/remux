@@ -1,4 +1,4 @@
-Status: Viewer implemented; app migration publication and Narrate retirement in progress
+Status: Viewer and app migration deployed; Narrate removal awaits client update
 Date: 2026-09-06
 Owner: primary agent; bounded Sol implementation lanes with primary review
 Supersedes target architecture: [html-file-preview-v1.md](html-file-preview-v1.md)
@@ -328,3 +328,22 @@ host without React Native. Building the full future Remux web app is out of scop
   library tests 148 passed, with a later baseline Agent-manifest integration
   assertion failing. Locks must be regenerated and integrated checks rerun when
   applied. Do not apply until the V4a client migration deployment is established.
+- Final browser parity checks passed: GFM tables/tasks/footnotes, KaTeX,
+  Mermaid, decoded local image, local links, sanitization, phone 390px and
+  desktop light/dark no-body-overflow. Exact 5 MiB single-line Source rendered
+  with bounded DOM text (371 ms in this desktop Chromium fixture; not a phone
+  performance guarantee). Run via `npm --workspace @remux/editor test`.
+- iOS preview update published 2026-09-06 18:04 UTC from `f2c4836`:
+  **Unified Viewer: Markdown and HTML preview/source**. Group
+  `46636c69-2482-482d-ba20-3b54375db5c0`; update
+  `01a077e4-37a8-7d2c-bebe-c86686e80d7d`; existing native runtime
+  `a100fc36093abfc62b43b2d93750f92f9bf78430`. Expo-selected launch asset verified
+  byte-for-byte against the new local export, 1,811,960 bytes, SHA256
+  `724387563739a43bbb412391d9a5dab8d320a198bb87fffa8c12e3fc6767764e`.
+  Source map confirms tab migration/protected bridge/native HTML override
+  removal. Proof `/tmp/remux-html-preview/expo-unified-proof.json`.
+- User can install through Settings → Updates → Check for updates → Restart
+  to update. Publication is verified; installation on the user's client is not
+  yet established. Narrate remains in the live catalog until that migration
+  update is running, per V4a/V4b ordering. No native-device isolation result is
+  claimed by the browser tests.
