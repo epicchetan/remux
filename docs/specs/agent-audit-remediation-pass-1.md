@@ -78,6 +78,27 @@ The host change requires a host worker build/restart; use the existing superviso
 worker-restart path, preserve the persistent native daemon, and verify thread
 identity/history afterward. Do not restart the full guardian/service unnecessarily.
 
+### H2/H4 accepted locally — 2026-09-06
+
+Primary accepted the bounded Rust host slice after reviewing watcher lifetime,
+first-publication locking, and cleanup scan cost. Startup watches an existing
+parent/ancestor of each source, so missing build roots and existing roots that
+are deleted/recreated remain observable. Publication locks are initialized for
+all declared views; cleanup takes the same lock for one view at a time across
+candidate selection/deletion. Global cache size is scanned once per cleanup pass,
+not once per view. Concurrent publication keeps the global byte cap best effort;
+current-publication protection is enforced by the per-view lock.
+
+Sol's focused `cargo test -p remux viewer_bundles` passed 11 tests, including
+external creation without explicit publication, delete/recreate observation and
+a retention-overflow publication/cleanup barrier. Host library integration,
+release build and live worker deployment remain pending below. H3 was not touched.
+
+To shorten the remaining serial work, that Sol next owns only S2a2's runtime
+`deliveryHeld` projection, protocol 11 and Compact eligibility/strict fixtures.
+The server Sol retains provider/owner/coordinator implementation and tests;
+they do not edit the same files. Primary still reviews both before deployment.
+
 ### Delivered batch scope
 
 | Lane | Next deliverable | Scope and handoff |

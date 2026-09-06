@@ -71,6 +71,8 @@ pub struct ViewerBundleRegistry {
     sources: HashMap<ViewerBundleKey, ViewerBundleSource>,
     watch_generations: Mutex<HashMap<ViewerBundleKey, u64>>,
     watcher: Mutex<Option<RecommendedWatcher>>,
+    #[cfg(test)]
+    cleanup_attempted: tokio::sync::Notify,
 }
 
 impl ViewerBundleRegistry {
@@ -114,16 +116,23 @@ impl ViewerBundleRegistry {
                 );
             }
         }
+        let publish_locks = sources
+            .keys()
+            .cloned()
+            .map(|key| (key, Arc::new(tokio::sync::Mutex::new(()))))
+            .collect();
         Arc::new(Self {
             cache_root: root_dir.join(".remux/cache/viewers"),
             journal,
             published: Arc::new(RwLock::new(HashMap::new())),
-            publish_locks: Mutex::new(HashMap::new()),
+            publish_locks: Mutex::new(publish_locks),
             cleanup_running: AtomicBool::new(false),
             runtime: tokio::runtime::Handle::current(),
             sources,
             watch_generations: Mutex::new(HashMap::new()),
             watcher: Mutex::new(None),
+            #[cfg(test)]
+            cleanup_attempted: tokio::sync::Notify::new(),
         })
     }
 
@@ -192,14 +201,13 @@ impl ViewerBundleRegistry {
         let mut roots = self
             .sources
             .values()
-            .map(|source| source.source_root.clone())
-            .filter(|root| root.exists())
+            .filter_map(|source| existing_watch_root(&source.source_root))
             .collect::<Vec<_>>();
         roots.sort();
         roots.dedup();
-        for root in roots {
+        for root in &roots {
             watcher
-                .watch(&root, RecursiveMode::Recursive)
+                .watch(root, RecursiveMode::Recursive)
                 .map_err(|error| format!("watch {}: {error}", root.display()))?;
         }
         *self.watcher.lock().unwrap() = Some(watcher);
@@ -383,17 +391,47 @@ impl ViewerBundleRegistry {
         }
         let registry = self.clone();
         self.runtime.spawn(async move {
+            let mut keys = registry.sources.keys().cloned().collect::<Vec<_>>();
+            keys.sort_by(|left, right| {
+                (&left.extension_id, &left.view_id).cmp(&(&right.extension_id, &right.view_id))
+            });
             let cache_root = registry.cache_root.clone();
             let published = registry.published.clone();
-            let cleanup =
-                tokio::task::spawn_blocking(move || cleanup_snapshots(&cache_root, &published))
+            let mut total =
+                match tokio::task::spawn_blocking(move || snapshot_bytes(&cache_root, &published))
                     .await
                     .map_err(|error| format!("snapshot cleanup worker: {error}"))
-                    .and_then(|result| result);
-            if let Err(error) = cleanup {
-                registry
-                    .journal
-                    .warn(&format!("viewer bundle cleanup failed: {error}"));
+                    .and_then(|result| result)
+                {
+                    Ok(total) => total,
+                    Err(error) => {
+                        registry
+                            .journal
+                            .warn(&format!("viewer bundle cleanup failed: {error}"));
+                        registry.cleanup_running.store(false, Ordering::Release);
+                        return;
+                    }
+                };
+            for key in keys {
+                let lock = registry.publish_locks.lock().unwrap().get(&key).cloned();
+                let Some(lock) = lock else { continue };
+                #[cfg(test)]
+                registry.cleanup_attempted.notify_waiters();
+                let _guard = lock.lock_owned().await;
+                let cache_root = registry.cache_root.clone();
+                let published = registry.published.clone();
+                let cleanup = tokio::task::spawn_blocking(move || {
+                    cleanup_view_snapshots(&cache_root, &published, &key, total)
+                })
+                .await
+                .map_err(|error| format!("snapshot cleanup worker: {error}"))
+                .and_then(|result| result);
+                match cleanup {
+                    Ok(updated_total) => total = updated_total,
+                    Err(error) => registry
+                        .journal
+                        .warn(&format!("viewer bundle cleanup failed: {error}")),
+                }
             }
             registry.cleanup_running.store(false, Ordering::Release);
         });
@@ -412,6 +450,13 @@ fn event_requires_publication(kind: EventKind) -> bool {
                 ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Name(_) | ModifyKind::Other
             )
     )
+}
+
+fn existing_watch_root(root: &Path) -> Option<PathBuf> {
+    root.parent()?
+        .ancestors()
+        .find(|candidate| candidate.is_dir())
+        .map(Path::to_path_buf)
 }
 
 fn valid_revision(revision: &str) -> bool {
@@ -713,25 +758,45 @@ fn hash_files(files: &[SourceFile]) -> Result<(Vec<u8>, u64), String> {
     Ok((hasher.finalize().to_vec(), total))
 }
 
-fn cleanup_snapshots(
+fn snapshot_bytes(
     cache_root: &Path,
     published: &RwLock<HashMap<ViewerBundleKey, PublishedViewerBundle>>,
-) -> Result<(), String> {
+) -> Result<u64, String> {
+    let snapshot = published.read().unwrap().clone();
+    let mut total = 0u64;
+    for published_key in snapshot.keys() {
+        let view_root = cache_root
+            .join(&published_key.extension_id)
+            .join(&published_key.view_id);
+        for path in directory_children(&view_root)? {
+            total = total.saturating_add(directory_size(&path)?);
+        }
+    }
+    Ok(total)
+}
+
+fn cleanup_view_snapshots(
+    cache_root: &Path,
+    published: &RwLock<HashMap<ViewerBundleKey, PublishedViewerBundle>>,
+    key: &ViewerBundleKey,
+    mut total: u64,
+) -> Result<u64, String> {
     let snapshot = published.read().unwrap().clone();
     let current = snapshot
         .values()
         .map(|bundle| bundle.snapshot_root.clone())
         .collect::<HashSet<_>>();
+    let Some(bundle) = snapshot.get(key) else {
+        return Ok(total);
+    };
+    let view_root = cache_root.join(&key.extension_id).join(&key.view_id);
     let mut candidates = Vec::new();
-    let mut total = 0u64;
-    for (key, bundle) in &snapshot {
-        let view_root = cache_root.join(&key.extension_id).join(&key.view_id);
+    {
         let mut revisions = directory_children(&view_root)?;
         revisions.sort_by_key(|path| modified_time(path));
         revisions.reverse();
         for (index, path) in revisions.into_iter().enumerate() {
             let bytes = directory_size(&path)?;
-            total = total.saturating_add(bytes);
             if index >= RETAIN_REVISIONS_PER_VIEW && path != bundle.snapshot_root {
                 candidates.push((modified_time(&path), bytes, path));
             } else if !current.contains(&path) {
@@ -741,12 +806,9 @@ fn cleanup_snapshots(
     }
     candidates.sort_by_key(|(modified, _, _)| *modified);
     for (_, bytes, path) in candidates {
-        let over_count = snapshot.values().any(|bundle| {
-            path.parent() == bundle.snapshot_root.parent()
-                && directory_children(path.parent().unwrap_or(Path::new("/")))
-                    .map(|children| children.len() > RETAIN_REVISIONS_PER_VIEW)
-                    .unwrap_or(false)
-        });
+        let over_count = directory_children(&view_root)
+            .map(|children| children.len() > RETAIN_REVISIONS_PER_VIEW)
+            .unwrap_or(false);
         if total <= MAX_SNAPSHOT_BYTES && !over_count {
             continue;
         }
@@ -765,7 +827,7 @@ fn cleanup_snapshots(
         fs::remove_dir_all(&path).map_err(|error| error.to_string())?;
         total = total.saturating_sub(bytes);
     }
-    Ok(())
+    Ok(total)
 }
 
 fn directory_children(root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -844,6 +906,35 @@ mod tests {
         }
     }
 
+    fn manifest(fixture_source: &ViewerBundleSource) -> ExtensionManifest {
+        ExtensionManifest {
+            display: Display {
+                icon: None,
+                icon_dark: None,
+                title: "Fixture".to_string(),
+            },
+            file_handlers: Vec::new(),
+            id: "fixture".to_string(),
+            launchers: Vec::new(),
+            name: "Fixture".to_string(),
+            root_dir: fixture_source.source_root.parent().unwrap().to_path_buf(),
+            server: None,
+            gateway: None,
+            views: vec![(
+                "main".to_string(),
+                View {
+                    build: None,
+                    cache: ViewCachePolicy::Immutable,
+                    entry: fixture_source.entry.clone(),
+                    host_chrome: Default::default(),
+                    route: fixture_source.route.clone(),
+                    watch: None,
+                },
+            )],
+            workloads: Default::default(),
+        }
+    }
+
     #[test]
     fn watcher_ignores_reads_and_metadata_but_accepts_content_changes() {
         assert!(!event_requires_publication(EventKind::Access(
@@ -871,32 +962,7 @@ mod tests {
     async fn publishing_does_not_retrigger_the_source_watcher() {
         let temp = TempDir::new().unwrap();
         let fixture_source = source(&temp);
-        let manifest = ExtensionManifest {
-            display: Display {
-                icon: None,
-                icon_dark: None,
-                title: "Fixture".to_string(),
-            },
-            file_handlers: Vec::new(),
-            id: "fixture".to_string(),
-            launchers: Vec::new(),
-            name: "Fixture".to_string(),
-            root_dir: temp.path().to_path_buf(),
-            server: None,
-            gateway: None,
-            views: vec![(
-                "main".to_string(),
-                View {
-                    build: None,
-                    cache: ViewCachePolicy::Immutable,
-                    entry: fixture_source.entry.clone(),
-                    host_chrome: Default::default(),
-                    route: fixture_source.route.clone(),
-                    watch: None,
-                },
-            )],
-            workloads: Default::default(),
-        };
+        let manifest = manifest(&fixture_source);
         let journal = Journal::new(temp.path(), 2, Arc::new(StdTerminal)).unwrap();
         let registry = ViewerBundleRegistry::new(temp.path(), &[manifest], journal);
         registry.start_watching().unwrap();
@@ -927,6 +993,143 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+
+        let second = registry.current("fixture", "main").unwrap();
+        fs::remove_dir_all(&fixture_source.source_root).unwrap();
+        fs::create_dir_all(fixture_source.source_root.join("assets")).unwrap();
+        fs::write(
+            &fixture_source.entry,
+            "<script src=\"assets/app.js\"></script>",
+        )
+        .unwrap();
+        fs::write(
+            fixture_source.source_root.join("assets/app.js"),
+            "console.log('recreated')",
+        )
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if registry
+                .current("fixture", "main")
+                .is_some_and(|bundle| bundle.revision != second.revision)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "recreated source root did not publish a new revision"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn watcher_publishes_a_source_root_created_after_startup() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("dist");
+        let fixture_source = ViewerBundleSource {
+            key: ViewerBundleKey {
+                extension_id: "fixture".to_string(),
+                view_id: "main".to_string(),
+            },
+            route: "/viewers/fixture".to_string(),
+            entry: root.join("index.html"),
+            source_root: root.clone(),
+            entry_relative_path: PathBuf::from("index.html"),
+        };
+        let manifest = manifest(&fixture_source);
+        let journal = Journal::new(temp.path(), 2, Arc::new(StdTerminal)).unwrap();
+        let registry = ViewerBundleRegistry::new(temp.path(), &[manifest], journal);
+        registry.start_watching().unwrap();
+
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&fixture_source.entry, "initial").unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let first = loop {
+            if let Some(bundle) = registry.current("fixture", "main") {
+                break bundle;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "creation under the watched ancestor did not publish"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+
+        fs::write(&fixture_source.entry, "changed").unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if registry
+                .current("fixture", "main")
+                .is_some_and(|bundle| bundle.revision != first.revision)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "late-created root was not watched"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_waits_for_publication_to_register_its_renamed_revision() {
+        let temp = TempDir::new().unwrap();
+        let fixture_source = source(&temp);
+        let manifest = manifest(&fixture_source);
+        let journal = Journal::new(temp.path(), 2, Arc::new(StdTerminal)).unwrap();
+        let registry = ViewerBundleRegistry::new(temp.path(), &[manifest], journal);
+        let current = registry.publish_now("fixture", "main").await.unwrap();
+        while registry.cleanup_running.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+
+        let key = fixture_source.key.clone();
+        let lock = registry
+            .publish_locks
+            .lock()
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .clone();
+        let guard = lock.lock_owned().await;
+        let view_root = current.snapshot_root.parent().unwrap();
+        let pending_root = view_root.join(format!("sha256-{:064x}", 0));
+        fs::create_dir_all(&pending_root).unwrap();
+        fs::write(pending_root.join("index.html"), "candidate").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        for index in 1..=RETAIN_REVISIONS_PER_VIEW + 1 {
+            let path = view_root.join(format!("sha256-{index:064x}"));
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("index.html"), "candidate").unwrap();
+        }
+        let pending = PublishedViewerBundle {
+            revision: pending_root
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            snapshot_root: pending_root.clone(),
+            ..current
+        };
+
+        let attempted = registry.cleanup_attempted.notified();
+        tokio::pin!(attempted);
+        attempted.as_mut().enable();
+        registry.schedule_cleanup();
+        attempted.await;
+        assert!(
+            pending_root.is_dir(),
+            "cleanup crossed the active publication lock"
+        );
+        registry.published.write().unwrap().insert(key, pending);
+        drop(guard);
+        while registry.cleanup_running.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        assert!(pending_root.join("index.html").is_file());
     }
 
     #[test]
