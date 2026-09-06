@@ -53,7 +53,7 @@ export function HtmlFilePreview({
     useCallback(() => controller.snapshot(), [controller]),
   );
   const availability = htmlPreviewAvailability(Platform.OS);
-  const [linksVisible, setLinksVisible] = useState(false);
+  const [overlay, setOverlay] = useState<'links' | 'menu' | null>(null);
   const [rendererError, setRendererError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -72,21 +72,7 @@ export function HtmlFilePreview({
   const document = state.document;
   return (
     <View style={styles.shell}>
-      <View style={[styles.header, { paddingTop: safeAreaInsets.top }]}>
-        <View style={styles.modeRow}>
-          <ModeButton active label="Preview" onPress={() => selectMode('preview')} styles={styles} />
-          <ModeButton active={false} label="Source" onPress={() => selectMode('source')} styles={styles} />
-        </View>
-        <View style={styles.actionRow}>
-          <StripButton disabled={!document} label="Links" onPress={() => setLinksVisible(true)} styles={styles} />
-          <StripButton disabled={!availability.enabled || !canLoad} label="Refresh" onPress={refresh} styles={styles} />
-          <StripButton label="Tabs" onPress={() => { void onOpenOverview?.('tabs'); }} styles={styles} />
-          <StripButton label="Close" onPress={onClose} styles={styles} />
-        </View>
-        <Text style={styles.contentNote}>Self-contained HTML · Open linked files in Links</Text>
-      </View>
-
-      <View style={[styles.content, { paddingBottom: safeAreaInsets.bottom }]}>
+      <View style={[styles.content, { paddingTop: safeAreaInsets.top }]}>
         {!availability.enabled ? (
           <MessageCard
             action="Open Source"
@@ -142,14 +128,51 @@ export function HtmlFilePreview({
         )}
       </View>
 
-      <LinksModal
+      <View style={[styles.actionBar, { paddingBottom: Math.max(12, safeAreaInsets.bottom) }]}>
+        <View style={styles.actionButtons}>
+          <IconButton
+            icon="tabs"
+            label="Open tabs"
+            onPress={() => { void onOpenOverview?.('tabs'); }}
+            styles={styles}
+          />
+          <IconButton
+            icon="menu"
+            label="HTML preview menu"
+            onPress={() => setOverlay('menu')}
+            styles={styles}
+          />
+        </View>
+        <Text
+          numberOfLines={1}
+          pointerEvents="none"
+          style={[styles.fileName, { bottom: Math.max(1, (Math.max(12, safeAreaInsets.bottom) - 10) / 2) }]}
+        >
+          {fileName(state.path)}
+        </Text>
+      </View>
+
+      <PreviewOverlay
         baseFilePath={state.path}
+        bottomInset={safeAreaInsets.bottom}
+        canReload={availability.enabled && canLoad}
+        hasDocument={Boolean(document)}
         links={document?.links ?? []}
         linksTruncated={document?.linksTruncated ?? false}
-        onClose={() => setLinksVisible(false)}
+        onClose={onClose}
+        onDismiss={() => setOverlay(null)}
+        onLinks={() => setOverlay('links')}
         onOpenFile={onOpenFile}
+        onReload={() => {
+          setOverlay(null);
+          refresh();
+        }}
+        onSource={() => {
+          setOverlay(null);
+          selectMode('source');
+        }}
         styles={styles}
-        visible={linksVisible}
+        view={overlay}
       />
     </View>
   );
@@ -164,39 +187,118 @@ export function HtmlFileSourceHeader({
   const safeAreaInsets = useSafeAreaInsets();
   const styles = useMemo(() => createStyles(theme), [theme]);
   return (
-    <View style={[styles.header, styles.sourceHeader, { paddingTop: safeAreaInsets.top }]}>
-      <View style={styles.modeRow}>
-      <ModeButton active={false} label="Preview" onPress={onPreview} styles={styles} />
-      <ModeButton active label="Source" onPress={() => undefined} styles={styles} />
-      </View>
+    <View style={[styles.sourceHeader, { paddingTop: safeAreaInsets.top }]}>
+      <Pressable accessibilityLabel="Back to HTML preview" accessibilityRole="button" onPress={onPreview} style={styles.backButton}>
+        <Text style={styles.backButtonText}>‹ Preview</Text>
+      </Pressable>
     </View>
   );
 }
 
-function ModeButton({ active, label, onPress, styles }: {
-  active: boolean;
+function IconButton({ icon, label, onPress, styles }: {
+  icon: 'menu' | 'tabs';
   label: string;
   onPress: () => void;
   styles: ReturnType<typeof createStyles>;
 }) {
   return (
-    <Pressable onPress={onPress} style={[styles.modeButton, active ? styles.modeButtonActive : null]}>
-      <Text style={[styles.stripText, active ? styles.modeTextActive : null]}>{label}</Text>
+    <Pressable accessibilityLabel={label} accessibilityRole="button" onPress={onPress} style={({ pressed }) => [styles.iconButton, pressed ? styles.iconButtonPressed : null]}>
+      {icon === 'menu' ? <MenuGlyph styles={styles} /> : <TabsGlyph styles={styles} />}
     </Pressable>
   );
 }
 
-function StripButton({ disabled = false, label, onPress, styles }: {
+function PreviewOverlay({ baseFilePath, bottomInset, canReload, hasDocument, links, linksTruncated, onClose, onDismiss, onLinks, onOpenFile, onReload, onSource, styles, view }: {
+  baseFilePath: string;
+  bottomInset: number;
+  canReload: boolean;
+  hasDocument: boolean;
+  links: readonly { href: string; label: string }[];
+  linksTruncated: boolean;
+  onClose: () => void;
+  onDismiss: () => void;
+  onLinks: () => void;
+  onOpenFile: (target: { line?: number | null; path: string }) => { ok: boolean; reason?: string };
+  onReload: () => void;
+  onSource: () => void;
+  styles: ReturnType<typeof createStyles>;
+  view: 'links' | 'menu' | null;
+}) {
+  const [linkError, setLinkError] = useState<string | null>(null);
+  const openLink = useCallback(async (href: string) => {
+    setLinkError(null);
+    try {
+      const externalUrl = webUrlFromHref(href);
+      if (externalUrl) await Linking.openURL(externalUrl);
+      else {
+        const target = hostFileHrefInfoFromHref(href, { baseFilePath, parseLine: true });
+        if (!target) throw new Error('This link is not supported.');
+        const result = onOpenFile({ line: target.line, path: target.path });
+        if (!result.ok) throw new Error(result.reason || 'The linked file could not be opened.');
+      }
+      onDismiss();
+    } catch (error) {
+      setLinkError(error instanceof Error ? error.message : 'The link could not be opened.');
+    }
+  }, [baseFilePath, onDismiss, onOpenFile]);
+
+  return (
+    <Modal animationType="fade" onRequestClose={onDismiss} transparent visible={view !== null}>
+      <Pressable onPress={onDismiss} style={[styles.menuBackdrop, view === 'links' ? styles.modalBackdrop : null]}>
+        {view === 'links' ? (
+          <Pressable onPress={() => undefined} style={[styles.linksSheet, { paddingBottom: Math.max(24, bottomInset) }]}>
+            <View style={styles.linksHeader}>
+              <Text style={styles.title}>Links</Text>
+              <Pressable accessibilityLabel="Close links" accessibilityRole="button" onPress={onDismiss} style={styles.doneButton}>
+                <Text style={styles.doneButtonText}>Done</Text>
+              </Pressable>
+            </View>
+            <ScrollView>
+              <Text style={styles.linksHelp}>Self-contained HTML does not load sibling assets. Open companion files here.</Text>
+              {links.length === 0 ? <Text style={styles.message}>No companion links in this document.</Text> : null}
+              {links.map((link, index) => (
+                <Pressable accessibilityRole="button" key={`${link.href}:${index}`} onPress={() => { void openLink(link.href); }} style={styles.linkRow}>
+                  <Text numberOfLines={1} style={styles.linkLabel}>{link.label}</Text>
+                  <Text numberOfLines={1} style={styles.linkHref}>{link.href}</Text>
+                </Pressable>
+              ))}
+              {linksTruncated ? <Text style={styles.limitNote}>Showing the first 100 supported links.</Text> : null}
+              {linkError ? <Text style={styles.linkError}>{linkError}</Text> : null}
+            </ScrollView>
+          </Pressable>
+        ) : (
+          <View style={[styles.menuPanel, { bottom: 58 + Math.max(12, bottomInset) }]}>
+            <MenuItem label="View source" onPress={onSource} styles={styles} />
+            <MenuItem disabled={!hasDocument} label="Links" onPress={onLinks} styles={styles} />
+            <MenuItem disabled={!canReload} label="Reload preview" onPress={onReload} styles={styles} />
+            <MenuItem danger label="Close tab" onPress={() => { onDismiss(); onClose(); }} styles={styles} />
+          </View>
+        )}
+      </Pressable>
+    </Modal>
+  );
+}
+
+function MenuItem({ danger = false, disabled = false, label, onPress, styles }: {
+  danger?: boolean;
   disabled?: boolean;
   label: string;
   onPress: () => void;
   styles: ReturnType<typeof createStyles>;
 }) {
   return (
-    <Pressable disabled={disabled} onPress={onPress} style={styles.stripButton}>
-      <Text style={[styles.stripText, disabled ? styles.disabledText : null]}>{label}</Text>
+    <Pressable accessibilityLabel={label} accessibilityRole="button" accessibilityState={{ disabled }} disabled={disabled} onPress={onPress} style={styles.menuItem}>
+      <Text style={[styles.menuItemText, danger ? styles.menuItemDanger : null, disabled ? styles.menuItemDisabled : null]}>{label}</Text>
     </Pressable>
   );
+}
+
+function TabsGlyph({ styles }: { styles: ReturnType<typeof createStyles> }) {
+  return <View style={styles.tabsGlyph}><View style={styles.tabsDivider} /><View style={styles.tabsChevronTop} /><View style={styles.tabsChevronBottom} /></View>;
+}
+
+function MenuGlyph({ styles }: { styles: ReturnType<typeof createStyles> }) {
+  return <View style={styles.menuGlyph}><View style={styles.menuLine} /><View style={styles.menuLine} /><View style={styles.menuLine} /></View>;
 }
 
 function MessageCard({ action, message, onAction, styles, title }: {
@@ -211,7 +313,7 @@ function MessageCard({ action, message, onAction, styles, title }: {
       <View style={styles.card}>
         <Text style={styles.title}>{title}</Text>
         <Text style={styles.message}>{message}</Text>
-        <Pressable onPress={onAction} style={styles.primaryButton}>
+        <Pressable accessibilityRole="button" onPress={onAction} style={styles.primaryButton}>
           <Text style={styles.primaryButtonText}>{action}</Text>
         </Pressable>
       </View>
@@ -219,85 +321,68 @@ function MessageCard({ action, message, onAction, styles, title }: {
   );
 }
 
-function LinksModal({ baseFilePath, links, linksTruncated, onClose, onOpenFile, styles, visible }: {
-  baseFilePath: string;
-  links: readonly { href: string; label: string }[];
-  linksTruncated: boolean;
-  onClose: () => void;
-  onOpenFile: (target: { line?: number | null; path: string }) => { ok: boolean; reason?: string };
-  styles: ReturnType<typeof createStyles>;
-  visible: boolean;
-}) {
-  const [linkError, setLinkError] = useState<string | null>(null);
-  const openLink = useCallback(async (href: string) => {
-    setLinkError(null);
-    try {
-      const externalUrl = webUrlFromHref(href);
-      if (externalUrl) {
-        await Linking.openURL(externalUrl);
-        onClose();
-        return;
-      }
-      const target = hostFileHrefInfoFromHref(href, { baseFilePath, parseLine: true });
-      if (!target) throw new Error('This link is not supported.');
-      const result = onOpenFile({ line: target.line, path: target.path });
-      if (!result.ok) throw new Error(result.reason || 'The linked file could not be opened.');
-      onClose();
-    } catch (error) {
-      setLinkError(error instanceof Error ? error.message : 'The link could not be opened.');
-    }
-  }, [baseFilePath, onClose, onOpenFile]);
-
-  return (
-    <Modal animationType="slide" onRequestClose={onClose} transparent visible={visible}>
-      <Pressable onPress={onClose} style={styles.modalBackdrop}>
-        <Pressable onPress={() => undefined} style={styles.linksSheet}>
-          <View style={styles.linksHeader}>
-            <Text style={styles.title}>Links</Text>
-            <StripButton label="Done" onPress={onClose} styles={styles} />
-          </View>
-          <ScrollView>
-            {links.length === 0 ? <Text style={styles.message}>No companion links in this document.</Text> : null}
-            {links.map((link, index) => (
-              <Pressable key={`${link.href}:${index}`} onPress={() => { void openLink(link.href); }} style={styles.linkRow}>
-                <Text numberOfLines={1} style={styles.linkLabel}>{link.label}</Text>
-                <Text numberOfLines={1} style={styles.linkHref}>{link.href}</Text>
-              </Pressable>
-            ))}
-            {linksTruncated ? <Text style={styles.limitNote}>Showing the first 100 supported links.</Text> : null}
-            {linkError ? <Text style={styles.linkError}>{linkError}</Text> : null}
-          </ScrollView>
-        </Pressable>
-      </Pressable>
-    </Modal>
-  );
-}
-
 function createStyles(theme: RemuxTheme) {
   return StyleSheet.create({
     shell: { backgroundColor: theme.surface, flex: 1 },
-    header: {
-      backgroundColor: theme.surfaceRaised,
-      borderBottomColor: theme.border,
-      borderBottomWidth: StyleSheet.hairlineWidth,
-      paddingHorizontal: 8,
-    },
-    sourceHeader: { minHeight: 44 },
-    modeRow: {
-      alignItems: 'center',
-      flexDirection: 'row',
-      gap: 4,
-      minHeight: 44,
-    },
-    actionRow: { alignItems: 'center', flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between' },
-    modeButton: { borderRadius: 8, justifyContent: 'center', minHeight: 44, paddingHorizontal: 11 },
-    modeButtonActive: { backgroundColor: theme.focusRing },
-    modeTextActive: { color: theme.surface },
-    stripButton: { justifyContent: 'center', minHeight: 44, paddingHorizontal: 9 },
-    stripText: { color: theme.text, fontSize: 13, fontWeight: '600' },
-    disabledText: { color: theme.textMuted },
-    contentNote: { color: theme.textMuted, fontSize: 11, paddingBottom: 7, paddingHorizontal: 4 },
     content: { flex: 1 },
+    actionBar: {
+      alignItems: 'center',
+      backgroundColor: theme.surfaceRaised,
+      borderTopColor: theme.borderSubtle,
+      borderTopWidth: StyleSheet.hairlineWidth,
+      justifyContent: 'center',
+      minHeight: 58,
+      paddingHorizontal: 18,
+      paddingTop: 10,
+      position: 'relative',
+    },
+    actionButtons: { alignItems: 'center', alignSelf: 'flex-start', flexDirection: 'row', gap: 7 },
+    iconButton: {
+      alignItems: 'center',
+      backgroundColor: theme.surfaceHover,
+      borderColor: theme.border,
+      borderRadius: 8,
+      borderWidth: StyleSheet.hairlineWidth,
+      elevation: 2,
+      height: 36,
+      justifyContent: 'center',
+      shadowColor: '#000',
+      shadowOffset: { height: 1, width: 0 },
+      shadowOpacity: 0.18,
+      shadowRadius: 2,
+      width: 39,
+    },
+    iconButtonPressed: { elevation: 0, transform: [{ translateY: 1 }] },
+    fileName: { color: theme.textMuted, fontSize: 9, left: 18, lineHeight: 10, position: 'absolute', right: 18, textAlign: 'center' },
+    tabsGlyph: { borderColor: theme.textMuted, borderRadius: 2, borderWidth: 1.5, height: 15, position: 'relative', width: 18 },
+    tabsDivider: { backgroundColor: theme.textMuted, bottom: 0, position: 'absolute', right: 5, top: 0, width: 1.5 },
+    tabsChevronTop: { backgroundColor: theme.textMuted, height: 1.5, left: 3, position: 'absolute', top: 5, transform: [{ rotate: '-38deg' }], width: 5 },
+    tabsChevronBottom: { backgroundColor: theme.textMuted, bottom: 4, height: 1.5, left: 3, position: 'absolute', transform: [{ rotate: '38deg' }], width: 5 },
+    menuGlyph: { gap: 2.5, width: 16 },
+    menuLine: { backgroundColor: theme.textMuted, borderRadius: 1, height: 1.5, width: 16 },
+    menuBackdrop: { flex: 1 },
+    menuPanel: {
+      backgroundColor: theme.surfaceRaised,
+      borderColor: theme.border,
+      borderRadius: 10,
+      borderWidth: StyleSheet.hairlineWidth,
+      elevation: 8,
+      left: 18,
+      padding: 3,
+      position: 'absolute',
+      shadowColor: '#000',
+      shadowOffset: { height: 4, width: 0 },
+      shadowOpacity: 0.24,
+      shadowRadius: 10,
+      width: 232,
+    },
+    menuItem: { justifyContent: 'center', minHeight: 40, paddingHorizontal: 10 },
+    menuItemText: { color: theme.text, fontSize: 14 },
+    menuItemDanger: { color: theme.danger },
+    menuItemDisabled: { color: theme.textMuted, opacity: 0.42 },
+    sourceHeader: { alignItems: 'flex-start', backgroundColor: theme.surfaceRaised, borderBottomColor: theme.borderSubtle, borderBottomWidth: StyleSheet.hairlineWidth, justifyContent: 'center', minHeight: 44, paddingHorizontal: 12 },
+    backButton: { justifyContent: 'center', minHeight: 40, paddingHorizontal: 6 },
+    backButtonText: { color: theme.textMuted, fontSize: 14, fontWeight: '600' },
     centered: { alignItems: 'center', flex: 1, justifyContent: 'center', padding: 24 },
     card: { alignItems: 'flex-start', backgroundColor: theme.surfaceRaised, borderRadius: 14, gap: 10, maxWidth: 480, padding: 20 },
     title: { color: theme.text, fontSize: 17, fontWeight: '700' },
@@ -309,10 +394,17 @@ function createStyles(theme: RemuxTheme) {
     modalBackdrop: { backgroundColor: 'rgba(0,0,0,0.42)', flex: 1, justifyContent: 'flex-end' },
     linksSheet: { backgroundColor: theme.surface, borderTopLeftRadius: 18, borderTopRightRadius: 18, maxHeight: '70%', minHeight: 220, paddingBottom: 24 },
     linksHeader: { alignItems: 'center', borderBottomColor: theme.border, borderBottomWidth: StyleSheet.hairlineWidth, flexDirection: 'row', justifyContent: 'space-between', padding: 14 },
+    doneButton: { justifyContent: 'center', minHeight: 40, paddingHorizontal: 8 },
+    doneButtonText: { color: theme.focusRing, fontSize: 14, fontWeight: '700' },
     linkRow: { borderBottomColor: theme.borderSubtle, borderBottomWidth: StyleSheet.hairlineWidth, gap: 3, paddingHorizontal: 16, paddingVertical: 12 },
+    linksHelp: { color: theme.textMuted, fontSize: 12, lineHeight: 17, paddingHorizontal: 16, paddingVertical: 12 },
     linkLabel: { color: theme.text, fontSize: 15, fontWeight: '600' },
     linkHref: { color: theme.textMuted, fontSize: 12 },
     limitNote: { color: theme.textMuted, fontSize: 12, padding: 16 },
     linkError: { color: theme.danger, fontSize: 13, padding: 16 },
   });
+}
+
+function fileName(path: string) {
+  return path.split(/[\\/]/u).filter(Boolean).at(-1) || path;
 }

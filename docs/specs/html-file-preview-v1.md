@@ -78,12 +78,17 @@ that optional device exercise is available.
 | Missing, unreadable, invalid UTF-8 or oversized document | Readable error with retry and working tab controls; no blank screen or endless spinner. |
 | Preview process terminates or renderer fails | Show recoverable failure outside the document; explicit reload resets report state. Do not loop automatic reloads. |
 
-The host owns a compact Preview / Source mode strip for HTML files. Preview
-has native refresh, companion Links, tab navigation and close controls. Source
-keeps the existing Editor action bar and copy/diff behavior; only the mode strip
-remains above it. Do not duplicate Source actions natively or add an Editor
-embedding protocol to unify the bars. Preserve source-line intent until the Source viewer acknowledges it;
-do not clear it merely because Preview mounted.
+Preview follows the Markdown viewer’s bottom action-bar pattern: compact raised
+Tabs and Menu icon buttons, with a muted filename footer. The menu contains
+View source, Links, Reload preview and Close tab. There is no narration control,
+top mode strip or permanent explanatory banner over the report. The controls
+remain native and outside the isolated document.
+
+Source keeps the existing Editor action bar and copy/diff behavior, with a
+compact return-to-preview control above it. Do not duplicate Source actions
+natively or add an Editor embedding protocol to unify the bars. Preserve
+source-line intent until the Source viewer acknowledges it; do not clear it
+merely because Preview mounted.
 
 Keep report scrolling within the available document surface. App safe areas and
 controls stay outside it. Do not impose Remux fonts/colors on authored content.
@@ -152,8 +157,8 @@ refresh is the recovery; do not add watchers or a snapshot store here.
 V1 supports self-contained HTML: inline scripts/styles, embedded data, SVG,
 canvas and embedded images/fonts. It does not fetch sibling assets, remote
 scripts, remote data, or run a development server. No npm/build pipeline is
-started to open a report. Show a concise app-owned note that external assets
-are unavailable; do not claim success implies every document dependency loaded.
+started to open a report. Keep any explanatory help in the menu or Links sheet;
+do not claim success implies every document dependency loaded.
 
 ## Execution and navigation boundary
 
@@ -334,3 +339,11 @@ refactoring. No new agent/server protocol or journal migration is required.
 - To install: app Settings → Updates → Check for updates (or Restart to update
   if downloaded), then open the HTML report link again. This reloads the app UI,
   not the provider session.
+
+- UI polish, 2026-09-06: Preview adopts Markdown’s bottom Tabs/Menu bar and
+  filename footer; Source has a compact return control. No narration or
+  permanent report banner. Menu and Links share one native modal to avoid
+  competing iOS presentations. Sol implemented the bounded UI change; primary
+  reviewed it. App typecheck, HTML integration/load checks, viewer-host contract
+  and viewer lifecycle checks passed (`/tmp/remux-html-preview/ui-checks.log`).
+  Device visual acceptance remains user-observed rather than claimed here.
