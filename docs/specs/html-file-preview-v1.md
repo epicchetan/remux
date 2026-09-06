@@ -1,4 +1,4 @@
-Status: Active Spec — implementation underway; native rollout gated
+Status: Active Spec — implementation and automated checks complete; native rollout gated
 Last verified: 2026-09-06
 Canonical code: `app/src/surfaces/viewer/`, `app/src/browser/`,
 `app/src/files/`, `extensions/editor/viewer/src/editor/`,
@@ -295,6 +295,24 @@ refactoring. No new agent/server protocol or journal migration is required.
   refresh failure retains the previous document. Evidence:
   `/tmp/remux-html-preview/p1-review.log`. Host release build passed in 20.38 s
   (`host-build.log`); the running worker has not been restarted.
-- P2 is frozen for integrated review behind the platform gate. P3 integration
-  and publication remain pending. No app update or host restart has occurred
-  for this feature. Update this checkpoint after each accepted slice.
+- P1 committed/pushed as `f338f9a`.
+- P2 reviewed: an HTML-only wrapper keeps unrelated Agent/Terminal surfaces out
+  of the new lifecycle; the controller owns mode, line intents are keyed by
+  nonce and acknowledged by Source, native controls resolve companion links,
+  and Source's nested top safe area is rebased. A second Sol read-only review
+  found no remaining code blocker. Routing helpers and source-contract checks
+  pass; these do not replace native component/device acceptance.
+- P3 automated integration passed: root and app typechecks, all three HTML
+  suites, and existing app viewer-host/lifecycle checks. Evidence:
+  `/tmp/remux-html-preview/integrated-checks.log`. Expo exported iOS and Android
+  Hermes bundles successfully, establishing Metro/Hermes build compatibility
+  of parse5/base64-js (`app-export.log`, bundles in `app-export/`). The host
+  release build passed. No production app update or host restart has occurred.
+- **Remaining gate:** native iOS/Android isolation and interaction validation,
+  followed by reviewed per-platform enablement and publication. No platform is
+  currently enabled. Do not describe this as live on the user's phone. The
+  prepared app bundles and host binary are build artifacts, not a deployment.
+  Run native validation on a development build before deciding the release
+  runtime/channel; do not bypass the Expo fingerprint policy without matching
+  the installed binary's compatibility evidence. Rollout can use a normal
+  compatible app update; if that cannot be established, build a new app binary.

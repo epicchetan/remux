@@ -21,8 +21,11 @@ prompted by Ledger's interactive HTML report. It reuses file-tab routing with an
 app-owned, bridge-free browser surface; it does not change Agent transcript
 rendering or provider lifecycle. The spec records implementation slices,
 native-platform isolation gates, commit/build cadence and deployment needs.
-This is specification work only so far. The remaining audit slices below keep
-their current status and scope; this feature is not an audit completion claim.
+The feature implementation and automated checks are complete, including native
+app exports and a host release build. Native-device isolation remains the
+per-platform rollout gate; it has not been published. The HTML spec records
+commit and validation evidence. The remaining audit slices below keep their
+current status and scope; this feature is not an audit completion claim.
 
 ### Deployed bounded follow-up — short active-turn Down navigation
 

@@ -18,6 +18,8 @@
     "test:viewer-lifecycle": "node --no-warnings scripts/test-viewer-lifecycle.mjs",
     "test:html-preview": "node --no-warnings scripts/test-html-preview.mjs",
     "test:html-preview-load": "node --no-warnings scripts/test-html-preview-load.mjs",
+    "test:html-preview-integration": "node --no-warnings scripts/test-html-preview-integration.mjs",
+    "test:html-preview-all": "npm run test:html-preview && npm run test:html-preview-load && npm run test:html-preview-integration",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
