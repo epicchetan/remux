@@ -29,7 +29,7 @@ export function ComposerStatusMessageRow({
     ? submissionLabel(submission.phase)
     : submissionError
       ?? pendingRecoveryError
-      ?? (hasPendingSubmission ? 'First message pending. Retry to check its status.' : null)
+      ?? (hasPendingSubmission ? 'Message pending. Retry to check its status.' : null)
       ?? (historyLoading ? 'Syncing conversation history' : null)
       ?? (historyFailed ? `Conversation history couldn’t sync${history.error ? `: ${history.error}` : '.'}` : null)
       ?? runtimeError;

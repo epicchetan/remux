@@ -1,4 +1,4 @@
-# New-chat recovery across disconnects
+# Message recovery across disconnects
 
 Status: implemented, committed, and deployed on 2026-09-06. Broader audit remains paused.
 
@@ -45,8 +45,10 @@ Retry if recovery cannot finish. An ordinary unsent draft must never send just
 because the app reconnects. Navigation must not redirect or clear the currently
 selected conversation when an older operation resolves.
 
-This slice covers new-chat creation and first-message submission, with server
-receipt lookup. No branch/steer/compact rewrite or new database schema is required.
+The original slice covers new-chat creation and first-message submission, with
+server receipt lookup. The parallel cleanup batch extends the same owner to
+ordinary messages in existing conversations. No branch/steer/compact rewrite,
+server queue-failure policy, or new database schema is included.
 Use staged Sol ownership: viewer owner/state-machine and tests; server read-only
 status API and tests; primary contract, integration review, commit/push, build,
 controlled restart and live verification. Preserve the shared native daemon.
@@ -115,6 +117,42 @@ and `subagent-deploy-thread-after.json`. Full browser results are in
 
 This evidence combines server receipt/replay tests, browser fault injection, and
 live legacy-draft recovery. It does not claim a live process-kill canary at every
-possible create/upload/send boundary. Unresolved or rejected provider-effecting
-receipts remain explicit errors; this slice does not manufacture replacement IDs
-or delete conversations to get past them.
+possible create/upload/send boundary. At that original checkpoint, unresolved
+and rejected provider-effecting receipts remained explicit errors. The ordinary-
+message extension below distinguishes a positively rejected send from uncertainty
+and permits a later explicit submission after rejection; uncertain requests never
+receive replacement IDs.
+
+
+## Ordinary-message extension — parallel cleanup batch
+
+Existing-conversation normal Send now persists the exact send request, IDs,
+configuration, parts, and submitted snapshot before any artifact or send effect.
+It uses the same receipt lookup, promise coalescer, bounded retry schedule,
+transcript/queue handoff, and conditional clearing as new-chat recovery. A queued
+receipt is accepted enqueue evidence; recovery must not create another queued
+message while waiting for native execution.
+
+`pendingMessageSubmission.ts` records an explicit `new-chat` or
+`existing-conversation` source. An existing-conversation record has no fabricated
+create stage and matches only its exact non-null conversation ID. One
+`submissionMatchesTarget` predicate protects both selection and in-flight
+recovery, including navigation to a blank New chat. Old source-less records still
+normalize to new-chat, and the shipped session-storage prefix is unchanged.
+
+The implementation deliberately shares the existing recovery flow instead of
+adding a parallel existing-message retry mechanism. The larger actions-hook
+extraction remains optional maintenance; this slice removes the separate ordinary
+send/handoff path and gives both paths one owner. Native rejection, unresolved
+delivery, and an accepted message whose transcript is still loading remain
+separate outcomes. A positively rejected `turn.send` releases the pending intent,
+retains the editable draft and visible error, and permits a later explicit Send
+with a fresh request. This is never an automatic replacement: transport errors,
+`dispatching`, and `recovery_failed` keep the original identity fenced. General
+queue retry/recheck, branch/edit/fork, and manual
+Compact/steer are separate cleanup stages.
+
+Focused evidence: 20 desktop/mobile shared-recovery cases, then eight existing
+message/navigation cases passed in Sol's handoff. Primary added shared target
+matching and legacy-record validation; six storage tests pass. Final integrated
+and live results are recorded in the remediation spec's batch deployment entry.

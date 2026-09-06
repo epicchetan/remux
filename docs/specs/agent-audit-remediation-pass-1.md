@@ -31,13 +31,14 @@ resuming the next bounded batch after the reorientation checkpoint.
   Codex portions of C4/A5/R7. Claude framing/resume, nested federation ownership,
   and the remaining lease/daemon cases are not thereby certified.
 - [New-chat recovery](agent-new-chat-recovery.md) is shipped (`73a2157`,
-  `dc04358`). It closes creation/first-message recovery in V1, not ordinary
-  existing-conversation retries or server queue recovery.
+  `dc04358`). It closes creation/first-message recovery in V1. Lane B now extends that owner
+  to ordinary messages, accepted locally and awaiting batch deployment; server
+  queue recovery remains separate.
 - The general viewer synchronization owner (S4), focused history integrity (S5),
   and most host/app work (S6) remain ahead. The original 76-row planned coverage
   count is not a completion count.
 
-Latest integrated evidence: typecheck and 285 server tests passed. Final browser
+Previous deployed checkpoint evidence: typecheck and 285 server tests passed. Final browser
 run: 198 passed, three skips, one mobile geometry mount miss; isolated geometry
 rerun passed all three cases. Live desktop/mobile legacy-draft recovery preserved
 text and admitted no message. Main-thread verification preserved its root/native
@@ -104,6 +105,40 @@ S2a2. Arbitrary corruption of preparing/dispatching/accepted-stage rows can stil
 fail startup closed; general database repair is out of scope. Integrated full
 suite/build/deployment is pending the A/B batch. Evidence:
 `/tmp/remux-audit-implementation/s2a1-closure-{final,typecheck,targeted}.log`.
+
+### Lane B accepted locally — 2026-09-06
+
+Ordinary messages now use the same persisted request recovery as new chats.
+The old ordinary-send/handoff path is removed. The pending record has an explicit
+source: existing conversations have no create stage and match only their own
+conversation ID. One shared target predicate guards both lookup and in-flight
+recovery, preserving unrelated/newer drafts. Source-less shipped records and the
+session-storage prefix remain compatible. Generic helper/type names describe
+both paths; no second recovery loop or server API was introduced.
+
+Sol's focused shared matrix passed 20 desktop/mobile cases, and its final
+existing-message/blank-route matrix passed eight. Primary reviewed the complete
+diff and unified target matching, added source-less compatibility coverage, and
+verified six storage cases. An independent final read-only review found no
+blocker in ownership/replay. Primary subsequently identified that a confirmed
+rejected send must release its pending intent so a later explicit Send can work;
+the shared owner now does this only after a positively rejected `turn.send`.
+Six desktop/mobile rejection, reload, and explicit fresh-Send cases pass, covering
+existing conversations and an attached first message. Integrated typecheck and all
+288 server tests passed; final viewer results and deployment are recorded at the
+batch checkpoint below. The scope
+is normal Send/recovery only: server queue retry policy and branch/edit/fork,
+steer, and Compact remain separate stages.
+
+### Lane C read-only host findings — 2026-09-06
+
+Source review confirmed that H2 registers watcher roots only at startup, H4
+leaves a rename-to-registry-insertion cleanup race, and H3 detaches manual build
+work from supervisor Stop/Restart. No Rust implementation or new host test was
+performed in this batch. The next smallest independent host slice is H2/H4 in
+`viewer_bundles.rs`, with deterministic missing-root and publication/cleanup
+regressions. H3 belongs to a separate supervisor/build-process lifetime slice.
+Neither is a reason to hold the completed Agent A/B changes for a host rebuild.
 
 ### Historical checkpoint and restart — 2026-09-05
 

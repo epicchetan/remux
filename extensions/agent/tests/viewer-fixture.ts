@@ -166,11 +166,16 @@ export async function installAgentHost(page: Page) {
     }
     let sequence = 1;
     let turnCounter = recoveredMessages.length;
+    const recoveredQueue = JSON.parse(
+      window.sessionStorage.getItem('remux.agent.fixture.accepted-queue') ?? '[]',
+    ) as typeof pendingQueue;
+    pendingQueue.push(...recoveredQueue);
     let lifecycleEpoch = 1;
     let invalidationsDropped = false;
     let nextTranscriptDelayMs = 0;
     let transcriptFailuresRemaining = 0;
     let nextMessageError: string | null = null;
+    let holdReadsAfterNextMessageError = false;
     let loseNextCreateResponse = false;
     let loseNextMessageResponse = false;
     let holdCommandReadsUntilReload = false;
@@ -183,6 +188,7 @@ export async function installAgentHost(page: Page) {
       viewportHeight: window.innerHeight,
       viewportWidth: window.innerWidth,
     };
+    if (recoveredQueue.length) syncFixtureQueue();
 
     if (routedConversation) {
       resources.set(conversationKey, {
@@ -2076,6 +2082,17 @@ export async function installAgentHost(page: Page) {
         if (nextMessageError) {
           const message = nextMessageError;
           nextMessageError = null;
+          commandReceipts.set(String(params.commandId), {
+            commandId: params.commandId,
+            kind: 'turn.send',
+            state: 'rejected',
+            errorMessage: message,
+          });
+          saveCommandReceipts();
+          if (holdReadsAfterNextMessageError) {
+            holdReadsAfterNextMessageError = false;
+            holdCommandReadsUntilReload = true;
+          }
           throw new Error(message);
         }
         const runtime = resources.get('runtime')?.value;
@@ -2085,19 +2102,33 @@ export async function installAgentHost(page: Page) {
         const conversation = resources.get(`conversation:${String(params.conversationId)}`)?.value
           ?? resources.get(conversationKey)?.value;
         if (runtime?.state === 'running' || runtime?.state === 'interrupting') {
-          pendingQueue.push({
+          const queued = {
             clientMessageId: String(params.clientMessageId),
             modelId: String(conversation?.modelId ?? 'gpt-5.6-sol'),
             operationId: String(params.commandId),
             parts,
             reasoning: String(conversation?.reasoning ?? 'high'),
             text,
-          });
+          };
+          pendingQueue.push(queued);
           syncFixtureQueue();
-          return {
+          window.sessionStorage.setItem(
+            'remux.agent.fixture.accepted-queue', JSON.stringify(pendingQueue),
+          );
+          const result = {
             accepted: true, commandId: params.commandId,
             delivery: 'queued', turnId: params.commandId,
           };
+          commandReceipts.set(String(params.commandId), {
+            commandId: params.commandId, kind: 'turn.send', state: 'accepted', result,
+          });
+          saveCommandReceipts();
+          if (loseNextMessageResponse) {
+            loseNextMessageResponse = false;
+            holdCommandReadsUntilReload = true;
+            throw new Error('Fixture connection closed after accepting the first message.');
+          }
+          return result;
         }
         const turn = startFixtureMessage({
           clientMessageId: String(params.clientMessageId),
@@ -2688,6 +2719,10 @@ export async function installAgentHost(page: Page) {
         },
         rejectNextMessage(message = 'Another conversation has an active turn.') {
           nextMessageError = message;
+        },
+        rejectNextMessageUntilReload(message = 'Another conversation has an active turn.') {
+          nextMessageError = message;
+          holdReadsAfterNextMessageError = true;
         },
         loseNextCreateAcknowledgement() {
           loseNextCreateResponse = true;

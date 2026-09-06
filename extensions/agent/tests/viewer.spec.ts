@@ -167,6 +167,71 @@ test('does not duplicate a text or image after the send acknowledgement is lost'
     .filter((key) => key.startsWith('remux.agent.new-chat-submission.v1:')).length)).toBe(0);
 });
 
+test('recovers one accepted message in an existing conversation after reload', async ({ page }) => {
+  await page.goto(conversationUrl());
+  await expect(transcript(page).getByText('Recovered from authoritative resources.')).toBeVisible();
+  await messageBox(page).fill('Existing conversation frozen message');
+  await page.evaluate(() => (window as any).__agentFixture.loseNextMessageAcknowledgement());
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Retry', exact: true })).toBeVisible();
+
+  await page.reload();
+  await expect(transcript(page).getByText('Existing conversation frozen message', { exact: true })).toHaveCount(1);
+  await expect.poll(() => page.evaluate(() => {
+    const receipts = JSON.parse(sessionStorage.getItem('remux.agent.fixture.command-receipts') ?? '[]');
+    return receipts.filter(([, value]: [string, any]) => value.kind === 'turn.send').length;
+  })).toBe(1);
+  await expect.poll(() => page.evaluate(() => Object.keys(sessionStorage)
+    .filter((key) => key.startsWith('remux.agent.new-chat-submission.v1:')).length)).toBe(0);
+});
+
+test('preserves newer existing-conversation edits while finishing an accepted message', async ({ page }) => {
+  await page.goto(conversationUrl());
+  await messageBox(page).fill('Existing submitted snapshot');
+  await page.evaluate(() => (window as any).__agentFixture.loseNextMessageAcknowledgement());
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Retry', exact: true })).toBeVisible();
+  await messageBox(page).fill('Existing newer draft');
+
+  await page.reload();
+  await expect(transcript(page).getByText('Existing submitted snapshot', { exact: true })).toHaveCount(1);
+  await expect.poll(() => messageBox(page).evaluate((element) => (element as HTMLElement).innerText.trim()))
+    .toBe('Existing newer draft');
+});
+
+test('recovers an accepted queued message without a second native send', async ({ page }) => {
+  await page.goto(conversationUrl('&fixtureRunning=1'));
+  await messageBox(page).fill('Persist this queued follow-up');
+  await page.evaluate(() => (window as any).__agentFixture.loseNextMessageAcknowledgement());
+  await page.getByRole('button', { name: 'Queue message', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Retry', exact: true })).toBeVisible();
+
+  await page.reload();
+  await expect(page.getByText('Queued 1', { exact: true })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => {
+    const receipts = JSON.parse(sessionStorage.getItem('remux.agent.fixture.command-receipts') ?? '[]');
+    return receipts.filter(([, value]: [string, any]) => value.kind === 'turn.send').length;
+  })).toBe(1);
+  await expect.poll(() => page.evaluate(() => Object.keys(sessionStorage)
+    .filter((key) => key.startsWith('remux.agent.new-chat-submission.v1:')).length)).toBe(0);
+});
+
+test('does not adopt an existing-conversation recovery from a blank new-chat route', async ({ page, isMobile }) => {
+  await page.goto(conversationUrl());
+  await messageBox(page).fill('Stay owned by the existing conversation');
+  await page.evaluate(() => (window as any).__agentFixture.loseNextMessageAcknowledgement());
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Retry', exact: true })).toBeVisible();
+  await startNewChat(page, isMobile);
+  await page.reload();
+
+  await expect(page.locator('.remux-new-chat-empty-title').getByText('New chat', { exact: true })).toBeVisible();
+  await expect.poll(() => messageBox(page).evaluate((element) => (element as HTMLElement).innerText.trim()))
+    .toBe('');
+  await expect.poll(() => page.evaluate(() => Object.keys(sessionStorage)
+    .filter((key) => key.startsWith('remux.agent.new-chat-submission.v1:')).length)).toBe(1);
+});
+
 test('does not send the first message after navigation until its owner is selected again', async ({ page, isMobile }) => {
   await messageBox(page).fill('Resume only when I return');
   await page.evaluate(() => {
@@ -604,6 +669,52 @@ test('preserves an unloaded conversation draft when lazy activation is rejected'
   await expect.poll(() => textbox.evaluate((element) => (element as HTMLElement).innerText))
     .toBe('Keep this exact draft after a busy rejection');
   await expect(textbox).toBeEditable();
+});
+
+test('releases a confirmed rejected send so an explicit retry uses a fresh command', async ({ page }) => {
+  await page.goto(conversationUrl());
+  await page.evaluate(() => (window as any).__agentFixture.rejectNextMessageUntilReload());
+  const textbox = messageBox(page);
+  await textbox.fill('Retry only after confirmed rejection');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('Another conversation has an active turn.');
+  await expect.poll(() => commandCount(page, 'remux/agent/conversation/message/send')).toBe(1);
+
+  await page.reload();
+  await expect(page.getByRole('alert')).toContainText('Another conversation has an active turn.');
+  await expect.poll(() => page.evaluate(() => Object.keys(sessionStorage)
+    .filter((key) => key.startsWith('remux.agent.new-chat-submission.v1:')).length)).toBe(0);
+  await expect.poll(() => commandCount(page, 'remux/agent/conversation/message/send')).toBe(0);
+  await expect.poll(() => textbox.evaluate((element) => (element as HTMLElement).innerText.trim()))
+    .toBe('Retry only after confirmed rejection');
+
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect.poll(() => commandCount(page, 'remux/agent/conversation/message/send')).toBe(1);
+  await expect(transcript(page).getByText('Retry only after confirmed rejection', { exact: true })).toHaveCount(1);
+  await expect.poll(() => page.evaluate(() => {
+    const receipts = JSON.parse(sessionStorage.getItem('remux.agent.fixture.command-receipts') ?? '[]');
+    return receipts.filter(([, value]: [string, any]) => value.kind === 'turn.send').length;
+  })).toBe(2);
+});
+
+test('releases a confirmed rejected first message after its conversation was attached', async ({ page }) => {
+  await page.evaluate(() => (window as any).__agentFixture.rejectNextMessageUntilReload());
+  const textbox = messageBox(page);
+  await textbox.fill('Retry the attached first message');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('Another conversation has an active turn.');
+
+  await page.reload();
+  await expect(page.getByRole('alert')).toContainText('Another conversation has an active turn.');
+  await expect.poll(() => page.evaluate(() => Object.keys(sessionStorage)
+    .filter((key) => key.startsWith('remux.agent.new-chat-submission.v1:')).length)).toBe(0);
+  await expect.poll(() => textbox.evaluate((element) => (element as HTMLElement).innerText.trim()))
+    .toBe('Retry the attached first message');
+  await expect.poll(() => commandCount(page, 'remux/agent/conversation/message/send')).toBe(0);
+
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect.poll(() => commandCount(page, 'remux/agent/conversation/message/send')).toBe(1);
+  await expect(transcript(page).getByText('Retry the attached first message', { exact: true })).toHaveCount(1);
 });
 
 test('renders terminal turn errors from the authoritative frame', async ({ page }) => {

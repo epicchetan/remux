@@ -4,14 +4,15 @@ import type { TurnSubmissionInput } from '../composer/actions/turnAction.ts';
 
 const PREFIX = 'remux.agent.new-chat-submission.v1:';
 
-export type PendingNewChatSubmission = {
+export type PendingMessageSubmission = {
   version: 1;
+  source: 'new-chat' | 'existing-conversation';
   draftId: string | null;
   snapshotKey: string;
   create: {
     operationId: string; providerInstanceId: string; cwd: string; nativeModelId: string;
     reasoning: ReasoningEffort; serviceTier: string | null; access: ProviderAccess;
-  };
+  } | null;
   original: TurnSubmissionInput;
   messageOperationId: string;
   clientMessageId: string;
@@ -24,32 +25,36 @@ export type PendingNewChatSubmission = {
   } | null;
 };
 
-export function loadPendingNewChatSubmission(): PendingNewChatSubmission | null {
-  return listPendingNewChatSubmissions()[0] ?? null;
-}
-
-export function findPendingNewChatSubmission(input: {
+export function findPendingMessageSubmission(input: {
   conversationId: string | null;
   draftId: string | null;
-}): PendingNewChatSubmission | null {
-  return listPendingNewChatSubmissions().find((record) =>
-    (input.conversationId && record.conversationId === input.conversationId)
-    || (!input.conversationId && record.draftId === input.draftId)) ?? null;
+}): PendingMessageSubmission | null {
+  return listPendingMessageSubmissions().find((record) => submissionMatchesTarget(record, input)) ?? null;
 }
 
-export function listPendingNewChatSubmissions(): PendingNewChatSubmission[] {
+export function submissionMatchesTarget(
+  record: Pick<PendingMessageSubmission, 'source' | 'conversationId' | 'draftId'>,
+  input: { conversationId: string | null; draftId: string | null },
+): boolean {
+  return record.source === 'existing-conversation'
+    ? Boolean(input.conversationId && record.conversationId === input.conversationId)
+    : Boolean((input.conversationId && record.conversationId === input.conversationId)
+      || (!input.conversationId && record.draftId === input.draftId));
+}
+
+export function listPendingMessageSubmissions(): PendingMessageSubmission[] {
   try {
     return Array.from({ length: sessionStorage.length }, (_, index) => sessionStorage.key(index))
       .filter((key): key is string => Boolean(key?.startsWith(PREFIX)))
       .flatMap((key) => {
         const record = parseRecord(sessionStorage.getItem(key));
-        return record && key === storageKey(record.create.operationId) ? [record] : [];
+        return record && key === storageKey(ownerOperationId(record)) ? [record] : [];
       });
   } catch { return []; }
 }
 
-export function persistPendingNewChatSubmission(value: PendingNewChatSubmission) {
-  const key = storageKey(value.create.operationId);
+export function persistPendingMessageSubmission(value: PendingMessageSubmission) {
+  const key = storageKey(ownerOperationId(value));
   const serialized = value.message
     ? { ...value, message: { ...value.message, parts: undefined } }
     : value;
@@ -59,7 +64,7 @@ export function persistPendingNewChatSubmission(value: PendingNewChatSubmission)
   if (sessionStorage.getItem(key) !== encoded) throw new Error('Could not save the pending message for recovery.');
 }
 
-export function clearPendingNewChatSubmission(operationId: string) {
+export function clearPendingMessageSubmission(operationId: string) {
   sessionStorage.removeItem(storageKey(operationId));
 }
 
@@ -88,19 +93,24 @@ function validDelivery(value: unknown): boolean {
   return value === 'auto' || value === 'queue' || value === 'steer';
 }
 
-function parseRecord(raw: string | null): PendingNewChatSubmission | null {
+function parseRecord(raw: string | null): PendingMessageSubmission | null {
   try {
     const value: unknown = JSON.parse(raw ?? 'null');
     if (!object(value) || value.version !== 1 || !nullableString(value.draftId)
-      || !nonempty(value.snapshotKey) || !object(value.create)
-      || !nonempty(value.create.operationId) || !nonempty(value.create.cwd)
-      || !nonempty(value.create.nativeModelId) || !validConfiguration(value.create)
+      || !nonempty(value.snapshotKey)
       || !object(value.original) || !validConfiguration(value.original)
       || !Array.isArray(value.original.parts) || !validParts(value.original.parts)
       || !nonempty(value.original.modelId) || typeof value.original.displayText !== 'string'
       || !nullableString(value.original.configurationRevision) || !validDelivery(value.original.delivery)
       || !nonempty(value.messageOperationId) || !nonempty(value.clientMessageId)
       || !nullableString(value.conversationId)) return null;
+    const source = value.source === undefined ? 'new-chat' : value.source;
+    if (source !== 'new-chat' && source !== 'existing-conversation') return null;
+    if (source === 'new-chat' && (!object(value.create)
+      || !nonempty(value.create.operationId) || !nonempty(value.create.cwd)
+      || !nonempty(value.create.nativeModelId) || !validConfiguration(value.create))) return null;
+    if (source === 'existing-conversation' && (value.create !== null
+      || !nonempty(value.conversationId) || value.draftId !== null || !object(value.message))) return null;
     if (value.message !== null) {
       const message = value.message;
       if (!object(message) || !validConfiguration(message) || !nonempty(message.nativeModelId)
@@ -111,8 +121,15 @@ function parseRecord(raw: string | null): PendingNewChatSubmission | null {
       // payload when creation advances to first-message dispatch.
       message.parts = value.original.parts;
     }
-    return value as PendingNewChatSubmission;
+    value.source = source;
+    return value as PendingMessageSubmission;
   } catch { return null; }
+}
+
+export function ownerOperationId(value: PendingMessageSubmission) {
+  return value.source === 'existing-conversation'
+    ? value.messageOperationId
+    : value.create!.operationId;
 }
 
 function validReasoning(value: unknown): value is ReasoningEffort {
