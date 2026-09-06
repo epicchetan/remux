@@ -16,17 +16,14 @@
     "eas:update:production": "node scripts/eas-with-env.mjs update --channel production --environment production --non-interactive",
     "test:viewer-host-contract": "node --no-warnings scripts/test-viewer-host-contract.mjs",
     "test:viewer-lifecycle": "node --no-warnings scripts/test-viewer-lifecycle.mjs",
-    "test:html-preview": "node --no-warnings scripts/test-html-preview.mjs",
-    "test:html-preview-load": "node --no-warnings scripts/test-html-preview-load.mjs",
-    "test:html-preview-integration": "node --no-warnings scripts/test-html-preview-integration.mjs",
-    "test:html-preview-all": "npm run test:html-preview && npm run test:html-preview-load && npm run test:html-preview-integration",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:protected-viewer": "node --no-warnings scripts/test-protected-viewer-transport.mjs && node --no-warnings scripts/test-viewer-transport-handshake.mjs",
+    "test:viewer-tab-migration": "node --no-warnings scripts/test-narrate-tab-migration.mjs"
   },
   "dependencies": {
     "@expo/ui": "56.0.17",
     "@react-native-async-storage/async-storage": "2.2.0",
     "@remux/viewer-kit": "*",
-    "base64-js": "1.5.1",
     "expo": "56.0.11",
     "expo-clipboard": "~56.0.4",
     "expo-document-picker": "~56.0.4",
@@ -38,7 +35,6 @@
     "expo-status-bar": "~56.0.4",
     "expo-system-ui": "~56.0.5",
     "expo-updates": "~56.0.19",
-    "parse5": "7.3.0",
     "react": "19.2.3",
     "react-native": "0.85.3",
     "react-native-safe-area-context": "~5.7.0",

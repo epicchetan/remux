@@ -300,3 +300,16 @@ host without React Native. Building the full future Remux web app is out of scop
   handler. Tests cover active selection, pending navigation, repeat application,
   old catalogs, distinct paths and distinct views; app typecheck passed.
   Publication and installed-client evidence remain pending.
+- V2/V3 integrated: one web shell owns Preview/Source and original-source Copy;
+  app-owned HTML surfaces removed. Markdown renderers moved without narration,
+  HTML moved to a blob-backed sandboxed child frame, and Git metadata is lazy.
+  Full Source supports 5 MiB, lightweight Source starts above 1 MiB or 20,000
+  characters in a line, and larger files use bounded windows with continuation
+  labels. Markdown preview is capped at 512,000 characters/10,000 lines;
+  Mermaid at 20,000 characters/200 edges, with readable Source fallbacks.
+- Controller, strict base64/UTF-8, HTML preparation and browser iframe tests pass.
+  Root/linked-viewer/app typechecks and Editor production build pass. Actual
+  Editor browser integration verifies toolbar order/pressed state, one initial
+  read, no toggle reread, original Copy, HTML state retention, same-byte reload
+  reset, failed-refresh retention, line focus and paged Copy disabled. Primary
+  corrected the first-host-generation duplicate-read race during review.

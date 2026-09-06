@@ -593,6 +593,7 @@ pub fn is_core_method(method: &str) -> bool {
         "remux/fs/readDirectory"
             | "remux/fs/readDirectories"
             | "remux/fs/readFile"
+            | "remux/fs/readFileGit"
             | "remux/fs/readFileWindow"
     )
 }
@@ -841,6 +842,7 @@ mod tests {
             "remux/fs/readDirectory",
             "remux/fs/readDirectories",
             "remux/fs/readFile",
+            "remux/fs/readFileGit",
             "remux/fs/readFileWindow",
         ] {
             let result = router

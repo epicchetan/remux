@@ -11,3 +11,6 @@ mountViewer(<App />, {
   name: 'editor',
   initialize: () => initializeIpc({ requireProtectedTransport: true }),
 });
+
+import './markdown/markdown.css';
+import 'katex/dist/katex.min.css';

@@ -2,6 +2,7 @@ import { useCallback, useRef, type ReactNode } from 'react';
 
 export type ActionButtonProps = {
   ariaExpanded?: boolean;
+  ariaPressed?: boolean;
   ariaHasPopup?: boolean | 'menu';
   activationDebounceMs?: number;
   busy?: boolean;
@@ -18,6 +19,7 @@ const syntheticClickWindowMs = 500;
 
 export function ActionButton({
   ariaExpanded,
+  ariaPressed,
   ariaHasPopup,
   activationDebounceMs = 350,
   busy,
@@ -44,6 +46,7 @@ export function ActionButton({
   return (
     <button
       aria-expanded={ariaExpanded}
+      aria-pressed={ariaPressed}
       aria-haspopup={ariaHasPopup}
       aria-label={label}
       className={[

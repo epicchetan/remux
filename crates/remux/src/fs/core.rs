@@ -27,6 +27,7 @@ use crate::rpc::router::{BoxFuture, CoreRpc, RpcResult};
 pub const READ_DIRECTORY_METHOD: &str = "remux/fs/readDirectory";
 pub const READ_DIRECTORIES_METHOD: &str = "remux/fs/readDirectories";
 pub const READ_FILE_METHOD: &str = "remux/fs/readFile";
+pub const READ_FILE_GIT_METHOD: &str = "remux/fs/readFileGit";
 pub const READ_FILE_WINDOW_METHOD: &str = "remux/fs/readFileWindow";
 
 pub const DIRECTORY_BATCH_CONCURRENCY: usize = 4;
@@ -95,6 +96,7 @@ impl FsCore {
             READ_DIRECTORY_METHOD => self.read_directory(params).await,
             READ_DIRECTORIES_METHOD => self.read_directories(params).await,
             READ_FILE_METHOD => self.read_file(params).await,
+            READ_FILE_GIT_METHOD => self.read_file_git(params).await,
             READ_FILE_WINDOW_METHOD => self.read_file_window(params).await,
             _ => Err(JsonRpcError::method_not_found(method)),
         }
@@ -482,6 +484,18 @@ impl FsCore {
                 serde_json::json!({ "kind": error.kind.as_str() }),
             )
         })
+    }
+
+    async fn read_file_git(&self, params: Option<&Value>) -> RpcResult {
+        let target_path = resolve_requested_path(&self.default_path, params, READ_FILE_GIT_METHOD)?;
+        let include_base = params
+            .and_then(Value::as_object)
+            .and_then(|record| record.get("includeBase"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        Ok(self
+            .read_file_git_metadata(include_base, &target_path)
+            .await)
     }
 
     async fn include_file_git(
@@ -1260,6 +1274,30 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(invalid.code, INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn read_file_git_returns_metadata_without_reading_working_contents() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("not-present.txt");
+        let core = FsCore::new(root.path());
+
+        let result = core
+            .handle_rpc(
+                READ_FILE_GIT_METHOD,
+                Some(&serde_json::json!({
+                    "includeBase": true,
+                    "path": missing,
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["repoRoot"], Value::Null);
+        assert_eq!(result["status"], Value::Null);
+        assert_eq!(
+            result["base"]["unavailableReason"],
+            "File is not in a git repository."
+        );
     }
 
     #[test]

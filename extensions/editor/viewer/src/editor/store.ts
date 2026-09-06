@@ -1,99 +1,43 @@
-import {
-  readFile,
-  type ReadFileGitMetadata,
-  type ReadFileResult,
-} from '@remux/viewer-kit/fs';
+import { readFileGit } from '@remux/viewer-kit/fs';
 import { create } from 'zustand';
 
-type EditorFileState =
-  | { status: 'idle' }
-  | { path: string; status: 'loading' }
-  | {
-      content: string;
-      encoding: 'utf8';
-      modifiedAtMs: number | null;
-      name: string;
-      path: string;
-      sizeBytes: number;
-      status: 'ready';
-      git: ReadFileGitMetadata | null;
-    }
-  | {
-      isBinary: boolean;
-      modifiedAtMs: number | null;
-      name: string;
-      path: string;
-      sizeBytes: number;
-      status: 'unsupported';
-      tooLarge: boolean;
-    }
-  | { message: string; path: string; status: 'error' };
+import { EditorFileController, type EditorControllerState, type PendingFocus } from './fileController';
+import { loadDocumentWindow, loadInitialDocument } from './fileLoading';
 
-type EditorStore = {
-  activeFile: EditorFileState;
-  loadFile: (path: string) => Promise<void>;
+export const editorController = new EditorFileController({
+  loadInitial: loadInitialDocument,
+  loadWindow: loadDocumentWindow,
+  readGit: readFileGit,
+});
+
+type EditorStore = EditorControllerState & {
+  acknowledgeFocus: (nonce: string | null) => void;
+  load: () => Promise<boolean>;
+  loadEnd: () => Promise<boolean>;
+  loadNext: () => Promise<boolean>;
+  loadPrevious: () => Promise<boolean>;
+  loadStart: () => Promise<boolean>;
+  reload: () => Promise<boolean>;
+  retarget: (path: string, options?: { hostGeneration?: number | null; focus?: PendingFocus | null }) => void;
+  setHostGeneration: (generation: number | null) => void;
+  setMode: EditorFileController['setMode'];
+  showDiff: () => Promise<boolean>;
 };
 
-let loadGeneration = 0;
-
-export const useEditorStore = create<EditorStore>((set) => ({
-  activeFile: { status: 'idle' },
-  loadFile: async (path) => {
-    const generation = ++loadGeneration;
-    set({
-      activeFile: { path, status: 'loading' },
-    });
-
-    try {
-      const result = await readFile(path, {
-        git: {
-          includeBase: true,
-          includeStatus: true,
-        },
-      });
-      if (generation !== loadGeneration) {
-        return;
-      }
-
-      const activeFile = fileStateFromResult(result);
-      set({ activeFile });
-    } catch (error) {
-      if (generation !== loadGeneration) {
-        return;
-      }
-
-      set({
-        activeFile: {
-          message: error instanceof Error ? error.message : String(error),
-          path,
-          status: 'error',
-        },
-      });
-    }
-  },
-}));
-
-function fileStateFromResult(result: ReadFileResult): EditorFileState {
-  if (result.content === null || result.encoding !== 'utf8') {
-    return {
-      isBinary: result.isBinary,
-      modifiedAtMs: result.modifiedAtMs,
-      name: result.name,
-      path: result.path,
-      sizeBytes: result.sizeBytes,
-      status: 'unsupported',
-      tooLarge: result.tooLarge,
-    };
-  }
-
+export const useEditorStore = create<EditorStore>((set) => {
+  editorController.subscribe((state) => set(state));
   return {
-    content: result.content,
-    encoding: result.encoding,
-    modifiedAtMs: result.modifiedAtMs,
-    name: result.name,
-    path: result.path,
-    sizeBytes: result.sizeBytes,
-    status: 'ready',
-    git: result.git ?? null,
+    ...editorController.snapshot(),
+    acknowledgeFocus: (nonce) => editorController.acknowledgeFocus(nonce),
+    load: () => editorController.load(),
+    loadEnd: () => editorController.loadEnd(),
+    loadNext: () => editorController.loadNext(),
+    loadPrevious: () => editorController.loadPrevious(),
+    loadStart: () => editorController.loadStart(),
+    reload: () => editorController.reload(),
+    retarget: (path, options) => editorController.retarget(path, options),
+    setHostGeneration: (generation) => editorController.setHostGeneration(generation),
+    setMode: (mode) => editorController.setMode(mode),
+    showDiff: () => editorController.showDiff(),
   };
-}
+});

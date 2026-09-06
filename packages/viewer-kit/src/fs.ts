@@ -72,6 +72,23 @@ export type ReadFileResult = {
   git?: ReadFileGitMetadata;
 };
 
+export type ReadFileWindowResult = {
+  content: string;
+  continuation: {
+    endsMidLine: boolean;
+    startsMidLine: boolean;
+  };
+  encoding: 'utf8';
+  eof: boolean;
+  nextOffset: number | null;
+  path: string;
+  previousOffset: number | null;
+  range: { endByte: number; startByte: number };
+  targetLine: { byteOffset: number; lineNumber: number } | null;
+  totalSizeBytes: number;
+  version: string;
+};
+
 export function readDirectory(path?: string | null, options: { force?: boolean } = {}) {
   return rpc.query<ReadDirectoryResult>(
     'remux/fs/readDirectory',
@@ -96,13 +113,57 @@ export function readFile(
   options: {
     format?: 'base64' | 'text';
     git?: { includeBase?: boolean; includeStatus?: boolean };
+    signal?: AbortSignal;
   } = {},
 ) {
+  const format = options.format ?? 'text';
+  const includeBase = options.git?.includeBase === true;
+  const includeStatus = options.git?.includeStatus === true;
   return rpc.query<ReadFileResult>('remux/fs/readFile', {
     ...(options.format ? { format: options.format } : {}),
     ...(options.git ? { git: options.git } : {}),
     path,
-  }, { resourceKey: `file:${path}` });
+  }, {
+    resourceKey: `file:${path}:format:${format}:git:${includeStatus ? 1 : 0}:${includeBase ? 1 : 0}`,
+    ...(options.signal ? { signal: options.signal } : {}),
+  });
+}
+
+export function readFileWindow(
+  path: string,
+  options: {
+    expectedVersion?: string;
+    limit?: number;
+    offset?: number;
+    signal?: AbortSignal;
+    targetLine?: number;
+  } = {},
+) {
+  const target = options.targetLine == null ? `offset:${options.offset ?? 0}` : `line:${options.targetLine}`;
+  return rpc.query<ReadFileWindowResult>('remux/fs/readFileWindow', {
+    ...(options.expectedVersion ? { expectedVersion: options.expectedVersion } : {}),
+    ...(options.limit == null ? {} : { limit: options.limit }),
+    ...(options.offset == null ? {} : { offset: options.offset }),
+    path,
+    ...(options.targetLine == null ? {} : { targetLine: options.targetLine }),
+  }, {
+    resourceKey: `file-window:${path}:${options.expectedVersion ?? 'fresh'}:${target}:${options.limit ?? 'default'}`,
+    ...(options.signal ? { signal: options.signal } : {}),
+  });
+}
+
+export function readFileGit(
+  path: string,
+  options: { includeBase?: boolean; signal?: AbortSignal } = {},
+) {
+  const includeBase = options.includeBase === true;
+  return rpc.query<ReadFileGitMetadata>('remux/fs/readFileGit', {
+    includeBase,
+    path,
+  }, {
+    resourceKey: `file-git:${path}:base:${includeBase ? 1 : 0}`,
+    ...(options.signal ? { signal: options.signal } : {}),
+  });
 }
 
 export async function readFileDataUrl(path: string) {

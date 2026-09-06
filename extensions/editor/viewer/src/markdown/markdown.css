@@ -1,0 +1,515 @@
+.remux-viewer-markdown {
+  --remux-viewer-markdown-alert-fg: color-mix(in srgb, var(--rmx-text) 86%, var(--rmx-text-muted) 14%);
+  --remux-viewer-markdown-alert-note-border: var(--rmx-focus-ring);
+  --remux-viewer-markdown-alert-note-bg: color-mix(in srgb, var(--rmx-focus-ring) 8%, transparent);
+  --remux-viewer-markdown-alert-note-title: var(--rmx-focus-ring);
+  --remux-viewer-markdown-alert-tip-border: var(--rmx-success);
+  --remux-viewer-markdown-alert-tip-bg: color-mix(in srgb, var(--rmx-success) 8%, transparent);
+  --remux-viewer-markdown-alert-tip-title: var(--rmx-success);
+  --remux-viewer-markdown-alert-important-border: #a78bfa;
+  --remux-viewer-markdown-alert-important-bg: rgb(167 139 250 / 9%);
+  --remux-viewer-markdown-alert-important-title: #c4b5fd;
+  --remux-viewer-markdown-alert-warning-border: var(--rmx-warning);
+  --remux-viewer-markdown-alert-warning-bg: color-mix(in srgb, var(--rmx-warning) 9%, transparent);
+  --remux-viewer-markdown-alert-warning-title: var(--rmx-warning);
+  --remux-viewer-markdown-alert-caution-border: var(--rmx-danger);
+  --remux-viewer-markdown-alert-caution-bg: color-mix(in srgb, var(--rmx-danger) 9%, transparent);
+  --remux-viewer-markdown-alert-caution-title: var(--rmx-danger);
+  min-height: 0;
+  flex: 1;
+  overflow-x: hidden;
+  overflow-y: auto;
+  background: var(--rmx-surface);
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+.remux-viewer-markdown-shell {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  background: var(--rmx-surface);
+}
+
+.remux-viewer-markdown-empty {
+  display: grid;
+  min-height: 0;
+  flex: 1;
+  place-items: center;
+  padding: 24px;
+}
+
+.remux-viewer-markdown-empty-card {
+  max-width: 310px;
+  text-align: center;
+}
+
+.remux-viewer-markdown-empty-title {
+  color: var(--rmx-text);
+  font-size: 18px;
+  font-weight: 800;
+  line-height: 24px;
+}
+
+.remux-viewer-markdown-empty-copy {
+  margin-top: 8px;
+  color: var(--rmx-text-muted);
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.remux-viewer-markdown-spinner {
+  width: 18px;
+  height: 18px;
+  margin: 0 auto 10px;
+  border: 2px solid color-mix(in srgb, var(--rmx-text) 18%, transparent);
+  border-top-color: var(--rmx-focus-ring);
+  border-radius: 999px;
+  animation: remux-viewer-markdown-spin 800ms linear infinite;
+}
+
+.remux-viewer-markdown-content-shell {
+  min-height: 0;
+  flex: 1;
+  overflow-x: hidden;
+  overflow-y: auto;
+  background: var(--rmx-surface);
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+.remux-viewer-markdown-document {
+  width: 100%;
+  max-width: 760px;
+  min-width: 0;
+  margin: 0 auto;
+  padding: calc(env(safe-area-inset-top) + 22px) 20px 34px;
+  color: var(--rmx-text);
+  font-size: 16px;
+  line-height: 1.58;
+  overflow-wrap: break-word;
+}
+
+.remux-viewer-markdown-document > :first-child {
+  margin-top: 0;
+}
+
+.remux-viewer-markdown-document > :last-child {
+  margin-bottom: 0;
+}
+
+.remux-viewer-markdown-document h1,
+.remux-viewer-markdown-document h2,
+.remux-viewer-markdown-document h3,
+.remux-viewer-markdown-document h4,
+.remux-viewer-markdown-document h5,
+.remux-viewer-markdown-document h6 {
+  margin: 1.45em 0 0.55em;
+  color: var(--rmx-text);
+  font-weight: 800;
+  letter-spacing: 0;
+  line-height: 1.18;
+  scroll-margin-top: calc(env(safe-area-inset-top) + 18px);
+}
+
+.remux-viewer-markdown-document h1 {
+  font-size: 30px;
+}
+
+.remux-viewer-markdown-document h2 {
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--rmx-border-subtle);
+  font-size: 24px;
+}
+
+.remux-viewer-markdown-document h3 {
+  font-size: 20px;
+}
+
+.remux-viewer-markdown-document h4,
+.remux-viewer-markdown-document h5,
+.remux-viewer-markdown-document h6 {
+  font-size: 17px;
+}
+
+.remux-viewer-markdown-document p,
+.remux-viewer-markdown-document ul,
+.remux-viewer-markdown-document ol,
+.remux-viewer-markdown-document blockquote,
+.remux-viewer-markdown-document pre,
+.remux-viewer-markdown-document details,
+.remux-viewer-markdown-document .remux-viewer-markdown-table-scroll,
+.remux-viewer-markdown-document .remux-viewer-markdown-mermaid-card {
+  margin: 0 0 16px;
+}
+
+.remux-viewer-markdown-document a {
+  color: var(--rmx-focus-ring);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.remux-viewer-markdown-document a:active {
+  color: color-mix(in srgb, var(--rmx-focus-ring) 78%, var(--rmx-text) 22%);
+}
+
+.remux-viewer-markdown-document strong {
+  color: var(--rmx-text);
+  font-weight: 800;
+}
+
+.remux-viewer-markdown-document blockquote {
+  padding: 2px 0 2px 14px;
+  border-left: 3px solid var(--rmx-border);
+  color: color-mix(in srgb, var(--rmx-text-muted) 72%, var(--rmx-text) 28%);
+}
+
+.remux-viewer-markdown-document blockquote.remux-viewer-markdown-alert {
+  padding: 12px 14px;
+  border: 1px solid var(--rmx-border-subtle);
+  border-left: 4px solid var(--remux-viewer-markdown-alert-note-border);
+  border-radius: 8px;
+  background: var(--remux-viewer-markdown-alert-note-bg);
+  color: var(--remux-viewer-markdown-alert-fg);
+}
+
+.remux-viewer-markdown-alert-title {
+  margin-bottom: 6px;
+  color: var(--remux-viewer-markdown-alert-note-title);
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  line-height: 18px;
+}
+
+.remux-viewer-markdown-document blockquote.remux-viewer-markdown-alert > :last-child {
+  margin-bottom: 0;
+}
+
+.remux-viewer-markdown-document blockquote.remux-viewer-markdown-alert-note {
+  border-left-color: var(--remux-viewer-markdown-alert-note-border);
+  background: var(--remux-viewer-markdown-alert-note-bg);
+}
+
+.remux-viewer-markdown-document blockquote.remux-viewer-markdown-alert-tip {
+  border-left-color: var(--remux-viewer-markdown-alert-tip-border);
+  background: var(--remux-viewer-markdown-alert-tip-bg);
+}
+
+.remux-viewer-markdown-document blockquote.remux-viewer-markdown-alert-tip .remux-viewer-markdown-alert-title {
+  color: var(--remux-viewer-markdown-alert-tip-title);
+}
+
+.remux-viewer-markdown-document blockquote.remux-viewer-markdown-alert-important {
+  border-left-color: var(--remux-viewer-markdown-alert-important-border);
+  background: var(--remux-viewer-markdown-alert-important-bg);
+}
+
+.remux-viewer-markdown-document blockquote.remux-viewer-markdown-alert-important .remux-viewer-markdown-alert-title {
+  color: var(--remux-viewer-markdown-alert-important-title);
+}
+
+.remux-viewer-markdown-document blockquote.remux-viewer-markdown-alert-warning {
+  border-left-color: var(--remux-viewer-markdown-alert-warning-border);
+  background: var(--remux-viewer-markdown-alert-warning-bg);
+}
+
+.remux-viewer-markdown-document blockquote.remux-viewer-markdown-alert-warning .remux-viewer-markdown-alert-title {
+  color: var(--remux-viewer-markdown-alert-warning-title);
+}
+
+.remux-viewer-markdown-document blockquote.remux-viewer-markdown-alert-caution {
+  border-left-color: var(--remux-viewer-markdown-alert-caution-border);
+  background: var(--remux-viewer-markdown-alert-caution-bg);
+}
+
+.remux-viewer-markdown-document blockquote.remux-viewer-markdown-alert-caution .remux-viewer-markdown-alert-title {
+  color: var(--remux-viewer-markdown-alert-caution-title);
+}
+
+.remux-viewer-markdown-document ul,
+.remux-viewer-markdown-document ol {
+  padding-left: 24px;
+}
+
+.remux-viewer-markdown-document li + li {
+  margin-top: 3px;
+}
+
+.remux-viewer-markdown-document .contains-task-list {
+  padding-left: 20px;
+}
+
+.remux-viewer-markdown-document .task-list-item {
+  list-style: none;
+}
+
+.remux-viewer-markdown-document input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0 7px 0 -20px;
+  vertical-align: -2px;
+  accent-color: var(--rmx-focus-ring);
+}
+
+.remux-viewer-markdown-document input[type="checkbox"][disabled] {
+  opacity: 0.9;
+}
+
+.remux-viewer-markdown-document code {
+  border-radius: 6px;
+  background: var(--rmx-code-bg);
+  color: var(--rmx-code-text);
+  font-family: var(--rmx-font-mono);
+  font-size: 0.88em;
+  padding: 0.16em 0.36em;
+}
+
+.remux-viewer-markdown-pre-block {
+  max-width: 100%;
+  margin: 0 0 16px;
+}
+
+.remux-viewer-markdown-pre-block > code,
+.remux-viewer-markdown-document pre {
+  overflow-x: auto;
+  border: 1px solid var(--rmx-code-border);
+  border-radius: 8px;
+  background: var(--rmx-code-bg);
+  -webkit-overflow-scrolling: touch;
+}
+
+.remux-viewer-markdown-pre-block > code {
+  display: block;
+  padding: 14px;
+  color: var(--rmx-code-text);
+  font-family: var(--rmx-font-mono);
+  font-size: 13px;
+  line-height: 20px;
+  white-space: pre;
+}
+
+.remux-viewer-markdown-document pre code {
+  display: block;
+  min-width: max-content;
+  padding: 14px;
+  background: transparent;
+  color: inherit;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.remux-viewer-markdown-code-highlight {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--rmx-code-border);
+  border-radius: 8px;
+  background: var(--rmx-code-bg);
+  -webkit-overflow-scrolling: touch;
+}
+
+.remux-viewer-markdown-code-highlight pre {
+  margin: 0 !important;
+  border: 0;
+  border-radius: 0;
+  background: transparent !important;
+}
+
+.remux-viewer-markdown-code-highlight code {
+  display: block;
+  min-width: max-content;
+  padding: 14px !important;
+  background: transparent;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.remux-viewer-markdown-code-highlight-pending pre {
+  color: var(--rmx-code-text);
+  font-family: var(--rmx-font-mono);
+}
+
+:root[data-remux-theme="light"] .remux-viewer-markdown-code-highlight .shiki {
+  background-color: var(--shiki-light-bg, var(--rmx-code-bg)) !important;
+  color: var(--shiki-light, var(--rmx-code-text)) !important;
+}
+
+:root[data-remux-theme="light"] .remux-viewer-markdown-code-highlight .shiki span {
+  color: var(--shiki-light, var(--rmx-code-text)) !important;
+}
+
+.remux-viewer-markdown-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--rmx-border-subtle);
+  border-radius: 8px;
+  -webkit-overflow-scrolling: touch;
+}
+
+.remux-viewer-markdown-document table {
+  width: 100%;
+  min-width: max-content;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.remux-viewer-markdown-document th,
+.remux-viewer-markdown-document td {
+  padding: 8px 10px;
+  border-right: 1px solid var(--rmx-border-subtle);
+  border-bottom: 1px solid var(--rmx-border-subtle);
+  text-align: left;
+  vertical-align: top;
+}
+
+.remux-viewer-markdown-document th:last-child,
+.remux-viewer-markdown-document td:last-child {
+  border-right: 0;
+}
+
+.remux-viewer-markdown-document tr:last-child td {
+  border-bottom: 0;
+}
+
+.remux-viewer-markdown-document th {
+  background: color-mix(in srgb, var(--rmx-overlay) 70%, transparent);
+  color: var(--rmx-text);
+  font-weight: 800;
+}
+
+.remux-viewer-markdown-document .footnotes {
+  margin-top: 28px;
+  padding-top: 16px;
+  border-top: 1px solid var(--rmx-overlay);
+  color: var(--rmx-text-muted);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.remux-viewer-markdown-document .footnotes h2 {
+  margin-top: 0;
+  padding-bottom: 0;
+  border-bottom: 0;
+  color: color-mix(in srgb, var(--rmx-text) 80%, var(--rmx-text-muted) 20%);
+  font-size: 15px;
+  line-height: 20px;
+}
+
+.remux-viewer-markdown-document .footnotes ol {
+  padding-left: 20px;
+}
+
+.remux-viewer-markdown-document sup a {
+  padding: 0 2px;
+  font-size: 12px;
+}
+
+.remux-viewer-markdown-document a[data-footnote-backref] {
+  color: var(--rmx-text-muted);
+}
+
+.remux-viewer-markdown-document hr {
+  height: 1px;
+  margin: 24px 0;
+  border: 0;
+  background: var(--rmx-overlay);
+}
+
+.remux-viewer-markdown-image-wrap {
+  display: block;
+  overflow: hidden;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--rmx-overlay) 30%, transparent);
+}
+
+.remux-viewer-markdown-image-wrap img {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  max-height: min(520px, 70vh);
+  height: auto;
+  margin: 0 auto;
+  object-fit: contain;
+}
+
+.remux-viewer-markdown-image-placeholder {
+  display: grid;
+  min-height: 132px;
+  place-items: center;
+  gap: 4px;
+  padding: 16px;
+  border: 1px solid var(--rmx-border-subtle);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--rmx-overlay) 40%, transparent);
+  color: var(--rmx-text-muted);
+  font-size: 13px;
+  line-height: 18px;
+  text-align: center;
+}
+
+.remux-viewer-markdown-image-placeholder-title {
+  color: color-mix(in srgb, var(--rmx-text) 80%, var(--rmx-text-muted) 20%);
+  font-weight: 700;
+}
+
+.remux-viewer-markdown-image-placeholder-alt {
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--rmx-text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remux-viewer-markdown-mermaid-card {
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 12px;
+  border: 1px solid var(--rmx-code-border);
+  border-radius: 8px;
+  background: var(--rmx-code-bg);
+  -webkit-overflow-scrolling: touch;
+}
+
+.remux-viewer-markdown-mermaid-diagram {
+  min-width: max-content;
+}
+
+.remux-viewer-markdown-mermaid-diagram svg {
+  display: block;
+  max-width: none;
+}
+
+.remux-viewer-markdown-mermaid-title {
+  color: var(--rmx-text);
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 20px;
+}
+
+.remux-viewer-markdown-mermaid-muted {
+  color: var(--rmx-text-muted);
+  font-size: 13px;
+  line-height: 18px;
+}
+
+.remux-viewer-markdown-mermaid-error {
+  border-color: color-mix(in srgb, var(--rmx-danger) 35%, transparent);
+}
+
+.remux-viewer-markdown-mermaid-error pre {
+  margin: 10px 0 0;
+}
+
+.remux-viewer-markdown .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 4px 0;
+  -webkit-overflow-scrolling: touch;
+}
+
+@keyframes remux-viewer-markdown-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

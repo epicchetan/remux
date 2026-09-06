@@ -5,11 +5,11 @@ import { parse } from 'parse5';
 
 import {
   HTML_PREVIEW_CONTENT_SECURITY_POLICY,
-  HTML_PREVIEW_DOCUMENT_URL,
   HTML_PREVIEW_LINK_LIMIT,
   prepareHtmlPreviewDocument,
-} from '../src/surfaces/html-preview/prepareHtmlPreviewDocument.ts';
-import { classifyHtmlPreviewNavigation } from '../src/surfaces/html-preview/htmlPreviewNavigation.ts';
+} from '../../../packages/viewer-kit/src/htmlPreview.ts';
+
+const HTML_PREVIEW_DOCUMENT_URL = 'https://preview-test.invalid/document';
 
 function elements(node, tagName, output = []) {
   if (node?.tagName === tagName) output.push(node);
@@ -17,7 +17,7 @@ function elements(node, tagName, output = []) {
   return output;
 }
 
-const fixture = await readFile(new URL('../src/surfaces/html-preview/__fixtures__/interactive-hostile.html', import.meta.url), 'utf8');
+const fixture = await readFile(new URL('./fixtures/interactive-hostile.html', import.meta.url), 'utf8');
 const prepared = prepareHtmlPreviewDocument(fixture);
 const parsed = parse(prepared.html);
 const heads = elements(parsed, 'head');
@@ -47,26 +47,6 @@ for (const source of [
 const manyLinks = prepareHtmlPreviewDocument(Array.from({ length: HTML_PREVIEW_LINK_LIMIT + 5 }, (_, index) => `<a href="file-${index}.json">${index}</a>`).join(''));
 assert.equal(manyLinks.links.length, HTML_PREVIEW_LINK_LIMIT);
 assert.equal(manyLinks.linksTruncated, true);
-
-assert.equal(classifyHtmlPreviewNavigation(HTML_PREVIEW_DOCUMENT_URL), 'allow-document');
-assert.equal(classifyHtmlPreviewNavigation(`${HTML_PREVIEW_DOCUMENT_URL}#details`), 'allow-fragment');
-for (const url of ['https://example.com/', 'file:///etc/passwd', 'data:text/html,test', 'javascript:alert(1)', 'https://html-preview.invalid/other']) {
-  assert.equal(classifyHtmlPreviewNavigation(url), 'block');
-}
-
-const rendererSource = await readFile(new URL('../src/surfaces/html-preview/HtmlPreviewRenderer.tsx', import.meta.url), 'utf8');
-for (const forbidden of ['onMessage=', 'injectedJavaScript=', 'injectedJavaScriptBeforeContentLoaded=', 'headers:', 'incognito']) {
-  assert.equal(rendererSource.includes(forbidden), false, `renderer must omit ${forbidden}`);
-}
-for (const required of ['sharedCookiesEnabled={false}', 'thirdPartyCookiesEnabled={false}', 'allowFileAccess={false}', 'setSupportMultipleWindows={false}', 'javaScriptCanOpenWindowsAutomatically={false}']) {
-  assert.ok(rendererSource.includes(required), `renderer is missing ${required}`);
-}
-
-const androidSource = await readFile(new URL('../../node_modules/react-native-webview/src/WebView.android.tsx', import.meta.url), 'utf8');
-const iosSource = await readFile(new URL('../../node_modules/react-native-webview/src/WebView.ios.tsx', import.meta.url), 'utf8');
-assert.match(androidSource, /messagingEnabled=\{typeof onMessageProp === 'function'\}/u);
-assert.match(iosSource, /messagingEnabled=\{typeof onMessageProp === 'function'\}/u);
-assert.match(rendererSource, /originWhitelist=\{\['\*'\]\}/u, 'native callback must decide navigation before React Native WebView opens an external URL');
 
 const browser = await chromium.launch({ headless: true });
 try {
@@ -100,6 +80,5 @@ try {
 process.stdout.write(`${JSON.stringify({
   ok: true,
   browserBehavior: true,
-  bridgeFreeRendererContract: true,
   nativeDeviceIsolationVerified: false,
 })}\n`);

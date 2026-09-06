@@ -1,9 +1,9 @@
 {
   "version": 1,
   "id": "editor",
-  "name": "Editor",
+  "name": "Viewer",
   "display": {
-    "title": "Editor",
+    "title": "Viewer",
     "icon": "assets/editor.png",
     "iconDark": "assets/editor-dark.png"
   },
@@ -33,9 +33,21 @@
   "launchers": [],
   "fileHandlers": [
     {
+      "id": "document-viewer",
+      "view": "main",
+      "label": "Viewer",
+      "extensions": [
+        "md",
+        "markdown",
+        "mdown",
+        "html",
+        "htm"
+      ]
+    },
+    {
       "id": "text-editor",
       "view": "main",
-      "label": "Editor",
+      "label": "Viewer",
       "extensions": [
         "*"
       ]

@@ -102,6 +102,60 @@ body {
   background: var(--rmx-surface);
 }
 
+.remux-editor-renderer {
+  position: absolute;
+  inset: 0;
+  min-height: 0;
+}
+
+.remux-editor-renderer-hidden {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.remux-editor-preview-placeholder {
+  display: grid;
+  position: absolute;
+  inset: 0;
+  place-items: center;
+  padding: 24px;
+  color: var(--rmx-text-muted);
+  text-align: center;
+}
+
+.remux-editor-preview-icon-active {
+  color: var(--rmx-accent);
+}
+
+.remux-editor-window-controls {
+  display: flex;
+  min-height: 36px;
+  align-items: center;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 4px 12px;
+  border-top: 1px solid var(--rmx-border);
+  color: var(--rmx-text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.remux-editor-window-controls span {
+  margin-right: auto;
+}
+
+.remux-editor-window-controls button {
+  padding: 4px 8px;
+  border: 1px solid var(--rmx-border);
+  border-radius: 6px;
+  background: var(--rmx-surface-hover);
+  color: var(--rmx-text);
+}
+
+.remux-editor-window-controls button:disabled {
+  opacity: 0.45;
+}
+
 .remux-editor-codemirror {
   position: absolute;
   inset: calc(env(safe-area-inset-top) + 16px) 0 0;

@@ -7,6 +7,7 @@
 export * from './fs';
 export * from './host';
 export * from './ipc';
+export * from './htmlPreview';
 export * from './links';
 export * from './route';
 export * from './rpc';

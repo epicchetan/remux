@@ -16,7 +16,8 @@
     "./tokens.native": "./src/tokens/tokens.native.ts",
     "./tokens.css": "./src/tokens/tokens.css",
     "./theme.css": "./src/tokens/theme.css",
-    "./ui/styles.css": "./src/ui/styles.css"
+    "./ui/styles.css": "./src/ui/styles.css",
+    "./htmlPreview": "./src/htmlPreview.ts"
   },
   "sideEffects": [
     "./src/tokens/tokens.css",
@@ -29,7 +30,8 @@
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.15",
     "clsx": "^2.1.1",
-    "tailwind-merge": "^3.6.0"
+    "tailwind-merge": "^3.6.0",
+    "parse5": "7.3.0"
   },
   "peerDependencies": {
     "react": "^19.2.0",

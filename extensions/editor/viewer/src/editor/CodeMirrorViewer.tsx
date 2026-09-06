@@ -33,7 +33,11 @@ type CodeMirrorViewerProps = {
   content: string;
   fileName: string;
   focusLine?: number | null;
+  lightweight?: boolean;
+  lineNumberStart?: number | null;
+  onFocusApplied?: () => void;
   showDiff?: boolean;
+  visible?: boolean;
 };
 
 type LineMarkerType = 'added' | 'deleted';
@@ -69,7 +73,11 @@ export function CodeMirrorViewer({
   content,
   fileName,
   focusLine = null,
+  lightweight = false,
+  lineNumberStart = null,
+  onFocusApplied,
   showDiff = false,
+  visible = true,
 }: CodeMirrorViewerProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const lineNumbersCompartmentRef = useRef(new Compartment());
@@ -77,10 +85,13 @@ export function CodeMirrorViewer({
   const themeCompartmentRef = useRef(new Compartment());
   const viewRef = useRef<EditorView | null>(null);
   const language = useMemo(() => languageForFileName(fileName), [fileName]);
-  const mergeEnabled = showDiff && baseContent != null;
+  const mergeEnabled = !lightweight && showDiff && baseContent != null;
   const lineNumbersExtension = useMemo(
-    () => remuxLineNumbers(markersFromMergeContent(baseContent, content)),
-    [baseContent, content],
+    () => remuxLineNumbers(
+      lightweight ? new Map() : markersFromMergeContent(baseContent, content),
+      lineNumberStart,
+    ),
+    [baseContent, content, lightweight, lineNumberStart],
   );
   const mergeExtension = useMemo(
     () => mergeEnabled
@@ -106,13 +117,13 @@ export function CodeMirrorViewer({
       doc: content,
       extensions: [
         lineNumbersCompartmentRef.current.of(lineNumbersExtension),
-        minimalSetup,
+        ...(lightweight ? [] : [minimalSetup]),
         EditorState.readOnly.of(true),
         EditorView.editable.of(false),
         themeCompartmentRef.current.of(codeMirrorThemeExtension(getHostTheme())),
-        syntaxHighlighting(remuxHighlightStyle),
+        ...(lightweight ? [] : [syntaxHighlighting(remuxHighlightStyle)]),
         mergeCompartmentRef.current.of(mergeExtension),
-        language,
+        ...(lightweight || !language ? [] : [language]),
       ].filter(Boolean) as Extension[],
     });
 
@@ -155,7 +166,12 @@ export function CodeMirrorViewer({
       effects: EditorView.scrollIntoView(position, { y: 'center' }),
       selection: { anchor: position },
     });
-  }, [content, focusLine]);
+    onFocusApplied?.();
+  }, [content, focusLine, onFocusApplied]);
+
+  useEffect(() => {
+    if (visible) viewRef.current?.requestMeasure();
+  }, [visible]);
 
   return <div className="remux-editor-codemirror" ref={containerRef} />;
 }
@@ -177,9 +193,14 @@ class RemuxLineNumberMarker extends GutterMarker {
   }
 }
 
-function remuxLineNumbers(markerByLine: Map<number, LineMarkerType>): Extension {
+function remuxLineNumbers(
+  markerByLine: Map<number, LineMarkerType>,
+  lineNumberStart: number | null,
+): Extension {
   return [
-    lineNumbers(),
+    lineNumbers({
+      formatNumber: (lineNumber) => String(lineNumber + (lineNumberStart ?? 1) - 1),
+    }),
     lineNumberMarkers.compute(['doc'], (state) => {
       const builder = new RangeSetBuilder<GutterMarker>();
       const markers = Array.from(markerByLine).sort(([left], [right]) => left - right);
