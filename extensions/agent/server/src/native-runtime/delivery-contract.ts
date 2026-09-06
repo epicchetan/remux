@@ -30,6 +30,17 @@ export interface DispatchBoundary {
   markPossiblySent(nativeSessionId: string, processGeneration?: string): void;
 }
 
+export type SteerDispatchContext = {
+  boundary: DispatchBoundary;
+  nativeClientMessageId: string;
+  expectedNativeTurnId: string;
+};
+
+export type CompactDispatchContext = {
+  boundary: DispatchBoundary;
+  nativeInputUuid?: string;
+};
+
 export type ProviderPositiveRead = (attempt: FrozenDeliveryAttempt) => Promise<ProviderPresenceRead>;
 export type DeliveryAttemptKind = 'root-turn' | 'steer' | 'manual-compact';
 export type DeliveryAttemptState = 'preparing' | 'dispatching' | 'accepted' | 'rejected' | 'unknown';

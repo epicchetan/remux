@@ -48,7 +48,8 @@ import type {
   ProviderRuntimeStatus,
   ProviderSession,
 } from '../../provider-adapter.ts';
-import type { DispatchBoundary, ProviderDispatchResult } from '../../native-runtime/delivery-contract.ts';
+import type { CompactDispatchContext, DispatchBoundary, ProviderDispatchResult,
+  SteerDispatchContext } from '../../native-runtime/delivery-contract.ts';
 import { CodexRequestError } from './codex-app-server-connection.ts';
 import { AsyncEventStream, ProviderEventStream } from '../../provider-adapter.ts';
 import {
@@ -737,22 +738,48 @@ export class CodexProviderSession implements ProviderSession {
     })) as Promise<ProviderDispatchResult>;
   }
 
-  async steer(unparsed: SteerProviderTurnInput): Promise<ProviderCommandAcceptance> {
+  async steer(unparsed: SteerProviderTurnInput,
+    context: SteerDispatchContext): Promise<ProviderDispatchResult> {
     const input = parseSteerProviderTurnInput(unparsed);
-    return this.onceCommand(input.commandId, input, async () => this.mutate(async () => {
+    const nativeClientMessageId = context.nativeClientMessageId;
+    return this.onceCommand(input.commandId, { ...input,
+      nativeClientMessageId,
+      expectedNativeTurnId: context.expectedNativeTurnId }, async () => this.mutate(async () => {
       this.assertOpen();
       const nativeTurnId = this.activeTurn?.remuxTurnId === input.turnId
         ? this.activeTurn.nativeTurnId
         : undefined;
       if (!nativeTurnId) throw new Error('Cannot steer a turn before Codex has bound its native turn ID.');
+      if (nativeTurnId !== context.expectedNativeTurnId) {
+        throw new Error('Codex active turn does not match the frozen steer target.');
+      }
       const providerInput = await mapUserContent(input.content, this.scopedImageResolver());
-      await this.connection.request('turn/steer', {
-        threadId: this.nativeSession.sessionId,
-        expectedTurnId: nativeTurnId,
-        input: providerInput,
-      });
-      return { accepted: true } as const;
-    })) as Promise<ProviderCommandAcceptance>;
+      try {
+        const response = object(await this.connection.request('turn/steer', {
+          threadId: this.nativeSession.sessionId,
+          expectedTurnId: nativeTurnId,
+          clientUserMessageId: nativeClientMessageId,
+          input: providerInput,
+        }, undefined, () => context.boundary.markPossiblySent(
+          this.nativeSession.sessionId, this.processGeneration)));
+        const responseTurnId = nonempty(response?.turnId);
+        if (responseTurnId !== nativeTurnId) throw new Error(
+          'Codex turn/steer response did not match the frozen native turn.');
+        return { accepted: true, outcome: 'accepted', evidence: {
+          kind: 'codex-turn-steer-response', threadId: this.nativeSession.sessionId,
+          turnId: nativeTurnId, nativeClientMessageId,
+        } } as const;
+      } catch (error) {
+        return error instanceof CodexRequestError && error.phase === 'not-sent'
+          ? { accepted: false, outcome: 'rejected', crossing: {
+              phase: 'not-sent', detail: 'closed-before-write' },
+            error: { code: 'codex_request_failed', message: error.message } } as const
+          : { accepted: false, outcome: 'unknown', crossing: {
+              phase: 'possibly-sent', detail: 'response-lost' },
+            error: { code: 'codex_request_failed',
+              message: error instanceof Error ? error.message : String(error) } } as const;
+      }
+    })) as Promise<ProviderDispatchResult>;
   }
 
   async interrupt(unparsed: InterruptProviderTurnInput): Promise<ProviderCommandAcceptance> {
@@ -807,9 +834,8 @@ export class CodexProviderSession implements ProviderSession {
     })) as Promise<ProviderCommandAcceptance>;
   }
 
-  async compact(unparsed: CompactProviderSessionInput): Promise<ProviderCommandAcceptance & {
-    nativeOperationId?: string;
-  }> {
+  async compact(unparsed: CompactProviderSessionInput,
+    context: CompactDispatchContext): Promise<ProviderDispatchResult> {
     const input = parseCompactProviderSessionInput(unparsed);
     if (input.conversationId !== this.openedWith.conversationId ||
         input.executionId !== this.openedWith.executionId) {
@@ -820,15 +846,31 @@ export class CodexProviderSession implements ProviderSession {
       if (this.activeTurn) throw new Error('Codex provider session is busy.');
       this.mapper.expectManualCompaction(input.commandId);
       try {
+        let requestId: number | undefined;
         await this.connection.request('thread/compact/start', {
           threadId: this.nativeSession.sessionId,
+        }, undefined, (_method, id) => {
+          requestId = id;
+          context.boundary.markPossiblySent(this.nativeSession.sessionId, this.processGeneration);
         });
-        return { accepted: true as const, nativeOperationId: input.commandId };
+        if (requestId === undefined) throw new Error('Codex Compact response lacked its request identity.');
+        return { accepted: true, outcome: 'accepted', evidence: {
+          kind: 'codex-compact-response', threadId: this.nativeSession.sessionId,
+          requestId, connectionGeneration: this.processGeneration,
+        } } as const;
       } catch (error) {
-        this.mapper.clearManualCompaction(input.commandId);
-        throw error;
+        const notSent = error instanceof CodexRequestError && error.phase === 'not-sent';
+        if (notSent) this.mapper.clearManualCompaction(input.commandId);
+        return notSent
+          ? { accepted: false, outcome: 'rejected', crossing: {
+              phase: 'not-sent', detail: 'closed-before-write' },
+            error: { code: 'codex_request_failed', message: error.message } } as const
+          : { accepted: false, outcome: 'unknown', crossing: {
+              phase: 'possibly-sent', detail: 'response-lost' },
+            error: { code: 'codex_request_failed',
+              message: error instanceof Error ? error.message : String(error) } } as const;
       }
-    })) as Promise<ProviderCommandAcceptance & { nativeOperationId?: string }>;
+    })) as Promise<ProviderDispatchResult>;
   }
 
   async snapshot(unparsed: ProviderSnapshotRequest): Promise<ProviderSnapshot> {

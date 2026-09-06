@@ -1964,6 +1964,14 @@ export class NativeAgentJournal {
     `).run(JSON.stringify(error), now, now, conversationId).changes > 0;
   }
 
+  restoreAcceptedCompactionDelivery(operationId: string, now: number) {
+    return this.database.prepare(`
+      UPDATE compaction_operations
+      SET state = 'running', error_json = NULL, completed_at = NULL, updated_at = ?
+      WHERE operation_id = ? AND state = 'delivery_unknown'
+    `).run(now, operationId).changes > 0;
+  }
+
   setCompactionNativeOperationId(operationId: string, nativeOperationId: string, now: number) {
     this.database.prepare(`
       UPDATE compaction_operations SET native_operation_id = ?, updated_at = ?

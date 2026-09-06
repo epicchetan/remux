@@ -62,7 +62,8 @@ import type {
   ProviderSession,
 } from '../../provider-adapter.ts';
 import { ProviderEventStream } from '../../provider-adapter.ts';
-import type { DispatchBoundary, ProviderDispatchResult } from '../../native-runtime/delivery-contract.ts';
+import type { CompactDispatchContext, DispatchBoundary,
+  ProviderDispatchResult } from '../../native-runtime/delivery-contract.ts';
 import {
   NativeSessionOwnershipRegistry,
   type NativeSessionLease,
@@ -583,6 +584,9 @@ export class ClaudeProviderSession implements ProviderSession {
   private readonly processGeneration = randomUUID();
   private rootAcceptance?: { promptUuid: string; resolve: (result: ProviderDispatchResult) => void;
     timeout: ReturnType<typeof setTimeout> };
+  private compactAcceptance?: { inputUuid: string; watermark: number; yielded: boolean; settled: boolean;
+    resolve: (result: ProviderDispatchResult) => void; timeout: ReturnType<typeof setTimeout> };
+  private readonly seenCompactionBoundaries = new Set<string>();
   private readonly processingEvidence = new Map<string, import('../../native-runtime/delivery-contract.ts').ProviderAcceptanceEvidence>();
   private readonly acceptanceTimeoutMs: number;
   private closed = false;
@@ -689,13 +693,12 @@ export class ClaudeProviderSession implements ProviderSession {
           timeout.unref?.();
           this.rootAcceptance = { promptUuid, resolve, timeout };
         });
-        boundary?.markPossiblySent(this.nativeSession.sessionId, this.processGeneration);
         this.prompt.push({
           type: 'user',
           message: { role: 'user', content },
           parent_tool_use_id: null,
           uuid: promptUuid as `${string}-${string}-${string}-${string}-${string}`,
-        });
+        }, () => boundary?.markPossiblySent(this.nativeSession.sessionId, this.processGeneration));
       } catch (error) {
         if (this.rootAcceptance) clearTimeout(this.rootAcceptance.timeout);
         this.rootAcceptance = undefined;
@@ -746,29 +749,62 @@ export class ClaudeProviderSession implements ProviderSession {
     });
   }
 
-  async compact(unparsed: CompactProviderSessionInput): Promise<ProviderCommandAcceptance & {
-    nativeOperationId?: string;
-  }> {
+  async compact(unparsed: CompactProviderSessionInput,
+    context: CompactDispatchContext): Promise<ProviderDispatchResult> {
     this.assertOpen();
     const input = parseCompactProviderSessionInput(unparsed);
     if (input.conversationId !== this.openedWith.conversationId ||
         input.executionId !== this.openedWith.executionId) {
       throw new Error('Claude compact request does not match the opened provider session.');
     }
-    return this.onceCommand(input.commandId, input, async () => {
+    const nativeInputUuid = context.nativeInputUuid;
+    if (!nativeInputUuid) throw new Error('Claude Compact requires its frozen native input UUID.');
+    return this.onceCommand(input.commandId, { ...input, nativeInputUuid }, async () => {
       if (this.activeTurn) throw new Error('Claude provider session is busy.');
+      if (this.compactAcceptance) throw new Error('Claude already has an unresolved manual Compact delivery.');
       const commands = await this.query.supportedCommands();
       if (!commands.some(({ name, aliases }) => name === 'compact' || aliases?.includes('compact'))) {
         throw new Error('Claude Code did not advertise the native /compact command.');
       }
       this.manualCompactionOperationId = input.commandId;
-      this.prompt.push({
-        type: 'user',
-        message: { role: 'user', content: '/compact' },
-        parent_tool_use_id: null,
-        uuid: stableUuid(`claude-compact\0${input.commandId}`) as `${string}-${string}-${string}-${string}-${string}`,
+      let acceptanceTimeout: ReturnType<typeof setTimeout>;
+      const acceptance = new Promise<ProviderDispatchResult>((resolve) => {
+        acceptanceTimeout = setTimeout(() => this.resolvePendingCompactAcceptance(nativeInputUuid,
+          'claude_compact_acceptance_timeout',
+          'Claude did not emit a correlated manual compaction boundary before the delivery timeout.'),
+        this.acceptanceTimeoutMs);
+        acceptanceTimeout.unref?.();
+        this.compactAcceptance = { inputUuid: nativeInputUuid,
+          watermark: -1, yielded: false, settled: false, resolve, timeout: acceptanceTimeout };
       });
-      return { accepted: true, nativeOperationId: input.commandId };
+      try {
+        this.prompt.push({
+          type: 'user',
+          message: { role: 'user', content: '/compact' },
+          parent_tool_use_id: null,
+          uuid: nativeInputUuid as `${string}-${string}-${string}-${string}-${string}`,
+        }, () => {
+          const pending = this.compactAcceptance;
+          if (pending?.inputUuid === nativeInputUuid) {
+            pending.watermark = this.sequence;
+            pending.yielded = true;
+          }
+          context.boundary.markPossiblySent(this.nativeSession.sessionId, this.processGeneration);
+        });
+      } catch (error) {
+        const pending = this.compactAcceptance as undefined | {
+          inputUuid: string; watermark: number; yielded: boolean; settled: boolean;
+          resolve: (result: ProviderDispatchResult) => void;
+          timeout: ReturnType<typeof setTimeout>;
+        };
+        if (pending?.inputUuid === nativeInputUuid) {
+          clearTimeout(acceptanceTimeout!);
+          this.compactAcceptance = undefined;
+          this.manualCompactionOperationId = undefined;
+        }
+        throw error;
+      }
+      return acceptance;
     });
   }
 
@@ -802,6 +838,11 @@ export class ClaudeProviderSession implements ProviderSession {
         crossing: { phase: 'possibly-sent', detail: 'response-lost' },
         error: { code: 'claude_session_closed', message: 'Claude session closed before correlated processing evidence.', retryable: true } });
       this.rootAcceptance = undefined;
+    }
+    if (this.compactAcceptance) {
+      this.resolvePendingCompactAcceptance(this.compactAcceptance.inputUuid,
+        'claude_session_closed', 'Claude session closed before the manual compaction boundary.');
+      this.compactAcceptance = undefined;
     }
     try {
       this.prompt.close();
@@ -841,6 +882,11 @@ export class ClaudeProviderSession implements ProviderSession {
       if (!this.closed) {
         this.resolvePendingAcceptance('claude_stream_ended',
           'Claude event stream ended before correlated processing evidence.');
+        if (this.compactAcceptance) {
+          this.resolvePendingCompactAcceptance(this.compactAcceptance.inputUuid,
+            'claude_stream_ended',
+            'Claude event stream ended before the manual compaction boundary.');
+        }
         this.state = 'lost';
         const diagnostic = this.diagnostics.at(-1);
         this.emit({
@@ -856,6 +902,11 @@ export class ClaudeProviderSession implements ProviderSession {
       if (this.closed) return;
       this.resolvePendingAcceptance('claude_stream_failed',
         'Claude event stream failed before correlated processing evidence.');
+      if (this.compactAcceptance) {
+        this.resolvePendingCompactAcceptance(this.compactAcceptance.inputUuid,
+          'claude_stream_failed',
+          'Claude event stream failed before the manual compaction boundary.');
+      }
       if (error instanceof ClaudeProviderAuthError) {
         // This runs inside consumeTask, so close only the native transport
         // here. Public close() remains the lease owner and may safely await
@@ -925,7 +976,7 @@ export class ClaudeProviderSession implements ProviderSession {
       }
       pending.resolve({ accepted: true, outcome: 'accepted', evidence, nativeTurnId: this.activeTurn?.nativeTurnId });
     }
-    if (record.type === 'system') this.handleSystemMessage(record);
+    if (record.type === 'system') this.handleSystemMessage(record, sessionId);
     else if (record.type === 'stream_event') await this.handleStreamEvent(record);
     else if (record.type === 'assistant') await this.handleAssistantMessage(record);
     else if (record.type === 'user') await this.handleUserMessage(record);
@@ -949,7 +1000,17 @@ export class ClaudeProviderSession implements ProviderSession {
       error: { code, message, retryable: true } });
   }
 
-  private handleSystemMessage(message: Record<string, unknown>) {
+  private resolvePendingCompactAcceptance(inputUuid: string, code: string, message: string) {
+    const pending = this.compactAcceptance;
+    if (!pending || pending.inputUuid !== inputUuid || pending.settled) return;
+    pending.settled = true;
+    clearTimeout(pending.timeout);
+    pending.resolve({ accepted: false, outcome: 'unknown',
+      crossing: { phase: 'possibly-sent', detail: 'response-lost' },
+      error: { code, message, retryable: true } });
+  }
+
+  private handleSystemMessage(message: Record<string, unknown>, sessionId: string | undefined) {
     const subtype = stringValue(message.subtype);
     if (subtype === 'init') {
       requireClaudeInitSubscription(message.apiKeySource, this.auth);
@@ -988,11 +1049,19 @@ export class ClaudeProviderSession implements ProviderSession {
           retryable: true,
         },
       }, 'system/status/compact-failed');
-      this.manualCompactionOperationId = undefined;
+      if (!this.compactAcceptance) this.manualCompactionOperationId = undefined;
       return;
     }
     if (subtype === 'compact_boundary') {
       if (message.parent_tool_use_id) return;
+      const boundaryUuid = this.currentEnvelopeUuid;
+      const replayedBoundary = boundaryUuid ? this.seenCompactionBoundaries.has(boundaryUuid) : true;
+      if (boundaryUuid && !replayedBoundary) {
+        this.seenCompactionBoundaries.add(boundaryUuid);
+        if (this.seenCompactionBoundaries.size > 2_048) {
+          this.seenCompactionBoundaries.delete(this.seenCompactionBoundaries.values().next().value!);
+        }
+      }
       this.contextUsage.compact();
       this.emitContextUsage('system/context-invalidated');
       const metadata = objectValue(message.compact_metadata);
@@ -1010,7 +1079,19 @@ export class ClaudeProviderSession implements ProviderSession {
         beforeTokens: nonnegativeInteger(metadata?.pre_tokens) ?? null,
         afterTokens: nonnegativeInteger(metadata?.post_tokens) ?? null,
       }, 'system/compact_boundary');
-      this.manualCompactionOperationId = undefined;
+      if (trigger === 'manual' && sessionId === this.nativeSession.sessionId &&
+          this.compactAcceptance?.yielded && !this.compactAcceptance.settled && !replayedBoundary &&
+          this.sequence > this.compactAcceptance.watermark && boundaryUuid) {
+        const pending = this.compactAcceptance;
+        this.compactAcceptance = undefined;
+        clearTimeout(pending.timeout);
+        pending.resolve({ accepted: true, outcome: 'accepted', evidence: {
+          kind: 'claude-manual-compact-boundary', sessionId: this.nativeSession.sessionId,
+          boundaryUuid, processGeneration: this.processGeneration,
+          trigger: 'manual',
+        } });
+      }
+      if (trigger === 'manual' && !this.compactAcceptance) this.manualCompactionOperationId = undefined;
       return;
     }
     const active = this.activeTurn;
@@ -1923,15 +2004,16 @@ export class ClaudeProviderSession implements ProviderSession {
 }
 
 class ClaudeInputQueue implements AsyncIterable<SDKUserMessage> {
-  private readonly values: SDKUserMessage[] = [];
+  private readonly values: Array<{ value: SDKUserMessage; onBeforeYield?: () => void }> = [];
   private readonly waiters: Array<(result: IteratorResult<SDKUserMessage>) => void> = [];
   private closed = false;
 
-  push(value: SDKUserMessage) {
+  push(value: SDKUserMessage, onBeforeYield?: () => void) {
     if (this.closed) throw new Error('Claude input stream is closed.');
-    const waiter = this.waiters.shift();
-    if (waiter) waiter({ done: false, value });
-    else this.values.push(value);
+    if (this.waiters.length > 0) {
+      onBeforeYield?.();
+      this.waiters.shift()?.({ done: false, value });
+    } else this.values.push({ value, onBeforeYield });
   }
 
   close() {
@@ -1945,8 +2027,11 @@ class ClaudeInputQueue implements AsyncIterable<SDKUserMessage> {
     return {
       next: async () => {
         if (returned) return { done: true, value: undefined };
-        const value = this.values.shift();
-        if (value) return { done: false, value };
+        const entry = this.values.shift();
+        if (entry) {
+          entry.onBeforeYield?.();
+          return { done: false, value: entry.value };
+        }
         if (this.closed) return { done: true, value: undefined };
         return new Promise((resolve) => this.waiters.push(resolve));
       },

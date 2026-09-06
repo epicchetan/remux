@@ -32,7 +32,8 @@ import type {
   ProviderSession,
 } from './provider-adapter.ts';
 import { ProviderEventStream } from './provider-adapter.ts';
-import type { DispatchBoundary, ProviderDispatchResult } from './native-runtime/delivery-contract.ts';
+import type { CompactDispatchContext, DispatchBoundary,
+  ProviderDispatchResult } from './native-runtime/delivery-contract.ts';
 
 const FIXTURE_CAPABILITIES: ProviderCapabilities = {
   protocolVersion: PROVIDER_RUNTIME_CONTRACT_VERSION,
@@ -318,9 +319,8 @@ export class FixtureProviderSession implements ProviderSession {
     return { accepted: true };
   }
 
-  async compact(unparsed: CompactProviderSessionInput): Promise<ProviderCommandAcceptance & {
-    nativeOperationId?: string;
-  }> {
+  async compact(unparsed: CompactProviderSessionInput,
+    context: CompactDispatchContext): Promise<ProviderDispatchResult> {
     this.assertOpen();
     const input = parseCompactProviderSessionInput(unparsed);
     if (!this.scenario.manualCompaction) throw new Error('Fixture native Compact is unavailable.');
@@ -332,14 +332,21 @@ export class FixtureProviderSession implements ProviderSession {
     const previous = this.receipts.get(input.commandId);
     if (previous) {
       if (previous !== requestHash) throw new Error('Provider command ID was reused with different input.');
-      return { accepted: true, nativeOperationId: input.commandId };
+      return { accepted: true, outcome: 'accepted', evidence: {
+        kind: 'fixture-correlated-acceptance', sessionId: this.nativeSession.sessionId,
+        commandId: input.commandId,
+      } };
     }
     if (this.activeTurn) throw new Error('Fixture provider session is busy.');
     this.receipts.set(input.commandId, requestHash);
     this.providerCompactCount += 1;
     this.dispatchLog.push(`compact:${input.commandId}`);
+    context.boundary.markPossiblySent(this.nativeSession.sessionId);
     if (this.scenario.omitCompactionCompletion) {
-      return { accepted: true, nativeOperationId: input.commandId };
+      return { accepted: true, outcome: 'accepted', evidence: {
+        kind: 'fixture-correlated-acceptance', sessionId: this.nativeSession.sessionId,
+        commandId: input.commandId,
+      } };
     }
     const complete = async () => {
       if (this.scenario.compactDelayMs) {
@@ -354,7 +361,10 @@ export class FixtureProviderSession implements ProviderSession {
       }, 'context/compact/completed');
     };
     queueMicrotask(() => void complete());
-    return { accepted: true, nativeOperationId: input.commandId };
+    return { accepted: true, outcome: 'accepted', evidence: {
+      kind: 'fixture-correlated-acceptance', sessionId: this.nativeSession.sessionId,
+      commandId: input.commandId,
+    } };
   }
 
   emitAutomaticCompaction(operationId = `fixture-auto-compact-${this.sequence + 1}`) {

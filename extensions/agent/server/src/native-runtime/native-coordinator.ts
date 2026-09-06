@@ -1872,6 +1872,7 @@ export class NativeAgentCoordinator {
       || this.journal.queuedEntries(conversation.conversationId).length > 0;
     const delivery = queueOccupied ? 'queued' as const : 'sent' as const;
     const result = { accepted: true as const, operationId, delivery };
+    let immediateAttempt: ReturnType<DeliveryAttemptOwner['prepare']> | undefined;
     this.journal.transaction(() => {
       this.journal.createManualCompaction({
         operationId,
@@ -1881,19 +1882,34 @@ export class NativeAgentCoordinator {
         now: this.now(),
       });
       if (queueOccupied) this.journal.acceptCommand(input.commandId, result, this.now());
-      else this.journal.markCommandDispatching(input.commandId, this.now());
+      else {
+        this.journal.markCommandDispatching(input.commandId, this.now());
+        const nativeInputUuid = conversation.provider === 'claude-code'
+          ? stableUuid(`claude-compact\0${operationId}`) : undefined;
+        immediateAttempt = this.deliveryOwner.prepare({
+          commandId: input.commandId, kind: 'manual-compact', provider: conversation.provider,
+          providerInstanceId: conversation.providerInstanceId,
+          conversationId: conversation.conversationId, executionId: conversation.rootExecutionId,
+          compactOperationId: operationId,
+          ...(nativeInputUuid ? { nativeClientMessageId: nativeInputUuid } : {}),
+          recoveryPayload: { operationId, ...(nativeInputUuid ? { nativeInputUuid } : {}) },
+          nativeSessionId: session.nativeSession.sessionId,
+          ownerInstanceId: this.deliveryOwnerInstanceId, now: this.now(),
+        });
+      }
     });
     this.invalidateConversation(conversation.conversationId);
     if (queueOccupied) return result;
 
+    const outcome = await this.dispatchCompaction(conversation, session, operationId, result, immediateAttempt);
     try {
-      this.assertRootDeliveryAvailable(conversation.conversationId);
-      await this.dispatchCompaction(conversation, session, operationId);
-      this.journal.acceptCommand(input.commandId, result, this.now());
-      return result;
-    } catch (error) {
-      this.journal.rejectCommand(input.commandId, safeMessage(error), this.now());
-      throw error;
+      if (outcome.outcome === 'accepted') {
+        return result;
+      }
+      if (outcome.outcome === 'rejected') {
+        this.journal.rejectCommand(input.commandId, outcomeError(outcome.result).message, this.now());
+      }
+      throw new Error(`Provider Compact delivery ${outcome.outcome}.`);
     } finally {
       this.invalidateConversation(conversation.conversationId);
     }
@@ -3264,7 +3280,7 @@ export class NativeAgentCoordinator {
     let cursorAttemptId = '';
     while (true) {
       const rows = this.journal.database.prepare(`SELECT attempt_id,created_at FROM delivery_attempts
-        WHERE kind='root-turn' AND state='unknown'
+        WHERE state='unknown'
           AND (created_at>? OR (created_at=? AND attempt_id>?))
         ORDER BY created_at,attempt_id LIMIT 256`).all(
           cursorCreatedAt, cursorCreatedAt, cursorAttemptId,
@@ -3282,7 +3298,9 @@ export class NativeAgentCoordinator {
       }
       if (!attempt) continue;
       const registration = this.providers.get(attempt.providerInstanceId);
-      if (!attempt.acceptanceEvidence && !registration?.adapter.readTurnPresence) continue;
+      if (!attempt.acceptanceEvidence &&
+          ((attempt.kind !== 'root-turn' && attempt.kind !== 'steer') ||
+            !registration?.adapter.readTurnPresence)) continue;
       const conversation = this.journal.conversation(attempt.conversationId);
       if (!conversation) continue;
       let inserted: readonly ProviderEventEnvelope[] = [];
@@ -3297,16 +3315,31 @@ export class NativeAgentCoordinator {
               nativeClientMessageId: attempt.nativeClientMessageId!,
             }),
         (accepted, staged) => {
-          const admitted = this.journal.admitQueuedTurn(
-            accepted.intendedTurnId!,
-            this.now(),
-            accepted.nativeTurnId,
-          );
-          if (!admitted && !this.journal.turn(accepted.intendedTurnId!)) {
-            throw new Error('Queued message disappeared before recovered acceptance was admitted.');
+          if (accepted.kind === 'root-turn') {
+            const admitted = this.journal.admitQueuedTurn(
+              accepted.intendedTurnId!, this.now(), accepted.nativeTurnId);
+            if (!admitted && !this.journal.turn(accepted.intendedTurnId!)) {
+              throw new Error('Queued message disappeared before recovered acceptance was admitted.');
+            }
+            inserted = this.journal.appendProviderEvents(staged.map(({ envelope }) => envelope));
+            return admitted;
           }
           inserted = this.journal.appendProviderEvents(staged.map(({ envelope }) => envelope));
-          return admitted;
+          if (accepted.kind === 'steer') {
+            this.journal.acceptCommand(accepted.commandId, {
+              accepted: true, commandId: accepted.commandId,
+              turnId: accepted.intendedTurnId!, delivery: 'steered',
+            } satisfies NativeMessageSendResult, this.now());
+          } else {
+            this.journal.restoreAcceptedCompactionDelivery(
+              accepted.compactOperationId!, this.now());
+            const receipt = this.journal.commandReceipt(accepted.commandId);
+            if (receipt?.state === 'dispatching') {
+              this.journal.acceptCommand(accepted.commandId, {
+                accepted: true, operationId: accepted.compactOperationId!, delivery: 'sent',
+              } satisfies NativeCompactConversationResult, this.now());
+            }
+          }
         },
         (staged) => this.prepareStagedProviderEvents(attempt.conversationId, staged),
       );
@@ -3334,22 +3367,51 @@ export class NativeAgentCoordinator {
     });
     try {
       const session = await this.ensureSession(conversation);
-      await session.steer!({
+      this.assertRootDeliveryAvailable(conversation.conversationId);
+      const current = this.requireConversation(conversation.conversationId);
+      if (current.activeTurnId !== activeTurnId) {
+        throw new Error('Active turn changed while preparing steer delivery.');
+      }
+      const activeTurn = this.journal.turn(activeTurnId);
+      if (!activeTurn?.nativeTurnId) {
+        throw new Error('Active turn has no native identity for steer delivery.');
+      }
+      const nativeClientMessageId = stableUuid(`steer\0${input.commandId}`);
+      const attempt = this.journal.transaction(() => this.deliveryOwner.prepare({
+      commandId: input.commandId, kind: 'steer', provider: conversation.provider,
+      providerInstanceId: conversation.providerInstanceId, conversationId: conversation.conversationId,
+      executionId: conversation.rootExecutionId, intendedTurnId: activeTurnId,
+      clientMessageId: input.clientMessageId, nativeClientMessageId,
+      recoveryPayload: { turnId: activeTurnId, clientMessageId: input.clientMessageId,
+        nativeClientMessageId, content: input.content, model: input.model,
+        ...(input.effort ? { effort: input.effort } : {}),
+        ...(input.serviceTier ? { serviceTier: input.serviceTier } : {}), access: input.access,
+        expectedNativeTurnId: activeTurn.nativeTurnId },
+      nativeSessionId: session.nativeSession.sessionId,
+      ownerInstanceId: this.deliveryOwnerInstanceId, now: this.now(),
+    }));
+      const result: NativeMessageSendResult = {
+      accepted: true, commandId: input.commandId, turnId: activeTurnId, delivery: 'steered',
+    };
+      const outcome = await this.deliveryOwner.dispatch(attempt.attemptId, (boundary) =>
+      session.steer!({
         commandId: input.commandId,
         turnId: activeTurnId,
         content: input.content,
-      });
-      const result: NativeMessageSendResult = {
-        accepted: true,
-        commandId: input.commandId,
-        turnId: activeTurnId,
-        delivery: 'steered',
-      };
-      this.journal.acceptCommand(input.commandId, result, this.now());
-      return result;
+      }, { boundary, nativeClientMessageId, expectedNativeTurnId: activeTurn.nativeTurnId! }),
+    () => this.journal.acceptCommand(input.commandId, result, this.now()));
+      if (outcome.outcome === 'accepted') return result;
+      const message = `Provider steer delivery ${outcome.outcome}.`;
+      if (outcome.outcome === 'rejected') this.journal.rejectCommand(input.commandId, message, this.now());
+      throw new Error(message);
     } catch (error) {
-      this.journal.rejectCommand(input.commandId, safeMessage(error), this.now());
+      const attempt = this.deliveryOwner.byCommand(input.commandId);
+      if (!attempt || attempt.state === 'rejected') {
+        this.journal.rejectCommand(input.commandId, safeMessage(error), this.now());
+      }
       throw error;
+    } finally {
+      this.invalidateConversation(conversation.conversationId, conversation.rootExecutionId);
     }
   }
 
@@ -3357,6 +3419,8 @@ export class NativeAgentCoordinator {
     conversation: JournalConversation,
     session: ProviderSession,
     operationId: string,
+    immediateResult?: NativeCompactConversationResult,
+    preparedAttempt?: ReturnType<DeliveryAttemptOwner['prepare']>,
   ) {
     if (!session.compact) {
       const error = coordinatorError('native_command_unavailable', 'Native Compact is unavailable in this session.');
@@ -3368,35 +3432,53 @@ export class NativeAgentCoordinator {
       }, `failed:${operationId}`);
       throw error;
     }
-    this.appendCoordinatorCompactionEvent(conversation, {
-      type: 'context.compaction.started',
-      trigger: 'manual',
-      operationId,
-      beforeTokens: this.journal.latestUsage(conversation.conversationId)?.context?.usedTokens ?? null,
-    }, `started:${operationId}`);
-    try {
-      const acceptance = await session.compact({
+    const operation = this.journal.compactionOperation(operationId);
+    if (!operation?.commandId) throw new Error('Manual Compact operation has no owning command.');
+    const nativeInputUuid = conversation.provider === 'claude-code'
+      ? stableUuid(`claude-compact\0${operationId}`) : undefined;
+    const attempt = preparedAttempt ?? this.journal.transaction(() => this.deliveryOwner.prepare({
+      commandId: operation.commandId!, kind: 'manual-compact', provider: conversation.provider,
+      providerInstanceId: conversation.providerInstanceId, conversationId: conversation.conversationId,
+      executionId: conversation.rootExecutionId, compactOperationId: operationId,
+      ...(nativeInputUuid ? { nativeClientMessageId: nativeInputUuid } : {}),
+      recoveryPayload: { operationId, ...(nativeInputUuid ? { nativeInputUuid } : {}) },
+      nativeSessionId: session.nativeSession.sessionId,
+      ownerInstanceId: this.deliveryOwnerInstanceId, now: this.now(),
+    }));
+    let inserted: readonly ProviderEventEnvelope[] = [];
+    const outcome = await this.deliveryOwner.dispatch(attempt.attemptId, (boundary) => session.compact!({
         commandId: operationId,
         conversationId: conversation.conversationId,
         executionId: conversation.rootExecutionId,
-      });
-      if (acceptance.nativeOperationId) {
-        this.journal.setCompactionNativeOperationId(operationId, acceptance.nativeOperationId, this.now());
+      }, { boundary, ...(nativeInputUuid ? { nativeInputUuid } : {}) }),
+    (_accepted, staged) => {
+      inserted = this.journal.appendProviderEvents(staged.map(({ envelope }) => envelope));
+      if (immediateResult) {
+        this.journal.acceptCommand(operation.commandId!, immediateResult, this.now());
       }
-    } catch (error) {
-      const displayError = {
-        code: error instanceof NativeCoordinatorError ? error.errorCode : 'native_command_failed',
-        message: safeMessage(error),
-        retryable: true,
-      };
-      this.appendCoordinatorCompactionEvent(conversation, {
-        type: 'context.compaction.failed',
-        trigger: 'manual',
-        operationId,
-        error: displayError,
-      }, `failed:${operationId}`);
-      throw error;
+    }, (staged) => this.prepareStagedProviderEvents(conversation.conversationId, staged));
+    if (outcome.outcome === 'accepted') {
+      const suffixOwner = this.deliveryOwner.acceptedWithStage(conversation.rootExecutionId);
+      if (suffixOwner?.attemptId === attempt.attemptId) {
+        const source = this.deliveryOwner.staged(attempt.attemptId);
+        const prepared = await this.prepareStagedProviderEvents(conversation.conversationId, source);
+        let suffix: readonly ProviderEventEnvelope[] = [];
+        this.deliveryOwner.drainAccepted(attempt.attemptId, prepared.staged,
+          prepared.sourceObservationIds,
+          (events) => { suffix = this.journal.appendProviderEvents(events); });
+        inserted = [...inserted, ...suffix];
+      }
+      await this.applyProviderEventEffects(conversation.conversationId,
+        conversation.rootExecutionId, inserted);
+      return outcome;
     }
+    if (outcome.outcome === 'rejected') {
+      this.journal.failCompaction(operationId, outcomeError(outcome.result!), this.now());
+    } else {
+      this.journal.markRunningCompactionDeliveryUnknown(conversation.conversationId,
+        outcomeError(outcome.result!), this.now());
+    }
+    return outcome;
   }
 
   private appendCoordinatorCompactionEvent(
@@ -3455,8 +3537,14 @@ export class NativeAgentCoordinator {
         try {
           const refreshed = this.requireConversation(conversationId);
           const session = await this.ensureSession(refreshed);
-          await this.dispatchCompaction(refreshed, session, queued.operationId);
+          this.assertRootDeliveryAvailable(conversationId);
+          const outcome = await this.dispatchCompaction(refreshed, session, queued.operationId);
+          if (outcome.outcome === 'rejected') {
+            queueMicrotask(() => void this.dispatchNext(conversationId));
+          }
         } catch (error) {
+          const existingAttempt = this.deliveryOwner.byCommand(queued.commandId);
+          if (existingAttempt) return;
           this.journal.failCompaction(queued.operationId, {
             code: error instanceof NativeCoordinatorError ? error.errorCode : 'native_command_failed',
             message: safeMessage(error),
@@ -4119,6 +4207,13 @@ export class NativeAgentCoordinator {
       if (events.length === 0) return;
     }
     const unresolved = this.deliveryOwner.unresolvedLane(conversationId);
+    if (unresolved?.kind === 'manual-compact' && unresolved.executionId === executionId) {
+      const dependent = events.filter((event) => event.scope.kind !== 'account' &&
+        event.scope.conversationId === conversationId && event.scope.executionId === executionId);
+      for (const event of dependent) this.deliveryOwner.observe(unresolved.attemptId, event);
+      events = events.filter((event) => !dependent.includes(event));
+      if (events.length === 0) return;
+    }
     if (unresolved?.kind === 'root-turn' && unresolved.executionId === executionId) {
       const declaredChildren = new Set(events.flatMap((event) => {
         if (event.scope.kind !== 'turn' || event.scope.turnId !== unresolved.intendedTurnId ||
@@ -4837,6 +4932,12 @@ function safeMessage(error: unknown) {
     .replace(/Bearer\s+\S+/giu, 'Bearer [redacted]')
     .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/gu, '[redacted]')
     .slice(0, 1_000);
+}
+
+function outcomeError(outcome: import('./delivery-contract.ts').ProviderDispatchResult) {
+  if (outcome.outcome === 'accepted') throw new Error('Accepted delivery has no failure diagnostic.');
+  return { code: outcome.error.code, message: outcome.error.message,
+    ...(outcome.error.retryable === undefined ? {} : { retryable: outcome.error.retryable }) };
 }
 
 function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {

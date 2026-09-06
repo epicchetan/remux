@@ -22,7 +22,8 @@ import type {
   StartProviderTurnInput,
   SteerProviderTurnInput,
 } from '../../shared/provider-runtime.ts';
-import type { DispatchBoundary, ProviderDispatchResult, ProviderPresenceRead } from './native-runtime/delivery-contract.ts';
+import type { CompactDispatchContext, DispatchBoundary, ProviderDispatchResult,
+  ProviderPresenceRead, SteerDispatchContext } from './native-runtime/delivery-contract.ts';
 
 export type ProviderCommandAcceptance = { accepted: true; nativeTurnId?: string };
 
@@ -87,15 +88,13 @@ export interface ProviderSession {
 
   startTurn(input: StartProviderTurnInput, boundary?: DispatchBoundary): Promise<ProviderDispatchResult>;
   readTurnPresence?(nativeClientMessageId: string): Promise<ProviderPresenceRead>;
-  steer?(input: SteerProviderTurnInput): Promise<ProviderCommandAcceptance>;
+  steer?(input: SteerProviderTurnInput, context: SteerDispatchContext): Promise<ProviderDispatchResult>;
   interrupt(input: InterruptProviderTurnInput): Promise<ProviderCommandAcceptance>;
   interruptChild?(input: InterruptProviderChildInput): Promise<ProviderCommandAcceptance>;
   snapshotChild?(
     input: ProviderSnapshotRequest & { childExecutionId: string; nativeSessionId: string },
   ): Promise<ProviderSnapshot>;
-  compact?(input: CompactProviderSessionInput): Promise<ProviderCommandAcceptance & {
-    nativeOperationId?: string;
-  }>;
+  compact?(input: CompactProviderSessionInput, context: CompactDispatchContext): Promise<ProviderDispatchResult>;
   /**
    * Cheap provider-native freshness probe. Returning null means the adapter
    * cannot prove that its transcript is unchanged and the coordinator must

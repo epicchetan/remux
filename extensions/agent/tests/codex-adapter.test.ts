@@ -8,6 +8,7 @@ import type {
   CodexAppServerConnection,
   CodexAppServerLaunchOptions,
 } from '../server/src/providers/codex/codex-app-server-process.ts';
+import { CodexRequestError } from '../server/src/providers/codex/codex-app-server-connection.ts';
 import { CodexNativeAdapter } from '../server/src/providers/codex/codex-adapter.ts';
 import { codexStableChildExecutionId } from '../server/src/providers/codex/codex-event-mapper.ts';
 import type {
@@ -178,14 +179,21 @@ test('Codex session launch scopes federation credentials and dispatches each tur
     conversationId: openInput.conversationId,
     executionId: openInput.executionId,
   };
-  assert.deepEqual(await session.compact!(compactInput), {
-    accepted: true,
-    nativeOperationId: 'compact-command-1',
+  const compactResult = await session.compact!(compactInput, {
+    boundary: { markPossiblySent() {} },
   });
-  assert.deepEqual(await session.compact!(structuredClone(compactInput)), {
-    accepted: true,
-    nativeOperationId: 'compact-command-1',
-  });
+  assert.equal(compactResult.outcome, 'accepted');
+  assert.equal(compactResult.accepted, true);
+  assert.equal('nativeOperationId' in compactResult, false);
+  if (compactResult.outcome === 'accepted') {
+    assert.equal(compactResult.evidence.kind, 'codex-compact-response');
+    assert.equal(compactResult.evidence.threadId, 'thread-created-1');
+    assert.equal(Number.isInteger(compactResult.evidence.requestId), true);
+    assert.equal(typeof compactResult.evidence.connectionGeneration, 'string');
+  }
+  assert.deepEqual(await session.compact!(structuredClone(compactInput), {
+    boundary: { markPossiblySent() {} },
+  }), compactResult);
   await compactTerminal;
   assert.equal(peer.requests.filter(({ method }) => method === 'thread/compact/start').length, 1);
   assert.equal(compactEvents.filter(({ event }) =>
@@ -220,16 +228,34 @@ test('Codex resume, steer, interrupt, snapshot, and fork preserve native identit
 
   await session.startTurn(turnInputWithText());
   peer.startChildTurn('child-thread-1', 'child-turn-1');
-  await session.steer!({
+  const steerCrossings: Array<{ sessionId: string; generation?: string }> = [];
+  const steer = await session.steer!({
     commandId: 'steer-command-1',
     turnId: 'remux-turn-1',
     content: [{ type: 'text', text: 'Actually, include tests.' }],
+  }, {
+    nativeClientMessageId: 'native-steer-client-1',
+    expectedNativeTurnId: 'native-turn-1',
+    boundary: { markPossiblySent(sessionId, generation) {
+      steerCrossings.push({ sessionId, generation });
+    } },
   });
+  assert.equal(steer.outcome, 'accepted');
+  if (steer.outcome === 'accepted') assert.deepEqual(steer.evidence, {
+    kind: 'codex-turn-steer-response',
+    threadId: 'thread-resumed-1',
+    turnId: 'native-turn-1',
+    nativeClientMessageId: 'native-steer-client-1',
+  });
+  assert.equal(steerCrossings.length, 1);
   await session.interrupt({ commandId: 'interrupt-command-1', turnId: 'remux-turn-1' });
   peer.completeActiveTurn();
-  assert.equal((peer.requests.find(({ method }) => method === 'turn/steer')?.params as {
-    expectedTurnId: string;
-  }).expectedTurnId, 'native-turn-1');
+  assert.deepEqual(peer.requests.find(({ method }) => method === 'turn/steer')?.params, {
+    threadId: 'thread-resumed-1',
+    expectedTurnId: 'native-turn-1',
+    clientUserMessageId: 'native-steer-client-1',
+    input: [{ type: 'text', text: 'Actually, include tests.', text_elements: [] }],
+  });
   const interrupts = peer.requests.filter(({ method }) => method === 'turn/interrupt');
   assert.deepEqual(interrupts[0]?.params, {
     threadId: 'thread-resumed-1',
@@ -274,6 +300,32 @@ test('Codex resume, steer, interrupt, snapshot, and fork preserve native identit
     event.type === 'turn.block.started' && event.block.payload.kind === 'native-child' &&
     event.block.payload.child.nativeSessionId === fork.sessionId), false,
   'the thread created by an explicit fork must not be projected as a native subagent');
+  await session.close();
+});
+
+test('Codex Compact keeps its pending operation mapping after an unknown response', async () => {
+  let peer!: FakeCodexConnection;
+  const adapter = new CodexNativeAdapter({ createConnection: async (options) => {
+    peer = new FakeCodexConnection(options, { failCompactPossiblySent: true });
+    return peer;
+  } });
+  const session = await adapter.openSession(openInput);
+  const result = await session.compact!({
+    commandId: 'compact-response-lost',
+    conversationId: openInput.conversationId,
+    executionId: openInput.executionId,
+  }, { boundary: { markPossiblySent() {} } });
+  assert.equal(result.outcome, 'unknown');
+  const events: ProviderEventEnvelope[] = [];
+  const terminal = collectUntil(session.events, events, ({ event }) =>
+    event.type === 'context.compaction.completed');
+  peer.emitNotification('thread/compacted', {
+    threadId: session.nativeSession.sessionId,
+    id: 'native-compact-after-lost-response',
+  });
+  await terminal;
+  assert.ok(events.some(({ event }) => event.type === 'context.compaction.completed' &&
+    event.operationId === 'compact-response-lost'));
   await session.close();
 });
 
@@ -453,10 +505,15 @@ test('Codex resume restores the exact active root turn for immediate steer and i
   await session.steer({
     commandId: 'steer-active-root', turnId: 'remux-active',
     content: [{ type: 'text', text: 'Continue.' }],
+  }, {
+    nativeClientMessageId: 'native-active-steer-client',
+    expectedNativeTurnId: 'native-active',
+    boundary: { markPossiblySent() {} },
   });
   await session.interrupt({ commandId: 'interrupt-active-root', turnId: 'remux-active' });
   assert.deepEqual(peer.requests.filter(({ method }) => method === 'turn/steer').at(-1)?.params, {
     threadId: 'root-active', expectedTurnId: 'native-active',
+    clientUserMessageId: 'native-active-steer-client',
     input: [{ type: 'text', text: 'Continue.', text_elements: [] }],
   });
   assert.deepEqual(peer.requests.filter(({ method }) => method === 'turn/interrupt').at(-1)?.params, {
@@ -879,6 +936,7 @@ type FakeOptions = {
   rolloutPath?: string;
   snapshotTurns?: unknown[];
   threadReadResponse?: unknown;
+  failCompactPossiblySent?: boolean;
 };
 
 class FakeCodexConnection implements CodexAppServerConnection {
@@ -893,8 +951,10 @@ class FakeCodexConnection implements CodexAppServerConnection {
   private readonly emitForkStarted: boolean;
   private readonly rolloutPath?: string;
   private readonly threadReadResponse?: unknown;
+  private readonly failCompactPossiblySent: boolean;
   private threadId = 'thread-created-1';
   private turnCounter = 0;
+  private requestCounter = 0;
   private updatedAt = 1_700_000_000;
   private activeNativeTurnId: string | undefined;
 
@@ -906,9 +966,13 @@ class FakeCodexConnection implements CodexAppServerConnection {
     this.childSnapshotTurns = options.childSnapshotTurns;
     this.rolloutPath = options.rolloutPath;
     this.threadReadResponse = options.threadReadResponse;
+    this.failCompactPossiblySent = options.failCompactPossiblySent ?? false;
   }
 
-  async request(method: string, params: unknown): Promise<unknown> {
+  async request(method: string, params: unknown, _timeoutMs?: number,
+    beforeWrite?: (method: string, id: number) => void): Promise<unknown> {
+    const requestId = ++this.requestCounter;
+    beforeWrite?.(method, requestId);
     this.requests.push({ method, params: structuredClone(params) });
     if (method === 'initialize') return { userAgent: 'codex-cli/0.144.0 test' };
     if (method === 'account/read') return { account: { type: 'chatgpt' }, requiresOpenaiAuth: true };
@@ -958,8 +1022,15 @@ class FakeCodexConnection implements CodexAppServerConnection {
       if (this.autoCompleteTurns) this.completeActiveTurn();
       return { turn };
     }
-    if (method === 'turn/steer' || method === 'turn/interrupt') return {};
+    if (method === 'turn/steer') return {
+      turnId: (params as { expectedTurnId: string }).expectedTurnId,
+    };
+    if (method === 'turn/interrupt') return {};
     if (method === 'thread/compact/start') {
+      if (this.failCompactPossiblySent) throw new CodexRequestError({
+        phase: 'possibly-sent', method, requestId,
+        message: 'connection closed before the response',
+      });
       this.emit('thread/compacted', { threadId: this.threadId, id: 'native-compact-1' });
       return {};
     }

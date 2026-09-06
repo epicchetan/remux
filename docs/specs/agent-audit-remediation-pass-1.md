@@ -99,6 +99,41 @@ To shorten the remaining serial work, that Sol next owns only S2a2's runtime
 The server Sol retains provider/owner/coordinator implementation and tests;
 they do not edit the same files. Primary still reviews both before deployment.
 
+### S2a2 accepted locally — 2026-09-06
+
+The server delivery slice now adopts steer and manual Compact through the existing
+`DeliveryAttemptOwner`; no second command/queue owner or schema was introduced.
+Immediate Compact creates its operation and attempt atomically. Queued Compact
+retains its already accepted enqueue receipt. Exact native acceptance admits
+steer or Compact once; possibly-sent failure retains the original unresolved
+attempt. Startup admits persisted positive proof without resending. Compact proof
+restores an uncertain operation to running until a real terminal event arrives;
+queued successors remain blocked during that interval.
+
+Codex uses exact steer turn/client identities and Compact request/generation
+response evidence, without an invented native operation ID. Claude uses the
+actual input-yield boundary, frozen UUID, exact session, manual boundary watermark,
+replay rejection and exclusive ownership. Timeout/stream loss remains unknown;
+a late boundary does not retroactively change the settled unknown result or
+release the durable hold. General unknown-operation recovery UI remains out of
+scope. Stage preparation failure preserves positive proof with an explicit
+pending-admission diagnostic.
+
+Primary reviewed the integration and sent concrete fixes back before acceptance.
+After the host slice landed, Sol work was split within S2a2 into disjoint
+coordinator/owner code, provider tests, and the narrow Claude adapter correction.
+No third cleanup project started. Runtime hold/Compact eligibility was committed
+separately as `215476d`; native protocol is 11 and schema remains 16.
+
+Final local integration: root typecheck passed, all 292 Agent server tests passed,
+and browser tests passed 213 with three existing skips. Focused provider tests
+passed 42, final owner/coordinator tests 49, and host library integration 138.
+The host release build passed. Production Agent build, coordinated worker restart
+and isolated live steer/Compact verification are the remaining deployment gate.
+Evidence: `/tmp/remux-audit-implementation/s2a2-final-server.log`,
+`s2a2-full-viewer.log`, `s2a2-claude-{typecheck,focused}.log`,
+`h2h4-lib-integration.log`, and `h2h4-release-build.log`.
+
 ### Delivered batch scope
 
 | Lane | Next deliverable | Scope and handoff |

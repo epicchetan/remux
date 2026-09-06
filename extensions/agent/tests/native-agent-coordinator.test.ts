@@ -355,13 +355,18 @@ test('trusted image admission grants direct, queued, and steer inputs before pro
     openSession: async (input) => {
       const session = await baseAdapter.openSession(input);
       const providerSession: ProviderSession = session;
-      providerSession.steer = async (steerInput) => {
+      providerSession.steer = async (steerInput, context) => {
         const artifactId = imageArtifactId(steerInput.content);
         assert.ok(artifactId);
         assert.equal(journal.artifactGrantedTo({ conversationId: input.conversationId,
           executionId: input.executionId }, artifactId), true);
         providerBoundaries.push(`steer:${artifactId}`);
-        return { accepted: true };
+        assert.ok(context);
+        context.boundary.markPossiblySent(session.nativeSession.sessionId);
+        return { accepted: true, outcome: 'accepted', evidence: {
+          kind: 'fixture-correlated-acceptance', sessionId: session.nativeSession.sessionId,
+          commandId: steerInput.commandId,
+        } };
       };
       return providerSession;
     },
@@ -1123,7 +1128,6 @@ test('native Compact is idempotent, invisible to turns, and projects its termina
     assert.deepEqual(journal.eventsForConversation(created.conversationId)
       .filter(({ event }) => event.type.startsWith('context.compaction.'))
       .map(({ event }) => event.type), [
-      'context.compaction.started',
       'context.compaction.completed',
     ]);
     const runtime = coordinator.projector.runtimeResource(created.conversationId);
@@ -1164,8 +1168,8 @@ test('native Compact provider failure settles durably and dispatches the queued 
         startTurn: (request, boundary) => native.startTurn(request, boundary),
         interrupt: (request) => native.interrupt(request),
         snapshot: (request) => native.snapshot(request),
-        compact: async (request) => {
-          const acceptance = await native.compact!(request);
+        compact: async (request, context) => {
+          const acceptance = await native.compact!(request, context);
           failCompaction = () => events.emit({
             contractVersion: PROVIDER_RUNTIME_CONTRACT_VERSION,
             eventId: `fixture:compact-failed:${request.commandId}`,
@@ -1405,6 +1409,143 @@ test('stream loss during native Compact becomes delivery_unknown and is never re
       'delivery_unknown terminates the control and releases later work');
   } finally {
     await coordinator.close();
+    journal.close();
+  }
+});
+
+test('restart admits durable positive Compact proof without reopening or resending', async () => {
+  const journal = createJournal();
+  const fixture = new NativeFixtureAdapter({ manualCompaction: true });
+  let compactWrites = 0;
+  const adapter: ProviderAdapter = {
+    probe: (id) => fixture.probe(id),
+    listModels: (id) => fixture.listModels(id),
+    openSession: async (input) => {
+      const session = await fixture.openSession(input);
+      session.compact = async (_request, context) => {
+        context.boundary.markPossiblySent(session.nativeSession.sessionId);
+        compactWrites += 1;
+        return { accepted: false, outcome: 'unknown', crossing: {
+          phase: 'possibly-sent', detail: 'response-lost' },
+          error: { code: 'fixture_lost', message: 'Controlled response loss.' } };
+      };
+      return session;
+    },
+  };
+  const first = new NativeAgentCoordinator({ journal, providers: [{
+    providerInstanceId: 'fixture-local', provider: 'fixture', label: 'Fixture', adapter,
+  }] });
+  let restarted: NativeAgentCoordinator | undefined;
+  try {
+    await first.initialize();
+    const created = await first.createConversation({ commandId: 'create-compact-restart-proof',
+      providerInstanceId: 'fixture-local', cwd: '/workspace/remux', model: 'fixture-native-v1',
+      access: 'workspace-write' });
+    await assert.rejects(first.compactConversation({
+      commandId: 'compact-restart-proof', conversationId: created.conversationId,
+    }), /delivery unknown/u);
+    await first.sendMessage(configuredMessage(first, {
+      commandId: 'queued-after-compact-proof', conversationId: created.conversationId,
+      clientMessageId: 'queued-client-after-compact-proof',
+      content: [{ type: 'text', text: 'Wait for native Compact completion.' }],
+    }));
+    const attempt = journal.database.prepare(`SELECT attempt_id AS attemptId,
+      native_session_id AS sessionId,compact_operation_id AS operationId
+      FROM delivery_attempts WHERE command_id='compact-restart-proof'`).get() as {
+        attemptId: string; sessionId: string; operationId: string;
+      };
+    journal.database.prepare(`UPDATE delivery_attempts SET acceptance_evidence_json=?
+      WHERE attempt_id=?`).run(JSON.stringify({ kind: 'fixture-correlated-acceptance',
+      sessionId: attempt.sessionId, commandId: attempt.operationId }), attempt.attemptId);
+    await first.close();
+
+    const restartAdapter = new NativeFixtureAdapter({ manualCompaction: true });
+    restarted = new NativeAgentCoordinator({ journal, providers: [{
+      providerInstanceId: 'fixture-local', provider: 'fixture', label: 'Fixture',
+      adapter: restartAdapter,
+    }] });
+    await restarted.initialize();
+    assert.equal(compactWrites, 1);
+    assert.equal(restartAdapter.opened.length, 0, 'durable proof admission needs no provider writer');
+    assert.equal(journal.commandReceipt('compact-restart-proof')?.state, 'accepted');
+    assert.equal(journal.compactionOperation(attempt.operationId)?.state, 'running');
+    assert.equal((journal.database.prepare(`SELECT state FROM delivery_attempts
+      WHERE attempt_id=?`).get(attempt.attemptId) as { state: string }).state, 'accepted');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(restartAdapter.opened.reduce((sum, session) =>
+      sum + session.providerDispatchCount, 0), 0,
+    'accepted Compact delivery remains running until its exact terminal event');
+    assert.equal((journal.database.prepare(`SELECT state FROM queued_messages
+      WHERE command_id='queued-after-compact-proof'`).get() as { state: string }).state, 'queued');
+  } finally {
+    await restarted?.close();
+    await first.close();
+    journal.close();
+  }
+});
+
+test('restart admits durable positive steer proof without steering twice', async () => {
+  const journal = createJournal();
+  const fixture = new NativeFixtureAdapter({ delayMs: 60_000 });
+  let steerWrites = 0;
+  const adapter: ProviderAdapter = {
+    probe: async (id) => {
+      const probe = await fixture.probe(id);
+      return { ...probe, capabilities: probe.capabilities && { ...probe.capabilities,
+        turns: { ...probe.capabilities.turns, steer: true } } };
+    },
+    listModels: (id) => fixture.listModels(id),
+    openSession: async (input) => {
+      const session = await fixture.openSession(input);
+      const providerSession: ProviderSession = session;
+      providerSession.steer = async (_request, context) => {
+        context.boundary.markPossiblySent(session.nativeSession.sessionId);
+        steerWrites += 1;
+        return { accepted: false, outcome: 'unknown', crossing: {
+          phase: 'possibly-sent', detail: 'response-lost' },
+          error: { code: 'fixture_lost', message: 'Controlled steer response loss.' } };
+      };
+      return providerSession;
+    },
+  };
+  const first = new NativeAgentCoordinator({ journal, providers: [{
+    providerInstanceId: 'fixture-local', provider: 'fixture', label: 'Fixture', adapter,
+  }] });
+  let restarted: NativeAgentCoordinator | undefined;
+  try {
+    await first.initialize();
+    const created = await first.createConversation({ commandId: 'create-steer-restart-proof',
+      providerInstanceId: 'fixture-local', cwd: '/workspace/remux', model: 'fixture-native-v1',
+      access: 'workspace-write' });
+    await first.sendMessage(configuredMessage(first, { commandId: 'root-for-steer-proof',
+      conversationId: created.conversationId, clientMessageId: 'root-client-for-steer-proof',
+      content: [{ type: 'text', text: 'Remain active.' }] }));
+    await assert.rejects(first.sendMessage({ ...configuredMessage(first, {
+      commandId: 'steer-restart-proof', conversationId: created.conversationId,
+      clientMessageId: 'steer-client-restart-proof',
+      content: [{ type: 'text', text: 'Steer.' }],
+    }), delivery: 'steer' }), /delivery unknown/u);
+    const attempt = journal.database.prepare(`SELECT attempt_id AS attemptId,
+      native_session_id AS sessionId FROM delivery_attempts
+      WHERE command_id='steer-restart-proof'`).get() as { attemptId: string; sessionId: string };
+    journal.database.prepare(`UPDATE delivery_attempts SET acceptance_evidence_json=?
+      WHERE attempt_id=?`).run(JSON.stringify({ kind: 'fixture-correlated-acceptance',
+      sessionId: attempt.sessionId, commandId: 'steer-restart-proof' }), attempt.attemptId);
+    await first.close();
+
+    const restartFixture = new NativeFixtureAdapter({ delayMs: 60_000 });
+    restarted = new NativeAgentCoordinator({ journal, providers: [{
+      providerInstanceId: 'fixture-local', provider: 'fixture', label: 'Fixture',
+      adapter: restartFixture,
+    }] });
+    await restarted.initialize();
+    assert.equal(steerWrites, 1);
+    assert.equal(journal.commandReceipt('steer-restart-proof')?.state, 'accepted');
+    assert.equal((journal.database.prepare(`SELECT state FROM delivery_attempts
+      WHERE attempt_id=?`).get(attempt.attemptId) as { state: string }).state, 'accepted');
+  } finally {
+    await restarted?.close();
+    await first.close();
     journal.close();
   }
 });

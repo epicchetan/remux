@@ -40,9 +40,6 @@ export class DeliveryAttemptOwner {
   }
 
   prepare(input: PrepareDeliveryAttempt): FrozenDeliveryAttempt {
-    if (input.kind !== 'root-turn') {
-      throw new Error(`Delivery kind ${input.kind} is not adopted until S2a2.`);
-    }
     if (input.ownerInstanceId !== this.ownerInstanceId) {
       throw new Error('Delivery attempt preparation owner does not match this owner instance.');
     }
@@ -83,7 +80,7 @@ export class DeliveryAttemptOwner {
     invoke: (boundary: DispatchBoundary) => Promise<ProviderDispatchResult>,
     admit: (attempt: FrozenDeliveryAttempt, staged: readonly StagedProviderEnvelope[]) => T,
     prepare?: (staged: readonly StagedProviderEnvelope[]) => Promise<readonly StagedProviderEnvelope[] | PreparedDeliveryStage>,
-  ): Promise<{ outcome: ProviderDispatchResult['outcome']; value?: T }> {
+  ): Promise<{ outcome: ProviderDispatchResult['outcome']; result: ProviderDispatchResult; value?: T }> {
     const initial = this.require(attemptId);
     if (initial.ownerInstanceId !== this.ownerInstanceId) {
       throw new Error('Delivery attempt belongs to another owner instance.');
@@ -126,15 +123,15 @@ export class DeliveryAttemptOwner {
     if (result.outcome === 'rejected') {
       if (persistedCrossing) {
         this.unknown(attemptId, { ...result.error, boundaryViolation: 'rejected-after-crossing' });
-        return { outcome: 'unknown' };
+        return { outcome: 'unknown', result };
       }
       this.reject(attemptId, result.error);
-      return { outcome: 'rejected' };
+      return { outcome: 'rejected', result };
     }
     if (result.outcome === 'unknown') {
       if (!persistedCrossing) this.markProviderSignalledCrossing(attemptId, 'unknown-without-marker');
       this.unknown(attemptId, result.error);
-      return { outcome: 'unknown' };
+      return { outcome: 'unknown', result };
     }
     if (!persistedCrossing) this.markProviderSignalledCrossing(attemptId, 'accepted-without-marker');
     if ((result.evidence.kind === 'codex-turn-start-response' && result.nativeTurnId !== result.evidence.turnId) ||
@@ -156,9 +153,13 @@ export class DeliveryAttemptOwner {
       }
     } catch (error) {
       this.markGap(attemptId, `preparation:${deliveryError(error).message}`, this.now());
-      return { outcome: 'unknown' };
+      return { outcome: 'unknown', result: {
+        accepted: false, outcome: 'unknown',
+        crossing: { phase: 'possibly-sent', detail: 'response-lost' },
+        error: deliveryError(error),
+      } };
     }
-    return { outcome: 'accepted', value: this.admit(
+    return { outcome: 'accepted', result, value: this.admit(
       attemptId,
       admit,
       prepared,
@@ -167,7 +168,12 @@ export class DeliveryAttemptOwner {
   }
 
   recordAcceptance(attemptId: string, evidence: ProviderAcceptanceEvidence, nativeTurnId?: string, nativeOperationId?: string) {
-    const attempt = this.require(attemptId); this.validateEvidence(attempt, evidence);
+    const attempt = this.require(attemptId);
+    if (evidence.kind === 'claude-manual-compact-boundary' && attempt.transcriptGap &&
+        !attempt.acceptanceEvidence) {
+      throw new Error('Claude Compact boundary cannot prove acceptance after a transcript gap.');
+    }
+    this.validateEvidence(attempt, evidence);
     const json = JSON.stringify(evidence); if (Buffer.byteLength(json) > 65536) throw new Error('Acceptance evidence exceeds 64 KiB.');
     this.journal.transaction(() => {
       const current = this.require(attemptId);
@@ -467,7 +473,7 @@ export class DeliveryAttemptOwner {
       'SELECT provider FROM provider_instances WHERE provider_instance_id=?',
     ).get(input.providerInstanceId) as { provider: string } | undefined;
     const conversation = this.journal.database.prepare(
-      'SELECT provider_instance_id,root_execution_id FROM conversations WHERE conversation_id=?',
+      'SELECT provider_instance_id,root_execution_id,active_turn_id FROM conversations WHERE conversation_id=?',
     ).get(input.conversationId) as Record<string, unknown> | undefined;
     const execution = this.journal.database.prepare(
       'SELECT conversation_id,provider_instance_id FROM executions WHERE execution_id=?',
@@ -485,6 +491,45 @@ export class DeliveryAttemptOwner {
       throw new Error('Delivery attempt scope does not match its provider, conversation, execution, and native session.');
     }
     const payload = parseRecordJson(payloadJson, 'delivery recovery payload');
+    if (input.kind === 'steer') {
+      const allowed = new Set(['turnId', 'clientMessageId', 'nativeClientMessageId', 'content',
+        'model', 'effort', 'serviceTier', 'access', 'expectedNativeTurnId']);
+      const receipt = this.journal.database.prepare(
+        'SELECT kind,state FROM command_receipts WHERE command_id=?',
+      ).get(input.commandId) as Record<string, unknown> | undefined;
+      const turn = this.journal.database.prepare(`SELECT turn_id,conversation_id,execution_id,
+        native_turn_id,state FROM turns WHERE turn_id=?`).get(input.intendedTurnId!) as
+        Record<string, unknown> | undefined;
+      if (!exactKeys(payload, allowed) || payload.turnId !== input.intendedTurnId ||
+          payload.clientMessageId !== input.clientMessageId ||
+          payload.nativeClientMessageId !== input.nativeClientMessageId ||
+          receipt?.kind !== 'turn.send' || receipt.state !== 'dispatching' ||
+          turn?.conversation_id !== input.conversationId || turn.execution_id !== input.executionId ||
+          conversation.active_turn_id !== input.intendedTurnId ||
+          !['running', 'recovering'].includes(String(turn.state)) ||
+          turn.native_turn_id !== payload.expectedNativeTurnId) {
+        throw new Error('Delivery steer attempt does not match its active turn and frozen input.');
+      }
+      return;
+    }
+    if (input.kind === 'manual-compact') {
+      const allowed = new Set(['operationId', 'nativeInputUuid']);
+      const operation = this.journal.database.prepare(`SELECT command_id,conversation_id,trigger,state
+        FROM compaction_operations WHERE operation_id=?`).get(input.compactOperationId!) as
+        Record<string, unknown> | undefined;
+      const receipt = this.journal.database.prepare(
+        'SELECT kind,state FROM command_receipts WHERE command_id=?',
+      ).get(input.commandId) as Record<string, unknown> | undefined;
+      if (!exactKeys(payload, allowed) || payload.operationId !== input.compactOperationId ||
+          (payload.nativeInputUuid ?? undefined) !== input.nativeClientMessageId ||
+          operation?.command_id !== input.commandId || operation.conversation_id !== input.conversationId ||
+          receipt?.kind !== 'conversation.compact' ||
+          !['dispatching', 'accepted'].includes(String(receipt.state)) ||
+          operation.trigger !== 'manual' || operation.state !== 'running') {
+        throw new Error('Delivery Compact attempt does not match its running manual operation.');
+      }
+      return;
+    }
     const allowed = new Set(['turnId', 'clientMessageId', 'nativeClientMessageId', 'content',
       'model', 'effort', 'serviceTier', 'access']);
     if (!exactKeys(payload, allowed) ||
@@ -523,7 +568,8 @@ function validateEnvelopeScope(attempt: FrozenDeliveryAttempt, envelope: Provide
   if (envelope.scope.executionId !== attempt.executionId && !declaredChildSession) {
     throw new Error('Provider observation execution is outside the unresolved root boundary.');
   }
-  if (envelope.scope.kind === 'turn' && envelope.scope.executionId === attempt.executionId &&
+  if (attempt.kind !== 'manual-compact' && envelope.scope.kind === 'turn' &&
+      envelope.scope.executionId === attempt.executionId &&
       envelope.scope.turnId !== attempt.intendedTurnId) {
     throw new Error('Provider observation turn is outside the unresolved root boundary.');
   }
@@ -531,6 +577,13 @@ function validateEnvelopeScope(attempt: FrozenDeliveryAttempt, envelope: Provide
     ? attempt.nativeSessionId : declaredChildSession;
   if (envelope.native.sessionId !== expectedSession) {
     throw new Error('Provider observation native session does not match delivery scope.');
+  }
+  if (attempt.kind === 'manual-compact' &&
+      (envelope.event.type === 'context.compaction.started' ||
+       envelope.event.type === 'context.compaction.completed' ||
+       envelope.event.type === 'context.compaction.failed') &&
+      envelope.event.operationId !== attempt.compactOperationId) {
+    throw new Error('Provider Compact observation does not match the frozen operation.');
   }
 }
 
@@ -591,10 +644,36 @@ function validateRootEvidence(attempt: FrozenDeliveryAttempt, raw: unknown): ass
     const threadId = identifier(evidence.threadId, 'threadId');
     const clientId = identifier(evidence.nativeClientMessageId, 'nativeClientMessageId');
     const turnId = optionalIdentifier(evidence.nativeTurnId, 'nativeTurnId');
-    if (attempt.kind !== 'root-turn' || attempt.provider !== 'codex' ||
+    const payload = parseRecordJson(attempt.recoveryPayloadJson, 'delivery recovery payload');
+    const validRoot = attempt.kind === 'root-turn' &&
+      (attempt.nativeTurnId === undefined || turnId === undefined || turnId === attempt.nativeTurnId);
+    const validSteer = attempt.kind === 'steer' && turnId !== undefined &&
+      turnId === payload.expectedNativeTurnId;
+    if ((!validRoot && !validSteer) || attempt.provider !== 'codex' ||
         threadId !== attempt.nativeSessionId || clientId !== attempt.nativeClientMessageId ||
-        (attempt.nativeTurnId !== undefined && turnId !== undefined && turnId !== attempt.nativeTurnId)) {
+        (attempt.kind === 'steer' && turnId === undefined)) {
       throw new Error('Codex history evidence does not match frozen delivery scope.');
+    }
+    return;
+  }
+  if (kind === 'codex-turn-steer-response') {
+    requireExactKeys(evidence, ['kind', 'threadId', 'turnId', 'nativeClientMessageId']);
+    const payload = parseRecordJson(attempt.recoveryPayloadJson, 'delivery recovery payload');
+    if (attempt.kind !== 'steer' || attempt.provider !== 'codex' ||
+        identifier(evidence.threadId, 'threadId') !== attempt.nativeSessionId ||
+        identifier(evidence.nativeClientMessageId, 'nativeClientMessageId') !== attempt.nativeClientMessageId ||
+        identifier(evidence.turnId, 'turnId') !== payload.expectedNativeTurnId) {
+      throw new Error('Codex steer evidence does not match frozen delivery scope.');
+    }
+    return;
+  }
+  if (kind === 'codex-compact-response') {
+    requireExactKeys(evidence, ['kind', 'threadId', 'requestId', 'connectionGeneration']);
+    if (attempt.kind !== 'manual-compact' || attempt.provider !== 'codex' ||
+        identifier(evidence.threadId, 'threadId') !== attempt.nativeSessionId ||
+        !Number.isSafeInteger(evidence.requestId) || Number(evidence.requestId) < 0 ||
+        identifier(evidence.connectionGeneration, 'connectionGeneration') !== attempt.processGeneration) {
+      throw new Error('Codex Compact evidence does not match frozen delivery scope.');
     }
     return;
   }
@@ -609,13 +688,25 @@ function validateRootEvidence(attempt: FrozenDeliveryAttempt, raw: unknown): ass
     }
     return;
   }
+  if (kind === 'claude-manual-compact-boundary') {
+    requireExactKeys(evidence, ['kind', 'sessionId', 'boundaryUuid', 'processGeneration', 'trigger']);
+    if (attempt.kind !== 'manual-compact' || attempt.provider !== 'claude-code' ||
+        identifier(evidence.sessionId, 'sessionId') !== attempt.nativeSessionId ||
+        identifier(evidence.processGeneration, 'processGeneration') !== attempt.processGeneration ||
+        identifier(evidence.boundaryUuid, 'boundaryUuid').length === 0 || evidence.trigger !== 'manual') {
+      throw new Error('Claude Compact evidence does not match frozen delivery scope.');
+    }
+    return;
+  }
   if (kind === 'fixture-correlated-acceptance') {
     requireExactKeys(evidence, ['kind', 'sessionId', 'commandId'], ['nativeTurnId']);
     const sessionId = identifier(evidence.sessionId, 'sessionId');
     const commandId = identifier(evidence.commandId, 'commandId');
     const turnId = optionalIdentifier(evidence.nativeTurnId, 'nativeTurnId');
-    if (attempt.kind !== 'root-turn' || attempt.provider !== 'fixture' ||
-        sessionId !== attempt.nativeSessionId || commandId !== attempt.commandId ||
+    const expectedCommandId = attempt.kind === 'manual-compact'
+      ? attempt.compactOperationId : attempt.commandId;
+    if (attempt.provider !== 'fixture' ||
+        sessionId !== attempt.nativeSessionId || commandId !== expectedCommandId ||
         (attempt.nativeTurnId !== undefined && turnId !== undefined && turnId !== attempt.nativeTurnId)) {
       throw new Error('Fixture acceptance evidence does not match frozen delivery scope.');
     }
@@ -631,6 +722,19 @@ function evidenceCompatible(left: ProviderAcceptanceEvidence, right: ProviderAcc
   if (left.kind === 'fixture-correlated-acceptance' && right.kind === 'fixture-correlated-acceptance') {
     return left.sessionId === right.sessionId && left.commandId === right.commandId &&
       left.nativeTurnId === right.nativeTurnId;
+  }
+  if (left.kind === 'codex-turn-steer-response' && right.kind === 'codex-turn-steer-response') {
+    return left.threadId === right.threadId && left.turnId === right.turnId &&
+      left.nativeClientMessageId === right.nativeClientMessageId;
+  }
+  if (left.kind === 'codex-compact-response' && right.kind === 'codex-compact-response') {
+    return left.threadId === right.threadId && left.requestId === right.requestId &&
+      left.connectionGeneration === right.connectionGeneration;
+  }
+  if (left.kind === 'claude-manual-compact-boundary' &&
+      right.kind === 'claude-manual-compact-boundary') {
+    return left.sessionId === right.sessionId && left.boundaryUuid === right.boundaryUuid &&
+      left.processGeneration === right.processGeneration && left.trigger === right.trigger;
   }
   const codexIdentity = (value: ProviderAcceptanceEvidence) => {
     if (value.kind === 'codex-turn-start-response') return {
@@ -664,7 +768,6 @@ function canonicalJson(value: unknown): string {
 
 function decodeAttempt(row: Record<string, unknown>): FrozenDeliveryAttempt {
   const kind = enumString(row.kind, 'kind', ['root-turn', 'steer', 'manual-compact'] as const);
-  if (kind !== 'root-turn') throw new Error(`Delivery kind ${kind} is not adopted until S2a2.`);
   const provider = enumString(row.provider, 'provider', ['codex', 'claude-code', 'fixture'] as const);
   const state = enumString(row.state, 'state', ['preparing', 'dispatching', 'accepted', 'rejected', 'unknown'] as const);
   const acceptanceEvidence = row.acceptance_evidence_json === null
@@ -695,10 +798,13 @@ function decodeAttempt(row: Record<string, unknown>): FrozenDeliveryAttempt {
     ...(acceptanceEvidence === undefined ? {} : { acceptanceEvidence: acceptanceEvidence as ProviderAcceptanceEvidence }),
     transcriptGap: row.transcript_gap === 1,
   };
-  if ((row.transcript_gap !== 0 && row.transcript_gap !== 1) ||
-      attempt.intendedTurnId === undefined || attempt.clientMessageId === undefined ||
-      attempt.nativeClientMessageId === undefined || attempt.compactOperationId !== undefined) {
-    throw new Error('Durable root delivery attempt has an invalid frozen shape.');
+  const validShape = kind === 'manual-compact'
+    ? attempt.intendedTurnId === undefined && attempt.clientMessageId === undefined &&
+      attempt.compactOperationId !== undefined
+    : attempt.intendedTurnId !== undefined && attempt.clientMessageId !== undefined &&
+      attempt.nativeClientMessageId !== undefined && attempt.compactOperationId === undefined;
+  if ((row.transcript_gap !== 0 && row.transcript_gap !== 1) || !validShape) {
+    throw new Error('Durable delivery attempt has an invalid frozen shape.');
   }
   return attempt;
 }
@@ -716,14 +822,24 @@ function validatePrepareIdentifiers(input: PrepareDeliveryAttempt) {
 
 function validateDecodedRootPayload(attempt: FrozenDeliveryAttempt) {
   const payload = parseRecordJson(attempt.recoveryPayloadJson, 'delivery recovery payload');
+  if (attempt.kind === 'manual-compact') {
+    const allowed = new Set(['operationId', 'nativeInputUuid']);
+    if (!exactKeys(payload, allowed) || payload.operationId !== attempt.compactOperationId ||
+        (payload.nativeInputUuid ?? undefined) !== attempt.nativeClientMessageId) {
+      throw new Error('Durable Compact payload does not match its frozen attempt shape.');
+    }
+    return;
+  }
   const allowed = new Set(['turnId', 'clientMessageId', 'nativeClientMessageId', 'content',
-    'model', 'effort', 'serviceTier', 'access']);
+    'model', 'effort', 'serviceTier', 'access', ...(attempt.kind === 'steer' ? ['expectedNativeTurnId'] : [])]);
   if (!exactKeys(payload, allowed) || payload.turnId !== attempt.intendedTurnId ||
       payload.clientMessageId !== attempt.clientMessageId ||
       payload.nativeClientMessageId !== attempt.nativeClientMessageId ||
       !Array.isArray(payload.content) || typeof payload.model !== 'string' || payload.model.length === 0 ||
       (payload.effort !== undefined && typeof payload.effort !== 'string') ||
       (payload.serviceTier !== undefined && typeof payload.serviceTier !== 'string') ||
+      (attempt.kind === 'steer' && optionalIdentifier(payload.expectedNativeTurnId,
+        'expectedNativeTurnId') === undefined) ||
       !['read-only', 'workspace-write', 'full-access'].includes(String(payload.access))) {
     throw new Error('Durable root recovery payload does not match its frozen attempt shape.');
   }

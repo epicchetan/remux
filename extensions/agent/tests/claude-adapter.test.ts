@@ -680,23 +680,40 @@ test('Claude Agent SDK session preserves the native harness, MCP scope, and sema
     if (lastEvent?.type === 'turn.completed') {
       assert.equal(lastEvent.outcome, 'completed');
     }
-    const compactEvents = collectThroughCompaction(session.events);
-    assert.deepEqual(await session.compact!({
+    const compactCrossings: Array<{ sessionId: string; generation?: string }> = [];
+    const compactAcceptance = session.compact!({
       commandId: 'claude-compact-command',
       conversationId: 'conversation-claude',
       executionId: 'execution-claude',
-    }), { accepted: true, nativeOperationId: 'claude-compact-command' });
+    }, {
+      nativeInputUuid: 'claude-manual-input-proof',
+      boundary: { markPossiblySent(sessionId, generation) {
+        compactCrossings.push({ sessionId, generation });
+      } },
+    });
+    assert.equal(compactCrossings.length, 0, 'queued input has not crossed the SDK boundary');
     const compactMessage = await invocation.prompt[Symbol.asyncIterator]().next();
+    assert.equal(compactCrossings.length, 1, 'the boundary is marked only when SDK input is yielded');
     assert.equal(compactMessage.done, false);
     assert.equal(compactMessage.value?.type, 'user');
     assert.equal(compactMessage.value?.message.content, '/compact');
+    assert.equal(compactMessage.value?.uuid, 'claude-manual-input-proof');
     assert.equal(compactMessage.value?.session_id, undefined);
+    const compactEvents = collectThroughCompaction(session.events);
     invocation.query.emit({
       type: 'system',
       subtype: 'compact_boundary',
+      uuid: 'manual-boundary-proof',
       session_id: session.nativeSession.sessionId,
       compact_metadata: { trigger: 'manual', pre_tokens: 90_000, post_tokens: 12_000 },
     });
+    const compactResult = await compactAcceptance;
+    assert.equal(compactResult.outcome, 'accepted');
+    if (compactResult.outcome === 'accepted') {
+      assert.equal(compactResult.evidence.kind, 'claude-manual-compact-boundary');
+      assert.equal(compactResult.evidence.boundaryUuid, 'manual-boundary-proof');
+      assert.equal(compactResult.evidence.trigger, 'manual');
+    }
     const compact = await compactEvents;
     assert.equal(compact.filter(({ event }) => event.type === 'context.compaction.started').length, 0,
       'the coordinator, not the adapter, authors the durable started boundary');
@@ -745,7 +762,95 @@ test('Claude workspace-write sessions require the native filesystem sandbox', as
   }
 });
 
-test('Claude compact failure settles once, preserves later operations, and fits provider errors', async () => {
+test('Claude Compact timeout and close remain unknown after SDK input delivery', async () => {
+  const openCompactSession = async (query: FakeClaudeQuery, acceptanceTimeoutMs: number) => {
+    let prompt: AsyncIterable<SDKUserMessage> | undefined;
+    const adapter = new ClaudeNativeAdapter({
+      acceptanceTimeoutMs,
+      createQuery: (input) => {
+        prompt = input.prompt as AsyncIterable<SDKUserMessage>;
+        return query as unknown as ClaudeQuery;
+      },
+    });
+    const session = await adapter.openSession({
+      commandId: `open-compact-${acceptanceTimeoutMs}`,
+      providerInstanceId: 'claude-local',
+      conversationId: 'conversation-claude-compact-acceptance',
+      executionId: 'execution-claude-compact-acceptance',
+      mode: 'create',
+      cwd: '/workspace/remux',
+      model: 'claude-sonnet-4-6',
+      access: 'read-only',
+      developerInstructions: [],
+    });
+    assert.ok(prompt);
+    return { session, prompt };
+  };
+  const input = (commandId: string) => ({
+    commandId,
+    conversationId: 'conversation-claude-compact-acceptance',
+    executionId: 'execution-claude-compact-acceptance',
+  });
+
+  const timeoutQuery = new FakeClaudeQuery();
+  const { session: timeoutSession, prompt: timeoutPrompt } = await openCompactSession(timeoutQuery, 5);
+  const timeout = timeoutSession.compact!(input('compact-timeout'), {
+    nativeInputUuid: 'compact-timeout-input',
+    boundary: { markPossiblySent() {} },
+  });
+  await timeoutPrompt[Symbol.asyncIterator]().next();
+  const timeoutResult = await timeout;
+  assert.equal(timeoutResult.outcome, 'unknown');
+  if (timeoutResult.outcome === 'unknown') {
+    assert.equal(timeoutResult.crossing.phase, 'possibly-sent');
+    assert.equal(timeoutResult.error.code, 'claude_compact_acceptance_timeout');
+  }
+  await assert.rejects(() => timeoutSession.compact!(input('compact-after-timeout'), {
+    nativeInputUuid: 'compact-after-timeout-input',
+    boundary: { markPossiblySent() {} },
+  }), /unresolved manual Compact delivery/u);
+  await timeoutSession.close();
+
+  const automaticQuery = new FakeClaudeQuery();
+  const { session: automaticSession, prompt: automaticPrompt } =
+    await openCompactSession(automaticQuery, 1_000);
+  let automaticSettled = false;
+  const automatic = automaticSession.compact!(input('compact-automatic-boundary'), {
+    nativeInputUuid: 'compact-automatic-input',
+    boundary: { markPossiblySent() {} },
+  }).then((result) => {
+    automaticSettled = true;
+    return result;
+  });
+  await automaticPrompt[Symbol.asyncIterator]().next();
+  automaticQuery.emit({
+    type: 'system', subtype: 'compact_boundary', uuid: 'automatic-boundary',
+    session_id: automaticSession.nativeSession.sessionId,
+    compact_metadata: { trigger: 'automatic', pre_tokens: 20_000, post_tokens: 10_000 },
+  });
+  await waitForClaudeEvent(automaticSession, ({ event }) =>
+    event.type === 'context.compaction.completed' && event.trigger === 'automatic');
+  assert.equal(automaticSettled, false, 'an automatic boundary cannot prove manual Compact delivery');
+  await automaticSession.close();
+  assert.equal((await automatic).outcome, 'unknown');
+
+  const closeQuery = new FakeClaudeQuery();
+  const { session: closeSession, prompt: closePrompt } = await openCompactSession(closeQuery, 1_000);
+  const closed = closeSession.compact!(input('compact-close'), {
+    nativeInputUuid: 'compact-close-input',
+    boundary: { markPossiblySent() {} },
+  });
+  await closePrompt[Symbol.asyncIterator]().next();
+  await closeSession.close();
+  const closeResult = await closed;
+  assert.equal(closeResult.outcome, 'unknown');
+  if (closeResult.outcome === 'unknown') {
+    assert.equal(closeResult.crossing.phase, 'possibly-sent');
+    assert.equal(closeResult.error.code, 'claude_session_closed');
+  }
+});
+
+test('Claude compact failure reports once, fits provider errors, and retains unknown ownership', async () => {
   const query = new FakeClaudeQuery();
   const adapter = new ClaudeNativeAdapter({
     acceptanceTimeoutMs: 5,
@@ -767,6 +872,9 @@ test('Claude compact failure settles once, preserves later operations, and fits 
     commandId,
     conversationId: 'conversation-claude-compact-failure',
     executionId: 'execution-claude-compact-failure',
+  }, {
+    nativeInputUuid: `native-input-${commandId}`,
+    boundary: { markPossiblySent() {} },
   });
   const emit = (value: Record<string, unknown>) => query.emit({
     type: 'system',
@@ -898,63 +1006,8 @@ test('Claude compact failure settles once, preserves later operations, and fits 
     assert.match(firstFailure.event.error.message, /error truncated/u);
     assert.equal(firstFailure.event.error.code, 'claude_compaction_failed');
     assert.equal(firstFailure.event.error.retryable, true);
-    await compact('compact-failure-fallback');
-    emit({
-      subtype: 'status',
-      status: null,
-      uuid: 'compact-root-failure',
-      compact_result: 'failed',
-      compact_error: 'replayed old error',
-    });
-    emit({ subtype: 'init', uuid: 'after-duplicate-failure' });
-    await waitForClaudeEvent(session, ({ native }) => native.messageId === 'after-duplicate-failure');
-    let failures = (await session.snapshot({ commandId: 'after-duplicate-snapshot' })).events
-      .filter(({ event }) => event.type === 'context.compaction.failed');
-    assert.equal(failures.filter(({ event }) => event.type === 'context.compaction.failed' &&
-      event.trigger === 'manual').length, 1,
-    'a replayed status UUID cannot settle a later operation');
-
-    emit({
-      subtype: 'status',
-      status: null,
-      uuid: 'compact-root-fallback',
-      compact_result: 'failed',
-    });
-    const fallback = await waitForClaudeEvent(session, ({ event }) =>
-      event.type === 'context.compaction.failed' && event.operationId === 'compact-failure-fallback');
-    assert.ok(fallback.event.type === 'context.compaction.failed');
-    assert.equal(fallback.event.error.message, 'Claude Code reported that context compaction failed.');
-
-    await compact('compact-missing-uuid-repeat-one');
-    emit({
-      subtype: 'status',
-      status: null,
-      compact_result: 'failed',
-      compact_error: 'Repeated malformed status.',
-    });
-    await waitForClaudeEvent(session, ({ event }) =>
-      event.type === 'context.compaction.failed' && event.operationId === 'compact-missing-uuid-repeat-one');
-    await compact('compact-missing-uuid-repeat-two');
-    emit({
-      subtype: 'status',
-      status: null,
-      compact_result: 'failed',
-      compact_error: 'Repeated malformed status.',
-    });
-    await waitForClaudeEvent(session, ({ event }) =>
-      event.type === 'context.compaction.failed' && event.operationId === 'compact-missing-uuid-repeat-two');
-
-    await compact('compact-after-failures');
-    emit({
-      subtype: 'compact_boundary',
-      uuid: 'compact-success',
-      compact_metadata: { trigger: 'manual', pre_tokens: 80_000, post_tokens: 10_000 },
-    });
-    const success = await waitForClaudeEvent(session, ({ event }) =>
-      event.type === 'context.compaction.completed' && event.operationId === 'compact-after-failures');
-    assert.ok(success.event.type === 'context.compaction.completed');
-    assert.equal(success.event.beforeTokens, 80_000);
-    assert.equal(success.event.afterTokens, 10_000);
+    await assert.rejects(() => compact('compact-after-unknown-failure'),
+      /unresolved manual Compact delivery/u);
 
   } finally {
     await session.close();
@@ -2150,7 +2203,9 @@ async function collectThroughCompaction(events: AsyncIterable<ProviderEventEnvel
   const collected: ProviderEventEnvelope[] = [];
   for await (const event of events) {
     collected.push(event);
-    if (event.event.type === 'context.compaction.completed') return collected;
+    if (event.event.type === 'context.compaction.completed' && event.event.trigger === 'manual') {
+      return collected;
+    }
   }
   throw new Error('Claude event stream ended before compact completion.');
 }
