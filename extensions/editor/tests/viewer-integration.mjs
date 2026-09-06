@@ -186,6 +186,10 @@ try {
     'phone Markdown must not overflow the body');
   await mkdir('/tmp/remux-html-preview', { recursive: true });
   await markdown.screenshot({ fullPage: true, path: '/tmp/remux-html-preview/unified-markdown-phone.png' });
+  const footnoteLink = markdown.locator('a[href="#user-content-fn-proof"]');
+  await footnoteLink.click();
+  assert.equal(await markdown.evaluate(() => Boolean(document.getElementById(decodeURIComponent(location.hash.slice(1))))), true,
+    'footnote navigation must resolve the sanitized destination ID');
   const leftLabels = await markdown.locator('.remux-extension-action-group').first().getByRole('button').evaluateAll(buttons => buttons.map(button => button.getAttribute('aria-label')));
   assert.deepEqual(leftLabels.slice(0, 4), ['Open tabs', 'Reload file', 'Show source', 'Copy file contents']);
   const markdownEye = markdown.getByRole('button', { name: 'Show source' });

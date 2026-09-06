@@ -347,3 +347,14 @@ host without React Native. Building the full future Remux web app is out of scop
   yet established. Narrate remains in the live catalog until that migration
   update is running, per V4a/V4b ordering. No native-device isolation result is
   claimed by the browser tests.
+- Final Markdown review preserves sanitized explicit heading IDs and resolves
+  sanitizer-prefixed footnote targets. Actual footnote navigation regression
+  passes with the integrated browser suite; Editor production build refreshed.
+- V4b validated again against committed `f2c4836` with an isolated clean npm
+  install. Root/linked/app typechecks, Agent style-parity/UI-boundary 8/8 and
+  app migration checks passed. No retirement integration blockers found.
+  Supplementary regenerated-lock patch:
+  `/tmp/remux-html-preview/narrate-retirement-locks.patch`, SHA256
+  `e0d0a82435445a0b97ccfb9d1760c8e61fc2893fbcef9b2bd59882b4e153b3b5`.
+  Both patches apply cleanly to main; apply both after client-update confirmation,
+  run the integrated checks, commit/push and redeploy the retired catalog.

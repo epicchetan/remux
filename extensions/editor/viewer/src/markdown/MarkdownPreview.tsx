@@ -83,13 +83,16 @@ function MarkdownHeading({ children, counts, level, ...props }: ComponentPropsWi
   counts: Map<string, number>;
   level: 1 | 2 | 3 | 4 | 5 | 6;
 }) {
-  return createElement(`h${level}`, { ...props, id: uniqueSlug(nodeText(children), counts) }, children);
+  return createElement(`h${level}`, { ...props, id: props.id ?? uniqueSlug(nodeText(children), counts) }, children);
 }
 
 function handleLink(event: MouseEvent<HTMLAnchorElement>, href: string | undefined, filePath: string) {
   if (!href) return;
   if (href.startsWith('#')) {
-    const target = document.getElementById(decodeFragment(href.slice(1)));
+    const fragment = decodeFragment(href.slice(1));
+    // Sanitization prefixes IDs to prevent DOM clobbering; generated footnote
+    // links retain their original fragment and need the same safe lookup.
+    const target = document.getElementById(fragment) ?? document.getElementById(`user-content-${fragment}`);
     if (!target) return;
     event.preventDefault();
     target.scrollIntoView({ behavior: 'smooth', block: 'start' });
