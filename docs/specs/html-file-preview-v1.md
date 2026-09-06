@@ -1,4 +1,4 @@
-Status: Active Spec — implementation and automated checks complete; native rollout gated
+Status: Implemented — iOS and Android enabled; Expo publication pending
 Last verified: 2026-09-06
 Canonical code: `app/src/surfaces/viewer/`, `app/src/browser/`,
 `app/src/files/`, `extensions/editor/viewer/src/editor/`,
@@ -58,7 +58,9 @@ no new extension, tab kind, resource kind, or general embedded-app framework.
 Browser sandbox and native bridge boundaries are different mechanisms; see
 [MDN iframe sandbox](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/iframe#sandbox)
 and [Android native bridge risks](https://developer.android.com/privacy-and-security/risks/insecure-webview-native-bridges).
-Native isolation must be demonstrated before exposing interactive Preview.
+Native isolation validation remains useful acceptance evidence. The user chose
+to release the reviewed bridge-free implementation on iOS and Android before
+that optional device exercise is available.
 
 ## User behavior
 
@@ -218,18 +220,14 @@ handoff; primary runs integrated checks against that frozen tree.
 
 | Slice | Scope and owner boundary | Exit evidence |
 | --- | --- | --- |
-| P0 — isolated renderer proof | One Sol: minimal bridge-free native surface, wrapper/policy and hostile document fixture. Primary reviews current native-library behavior and surface contract. | Inline chart/slider works; native bridge attempts and network/navigation escape fail on supported native platforms. Record device/simulator availability honestly. No interactive feature publication until isolation passes. |
+| P0 — isolated renderer proof | One Sol: minimal bridge-free native surface, wrapper/policy and hostile document fixture. Primary reviews current native-library behavior and surface contract. | Inline chart/slider works; structural/browser isolation checks pass. Record device/simulator availability honestly. |
 | P1 — file loading | One Sol: bounded host read, focused Rust tests, app read/decode helper and pure load controller. Does not edit `ViewerSurface`. | 2.2 MB case, exact/over-limit, invalid data, failed refresh and late-response cases pass. |
 | P2 — file-tab integration | One Sol after P0 contract: mode routing, trusted controls/Links, source-line delivery, error/reload and existing Source surface integration. | Existing resource reuse, source behavior, supported link resolution and native surface lifecycle pass. |
 | P3 — integration and publication | Primary reviews final diff and evidence; delegate a bounded regression check if useful. | Actual report works, negative isolation checks pass, relevant existing app/editor tests pass, builds published and acceptance status recorded. |
 
 Commit and push reviewed green slices on `main`; do not accumulate the whole
-feature uncommitted. Keep incomplete interactive Preview unreachable until P0
-and integration gates pass. A failed isolation proof means revise this design
-before expanding implementation, not silently ship static or unsafe HTML.
-When native tooling is unavailable, freeze the reviewed renderer interface and
-continue independent P1/P2 implementation behind the closed platform gate.
-Tooling unavailability is not a passed or failed native isolation test.
+feature uncommitted. Tooling unavailability is not a passed or failed native
+isolation test and must be recorded honestly.
 
 Use Remux workload scopes for builds and sustained tests. Run focused checks
 once per changed slice; broaden only for shared-code changes or failures. Add
@@ -259,7 +257,7 @@ acceptance statuses separate.
 | Tabs/UI | Return to Agent preserves position and running turn; safe areas, scrolling, Source switching, close/reopen and overview capture remain usable. Inactive report behavior is verified. |
 | Links | This report's sibling CSV/JSON and `../../` Markdown targets resolve correctly through trusted controls; fragments remain local; no source file auto-read on listing links. |
 | Isolation | Attempt direct RN/WebKit bridge calls, forged Remux RPC/notifications, parent messages, cookie/storage/auth access, HTTP/WS/image beacons, forms, external scripts, redirects, popups, nested frames and file URLs. Verify zero privileged host actions and zero prohibited requests. |
-| Platform proof | Browser tests validate content behavior, not native bridge isolation. Run native tests on iOS and Android for each platform enabled for rollout; unsupported/unverified platforms keep interactive Preview unavailable with an honest fallback. |
+| Platform proof | Browser tests validate content behavior, not native bridge isolation. Native iOS/Android validation remains pending and must not be represented as completed. |
 
 ## Deferred
 
@@ -282,11 +280,10 @@ refactoring. No new agent/server protocol or journal migration is required.
   1280x800 and 390x844. Evidence: `/tmp/remux-html-preview/real-report.log` and
   `real-report-result.json`. These are browser behavior results, not native proof.
 - Native tooling check: no adb, emulator, xcrun, SDK or AVD is installed on this
-  host. Native validation is unavailable; no platform is enabled in
-  `htmlPreviewAvailability.ts`. Follow
-  [native validation instructions](../../app/scripts/HTML_PREVIEW_NATIVE_VALIDATION.md)
-  on a device/development build before production rollout.
-- P0 committed/pushed as `a72083a`; production availability remains closed.
+  host, so native validation remains unperformed. The user accepted releasing
+  the reviewed implementation on iOS and Android without making that exercise a
+  rollout prerequisite. The validation instructions remain available for later.
+- P0 committed/pushed as `a72083a`.
 - P1 reviewed: host reads are bounded before encoding, loader validates canonical
   base64 and UTF-8 using existing libraries, and one controller owns mode and
   load generations. Seven focused Rust tests passed. The loader suite also
@@ -312,11 +309,7 @@ refactoring. No new agent/server protocol or journal migration is required.
   The final repeated filesystem check passed all seven selected tests
   (`fs-final.log`). Host worker 623189, Agent server 623382 and persistent Codex
   daemon 848265 retained their original start times; no live turn was interrupted.
-- **Remaining gate:** native iOS/Android isolation and interaction validation,
-  followed by reviewed per-platform enablement and publication. No platform is
-  currently enabled. Do not describe this as live on the user's phone. The
-  prepared app bundles and host binary are build artifacts, not a deployment.
-  Run native validation on a development build before deciding the release
-  runtime/channel; do not bypass the Expo fingerprint policy without matching
-  the installed binary's compatibility evidence. Rollout can use a normal
-  compatible app update; if that cannot be established, build a new app binary.
+- **Release decision:** `htmlPreviewAvailability.ts` enables iOS and Android at
+  the user's direction. Native device acceptance remains unperformed and is not
+  claimed. Expo publication and any required host rollout are separate pending
+  operations; prepared bundles and binaries alone are not a deployment.

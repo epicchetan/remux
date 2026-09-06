@@ -5,6 +5,11 @@ import {
   htmlPreviewModeForTarget,
   htmlPreviewPath,
 } from '../src/surfaces/html-preview/htmlPreviewControllerHook.ts';
+import { htmlPreviewAvailability } from '../src/surfaces/html-preview/htmlPreviewAvailability.ts';
+
+assert.deepEqual(htmlPreviewAvailability('ios'), { enabled: true, reason: null });
+assert.deepEqual(htmlPreviewAvailability('android'), { enabled: true, reason: null });
+assert.equal(htmlPreviewAvailability('web').enabled, false);
 
 const htmlTab = {
   extensionId: 'editor',

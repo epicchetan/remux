@@ -1,10 +1,9 @@
 # HTML preview native isolation validation
 
-This is a physical-device/simulator gate. The browser test in
-`test-html-preview.mjs` does not satisfy it. Run these checks on every iOS and
-Android platform enabled for rollout, after the normal P2 file-tab route renders
-`HtmlPreviewRenderer`. Do not add an `onMessage` handler or a privileged test
-bridge to collect results.
+This is an optional physical-device/simulator acceptance exercise. The browser
+test in `test-html-preview.mjs` does not satisfy it. iOS and Android are enabled
+by the user's release decision while this evidence remains unperformed. Do not
+add an `onMessage` handler or a privileged test bridge to collect results.
 
 ## Prepare the document
 
@@ -23,13 +22,10 @@ that imports the fixture as a string is insufficient because it bypasses that
 path. Record the app build/update ID, OS version, device or simulator model, and
 WebView version with the result.
 
-The checked-in availability gate is closed. In a disposable validation checkout,
-add only the platform under test to `verifiedPlatforms` in
-`htmlPreviewAvailability.ts`, then build the development app. This temporary
-change is for the proof run, not a production enablement; do not publish it to
-the production channel or commit it as accepted evidence before the checks pass.
-After validation, remove the temporary change. A reviewed enablement commit must
-record the actual device results before adding a platform to the release gate.
+The checked-in availability policy enables iOS and Android. Build the normal
+development app for the platform under test; no temporary availability edit is
+needed. Record results as acceptance evidence without rewriting the earlier
+release decision as prior native verification.
 
 ## Observe prohibited traffic
 
@@ -92,7 +88,6 @@ Repeat at phone and desktop-sized viewport widths. Then terminate the WebView
 content/render process using the platform debugger and confirm the app-owned
 recoverable failure appears without an automatic reload loop.
 
-Record each platform separately as pass, fail, or unavailable. Interactive
-Preview must stay unavailable on a platform until that platform passes. Keep the
-browser-policy result and source inspection as supporting evidence rather than
-labeling them native isolation proof.
+Record each platform separately as pass, fail, or unavailable. Keep the browser
+policy result and source inspection as supporting evidence rather than labeling
+them native isolation proof. A failure should be triaged as a release defect.

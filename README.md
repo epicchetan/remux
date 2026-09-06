@@ -8,6 +8,9 @@ control plane responsive under heavy extension workloads.
 Codex is the most complete extension today. Terminal, Markdown, and Editor
 exercise the same manifest, viewer, and optional stdio-server model.
 
+Editor file tabs support interactive previews for self-contained HTML reports
+up to 5 MiB on iOS and Android, with Source and trusted companion-file controls.
+
 ## Architecture
 
 ```mermaid

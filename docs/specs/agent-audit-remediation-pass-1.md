@@ -22,8 +22,8 @@ app-owned, bridge-free browser surface; it does not change Agent transcript
 rendering or provider lifecycle. The spec records implementation slices,
 native-platform isolation gates, commit/build cadence and deployment needs.
 The feature implementation and automated checks are complete, including native
-app exports and a host release build. Native-device isolation remains the
-per-platform rollout gate; it has not been published. The HTML spec records
+app exports and a host release build. The user elected to enable the native
+platforms and proceed with Expo publication before device acceptance. The HTML spec records
 commit and validation evidence. The remaining audit slices below keep their
 current status and scope; this feature is not an audit completion claim.
 
