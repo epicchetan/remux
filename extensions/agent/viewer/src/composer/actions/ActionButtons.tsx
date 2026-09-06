@@ -53,7 +53,7 @@ export function ComposerActionButtons({
   onSend: (
     input: TurnSubmissionInput,
     setPhase: (phase: 'sending' | 'updating-transcript') => void,
-  ) => Promise<void>;
+  ) => Promise<void | 'preserve-draft'>;
   onProviderLogin: (providerInstanceId: string, mode: 'device-code' | 'browser') => void;
   onProviderLogout: (providerInstanceId: string) => void;
   onPreferenceChange: (input: {

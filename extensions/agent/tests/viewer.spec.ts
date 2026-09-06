@@ -90,7 +90,7 @@ test('keeps one conversation operation identity across a draft reload', async ({
 
   await messageBox(page).fill('Unsaved text survives this reload');
   await page.reload();
-  await expect.poll(() => messageBox(page).evaluate((element) => (element as HTMLElement).innerText))
+  await expect.poll(() => messageBox(page).evaluate((element) => (element as HTMLElement).innerText.trim()))
     .toBe('Unsaved text survives this reload');
   await messageBox(page).fill('Send the reloaded draft');
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
@@ -99,6 +99,113 @@ test('keeps one conversation operation identity across a draft reload', async ({
   await expect.poll(() => lastConversationOperationId(page)).toBe(beforeReload);
   await expect.poll(() => page.evaluate(() =>
     window.sessionStorage.getItem('remux.agent.draft-operation.v1'))).toBeNull();
+});
+
+test('recovers an accepted legacy draft without sending mutable text', async ({ page }) => {
+  await messageBox(page).fill('Keep this legacy draft for review');
+  const operationId = await page.evaluate(() =>
+    window.sessionStorage.getItem('remux.agent.draft-operation.v1'));
+  expect(operationId).toMatch(UUID_V4);
+  await page.evaluate((id) => (window as any).__agentFixture.acceptLegacyDraft(id), operationId);
+  await page.reload();
+
+  await expect.poll(() => page.url()).toContain(FIXTURE_CONVERSATION_ID);
+  await expect.poll(() => messageBox(page).evaluate((element) => (element as HTMLElement).innerText))
+    .toBe('Keep this legacy draft for review');
+  await expect.poll(() => commandCount(page, 'remux/agent/conversation/message/send')).toBe(0);
+});
+
+test('resumes the frozen first message after a lost create acknowledgement', async ({ page }) => {
+  await messageBox(page).fill('Recover this exact first message');
+  await page.evaluate(() => (window as any).__agentFixture.loseNextCreateAcknowledgement());
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Retry', exact: true })).toBeVisible();
+
+  await page.reload();
+  await expect(page.getByText('The fixture stream completed.')).toBeVisible();
+  await expect(transcript(page).getByText('Recover this exact first message', { exact: true })).toHaveCount(1);
+  await expect.poll(() => commandCount(page, 'remux/agent/conversation/message/send')).toBe(1);
+});
+
+test('keeps later edits while recovering the frozen first message', async ({ page }) => {
+  await messageBox(page).fill('Submit the frozen version');
+  await page.evaluate(() => (window as any).__agentFixture.delayNextCreateAcknowledgement());
+  await page.evaluate(() => (window as any).__agentFixture.loseNextCreateAcknowledgement());
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await messageBox(page).fill('Keep this newer edit');
+  await page.waitForTimeout(800);
+  await page.reload();
+  await expect(transcript(page).getByText('Submit the frozen version', { exact: true })).toHaveCount(1);
+  await expect.poll(() => messageBox(page).evaluate((element) => (element as HTMLElement).innerText))
+    .toBe('Keep this newer edit');
+});
+
+test('does not duplicate a text or image after the send acknowledgement is lost', async ({ page }) => {
+  await messageBox(page).fill('One accepted message with an image');
+  await page.getByRole('button', { name: 'Attach', exact: true }).click();
+  await page.getByText('Photo Library', { exact: true }).click();
+  await expect(page.locator('.remux-composer-attachment-card').getByText('picked.png')).toBeVisible();
+  await page.evaluate(() => (window as any).__agentFixture.loseNextMessageAcknowledgement());
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Retry', exact: true })).toBeVisible();
+  await expect.poll(() => commandCount(page, 'remux/agent/artifact/put')).toBe(1);
+
+  await page.reload();
+  await expect(transcript(page).getByText('One accepted message with an image', { exact: true })).toHaveCount(1);
+  await expect.poll(() => page.evaluate(() => {
+    const receipts = JSON.parse(sessionStorage.getItem('remux.agent.fixture.command-receipts') ?? '[]');
+    return receipts.filter(([, value]: [string, any]) => value.kind === 'turn.send').length;
+  })).toBe(1);
+  await expect.poll(() => page.evaluate(() => {
+    const messages = JSON.parse(sessionStorage.getItem('remux.agent.fixture.accepted-messages') ?? '[]');
+    return messages.filter((entry: any) => entry.text === 'One accepted message with an image').length;
+  })).toBe(1);
+  await expect.poll(() => commandCount(page, 'remux/agent/artifact/put')).toBe(0);
+  await expect.poll(() => messageBox(page).evaluate((element) => (element as HTMLElement).innerText.trim()))
+    .toBe('');
+  await expect.poll(() => page.evaluate(() => Object.keys(sessionStorage)
+    .filter((key) => key.startsWith('remux.agent.new-chat-submission.v1:')).length)).toBe(0);
+});
+
+test('does not send the first message after navigation until its owner is selected again', async ({ page, isMobile }) => {
+  await messageBox(page).fill('Resume only when I return');
+  await page.evaluate(() => {
+    (window as any).__agentFixture.delayNextCreateAcknowledgement();
+    (window as any).__agentFixture.loseNextCreateAcknowledgement();
+  });
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  let history = await openHistory(page, isMobile);
+  await history.getByRole('button', { name: 'Start new chat', exact: true }).click();
+  await page.waitForTimeout(900);
+  await page.evaluate(() => (window as any).__agentFixture.releaseCommandReads());
+  await expect.poll(() => commandCount(page, 'remux/agent/conversation/message/send')).toBe(0);
+
+  history = await openHistory(page, isMobile);
+  await history.getByRole('button', { name: /Resume only when I return/u }).click();
+  await expect.poll(() => page.evaluate(() => {
+    const messages = JSON.parse(sessionStorage.getItem('remux.agent.fixture.accepted-messages') ?? '[]');
+    return messages.filter((entry: any) => entry.text === 'Resume only when I return').length;
+  })).toBe(1);
+});
+
+test('coalesces concurrent recovery retries into one first-message command', async ({ page }) => {
+  await messageBox(page).fill('Retry this owner once');
+  await page.evaluate(() => {
+    (window as any).__agentFixture.delayNextCreateAcknowledgement();
+    (window as any).__agentFixture.loseNextCreateAcknowledgement();
+  });
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Retry', exact: true })).toBeVisible();
+  await page.evaluate(() => {
+    (window as any).__agentFixture.releaseCommandReads();
+    const retry = Array.from(document.querySelectorAll('button')).find((button) => button.textContent === 'Retry');
+    retry?.click();
+    retry?.click();
+  });
+  await expect.poll(() => page.evaluate(() => {
+    const receipts = JSON.parse(sessionStorage.getItem('remux.agent.fixture.command-receipts') ?? '[]');
+    return receipts.filter(([, value]: [string, any]) => value.kind === 'turn.send').length;
+  })).toBe(1);
 });
 
 test('interrupts an active turn through the server command', async ({ page }) => {

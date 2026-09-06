@@ -144,13 +144,37 @@ export async function installAgentHost(page: Page) {
     const executionScopes = new Map<string, any>();
     const lifecycleByConversation = new Map<string, any>();
     const requestLog: Array<{ method: string; summary: string }> = [];
+    const commandReceipts = new Map<string, any>(JSON.parse(
+      window.sessionStorage.getItem('remux.agent.fixture.command-receipts') ?? '[]',
+    ));
+    const saveCommandReceipts = () => window.sessionStorage.setItem(
+      'remux.agent.fixture.command-receipts', JSON.stringify(Array.from(commandReceipts)),
+    );
+    if (Array.from(commandReceipts.values()).some((receipt) =>
+      receipt.kind === 'conversation.create' && receipt.state === 'accepted')) {
+      resources.set(conversationKey, {
+        revision: 1,
+        value: conversationSummary('/tmp/remux-fixture', 'idle'),
+      });
+      resources.set('runtime', { revision: 2, value: runtimeValue('idle') });
+    }
+    const recoveredMessages = JSON.parse(
+      window.sessionStorage.getItem('remux.agent.fixture.accepted-messages') ?? '[]',
+    ) as Array<{ commandId: string; turnId: string; text: string }>;
+    for (const recovered of recoveredMessages) {
+      turns.push(completedTurn(recovered.turnId, recovered.text, 'The fixture stream completed.'));
+    }
     let sequence = 1;
-    let turnCounter = 0;
+    let turnCounter = recoveredMessages.length;
     let lifecycleEpoch = 1;
     let invalidationsDropped = false;
     let nextTranscriptDelayMs = 0;
     let transcriptFailuresRemaining = 0;
     let nextMessageError: string | null = null;
+    let loseNextCreateResponse = false;
+    let loseNextMessageResponse = false;
+    let holdCommandReadsUntilReload = false;
+    let nextCreateResponseDelayMs = 0;
     let viewportMetrics = {
       keyboardHeight: 0,
       keyboardVisible: false,
@@ -1878,6 +1902,12 @@ export async function installAgentHost(page: Page) {
         if (resourceReadFailure) throw new Error('Fixture Agent runtime is unavailable.');
         return nativeResourceResult(params);
       }
+      if (request.method === 'remux/agent/command/read') {
+        if (holdCommandReadsUntilReload) {
+          return { commandId: params.commandId, kind: params.kind, state: 'dispatching' };
+        }
+        return commandReceipts.get(String(params.commandId)) ?? { state: 'missing' };
+      }
       if (request.method === 'remux/agent/transcript/resources/read') {
         if (params.historySync === 'force') {
           historyState = 'ready';
@@ -1956,7 +1986,18 @@ export async function installAgentHost(page: Page) {
         invalidateResource(conversationKey, 'created');
         syncConversationList();
         invalidateResource('runtime');
-        return { accepted: true, commandId: params.commandId, conversationId };
+        const result = { accepted: true, commandId: params.commandId, conversationId };
+        commandReceipts.set(String(params.commandId), {
+          commandId: params.commandId, kind: 'conversation.create', state: 'accepted',
+          result: { accepted: true, conversationId },
+        });
+        saveCommandReceipts();
+        if (loseNextCreateResponse) {
+          loseNextCreateResponse = false;
+          holdCommandReadsUntilReload = true;
+          throw new Error('Fixture connection closed after accepting conversation creation.');
+        }
+        return result;
       }
       if (request.method === 'remux/agent/composer/provider-preference/set') {
         nativeModelId = String(params.model);
@@ -2065,12 +2106,32 @@ export async function installAgentHost(page: Page) {
           reasoning: String(conversation?.reasoning ?? 'high'),
           text,
         });
-        return {
+        const result = {
           accepted: true,
           commandId: params.commandId,
           delivery: 'sent',
           turnId: turn.id,
         };
+        commandReceipts.set(String(params.commandId), {
+          commandId: params.commandId, kind: 'turn.send', state: 'accepted',
+          result,
+        });
+        const acceptedMessages = JSON.parse(
+          window.sessionStorage.getItem('remux.agent.fixture.accepted-messages') ?? '[]',
+        ) as Array<{ commandId: string; turnId: string; text: string }>;
+        if (!acceptedMessages.some((entry) => entry.commandId === String(params.commandId))) {
+          acceptedMessages.push({ commandId: String(params.commandId), turnId: turn.id, text });
+          window.sessionStorage.setItem(
+            'remux.agent.fixture.accepted-messages', JSON.stringify(acceptedMessages),
+          );
+        }
+        saveCommandReceipts();
+        if (loseNextMessageResponse) {
+          loseNextMessageResponse = false;
+          holdCommandReadsUntilReload = true;
+          throw new Error('Fixture connection closed after accepting the first message.');
+        }
+        return result;
       }
       if (request.method === 'remux/agent/conversation/message/queue/remove') {
         const index = pendingQueue.findIndex((entry) => entry.operationId === params.turnId);
@@ -2410,6 +2471,20 @@ export async function installAgentHost(page: Page) {
           }
           if (request.id !== undefined && request.method) {
             try {
+              if (request.method === 'remux/agent/conversation/create' && nextCreateResponseDelayMs > 0) {
+                const delay = nextCreateResponseDelayMs;
+                nextCreateResponseDelayMs = 0;
+                const lose = loseNextCreateResponse;
+                loseNextCreateResponse = false;
+                const result = resultFor(request);
+                if (lose) holdCommandReadsUntilReload = true;
+                setTimeout(() => dispatch(lose
+                  ? { type: 'remux/error', id: request.id, error: { code: -32019,
+                      data: { kind: 'active_runtime_busy' },
+                      message: 'Fixture connection closed after accepting conversation creation.' } }
+                  : { type: 'remux/response', id: request.id, result }), delay);
+                return;
+              }
               if (delayModels && !modelsDelayed && request.method === 'remux/agent/resources/read'
                   && request.params?.requests?.some((entry: any) => String(entry.key).startsWith('agent/models:'))) {
                 modelsDelayed = true;
@@ -2613,6 +2688,31 @@ export async function installAgentHost(page: Page) {
         },
         rejectNextMessage(message = 'Another conversation has an active turn.') {
           nextMessageError = message;
+        },
+        loseNextCreateAcknowledgement() {
+          loseNextCreateResponse = true;
+        },
+        delayNextCreateAcknowledgement(delayMs = 750) {
+          nextCreateResponseDelayMs = Number(delayMs);
+        },
+        loseNextMessageAcknowledgement() {
+          loseNextMessageResponse = true;
+        },
+        releaseCommandReads() {
+          holdCommandReadsUntilReload = false;
+        },
+        acceptLegacyDraft(operationId: string) {
+          resources.set(conversationKey, {
+            revision: 1,
+            value: conversationSummary('/tmp/remux-fixture', 'idle'),
+          });
+          resources.set('runtime', { revision: 2, value: runtimeValue('idle') });
+          syncConversationList();
+          commandReceipts.set(operationId, {
+            commandId: operationId, kind: 'conversation.create', state: 'accepted',
+            result: { accepted: true, conversationId },
+          });
+          saveCommandReceipts();
         },
         connection: dispatchStatus,
         lifecycle: dispatchLifecycle,

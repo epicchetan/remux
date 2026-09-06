@@ -6,10 +6,18 @@ import { useComposerStore } from '../store.ts';
 export function ComposerStatusMessageRow({
   history,
   onRetryHistory,
+  onRetrySubmission,
+  pendingRecoveryError,
+  hasPendingSubmission,
+  isRecoveringSubmission,
   runtimeError,
 }: {
   history: NativeConversationSummary['history'] | null;
   onRetryHistory: () => Promise<void>;
+  onRetrySubmission: () => Promise<void>;
+  pendingRecoveryError: string | null;
+  hasPendingSubmission: boolean;
+  isRecoveringSubmission: boolean;
   runtimeError: string | null;
 }) {
   const submission = useComposerStore((state) => state.submission);
@@ -17,13 +25,16 @@ export function ComposerStatusMessageRow({
   const [retrying, setRetrying] = useState(false);
   const historyLoading = history?.state === 'indexed' || history?.state === 'loading' || retrying;
   const historyFailed = history?.state === 'failed';
-  const message = submission
+  const message = isRecoveringSubmission ? 'Checking pending message' : submission
     ? submissionLabel(submission.phase)
     : submissionError
+      ?? pendingRecoveryError
+      ?? (hasPendingSubmission ? 'First message pending. Retry to check its status.' : null)
       ?? (historyLoading ? 'Syncing conversation history' : null)
       ?? (historyFailed ? `Conversation history couldn’t sync${history.error ? `: ${history.error}` : '.'}` : null)
       ?? runtimeError;
-  const actionable = !submission && !submissionError && historyFailed && !retrying;
+  const actionableRecovery = hasPendingSubmission && !isRecoveringSubmission && !submission && !retrying;
+  const actionable = actionableRecovery || (!submission && !submissionError && historyFailed && !retrying);
 
   if (!message) return null;
   return (
@@ -31,8 +42,8 @@ export function ComposerStatusMessageRow({
       className="remux-composer-message-status-row"
       data-actionable={actionable ? 'true' : undefined}
       data-remux-no-composer-focus
-      data-tone={submission || historyLoading ? 'muted' : 'error'}
-      role={submission || historyLoading ? undefined : 'alert'}
+      data-tone={submission || isRecoveringSubmission || historyLoading ? 'muted' : 'error'}
+      role={submission || isRecoveringSubmission || historyLoading ? undefined : 'alert'}
     >
       <span className="remux-composer-message-status-text">{message.trim() || 'Agent turn failed'}</span>
       {actionable ? (
@@ -41,7 +52,7 @@ export function ComposerStatusMessageRow({
           data-remux-no-composer-focus
           onClick={() => {
             setRetrying(true);
-            void onRetryHistory()
+            void (actionableRecovery ? onRetrySubmission() : onRetryHistory())
               .catch(() => undefined)
               .finally(() => setRetrying(false));
           }}

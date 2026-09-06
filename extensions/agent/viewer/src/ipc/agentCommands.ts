@@ -58,6 +58,12 @@ export const agentCommands = {
     }
     return resource.value as AgentRuntimeResource;
   },
+  readCommand(commandId: string, kind: 'conversation.create' | 'turn.send') {
+    return rpc.query<import('../../../shared/native-agent-protocol.ts').NativeCommandReadResult>(
+      NATIVE_AGENT_METHODS.commandRead,
+      { commandId, kind },
+    );
+  },
   interrupt(conversationId: string, turnId: string) {
     return rpc.command(NATIVE_AGENT_METHODS.turnInterrupt, {
       commandId: createViewerUuid(),

@@ -37,7 +37,7 @@ export function useComposerTurnAction({
   onSend: (
     input: TurnSubmissionInput,
     setPhase: (phase: 'sending' | 'updating-transcript') => void,
-  ) => Promise<void>;
+  ) => Promise<void | 'preserve-draft'>;
   runtime: AgentRuntimeResource | null;
   imagesEnabled: boolean;
   fileReferencesEnabled: boolean;
@@ -98,8 +98,9 @@ export function useComposerTurnAction({
         ? onFork(forkTarget, input, setPhase)
         : onSend(input, setPhase);
     void request
-      .then(() => {
-        if (useComposerStore.getState().snapshot.contentKey === next.snapshot.contentKey) {
+      .then((result) => {
+        if (useComposerStore.getState().submission?.id !== next.id) return;
+        if (result !== 'preserve-draft' && useComposerStore.getState().snapshot.contentKey === next.snapshot.contentKey) {
           clearComposer();
         }
         clearMode();

@@ -1,4 +1,4 @@
-import { useCallback, type Dispatch, type MutableRefObject, type SetStateAction } from 'react';
+import { useCallback, useEffect, useRef, useState, type Dispatch, type MutableRefObject, type SetStateAction } from 'react';
 
 import {
   type ConversationValue,
@@ -9,6 +9,7 @@ import type { ComposerEditTarget, ComposerForkTarget } from '../composer/store.t
 import {
   clearConversationDraftContent,
   persistConversationDraft,
+  loadConversationDraft,
   removeNewChatDraft,
   type AgentNewChatDraft,
 } from '../conversation/drafts.ts';
@@ -21,6 +22,12 @@ import {
 import { agentCommands } from '../ipc/agentCommands.ts';
 import { useComposerStore } from '../composer/store.ts';
 import { resolveModel } from '../composer/config/modelSelection.ts';
+import {
+  clearPendingNewChatSubmission,
+  findPendingNewChatSubmission,
+  persistPendingNewChatSubmission,
+  type PendingNewChatSubmission,
+} from './newChatSubmission.ts';
 import {
   getTranscriptResourceState,
   recoverActiveTranscriptResources,
@@ -35,6 +42,8 @@ type ComposerPhase = 'sending' | 'updating-transcript';
 export function useConversationActions(options: {
   activeConversationIdRef: MutableRefObject<string | null>;
   activeDraftIdRef: MutableRefObject<string | null>;
+  activeConversationId: string | null;
+  activeDraftId: string | null;
   conversation: ConversationValue | null;
   nativeRuntime: AgentRuntimeResource | null;
   cwd: string;
@@ -45,10 +54,13 @@ export function useConversationActions(options: {
   setActiveDraftId: Dispatch<SetStateAction<string | null>>;
   setDraft: Dispatch<SetStateAction<AgentNewChatDraft | null>>;
   setError: Dispatch<SetStateAction<string | null>>;
+  connected: boolean;
 }) {
   const {
     activeConversationIdRef,
     activeDraftIdRef,
+    activeConversationId,
+    activeDraftId,
     conversation,
     nativeRuntime,
     cwd,
@@ -59,61 +71,237 @@ export function useConversationActions(options: {
     setActiveDraftId,
     setDraft,
     setError,
+    connected,
   } = options;
+  const [recoveryError, setRecoveryError] = useState<{ operationId: string; message: string } | null>(null);
+  const [recoveryVersion, setRecoveryVersion] = useState(0);
+  const [runningOperations, setRunningOperations] = useState<Set<string>>(new Set());
+  const recoveryPromisesRef = useRef(new Map<string, Promise<void>>());
+  const automaticAttemptsRef = useRef(new Map<string, number>());
+  const legacyAttemptsRef = useRef(new Map<string, number>());
+  const mountedRef = useRef(true);
   const ensureConversation = useConversationHistoryStore((state) => state.ensureConversation);
-  const createConversation = useCallback(async (
-    input: TurnSubmissionInput,
+  const ownsRecord = useCallback((record: { draftId: string | null; conversationId: string | null }) =>
+    (record.conversationId !== null && activeConversationIdRef.current === record.conversationId)
+    || (activeConversationIdRef.current === null && activeDraftIdRef.current === record.draftId),
+  [activeConversationIdRef, activeDraftIdRef]);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+  useEffect(() => {
+    if (connected) {
+      automaticAttemptsRef.current.clear();
+      legacyAttemptsRef.current.clear();
+      setRecoveryVersion((value) => value + 1);
+    }
+  }, [connected]);
+  const attachCreatedConversation = useCallback(async (
+    record: { create: { operationId: string }; draftId: string | null; snapshotKey: string },
+    conversationId: string,
   ) => {
-    if (!input.modelId || !input.providerInstanceId || !cwd) {
-      throw new Error('Choose a workspace, provider, and model first.');
+    if (!await ensureConversation(conversationId, true)) {
+      throw new Error('Conversation created. Retry to finish loading it.');
     }
-    const selected = resolveModel(useComposerStore.getState().models, input.modelId);
-    if (!selected?.nativeId || selected.providerInstanceId !== input.providerInstanceId) {
-      throw new Error('The selected native provider model is unavailable.');
-    }
-    const operationId = activeDraftIdRef.current ?? loadOrCreateDraftOperationId();
-    const sourceDraftId = activeDraftIdRef.current;
-    const result = await agentCommands.createConversation({
-      operationId,
-      providerInstanceId: input.providerInstanceId,
-      cwd,
-      nativeModelId: selected.nativeId,
-      reasoning: input.reasoning,
-      serviceTier: input.serviceTier,
-      access: input.access,
-    });
-    persistConversationDraft(
-      result.conversationId,
-      useComposerStore.getState().snapshot,
-    );
-    confirmDraftOperationId(operationId);
-    if (sourceDraftId) removeNewChatDraft(sourceDraftId);
-    if (draftRef.current?.id === sourceDraftId) {
-      draftRef.current = null;
-      setDraft(null);
-    }
-    await ensureConversation(result.conversationId, true);
-    if (activeDraftIdRef.current === sourceDraftId) {
+    const stillOwnsTarget = activeConversationIdRef.current === conversationId
+      || (activeConversationIdRef.current === null && activeDraftIdRef.current === record.draftId);
+    if (stillOwnsTarget) {
+      const snapshot = useComposerStore.getState().snapshot;
+      persistConversationDraft(conversationId, snapshot);
+      if (loadConversationDraft(conversationId).snapshot.contentKey !== snapshot.contentKey) {
+        throw new Error('Could not preserve the draft. Retry after freeing browser storage.');
+      }
+      if (draftRef.current?.id === record.draftId) {
+        draftRef.current = null;
+        setDraft(null);
+      }
       activeDraftIdRef.current = null;
-      activeConversationIdRef.current = result.conversationId;
+      activeConversationIdRef.current = conversationId;
       setActiveDraftId(null);
-      setActiveConversationId(result.conversationId);
-      await getTranscriptResourceState().setActiveConversationId(result.conversationId);
+      setActiveConversationId(conversationId);
+      await getTranscriptResourceState().setActiveConversationId(conversationId);
+      confirmDraftOperationId(record.create.operationId);
+      if (record.draftId) removeNewChatDraft(record.draftId);
     }
-    return {
-      conversationId: result.conversationId,
-      runtime: await agentCommands.readRuntime(result.conversationId),
-    };
-  }, [
-    activeConversationIdRef,
-    activeDraftIdRef,
-    cwd,
-    draftRef,
-    ensureConversation,
-    setActiveConversationId,
-    setActiveDraftId,
-    setDraft,
-  ]);
+  }, [activeConversationIdRef, activeDraftIdRef, draftRef, ensureConversation,
+    setActiveConversationId, setActiveDraftId, setDraft]);
+
+  const finishRecoveredSubmission = useCallback(async (
+    record: PendingNewChatSubmission,
+    sent: { turnId: string; delivery: 'sent' | 'queued' | 'steered' },
+  ) => {
+    if (!record.conversationId || !record.message) return;
+    if (sent.delivery === 'sent') {
+      trackTranscriptUserMessage(record.conversationId, record.clientMessageId, sent.turnId);
+    } else {
+      discardTranscriptUserMessage(record.clientMessageId);
+    }
+    await Promise.all([
+      refresh([`agent/runtime:${record.conversationId}`, `agent/queue:${record.conversationId}`]),
+      ensureConversation(record.conversationId, true),
+      ...(activeConversationIdRef.current === record.conversationId && sent?.delivery !== 'queued' && sent?.turnId
+        ? [recoverActiveTranscriptResources({ attempts: 4, forceFullMeasure: false,
+            preserveReady: true, requiredTurnId: sent.turnId, windowPolicy: 'tail' }).then((recovered) => {
+              if (!recovered && activeConversationIdRef.current === record.conversationId) {
+                throw new Error('The message was accepted. Retry to finish syncing its conversation.');
+              }
+            })]
+        : []),
+    ]);
+    const isSelected = activeConversationIdRef.current === record.conversationId;
+    const currentSnapshot = isSelected ? useComposerStore.getState().snapshot
+      : loadConversationDraft(record.conversationId).snapshot;
+    if (currentSnapshot.contentKey === record.snapshotKey) {
+      clearConversationDraftContent(record.conversationId);
+      if (isSelected) useComposerStore.getState().clearComposer();
+    }
+    if (ownsRecord(record)) useComposerStore.setState({ submissionError: null });
+    clearPendingNewChatSubmission(record.create.operationId);
+  }, [activeConversationIdRef, ensureConversation, ownsRecord, refresh]);
+
+  const recoverRecord = useCallback(async (initial: PendingNewChatSubmission) => {
+    let record = initial;
+    if (!mountedRef.current || !ownsRecord(record)) return;
+    let conversationId = record.conversationId;
+    if (!conversationId) {
+      const receipt = await agentCommands.readCommand(record.create.operationId, 'conversation.create');
+      if (receipt.state === 'accepted' && receipt.kind === 'conversation.create') {
+        conversationId = receipt.result.conversationId;
+      } else if (receipt.state === 'missing' || receipt.state === 'received') {
+        if (!mountedRef.current || !ownsRecord(record)) return;
+        conversationId = (await agentCommands.createConversation(record.create)).conversationId;
+      } else {
+        throw new Error(commandRecoveryMessage(receipt, 'Conversation creation'));
+      }
+      record = { ...record, conversationId };
+      persistPendingNewChatSubmission(record);
+    }
+    if (!mountedRef.current || !ownsRecord(record)) return;
+    if (activeConversationIdRef.current !== conversationId) {
+      await attachCreatedConversation(record, conversationId);
+    }
+    if (!mountedRef.current || !ownsRecord(record)) return;
+    if (!record.message) {
+      const runtime = await agentCommands.readRuntime(conversationId);
+      if (!mountedRef.current || !ownsRecord(record)) return;
+      record = { ...record, message: {
+        operationId: record.messageOperationId,
+        clientMessageId: record.clientMessageId,
+        conversationId,
+        parts: record.original.parts,
+        nativeModelId: record.create.nativeModelId,
+        reasoning: record.original.reasoning,
+        serviceTier: runtime.composer.nextTurn.serviceTier,
+        providerInstanceId: runtime.providerInstanceId,
+        access: runtime.composer.nextTurn.access,
+        configurationRevision: runtime.composer.revision,
+        delivery: record.original.delivery,
+      } };
+      persistPendingNewChatSubmission(record);
+    }
+    const message = record.message!;
+    const receipt = await agentCommands.readCommand(message.operationId, 'turn.send');
+    if (!mountedRef.current || !ownsRecord(record)) return;
+    if (receipt.state === 'accepted' && receipt.kind === 'turn.send') {
+      await finishRecoveredSubmission(record, receipt.result);
+      return;
+    }
+    if (receipt.state !== 'missing' && receipt.state !== 'received') {
+      throw new Error(commandRecoveryMessage(receipt, 'The first message'));
+    }
+    const sent = await agentCommands.sendMessage(message);
+    await finishRecoveredSubmission(record, sent);
+  }, [activeConversationIdRef, attachCreatedConversation, finishRecoveredSubmission, ownsRecord]);
+
+  const runRecovery = useCallback((record: PendingNewChatSubmission) => {
+    const operationId = record.create.operationId;
+    const existing = recoveryPromisesRef.current.get(operationId);
+    if (existing) return existing;
+    setRunningOperations((values) => new Set(values).add(operationId));
+    setRecoveryError(null);
+    const promise = recoverRecord(record)
+      .then(() => {
+        if (mountedRef.current && ownsRecord(record)) setRecoveryError(null);
+      })
+      .catch((reason) => {
+        if (mountedRef.current && findPendingNewChatSubmission({
+          conversationId: activeConversationIdRef.current, draftId: activeDraftIdRef.current,
+        })?.create.operationId === operationId) {
+          setRecoveryError({ operationId, message: messageOf(reason) });
+        }
+        throw reason;
+      })
+      .finally(() => {
+        recoveryPromisesRef.current.delete(operationId);
+        if (mountedRef.current) {
+          setRunningOperations((values) => {
+            const next = new Set(values);
+            next.delete(operationId);
+            return next;
+          });
+          setRecoveryVersion((value) => value + 1);
+        }
+      });
+    recoveryPromisesRef.current.set(operationId, promise);
+    return promise;
+  }, [activeConversationIdRef, activeDraftIdRef, ownsRecord, recoverRecord]);
+
+  const pendingRecord = findPendingNewChatSubmission({ conversationId: activeConversationId, draftId: activeDraftId });
+  const pendingOperationId = pendingRecord?.create.operationId ?? null;
+  const pendingRecoveryError = recoveryError?.operationId === pendingOperationId ? recoveryError?.message ?? null : null;
+  const isRecoveringSubmission = pendingOperationId !== null && runningOperations.has(pendingOperationId);
+
+  const retryPendingSubmission = useCallback(async () => {
+    const record = findPendingNewChatSubmission({
+      conversationId: activeConversationIdRef.current,
+      draftId: activeDraftIdRef.current,
+    });
+    if (record) await runRecovery(record);
+  }, [activeConversationIdRef, activeDraftIdRef, runRecovery]);
+
+  useEffect(() => {
+    if (!connected || !pendingOperationId || recoveryPromisesRef.current.has(pendingOperationId)) return;
+    const attempts = automaticAttemptsRef.current.get(pendingOperationId) ?? 0;
+    if (attempts >= 3) return;
+    const timer = setTimeout(() => {
+      const record = findPendingNewChatSubmission({
+        conversationId: activeConversationIdRef.current, draftId: activeDraftIdRef.current,
+      });
+      if (!record || record.create.operationId !== pendingOperationId) return;
+      automaticAttemptsRef.current.set(pendingOperationId, attempts + 1);
+      void runRecovery(record).catch(() => undefined);
+    }, attempts === 0 ? 0 : 600);
+    return () => clearTimeout(timer);
+  }, [activeConversationId, activeConversationIdRef, activeDraftId, activeDraftIdRef,
+    connected, pendingOperationId, recoveryVersion, runRecovery]);
+
+  // Pre-upgrade drafts contain no frozen send intent. Only attach a positively
+  // accepted conversation; the current draft still requires an explicit Send.
+  useEffect(() => {
+    if (!connected || activeConversationId || !activeDraftId || pendingOperationId) return;
+    const draftId = activeDraftId;
+    const attempts = legacyAttemptsRef.current.get(draftId) ?? 0;
+    if (attempts >= 3) return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      legacyAttemptsRef.current.set(draftId, attempts + 1);
+      void agentCommands.readCommand(draftId, 'conversation.create').then(async (receipt) => {
+        if (cancelled || activeDraftIdRef.current !== draftId) return;
+        if (receipt.state !== 'accepted' || receipt.kind !== 'conversation.create') {
+          if (receipt.state === 'missing') legacyAttemptsRef.current.set(draftId, 3);
+          return;
+        }
+        if (findPendingNewChatSubmission({ conversationId: null, draftId })) return;
+        const snapshot = useComposerStore.getState().snapshot;
+        await attachCreatedConversation({ draftId, snapshotKey: snapshot.contentKey,
+          create: { operationId: draftId } }, receipt.result.conversationId);
+      }).catch(() => undefined).finally(() => {
+        if (!cancelled) setRecoveryVersion((value) => value + 1);
+      });
+    }, attempts === 0 ? 0 : 600);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [activeConversationId, activeDraftId, activeDraftIdRef, attachCreatedConversation,
+    connected, pendingOperationId, recoveryVersion]);
 
   const send = useCallback(async (
     input: TurnSubmissionInput,
@@ -121,20 +309,40 @@ export function useConversationActions(options: {
   ) => {
     setError(null);
     const currentId = activeConversationIdRef.current;
-    const created = currentId ? null : await createConversation(input);
-    const activeId = currentId ?? created!.conversationId;
-    const submissionRuntime = created?.runtime
-      ?? (nativeRuntime?.conversationId === activeId ? nativeRuntime : null);
+    const existing = findPendingNewChatSubmission({
+      conversationId: currentId,
+      draftId: activeDraftIdRef.current,
+    });
+    if (existing) {
+      await runRecovery(existing);
+      return 'preserve-draft' as const;
+    }
+    if (!currentId) {
+      const selected = resolveModel(useComposerStore.getState().models, input.modelId);
+      if (!selected?.nativeId || selected.providerInstanceId !== input.providerInstanceId || !cwd) {
+        throw new Error('Choose a workspace, provider, and model first.');
+      }
+      const operationId = activeDraftIdRef.current ?? loadOrCreateDraftOperationId();
+      const pending: PendingNewChatSubmission = {
+        version: 1,
+        draftId: activeDraftIdRef.current,
+        snapshotKey: useComposerStore.getState().snapshot.contentKey,
+        create: { operationId, providerInstanceId: input.providerInstanceId, cwd,
+          nativeModelId: selected.nativeId, reasoning: input.reasoning,
+          serviceTier: input.serviceTier, access: input.access },
+        original: structuredClone(input), conversationId: null,
+        messageOperationId: createViewerUuid(), clientMessageId: createViewerUuid(), message: null,
+      };
+      persistPendingNewChatSubmission(pending);
+      await runRecovery(pending);
+      return 'preserve-draft' as const;
+    }
+    const activeId = currentId;
+    const submissionRuntime = nativeRuntime?.conversationId === activeId ? nativeRuntime : null;
     if (!submissionRuntime) throw new Error('Conversation configuration is still loading.');
-    const submittedProviderInstanceId = created
-      ? submissionRuntime.providerInstanceId
-      : input.providerInstanceId;
-    const submittedAccess = created
-      ? submissionRuntime.composer.nextTurn.access
-      : input.access;
-    const submittedConfigurationRevision = created
-      ? submissionRuntime.composer.revision
-      : input.configurationRevision;
+    const submittedProviderInstanceId = input.providerInstanceId;
+    const submittedAccess = input.access;
+    const submittedConfigurationRevision = input.configurationRevision;
     if (!submittedConfigurationRevision) {
       throw new Error('Conversation configuration is still loading.');
     }
@@ -146,21 +354,20 @@ export function useConversationActions(options: {
     }
     let sent;
     try {
-      sent = await agentCommands.sendMessage({
+      const message = {
         operationId: createViewerUuid(),
         conversationId: activeId,
         clientMessageId,
         parts: input.parts,
         nativeModelId: selected.nativeId,
         reasoning: input.reasoning,
-        serviceTier: created
-          ? submissionRuntime.composer.nextTurn.serviceTier
-          : input.serviceTier,
+        serviceTier: input.serviceTier,
         providerInstanceId: submittedProviderInstanceId,
         access: submittedAccess,
         configurationRevision: submittedConfigurationRevision,
         delivery: input.delivery,
-      });
+      };
+      sent = await agentCommands.sendMessage(message);
     } catch (reason) {
       throw reason;
     }
@@ -187,7 +394,7 @@ export function useConversationActions(options: {
           })]
         : []),
     ]);
-  }, [activeConversationIdRef, createConversation, ensureConversation, nativeRuntime, refresh, setError]);
+  }, [activeConversationIdRef, activeDraftIdRef, cwd, ensureConversation, nativeRuntime, refresh, runRecovery, setError]);
 
   const branchMessage = useCallback(async (
     mode: 'edit' | 'fork',
@@ -277,9 +484,17 @@ export function useConversationActions(options: {
     }
   }, [conversation?.id, nativeRuntime?.conversationId, refresh, setError]);
 
-  return { branchMessage, compact, interrupt, send };
+  return { branchMessage, compact, interrupt, pendingRecoveryError,
+    hasPendingSubmission: pendingOperationId !== null, isRecoveringSubmission, retryPendingSubmission, send };
 }
 
 function messageOf(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function commandRecoveryMessage(receipt: { state: string; errorMessage?: string }, subject: string) {
+  if (receipt.state === 'rejected') {
+    return `${subject} was rejected.${receipt.errorMessage ? ` ${receipt.errorMessage}` : ''}`;
+  }
+  return `${subject} is still unresolved. Retry to check again.${receipt.errorMessage ? ` ${receipt.errorMessage}` : ''}`;
 }

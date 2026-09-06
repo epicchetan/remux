@@ -32,6 +32,7 @@ export function ComposerContent({
   onFork,
   onQueueChanged,
   onRetryHistory,
+  onRetrySubmission,
   onSend,
   onProviderLogin,
   onProviderLogout,
@@ -40,6 +41,9 @@ export function ComposerContent({
   providers,
   runtime,
   runtimeError,
+  pendingRecoveryError,
+  hasPendingSubmission,
+  isRecoveringSubmission,
   queue,
 }: {
   connected: boolean;
@@ -53,10 +57,11 @@ export function ComposerContent({
   onFork: ComposerBranchCallback<ComposerForkTarget>;
   onQueueChanged: () => Promise<void>;
   onRetryHistory: () => Promise<void>;
+  onRetrySubmission: () => Promise<void>;
   onSend: (
     input: TurnSubmissionInput,
     setPhase: (phase: 'sending' | 'updating-transcript') => void,
-  ) => Promise<void>;
+  ) => Promise<void | 'preserve-draft'>;
   onProviderLogin: (providerInstanceId: string, mode: 'device-code' | 'browser') => void;
   onProviderLogout: (providerInstanceId: string) => void;
   onPreferenceChange: (input: {
@@ -70,6 +75,9 @@ export function ComposerContent({
   runtime: AgentRuntimeResource | null;
   queue: AgentPendingQueueValue | null;
   runtimeError: string | null;
+  pendingRecoveryError: string | null;
+  hasPendingSubmission: boolean;
+  isRecoveringSubmission: boolean;
 }) {
   const cwd = useConversationStore((state) => state.cwd);
   const pickerOpen = useConversationStore((state) => state.directoryPickerOpen);
@@ -153,6 +161,10 @@ export function ComposerContent({
         <ComposerStatusMessageRow
           history={conversation ? runtime?.history ?? null : null}
           onRetryHistory={onRetryHistory}
+          onRetrySubmission={onRetrySubmission}
+          pendingRecoveryError={pendingRecoveryError}
+          hasPendingSubmission={hasPendingSubmission}
+          isRecoveringSubmission={isRecoveringSubmission}
           runtimeError={runtimeError}
         />
       ) : null}

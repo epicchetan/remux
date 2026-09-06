@@ -594,12 +594,15 @@ export function App() {
     });
   }, [activeConversationId, activeDraftId, nativeRuntime, refresh, setAccess, setError]);
 
-  const { branchMessage, compact, interrupt, send } = useConversationActions({
+  const { branchMessage, compact, interrupt, pendingRecoveryError, hasPendingSubmission, isRecoveringSubmission, retryPendingSubmission, send } = useConversationActions({
+    activeConversationId,
     activeConversationIdRef,
+    activeDraftId,
     activeDraftIdRef,
     conversation,
     nativeRuntime,
     cwd,
+    connected: connectionStatus.type === 'connected',
     draftRef,
     refresh,
     selectConversation,
@@ -726,6 +729,7 @@ export function App() {
               ? refresh([`agent/queue:${activeConversationId}`])
               : Promise.resolve()}
             onRetryHistory={retryHistorySync}
+            onRetrySubmission={retryPendingSubmission}
             onSend={send}
             onProviderLogin={(providerInstanceId, mode) => {
               void runAuth(() => agentCommands.login(providerInstanceId, mode));
@@ -738,6 +742,9 @@ export function App() {
             providers={providers}
             runtime={nativeRuntime}
             runtimeError={error ?? conversation?.error ?? nativeRuntime?.lifecycle.stopError ?? null}
+            pendingRecoveryError={pendingRecoveryError}
+            hasPendingSubmission={hasPendingSubmission}
+            isRecoveringSubmission={isRecoveringSubmission}
             queue={queue}
           />
         </div>
