@@ -217,3 +217,16 @@ also requires that evidence, so old placeholder values are hidden without databa
 rewrites. A real prompt equal to the title remains valid. Empty task text is
 explicitly shown as “Original task unavailable.” Root/federated task content is
 preserved. We did not add whole-parent replay or an unbounded metadata reader.
+
+
+Revision deployment: implementation faf32b6 pushed on main. All 281 server tests,
+typecheck, production server/viewer builds and 14 focused browser cases passed.
+The restarted Agent PID is 1861496. Live desktop/mobile checks confirm no badge
+or extra activity row, first list entry opens exact execution ending
+59d87de45b4fbfa0a686 (verify_commit_push), and its task section displays the
+unavailable fallback. Evidence: subagent-validation/task-live.json and
+subagent-icon-task-live/{desktop,mobile}-task.png under
+/tmp/remux-audit-implementation/. This thread retained all 67 original baseline
+turn IDs/user-content hashes, the native session, root and active strand; current
+state is running without a health error. The full original delegated prompt for
+that historical Codex child remains unavailable, not recovered by this revision.
