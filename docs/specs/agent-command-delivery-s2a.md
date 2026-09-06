@@ -211,7 +211,7 @@ command and attempt linked in its own schema-reviewed slice.
 Add these server-internal types in a focused delivery contract module, imported
 by `provider-adapter.ts`; they do not change
 provider contract v6 or native wire v9 during S2a1. S2a2 adds a truthful
-runtime delivery-hold field and bumps the native wire to v10 as described below;
+runtime delivery-hold field and bumps the now-shipped native wire v10 to v11 as described below;
 the server-internal provider method changes still do not alter provider v6.
 
 ```ts
@@ -469,14 +469,16 @@ Crash classification order at startup is:
 10. Existing F2 held/unknown reservation and exact-release tests remain green;
     this slice neither creates reservation state nor releases one from generic
     adapter failure. Provider contract v6 remains unchanged; S2a1 retains native
-    wire v9 and S2a2 validates the explicit v10 runtime change below.
+    wire v9 and S2a2 validates the explicit v11 runtime change below.
 
 ## S2a2 runtime delivery hold
 
 S2a2 adds a required server-derived `deliveryHeld: boolean` to
-`AgentRuntimeResource`, with native protocol v10. Schema 15 and provider contract
-v6 remain unchanged. This change is planned for the serial steer/Compact
-assignment after S2a1 acceptance; do not add the field during S2a1.
+`AgentRuntimeResource`, with native protocol v11. Native protocol v10 has already
+shipped for subagent lifecycle; this required runtime field therefore advances it
+to v11. Existing schema-15 delivery tables in the current schema-16 database and
+provider contract v6 remain unchanged. This change belongs to the serial
+steer/Compact assignment after S2a1 acceptance.
 
 Derive the field from the shared journal lane predicate: a preparing,
 dispatching, or unknown attempt, or an accepted attempt with an undrained

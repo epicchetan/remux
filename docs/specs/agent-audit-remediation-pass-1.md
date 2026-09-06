@@ -1,4 +1,4 @@
-Status: Active Spec — parallel delivery batch deployed; S2a2 and host work next
+Status: Active Spec — S2a2 and host watcher/publication batch in progress
 Last verified: 2026-09-06
 Canonical code: `extensions/agent/server/src/native-runtime/`,
 `extensions/agent/server/src/providers/`,
@@ -45,6 +45,38 @@ text and admitted no message. Main-thread verification preserved its root/native
 session/strand and all 67 baseline turn identities/content hashes; 90 turns are
 now hydrated, with no health error. Detailed evidence lives in the two incident
 specs. The transient geometry failure is recorded, not erased by the rerun.
+
+### Active next batch — S2a2 and H2/H4, 2026-09-06
+
+Baseline is clean, pushed main at `c1bd341`. The user authorized continuation
+with two disjoint Sol implementation lanes and primary integration/review.
+Earlier batch assignments and local acceptance headings below are historical.
+
+- Sol `implement_s2a1_acceptance` owns S2a2: steer and manual Compact adoption of
+  the existing delivery owner, exact provider evidence, bounded persisted staging,
+  distinct immediate/queued receipt semantics, and necessary coordinator guards,
+  runtime projection, Compact eligibility and focused regressions. Schema 16,
+  Stop, F2, branch/federation and general queue recovery are outside this slice.
+- Sol `review_revised_spec` owns H2/H4 in `viewer_bundles.rs`: observe first builds
+  whose output root did not exist at startup, and prevent cleanup from deleting
+  a publication between rename and registry insertion. Require deterministic
+  focused regressions. H3 detached build-process lifetime remains a later slice.
+- Primary owns spec changes, reviews, explicit-path main commits/pushes, integrated
+  checks, production builds and coordinated deployment. A lane stops at a tested
+  handoff; it does not start another stage or restart the live service itself.
+
+Primary protocol decision: add required `AgentRuntimeResource.deliveryHeld`,
+derived from the shared journal lane predicate and checked by Compact eligibility.
+Native protocol 10 already shipped for lifecycle, so this required shape moves to
+11 with server/viewer built together. No schema or provider-wire bump is needed.
+The delivery contract's earlier v9-to-v10 plan is amended accordingly.
+
+Automatic viewer builds are paused during source edits. The main-thread baseline
+captures 94 turn identities/content hashes and its unchanged native session and
+strand under `/tmp/remux-audit-implementation/s2a2-host-thread-before.json`.
+The host change requires a host worker build/restart; use the existing supervisor
+worker-restart path, preserve the persistent native daemon, and verify thread
+identity/history afterward. Do not restart the full guardian/service unnecessarily.
 
 ### Delivered batch scope
 
