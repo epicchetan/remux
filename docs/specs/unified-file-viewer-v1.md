@@ -284,3 +284,13 @@ host without React Native. Building the full future Remux web app is out of scop
   router tests passed; primary added a nonblocking regular-file check regression
   so opening a FIFO cannot hang before validation. Final window tests: 6 passed
   (`/tmp/remux-html-preview/source-window-review.log`). Host not deployed yet.
+- V0 protected Editor transport reviewed by primary and a second Sol review.
+  App-issued native UUID capability is held in a top-frame closure and pinned to
+  the trusted document URL. Native dispatch rejects raw/stale child messages;
+  DOM IPC rejects child senders. Delayed protected and legacy host handshake,
+  canceled queued reads, stale tokens, payload bounds and iframe navigation
+  browser tests passed, plus app typecheck and viewer-host contract. Evidence:
+  `/tmp/remux-html-preview/viewer-v0-final-check.log`;
+  `app/scripts/test-viewer-transport-handshake.mjs`. No native-device proof is
+  claimed. The runtime capability enables the supported path; there is no new
+  manual device-approval gate. Native app update not published yet.

@@ -4,6 +4,7 @@ import {
   type RpcContract,
   type RpcRequestOptions,
 } from './rpc';
+import { isTrustedHostMessageEvent } from './ipcSenderPolicy';
 
 export type JsonRpcId = number | string;
 
@@ -116,6 +117,10 @@ export type IpcStatusSnapshot = {
 
 const requestIdPrefix = 'remux-extension-viewer';
 let initialized = false;
+let protectedTransportRequired = false;
+let legacyTransportEstablished = false;
+let protectedTransportFailure: string | null = null;
+const protectedTransportQueue: WebViewRequest[] = [];
 let nextId = 1;
 let eventFlushScheduled = false;
 let statusSnapshot: IpcStatusSnapshot = {
@@ -136,6 +141,10 @@ let lifecycleSnapshot: RemuxHostLifecycleEvent = {
 
 declare global {
   interface Window {
+    __REMUX_HOST_CAPABILITIES__?: {
+      protectedHtmlPreviewTransport?: boolean;
+    };
+    __REMUX_PROTECTED_POST_MESSAGE__?: (message: string) => void;
     ReactNativeWebView?: {
       postMessage: (message: string) => void;
     };
@@ -367,24 +376,63 @@ export function getIpcStatusSnapshot() {
   return statusSnapshot;
 }
 
-export function initializeIpc() {
+export type InitializeIpcOptions = Readonly<{
+  requireProtectedTransport?: boolean;
+}>;
+
+export function initializeIpc(options: InitializeIpcOptions = {}) {
+  if (options.requireProtectedTransport) {
+    protectedTransportRequired = true;
+  }
   if (initialized) {
     return;
   }
 
   window.addEventListener('message', handleNativeMessage);
   document.addEventListener('message', handleNativeMessage as EventListener);
+  window.addEventListener('remux:host-capabilities-ready', flushProtectedTransportQueue);
   initialized = true;
 
   observePreviewMutations();
   observeResumeSignals();
   postMessage({ type: 'remux/ready' });
+  if (
+    protectedTransportRequired
+    && !getIpcHostCapabilities().protectedHtmlPreviewTransport
+  ) {
+    // A harmless readiness probe lets an older host establish legacy Source /
+    // Markdown transport. A protected host rejects it and waits for the wrapper.
+    let attemptsRemaining = 200;
+    const probe = () => {
+      if (legacyTransportEstablished || getIpcHostCapabilities().protectedHtmlPreviewTransport) return;
+      window.ReactNativeWebView?.postMessage(JSON.stringify({ type: 'remux/ready' }));
+      attemptsRemaining -= 1;
+      if (attemptsRemaining > 0) window.setTimeout(probe, 25);
+      else {
+        protectedTransportQueue.splice(0);
+        protectedTransportFailure = 'The viewer host did not become ready. Reload the viewer to retry.';
+        rejectPendingRequests(protectedTransportFailure);
+      }
+    };
+    if (window.ReactNativeWebView || window.parent === window) probe();
+  }
 }
 
 function handleNativeMessage(event: MessageEvent) {
+  if (!isTrustedHostMessageEvent(event)) {
+    return;
+  }
   const message = parseNativeMessage(event.data);
   if (!message) {
     return;
+  }
+  if (
+    protectedTransportRequired
+    && (window.ReactNativeWebView || window.parent === window)
+    && !getIpcHostCapabilities().protectedHtmlPreviewTransport
+  ) {
+    legacyTransportEstablished = true;
+    flushProtectedTransportQueue();
   }
 
   if (message.type === 'remux/event') {
@@ -458,6 +506,17 @@ function handleNativeMessage(event: MessageEvent) {
   pending.resolve(message.result);
 }
 
+export type RemuxHostCapabilities = Readonly<{
+  protectedHtmlPreviewTransport: boolean;
+}>;
+
+export function getIpcHostCapabilities(): RemuxHostCapabilities {
+  return {
+    protectedHtmlPreviewTransport:
+      window.__REMUX_HOST_CAPABILITIES__?.protectedHtmlPreviewTransport === true,
+  };
+}
+
 function updateStatus(snapshot: IpcStatusSnapshot) {
   const wasConnected = statusSnapshot.status.type === 'connected';
   statusSnapshot = snapshot;
@@ -522,14 +581,41 @@ function parseNativeMessage(data: unknown): NativeMessage | null {
 }
 
 function postMessage(message: WebViewRequest) {
+  if (
+    protectedTransportRequired
+    && !legacyTransportEstablished
+    && (window.ReactNativeWebView || window.parent === window)
+    && !getIpcHostCapabilities().protectedHtmlPreviewTransport
+  ) {
+    if (protectedTransportFailure) throw new Error(protectedTransportFailure);
+    if (protectedTransportQueue.length >= 64) {
+      throw new Error('Protected Remux transport is not ready');
+    }
+    protectedTransportQueue.push(message);
+    return;
+  }
   const serialized = JSON.stringify(message);
 
+  if (window.__REMUX_PROTECTED_POST_MESSAGE__) {
+    window.__REMUX_PROTECTED_POST_MESSAGE__(serialized);
+    return;
+  }
   if (window.ReactNativeWebView) {
     window.ReactNativeWebView.postMessage(serialized);
     return;
   }
 
   window.parent?.postMessage(serialized, '*');
+}
+
+function flushProtectedTransportQueue() {
+  if (!legacyTransportEstablished && !getIpcHostCapabilities().protectedHtmlPreviewTransport) return;
+  protectedTransportFailure = null;
+  const queued = protectedTransportQueue.splice(0);
+  for (const message of queued) {
+    if (message.type === 'remux/request' && !pendingRequests.has(message.id)) continue;
+    postMessage(message);
+  }
 }
 
 function abortReason(reason: unknown) {

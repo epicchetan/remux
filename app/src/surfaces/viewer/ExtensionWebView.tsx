@@ -44,6 +44,12 @@ import { serializedResourceKey } from '../../browser/resourceKeys';
 import { noteTabPreviewContentChanged } from '../../browser/tabPreviewCapture';
 import { NativeGlassIconButton } from '../../ui/NativeGlassIconButton';
 import {
+  createProtectedViewerBootstrapScript,
+  createProtectedViewerToken,
+  isProtectedViewerBlobNavigation,
+  unwrapProtectedViewerMessage,
+} from './protectedViewerTransport';
+import {
   HostLifecycleEvidenceClock,
   type HostLifecycleEvent,
 } from './lifecycleEvidence';
@@ -352,24 +358,6 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
     resourceKey: serializedResourceKey(tab),
     tabId: tab.id,
   }), [tab.extensionId, tab.id, tab.resourceId, tab.resourceKind, tab.viewId]);
-  const injectedBeforeContentLoaded = useMemo(
-    () => createWebViewBeforeContentLoadedScript(
-      theme.name,
-      hostChrome,
-      hostControlInsetLeft,
-      safeAreaInsets,
-    ),
-    [
-      hostChrome,
-      hostControlInsetLeft,
-      safeAreaInsets.bottom,
-      safeAreaInsets.left,
-      safeAreaInsets.right,
-      safeAreaInsets.top,
-      theme.name,
-    ],
-  );
-
   const clearReadyTimeout = useCallback(() => {
     if (readyTimeoutRef.current !== null) {
       clearTimeout(readyTimeoutRef.current);
@@ -746,6 +734,36 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
     () => sourceUrlWithReloadNonce(activeSourceUrl, reloadNonce),
     [activeSourceUrl, reloadNonce],
   );
+  const protectedEditorTransport = tab.extensionId === 'editor';
+  const protectedTransportToken = useMemo(
+    () => protectedEditorTransport ? createProtectedViewerToken() : null,
+    [protectedEditorTransport, webViewSourceUrl],
+  );
+  const protectedTransportBootstrap = useMemo(
+    () => protectedTransportToken
+      ? createProtectedViewerBootstrapScript(protectedTransportToken, webViewSourceUrl)
+      : null,
+    [protectedTransportToken, webViewSourceUrl],
+  );
+  const injectedBeforeContentLoaded = useMemo(
+    () => createWebViewBeforeContentLoadedScript(
+      theme.name,
+      hostChrome,
+      hostControlInsetLeft,
+      safeAreaInsets,
+      protectedTransportBootstrap,
+    ),
+    [
+      hostChrome,
+      hostControlInsetLeft,
+      protectedTransportBootstrap,
+      safeAreaInsets.bottom,
+      safeAreaInsets.left,
+      safeAreaInsets.right,
+      safeAreaInsets.top,
+      theme.name,
+    ],
+  );
 
   const failWebView = useCallback((message: string) => {
     resetWebViewReadiness('failed');
@@ -801,7 +819,18 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
 
   const handleMessage = useCallback(
     (event: WebViewMessageEvent) => {
-      const message = parseWebViewMessage(event.nativeEvent.data);
+      const rawMessage = event.nativeEvent.data;
+      const acceptedMessage = protectedTransportToken
+        ? unwrapProtectedViewerMessage(rawMessage, protectedTransportToken)
+        : rawMessage;
+      if (acceptedMessage === null) {
+        logRemuxDebug('webview:protected-message:rejected', {
+          instanceId: instanceIdRef.current,
+          protectedEditorTransport,
+        });
+        return;
+      }
+      const message = parseWebViewMessage(acceptedMessage);
       if (!message) {
         return;
       }
@@ -1132,6 +1161,8 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
       postTheme,
       postViewportMetrics,
       postToWebView,
+      protectedEditorTransport,
+      protectedTransportToken,
       remux,
       remuxRequestContext,
       tab.id,
@@ -1345,6 +1376,12 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
   }, [autoReloadWebView, title]);
 
   const handleShouldStartLoadWithRequest = useCallback((request: ShouldStartLoadRequest) => {
+    // Android labels every callback top-frame, including subframes. The
+    // scripts-only sandbox prevents report top navigation; the bootstrap also
+    // pins its capability to the exact trusted document URL, never a blob.
+    if (protectedEditorTransport
+      && (Platform.OS === 'android' || request.isTopFrame === false)
+      && isProtectedViewerBlobNavigation(request.url, webViewSourceUrl)) return true;
     const decision = webViewNavigationDecision({
       isTopFrame: request.isTopFrame !== false,
       requestUrl: request.url,
@@ -1371,7 +1408,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
     }
 
     return true;
-  }, [webViewSourceUrl]);
+  }, [protectedEditorTransport, webViewSourceUrl]);
 
   useEffect(() => () => {
     clearReadyTimeout();
@@ -1440,6 +1477,13 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
         javaScriptEnabled
         keyboardDisplayRequiresUserAction={false}
         injectedJavaScriptBeforeContentLoaded={injectedBeforeContentLoaded}
+        injectedJavaScriptBeforeContentLoadedForMainFrameOnly
+        {...(protectedTransportBootstrap
+          ? {
+              injectedJavaScript: protectedTransportBootstrap,
+              injectedJavaScriptForMainFrameOnly: true,
+            }
+          : {})}
         onContentProcessDidTerminate={handleContentProcessTerminated}
         onError={handleLoadError}
         onHttpError={handleHttpError}
@@ -1924,8 +1968,9 @@ function createWebViewBeforeContentLoadedScript(
   hostChrome: RemuxViewHostChrome,
   hostControlInsetLeft: number,
   safeAreaInsets: NativeSafeAreaInsets,
+  protectedTransportBootstrap: string | null,
 ) {
-  return `${createWebViewThemeScript(theme, false)}\n${createWebViewHostLayoutScript(
+  return `${protectedTransportBootstrap ?? ''}\n${createWebViewThemeScript(theme, false)}\n${createWebViewHostLayoutScript(
     hostChrome,
     hostControlInsetLeft,
     safeAreaInsets,
@@ -1963,7 +2008,8 @@ const webViewDiagnosticsScript = `
     function post(level, value) {
       try {
         var text = typeof value === 'string' ? value : JSON.stringify(value);
-        window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify({
+        var send = window.__REMUX_PROTECTED_POST_MESSAGE__ || (window.ReactNativeWebView && window.ReactNativeWebView.postMessage.bind(window.ReactNativeWebView));
+        send && send(JSON.stringify({
           type: 'remux/webview-log',
           level: level,
           message: text
@@ -1985,7 +2031,8 @@ const webViewDiagnosticsScript = `
 
     function postRaw(message) {
       try {
-        window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify(message));
+        var send = window.__REMUX_PROTECTED_POST_MESSAGE__ || (window.ReactNativeWebView && window.ReactNativeWebView.postMessage.bind(window.ReactNativeWebView));
+        send && send(JSON.stringify(message));
       } catch (error) {
       }
     }

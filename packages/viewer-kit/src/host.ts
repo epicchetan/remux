@@ -1,5 +1,6 @@
 import {
   getIpcLifecycleSnapshot,
+  getIpcHostCapabilities,
   getIpcStatusSnapshot,
   rpc,
   signalIpcPreviewChanged,
@@ -79,6 +80,10 @@ export type {
   IpcStatusSnapshot as RemuxHostStatusSnapshot,
   RemuxViewHostStatus,
 };
+
+export function getHostCapabilities() {
+  return getIpcHostCapabilities();
+}
 
 export function dismissHostKeyboard() {
   return rpc.command('host/keyboard/dismiss');

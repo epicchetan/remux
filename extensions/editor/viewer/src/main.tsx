@@ -9,5 +9,5 @@ import './styles.css';
 
 mountViewer(<App />, {
   name: 'editor',
-  initialize: initializeIpc,
+  initialize: () => initializeIpc({ requireProtectedTransport: true }),
 });
