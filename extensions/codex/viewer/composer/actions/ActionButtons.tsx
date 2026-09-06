@@ -7,8 +7,6 @@ import { useTranscriptViewportControls } from '../../transcript';
 import { ComposerAttachmentButton } from '../attachments/AttachmentButton';
 import { ComposerConfigButton } from '../config/ConfigButton';
 import { useComposerTurnAction } from './turnAction';
-import { NarrationPlaybackActions } from '../../narration/PlaybackActions';
-import { useNarrationStore } from '../../narration/client';
 import { ComposerActionKey, type ComposerAction } from './ActionKey';
 
 export function ComposerActionButtons() {
@@ -21,8 +19,6 @@ export function ComposerActionButtons() {
   const goToParentDirectory = useThreadsStore((state) => state.goToParentDirectory);
   const selectDirectoryPickerPath = useThreadsStore((state) => state.selectDirectoryPickerPath);
   const turn = useComposerTurnAction();
-  const narrationPhase = useNarrationStore((state) => state.phase);
-  const narrationPlaybackActive = narrationPhase === 'buffering' || narrationPhase === 'ready' || narrationPhase === 'playing' || narrationPhase === 'paused';
   const pickingDirectory = Boolean(draft && directoryPickerOpen);
   const directoryParent = directoryPickerPath ? parentDirectory(directoryPickerPath) : null;
 
@@ -102,13 +98,10 @@ export function ComposerActionButtons() {
         {leftActions.map((action) => (
           <ComposerActionKey action={action} key={action.label} />
         ))}
-        {narrationPlaybackActive ? null : <ComposerConfigButton disabled={pickingDirectory} />}
+        <ComposerConfigButton disabled={pickingDirectory} />
       </div>
       <div className="remux-composer-action-group remux-composer-action-group-right">
-        {narrationPlaybackActive && !pickingDirectory ? (
-          <NarrationPlaybackActions />
-        ) : (
-          <>
+        <>
             {(pickingDirectory ? directoryActions : scrollActions).map((action) => (
               <ComposerActionKey action={action} key={action.label} />
             ))}
@@ -121,8 +114,7 @@ export function ComposerActionButtons() {
                 ) : null}
               </>
             )}
-          </>
-        )}
+        </>
       </div>
     </div>
   );

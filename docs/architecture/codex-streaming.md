@@ -120,7 +120,7 @@ Disclosure is layered:
 
 History indexing is incremental. The server retains file identity, scanned and newline-parsed offsets, an incomplete trailing line, a boundary fingerprint, visible order, rollback state, and turn byte ranges. Normal appends read only new bytes. Completed-turn projection cache validity uses the stable range plus its content hash, not the rollout's global mtime/length revision.
 
-The active presentation window is contiguous. Only a settled user touch/wheel gesture near its top or bottom may slide the window by up to 16 turns; programmatic scroll settlement and resize cannot page. The virtualizer consumes turn order and measured rows from one layout snapshot and preserves prepend position against an actual mounted row when possible. Direct turn and narration navigation request a 12-before/12-after window when the target is not loaded.
+The active presentation window is contiguous. Only a settled user touch/wheel gesture near its top or bottom may slide the window by up to 16 turns; programmatic scroll settlement and resize cannot page. The virtualizer consumes turn order and measured rows from one layout snapshot and preserves prepend position against an actual mounted row when possible. Direct turn navigation requests a 12-before/12-after window when the target is not loaded.
 
 The transcript uses one width-contained flex scroller. Safe-area top padding remains in its measured lane and is tracked separately from turn heights. Code blocks, tables, diffs, and detail panels own their local horizontal scrolling; their min-content width cannot enlarge the transcript or document.
 

@@ -1,6 +1,6 @@
 # Narrate streaming transcript, pronunciation, and playback v5
 
-Status: Archived — superseded by `docs/specs/narrate-local-g2p-sparse-patches.md`
+Status: Archived — product retired 2026-09-06
 Last verified: 2026-07-13
 Canonical code: `extensions/narrate/server/`, `crates/remux-tts/`, `extensions/codex/server/src/structured_inference.rs`, `extensions/codex/shared/narration.ts`, `extensions/codex/viewer/narration/`
 Evidence: `docs/specs/narrate-streaming-g2p-rd.md`, `docs/specs/narrate-streaming-g2p-contract-rd.md`, `tools/narration-rd/`

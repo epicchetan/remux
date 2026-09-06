@@ -45,7 +45,7 @@ finding dispositions and implementation statuses in
 | --- | --- | --- |
 | [codex/assistant-narration.md](codex/assistant-narration.md) | Archived | Initial behavior and UI rationale; provider, RPC, cache, and readiness details are superseded by the implemented Narrate v5 spec. |
 | [codex/assistant-narration-planning-optimization.md](codex/assistant-narration-planning-optimization.md) | Archived | Historical v3 planning and highlighting rationale, superseded by the server-owned-group v5 replacement spec. |
-| [codex/assistant-math-rendering.md](codex/assistant-math-rendering.md) | Active Spec | Implementation and automated desktop/mobile validation landed; physical-phone validation remains. Covers display/inline KaTeX, Markdown-aware delimiters, snapshot-safe streaming, responsive safe display wrapping, exact measured geometry, literal fallback, narration, bounded caches, and t3code-informed mutable-tail discipline. |
+| [codex/assistant-math-rendering.md](codex/assistant-math-rendering.md) | Active Spec | Implementation and automated desktop/mobile validation landed; physical-phone validation remains. Covers display/inline KaTeX, Markdown-aware delimiters, snapshot-safe streaming, responsive safe display wrapping, exact measured geometry, literal fallback, bounded caches, and t3code-informed mutable-tail discipline. |
 | [codex/narration-onnx-synthesis.md](codex/narration-onnx-synthesis.md) | Archived | Historical finite-task and native Kokoro rationale, superseded by task-v6 streaming in the Narrate v5 spec. |
 | [codex/thread-operation-queue.md](codex/thread-operation-queue.md) | Implemented | Hidden-when-empty process-memory queue for pending messages and compactions, with direct idle dispatch, steering, delete, and cancel-on-interrupt semantics. |
 | [codex/server-authoritative-transcript-windows.md](codex/server-authoritative-transcript-windows.md) | Active Spec | Version 2 implementation landed: self-contained turn frames, grouped work/detail disclosure, incremental rollout indexing, native lifecycle resume, window sliding, safe-area ownership, and Version 1 compatibility. Physical iOS validation and the observation-release cleanup remain. |
@@ -58,13 +58,17 @@ finding dispositions and implementation statuses in
 
 ## Narrate Specs
 
+Narrate and its Codex playback integration were retired in September 2026.
+These records remain as historical design and R&D evidence; none describes an
+active product surface, package, service, model, or release requirement.
+
 | Spec | Status | Notes |
 | --- | --- | --- |
-| [narrate-viewer-playback.md](narrate-viewer-playback.md) | Active Spec | Narrate Markdown viewer integration: authoritative logical Markdown blocks and DOM offsets, document-scoped playback states and controls, sentence/word/structural paint, seeking/follow behavior, revision fencing, and realistic verification. |
-| [narration-client-package.md](narration-client-package.md) | Implemented | The generic transport, lifecycle, browser audio, cue resolution, strict decoding, and controller now live in `@remux/narration-client`; Codex is the sole v1 dogfood consumer and Narrate-viewer playback remains explicitly deferred. |
-| [narrate-structural-transcripts.md](narrate-structural-transcripts.md) | Implemented | v5 text-only structural projection: Sol authors plain transcripts for code/table/diagram blocks, then every generated word flows through the shared Misaki baseline and pronunciation review. |
-| [narrate-pronunciation-audit.md](narrate-pronunciation-audit.md) | Implemented | v4 post-transcript review: one complete projected speech document, contextual Misaki baseline, raw unresolved-phone evidence, explicit Kokoro lexical vocabulary, and sparse Sol corrections before synthesis. |
-| [narrate-batch-alignment.md](narrate-batch-alignment.md) | Implemented | Current exact-source word/sentence alignment, NLP-aware acoustic planning, Kokoro duration projection, final-WAV artifact, and Codex-owned playback/highlighting contract. |
+| [narrate-viewer-playback.md](narrate-viewer-playback.md) | Archived | Historical Narrate Markdown viewer and playback integration. |
+| [narration-client-package.md](narration-client-package.md) | Archived | Historical shared playback-client extraction; the package was removed with Narrate. |
+| [narrate-structural-transcripts.md](narrate-structural-transcripts.md) | Archived | Historical structural speech projection design. |
+| [narrate-pronunciation-audit.md](narrate-pronunciation-audit.md) | Archived | Historical pronunciation review design. |
+| [narrate-batch-alignment.md](narrate-batch-alignment.md) | Archived | Historical batch alignment and playback contract. |
 | [narrate-local-g2p-sparse-patches.md](narrate-local-g2p-sparse-patches.md) | Archived | Historical v6 whole-document sparse-patch pipeline, superseded by batch alignment and bounded full-word pronunciation review. |
 | [narrate-streaming-g2p.md](narrate-streaming-g2p.md) | Archived | Historical v5 complete model-generated token/phoneme contract, superseded by the local-G2P sparse-patch v6 implementation. |
 | [narrate-streaming-g2p-contract-rd.md](narrate-streaming-g2p-contract-rd.md) | R&D evidence | Real-thread contract/model benchmark that found the v4 cardinality failure, then live sparse-contract fragility, and motivated server-owned token structure, explicit risk metadata, and removal of repair turns. |
@@ -85,8 +89,8 @@ finding dispositions and implementation statuses in
 
 | Spec | Status | Notes |
 | --- | --- | --- |
-| [unified-file-viewer-v1.md](unified-file-viewer-v1.md) | Proposed — implementation not started | One web Viewer with default Markdown/HTML preview, shared Source toggle, bounded large-file Source, iframe bridge isolation, and full Narrate retirement with tab migration. |
-| [html-file-preview-v1.md](html-file-preview-v1.md) | Implemented — iOS Expo preview published | Interactive self-contained HTML in existing file tabs, with Preview/Source and companion links. iOS update published and served bundle verified; no server restart needed. Android enabled in source; device acceptance remains unperformed. |
+| [unified-file-viewer-v1.md](unified-file-viewer-v1.md) | Implemented — final retirement deployment in progress | One web Viewer with default Markdown/HTML preview, shared Source toggle, bounded large-file Source, iframe bridge isolation, and full Narrate retirement with tab migration. |
+| [html-file-preview-v1.md](html-file-preview-v1.md) | Superseded | Historical native HTML preview; replaced by the unified web Viewer. |
 | [multi-provider-agent-workspace-extension.md](multi-provider-agent-workspace-extension.md) | Archived prototype | Historical full-capsule T3 Code integration. Its provider analysis, gateway, and mobile findings remain evidence; its source and extension were removed when Agent became the product path. |
 | [agent-native-provider-runtime-v1.md](agent-native-provider-runtime-v1.md) | Active Spec — implementation landed; live/phone acceptance pending | Canonical Agent replacement: native Codex/Claude harness adapters, light durable coordinator, server-authoritative virtualized UI, chat-only interaction, native same-provider subagents, and scoped MCP cross-provider federation. |
 | [agent-canonical-turn-journal-v2.md](agent-canonical-turn-journal-v2.md) | Active Spec — implementation landed; physical-phone acceptance pending | Ordered provider-neutral turns and assistant passes, native reasoning boundaries, lazy exact-diff artifacts, stable block identity, scope-correct usage/compaction/child events, restart-safe reconciliation, legacy migration, and bounded federated-child rediscovery. |

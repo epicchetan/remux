@@ -3,20 +3,20 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { extname, join } from 'node:path';
 import { test } from '@playwright/test';
 
-test('Agent viewer does not import Codex or narration implementations', () => {
+test('Agent viewer does not import Codex implementations', () => {
   const source = sourceText([
     new URL('../../viewer/src/', import.meta.url),
     new URL('../../shared/', import.meta.url),
   ]);
 
-  assert.doesNotMatch(source, /(?:@remux\/codex|extensions\/codex|@remux\/narration-client|narration-client)/u);
+  assert.doesNotMatch(source, /(?:@remux\/codex|extensions\/codex)/u);
   assert.doesNotMatch(source, /remux\/codex\//u);
   assert.doesNotMatch(source, /codex-app-server|app-server-protocol/u);
 });
 
 test('native provider adapters do not reach into the legacy Codex extension', () => {
   const source = sourceText([new URL('../../server/src/', import.meta.url)]);
-  assert.doesNotMatch(source, /(?:@remux\/codex|extensions\/codex|@remux\/narration-client|narration-client)/u);
+  assert.doesNotMatch(source, /(?:@remux\/codex|extensions\/codex)/u);
 });
 
 test('the deleted Pi, context-compiler, and custom child runtime cannot return as a hidden fallback', () => {
@@ -59,7 +59,7 @@ test('the Agent composer owns the applicable interaction surface without Codex-o
   const packageJson = JSON.parse(readFileSync(new URL('package.json', root), 'utf8')) as {
     dependencies: Record<string, string>;
   };
-  const forbiddenDependencies = ['@remux/codex', '@remux/narration-client'];
+  const forbiddenDependencies = ['@remux/codex'];
   for (const dependency of forbiddenDependencies) {
     assert.equal(packageJson.dependencies[dependency], undefined);
   }
@@ -75,7 +75,7 @@ test('the Agent composer owns the applicable interaction surface without Codex-o
   }
 
   const source = sourceText([new URL('viewer/src/', root)]);
-  assert.doesNotMatch(source, /reviewMode|auto-review|compactThread|NarrationBar|NarrationPlayback/u);
+  assert.doesNotMatch(source, /reviewMode|auto-review|compactThread/u);
 });
 
 function sourceText(roots: URL[]) {

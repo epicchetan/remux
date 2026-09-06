@@ -21,11 +21,6 @@ import type { AlignType, BlockContent, DefinitionContent, PhrasingContent, RootC
 import { hostFileHrefInfoFromHref, webUrlFromHref } from '@remux/viewer-kit/links';
 
 import { mentionPathFromHref } from '../../model/userMessageMarkdown';
-import type {
-  NarrationBlockKind,
-  NarrationSourceDocument,
-  NarrationSourceBlock,
-} from '@remux/narration-client/protocol';
 import { renderKatex, type TrustedKatexMarkup } from './katexAdapter';
 import {
   mathMetricsRevision,
@@ -111,45 +106,45 @@ export type PreparedMarkdownBlock =
   | {
       depth: 1 | 2 | 3;
       lines: PreparedMarkdownInlineLine[];
-      narrationId: string;
+      blockId: string;
       type: 'heading';
     }
   | {
       lines: PreparedMarkdownInlineLine[];
-      narrationId: string;
+      blockId: string;
       type: 'paragraph';
     }
   | {
       language: string | null;
-      narrationId: string;
+      blockId: string;
       text: string;
       type: 'code';
     }
   | {
       math: PreparedMarkdownMath;
-      narrationId: string;
+      blockId: string;
       type: 'mathDisplay';
     }
   | {
       children: PreparedMarkdownBlock[];
-      narrationId: string;
+      blockId: string;
       type: 'blockquote';
     }
   | {
       items: PreparedMarkdownListItem[];
-      narrationId: string;
+      blockId: string;
       ordered: boolean;
       start: number;
       type: 'list';
     }
   | {
       align: MarkdownTableAlignment[];
-      narrationId: string;
+      blockId: string;
       rows: PreparedMarkdownTableRow[];
       type: 'table';
     }
   | {
-      narrationId: string;
+      blockId: string;
       type: 'rule';
     };
 
@@ -202,7 +197,7 @@ export type MarkdownLayoutTextLine = {
 export type MarkdownLayoutBlockBase = {
   contentHeight: number;
   height: number;
-  narrationId: string;
+  blockId: string;
   topGap: number;
 };
 
@@ -297,45 +292,45 @@ export type RawMarkdownBlock =
   | {
       depth: 1 | 2 | 3;
       lines: MarkdownInline[][];
-      narrationId: string;
+      blockId: string;
       type: 'heading';
     }
   | {
       lines: MarkdownInline[][];
-      narrationId: string;
+      blockId: string;
       type: 'paragraph';
     }
   | {
       language: string | null;
-      narrationId: string;
+      blockId: string;
       text: string;
       type: 'code';
     }
   | {
       math: MarkdownMathSource;
-      narrationId: string;
+      blockId: string;
       type: 'mathDisplay';
     }
   | {
       children: RawMarkdownBlock[];
-      narrationId: string;
+      blockId: string;
       type: 'blockquote';
     }
   | {
       items: RawMarkdownListItem[];
-      narrationId: string;
+      blockId: string;
       ordered: boolean;
       start: number;
       type: 'list';
     }
   | {
       align: MarkdownTableAlignment[];
-      narrationId: string;
+      blockId: string;
       rows: RawMarkdownTableRow[];
       type: 'table';
     }
   | {
-      narrationId: string;
+      blockId: string;
       type: 'rule';
     };
 
@@ -542,21 +537,6 @@ export function releaseStreamingMarkdownCaches(scopeKey: string) {
   streamingLayoutCache.delete(scopeKey);
 }
 
-export function narrationSourceBlocks(markdown: string): NarrationSourceBlock[] {
-  const blocks = parseMarkdownBlocks(markdown, markdownParseOptions({ richFileLinks: true }));
-  const output: NarrationSourceBlock[] = [];
-  collectNarrationSourceBlocks(blocks, output);
-  return output;
-}
-
-export function narrationSourceDocument(markdown: string): NarrationSourceDocument {
-  return {
-    blocks: narrationSourceBlocks(markdown),
-    offsetEncoding: 'utf16CodeUnit',
-    schemaVersion: 1,
-  };
-}
-
 export function getMarkdownLayoutDocument(
   markdown: string,
   density: MarkdownDensity,
@@ -675,7 +655,7 @@ function layoutPreparedMarkdownBlock(
         height: topGap + contentHeight,
         lineHeight,
         lines,
-        narrationId: block.narrationId,
+        blockId: block.blockId,
         topGap,
         type: 'paragraph',
       };
@@ -691,7 +671,7 @@ function layoutPreparedMarkdownBlock(
         height: topGap + contentHeight,
         lineHeight: metrics.lineHeight,
         lines,
-        narrationId: block.narrationId,
+        blockId: block.blockId,
         topGap,
         type: 'heading',
       };
@@ -711,7 +691,7 @@ function layoutPreparedMarkdownBlock(
         lineHeight,
         lines,
         naturalOuterHeight,
-        narrationId: block.narrationId,
+        blockId: block.blockId,
         text: block.text,
         textHeight,
         topGap,
@@ -763,7 +743,7 @@ function layoutPreparedMarkdownBlock(
         mathHeight,
         naturalOuterHeight,
         naturalWidth: block.math.metrics?.naturalWidth ?? safeWidth,
-        narrationId: block.narrationId,
+        blockId: block.blockId,
         originalSource: block.math.source.originalSource,
         sourceEnd: block.math.source.sourceEnd,
         sourceStart: block.math.source.sourceStart,
@@ -784,7 +764,7 @@ function layoutPreparedMarkdownBlock(
         children: children.blocks,
         contentHeight: children.height,
         height: topGap + children.height,
-        narrationId: block.narrationId,
+        blockId: block.blockId,
         topGap,
         type: 'blockquote',
       };
@@ -814,7 +794,7 @@ function layoutPreparedMarkdownBlock(
         contentHeight,
         height: topGap + contentHeight,
         items,
-        narrationId: block.narrationId,
+        blockId: block.blockId,
         ordered: block.ordered,
         start: block.start,
         topGap,
@@ -827,7 +807,7 @@ function layoutPreparedMarkdownBlock(
       return {
         contentHeight: markdownMetrics.ruleHeight,
         height: topGap + markdownMetrics.ruleHeight,
-        narrationId: block.narrationId,
+        blockId: block.blockId,
         topGap,
         type: 'rule',
       };
@@ -848,7 +828,7 @@ function layoutPreparedMarkdownTable(
       contentHeight: 0,
       height: topGap,
       lineHeight: markdownMetrics.paragraph.lineHeight[density],
-      narrationId: block.narrationId,
+      blockId: block.blockId,
       rows: [],
       tableWidth: 0,
       topGap,
@@ -917,7 +897,7 @@ function layoutPreparedMarkdownTable(
     contentHeight,
     height: topGap + contentHeight,
     lineHeight,
-    narrationId: block.narrationId,
+    blockId: block.blockId,
     rows,
     tableWidth,
     topGap,
@@ -1215,7 +1195,7 @@ function prepareMarkdownBlock(
     case 'paragraph':
       return {
         lines: block.lines.map((line) => prepareInlineLine(line, density, 'body', emptyMarks, cacheScope)),
-        narrationId: block.narrationId,
+        blockId: block.blockId,
         type: 'paragraph',
       };
     case 'heading':
@@ -1228,26 +1208,26 @@ function prepareMarkdownBlock(
           emptyMarks,
           cacheScope,
         )),
-        narrationId: block.narrationId,
+        blockId: block.blockId,
         type: 'heading',
       };
     case 'code':
       return {
         language: block.language,
-        narrationId: block.narrationId,
+        blockId: block.blockId,
         text: stripSingleTrailingNewline(block.text),
         type: 'code',
       };
     case 'mathDisplay':
       return {
         math: prepareMath(block.math, true, density, 'body', cacheScope),
-        narrationId: block.narrationId,
+        blockId: block.blockId,
         type: 'mathDisplay',
       };
     case 'blockquote':
       return {
         children: block.children.map((child) => prepareMarkdownBlock(child, density, cacheScope)),
-        narrationId: block.narrationId,
+        blockId: block.blockId,
         type: 'blockquote',
       };
     case 'list':
@@ -1256,7 +1236,7 @@ function prepareMarkdownBlock(
           blocks: item.blocks.map((child) => prepareMarkdownBlock(child, density, cacheScope)),
           marker: item.marker,
         })),
-        narrationId: block.narrationId,
+        blockId: block.blockId,
         ordered: block.ordered,
         start: block.start,
         type: 'list',
@@ -1264,7 +1244,7 @@ function prepareMarkdownBlock(
     case 'table':
       return {
         align: block.align,
-        narrationId: block.narrationId,
+        blockId: block.blockId,
         rows: block.rows.map((row) => ({
           cells: row.cells.map((cell) => ({
             lines: cell.lines.map((line) => prepareInlineLine(
@@ -1280,7 +1260,7 @@ function prepareMarkdownBlock(
         type: 'table',
       };
     case 'rule':
-      return { narrationId: block.narrationId, type: 'rule' };
+      return { blockId: block.blockId, type: 'rule' };
   }
 }
 
@@ -1436,7 +1416,7 @@ function inlineRichItems(
           );
           items.push({
             break: 'never',
-            // PreText keeps the full label for narration and highlighting, while
+            // PreText keeps the full label for text ranges, while
             // this adjustment gives its atomic box the same capped width as the
             // rendered, ellipsized file chip.
             extraWidth: occupiedWidth - textWidth,
@@ -1579,7 +1559,7 @@ function parseMarkdownBlocks(markdown: string, options: MarkdownParseOptions): R
     ? sourceTree
     : parseMarkdownTree(mathMask.masked);
   const blocks = rootContentToRawBlocks(parsedTree.children, parseOptions);
-  assignNarrationIds(blocks, '');
+  assignBlockIds(blocks, '');
   writeScopedCache(
     rawDocumentCache,
     streamingRawDocumentCache,
@@ -1621,120 +1601,18 @@ function markdownAstProtectedRanges(root: ReturnType<typeof parseMarkdownTree>) 
   return ranges;
 }
 
-function assignNarrationIds(blocks: RawMarkdownBlock[], parentPath: string) {
+function assignBlockIds(blocks: RawMarkdownBlock[], parentPath: string) {
   blocks.forEach((block, blockIndex) => {
     const path = parentPath ? `${parentPath}/${blockIndex}` : String(blockIndex);
-    block.narrationId = `md:${path}`;
+    block.blockId = `md:${path}`;
     if (block.type === 'blockquote') {
-      assignNarrationIds(block.children, `${path}/blockquote`);
+      assignBlockIds(block.children, `${path}/blockquote`);
     } else if (block.type === 'list') {
       block.items.forEach((item, itemIndex) => {
-        assignNarrationIds(item.blocks, `${path}/list/${itemIndex}`);
+        assignBlockIds(item.blocks, `${path}/list/${itemIndex}`);
       });
     }
   });
-}
-
-function collectNarrationSourceBlocks(
-  blocks: RawMarkdownBlock[],
-  output: NarrationSourceBlock[],
-  containerKind?: 'blockquote' | 'listItem',
-) {
-  for (const block of blocks) {
-    if (block.type === 'blockquote') {
-      collectNarrationSourceBlocks(block.children, output, 'blockquote');
-      continue;
-    }
-    if (block.type === 'list') {
-      for (const item of block.items) {
-        collectNarrationSourceBlocks(item.blocks, output, 'listItem');
-      }
-      continue;
-    }
-    if (block.type === 'rule') {
-      continue;
-    }
-
-    const source = narrationSourceForBlock(block, containerKind);
-    if (source.text.trim()) {
-      output.push(source);
-    }
-  }
-}
-
-function narrationSourceForBlock(
-  block: Exclude<RawMarkdownBlock, { type: 'blockquote' | 'list' | 'rule' }>,
-  containerKind?: 'blockquote' | 'listItem',
-): NarrationSourceBlock {
-  let text = '';
-  let kind: NarrationBlockKind;
-
-  switch (block.type) {
-    case 'paragraph': {
-      text = narrationInlineText(block.lines);
-      kind = containerKind ?? 'paragraph';
-      break;
-    }
-    case 'heading': {
-      text = narrationInlineText(block.lines);
-      kind = 'heading';
-      break;
-    }
-    case 'code':
-      text = stripSingleTrailingNewline(block.text);
-      kind = block.language === 'mermaid' ? 'diagram' : 'code';
-      break;
-    case 'mathDisplay':
-      text = block.math.tex;
-      kind = 'code';
-      break;
-    case 'table':
-      text = block.rows
-        .map((row) => row.cells.map((cell) => narrationInlineText(cell.lines)).join(' | '))
-        .join('\n');
-      kind = 'table';
-      break;
-  }
-
-  return {
-    highlightMode: kind === 'code' || kind === 'diagram' || kind === 'table' ? 'block' : 'text',
-    id: block.narrationId,
-    kind,
-    text,
-  };
-}
-
-function narrationInlineText(lines: MarkdownInline[][]) {
-  let text = '';
-
-  const walk = (inlines: MarkdownInline[]) => {
-    for (const inline of inlines) {
-      switch (inline.type) {
-        case 'text':
-        case 'code':
-          text += inline.text;
-          break;
-        case 'math':
-          text += inline.math.tex;
-          break;
-        case 'fileLink':
-          text += inline.file.displayName;
-          break;
-        case 'link':
-        case 'strong':
-        case 'emphasis':
-          walk(inline.children);
-          break;
-      }
-    }
-  };
-
-  lines.forEach((line, index) => {
-    if (index > 0) text += '\n';
-    walk(line);
-  });
-
-  return text;
 }
 
 function sanitizeHref(href: string) {
@@ -1785,7 +1663,7 @@ function blockContentToRawBlock(node: BlockContent, options: MarkdownParseOption
         {
           depth: Math.min(node.depth, 3) as 1 | 2 | 3,
           lines: phrasingToInlineLines(node.children, options),
-          narrationId: '',
+          blockId: '',
           type: 'heading',
         },
       ];
@@ -1793,7 +1671,7 @@ function blockContentToRawBlock(node: BlockContent, options: MarkdownParseOption
       return [
         {
           language: node.lang?.trim() || null,
-          narrationId: '',
+          blockId: '',
           text: node.value,
           type: 'code',
         },
@@ -1802,7 +1680,7 @@ function blockContentToRawBlock(node: BlockContent, options: MarkdownParseOption
       return [
         {
           children: blockContentToRawBlocks(node.children, options),
-          narrationId: '',
+          blockId: '',
           type: 'blockquote',
         },
       ];
@@ -1815,7 +1693,7 @@ function blockContentToRawBlock(node: BlockContent, options: MarkdownParseOption
             blocks: blockContentToRawBlocks(item.children, options),
             marker: ordered ? `${start + index}.` : '•',
           })),
-          narrationId: '',
+          blockId: '',
           ordered,
           start,
           type: 'list',
@@ -1823,14 +1701,14 @@ function blockContentToRawBlock(node: BlockContent, options: MarkdownParseOption
       ];
     }
     case 'thematicBreak':
-      return [{ narrationId: '', type: 'rule' }];
+      return [{ blockId: '', type: 'rule' }];
     case 'html':
       return textToParagraphBlocks(node.value);
     case 'table':
       return [
         {
           align: (node.align ?? []).map((alignment) => alignment ?? null),
-          narrationId: '',
+          blockId: '',
           rows: node.children.map((row, rowIndex) => ({
             cells: row.children.map((cell) => ({
               lines: phrasingToInlineLines(cell.children, options),
@@ -1855,7 +1733,7 @@ function paragraphContentToRawBlocks(
     if (pending.length === 0) return;
     const lines = phrasingToInlineLines(pending, options);
     if (lines.some((line) => line.length > 0)) {
-      blocks.push({ lines, narrationId: '', type: 'paragraph' });
+      blocks.push({ lines, blockId: '', type: 'paragraph' });
     }
     pending = [];
   };
@@ -1870,7 +1748,7 @@ function paragraphContentToRawBlocks(
         flushParagraph();
         blocks.push({
           math: part.token.source,
-          narrationId: '',
+          blockId: '',
           type: 'mathDisplay',
         });
         continue;
@@ -1890,7 +1768,7 @@ function textToParagraphBlocks(text: string): RawMarkdownBlock[] {
     ? [
         {
           lines: [[{ text, type: 'text' }]],
-          narrationId: '',
+          blockId: '',
           type: 'paragraph',
         },
       ]

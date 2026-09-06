@@ -55,7 +55,6 @@ resource, RPC, and recovery model.
 | `app/` | Expo/React Native shell, tabs, WebView bridge, connection state, and native integrations |
 | `crates/remux/` | Rust runtime, guardian, CLI, HTTP/WebSocket router, extension supervisor, and resource manager |
 | `crates/remux-compute/` | Typed finite tasks that re-execute extension servers in declared Remux workloads |
-| `crates/remux-tts/` | Native Kokoro narration inference and artifact assembly |
 | `extensions/` | Bundled extension manifests, viewers, and optional stdio servers |
 | `packages/` | Shared TypeScript packages, currently `@remux/viewer-kit` |
 | `deploy/` | systemd units and host integrations installed by Remux |

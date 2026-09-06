@@ -18,7 +18,7 @@ test('keeps the Agent base theme identical to Codex apart from its source root',
 });
 
 test('contains every provider-neutral Codex component style unchanged', () => {
-  assert.doesNotMatch(agentStyles, /(?:narration|compaction)/u);
+  assert.doesNotMatch(agentStyles, /compaction/u);
   const expected = ruleSignatures(codexStyles, true);
   const actual = ruleSignatures(agentStyles, false);
 
@@ -48,12 +48,12 @@ function ruleSignatures(source: string, excludeCodexOnly: boolean) {
     // Agent inline status is intentionally interactive because it owns the
     // provider-neutral usage tray. Everything else shared by the chat renderer
     // stays byte-for-byte declaration compatible.
-    if (excludeCodexOnly && /(?:narration|compaction|math|remux-composer-inline-status)/u.test(rule.selector)) return;
+    if (excludeCodexOnly && /(?:compaction|math|remux-composer-inline-status)/u.test(rule.selector)) return;
     const declarations = rule.nodes
       .filter((node) => node.type === 'decl')
       .filter((node) => !excludeCodexOnly || (
-        !/(?:narration|compaction|math)/u.test(node.prop) &&
-        !/(?:narration|compaction|math)/u.test(node.value)
+        !/(?:compaction|math)/u.test(node.prop) &&
+        !/(?:compaction|math)/u.test(node.value)
       ))
       .map((node) => `${node.prop}:${node.value}${node.important ? '!important' : ''}`);
     if (declarations.length === 0) return;

@@ -6,7 +6,6 @@ import { AssistantMessage } from './components/assistantMessage';
 import { Compaction } from './components/compaction';
 import { UserMessage } from './components/userMessage';
 import { WorkSection } from './components/work/WorkSection';
-import { resolveNarrationBlockElements } from '../narration/blockRegistry';
 import { transcriptLayout } from './layout/constants';
 import type { TranscriptMeasuredRow, TranscriptMeasuredTurn } from './layout/types';
 import { useThreadRuntimeStore } from '../threads/runtimeStore';
@@ -18,7 +17,6 @@ import {
 } from './resourceStore';
 import {
   type TranscriptAutoScrollMode,
-  type TranscriptNarrationFocusRequest,
   useTranscriptViewportStore,
 } from './viewportStore';
 import {
@@ -66,7 +64,6 @@ type TranscriptViewportModeChangeReason =
   | 'initial-scroll'
   | 'mount-stickiness'
   | 'manual-scroll'
-  | 'narration-focus'
   | 'scroll-navigation'
   | 'scroll-navigation-bottom'
   | 'scroll-settled'
@@ -129,7 +126,6 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
   const bottomScrollRafRef = useRef<number | null>(null);
   const scrollAnimationRafRef = useRef<number | null>(null);
   const scrollAnimationCompletionRef = useRef<(() => void) | null>(null);
-  const explicitNarrationFocusTokenRef = useRef(0);
   const activeTurnIdsRef = useRef(activeTurnIds);
   const initialScrollThreadIdRef = useRef<string | null>(null);
   const handledTurnScrollRequestIdRef = useRef(0);
@@ -299,9 +295,7 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
       return;
     }
 
-    // Narration focus scrolls are driven by cue changes through
-    // focusNarration; content growth must not move the viewport.
-    if (mode.type === 'off' || mode.type === 'narration-follow') {
+    if (mode.type === 'off') {
       managedClientHeightRef.current = viewport.clientHeight;
       anchorPinnedSegmentIdRef.current = null;
       setAnchorRunway(0);
@@ -509,102 +503,6 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
     scrollAnimationRafRef.current = window.requestAnimationFrame(step);
   }, [cancelScrollAnimation, scheduleRangeUpdate, setViewportAutoScrollMode]);
 
-  const focusNarration = useCallback((request: TranscriptNarrationFocusRequest) => {
-    if (request.threadId !== activeThreadId) return;
-    let attempts = 0;
-    let requestedWindow = false;
-    const focusWhenMounted = () => {
-      if (!turnsRef.current.some((turn) => turn.turnId === request.turnId)) {
-        if (!requestedWindow) {
-          requestedWindow = true;
-          void loadTranscriptAroundTurn(request.turnId).then(() => {
-            window.requestAnimationFrame(focusWhenMounted);
-          });
-        }
-        return;
-      }
-      const viewport = viewportRef.current;
-      if (!viewport) return;
-      const elements = resolveNarrationBlockElements(request.assistantMessageId, request.blockIds);
-      if (elements.length === 0) {
-        if (attempts === 0 && turnsRef.current.some((turn) => turn.turnId === request.turnId)) {
-          const nextIds = Array.from(new Set([...activeTurnIdsRef.current, request.turnId]));
-          activeTurnIdsRef.current = nextIds;
-          setActiveTurnIds(nextIds);
-          scheduleRangeUpdate();
-        }
-        attempts += 1;
-        if (attempts <= 8) window.requestAnimationFrame(focusWhenMounted);
-        return;
-      }
-      if (request.materializeOnly) return;
-      if (request.reason === 'follow' && nativeScrollOwnsTranscriptViewport(nativeScrollPhaseRef.current)) {
-        return;
-      }
-      if (request.reason === 'follow' && explicitNarrationFocusTokenRef.current !== 0) {
-        return;
-      }
-      // Passive follow scrolls only while narration owns the viewport;
-      // explicit seeks and follow re-enablement re-claim it below.
-      if (request.reason === 'follow' && autoScrollModeRef.current.type !== 'narration-follow') {
-        return;
-      }
-      const viewportBounds = viewport.getBoundingClientRect();
-      const composerTop = document.querySelector<HTMLElement>('[data-remux-composer-root]')
-        ?.getBoundingClientRect().top ?? viewportBounds.bottom;
-      const usableBottom = Math.min(viewportBounds.bottom, composerTop);
-      const usableHeight = Math.max(1, usableBottom - viewportBounds.top);
-      const elementBounds = elements.map((element) => element.getBoundingClientRect());
-      const targetTop = request.bounds?.top ?? Math.min(...elementBounds.map((bound) => bound.top));
-      const targetBottom = request.bounds?.bottom ?? Math.max(...elementBounds.map((bound) => bound.bottom));
-      const bandTop = viewportBounds.top + usableHeight * 0.22;
-      const bandBottom = viewportBounds.top + usableHeight * 0.65;
-      if (request.reason === 'follow' && targetTop >= bandTop && targetBottom <= bandBottom) {
-        return;
-      }
-      // A tapped block is already under the user's finger; only scroll when
-      // it is partially outside the usable area.
-      if (
-        request.reason === 'explicitSeekInPlace' &&
-        targetTop >= viewportBounds.top &&
-        targetBottom <= usableBottom
-      ) {
-        return;
-      }
-      const explicitReason =
-        request.reason === 'explicitSeek' || request.reason === 'explicitSeekInPlace';
-      const desiredScrollTop = viewport.scrollTop
-        + targetTop
-        - viewportBounds.top
-        - usableHeight * 0.30;
-      const explicitFocusToken = explicitReason
-        ? explicitNarrationFocusTokenRef.current + 1
-        : 0;
-      if (explicitFocusToken !== 0) explicitNarrationFocusTokenRef.current = explicitFocusToken;
-      // Follow-driven focus keeps (or re-claims) narration's viewport
-      // ownership; explicit seeks scroll once without changing who owns it.
-      const nextAutoScrollMode: TranscriptAutoScrollMode = explicitReason
-        ? (autoScrollModeRef.current.type === 'narration-follow'
-          ? autoScrollModeRef.current
-          : { type: 'off' })
-        : { type: 'narration-follow' };
-      scrollToPosition(
-        desiredScrollTop,
-        nextAutoScrollMode,
-        'narration-focus',
-        request.reason !== 'follow',
-        explicitFocusToken === 0
-          ? undefined
-          : () => {
-              if (explicitNarrationFocusTokenRef.current === explicitFocusToken) {
-                explicitNarrationFocusTokenRef.current = 0;
-              }
-            },
-      );
-    };
-    focusWhenMounted();
-  }, [activeThreadId, loadTranscriptAroundTurn, scheduleRangeUpdate, scrollToPosition, setActiveTurnIds]);
-
   const scrollUp = useCallback(() => {
     const viewport = viewportRef.current;
     if (!viewport) {
@@ -659,9 +557,9 @@ export function VirtualizedTranscript({ threadId = null }: { threadId?: string |
   }, [activeThreadId, scrollToPosition, setAnchorRunway, setViewportAutoScrollMode]);
 
   useEffect(() => {
-    setScrollNavigationController({ focusNarration, scrollDown, scrollUp });
+    setScrollNavigationController({ scrollDown, scrollUp });
     return () => setScrollNavigationController(null);
-  }, [focusNarration, scrollDown, scrollUp, setScrollNavigationController]);
+  }, [scrollDown, scrollUp, setScrollNavigationController]);
 
   useLayoutEffect(() => {
     if (

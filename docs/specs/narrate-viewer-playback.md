@@ -1,6 +1,6 @@
 # Narrate Markdown viewer playback v1
 
-Status: Active Spec
+Status: Archived — product retired 2026-09-06
 Last verified: 2026-07-19
 Canonical code: `extensions/narrate/viewer/`, `packages/narration-client/`,
 `extensions/narrate/server/`, and `docs/specs/narrate-batch-alignment.md`

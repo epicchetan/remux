@@ -4,8 +4,6 @@ import {
   cappedMarkdownLayoutDocumentHeight,
   getMarkdownLayoutDocument,
   markdownMetrics,
-  narrationSourceBlocks,
-  narrationSourceDocument,
   parseMarkdownDocument,
   type MarkdownInline,
 } from '../viewer/transcript/components/markdown/markdownModel';
@@ -23,81 +21,6 @@ if (typeof globalThis.OffscreenCanvas === 'undefined') {
 }
 
 test.describe('markdownModel', () => {
-  test('builds stable speakable block identities for complex Markdown', () => {
-    const markdown = [
-      '# Overview',
-      '',
-      'Plain prose.',
-      '',
-      '- First item',
-      '- Second `item`',
-      '',
-      '> Quoted text.',
-      '',
-      '```ts',
-      'const value = 1;',
-      '```',
-      '',
-      '| Name | Price |',
-      '| --- | ---: |',
-      '| Plan | $5 |',
-    ].join('\n');
-
-    const first = narrationSourceBlocks(markdown);
-    const second = narrationSourceBlocks(markdown);
-
-    expect(second).toEqual(first);
-    expect(first.map((block) => block.id)).toEqual([
-      'md:0',
-      'md:1',
-      'md:2/list/0/0',
-      'md:2/list/1/0',
-      'md:3/blockquote/0',
-      'md:4',
-      'md:5',
-    ]);
-    expect(first.map((block) => block.kind)).toEqual([
-      'heading',
-      'paragraph',
-      'listItem',
-      'listItem',
-      'blockquote',
-      'code',
-      'table',
-    ]);
-    expect(first.every((block) => !('needsTransform' in block))).toBe(true);
-    expect(first.at(-1)).toMatchObject({ kind: 'table' });
-
-    const document = narrationSourceDocument(markdown);
-    expect(document).toMatchObject({
-      offsetEncoding: 'utf16CodeUnit',
-      schemaVersion: 1,
-    });
-    expect(document.blocks.map((block) => block.highlightMode)).toEqual([
-      'text',
-      'text',
-      'text',
-      'text',
-      'text',
-      'block',
-      'block',
-    ]);
-    expect(Object.keys(document).sort()).toEqual(['blocks', 'offsetEncoding', 'schemaVersion']);
-    expect(Object.keys(document.blocks[0]).sort()).toEqual(['highlightMode', 'id', 'kind', 'text']);
-  });
-
-  test('leaves word and expression alignment to the narration artifact', () => {
-    const document = narrationSourceDocument(
-      '`live_transcript.rs`: filters HTTP APIs and notification-only state.',
-    );
-    expect(document.blocks).toEqual([{
-      highlightMode: 'text',
-      id: 'md:0',
-      kind: 'paragraph',
-      text: 'live_transcript.rs: filters HTTP APIs and notification-only state.',
-    }]);
-  });
-
   test('parses backslash and dollar display math as measured structural blocks', () => {
     const observedPrice = [
       'Before.',
@@ -131,14 +54,7 @@ test.describe('markdownModel', () => {
       type: 'mathDisplay',
     });
 
-    const narration = narrationSourceBlocks(observedPrice);
-    expect(narration.map((block) => block.kind)).toEqual([
-      'paragraph',
-      'code',
-      'paragraph',
-      'code',
-    ]);
-    expect(narration[1]?.text).toContain('\\text{observed price}');
+
 
     const layout = getMarkdownLayoutDocument(observedPrice, 'default', 360);
     const displayBlocks = layout.blocks.filter((block) => block.type === 'mathDisplay');
@@ -163,10 +79,6 @@ test.describe('markdownModel', () => {
     expect(inlines.filter((inline) => inline.type === 'math').map((inline) => (
       inline.type === 'math' ? inline.math.tex : ''
     ))).toEqual(['p_t', 'O(n^2)', '5x']);
-    expect(narrationSourceBlocks(markdown)[0]?.text).toContain(
-      'Pay $5.00 or $5.00 and $10.00; inspect $HOME and $(command).',
-    );
-    expect(narrationSourceBlocks(markdown)[0]?.text).toContain('https://example.com/$plain$');
     expect(inlines.some((inline) => inline.type === 'code' && inline.text === '\\(code\\)')).toBe(true);
   });
 
@@ -186,7 +98,6 @@ test.describe('markdownModel', () => {
 
     expect(blocks.map((block) => block.type)).toEqual(['code', 'paragraph', 'table']);
     expect(blocks[0]).toMatchObject({ text: '\\[code equation\\]', type: 'code' });
-    expect(narrationSourceBlocks(markdown)[1]?.text).toContain('\\(html equation\\)');
     const table = blocks[2];
     expect(table?.type).toBe('table');
     if (table?.type !== 'table') throw new Error('Expected table');
@@ -240,12 +151,6 @@ test.describe('markdownModel', () => {
     });
     expect(blocks[6]).toMatchObject({ type: 'heading' });
     expect(blocks[7]).toMatchObject({ type: 'paragraph' });
-    expect(narrationSourceBlocks(markdown).map((block) => block.text)).toEqual(
-      expect.arrayContaining([
-        expect.stringContaining('Heading \\[u = v\\]'),
-        expect.stringContaining('Label \\[w = z\\]'),
-      ]),
-    );
   });
 
   test('bounds formula count and source length with exact literal recovery', () => {
@@ -718,38 +623,6 @@ test.describe('markdownModel', () => {
       source: { kind: 'fileLink' },
       text: label,
     });
-  });
-
-  test('keeps rendered fragment ranges aligned with display text across collapsed whitespace', () => {
-    const fixtures = [
-      '**Bold** next word after emphasis',
-      '[Linked](https://example.com) next word after link',
-      '`inlineCode` next word after code',
-      '[app.ts](src/app.ts) next word after file chip',
-      'Value \\(x^2\\) next word after math',
-      'alpha    beta\tgamma delta',
-      'café 😀alpha beta repeated beta',
-    ];
-
-    for (const markdown of fixtures) {
-      for (const width of [110, 170, 280]) {
-        const document = getMarkdownLayoutDocument(markdown, 'default', width);
-        const sourceById = new Map(narrationSourceBlocks(markdown).map((block) => [block.id, block]));
-        for (const block of document.blocks) {
-          if (block.type !== 'paragraph' && block.type !== 'heading') continue;
-          const sourceText = sourceById.get(block.narrationId)?.text;
-          expect(sourceText).toBeDefined();
-          for (const line of block.lines) {
-            for (const fragment of line.fragments) {
-              expect(
-                sourceText!.slice(fragment.displayStart, fragment.displayEnd),
-                `${JSON.stringify(markdown)} at ${width}px range ${fragment.displayStart}-${fragment.displayEnd}`,
-              ).toBe(fragment.text);
-            }
-          }
-        }
-      }
-    }
   });
 
   test('lays out a long fenced code line as one logical line at narrow width', () => {

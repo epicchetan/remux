@@ -1,6 +1,6 @@
 # Narrate text-only structural speech projection v5
 
-Status: Implemented
+Status: Archived — product retired 2026-09-06
 Last revised: 2026-07-18
 Depends on: `docs/specs/narrate-batch-alignment.md` and
 `docs/specs/narrate-pronunciation-audit.md`

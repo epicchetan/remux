@@ -1,6 +1,6 @@
 # Codex Narration ONNX Synthesis and Structural Contract Simplification
 
-Status: Archived — superseded by `docs/specs/narrate-streaming-g2p.md`
+Status: Archived — product retired 2026-09-06
 Last verified: 2026-07-13
 Canonical code: `crates/remux-compute/`, `crates/remux-tts/`, `extensions/codex/narration/model-manifest.json`, `extensions/codex/server/src/narration.rs`, `extensions/codex/server/src/narration_planning.rs`, `extensions/codex/server/src/narration_source_mapping.rs`, `extensions/codex/shared/narration.ts`, `extensions/codex/viewer/narration/`, `extensions/codex/viewer/transcript/components/markdown/`, `crates/remux/`
 Extends: `docs/specs/codex/assistant-narration-planning-optimization.md`

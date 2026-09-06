@@ -913,10 +913,10 @@ mod tests {
         );
         write_manifest(
             root.path(),
-            "narrate",
+            "broken-extension",
             serde_json::json!({
                 "version": 1,
-                "id": "narrate",
+                "id": "broken-extension",
                 "resources": { "workloads": {} },
                 "views": { "main": { "entry": "viewer/dist/index.html" } },
             }),
@@ -924,7 +924,7 @@ mod tests {
 
         let quarantined = restart_preflight(root.path()).unwrap();
         assert_eq!(quarantined.len(), 1);
-        assert_eq!(quarantined[0]["id"], "narrate");
+        assert_eq!(quarantined[0]["id"], "broken-extension");
     }
 
     #[test]
@@ -932,10 +932,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         write_manifest(
             root.path(),
-            "narrate",
+            "broken-extension",
             serde_json::json!({
                 "version": 1,
-                "id": "narrate",
+                "id": "broken-extension",
                 "resources": { "workloads": {} },
                 "views": { "main": { "entry": "viewer/dist/index.html" } },
             }),

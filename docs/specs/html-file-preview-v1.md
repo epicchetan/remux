@@ -1,6 +1,6 @@
-Status: Implemented — iOS Expo preview update published
+Status: Superseded — native preview retired
 Last verified: 2026-09-06
-Canonical code: `app/src/surfaces/viewer/`, `app/src/browser/`,
+Historical implementation locations: `app/src/surfaces/viewer/`, `app/src/browser/`,
 `app/src/files/`, `extensions/editor/viewer/src/editor/`,
 `packages/viewer-kit/src/{fs,links}.ts`, `crates/remux/src/fs/core.rs`
 Related: [tab-identity-and-routing.md](tab-identity-and-routing.md),
@@ -8,10 +8,9 @@ Related: [tab-identity-and-routing.md](tab-identity-and-routing.md),
 
 # HTML file preview v1
 
-The deployed implementation is recorded here. The proposed replacement and
-Narrate retirement are owned by [unified-file-viewer-v1.md](unified-file-viewer-v1.md);
-its web viewer architecture supersedes this document’s native surface target
-once implemented.
+This document records the retired native preview implementation.
+[unified-file-viewer-v1.md](unified-file-viewer-v1.md) owns the implemented web
+Viewer and Narrate retirement. Its architecture supersedes this document.
 
 ## Outcome and scope
 

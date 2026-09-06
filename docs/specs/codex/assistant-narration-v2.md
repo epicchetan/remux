@@ -1,6 +1,6 @@
 # Codex Assistant Narration V2 Cleanup Spec
 
-Status: Core cleanup implemented; provider and distribution hardening remains planned
+Status: Archived — product retired 2026-09-06
 Last verified: 2026-07-11
 Supersedes for new work: `docs/specs/codex/assistant-narration.md`
 Canonical implementation areas: `extensions/codex/shared/narration.ts`, `extensions/codex/server/src/narration.rs`, `extensions/codex/narration/`, `extensions/codex/viewer/narration/`, `extensions/codex/viewer/transcript/components/markdown/`, `extensions/codex/viewer/transcript/virtualizer.tsx`, `extensions/codex/viewer/transcript/viewportStore.ts`

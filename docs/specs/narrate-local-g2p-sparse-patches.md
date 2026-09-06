@@ -1,6 +1,6 @@
 # Narrate local G2P and sparse spoken-text patches v6
 
-Status: Archived — superseded by narrate-batch-alignment.md and narrate-pronunciation-audit.md
+Status: Archived — product retired 2026-09-06
 Last verified: 2026-07-14
 Evidence: `docs/specs/narrate-baseline-patch-rd.md`, `tools/narration-rd/run_baseline_patch_v6_experiment.py`
 

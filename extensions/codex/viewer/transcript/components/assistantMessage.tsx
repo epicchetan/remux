@@ -1,15 +1,11 @@
-import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
-import { AudioLines, Check, Copy, GitFork, Loader2 } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { Check, Copy, GitFork } from 'lucide-react';
 
 import type { CodexAssistantMessageSegment, CodexTranscriptTurn } from '../../../shared/transcript';
 import { useComposerStore } from '../../composer/store';
 import { MarkdownBlock } from './markdown/MarkdownBlock';
 import { useOperationQueueStore } from '../../threads/operationQueueStore';
-import {
-  narrationSourceDocument,
-  releaseStreamingMarkdownCaches,
-} from './markdown/markdownModel';
-import { narrationSourceHash, useNarrationStore } from '../../narration/client';
+import { releaseStreamingMarkdownCaches } from './markdown/markdownModel';
 import { releaseStreamingKatexCache } from './markdown/katexAdapter';
 import { releaseStreamingMathMetrics } from './markdown/mathMetricsStore';
 
@@ -28,9 +24,6 @@ export function AssistantMessage({
   turnId?: string;
   width: number;
 }) {
-  const narrationTargetMessageId = useNarrationStore((state) => state.target?.assistantMessageId ?? null);
-  const narrationPhase = useNarrationStore((state) => state.phase);
-  const seekNarrationToBlock = useNarrationStore((state) => state.seekToBlock);
   const streaming = turnStatus === 'inProgress';
   useEffect(() => {
     if (!streaming) {
@@ -48,29 +41,10 @@ export function AssistantMessage({
   if (!segment.text.trim()) {
     return null;
   }
-  // Tap-to-seek is narration-only and block-level: while this message is the
-  // playback target, tapping a narrated block seeks the audio to its start.
-  const narrationSeekable = narrationTargetMessageId === segment.id &&
-    (narrationPhase === 'ready' || narrationPhase === 'playing' || narrationPhase === 'buffering' || narrationPhase === 'paused');
-  const seekToTappedBlock = (event: ReactMouseEvent<HTMLDivElement>) => {
-    if (!(event.target instanceof Element)) return;
-    if (event.target.closest('a, button, [data-remux-no-composer-focus]')) return;
-    const selection = window.getSelection();
-    if (selection && !selection.isCollapsed) return;
-    const blockId = event.target
-      .closest('[data-narration-block-id]')
-      ?.getAttribute('data-narration-block-id');
-    if (!blockId) return;
-    void seekNarrationToBlock(blockId);
-  };
   return (
-    <div
-      className="codex-assistant-message"
-      onClick={narrationSeekable ? seekToTappedBlock : undefined}
-    >
+    <div className="codex-assistant-message">
       <MarkdownBlock
         messageCacheKey={segment.id}
-        narrationAssistantMessageId={narrationTargetMessageId === segment.id ? segment.id : null}
         streaming={streaming}
         width={width}
       >{segment.text}</MarkdownBlock>
@@ -98,25 +72,13 @@ function AssistantMessageActions({
   turnId: string;
 }) {
   const copiedTimeoutRef = useRef<number | null>(null);
-  const editTarget = useComposerStore((state) => state.editTarget);
-  const forkTarget = useComposerStore((state) => state.forkTarget);
   const startFork = useComposerStore((state) => state.startFork);
-  const narrationPhase = useNarrationStore((state) => state.phase);
-  const narrationTargetMessageId = useNarrationStore((state) => state.target?.assistantMessageId ?? null);
-  const playNarration = useNarrationStore((state) => state.play);
-  const closeNarration = useNarrationStore((state) => state.close);
-  const startNarration = useNarrationStore((state) => state.start);
   const queueBlocksFork = useOperationQueueStore((state) =>
     state.queue?.threadId === threadId && state.queue.entries.length > 0);
   const [copied, setCopied] = useState(false);
-  const narrationIsTarget = narrationTargetMessageId === segment.id;
-  const narrationPreparing = narrationIsTarget && narrationPhase === 'preparing';
-  const narrationPlaying = narrationIsTarget && (narrationPhase === 'buffering' || narrationPhase === 'playing');
   // A message in an in-progress turn is still mutable: codex rejects it as a
-  // fork point and its text would go stale under a narration. Completed
-  // messages stay forkable and narratable while a newer turn runs.
+  // fork point and its text would go stale.
   const forkDisabled = queueBlocksFork || streaming;
-  const narrationDisabled = Boolean(editTarget || forkTarget) || streaming;
 
   useEffect(() => () => {
     if (copiedTimeoutRef.current !== null) {
@@ -138,30 +100,10 @@ function AssistantMessageActions({
 
   const fork = () => {
     if (forkDisabled) return;
-    closeNarration();
     startFork({
       assistantMessageId: segment.id,
       threadId,
       turnId,
-    });
-  };
-
-  const narrate = () => {
-    if (narrationDisabled || narrationPreparing || narrationPlaying) return;
-    if (narrationIsTarget && (narrationPhase === 'ready' || narrationPhase === 'paused')) {
-      void playNarration();
-      return;
-    }
-    const sourceHash = narrationSourceHash(segment.text);
-    void startNarration({
-      document: narrationSourceDocument(segment.text),
-      target: {
-        assistantMessageId: segment.id,
-        messageRevision: segment.revision,
-        sourceHash,
-        threadId,
-        turnId,
-      },
     });
   };
 
@@ -183,23 +125,6 @@ function AssistantMessageActions({
         type="button"
       >
         <GitFork className="size-4" />
-      </button>
-      <button
-        aria-label={narrationPreparing
-          ? 'Preparing narration'
-          : narrationPlaying
-            ? 'Narration playing'
-          : narrationIsTarget && narrationPhase !== 'failed'
-            ? 'Play narration'
-            : narrationIsTarget && narrationPhase === 'failed'
-              ? 'Narration failed; retry'
-              : 'Narrate response'}
-        className={`codex-user-action-button${narrationIsTarget ? ' is-active' : ''}`}
-        disabled={narrationDisabled || narrationPreparing || narrationPlaying}
-        onClick={narrate}
-        type="button"
-      >
-        {narrationPreparing ? <Loader2 className="size-4 animate-spin" /> : <AudioLines className="size-4" />}
       </button>
     </div>
   );

@@ -1,8 +1,0 @@
-{
-  "version": 4,
-  "windowId": 0,
-  "phonemePatches": [
-    { "wordId": 4, "phones": "ˌeɪtʃ tˌiː ˌɛm ˈɛl" },
-    { "wordId": 9, "phones": "sˈoʊl" }
-  ]
-}

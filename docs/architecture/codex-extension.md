@@ -77,10 +77,7 @@ at the outer relation/binary-operator chunks emitted by KaTeX; constructs inside
 fractions, braces, and tables stay atomic. Short displays remain centered,
 constrained displays align to the readable leading edge, expressions with no
 safe break retain local horizontal scrolling, and tall displays use a capped
-local vertical scroller. None can widen the transcript. Inline narration
-exposes the delimiter-free TeX as its logical text and paints the entire
-rendered formula when a cue overlaps it; display formulas use structural block
-narration.
+local vertical scroller. None can widen the transcript.
 
 The detailed syntax, recovery, geometry, accessibility, and validation contract
 is recorded in

@@ -1,7 +1,0 @@
-{
-  "schemaVersion": 1,
-  "offsetEncoding": "utf16CodeUnit",
-  "blocks": [
-    { "id": "md:0", "kind": "paragraph", "text": "Hello.", "highlightMode": "text", "targets": [] }
-  ]
-}

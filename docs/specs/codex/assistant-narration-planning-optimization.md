@@ -1,6 +1,6 @@
 # Codex Assistant Narration Planning, Alignment, and Highlighting Spec
 
-Status: Archived — superseded by `docs/specs/narrate-streaming-g2p.md`
+Status: Archived — product retired 2026-09-06
 Last verified: 2026-07-13
 Canonical code: `extensions/codex/server/src/narration.rs`, `extensions/codex/server/src/narration_planning.rs`, `extensions/codex/server/src/narration_source_mapping.rs`, `crates/remux-tts/`, `extensions/codex/shared/narration.ts`, `extensions/codex/viewer/narration/paintController.ts`, `extensions/codex/viewer/narration/textLeafRegistry.ts`
 Extends: `docs/specs/codex/assistant-narration-v2.md`

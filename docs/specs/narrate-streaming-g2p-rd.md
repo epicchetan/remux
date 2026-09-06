@@ -1,6 +1,6 @@
 # Narrate Streaming Transcript and G2P R&D
 
-Status: R&D evidence
+Status: Historical R&D evidence — product retired 2026-09-06
 Last verified: 2026-07-13
 Canonical code: `tools/narration-rd/`
 Related: `docs/specs/narrate-service.md`, `docs/specs/codex/narration-onnx-synthesis.md`

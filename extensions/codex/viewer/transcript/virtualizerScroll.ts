@@ -88,13 +88,6 @@ export function autoScrollModeForStreamingTurn({
     return currentMode;
   }
 
-  if (currentMode.type === 'narration-follow') {
-    // Narration owns the viewport; a streaming turn must not convert its
-    // focus into bottom stickiness. The user or the narration store decides
-    // when that ownership ends.
-    return currentMode;
-  }
-
   if (currentMode.type === 'bottom' || nearBottom) {
     return { type: 'bottom' };
   }

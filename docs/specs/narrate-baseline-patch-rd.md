@@ -1,6 +1,6 @@
 # Narrate deterministic-baseline plus sparse-patch R&D
 
-Status: R&D evidence — implemented by Narrate v6
+Status: Historical R&D evidence — product retired 2026-09-06
 Last verified: 2026-07-13
 Canonical harness: `tools/narration-rd/run_baseline_patch_v6_experiment.py`
 Related implementation spec: `docs/specs/narrate-local-g2p-sparse-patches.md`

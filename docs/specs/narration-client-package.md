@@ -1,6 +1,6 @@
 # Shared narration client extraction v1
 
-Status: Implemented
+Status: Archived — product retired 2026-09-06
 Last verified: 2026-07-19
 Target code: `packages/narration-client/`,
 `extensions/codex/viewer/narration/`,

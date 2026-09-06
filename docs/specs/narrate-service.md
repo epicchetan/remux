@@ -1,6 +1,6 @@
 # Narrate Service
 
-Status: Archived — superseded by `docs/specs/narrate-local-g2p-sparse-patches.md`
+Status: Archived — product retired 2026-09-06
 Last verified: 2026-07-13
 Canonical code: `extensions/narrate/server/`, `extensions/codex/server/src/structured_inference.rs`, `crates/remux-extension-rpc/`, `crates/remux-tts/`, `crates/remux/src/extensions/supervisor.rs`
 

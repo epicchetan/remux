@@ -20,11 +20,6 @@
     "test:agent": "npm --workspace @remux/agent test",
     "test:agent-server": "npm --workspace @remux/agent run test:server",
     "test:agent-viewer": "npm --workspace @remux/agent run test:viewer",
-    "test:narrate": "npm --workspace @remux/narrate test",
-    "test:narration-client": "npm --workspace @remux/narration-client test",
-    "build:codex:narration-real": "npm --workspace @remux/codex run build && npm --workspace @remux/narrate run build && cargo build --release -p remux --offline && cargo build --release --manifest-path extensions/codex/server/Cargo.toml --target-dir /tmp/remux-codex-server-target --offline && cargo build --release --manifest-path extensions/narrate/server/Cargo.toml --target-dir /tmp/remux-narrate-server-target --offline",
-    "test:codex:narration-real": "npm run build:codex:narration-real && playwright test -c extensions/codex/playwright.narration-real.config.ts",
-    "test:narrate:playback-real": "npm run build:codex:narration-real && playwright test -c extensions/narrate/playwright.real.config.ts",
     "test:terminal-server": "cargo test --manifest-path extensions/terminal/server/Cargo.toml",
     "test:terminal-smoke": "node extensions/terminal/tests/ws-smoke.cjs",
     "test:terminal": "playwright test -c extensions/terminal/playwright.config.ts"

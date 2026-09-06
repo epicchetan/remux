@@ -229,12 +229,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("extensions");
         write_manifest(&root.join("codex"), "codex");
-        std::fs::create_dir_all(root.join("narrate")).unwrap();
+        std::fs::create_dir_all(root.join("broken-extension")).unwrap();
         std::fs::write(
-            root.join("narrate").join(MANIFEST_FILENAME),
+            root.join("broken-extension").join(MANIFEST_FILENAME),
             json!({
                 "version": 1,
-                "id": "narrate",
+                "id": "broken-extension",
                 "resources": { "workloads": {} },
                 "views": { "main": { "entry": "viewer/dist/index.html" } }
             })
@@ -252,7 +252,7 @@ mod tests {
             vec!["codex"]
         );
         assert_eq!(discovery.invalid.len(), 1);
-        assert_eq!(discovery.invalid[0].id.as_deref(), Some("narrate"));
+        assert_eq!(discovery.invalid[0].id.as_deref(), Some("broken-extension"));
         assert!(discovery.invalid[0]
             .error
             .contains("resources requires version 2"));

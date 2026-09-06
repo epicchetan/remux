@@ -1,4 +1,4 @@
-Status: Viewer and app migration deployed; Narrate removal awaits client update
+Status: Implemented — final Narrate retirement deployment in progress
 Date: 2026-09-06
 Owner: primary agent; bounded Sol implementation lanes with primary review
 Supersedes target architecture: [html-file-preview-v1.md](html-file-preview-v1.md)
@@ -376,3 +376,18 @@ host without React Native. Building the full future Remux web app is out of scop
   touch scrolling, bottom-marker geometry, fixed toolbar, retained scroll across
   mode changes and one document read. This covers vertical scrolling explicitly;
   earlier horizontal-overflow/parity checks did not catch it.
+- User validated the updated viewer and authorized the final Narrate cutover.
+  V4b source and lock patches applied to main without conflicts, preserving all
+  later Markdown scroll/fragment fixes and the Links-button removal. Root removed
+  extraneous retired workspace records left by npm, then pruned dependencies.
+- Final integrated validation: root/linked/app typechecks; Agent UI-boundary and
+  style-parity 8/8; persisted-tab migration; complete Editor test script including
+  scrolling, large Source and iframe proof; Codex production build. The retained
+  Codex desktop/mobile suite had already passed 226 tests on this retirement patch.
+  Full Remux runtime suite now passes 250 tests. Root corrected its stale Agent
+  manifest assertion (research workload added in prior commit `bdafc52`) and built
+  the release runtime. This fixes the baseline failure noted in the dry run.
+- Retirement removes the Narrate extension and server, old Codex playback,
+  narration-client package, remux-tts crate, narration R&D, runtime dispatch
+  special cases and build/workspace references. Historical specs remain archived;
+  the app's persisted-tab migration remains to restore older saved tabs.

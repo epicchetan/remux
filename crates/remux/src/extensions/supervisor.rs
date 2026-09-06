@@ -2627,12 +2627,12 @@ mod tests {
         assert_eq!(
             extension_request(&serde_json::json!({
                 "jsonrpc": "2.0",
-                "id": "narrate:123:1",
+                "id": "broken-extension:123:1",
                 "method": "remux/codex/inference/structured/generate",
                 "params": { "value": 1 },
             })),
             Some((
-                Value::from("narrate:123:1"),
+                Value::from("broken-extension:123:1"),
                 "remux/codex/inference/structured/generate".to_string(),
                 Some(serde_json::json!({ "value": 1 })),
             ))

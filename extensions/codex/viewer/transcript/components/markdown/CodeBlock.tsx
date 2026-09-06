@@ -66,7 +66,6 @@ export function CodeBlock({
   return (
     <pre
       className="codex-md-block codex-md-code-block"
-      data-narration-surface="code"
       data-highlight-state={highlightState.status}
       data-language={block.language ?? undefined}
       style={{
@@ -76,7 +75,7 @@ export function CodeBlock({
     >
       <code style={{ minHeight: `${block.textHeight}px` }}>
         {block.lines.map((line, index) => (
-          <NarratedCodeLine
+          <CodeLine
             fallbackText={line.text}
             key={`${index}:${line.text}`}
             tokens={highlightState.status === 'ready' ? highlightState.result.lines[index]?.tokens : null}
@@ -87,7 +86,7 @@ export function CodeBlock({
   );
 }
 
-function NarratedCodeLine({
+function CodeLine({
   fallbackText,
   tokens,
 }: {

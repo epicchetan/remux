@@ -4,19 +4,8 @@ import { initialTranscriptActiveTurnIds, sameTurnIds } from './virtualizerRange'
 import { userMessageRowMatchesId } from './virtualizerScroll';
 
 type TranscriptScrollNavigationController = {
-  focusNarration: (request: TranscriptNarrationFocusRequest) => void;
   scrollDown: () => void;
   scrollUp: () => void;
-};
-
-export type TranscriptNarrationFocusRequest = {
-  assistantMessageId: string;
-  bounds?: { bottom: number; top: number };
-  materializeOnly?: boolean;
-  reason: 'explicitSeek' | 'explicitSeekInPlace' | 'follow' | 'followReenabled';
-  blockIds: string[];
-  threadId: string;
-  turnId: string;
 };
 
 export type TranscriptAutoScrollMode =
@@ -28,10 +17,6 @@ export type TranscriptAutoScrollMode =
       type: 'sent-message-anchor';
       turnId: string;
     }
-  // Narration playback owns programmatic scrolling; content growth at the
-  // bottom must not move the viewport. The narration store claims and
-  // releases this mode and mirrors losing it as a follow suspension.
-  | { type: 'narration-follow' }
   | { type: 'off' };
 
 type TranscriptViewportStoreState = {
@@ -39,7 +24,6 @@ type TranscriptViewportStoreState = {
   autoScrollMode: TranscriptAutoScrollMode;
   canScrollDown: boolean;
   canScrollUp: boolean;
-  focusNarration: (request: TranscriptNarrationFocusRequest) => void;
   lifecycleState: 'active' | 'background' | 'inactive';
   pendingUserMessageIds: string[];
   requestedTurnScroll: TranscriptTurnScrollRequest | null;
@@ -62,7 +46,6 @@ type TranscriptTurnScrollRequest = {
 };
 
 const noopScrollNavigation = () => undefined;
-const noopNarrationFocus = (_request: TranscriptNarrationFocusRequest) => undefined;
 let turnScrollRequestId = 0;
 
 const actions: Pick<
@@ -154,7 +137,6 @@ const actions: Pick<
     viewportStore.setState({
       canScrollDown: controller ? state.canScrollDown : false,
       canScrollUp: controller ? state.canScrollUp : false,
-      focusNarration: controller?.focusNarration ?? noopNarrationFocus,
       scrollDown: controller?.scrollDown ?? noopScrollNavigation,
       scrollUp: controller?.scrollUp ?? noopScrollNavigation,
     });
@@ -166,7 +148,6 @@ const viewportStore = createExternalStore<TranscriptViewportStoreState>({
   autoScrollMode: { type: 'off' },
   canScrollDown: false,
   canScrollUp: false,
-  focusNarration: noopNarrationFocus,
   lifecycleState: 'active',
   pendingUserMessageIds: [],
   requestedTurnScroll: null,
@@ -227,10 +208,6 @@ export function setTranscriptViewportLifecycleState(
   state: 'active' | 'background' | 'inactive',
 ) {
   viewportStore.getState().setLifecycleState(state);
-}
-
-export function focusTranscriptNarration(request: TranscriptNarrationFocusRequest) {
-  viewportStore.getState().focusNarration(request);
 }
 
 export function reconcileTranscriptViewportForLayout(

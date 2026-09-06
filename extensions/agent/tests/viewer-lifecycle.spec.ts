@@ -510,7 +510,7 @@ test('previous-turn navigation skips user messages already visible in a short mo
 test('keeps excluded Codex surfaces out of the Agent shell', async ({ page }) => {
   await page.goto('/viewers/agent/');
   await page.getByRole('button', { name: 'Preferences' }).click();
-  for (const name of ['Attach', 'Compact', 'Review', 'Speed', 'Narration', 'Queue']) {
+  for (const name of ['Attach', 'Compact', 'Review', 'Speed', 'Queue']) {
     await expect(page.getByText(name, { exact: false })).toHaveCount(0);
   }
 });

@@ -302,10 +302,10 @@ mod tests {
 
     #[test]
     fn finds_exact_workload_scope_in_cgroup() {
-        let value = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/remux-workload-codex-narration-background-operation-job-12.scope\n";
+        let value = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/remux-workload-codex-analysis-background-operation-job-12.scope\n";
         assert_eq!(
             workload_unit_from_cgroup(value),
-            Some("remux-workload-codex-narration-background-operation-job-12.scope")
+            Some("remux-workload-codex-analysis-background-operation-job-12.scope")
         );
         assert_eq!(
             workload_unit_from_cgroup("0::/user.slice/app.slice\n"),

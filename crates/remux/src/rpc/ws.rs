@@ -910,7 +910,6 @@ impl WsServer {
             .and_then(|contract| contract.get("kind"))
             .and_then(Value::as_str)
             == Some("job-start")
-            && method != "remux/narrate/narration/start"
         {
             self.clone()
                 .start_job(client.clone(), message, method, id.clone())
@@ -1348,17 +1347,6 @@ fn dispatch_lane(client: &WsClient, method: &str, work: &DispatchWork) -> (Strin
             "core:filesystem".to_string(),
             DispatchMode::ConcurrentBusiness,
         );
-    }
-    if method.starts_with("remux/narrate/narration/") {
-        let mode = if matches!(
-            method,
-            "remux/narrate/narration/resources/read" | "remux/narrate/narration/diagnostics/read"
-        ) {
-            DispatchMode::ConcurrentBusiness
-        } else {
-            DispatchMode::Serial
-        };
-        return ("extension:narrate:narration".to_string(), mode);
     }
     if matches!(
         method,

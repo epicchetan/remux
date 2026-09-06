@@ -1,6 +1,6 @@
 # Narrate batch source alignment v1
 
-Status: Implemented — v1 contract
+Status: Archived — product retired 2026-09-06
 Last verified: 2026-07-17
 Extended by: docs/specs/narrate-pronunciation-audit.md and
 docs/specs/narrate-structural-transcripts.md (implemented)

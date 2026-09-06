@@ -28,7 +28,6 @@ export default defineConfig({
   ],
   reporter: process.env.CI ? [['list'], ['html', { open: 'never', outputFolder: '../../playwright-report/codex' }]] : 'list',
   testDir: './tests',
-  testIgnore: '**/narration-real.spec.ts',
   timeout: 45_000,
   use: {
     baseURL,

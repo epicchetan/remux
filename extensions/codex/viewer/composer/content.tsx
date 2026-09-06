@@ -6,7 +6,6 @@ import { ComposerLexicalInput } from './editor/LexicalInput';
 import { NewChatBar } from './newChat/NewChatBar';
 import { useThreadsStore } from '../threads/store';
 import { OperationQueueTray } from './queue/OperationQueueTray';
-import { NarrationBar } from '../narration/NarrationBar';
 
 export function ComposerContent() {
   const pickingDirectory = useThreadsStore((state) =>
@@ -17,7 +16,6 @@ export function ComposerContent() {
       {pickingDirectory ? null : (
         <div className="remux-composer-context-strip">
           <ComposerEditBar />
-          <NarrationBar />
           <OperationQueueTray />
         </div>
       )}

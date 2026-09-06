@@ -1,6 +1,6 @@
 # Narrate post-transcript Misaki review v4
 
-Status: Implemented
+Status: Archived — product retired 2026-09-06
 Last revised: 2026-07-18
 Depends on: `docs/specs/narrate-batch-alignment.md`
 Companion: `docs/specs/narrate-structural-transcripts.md`

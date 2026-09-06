@@ -1016,19 +1016,6 @@ test.describe('transcript virtualizer scroll targets', () => {
     })).toEqual(sentMessageMode('turn-1'));
   });
 
-  test('streaming never steals viewport ownership from narration follow', () => {
-    expect(autoScrollModeForStreamingTurn({
-      currentMode: { type: 'narration-follow' },
-      nearBottom: true,
-      streamingTurnId: 'turn-1',
-    })).toEqual({ type: 'narration-follow' });
-    expect(autoScrollModeForStreamingTurn({
-      currentMode: { type: 'narration-follow' },
-      nearBottom: false,
-      streamingTurnId: null,
-    })).toEqual({ type: 'narration-follow' });
-  });
-
   test('uses safe-area-aware offset for sent message targets', () => {
     const layout = measureCollapsedTranscript({
       turns: [

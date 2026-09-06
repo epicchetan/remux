@@ -25,8 +25,6 @@ import { CodexSidebar } from './threads/Sidebar';
 import { shortenPath, threadTitle } from './threads/threadFormat';
 import { CodexTranscript } from './transcript';
 import { requestTranscriptTurnScroll } from './transcript/viewportStore';
-import { attachNarrationClient, useNarrationStore } from './narration/client';
-import { installNarrationPaintController } from './narration/paintController';
 
 export function App() {
   const connectionStatus = useHostStore((state) => state.connectionStatus);
@@ -73,9 +71,6 @@ export function App() {
   const mentionSession = useComposerStore((state) => state.mentionSession);
   const setComposerDocument = useComposerStore((state) => state.setComposerDocument);
   const snapshot = useComposerStore((state) => state.snapshot);
-  const closeNarration = useNarrationStore((state) => state.close);
-  const narrationPhase = useNarrationStore((state) => state.phase);
-  const narrationTargetThreadId = useNarrationStore((state) => state.target?.threadId ?? null);
   const mainPaneRef = useRef<HTMLElement | null>(null);
   const bottomBarSlotRef = useRef<HTMLDivElement | null>(null);
   const draftRestorePendingRef = useRef<string | null>(null);
@@ -339,27 +334,6 @@ export function App() {
     historyInitialLoadRequestedRef.current = true;
     void loadThreadHistory();
   }, [loadThreadHistory]);
-
-  useEffect(() => attachNarrationClient(), []);
-  useEffect(() => installNarrationPaintController(), []);
-
-  useEffect(() => {
-    if (narrationTargetThreadId && narrationTargetThreadId !== activeThreadId) {
-      closeNarration();
-      return;
-    }
-
-    // A running turn no longer closes narration: playback of a completed
-    // message coexists with streaming, and the transcript auto-scroll mode
-    // decides which of them drives the viewport. Entering edit/fork or the
-    // directory picker still dismisses playback since they replace the
-    // composer surface narration controls live in.
-    const playbackActive = narrationPhase === 'buffering' || narrationPhase === 'ready' || narrationPhase === 'playing' || narrationPhase === 'paused';
-    if (!playbackActive) return;
-    if (editTarget || forkTarget || directoryPickerOpen) {
-      closeNarration();
-    }
-  }, [activeThreadId, closeNarration, directoryPickerOpen, editTarget, forkTarget, narrationPhase, narrationTargetThreadId]);
 
   useEffect(() => subscribeHostNavigate((navigation) => {
     if (navigation.resourceKind !== 'thread' || !navigation.resourceId) {

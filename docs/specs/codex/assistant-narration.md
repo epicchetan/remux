@@ -1,6 +1,6 @@
 # Codex Assistant Response Narration Spec
 
-Status: Archived — superseded by `docs/specs/narrate-streaming-g2p.md`
+Status: Archived — product retired 2026-09-06
 Last verified: 2026-07-13
 Canonical code: `extensions/codex/viewer/transcript/components/assistantMessage.tsx`, `extensions/codex/viewer/composer/actions/ActionButtons.tsx`, `extensions/codex/viewer/composer/content.tsx`, `extensions/codex/viewer/transcript/components/markdown/`, `extensions/codex/server/src/app_server.rs`, `extensions/codex/server/src/main.rs`
 
