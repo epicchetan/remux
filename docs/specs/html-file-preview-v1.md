@@ -1,4 +1,4 @@
-Status: Implemented — iOS and Android enabled; Expo publication pending
+Status: Implemented — iOS Expo preview update published
 Last verified: 2026-09-06
 Canonical code: `app/src/surfaces/viewer/`, `app/src/browser/`,
 `app/src/files/`, `extensions/editor/viewer/src/editor/`,
@@ -311,5 +311,26 @@ refactoring. No new agent/server protocol or journal migration is required.
   daemon 848265 retained their original start times; no live turn was interrupted.
 - **Release decision:** `htmlPreviewAvailability.ts` enables iOS and Android at
   the user's direction. Native device acceptance remains unperformed and is not
-  claimed. Expo publication and any required host rollout are separate pending
-  operations; prepared bundles and binaries alone are not a deployment.
+  claimed.
+- Published 2026-09-06 16:19 UTC from `5f5e130` to the existing **iOS preview**
+  channel. Message: `Interactive HTML previews in file tabs`. Update group:
+  `322069d0-e254-45d1-8462-1315150625df`; update ID:
+  `01a07784-960c-7223-a410-371bd96ff111`. Runtime:
+  `a100fc36093abfc62b43b2d93750f92f9bf78430`, matching the existing preview
+  binaries and previous OTA. Native package versions and app native config are
+  unchanged since that OTA; new parse5/base64-js dependencies are JavaScript.
+  The existing explicit runtime override was used for this compatible update.
+- Verified the Expo manifest selects that update for the iOS preview channel
+  and runtime, then downloaded its authenticated launch asset and compared it
+  byte-for-byte with the local export. Source map confirms native Preview is
+  enabled. Evidence: `/tmp/remux-html-preview/expo-deployment-proof.json`,
+  `expo-publication.json`, and `expo-publication.log`. Android is enabled in
+  source but was not published to an Android channel in this operation.
+- No Remux server restart is required to use Preview: an authenticated read
+  through the running host returned the actual 2,255,261-byte Ledger report
+  exactly (`live-file-read.json`). The additional bounded-read hardening is
+  committed/built and will take effect at the next normal worker restart.
+  This release did not restart the worker, Agent server or Codex daemon.
+- To install: app Settings → Updates → Check for updates (or Restart to update
+  if downloaded), then open the HTML report link again. This reloads the app UI,
+  not the provider session.

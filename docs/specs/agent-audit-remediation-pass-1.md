@@ -24,7 +24,9 @@ native-platform isolation gates, commit/build cadence and deployment needs.
 The feature implementation and automated checks are complete, including native
 app exports and a host release build. The user elected to enable the native
 platforms and proceed with Expo publication before device acceptance. The HTML spec records
-commit and validation evidence. The remaining audit slices below keep their
+commit and validation evidence. The iOS preview update is now published from
+`5f5e130`; the running host already serves these files, so no worker restart
+was needed. The remaining audit slices below keep their
 current status and scope; this feature is not an audit completion claim.
 
 ### Deployed bounded follow-up — short active-turn Down navigation
