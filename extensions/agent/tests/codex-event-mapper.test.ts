@@ -1335,6 +1335,7 @@ test('Codex native subagents remain native child executions under the owning tur
   assert.equal(activity[0].event.block.payload.child.ownership, 'native');
   assert.equal(activity[0].event.block.payload.child.nativeSessionId, childThreadId);
   assert.equal(activity[0].event.block.payload.child.transcriptAvailable, true);
+  assert.equal(activity[0].event.block.payload.child.title, '/root/reviewer');
 
   const completed = subject.mapNotification({
     method: 'turn/completed',
@@ -1354,6 +1355,22 @@ test('Codex native subagents remain native child executions under the owning tur
     );
     assert.equal(completed[0].event.structure.blockId, activity[0].event.structure.blockId);
     assert.equal(completed[0].event.structure.passId, activity[0].event.structure.passId);
+  }
+});
+
+test('Codex child turn notifications do not invent a task title without provider evidence', () => {
+  const subject = mapper();
+  subject.bindTurn('remux-owner', NATIVE_TURN);
+  const childThreadId = 'codex-child-untitled';
+  const [spawned] = subject.mapNotification({ method: 'item/completed', params: {
+    threadId: ROOT_THREAD, turnId: NATIVE_TURN,
+    item: { id: 'spawn-untitled', type: 'subAgentActivity', kind: 'started',
+      agentThreadId: childThreadId },
+  } });
+  assert.ok(spawned?.event.type === 'turn.block.started');
+  if (spawned?.event.type === 'turn.block.started' &&
+      spawned.event.block.payload.kind === 'native-child') {
+    assert.equal(spawned.event.block.payload.child.title, undefined);
   }
 });
 

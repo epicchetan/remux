@@ -204,7 +204,7 @@ export function projectNativeChildExecutionScope(
       .flatMap((part) => part.type === 'text' ? [part.text] : [])
       .join('\n')
       .trim();
-    return projectTurnInferences(turn, task ? `Task\n\n${task}` : undefined);
+    return projectTurnInferences(turn, task ? `Task\n\n${task}` : 'Task\n\nOriginal task unavailable.');
   }).map((inference, ordinal) => ({ ...inference, ordinal }));
   const first = transcript.turns[0];
   const last = transcript.turns.at(-1);

@@ -28,28 +28,24 @@ Queued messages survive and must not auto-start as a side effect of Stop.
 
 ## Presentation
 
-The existing Agents button beside the composer preferences/menu carries a small
-corner activity badge. It opens the Agents view and stays available for history
-when idle. There is no additional activity row above the composer and no child
-transcript dropdown in Work. One agent entry contains successive assignments.
+The existing Agents icon beside the composer preferences/menu turns Remux primary
+orange while subagent activity is unresolved. It stays the normal color when idle.
+There is no badge, animation or activity row. The button opens Agents at all times.
+Its accessible name and title report running/checking/stopping counts or an error;
+a disconnected viewer describes cached work as checking. Only the selected
+conversation supplies activity state. Icon color changes have no layout effect.
 
-| Situation | Composer button |
-| --- | --- |
-| No active/unresolved agents | Normal Agents button, no badge |
-| Confirmed active agents | Subtle activity badge; accessible label/title reports N running |
-| Some finish or an existing agent receives follow-up | Update the same badge/label using unique agent identities |
-| Parent finishes while children work | Badge remains active |
-| Stop pending, including root already terminal | Stopping badge; label/title reports N stopping |
-| All targets terminal | Badge disappears; button remains |
-| Reconnecting/unverified work | Checking indicator, no claim that cached counts are confirmed running |
-| Mixed visibility | Label/title reports running/checking counts |
-| Reconciliation/Stop fails | Distinct warning indicator; explanation in label/title and Agents details |
-| Conversation switch | Only selected conversation state |
+Agents are listed newest-first using durable execution creation time (`startedAt`),
+with execution ID as a deterministic tie break. History hydration timestamps must
+not reorder the list. One agent entry retains successive assignments, displayed
+chronologically in its detail view. Opening Agents and returning preserves the
+reading anchor.
 
-The badge overlays the existing icon and never changes button, composer or
-transcript dimensions. It does not add a focus target or block navigation. Honor
-reduced-motion preferences. Opening Agents and returning preserves the reading
-anchor. Root-only activity remains the existing Thinking behavior.
+The Task section must contain actual assignment content supported by provider
+user-message evidence, never an execution title used as a placeholder. Where the
+provider omits an original assignment, show that it is unavailable. Metadata or
+history reads must remain scoped to the child and bounded; opening an old child
+must not replay the active root conversation solely to recover a missing prompt.
 
 ## Checkpoints and ownership
 
@@ -71,14 +67,14 @@ single incident. Validate on a copy; idempotent audited repair; retain diagnosti
 events, genuine turns/descendants and ambiguous cases. Reconcile real stale work
 using native evidence, not age, naming or CPU usage.
 
-C. Viewer: after A's resource contract settles, Sol writer owns composer activity badge,
+C. Viewer: after A's resource contract settles, Sol writer owns composer activity icon,
 Agents view integration and viewer tests. Remove subagent dropdown presentation;
 reuse existing navigation/transcript components. No virtualizer rewrite.
 
 Essential tests: spawn/message/follow-up identity; old terminal/replayed starts;
 restart root+child then Stop; missed terminal reconciles without Agents view;
 parent settles first; child interrupt error; Stop survives restart and preserves
-queue; composer-badge geometry/navigation/state/visibility desktop and mobile.
+queue; composer-icon geometry/navigation/state/visibility desktop and mobile.
 
 ## Evidence and progress
 
@@ -201,3 +197,23 @@ production build passed. Live desktop/mobile verification is recorded in
 `/tmp/remux-audit-implementation/subagent-validation/badge-live.json`. This is a
 viewer-only revision served by the running host; no database migration or agent
 session restart is required.
+
+
+Icon and ordering revision, 2026-09-06: user requested primary-orange icon color
+instead of a badge, and newest-first Agents ordering. The icon has no badge or
+pulse; detailed lifecycle remains in its accessible name/title. One shared sort
+at the execution-list boundary uses immutable startedAt descending and identity
+as a tie break, never metadata refresh time. Focused desktop/mobile browser
+acceptance passed 14/14; order coverage verifies the source list is not mutated.
+
+Missing task root cause: ensureNativeChildTurn copied execution.title into the
+user-content field before a real message arrived. The recent native Codex
+subagent has no original delegated prompt in thread/read, parent activity,
+rollout messages or provider metadata. This provider limitation remains; the
+full original prompt cannot be recovered through the available native contract.
+The adapter no longer invents a generic child title, and newly admitted turns
+use only a real user.message as task content. Historical native child projection
+also requires that evidence, so old placeholder values are hidden without database
+rewrites. A real prompt equal to the title remains valid. Empty task text is
+explicitly shown as “Original task unavailable.” Root/federated task content is
+preserved. We did not add whole-parent replay or an unbounded metadata reader.

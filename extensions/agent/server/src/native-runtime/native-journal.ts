@@ -3976,9 +3976,7 @@ export class NativeAgentJournal {
         execution.conversationId !== envelope.scope.conversationId) return;
     const conversation = this.conversation(execution.conversationId);
     if (!conversation) return;
-    const content = envelope.event.type === 'user.message'
-      ? envelope.event.content
-      : execution.title ? [{ type: 'text' as const, text: execution.title }] : [];
+    const content = envelope.event.type === 'user.message' ? envelope.event.content : [];
     this.createTurn({
       turnId: envelope.scope.turnId,
       conversationId: execution.conversationId,

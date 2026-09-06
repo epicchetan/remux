@@ -58,7 +58,7 @@ test('native and federated children expose provider-neutral lazy execution scope
     turnOrder: ['child-turn-1', 'child-turn-2'],
     turns: [
       frame('child-turn-1', 'federated-child', 'completed', 'Initial result.'),
-      frame('child-turn-2', 'federated-child', 'completed', 'Follow-up result.'),
+      { ...frame('child-turn-2', 'federated-child', 'completed', 'Follow-up result.'), userContent: [] },
     ],
     window: {
       startIndex: 0,
@@ -80,6 +80,8 @@ test('native and federated children expose provider-neutral lazy execution scope
     block.type === 'action' ? block.call.name : block.text), [
     'Task\n\nRequest for child-turn-1',
   ]);
+  assert.deepEqual(scope.inferences[1]?.blocks.map((block) =>
+    block.type === 'action' ? block.call.name : block.text), ['Task\n\nOriginal task unavailable.']);
   assert.equal(scope.result, 'Follow-up result.');
   assert.equal(scope.state, 'completed');
   assert.deepEqual(scope.window, {

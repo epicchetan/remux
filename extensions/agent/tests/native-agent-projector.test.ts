@@ -245,6 +245,36 @@ test('native projector turns normalized events into provider-private-free virtua
   }
 });
 
+test('native child prompts require user-message evidence while other prompts remain unchanged', () => {
+  const journal = createJournal();
+  try {
+    seed(journal);
+    const projector = new NativeAgentProjector(journal);
+    const root = projector.project('agent/turn:turn-1') as NativeAgentTurnFrame;
+    assert.deepEqual(root.userContent, [{ type: 'text', text: 'Implement.' }],
+      'root prompts continue to use their durable admitted content');
+
+    journal.database.prepare(`
+      UPDATE executions SET ownership = 'native', title = 'Same text' WHERE execution_id = 'execution-1'
+    `).run();
+    journal.database.prepare(`
+      UPDATE turns SET user_content_json = ? WHERE turn_id = 'turn-1'
+    `).run(JSON.stringify([{ type: 'text', text: 'Same text' }]));
+    const historical = projector.project('agent/turn:turn-1') as NativeAgentTurnFrame;
+    assert.deepEqual(historical.userContent, [],
+      'a historical native-child title copied into the turn is not prompt evidence');
+
+    journal.appendProviderEvent(event('child-user-message', 4, {
+      type: 'user.message', content: [{ type: 'text', text: 'Same text' }],
+    }));
+    const evidenced = projector.project('agent/turn:turn-1') as NativeAgentTurnFrame;
+    assert.deepEqual(evidenced.userContent, [{ type: 'text', text: 'Same text' }],
+      'an actual child message remains visible even when it equals the execution title');
+  } finally {
+    journal.close();
+  }
+});
+
 test('native runtime projects a durable elapsed anchor without revision churn', () => {
   const journal = createJournal();
   try {

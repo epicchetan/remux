@@ -7,20 +7,18 @@ test.beforeEach(async ({ page }) => {
   await page.goto(conversationUrl('&fixtureLong=1'));
 });
 
-test('renders authoritative subagent lifecycle state in one fixed-size Agents badge', async ({ page }) => {
-  const badge = page.locator('.remux-subagent-badge');
+test('colors the Agents icon for authoritative subagent lifecycle state', async ({ page }) => {
+  const icon = page.locator('.remux-agents-icon');
   await setLifecycle(page, { state: 'running', runningCount: 1 });
   await expect(page.locator('.remux-composer-agents-button')).toHaveAttribute('aria-label', /1 subagent running/u);
-  await expect(badge).toHaveCSS('height', '7px');
-  await expect(badge).toHaveCSS('animation-name', 'remux-subagent-badge-pulse');
+  await expect(icon).toHaveAttribute('data-active', 'true');
+  await expect(icon).toHaveCSS('color', 'rgb(249, 115, 22)');
+  await expect(page.locator('.remux-subagent-badge')).toHaveCount(0);
   await expect(page.locator('.remux-composer-agents-button')).toHaveAttribute('title', '1 subagent running');
-  await page.emulateMedia({ reducedMotion: 'reduce' });
-  await expect(badge).toHaveCSS('animation-name', 'none');
-  await page.emulateMedia({ reducedMotion: 'no-preference' });
 
   await setLifecycle(page, { state: 'running', runningCount: 2, checkingCount: 1 });
   await expect(page.locator('.remux-composer-agents-button')).toHaveAttribute('aria-label', /2 subagents running · 1 checking/u);
-  await expect(badge).toHaveCSS('height', '7px');
+  await expect(icon).toHaveAttribute('data-state', 'running');
 
   await setLifecycle(page, { state: 'checking', checkingCount: 1 });
   await expect(page.locator('.remux-composer-agents-button')).toHaveAttribute('aria-label', /Checking subagents…/u);
@@ -31,7 +29,7 @@ test('renders authoritative subagent lifecycle state in one fixed-size Agents ba
   await setLifecycle(page, { state: 'idle', stopErrorCount: 2 });
   await expect(page.locator('.remux-composer-agents-button')).toHaveAttribute('aria-label', /Couldn’t stop 2 subagents/u);
   await setLifecycle(page, { state: 'idle' });
-  await expect(badge).toHaveCount(0);
+  await expect(icon).not.toHaveAttribute('data-active', 'true');
 });
 
 test('shows checking while disconnected and stops children when the root is idle', async ({ page }) => {
@@ -83,7 +81,7 @@ test('does not flash lifecycle counts across conversation switches', async ({ pa
   }, FIXTURE_SECOND_CONVERSATION_ID);
   await expect.poll(() => new URL(page.url()).searchParams.get('remuxResourceId'))
     .toBe(FIXTURE_SECOND_CONVERSATION_ID);
-  await expect(page.locator('.remux-subagent-badge')).toHaveCount(0);
+  await expect(page.locator('.remux-agents-icon')).not.toHaveAttribute('data-active', 'true');
 });
 
 async function setLifecycle(page: Page, lifecycle: Record<string, unknown>) {

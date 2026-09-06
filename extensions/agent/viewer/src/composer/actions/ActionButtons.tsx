@@ -92,7 +92,7 @@ export function ComposerActionButtons({
     branchEnabled: runtime?.capabilities.session.forkNative === true,
   });
   const parent = parentDirectory(pickerPath);
-  const badgeLabel = subagentBadgeLabel(runtime, connected, conversationId);
+  const activityLabel = subagentActivityLabel(runtime, connected, conversationId);
 
   const left: ComposerAction[] = [{
     className: 'remux-composer-overview-button',
@@ -131,21 +131,18 @@ export function ComposerActionButtons({
         />
         {!pickerOpen && conversationExists ? <ComposerActionKey action={{
           className: 'remux-composer-agents-button',
-          icon: <span className="remux-agents-icon">
+          icon: <span
+            className="remux-agents-icon"
+            data-active={activityLabel ? 'true' : undefined}
+            data-state={subagentActivityState(runtime, connected, conversationId)}
+          >
             <Bot className="size-4" />
-            {badgeLabel ? (
-              <span
-                aria-hidden="true"
-                className="remux-subagent-badge"
-                data-state={subagentBadgeState(runtime, connected, conversationId)}
-              />
-            ) : null}
           </span>,
           label: `${childExecutionCount > 0
             ? childExecutionCount === 1 ? 'View 1 subagent' : `View ${childExecutionCount} subagents`
-            : 'View agents'}${badgeLabel ? ` · ${badgeLabel}` : ''}`,
+            : 'View agents'}${activityLabel ? ` · ${activityLabel}` : ''}`,
           onClick: onOpenAgents,
-          title: badgeLabel ?? 'View agents',
+          title: activityLabel ?? 'View agents',
         }} /> : null}
       </div>
       <div className="remux-composer-action-group remux-composer-action-group-right">
@@ -185,7 +182,7 @@ type ComposerBranchCallback<T> = (
   setPhase: (phase: 'sending' | 'updating-transcript') => void,
 ) => Promise<void>;
 
-function subagentBadgeLabel(
+function subagentActivityLabel(
   runtime: AgentRuntimeResource | null,
   connected: boolean,
   conversationId: string | null,
@@ -212,7 +209,7 @@ function subagentBadgeLabel(
   return parts.join(' · ');
 }
 
-function subagentBadgeState(
+function subagentActivityState(
   runtime: AgentRuntimeResource | null,
   connected: boolean,
   conversationId: string | null,

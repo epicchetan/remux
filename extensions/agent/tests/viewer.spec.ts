@@ -689,16 +689,16 @@ test('keeps the compact Remux composer inside the Agent transcript material', as
   }
 });
 
-test('keeps duration in the work header and subagent activity badge stable while work settles', async ({ page }) => {
+test('keeps duration in the work header and subagent activity icon stable while work settles', async ({ page }) => {
   await messageBox(page).fill('Please interrupt after showing live activity');
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
 
   const workHeader = page.locator('.codex-work-header');
   await expect(workHeader).toContainText(/^Working for \S+$/u);
   await expect(workHeader.getByRole('status')).toHaveCount(0);
-  const activity = page.locator('.remux-subagent-badge');
+  const activity = page.locator('.remux-agents-icon');
   await expect(page.locator('.remux-composer-agents-button')).toHaveAttribute('aria-label', /1 subagent running/u);
-  await expect(activity).toHaveCSS('height', '7px');
+  await expect(activity).toHaveCSS('color', 'rgb(249, 115, 22)');
   const runningHeight = await workHeader.evaluate((element) => element.getBoundingClientRect().height);
   await expect(page.getByRole('status', { name: 'Thinking' })).toHaveCount(0);
 
@@ -709,7 +709,7 @@ test('keeps duration in the work header and subagent activity badge stable while
   await page.getByRole('button', { name: 'Stop turn', exact: true }).click();
   await expect(workHeader).toContainText(/^Worked for \S+$/u);
   await expect(page.locator('.codex-work-header-status')).toHaveCount(0);
-  await expect(activity).toHaveCount(0);
+  await expect(activity).not.toHaveAttribute('data-active', 'true');
   await expect(page.locator('.agent-child-execution')).toHaveCount(0);
   await expect.poll(() => workHeader.evaluate((element) => element.getBoundingClientRect().height))
     .toBe(runningHeight);

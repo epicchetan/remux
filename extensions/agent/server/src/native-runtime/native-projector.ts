@@ -794,6 +794,13 @@ function projectTurn(
   const events = allEvents.filter((event) =>
     event.scope.kind === 'turn' && event.scope.turnId === turn.turnId);
   const legacyEvents = allLegacyEvents.filter((event) => event.turnId === turn.turnId);
+  let userContent = turn.userContent;
+  if (journal.execution(turn.executionId)?.ownership === 'native') {
+    userContent = [];
+    for (const envelope of events) {
+      if (envelope.event.type === 'user.message') userContent = envelope.event.content;
+    }
+  }
   let completePasses = viewerSafePasses(journal.orderedPasses(turn.turnId, {
     includeToolOutputPreviews: options.includeToolOutputPreviews !== false,
   }));
@@ -885,7 +892,7 @@ function projectTurn(
     executionId: turn.executionId,
     state: projectTurnState(turn.state),
     ...(turn.outcome ? { outcome: turn.outcome } : {}),
-    userContent: turn.userContent,
+    userContent,
     ordering: turn.ordering,
     passes,
     finalBlockId: finalBlock?.blockId ?? null,
@@ -926,7 +933,7 @@ function projectTurn(
     projection: 'agent-turn-layout-v1',
     turnId: turn.turnId,
     state: projectTurnState(turn.state),
-    userContent: turn.userContent,
+    userContent,
     workLayout: passes.map(({ passId, blocks }) => ({
       passId,
       blocks: blocks.flatMap((block) => block.blockId === finalBlock?.blockId

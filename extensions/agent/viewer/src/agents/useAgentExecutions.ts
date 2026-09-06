@@ -8,6 +8,7 @@ import {
 } from '../../../shared/native-agent-protocol.ts';
 import { subscribeAgentResourceInvalidations } from '../ipc/resourceInvalidations.ts';
 import { AgentResourceReader } from '../ipc/resources.ts';
+import { newestAgentExecutions } from './executionOrder.ts';
 
 export type AgentExecutionTree = {
   executions: readonly AgentExecutionResource[];
@@ -139,10 +140,8 @@ function snapshot(
   error: string | null,
 ): AgentExecutionTree {
   const executions = entry
-    ? [...entry.byId.values()]
-      .filter(({ ownership }) => ownership !== 'root')
-      .sort((left, right) => left.startedAt - right.startedAt ||
-        left.executionId.localeCompare(right.executionId))
+    ? newestAgentExecutions([...entry.byId.values()]
+      .filter(({ ownership }) => ownership !== 'root'))
     : [];
   return { executions, loading: loading && executions.length === 0, error };
 }

@@ -197,6 +197,8 @@ test('accepted child Stop settles from its snapshot when every live terminal is 
         : { type: 'turn.started' },
     });
     journal.appendProviderEvent(envelope(false));
+    assert.deepEqual(journal.turn(childTurnId)?.userContent, [],
+      'a provider-owned child title is not evidence of its delegated task');
     // A parent snapshot can settle its child card before the child's own
     // terminal turn is observed. The unfinished assignment still requires
     // recovery from the child thread.
