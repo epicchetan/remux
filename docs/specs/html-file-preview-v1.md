@@ -302,12 +302,16 @@ refactoring. No new agent/server protocol or journal migration is required.
   and Source's nested top safe area is rebased. A second Sol read-only review
   found no remaining code blocker. Routing helpers and source-contract checks
   pass; these do not replace native component/device acceptance.
+  P2 committed/pushed as `97f2a73`.
 - P3 automated integration passed: root and app typechecks, all three HTML
   suites, and existing app viewer-host/lifecycle checks. Evidence:
   `/tmp/remux-html-preview/integrated-checks.log`. Expo exported iOS and Android
   Hermes bundles successfully, establishing Metro/Hermes build compatibility
   of parse5/base64-js (`app-export.log`, bundles in `app-export/`). The host
   release build passed. No production app update or host restart has occurred.
+  The final repeated filesystem check passed all seven selected tests
+  (`fs-final.log`). Host worker 623189, Agent server 623382 and persistent Codex
+  daemon 848265 retained their original start times; no live turn was interrupted.
 - **Remaining gate:** native iOS/Android isolation and interaction validation,
   followed by reviewed per-platform enablement and publication. No platform is
   currently enabled. Do not describe this as live on the user's phone. The
