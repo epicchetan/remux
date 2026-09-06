@@ -1327,3 +1327,31 @@ This composer control-plane pass is complete when:
   not appear as a normal Agent turn; and
 - fixture, restart, out-of-order, and live subscription acceptance pass for
   both provider adapters.
+
+## Stable composer status footer (2026-09-06)
+
+Routine history and submission activity uses the existing reserved footer area.
+It replaces model/reasoning temporarily while context usage remains accessible.
+It must not mount an extra row, wrap text, or change the composer, input, action
+buttons, or transcript viewport geometry. Returning to idle restores the model
+and reasoning immediately; no completion message or height animation is added.
+
+Failures use the same one-line footer, with the existing pending-submission or
+failed-history Retry action where supported. Full error text is available in an
+on-demand dialog. Error details and Retry are independent controls, never nested
+inside the usage button. Status tone and action are derived from the selected
+status, so unrelated history loading cannot mute a displayed submission error.
+
+This is presentation over the existing submission/history state, with no changes
+to delivery, retry ownership, server behavior, or transcript virtualization.
+Browser acceptance covers fixed geometry across each status, long error details,
+failed-history retry, and usage access while syncing on desktop and mobile.
+
+Validation: 26 targeted desktop/mobile browser cases passed, including six new
+footer geometry/detail cases and existing send recovery, history retry, and usage
+checks. The six footer cases passed again after final styling and dialog focus
+corrections. Repository and linked-viewer typechecks and the Agent production
+build passed. Mobile screenshots were reviewed.
+
+Served Agent revision: `sha256-0ec370600aa4b2e04142ab0a199d40cfd039349c9ae8b533005d76a1d3d33568`.
+Reload the Agent view to receive it; no server restart or Expo update is required.

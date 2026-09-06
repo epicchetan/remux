@@ -62,7 +62,7 @@ export async function installAgentHost(page: Page) {
     const delayModels = route.get('fixtureDelayModels') === '1';
     const currentEffortNull = route.get('fixtureCurrentEffortNull') === '1';
     let modelsDelayed = false;
-    let historyState: 'failed' | 'ready' = route.get('fixtureHistoryFailed') === '1'
+    let historyState: 'indexed' | 'loading' | 'failed' | 'ready' = route.get('fixtureHistoryFailed') === '1'
       ? 'failed'
       : 'ready';
     const persistedNativeConfig = JSON.parse(
@@ -1181,7 +1181,7 @@ export async function installAgentHost(page: Page) {
         activeTurnId,
         history: historyState === 'failed'
           ? { state: 'failed', error: 'Fixture history read failed.' }
-          : { state: 'ready' },
+          : { state: historyState },
         resumable: compactEligibility !== 'unresumable',
         createdAt: Number(summary.createdAt ?? Date.now()),
         updatedAt: Number(summary.updatedAt ?? Date.now()),
@@ -1231,7 +1231,7 @@ export async function installAgentHost(page: Page) {
         lifecycle,
         history: historyState === 'failed'
           ? { state: 'failed', error: 'Fixture history read failed.' }
-          : { state: 'ready' },
+          : { state: historyState },
         provider: 'fixture',
         providerInstanceId,
         activeConfiguration: {
@@ -2759,6 +2759,12 @@ export async function installAgentHost(page: Page) {
         },
         connection: dispatchStatus,
         lifecycle: dispatchLifecycle,
+        setHistoryState(state: typeof historyState) {
+          historyState = state;
+          const runtime = resources.get('runtime');
+          if (runtime) runtime.revision += 1;
+          invalidateResource('runtime');
+        },
         setRuntimeLifecycle(input: {
           state: 'idle' | 'running' | 'checking' | 'stopping' | 'unavailable';
           runningCount?: number;

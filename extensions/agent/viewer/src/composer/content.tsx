@@ -10,7 +10,6 @@ import { useConversationStore } from '../conversation/store.ts';
 import { ComposerActionButtons } from './actions/ActionButtons.tsx';
 import type { TurnSubmissionInput } from './actions/turnAction.ts';
 import { ComposerInlineStatus } from './actions/InlineStatus.tsx';
-import { ComposerStatusMessageRow } from './actions/StatusMessageRow.tsx';
 import { ComposerLexicalInput } from './editor/LexicalInput.tsx';
 import { ComposerEditBar } from './edit/EditBar.tsx';
 import { NewChatBar } from './newChat/NewChatBar.tsx';
@@ -158,22 +157,18 @@ export function ComposerContent({
         />
       </div>
       {!pickerOpen ? (
-        <ComposerStatusMessageRow
-          history={conversation ? runtime?.history ?? null : null}
-          onRetryHistory={onRetryHistory}
-          onRetrySubmission={onRetrySubmission}
-          pendingRecoveryError={pendingRecoveryError}
-          hasPendingSubmission={hasPendingSubmission}
-          isRecoveringSubmission={isRecoveringSubmission}
-          runtimeError={runtimeError}
-        />
-      ) : null}
-      {!pickerOpen ? (
         <ComposerInlineStatus
           expanded={usageExpanded}
+          hasPendingSubmission={hasPendingSubmission}
+          history={conversation ? runtime?.history ?? null : null}
+          isRecoveringSubmission={isRecoveringSubmission}
+          onRetryHistory={onRetryHistory}
+          onRetrySubmission={onRetrySubmission}
           onToggle={() => setUsageExpanded((value) => !value)}
+          pendingRecoveryError={pendingRecoveryError}
           providers={providers}
           runtime={runtime}
+          runtimeError={runtimeError}
         />
       ) : null}
     </div>

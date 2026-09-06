@@ -1836,11 +1836,30 @@
     z-index: 1;
   }
 
-  .remux-composer-inline-status:disabled {
+  .remux-composer-inline-status-content {
+    position: absolute;
+    inset: 0;
+    height: 100%;
+    display: flex;
+    width: 100%;
+    min-width: 0;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    border: 0;
+    background: transparent;
+    padding: 5px 3px;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .remux-composer-inline-status-content:disabled {
     cursor: default;
   }
 
-  .remux-composer-inline-status:focus-visible {
+  .remux-composer-inline-status-content:focus-visible {
     border-radius: 4px;
     outline: 2px solid var(--ring);
     outline-offset: -2px;
@@ -1850,36 +1869,56 @@
     overflow: hidden;
   }
 
+  .remux-composer-transient-status {
+    cursor: default;
+  }
+
+  .remux-composer-status-layout {
+    display: flex;
+    width: 100%;
+    min-width: 0;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .remux-composer-transient-status[data-tone="error"] {
+    color: color-mix(in srgb, var(--destructive) 82%, var(--foreground) 18%);
+  }
+
+  .remux-composer-transient-copy {
+    flex: 1 1 auto;
+  }
+
+  .remux-composer-status-spinner {
+    width: 9px;
+    height: 9px;
+    flex: none;
+  }
+
+  .remux-composer-status-usage {
+    min-width: 0;
+    flex: none;
+    border: 0;
+    background: transparent;
+    padding: 0;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+  }
+
+  .remux-composer-status-usage:focus-visible {
+    border-radius: 3px;
+    outline: 1px solid currentColor;
+    outline-offset: 2px;
+  }
+
   @media (pointer: coarse) {
     .remux-composer-inline-status {
       bottom: 0;
       height: max(34px, var(--remux-composer-bottom-pad));
       min-height: 34px;
     }
-  }
-
-  .remux-composer-message-status-row {
-    display: flex;
-    width: 100%;
-    max-width: var(--remux-feed-max-width);
-    min-width: 0;
-    margin: 6px auto 0;
-    align-items: center;
-    padding: 0 3px;
-    color: color-mix(in srgb, var(--muted-foreground) 82%, transparent);
-    font-size: 11px;
-    letter-spacing: 0;
-    line-height: 14px;
-    user-select: none;
-    pointer-events: none;
-  }
-
-  .remux-composer-message-status-row[data-tone="error"] {
-    color: color-mix(in srgb, var(--destructive) 82%, var(--foreground) 18%);
-  }
-
-  .remux-composer-message-status-row[data-actionable="true"] {
-    pointer-events: auto;
   }
 
   .remux-composer-message-status-text {
@@ -1899,6 +1938,29 @@
     font: inherit;
     font-weight: 600;
     cursor: pointer;
+  }
+
+  .remux-composer-transient-status .remux-composer-message-status-action {
+    padding-block: 5px;
+  }
+
+  .agent-exact-content-dialog.remux-composer-error-dialog {
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .remux-composer-error-modal {
+    width: min(640px, calc(100% - 32px));
+    max-width: none;
+    max-height: calc(100dvh - 32px);
+    margin: auto;
+    border: 0;
+    background: transparent;
+    padding: 0;
+  }
+
+  .remux-composer-error-modal::backdrop {
+    background: rgb(0 0 0 / 70%);
+    backdrop-filter: blur(4px);
   }
 
   .remux-composer-message-status-action:hover {
