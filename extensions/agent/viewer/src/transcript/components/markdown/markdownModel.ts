@@ -96,6 +96,11 @@ export type PreparedMarkdownBlock =
       type: 'code';
     }
   | {
+      renderId: string;
+      text: string;
+      type: 'diagram';
+    }
+  | {
       children: PreparedMarkdownBlock[];
       renderId: string;
       type: 'blockquote';
@@ -189,6 +194,10 @@ export type MarkdownLayoutBlock =
       type: 'code';
     })
   | (MarkdownLayoutBlockBase & {
+      text: string;
+      type: 'diagram';
+    })
+  | (MarkdownLayoutBlockBase & {
       children: MarkdownLayoutBlock[];
       type: 'blockquote';
     })
@@ -257,6 +266,11 @@ export type RawMarkdownBlock =
       renderId: string;
       text: string;
       type: 'code';
+    }
+  | {
+      renderId: string;
+      text: string;
+      type: 'diagram';
     }
   | {
       children: RawMarkdownBlock[];
@@ -342,6 +356,13 @@ export const markdownMetrics = {
     },
     paddingX: 14,
     paddingY: 12,
+  },
+  diagram: {
+    maxHeight: 360,
+    minHeight: 240,
+    padding: 12,
+    toolbarHeight: 32,
+    widthRatio: 0.65,
   },
   fontFamily: {
     mono: 'ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace',
@@ -630,6 +651,20 @@ function layoutPreparedMarkdownBlock(
         type: 'code',
       };
     }
+    case 'diagram': {
+      const contentHeight = Math.min(
+        markdownMetrics.diagram.maxHeight,
+        Math.max(markdownMetrics.diagram.minHeight, safeWidth * markdownMetrics.diagram.widthRatio),
+      );
+      return {
+        contentHeight,
+        height: topGap + contentHeight,
+        renderId: block.renderId,
+        text: block.text,
+        topGap,
+        type: 'diagram',
+      };
+    }
     case 'blockquote': {
       const innerWidth = Math.max(
         1,
@@ -850,6 +885,11 @@ function cappedMarkdownBlockHeight(block: MarkdownLayoutBlock, remainingLines: n
         remainingLines: remainingLines - visibleLines,
       };
     }
+    case 'diagram':
+      return {
+        height: block.topGap + block.contentHeight,
+        remainingLines: remainingLines - 1,
+      };
     case 'blockquote': {
       const capped = cappedMarkdownBlocksHeight(block.children, remainingLines);
       return {
@@ -1048,6 +1088,12 @@ function prepareMarkdownBlock(block: RawMarkdownBlock, density: MarkdownDensity)
         renderId: block.renderId,
         text: stripSingleTrailingNewline(block.text),
         type: 'code',
+      };
+    case 'diagram':
+      return {
+        renderId: block.renderId,
+        text: block.text,
+        type: 'diagram',
       };
     case 'blockquote':
       return {
@@ -1296,7 +1342,7 @@ function parseMarkdownBlocks(markdown: string, options: MarkdownParseOptions): R
   const blocks = rootContentToRawBlocks(fromMarkdown(markdown, {
     extensions: [gfmTable()],
     mdastExtensions: [gfmTableFromMarkdown()],
-  }).children, options);
+  }).children, options, markdown);
   assignRenderIds(blocks, '');
   writeScopedCache(
     rawDocumentCache,
@@ -1307,6 +1353,36 @@ function parseMarkdownBlocks(markdown: string, options: MarkdownParseOptions): R
     maxRawDocumentCacheEntries,
   );
   return blocks;
+}
+
+function hasExplicitClosingFence(node: Extract<BlockContent, { type: 'code' }>, markdown: string) {
+  const position = node.position;
+  const startOffset = position?.start.offset;
+  const endOffset = position?.end.offset;
+  if (startOffset === undefined || endOffset === undefined || !position || position.end.line <= position.start.line) {
+    return false;
+  }
+
+  const fenceCharacter = markdown[startOffset];
+  if (fenceCharacter !== '`' && fenceCharacter !== '~') return false;
+  let openingLength = 0;
+  while (markdown[startOffset + openingLength] === fenceCharacter) openingLength += 1;
+  if (openingLength < 3) return false;
+
+  const closingLineStart = markdown.lastIndexOf('\n', Math.max(0, endOffset - 1)) + 1;
+  const closingLine = markdown.slice(closingLineStart, endOffset)
+    .replace(/\r$/u, '')
+    .replace(/^[\t >]*/u, '');
+  let closingLength = 0;
+  while (closingLine[closingLength] === fenceCharacter) closingLength += 1;
+  if (closingLength < openingLength || !/^[\t ]*$/u.test(closingLine.slice(closingLength))) return false;
+
+  // mdast excludes a real closing fence from `value`, so its source span has
+  // one more logical line than the opening line plus the value. An unclosed
+  // fence-like final content line remains in `value` and consumes that line.
+  if (node.value === '') return true;
+  const valueLineCount = node.value.split(/\r?\n/u).length;
+  return valueLineCount === position.end.line - position.start.line - 1;
 }
 
 function assignRenderIds(blocks: RawMarkdownBlock[], parentPath: string) {
@@ -1331,18 +1407,19 @@ function sanitizeHref(href: string) {
   return webUrlFromHref(href);
 }
 
-function rootContentToRawBlocks(nodes: readonly RootContent[], options: MarkdownParseOptions): RawMarkdownBlock[] {
+function rootContentToRawBlocks(nodes: readonly RootContent[], options: MarkdownParseOptions, markdown: string): RawMarkdownBlock[] {
   return nodes.flatMap((node) => {
-    return isBlockContent(node) ? blockContentToRawBlock(node, options) : [];
+    return isBlockContent(node) ? blockContentToRawBlock(node, options, markdown) : [];
   });
 }
 
 function blockContentToRawBlocks(
   nodes: readonly (BlockContent | DefinitionContent)[],
   options: MarkdownParseOptions,
+  markdown: string,
 ): RawMarkdownBlock[] {
   return nodes.flatMap((node) => {
-    return isBlockContent(node) ? blockContentToRawBlock(node, options) : [];
+    return isBlockContent(node) ? blockContentToRawBlock(node, options, markdown) : [];
   });
 }
 
@@ -1362,7 +1439,7 @@ function isBlockContent(node: RootContent | BlockContent | DefinitionContent): n
   }
 }
 
-function blockContentToRawBlock(node: BlockContent, options: MarkdownParseOptions): RawMarkdownBlock[] {
+function blockContentToRawBlock(node: BlockContent, options: MarkdownParseOptions, markdown: string): RawMarkdownBlock[] {
   switch (node.type) {
     case 'paragraph':
       return [
@@ -1382,6 +1459,9 @@ function blockContentToRawBlock(node: BlockContent, options: MarkdownParseOption
         },
       ];
     case 'code':
+      if (node.lang?.trim().toLowerCase() === 'mermaid' && hasExplicitClosingFence(node, markdown)) {
+        return [{ renderId: '', text: node.value, type: 'diagram' }];
+      }
       return [
         {
           language: node.lang?.trim() || null,
@@ -1393,7 +1473,7 @@ function blockContentToRawBlock(node: BlockContent, options: MarkdownParseOption
     case 'blockquote':
       return [
         {
-          children: blockContentToRawBlocks(node.children, options),
+          children: blockContentToRawBlocks(node.children, options, markdown),
           renderId: '',
           type: 'blockquote',
         },
@@ -1404,7 +1484,7 @@ function blockContentToRawBlock(node: BlockContent, options: MarkdownParseOption
       return [
         {
           items: node.children.map((item, index) => ({
-            blocks: blockContentToRawBlocks(item.children, options),
+            blocks: blockContentToRawBlocks(item.children, options, markdown),
             marker: ordered ? `${start + index}.` : '•',
           })),
           renderId: '',

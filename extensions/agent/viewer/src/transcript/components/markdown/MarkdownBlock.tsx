@@ -11,6 +11,7 @@ import {
   type MarkdownLayoutLineFragment,
 } from './markdownModel';
 import { CodeBlock } from './CodeBlock';
+import { DiagramBlock } from './DiagramBlock';
 import { fileReferenceStyle } from '../file/FileReferenceChip';
 import { FileTypeIcon } from '../file/fileTypeIcons';
 import { cn } from '@remux/viewer-kit/shadcn';
@@ -112,6 +113,8 @@ function MarkdownBlockContent({
         block={block}
         style={style}
       />;
+    case 'diagram':
+      return <DiagramBlock block={block} style={style} />;
     case 'blockquote':
       return (
         <blockquote className="codex-md-block codex-md-blockquote" style={style}>

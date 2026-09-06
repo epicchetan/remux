@@ -6,6 +6,9 @@ Historical specs preserve paths and command names from the implementation pass
 they describe. The Rust runtime moved from `cli/` to `crates/remux/` on
 2026-07-11; use the current architecture and guides for today's layout.
 
+The Agent transcript Mermaid implementation is tracked in
+[agent-transcript-mermaid-v1.md](agent-transcript-mermaid-v1.md).
+
 ## Statuses
 
 - `Active Spec`: still informs ongoing implementation or design.

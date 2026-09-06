@@ -90,3 +90,66 @@ test('lays out GFM tables and clamps tall fenced code', () => {
   assert.equal(code?.contentHeight, markdownMetrics.code.capHeight.default);
   assert.ok(cappedMarkdownLayoutDocumentHeight(layout, 3) < layout.height);
 });
+
+test('classifies only explicitly closed Mermaid fences as diagrams', () => {
+  const cases = [
+    ['```mermaid\n```', ''],
+    ['```mermaid\n\n```', ''],
+    ['```mermaid\ngraph TD\nA-->B\n```', 'graph TD\nA-->B'],
+    ['```mermaid\ngraph TD\nA-->B\n\n```', 'graph TD\nA-->B\n'],
+    ['~~~~mermaid\r\ngraph LR\r\nA-->B\r\n~~~~~', 'graph LR\r\nA-->B'],
+    ['> ```mermaid\n> graph TD\n> A-->B\n> ```', 'graph TD\nA-->B'],
+    ['- diagram:\n\n  ```mermaid\n  graph TD\n  A-->B\n  ```', 'graph TD\nA-->B'],
+  ] as const;
+
+  for (const [markdown, expectedText] of cases) {
+    const findDiagram = (blocks: ReturnType<typeof parseMarkdownDocument>): Extract<(typeof blocks)[number], { type: 'diagram' }> | null => {
+      for (const block of blocks) {
+        if (block.type === 'diagram') return block;
+        if (block.type === 'blockquote') {
+          const nested = findDiagram(block.children);
+          if (nested) return nested;
+        }
+        if (block.type === 'list') {
+          for (const item of block.items) {
+            const nested = findDiagram(item.blocks);
+            if (nested) return nested;
+          }
+        }
+      }
+      return null;
+    };
+    const diagram = findDiagram(parseMarkdownDocument(markdown));
+    assert.equal(diagram?.text, expectedText);
+  }
+
+  for (const markdown of [
+    '```mermaid\ngraph TD\nA-->B',
+    '```mermaid\ngraph TD\n> ```',
+    '```mermaid\ngraph TD\n    ```',
+    '```\ngraph TD\nA-->B\n```',
+    '```mermaid\ngraph TD\nA-->B\n~~`',
+  ]) {
+    assert.equal(parseMarkdownDocument(markdown).some((block) => block.type === 'diagram'), false);
+    assert.equal(parseMarkdownDocument(markdown)[0]?.type, 'code');
+  }
+});
+
+test('uses stable bounded geometry and cached identity for Mermaid diagrams', () => {
+  const markdown = '```mermaid\ngraph TD\nA-->B\n```';
+  const narrow = getMarkdownLayoutDocument(markdown, 'default', 300);
+  const wide = getMarkdownLayoutDocument(markdown, 'default', 1000);
+  const cached = getMarkdownLayoutDocument(markdown, 'default', 300);
+  const narrowDiagram = narrow.blocks[0];
+  const wideDiagram = wide.blocks[0];
+
+  assert.equal(narrow, cached);
+  assert.equal(narrowDiagram?.type, 'diagram');
+  assert.equal(wideDiagram?.type, 'diagram');
+  if (narrowDiagram?.type !== 'diagram' || wideDiagram?.type !== 'diagram') return;
+  assert.equal(narrowDiagram.renderId, 'md:0');
+  assert.equal(narrowDiagram.contentHeight, markdownMetrics.diagram.minHeight);
+  assert.equal(narrowDiagram.height, narrowDiagram.topGap + narrowDiagram.contentHeight);
+  assert.equal(wideDiagram.contentHeight, markdownMetrics.diagram.maxHeight);
+  assert.equal(wideDiagram.height, wideDiagram.topGap + wideDiagram.contentHeight);
+});
