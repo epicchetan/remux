@@ -12,7 +12,8 @@
   },
   "scripts": {
     "build": "vite build --config viewer/vite.config.ts",
-    "watch": "vite build --watch --config viewer/vite.config.ts"
+    "watch": "vite build --watch --config viewer/vite.config.ts",
+    "test": "node tests/file-controller.mjs && node tests/source-decode.mjs && node tests/html-document.mjs && node tests/iframe-boundary.mjs && node tests/viewer-integration.mjs"
   },
   "dependencies": {
     "@codemirror/lang-css": "^6.3.1",

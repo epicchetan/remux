@@ -118,4 +118,3 @@ function configureMermaid(mermaid: typeof import('mermaid').default, theme: Remu
     ...mermaidThemeConfigs[theme],
   });
 }
-

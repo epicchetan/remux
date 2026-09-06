@@ -1,4 +1,4 @@
-Status: Implementing — V0/V1 foundations in progress
+Status: Viewer implemented; app migration publication and Narrate retirement in progress
 Date: 2026-09-06
 Owner: primary agent; bounded Sol implementation lanes with primary review
 Supersedes target architecture: [html-file-preview-v1.md](html-file-preview-v1.md)
@@ -313,3 +313,18 @@ host without React Native. Building the full future Remux web app is out of scop
   read, no toggle reread, original Copy, HTML state retention, same-byte reload
   reset, failed-refresh retention, line focus and paged Copy disabled. Primary
   corrected the first-host-generation duplicate-read race during review.
+- V0/V1/V2/V3 and V4a are pushed on main through `3ecb23d` (migration
+  `0f89c10`, transport `0d179a8`, windows `532115f`). Host deployed by guardian
+  worker restart; live window RPC and immutable Editor bundle/CSP/styles verified.
+  Codex daemon PID 848265 retained its original start time. Host proof:
+  `/tmp/remux-html-preview/unified-host-proof.json`.
+- V4b retirement prepared in an isolated scratch checkout and reviewed against
+  current main. Patch `/tmp/remux-html-preview/narrate-retirement.patch`, SHA256
+  `3cee4054d71dffabe394ed7c7435c4f505a3260a52ba64f39ac458a3ab62f305`;
+  inventory `/tmp/remux-html-preview/narrate-retirement-files.txt`. Removes
+  24,103 lines across 162 files, including the extension, old Codex playback,
+  client package, TTS crate, R&D, runtime references and active documentation.
+  Scratch Codex build and 226 retained desktop/mobile tests passed; runtime
+  library tests 148 passed, with a later baseline Agent-manifest integration
+  assertion failing. Locks must be regenerated and integrated checks rerun when
+  applied. Do not apply until the V4a client migration deployment is established.
