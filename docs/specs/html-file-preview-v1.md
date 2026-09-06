@@ -1,4 +1,4 @@
-Status: Active Spec — implementation pending
+Status: Active Spec — implementation underway; native rollout gated
 Last verified: 2026-09-06
 Canonical code: `app/src/surfaces/viewer/`, `app/src/browser/`,
 `app/src/files/`, `extensions/editor/viewer/src/editor/`,
@@ -227,6 +227,9 @@ Commit and push reviewed green slices on `main`; do not accumulate the whole
 feature uncommitted. Keep incomplete interactive Preview unreachable until P0
 and integration gates pass. A failed isolation proof means revise this design
 before expanding implementation, not silently ship static or unsafe HTML.
+When native tooling is unavailable, freeze the reviewed renderer interface and
+continue independent P1/P2 implementation behind the closed platform gate.
+Tooling unavailability is not a passed or failed native isolation test.
 
 Use Remux workload scopes for builds and sustained tests. Run focused checks
 once per changed slice; broaden only for shared-code changes or failures. Add
@@ -272,6 +275,17 @@ refactoring. No new agent/server protocol or journal migration is required.
   Sol read-only review confirmed the bridge, read-size, relative-link and tab
   identity constraints. Interactive content is assigned to a bridge-free native
   surface rather than the initially considered iframe inside Editor.
-- P0, P1, P2 and P3: pending. No feature code, builds, restart or device acceptance
-  is implied by this document. Update this section after each reviewed slice
-  with commit, tests, deployment and remaining limitations.
+- P0 implementation reviewed: parse5 document preparation, bounded link list,
+  bridge-free renderer, native navigation policy and executable browser/structural
+  checks. Browser checks passed; the actual Ledger report's selectors, reveal
+  slider, ten-second chart, continuous chart and hash navigation passed at
+  1280x800 and 390x844. Evidence: `/tmp/remux-html-preview/real-report.log` and
+  `real-report-result.json`. These are browser behavior results, not native proof.
+- Native tooling check: no adb, emulator, xcrun, SDK or AVD is installed on this
+  host. Native validation is unavailable; no platform is enabled in
+  `htmlPreviewAvailability.ts`. Follow
+  [native validation instructions](../../app/scripts/HTML_PREVIEW_NATIVE_VALIDATION.md)
+  on a device/development build before production rollout.
+- P1/P2 are implementing against the frozen P0 interface behind that gate.
+  P3 integration and publication remain pending. No app update or host restart
+  has occurred for this feature. Update this checkpoint after each accepted slice.

