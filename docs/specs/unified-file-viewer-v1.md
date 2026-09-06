@@ -72,7 +72,7 @@ Left controls: **Tabs → Reload → Preview toggle → Copy**. Use Lucide `Eye`
 the toggle, orange while Preview is selected, neutral in Source, with
 `aria-pressed` and an action label of Show source / Show preview. Keep the glyph
 stable. Omit the toggle for unsupported preview formats. Existing Diff and Close
-remain on the right; companion HTML Links belongs in the web viewer controls.
+remain on the right. HTML preview has no additional floating controls.
 Reuse actual shared components and theme tokens, not lookalike native controls.
 
 | Event | Result |
@@ -141,10 +141,10 @@ Use supported browser policies; do not depend on experimental iframe `csp` or
 credentialless behavior. Exact source installation and policy follow the V0
 browser/native transport proof rather than guessing at portability.
 
-Generated pages receive no generic RPC proxy. Retain companion links collected
-from the document in a trusted web Links control. Resolve relative files with
-viewer-kit rules; fragments stay inside the report. An optional report event
-must be a narrowly validated document event, never forwarded to host IPC.
+Generated pages receive no generic RPC proxy. Fragments stay inside the report.
+Companion-link navigation is outside the current viewer UI scope; the Links
+menu was removed at user request. An optional report event must be a narrowly
+validated document event, never forwarded to host IPC.
 
 Expose a host capability so updated web assets cannot mount executable HTML on
 an older unprotected app. Source/Markdown remain available there with a concise
@@ -358,3 +358,7 @@ host without React Native. Building the full future Remux web app is out of scop
   `e0d0a82435445a0b97ccfb9d1760c8e61fc2893fbcef9b2bd59882b4e153b3b5`.
   Both patches apply cleanly to main; apply both after client-update confirmation,
   run the integrated checks, commit/push and redeploy the retired catalog.
+
+- Follow-up UI decision: remove the floating HTML Links button and its menu.
+  Preview keeps the shared bottom toolbar; iframe isolation and interactions
+  retain their existing behavior. This is a web viewer asset update.

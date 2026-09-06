@@ -171,7 +171,7 @@ function EditorBody({ active, baseContent, document, error, mode, onFocusApplied
       ) : null}
       {visitedModes.has('preview') && document.kind === 'full' && previewKind === 'html' ? (
         <div aria-hidden={mode !== 'preview'} className={`remux-editor-renderer ${mode === 'preview' ? '' : 'remux-editor-renderer-hidden'}`}>
-          <HtmlPreview key={document.revision} active={active} content={document.text} filePath={document.path} />
+          <HtmlPreview key={document.revision} active={active} content={document.text} />
         </div>
       ) : null}
     </section>

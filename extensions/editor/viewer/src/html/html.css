@@ -14,45 +14,6 @@
   background: white;
 }
 
-.remux-html-preview-links {
-  position: absolute;
-  z-index: 2;
-  top: max(10px, env(safe-area-inset-top));
-  right: max(10px, env(safe-area-inset-right));
-  padding: 3px;
-  border: 1px solid color-mix(in srgb, var(--rmx-border) 82%, transparent);
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--rmx-surface-raised) 90%, transparent);
-  box-shadow: var(--rmx-shadow-menu);
-}
-
-.remux-html-preview-links-panel {
-  top: calc(100% + 8px);
-  bottom: auto;
-  max-height: min(420px, calc(100vh - 82px));
-  overflow-y: auto;
-}
-
-.remux-html-preview-links-note,
-.remux-html-preview-error {
-  padding: 8px 10px;
-  color: var(--rmx-text-muted);
-  font-size: 12px;
-  line-height: 16px;
-}
-
-.remux-html-preview-error {
-  position: absolute;
-  right: 10px;
-  bottom: 10px;
-  left: 10px;
-  z-index: 2;
-  border: 1px solid color-mix(in srgb, var(--rmx-danger) 55%, var(--rmx-border));
-  border-radius: 8px;
-  background: var(--rmx-surface-raised);
-  color: var(--rmx-danger);
-}
-
 .remux-html-preview-loading,
 .remux-html-preview-message {
   display: grid;

@@ -1,8 +1,7 @@
 import { getHostCapabilities } from '@remux/viewer-kit/host';
-import { openHostHref } from '@remux/viewer-kit/links';
 import { prepareHtmlPreviewDocument, type PreparedHtmlPreviewDocument } from '@remux/viewer-kit';
-import { ActionButton, ActionMenu, ActionMenuItem } from '@remux/viewer-kit/ui';
-import { ExternalLink, FileText, Link as LinkIcon, RotateCcw } from 'lucide-react';
+import { ActionButton } from '@remux/viewer-kit/ui';
+import { RotateCcw } from 'lucide-react';
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 
 import './html.css';
@@ -10,19 +9,17 @@ import './html.css';
 export type HtmlPreviewProps = Readonly<{
   active: boolean;
   content: string;
-  filePath: string;
 }>;
 
 type Preparation =
   | { document: PreparedHtmlPreviewDocument; error: null }
   | { document: null; error: string };
 
-export function HtmlPreview({ active, content, filePath }: HtmlPreviewProps) {
+export function HtmlPreview({ active, content }: HtmlPreviewProps) {
   const [capabilityReady, setCapabilityReady] = useState(
     () => getHostCapabilities().protectedHtmlPreviewTransport,
   );
   const [frameError, setFrameError] = useState<string | null>(null);
-  const [linkError, setLinkError] = useState<string | null>(null);
   const [retry, setRetry] = useState(0);
   const preparation = useMemo<Preparation>(() => {
     try {
@@ -62,12 +59,6 @@ export function HtmlPreview({ active, content, filePath }: HtmlPreviewProps) {
     }
   }, [active, capabilityReady, preparation.document, retry]);
 
-  const openLink = async (href: string) => {
-    setLinkError(null);
-    const result = await openHostHref(href, { baseFilePath: filePath, parseLine: true });
-    if (!result.ok) setLinkError(result.kind === 'unsupported' ? result.reason : 'The link could not be opened.');
-  };
-
   if (!capabilityReady) {
     return <PreviewMessage title="HTML preview needs an app update">
       Source remains available. Update the Remux app to use protected interactive HTML preview.
@@ -76,7 +67,6 @@ export function HtmlPreview({ active, content, filePath }: HtmlPreviewProps) {
   if (!preparation.document) {
     return <PreviewMessage title="Could not prepare HTML preview">{preparation.error}</PreviewMessage>;
   }
-  const preparedDocument = preparation.document;
   if (!active) return <div className="remux-html-preview" data-suspended="true" />;
   if (frameError) {
     return <PreviewMessage title="HTML preview stopped" action={
@@ -99,23 +89,6 @@ export function HtmlPreview({ active, content, filePath }: HtmlPreviewProps) {
         title="Interactive HTML document"
       />
     ) : <div className="remux-html-preview-loading">Preparing HTML preview</div>}
-    {preparedDocument.links.length || preparedDocument.linksTruncated ? (
-      <div className="remux-html-preview-links">
-        <ActionMenu align="end" icon={<LinkIcon aria-hidden="true" />} label="Open document links" panelClassName="remux-html-preview-links-panel">
-          {preparedDocument.links.map((link) => {
-            const external = /^https?:\/\//iu.test(link.href);
-            return <ActionMenuItem
-              icon={external ? <ExternalLink /> : <FileText />}
-              key={link.href}
-              label={`${link.label} — ${link.href}`}
-              onSelect={() => { void openLink(link.href); }}
-            />;
-          })}
-          {preparedDocument.linksTruncated ? <div className="remux-html-preview-links-note">Showing the first 100 supported links.</div> : null}
-        </ActionMenu>
-      </div>
-    ) : null}
-    {linkError ? <div className="remux-html-preview-error" role="status">{linkError}</div> : null}
   </section>;
 }
 
