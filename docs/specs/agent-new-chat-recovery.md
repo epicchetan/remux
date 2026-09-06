@@ -1,6 +1,6 @@
 # New-chat recovery across disconnects
 
-Status: approved in chat; implementation in progress. Broader audit remains paused.
+Status: implemented, committed, and deployed on 2026-09-06. Broader audit remains paused.
 
 ## Incident and contract
 
@@ -13,7 +13,8 @@ and showed a transport error. Exact create replay returned the existing ID.
 One persistent client owner records new-chat submission before any side effect:
 original draft/snapshot, exact creation request and operation ID, accepted
 conversation identity, exact first-message request and operation/client-message
-IDs, and acknowledged result. Reconnect/reload resumes that same operation.
+IDs. Accepted results remain durable in server receipts and are read again during
+recovery. Reconnect/reload resumes that same operation.
 No new ID or changed payload may be substituted for an uncertain request.
 
 Persist the frozen message intent and IDs before artifact uploads or send. Keep
@@ -65,4 +66,55 @@ controlled restart and live verification. Preserve the shared native daemon.
 
 ## Evidence
 
-Implementation and acceptance pending.
+Implementation checkpoints:
+
+- `73a2157`: read-only create/send receipt API, strict kind validation, safe
+  accepted-result projection, and server regression coverage.
+- `dc04358`: persistent viewer owner, exact replay identities, bounded automatic
+  recovery and explicit Retry, legacy attachment, and browser/storage coverage.
+- Main pushed; server API rebuilt and restarted through the extension lifecycle.
+  Viewer rebuilt and published after review. The shared native daemon was kept
+  running, and the viewer watcher was restored after publication.
+
+The pending record uses per-operation session storage, so separate drafts cannot
+replace one another's frozen intent. Image bytes are stored once within that
+record. A failed storage write stops submission before effects. Automatic checks
+are limited to three attempts per operation in a connection; reconnect resets the
+budget, and explicit Retry reuses the same operation. Closing a browser tab or
+clearing its session storage is outside the reconnect/reload recovery guarantee.
+
+Validation:
+
+- Root TypeScript and linked-viewer typechecks passed.
+- Server suite: 285 passed, including four pending-record storage tests.
+- Desktop/mobile recovery cases cover legacy attachment with no send, accepted
+  create/lost response and reload, later edits, navigation away and return,
+  simultaneous retries, and accepted send/lost response with an image. The image
+  case verifies the original turn, one accepted send, no artifact re-upload,
+  cleared submitted composer, and removed pending record after handoff.
+- Final full browser suite: 198 passed, 3 skipped, one mobile geometry case failed
+  because a neighboring virtualized turn was not mounted. The isolated mobile
+  geometry suite then passed all 3 cases. An earlier full run passed 199 with 3
+  skips. No virtualizer code was changed in this slice; retain the transient
+  failure as a test reliability observation rather than claiming every full run
+  was green.
+- Exact create replay and read-only receipt lookup returned the incident's
+  existing conversation. The live built viewer recovered that legacy draft on
+  desktop and mobile, preserved diagnostic draft text, and emitted no page errors.
+  Before/after checks show the same idle conversation/native session and zero
+  turns; the original user's message was not submitted by the check.
+- Main-thread integrity check preserved all 67 baseline turn IDs and user-content
+  hashes, the root execution, native session, and strand. It currently has 90
+  hydrated turns, remains running, and reports no health error.
+
+Evidence artifacts are under `/tmp/remux-audit-implementation/`:
+`newchat-server-regression.log`, `newchat-viewer-build.log`,
+`newchat-recovery/legacy-live.json`, desktop/mobile screenshots in that directory,
+and `subagent-deploy-thread-after.json`. Full browser results are in
+`/tmp/newchat-full-viewer-final.log`.
+
+This evidence combines server receipt/replay tests, browser fault injection, and
+live legacy-draft recovery. It does not claim a live process-kill canary at every
+possible create/upload/send boundary. Unresolved or rejected provider-effecting
+receipts remain explicit errors; this slice does not manufacture replacement IDs
+or delete conversations to get past them.
