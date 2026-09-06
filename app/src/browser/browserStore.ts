@@ -31,6 +31,7 @@ import type {
   ViewerTab,
 } from './browserTypes';
 import { serializedResourceKey } from './resourceKeys';
+import { migrateNarrateFileTabs } from './narrateTabMigration';
 
 type BrowserCatalogStatus = 'error' | 'idle' | 'loading' | 'ready';
 export type BrowserCatalogSource = 'cache' | 'network' | null;
@@ -682,9 +683,10 @@ function restoreBrowserSession(
   session: PersistedBrowserSession,
   extensions: RemuxExtension[],
 ): { activeTabId: string | null; section: BrowserSection; tabs: BrowserTab[] } {
-  const tabs = rebuildBrowserTabs(session.tabs, extensions);
-  const activeTabId = session.activeTabId && tabs.some((tab) => tab.id === session.activeTabId)
-    ? session.activeTabId
+  const migrated = migrateNarrateFileTabs(session.tabs, session.activeTabId, extensions);
+  const tabs = rebuildBrowserTabs(migrated.tabs, extensions);
+  const activeTabId = migrated.activeTabId && tabs.some((tab) => tab.id === migrated.activeTabId)
+    ? migrated.activeTabId
     : nextActiveTabId(tabs);
 
   return {
@@ -720,13 +722,22 @@ function applyExtensionCatalog(
     const restoredSession = state.tabs.length === 0 && persistedSession
       ? restoreBrowserSession(persistedSession, catalog.extensions)
       : null;
-    const tabs = restoredSession?.tabs ?? reconcileBrowserTabs(state.tabs, catalog.extensions);
+    const liveMigration = restoredSession
+      ? null
+      : migrateNarrateFileTabs(state.tabs, state.activeTabId, catalog.extensions);
+    const tabs = restoredSession?.tabs ?? reconcileBrowserTabs(
+      liveMigration?.tabs ?? state.tabs,
+      catalog.extensions,
+      liveMigration?.migratedTabIds,
+    );
     const activeTab = state.activeTabId
       ? tabs.find((tab) => tab.id === state.activeTabId)
       : null;
     const activeTabId = restoredSession
       ? restoredSession.activeTabId
-      : activeTab?.id ?? nextActiveTabId(tabs);
+      : liveMigration?.activeTabId && tabs.some((tab) => tab.id === liveMigration.activeTabId)
+        ? liveMigration.activeTabId
+        : activeTab?.id ?? nextActiveTabId(tabs);
 
     return {
       activeTabId,
@@ -744,14 +755,18 @@ function applyExtensionCatalog(
   persistCurrentBrowserSession(get());
 }
 
-function reconcileBrowserTabs(tabs: BrowserTab[], extensions: RemuxExtension[]) {
+function reconcileBrowserTabs(
+  tabs: BrowserTab[],
+  extensions: RemuxExtension[],
+  migratedTabIds: ReadonlySet<string> = new Set(),
+) {
   return tabs.flatMap((tab) => {
     const extension = extensions.find((candidate) => candidate.id === tab.extensionId);
     if (!extension || !extension.views[tab.viewId]) {
       return [];
     }
     return [{
-      ...adoptLatestViewRevision(tab, extensions),
+      ...adoptLatestViewRevision(tab, extensions, migratedTabIds.has(tab.id)),
       iconDarkUrl: extension.display.iconDarkUrl,
       iconUrl: extension.display.iconUrl,
     }];

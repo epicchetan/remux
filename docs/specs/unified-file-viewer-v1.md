@@ -294,3 +294,9 @@ host without React Native. Building the full future Remux web app is out of scop
   `app/scripts/test-viewer-transport-handshake.mjs`. No native-device proof is
   claimed. The runtime capability enables the supported path; there is no new
   manual device-approval gate. Native app update not published yet.
+- V4a migration implemented for restored and live `narrate/main` Markdown tabs.
+  It preserves active identity and pending line navigation, deduplicates using
+  existing browser resource identity, and waits for the Editor `document-viewer`
+  handler. Tests cover active selection, pending navigation, repeat application,
+  old catalogs, distinct paths and distinct views; app typecheck passed.
+  Publication and installed-client evidence remain pending.
