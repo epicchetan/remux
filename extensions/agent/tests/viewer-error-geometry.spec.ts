@@ -9,7 +9,7 @@ test.beforeEach(async ({ page }) => {
 
 test('keeps failed-turn modeled geometry aligned through wrapping, resize, and virtual remount', async ({ page }) => {
   await expect(page.getByText('Geometry answer 48.', { exact: true })).toBeVisible();
-  await scrollTurnIntoView(page, 'turn-27');
+  await scrollTurnIntoView(page, 'turn-27', ['turn-24', 'turn-25', 'turn-26', 'turn-27', 'turn-28']);
 
   await expect(page.locator('[data-turn-id="turn-26"] .codex-turn-error')).toHaveText('Short capacity error.');
   await expect(page.locator('[data-turn-id="turn-27"] .codex-turn-error')).toContainText('Selected model is at capacity.');
@@ -18,7 +18,7 @@ test('keeps failed-turn modeled geometry aligned through wrapping, resize, and v
     await page.locator('[data-turn-id="turn-27"] .codex-turn-error').evaluate((node) => node.clientHeight));
 
   await page.setViewportSize({ width: 360, height: 720 });
-  await scrollTurnIntoView(page, 'turn-27');
+  await scrollTurnIntoView(page, 'turn-27', ['turn-26', 'turn-27', 'turn-28']);
   await expectTurnGeometry(page, ['turn-26', 'turn-27', 'turn-28']);
 
   const viewport = page.getByTestId('agent-transcript-scroll');
@@ -29,13 +29,13 @@ test('keeps failed-turn modeled geometry aligned through wrapping, resize, and v
     node.dispatchEvent(new Event('scrollend'));
   });
   await expect(page.locator('[data-turn-id="turn-27"]')).toHaveCount(0);
-  await scrollTurnIntoView(page, 'turn-27');
+  await scrollTurnIntoView(page, 'turn-27', ['turn-26', 'turn-27', 'turn-28']);
   await expectTurnGeometry(page, ['turn-26', 'turn-27', 'turn-28']);
 });
 
 test('preserves a reading anchor when an error clears and reappears and keeps bottom follow', async ({ page }) => {
   await expect(page.getByText('Geometry answer 48.', { exact: true })).toBeVisible();
-  await scrollTurnIntoView(page, 'turn-28');
+  await scrollTurnIntoView(page, 'turn-28', ['turn-27', 'turn-28']);
   await page.getByRole('button', { name: 'Previous turn' }).click();
   await expectMessageAnchor(page, 'turn-27');
   await page.getByRole('button', { name: 'Next turn or bottom' }).click();
@@ -144,7 +144,7 @@ async function expectTurnGeometry(page: Page, turnIds: string[]) {
   }
 }
 
-async function scrollTurnIntoView(page: Page, turnId: string) {
+async function scrollTurnIntoView(page: Page, turnId: string, mountedTurnIds = [turnId]) {
   const locator = page.locator(`[data-turn-id="${turnId}"]`).first();
   if (await locator.count() === 0) {
     const previous = page.getByRole('button', { name: 'Previous turn' });
@@ -154,12 +154,19 @@ async function scrollTurnIntoView(page: Page, turnId: string) {
     await expect(locator).toBeAttached();
   }
   await locator.evaluate((node) => node.scrollIntoView({ block: 'start' }));
-  await page.getByTestId('agent-transcript-scroll').evaluate((node) => {
+  const viewport = page.getByTestId('agent-transcript-scroll');
+  await viewport.evaluate(async (node) => {
     node.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: 1 }));
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
     node.dispatchEvent(new Event('scroll'));
-    node.dispatchEvent(new Event('scrollend'));
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
   });
   await expect(locator).toBeVisible();
+  await viewport.hover();
+  await page.mouse.wheel(0, -1);
+  for (const mountedTurnId of mountedTurnIds) {
+    await expect(page.locator(`[data-turn-id="${mountedTurnId}"]`).first()).toBeAttached();
+  }
 }
 
 async function turnViewportOffset(page: Page, turnId: string) {

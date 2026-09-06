@@ -47,7 +47,7 @@ testing, but the earlier Node abort's attribution to that leak is unproven.
 | --- | --- | --- | --- | --- | --- |
 | C1 | P1 | `native-coordinator.ts:2771`, `native-journal.ts:1377`, `:1464` | Pre-accept rejection or restart during dispatch marks the queue head `delivery_unknown`; claim refuses it; nothing reconciles; lane blocks forever. | Pass A | planned; revalidate at slice entry |
 | C2 | P1 | `native-coordinator.ts:878`, `:1977`, `provider-adapter.ts:81` | Stop records adapter acceptance only; no durable interrupt-requested state, no `Stopping` projection, no watchdog. | Pass B | implemented/deployed through lifecycle Stop intents; local and live Codex root/child restart+Stop verified; remaining provider cases tracked separately |
-| C3 | P1 | `native-journal.ts:368`, `native-coordinator.ts:3826` | Concurrent commands with one command ID both execute; reproduced `UNIQUE constraint failed` on compaction. | Pass B | C3a verified locally, 234/234 server; restart/delivery remainder in S2 |
+| C3 | P1 | `native-journal.ts:368`, `native-coordinator.ts:3826` | Concurrent commands with one command ID both execute; reproduced `UNIQUE constraint failed` on compaction. | Pass B | C3a and S2a1 root delivery verified/deployed; 288/288 server at batch checkpoint; steer/Compact and later delivery adoption remain S2 |
 | C4 | P1 | `codex-event-mapper.ts:864`, `native-journal.ts:3193` | Late native-child completion attaches to the current root turn while the execution row keeps the original. | Pass C | Codex late-child ownership covered by I3/lifecycle implementation and regressions; remaining cross-provider overlap revalidated in S3 |
 | C5 | P2 | `native-coordinator.ts:1641`, `native-journal.ts:1262` | Edit/fork inserts the canonical destination turn before provider acceptance. | Pass B | planned; revalidate at slice entry |
 | C6 | P2 | `schema.ts:91`, `:915` | v7 migration cannot add table-level foreign keys, so a v6-migrated DB differs from fresh. | Pass C (scoped constraint repair) | planned; revalidate at slice entry |
@@ -128,7 +128,7 @@ testing, but the earlier Node abort's attribution to that leak is unproven.
 
 | ID | Sev | Where | Finding | Planned disposition | Implementation status |
 | --- | --- | --- | --- | --- | --- |
-| V1 | P1 | `useConversationActions.ts:141`, `agentCommands.ts:101` | Retries mint new command and client message IDs; lost response duplicates the turn. | Pass E | partial: new-chat create/first-message recovery shipped (I8); ordinary existing-conversation request recovery is next viewer lane; server queue recovery remains S2 |
+| V1 | P1 | `useConversationActions.ts:141`, `agentCommands.ts:101` | Retries mint new command and client message IDs; lost response duplicates the turn. | Pass E | partial: new-chat create/first-message recovery shipped (I8); ordinary existing-conversation request recovery shipped in `3a6780c`; server queue recovery remains S2 |
 | V2 | P1 | `resourceInvalidations.ts:30`, `useAgentResources.ts:191`, `historyStore.ts:88` | Three independent refresh paths; tray and transcript disagree; refetch storms. | Pass E | planned; revalidate at slice entry |
 | V3 | P1 | `useConversationActions.ts:222`, `resourceStore.ts:444` | Edit hydration exhaustion treated as success; old strand stays without error. | Pass E | planned; revalidate at slice entry |
 | V4 | P1 | `turnAction.ts:95`, `useConversationActions.ts:188` | Head-CAS rejection leaves the editor bound to the stale strand and revision. | Pass E | planned; revalidate at slice entry |
@@ -138,16 +138,16 @@ testing, but the earlier Node abort's attribution to that leak is unproven.
 | V8 | intent | `Sidebar.tsx:88`, `agentCommands.ts:91` | No historical preview or Make Current UI though the spec and README claim it. | Decision: server-only, fix docs | decision; docs planned |
 | V9 | intent | `usageWindows.ts:3`, `usage-windows.test.ts:14` | Codex Spark usage windows omitted while the composer spec requires every window. | Decision: keep omission, fix spec | decision; docs planned |
 | V10 | P2 | `UsageTray.tsx:23`, `:53` | Compact eligibility ignores queued compact and session resumability. | Pass E | verified locally; selected runtime/queue, resumability and queued/running gating; full viewer 179 passed |
-| V11 | P2 | `viewer.spec.ts:751`, `viewer-lifecycle.spec.ts:9` | No coverage for lost response, CAS conflict, hydration failure, reload mid-stream, stopping across reload. | Pass E tests | partial: new-chat lost-response/reload and lifecycle Stop scenarios covered; remaining edit/CAS/hydration matrix open |
+| V11 | P2 | `viewer.spec.ts:751`, `viewer-lifecycle.spec.ts:9` | No coverage for lost response, CAS conflict, hydration failure, reload mid-stream, stopping across reload. | Pass E tests | partial: new-chat and ordinary-send lost-response/reload, confirmed rejection and lifecycle Stop scenarios covered; remaining edit/CAS/hydration matrix open |
 
 ## Rust host and app host
 
 | ID | Sev | Where | Finding | Planned disposition | Implementation status |
 | --- | --- | --- | --- | --- | --- |
 | H1 | P1 | `ws.rs:781`, `:1425`, `:43` | Agent lanes keyed by caller conversation ID, never evicted; 512 cap is global. | Pass G | planned; revalidate at slice entry |
-| H2 | P1 | `viewer_bundles.rs:170`, `:294` | Watcher registers only roots existing at startup. | Pass G | planned; revalidate at slice entry |
-| H3 | P1 | `supervisor.rs:1291` | Manual view builds detached; not reaped on stop or restart. | Pass G | planned; revalidate at slice entry |
-| H4 | P1 (plausible) | `viewer_bundles.rs:519` | Publication renames before insert; cleanup without the per-view lock can delete it. | Pass G | planned; revalidate at slice entry |
+| H2 | P1 | `viewer_bundles.rs:170`, `:294` | Watcher registers only roots existing at startup. | Pass G | source-confirmed 2026-09-06; next bounded H2/H4 host slice; implementation/reproduction tests pending |
+| H3 | P1 | `supervisor.rs:1291` | Manual view builds detached; not reaped on stop or restart. | Pass G | source-confirmed 2026-09-06; separate supervisor/build-process lifetime slice after H2/H4 |
+| H4 | P1 (plausible) | `viewer_bundles.rs:519` | Publication renames before insert; cleanup without the per-view lock can delete it. | Pass G | source-confirmed race 2026-09-06; next H2/H4 host slice needs deterministic interleaving regression |
 | H5 | P2 | `extension_gateways.rs:614` | `Connection`-nominated headers not stripped on non-101 responses. | Pass G | planned; revalidate at slice entry |
 | H6 | P2 | `ws.rs:1425` | Lane policy is a hard-coded method list, not derived from the request contract kind. | Pass G | planned; revalidate at slice entry |
 | H7 | P2 | `ExtensionWebView.tsx:525` | Lifecycle evidence consumed before page readiness; `inactiveForMs` lost. | Pass G | planned; revalidate at slice entry |

@@ -1,4 +1,4 @@
-Status: Active Spec — current checkpoint reconciled; parallel delivery plan ready
+Status: Active Spec — parallel delivery batch deployed; S2a2 and host work next
 Last verified: 2026-09-06
 Canonical code: `extensions/agent/server/src/native-runtime/`,
 `extensions/agent/server/src/providers/`,
@@ -23,8 +23,8 @@ resuming the next bounded batch after the reorientation checkpoint.
   evidence remains in the slice records; deployment does not certify every
   provider scenario.
 - S2a1 root-send delivery is implemented; the bounded closure review is now
-  accepted locally with 87 focused tests and typecheck passing. Two coordinator
-  corrections are ready for the batch deployment recorded below. S2a2
+  accepted and deployed with the batch evidence below. Two coordinator
+  corrections close the demonstrated startup/child-terminal gaps. S2a2
   steer/manual Compact and later queue/branch/spawn adoption are not done.
 - [Subagent lifecycle](agent-subagent-lifecycle.md) is shipped with live Codex
   root/child restart and Stop evidence. This covers substantial C2 work and the
@@ -32,8 +32,8 @@ resuming the next bounded batch after the reorientation checkpoint.
   and the remaining lease/daemon cases are not thereby certified.
 - [New-chat recovery](agent-new-chat-recovery.md) is shipped (`73a2157`,
   `dc04358`). It closes creation/first-message recovery in V1. Lane B now extends that owner
-  to ordinary messages, accepted locally and awaiting batch deployment; server
-  queue recovery remains separate.
+  to ordinary messages and is now deployed (`3a6780c`); server queue recovery
+  remains separate.
 - The general viewer synchronization owner (S4), focused history integrity (S5),
   and most host/app work (S6) remain ahead. The original 76-row planned coverage
   count is not a completion count.
@@ -46,7 +46,7 @@ session/strand and all 67 baseline turn identities/content hashes; 90 turns are
 now hydrated, with no health error. Detailed evidence lives in the two incident
 specs. The transient geometry failure is recorded, not erased by the rerun.
 
-### Next bounded batch
+### Delivered batch scope
 
 | Lane | Next deliverable | Scope and handoff |
 | --- | --- | --- |
@@ -60,7 +60,7 @@ owner extraction; branch/federation delivery still adopts the existing server
 owner serially. Small ownership labels and documentation nits may join a relevant
 change, but do not displace delivery/restart fixes just because they parallelize.
 
-### Active batch assignments — 2026-09-06
+### Batch assignments — 2026-09-06
 
 Lane A is assigned to Sol `implement_s2a1_acceptance`: S2a1 closure only,
 covering delivery owner/contract, journal/coordinator, and necessary provider
@@ -139,6 +139,51 @@ performed in this batch. The next smallest independent host slice is H2/H4 in
 `viewer_bundles.rs`, with deterministic missing-root and publication/cleanup
 regressions. H3 belongs to a separate supervisor/build-process lifetime slice.
 Neither is a reason to hold the completed Agent A/B changes for a host rebuild.
+
+### Batch deployment and live acceptance — 2026-09-06
+
+Server corrections `ed3ff13` and viewer recovery `3a6780c` were reviewed, committed
+and pushed separately on main, then built and deployed together with one Agent
+restart. Agent PID changed from 2478928 to 3958565; native Codex daemon PID 848265
+and its start time were unchanged. The viewer watcher was restored after the
+production builds. Root typecheck and all 288 server tests passed.
+
+The final full browser run passed 210 cases with three skips and one failure in
+the geometry test's programmatic-scroll helper. Earlier in this batch, two busy-
+rejection tests failed because the fixture omitted a durable rejected receipt;
+that mismatch and the actual explicit-resubmission gap are fixed. Their desktop/
+mobile regressions pass. The geometry helper follow-up and its verification are
+recorded below; the full-run failure is retained as evidence rather than counted
+as a pass. The helper had stopped at a mounted-range boundary (27–48), where
+target 27 was visible but required neighbor 26 was absent. Its test-only fix
+waits through range publication, uses one real wheel input, and explicitly waits
+for the required neighborhood. Every geometry assertion is unchanged. Repeating
+all six desktop/mobile geometry cases three times passed 18/18 in 13.5 seconds.
+No product virtualizer code changed and no further full-suite rerun was made.
+
+A live mobile browser canary intentionally lost an accepted ordinary-message
+response, reloaded, and recovered the accepted receipt. It issued exactly one
+message RPC and produced one canonical turn, cleared only the submitted draft,
+and had no browser errors. Two earlier canary runs reached recovery but exposed
+harness assertions (a text selector also matched history, then an empty editor
+reported a newline); those assertions were corrected. All three isolated read-
+only canary conversations settled and were archived. No original user draft was
+submitted. Live desktop/mobile legacy-draft checks preserved the draft and the
+original incident conversation remains idle with zero turns.
+
+Post-restart resource reads preserved all 93 baseline turn IDs/content hashes,
+root/native session identity, and active strand/revision; this thread remained
+running with no health error. Evidence is under
+`/tmp/remux-audit-implementation/parallel-*`,
+`cleanup-parallel-thread-{before,after}.json`, and
+`ordinary-recovery-live/result.json`. This verifies the bounded A/B deployment,
+not every provider failure mode or arbitrary process-kill boundary.
+
+Next implementation batch: S2a2 steer/manual Compact in the server lane and the
+small H2/H4 watcher/publication fix in the independent host lane. H3 build-process
+lifetime follows separately. Both keep Sol ownership, primary review, per-slice
+commits/pushes, and a coordinated deployment checkpoint. No S2a2 or Rust source
+implementation was started in this batch.
 
 ### Historical checkpoint and restart — 2026-09-05
 
@@ -284,7 +329,7 @@ independent overlap. Split shared-server cutovers into smaller serial slices.
 | S0a — native Codex child identity | Fix I3's duplicate lifecycle blocks, completion mapping, and phantom descendants; establish explicit child ownership/identity for both native event paths. Reuse this boundary in S3. | S0; one bounded Sol assignment with primary review. Recorded-event regressions before live acceptance; repair existing incident from proven evidence. | Committed/deployed; copied/live repair and browser navigation verified; original-device check not repeated |
 | S0b — transcript error geometry | Include terminal error banners and per-turn projection retry in the shared layout/geometry model (I4); preserve navigation and scroll anchors through appearance, wrapping, clearing, and virtualization. | S0a; separate serial Sol assignment with primary review. Browser geometry assertions, not visibility alone. | Committed/deployed; geometry/browser evidence recorded; original-device check not repeated |
 | S1 — bounded correctness fixes | Serial slices for fitted bounds and compact failure (D, A7); auth/capability accuracy (A9/A10); draft/effort/compact gating (V6/V7/V10); attachment grants, checkout keys, catalog, result bounds (F1/F2/F5/F6); socket cleanup (R1). | S0b; affected scenario tests and source review per slice. Review any schema change before its implementation. | Committed/deployed; all S1 slices and C3a locally verified; scenario-specific live limits retained; S2 tightens Compact delivery evidence |
-| S2 — command delivery | First ledger deduplication and stable client retries (C3/V1); then safe queue failure/recovery plus ownership-free reads (C1/R2); then edit/fork/spawn acceptance using the same delivery component (C5/A2/F4). Introduce the minimal transaction revision helper needed by admission. | S1 except the small C3a coalescing prerequisite moved before F2; review delivery transitions and provider evidence contract first. No prompt-text or session-binding acceptance inference. | C3a/A13/S2a0 shipped; S2a1 closure accepted locally; coordinator corrections await batch deployment; V1 new-chat subset shipped |
+| S2 — command delivery | First ledger deduplication and stable client retries (C3/V1); then safe queue failure/recovery plus ownership-free reads (C1/R2); then edit/fork/spawn acceptance using the same delivery component (C5/A2/F4). Introduce the minimal transaction revision helper needed by admission. | S1 except the small C3a coalescing prerequisite moved before F2; review delivery transitions and provider evidence contract first. No prompt-text or session-binding acceptance inference. | C3a/A13/S2a0 shipped; S2a1 closure and coordinator corrections deployed; V1 new-chat and ordinary-send client recovery shipped; S2a2 and server queue policy remain |
 | S3 — runtime and child lifecycle | Durable Stop and recovery (C2/A8/R3/R7); native child identity/ordinals/late completion and nested caller ownership (C4/A3/A4/A5/F3/F7). | Shared coordinator/provider changes follow delivery ownership; disjoint work may proceed now. | Partly shipped via lifecycle incident spec; remaining Claude/federation/lease work open |
 | S4 — viewer convergence | Projection revisions, one sync controller, edit/resume consistency, bounded detail caches, protocol mismatch (E excluding earlier V1/V6/V7/V10 slices). | S2–S3; prepare contracts and controller serially, then activate one refresh owner in an integrated cutover. | Planned |
 | S5 — history integrity | Identity aliases, coverage-aware reconciliation, consistent sealing, bounded final output, scoped repair and foreign-key parity (C excluding S3 child work). | S4; identity/coverage plan reviewed before migration; copied-data and replay checks before acceptance. | Planned |
