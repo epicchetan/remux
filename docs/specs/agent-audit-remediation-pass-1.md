@@ -14,10 +14,10 @@ Amends: [agent-state-authority-and-synchronization-v1.md](agent-state-authority-
 
 ## Current checkpoint — 2026-09-06
 
-Baseline: clean `main` at `0037e9b`, pushed to origin. The Agent server and viewer
+Baseline: clean `main` at `812e95f`, pushed to origin. The Agent server and viewer
 are built and deployed. This section and the delivery rules below supersede the
-historical assignment/status prose later in this document. No production coding
-assignment starts during this reorientation/documentation checkpoint.
+historical assignment/status prose later in this document. The user approved
+resuming the next bounded batch after the reorientation checkpoint.
 
 - S0/S1 correctness work is committed and deployed. Its individual scenario/live
   evidence remains in the slice records; deployment does not certify every
@@ -59,6 +59,29 @@ lifetime fix can take that lane. General viewer convergence follows as a focused
 owner extraction; branch/federation delivery still adopts the existing server
 owner serially. Small ownership labels and documentation nits may join a relevant
 change, but do not displace delivery/restart fixes just because they parallelize.
+
+### Active batch assignments — 2026-09-06
+
+Lane A is assigned to Sol `implement_s2a1_acceptance`: S2a1 closure only,
+covering delivery owner/contract, journal/coordinator, and necessary provider
+corrections plus focused server regressions. The schema, wire protocol, Stop
+owner and receipt lookup API stay fixed for this batch unless a demonstrated
+blocker requires primary to revise the boundary. Closure focuses on persisted
+proof validation, possibly-sent fencing, admission rollback/reopen without resend,
+and dependent-child/staged-prefix/suffix ordering. Reuse existing coverage.
+
+Lane B is assigned to Sol `implement_subagent_activity_ui`: ordinary-message
+request recovery using the accepted `turn.send` receipt API and shared pending
+submission owner. It owns viewer submission code and browser/storage tests only.
+Verify accepted and queued lost acknowledgements, reload, immutable attachment
+identities, edits/navigation, coalesced Send/Retry, and existing new-chat/legacy
+regressions. Branch/steer/Compact and server queue recovery remain outside B.
+
+Lane C is assigned to Sol `review_revised_spec` for read-only H2/H3/H4
+investigation; it does not edit repository source/tests. Primary owns docs,
+integration checks, commits/pushes and deployment. Automatic viewer publication
+is paused while source changes; the currently deployed app remains running.
+Each lane reports a reviewed handoff rather than starting its next stage itself.
 
 ### Historical checkpoint and restart — 2026-09-05
 
