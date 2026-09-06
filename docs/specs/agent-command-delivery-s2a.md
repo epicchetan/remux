@@ -3,9 +3,13 @@
 Status: primary-reviewed implementation contract, 2026-09-05. This is the S2a
 contract under [remediation pass 1](agent-audit-remediation-pass-1.md), which owns
 assignment order and acceptance status. F2/schema 14 and A13 are locally verified;
-S2a0 is locally verified. The cutover proceeds serially: S2a1 adopts root
+S2a0 is locally verified. Root delivery is now committed and deployed, with
+S2a1 acceptance closure still pending at the 2026-09-06 checkpoint. The shared
+server cutover proceeds serially: S2a1 adopts root
 start with the durable owner; S2a2 adopts steer and manual Compact after primary
-review. Both form S2a; neither alone completes C1/V1 or all of S2. No implementation or live acceptance is implied by this document.
+review. Both form S2a; neither alone completes C1/V1 or all of S2. This contract
+does not itself certify acceptance; the remediation spec records
+current evidence and permits independent viewer/host lanes alongside this cutover.
 
 ## First cutover
 

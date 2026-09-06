@@ -1,5 +1,5 @@
-Status: Active Spec — staged implementation; incident fixes locally verified
-Last verified: 2026-09-05
+Status: Active Spec — current checkpoint reconciled; parallel delivery plan ready
+Last verified: 2026-09-06
 Canonical code: `extensions/agent/server/src/native-runtime/`,
 `extensions/agent/server/src/providers/`,
 `extensions/agent/server/src/federation/`, `extensions/agent/shared/`,
@@ -12,12 +12,57 @@ Amends: [agent-state-authority-and-synchronization-v1.md](agent-state-authority-
 
 # Agent audit remediation pass 1
 
-## User-directed checkpoint and restart
+## Current checkpoint — 2026-09-06
 
-Completed priority: [durable subagent lifecycle and activity](agent-subagent-lifecycle.md)
-A/B/C checkpoints are committed, pushed and deployed with live root+child
-restart/Stop acceptance. The broader audit remains paused. The account below
-records the previous checkpoint; it is not the current subagent implementation status.
+Baseline: clean `main` at `0037e9b`, pushed to origin. The Agent server and viewer
+are built and deployed. This section and the delivery rules below supersede the
+historical assignment/status prose later in this document. No production coding
+assignment starts during this reorientation/documentation checkpoint.
+
+- S0/S1 correctness work is committed and deployed. Its individual scenario/live
+  evidence remains in the slice records; deployment does not certify every
+  provider scenario.
+- S2a1 root-send delivery code is committed and running. **Its primary acceptance
+  closure is still open.** Reconcile the old review list against current code and
+  tests once, then fix only demonstrated remaining defects or essential missing
+  regressions. Do not restart implementation or expand a new audit around it.
+  S2a2 steer/manual Compact and the later queue/branch/spawn adoption are not done.
+- [Subagent lifecycle](agent-subagent-lifecycle.md) is shipped with live Codex
+  root/child restart and Stop evidence. This covers substantial C2 work and the
+  Codex portions of C4/A5/R7. Claude framing/resume, nested federation ownership,
+  and the remaining lease/daemon cases are not thereby certified.
+- [New-chat recovery](agent-new-chat-recovery.md) is shipped (`73a2157`,
+  `dc04358`). It closes creation/first-message recovery in V1, not ordinary
+  existing-conversation retries or server queue recovery.
+- The general viewer synchronization owner (S4), focused history integrity (S5),
+  and most host/app work (S6) remain ahead. The original 76-row planned coverage
+  count is not a completion count.
+
+Latest integrated evidence: typecheck and 285 server tests passed. Final browser
+run: 198 passed, three skips, one mobile geometry mount miss; isolated geometry
+rerun passed all three cases. Live desktop/mobile legacy-draft recovery preserved
+text and admitted no message. Main-thread verification preserved its root/native
+session/strand and all 67 baseline turn identities/content hashes; 90 turns are
+now hydrated, with no health error. Detailed evidence lives in the two incident
+specs. The transient geometry failure is recorded, not erased by the rerun.
+
+### Next bounded batch
+
+| Lane | Next deliverable | Scope and handoff |
+| --- | --- | --- |
+| A — server delivery | Close S2a1 acceptance against the shipped code. | One Sol owns delivery owner/journal/coordinator and only the provider files actually needed. Produce a short resolved/open checklist, focused regressions, and any required fixes. Primary accepts or names concrete blockers; no indefinite acceptance-only assignment. S2a2 follows this gate. |
+| B — viewer message recovery | Extend stable pending-request recovery to ordinary messages in an existing conversation (remaining V1 client scope). | One Sol owns viewer submission code and its tests. Reuse the existing `turn.send` receipt API and pending-submission owner; extract that owner from the growing actions hook as needed, rather than adding a competing recovery loop. No queue failure semantics, new protocol, edit/fork, or provider changes in this slice. This lane does not depend on S2a2. |
+| C — optional short investigation/review | Reproduce host build/watcher lifetime risks H2/H3 and verify whether H4 is real. | A third Sol may perform read-only Rust-host reproduction or review a ready lane. Running existing focused tests is allowed; no repository source/test edits until primary assigns an implementation owner. Report a minimal actionable defect and acceptance case. Do not run a third broad implementation project or hold A/B delivery for this investigation. |
+
+After A closes, its writer takes S2a2. When B lands, a reproduced host build
+lifetime fix can take that lane. General viewer convergence follows as a focused
+owner extraction; branch/federation delivery still adopts the existing server
+owner serially. Small ownership labels and documentation nits may join a relevant
+change, but do not displace delivery/restart fixes just because they parallelize.
+
+### Historical checkpoint and restart — 2026-09-05
+
+The following records the earlier pause/restart, not current instructions.
 
 Implementation is paused at the user's request. Commit the accumulated work on
 main, push it, build the Agent server and viewer, and perform a controlled
@@ -85,40 +130,85 @@ product behavior unless the user changes it.
 
 ## Delivery order and responsibility
 
-The primary agent owns implementation outcomes, contracts, integration, review,
-and this document. On implementation kickoff, it delegates bounded coding
-slices to native same-provider `gpt-5.6-sol` subagents and reviews their work.
-Use one implementation subagent at a time by default. A second may run only
-for a concrete independent task with disjoint files and settled contracts;
-never assign all stages or all audit areas concurrently. Shared schema,
-protocol, coordinator, and journal edits have one writer at a time. Subagents
-do not recursively delegate, commit, push, or restart services.
+The primary agent owns contracts, integration, review, the current work list, and
+release outcomes. Use native same-provider `gpt-5.6-sol` subagents for bounded
+implementation. **Default to two concurrent implementation lanes** with disjoint
+files and settled interfaces. A third Sol may handle read-only review or reproduction, including running
+existing focused tests. It does not edit repository source/tests without a new
+bounded implementation assignment and explicit ownership. Keep the primary available to review and land work.
+This replaces the earlier one-writer-at-a-time default across the whole project.
 
-Before delegation, record the slice's finding IDs, invariants, allowed files,
-dependencies, and acceptance scenarios. The primary agent reads the relevant
-existing changes and gives the subagent enough context to preserve them.
-During implementation the primary agent reviews the affected contracts and
-failure paths; it does not independently edit files owned by that subagent.
-After handoff it inspects the diff and tests, requests corrections, and runs
-the appropriate integration checks. A subagent's completion report alone is
-not acceptance. Work stays on `main`; commits, pushes, and live service
-restarts are separate actions under the user's instructions.
+Each shared file still has one writer. Schema, protocol, coordinator, journal,
+and provider-adapter changes require explicit file ownership; logical independence
+alone is insufficient. Freeze a shared contract first, land it, then run its
+consumers in parallel. Do not assign all audit areas at once. Subagents do not
+recursively delegate or restart services. The primary normally handles Git, but
+may delegate an explicit-path commit/push operation after primary review, as
+the user has requested for testing.
+
+Before delegation, record only what the writer needs: finding IDs, outcome,
+allowed files, settled interfaces, acceptance cases, and exclusions. Existing
+contracts remain linked references; do not repeat the full audit in each prompt.
+Aim for a reviewable milestone within roughly 30–60 minutes. If a task grows,
+split at a safe buildable boundary and report the specific blocker; do not hide
+an hours-long implementation behind an expanded test checklist. This is a scope
+control target, not permission to accept incomplete safety-critical behavior.
+
+The primary reviews ready handoffs while the other lane continues. It does not
+edit the active writer's files. A subagent's completion report is evidence to
+inspect, not acceptance. Record a concrete unresolved defect when a handoff is
+rejected, rather than repeatedly returning an open-ended request for more tests.
+
+### Commit, validation, and deployment cadence
+
+- Commit and push each reviewed, buildable slice on `main` as soon as its focused
+  checks pass. Stage explicit paths; never sweep in another lane's unfinished
+  work. Do not wait for a whole S-stage, all findings, or the next restart. Keep
+  the status/evidence update in that commit or an immediate follow-up commit.
+- Before integrated validation and publication, briefly freeze source writes so
+  tests/builds describe a known committed revision. Other agents can review or
+  investigate during the freeze. Keep automatic viewer publication paused while
+  unaccepted source is changing; restore it after a coherent publication.
+- Run the defect regression and affected unit/type checks for each slice. Run
+  the relevant full server/browser/host suite once for the integrated batch.
+  Re-run only changed paths, failed checks, or genuinely unresolved concerns.
+  Use Remux workload limits for heavy tests/builds; three agents do not imply
+  three unconstrained full suites running at once.
+- Build and verify the running app after each accepted batch, usually one or two
+  slices. Viewer-only changes need viewer publication and a smoke check, not a
+  server restart. Batch server changes into one controlled Agent restart; preserve
+  the shared daemon and verify the active thread. Rust-host changes get their
+  own deployment checkpoint. Do not restart while a build or another deployment
+  is still in progress.
+- Done means reviewed, focused checks passed, committed/pushed, plus an explicit
+  deployment/evidence state. A committed slice may await the next batch deployment;
+  describe that honestly. User-visible bug fixes should not remain indefinitely
+  committed but absent from the running app.
+
+Tests remain proportional to the failure class. No-double-send, ownership under
+uncertainty, accepted-proof recovery, history preservation, and exact-target Stop
+are essential gates. Do not weaken those to move faster. Exhaustive unrelated
+provider combinations, speculative migrations, cosmetic refactors, and broad
+live failure campaigns do not block an otherwise accepted slice. Add a deferred
+finding with a reason and revisit trigger when appropriate. The existing J7,
+T5/T6/T8, and H11 deferrals remain in force.
 
 Pass A–H below are topical requirements retained for finding traceability.
 They are **not** eight parallel assignments or eight required commits. This
-table determines delivery order; split a stage into smaller serial slices.
+table records logical dependencies; the next-batch lanes above authorize
+independent overlap. Split shared-server cutovers into smaller serial slices.
 
 | Stage | Outcome and scope | Dependency / review gate | State |
 | --- | --- | --- | --- |
 | S0 — establish baseline | Inventory shared changes; review I1/I2 incident fixes and their tests; record current versions and validation. | Distinguish existing edits, locally verified changes, and live deployment. | Baseline inventoried; 196/196 server tests passed; prior local I1/I2 evidence reviewed |
-| S0a — native Codex child identity | Fix I3's duplicate lifecycle blocks, completion mapping, and phantom descendants; establish explicit child ownership/identity for both native event paths. Reuse this boundary in S3. | S0; one bounded Sol assignment with primary review. Recorded-event regressions before live acceptance; repair existing incident from proven evidence. | Verified locally — runtime and copied-data repair; live repair/device acceptance pending |
-| S0b — transcript error geometry | Include terminal error banners and per-turn projection retry in the shared layout/geometry model (I4); preserve navigation and scroll anchors through appearance, wrapping, clearing, and virtualization. | S0a; separate serial Sol assignment with primary review. Browser geometry assertions, not visibility alone. | Verified locally — primary review and full viewer integration; live/device acceptance pending |
-| S1 — bounded correctness fixes | Serial slices for fitted bounds and compact failure (D, A7); auth/capability accuracy (A9/A10); draft/effort/compact gating (V6/V7/V10); attachment grants, checkout keys, catalog, result bounds (F1/F2/F5/F6); socket cleanup (R1). | S0b; affected scenario tests and source review per slice. Review any schema change before its implementation. | Verified locally — all S1 slices plus prerequisite C3a; F2 primary server 246/246; live acceptance pending; S2 tightens compact delivery evidence |
-| S2 — command delivery | First ledger deduplication and stable client retries (C3/V1); then safe queue failure/recovery plus ownership-free reads (C1/R2); then edit/fork/spawn acceptance using the same delivery component (C5/A2/F4). Introduce the minimal transaction revision helper needed by admission. | S1 except the small C3a coalescing prerequisite moved before F2; review delivery transitions and provider evidence contract first. No prompt-text or session-binding acceptance inference. | C3a, A13 and S2a0 verified locally; S2a1 root delivery assigned |
-| S3 — runtime and child lifecycle | Durable Stop and recovery (C2/A8/R3/R7); native child identity/ordinals/late completion and nested caller ownership (C4/A3/A4/A5/F3/F7). | S2; ownership survives stream loss and late events; no lane release based solely on disconnect. | Planned |
+| S0a — native Codex child identity | Fix I3's duplicate lifecycle blocks, completion mapping, and phantom descendants; establish explicit child ownership/identity for both native event paths. Reuse this boundary in S3. | S0; one bounded Sol assignment with primary review. Recorded-event regressions before live acceptance; repair existing incident from proven evidence. | Committed/deployed; copied/live repair and browser navigation verified; original-device check not repeated |
+| S0b — transcript error geometry | Include terminal error banners and per-turn projection retry in the shared layout/geometry model (I4); preserve navigation and scroll anchors through appearance, wrapping, clearing, and virtualization. | S0a; separate serial Sol assignment with primary review. Browser geometry assertions, not visibility alone. | Committed/deployed; geometry/browser evidence recorded; original-device check not repeated |
+| S1 — bounded correctness fixes | Serial slices for fitted bounds and compact failure (D, A7); auth/capability accuracy (A9/A10); draft/effort/compact gating (V6/V7/V10); attachment grants, checkout keys, catalog, result bounds (F1/F2/F5/F6); socket cleanup (R1). | S0b; affected scenario tests and source review per slice. Review any schema change before its implementation. | Committed/deployed; all S1 slices and C3a locally verified; scenario-specific live limits retained; S2 tightens Compact delivery evidence |
+| S2 — command delivery | First ledger deduplication and stable client retries (C3/V1); then safe queue failure/recovery plus ownership-free reads (C1/R2); then edit/fork/spawn acceptance using the same delivery component (C5/A2/F4). Introduce the minimal transaction revision helper needed by admission. | S1 except the small C3a coalescing prerequisite moved before F2; review delivery transitions and provider evidence contract first. No prompt-text or session-binding acceptance inference. | C3a/A13/S2a0 shipped; S2a1 root delivery implemented/deployed with closure review pending; V1 new-chat subset shipped |
+| S3 — runtime and child lifecycle | Durable Stop and recovery (C2/A8/R3/R7); native child identity/ordinals/late completion and nested caller ownership (C4/A3/A4/A5/F3/F7). | Shared coordinator/provider changes follow delivery ownership; disjoint work may proceed now. | Partly shipped via lifecycle incident spec; remaining Claude/federation/lease work open |
 | S4 — viewer convergence | Projection revisions, one sync controller, edit/resume consistency, bounded detail caches, protocol mismatch (E excluding earlier V1/V6/V7/V10 slices). | S2–S3; prepare contracts and controller serially, then activate one refresh owner in an integrated cutover. | Planned |
 | S5 — history integrity | Identity aliases, coverage-aware reconciliation, consistent sealing, bounded final output, scoped repair and foreign-key parity (C excluding S3 child work). | S4; identity/coverage plan reviewed before migration; copied-data and replay checks before acceptance. | Planned |
-| S6 — host and app reliability | Separate lane, build/watcher, gateway, runtime-job, lifecycle-evidence slices (G); wire app tests (H10). | Serial slices with applicable host/app tests; do not couple independent host work to journal migrations. | Planned |
+| S6 — host and app reliability | Separate lane, build/watcher, gateway, runtime-job, lifecycle-evidence slices (G); wire app tests (H10). | Independent lane with applicable host/app tests; no dependency on journal migrations unless a concrete shared contract requires one. | Planned; build/watcher lifetime reproduction eligible now |
 | S7 — closeout | Finish documentation corrections (H, including T7 and decision docs), audit unresolved findings, record release validation and any live acceptance still pending. | All in-scope findings have evidence or an explicit revised disposition. | Planned |
 
 J9, A12, F9, V11, and H9 describe scenario coverage that accompanies the
@@ -970,8 +1060,8 @@ adopts live steer and manual Compact into the same owner; their schema kinds
 are included in the reviewed schema 15. Existing branch/federation start
 callers use one temporary typed-result compatibility helper and retain F2's
 possibly-sent holds. S2b then implements failed queue progression and viewer
-retry/recheck; do not mark C1/V1 complete in this slice. No second production
-writer runs alongside this assignment.
+retry/recheck; do not mark C1/V1 complete in this slice. No second production writer edits those shared server files during this
+assignment; the independent lanes in the current checkpoint may run alongside it.
 
 S2a2 protocol decision: add a server-derived runtime `deliveryHeld` boolean
 under native protocol v10, using the same journal predicate as writer guards
@@ -1003,7 +1093,8 @@ checked admission/rejection transitions. Exercise admission of a captured
 prefix while a suffix arrives, followed by another event before that suffix
 drains; retained ordinals must preserve order without colliding. Legacy Claude
 start callers must also wait for actual correlated processing evidence.
-The next slices remain unassigned until this gate and copied migration pass.
+Later shared-server adoption slices remain gated on this review and copied
+migration acceptance. This does not block the current independent viewer/host lanes.
 
 Serial acceptance handoff: the first Sol writer returned a stable production
 checkpoint with typecheck and 95 focused owner/provider/schema/coordinator
@@ -1501,28 +1592,21 @@ including the first turn. Fail explicitly on unsupported runtimes rather than
 guessing a parameter. Record the actual installed/reference protocol used by
 tests; do not assume the audit's version remains current.
 
-Stop. Add `interrupt_requested_at` to `turns` for root turns and to
-`executions` for child executions. `interruptTurn` and `interruptExecution`
-record it in the command transaction, advance the projection revision, then
-call the adapter. The runtime resource projects `stopping` from those columns.
-A reconciliation task per stopping target owns its timers, cancellation, and
-restart recovery; default checks are at 15 and 45 seconds after intent, with
-injectable timings for deterministic tests. After those probes, unresolved
-targets wait for native evidence, session recovery, or explicit recheck rather
-than an unbounded polling loop. Reconstruct pending deadlines on restart.
-Deadlines trigger probes, not invented terminal outcomes. `readHistoryRevision`
-is only a change probe; the watchdog reads terminal evidence through `snapshot`
-or the read-only history path. A terminal native
-turn closes the Remux turn as interrupted or completed from provider evidence;
-a proven-dead owning Claude process may close its lost invocation as failed;
-a still-running or unknown turn retains lane ownership. After the second check
-the runtime exposes recovery actions supported by the provider. Force-close
-may release the lane only after verified termination of that work or an
-established fencing mechanism that prevents overlapping execution. Closing a
-shared-daemon socket or expiring a local timer proves neither. If no safe
-force-close exists, show unresolved recovery and recheck; preserve queued work
-without dispatching it. Adapter interruption rejection is recorded explicitly;
-it cannot look like successful cancellation or strand an uncancellable timer.
+Stop. The durable Stop-intent/assignment-target design in
+[agent-subagent-lifecycle.md](agent-subagent-lifecycle.md) is implemented and
+supersedes the original proposed `interrupt_requested_at` columns and watchdog
+layout. Preserve that owner, its `stopping` projection, frozen assignment targets,
+bounded reconciliation, restart restoration, explicit errors, and paused/preserved
+queued work. Do not add a second Stop state machine or repeat the implemented
+Codex root/child work. The lifecycle spec owns its accepted implementation and
+recorded live scenarios.
+
+Revalidate the remaining Claude, daemon-death, and lease-window scenarios against
+that owner. A probe deadline or disconnected socket is not terminal proof and
+must not release a writer. Terminal native evidence may close the exact target;
+verified termination or effective fencing is required before any force-close can
+permit overlapping work. Unknown work stays unresolved and recheckable. Do not
+claim the live Codex canary covers the remaining provider cases.
 
 Claude adapter. Resume emits `recovering`; an SDK `init` establishes session
 readiness, not absence of an accepted turn's result. Reconcile using correlated

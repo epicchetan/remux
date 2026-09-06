@@ -1,5 +1,5 @@
-Status: Audit record — 84 original findings, 6 incident follow-ups, 1 implementation finding; implementation tracked
-Last verified: 2026-09-05
+Status: Audit record — 84 original findings, 8 incident follow-ups, 1 implementation finding; implementation tracked
+Last verified: 2026-09-06
 Canonical code: `extensions/agent/`, `crates/remux/`, `app/src/`
 Remediation: [agent-audit-remediation-pass-1.md](agent-audit-remediation-pass-1.md)
 
@@ -8,7 +8,7 @@ Remediation: [agent-audit-remediation-pass-1.md](agent-audit-remediation-pass-1.
 Nine independent read-only reviews (GPT-5.6-Sol, xhigh) covered the four
 commits that made native Agent the product path, one slice each, followed by
 spot checks and a verification pass over the remediation spec. This file is
-the original 84-row list; I1–I6 below add incidents from the subsequent
+the original 84-row list; I1–I8 below add incidents from the subsequent
 conversation, and A13 records a reproduced implementation-stage finding.
 Every row retains its finding ID and a planned disposition.
 Pass references identify coverage, not completed fixes. The remediation spec's
@@ -27,8 +27,10 @@ primary implementation review; `in progress` means a bounded slice is active;
 requires primary review and recorded test evidence; `verified live` requires
 the relevant loaded-runtime check. Existing decisions retain `decision` status
 while their documentation corrections remain scheduled. Deferred rows remain
-open with a reason and revisit condition. No original row is newly certified
-fixed by this documentation revision.
+open with a reason and revisit condition. The 2026-09-06 checkpoint maps already
+shipped incident evidence back to
+C2/C4/A5/R7/V1/V11. Partial coverage stays explicit; it does not certify the
+remaining provider or failure matrices.
 
 Test state at audit time: `npm run test:server` 181 of 182 with a Node 24
 process abort in `codex-runtime-host.test.ts`; `npm run test:unit` pass;
@@ -44,9 +46,9 @@ testing, but the earlier Node abort's attribution to that leak is unproven.
 | ID | Sev | Where | Finding | Planned disposition | Implementation status |
 | --- | --- | --- | --- | --- | --- |
 | C1 | P1 | `native-coordinator.ts:2771`, `native-journal.ts:1377`, `:1464` | Pre-accept rejection or restart during dispatch marks the queue head `delivery_unknown`; claim refuses it; nothing reconciles; lane blocks forever. | Pass A | planned; revalidate at slice entry |
-| C2 | P1 | `native-coordinator.ts:878`, `:1977`, `provider-adapter.ts:81` | Stop records adapter acceptance only; no durable interrupt-requested state, no `Stopping` projection, no watchdog. | Pass B | planned; revalidate at slice entry |
+| C2 | P1 | `native-coordinator.ts:878`, `:1977`, `provider-adapter.ts:81` | Stop records adapter acceptance only; no durable interrupt-requested state, no `Stopping` projection, no watchdog. | Pass B | implemented/deployed through lifecycle Stop intents; local and live Codex root/child restart+Stop verified; remaining provider cases tracked separately |
 | C3 | P1 | `native-journal.ts:368`, `native-coordinator.ts:3826` | Concurrent commands with one command ID both execute; reproduced `UNIQUE constraint failed` on compaction. | Pass B | C3a verified locally, 234/234 server; restart/delivery remainder in S2 |
-| C4 | P1 | `codex-event-mapper.ts:864`, `native-journal.ts:3193` | Late native-child completion attaches to the current root turn while the execution row keeps the original. | Pass C | planned; revalidate at slice entry |
+| C4 | P1 | `codex-event-mapper.ts:864`, `native-journal.ts:3193` | Late native-child completion attaches to the current root turn while the execution row keeps the original. | Pass C | Codex late-child ownership covered by I3/lifecycle implementation and regressions; remaining cross-provider overlap revalidated in S3 |
 | C5 | P2 | `native-coordinator.ts:1641`, `native-journal.ts:1262` | Edit/fork inserts the canonical destination turn before provider acceptance. | Pass B | planned; revalidate at slice entry |
 | C6 | P2 | `schema.ts:91`, `:915` | v7 migration cannot add table-level foreign keys, so a v6-migrated DB differs from fresh. | Pass C (scoped constraint repair) | planned; revalidate at slice entry |
 | C7 | P2 | `native-agent-server.ts:167`, `native-agent-protocol.ts:546` | No projection fence or typed changes; invalidations are broad keys plus journal sequence. | Pass E | planned; revalidate at slice entry |
@@ -73,7 +75,7 @@ testing, but the earlier Node abort's attribution to that leak is unproven.
 | A2 | P1 | `codex-adapter.ts:826`, `:1073` | Edit-before fork sends `beforeTurnId`; absent in pinned v0.144.0 reference, present in installed 0.153.2. Unversioned assumption. | Pass B (verify supported fork semantics) | planned; revalidate at slice entry |
 | A3 | P1 | `claude-adapter.ts:1009` | Finalized subagent assistant frames with `parent_tool_use_id` project into the root turn. | Pass C | planned; revalidate at slice entry |
 | A4 | P1 | `claude-adapter.ts:1020` | Content-block ordinals reset per frame; same-kind blocks collapse. | Pass C | planned; revalidate at slice entry |
-| A5 | P1 | `claude-adapter.ts:824`, `codex-event-mapper.ts:864` | Child ownership lost once the root turn ends; Claude drops post-result `task_notification`. | Pass C | planned; revalidate at slice entry |
+| A5 | P1 | `claude-adapter.ts:824`, `codex-event-mapper.ts:864` | Child ownership lost once the root turn ends; Claude drops post-result `task_notification`. | Pass C | partial: Codex durable assignments and post-parent reconciliation shipped; Claude late-task semantics remain open |
 | A6 | P1 | `codex-event-mapper.ts:662`, `claude-adapter.ts:939`, `:1318` | Oversized titles, reasoning revisions, and error messages drop whole events; `turn.completed` can fail validation. | Pass D | verified locally; v6 fitting/legacy compatibility, primary server 222/222 |
 | A7 | P1 | `claude-adapter.ts:792` | `compact_result: 'failed'` ignored; manual compaction runs forever. | Pass B | partially verified in S1; error surfaced, but S2 source review requires correlated manual evidence before release; untagged failure is ambiguous |
 | A8 | P1 | `claude-adapter.ts:544` | Resume fails the interrupted turn before the SDK init handshake. | Pass B | planned; revalidate at slice entry |
@@ -93,7 +95,7 @@ testing, but the earlier Node abort's attribution to that leak is unproven.
 | R4 | P2 | `SettingsOverview.tsx:232`, `:180`, `ws.rs:1149` | Runtime jobs treated as complete on admission; failures discarded. | Pass G | planned; revalidate at slice entry |
 | R5 | P2 | `agentRuntimeApi.ts:44`, `SettingsOverview.tsx:213` | "Check runtimes" rereads cached status; no re-probe. | Pass G | planned; revalidate at slice entry |
 | R6 | P2 | `codex-adapter.ts:150` | Daemon-managed executable published as the resolved configured executable. | Pass G | planned; revalidate at slice entry |
-| R7 | P2 | `codex-runtime-host.test.ts:75` | No concurrent acquisition, restart reuse, daemon death mid-turn, or lease-window tests. | Pass B, Pass F tests | planned; revalidate at slice entry |
+| R7 | P2 | `codex-runtime-host.test.ts:75` | No concurrent acquisition, restart reuse, daemon death mid-turn, or lease-window tests. | Pass B, Pass F tests | partial: root/child restart reuse and exact-target Stop verified locally/live; remaining daemon/acquisition/lease scenarios open |
 
 ## Federation
 
@@ -126,7 +128,7 @@ testing, but the earlier Node abort's attribution to that leak is unproven.
 
 | ID | Sev | Where | Finding | Planned disposition | Implementation status |
 | --- | --- | --- | --- | --- | --- |
-| V1 | P1 | `useConversationActions.ts:141`, `agentCommands.ts:101` | Retries mint new command and client message IDs; lost response duplicates the turn. | Pass E | planned; revalidate at slice entry |
+| V1 | P1 | `useConversationActions.ts:141`, `agentCommands.ts:101` | Retries mint new command and client message IDs; lost response duplicates the turn. | Pass E | partial: new-chat create/first-message recovery shipped (I8); ordinary existing-conversation request recovery is next viewer lane; server queue recovery remains S2 |
 | V2 | P1 | `resourceInvalidations.ts:30`, `useAgentResources.ts:191`, `historyStore.ts:88` | Three independent refresh paths; tray and transcript disagree; refetch storms. | Pass E | planned; revalidate at slice entry |
 | V3 | P1 | `useConversationActions.ts:222`, `resourceStore.ts:444` | Edit hydration exhaustion treated as success; old strand stays without error. | Pass E | planned; revalidate at slice entry |
 | V4 | P1 | `turnAction.ts:95`, `useConversationActions.ts:188` | Head-CAS rejection leaves the editor bound to the stale strand and revision. | Pass E | planned; revalidate at slice entry |
@@ -136,7 +138,7 @@ testing, but the earlier Node abort's attribution to that leak is unproven.
 | V8 | intent | `Sidebar.tsx:88`, `agentCommands.ts:91` | No historical preview or Make Current UI though the spec and README claim it. | Decision: server-only, fix docs | decision; docs planned |
 | V9 | intent | `usageWindows.ts:3`, `usage-windows.test.ts:14` | Codex Spark usage windows omitted while the composer spec requires every window. | Decision: keep omission, fix spec | decision; docs planned |
 | V10 | P2 | `UsageTray.tsx:23`, `:53` | Compact eligibility ignores queued compact and session resumability. | Pass E | verified locally; selected runtime/queue, resumability and queued/running gating; full viewer 179 passed |
-| V11 | P2 | `viewer.spec.ts:751`, `viewer-lifecycle.spec.ts:9` | No coverage for lost response, CAS conflict, hydration failure, reload mid-stream, stopping across reload. | Pass E tests | planned; revalidate at slice entry |
+| V11 | P2 | `viewer.spec.ts:751`, `viewer-lifecycle.spec.ts:9` | No coverage for lost response, CAS conflict, hydration failure, reload mid-stream, stopping across reload. | Pass E tests | partial: new-chat lost-response/reload and lifecycle Stop scenarios covered; remaining edit/CAS/hydration matrix open |
 
 ## Rust host and app host
 
