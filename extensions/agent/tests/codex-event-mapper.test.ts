@@ -978,14 +978,22 @@ test('Codex native compaction turns stay conversation-scoped and complete one ma
       turn: { id: nativeCompactionTurn, status: 'inProgress', items: [] },
     },
   }), []);
-  assert.deepEqual(subject.mapNotification({
+  const started = subject.mapNotification({
     method: 'item/started',
     params: {
       threadId: ROOT_THREAD,
       turnId: nativeCompactionTurn,
       item: { id: 'compact-item-1', type: 'contextCompaction' },
     },
-  }), []);
+  });
+  assert.equal(started.length, 1);
+  assert.equal(started[0]?.scope.kind, 'conversation');
+  assert.deepEqual(started[0]?.event, {
+    type: 'context.compaction.started',
+    trigger: 'manual',
+    operationId: 'manual-compact-1',
+    beforeTokens: null,
+  });
   const completed = subject.mapNotification({
     method: 'item/completed',
     params: {

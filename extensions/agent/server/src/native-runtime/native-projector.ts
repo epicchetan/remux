@@ -978,9 +978,12 @@ function boundaryCompactions(
   const nextTurn = pathTurns[turnIndex + 1];
   const controls = latestBoundaryCompactions(events, turn.executionId);
   const structuralBefore = controls.filter(({ event }) =>
-    event.strandId !== null && event.nextTurnId === turn.turnId);
+    event.strandId !== null && (event.nextTurnId === turn.turnId ||
+      (event.nextTurnId === null && previousTurn !== undefined &&
+        event.previousTurnId === previousTurn.turnId)));
   const structuralAfter = controls.filter(({ event }) =>
-    event.strandId !== null && event.nextTurnId === null && event.previousTurnId === turn.turnId);
+    event.strandId !== null && event.nextTurnId === null &&
+      event.previousTurnId === turn.turnId && nextTurn === undefined);
   const legacy = controls.filter(({ event }) => event.strandId === null);
   return {
     beforeUser: [

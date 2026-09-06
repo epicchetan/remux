@@ -1355,3 +1355,38 @@ build passed. Mobile screenshots were reviewed.
 
 Served Agent revision: `sha256-0ec370600aa4b2e04142ab0a199d40cfd039349c9ae8b533005d76a1d3d33568`.
 Reload the Agent view to receive it; no server restart or Expo update is required.
+
+## Manual compaction transcript progress (2026-09-06)
+
+Manual Compact must appear in the transcript while its durable operation is
+running, even when the provider has not yet supplied a compaction control event.
+The running operation describes Remux's in-flight work; it is not evidence of
+provider acceptance and must not change delivery receipts or release the lane.
+The transcript composes operation state with native control evidence under the
+same operation ID. Native start events are preserved when available.
+
+The operation owns one boundary marker that settles to completed or failed.
+Delivery-unknown outcomes retain their diagnostic instead of leaving a running
+marker. Queued and cancelled operations stay out of the transcript; a queued
+request satisfied by native automatic compaction must not add a second marker.
+Location is strand-scoped and survives reload, and terminal/native replay updates
+the existing marker. No synthetic user turn, new virtualizer geometry, or database
+schema migration is required.
+
+Acceptance covers the unresolved dispatch interval before provider acceptance,
+reload, queued-to-running transition, terminal failure and uncertain delivery,
+native replay deduplication, and stable marker geometry on desktop/mobile.
+
+Validation: all 294 Agent server tests and repository/linked-viewer typechecks
+passed. Four desktop/mobile browser cases verify the marker before completion,
+reload, completed/failed settlement, duplicate invalidation, and unchanged row
+height. Server tests additionally verify an unresolved provider response leaves
+the command dispatching while progress is visible, queue dispatch, uncertain
+outcome followed by authoritative completion, reconstruction from journal state,
+strand isolation, and movement before the next user turn. The Agent production
+server build passed. Existing running operations without a persisted strand
+location are not backfilled by guessing; historical native markers are retained.
+
+Deployment: server bundle built; Agent server restart is pending while the Ledger
+conversation is active. A viewer reload alone cannot activate this server change.
+No schema migration or Expo update is required.

@@ -1864,7 +1864,7 @@ export class NativeAgentJournal {
         this.nextQueueOrdinal(input.conversationId),
         input.now,
       );
-    }
+    } else this.recordManualCompactionPath(input.conversationId, input.operationId);
   }
 
   queuedCompactions(conversationId: string): NativeQueuedCompact[] {
@@ -1922,8 +1922,33 @@ export class NativeAgentJournal {
         UPDATE compaction_operations SET state = 'running', started_at = COALESCE(started_at, ?),
           updated_at = ? WHERE operation_id = ? AND state = 'queued'
       `).run(now, now, next.operationId);
+      this.recordManualCompactionPath(conversationId, next.operationId);
       return next;
     });
+  }
+
+  private recordManualCompactionPath(conversationId: string, operationId: string) {
+    const location = this.database.prepare(`
+      SELECT e.strand_id, t.turn_id
+      FROM conversations c
+      JOIN executions e ON e.execution_id = c.root_execution_id
+      JOIN strand_turn_path p ON p.strand_id = e.strand_id
+      JOIN turns t ON t.turn_id = p.turn_id
+      WHERE c.conversation_id = ?
+      ORDER BY p.ordinal DESC LIMIT 1
+    `).get(conversationId) as { strand_id: string; turn_id: string } | undefined;
+    if (!location) return;
+    this.database.prepare(`
+      INSERT OR IGNORE INTO strand_control_path(
+        path_entry_id, strand_id, operation_id, previous_turn_id, next_turn_id,
+        native_ordinal, relation
+      ) VALUES (?, ?, ?, ?, NULL, 0, 'local')
+    `).run(
+      `path:${location.strand_id}:control:${operationId}`,
+      location.strand_id,
+      operationId,
+      location.turn_id,
+    );
   }
 
   removeQueuedCompaction(conversationId: string, operationId: string, now: number) {
@@ -2578,7 +2603,7 @@ export class NativeAgentJournal {
       WHERE c.conversation_id = ? AND c.kind = 'compaction'
       ORDER BY c.created_at, c.control_event_id
     `).all(strandId ?? null, conversationId) as Record<string, unknown>[];
-    return rows.map((row) => {
+    const controls = rows.map((row) => {
       const payload = JSON.parse(String(row.payload_json)) as {
         trigger: 'manual' | 'automatic';
         beforeTokens?: number | null;
@@ -2607,6 +2632,63 @@ export class NativeAgentJournal {
         ...(row.completed_at === null ? {} : { completedAt: Number(row.completed_at) }),
       };
     });
+    // Transcript presentation also includes Remux-owned in-flight operations.
+    // This does not append provider evidence or advance a delivery receipt.
+    // Require a persisted strand location; older unlocated operations remain
+    // represented by their native control events rather than a guessed boundary.
+    const operations = (this.database.prepare(`
+      SELECT o.*, c.root_execution_id, p.strand_id, p.previous_turn_id, p.next_turn_id
+      FROM compaction_operations o
+      JOIN conversations c USING(conversation_id)
+      JOIN strand_control_path p ON p.operation_id = o.operation_id AND p.strand_id = ?
+      WHERE o.conversation_id = ? AND o.trigger = 'manual'
+        AND o.command_id IS NOT NULL
+        AND COALESCE(o.disposition, '') != 'satisfied-by-native-auto'
+        AND o.state IN ('running', 'completed', 'failed', 'delivery_unknown')
+      ORDER BY o.created_at, o.operation_id
+    `).all(strandId ?? null, conversationId) as Record<string, unknown>[]).map((row) => ({
+      operation: compactionOperationRow(row),
+      executionId: String(row.root_execution_id),
+      strandId: String(row.strand_id),
+      previousTurnId: row.previous_turn_id === null ? null : String(row.previous_turn_id),
+      nextTurnId: row.next_turn_id === null ? null : String(row.next_turn_id),
+    }));
+    for (const { operation, executionId, strandId: operationStrandId,
+      previousTurnId, nextTurnId } of operations) {
+      const matching = controls.filter(({ operationId }) => operationId === operation.operationId);
+      const state = operation.state === 'running' ? 'started'
+        : operation.state === 'completed' ? 'completed' : 'failed';
+      const existing = matching.at(-1);
+      const createdAt = Math.min(
+        existing?.createdAt ?? Number.POSITIVE_INFINITY,
+        operation.startedAt ?? operation.createdAt,
+      );
+      const projected: JournalCompactionControlEvent = {
+        controlEventId: existing?.controlEventId ?? `operation:${operation.operationId}`,
+        conversationId,
+        executionId: existing?.executionId ?? executionId,
+        boundary: existing?.boundary ?? { kind: 'between-turns' },
+        state,
+        operationId: operation.operationId,
+        providerSubjectKey: existing?.providerSubjectKey ?? operation.providerSubjectKey ?? null,
+        strandId: existing?.strandId ?? operationStrandId,
+        previousTurnId: existing?.previousTurnId ?? previousTurnId,
+        nextTurnId: existing?.nextTurnId ?? nextTurnId,
+        nativeIdentity: existing?.nativeIdentity ?? operation.nativeOperationId ?? null,
+        trigger: operation.trigger,
+        beforeTokens: operation.beforeTokens,
+        afterTokens: operation.afterTokens,
+        ...(operation.error ? { error: operation.error } : {}),
+        createdAt,
+        ...(state === 'started'
+          ? {}
+          : { completedAt: operation.completedAt ?? operation.updatedAt }),
+      };
+      for (const control of matching) controls.splice(controls.indexOf(control), 1);
+      controls.push(projected);
+    }
+    return controls.sort((left, right) => left.createdAt - right.createdAt ||
+      left.controlEventId.localeCompare(right.controlEventId));
   }
 
   legacyEventsForExecution(executionId: string): LegacyJournalEvent[] {

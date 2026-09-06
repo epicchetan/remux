@@ -490,6 +490,92 @@ test('standalone compaction moves from the transcript tail to before the next us
   }
 });
 
+test('manual compaction operation projects queued, running, native, and uncertain delivery durably', () => {
+  const journal = createJournal();
+  try {
+    seed(journal);
+    journal.appendProviderEvent(event('turn-1-complete', 10, {
+      type: 'turn.completed', outcome: 'completed',
+    }));
+    journal.claimCommand('compact-command', 'conversation.compact', {
+      conversationId: 'conversation-1',
+    }, 11);
+    journal.createManualCompaction({
+      operationId: 'compact-operation',
+      commandId: 'compact-command',
+      conversationId: 'conversation-1',
+      state: 'queued',
+      now: 12,
+    });
+    const projector = new NativeAgentProjector(journal);
+    const marker = () => (projector.project(
+      'agent/transcript:conversation-1:tail-24',
+    ) as NativeTranscriptWindow).turns[0]?.boundaryCompactions?.afterTurn[0];
+
+    assert.equal(marker(), undefined, 'queued work remains represented by the queue');
+    assert.equal(journal.claimNext('conversation-1', 13)?.kind, 'compact');
+    assert.deepEqual(marker(), {
+      operationId: 'compact-operation', trigger: 'manual', state: 'started',
+      beforeTokens: null, afterTokens: null, createdAt: 13,
+    });
+
+    const reconstructed = new NativeAgentProjector(new NativeAgentJournal(journal.database));
+    assert.deepEqual((reconstructed.project(
+      'agent/transcript:conversation-1:tail-24',
+    ) as NativeTranscriptWindow).turns[0]?.boundaryCompactions?.afterTurn[0], marker(),
+    'progress reconstructs entirely from durable journal state');
+    assert.equal(journal.compactionControlEvents('conversation-1', 'unrelated-strand').length, 0,
+      'operation progress cannot leak into an unrelated strand');
+
+    journal.appendProviderEvent(controlEvent('native-compact-started', 14, {
+      type: 'context.compaction.started', trigger: 'manual',
+      operationId: 'compact-operation', beforeTokens: null,
+    }));
+    assert.equal(marker()?.createdAt, 13, 'native evidence preserves the durable marker position');
+    assert.equal(marker()?.state, 'started');
+
+    journal.markRunningCompactionDeliveryUnknown('conversation-1', {
+      code: 'compaction_delivery_unknown',
+      message: 'The native result is uncertain.',
+      retryable: true,
+    }, 15);
+    assert.deepEqual(marker(), {
+      operationId: 'compact-operation', trigger: 'manual', state: 'failed',
+      beforeTokens: null, afterTokens: null,
+      error: {
+        code: 'compaction_delivery_unknown',
+        message: 'The native result is uncertain.',
+        retryable: true,
+      },
+      createdAt: 13, completedAt: 15,
+    });
+
+    journal.appendProviderEvent(controlEvent('native-compact-completed', 16, {
+      type: 'context.compaction.completed', trigger: 'manual',
+      operationId: 'compact-operation', beforeTokens: 70_000, afterTokens: 9_000,
+    }));
+    assert.deepEqual(marker(), {
+      operationId: 'compact-operation', trigger: 'manual', state: 'completed',
+      beforeTokens: 70_000, afterTokens: 9_000, createdAt: 13, completedAt: 16,
+    }, 'later authoritative completion replaces uncertain delivery on one marker');
+
+    journal.claimCommand('send-after-compact', 'turn.send', { content: 'Continue.' }, 19);
+    journal.createTurn({
+      turnId: 'turn-after-compact', conversationId: 'conversation-1', executionId: 'execution-1',
+      clientMessageId: 'message-after-compact', commandId: 'send-after-compact',
+      content: [{ type: 'text', text: 'Continue.' }], model: 'fixture-native-v1',
+      state: 'running', now: 20,
+    });
+    const nextWindow = projector.project('agent/transcript:conversation-1:tail-24') as NativeTranscriptWindow;
+    assert.equal(nextWindow.turns[0]?.boundaryCompactions, undefined);
+    assert.equal(nextWindow.turns[1]?.boundaryCompactions?.beforeUser[0]?.operationId, 'compact-operation');
+    assert.equal(nextWindow.turns[1]?.boundaryCompactions?.beforeUser[0]?.createdAt, 13);
+
+  } finally {
+    journal.close();
+  }
+});
+
 test('native projector bounds terminal UTF-8 text and exposes its exact viewer artifact', () => {
   const journal = createJournal();
   try {

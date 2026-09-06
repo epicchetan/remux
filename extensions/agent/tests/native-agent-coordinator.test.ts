@@ -1141,6 +1141,72 @@ test('native Compact is idempotent, invisible to turns, and projects its termina
   }
 });
 
+test('manual Compact projects progress while provider acceptance is unresolved', async () => {
+  const journal = createJournal();
+  const adapter = new NativeFixtureAdapter({ manualCompaction: true });
+  const invalidations: string[][] = [];
+  const coordinator = new NativeAgentCoordinator({ journal, providers: [{
+    providerInstanceId: 'fixture-local', provider: 'fixture', label: 'Fixture', adapter,
+  }], onResourcesInvalidated: (keys) => invalidations.push([...keys]) });
+  let releaseCompact: (() => void) | undefined;
+  const compactBarrier = new Promise<void>((resolve) => { releaseCompact = resolve; });
+  try {
+    await coordinator.initialize();
+    const created = await coordinator.createConversation({
+      commandId: 'create-held-compact', providerInstanceId: 'fixture-local',
+      cwd: '/workspace/remux', model: 'fixture-native-v1', access: 'workspace-write',
+    });
+    const prior = await coordinator.sendMessage(configuredMessage(coordinator, {
+      commandId: 'prior-held-compact', conversationId: created.conversationId,
+      clientMessageId: 'prior-held-compact-message',
+      content: [{ type: 'text', text: 'Establish the transcript boundary.' }],
+    }));
+    await waitFor(() => journal.turn(prior.turnId)?.state === 'completed');
+    const session = adapter.opened[0]!;
+    const nativeCompact = session.compact.bind(session);
+    let entered: (() => void) | undefined;
+    const compactEntered = new Promise<void>((resolve) => { entered = resolve; });
+    session.compact = async (request, context) => {
+      entered?.();
+      await compactBarrier;
+      return nativeCompact(request, context);
+    };
+
+    const pending = coordinator.compactConversation({
+      commandId: 'held-compact', conversationId: created.conversationId,
+    });
+    await compactEntered;
+    const inFlight = coordinator.projector.project(
+      `agent/transcript:${created.conversationId}:tail-24`,
+    ) as NativeTranscriptWindow;
+    const started = inFlight.turns[0]?.boundaryCompactions?.afterTurn;
+    assert.equal(started?.length, 1);
+    assert.equal(started?.[0]?.state, 'started');
+    assert.equal(journal.commandReceipt('held-compact')?.state, 'dispatching');
+    assert.ok(invalidations.some((keys) => keys.some((key) =>
+      key.startsWith(`agent/transcript:${created.conversationId}:`))));
+    assert.equal(journal.eventsForConversation(created.conversationId)
+      .some(({ event }) => event.type === 'context.compaction.started'), false,
+    'durable operation progress does not invent provider acceptance');
+
+    releaseCompact?.();
+    const result = await pending;
+    await waitFor(() => journal.compactionOperation(result.operationId)?.state === 'completed');
+    const completed = coordinator.projector.project(
+      `agent/transcript:${created.conversationId}:tail-24`,
+    ) as NativeTranscriptWindow;
+    const terminal = completed.turns[0]?.boundaryCompactions?.afterTurn;
+    assert.equal(terminal?.length, 1);
+    assert.equal(terminal?.[0]?.operationId, started?.[0]?.operationId);
+    assert.equal(terminal?.[0]?.createdAt, started?.[0]?.createdAt);
+    assert.equal(terminal?.[0]?.state, 'completed');
+  } finally {
+    releaseCompact?.();
+    await coordinator.close();
+    journal.close();
+  }
+});
+
 test('native Compact provider failure settles durably and dispatches the queued next turn', async () => {
   const journal = createJournal();
   const fixture = new NativeFixtureAdapter({

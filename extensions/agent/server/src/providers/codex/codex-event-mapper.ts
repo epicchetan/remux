@@ -559,7 +559,6 @@ export class CodexEventMapper {
     if (type === 'contextCompaction') {
       const controlTurn = this.compactionNativeTurns.has(nativeTurnId);
       const compactionItemIdentity = `${nativeTurnId}\0${itemId}`;
-      if (!completed && controlTurn) return [];
       // Live completion notifications can replay, but an authoritative
       // snapshot still has to emit its ordered marker. The journal uses that
       // marker to retain live tool activity omitted by a compacted snapshot.

@@ -56,6 +56,12 @@ export async function installAgentHost(page: Page) {
     const runningTranscript = route.get('fixtureRunning') === '1';
     const tallRunningWork = route.get('fixtureTallWork') === '1';
     const compactionTranscript = route.get('fixtureCompaction') === '1';
+    const holdManualCompaction = route.get('fixtureHoldManualCompaction') === '1';
+    type ManualCompaction = { operationId: string; state: 'started' | 'completed' | 'failed'; createdAt: number; completedAt?: number };
+    let manualCompaction: ManualCompaction | null = holdManualCompaction
+      ? JSON.parse(window.sessionStorage.getItem('remux.fixture.manual-compaction') ?? 'null')
+      : null;
+
     const errorGeometryTranscript = route.get('fixtureErrorGeometry') === '1';
     const effortFixture = route.get('fixtureEffort');
     const compactEligibility = route.get('fixtureCompactEligibility');
@@ -1266,7 +1272,9 @@ export async function installAgentHost(page: Page) {
         },
         compaction: {
           policy: 'native-auto',
-          operation: compactEligibility === 'running'
+          operation: manualCompaction?.state === 'started'
+            ? { state: 'running', operationId: manualCompaction.operationId, startedAt: manualCompaction.createdAt, lastResult: null }
+            : compactEligibility === 'running'
             ? { state: 'running', operationId: 'fixture-compact', startedAt: Date.now(), lastResult: null }
             : { state: 'idle', lastResult: null },
         },
@@ -1441,6 +1449,16 @@ export async function installAgentHost(page: Page) {
         .filter((segment) => segment.type === 'compaction').map(compactionValue);
       const afterTurnCompactions = turn.segments.slice(Math.max(0, userIndex + 1))
         .filter((segment) => segment.type === 'compaction').map(compactionValue);
+      if (manualCompaction && turn.id === turns.at(-1)?.id) {
+        afterTurnCompactions.push({
+          ...manualCompaction,
+          trigger: 'manual', beforeTokens: 36_000,
+          afterTokens: manualCompaction.state === 'completed' ? 8_000 : null,
+          ...(manualCompaction.state === 'failed'
+            ? { error: { code: 'fixture_compaction_failed', message: 'Fixture manual compaction failed.' } }
+            : {}),
+        });
+      }
       const finalBlockId = assistantText ? `final:${turn.id}` : null;
       if (finalBlockId) {
         const target = nativePasses.at(-1) ?? {
@@ -2070,6 +2088,14 @@ export async function installAgentHost(page: Page) {
         };
       }
       if (request.method === 'remux/agent/conversation/compact') {
+        if (holdManualCompaction) {
+          manualCompaction = { operationId: String(params.commandId), state: 'started', createdAt: Date.now() };
+          window.sessionStorage.setItem('remux.fixture.manual-compaction', JSON.stringify(manualCompaction));
+          const turn = turns.at(-1)!;
+          touchTurn(turn);
+          invalidateTranscript(turn.id, 'runtimeEvent', false);
+        }
+
         const runtime = resources.get('runtime')!;
         runtime.revision += 1;
         invalidateResource('runtime');
@@ -2759,6 +2785,17 @@ export async function installAgentHost(page: Page) {
         },
         connection: dispatchStatus,
         lifecycle: dispatchLifecycle,
+        finishManualCompaction(state: 'completed' | 'failed') {
+          if (!manualCompaction) throw new Error('No fixture compaction is running.');
+          manualCompaction = { ...manualCompaction, state, completedAt: Date.now() };
+          window.sessionStorage.setItem('remux.fixture.manual-compaction', JSON.stringify(manualCompaction));
+          const turn = turns.at(-1)!;
+          touchTurn(turn);
+          invalidateTranscript(turn.id, 'runtimeEvent', false);
+          const runtime = resources.get('runtime');
+          if (runtime) runtime.revision += 1;
+          invalidateResource('runtime');
+        },
         setHistoryState(state: typeof historyState) {
           historyState = state;
           const runtime = resources.get('runtime');
