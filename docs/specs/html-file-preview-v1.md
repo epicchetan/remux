@@ -8,6 +8,11 @@ Related: [tab-identity-and-routing.md](tab-identity-and-routing.md),
 
 # HTML file preview v1
 
+The deployed implementation is recorded here. The proposed replacement and
+Narrate retirement are owned by [unified-file-viewer-v1.md](unified-file-viewer-v1.md);
+its web viewer architecture supersedes this document’s native surface target
+once implemented.
+
 ## Outcome and scope
 
 Opening an HTML file from Agent or Files shows an interactive document in the

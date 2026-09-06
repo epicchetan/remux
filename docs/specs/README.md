@@ -85,6 +85,7 @@ finding dispositions and implementation statuses in
 
 | Spec | Status | Notes |
 | --- | --- | --- |
+| [unified-file-viewer-v1.md](unified-file-viewer-v1.md) | Proposed — implementation not started | One web Viewer with default Markdown/HTML preview, shared Source toggle, bounded large-file Source, iframe bridge isolation, and full Narrate retirement with tab migration. |
 | [html-file-preview-v1.md](html-file-preview-v1.md) | Implemented — iOS Expo preview published | Interactive self-contained HTML in existing file tabs, with Preview/Source and companion links. iOS update published and served bundle verified; no server restart needed. Android enabled in source; device acceptance remains unperformed. |
 | [multi-provider-agent-workspace-extension.md](multi-provider-agent-workspace-extension.md) | Archived prototype | Historical full-capsule T3 Code integration. Its provider analysis, gateway, and mobile findings remain evidence; its source and extension were removed when Agent became the product path. |
 | [agent-native-provider-runtime-v1.md](agent-native-provider-runtime-v1.md) | Active Spec — implementation landed; live/phone acceptance pending | Canonical Agent replacement: native Codex/Claude harness adapters, light durable coordinator, server-authoritative virtualized UI, chat-only interaction, native same-provider subagents, and scoped MCP cross-provider federation. |
