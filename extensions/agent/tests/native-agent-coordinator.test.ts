@@ -2523,6 +2523,114 @@ test('an unknown durable root delivery fences later work after its queue card is
     assert.equal(providerWrites, 1);
     assert.equal((journal.database.prepare(`SELECT state FROM queued_messages
       WHERE command_id='unknown-root-2'`).get() as { state: string }).state, 'queued');
+
+    journal.database.prepare(`UPDATE delivery_attempts SET acceptance_evidence_json=?
+      WHERE command_id='unknown-root-1'`).run(JSON.stringify({
+      kind: 'fixture-correlated-acceptance',
+      sessionId: 'fixture-session-corrupt',
+      commandId: 7,
+      extra: true,
+    }));
+
+    await coordinator.close();
+    const restartedAdapter = new NativeFixtureAdapter();
+    const restarted = new NativeAgentCoordinator({ journal, providers: [{
+      providerInstanceId: 'fixture-local', provider: 'fixture', label: 'Fixture',
+      adapter: restartedAdapter,
+    }] });
+    try {
+      await restarted.initialize();
+      assert.equal((journal.database.prepare(`SELECT state FROM delivery_attempts
+        WHERE command_id='unknown-root-1'`).get() as { state: string }).state, 'unknown',
+      'malformed stored proof must leave the durable lane fenced');
+      assert.equal(restartedAdapter.opened.length, 0,
+        'startup delivery reconciliation must use no writer session');
+      const internals = restarted as unknown as {
+        openAttachedSession(conversationId: string, executionId: string,
+          open: () => Promise<ProviderSession>): Promise<ProviderSession>;
+      };
+      let attemptedWriterOpens = 0;
+      await assert.rejects(
+        internals.openAttachedSession(created.conversationId, journal.conversation(
+          created.conversationId)!.rootExecutionId, async () => {
+          attemptedWriterOpens += 1;
+          throw new Error('writer opener must not run');
+        }),
+        /fenced by unresolved root delivery/u,
+      );
+      assert.equal(attemptedWriterOpens, 0);
+      assert.equal(restartedAdapter.opened.length, 0,
+        'passive history hydration must not reopen the unresolved root writer');
+      assert.equal((journal.database.prepare(`SELECT state FROM queued_messages
+        WHERE command_id='unknown-root-2'`).get() as { state: string }).state, 'queued');
+    } finally {
+      await restarted.close();
+    }
+  } finally {
+    await coordinator.close();
+    journal.close();
+  }
+});
+
+test('native child terminal events from the root stream never settle the root lifecycle', async () => {
+  const journal = createJournal();
+  const adapter = new NativeFixtureAdapter({ emitNativeChild: true });
+  const terminalTurns: string[] = [];
+  const coordinator = new NativeAgentCoordinator({ journal, onTerminalTurn: ({ turnId }) => {
+    terminalTurns.push(turnId);
+  }, providers: [{
+    providerInstanceId: 'fixture-local', provider: 'fixture', label: 'Fixture', adapter,
+  }] });
+  try {
+    await coordinator.initialize();
+    const created = await coordinator.createConversation({ commandId: 'create-child-terminal-scope',
+      providerInstanceId: 'fixture-local', cwd: '/workspace/remux', model: 'fixture-native-v1',
+      access: 'workspace-write' });
+    const root = await coordinator.sendMessage(configuredMessage(coordinator, {
+      commandId: 'send-child-terminal-scope', conversationId: created.conversationId,
+      clientMessageId: 'message-child-terminal-scope', content: [{ type: 'text', text: 'Spawn.' }],
+    }));
+    await waitFor(() => journal.turn(root.turnId)?.state === 'completed');
+    const rootExecutionId = journal.conversation(created.conversationId)!.rootExecutionId;
+    const childExecutionId = `${rootExecutionId}:native-child-1`;
+    await waitFor(() => journal.execution(childExecutionId) !== undefined);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    journal.claimCommand('queued-after-child-terminal', 'turn.send', {
+      commandId: 'queued-after-child-terminal', conversationId: created.conversationId,
+    }, Date.now());
+    journal.enqueueTurn({ commandId: 'queued-after-child-terminal',
+      conversationId: created.conversationId, turnId: 'queued-after-child-terminal-turn',
+      clientMessageId: 'queued-after-child-terminal-message',
+      content: [{ type: 'text', text: 'Remain queued.' }], model: 'fixture-native-v1',
+      access: 'workspace-write', now: Date.now() });
+    journal.acceptCommand('queued-after-child-terminal', {
+      accepted: true, commandId: 'queued-after-child-terminal',
+      turnId: 'queued-after-child-terminal-turn', delivery: 'queued',
+    }, Date.now());
+    const childTurnId = 'scoped-native-child-turn';
+    const childSessionId = `${adapter.opened[0]!.nativeSession.sessionId}:child-1`;
+    const make = (eventId: string, event: { type: 'turn.started' } | {
+      type: 'turn.completed'; outcome: 'completed';
+    }) => parseProviderEventEnvelope({
+      contractVersion: PROVIDER_RUNTIME_CONTRACT_VERSION,
+      eventId, provider: 'fixture',
+      scope: { kind: 'turn', providerInstanceId: 'fixture-local',
+        conversationId: created.conversationId, executionId: childExecutionId, turnId: childTurnId },
+      native: { sessionId: childSessionId, turnId: 'native-child-turn', kind: eventId },
+      observedAt: Date.now(), event,
+    });
+    const internals = coordinator as unknown as { consumeEventBatch(
+      conversationId: string, executionId: string, events: readonly ProviderEventEnvelope[]): Promise<void> };
+    await internals.consumeEventBatch(created.conversationId, rootExecutionId, [
+      make('child-turn-started-scoped', { type: 'turn.started' }),
+      make('child-turn-completed-scoped', { type: 'turn.completed', outcome: 'completed' }),
+    ]);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(terminalTurns, [root.turnId]);
+    assert.equal(journal.turn(childTurnId)?.outcome, 'completed');
+    assert.equal(adapter.opened[0]?.providerDispatchCount, 1);
+    assert.equal((journal.database.prepare(`SELECT state FROM queued_messages
+      WHERE command_id='queued-after-child-terminal'`).get() as { state: string }).state, 'queued');
   } finally {
     await coordinator.close();
     journal.close();

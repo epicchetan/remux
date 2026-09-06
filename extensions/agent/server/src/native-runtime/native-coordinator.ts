@@ -3271,7 +3271,15 @@ export class NativeAgentCoordinator {
         ) as Array<{ attempt_id: string; created_at: number }>;
       if (rows.length === 0) break;
       for (const { attempt_id: attemptId } of rows) {
-      const attempt = this.deliveryOwner.get(attemptId);
+      let attempt;
+      try {
+        attempt = this.deliveryOwner.get(attemptId);
+      } catch (error) {
+        this.publishDiagnostic('delivery.reconcile', Date.now(), 'failed', {
+          error: safeMessage(error),
+        });
+        continue;
+      }
       if (!attempt) continue;
       const registration = this.providers.get(attempt.providerInstanceId);
       if (!attempt.acceptanceEvidence && !registration?.adapter.readTurnPresence) continue;
@@ -4221,28 +4229,32 @@ export class NativeAgentCoordinator {
       this.checkoutOwner.terminal(event, 'live-provider', this.now());
       if (event.event.type === 'turn.completed' ||
           (event.event.type === 'session.health' && event.event.state === 'ready' &&
-            !this.automaticRecoveryProbation.has(executionId))) {
-        this.automaticRecoveryAttempts.delete(executionId);
+            event.scope.kind !== 'account' &&
+            !this.automaticRecoveryProbation.has(event.scope.executionId))) {
+        if (event.scope.kind !== 'account') {
+          this.automaticRecoveryAttempts.delete(event.scope.executionId);
+        }
       }
       if (event.event.type === 'turn.completed' && event.scope.kind === 'turn') {
         this.journal.acknowledgeQueuedTurnDispatch(event.scope.turnId);
         await this.sealTerminalOutput(event.scope.turnId);
         const conversation = this.requireConversation(conversationId);
-        if (conversation.rootExecutionId === executionId) {
+        if (conversation.rootExecutionId === event.scope.executionId) {
           rootTurnCompleted = true;
           this.onTerminalTurn({
             conversationId,
             turnId: event.scope.turnId,
             outcome: event.event.outcome,
           });
-          if (!this.deliveryOwner.acceptedWithStage(executionId)) {
+          if (!this.deliveryOwner.acceptedWithStage(event.scope.executionId)) {
             queueMicrotask(() => void this.dispatchNext(conversationId));
           }
-        } else if (this.journal.execution(executionId)?.ownership === 'federated') {
-          this.finalizeFederatedExecution(executionId);
+        } else if (this.journal.execution(event.scope.executionId)?.ownership === 'federated') {
+          this.finalizeFederatedExecution(event.scope.executionId);
         }
       }
-      if (event.event.type === 'context.compaction.completed') {
+      if (event.event.type === 'context.compaction.completed' && event.scope.kind !== 'account' &&
+          this.requireConversation(conversationId).rootExecutionId === event.scope.executionId) {
         if (event.event.trigger === 'automatic') {
           this.journal.satisfyQueuedCompactionsAfterAutomatic(
             conversationId,

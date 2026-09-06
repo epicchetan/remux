@@ -22,11 +22,10 @@ resuming the next bounded batch after the reorientation checkpoint.
 - S0/S1 correctness work is committed and deployed. Its individual scenario/live
   evidence remains in the slice records; deployment does not certify every
   provider scenario.
-- S2a1 root-send delivery code is committed and running. **Its primary acceptance
-  closure is still open.** Reconcile the old review list against current code and
-  tests once, then fix only demonstrated remaining defects or essential missing
-  regressions. Do not restart implementation or expand a new audit around it.
-  S2a2 steer/manual Compact and the later queue/branch/spawn adoption are not done.
+- S2a1 root-send delivery is implemented; the bounded closure review is now
+  accepted locally with 87 focused tests and typecheck passing. Two coordinator
+  corrections are ready for the batch deployment recorded below. S2a2
+  steer/manual Compact and later queue/branch/spawn adoption are not done.
 - [Subagent lifecycle](agent-subagent-lifecycle.md) is shipped with live Codex
   root/child restart and Stop evidence. This covers substantial C2 work and the
   Codex portions of C4/A5/R7. Claude framing/resume, nested federation ownership,
@@ -82,6 +81,29 @@ investigation; it does not edit repository source/tests. Primary owns docs,
 integration checks, commits/pushes and deployment. Automatic viewer publication
 is paused while source changes; the currently deployed app remains running.
 Each lane reports a reviewed handoff rather than starting its next stage itself.
+
+### Lane A closure accepted locally — 2026-09-06
+
+Primary reviewed the two-file coordinator/test diff and the 87/87 focused owner,
+coordinator, Claude, and Codex results plus root typecheck. Existing tests already
+cover possibly-sent exceptions without markers, malformed proof callback fencing,
+file-backed admission rollback/reopen with no second dispatch, captured prefix
+and later suffix ordering, row bounds, and provider-specific positive evidence.
+The prior copied schema-15 migration preservation evidence remains applicable;
+this slice changes no schema or protocol.
+
+Two concrete corrections: unknown-attempt proof decoding failure no longer aborts
+all startup reconciliation (that attempt remains fenced); provider effects use
+each event's execution identity, so a child terminal event in a root stream cannot
+fire root terminal callbacks/checkpointing or wake its queued successor. The new
+regression asserts canonical child completion, no extra root callback, no extra
+provider dispatch, and the successor remaining queued.
+
+This closes the bounded S2a1 primary review, not C1/C3/R2 as whole findings or
+S2a2. Arbitrary corruption of preparing/dispatching/accepted-stage rows can still
+fail startup closed; general database repair is out of scope. Integrated full
+suite/build/deployment is pending the A/B batch. Evidence:
+`/tmp/remux-audit-implementation/s2a1-closure-{final,typecheck,targeted}.log`.
 
 ### Historical checkpoint and restart — 2026-09-05
 
@@ -227,7 +249,7 @@ independent overlap. Split shared-server cutovers into smaller serial slices.
 | S0a — native Codex child identity | Fix I3's duplicate lifecycle blocks, completion mapping, and phantom descendants; establish explicit child ownership/identity for both native event paths. Reuse this boundary in S3. | S0; one bounded Sol assignment with primary review. Recorded-event regressions before live acceptance; repair existing incident from proven evidence. | Committed/deployed; copied/live repair and browser navigation verified; original-device check not repeated |
 | S0b — transcript error geometry | Include terminal error banners and per-turn projection retry in the shared layout/geometry model (I4); preserve navigation and scroll anchors through appearance, wrapping, clearing, and virtualization. | S0a; separate serial Sol assignment with primary review. Browser geometry assertions, not visibility alone. | Committed/deployed; geometry/browser evidence recorded; original-device check not repeated |
 | S1 — bounded correctness fixes | Serial slices for fitted bounds and compact failure (D, A7); auth/capability accuracy (A9/A10); draft/effort/compact gating (V6/V7/V10); attachment grants, checkout keys, catalog, result bounds (F1/F2/F5/F6); socket cleanup (R1). | S0b; affected scenario tests and source review per slice. Review any schema change before its implementation. | Committed/deployed; all S1 slices and C3a locally verified; scenario-specific live limits retained; S2 tightens Compact delivery evidence |
-| S2 — command delivery | First ledger deduplication and stable client retries (C3/V1); then safe queue failure/recovery plus ownership-free reads (C1/R2); then edit/fork/spawn acceptance using the same delivery component (C5/A2/F4). Introduce the minimal transaction revision helper needed by admission. | S1 except the small C3a coalescing prerequisite moved before F2; review delivery transitions and provider evidence contract first. No prompt-text or session-binding acceptance inference. | C3a/A13/S2a0 shipped; S2a1 root delivery implemented/deployed with closure review pending; V1 new-chat subset shipped |
+| S2 — command delivery | First ledger deduplication and stable client retries (C3/V1); then safe queue failure/recovery plus ownership-free reads (C1/R2); then edit/fork/spawn acceptance using the same delivery component (C5/A2/F4). Introduce the minimal transaction revision helper needed by admission. | S1 except the small C3a coalescing prerequisite moved before F2; review delivery transitions and provider evidence contract first. No prompt-text or session-binding acceptance inference. | C3a/A13/S2a0 shipped; S2a1 closure accepted locally; coordinator corrections await batch deployment; V1 new-chat subset shipped |
 | S3 — runtime and child lifecycle | Durable Stop and recovery (C2/A8/R3/R7); native child identity/ordinals/late completion and nested caller ownership (C4/A3/A4/A5/F3/F7). | Shared coordinator/provider changes follow delivery ownership; disjoint work may proceed now. | Partly shipped via lifecycle incident spec; remaining Claude/federation/lease work open |
 | S4 — viewer convergence | Projection revisions, one sync controller, edit/resume consistency, bounded detail caches, protocol mismatch (E excluding earlier V1/V6/V7/V10 slices). | S2–S3; prepare contracts and controller serially, then activate one refresh owner in an integrated cutover. | Planned |
 | S5 — history integrity | Identity aliases, coverage-aware reconciliation, consistent sealing, bounded final output, scoped repair and foreign-key parity (C excluding S3 child work). | S4; identity/coverage plan reviewed before migration; copied-data and replay checks before acceptance. | Planned |
