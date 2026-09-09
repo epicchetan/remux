@@ -11,7 +11,7 @@
 }
 
 .codex-user-bubble {
-  max-width: 80%;
+  max-width: 100%;
   gap: 8px;
   border: 0;
   border-radius: 16px;
@@ -24,12 +24,15 @@
 
 .codex-user-message-work .codex-user-bubble,
 .codex-user-message-work .codex-user-bubble-with-rail {
-  max-width: 80%;
-  width: auto;
+  max-width: 86%;
 }
 
 .codex-user-bubble-with-rail {
-  width: min(100%, 640px);
+  width: 100%;
+}
+
+.codex-user-message-work .codex-user-bubble-with-rail {
+  width: 86%;
 }
 
 .codex-user-actions,
@@ -329,12 +332,6 @@
 }
 
 @media (max-width: 639px) {
-  .codex-user-bubble,
-  .codex-user-message-work .codex-user-bubble,
-  .codex-user-message-work .codex-user-bubble-with-rail {
-    max-width: 88%;
-  }
-
   .codex-user-action-button {
     width: 40px;
     height: 40px;

@@ -20,10 +20,15 @@ test('contains rich Markdown while preserving its presentation primitives', asyn
     scrollWidth: element.scrollWidth,
   }));
   expect(containment.scrollWidth).toBeLessThanOrEqual(containment.clientWidth + 1);
+
+  const shortMessage = await page.locator('.codex-user-bubble').evaluate((bubble) => ({
+    width: bubble.getBoundingClientRect().width,
+    available: bubble.parentElement!.getBoundingClientRect().width,
+  }));
+  expect(shortMessage.width).toBeLessThan(shortMessage.available * 0.8);
 });
 
-test('keeps long user and assistant content inside the mobile transcript rail', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'mobile', 'This regression targets the phone-width transcript rail.');
+test('lets long user messages use the transcript width without overflowing or changing modeled heights', async ({ page }) => {
   await page.goto(conversationUrl('&fixtureOverflow=1'));
 
   await expect(page.getByText('Automated recovery retry:', { exact: false })).toBeVisible();
@@ -56,6 +61,18 @@ test('keeps long user and assistant content inside the mobile transcript rail', 
   expect(containment.layoutWidth).toBeGreaterThanOrEqual(containment.contentWidth - 1);
   expect(containment.offenders).toEqual([]);
   expect(containment.scrollerScrollWidth).toBeLessThanOrEqual(containment.scrollerWidth + 1);
+
+  const geometry = await page.locator('[data-row-kind="userMessage"]').evaluate((row) => {
+    const bubble = row.querySelector<HTMLElement>('.codex-user-bubble')!;
+    return {
+      bubbleWidth: bubble.getBoundingClientRect().width,
+      rowWidth: row.getBoundingClientRect().width,
+      height: row.getBoundingClientRect().height,
+      modeledHeight: Number((row as HTMLElement).dataset.collapsedHeight),
+    };
+  });
+  expect(geometry.bubbleWidth).toBeGreaterThan(geometry.rowWidth * 0.9);
+  expect(Math.abs(geometry.height - geometry.modeledHeight)).toBeLessThanOrEqual(0.5);
 });
 
 test('loads oversized exact content only after an explicit viewer action', async ({ page }) => {

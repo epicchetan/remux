@@ -26,9 +26,7 @@ export const transcriptLayout = {
     actionTopGap: 6,
     bubbleGap: 8,
     bubbleBorderWidth: 0,
-    bubbleMaxWidthRatio: 0.8,
-    bubbleMobileMaxWidthRatio: 0.88,
-    bubbleMobileBreakpoint: 640,
+    bubbleMaxWidthRatio: 0.86,
     bubblePaddingX: 14,
     bubblePaddingY: 12,
     bubbleTextMeasureGuard: 8,
@@ -46,11 +44,11 @@ export const transcriptLayout = {
   },
 } as const;
 
-export function userBubbleContentWidth(contentWidth: number, _placement: 'topLevel' | 'work' = 'topLevel') {
-  const ratio = contentWidth < transcriptLayout.user.bubbleMobileBreakpoint
-    ? transcriptLayout.user.bubbleMobileMaxWidthRatio
-    : transcriptLayout.user.bubbleMaxWidthRatio;
-  const bubbleWidth = Math.max(1, contentWidth * ratio);
+export function userBubbleContentWidth(contentWidth: number, placement: 'topLevel' | 'work' = 'topLevel') {
+  const bubbleWidth = Math.max(
+    1,
+    placement === 'work' ? contentWidth * transcriptLayout.user.bubbleMaxWidthRatio : contentWidth,
+  );
   return Math.max(
     1,
     bubbleWidth -
