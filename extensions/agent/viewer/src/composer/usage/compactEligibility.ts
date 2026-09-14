@@ -16,3 +16,10 @@ export function canManuallyCompact(
     && !queue.entries.some((entry) => entry.kind === 'compact'),
   );
 }
+
+export function compactActionLabel(runtime: AgentRuntimeResource | null, idleLabel = 'Compact') {
+  if (runtime?.compaction.operation.state !== 'running') return idleLabel;
+  if (runtime.compaction.pendingPhase === 'queued') return 'Compaction queued';
+  if (runtime.compaction.pendingPhase === 'requested') return 'Compaction requested';
+  return 'Compacting…';
+}

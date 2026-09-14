@@ -489,7 +489,7 @@ test('faithful schema v12 migrates grants, exclusions, constraints, and rollback
     rollback.close();
     const reopened = await openNativeAgentJournal({ dataRoot: rollbackRoot });
     assert.equal((reopened.database.prepare('PRAGMA user_version').get() as { user_version: number })
-      .user_version, 16);
+      .user_version, NATIVE_AGENT_SCHEMA_VERSION);
     reopened.close();
   } finally {
     await rm(rollbackRoot, { recursive: true, force: true });
@@ -526,7 +526,7 @@ test('faithful committed schema v8 upgrades through v16', async () => {
     migrateNativeAgentSchema(database, 8);
     database.exec('COMMIT');
     validateNativeAgentSchema(database);
-    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16);
+    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, NATIVE_AGENT_SCHEMA_VERSION);
     assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
     assert.ok(listNativeAgentTables(database).includes('artifact_grants'));
   } finally {
@@ -545,7 +545,7 @@ test('faithful accepted schema v13 upgrades to the fresh v16 shape', async () =>
     migrateNativeAgentSchema(database, 13);
     database.exec('COMMIT');
     validateNativeAgentSchema(database);
-    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16);
+    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, NATIVE_AGENT_SCHEMA_VERSION);
     assert.ok(listNativeAgentTables(database).includes('federation_checkout_reservations'));
     assert.ok((database.prepare('PRAGMA table_info(executions)').all() as Array<{ name: string }>)
       .some(({ name }) => name === 'checkout_key'));
@@ -593,7 +593,7 @@ test('schema v15 opener rolls back a mid-migration failure and reopens cleanly',
       rolledBack.close();
     }
     const reopened = await openNativeAgentJournal({ dataRoot });
-    assert.equal((reopened.database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16);
+    assert.equal((reopened.database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, NATIVE_AGENT_SCHEMA_VERSION);
     reopened.close();
   } finally {
     await rm(dataRoot, { recursive: true, force: true });
@@ -703,7 +703,7 @@ test('schema v15 opener preserves a v14 database after a delivery-object collisi
     }
     const reopened = await openNativeAgentJournal({ dataRoot });
     assert.equal((reopened.database.prepare('PRAGMA user_version').get() as
-      { user_version: number }).user_version, 16);
+      { user_version: number }).user_version, NATIVE_AGENT_SCHEMA_VERSION);
     reopened.close();
   } finally {
     await rm(dataRoot, { recursive: true, force: true });

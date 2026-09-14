@@ -113,7 +113,7 @@ export type AgentPendingQueueEntry = {
   id: string;
   mentionCount: number;
   kind: 'message' | 'compact';
-  state?: 'queued' | 'dispatching' | 'blocked' | 'delivery-unknown';
+  state?: 'queued' | 'dispatching' | 'blocked' | 'delivery-unknown' | 'delivery-failed';
   text: string;
 };
 
@@ -157,6 +157,7 @@ export type MessageSendResult = {
   operationId: string;
   turnId: string;
   delivery: 'sent' | 'queued' | 'steered';
+  deliveryError?: string;
   transcriptFence?: AgentTranscriptFence;
 };
 

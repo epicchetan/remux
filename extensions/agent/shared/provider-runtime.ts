@@ -59,6 +59,7 @@ export type ProviderCapabilities = {
   turns: {
     interrupt: boolean;
     steer: boolean;
+    activeInput?: 'native-steer' | 'stream-input';
     queue: boolean;
     changeModelOnExistingSession: boolean;
     changeEffortOnExistingSession: boolean;
@@ -94,6 +95,7 @@ export type ProviderCapabilities = {
   compaction: {
     automaticNative: boolean;
     manualNative: boolean;
+    activeParent?: 'background-native-agent';
   };
 };
 
@@ -675,8 +677,8 @@ export function parseProviderCapabilities(value: unknown): ProviderCapabilities 
     'turn', 'cumulative', 'context', 'plan', 'estimatedCost',
   ]);
   const compaction = strictRecord(record.compaction, '$.compaction', [
-    'automaticNative', 'manualNative',
-  ]);
+    'automaticNative', 'manualNative', 'activeParent',
+  ], ['activeParent']);
   exactLiteral(interaction.blockingApprovals, false, '$.interaction.blockingApprovals');
   exactLiteral(interaction.structuredUserInput, false, '$.interaction.structuredUserInput');
   return {
@@ -706,6 +708,7 @@ export function parseProviderCapabilities(value: unknown): ProviderCapabilities 
     turns: {
       interrupt: bool(turns.interrupt, '$.turns.interrupt'),
       steer: bool(turns.steer, '$.turns.steer'),
+      ...(turns.activeInput === undefined ? {} : { activeInput: oneOf(turns.activeInput, ['native-steer', 'stream-input'] as const, '$.turns.activeInput') }),
       queue: bool(turns.queue, '$.turns.queue'),
       changeModelOnExistingSession: bool(
         turns.changeModelOnExistingSession,
@@ -748,6 +751,8 @@ export function parseProviderCapabilities(value: unknown): ProviderCapabilities 
     compaction: {
       automaticNative: bool(compaction.automaticNative, '$.compaction.automaticNative'),
       manualNative: bool(compaction.manualNative, '$.compaction.manualNative'),
+      ...(compaction.activeParent === undefined ? {} : { activeParent: oneOf(
+        compaction.activeParent, ['background-native-agent'], '$.compaction.activeParent') }),
     },
   };
 }

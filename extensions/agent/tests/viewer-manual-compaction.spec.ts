@@ -46,3 +46,24 @@ for (const outcome of ['completed', 'failed'] as const) {
     });
   }
 }
+
+for (const phase of ['queued', 'requested', 'compacting'] as const) {
+  test(`composer distinguishes ${phase} compaction without blocking the draft`, async ({ page }, testInfo) => {
+    if (testInfo.project.name === 'mobile') await page.setViewportSize({ width: 320, height: 844 });
+    await installAgentHost(page);
+    await page.goto(`/viewers/agent/?remuxResourceKind=agentConversation&remuxResourceId=${FIXTURE_CONVERSATION_ID}` +
+      `&fixtureRunning=1&fixtureCompactEligibility=${phase === 'queued' ? 'queued' : 'running'}&fixtureCompactPhase=${phase}`);
+    const text = phase === 'queued' ? 'Compaction queued · after this response'
+      : phase === 'requested' ? 'Compaction requested · waiting to start' : 'Compacting context…';
+    await expect(page.getByText(text, { exact: true })).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(page.viewportSize()!.width);
+    const editor = page.getByRole('textbox', { name: 'Message', exact: true });
+    await editor.fill('Continue after compaction');
+    await expect(editor).toHaveText('Continue after compaction');
+    await page.getByRole('button', { name: 'Preferences', exact: true }).click();
+    await expect(page.getByRole('button', { name: phase === 'queued' ? 'Compaction queued'
+      : phase === 'requested' ? 'Compaction requested' : 'Compacting…', exact: true })).toBeDisabled();
+    await page.keyboard.press('Escape');
+    await expect(editor).toHaveText('Continue after compaction');
+  });
+}

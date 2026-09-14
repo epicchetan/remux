@@ -120,7 +120,7 @@ export function ComposerContent({
             <ComposerUsageTray conversation={conversation} onCompact={onCompact} providers={providers} queue={queue} runtime={runtime} />
           ) : null}
           <ComposerEditBar />
-          <OperationQueueTray onChanged={onQueueChanged} queue={queue} />
+          <OperationQueueTray onChanged={onQueueChanged} queue={queue} runtime={runtime} />
         </div>
       ) : null}
       <div className="remux-composer-panel">
@@ -154,6 +154,7 @@ export function ComposerContent({
           onAccessChange={onAccessChange}
           providers={providers}
           runtime={runtime}
+          queue={queue}
         />
       </div>
       {!pickerOpen ? (

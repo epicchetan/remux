@@ -2,9 +2,10 @@ import { createHash, randomUUID } from 'node:crypto';
 import { parseProviderEventEnvelope, type ProviderEventEnvelope, type ProviderKind } from '../../../shared/provider-runtime.ts';
 import type { NativeAgentJournal } from './native-journal.ts';
 import { CodexRequestError } from '../providers/codex/codex-app-server-connection.ts';
+import { isCodexActiveCompactRejection } from '../providers/codex/codex-delivery-rejection.ts';
 import type {
   DeliveryAttemptKind, DispatchBoundary, FrozenDeliveryAttempt, ProviderAcceptanceEvidence,
-  ProviderDispatchResult, ProviderPositiveRead, StagedProviderEnvelope,
+  ProviderDispatchResult, ProviderPositiveRead, ProviderRejectionEvidence, StagedProviderEnvelope,
 } from './delivery-contract.ts';
 
 const MAX_STAGE_BYTES = 64 * 1024 * 1024;
@@ -122,6 +123,10 @@ export class DeliveryAttemptOwner {
     const persistedCrossing = this.require(attemptId).crossedAt !== undefined;
     if (result.outcome === 'rejected') {
       if (persistedCrossing) {
+        if ('rejectionEvidence' in result &&
+            this.rejectProviderResponse(attemptId, result.rejectionEvidence, result.error)) {
+          return { outcome: 'rejected', result };
+        }
         this.unknown(attemptId, { ...result.error, boundaryViolation: 'rejected-after-crossing' });
         return { outcome: 'unknown', result };
       }
@@ -348,6 +353,26 @@ export class DeliveryAttemptOwner {
   }
 
   recover() {
+    // Older adapters retained this explicit RPC rejection as a transport
+    // uncertainty. Recover only that exact recorded response, never absence
+    // from a partial history read or a generic internal/connection error.
+    const rejected = this.journal.database.prepare(`SELECT attempt_id,recovery_json
+      FROM delivery_attempts WHERE provider='codex' AND kind='root-turn'
+        AND state='unknown' AND recovery_json IS NOT NULL`).all() as Array<{
+          attempt_id: string; recovery_json: string;
+        }>;
+    for (const row of rejected) {
+      const transport = (JSON.parse(row.recovery_json) as {
+        transport?: { code?: string; message?: string };
+      }).transport;
+      if (transport?.code !== 'codex_request_failed' ||
+          !isCodexActiveCompactRejection(transport.message)) continue;
+      const attempt = this.require(row.attempt_id);
+      this.rejectProviderResponse(attempt.attemptId, {
+        kind: 'codex-active-compact-rejection', threadId: attempt.nativeSessionId,
+        nativeCode: -32603, source: 'legacy-recorded-response',
+      }, { code: 'codex_active_compaction', message: transport.message });
+    }
     let cursorCreatedAt = -1;
     let cursorAttemptId = '';
     while (true) {
@@ -403,6 +428,45 @@ export class DeliveryAttemptOwner {
       rejected_at=?,rejection_json=?,updated_at=? WHERE attempt_id=? AND state='preparing'`)
       .run(now, JSON.stringify(boundedDeliveryError(error)), now, id).changes;
     if (changed !== 1) throw new Error('Delivery rejection CAS failed.');
+  }
+
+  private rejectProviderResponse(id: string, evidence: ProviderRejectionEvidence,
+    error: { code: string; message: string }) {
+    return this.journal.transaction(() => {
+      const attempt = this.require(id);
+      if (attempt.provider !== 'codex' || attempt.kind !== 'root-turn' ||
+          !['dispatching', 'unknown'].includes(attempt.state) ||
+          evidence.kind !== 'codex-active-compact-rejection' ||
+          evidence.threadId !== attempt.nativeSessionId || evidence.nativeCode !== -32603 ||
+          (evidence.source === 'rpc-response' && !Number.isSafeInteger(evidence.requestId)) ||
+          !isCodexActiveCompactRejection(error.message) ||
+          attempt.acceptanceEvidence || attempt.nativeTurnId || attempt.transcriptGap) return false;
+      const staged = this.staged(id);
+      // The old owner also staged conversation controls behind a root input.
+      // They belong to the existing compaction, not the rejected user turn.
+      // Preserve them, but never discard contradictory user-turn evidence.
+      if (staged.some(({ envelope }) => {
+        if (envelope.scope.kind !== 'conversation' ||
+            envelope.scope.conversationId !== attempt.conversationId ||
+            envelope.scope.executionId !== attempt.executionId ||
+            envelope.native.sessionId !== attempt.nativeSessionId ||
+            !envelope.event.type.startsWith('context.compaction.')) return true;
+        const event = envelope.event as Extract<ProviderEventEnvelope['event'], {
+          type: `context.compaction.${string}`;
+        }>;
+        const operation = this.journal.compactionOperation(event.operationId);
+        return !operation?.providerSubjectKey ||
+          operation.providerSubjectKey !== envelope.native.subject?.key;
+      })) return false;
+      this.journal.appendProviderEvents(staged.map(({ envelope }) => envelope));
+      this.deleteStagedPrefix(id, staged.map(({ observationId }) => observationId));
+      const now = this.transitionTime(id);
+      const changed = this.journal.database.prepare(`UPDATE delivery_attempts
+        SET state='rejected',rejected_at=?,unknown_at=NULL,rejection_json=?,updated_at=?
+        WHERE attempt_id=? AND state IN ('dispatching','unknown')`).run(
+          now, JSON.stringify({ ...error, evidence }), now, id).changes;
+      return changed === 1;
+    });
   }
 
   private unknown(id: string, error: unknown) {
@@ -522,17 +586,25 @@ export class DeliveryAttemptOwner {
     const payload = parseRecordJson(payloadJson, 'delivery recovery payload');
     if (input.kind === 'steer') {
       const allowed = new Set(['turnId', 'clientMessageId', 'nativeClientMessageId', 'content',
-        'model', 'effort', 'serviceTier', 'access', 'expectedNativeTurnId']);
+        'model', 'effort', 'serviceTier', 'access', 'expectedNativeTurnId', 'afterBlockId']);
       const receipt = this.journal.database.prepare(
         'SELECT kind,state FROM command_receipts WHERE command_id=?',
       ).get(input.commandId) as Record<string, unknown> | undefined;
       const turn = this.journal.database.prepare(`SELECT turn_id,conversation_id,execution_id,
         native_turn_id,state FROM turns WHERE turn_id=?`).get(input.intendedTurnId!) as
         Record<string, unknown> | undefined;
+      const queued = receipt?.state === 'accepted' ? this.journal.database.prepare(`SELECT
+        client_message_id,content_json,model,effort,service_tier,access FROM queued_messages
+        WHERE command_id=? AND conversation_id=? AND delivery_intent='auto' AND state='dispatching'`
+      ).get(input.commandId, input.conversationId) as Record<string, unknown> | undefined : undefined;
+      const matchesQueuedInput = queued && queued.client_message_id === input.clientMessageId &&
+        canonicalJson(JSON.parse(requiredString(queued.content_json, 'queued content', 64 * 1024 * 1024))) === canonicalJson(payload.content) &&
+        queued.model === payload.model && (queued.effort ?? undefined) === payload.effort &&
+        (queued.service_tier ?? undefined) === payload.serviceTier && queued.access === payload.access;
       if (!exactKeys(payload, allowed) || payload.turnId !== input.intendedTurnId ||
           payload.clientMessageId !== input.clientMessageId ||
           payload.nativeClientMessageId !== input.nativeClientMessageId ||
-          receipt?.kind !== 'turn.send' || receipt.state !== 'dispatching' ||
+          receipt?.kind !== 'turn.send' || !(receipt.state === 'dispatching' || matchesQueuedInput) ||
           turn?.conversation_id !== input.conversationId || turn.execution_id !== input.executionId ||
           conversation.active_turn_id !== input.intendedTurnId ||
           !['running', 'recovering'].includes(String(turn.state)) ||
@@ -542,13 +614,18 @@ export class DeliveryAttemptOwner {
       return;
     }
     if (input.kind === 'manual-compact') {
-      const allowed = new Set(['operationId', 'nativeInputUuid']);
+      const allowed = new Set(['operationId', 'nativeInputUuid', 'activeParent']);
       const operation = this.journal.database.prepare(`SELECT command_id,conversation_id,trigger,state
         FROM compaction_operations WHERE operation_id=?`).get(input.compactOperationId!) as
         Record<string, unknown> | undefined;
       const receipt = this.journal.database.prepare(
         'SELECT kind,state FROM command_receipts WHERE command_id=?',
       ).get(input.commandId) as Record<string, unknown> | undefined;
+      validateActiveCompactPayload(payload, input.provider);
+      if (payload.activeParent && (this.journal.turn(String(conversation.active_turn_id))?.nativeTurnId !==
+          (payload.activeParent as { nativeTurnId: string }).nativeTurnId)) {
+        throw new Error('Active Compact target does not match its current native parent.');
+      }
       if (!exactKeys(payload, allowed) || payload.operationId !== input.compactOperationId ||
           (payload.nativeInputUuid ?? undefined) !== input.nativeClientMessageId ||
           operation?.command_id !== input.commandId || operation.conversation_id !== input.conversationId ||
@@ -611,6 +688,7 @@ function validateEnvelopeScope(attempt: FrozenDeliveryAttempt, envelope: Provide
       (envelope.event.type === 'context.compaction.started' ||
        envelope.event.type === 'context.compaction.completed' ||
        envelope.event.type === 'context.compaction.failed') &&
+      envelope.event.trigger !== 'automatic' &&
       envelope.event.operationId !== attempt.compactOperationId) {
     throw new Error('Provider Compact observation does not match the frozen operation.');
   }
@@ -706,6 +784,18 @@ function validateRootEvidence(attempt: FrozenDeliveryAttempt, raw: unknown): ass
     }
     return;
   }
+  if (kind === 'claude-input-replay') {
+    requireExactKeys(evidence, ['kind', 'sessionId', 'userMessageUuid', 'nativeTurnId', 'processGeneration']);
+    const payload = parseRecordJson(attempt.recoveryPayloadJson, 'delivery recovery payload');
+    if (attempt.kind !== 'steer' || attempt.provider !== 'claude-code' ||
+        identifier(evidence.sessionId, 'sessionId') !== attempt.nativeSessionId ||
+        identifier(evidence.userMessageUuid, 'userMessageUuid') !== attempt.nativeClientMessageId ||
+        identifier(evidence.nativeTurnId, 'nativeTurnId') !== payload.expectedNativeTurnId ||
+        identifier(evidence.processGeneration, 'processGeneration') !== attempt.processGeneration) {
+      throw new Error('Claude input replay does not match frozen delivery scope.');
+    }
+    return;
+  }
   if (kind === 'claude-root-processing') {
     requireExactKeys(evidence, ['kind', 'sessionId', 'userMessageUuid', 'observationUuid']);
     const sessionId = identifier(evidence.sessionId, 'sessionId');
@@ -757,6 +847,10 @@ function validateRootEvidence(attempt: FrozenDeliveryAttempt, raw: unknown): ass
 }
 
 function evidenceCompatible(left: ProviderAcceptanceEvidence, right: ProviderAcceptanceEvidence) {
+  if (left.kind === 'claude-input-replay' && right.kind === 'claude-input-replay') {
+    return left.sessionId === right.sessionId && left.userMessageUuid === right.userMessageUuid &&
+      left.nativeTurnId === right.nativeTurnId && left.processGeneration === right.processGeneration;
+  }
   if (left.kind === 'claude-manual-compact-status' && right.kind === 'claude-manual-compact-status') {
     return left.sessionId === right.sessionId && left.inputUuid === right.inputUuid &&
       left.processGeneration === right.processGeneration;
@@ -868,7 +962,8 @@ function validatePrepareIdentifiers(input: PrepareDeliveryAttempt) {
 function validateDecodedRootPayload(attempt: FrozenDeliveryAttempt) {
   const payload = parseRecordJson(attempt.recoveryPayloadJson, 'delivery recovery payload');
   if (attempt.kind === 'manual-compact') {
-    const allowed = new Set(['operationId', 'nativeInputUuid']);
+    const allowed = new Set(['operationId', 'nativeInputUuid', 'activeParent']);
+    validateActiveCompactPayload(payload, attempt.provider);
     if (!exactKeys(payload, allowed) || payload.operationId !== attempt.compactOperationId ||
         (payload.nativeInputUuid ?? undefined) !== attempt.nativeClientMessageId) {
       throw new Error('Durable Compact payload does not match its frozen attempt shape.');
@@ -876,7 +971,7 @@ function validateDecodedRootPayload(attempt: FrozenDeliveryAttempt) {
     return;
   }
   const allowed = new Set(['turnId', 'clientMessageId', 'nativeClientMessageId', 'content',
-    'model', 'effort', 'serviceTier', 'access', ...(attempt.kind === 'steer' ? ['expectedNativeTurnId'] : [])]);
+    'model', 'effort', 'serviceTier', 'access', ...(attempt.kind === 'steer' ? ['expectedNativeTurnId', 'afterBlockId'] : [])]);
   if (!exactKeys(payload, allowed) || payload.turnId !== attempt.intendedTurnId ||
       payload.clientMessageId !== attempt.clientMessageId ||
       payload.nativeClientMessageId !== attempt.nativeClientMessageId ||
@@ -888,6 +983,18 @@ function validateDecodedRootPayload(attempt: FrozenDeliveryAttempt) {
       !['read-only', 'workspace-write', 'full-access'].includes(String(payload.access))) {
     throw new Error('Durable root recovery payload does not match its frozen attempt shape.');
   }
+}
+
+function validateActiveCompactPayload(payload: Record<string, unknown>, provider: string) {
+  if (payload.activeParent === undefined) return;
+  const target = requireRecord(payload.activeParent, 'active Compact target');
+  if (provider !== 'claude-code' || !exactKeys(target, new Set(['nativeTurnId', 'toolUseIds'])) ||
+      !Array.isArray(target.toolUseIds) || target.toolUseIds.length === 0 ||
+      target.toolUseIds.length > 128 || new Set(target.toolUseIds).size !== target.toolUseIds.length) {
+    throw new Error('Invalid active Compact target.');
+  }
+  identifier(target.nativeTurnId, 'active Compact native turn');
+  for (const id of target.toolUseIds) identifier(id, 'active Compact tool use');
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

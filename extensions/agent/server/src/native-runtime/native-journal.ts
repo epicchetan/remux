@@ -1,3 +1,4 @@
+import type { FrozenDeliveryAttempt } from './delivery-contract.ts';
 import { createHash } from 'node:crypto';
 import { chmod, mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -579,6 +580,14 @@ export class NativeAgentJournal {
       SELECT * FROM command_receipts WHERE command_id = ?
     `).get(commandId) as Record<string, unknown> | undefined;
     return row ? receiptRow(row) : undefined;
+  }
+
+  messageDeliveryError(commandId: string): string | undefined {
+    const row = this.database.prepare(`SELECT rejection_json FROM delivery_attempts
+      WHERE command_id = ? AND kind = 'root-turn' AND state = 'rejected'`).get(commandId) as
+      { rejection_json: string } | undefined;
+    if (!row) return undefined;
+    return 'The provider did not accept this message. Your text is saved; remove its queued entry before resending.';
   }
 
   markCommandDispatching(commandId: string, now: number) {
@@ -1619,6 +1628,7 @@ export class NativeAgentJournal {
   }
 
   enqueueTurn(input: {
+    deliveryIntent?: 'auto' | 'queue';
     commandId: string;
     conversationId: string;
     turnId: string;
@@ -1634,8 +1644,8 @@ export class NativeAgentJournal {
     this.database.prepare(`
       INSERT INTO queued_messages(
         command_id, conversation_id, turn_id, client_message_id, content_json,
-        model, effort, service_tier, access, state, ordinal, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+        model, effort, service_tier, access, state, ordinal, created_at, delivery_intent
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
     `).run(
       input.commandId,
       input.conversationId,
@@ -1648,6 +1658,7 @@ export class NativeAgentJournal {
       input.access,
       ordinal,
       input.now,
+      input.deliveryIntent ?? 'queue',
     );
   }
 
@@ -1664,6 +1675,35 @@ export class NativeAgentJournal {
       `).run(queued.commandId);
       return { ...queued, state: 'dispatching' };
     });
+  }
+
+  activeInputAnchor(turnId: string): string | null {
+    return this.orderedPasses(turnId).at(-1)?.blocks.at(-1)?.blockId ?? null;
+  }
+
+  admitActiveInput(attempt: FrozenDeliveryAttempt) {
+    if (attempt.kind !== 'steer' || !attempt.intendedTurnId || !attempt.clientMessageId) {
+      throw new Error('Active input requires a correlated steer attempt.');
+    }
+    const payload = JSON.parse(attempt.recoveryPayloadJson);
+    const existing = this.database.prepare('SELECT command_id FROM turn_inputs WHERE client_message_id=?')
+      .get(attempt.clientMessageId) as { command_id: string } | undefined;
+    if (existing && existing.command_id !== attempt.commandId) throw new Error('User message identity was reused.');
+    this.database.prepare(`INSERT OR IGNORE INTO turn_inputs(
+      client_message_id,turn_id,command_id,content_json,after_block_id,created_at
+    ) VALUES(?,?,?,?,?,?)`).run(attempt.clientMessageId, attempt.intendedTurnId, attempt.commandId,
+      JSON.stringify(payload.content), payload.afterBlockId ?? null, Number((this.database.prepare(
+        'SELECT created_at FROM delivery_attempts WHERE attempt_id=?').get(attempt.attemptId) as { created_at: number }).created_at));
+    this.database.prepare('DELETE FROM queued_messages WHERE command_id=?').run(attempt.commandId);
+  }
+
+  additionalTurnMessages(turnId: string) {
+    return (this.database.prepare(`SELECT * FROM turn_inputs WHERE turn_id=?
+      ORDER BY created_at, rowid`).all(turnId) as Record<string, unknown>[]).map((row) => ({
+        clientMessageId: String(row.client_message_id),
+        content: JSON.parse(String(row.content_json)) as UserContentPart[],
+        afterBlockId: row.after_block_id === null ? null : String(row.after_block_id),
+      }));
   }
 
   admitQueuedTurn(turnId: string, now: number, nativeTurnId?: string) {
@@ -1824,9 +1864,10 @@ export class NativeAgentJournal {
 
   queuedMessages(conversationId: string): NativeQueuedMessage[] {
     return (this.database.prepare(`
-      SELECT * FROM queued_messages
-      WHERE conversation_id = ?
-      ORDER BY ordinal
+      SELECT q.*, a.state AS delivery_state FROM queued_messages q
+      LEFT JOIN delivery_attempts a ON a.command_id = q.command_id
+      WHERE q.conversation_id = ?
+      ORDER BY q.ordinal
     `).all(conversationId) as Record<string, unknown>[]).map(queueRow);
   }
 
@@ -1881,11 +1922,11 @@ export class NativeAgentJournal {
   queuedEntries(conversationId: string): NativeQueueEntry[] {
     const entries = this.database.prepare(`
       SELECT 'message' AS queue_kind, ordinal, command_id, turn_id, client_message_id,
-        content_json, model, effort, access, state, created_at, NULL AS operation_id
+        content_json, model, effort, access, state, created_at, NULL AS operation_id, service_tier, delivery_intent
       FROM queued_messages WHERE conversation_id = ?
       UNION ALL
       SELECT 'compact' AS queue_kind, ordinal, command_id, NULL, NULL, NULL, NULL, NULL,
-        NULL, NULL, created_at, operation_id
+        NULL, NULL, created_at, operation_id, NULL, NULL
       FROM queued_compactions WHERE conversation_id = ?
       ORDER BY ordinal
     `).all(conversationId, conversationId) as Record<string, unknown>[];
@@ -3548,6 +3589,17 @@ export class NativeAgentJournal {
     return row ? compactionOperationRow(row) : undefined;
   }
 
+  pendingCompactionOperation(conversationId: string): JournalCompactionOperation | undefined {
+    // Snapshot imports are timestamped when observed. Historical completions
+    // must never hide an operation that still owns the conversation lane.
+    const row = this.database.prepare(`
+      SELECT * FROM compaction_operations
+      WHERE conversation_id = ? AND state IN ('running', 'queued')
+      ORDER BY (state = 'running') DESC, created_at DESC, operation_id DESC LIMIT 1
+    `).get(conversationId) as Record<string, unknown> | undefined;
+    return row ? compactionOperationRow(row) : undefined;
+  }
+
   compactionGeneration(conversationId: string) {
     return Number((this.database.prepare(`
       SELECT COUNT(*) AS generation FROM compaction_operations
@@ -3556,7 +3608,8 @@ export class NativeAgentJournal {
   }
 
   runtimeCompaction(conversationId: string, policy: RuntimeCompactionView['policy']): RuntimeCompactionView {
-    const latest = this.latestCompactionOperation(conversationId);
+    const latest = this.pendingCompactionOperation(conversationId)
+      ?? this.latestCompactionOperation(conversationId);
     const lastCompletedRow = this.database.prepare(`
       SELECT * FROM compaction_operations
       WHERE conversation_id = ? AND state = 'completed'
@@ -3572,8 +3625,13 @@ export class NativeAgentJournal {
       completedAt: lastCompleted.completedAt ?? lastCompleted.updatedAt,
     } : null;
     if (latest?.state === 'queued' || latest?.state === 'running') {
+      const attempt = latest.commandId ? this.database.prepare(
+        'SELECT acceptance_evidence_json FROM delivery_attempts WHERE command_id=?',
+      ).get(latest.commandId) : undefined;
       return {
         policy,
+        pendingPhase: latest.state === 'queued' ? 'queued'
+          : latest.trigger === 'automatic' || attempt?.acceptance_evidence_json ? 'compacting' : 'requested',
         operation: {
           state: 'running',
           trigger: latest.trigger,
@@ -4387,8 +4445,8 @@ function conversationRow(row: Record<string, unknown>): JournalConversation {
     preview: String(row.preview),
     cwd: String(row.cwd),
     model: String(row.model),
-    ...(row.effort === null ? {} : { effort: String(row.effort) }),
-    serviceTier: row.service_tier === null ? null : String(row.service_tier),
+    ...(row.effort == null ? {} : { effort: String(row.effort) }),
+    serviceTier: row.service_tier == null ? null : String(row.service_tier),
     access: row.access as JournalConversation['access'],
     state: row.state as JournalConversation['state'],
     rootExecutionId: String(row.root_execution_id),
@@ -4502,7 +4560,7 @@ function turnRow(row: Record<string, unknown>): JournalTurn {
     commandId: String(row.command_id),
     userContent: JSON.parse(String(row.user_content_json)) as UserContentPart[],
     model: String(row.model),
-    ...(row.effort === null ? {} : { effort: String(row.effort) }),
+    ...(row.effort == null ? {} : { effort: String(row.effort) }),
     ...(row.service_tier === null ? {} : { serviceTier: String(row.service_tier) }),
     ...(row.native_turn_id === null ? {} : { nativeTurnId: String(row.native_turn_id) }),
     ...(row.assistant_artifact_id === null
@@ -4534,7 +4592,7 @@ function executionRow(row: Record<string, unknown>): JournalExecution {
     provider: row.provider as ProviderKind,
     providerInstanceId: String(row.provider_instance_id),
     ...(row.model === null ? {} : { model: String(row.model) }),
-    ...(row.effort === null ? {} : { effort: String(row.effort) }),
+    ...(row.effort == null ? {} : { effort: String(row.effort) }),
     ...(row.service_tier === null ? {} : { serviceTier: String(row.service_tier) }),
     ...(row.checkout_key === null || row.checkout_key === undefined
       ? {}
@@ -4562,16 +4620,17 @@ function executionRow(row: Record<string, unknown>): JournalExecution {
 function queueRow(row: Record<string, unknown>): NativeQueuedMessage {
   return {
     kind: 'message',
+    deliveryIntent: row.delivery_intent === 'auto' ? 'auto' : 'queue',
     commandId: String(row.command_id),
     conversationId: String(row.conversation_id),
     turnId: String(row.turn_id),
     clientMessageId: String(row.client_message_id),
     content: JSON.parse(String(row.content_json)) as UserContentPart[],
     model: String(row.model),
-    ...(row.effort === null ? {} : { effort: String(row.effort) }),
-    serviceTier: row.service_tier === null ? null : String(row.service_tier),
+    ...(row.effort == null ? {} : { effort: String(row.effort) }),
+    serviceTier: row.service_tier == null ? null : String(row.service_tier),
     access: row.access as NativeQueuedMessage['access'],
-    state: row.state === 'delivery_unknown'
+    state: row.delivery_state === 'rejected' ? 'delivery-failed' : row.state === 'delivery_unknown'
       ? 'delivery-unknown'
       : row.state as NativeQueuedMessage['state'],
     createdAt: Number(row.created_at),
@@ -4585,7 +4644,7 @@ function composerPreferenceRow(row: Record<string, unknown>): JournalComposerPre
     providerInstanceId: String(row.provider_instance_id),
     model: row.model === null ? null : String(row.model),
     effort: row.effort === null ? null : String(row.effort),
-    serviceTier: row.service_tier === null ? null : String(row.service_tier),
+    serviceTier: row.service_tier == null ? null : String(row.service_tier),
     revision: Number(row.revision),
     updatedAt: Number(row.updated_at),
   };

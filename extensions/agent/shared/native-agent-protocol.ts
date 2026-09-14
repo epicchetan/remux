@@ -346,12 +346,14 @@ export type ContextCompactionView =
     };
 
 export type RuntimeCompactionView = {
+  pendingPhase?: 'queued' | 'requested' | 'compacting';
   policy: 'native-auto' | 'manual';
   operation: ContextCompactionView;
 };
 
 export type NativeQueuedMessage = {
   kind: 'message';
+  deliveryIntent?: 'auto' | 'queue';
   commandId: string;
   turnId: string;
   clientMessageId: string;
@@ -360,7 +362,7 @@ export type NativeQueuedMessage = {
   effort?: string;
   serviceTier?: string | null;
   access: ProviderAccess;
-  state: 'queued' | 'dispatching' | 'blocked' | 'delivery-unknown';
+  state: 'queued' | 'dispatching' | 'blocked' | 'delivery-unknown' | 'delivery-failed';
   createdAt: number;
 };
 
@@ -457,6 +459,9 @@ export type NativeAgentTurnFrame = {
   state: 'queued' | 'running' | 'recovering' | 'completed' | 'failed' | 'interrupted';
   outcome?: ProviderTurnOutcome;
   userContent: readonly UserContentPart[];
+  additionalMessages?: readonly {
+    clientMessageId: string; content: readonly UserContentPart[]; afterBlockId: string | null;
+  }[];
   ordering: 'native-exact' | 'live-provisional' | 'legacy-grouped';
   passes: readonly NativeAssistantPass[];
   finalBlockId: string | null;
@@ -612,6 +617,7 @@ export type NativeCommandReadResult =
         commandId: string;
         turnId: string;
         delivery: 'sent' | 'queued' | 'steered';
+        deliveryError?: string;
       };
     }
   | {

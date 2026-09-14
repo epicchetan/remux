@@ -1,28 +1,29 @@
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
 import { DeliveryAttemptOwner } from '../server/src/native-runtime/delivery-attempt-owner.ts';
 import { NativeAgentJournal } from '../server/src/native-runtime/native-journal.ts';
-import { createNativeAgentSchema } from '../server/src/native-runtime/schema.ts';
+import { createNativeAgentSchema, migrateNativeAgentSchema, NATIVE_AGENT_SCHEMA_VERSION } from '../server/src/native-runtime/schema.ts';
 import { NativeFixtureAdapter } from '../server/src/native-fixture-adapter.ts';
 import { CodexRequestError } from '../server/src/providers/codex/codex-app-server-connection.ts';
+import { CODEX_ACTIVE_COMPACT_REJECTION } from '../server/src/providers/codex/codex-delivery-rejection.ts';
 import { PROVIDER_RUNTIME_CONTRACT_VERSION, type ProviderEventEnvelope } from '../shared/provider-runtime.ts';
 
-async function fixture(now = 100, database = new DatabaseSync(':memory:')) {
+async function fixture(now = 100, database = new DatabaseSync(':memory:'), provider: 'fixture' | 'codex' | 'claude-code' = 'fixture') {
   database.exec('PRAGMA foreign_keys=ON');
   createNativeAgentSchema(database);
   const journal = new NativeAgentJournal(database);
   const adapter = new NativeFixtureAdapter();
-  journal.upsertProviderInstance({ providerInstanceId: 'fixture-local', provider: 'fixture',
+  journal.upsertProviderInstance({ providerInstanceId: 'fixture-local', provider,
     label: 'Fixture', probe: await adapter.probe('fixture-local'), now });
   journal.createConversation({ conversationId: 'conversation-1', rootExecutionId: 'execution-1',
-    provider: 'fixture', providerInstanceId: 'fixture-local', title: 'Delivery', cwd: '/workspace/remux',
+    provider, providerInstanceId: 'fixture-local', title: 'Delivery', cwd: '/workspace/remux',
     model: 'fixture-native-v1', access: 'workspace-write', now });
-  journal.bindNativeSession({ executionId: 'execution-1', nativeSession: { provider: 'fixture',
+  journal.bindNativeSession({ executionId: 'execution-1', nativeSession: { provider,
     providerInstanceId: 'fixture-local', sessionId: 'fixture-session-1' }, adapterVersion: 'fixture-1', now });
   const request = { commandId: 'command-1', conversationId: 'conversation-1' };
   journal.claimCommand('command-1', 'turn.send', request, now);
@@ -33,7 +34,7 @@ async function fixture(now = 100, database = new DatabaseSync(':memory:')) {
   journal.claimQueuedTurn('conversation-1', now);
   const owner = new DeliveryAttemptOwner(journal, () => now - 50, 'owner-1');
   const attempt = journal.transaction(() => owner.prepare({ attemptId: 'attempt-1', commandId: 'command-1',
-    kind: 'root-turn', provider: 'fixture', providerInstanceId: 'fixture-local',
+    kind: 'root-turn', provider, providerInstanceId: 'fixture-local',
     conversationId: 'conversation-1', executionId: 'execution-1', intendedTurnId: 'turn-1',
     clientMessageId: 'viewer-message-1', nativeClientMessageId: 'turn-1',
     recoveryPayload: { turnId: 'turn-1', clientMessageId: 'viewer-message-1',
@@ -366,5 +367,155 @@ test('staging accepts one largest valid final-event envelope at the 32 MiB row l
       };
     assert.equal(row.byte_length, rowLimit);
     assert.equal(owner.get(attempt.attemptId)?.transcriptGap, false);
+  } finally { journal.close(); }
+});
+
+test('explicit Codex active-compact rejection releases the lane without admitting or losing the queued input', async () => {
+  for (const wrongThread of [false, true]) {
+    const { journal, owner, attempt } = await fixture(100, undefined, 'codex');
+    try {
+      const result = await owner.dispatch(attempt.attemptId, async (boundary) => {
+        boundary.markPossiblySent('fixture-session-1');
+        return { accepted: false, outcome: 'rejected',
+          crossing: { phase: 'possibly-sent', detail: 'entered-write' },
+          rejectionEvidence: { kind: 'codex-active-compact-rejection',
+            threadId: wrongThread ? 'another-thread' : 'fixture-session-1', nativeCode: -32603,
+            source: 'rpc-response', requestId: 7 },
+          error: { code: 'codex_active_compaction', message: CODEX_ACTIVE_COMPACT_REJECTION } };
+      }, () => assert.fail('rejected input must not be admitted'));
+      assert.equal(result.outcome, wrongThread ? 'unknown' : 'rejected');
+      assert.equal(journal.hasUnresolvedRootDelivery('conversation-1'), wrongThread);
+      assert.equal(journal.turn('turn-1'), undefined);
+      assert.equal(journal.queuedMessages('conversation-1')[0]?.state,
+        wrongThread ? 'dispatching' : 'delivery-failed');
+      if (!wrongThread) {
+        journal.markQueuedTurnDeliveryUnknown('turn-1');
+        assert.equal(journal.removeQueuedTurn('conversation-1', 'command-1', 101), true);
+        assert.equal(journal.hasUnresolvedRootDelivery('conversation-1'), false);
+      }
+    } finally { journal.close(); }
+  }
+});
+
+test('restart repairs only recorded active-compact rejection and preserves unrelated compaction evidence', async () => {
+  for (const scenario of ['known', 'compaction', 'generic', 'turn-evidence'] as const) {
+    const { journal, owner, attempt } = await fixture(100, undefined, 'codex');
+    try {
+      if (scenario === 'turn-evidence') owner.observe(attempt.attemptId, {
+        ...envelope('contradictory-input'), provider: 'codex',
+      });
+      if (scenario === 'compaction') {
+        journal.claimCommand('compact-1', 'conversation.compact', {}, 90);
+        journal.createManualCompaction({ operationId: 'compact-1', commandId: 'compact-1',
+          conversationId: 'conversation-1', state: 'running', now: 90 });
+        journal.database.prepare("UPDATE compaction_operations SET provider_subject_key='compact-subject' WHERE operation_id='compact-1'").run();
+        owner.observe(attempt.attemptId, {
+          ...envelope('compaction-completed'), provider: 'codex',
+          scope: { kind: 'conversation', conversationId: 'conversation-1', executionId: 'execution-1',
+            providerInstanceId: 'fixture-local' },
+          native: { sessionId: 'fixture-session-1', kind: 'control/contextCompaction/completed',
+            subject: { kind: 'context-compaction', key: 'compact-subject' } },
+          event: { type: 'context.compaction.completed', trigger: 'manual', operationId: 'compact-1',
+            beforeTokens: null, afterTokens: null },
+        });
+      }
+      await owner.dispatch(attempt.attemptId, async (boundary) => {
+        boundary.markPossiblySent('fixture-session-1');
+        return { accepted: false, outcome: 'unknown',
+          crossing: { phase: 'possibly-sent', detail: 'response-lost' },
+          error: { code: 'codex_request_failed', message: scenario === 'generic'
+            ? 'Codex App Server turn/start failed (-32603): internal error' : CODEX_ACTIVE_COMPACT_REJECTION } };
+      }, () => assert.fail('unknown input must not be admitted'));
+      journal.markQueuedTurnDeliveryUnknown('turn-1');
+      journal.removeQueuedTurn('conversation-1', 'command-1', 101);
+      const recovered = new DeliveryAttemptOwner(journal, () => 102, 'new-owner');
+      recovered.recover();
+      recovered.recover();
+      const known = scenario === 'known' || scenario === 'compaction';
+      assert.equal(recovered.get(attempt.attemptId)?.state, known ? 'rejected' : 'unknown', scenario);
+      assert.equal(journal.hasUnresolvedRootDelivery('conversation-1'), !known, scenario);
+      assert.equal(journal.turn('turn-1'), undefined);
+      if (scenario === 'compaction') {
+        assert.equal(journal.compactionOperation('compact-1')?.state, 'completed');
+        assert.equal(recovered.staged(attempt.attemptId).length, 0);
+      }
+    } finally { journal.close(); }
+  }
+});
+
+
+test('v16 delivery migration preserves crossed attempts and staged observations', async () => {
+  const { journal, owner, attempt } = await fixture(100, undefined, 'codex');
+  try {
+    await owner.dispatch(attempt.attemptId, async (boundary) => {
+      boundary.markPossiblySent('fixture-session-1');
+      return { accepted: false, outcome: 'unknown', crossing: { phase: 'possibly-sent', detail: 'response-lost' },
+        error: { code: 'codex_request_failed', message: CODEX_ACTIVE_COMPACT_REJECTION } };
+    }, () => assert.fail('not admitted'));
+    owner.observe(attempt.attemptId, { ...envelope('retained-stage'), provider: 'codex' });
+    const db = journal.database;
+    const before = db.prepare('SELECT * FROM delivery_attempts').all();
+    const staged = db.prepare('SELECT * FROM delivery_attempt_staging').all();
+    const oldSql = await readFile(new URL('./fixtures/native-agent-delivery-v16.sql', import.meta.url), 'utf8');
+    db.exec(`CREATE TEMP TABLE saved_attempts AS SELECT * FROM delivery_attempts;
+      CREATE TEMP TABLE saved_stage AS SELECT * FROM delivery_attempt_staging;
+      DROP TABLE delivery_attempt_staging; DROP TABLE delivery_attempts;`);
+    db.exec(oldSql);
+    db.exec(`INSERT INTO delivery_attempts SELECT * FROM saved_attempts;
+      INSERT INTO delivery_attempt_staging SELECT * FROM saved_stage;
+      DROP TABLE saved_attempts; DROP TABLE saved_stage; PRAGMA user_version=16; BEGIN IMMEDIATE;`);
+    migrateNativeAgentSchema(db, 16);
+    db.exec('COMMIT');
+    assert.deepEqual(db.prepare('SELECT * FROM delivery_attempts').all(), before);
+    assert.deepEqual(db.prepare('SELECT * FROM delivery_attempt_staging').all(), staged);
+    assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
+    assert.equal(db.prepare('PRAGMA user_version').get()?.user_version, NATIVE_AGENT_SCHEMA_VERSION);
+    assert.throws(() => db.prepare(`UPDATE delivery_attempts SET state='rejected', rejected_at=100,
+      unknown_at=NULL,rejection_json='{}' WHERE attempt_id=?`).run(attempt.attemptId), /CHECK constraint/);
+  } finally { journal.close(); }
+});
+
+
+test('Claude active input freezes queued content and accepts repeated exact replay evidence', async () => {
+  const { journal, owner, attempt } = await fixture(100, new DatabaseSync(':memory:'), 'claude-code');
+  try {
+    await owner.dispatch(attempt.attemptId, async (boundary) => {
+      boundary.markPossiblySent('fixture-session-1', 'generation-1');
+      return { accepted: true, outcome: 'accepted', nativeTurnId: 'turn-1', evidence: {
+        kind: 'claude-root-processing', sessionId: 'fixture-session-1',
+        userMessageUuid: 'turn-1', observationUuid: 'root-observation',
+      } };
+    }, (accepted) => journal.admitQueuedTurn(accepted.intendedTurnId!, 100, accepted.nativeTurnId));
+    journal.claimCommand('command-2', 'turn.send', { commandId: 'command-2' }, 101);
+    journal.enqueueTurn({ commandId: 'command-2', conversationId: 'conversation-1', turnId: 'reserved-turn-2',
+      clientMessageId: 'viewer-message-2', content: [{ type: 'text', text: 'follow up' }],
+      model: 'fixture-native-v1', access: 'workspace-write', deliveryIntent: 'auto', now: 101 });
+    journal.acceptCommand('command-2', { accepted: true }, 101);
+    journal.claimQueuedTurn('conversation-1', 101);
+    const input = {
+      attemptId: 'attempt-2', commandId: 'command-2', kind: 'steer' as const, provider: 'claude-code' as const,
+      providerInstanceId: 'fixture-local', conversationId: 'conversation-1', executionId: 'execution-1',
+      intendedTurnId: 'turn-1', clientMessageId: 'viewer-message-2', nativeClientMessageId: 'native-message-2',
+      nativeSessionId: 'fixture-session-1', ownerInstanceId: 'owner-1', now: 101,
+      recoveryPayload: { turnId: 'turn-1', clientMessageId: 'viewer-message-2', nativeClientMessageId: 'native-message-2',
+        content: [{ type: 'text', text: 'follow up' }], model: 'fixture-native-v1', access: 'workspace-write',
+        expectedNativeTurnId: 'turn-1', afterBlockId: null },
+    };
+    assert.throws(() => owner.prepare({ ...input, recoveryPayload: { ...input.recoveryPayload,
+      content: [{ type: 'text', text: 'different content' }] } }), /frozen input/);
+    assert.throws(() => owner.prepare({ ...input, recoveryPayload: { ...input.recoveryPayload,
+      model: 'different-model' } }), /frozen input/);
+    const active = owner.prepare(input);
+    const evidence = { kind: 'claude-input-replay' as const, sessionId: 'fixture-session-1',
+      userMessageUuid: 'native-message-2', nativeTurnId: 'turn-1', processGeneration: 'generation-1' };
+    await owner.dispatch(active.attemptId, async (boundary) => {
+      boundary.markPossiblySent('fixture-session-1', 'generation-1');
+      return { accepted: true, outcome: 'accepted', evidence, nativeTurnId: 'turn-1' };
+    }, (accepted) => journal.admitActiveInput(accepted));
+    owner.recordAcceptance(active.attemptId, { ...evidence }, 'turn-1');
+    assert.equal(journal.additionalTurnMessages('turn-1').length, 1);
+    assert.throws(() => owner.recordAcceptance(active.attemptId, {
+      ...evidence, processGeneration: 'different-generation',
+    }), /frozen delivery scope/);
   } finally { journal.close(); }
 });

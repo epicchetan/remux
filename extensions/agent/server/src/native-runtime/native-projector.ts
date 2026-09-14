@@ -884,7 +884,9 @@ function projectTurn(
   const assistantArtifact = turn.assistantArtifactId
     ? journal.artifact(turn.assistantArtifactId)
     : undefined;
+  const additionalMessages = journal.additionalTurnMessages(turn.turnId);
   const base = {
+    additionalMessages,
     pathEntryId: turn.pathEntryId ?? `turn:${turn.turnId}`,
     strandId: turn.strandId ?? `execution:${turn.executionId}`,
     ordinal: turn.ordinal ?? 0,
@@ -943,6 +945,7 @@ function projectTurn(
     })),
     fileChanges,
     boundaryCompactions: boundary ?? null,
+    additionalMessages,
     children: [...children.values()].map((child) => ({
       executionId: child.executionId,
       title: child.title ?? null,

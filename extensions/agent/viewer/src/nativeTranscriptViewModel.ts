@@ -62,6 +62,7 @@ export function projectNativeTranscript(
 }
 
 export function projectNativeTurn(turn: NativeAgentTurnFrame): AgentTurnRenderFrame {
+  if (turn.additionalMessages?.length) return projectTurnWithInputs(turn);
   const segments: AgentTurnSegment[] = [];
   const inferences = projectTurnInferences(turn);
   const text = turn.userContent.flatMap((part) => part.type === 'text' ? [part.text] : []).join('');
@@ -132,6 +133,69 @@ export function projectNativeTurn(turn: NativeAgentTurnFrame): AgentTurnRenderFr
   };
 }
 
+/** Partition presentation only; all sections retain the original native turn. */
+function inputSections(turn: NativeAgentTurnFrame) {
+  const messages = turn.additionalMessages ?? [];
+  const blocks = turn.passes.flatMap((pass) => pass.blocks);
+  let start = 0;
+  return [null, ...messages].map((input, index, entries) => {
+    const next = entries[index + 1];
+    const anchor = next?.afterBlockId ? blocks.findIndex(({ blockId }) => blockId === next.afterBlockId) : -1;
+    const end = next ? Math.max(start, next.afterBlockId === null ? 0 : anchor < 0 ? blocks.length : anchor + 1)
+      : blocks.length;
+    const ids = new Set(blocks.slice(start, end).map(({ blockId }) => blockId));
+    start = end;
+    const tail = index === entries.length - 1;
+    const ownsFinal = Boolean(turn.finalBlockId && ids.has(turn.finalBlockId));
+    const scoped: NativeAgentTurnFrame = {
+      ...turn, additionalMessages: undefined, boundaryCompactions: undefined,
+      passes: turn.passes.map((pass) => ({ ...pass, blocks: pass.blocks.filter(({ blockId }) => ids.has(blockId)) }))
+        .filter(({ blocks }) => blocks.length > 0),
+      finalBlockId: ownsFinal ? turn.finalBlockId : null,
+      assistantText: ownsFinal ? turn.assistantText : '',
+      assistantContent: ownsFinal ? turn.assistantContent : undefined,
+      // Compatibility fallbacks must not repeat every tool/child in each section.
+      activity: { ...turn.activity, reasoning: '', commentary: '', operations: [], web: [], notices: [],
+        compacted: tail && turn.activity.compacted,
+        fileChanges: turn.activity.fileChanges.filter((change) => Boolean(change.blockId && ids.has(change.blockId))),
+        children: turn.activity.children.filter((child) => blocks.some((block) => ids.has(block.blockId) &&
+          (block.payload.kind === 'native-child' || block.payload.kind === 'federated-child') &&
+          block.payload.child.executionId === child.executionId)),
+      },
+    };
+    return { input, turn: scoped, tail,
+      scopeId: input ? `input:${input.clientMessageId}` : turn.executionId };
+  });
+}
+
+function projectTurnWithInputs(turn: NativeAgentTurnFrame): AgentTurnRenderFrame {
+  const base = projectNativeTurn({ ...turn, additionalMessages: undefined });
+  const segments: AgentTurnSegment[] = [...(turn.boundaryCompactions?.beforeUser ?? []).map(projectCompactionSegment)];
+  const rootUser = base.segments.find((segment) => segment.type === 'userMessage')!;
+  segments.push(rootUser);
+  for (const section of inputSections(turn)) {
+    if (section.input) segments.push({
+      id: `user-input:${section.input.clientMessageId}`, type: 'userMessage',
+      clientMessageId: section.input.clientMessageId, revision: turn.renderRevision,
+      branchUnavailable: true,
+      text: section.input.content.flatMap((part) => part.type === 'text' ? [part.text] : []).join(''),
+      parts: section.input.content.map(projectUserPart),
+    });
+    const projected = projectNativeTurn(section.turn);
+    for (const segment of projected.segments) {
+      if (segment.type === 'work') {
+        if (!section.turn.passes.length && !section.tail) continue;
+        segments.push({ ...segment, id: `work:${section.scopeId}`, scopeId: section.scopeId,
+          // A section can still contain a running tool after the input boundary.
+          // Do not report the original turn duration once per section.
+          durationMs: null });
+      } else if (segment.type === 'assistantMessage') segments.push(segment);
+    }
+  }
+  segments.push(...(turn.boundaryCompactions?.afterTurn ?? []).map(projectCompactionSegment));
+  return { ...base, segments };
+}
+
 function projectCompactionSegment(
   compaction: NonNullable<NativeAgentTurnFrame['boundaryCompactions']>['beforeUser'][number],
 ): Extract<AgentTurnSegment, { type: 'compaction' }> {
@@ -162,7 +226,9 @@ export function projectNativeExecutionScope(
   request: AgentExecutionScopeRequest,
   basisSequence: number,
 ): AgentExecutionScopeResource {
-  const inferences = projectTurnInferences(turn);
+  const section = turn.additionalMessages?.length
+    ? inputSections(turn).find(({ scopeId }) => scopeId === request.scopeId) : undefined;
+  const inferences = projectTurnInferences(section?.turn ?? turn);
   return {
     conversationId,
     turnId: turn.turnId,

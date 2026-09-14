@@ -12,7 +12,7 @@ import type {
 import type { AccountUsageWindow } from '../../../../shared/provider-runtime.ts';
 import { useComposerStore } from '../store.ts';
 import { visibleAccountUsageWindows } from './usageWindows.ts';
-import { canManuallyCompact } from './compactEligibility.ts';
+import { canManuallyCompact, compactActionLabel } from './compactEligibility.ts';
 
 export function ComposerUsageTray({ conversation, onCompact, providers, queue, runtime }: {
   conversation: ConversationValue | null;
@@ -77,7 +77,7 @@ export function ComposerUsageTray({ conversation, onCompact, providers, queue, r
               {compactPending || compacting
                 ? <Loader2 className="size-3.5 animate-spin" />
                 : <Minimize2 className="size-3.5" />}
-              {compactPending || compacting ? 'Compacting…' : 'Compact'}
+              {compactPending && !compacting ? 'Requesting compaction…' : compactActionLabel(runtime)}
             </button>
           ) : null}
         </div>

@@ -66,6 +66,7 @@ export async function installAgentHost(page: Page) {
     const errorGeometryTranscript = route.get('fixtureErrorGeometry') === '1';
     const effortFixture = route.get('fixtureEffort');
     const compactEligibility = route.get('fixtureCompactEligibility');
+    let deliveryRuntimeOverride: Record<string, unknown> = {};
     const delayModels = route.get('fixtureDelayModels') === '1';
     const currentEffortNull = route.get('fixtureCurrentEffortNull') === '1';
     let modelsDelayed = false;
@@ -1064,6 +1065,7 @@ export async function installAgentHost(page: Page) {
         },
         turns: {
           interrupt: true, steer: false, queue: true,
+          ...(route.get('fixtureActiveInput') === '1' ? { activeInput: 'native-steer' } : {}),
           changeModelOnExistingSession: true, changeEffortOnExistingSession: true,
         },
         content: {
@@ -1273,13 +1275,15 @@ export async function installAgentHost(page: Page) {
         },
         compaction: {
           policy: 'native-auto',
+          pendingPhase: compactEligibility === 'queued' ? 'queued' : route.get('fixtureCompactPhase') ?? undefined,
           operation: manualCompaction?.state === 'started'
             ? { state: 'running', operationId: manualCompaction.operationId, startedAt: manualCompaction.createdAt, lastResult: null }
-            : compactEligibility === 'running'
+            : ['running', 'queued'].includes(compactEligibility ?? '')
             ? { state: 'running', operationId: 'fixture-compact', startedAt: Date.now(), lastResult: null }
             : { state: 'idle', lastResult: null },
         },
         ...(activeRuntime?.error ? { healthMessage: String(activeRuntime.error) } : {}),
+        ...deliveryRuntimeOverride,
       };
     }
 
@@ -2116,6 +2120,15 @@ export async function installAgentHost(page: Page) {
         };
       }
       if (request.method === 'remux/agent/conversation/message/send') {
+        if (route.get('fixtureDeliveryRejected') === '1') {
+          const result = { accepted: true, commandId: params.commandId, turnId: 'rejected-turn',
+            delivery: 'sent', deliveryError: 'The provider did not accept this message. Your text is saved; remove its queued entry before resending.' };
+          commandReceipts.set(String(params.commandId), {
+            commandId: params.commandId, kind: 'turn.send', state: 'accepted', result,
+          });
+          saveCommandReceipts();
+          return result;
+        }
         if (nextMessageError) {
           const message = nextMessageError;
           nextMessageError = null;
@@ -2839,6 +2852,12 @@ export async function installAgentHost(page: Page) {
         },
         setHistoryState(state: typeof historyState) {
           historyState = state;
+          const runtime = resources.get('runtime');
+          if (runtime) runtime.revision += 1;
+          invalidateResource('runtime');
+        },
+        setDeliveryState(input: Record<string, unknown>) {
+          deliveryRuntimeOverride = input;
           const runtime = resources.get('runtime');
           if (runtime) runtime.revision += 1;
           invalidateResource('runtime');

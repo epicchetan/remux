@@ -127,3 +127,35 @@ async function openHistory(page: Page, isMobile: boolean) {
   }
   return page.getByLabel('Agent history');
 }
+
+test('provider rejection preserves the draft and ends transcript synchronization recovery', async ({ page }) => {
+  await page.goto('/viewers/agent/?remuxResourceKind=agentConversation&remuxResourceId=11111111-1111-4111-8111-111111111111&fixtureDeliveryRejected=1');
+  const message = page.getByRole('textbox', { name: 'Message', exact: true });
+  await message.fill('Keep my cleanup instructions');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect(page.getByText('The provider did not accept this message. Your text is saved; remove its queued entry before resending.', { exact: true })).toBeVisible();
+  await expect(message).toHaveText('Keep my cleanup instructions');
+  await expect(page.getByText('The message was accepted. Retry to finish syncing its conversation.', { exact: true })).toHaveCount(0);
+  await page.reload();
+  await expect(message).toHaveText('Keep my cleanup instructions');
+  await expect.poll(async () => page.evaluate(() => (window as any).__agentFixture.requestLog
+    .filter((entry: { method: string }) => entry.method === 'remux/agent/conversation/message/send').length)).toBe(0);
+});
+
+test('current-turn delivery requests auto; reloaded pending work retains queue order', async ({ page }) => {
+  await page.goto(`/viewers/agent/?remuxResourceKind=agentConversation&remuxResourceId=11111111-1111-4111-8111-111111111111&fixtureRunning=1&fixtureActiveInput=1`);
+  await page.getByRole('textbox', { name: 'Message', exact: true }).fill('Respond while the child works');
+  await page.getByRole('button', { name: 'Choose message delivery', exact: true }).click();
+  await page.getByRole('menuitem', { name: 'Send to current turn', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => {
+    const request = (window as any).__agentFixture.requestLog.findLast((entry: any) =>
+      entry.method === 'remux/agent/conversation/message/send');
+    return request ? JSON.parse(request.summary).delivery : null;
+  })).toBe('auto');
+  await page.goto(`/viewers/agent/?remuxResourceKind=agentConversation&remuxResourceId=11111111-1111-4111-8111-111111111111&fixtureRunning=1`);
+  await page.getByRole('textbox', { name: 'Message', exact: true }).fill('Wait for the next turn');
+  await expect(page.getByRole('button', { name: 'Queue for next turn', exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Choose message delivery', exact: true }).click();
+  await expect(page.getByRole('menuitem', { name: 'Queue after pending work', exact: true })).toBeVisible();
+  await expect(page.getByRole('menuitem', { name: 'Send to current turn', exact: true })).toHaveCount(0);
+});

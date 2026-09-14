@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 
-export const NATIVE_AGENT_SCHEMA_VERSION = 16;
+export const NATIVE_AGENT_SCHEMA_VERSION = 18;
 export const NATIVE_AGENT_APPLICATION_ID = 0x524d584e; // RMXN
 export const NATIVE_AGENT_SCHEMA_ID = 'remux-agent-native-v1';
 
@@ -20,6 +20,7 @@ export const NATIVE_AGENT_TABLES = [
   'federation_checkout_reservations',
   'events',
   'legacy_events',
+  'turn_inputs',
   'turn_passes',
   'turn_blocks',
   'conversation_control_events',
@@ -504,9 +505,21 @@ CREATE TABLE command_receipts (
   updated_at INTEGER NOT NULL CHECK (updated_at >= created_at)
 ) STRICT;
 
+CREATE TABLE turn_inputs (
+  client_message_id TEXT PRIMARY KEY NOT NULL,
+  turn_id TEXT NOT NULL,
+  command_id TEXT NOT NULL UNIQUE,
+  content_json TEXT NOT NULL CHECK (json_valid(content_json)),
+  after_block_id TEXT,
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  FOREIGN KEY (turn_id) REFERENCES turns(turn_id),
+  FOREIGN KEY (command_id) REFERENCES command_receipts(command_id)
+) STRICT;
+
 CREATE TABLE queued_messages (
   command_id TEXT PRIMARY KEY NOT NULL,
   conversation_id TEXT NOT NULL,
+  delivery_intent TEXT NOT NULL DEFAULT 'queue' CHECK (delivery_intent IN ('auto', 'queue')),
   turn_id TEXT NOT NULL UNIQUE,
   client_message_id TEXT NOT NULL,
   content_json TEXT NOT NULL CHECK (json_valid(content_json)),
@@ -611,7 +624,7 @@ CREATE TABLE delivery_attempts (
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
   CHECK ((kind = 'root-turn' AND intended_turn_id IS NOT NULL AND client_message_id IS NOT NULL AND native_client_message_id IS NOT NULL AND compact_operation_id IS NULL) OR (kind = 'steer' AND intended_turn_id IS NOT NULL AND client_message_id IS NOT NULL AND native_client_message_id IS NOT NULL AND compact_operation_id IS NULL) OR (kind = 'manual-compact' AND intended_turn_id IS NULL AND client_message_id IS NULL AND compact_operation_id IS NOT NULL)),
-  CHECK ((state IN ('preparing', 'rejected') AND crossed_at IS NULL) OR (state IN ('dispatching', 'accepted', 'unknown') AND crossed_at IS NOT NULL)),
+  CHECK ((state = 'preparing' AND crossed_at IS NULL) OR (state = 'rejected' AND (crossed_at IS NULL OR (provider = 'codex' AND kind = 'root-turn' AND COALESCE(json_extract(rejection_json, '$.evidence.kind') = 'codex-active-compact-rejection', 0)))) OR (state IN ('dispatching', 'accepted', 'unknown') AND crossed_at IS NOT NULL)),
   CHECK ((state = 'accepted') = (accepted_at IS NOT NULL)),
   CHECK ((state = 'rejected') = (rejected_at IS NOT NULL)),
   CHECK ((state = 'unknown') = (unknown_at IS NOT NULL)),
@@ -684,13 +697,14 @@ export function migrateNativeAgentSchema(
   fromVersion: number,
   repairContext?: { backupPath?: string; migratedAt?: number },
 ) {
-  if (fromVersion < 1 || fromVersion > 15) {
+  if (fromVersion < 1 || fromVersion > 17) {
     throw new NativeAgentSchemaError(`No Native Agent migration exists from schema ${fromVersion}.`);
   }
   for (const name of ['delivery_attempts', 'delivery_attempts_lane',
     'delivery_attempts_execution', 'delivery_attempt_staging']) {
     if (database.prepare('SELECT 1 FROM sqlite_schema WHERE name = ?').get(name) &&
-        !schemaObjectMatchesDefinition(database, name)) {
+        !schemaObjectMatchesDefinition(database, name) &&
+        !(name === 'delivery_attempts' && schemaObjectMatchesDefinition(database, name, true))) {
       throw new NativeAgentSchemaError(`Version 15 found conflicting preexisting object ${name}.`);
     }
   }
@@ -812,7 +826,30 @@ export function migrateNativeAgentSchema(
   if (fromVersion <= 13) migrateVersionFourteen(database);
   if (fromVersion <= 14) migrateVersionFifteen(database);
   if (fromVersion <= 15) migrateVersionSixteen(database);
+  if (fromVersion <= 16) migrateVersionSeventeen(database);
+  if (!schemaColumnExists(database, 'queued_messages', 'delivery_intent')) database.exec("ALTER TABLE queued_messages ADD COLUMN delivery_intent TEXT NOT NULL DEFAULT 'queue' CHECK (delivery_intent IN ('auto', 'queue'));");
+  createObjectsFromSchema(database, ['turn_inputs'], 'Version 18');
   database.exec(`PRAGMA user_version = ${NATIVE_AGENT_SCHEMA_VERSION}`);
+}
+
+function migrateVersionSeventeen(database: DatabaseSync) {
+  if (schemaObjectMatchesDefinition(database, 'delivery_attempts')) return;
+  // Rebuild only the small delivery-owner tables. Keep crossing timestamps,
+  // frozen inputs, receipts, and staged observations unchanged.
+  database.exec(`
+    CREATE TEMP TABLE remux_v17_attempts AS SELECT * FROM delivery_attempts;
+    CREATE TEMP TABLE remux_v17_staging AS SELECT * FROM delivery_attempt_staging;
+    DROP TABLE delivery_attempt_staging;
+    DROP TABLE delivery_attempts;
+  `);
+  createObjectsFromSchema(database, ['delivery_attempts', 'delivery_attempts_lane',
+    'delivery_attempts_execution', 'delivery_attempt_staging'], 'Version 17');
+  database.exec(`
+    INSERT INTO delivery_attempts SELECT * FROM remux_v17_attempts;
+    INSERT INTO delivery_attempt_staging SELECT * FROM remux_v17_staging;
+    DROP TABLE remux_v17_attempts;
+    DROP TABLE remux_v17_staging;
+  `);
 }
 
 function migrateVersionSixteen(database: DatabaseSync) {
@@ -828,11 +865,15 @@ function migrateVersionSixteen(database: DatabaseSync) {
   }
 }
 
-function schemaObjectMatchesDefinition(database: DatabaseSync, name: string) {
+function schemaObjectMatchesDefinition(database: DatabaseSync, name: string, legacyDelivery = false) {
   const actual = database.prepare('SELECT sql FROM sqlite_schema WHERE name = ?').get(name) as
     { sql: string | null } | undefined;
-  const expected = SCHEMA_SQL.split(';').map((statement) => statement.trim()).find((statement) =>
+  let expected = SCHEMA_SQL.split(';').map((statement) => statement.trim()).find((statement) =>
     new RegExp(`^CREATE\\s+(?:TABLE|(?:UNIQUE\\s+)?INDEX)\\s+${name}\\b`, 'iu').test(statement));
+  if (legacyDelivery && expected) expected = expected.replace(
+    "CHECK ((state = 'preparing' AND crossed_at IS NULL) OR (state = 'rejected' AND (crossed_at IS NULL OR (provider = 'codex' AND kind = 'root-turn' AND COALESCE(json_extract(rejection_json, '$.evidence.kind') = 'codex-active-compact-rejection', 0)))) OR (state IN ('dispatching', 'accepted', 'unknown') AND crossed_at IS NOT NULL))",
+    "CHECK ((state IN ('preparing', 'rejected') AND crossed_at IS NULL) OR (state IN ('dispatching', 'accepted', 'unknown') AND crossed_at IS NOT NULL))",
+  );
   const normalize = (sql: string) => sql.replace(/\s+/gu, ' ').trim().replace(/;$/u, '');
   return Boolean(actual?.sql && expected && normalize(actual.sql) === normalize(expected));
 }

@@ -51,6 +51,7 @@ import type {
 import type { CompactDispatchContext, DispatchBoundary, ProviderDispatchResult,
   SteerDispatchContext } from '../../native-runtime/delivery-contract.ts';
 import { CodexRequestError } from './codex-app-server-connection.ts';
+import { isCodexActiveCompactRejection } from './codex-delivery-rejection.ts';
 import { AsyncEventStream, ProviderEventStream } from '../../provider-adapter.ts';
 import {
   NativeSessionOwnershipRegistry,
@@ -731,6 +732,15 @@ export class CodexProviderSession implements ProviderSession {
         return { accepted: true, outcome: 'accepted', evidence: { kind: 'codex-turn-start-response', threadId: this.nativeSession.sessionId, turnId: nativeTurnId, nativeClientMessageId: input.turnId }, nativeTurnId } as const;
       } catch (error) {
         this.activeTurn = undefined;
+        if (error instanceof CodexRequestError && error.method === 'turn/start' &&
+            error.nativeCode === -32603 && isCodexActiveCompactRejection(error.message)) {
+          return { accepted: false, outcome: 'rejected',
+            crossing: { phase: 'possibly-sent', detail: 'entered-write' },
+            rejectionEvidence: { kind: 'codex-active-compact-rejection',
+              threadId: this.nativeSession.sessionId, nativeCode: -32603,
+              source: 'rpc-response', requestId: error.requestId },
+            error: { code: 'codex_active_compaction', message: error.message, retryable: true } };
+        }
         return error instanceof CodexRequestError && error.phase === 'not-sent'
           ? { accepted: false, outcome: 'rejected', crossing: { phase: 'not-sent', detail: 'closed-before-write' }, error: { code: 'codex_request_failed', message: error.message } }
           : { accepted: false, outcome: 'unknown', crossing: { phase: 'possibly-sent', detail: 'response-lost' }, error: { code: 'codex_request_failed', message: error instanceof Error ? error.message : String(error) } };
@@ -1536,6 +1546,7 @@ function codexCapabilities(providerVersion: string): ProviderCapabilities {
     turns: {
       interrupt: true,
       steer: true,
+      activeInput: 'native-steer',
       queue: false,
       changeModelOnExistingSession: true,
       changeEffortOnExistingSession: true,

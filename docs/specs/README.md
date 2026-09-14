@@ -31,6 +31,9 @@ Its ordered turn, journal, recovery, and child-rediscovery amendment is
 [agent-canonical-turn-journal-v2.md](agent-canonical-turn-journal-v2.md).
 Its composer, usage, and native Compact amendment is
 [agent-composer-control-plane-v2.md](agent-composer-control-plane-v2.md).
+The conversational-input and adaptive-composer pass is documented in
+[agent-conversation-input-and-background-work.md](agent-conversation-input-and-background-work.md),
+including verified provider differences, delivery evidence, implementation status, and release limits.
 Its conversation identity, edit/fork lineage, native branch, and sidebar-tree
 amendment is
 [agent-conversation-lineage-and-sidebar-tree-v1.md](agent-conversation-lineage-and-sidebar-tree-v1.md).

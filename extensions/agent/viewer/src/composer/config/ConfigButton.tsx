@@ -6,6 +6,7 @@ import type { AgentProvidersResource, AgentRuntimeResource } from '../../../../s
 import type { ProviderAccess } from '../../../../shared/provider-runtime.ts';
 import type { ModelInfo, ReasoningEffort } from '../../../../shared/protocol.ts';
 import { preferredReasoning, preferredServiceTier, reasoningLabel } from './modelSelection.ts';
+import { compactActionLabel } from '../usage/compactEligibility.ts';
 import { useComposerStore } from '../store.ts';
 
 type ConfigSection = 'providers' | 'model' | 'speed' | 'reasoning' | 'access';
@@ -149,7 +150,7 @@ export function ComposerConfigButton({
             <ConfigAction
               disabled={busy || compacting || !compactEnabled}
               icon={<Minimize2 className="size-4" />}
-              label={compacting ? 'Compacting…' : 'Compact context'}
+              label={compactActionLabel(runtime, 'Compact context')}
               onClick={() => {
                 setOpen(false);
                 void onCompact();

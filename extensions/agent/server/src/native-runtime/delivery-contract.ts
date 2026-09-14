@@ -11,15 +11,24 @@ export type ProviderAcceptanceEvidence =
   | { kind: 'codex-turn-steer-response'; threadId: string; turnId: string; nativeClientMessageId: string }
   | { kind: 'codex-compact-response'; threadId: string; requestId: number; connectionGeneration: string }
   | { kind: 'codex-history-client-id'; threadId: string; nativeClientMessageId: string; nativeTurnId?: string }
+  | { kind: 'claude-input-replay'; sessionId: string; userMessageUuid: string; nativeTurnId: string; processGeneration: string }
   | { kind: 'claude-root-processing'; sessionId: string; userMessageUuid: string; observationUuid: string }
   | { kind: 'claude-manual-compact-boundary'; sessionId: string; boundaryUuid: string; processGeneration: string; trigger: 'manual' }
   | { kind: 'claude-manual-compact-status'; sessionId: string; inputUuid: string; statusUuid: string; processGeneration: string; status: 'compacting' | 'failed' }
   | { kind: 'fixture-correlated-acceptance'; sessionId: string; commandId: string; nativeTurnId?: string };
 
 export type ProviderReceiptEvidence = never;
+export type ProviderRejectionEvidence = {
+  kind: 'codex-active-compact-rejection';
+  threadId: string;
+  nativeCode: -32603;
+  source: 'rpc-response' | 'legacy-recorded-response';
+  requestId?: number;
+};
 export type ProviderDispatchResult =
   | { accepted: true; outcome: 'accepted'; evidence: ProviderAcceptanceEvidence; nativeTurnId?: string; nativeOperationId?: string }
   | { accepted: false; outcome: 'rejected'; crossing: Extract<ProviderCrossing, { phase: 'not-sent' }>; error: ProviderDeliveryError; nativeTurnId?: undefined }
+  | { accepted: false; outcome: 'rejected'; crossing: Extract<ProviderCrossing, { phase: 'possibly-sent' }>; rejectionEvidence: ProviderRejectionEvidence; error: ProviderDeliveryError; nativeTurnId?: undefined }
   | { accepted: false; outcome: 'unknown'; crossing: Extract<ProviderCrossing, { phase: 'possibly-sent' }>; error: ProviderDeliveryError; receiptEvidence?: ProviderReceiptEvidence; nativeTurnId?: undefined };
 export type ProviderNegativeCoverage = never;
 export type ProviderPresenceRead =
@@ -37,7 +46,13 @@ export type SteerDispatchContext = {
   expectedNativeTurnId: string;
 };
 
+export type ActiveCompactionTarget = {
+  nativeTurnId: string;
+  toolUseIds: readonly string[];
+};
+
 export type CompactDispatchContext = {
+  activeParent?: ActiveCompactionTarget;
   boundary: DispatchBoundary;
   nativeInputUuid?: string;
 };

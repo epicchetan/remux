@@ -9,6 +9,7 @@ import type {
   CodexAppServerLaunchOptions,
 } from '../server/src/providers/codex/codex-app-server-process.ts';
 import { CodexRequestError } from '../server/src/providers/codex/codex-app-server-connection.ts';
+import { CODEX_ACTIVE_COMPACT_REJECTION } from '../server/src/providers/codex/codex-delivery-rejection.ts';
 import { CodexNativeAdapter } from '../server/src/providers/codex/codex-adapter.ts';
 import { codexStableChildExecutionId } from '../server/src/providers/codex/codex-event-mapper.ts';
 import type {
@@ -1221,5 +1222,36 @@ test('Codex ownership-free delivery read requires exact frozen thread and client
     assert.equal(readPeer.requests.some(({ method }) =>
       method === 'thread/start' || method === 'thread/resume'), false, item.name);
     assert.equal(readPeer.closed, true, item.name);
+  }
+});
+
+test('Codex distinguishes a correlated active-compact rejection from generic errors and lost responses', async () => {
+  for (const scenario of ['compact', 'generic', 'lost'] as const) {
+    const adapter = new CodexNativeAdapter({ createConnection: async (launch) => {
+      const peer = new FakeCodexConnection(launch);
+      const request = peer.request.bind(peer);
+      peer.request = async (method, params, timeout, beforeWrite) => {
+        if (method !== 'turn/start') return request(method, params, timeout, beforeWrite);
+        beforeWrite?.(method, 999);
+        throw new CodexRequestError({ phase: 'possibly-sent', method, requestId: 999,
+          ...(scenario === 'lost' ? {} : { nativeCode: -32603 }),
+          message: scenario === 'compact' ? CODEX_ACTIVE_COMPACT_REJECTION
+            : scenario === 'generic' ? 'Codex App Server turn/start failed (-32603): internal error'
+              : 'connection closed before response' });
+      };
+      return peer;
+    } });
+    const session = await adapter.openSession(openInput);
+    try {
+      let crossed = 0;
+      const result = await session.startTurn({ ...turnInput, content: [{ type: 'text', text: 'hello' }] },
+        { markPossiblySent() { crossed += 1; } });
+      assert.equal(crossed, 1);
+      assert.equal(result.outcome, scenario === 'compact' ? 'rejected' : 'unknown');
+      if (result.outcome === 'rejected' && 'rejectionEvidence' in result) {
+        assert.equal(result.rejectionEvidence.threadId, session.nativeSession.sessionId);
+        assert.equal(result.rejectionEvidence.requestId, 999);
+      }
+    } finally { await session.close(); }
   }
 });

@@ -59,6 +59,7 @@ export type AgentUserMessagePart =
 export type AgentUserMessageSegment = {
   id: string;
   type: 'userMessage';
+  branchUnavailable?: boolean;
   clientMessageId: string | null;
   revision: string;
   text: string;

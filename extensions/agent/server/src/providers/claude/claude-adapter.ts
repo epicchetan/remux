@@ -30,6 +30,7 @@ import {
   parseProviderSnapshot,
   parseProviderSnapshotRequest,
   parseStartProviderTurnInput,
+  parseSteerProviderTurnInput,
   type InterruptProviderTurnInput,
   type InterruptProviderChildInput,
   type ChildExecutionDisplay,
@@ -589,9 +590,15 @@ export class ClaudeProviderSession implements ProviderSession {
   private readonly settledCompactionStatuses = new Set<string>();
   private recoveringAcceptedTurn = false;
   private readonly processGeneration = randomUUID();
+  private readonly activeInputAcceptances = new Map<string, {
+    expectedNativeTurnId: string; yielded: boolean; watermark: number;
+    resolve: (result: ProviderDispatchResult) => void; timeout: ReturnType<typeof setTimeout>;
+  }>();
+  private readonly pendingRootTools = new Map<string, string>();
+  private readonly foregroundAgentTools = new Map<string, string>();
   private rootAcceptance?: { promptUuid: string; resolve: (result: ProviderDispatchResult) => void;
     timeout: ReturnType<typeof setTimeout> };
-  private compactAcceptance?: { inputUuid: string; watermark: number; yielded: boolean; settled: boolean;
+  private compactAcceptance?: { expectedNativeTurnId?: string; inputUuid: string; watermark: number; yielded: boolean; settled: boolean;
     resolve: (result: ProviderDispatchResult) => void; timeout: ReturnType<typeof setTimeout> };
   private readonly seenCompactionBoundaries = new Set<string>();
   private readonly compactionEvidence = new Map<string, ProviderAcceptanceEvidence>();
@@ -672,7 +679,7 @@ export class ClaudeProviderSession implements ProviderSession {
 
   hasBackgroundWork() {
     return Boolean(this.activeTurn || this.manualCompactionOperationId) ||
-      this.nativeRunning || this.backgroundTasks.size > 0;
+      this.nativeRunning || this.backgroundTasks.size > 0 || this.activeInputAcceptances.size > 0;
   }
 
   start(resumed: boolean) {
@@ -773,6 +780,74 @@ export class ClaudeProviderSession implements ProviderSession {
     }) as Promise<ProviderDispatchResult>;
   }
 
+  async sendActiveInput(unparsed: import('../../../../shared/provider-runtime.ts').SteerProviderTurnInput,
+    context: import('../../native-runtime/delivery-contract.ts').SteerDispatchContext): Promise<ProviderDispatchResult> {
+    const input = parseSteerProviderTurnInput(unparsed);
+    return this.onceCommand(input.commandId, { ...input, nativeClientMessageId: context.nativeClientMessageId,
+      expectedNativeTurnId: context.expectedNativeTurnId }, async () => {
+      if (this.closed || this.activeTurn?.turnId !== input.turnId ||
+          this.activeTurn?.nativeTurnId !== context.expectedNativeTurnId) {
+        throw new Error('Claude active input does not match the frozen parent turn.');
+      }
+      const content = await mapClaudeUserContent(input.content, this.resolveImageArtifact
+        ? (artifactId, mimeType) => this.resolveImageArtifact!({
+            conversationId: this.openedWith.conversationId, executionId: this.openedWith.executionId,
+          }, artifactId, mimeType) : undefined);
+      if (this.activeTurn?.nativeTurnId !== context.expectedNativeTurnId) {
+        throw new Error('Claude parent completed before active input preparation.');
+      }
+      const uuid = context.nativeClientMessageId;
+      let crossed = false;
+      const cross = () => {
+        if (!crossed) context.boundary.markPossiblySent(this.nativeSession.sessionId, this.processGeneration);
+        crossed = true;
+      };
+      const acceptance = new Promise<ProviderDispatchResult>((resolve) => {
+        const timeout = setTimeout(() => resolve({ accepted: false, outcome: 'unknown',
+          crossing: { phase: 'possibly-sent', detail: 'response-lost' },
+          error: { code: 'claude_input_receipt_timeout', message: 'Claude input delivery is unconfirmed.' } }), this.acceptanceTimeoutMs);
+        timeout.unref?.();
+        this.activeInputAcceptances.set(uuid, { expectedNativeTurnId: context.expectedNativeTurnId,
+          yielded: false, watermark: this.messageSequence, resolve, timeout });
+      });
+      try {
+        const foreground = [...this.foregroundAgentTools].filter(([, turn]) => turn === context.expectedNativeTurnId);
+        this.prompt.push({ type: 'user', uuid: uuid as `${string}-${string}-${string}-${string}-${string}`,
+          parent_tool_use_id: null, message: { role: 'user', content } }, () => {
+          cross();
+          const pending = this.activeInputAcceptances.get(uuid);
+          if (pending) { pending.yielded = true; pending.watermark = this.messageSequence; }
+        }, () => {
+          // The SDK pulls its next input only after awaiting the previous
+          // transport write. Put the user input on the wire before freeing
+          // the foreground Agent, or Claude can finish the old turn first.
+          void (async () => {
+            for (const [toolUseId, nativeTurnId] of foreground) {
+              if (this.closed || this.activeTurn?.nativeTurnId !== nativeTurnId ||
+                  this.foregroundAgentTools.get(toolUseId) !== nativeTurnId) continue;
+              await this.query.backgroundTasks(toolUseId);
+              this.foregroundAgentTools.delete(toolUseId);
+            }
+          })().catch((error) => {
+            const pending = this.activeInputAcceptances.get(uuid);
+            if (pending) pending.resolve({ accepted: false, outcome: 'unknown',
+              crossing: { phase: 'possibly-sent', detail: 'response-lost' },
+              error: { code: 'claude_background_control_unknown', message: safeMessage(error) } });
+          });
+        });
+      } catch (error) {
+        const pending = this.activeInputAcceptances.get(uuid);
+        if (pending) clearTimeout(pending.timeout);
+        this.activeInputAcceptances.delete(uuid);
+        if (!crossed) throw error;
+        return { accepted: false, outcome: 'unknown',
+          crossing: { phase: 'possibly-sent', detail: 'response-lost' },
+          error: { code: 'claude_input_delivery_unknown', message: safeMessage(error) } };
+      }
+      return acceptance;
+    }) as Promise<ProviderDispatchResult>;
+  }
+
   async interrupt(unparsed: InterruptProviderTurnInput): Promise<ProviderCommandAcceptance> {
     this.assertOpen();
     const input = parseInterruptProviderTurnInput(unparsed);
@@ -813,6 +888,17 @@ export class ClaudeProviderSession implements ProviderSession {
     });
   }
 
+  activeCompactionTarget() {
+    const nativeTurnId = this.activeTurn?.nativeTurnId;
+    if (!nativeTurnId || this.closed || this.recoveringAcceptedTurn || this.compactAcceptance ||
+        this.manualCompactionOperationId || this.activeInputAcceptances.size) return undefined;
+    const toolUseIds = [...this.foregroundAgentTools]
+      .filter(([, turn]) => turn === nativeTurnId).map(([id]) => id);
+    if (!toolUseIds.length || [...this.pendingRootTools].some(([id, turn]) =>
+        turn === nativeTurnId && !toolUseIds.includes(id))) return undefined;
+    return { nativeTurnId, toolUseIds };
+  }
+
   async compact(unparsed: CompactProviderSessionInput,
     context: CompactDispatchContext): Promise<ProviderDispatchResult> {
     this.assertOpen();
@@ -823,13 +909,20 @@ export class ClaudeProviderSession implements ProviderSession {
     }
     const nativeInputUuid = context.nativeInputUuid;
     if (!nativeInputUuid) throw new Error('Claude Compact requires its frozen native input UUID.');
-    return this.onceCommand(input.commandId, { ...input, nativeInputUuid }, async () => {
-      if (this.activeTurn) throw new Error('Claude provider session is busy.');
+    const activeParent = context.activeParent;
+    return this.onceCommand(input.commandId, { ...input, nativeInputUuid, activeParent }, async () => {
+      if (this.activeTurn && (!activeParent || this.activeTurn.nativeTurnId !== activeParent.nativeTurnId)) {
+        throw new Error('Claude Compact does not match an eligible frozen parent.');
+      }
       if (this.compactAcceptance) throw new Error('Claude already has an unresolved manual Compact delivery.');
       if (this.manualCompactionOperationId) throw new Error('Claude manual compaction is still running.');
       const commands = await this.query.supportedCommands();
       if (!commands.some(({ name, aliases }) => name === 'compact' || aliases?.includes('compact'))) {
         throw new Error('Claude Code did not advertise the native /compact command.');
+      }
+      // supportedCommands awaits native control. Never redirect a frozen request to a newer parent.
+      if (this.activeTurn && this.activeTurn.nativeTurnId !== activeParent?.nativeTurnId) {
+        throw new Error('Claude parent changed before Compact dispatch.');
       }
       this.manualCompactionOperationId = input.commandId;
       let acceptanceTimeout: ReturnType<typeof setTimeout>;
@@ -839,7 +932,7 @@ export class ClaudeProviderSession implements ProviderSession {
           'Claude did not acknowledge manual compaction before the delivery timeout.'),
         this.acceptanceTimeoutMs);
         acceptanceTimeout.unref?.();
-        this.compactAcceptance = { inputUuid: nativeInputUuid,
+        this.compactAcceptance = { inputUuid: nativeInputUuid, expectedNativeTurnId: activeParent?.nativeTurnId,
           watermark: -1, yielded: false, settled: false, resolve, timeout: acceptanceTimeout };
       });
       try {
@@ -855,7 +948,19 @@ export class ClaudeProviderSession implements ProviderSession {
             pending.yielded = true;
           }
           context.boundary.markPossiblySent(this.nativeSession.sessionId, this.processGeneration);
-        });
+        }, activeParent ? () => {
+          // As with active input, the next SDK pull follows the awaited input write.
+          // Keep the compact input ahead of background control on the native transport.
+          void (async () => {
+            for (const toolUseId of activeParent.toolUseIds) {
+              if (this.closed || this.activeTurn?.nativeTurnId !== activeParent.nativeTurnId ||
+                  this.foregroundAgentTools.get(toolUseId) !== activeParent.nativeTurnId) continue;
+              await this.query.backgroundTasks(toolUseId);
+              this.foregroundAgentTools.delete(toolUseId);
+            }
+          })().catch((error) => this.resolvePendingCompactAcceptance(nativeInputUuid,
+            'claude_compact_background_unknown', safeMessage(error)));
+        } : undefined);
       } catch (error) {
         const pending = this.compactAcceptance as undefined | {
           inputUuid: string; watermark: number; yielded: boolean; settled: boolean;
@@ -897,6 +1002,7 @@ export class ClaudeProviderSession implements ProviderSession {
   async close() {
     if (this.closed) return;
     this.closed = true;
+    this.resolvePendingAcceptance('claude_session_closed', 'Claude session closed before input acknowledgement.');
     if (this.rootAcceptance) {
       clearTimeout(this.rootAcceptance.timeout);
       this.rootAcceptance.resolve({ accepted: false, outcome: 'unknown',
@@ -1034,6 +1140,20 @@ export class ClaudeProviderSession implements ProviderSession {
     }
     this.currentEnvelopeUuid = stringValue(record.uuid);
     this.observeNativeTurn(record);
+    const replayUuid = stringValue(record.uuid);
+    const replay = replayUuid ? this.activeInputAcceptances.get(replayUuid) : undefined;
+    if (replay && replayUuid && record.type === 'user' && record.isReplay === true &&
+        record.isSynthetic !== true && record.parent_tool_use_id === null &&
+        sessionId === this.nativeSession.sessionId && replay.yielded &&
+        this.messageSequence > replay.watermark && this.activeTurn?.nativeTurnId === replay.expectedNativeTurnId) {
+      const evidence = { kind: 'claude-input-replay' as const, sessionId,
+        userMessageUuid: replayUuid, nativeTurnId: replay.expectedNativeTurnId,
+        processGeneration: this.processGeneration };
+      this.processingEvidence.set(replayUuid, evidence);
+      this.activeInputAcceptances.delete(replayUuid);
+      clearTimeout(replay.timeout);
+      replay.resolve({ accepted: true, outcome: 'accepted', evidence });
+    }
     const correlatedUserUuid = stringValue(record.user_message_uuid);
     const streamType = stringValue(objectValue(record.event)?.type);
     const partialKinds = new Set(['message_start', 'message_delta', 'message_stop',
@@ -1076,6 +1196,12 @@ export class ClaudeProviderSession implements ProviderSession {
   }
 
   private resolvePendingAcceptance(code: string, message: string) {
+    for (const pending of this.activeInputAcceptances.values()) {
+      clearTimeout(pending.timeout);
+      pending.resolve({ accepted: false, outcome: 'unknown',
+        crossing: { phase: 'possibly-sent', detail: 'response-lost' }, error: { code, message } });
+    }
+    this.activeInputAcceptances.clear();
     if (!this.rootAcceptance) return;
     const pending = this.rootAcceptance;
     this.rootAcceptance = undefined;
@@ -1166,9 +1292,13 @@ export class ClaudeProviderSession implements ProviderSession {
       if (this.settledCompactionStatuses.has(statusIdentity)) return;
       this.rememberSettledCompactionStatus(statusIdentity);
       const pending = this.compactAcceptance;
+      // An active parent can auto-compact before consuming queued /compact.
+      // Its generic status cannot acknowledge our manual request. The explicit
+      // manual boundary remains valid evidence, even if no idle status arrives.
+      if (pending?.expectedNativeTurnId && this.activeTurn) return;
       if (pending?.yielded && this.messageSequence > pending.watermark &&
           sessionId === this.nativeSession.sessionId && this.currentEnvelopeUuid) {
-        // Compact is delivered only on an idle, exclusive root lane. A fresh
+        // With no active parent, Compact owns the exclusive input lane. A fresh
         // root status after input yield acknowledges processing, not completion.
         this.acceptPendingCompact({
           kind: 'claude-manual-compact-status', sessionId, inputUuid: pending.inputUuid,
@@ -1274,6 +1404,10 @@ export class ClaudeProviderSession implements ProviderSession {
     const childExecutionId = this.childByTask.get(taskId)
       ?? stableUuid(`claude-child\0${this.nativeSession.sessionId}\0${taskId}`);
     if (subtype === 'task_started') {
+      if (toolUseId && linkedTool && isClaudeChildTool(linkedTool.name) &&
+          objectValue(linkedTool.input)?.run_in_background !== true) {
+        this.foregroundAgentTools.set(toolUseId, active.nativeTurnId);
+      }
       const existing = this.childByTask.has(taskId);
       this.childByTask.set(taskId, childExecutionId);
       this.childOwners.set(taskId, { turnId: active.turnId, nativeTurnId: active.nativeTurnId });
@@ -1650,6 +1784,7 @@ export class ClaudeProviderSession implements ProviderSession {
       const callId = stringValue(block.tool_use_id);
       if (!callId || !this.tools.has(callId)) continue;
       const tool = this.tools.get(callId)!;
+      this.foregroundAgentTools.delete(callId);
       this.emit({
         type: 'tool.updated',
         toolCallId: callId,
@@ -1841,6 +1976,10 @@ export class ClaudeProviderSession implements ProviderSession {
     itemId?: string,
     blockIndex?: number,
   ) {
+    if (nativeTurnId && itemId) {
+      if (input.type === 'tool.started') this.pendingRootTools.set(itemId, nativeTurnId);
+      if (input.type === 'tool.completed') this.pendingRootTools.delete(itemId);
+    }
     const sequence = this.sequence + 1;
     const nativeItemId = itemId
       ? stableUuid(`claude-item\0${this.nativeSession.sessionId}\0${itemId}`)
@@ -2177,16 +2316,18 @@ export class ClaudeProviderSession implements ProviderSession {
 }
 
 class ClaudeInputQueue implements AsyncIterable<SDKUserMessage> {
-  private readonly values: Array<{ value: SDKUserMessage; onBeforeYield?: () => void }> = [];
+  private readonly values: Array<{ value: SDKUserMessage; onBeforeYield?: () => void; onNextPull?: () => void }> = [];
+  private afterPreviousPull?: () => void;
   private readonly waiters: Array<(result: IteratorResult<SDKUserMessage>) => void> = [];
   private closed = false;
 
-  push(value: SDKUserMessage, onBeforeYield?: () => void) {
+  push(value: SDKUserMessage, onBeforeYield?: () => void, onNextPull?: () => void) {
     if (this.closed) throw new Error('Claude input stream is closed.');
     if (this.waiters.length > 0) {
       onBeforeYield?.();
+      this.afterPreviousPull = onNextPull;
       this.waiters.shift()?.({ done: false, value });
-    } else this.values.push({ value, onBeforeYield });
+    } else this.values.push({ value, onBeforeYield, onNextPull });
   }
 
   close() {
@@ -2199,10 +2340,14 @@ class ClaudeInputQueue implements AsyncIterable<SDKUserMessage> {
     let returned = false;
     return {
       next: async () => {
+        const afterPreviousPull = this.afterPreviousPull;
+        this.afterPreviousPull = undefined;
+        if (!this.closed) afterPreviousPull?.();
         if (returned) return { done: true, value: undefined };
         const entry = this.values.shift();
         if (entry) {
           entry.onBeforeYield?.();
+          this.afterPreviousPull = entry.onNextPull;
           return { done: false, value: entry.value };
         }
         if (this.closed) return { done: true, value: undefined };
@@ -2245,6 +2390,7 @@ function claudeCapabilities(providerVersion: string, manualCompact = true): Prov
     turns: {
       interrupt: true,
       steer: false,
+      ...(providerVersion === '2.1.258' ? { activeInput: 'stream-input' as const } : {}),
       queue: true,
       changeModelOnExistingSession: true,
       changeEffortOnExistingSession: true,
@@ -2274,7 +2420,9 @@ function claudeCapabilities(providerVersion: string, manualCompact = true): Prov
       plan: 'read-and-push',
       estimatedCost: true,
     },
-    compaction: { automaticNative: true, manualNative: manualCompact },
+    compaction: { automaticNative: true, manualNative: manualCompact,
+      ...(manualCompact && providerVersion === '2.1.258'
+        ? { activeParent: 'background-native-agent' as const } : {}) },
   };
 }
 
@@ -2325,6 +2473,7 @@ function sessionQueryOptions(input: {
     },
     hooks: claudeSessionHooks(input.input.access, input.input.cwd, input.onFileChanged),
     tools: { type: 'preset', preset: 'claude_code' },
+    extraArgs: { 'replay-user-messages': null },
     includePartialMessages: true,
     forwardSubagentText: true,
     perTaskStopAffordance: true,

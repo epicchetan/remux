@@ -1,9 +1,9 @@
-import { ArrowDown, ArrowLeft, ArrowUp, Bot, Check, History, Loader2, PanelRightOpen, Send, Square } from 'lucide-react';
+import { ArrowDown, ArrowLeft, ArrowUp, Bot, Check, History, Loader2, PanelRightOpen, Square } from 'lucide-react';
 import { openHostOverview } from '@remux/viewer-kit/host';
 
 import type { AgentProvidersResource, AgentRuntimeResource } from '../../../../shared/native-agent-protocol.ts';
 import type { ProviderAccess } from '../../../../shared/provider-runtime.ts';
-import type { ReasoningEffort } from '../../../../shared/protocol.ts';
+import type { AgentPendingQueueValue, ReasoningEffort } from '../../../../shared/protocol.ts';
 import { parentDirectory } from '../../conversation/format.ts';
 import { useAgentSidebarStore } from '../../conversation/sidebarStore.ts';
 import { useConversationStore } from '../../conversation/store.ts';
@@ -11,6 +11,7 @@ import { useComposerStore } from '../store.ts';
 import { useTranscriptViewportControls } from '../../transcript/index.ts';
 import { ComposerAttachmentButton } from '../attachments/AttachmentButton.tsx';
 import { ComposerConfigButton } from '../config/ConfigButton.tsx';
+import { ComposerSendButton } from './SendButton.tsx';
 import { ComposerActionKey, type ComposerAction } from './ActionKey.tsx';
 import { useComposerTurnAction, type TurnSubmissionInput } from './turnAction.ts';
 import type { ComposerEditTarget, ComposerForkTarget } from '../store.ts';
@@ -36,6 +37,7 @@ export function ComposerActionButtons({
   onAccessChange,
   providers,
   runtime,
+  queue,
 }: {
   canStart: boolean;
   connected: boolean;
@@ -65,6 +67,7 @@ export function ComposerActionButtons({
   onAccessChange: (access: ProviderAccess) => Promise<void>;
   providers: AgentProvidersResource | null;
   runtime: AgentRuntimeResource | null;
+  queue: AgentPendingQueueValue | null;
 }) {
   const { canScrollDown, canScrollUp, scrollDown, scrollUp } = useTranscriptViewportControls();
   const openMobileSidebar = useAgentSidebarStore((state) => state.openMobile);
@@ -87,6 +90,7 @@ export function ComposerActionButtons({
     onInterrupt,
     onSend,
     runtime,
+    queue,
     imagesEnabled: providerCapabilities?.content.images === true,
     fileReferencesEnabled: providerCapabilities?.content.fileReferences === true,
     branchEnabled: runtime?.capabilities.session.forkNative === true,
@@ -157,20 +161,16 @@ export function ComposerActionButtons({
           label: turn.isStopping ? 'Stopping turn' : 'Stop turn',
           onClick: turn.handleInterrupt,
         }} /> : null}
-        {!pickerOpen && (!isWorking || (turn.hasSendableContent && !turn.isStopping)) ? <ComposerActionKey action={{
-          busy: turn.isSubmitting,
-          disabled: turn.sendDisabled,
-          icon: turn.isSubmitting ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />,
-          label: turn.isSubmitting
-            ? 'Sending message'
-            : turn.editTarget
-              ? 'Save edited message'
-              : turn.forkTarget
-                ? 'Send forked message'
-              : isWorking ? 'Queue message' : 'Send message',
-          onClick: turn.handleSend,
-          tone: 'send',
-        }} /> : null}
+        {!pickerOpen && (!isWorking || (turn.hasSendableContent && !turn.isStopping)) ? <ComposerSendButton
+          busy={turn.isSubmitting}
+          disabled={turn.sendDisabled}
+          scopeKey={`${conversationId ?? 'new'}:${turn.editTarget ? 'edit' : turn.forkTarget ? 'fork' : 'send'}`}
+          delivery={turn.deliveryState}
+          useMenu={!turn.editTarget && !turn.forkTarget}
+          directLabel={turn.editTarget ? 'Save edited message' : turn.forkTarget ? 'Send forked message' : 'Send message'}
+          onSend={turn.handleSend}
+          onDelivery={turn.handleDelivery}
+        /> : null}
       </div>
     </div>
   );

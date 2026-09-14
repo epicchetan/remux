@@ -418,3 +418,28 @@ function frame(
     layoutRevision: `${turnId}:layout`,
   };
 }
+
+
+test('additional input divides display work without changing turn or native block identity', () => {
+  const turn = frame('input-turn', 'root-execution', 'completed', 'Done');
+  turn.passes = [{ passId: 'native-message', ordinal: 0, state: 'completed', blocks: [
+    block('before', 0, 'commentary', { kind: 'commentary', text: 'Earlier work' }),
+    block('after', 1, 'commentary', { kind: 'commentary', text: 'Work after input' }),
+    block('final', 2, 'final-message', { kind: 'final-message', text: 'Done' }),
+  ] }];
+  turn.finalBlockId = 'final';
+  turn.additionalMessages = [{ clientMessageId: 'followup', afterBlockId: 'before',
+    content: [{ type: 'text', text: 'Focus on auth' }] }];
+  const result = projectNativeTurn(turn);
+  assert.equal(result.id, 'input-turn');
+  assert.deepEqual(result.segments.map(s=>s.type), ['userMessage', 'work', 'userMessage', 'work', 'assistantMessage']);
+  const work = result.segments.filter(s=>s.type==='work');
+  assert.deepEqual(work.map(s=>s.scopeId), ['root-execution', 'input:followup']);
+  const scopes = work.map(s=>projectNativeExecutionScope('conversation',turn,{
+    type:'executionScope',protocolVersion:AGENT_TRANSCRIPT_PROTOCOL_VERSION,turnId:turn.turnId,scopeId:s.scopeId,
+  },1));
+  assert.deepEqual(scopes.map(s=>s.inferences.flatMap(i=>i.blocks.map(b=>b.id))), [['before'],['after']]);
+  assert.equal(result.segments.at(-1)?.id, 'assistant:input-turn');
+  const again = projectNativeTurn({...turn,renderRevision:'updated'});
+  assert.deepEqual(again.segments.map(s=>s.id), result.segments.map(s=>s.id));
+});

@@ -45,6 +45,7 @@ test('Claude probe accepts native subscription auth and refuses API-key fallback
   assert.equal(ready.capabilities?.session.forkNative, true);
   assert.equal(ready.capabilities?.session.contextBranching?.strategy, 'native');
   assert.equal(ready.capabilities?.turns.steer, false);
+  assert.equal(ready.capabilities?.compaction.activeParent, undefined);
   assert.equal(ready.capabilities?.content.diffs, true);
   assert.equal(ready.capabilities?.usage.plan, 'read-and-push');
   assert.equal(ready.capabilities?.usage.context, 'derived');
@@ -72,6 +73,13 @@ test('Claude probe accepts native subscription auth and refuses API-key fallback
   const unverified = await unknown.probe('claude-local');
   assert.equal(unverified.state, 'incompatible');
   assert.equal(unverified.diagnosticCode, 'claude_subscription_required');
+});
+
+test('Claude advertises active-parent compaction only for the verified producer', async () => {
+  const adapter = new ClaudeNativeAdapter({ runCli: async args => args[0] === '--version'
+    ? '2.1.258 (Claude Code)' : JSON.stringify({ loggedIn: true, authMethod: 'claude.ai',
+      apiProvider: 'firstParty', subscriptionType: 'max' }) });
+  assert.equal((await adapter.probe('claude-local')).capabilities?.compaction.activeParent, 'background-native-agent');
 });
 
 test('Claude session initialization requires first-party subscription authentication', async () => {
@@ -2219,6 +2227,233 @@ test('Claude preparation failure dispatches no prompt and the next command reass
   } finally { await session.close(); }
 });
 
+for (const receipt of ['exact', 'synthetic', 'child', 'late', 'parent-ended'] as const) {
+  test(`Claude active input correlates ${receipt} replay without interrupting the child`, async () => {
+    const query = new FakeClaudeQuery();
+    let prompt!: AsyncIterable<SDKUserMessage>;
+    const adapter = new ClaudeNativeAdapter({ acceptanceTimeoutMs: 25, createQuery: (input) => {
+      prompt = input.prompt as AsyncIterable<SDKUserMessage>;
+      assert.equal(input.options?.extraArgs?.['replay-user-messages'], null);
+      return query as unknown as ClaudeQuery;
+    } });
+    const session = await adapter.openSession({ commandId: 'open-active-input',
+      providerInstanceId: 'claude-local', conversationId: 'input-conversation', executionId: 'input-execution',
+      mode: 'create', cwd: '/workspace/remux', model: 'fable[1m]', access: 'read-only', developerInstructions: [] });
+    try {
+      const iterator = prompt[Symbol.asyncIterator]();
+      const root = session.startTurn({ commandId: 'root-input', turnId: 'input-turn',
+        conversationId: 'input-conversation', executionId: 'input-execution', content: [{ type: 'text', text: 'Work' }] });
+      const sent = (await iterator.next()).value!;
+      query.emit({ type: 'assistant', uuid: 'root-reply', session_id: session.nativeSession.sessionId,
+        parent_tool_use_id: null, user_message_uuid: sent.uuid,
+        message: { id: 'root-assistant', role: 'assistant', content: [{ type: 'tool_use', id: 'foreground-agent',
+          name: 'Agent', input: { run_in_background: false, prompt: 'Work' } }] } });
+      const rootResult = await root;
+      assert.equal(rootResult.outcome, 'accepted');
+      query.emit({ type: 'system', subtype: 'task_started', task_id: 'native-child', tool_use_id: 'foreground-agent',
+        task_type: 'local_agent', uuid: 'task-start', session_id: session.nativeSession.sessionId });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      let crossings = 0;
+      const uuid = '22222222-2222-4222-8222-222222222222';
+      const pending = session.sendActiveInput!({ commandId: 'active-input', turnId: 'input-turn',
+        content: [{ type: 'text', text: 'Respond now' }] }, {
+        nativeClientMessageId: uuid, expectedNativeTurnId: rootResult.nativeTurnId!,
+        boundary: { markPossiblySent: () => { crossings++; } },
+      });
+      const next = (await iterator.next()).value!;
+      assert.equal(next.uuid, uuid);
+      assert.equal(next.priority, undefined);
+      assert.deepEqual(query.backgroundedTools, [], 'do not free the Agent before SDK writes the input');
+      void iterator.next(); // SDK pulls again after awaiting transport.write(input).
+      assert.deepEqual(query.backgroundedTools, ['foreground-agent']);
+      assert.equal(crossings, 1);
+      const replay = { type: 'user', uuid, session_id: session.nativeSession.sessionId,
+        parent_tool_use_id: receipt === 'child' ? 'foreground-agent' : null,
+        isReplay: true, isSynthetic: receipt === 'synthetic',
+        message: { role: 'user', content: 'Respond now' } };
+      if (receipt === 'parent-ended') query.emit({ type: 'result', subtype: 'success', uuid: 'root-end',
+        session_id: session.nativeSession.sessionId, is_error: false, num_turns: 1, result: 'Finished' });
+      if (receipt !== 'late') query.emit(replay);
+      const result = await pending;
+      assert.equal(result.outcome, receipt === 'exact' ? 'accepted' : 'unknown');
+      if (receipt === 'late') {
+        query.emit(replay);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        assert.equal((await session.readTurnPresence!(uuid)).presence, 'present');
+      }
+      assert.equal(query.interrupts, 0);
+      assert.deepEqual(query.stoppedTasks, []);
+    } finally { await session.close(); }
+  });
+}
+
+for (const scenario of ['foreground', 'mixed-tools', 'background', 'control-lost', 'parent-finished'] as const) {
+  test(`Claude active Compact ${scenario} preserves native ownership and correlated acceptance`, async () => {
+    const query = new FakeClaudeQuery();
+    let prompt!: AsyncIterable<SDKUserMessage>;
+    const adapter = new ClaudeNativeAdapter({ acceptanceTimeoutMs: 200, createQuery: (input) => {
+      prompt = input.prompt as AsyncIterable<SDKUserMessage>;
+      return query as unknown as ClaudeQuery;
+    } });
+    const session = await adapter.openSession({ commandId: 'open-active-compact',
+      providerInstanceId: 'claude-local', conversationId: 'compact-conversation', executionId: 'compact-execution',
+      mode: 'create', cwd: '/workspace/remux', model: 'fable[1m]', access: 'read-only', developerInstructions: [] });
+    try {
+      const iterator = prompt[Symbol.asyncIterator]();
+      const root = session.startTurn({ commandId: 'root-compact', turnId: 'compact-turn',
+        conversationId: 'compact-conversation', executionId: 'compact-execution', content: [{ type: 'text', text: 'Work' }] });
+      const sent = (await iterator.next()).value!;
+      query.emit({ type: 'assistant', uuid: 'compact-root-reply', session_id: session.nativeSession.sessionId,
+        parent_tool_use_id: null, user_message_uuid: sent.uuid,
+        message: { id: 'compact-root-assistant', role: 'assistant', content: [
+          { type: 'tool_use', id: 'compact-agent', name: 'Agent', input: { run_in_background: scenario === 'background' } },
+          ...(scenario === 'mixed-tools' ? [{ type: 'tool_use', id: 'other-tool', name: 'Bash', input: { command: 'sleep 10' } }] : []),
+        ] } });
+      const rootResult = await root;
+      query.emit({ type: 'system', subtype: 'task_started', task_id: 'compact-child', tool_use_id: 'compact-agent',
+        task_type: 'local_agent', uuid: 'compact-task-start', session_id: session.nativeSession.sessionId });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      const target = session.activeCompactionTarget!();
+      if (scenario === 'mixed-tools' || scenario === 'background') {
+        assert.equal(target, undefined);
+        await assert.rejects(session.compact!({ commandId: 'blocked-compact', conversationId: 'compact-conversation',
+          executionId: 'compact-execution' }, { nativeInputUuid: '33333333-3333-4333-8333-333333333333',
+          boundary: { markPossiblySent: () => assert.fail('unsupported Compact crossed') } }), /eligible frozen parent/);
+        assert.deepEqual(query.backgroundedTools, []);
+        return;
+      }
+      assert.deepEqual(target, { nativeTurnId: rootResult.nativeTurnId, toolUseIds: ['compact-agent'] });
+      let crossed = 0;
+      let settled = false;
+      const uuid = '33333333-3333-4333-8333-333333333333';
+      if (scenario === 'control-lost') query.backgroundTasks = async () => { throw new Error('control response lost'); };
+      const compact = session.compact!({ commandId: 'compact-active', conversationId: 'compact-conversation',
+        executionId: 'compact-execution' }, { activeParent: target, nativeInputUuid: uuid,
+        boundary: { markPossiblySent: () => { crossed++; } } }).then(result => { settled = true; return result; });
+      const input = (await iterator.next()).value!;
+      assert.equal(input.message.content, '/compact');
+      assert.equal(input.priority, undefined);
+      assert.equal(crossed, 1);
+      assert.deepEqual(query.backgroundedTools, []);
+      const finishParent = () => query.emit({ type: 'result', subtype: 'success', uuid: 'compact-parent-end',
+        session_id: session.nativeSession.sessionId, is_error: false, num_turns: 1, result: 'Parent finished' });
+      if (scenario === 'parent-finished') {
+        finishParent();
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      void iterator.next();
+      if (scenario === 'foreground') {
+        assert.deepEqual(query.backgroundedTools, ['compact-agent']);
+        query.emit({ type: 'system', subtype: 'status', status: 'compacting', uuid: 'ambiguous-active-status',
+          session_id: session.nativeSession.sessionId });
+        await new Promise(resolve => setTimeout(resolve, 10));
+        assert.equal(settled, false, 'active auto-compaction status cannot acknowledge manual input');
+      }
+      if (scenario === 'control-lost') assert.equal((await compact).outcome, 'unknown');
+      if (scenario !== 'parent-finished') finishParent();
+      query.emit({ type: 'system', subtype: 'compact_boundary', uuid: 'exact-manual-boundary',
+        session_id: session.nativeSession.sessionId, compact_metadata: { trigger: 'manual', pre_tokens: 1000 } });
+      if (scenario !== 'control-lost') assert.equal((await compact).outcome, 'accepted');
+      await new Promise(resolve => setTimeout(resolve, 10));
+      assert.equal((await session.readCompactionPresence!(uuid)).presence, 'present');
+      assert.equal(session.hasBackgroundWork!(), true, 'the same child remains pending');
+      assert.equal(query.interrupts, 0);
+      assert.deepEqual(query.stoppedTasks, []);
+      if (scenario === 'parent-finished') assert.deepEqual(query.backgroundedTools, [], 'do not control a finished parent');
+    } finally { await session.close(); }
+  });
+}
+
+for (const mode of ['eligible', 'unsupported', 'older-queue'] as const) {
+  test(`coordinator active Compact ${mode} preserves the ordered conversation lane`, async () => {
+    const database = new DatabaseSync(':memory:');
+    database.exec('PRAGMA foreign_keys=ON'); createNativeAgentSchema(database);
+    const journal = new NativeAgentJournal(database);
+    const query = new FakeClaudeQuery();
+    let prompt!: AsyncIterable<SDKUserMessage>;
+    const claude = new ClaudeNativeAdapter({ acceptanceTimeoutMs: 500, createQuery: (input) => {
+      prompt = input.prompt as AsyncIterable<SDKUserMessage>;
+      query.emit({ type: 'system', subtype: 'init', uuid: 'active-coordinator-init', session_id: input.options?.sessionId });
+      return query as unknown as ClaudeQuery;
+    } });
+    const fixture = new NativeFixtureAdapter({ provider: 'claude-code', manualCompaction: true });
+    const coordinator = new NativeAgentCoordinator({ journal, providers: [{
+      providerInstanceId: 'claude-local', provider: 'claude-code', label: 'Claude', adapter: {
+        probe: async id => { const probe = await fixture.probe(id); return { ...probe, capabilities: {
+          ...probe.capabilities!, compaction: { ...probe.capabilities!.compaction,
+            ...(mode === 'unsupported' ? {} : { activeParent: 'background-native-agent' as const }) },
+        } }; }, listModels: id => fixture.listModels(id), openSession: input => claude.openSession(input),
+      },
+    }] });
+    const until = async (condition: () => boolean) => {
+      for (let i = 0; i < 200; i++) { if (condition()) return; await new Promise(resolve => setTimeout(resolve, 5)); }
+      assert.fail('Active Compact coordinator did not settle');
+    };
+    try {
+      await coordinator.initialize();
+      const { conversationId } = await coordinator.createConversation({ commandId: 'create-active-compact',
+        providerInstanceId: 'claude-local', cwd: '/workspace/remux', model: 'fixture-native-v1', access: 'read-only' });
+      const send = (id: string) => { const runtime = coordinator.projector.runtimeResource(conversationId)!;
+        return coordinator.sendMessage({ commandId: id, clientMessageId: `client-${id}`, conversationId,
+          providerInstanceId: runtime.providerInstanceId, model: runtime.composer.nextTurn.model,
+          effort: runtime.composer.nextTurn.effort, access: runtime.composer.nextTurn.access,
+          configurationRevision: runtime.composer.revision, delivery: 'queue', content: [{ type: 'text', text: id }] }); };
+      const first = send('active-root');
+      await until(() => Boolean(prompt));
+      const iterator = prompt[Symbol.asyncIterator]();
+      const rootInput = (await iterator.next()).value!;
+      const sessionId = journal.nativeSession(journal.conversation(conversationId)!.rootExecutionId)!.sessionId;
+      query.emit({ type: 'assistant', uuid: 'active-root-reply', session_id: sessionId,
+        parent_tool_use_id: null, user_message_uuid: rootInput.uuid,
+        message: { id: 'active-root-assistant', role: 'assistant', content: [
+          { type: 'tool_use', id: 'active-agent', name: 'Agent', input: { run_in_background: false } },
+        ] } });
+      const root = await first;
+      query.emit({ type: 'system', subtype: 'task_started', task_id: 'active-child', tool_use_id: 'active-agent',
+        task_type: 'local_agent', uuid: 'active-task-start', session_id: sessionId });
+      await until(() => journal.executionsForConversation(conversationId).some(e => e.ownership === 'native'));
+      if (mode === 'older-queue') await send('older-message');
+      const compact = await coordinator.compactConversation({ commandId: 'active-manual-compact', conversationId });
+      assert.equal(compact.delivery, 'queued', 'receipt describes durable admission');
+      if (mode !== 'eligible') {
+        await new Promise(resolve => setTimeout(resolve, 20));
+        assert.equal(journal.compactionOperation(compact.operationId)?.state, 'queued');
+        assert.equal(journal.runtimeCompaction(conversationId, 'native-auto').pendingPhase, 'queued');
+        assert.equal(database.prepare('SELECT 1 FROM delivery_attempts WHERE command_id=?').get('active-manual-compact'), undefined);
+        assert.deepEqual(query.backgroundedTools, []);
+      } else {
+        const input = (await iterator.next()).value!;
+        assert.equal(input.message.content, '/compact');
+        assert.equal(journal.runtimeCompaction(conversationId, 'native-auto').pendingPhase, 'requested');
+        const row = database.prepare('SELECT recovery_payload_json FROM delivery_attempts WHERE command_id=?').get('active-manual-compact');
+        assert.deepEqual(JSON.parse(String(row?.recovery_payload_json)).activeParent.toolUseIds, ['active-agent']);
+        await send('after-compact');
+        assert.equal(journal.queuedMessages(conversationId).length, 1);
+        void iterator.next();
+        assert.deepEqual(query.backgroundedTools, ['active-agent']);
+        query.emit({ type: 'system', subtype: 'compact_boundary', uuid: 'automatic-before-manual', session_id: sessionId,
+          compact_metadata: { trigger: 'auto', pre_tokens: 1000 } });
+        query.emit({ type: 'result', subtype: 'success', uuid: 'active-parent-end', session_id: sessionId,
+          is_error: false, num_turns: 1, result: 'Parent finished' });
+        query.emit({ type: 'system', subtype: 'status', status: 'compacting', uuid: 'active-compact-status', session_id: sessionId });
+        await until(() => journal.runtimeCompaction(conversationId, 'native-auto').pendingPhase === 'compacting');
+        assert.equal(journal.queuedMessages(conversationId).length, 1, 'messages stay behind native compaction');
+        assert.equal(journal.turn(root.turnId)?.state, 'completed');
+        assert.ok(journal.compactionControlEvents(conversationId).some(event => event.trigger === 'automatic'),
+          'an automatic boundary staged during manual delivery keeps its native trigger');
+        query.emit({ type: 'system', subtype: 'compact_boundary', uuid: 'delayed-automatic-boundary', session_id: sessionId,
+          compact_metadata: { trigger: 'auto', pre_tokens: 1000 } });
+        await new Promise(resolve => setTimeout(resolve, 10));
+        assert.equal(journal.compactionOperation(compact.operationId)?.state, 'running',
+          'an automatic observation after acceptance must not complete the manual operation');
+        assert.equal(journal.executionsForConversation(conversationId).find(e => e.ownership === 'native')?.state, 'running');
+      }
+      assert.equal(query.interrupts, 0);
+      assert.deepEqual(query.stoppedTasks, []);
+    } finally { await coordinator.close(); journal.close(); }
+  });
+}
+
 class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
   mcpServers: unknown;
   async setMcpServers(servers: unknown) {
@@ -2233,6 +2468,8 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
   readonly modelChanges: string[] = [];
   readonly flags: unknown[] = [];
   readonly stoppedTasks: string[] = [];
+  readonly backgroundedTools: string[] = [];
+  async backgroundTasks(toolUseId: string) { this.backgroundedTools.push(toolUseId); return true; }
   readonly account: ClaudeAccountInfo;
   interrupts = 0;
   nextModelError: Error | undefined;

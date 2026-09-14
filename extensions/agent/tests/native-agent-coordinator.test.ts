@@ -3019,3 +3019,42 @@ class AuthenticationFixtureAdapter implements ProviderAdapter {
     return { accepted: true as const };
   }
 }
+
+test('historical compaction imports cannot hide a running Compact or release queued input', async () => {
+  const journal = createJournal();
+  const adapter = new NativeFixtureAdapter({ manualCompaction: true, compactDelayMs: 250 });
+  const coordinator = new NativeAgentCoordinator({ journal, providers: [{
+    providerInstanceId: 'fixture-local', provider: 'fixture', label: 'Fixture', adapter,
+  }] });
+  try {
+    await coordinator.initialize();
+    const created = await coordinator.createConversation({ commandId: 'historical-compact-create',
+      providerInstanceId: 'fixture-local', cwd: '/workspace/remux', model: 'fixture-native-v1', access: 'workspace-write' });
+    const compact = await coordinator.compactConversation({ commandId: 'historical-compact',
+      conversationId: created.conversationId });
+    const session = adapter.opened[0]!;
+    const operation = journal.compactionOperation(compact.operationId)!;
+    journal.appendProviderEvents([{
+      contractVersion: PROVIDER_RUNTIME_CONTRACT_VERSION, eventId: 'import-old-compaction', provider: 'fixture',
+      scope: { kind: 'conversation', providerInstanceId: 'fixture-local',
+        conversationId: created.conversationId, executionId: session.openedWith.executionId },
+      native: { sessionId: session.nativeSession.sessionId, kind: 'control/contextCompaction/completed' },
+      observedAt: operation.createdAt + 1,
+      event: { type: 'context.compaction.completed', trigger: 'automatic', operationId: 'historical-completed',
+        beforeTokens: null, afterTokens: null },
+    }]);
+    assert.equal(journal.latestCompactionOperation(created.conversationId)?.operationId, 'historical-completed');
+    assert.equal(coordinator.projector.runtimeResource(created.conversationId)?.compaction.operation.state, 'running');
+    await assert.rejects(coordinator.compactConversation({ commandId: 'duplicate-during-import',
+      conversationId: created.conversationId }), /already pending/);
+    const sent = await coordinator.sendMessage(configuredMessage(coordinator, {
+      commandId: 'after-historical-import', conversationId: created.conversationId, clientMessageId: 'after-history-client',
+      content: [{ type: 'text', text: 'Wait until actual compaction completes.' }],
+    }));
+    assert.equal(sent.delivery, 'queued');
+    assert.equal(session.providerDispatchCount, 0);
+    await waitFor(() => journal.turn(sent.turnId)?.state === 'completed');
+    assert.equal(session.providerDispatchCount, 1);
+    assert.equal(journal.compactionOperation(compact.operationId)?.state, 'completed');
+  } finally { await coordinator.close(); journal.close(); }
+});

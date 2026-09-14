@@ -174,9 +174,10 @@ function UserActions({ conversationId, pathEntryId, segment, strandId, turnId }:
       <button
         aria-label="Edit message"
         className="codex-user-action-button"
-        disabled={working || loadingEdit || !canForkNative || !summary}
+        disabled={working || loadingEdit || !canForkNative || !summary || segment.branchUnavailable}
+        title={segment.branchUnavailable ? 'This input has no native branch boundary.' : undefined}
         onClick={() => {
-          if (working || loadingEdit || !canForkNative || !summary) return;
+          if (working || loadingEdit || !canForkNative || !summary || segment.branchUnavailable) return;
           setLoadingEdit(true);
           void hydrateUserInput(segment)
             .then((parts) => {

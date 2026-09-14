@@ -22,7 +22,7 @@ import type {
   StartProviderTurnInput,
   SteerProviderTurnInput,
 } from '../../shared/provider-runtime.ts';
-import type { CompactDispatchContext, DispatchBoundary, ProviderDispatchResult,
+import type { ActiveCompactionTarget, CompactDispatchContext, DispatchBoundary, ProviderDispatchResult,
   ProviderPresenceRead, SteerDispatchContext } from './native-runtime/delivery-contract.ts';
 
 export type ProviderCommandAcceptance = { accepted: true; nativeTurnId?: string };
@@ -94,11 +94,14 @@ export interface ProviderSession {
   startTurn(input: StartProviderTurnInput, boundary?: DispatchBoundary): Promise<ProviderDispatchResult>;
   readTurnPresence?(nativeClientMessageId: string): Promise<ProviderPresenceRead>;
   steer?(input: SteerProviderTurnInput, context: SteerDispatchContext): Promise<ProviderDispatchResult>;
+  sendActiveInput?(input: SteerProviderTurnInput, context: SteerDispatchContext): Promise<ProviderDispatchResult>;
   interrupt(input: InterruptProviderTurnInput): Promise<ProviderCommandAcceptance>;
   interruptChild?(input: InterruptProviderChildInput): Promise<ProviderCommandAcceptance>;
   snapshotChild?(
     input: ProviderSnapshotRequest & { childExecutionId: string; nativeSessionId: string },
   ): Promise<ProviderSnapshot>;
+  /** Exact native foreground agents that can be backgrounded without interrupting the parent. */
+  activeCompactionTarget?(): ActiveCompactionTarget | undefined;
   compact?(input: CompactProviderSessionInput, context: CompactDispatchContext): Promise<ProviderDispatchResult>;
   /** Process-local, correlated evidence for a delayed manual Compact response. */
   readCompactionPresence?(nativeInputUuid: string): Promise<ProviderPresenceRead>;

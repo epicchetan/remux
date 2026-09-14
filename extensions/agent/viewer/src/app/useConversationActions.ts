@@ -129,9 +129,15 @@ export function useConversationActions(options: {
 
   const finishRecoveredSubmission = useCallback(async (
     record: PendingMessageSubmission,
-    sent: { turnId: string; delivery: 'sent' | 'queued' | 'steered' },
+    sent: { turnId: string; delivery: 'sent' | 'queued' | 'steered'; deliveryError?: string },
   ) => {
     if (!record.conversationId || !record.message) return;
+    if (sent.deliveryError) {
+      discardTranscriptUserMessage(record.clientMessageId);
+      clearPendingMessageSubmission(ownerOperationId(record));
+      if (ownsRecord(record)) useComposerStore.setState({ submissionError: sent.deliveryError });
+      throw new Error(sent.deliveryError);
+    }
     if (sent.delivery === 'sent') {
       trackTranscriptUserMessage(record.conversationId, record.clientMessageId, sent.turnId);
     } else {
