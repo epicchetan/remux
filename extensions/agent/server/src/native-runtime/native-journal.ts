@@ -2328,7 +2328,7 @@ export class NativeAgentJournal {
     const envelope = this.canonicalizeTurnBlockPlacement(
       this.canonicalizeCompactionEnvelope(candidate),
     );
-    this.ensureNativeChildTurn(envelope);
+    this.ensureNativeProviderTurn(envelope);
     if (this.hasCanonicalCompactionState(envelope)) {
       this.reconcileCompactionPath(envelope);
       return false;
@@ -3892,6 +3892,15 @@ export class NativeAgentJournal {
             now,
           );
           this.bindNativeChildHandle(child, now);
+          if (child.ownership === 'native' && child.provider === 'claude-code' &&
+              envelope.native.kind === 'task/resumed' && block.payload.executionState === 'running') {
+            // Claude resumes the same task/card instead of opening a separate
+            // child turn. A new native start explicitly supersedes its terminal.
+            this.database.prepare(`
+              UPDATE executions SET state = 'running', outcome = NULL, completed_at = NULL
+              WHERE execution_id = ? AND updated_at <= ?
+            `).run(child.executionId, now);
+          }
         }
         if (!envelope.native.position) {
           this.database.prepare(`
@@ -4059,20 +4068,27 @@ export class NativeAgentJournal {
     );
   }
 
-  private ensureNativeChildTurn(envelope: ProviderEventEnvelope) {
+  private ensureNativeProviderTurn(envelope: ProviderEventEnvelope) {
     if (envelope.scope.kind !== 'turn' || this.turn(envelope.scope.turnId)) return;
     const execution = this.execution(envelope.scope.executionId);
-    if (!execution || execution.ownership !== 'native' ||
+    const autonomous = envelope.event.type === 'turn.started' && envelope.event.origin === 'native';
+    if (!execution || (execution.ownership !== 'native' && !autonomous) ||
         execution.conversationId !== envelope.scope.conversationId) return;
     const conversation = this.conversation(execution.conversationId);
     if (!conversation) return;
-    const content = envelope.event.type === 'user.message' ? envelope.event.content : [];
+    if (autonomous && execution.ownership === 'root' &&
+        (conversation.rootExecutionId !== execution.executionId || conversation.activeTurnId ||
+         this.hasUnresolvedRootDelivery(conversation.conversationId))) {
+      throw new Error('Native autonomous turn conflicts with the current root execution or delivery.');
+    }
+    const content: readonly UserContentPart[] = envelope.event.type === 'user.message' ? envelope.event.content
+      : autonomous ? [{ type: 'text', text: 'Background follow-up' }] : [];
     this.createTurn({
       turnId: envelope.scope.turnId,
       conversationId: execution.conversationId,
       executionId: execution.executionId,
-      clientMessageId: `native-child-message:${envelope.scope.turnId}`,
-      commandId: `native-child-command:${envelope.scope.turnId}`,
+      clientMessageId: `${autonomous ? 'native-followup' : 'native-child'}-message:${envelope.scope.turnId}`,
+      commandId: `${autonomous ? 'native-followup' : 'native-child'}-command:${envelope.scope.turnId}`,
       content,
       model: execution.model ?? conversation.model,
       ...(execution.effort ? { effort: execution.effort } : {}),

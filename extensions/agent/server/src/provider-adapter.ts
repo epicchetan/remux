@@ -86,6 +86,11 @@ export interface ProviderSession {
   readonly nativeSession: NativeSessionRef;
   readonly events: AsyncIterable<ProviderEventEnvelope>;
 
+  /** Called only after the coordinator persists and authorizes the native session. */
+  connectFederation?(): Promise<void>;
+  /** Synchronous process activity guard, including work between root turns. */
+  hasBackgroundWork?(): boolean;
+
   startTurn(input: StartProviderTurnInput, boundary?: DispatchBoundary): Promise<ProviderDispatchResult>;
   readTurnPresence?(nativeClientMessageId: string): Promise<ProviderPresenceRead>;
   steer?(input: SteerProviderTurnInput, context: SteerDispatchContext): Promise<ProviderDispatchResult>;

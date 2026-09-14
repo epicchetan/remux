@@ -3824,6 +3824,7 @@ export class NativeAgentCoordinator {
       executionId: input.executionId,
       providerInstanceId: input.registration.providerInstanceId,
     });
+    let openedSession: ProviderSession | undefined;
     try {
       const execution = this.journal.execution(input.executionId);
       const nativeTurnBindings = this.journal.turnsForExecution(input.executionId)
@@ -3893,6 +3894,7 @@ export class NativeAgentCoordinator {
           } : {}),
         }),
       );
+      openedSession = session;
       const capabilities = this.requireCapabilities(input.registration.providerInstanceId);
       this.journal.bindNativeSession({
         executionId: input.executionId,
@@ -3901,6 +3903,7 @@ export class NativeAgentCoordinator {
         now: this.now(),
       });
       binding?.bindNativeSession?.(session.nativeSession);
+      await session.connectFederation?.();
       const previous = this.federationBindings.get(input.executionId);
       previous?.revoke?.();
       if (binding) {
@@ -3912,6 +3915,7 @@ export class NativeAgentCoordinator {
       return session;
     } catch (error) {
       binding?.revoke?.();
+      await openedSession?.close().catch(() => undefined);
       throw error;
     }
   }
@@ -4023,22 +4027,30 @@ export class NativeAgentCoordinator {
     this.sessionLastUsedAt.set(executionId, this.now());
   }
 
+  private hasSessionWork(executionId: string, session: ProviderSession) {
+    // A process-local level is authoritative after restart, unlike stale
+    // persisted child rows. Other providers fall back to their child journal.
+    return session.hasBackgroundWork?.() ?? this.journal.childExecutions(executionId)
+      .some(child => child.ownership === 'native' && ['running', 'recovering'].includes(child.state));
+  }
+
   private async releasePassiveHistorySession(
     conversation: JournalConversation,
     session: ProviderSession,
   ) {
     const refreshed = this.journal.conversation(conversation.conversationId);
     const compaction = this.journal.latestCompactionOperation(conversation.conversationId);
-    if (!refreshed || refreshed.activeTurnId ||
+    if (!refreshed || refreshed.activeTurnId || this.hasSessionWork(conversation.rootExecutionId, session) ||
         this.journal.queuedEntries(conversation.conversationId).length > 0 ||
         compaction?.state === 'running') return;
-    await this.detachAndCloseSession(conversation.rootExecutionId, session);
+    await this.detachAndCloseSession(conversation.rootExecutionId, session, 'passive-history');
   }
 
   private async evictIdleSessions() {
     if (this.closed || this.sessions.size === 0) return;
     const now = this.now();
     const candidates = [...this.sessions.entries()].flatMap(([executionId, session]) => {
+      if (this.hasSessionWork(executionId, session)) return [];
       if (this.hydrationJobs.has(executionId) || this.openingSessions.has(executionId)) return [];
       const execution = this.journal.execution(executionId);
       if (!execution || execution.state === 'running' || execution.state === 'recovering') return [];
@@ -4060,16 +4072,18 @@ export class NativeAgentCoordinator {
       }
     }
     await Promise.allSettled([...selected].map(([executionId, session]) =>
-      this.detachAndCloseSession(executionId, session)));
+      this.detachAndCloseSession(executionId, session, 'idle-eviction')));
   }
 
-  private async detachAndCloseSession(executionId: string, session: ProviderSession) {
+  private async detachAndCloseSession(executionId: string, session: ProviderSession, reason = 'explicit') {
     if (this.sessions.get(executionId) !== session) return;
+    if (reason !== 'explicit' && this.hasSessionWork(executionId, session)) return;
     this.sessions.delete(executionId);
     this.sessionLastUsedAt.delete(executionId);
     this.federationBindings.get(executionId)?.revoke?.();
     this.federationBindings.delete(executionId);
     await session.close().catch(() => undefined);
+    this.publishDiagnostic(`session.close.${reason}`, Date.now(), 'completed', { executionId });
   }
 
   private async consumeEvents(conversationId: string, executionId: string, session: ProviderSession) {

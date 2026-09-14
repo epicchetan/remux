@@ -517,7 +517,7 @@ export type ProviderEvent =
   | { type: 'session.bound'; resumed: boolean }
   | { type: 'session.materialized' }
   | { type: 'session.health'; state: 'ready' | 'recovering' | 'lost'; message?: string }
-  | { type: 'turn.started' }
+  | { type: 'turn.started'; origin?: 'native' }
   | { type: 'turn.status'; state: 'running' | 'recovering' | 'idle' }
   | { type: 'turn.completed'; outcome: ProviderTurnOutcome; error?: DisplayError }
   | { type: 'user.message'; content: readonly UserContentPart[] }
@@ -1444,8 +1444,8 @@ function parseProviderEvent(
       };
     }
     case 'turn.started':
-      assertExactKeys(record, path, ['type']);
-      return { type };
+      assertAllowedKeys(record, path, ['type', 'origin']);
+      return { type, ...(record.origin === undefined ? {} : { origin: oneOf(record.origin, ['native'], `${path}.origin`) }) };
     case 'turn.status':
       assertExactKeys(record, path, ['type', 'state']);
       return { type, state: oneOf(record.state, ['running', 'recovering', 'idle'], `${path}.state`) };

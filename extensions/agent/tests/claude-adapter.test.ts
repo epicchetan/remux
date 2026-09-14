@@ -365,7 +365,9 @@ test('Claude Agent SDK session preserves the native harness, MCP scope, and sema
     assert.equal(options.env?.REMUX_FEDERATION_MCP_BEARER_TOKEN, undefined);
     assert.equal(options.env?.CLAUDE_CONFIG_DIR, '/tmp/claude-config');
     assert.equal(options.env?.CLAUDE_AGENT_SDK_CLIENT_APP, 'remux-agent/1');
-    assert.deepEqual(options.mcpServers, {
+    assert.equal(options.mcpServers, undefined);
+    await session.connectFederation();
+    assert.deepEqual(invocation.query.mcpServers, {
       'remux-federation': {
         type: 'http',
         url: 'http://127.0.0.1:4242/mcp',
@@ -2095,6 +2097,12 @@ test('Claude preparation failure dispatches no prompt and the next command reass
 });
 
 class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
+  mcpServers: unknown;
+  async setMcpServers(servers: unknown) {
+    this.mcpServers = servers;
+    return { added: ['remux-federation'], removed: [], errors: {} };
+  }
+  async mcpServerStatus() { return [{ name: 'remux-federation', status: 'connected' }]; }
   private readonly values: SDKMessage[] = [];
   private readonly waiters: Array<(result: IteratorResult<SDKMessage>) => void> = [];
   private closed = false;

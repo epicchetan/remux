@@ -548,6 +548,12 @@ export class ClaudeProviderSession implements ProviderSession {
   private readonly toolByMessageBlock = new Map<string, string>();
   private readonly assistantBlocksByMessage = new Map<string, ClaudeAssistantBlockRef[]>();
   private readonly childByTask = new Map<string, string>();
+  private readonly childOwners = new Map<string, { turnId: string; nativeTurnId: string }>();
+  private backgroundTasks = new Set<string>();
+  private backgroundLevelSeen = false;
+  private nativeRunning = false;
+  private readonly settledPromptUuids = new Set<string>();
+  private federationConnected = false;
   private readonly backgroundToolByTask = new Map<string, string>();
   private readonly blocks = new Map<string, ClaudeBlockState>();
   private readonly toolBlockKey = new Map<string, string>();
@@ -624,10 +630,59 @@ export class ClaudeProviderSession implements ProviderSession {
       .filter((cursor): cursor is ClaudeBranchCursor => Boolean(cursor))
       .at(-1);
     this.lastChainEntryUuid = lastCursor?.lastChainEntryUuid;
+    for (const binding of options.input.nativeTurnBindings ?? []) {
+      const cursor = claudeBranchCursor(binding.branchCursor);
+      if (cursor) this.settledPromptUuids.add(cursor.promptUuid);
+    }
+    for (const binding of options.input.nativeChildBindings ?? []) {
+      if (binding.parentExecutionId !== options.input.executionId) continue;
+      this.childByTask.set(binding.nativeThreadId, binding.executionId);
+      this.childOwners.set(binding.nativeThreadId, {
+        turnId: binding.ownerTurnId, nativeTurnId: binding.ownerNativeTurnId,
+      });
+      if (binding.canonicalBlock) {
+        const key = `restored-child\0${binding.executionId}`;
+        this.blocks.set(key, structuredClone(binding.canonicalBlock));
+        this.childBlockKey.set(binding.executionId, key);
+      }
+    }
+  }
+
+  async connectFederation() {
+    const federation = this.openedWith.federation;
+    if (!federation || this.federationConnected) return;
+    const result = await this.query.setMcpServers({
+      [FEDERATION_SERVER_NAME]: {
+        type: 'http', url: federation.endpoint,
+        headers: { Authorization: federation.authorizationHeader },
+        timeout: FEDERATION_TOOL_TIMEOUT_MS, alwaysLoad: true,
+      },
+    });
+    if (result.errors[FEDERATION_SERVER_NAME]) {
+      throw new Error('Claude could not connect to the authorized Remux federation server.');
+    }
+    const status = (await this.query.mcpServerStatus()).find(({ name }) => name === FEDERATION_SERVER_NAME);
+    if (status?.status !== 'connected') {
+      throw new Error('Claude did not establish its authorized Remux federation connection.');
+    }
+    this.federationConnected = true;
+  }
+
+  hasBackgroundWork() {
+    return Boolean(this.activeTurn) || this.nativeRunning || this.backgroundTasks.size > 0;
   }
 
   start(resumed: boolean) {
     this.emit({ type: 'session.bound', resumed }, 'session/bound');
+    // Background jobs belong to the old CLI process, not its saved transcript.
+    for (const binding of this.openedWith.nativeChildBindings ?? []) {
+      if (binding.parentExecutionId !== this.openedWith.executionId || binding.outcome) continue;
+      this.emit({ type: 'child.summary', childExecutionId: binding.executionId,
+        summary: 'The previous Claude process ended. Send a follow-up to resume unfinished work.' },
+      'task/process-ended-summary', binding.ownerTurnId, binding.ownerNativeTurnId, binding.nativeThreadId);
+      this.emit({ type: 'child.completed', childExecutionId: binding.executionId, outcome: 'interrupted' },
+        'task/process-ended', binding.ownerTurnId, binding.ownerNativeTurnId, binding.nativeThreadId);
+    }
     if (this.recoveringAcceptedTurn) {
       this.emit({
         type: 'session.health',
@@ -888,6 +943,7 @@ export class ClaudeProviderSession implements ProviderSession {
             'Claude event stream ended before the manual compaction boundary.');
         }
         this.state = 'lost';
+        this.endBackgroundTasks();
         const diagnostic = this.diagnostics.at(-1);
         this.emit({
           type: 'session.health',
@@ -915,6 +971,7 @@ export class ClaudeProviderSession implements ProviderSession {
         this.query.close();
       }
       this.state = 'lost';
+      this.endBackgroundTasks();
       const diagnostic = this.diagnostics.at(-1);
       const message = diagnostic
         ? `${safeMessage(error)} Last Claude diagnostic: ${diagnostic}`
@@ -942,6 +999,22 @@ export class ClaudeProviderSession implements ProviderSession {
     }
   }
 
+  private endBackgroundTasks() {
+    this.backgroundTasks.clear();
+    this.nativeRunning = false;
+    for (const [taskId, childExecutionId] of this.childByTask) {
+      const owner = this.childOwners.get(taskId);
+      const key = this.childBlockKey.get(childExecutionId);
+      const block = key ? this.blocks.get(key)?.block : undefined;
+      if (!owner || !block || !['running', 'streaming'].includes(block.state)) continue;
+      this.emit({ type: 'child.summary', childExecutionId,
+        summary: 'Claude process ended before this task reported completion. Send a follow-up to resume it.' },
+      'task/process-ended-summary', owner.turnId, owner.nativeTurnId, taskId);
+      this.emit({ type: 'child.completed', childExecutionId, outcome: 'interrupted' },
+        'task/process-ended', owner.turnId, owner.nativeTurnId, taskId);
+    }
+  }
+
   private async handleMessage(message: SDKMessage) {
     const record = message as unknown as Record<string, unknown>;
     const sessionId = stringValue(record.session_id);
@@ -949,6 +1022,7 @@ export class ClaudeProviderSession implements ProviderSession {
       throw new Error('Claude emitted a different native session ID than requested.');
     }
     this.currentEnvelopeUuid = stringValue(record.uuid);
+    this.observeNativeTurn(record);
     const correlatedUserUuid = stringValue(record.user_message_uuid);
     const streamType = stringValue(objectValue(record.event)?.type);
     const partialKinds = new Set(['message_start', 'message_delta', 'message_stop',
@@ -1000,6 +1074,29 @@ export class ClaudeProviderSession implements ProviderSession {
       error: { code, message, retryable: true } });
   }
 
+  private observeNativeTurn(message: Record<string, unknown>) {
+    if (this.activeTurn || this.recoveringAcceptedTurn || message.parent_tool_use_id !== null) return;
+    const stream = objectValue(message.event);
+    if (message.type !== 'assistant' && !(message.type === 'stream_event' && stream?.type === 'message_start')) return;
+    const promptUuid = stringValue(message.user_message_uuid);
+    if (promptUuid && this.settledPromptUuids.has(promptUuid)) return;
+    const identity = promptUuid ?? stringValue(message.uuid) ?? stringValue(objectValue(message.message)?.id);
+    if (!identity) return;
+    const nativeTurnId = stableUuid(`claude-autonomous-turn\0${this.nativeSession.sessionId}\0${identity}`);
+    const turnId = stableUuid(`claude-autonomous\0${this.nativeSession.sessionId}\0${identity}`);
+    this.activeTurn = {
+      turnId, nativeTurnId, assistantText: '',
+      ...(promptUuid ? { promptUuid } : {}),
+      ...(this.lastChainEntryUuid ? { previousChainEntryUuid: this.lastChainEntryUuid } : {}),
+    };
+    this.currentMessageId = undefined;
+    this.lastAssistantMessageId = undefined;
+    this.contextUsage.startTurn();
+    this.latestUsage = { ...this.latestUsage, turn: null, context: null };
+    this.state = 'running';
+    this.emit({ type: 'turn.started', origin: 'native' }, 'turn/native-started', turnId, nativeTurnId);
+  }
+
   private resolvePendingCompactAcceptance(inputUuid: string, code: string, message: string) {
     const pending = this.compactAcceptance;
     if (!pending || pending.inputUuid !== inputUuid || pending.settled) return;
@@ -1012,6 +1109,19 @@ export class ClaudeProviderSession implements ProviderSession {
 
   private handleSystemMessage(message: Record<string, unknown>, sessionId: string | undefined) {
     const subtype = stringValue(message.subtype);
+    if (subtype === 'background_tasks_changed') {
+      this.backgroundLevelSeen = true;
+      this.backgroundTasks = new Set((Array.isArray(message.tasks) ? message.tasks : []).flatMap(value => {
+        const task = objectValue(value);
+        const id = stringValue(task?.task_id);
+        return id && task?.ambient !== true ? [id] : [];
+      }));
+      return;
+    }
+    if (subtype === 'session_state_changed') {
+      this.nativeRunning = message.state !== 'idle';
+      return;
+    }
     if (subtype === 'init') {
       requireClaudeInitSubscription(message.apiKeySource, this.auth);
       this.emit({ type: 'session.materialized' }, 'session/materialized');
@@ -1094,31 +1204,49 @@ export class ClaudeProviderSession implements ProviderSession {
       if (trigger === 'manual' && !this.compactAcceptance) this.manualCompactionOperationId = undefined;
       return;
     }
-    const active = this.activeTurn;
-    if (!active) return;
     const taskId = stringValue(message.task_id);
     if (!taskId) return;
+    if (!this.backgroundLevelSeen && message.ambient !== true && message.skip_transcript !== true) {
+      if (subtype === 'task_started') this.backgroundTasks.add(taskId);
+      if (subtype === 'task_notification' || (subtype === 'task_updated' &&
+          ['completed', 'failed', 'killed'].includes(stringValue(objectValue(message.patch)?.status) ?? ''))) {
+        this.backgroundTasks.delete(taskId);
+      }
+    }
+    if (message.ambient === true || message.skip_transcript === true) return;
     const toolUseId = stringValue(message.tool_use_id)
       ?? this.backgroundToolByTask.get(taskId);
     const linkedTool = toolUseId ? this.tools.get(toolUseId) : undefined;
-    if ((linkedTool && !isClaudeChildTool(linkedTool.name)) ||
+    if ((message.task_type && !['local_agent', 'remote_agent'].includes(String(message.task_type))) ||
+        (linkedTool && !isClaudeChildTool(linkedTool.name)) ||
         this.backgroundToolByTask.has(taskId)) {
       // Claude uses task lifecycle messages for both native subagents and
       // run_in_background tools. The Bash call already owns the visible
       // command row; projecting its task as a child creates a duplicate row
       // and falsely advertises a subagent. Keep only enough identity to
       // suppress the later progress/notification messages.
-      if (toolUseId) this.backgroundToolByTask.set(taskId, toolUseId);
+      this.backgroundToolByTask.set(taskId, toolUseId ?? '');
       return;
     }
+    if (subtype !== 'task_started' && !this.childOwners.has(taskId)) return;
+    const active = this.childOwners.get(taskId) ?? this.activeTurn;
+    if (!active) return;
     const childExecutionId = this.childByTask.get(taskId)
       ?? stableUuid(`claude-child\0${this.nativeSession.sessionId}\0${taskId}`);
     if (subtype === 'task_started') {
+      const existing = this.childByTask.has(taskId);
       this.childByTask.set(taskId, childExecutionId);
+      this.childOwners.set(taskId, { turnId: active.turnId, nativeTurnId: active.nativeTurnId });
       if (toolUseId) {
         const tool = this.tools.get(toolUseId);
         if (tool) this.tools.set(toolUseId, { ...tool, childExecutionId });
       }
+      if (existing) {
+        this.emit({ type: 'child.status', childExecutionId, state: 'running' },
+          'task/resumed', active.turnId, active.nativeTurnId, taskId);
+        return;
+      }
+      const model = stringValue(message.model) ?? stringValue(objectValue(linkedTool?.input)?.model);
       this.emit({
         type: 'child.started',
         child: {
@@ -1126,7 +1254,7 @@ export class ClaudeProviderSession implements ProviderSession {
           ownership: 'native',
           provider: 'claude-code',
           providerInstanceId: this.openedWith.providerInstanceId,
-          model: this.openedWith.model,
+          ...(model ? { model } : {}),
           title: stringValue(message.description) ?? stringValue(message.subagent_type) ?? 'Claude subagent',
           nativeSessionId: taskId,
         },
@@ -1134,6 +1262,9 @@ export class ClaudeProviderSession implements ProviderSession {
       return;
     }
     if (subtype === 'task_progress') {
+      const key = this.childBlockKey.get(childExecutionId);
+      const block = key ? this.blocks.get(key)?.block : undefined;
+      if (block && ['completed', 'failed', 'interrupted'].includes(block.state)) return;
       this.emit({ type: 'child.status', childExecutionId, state: 'running' },
         'task/progress', active.turnId, active.nativeTurnId, taskId);
       const summary = stringValue(message.summary) ?? stringValue(message.description);
@@ -1290,7 +1421,7 @@ export class ClaudeProviderSession implements ProviderSession {
 
   private async handleAssistantMessage(message: Record<string, unknown>) {
     const active = this.activeTurn;
-    if (!active || this.recoveringAcceptedTurn) return;
+    if (!active || this.recoveringAcceptedTurn || message.parent_tool_use_id) return;
     const body = objectValue(message.message);
     const content = Array.isArray(body?.content) ? body.content : [];
     const nativeMessageId = stringValue(body?.id);
@@ -1470,7 +1601,7 @@ export class ClaudeProviderSession implements ProviderSession {
 
   private async handleUserMessage(message: Record<string, unknown>) {
     const active = this.activeTurn;
-    if (!active || this.recoveringAcceptedTurn) return;
+    if (!active || this.recoveringAcceptedTurn || message.parent_tool_use_id) return;
     const body = objectValue(message.message);
     const content = Array.isArray(body?.content) ? body.content : [];
     for (const blockValue of content) {
@@ -1605,6 +1736,7 @@ export class ClaudeProviderSession implements ProviderSession {
         ? { error: { code: 'claude_turn_failed', message: errors.join('\n') || finalText || 'Claude Code turn failed.' } }
         : {}),
     }, 'result/completed', active.turnId, active.nativeTurnId);
+    if (active.promptUuid) this.settledPromptUuids.add(active.promptUuid);
     this.activeTurn = undefined;
     this.interruptRequested = false;
     this.state = 'idle';
@@ -1829,7 +1961,8 @@ export class ClaudeProviderSession implements ProviderSession {
               executionState: 'running' as const,
             };
         const completed = event.type === 'child.completed';
-        const outcome = completed ? event.outcome as 'completed' | 'failed' | 'interrupted' : payload.outcome;
+        const outcome = completed ? event.outcome as 'completed' | 'failed' | 'interrupted'
+          : event.type === 'child.status' && event.state === 'running' ? undefined : payload.outcome;
         const executionState = event.type === 'child.status'
           ? event.state as typeof payload.executionState
           : completed ? outcome === 'completed' ? 'idle' : outcome === 'interrupted' ? 'interrupted' : 'failed'
@@ -1837,12 +1970,12 @@ export class ClaudeProviderSession implements ProviderSession {
         return this.blockEvent(turnId, nativeTurnId, childExecutionId, blockIndex, 'native-child', {
           ...payload,
           executionState,
+          outcome,
           ...(event.type === 'child.summary' && stringValue(event.summary)
             ? { summary: stringValue(event.summary)! } : {}),
-          ...(outcome ? { outcome } : {}),
         }, completed
           ? outcome === 'completed' ? 'completed' : outcome === 'interrupted' ? 'interrupted' : 'failed'
-          : 'running', completed, key);
+          : event.type === 'child.summary' ? previous?.block.state ?? 'running' : 'running', completed, key);
       }
       case 'usage.updated':
         return { type: 'turn.usage-updated', usage: event.usage as never };
@@ -2166,15 +2299,8 @@ function sessionQueryOptions(input: {
       // policy in the SDK's supported hook layer without a shadowed canUseTool
       // callback; the scoped credential and coordinator enforce federation.
       allowedTools: [...FEDERATION_ALLOWED_TOOLS],
-      mcpServers: {
-        [FEDERATION_SERVER_NAME]: {
-          type: 'http',
-          url: input.input.federation.endpoint,
-          headers: { Authorization: input.input.federation.authorizationHeader },
-          timeout: FEDERATION_TOOL_TIMEOUT_MS,
-          alwaysLoad: true,
-        },
-      },
+      // The coordinator binds the credential after openSession returns.
+      // connectFederation then adds this server through the SDK control API.
     } : {}),
     stderr: input.onStderr,
   };
