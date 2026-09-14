@@ -347,6 +347,29 @@ test('Codex command actions become friendly file activity and hide the shell wra
   assert.equal(action.call.presentation.subject, 'src/a.ts');
 });
 
+test('shell descriptions survive projection while command fallbacks stay compact and exact arguments remain accessible', () => {
+  const turn = frame('shell-descriptions', 'root-execution', 'completed', 'Done.');
+  const longCommand = `rg ${'snapshot '.repeat(40)}delivery.rs`;
+  turn.passes = [{ passId: 'pass', ordinal: 0, state: 'completed', blocks: [
+    block('claude', 0, 'tool', {
+      kind: 'tool', tool: { callId: 'claude', name: 'Bash', category: 'shell', title: 'Inspect snapshot delivery' },
+      inputPreview: { command: 'rg snapshot delivery.rs', description: 'Inspect snapshot delivery' },
+    }),
+    block('codex', 1, 'tool', {
+      kind: 'tool', tool: { callId: 'codex', name: 'shell', category: 'shell', title: longCommand },
+      inputPreview: { command: longCommand },
+    }),
+  ] }];
+  const scope = projectNativeExecutionScope('conversation-1', turn, {
+    type: 'executionScope', protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION,
+    turnId: turn.turnId, scopeId: 'root-execution',
+  }, 1);
+  const calls = scope.inferences.flatMap(p => p.blocks.flatMap(b => b.type === 'action' ? [b.call] : []));
+  assert.equal(calls[0]?.presentation.label, 'Inspect snapshot delivery');
+  assert.equal(calls[1]?.presentation.label, `Ran ${longCommand.slice(0, 160)}…`);
+  assert.equal(JSON.parse(calls[1]!.detailPreview!).command, longCommand);
+});
+
 function block(
   blockId: string,
   ordinal: number,

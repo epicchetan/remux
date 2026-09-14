@@ -298,7 +298,7 @@ test('opens a native subagent transcript and stops the child without a child com
 
   await expect(page.getByRole('heading', { name: 'Native subagent', exact: true })).toBeVisible();
   await expect(page.getByText('Compared the implementation with its contract.')).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Ran 1 command', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Ran npm test -- seam', exact: true })).toBeVisible();
   await expect(messageBox(page)).toHaveCount(0);
   await page.getByRole('button', { name: 'Stop', exact: true }).click();
 

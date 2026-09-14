@@ -236,7 +236,7 @@ test('loads normalized native activity and operation details only after disclosu
   await expect.poll(() => collapsedRowGeometryError(workRow)).toBeLessThanOrEqual(0.5);
 });
 
-test('refreshes an open normalized activity frame without flattening its new inference', async ({ page }) => {
+test('refreshes an open activity frame and preserves new reasoning as a visible boundary', async ({ page }) => {
   await page.goto('/viewers/agent/');
   await page.getByRole('textbox', { name: 'Message', exact: true }).fill('Create refreshable work');
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
@@ -247,7 +247,8 @@ test('refreshes an open normalized activity frame without flattening its new inf
   await page.evaluate(() => (window as any).__agentFixture.reviseLatestExecutionScope());
   await expect(page.getByText('Validated the refreshed execution-scope revision.', { exact: false }))
     .toBeVisible();
-  await expect(page.locator('.agent-inference')).toHaveCount(2);
+  await expect(page.locator('.agent-inference')).toHaveCount(1);
+  await expect(page.locator('.agent-reasoning-block')).toHaveCount(2);
   await expect.poll(() => nativeTurnReadCount(page)).toBeGreaterThan(readsBefore);
 });
 
@@ -658,3 +659,32 @@ async function transcriptSyncCount(page: Page) {
 async function latestTranscriptWindowKey(page: Page) {
   return (await transcriptKeys(page)).filter((key) => key.startsWith('agent/transcript:')).at(-1) ?? '';
 }
+
+test('groups streamed tool passes with descriptive labels and keeps open command details stable', async ({ page }) => {
+  await page.goto('/viewers/agent/');
+  await page.getByRole('textbox', { name: 'Message', exact: true }).fill('Create refreshable work');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  await expect(page.getByText('The fixture stream completed.')).toBeVisible();
+  await page.locator('.codex-work-header').click();
+  await page.evaluate(() => (window as any).__agentFixture.appendToolPass('Inspect snapshot delivery'));
+  const summary = page.locator('.agent-action-run-header').filter({ hasText: 'Inspect snapshot delivery' });
+  await expect(summary).toBeVisible();
+  const identity = await summary.getAttribute('data-testid');
+  await summary.click();
+  const group = page.locator('.agent-action-run').filter({ has: page.getByTestId(identity!) });
+  const operation = group.locator('.agent-tool-call-header').filter({ hasText: 'Inspect snapshot delivery' });
+  await operation.click();
+  await expect(group).toContainText('rg snapshot delivery.rs');
+  await page.evaluate(() => (window as any).__agentFixture.appendToolPass('Probe bars', 'failed'));
+  await expect(page.getByTestId(identity!)).toHaveAttribute('aria-expanded', 'true');
+  await expect(page.getByTestId(identity!)).toContainText('1 failed');
+  await expect(group.locator('.agent-tool-call')).toHaveCount(2);
+  await expect(operation).toHaveAttribute('aria-expanded', 'true');
+  await page.evaluate(() => (window as any).__agentFixture.appendToolPass('Check host logs', 'running'));
+  await expect(page.getByTestId(identity!)).toContainText('Running · Check host logs · 1 completed · 1 failed');
+  await expect(group.locator('.agent-tool-call')).toHaveCount(3);
+  await expect(group).toContainText('snapshot found');
+  await expect(operation).toHaveAttribute('aria-expanded', 'true');
+  const overflow = await group.evaluate(node => node.scrollWidth > node.clientWidth + 1);
+  expect(overflow).toBe(false);
+});

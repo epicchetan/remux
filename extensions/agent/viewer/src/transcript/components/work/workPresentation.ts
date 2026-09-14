@@ -1,8 +1,27 @@
 import type { AgentToolCallSummary } from '../../../../../shared/transcript.ts';
 
 export function summarizeActionRun(calls: AgentToolCallSummary[]) {
+  const failed = calls.filter(({ status }) => status === 'failed').length;
+  const interrupted = calls.filter(({ status }) => status === 'interrupted').length;
+  const issues = [failed ? `${failed} failed` : '', interrupted ? `${interrupted} interrupted` : ''].filter(Boolean);
   const active = [...calls].reverse().find(({ status }) => status === 'running');
-  if (active) return activeActionLabel(active);
+  if (active) {
+    const completed = calls.filter(({ status }) => status === 'completed').length;
+    return [activeActionLabel(active), completed ? `${completed} completed` : '', ...issues].filter(Boolean).join(' · ');
+  }
+  if (calls.length === 1) {
+    const call = calls[0]!;
+    const label = call.presentation.label.trim() || 'Tool activity';
+    return call.status === 'failed' ? `Failed · ${label}`
+      : call.status === 'interrupted' ? `Interrupted · ${label}` : label;
+  }
+
+  // Counts describe successful calls; failed and interrupted calls stay explicit.
+  return [summarizeCompletedCalls(calls.filter(({ status }) => status === 'completed')), ...issues]
+    .filter(Boolean).join(' · ') || 'Tool activity';
+}
+
+function summarizeCompletedCalls(calls: AgentToolCallSummary[]) {
 
   const counts = { command: 0, edit: 0, read: 0, search: 0, context: 0, tool: 0 };
   const edited = new Set<string>();
@@ -21,11 +40,11 @@ export function summarizeActionRun(calls: AgentToolCallSummary[]) {
   return joinSummaryParts([
     counts.read ? `Read ${formatCount(counts.read, 'file')}` : null,
     editedSummary,
-    counts.command ? `Ran ${formatCount(counts.command, 'command')}` : null,
+    counts.command ? `Ran ${formatCount(counts.command, 'shell call')}` : null,
     counts.search ? `Searched ${formatCount(counts.search, 'time')}` : null,
     counts.context ? `Used ${formatCount(counts.context, 'context tool')}` : null,
     counts.tool ? `Used ${formatCount(counts.tool, 'tool')}` : null,
-  ]) || 'Tool activity';
+  ]);
 }
 
 export function actionRunActivityKind(calls: AgentToolCallSummary[]) {
@@ -53,7 +72,7 @@ function activeActionLabel(call: AgentToolCallSummary) {
     case 'search':
       return `Searching ${subject || label || 'files'}`;
     case 'command':
-      return `Running ${label || 'command'}`;
+      return `Running · ${label || 'command'}`;
     case 'context':
     case 'tool':
       return `Using ${label || 'tool'}`;

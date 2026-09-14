@@ -253,7 +253,8 @@ test('idle eviction and passive history release preserve provider background wor
     closed: false, sessions: new Map([['parent', session]]), now: () => 700001,
     sessionLastUsedAt: new Map([['parent', 100000]]), hydrationJobs: new Map(), openingSessions: new Map(), federationBindings: new Map(),
     journal: { execution: () => ({ executionId: 'parent', conversationId: 'conversation', state: 'idle' }),
-      conversation: () => conversation, queuedEntries: () => [], pendingCompactionOperation: () => undefined,
+      conversation: () => conversation, queuedEntries: () => [],
+      latestCompactionOperation: () => undefined, pendingCompactionOperation: () => undefined,
       childExecutions: () => [] }, publishDiagnostic: () => {},
   });
   await coordinator.evictIdleSessions();

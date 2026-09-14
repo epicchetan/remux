@@ -845,8 +845,17 @@ function toolLabel(
 ) {
   const running = status === 'running';
   if (category === 'command') {
-    const command = displayShellCommand(jsonString(jsonRecord(input)?.command) ?? title ?? name);
-    return `${running ? 'Running' : 'Ran'} ${command || 'command'}`;
+    const record = jsonRecord(input);
+    const description = jsonString(record?.description)?.trim();
+    if (description) return description;
+    const commandInput = jsonString(record?.command) ?? jsonString(input);
+    const command = displayShellCommand(commandInput ?? title ?? name);
+    if (title?.trim() && title !== name && !/^(?:shell command|run command|bash)$/iu.test(title.trim()) &&
+      commandInput && title.trim() !== command) return title.trim();
+    // Full arguments remain available in the operation disclosure.
+    const compactCommand = command.replace(/\s+/gu, ' ');
+    const preview = compactCommand.slice(0, 160);
+    return `${running ? 'Running' : 'Ran'} ${preview || 'command'}${compactCommand.length > 160 ? '…' : ''}`;
   }
   return title ?? name;
 }

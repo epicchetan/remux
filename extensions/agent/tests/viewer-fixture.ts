@@ -2699,6 +2699,29 @@ export async function installAgentHost(page: Page) {
         failNextTranscriptReads(count = 1) {
           transcriptFailuresRemaining = Math.max(0, Number(count));
         },
+        appendToolPass(label: string, status: 'running' | 'completed' | 'failed' = 'completed') {
+          const turn = turns.at(-1);
+          const work = turn?.segments.find((segment) => segment.type === 'work');
+          const value = work && executionScopes.get(executionScopeKey(turn!.id, work.scopeId));
+          if (!turn || !work || !value) throw new Error('No fixture work is available.');
+          sequence += 1;
+          const id = `tool-pass:${sequence}`;
+          value.inferences.push({
+            id, ordinal: value.inferences.length, state: status === 'running' ? 'running' : 'completed',
+            revision: id, startedAt: Date.now(), completedAt: null, durationMs: null,
+            blocks: [{ id, type: 'action', state: status, revision: id, call: {
+              id, callId: id, name: 'Bash', presentation: { category: 'command', label, subject: null },
+              status, revision: id, detailPreview: 'rg snapshot delivery.rs', outputPreview: 'snapshot found',
+              durationMs: null, childScopeId: null, childBoundary: null, childState: null,
+              childDurationMs: null, childOperationCount: 0, childArtifactCount: 0, hasDetail: true,
+            } }],
+          });
+          value.inferenceOrder.push(id);
+          value.revision = id;
+          value.basisSequence = sequence;
+          touchTurn(turn);
+          invalidateTranscript(turn.id, 'runtimeEvent', true);
+        },
         reviseLatestExecutionScope() {
           const turn = turns.at(-1);
           const work = turn?.segments.find((segment) => segment.type === 'work');

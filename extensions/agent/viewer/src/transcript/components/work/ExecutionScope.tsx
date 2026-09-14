@@ -13,8 +13,6 @@ import {
   executionScopeResourceKey,
   operationDetailResourceKey,
   type AgentExecutionScopeResource,
-  type AgentInferenceBlock,
-  type AgentInferenceTrace,
   type AgentToolCallSummary,
   type AgentExecutionArtifactReference,
 } from '../../../../../shared/transcript.ts';
@@ -28,6 +26,7 @@ import { LiveActivity } from './LiveActivity.tsx';
 import { formatWorkDuration } from './workDuration.ts';
 import { executionScopeIsWaitingForContent } from './workActivityState.ts';
 import { actionRunActivityKind, summarizeActionRun } from './workPresentation.ts';
+import { scopeTraceItems, type ActionTraceItem } from './workTrace.ts';
 
 export function ExecutionScopeContent({
   conversationId,
@@ -126,17 +125,14 @@ function ExecutionScopeBody({
       ref={scopeRef}
     >
       <div className="agent-inference-list">
-        {value.inferences.map((inference) => (
-          <InferenceTrace
-            conversationId={conversationId}
-            inference={inference}
-            key={inference.id}
-            laneWidth={scopeWidth}
-            scopeId={value.scopeId}
-            turnId={turnId}
-            workKey={workKey}
-          />
-        ))}
+        <ScopeTrace
+          conversationId={conversationId}
+          items={scopeTraceItems(value.scopeId, value.inferences)}
+          laneWidth={scopeWidth}
+          scopeId={value.scopeId}
+          turnId={turnId}
+          workKey={workKey}
+        />
       </div>
       {value.window.hasEarlier && firstInferenceId ? (
         <button
@@ -164,25 +160,24 @@ function ExecutionScopeBody({
   );
 }
 
-function InferenceTrace({
+function ScopeTrace({
   conversationId,
-  inference,
+  items,
   laneWidth,
   scopeId,
   turnId,
   workKey,
 }: {
   conversationId: string;
-  inference: AgentInferenceTrace;
+  items: ActionTraceItem[];
   laneWidth: number;
   scopeId: string;
   turnId: string;
   workKey: string;
 }) {
-  const items = inferenceTraceItems(scopeId, inference.blocks);
   const actionKeys = items.filter((item) => item.kind === 'actions').map((item) => item.key);
   return (
-    <section className="agent-inference" data-state={inference.state}>
+    <section className="agent-inference">
       {items.map((item) => {
         if (item.kind === 'text') {
           if (item.block.type === 'notice' && item.block.code === 'context-compaction') {
@@ -255,46 +250,6 @@ function InferenceTrace({
       })}
     </section>
   );
-}
-
-type ActionTraceItem =
-  | { kind: 'text'; block: Extract<AgentInferenceBlock, { type: 'reasoning' | 'commentary' | 'assistantText' | 'notice' }> }
-  | { kind: 'actions'; key: string; calls: AgentToolCallSummary[] }
-  | { kind: 'scope'; call: AgentToolCallSummary };
-
-function inferenceTraceItems(
-  scopeId: string,
-  blocks: AgentInferenceBlock[],
-): ActionTraceItem[] {
-  const items: ActionTraceItem[] = [];
-  let pending: AgentToolCallSummary[] = [];
-  let runIndex = 0;
-  const flush = () => {
-    if (!pending.length) return;
-    items.push({
-      kind: 'actions',
-      key: `action-run:${scopeId}:${pending[0]!.id}:${pending.at(-1)!.id}:${runIndex}`,
-      calls: pending,
-    });
-    pending = [];
-    runIndex += 1;
-  };
-  for (const block of blocks) {
-    if (block.type !== 'action') {
-      flush();
-      items.push({ kind: 'text', block });
-      continue;
-    }
-    const call = block.call;
-    if (call.childScopeId) {
-      flush();
-      items.push({ kind: 'scope', call });
-      continue;
-    }
-    pending.push(call);
-  }
-  flush();
-  return items;
 }
 
 function actionRunState(calls: AgentToolCallSummary[]) {
