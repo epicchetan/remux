@@ -62,7 +62,7 @@ import type {
   ProviderSession,
 } from '../../provider-adapter.ts';
 import { ProviderEventStream } from '../../provider-adapter.ts';
-import type { CompactDispatchContext, DispatchBoundary,
+import type { CompactDispatchContext, DispatchBoundary, ProviderAcceptanceEvidence,
   ProviderDispatchResult } from '../../native-runtime/delivery-contract.ts';
 import {
   NativeSessionOwnershipRegistry,
@@ -569,6 +569,7 @@ export class ClaudeProviderSession implements ProviderSession {
   }>();
   private fileChangeSequence = 0;
   private sequence = 0;
+  private messageSequence = 0;
   private currentEnvelopeUuid: string | undefined;
   private currentMessageId: string | undefined;
   private lastAssistantMessageId: string | undefined;
@@ -593,6 +594,7 @@ export class ClaudeProviderSession implements ProviderSession {
   private compactAcceptance?: { inputUuid: string; watermark: number; yielded: boolean; settled: boolean;
     resolve: (result: ProviderDispatchResult) => void; timeout: ReturnType<typeof setTimeout> };
   private readonly seenCompactionBoundaries = new Set<string>();
+  private readonly compactionEvidence = new Map<string, ProviderAcceptanceEvidence>();
   private readonly processingEvidence = new Map<string, import('../../native-runtime/delivery-contract.ts').ProviderAcceptanceEvidence>();
   private readonly acceptanceTimeoutMs: number;
   private closed = false;
@@ -669,7 +671,8 @@ export class ClaudeProviderSession implements ProviderSession {
   }
 
   hasBackgroundWork() {
-    return Boolean(this.activeTurn) || this.nativeRunning || this.backgroundTasks.size > 0;
+    return Boolean(this.activeTurn || this.manualCompactionOperationId) ||
+      this.nativeRunning || this.backgroundTasks.size > 0;
   }
 
   start(resumed: boolean) {
@@ -788,6 +791,12 @@ export class ClaudeProviderSession implements ProviderSession {
       : { presence: 'unknown' as const, reason: 'Claude history does not prove root processing.' };
   }
 
+  async readCompactionPresence(nativeInputUuid: string) {
+    const evidence = this.compactionEvidence.get(nativeInputUuid);
+    return evidence ? { presence: 'present' as const, evidence }
+      : { presence: 'unknown' as const, reason: 'No correlated Compact response in this process.' };
+  }
+
   async interruptChild(unparsed: InterruptProviderChildInput): Promise<ProviderCommandAcceptance> {
     this.assertOpen();
     const input = parseInterruptProviderChildInput(unparsed);
@@ -817,6 +826,7 @@ export class ClaudeProviderSession implements ProviderSession {
     return this.onceCommand(input.commandId, { ...input, nativeInputUuid }, async () => {
       if (this.activeTurn) throw new Error('Claude provider session is busy.');
       if (this.compactAcceptance) throw new Error('Claude already has an unresolved manual Compact delivery.');
+      if (this.manualCompactionOperationId) throw new Error('Claude manual compaction is still running.');
       const commands = await this.query.supportedCommands();
       if (!commands.some(({ name, aliases }) => name === 'compact' || aliases?.includes('compact'))) {
         throw new Error('Claude Code did not advertise the native /compact command.');
@@ -826,7 +836,7 @@ export class ClaudeProviderSession implements ProviderSession {
       const acceptance = new Promise<ProviderDispatchResult>((resolve) => {
         acceptanceTimeout = setTimeout(() => this.resolvePendingCompactAcceptance(nativeInputUuid,
           'claude_compact_acceptance_timeout',
-          'Claude did not emit a correlated manual compaction boundary before the delivery timeout.'),
+          'Claude did not acknowledge manual compaction before the delivery timeout.'),
         this.acceptanceTimeoutMs);
         acceptanceTimeout.unref?.();
         this.compactAcceptance = { inputUuid: nativeInputUuid,
@@ -841,7 +851,7 @@ export class ClaudeProviderSession implements ProviderSession {
         }, () => {
           const pending = this.compactAcceptance;
           if (pending?.inputUuid === nativeInputUuid) {
-            pending.watermark = this.sequence;
+            pending.watermark = this.messageSequence;
             pending.yielded = true;
           }
           context.boundary.markPossiblySent(this.nativeSession.sessionId, this.processGeneration);
@@ -1016,6 +1026,7 @@ export class ClaudeProviderSession implements ProviderSession {
   }
 
   private async handleMessage(message: SDKMessage) {
+    this.messageSequence += 1;
     const record = message as unknown as Record<string, unknown>;
     const sessionId = stringValue(record.session_id);
     if (sessionId && sessionId !== this.nativeSession.sessionId) {
@@ -1107,6 +1118,19 @@ export class ClaudeProviderSession implements ProviderSession {
       error: { code, message, retryable: true } });
   }
 
+  private acceptPendingCompact(evidence: ProviderAcceptanceEvidence) {
+    const pending = this.compactAcceptance;
+    if (!pending) return;
+    this.compactionEvidence.set(pending.inputUuid, evidence);
+    while (this.compactionEvidence.size > 32) {
+      this.compactionEvidence.delete(this.compactionEvidence.keys().next().value!);
+    }
+    this.compactAcceptance = undefined;
+    clearTimeout(pending.timeout);
+    // Preserve late evidence even if the dispatch promise already timed out.
+    pending.resolve({ accepted: true, outcome: 'accepted', evidence });
+  }
+
   private handleSystemMessage(message: Record<string, unknown>, sessionId: string | undefined) {
     const subtype = stringValue(message.subtype);
     if (subtype === 'background_tasks_changed') {
@@ -1134,13 +1158,31 @@ export class ClaudeProviderSession implements ProviderSession {
       }, 'system/init');
       return;
     }
-    if (subtype === 'status' && message.compact_result === 'failed') {
+    if (subtype === 'status' && (message.status === 'compacting' || message.compact_result === 'failed')) {
       if (message.parent_tool_use_id) return;
       // SDK status UUIDs are the only replay identity. A malformed UUID-less
       // status is a distinct observation because its content cannot prove replay.
-      const statusIdentity = this.currentEnvelopeUuid ?? `missing-uuid-observation:${this.sequence + 1}`;
+      const statusIdentity = this.currentEnvelopeUuid ?? `missing-uuid-observation:${this.messageSequence}`;
       if (this.settledCompactionStatuses.has(statusIdentity)) return;
       this.rememberSettledCompactionStatus(statusIdentity);
+      const pending = this.compactAcceptance;
+      if (pending?.yielded && this.messageSequence > pending.watermark &&
+          sessionId === this.nativeSession.sessionId && this.currentEnvelopeUuid) {
+        // Compact is delivered only on an idle, exclusive root lane. A fresh
+        // root status after input yield acknowledges processing, not completion.
+        this.acceptPendingCompact({
+          kind: 'claude-manual-compact-status', sessionId, inputUuid: pending.inputUuid,
+          statusUuid: this.currentEnvelopeUuid, processGeneration: this.processGeneration,
+          status: message.compact_result === 'failed' ? 'failed' : 'compacting',
+        });
+      }
+      if (message.compact_result !== 'failed') {
+        if (this.manualCompactionOperationId && !this.compactAcceptance) {
+          this.emit({ type: 'context.compaction.started', trigger: 'manual',
+            operationId: this.manualCompactionOperationId, beforeTokens: null }, 'system/status/compacting');
+        }
+        return;
+      }
       const operationId = this.manualCompactionOperationId
         ?? `claude-auto-compact-${hashJson({
           sessionId: this.nativeSession.sessionId,
@@ -1166,6 +1208,7 @@ export class ClaudeProviderSession implements ProviderSession {
       if (message.parent_tool_use_id) return;
       const boundaryUuid = this.currentEnvelopeUuid;
       const replayedBoundary = boundaryUuid ? this.seenCompactionBoundaries.has(boundaryUuid) : true;
+      if (boundaryUuid && replayedBoundary) return;
       if (boundaryUuid && !replayedBoundary) {
         this.seenCompactionBoundaries.add(boundaryUuid);
         if (this.seenCompactionBoundaries.size > 2_048) {
@@ -1176,7 +1219,7 @@ export class ClaudeProviderSession implements ProviderSession {
       this.emitContextUsage('system/context-invalidated');
       const metadata = objectValue(message.compact_metadata);
       const trigger = metadata?.trigger === 'manual' ? 'manual' : 'automatic';
-      const operationId = trigger === 'manual' && this.manualCompactionOperationId
+      const operationId = trigger === 'manual' && !replayedBoundary && this.manualCompactionOperationId
         ? this.manualCompactionOperationId
         : `claude-compact-${hashJson({
             sessionId: this.nativeSession.sessionId,
@@ -1190,18 +1233,15 @@ export class ClaudeProviderSession implements ProviderSession {
         afterTokens: nonnegativeInteger(metadata?.post_tokens) ?? null,
       }, 'system/compact_boundary');
       if (trigger === 'manual' && sessionId === this.nativeSession.sessionId &&
-          this.compactAcceptance?.yielded && !this.compactAcceptance.settled && !replayedBoundary &&
-          this.sequence > this.compactAcceptance.watermark && boundaryUuid) {
-        const pending = this.compactAcceptance;
-        this.compactAcceptance = undefined;
-        clearTimeout(pending.timeout);
-        pending.resolve({ accepted: true, outcome: 'accepted', evidence: {
+          this.compactAcceptance?.yielded && !replayedBoundary &&
+          this.messageSequence > this.compactAcceptance.watermark && boundaryUuid) {
+        this.acceptPendingCompact({
           kind: 'claude-manual-compact-boundary', sessionId: this.nativeSession.sessionId,
           boundaryUuid, processGeneration: this.processGeneration,
           trigger: 'manual',
-        } });
+        });
       }
-      if (trigger === 'manual' && !this.compactAcceptance) this.manualCompactionOperationId = undefined;
+      if (trigger === 'manual' && !replayedBoundary && !this.compactAcceptance) this.manualCompactionOperationId = undefined;
       return;
     }
     const taskId = stringValue(message.task_id);

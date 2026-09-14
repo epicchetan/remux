@@ -169,7 +169,8 @@ export class DeliveryAttemptOwner {
 
   recordAcceptance(attemptId: string, evidence: ProviderAcceptanceEvidence, nativeTurnId?: string, nativeOperationId?: string) {
     const attempt = this.require(attemptId);
-    if (evidence.kind === 'claude-manual-compact-boundary' && attempt.transcriptGap &&
+    if ((evidence.kind === 'claude-manual-compact-boundary' ||
+         evidence.kind === 'claude-manual-compact-status') && attempt.transcriptGap &&
         !attempt.acceptanceEvidence) {
       throw new Error('Claude Compact boundary cannot prove acceptance after a transcript gap.');
     }
@@ -316,6 +317,34 @@ export class DeliveryAttemptOwner {
       byteLength: Number(row.byte_length),
       observedAt: Number(row.observed_at),
     }));
+  }
+
+  recoverCompactionEvidence(attemptId: string) {
+    const attempt = this.require(attemptId);
+    if (attempt.kind !== 'manual-compact' || attempt.provider !== 'claude-code' ||
+        attempt.state !== 'unknown' || attempt.acceptanceEvidence || attempt.transcriptGap ||
+        !attempt.processGeneration || attempt.crossedAt === undefined) return false;
+    // The old adapter staged late completion but never resolved its timed-out
+    // promise. Only its exact operation-correlated live boundary is proof;
+    // an imported history boundary or a completed projection alone is not.
+    const boundaries = this.staged(attemptId).filter(({ envelope }) =>
+      envelope.provider === 'claude-code' && envelope.scope.kind === 'conversation' &&
+      envelope.scope.providerInstanceId === attempt.providerInstanceId &&
+      envelope.scope.conversationId === attempt.conversationId &&
+      envelope.scope.executionId === attempt.executionId &&
+      envelope.native.sessionId === attempt.nativeSessionId &&
+      envelope.native.kind === 'system/compact_boundary' &&
+      envelope.native.position?.kind === 'native-sequence' &&
+      Boolean(envelope.native.messageId) && envelope.observedAt >= attempt.crossedAt! &&
+      envelope.event.type === 'context.compaction.completed' &&
+      envelope.event.trigger === 'manual' && envelope.event.operationId === attempt.compactOperationId);
+    if (boundaries.length !== 1) return false;
+    this.recordAcceptance(attemptId, {
+      kind: 'claude-manual-compact-boundary', sessionId: attempt.nativeSessionId,
+      boundaryUuid: boundaries[0]!.envelope.native.messageId!,
+      processGeneration: attempt.processGeneration, trigger: 'manual',
+    });
+    return true;
   }
 
   recover() {
@@ -698,6 +727,18 @@ function validateRootEvidence(attempt: FrozenDeliveryAttempt, raw: unknown): ass
     }
     return;
   }
+  if (kind === 'claude-manual-compact-status') {
+    requireExactKeys(evidence, ['kind', 'sessionId', 'inputUuid', 'statusUuid', 'processGeneration', 'status']);
+    if (attempt.kind !== 'manual-compact' || attempt.provider !== 'claude-code' ||
+        identifier(evidence.sessionId, 'sessionId') !== attempt.nativeSessionId ||
+        identifier(evidence.inputUuid, 'inputUuid') !== attempt.nativeClientMessageId ||
+        identifier(evidence.processGeneration, 'processGeneration') !== attempt.processGeneration ||
+        !identifier(evidence.statusUuid, 'statusUuid') ||
+        (evidence.status !== 'compacting' && evidence.status !== 'failed')) {
+      throw new Error('Claude Compact status evidence does not match frozen delivery scope.');
+    }
+    return;
+  }
   if (kind === 'fixture-correlated-acceptance') {
     requireExactKeys(evidence, ['kind', 'sessionId', 'commandId'], ['nativeTurnId']);
     const sessionId = identifier(evidence.sessionId, 'sessionId');
@@ -716,6 +757,10 @@ function validateRootEvidence(attempt: FrozenDeliveryAttempt, raw: unknown): ass
 }
 
 function evidenceCompatible(left: ProviderAcceptanceEvidence, right: ProviderAcceptanceEvidence) {
+  if (left.kind === 'claude-manual-compact-status' && right.kind === 'claude-manual-compact-status') {
+    return left.sessionId === right.sessionId && left.inputUuid === right.inputUuid &&
+      left.processGeneration === right.processGeneration;
+  }
   if (left.kind === 'claude-root-processing' && right.kind === 'claude-root-processing') {
     return left.sessionId === right.sessionId && left.userMessageUuid === right.userMessageUuid;
   }

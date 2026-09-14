@@ -357,7 +357,7 @@ function markCachedTranscriptInvalidations(
     if (
       !generationChanged &&
       cached.snapshot.basisSequence !== null &&
-      invalidation.basisSequence <= cached.snapshot.basisSequence
+      invalidation.basisSequence < cached.snapshot.basisSequence
     ) continue;
     if (generationChanged) cached.requiredServerGeneration = serverGeneration;
     if (
@@ -489,7 +489,10 @@ export async function invalidateTranscriptResources(
   const relevant = invalidations.filter((invalidation) =>
     'conversationId' in invalidation &&
     invalidation.conversationId === conversationId &&
-    (current.basisSequence === null || invalidation.basisSequence > current.basisSequence));
+    // Local operation changes (including manual Compact) do not append a
+    // provider event. Equal sequence notifications still require revalidation;
+    // resource revisions determine whether the projected content changed.
+    (current.basisSequence === null || invalidation.basisSequence >= current.basisSequence));
   if (relevant.length === 0) return;
   const requiredBasisSequence = Math.max(...relevant.flatMap((invalidation) =>
     'basisSequence' in invalidation ? [invalidation.basisSequence] : []));

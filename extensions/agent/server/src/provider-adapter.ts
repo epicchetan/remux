@@ -100,6 +100,8 @@ export interface ProviderSession {
     input: ProviderSnapshotRequest & { childExecutionId: string; nativeSessionId: string },
   ): Promise<ProviderSnapshot>;
   compact?(input: CompactProviderSessionInput, context: CompactDispatchContext): Promise<ProviderDispatchResult>;
+  /** Process-local, correlated evidence for a delayed manual Compact response. */
+  readCompactionPresence?(nativeInputUuid: string): Promise<ProviderPresenceRead>;
   /**
    * Cheap provider-native freshness probe. Returning null means the adapter
    * cannot prove that its transcript is unchanged and the coordinator must

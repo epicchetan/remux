@@ -13,6 +13,7 @@ export type ProviderAcceptanceEvidence =
   | { kind: 'codex-history-client-id'; threadId: string; nativeClientMessageId: string; nativeTurnId?: string }
   | { kind: 'claude-root-processing'; sessionId: string; userMessageUuid: string; observationUuid: string }
   | { kind: 'claude-manual-compact-boundary'; sessionId: string; boundaryUuid: string; processGeneration: string; trigger: 'manual' }
+  | { kind: 'claude-manual-compact-status'; sessionId: string; inputUuid: string; statusUuid: string; processGeneration: string; status: 'compacting' | 'failed' }
   | { kind: 'fixture-correlated-acceptance'; sessionId: string; commandId: string; nativeTurnId?: string };
 
 export type ProviderReceiptEvidence = never;

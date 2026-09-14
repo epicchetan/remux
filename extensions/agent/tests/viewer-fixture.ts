@@ -57,6 +57,7 @@ export async function installAgentHost(page: Page) {
     const tallRunningWork = route.get('fixtureTallWork') === '1';
     const compactionTranscript = route.get('fixtureCompaction') === '1';
     const holdManualCompaction = route.get('fixtureHoldManualCompaction') === '1';
+    let manualCompactionRevision = 0;
     type ManualCompaction = { operationId: string; state: 'started' | 'completed' | 'failed'; createdAt: number; completedAt?: number };
     let manualCompaction: ManualCompaction | null = holdManualCompaction
       ? JSON.parse(window.sessionStorage.getItem('remux.fixture.manual-compaction') ?? 'null')
@@ -1903,6 +1904,9 @@ export async function installAgentHost(page: Page) {
         resources: params.requests.map((item: any) => {
           const entry = nativeResourceValue(String(item.key));
           if (!entry) return { key: item.key, status: 'missing' };
+          if (/^agent\/(?:transcript|turn):/u.test(String(item.key))) {
+            entry.revision += manualCompactionRevision;
+          }
           if (!generationChanged && item.ifNoneMatch === entry.revision) {
             return { key: item.key, status: 'notModified', revision: entry.revision, basisSequence: sequence };
           }
@@ -2092,8 +2096,14 @@ export async function installAgentHost(page: Page) {
           manualCompaction = { operationId: String(params.commandId), state: 'started', createdAt: Date.now() };
           window.sessionStorage.setItem('remux.fixture.manual-compaction', JSON.stringify(manualCompaction));
           const turn = turns.at(-1)!;
+          const providerSequence = sequence;
           touchTurn(turn);
-          invalidateTranscript(turn.id, 'runtimeEvent', false);
+          sequence = providerSequence;
+          turn.renderRevision += ':compact-start';
+          turn.layoutRevision += ':compact-start';
+          manualCompactionRevision += 1;
+          // Operation admission changes projections without a provider event.
+          invalidateTranscript('', 'runtimeEvent', false);
         }
 
         const runtime = resources.get('runtime')!;
@@ -2818,6 +2828,14 @@ export async function installAgentHost(page: Page) {
           const runtime = resources.get('runtime');
           if (runtime) runtime.revision += 1;
           invalidateResource('runtime');
+        },
+        setLatestChildSummary(summary: string) {
+          const turn = turns.at(-1)!;
+          const child = fixtureChildCalls(turn)[0];
+          if (!child) throw new Error('No fixture child is available.');
+          child.scope.result = summary;
+          touchTurn(turn);
+          invalidateTranscript(turn.id, 'runtimeEvent', false);
         },
         setHistoryState(state: typeof historyState) {
           historyState = state;

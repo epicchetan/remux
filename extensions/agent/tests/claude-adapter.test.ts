@@ -3,6 +3,11 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
+import { NativeFixtureAdapter } from '../server/src/native-fixture-adapter.ts';
+import { NativeAgentCoordinator } from '../server/src/native-runtime/native-coordinator.ts';
+import { NativeAgentJournal } from '../server/src/native-runtime/native-journal.ts';
+import { createNativeAgentSchema } from '../server/src/native-runtime/schema.ts';
 
 import type {
   AccountInfo as ClaudeAccountInfo,
@@ -764,6 +769,117 @@ test('Claude workspace-write sessions require the native filesystem sandbox', as
   }
 });
 
+for (const response of ['progress', 'late-boundary', 'failure'] as const) {
+  test(`Claude Compact ${response} settles the coordinator delivery and operation consistently`, async () => {
+    const database = new DatabaseSync(':memory:');
+    database.exec('PRAGMA foreign_keys=ON');
+    createNativeAgentSchema(database);
+    const journal = new NativeAgentJournal(database);
+    const query = new FakeClaudeQuery();
+    let prompt!: AsyncIterable<SDKUserMessage>;
+    const claude = new ClaudeNativeAdapter({ acceptanceTimeoutMs: 50, createQuery: (input) => {
+      prompt = input.prompt as AsyncIterable<SDKUserMessage>;
+      assert.ok(input.options?.sessionId);
+      query.emit({ type: 'system', subtype: 'init', uuid: 'coordinator-init', session_id: input.options.sessionId });
+      return query as unknown as ClaudeQuery;
+    } });
+    const fixture = new NativeFixtureAdapter({ provider: 'claude-code', manualCompaction: true });
+    const coordinator = new NativeAgentCoordinator({ journal, providers: [{
+      providerInstanceId: 'claude-local', provider: 'claude-code', label: 'Claude', adapter: {
+        probe: (id) => fixture.probe(id), listModels: (id) => fixture.listModels(id),
+        openSession: (input) => claude.openSession(input),
+      },
+    }] });
+    const waitUntil = async (condition: () => boolean) => {
+      for (let i = 0; i < 200; i += 1) {
+        if (condition()) return;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.fail('Claude coordinator did not settle');
+    };
+    try {
+      await coordinator.initialize();
+      const created = await coordinator.createConversation({ commandId: 'create-compact-integration',
+        providerInstanceId: 'claude-local', cwd: '/workspace/remux', model: 'fixture-native-v1', access: 'read-only' });
+      await waitUntil(() => journal.conversation(created.conversationId)?.resumable === true);
+      const pending = coordinator.compactConversation({ commandId: 'compact-integration', conversationId: created.conversationId });
+      const rejected = response === 'late-boundary' ? assert.rejects(pending, /delivery unknown/u) : undefined;
+      const delivered = await prompt[Symbol.asyncIterator]().next();
+      assert.equal(delivered.value?.message.content, '/compact');
+      const conversation = journal.conversation(created.conversationId)!;
+      const sessionId = journal.nativeSession(conversation.rootExecutionId)!.sessionId;
+      if (response === 'late-boundary') await rejected;
+      else {
+        query.emit({ type: 'system', subtype: 'status', uuid: 'coordinator-status', session_id: sessionId,
+          status: response === 'failure' ? null : 'compacting',
+          ...(response === 'failure' ? { compact_result: 'failed', compact_error: 'Summary failed.' } : {}) });
+        await pending;
+        if (response === 'progress') {
+          await new Promise((resolve) => setTimeout(resolve, 75));
+          assert.equal(journal.latestCompactionOperation(created.conversationId)?.state, 'running');
+        }
+      }
+      if (response !== 'failure') query.emit({ type: 'system', subtype: 'compact_boundary', uuid: 'coordinator-boundary',
+        session_id: sessionId, compact_metadata: { trigger: 'manual', pre_tokens: 211664, post_tokens: 9454 } });
+      await waitUntil(() => !journal.hasUnresolvedRootDelivery(created.conversationId) &&
+        journal.commandReceipt('compact-integration')?.state === 'accepted' &&
+        journal.latestCompactionOperation(created.conversationId)?.state !== 'running');
+      const operation = database.prepare('SELECT state FROM compaction_operations WHERE command_id=?').get('compact-integration');
+      assert.equal(operation?.state, response === 'failure' ? 'failed' : 'completed');
+      const delivery = database.prepare('SELECT state FROM delivery_attempts WHERE command_id=?').get('compact-integration');
+      assert.equal(delivery?.state, 'accepted');
+    } finally { await coordinator.close(); journal.close(); }
+  });
+}
+
+for (const outcome of ['completed', 'failed'] as const) {
+  test(`Claude streamed Compact acknowledgment stays accepted until ${outcome}`, async () => {
+    const query = new FakeClaudeQuery();
+    let prompt!: AsyncIterable<SDKUserMessage>;
+    const adapter = new ClaudeNativeAdapter({ acceptanceTimeoutMs: 50, createQuery: (input) => {
+      prompt = input.prompt as AsyncIterable<SDKUserMessage>;
+      return query as unknown as ClaudeQuery;
+    } });
+    const session = await adapter.openSession({ commandId: `open-status-${outcome}`,
+      providerInstanceId: 'claude-local', conversationId: 'compact-status', executionId: 'compact-status-root',
+      mode: 'create', cwd: '/workspace/remux', model: 'claude-sonnet-4-6', access: 'read-only', developerInstructions: [],
+    });
+    const status = (uuid: string, extra = {}) => query.emit({ type: 'system', subtype: 'status',
+      session_id: session.nativeSession.sessionId, uuid, status: 'compacting', ...extra });
+    try {
+      status('old-status');
+      query.emit({ type: 'system', subtype: 'init', uuid: 'old-status-drained', session_id: session.nativeSession.sessionId });
+      await waitForClaudeEvent(session, ({ native }) => native.messageId === 'old-status-drained');
+      let settled = false;
+      const pending = session.compact!({ commandId: 'status-operation', conversationId: 'compact-status',
+        executionId: 'compact-status-root' }, { nativeInputUuid: 'status-input', boundary: { markPossiblySent() {} } })
+        .then((result) => { settled = true; return result; });
+      await prompt[Symbol.asyncIterator]().next();
+      status('old-status');
+      status('child-status', { parent_tool_use_id: 'child-tool' });
+      query.emit({ type: 'system', subtype: 'init', uuid: 'ignored-statuses-drained', session_id: session.nativeSession.sessionId });
+      await waitForClaudeEvent(session, ({ native }) => native.messageId === 'ignored-statuses-drained');
+      assert.equal(settled, false, 'replayed and child statuses cannot acknowledge root Compact');
+      status('fresh-status');
+      const result = await pending;
+      assert.equal(result.outcome, 'accepted');
+      if (result.outcome === 'accepted') assert.equal(result.evidence.kind, 'claude-manual-compact-status');
+      await waitForClaudeEvent(session, ({ event }) => event.type === 'context.compaction.started');
+      assert.equal(session.hasBackgroundWork(), true, 'idle eviction must preserve ongoing compaction');
+      await new Promise((resolve) => setTimeout(resolve, 75));
+      assert.equal((await session.readCompactionPresence!('status-input')).presence, 'present');
+      await assert.rejects(session.compact!({ commandId: 'duplicate', conversationId: 'compact-status',
+        executionId: 'compact-status-root' }, { nativeInputUuid: 'duplicate-input', boundary: { markPossiblySent() {} } }), /still running/u);
+      if (outcome === 'completed') query.emit({ type: 'system', subtype: 'compact_boundary', uuid: 'status-boundary',
+        session_id: session.nativeSession.sessionId, compact_metadata: { trigger: 'manual', pre_tokens: 211664, post_tokens: 9454 } });
+      else status('failure-status', { status: null, compact_result: 'failed', compact_error: 'Summary failed.' });
+      const terminal = await waitForClaudeEvent(session, ({ event }) => event.type === `context.compaction.${outcome}`);
+      assert.equal('operationId' in terminal.event && terminal.event.operationId, 'status-operation');
+      assert.equal(session.hasBackgroundWork(), false);
+    } finally { await session.close(); }
+  });
+}
+
 test('Claude Compact timeout and close remain unknown after SDK input delivery', async () => {
   const openCompactSession = async (query: FakeClaudeQuery, acceptanceTimeoutMs: number) => {
     let prompt: AsyncIterable<SDKUserMessage> | undefined;
@@ -811,6 +927,13 @@ test('Claude Compact timeout and close remain unknown after SDK input delivery',
     nativeInputUuid: 'compact-after-timeout-input',
     boundary: { markPossiblySent() {} },
   }), /unresolved manual Compact delivery/u);
+  timeoutQuery.emit({ type: 'system', subtype: 'compact_boundary', uuid: 'late-boundary',
+    session_id: timeoutSession.nativeSession.sessionId,
+    compact_metadata: { trigger: 'manual', pre_tokens: 211664, post_tokens: 9454 } });
+  await waitForClaudeEvent(timeoutSession, ({ event }) => event.type === 'context.compaction.completed');
+  const late = await timeoutSession.readCompactionPresence!('compact-timeout-input');
+  assert.equal(late.presence, 'present', 'late success remains available to reconcile durable delivery');
+  if (late.presence === 'present') assert.equal(late.evidence.kind, 'claude-manual-compact-boundary');
   await timeoutSession.close();
 
   const automaticQuery = new FakeClaudeQuery();

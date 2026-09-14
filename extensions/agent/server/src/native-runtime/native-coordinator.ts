@@ -2290,7 +2290,7 @@ export class NativeAgentCoordinator {
     }
     const executionId = stableUuid(`federated-execution\0${input.commandId}`);
     const turnId = stableUuid(`federated-turn\0${input.commandId}`);
-    const title = boundedSummary(input.task, 96) || 'Federated agent';
+    const title = boundedSummary(input.task.replace(/\s+/gu, ' '), 96) || 'Federated agent';
     const content: readonly UserContentPart[] = [
       { type: 'text', text: input.task.trim() }, ...(input.attachments ?? []),
     ];
@@ -3297,6 +3297,9 @@ export class NativeAgentCoordinator {
         continue;
       }
       if (!attempt) continue;
+      if (this.deliveryOwner.recoverCompactionEvidence(attempt.attemptId)) {
+        attempt = this.deliveryOwner.get(attempt.attemptId)!;
+      }
       const registration = this.providers.get(attempt.providerInstanceId);
       if (!attempt.acceptanceEvidence &&
           ((attempt.kind !== 'root-turn' && attempt.kind !== 'steer') ||
@@ -4225,6 +4228,26 @@ export class NativeAgentCoordinator {
       const dependent = events.filter((event) => event.scope.kind !== 'account' &&
         event.scope.conversationId === conversationId && event.scope.executionId === executionId);
       for (const event of dependent) this.deliveryOwner.observe(unresolved.attemptId, event);
+      const session = this.sessions.get(executionId);
+      if (unresolved.state === 'unknown' && !unresolved.transcriptGap &&
+          session?.readCompactionPresence && unresolved.nativeClientMessageId) {
+        let inserted: readonly ProviderEventEnvelope[] = [];
+        const result = await this.deliveryOwner.reconcile(unresolved.attemptId,
+          () => session.readCompactionPresence!(unresolved.nativeClientMessageId!),
+          (accepted, staged) => {
+            this.journal.restoreAcceptedCompactionDelivery(accepted.compactOperationId!, this.now());
+            inserted = this.journal.appendProviderEvents(staged.map(({ envelope }) => envelope));
+            if (this.journal.commandReceipt(accepted.commandId)?.state === 'dispatching') {
+              this.journal.acceptCommand(accepted.commandId, {
+                accepted: true, operationId: accepted.compactOperationId!, delivery: 'sent',
+              } satisfies NativeCompactConversationResult, this.now());
+            }
+          }, (staged) => this.prepareStagedProviderEvents(conversationId, staged));
+        if (result.outcome === 'accepted') {
+          await this.applyProviderEventEffects(conversationId, executionId, inserted);
+          this.invalidateConversation(conversationId, executionId);
+        }
+      }
       events = events.filter((event) => !dependent.includes(event));
       if (events.length === 0) return;
     }
@@ -4997,7 +5020,7 @@ function accessWithin(requested: ProviderAccess, ceiling: ProviderAccess) {
 }
 
 function boundedSummary(value: string, maxLength = 4_000) {
-  const normalized = value.replace(/\s+/gu, ' ').trim();
+  const normalized = value.trim();
   if (normalized.length <= maxLength) return normalized;
   return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
 }

@@ -17,7 +17,7 @@ import { NativeAgentJournal } from '../server/src/native-runtime/native-journal.
 import { NATIVE_ASSISTANT_PREVIEW_BYTES } from '../server/src/native-runtime/native-output.ts';
 import { createNativeAgentSchema } from '../server/src/native-runtime/schema.ts';
 import { prepareAgentDataPaths } from '../server/src/storage/data-root.ts';
-import type { NativeTranscriptWindow } from '../shared/native-agent-protocol.ts';
+import type { AgentExecutionResource, NativeTranscriptWindow } from '../shared/native-agent-protocol.ts';
 
 const declaredCheckoutPaths = new Set([
   '/workspace/artifact-failure', '/workspace/artifact-scope', '/workspace/deadline',
@@ -729,6 +729,27 @@ test('federation HTTP wait deadline leaves the accepted child running and discov
     await federation.close();
     journal.close();
   }
+});
+
+test('federated completion summaries retain Markdown structure while task titles stay on one line', async () => {
+  const journal = createJournal();
+  const finalText = '## Result\n\n- **Passed:** regression tests\n\n| Check | Result |\n| --- | --- |\n| Tests | Passed |\n\n```rust\nfn main() {\n    run();\n}\n```';
+  const rootAdapter = new NativeFixtureAdapter({ provider: 'codex', delayMs: 60_000 });
+  const childAdapter = new NativeFixtureAdapter({ provider: 'claude-code', delayMs: 2, finalText });
+  const coordinator = new NativeAgentCoordinator({ journal, checkoutResolver: declaredCheckoutResolver,
+    providers: fixtureProviders(rootAdapter, childAdapter) });
+  try {
+    await coordinator.initialize();
+    const root = await activeRoot(coordinator, journal, 'formatted-summary', '/workspace/remux');
+    const child = await coordinator.spawnFederatedAgent({ commandId: 'spawn-formatted-summary',
+      parentConversationId: root.conversationId, parentExecutionId: root.executionId,
+      rootTurnId: root.turnId, targetProviderInstanceId: 'claude-local',
+      task: 'Review the change\n\n  and report results.', access: 'read-only', scheduling: 'background', depth: 1 });
+    await coordinator.waitForFederatedExecution(child.executionId);
+    const execution = coordinator.projector.project(`agent/execution:${child.executionId}`) as AgentExecutionResource;
+    assert.equal(execution?.summary, finalText);
+    assert.equal(execution?.title, 'Review the change and report results.');
+  } finally { await coordinator.close(); journal.close(); }
 });
 
 test('federation result fails boundedly when a large final answer cannot be sealed', async () => {

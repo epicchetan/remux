@@ -17,6 +17,7 @@ import type {
 import { agentCommands } from '../ipc/agentCommands.ts';
 import { nativeExecutionScopeId } from '../nativeTranscriptViewModel.ts';
 import { ExecutionScopeContent } from '../transcript/components/work/ExecutionScope.tsx';
+import { MarkdownBlock } from '../transcript/components/markdown/MarkdownBlock.tsx';
 import type { AgentExecutionTree } from './useAgentExecutions.ts';
 
 export function AgentExecutionsView({
@@ -128,7 +129,10 @@ function AgentExecutionDetail({
   useLayoutEffect(() => {
     const lane = laneRef.current;
     if (!lane) return;
-    const publish = () => setLaneWidth(lane.getBoundingClientRect().width);
+    const publish = () => {
+      const style = getComputedStyle(lane);
+      setLaneWidth(Math.max(0, lane.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)));
+    };
     publish();
     const observer = new ResizeObserver(publish);
     observer.observe(lane);
@@ -175,7 +179,7 @@ function AgentExecutionDetail({
           {execution.summary ? (
             <section className="agent-execution-assignment">
               <span>Latest update</span>
-              <p>{execution.summary}</p>
+              {laneWidth > 0 ? <MarkdownBlock width={laneWidth}>{execution.summary}</MarkdownBlock> : null}
             </section>
           ) : null}
           {execution.transcriptAvailable && execution.rootTurnId && laneWidth > 0 ? (
