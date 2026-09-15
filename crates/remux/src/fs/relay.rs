@@ -175,6 +175,46 @@ impl FsRelay {
         }
     }
 
+    /// Mutations bypass watcher debounce and rate limiting. Invalidation always
+    /// precedes notification, including for directories never watched before.
+    pub fn on_paths_mutated(&self, paths: &[PathBuf]) {
+        let directories: Vec<PathBuf> = paths
+            .iter()
+            .filter_map(|p| p.parent().map(crate::paths::resolve))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if directories.is_empty() {
+            return;
+        }
+        let (broadcast, invalidate, roots) = {
+            let state = self.state.lock().unwrap();
+            if state.closed {
+                return;
+            }
+            let roots: Vec<_> = directories
+                .iter()
+                .filter_map(|p| repo_root_for_path(&state, p))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            (
+                state.wiring.broadcast.clone(),
+                state.wiring.invalidate.clone(),
+                roots,
+            )
+        };
+        if let Some(invalidate) = invalidate {
+            invalidate(&directories, &roots);
+        }
+        if let Some(broadcast) = broadcast {
+            broadcast(serde_json::json!({
+                "method": FS_DID_CHANGE_METHOD,
+                "params": {"changedPaths": directories, "gitDirtyRoots": roots},
+            }));
+        }
+    }
+
     pub fn close(self: &Arc<Self>) {
         let mut state = self.state.lock().unwrap();
         if state.closed {
@@ -778,4 +818,44 @@ fn notify_watch_path(
     Ok(Box::new(NotifyHandle {
         watcher: Some(watcher),
     }))
+}
+
+#[cfg(test)]
+mod mutation_tests {
+    use super::*;
+    #[tokio::test]
+    async fn immediate_mutation_feed_deduplicates_and_invalidates_first() {
+        let relay = FsRelay::new(
+            FsRelayOptions::default(),
+            FsRelay::production_hooks(Arc::new(|_| {})),
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let broadcast_events = events.clone();
+        let invalidation_events = events.clone();
+        relay.start(
+            Arc::new(move |value| broadcast_events.lock().unwrap().push(value)),
+            Arc::new(move |paths, _| {
+                invalidation_events
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::json!({"invalidate":paths}))
+            }),
+        );
+        for _ in 0..2 {
+            relay.on_paths_mutated(&[
+                PathBuf::from("/a/file"),
+                PathBuf::from("/b/file"),
+                PathBuf::from("/a/second"),
+            ]);
+        }
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 4, "does not wait for debounce or throttle");
+        assert_eq!(events[0]["invalidate"], serde_json::json!(["/a", "/b"]));
+        assert_eq!(events[1]["method"], FS_DID_CHANGE_METHOD);
+        assert_eq!(
+            events[1]["params"]["changedPaths"],
+            serde_json::json!(["/a", "/b"])
+        );
+        relay.close();
+    }
 }

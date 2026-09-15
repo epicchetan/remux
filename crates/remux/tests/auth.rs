@@ -80,12 +80,18 @@ struct Harness {
 async fn serve(root: &std::path::Path, require: bool) -> Harness {
     let extension = fixture_extension(root);
     let journal = Journal::new(root, 1, Arc::new(StdTerminal)).unwrap();
-    let viewer_bundles = ViewerBundleRegistry::new(root, &[extension.clone()], journal);
+    let viewer_bundles = ViewerBundleRegistry::new(root, std::slice::from_ref(&extension), journal);
     viewer_bundles.publish_all().await;
-    let extension_gateways =
-        remux::http::extension_gateways::ExtensionGatewayRegistry::new(root, &[extension.clone()])
-            .unwrap();
+    let extension_gateways = remux::http::extension_gateways::ExtensionGatewayRegistry::new(
+        root,
+        std::slice::from_ref(&extension),
+    )
+    .unwrap();
     let state = Arc::new(HttpState {
+        raw_files: remux::http::raw_files::RawFileService::new(
+            remux::fs::core::FsCore::new(root),
+            remux::config::DEFAULT_MAX_UPLOAD_BYTES,
+        ),
         viewer_providers: ViewerProvider::for_extension(&extension, viewer_bundles.clone()),
         viewer_bundles,
         default_extension: extension.clone(),
@@ -113,6 +119,9 @@ async fn serve(root: &std::path::Path, require: bool) -> Harness {
         .layer(axum::middleware::from_fn_with_state(
             auth_state,
             require_auth,
+        ))
+        .layer(axum::middleware::from_fn(
+            remux::http::raw_files::secure_raw_responses,
         ))
         .into_make_service_with_connect_info::<SocketAddr>();
 
@@ -262,7 +271,12 @@ async fn cookie_auth_serves_and_query_auth_hands_off_cookie() {
     )
     .await;
     assert_eq!(response.status(), 200);
-    let cookie = response.headers().get("set-cookie").unwrap().to_str().unwrap();
+    let cookie = response
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert!(cookie.starts_with(&format!("remux_auth={TOKEN}; ")));
     assert!(cookie.contains("Path=/; HttpOnly; SameSite=Lax"));
 }
@@ -318,4 +332,49 @@ async fn ws_upgrade_401s_without_a_token_and_connects_with_one() {
     };
     let message: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(message["result"], json!({ "ok": true }));
+}
+
+#[tokio::test]
+async fn raw_file_routes_are_covered_by_global_auth() {
+    let root = tempfile::tempdir().unwrap();
+    let harness = serve(root.path(), true).await;
+    let path = root.path().join("raw.txt");
+    std::fs::write(&path, "private file").unwrap();
+    let mut url = reqwest::Url::parse(&format!("http://{}/remux/fs/raw", harness.addr)).unwrap();
+    url.query_pairs_mut()
+        .append_pair("path", &path.to_string_lossy());
+    let client = reqwest::Client::new();
+    for method in [
+        reqwest::Method::GET,
+        reqwest::Method::HEAD,
+        reqwest::Method::PUT,
+    ] {
+        let response = client
+            .request(method, url.clone())
+            .body("denied")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+        assert_eq!(response.headers()["content-security-policy"], "sandbox");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "private file");
+    for (name, value) in [
+        ("authorization", format!("Bearer {TOKEN}")),
+        ("cookie", format!("remux_auth={TOKEN}")),
+    ] {
+        let response = client
+            .get(url.clone())
+            .header(name, value)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), "private file");
+    }
+    // The pre-existing global middleware accepts query tokens for all routes;
+    // S1 deliberately does not change that shared authentication policy.
+    url.query_pairs_mut().append_pair("token", TOKEN);
+    assert_eq!(client.get(url).send().await.unwrap().status(), 200);
 }

@@ -77,15 +77,25 @@ fn fixture_extension(root: &std::path::Path) -> ExtensionManifest {
 }
 
 async fn serve_fixture(root: &std::path::Path) -> (SocketAddr, String) {
+    serve_fixture_with_cap(root, remux::config::DEFAULT_MAX_UPLOAD_BYTES).await
+}
+
+async fn serve_fixture_with_cap(root: &std::path::Path, cap: u64) -> (SocketAddr, String) {
     let extension = fixture_extension(root);
     let journal = Journal::new(root, 1, Arc::new(StdTerminal)).unwrap();
-    let viewer_bundles = ViewerBundleRegistry::new(root, &[extension.clone()], journal);
+    let viewer_bundles = ViewerBundleRegistry::new(root, std::slice::from_ref(&extension), journal);
     viewer_bundles.publish_all().await;
     let revision = viewer_bundles.current("codex", "main").unwrap().revision;
-    let extension_gateways =
-        remux::http::extension_gateways::ExtensionGatewayRegistry::new(root, &[extension.clone()])
-            .unwrap();
+    let extension_gateways = remux::http::extension_gateways::ExtensionGatewayRegistry::new(
+        root,
+        std::slice::from_ref(&extension),
+    )
+    .unwrap();
     let state = Arc::new(HttpState {
+        raw_files: remux::http::raw_files::RawFileService::new(
+            remux::fs::core::FsCore::new(root),
+            cap,
+        ),
         viewer_providers: ViewerProvider::for_extension(&extension, viewer_bundles.clone()),
         viewer_bundles,
         default_extension: extension.clone(),
@@ -408,4 +418,341 @@ async fn serves_health_catalog_redirect_icons_viewers_and_404() {
     let missing_icon = get(addr, "/remux/extensions/unknown/icon").await;
     assert_eq!(missing_icon.status(), 404);
     assert_eq!(missing_icon.text().await.unwrap(), "Not found.");
+}
+
+fn raw_url(addr: SocketAddr, path: &std::path::Path) -> String {
+    let mut url = reqwest::Url::parse(&format!("http://{addr}/remux/fs/raw")).unwrap();
+    url.query_pairs_mut()
+        .append_pair("path", &path.to_string_lossy());
+    url.into()
+}
+
+fn assert_raw_headers(response: &reqwest::Response) {
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(response.headers()["content-security-policy"], "sandbox");
+    assert_eq!(response.headers()["cache-control"], "private, no-cache");
+    assert!(response.headers().get("content-encoding").is_none());
+}
+
+#[tokio::test]
+async fn raw_get_head_ranges_etags_and_dispositions() {
+    let root = tempfile::tempdir().unwrap();
+    let (addr, _) = serve_fixture(root.path()).await;
+    let client = reqwest::Client::new();
+    let path = root.path().join("space é.txt");
+    let content = "0123456789".repeat(400);
+    std::fs::write(&path, &content).unwrap();
+    let url = raw_url(addr, &path);
+    let response = client
+        .get(&url)
+        .header("accept-encoding", "br, gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_raw_headers(&response);
+    assert_eq!(response.headers()["content-length"], "4000");
+    assert_eq!(response.headers()["accept-ranges"], "bytes");
+    assert_eq!(response.headers()["content-type"], "text/plain");
+    assert_eq!(
+        response.headers()["content-disposition"],
+        "attachment; filename*=UTF-8''space%20%C3%A9.txt"
+    );
+    assert!(response.headers().contains_key("last-modified"));
+    let etag = response.headers()["etag"].to_str().unwrap().to_owned();
+    let stat = remux::fs::core::FsCore::new(root.path())
+        .handle_rpc("remux/fs/stat", Some(&json!({"path":path})))
+        .await
+        .unwrap();
+    assert_eq!(etag, format!("\"{}\"", stat["version"].as_str().unwrap()));
+    assert_eq!(response.text().await.unwrap(), content);
+    for method in [reqwest::Method::GET, reqwest::Method::HEAD] {
+        let response = client
+            .request(method, &url)
+            .header("if-none-match", &etag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 304);
+        assert_raw_headers(&response);
+        assert!(response.bytes().await.unwrap().is_empty());
+    }
+    let response = client.head(&url).send().await.unwrap();
+    assert_raw_headers(&response);
+    assert_eq!(response.headers()["content-length"], "4000");
+    assert!(response.bytes().await.unwrap().is_empty());
+    for (range, expected_range, expected) in [
+        ("bytes=2-5", "bytes 2-5/4000", "2345"),
+        ("bytes=-4", "bytes 3996-3999/4000", "6789"),
+        ("bytes=3997-", "bytes 3997-3999/4000", "789"),
+    ] {
+        let response = client
+            .get(&url)
+            .header("range", range)
+            .header("accept-encoding", "gzip")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 206);
+        assert_raw_headers(&response);
+        assert_eq!(response.headers()["content-range"], expected_range);
+        assert_eq!(
+            response.headers()["content-length"],
+            expected.len().to_string()
+        );
+        assert_eq!(response.text().await.unwrap(), expected);
+    }
+    for range in ["bytes=4000-", "bytes=3-2", "bytes=0-1,4-5", "bytes=-0"] {
+        let response = client
+            .get(&url)
+            .header("range", range)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 416);
+        assert_raw_headers(&response);
+        assert_eq!(response.headers()["content-range"], "bytes */4000");
+    }
+    for (ext, inline) in [
+        ("html", false),
+        ("svg", false),
+        ("xml", false),
+        ("png", true),
+        ("pdf", true),
+        ("mp3", true),
+        ("mp4", true),
+        ("woff2", true),
+    ] {
+        let path = root.path().join(format!("fixture.{ext}"));
+        std::fs::write(&path, "fixture").unwrap();
+        let url = raw_url(addr, &path);
+        let response = client.get(&url).send().await.unwrap();
+        assert_raw_headers(&response);
+        assert!(response.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .starts_with(if inline { "inline;" } else { "attachment;" }));
+        let response = client
+            .get(format!("{url}&download=1"))
+            .send()
+            .await
+            .unwrap();
+        assert_raw_headers(&response);
+        assert!(response.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .starts_with("attachment;"));
+    }
+    std::fs::write(&path, "changed").unwrap();
+    let response = client
+        .get(&url)
+        .header("if-none-match", &etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_ne!(response.headers()["etag"], etag);
+}
+
+#[tokio::test]
+async fn raw_paths_symlinks_special_files_and_error_headers() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let (addr, _) = serve_fixture(root.path()).await;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let target = root.path().join("target");
+    std::fs::write(&target, b"%PDF-1.7").unwrap();
+    let link = root.path().join("link");
+    symlink(&target, &link).unwrap();
+    let response = client.get(raw_url(addr, &link)).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-type"], "application/pdf");
+    assert_eq!(response.text().await.unwrap(), "%PDF-1.7");
+    let fifo = root.path().join("fifo");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).unwrap();
+    for (path, status) in [
+        (fifo.as_path(), 400),
+        (root.path(), 400),
+        (&root.path().join("missing"), 404),
+        (std::path::Path::new("/dev/null"), 400),
+    ] {
+        let response = client.get(raw_url(addr, path)).send().await.unwrap();
+        assert_eq!(response.status(), status);
+        assert_raw_headers(&response);
+    }
+    for suffix in ["", "?path=", "?path=relative", "?path=%00"] {
+        let response = client
+            .get(format!("http://{addr}/remux/fs/raw{suffix}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        assert_raw_headers(&response);
+    }
+    let response = client.post(raw_url(addr, &target)).send().await.unwrap();
+    assert_eq!(response.status(), 405);
+    assert_raw_headers(&response);
+    let empty = root.path().join("empty");
+    std::fs::write(&empty, "").unwrap();
+    let response = client
+        .get(raw_url(addr, &empty))
+        .header("range", "bytes=0-")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 416);
+    assert_eq!(response.headers()["content-range"], "bytes */0");
+}
+
+#[tokio::test]
+async fn raw_upload_create_conflict_versions_limit_and_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let (addr, _) = serve_fixture_with_cap(root.path(), 3 * 1024 * 1024).await;
+    let client = reqwest::Client::new();
+    let path = root.path().join("upload.txt");
+    let url = raw_url(addr, &path);
+    let response = client.put(&url).body("first").send().await.unwrap();
+    assert_eq!(response.status(), 201);
+    assert_raw_headers(&response);
+    let descriptor: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(descriptor["sizeBytes"], 5);
+    assert_eq!(descriptor["path"], path.to_str().unwrap());
+    let version = descriptor["version"].as_str().unwrap();
+    for expected in [None, Some("\"stale\""), Some(version)] {
+        let mut request = client.put(&url).body("conflict");
+        if let Some(expected) = expected {
+            request = request.header("if-match", expected);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), 409);
+        assert_raw_headers(&response);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+    }
+    let response = client
+        .put(&url)
+        .header("if-match", format!("\"{version}\""))
+        .body("second")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_raw_headers(&response);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+    let response = client
+        .put(format!("{url}&overwrite=1"))
+        .body("replace")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "replace");
+    let oversized = root.path().join("oversized");
+    let response = client
+        .put(raw_url(addr, &oversized))
+        .body(vec![0; 3 * 1024 * 1024 + 1])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 413);
+    assert_raw_headers(&response);
+    assert!(!oversized.exists());
+    let large = root.path().join("large");
+    let response = client
+        .put(raw_url(addr, &large))
+        .body(vec![0; 3 * 1024 * 1024])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        201,
+        "route accepts bodies above axum's default 2 MiB limit"
+    );
+    assert_eq!(std::fs::metadata(large).unwrap().len(), 3 * 1024 * 1024);
+    let response = client
+        .put(raw_url(addr, &root.path().join("missing/file")))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    assert_raw_headers(&response);
+    let response = client
+        .put(format!("{}&overwrite=1", raw_url(addr, root.path())))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert_raw_headers(&response);
+    assert_no_upload_temps(root.path());
+}
+
+fn assert_no_upload_temps(root: &std::path::Path) {
+    assert!(!std::fs::read_dir(root).unwrap().any(|e| e
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".remux-upload-")));
+}
+
+#[tokio::test]
+async fn raw_upload_disconnect_cleans_partial_temp_and_requires_length() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let root = tempfile::tempdir().unwrap();
+    let (addr, _) = serve_fixture(root.path()).await;
+    let path = root.path().join("aborted");
+    let url = reqwest::Url::parse(&raw_url(addr, &path)).unwrap();
+    let request_target = format!("{}?{}", url.path(), url.query().unwrap());
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    socket.write_all(format!("PUT {request_target} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 10000\r\n\r\npartial").as_bytes()).await.unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if std::fs::read_dir(root.path()).unwrap().any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".remux-upload-")
+        }) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "upload should start"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    drop(socket);
+    loop {
+        if !std::fs::read_dir(root.path()).unwrap().any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".remux-upload-")
+        }) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "upload temp should be removed after disconnect"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!path.exists());
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    socket
+        .write_all(
+            format!("PUT {request_target} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = String::new();
+    socket.read_to_string(&mut response).await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 411"), "{response}");
+    assert!(response.contains("content-security-policy: sandbox"));
+    assert_no_upload_temps(root.path());
 }

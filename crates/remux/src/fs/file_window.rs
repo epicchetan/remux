@@ -63,7 +63,8 @@ pub async fn read_file_window(request: FileWindowRequest) -> Result<Value, FileW
     // check. Nonblocking open has no effect on ordinary files.
     #[cfg(unix)]
     options.custom_flags(nix::libc::O_NONBLOCK);
-    let mut file = options.open(&request.path)
+    let mut file = options
+        .open(&request.path)
         .await
         .map_err(|error| read_error(error, &request.path))?;
     let initial_metadata = file
@@ -381,7 +382,7 @@ fn is_continuation(byte: u8) -> bool {
 /// Advisory identity for paging, not a transactional snapshot. An in-place
 /// rewrite that preserves inode, byte length and nanosecond mtime can retain
 /// the same token; callers recover by starting a fresh explicit reload.
-fn file_version(metadata: &std::fs::Metadata) -> String {
+pub(crate) fn file_version(metadata: &std::fs::Metadata) -> String {
     let mut hash = Sha1::new();
     hash.update(metadata.len().to_le_bytes());
     if let Ok(modified) = metadata.modified().and_then(|time| {
@@ -413,7 +414,9 @@ mod tests {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             read_file_window(request(path, 0, DEFAULT_WINDOW_BYTES)),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert_eq!(result.unwrap_err().kind, FileWindowErrorKind::Read);
     }
 

@@ -2,6 +2,8 @@
 //! params, result shapes, error codes, cache TTLs (directory 3s + in-flight
 //! dedup, git status 1s, repo root 5s), concurrency limits (batch 4, entries
 //! 24), and file caps (1 MiB text / 5 MiB base64).
+//! Delete returns the descriptor captured before removal, plus `deleted: true`.
+//! Atomic writes replace the named entry (including symlinks); reads follow links.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,6 +31,13 @@ pub const READ_DIRECTORIES_METHOD: &str = "remux/fs/readDirectories";
 pub const READ_FILE_METHOD: &str = "remux/fs/readFile";
 pub const READ_FILE_GIT_METHOD: &str = "remux/fs/readFileGit";
 pub const READ_FILE_WINDOW_METHOD: &str = "remux/fs/readFileWindow";
+
+pub const STAT_METHOD: &str = "remux/fs/stat";
+pub const WRITE_FILE_METHOD: &str = "remux/fs/writeFile";
+pub const CREATE_DIRECTORY_METHOD: &str = "remux/fs/createDirectory";
+pub const RENAME_METHOD: &str = "remux/fs/rename";
+pub const DELETE_METHOD: &str = "remux/fs/delete";
+pub const MUTATION_ERROR: i64 = -32013;
 
 pub const DIRECTORY_BATCH_CONCURRENCY: usize = 4;
 pub const DIRECTORY_CACHE_TTL_MS: u64 = 3_000;
@@ -70,6 +79,8 @@ struct CachedStatus {
 
 pub struct FsCore {
     default_path: PathBuf,
+    relay: Mutex<std::sync::Weak<crate::fs::relay::FsRelay>>,
+    pub(crate) mutation_lock: Arc<Mutex<()>>,
     directory_cache: Mutex<HashMap<PathBuf, CachedDirectory>>,
     directory_gates: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
     repo_root_cache: Mutex<HashMap<PathBuf, CachedRepoRoot>>,
@@ -82,6 +93,8 @@ impl FsCore {
     pub fn new(root_dir: &Path) -> Arc<Self> {
         Arc::new(Self {
             default_path: paths::resolve(root_dir),
+            relay: Mutex::new(std::sync::Weak::new()),
+            mutation_lock: Arc::new(Mutex::new(())),
             directory_cache: Mutex::new(HashMap::new()),
             directory_gates: Mutex::new(HashMap::new()),
             repo_root_cache: Mutex::new(HashMap::new()),
@@ -93,6 +106,16 @@ impl FsCore {
 
     pub async fn handle_rpc(&self, method: &str, params: Option<&Value>) -> RpcResult {
         match method {
+            STAT_METHOD => {
+                let path = resolve_requested_path(&self.default_path, params, method)?;
+                tokio::task::spawn_blocking(move || stat_path(&path))
+                    .await
+                    .map_err(|e| fs_error(READ_FILE_ERROR, &std::io::Error::other(e)))?
+                    .map_err(|e| fs_error(READ_FILE_ERROR, &e))
+            }
+            WRITE_FILE_METHOD | CREATE_DIRECTORY_METHOD | RENAME_METHOD | DELETE_METHOD => {
+                self.mutate(method, params).await
+            }
             READ_DIRECTORY_METHOD => self.read_directory(params).await,
             READ_DIRECTORIES_METHOD => self.read_directories(params).await,
             READ_FILE_METHOD => self.read_file(params).await,
@@ -100,6 +123,159 @@ impl FsCore {
             READ_FILE_WINDOW_METHOD => self.read_file_window(params).await,
             _ => Err(JsonRpcError::method_not_found(method)),
         }
+    }
+
+    pub fn set_relay(&self, relay: &Arc<crate::fs::relay::FsRelay>) {
+        *self.relay.lock().unwrap() = Arc::downgrade(relay);
+    }
+
+    pub fn on_paths_mutated(&self, paths: &[PathBuf]) {
+        let parents: Vec<_> = paths
+            .iter()
+            .filter_map(|p| p.parent().map(Path::to_path_buf))
+            .collect();
+        self.invalidate(&parents, &[]);
+        if let Some(relay) = self.relay.lock().unwrap().upgrade() {
+            relay.on_paths_mutated(paths);
+        }
+    }
+
+    async fn mutate(&self, method: &str, params: Option<&Value>) -> RpcResult {
+        let record = params
+            .and_then(Value::as_object)
+            .ok_or_else(|| JsonRpcError::new(INVALID_PARAMS, "Expected mutation params"))?;
+        let field = if method == RENAME_METHOD {
+            "from"
+        } else {
+            "path"
+        };
+        let requested = required_string(record, field)?;
+        let path = resolve_requested_path(
+            &self.default_path,
+            Some(&serde_json::json!({"path": requested})),
+            method,
+        )?;
+        let destination = if method == RENAME_METHOD {
+            Some(resolve_requested_path(
+                &self.default_path,
+                Some(&serde_json::json!({"path": required_string(record, "to")?})),
+                method,
+            )?)
+        } else {
+            None
+        };
+        let content = if method == WRITE_FILE_METHOD {
+            let content = record
+                .get("content")
+                .and_then(Value::as_str)
+                .ok_or_else(|| JsonRpcError::new(INVALID_PARAMS, "Expected UTF-8 content"))?;
+            if content.len() as u64 > MAX_BINARY_FILE_BYTES {
+                return Err(mutation_error("tooLarge", "Text exceeds 5 MiB"));
+            }
+            Some(content.to_owned())
+        } else {
+            None
+        };
+        let expected = match record.get("expectedVersion") {
+            None => None,
+            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            _ => return Err(JsonRpcError::new(INVALID_PARAMS, "Invalid expectedVersion")),
+        };
+        let create = optional_bool(record, "create")?;
+        let overwrite = optional_bool(record, "overwrite")?;
+        let recursive = optional_bool(record, "recursive")?;
+        let method = method.to_owned();
+        let lock = self.mutation_lock.clone();
+        let relay = self.relay.lock().unwrap().clone();
+        let changed = vec![path.clone()]
+            .into_iter()
+            .chain(destination.clone())
+            .collect::<Vec<_>>();
+        let notification_paths = changed.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let _guard = lock.lock().unwrap();
+            let affected = destination.as_deref().unwrap_or(&path);
+            let before_delete = if method == DELETE_METHOD {
+                Some(stat_path(&path).map_err(|e| fs_error(MUTATION_ERROR, &e))?)
+            } else {
+                None
+            };
+            match method.as_str() {
+                WRITE_FILE_METHOD => {
+                    let previous =
+                        existing_metadata(&path).map_err(|e| fs_error(MUTATION_ERROR, &e))?;
+                    if create && previous.is_some() {
+                        return Err(mutation_error("exists", "Target exists"));
+                    }
+                    if let Some(expected) = expected {
+                        if current_version(&path)
+                            .map_err(|e| fs_error(MUTATION_ERROR, &e))?
+                            .as_deref()
+                            != Some(&expected)
+                        {
+                            return Err(mutation_error("versionChanged", "File version changed"));
+                        }
+                    }
+                    let mut temp = tempfile::Builder::new()
+                        .prefix(".remux-upload-")
+                        .tempfile_in(path.parent().unwrap_or(Path::new("/")))
+                        .map_err(|e| fs_error(MUTATION_ERROR, &e))?;
+                    use std::io::Write;
+                    temp.write_all(content.as_ref().unwrap().as_bytes())
+                        .map_err(|e| fs_error(MUTATION_ERROR, &e))?;
+                    if let Some(metadata) = previous {
+                        temp.as_file()
+                            .set_permissions(metadata.permissions())
+                            .map_err(|e| fs_error(MUTATION_ERROR, &e))?;
+                    }
+                    temp.as_file()
+                        .sync_all()
+                        .map_err(|e| fs_error(MUTATION_ERROR, &e))?;
+                    atomic_rename(temp.path(), &path, !create)
+                        .map_err(|e| fs_error(MUTATION_ERROR, &e))?;
+                }
+                CREATE_DIRECTORY_METHOD => {
+                    std::fs::create_dir(&path).map_err(|e| fs_error(MUTATION_ERROR, &e))?
+                }
+                RENAME_METHOD => atomic_rename(&path, affected, overwrite)
+                    .map_err(|e| fs_error(MUTATION_ERROR, &e))?,
+                DELETE_METHOD => {
+                    let metadata = std::fs::symlink_metadata(&path)
+                        .map_err(|e| fs_error(MUTATION_ERROR, &e))?;
+                    let result = if metadata.is_dir() {
+                        if recursive {
+                            std::fs::remove_dir_all(&path)
+                        } else {
+                            std::fs::remove_dir(&path)
+                        }
+                    } else {
+                        std::fs::remove_file(&path)
+                    };
+                    result.map_err(|e| fs_error(MUTATION_ERROR, &e))?;
+                }
+                _ => unreachable!(),
+            }
+            if let Some(relay) = relay.upgrade() {
+                relay.on_paths_mutated(&notification_paths);
+            }
+            if let Some(mut descriptor) = before_delete {
+                descriptor["deleted"] = Value::Bool(true);
+                Ok(descriptor)
+            } else {
+                stat_path(affected).map_err(|e| fs_error(MUTATION_ERROR, &e))
+            }
+        })
+        .await
+        .map_err(|e| fs_error(MUTATION_ERROR, &std::io::Error::other(e)))?;
+        // Also invalidate standalone cores that have no relay wired.
+        self.invalidate(
+            &changed
+                .iter()
+                .filter_map(|p| p.parent().map(Path::to_path_buf))
+                .collect::<Vec<_>>(),
+            &[],
+        );
+        result
     }
 
     /// Cache invalidation used by the relay before each `didChange`
@@ -1077,11 +1253,45 @@ async fn read_git_file_base(
     })
 }
 
-fn mime_type_from_path(file_path: &Path) -> Option<&'static str> {
+pub(crate) fn mime_type_from_path(file_path: &Path) -> Option<&'static str> {
     let extension = file_path
         .extension()
         .map(|ext| ext.to_string_lossy().to_lowercase())?;
     match extension.as_str() {
+        "pdf" => Some("application/pdf"),
+        "mp3" => Some("audio/mpeg"),
+        "m4a" => Some("audio/mp4"),
+        "wav" => Some("audio/wav"),
+        "ogg" => Some("audio/ogg"),
+        "flac" => Some("audio/flac"),
+        "aac" => Some("audio/aac"),
+        "mp4" => Some("video/mp4"),
+        "m4v" => Some("video/mp4"),
+        "mov" => Some("video/quicktime"),
+        "webm" => Some("video/webm"),
+        "woff" => Some("font/woff"),
+        "woff2" => Some("font/woff2"),
+        "ttf" => Some("font/ttf"),
+        "otf" => Some("font/otf"),
+        "zip" => Some("application/zip"),
+        "tar" => Some("application/x-tar"),
+        "gz" => Some("application/gzip"),
+        "tgz" => Some("application/gzip"),
+        "7z" => Some("application/x-7z-compressed"),
+        "csv" => Some("text/csv"),
+        "tsv" => Some("text/tab-separated-values"),
+        "xml" => Some("application/xml"),
+        "yaml" => Some("application/yaml"),
+        "yml" => Some("application/yaml"),
+        "toml" => Some("application/toml"),
+        "docx" => Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "pptx" => Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+        "html" => Some("text/html"),
+        "htm" => Some("text/html"),
+        "txt" => Some("text/plain"),
+        "md" => Some("text/markdown"),
+        "json" => Some("application/json"),
         "apng" => Some("image/apng"),
         "avif" => Some("image/avif"),
         "gif" => Some("image/gif"),
@@ -1306,5 +1516,231 @@ mod tests {
         assert_eq!(format_bytes(2048), "2 KB");
         assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
         assert_eq!(format_bytes(1536 * 1024), "1.5 MB");
+    }
+}
+
+fn required_string<'a>(record: &'a Map<String, Value>, key: &str) -> Result<&'a str, JsonRpcError> {
+    record
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| JsonRpcError::new(INVALID_PARAMS, format!("Expected non-empty {key}")))
+}
+
+fn optional_bool(record: &Map<String, Value>, key: &str) -> Result<bool, JsonRpcError> {
+    match record.get(key) {
+        None => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        _ => Err(JsonRpcError::new(INVALID_PARAMS, format!("Invalid {key}"))),
+    }
+}
+
+pub(crate) fn mutation_error(kind: &str, message: &str) -> JsonRpcError {
+    JsonRpcError::with_data(MUTATION_ERROR, message, serde_json::json!({"kind":kind}))
+}
+
+pub(crate) fn fs_error(code: i64, error: &std::io::Error) -> JsonRpcError {
+    let kind = match error.kind() {
+        std::io::ErrorKind::NotFound => "notFound",
+        std::io::ErrorKind::AlreadyExists if code == MUTATION_ERROR => "exists",
+        std::io::ErrorKind::DirectoryNotEmpty if code == MUTATION_ERROR => "notEmpty",
+        std::io::ErrorKind::CrossesDevices if code == MUTATION_ERROR => "crossDevice",
+        _ => "io",
+    };
+    JsonRpcError::with_data(code, error.to_string(), serde_json::json!({"kind":kind}))
+}
+
+pub(crate) fn existing_metadata(path: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => Ok(Some(m)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+pub(crate) fn current_version(path: &Path) -> std::io::Result<Option<String>> {
+    let Some(link) = existing_metadata(path)? else {
+        return Ok(None);
+    };
+    let metadata = if link.is_symlink() {
+        match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => link,
+            Err(e) => return Err(e),
+        }
+    } else {
+        link
+    };
+    Ok(Some(crate::fs::file_window::file_version(&metadata)))
+}
+
+/// Linux renameat2 preserves create-only semantics even if another process
+/// creates the destination between the version check and the rename.
+pub(crate) fn atomic_rename(from: &Path, to: &Path, overwrite: bool) -> std::io::Result<()> {
+    if overwrite {
+        return std::fs::rename(from, to);
+    }
+    nix::fcntl::renameat2(
+        None,
+        from,
+        None,
+        to,
+        nix::fcntl::RenameFlags::RENAME_NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+}
+
+/// Reads at most 8 KiB, following symlinks but never reading special devices.
+/// Symlink descriptors retain their entry kind; size/version describe the target
+/// when it exists. Dangling symlinks describe the link itself.
+pub(crate) fn stat_path(path: &Path) -> std::io::Result<Value> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let link = std::fs::symlink_metadata(path)?;
+    let target = if link.is_symlink() {
+        match std::fs::metadata(path) {
+            Ok(m) => Some(m),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        }
+    } else {
+        None
+    };
+    let mut metadata = target.as_ref().unwrap_or(&link).clone();
+    let mut prefix = Vec::new();
+    if metadata.is_file() {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open(path)?;
+        metadata = file.metadata()?;
+        if metadata.is_file() {
+            file.take(8192).read_to_end(&mut prefix)?;
+        }
+    }
+    let target_kind = if link.is_symlink() {
+        target.as_ref().and_then(|m| {
+            if m.is_file() {
+                Some("file")
+            } else if m.is_dir() {
+                Some("directory")
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+    Ok(serde_json::json!({
+        "path": path.to_string_lossy(),
+        "name": path.file_name().unwrap_or_default().to_string_lossy(),
+        "kind": kind_from_file_type(link.file_type()),
+        "targetKind": target_kind,
+        "sizeBytes": metadata.len(),
+        "modifiedAtMs": modified_at_ms(&metadata),
+        "version": crate::fs::file_window::file_version(&metadata),
+        "mimeType": if metadata.is_file() { mime_type(path, &prefix) } else { None },
+        "isBinary": if metadata.is_file() { Some(is_likely_binary(&prefix)) } else { None },
+    }))
+}
+
+pub(crate) fn mime_type(path: &Path, prefix: &[u8]) -> Option<&'static str> {
+    mime_type_from_path(path).or_else(|| {
+        if prefix.starts_with(b"\x89PNG\r\n\x1a\n") {
+            Some("image/png")
+        } else if prefix.starts_with(b"\xff\xd8\xff") {
+            Some("image/jpeg")
+        } else if prefix.starts_with(b"GIF87a") || prefix.starts_with(b"GIF89a") {
+            Some("image/gif")
+        } else if prefix.starts_with(b"RIFF") && prefix.get(8..12) == Some(b"WEBP") {
+            Some("image/webp")
+        } else if prefix.starts_with(b"%PDF-") {
+            Some("application/pdf")
+        } else if [b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"]
+            .iter()
+            .any(|magic| prefix.starts_with(*magic))
+        {
+            Some("application/zip")
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(test)]
+mod file_service_tests {
+    use super::*;
+    #[test]
+    fn mime_extensions_override_sniffing() {
+        for (ext, mime) in [
+            ("pdf", "application/pdf"),
+            ("SVG", "image/svg+xml"),
+            ("mp3", "audio/mpeg"),
+            ("m4a", "audio/mp4"),
+            ("wav", "audio/wav"),
+            ("ogg", "audio/ogg"),
+            ("flac", "audio/flac"),
+            ("aac", "audio/aac"),
+            ("mp4", "video/mp4"),
+            ("m4v", "video/mp4"),
+            ("mov", "video/quicktime"),
+            ("webm", "video/webm"),
+            ("woff", "font/woff"),
+            ("woff2", "font/woff2"),
+            ("ttf", "font/ttf"),
+            ("otf", "font/otf"),
+            ("zip", "application/zip"),
+            ("tar", "application/x-tar"),
+            ("gz", "application/gzip"),
+            ("tgz", "application/gzip"),
+            ("7z", "application/x-7z-compressed"),
+            ("csv", "text/csv"),
+            ("tsv", "text/tab-separated-values"),
+            ("xml", "application/xml"),
+            ("yaml", "application/yaml"),
+            ("toml", "application/toml"),
+        ] {
+            assert_eq!(
+                mime_type(Path::new(&format!("file.{ext}")), b"%PDF-"),
+                Some(mime)
+            );
+        }
+        for ext in ["docx", "xlsx", "pptx"] {
+            assert!(mime_type_from_path(Path::new(&format!("file.{ext}")))
+                .unwrap()
+                .starts_with("application/vnd.openxmlformats-officedocument."));
+        }
+        assert_eq!(mime_type(Path::new("unknown"), b"plain"), None);
+    }
+    #[test]
+    fn rename_cross_device_error_mapping() {
+        assert_eq!(
+            fs_error(
+                MUTATION_ERROR,
+                &std::io::Error::from_raw_os_error(nix::libc::EXDEV)
+            )
+            .data
+            .unwrap()["kind"],
+            "crossDevice"
+        );
+        // The workspace sandbox may have no writable second mount. Exercise
+        // the real syscall when /tmp and the workspace are different devices.
+        use std::os::unix::fs::MetadataExt;
+        let local = tempfile::tempdir_in(".").unwrap();
+        let other = tempfile::tempdir().unwrap();
+        if std::fs::metadata(local.path()).unwrap().dev()
+            == std::fs::metadata(other.path()).unwrap().dev()
+        {
+            eprintln!("Skipping real EXDEV: no writable second device");
+            return;
+        }
+        let from = local.path().join("from");
+        std::fs::write(&from, "data").unwrap();
+        let error = atomic_rename(&from, &other.path().join("to"), false).unwrap_err();
+        assert_eq!(
+            fs_error(MUTATION_ERROR, &error).data.unwrap()["kind"],
+            "crossDevice"
+        );
+        assert!(from.exists());
     }
 }

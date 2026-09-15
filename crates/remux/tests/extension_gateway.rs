@@ -177,8 +177,13 @@ async fn start_remux(
     registry: ExtensionGatewayRegistry,
     journal: Arc<Journal>,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let viewer_bundles = ViewerBundleRegistry::new(root, &[extension.clone()], journal.clone());
+    let viewer_bundles =
+        ViewerBundleRegistry::new(root, std::slice::from_ref(extension), journal.clone());
     let state = Arc::new(HttpState {
+        raw_files: remux::http::raw_files::RawFileService::new(
+            remux::fs::core::FsCore::new(root),
+            remux::config::DEFAULT_MAX_UPLOAD_BYTES,
+        ),
         viewer_providers: ViewerProvider::for_extension(extension, viewer_bundles.clone()),
         viewer_bundles,
         default_extension: extension.clone(),
@@ -215,7 +220,8 @@ fn authorized_client() -> reqwest::Client {
 async fn authenticated_http_and_websocket_gateway_is_generation_fenced() {
     let root = tempfile::tempdir().unwrap();
     let extension = fixture_extension(root.path());
-    let registry = ExtensionGatewayRegistry::new(root.path(), &[extension.clone()]).unwrap();
+    let registry =
+        ExtensionGatewayRegistry::new(root.path(), std::slice::from_ref(&extension)).unwrap();
     let socket_path = registry
         .prepare_generation(&extension.id, GENERATION)
         .unwrap()
@@ -266,10 +272,7 @@ async fn authenticated_http_and_websocket_gateway_is_generation_fenced() {
         inspected_response.headers()["x-remux-extension-generation"],
         GENERATION.to_string()
     );
-    let inspected: Value = inspected_response
-        .json()
-        .await
-        .unwrap();
+    let inspected: Value = inspected_response.json().await.unwrap();
     assert_eq!(inspected["method"], "POST");
     assert_eq!(inspected["path"], "/inspect");
     assert_eq!(inspected["query"], "x=hello+world");
@@ -341,10 +344,7 @@ async fn authenticated_http_and_websocket_gateway_is_generation_fenced() {
         "false"
     );
     assert_eq!(handshake.headers()["x-fixture-generation"], "7");
-    assert_eq!(
-        handshake.headers()["x-remux-extension-generation"],
-        "7"
-    );
+    assert_eq!(handshake.headers()["x-remux-extension-generation"], "7");
     assert_eq!(
         handshake.headers()["x-fixture-query"],
         "wsTicket=fixture-ticket"

@@ -388,3 +388,61 @@ async fn close_is_idempotent_and_silences_all_layers() {
     assert_eq!(harness.broadcasts().len(), 0);
     assert!(harness.registry.is_closed("/repo/src"));
 }
+
+#[tokio::test]
+async fn mutation_rpcs_invalidate_cached_listings_and_broadcast_immediately() {
+    use remux::fs::core::FsCore;
+    let root = tempfile::tempdir().unwrap();
+    let core = FsCore::new(root.path());
+    let relay = FsRelay::new(
+        FsRelayOptions::default(),
+        FsRelay::production_hooks(Arc::new(|_| {})),
+    );
+    core.set_relay(&relay);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let notifications = events.clone();
+    let invalidated_core = core.clone();
+    relay.start(
+        Arc::new(move |v| notifications.lock().unwrap().push(v)),
+        Arc::new(move |p, r| invalidated_core.invalidate(p, r)),
+    );
+    let initial = core
+        .handle_rpc("remux/fs/readDirectory", Some(&json!({"path":"."})))
+        .await
+        .unwrap();
+    assert!(initial["entries"].as_array().unwrap().is_empty());
+    for (method, params) in [
+        ("remux/fs/writeFile", json!({"path":"a","content":"a"})),
+        ("remux/fs/createDirectory", json!({"path":"dir"})),
+        ("remux/fs/rename", json!({"from":"a","to":"dir/a"})),
+        ("remux/fs/delete", json!({"path":"dir","recursive":true})),
+    ] {
+        let count = events.lock().unwrap().len();
+        core.handle_rpc(method, Some(&params)).await.unwrap();
+        assert_eq!(
+            events.lock().unwrap().len(),
+            count + 1,
+            "{method} must broadcast before returning"
+        );
+        let fresh = core
+            .handle_rpc("remux/fs/readDirectory", Some(&json!({"path":"."})))
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh["entries"].as_array().unwrap().len(),
+            match count {
+                0 => 1,
+                1 => 2,
+                2 => 1,
+                _ => 0,
+            }
+        );
+    }
+    let events = events.lock().unwrap();
+    let rename_paths = events[2]["params"]["changedPaths"].as_array().unwrap();
+    assert_eq!(
+        rename_paths,
+        &vec![json!(root.path()), json!(root.path().join("dir"))]
+    );
+    relay.close();
+}

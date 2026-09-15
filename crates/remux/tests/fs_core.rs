@@ -443,3 +443,194 @@ async fn reports_symlink_target_kinds() {
     assert_eq!(by_name["broken-link"]["targetKind"], Value::Null);
     assert_eq!(by_name["real-dir"]["targetKind"], Value::Null);
 }
+
+#[tokio::test]
+async fn stat_and_mutation_contracts() {
+    use remux::fs::core::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let root = tempfile::tempdir().unwrap();
+    let core = FsCore::new(root.path());
+    let call = |method, params| {
+        let core = core.clone();
+        async move { core.handle_rpc(method, Some(&params)).await }
+    };
+    let first = call(
+        WRITE_FILE_METHOD,
+        json!({"path":"a.txt", "content":"hello", "create":true}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first["kind"], "file");
+    assert_eq!(first["isBinary"], false);
+    assert_eq!(first["sizeBytes"], 5);
+    let window = call(READ_FILE_WINDOW_METHOD, json!({"path":"a.txt"}))
+        .await
+        .unwrap();
+    assert_eq!(first["version"], window["version"]);
+    let err = call(
+        WRITE_FILE_METHOD,
+        json!({"path":"a.txt","content":"no","create":true}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, -32013);
+    assert_eq!(err.data.unwrap()["kind"], "exists");
+    let err = call(
+        WRITE_FILE_METHOD,
+        json!({"path":"a.txt","content":"no","expectedVersion":"old"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.data.unwrap()["kind"], "versionChanged");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
+        "hello"
+    );
+    std::fs::set_permissions(
+        root.path().join("a.txt"),
+        std::fs::Permissions::from_mode(0o640),
+    )
+    .unwrap();
+    let second = call(
+        WRITE_FILE_METHOD,
+        json!({"path":"a.txt","content":"world","expectedVersion":first["version"]}),
+    )
+    .await
+    .unwrap();
+    assert_ne!(first["version"], second["version"]);
+    assert_eq!(
+        std::fs::metadata(root.path().join("a.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640
+    );
+    symlink("a.txt", root.path().join("link")).unwrap();
+    let link = call(STAT_METHOD, json!({"path":"link"})).await.unwrap();
+    assert_eq!(link["kind"], "symlink");
+    assert_eq!(link["targetKind"], "file");
+    assert_eq!(link["version"], second["version"]);
+    let deleted = call(DELETE_METHOD, json!({"path":"link","recursive":true}))
+        .await
+        .unwrap();
+    assert_eq!(deleted["kind"], "symlink");
+    assert_eq!(deleted["deleted"], true);
+    assert!(root.path().join("a.txt").exists());
+    call(CREATE_DIRECTORY_METHOD, json!({"path":"dir"}))
+        .await
+        .unwrap();
+    call(
+        WRITE_FILE_METHOD,
+        json!({"path":"dir/child","content":"child"}),
+    )
+    .await
+    .unwrap();
+    let err = call(DELETE_METHOD, json!({"path":"dir"}))
+        .await
+        .unwrap_err();
+    assert_eq!(err.data.unwrap()["kind"], "notEmpty");
+    call(DELETE_METHOD, json!({"path":"dir","recursive":true}))
+        .await
+        .unwrap();
+    assert!(!root.path().join("dir").exists());
+    let renamed = call(RENAME_METHOD, json!({"from":"a.txt","to":"b.txt"}))
+        .await
+        .unwrap();
+    assert_eq!(renamed["name"], "b.txt");
+    call(WRITE_FILE_METHOD, json!({"path":"c.txt","content":"c"}))
+        .await
+        .unwrap();
+    let err = call(RENAME_METHOD, json!({"from":"b.txt","to":"c.txt"}))
+        .await
+        .unwrap_err();
+    assert_eq!(err.data.unwrap()["kind"], "exists");
+    call(
+        RENAME_METHOD,
+        json!({"from":"b.txt","to":"c.txt","overwrite":true}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("c.txt")).unwrap(),
+        "world"
+    );
+    for method in [STAT_METHOD, DELETE_METHOD, CREATE_DIRECTORY_METHOD] {
+        let err = call(method, json!({"path":"missing/child"}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            if method == STAT_METHOD {
+                -32011
+            } else {
+                -32013
+            }
+        );
+        assert_eq!(err.data.unwrap()["kind"], "notFound");
+    }
+    let err = call(
+        WRITE_FILE_METHOD,
+        json!({"path":"large","content":"x".repeat(5 * 1024 * 1024 + 1)}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.data.unwrap()["kind"], "tooLarge");
+    assert!(!root.path().join("large").exists());
+    assert!(std::fs::read_dir(root.path()).unwrap().all(|e| !e
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".remux-upload-")));
+}
+
+#[tokio::test]
+async fn stat_sniffs_unknown_extensions_and_handles_special_entries() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let core = FsCore::new(root.path());
+    for (name, bytes, mime) in [
+        ("png.unknown", &b"\x89PNG\r\n\x1a\n"[..], "image/png"),
+        ("jpeg", &b"\xff\xd8\xff"[..], "image/jpeg"),
+        ("gif", &b"GIF89a"[..], "image/gif"),
+        ("webp", &b"RIFFxxxxWEBP"[..], "image/webp"),
+        ("pdf", &b"%PDF-1.7"[..], "application/pdf"),
+        ("zip", &b"PK\x03\x04"[..], "application/zip"),
+    ] {
+        std::fs::write(root.path().join(name), bytes).unwrap();
+        let stat = rpc(&core, "remux/fs/stat", Some(json!({"path":name})))
+            .await
+            .unwrap();
+        assert_eq!(stat["mimeType"], mime);
+    }
+    nix::unistd::mkfifo(&root.path().join("fifo"), nix::sys::stat::Mode::S_IRUSR).unwrap();
+    symlink("absent", root.path().join("dangling")).unwrap();
+    for (name, kind) in [
+        ("fifo", "other"),
+        ("dangling", "symlink"),
+        (".", "directory"),
+    ] {
+        let stat = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            rpc(&core, "remux/fs/stat", Some(json!({"path":name}))),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stat["kind"], kind);
+        assert!(stat["isBinary"].is_null());
+        assert!(stat["targetKind"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn concurrent_create_only_write_has_one_winner() {
+    let root = tempfile::tempdir().unwrap();
+    let core = FsCore::new(root.path());
+    let params = json!({"path":"race", "content":"new", "create":true});
+    let (a, b) = tokio::join!(
+        core.handle_rpc("remux/fs/writeFile", Some(&params)),
+        core.handle_rpc("remux/fs/writeFile", Some(&params))
+    );
+    assert_ne!(a.is_ok(), b.is_ok());
+}

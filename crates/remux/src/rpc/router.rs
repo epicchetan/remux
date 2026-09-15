@@ -66,7 +66,7 @@ pub struct GatewayFacet {
     pub generation: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ViewsFacet {
     /// Views with a declared build.
     pub declared: u32,
@@ -74,16 +74,6 @@ pub struct ViewsFacet {
     /// time).
     pub built: bool,
     pub last_build_at_ms: Option<i64>,
-}
-
-impl Default for ViewsFacet {
-    fn default() -> Self {
-        Self {
-            declared: 0,
-            built: false,
-            last_build_at_ms: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -594,6 +584,11 @@ pub fn is_core_method(method: &str) -> bool {
             | "remux/fs/readDirectories"
             | "remux/fs/readFile"
             | "remux/fs/readFileGit"
+            | "remux/fs/stat"
+            | "remux/fs/writeFile"
+            | "remux/fs/createDirectory"
+            | "remux/fs/rename"
+            | "remux/fs/delete"
             | "remux/fs/readFileWindow"
     )
 }
@@ -844,6 +839,11 @@ mod tests {
             "remux/fs/readFile",
             "remux/fs/readFileGit",
             "remux/fs/readFileWindow",
+            "remux/fs/stat",
+            "remux/fs/writeFile",
+            "remux/fs/createDirectory",
+            "remux/fs/rename",
+            "remux/fs/delete",
         ] {
             let result = router
                 .handle_request(method, Some(&json!({ "path": "/tmp" })))

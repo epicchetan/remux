@@ -477,6 +477,7 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
         FsRelayOptions::default(),
         FsRelay::production_hooks(Arc::new(move |message| relay_warn_journal.warn(&message))),
     );
+    fs_core.set_relay(&relay);
     let _ = shared.relay.set(relay.clone());
     {
         let relay = relay.clone();
@@ -610,6 +611,10 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
         .flat_map(|extension| ViewerProvider::for_extension(extension, viewer_bundles.clone()))
         .collect();
     let http_state = Arc::new(HttpState {
+        raw_files: crate::http::raw_files::RawFileService::new(
+            fs_core.clone(),
+            config.max_upload_bytes(),
+        ),
         default_extension: default_extension.clone(),
         extensions: extensions.clone(),
         invalid_extensions,
@@ -651,6 +656,9 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
         .layer(axum::middleware::from_fn_with_state(
             auth_state,
             crate::auth::require_auth,
+        ))
+        .layer(axum::middleware::from_fn(
+            crate::http::raw_files::secure_raw_responses,
         ))
         .layer(compression_layer())
         .into_make_service_with_connect_info::<std::net::SocketAddr>();

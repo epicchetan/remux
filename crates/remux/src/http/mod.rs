@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod extension_gateways;
 pub mod icons;
 pub mod media;
+pub mod raw_files;
 pub mod viewer_bundles;
 pub mod viewers;
 
@@ -29,6 +30,7 @@ use crate::rpc::router::{RpcRouter, EXTENSION_STATUS_METHOD, SYSTEM_RESOURCES_ME
 use viewers::ViewerProvider;
 
 pub struct HttpState {
+    pub raw_files: Arc<raw_files::RawFileService>,
     pub default_extension: ExtensionManifest,
     pub extensions: Vec<ExtensionManifest>,
     pub invalid_extensions: Vec<InvalidExtension>,
@@ -58,6 +60,10 @@ impl Predicate for NotForExtensionGateway {
             .extensions()
             .get::<extension_gateways::GatewayResponse>()
             .is_none()
+            && response
+                .extensions()
+                .get::<raw_files::RawFileResponse>()
+                .is_none()
     }
 }
 
@@ -75,6 +81,10 @@ pub fn compression_layer() -> CompressionLayer<impl Predicate> {
 pub fn build_router(state: Arc<HttpState>) -> axum::Router {
     axum::Router::new()
         .route(
+            "/remux/fs/raw",
+            raw_files::routes(state.raw_files.max_upload_bytes),
+        )
+        .route(
             "/remux/extensions/{extension_id}/gateway",
             any(handle_extension_gateway),
         )
@@ -91,6 +101,10 @@ pub fn build_router_with_status(
     status_state: Arc<ApiStatusState>,
 ) -> axum::Router {
     axum::Router::new()
+        .route(
+            "/remux/fs/raw",
+            raw_files::routes(state.raw_files.max_upload_bytes),
+        )
         .route(
             "/api/status",
             get({

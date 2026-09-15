@@ -12,6 +12,7 @@ use serde::Deserialize;
 use crate::paths;
 
 pub const CONFIG_RELATIVE_PATH: &str = ".remux/config.toml";
+pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_HOST: &str = "0.0.0.0";
 pub const DEFAULT_PORT: u16 = 48123;
 pub const DEFAULT_GUARDIAN_PORT: u16 = 48124;
@@ -22,6 +23,7 @@ pub const DEFAULT_WATCHDOG_STALE_SECONDS: u32 = 30;
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemuxConfig {
+    pub max_upload_bytes: Option<u64>,
     pub host: Option<String>,
     pub port: Option<i64>,
     pub guardian_port: Option<i64>,
@@ -45,6 +47,10 @@ pub struct RemuxConfig {
 }
 
 impl RemuxConfig {
+    pub fn max_upload_bytes(&self) -> u64 {
+        self.max_upload_bytes.unwrap_or(DEFAULT_MAX_UPLOAD_BYTES)
+    }
+
     pub fn guardian_port(&self) -> Result<u16, String> {
         match self.guardian_port {
             Some(port) => parse_port_number(port, "guardian_port"),
@@ -174,6 +180,18 @@ fn port_in_range(value: i64) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_limit_defaults_and_parses() {
+        assert_eq!(RemuxConfig::default().max_upload_bytes(), 512 * 1024 * 1024);
+        assert_eq!(
+            parse_remux_config_toml("max_upload_bytes = 123", "config")
+                .unwrap()
+                .max_upload_bytes(),
+            123
+        );
+        assert!(parse_remux_config_toml("max_upload_bytes = -1", "config").is_err());
+    }
 
     #[test]
     fn parses_runtime_values_and_extension_roots() {
