@@ -332,7 +332,15 @@ Commit and push each reviewed green slice to main.
   fails at the terminal extension's state-worker step because the optional
   `@esbuild/linux-x64` package is missing from `node_modules`; the terminal
   extension is unchanged by this work, so its existing dist stands.
-- 2026-09-15: main pushed (11a74b1). OTA published to the `preview` branch:
-  iOS update `01a0a705-642a-7fda-8b3e-581924ce09c3` (group
-  `b7d253cd-2cf4-4c95-a17a-a279825768e4`, runtime version
-  `11b00fff61cb9ab6cb72f4498518e4bdcf7c009f`).
+- 2026-09-15: main pushed (11a74b1). OTA published to the `preview` branch.
+  The first publish landed on runtime fingerprint `11b00fff…` because
+  `@expo/fingerprint` hashes the `scripts` block of `app/package.json`, which
+  gained test scripts since the installed build; every earlier update sits on
+  `a100fc36…`. Republished with the July `scripts` block swapped in
+  temporarily (`git show 27ab393:app/package.json`, `eas fingerprint:compare`
+  confirmed the match), giving iOS update
+  `01a0a707-a109-7d32-8744-239d24b58df2` (group
+  `ce69a8bc-e54b-48a6-beef-c3926ae5130d`) on `a100fc36…`. The next native
+  build should add a `fingerprint.config.js` with
+  `sourceSkips: PackageJsonScriptsAll` so script edits stop moving the
+  fingerprint.
