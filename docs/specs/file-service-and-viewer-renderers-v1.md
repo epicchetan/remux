@@ -199,6 +199,9 @@ Windowed text keeps its range controls.
   only ever an `<img>` source, never inline markup. Load failure shows a
   retry card; nothing blanks the tab.
 - **pdf**: an `<iframe>` on the raw URL; WKWebView renders PDFs natively.
+  The app's WebView navigation policy blocks same-origin navigations outside
+  the viewer route, so it allows exactly one exception: a subframe (never
+  the top frame) navigating to `/remux/fs/raw`.
   Android is unsupported and shows the binary fallback.
 - **media**: `<audio controls>` or `<video controls playsinline>` on the raw
   URL, relying on range support for seeking.
@@ -354,3 +357,8 @@ Commit and push each reviewed green slice to main.
   Cause: the sandbox CSP header on the raw response, as anticipated above.
   Fix: `application/pdf` raw responses no longer carry
   `Content-Security-Policy: sandbox` (nosniff stays); test added.
+- 2026-09-15: the PDF stayed blank after the header fix. Second cause: the
+  app's `webViewNavigationDecision` blocked the iframe's same-origin
+  navigation to `/remux/fs/raw` as `outside-viewer-route` before the request
+  left the device. Subframe navigations to that exact path are now allowed;
+  top-frame ones stay blocked. App-only change, shipped by OTA.

@@ -71,6 +71,15 @@ for (const marker of [
   assert.ok(webViewSource.includes(marker), `missing host file download marker: ${marker}`);
 }
 
+// The Viewer's PDF renderer is an iframe onto the raw route; only a subframe
+// may navigate there.
+for (const marker of [
+  "if (!isTopFrame && request.pathname === rawFileRoutePath) {",
+  "const rawFileRoutePath = '/remux/fs/raw';",
+]) {
+  assert.ok(webViewSource.includes(marker), `missing raw-route subframe marker: ${marker}`);
+}
+
 const protectedTransportSource = await readFile(
   new URL('../src/surfaces/viewer/protectedViewerTransport.ts', import.meta.url),
   'utf8',
@@ -115,6 +124,6 @@ assert.ok(
 
 process.stdout.write(
   `${JSON.stringify({
-    ok: true, explicitSafeAreas: true, hostFileDownload: true, minimalHostChrome: true,
+    ok: true, explicitSafeAreas: true, hostFileDownload: true, minimalHostChrome: true, rawRouteSubframe: true,
   })}\n`,
 );

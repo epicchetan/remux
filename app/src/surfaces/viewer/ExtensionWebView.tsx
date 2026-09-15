@@ -1953,6 +1953,14 @@ function webViewNavigationDecision({
       : { reason: 'unsupported-external-scheme', type: 'blocked' };
   }
 
+  // The Viewer's PDF renderer is an iframe onto the raw file route. Only a
+  // subframe may go there: a top-frame navigation would replace the viewer,
+  // and the raw response cannot script the origin (nosniff, sandbox CSP for
+  // everything but PDF, which WebKit draws natively).
+  if (!isTopFrame && request.pathname === rawFileRoutePath) {
+    return { type: 'allow' };
+  }
+
   const sourcePath = source.pathname.endsWith('/')
     ? source.pathname
     : source.pathname.slice(0, source.pathname.lastIndexOf('/') + 1);
@@ -1960,6 +1968,8 @@ function webViewNavigationDecision({
     ? { type: 'allow' }
     : { reason: 'outside-viewer-route', type: 'blocked' };
 }
+
+const rawFileRoutePath = '/remux/fs/raw';
 
 function isWebProtocol(protocol: string) {
   return protocol === 'http:' || protocol === 'https:';
