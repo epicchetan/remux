@@ -2,8 +2,10 @@ import { useCallback, useEffect, useRef, type Ref } from 'react';
 
 import { useBrowserStore } from '../../browser/browserStore';
 import type { BrowserSection, ViewerTab } from '../../browser/browserTypes';
+import { downloadAndShareFile } from '../../files/fileDownload';
 import { matchingFileHandlers } from '../../files/fileHandlers';
 import { logRemuxDebug } from '../../remote/remuxDebug';
+import { currentRemuxOrigin, useRemuxSettingsStore } from '../../remote/remuxSettingsStore';
 import { ExtensionWebView, type ExtensionWebViewHandle } from './ExtensionWebView';
 
 type ViewerSurfaceProps = {
@@ -55,6 +57,13 @@ export function ViewerSurface({ active, onOpenOverview, surfaceRef, tab }: Viewe
       ok: true,
     };
   }, [extensions, openResource]);
+  // Read at invocation: a download started now must use the runtime the app is
+  // connected to now, not the one captured when this surface last rendered.
+  const downloadFile = useCallback(({ path }: { path: string }) => downloadAndShareFile({
+    origin: currentRemuxOrigin(),
+    path,
+    token: useRemuxSettingsStore.getState().token,
+  }), []);
   const closeCurrentTab = useCallback(() => {
     closeTab(tab.id, { returnToOverview: true });
   }, [closeTab, tab.id]);
@@ -91,6 +100,7 @@ export function ViewerSurface({ active, onOpenOverview, surfaceRef, tab }: Viewe
       active={active}
       hostChrome={hostChrome}
       onCloseTab={closeCurrentTab}
+      onDownloadFile={downloadFile}
       onOpenFile={openFile}
       onOpenOverview={onOpenOverview}
       onReloadView={refreshViewerRevision}

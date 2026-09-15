@@ -63,6 +63,23 @@ for (const marker of [
   assert.ok(webViewSource.includes(marker), `missing native hosted-shell marker: ${marker}`);
 }
 
+for (const marker of [
+  "message.method === 'host/file/download'",
+  "message: 'Invalid file download params'",
+  "onDownloadFile?.(params) ?? { ok: false, reason: 'unavailable' }",
+]) {
+  assert.ok(webViewSource.includes(marker), `missing host file download marker: ${marker}`);
+}
+
+const protectedTransportSource = await readFile(
+  new URL('../src/surfaces/viewer/protectedViewerTransport.ts', import.meta.url),
+  'utf8',
+);
+assert.ok(
+  protectedTransportSource.includes('Object.freeze({ fileDownload: true, protectedHtmlPreviewTransport: true })'),
+  'the native host must advertise the fileDownload capability',
+);
+
 const activeSurfaceSource = await readFile(
   new URL('../src/browser/ActiveSurface.tsx', import.meta.url),
   'utf8',
@@ -91,7 +108,13 @@ for (const marker of [
 ]) {
   assert.ok(viewerSurfaceSource.includes(marker), `missing revision-aware reload marker: ${marker}`);
 }
+assert.ok(
+  viewerSurfaceSource.includes('onDownloadFile={downloadFile}'),
+  'the Viewer surface must route host downloads to the share sheet',
+);
 
 process.stdout.write(
-  `${JSON.stringify({ ok: true, explicitSafeAreas: true, minimalHostChrome: true })}\n`,
+  `${JSON.stringify({
+    ok: true, explicitSafeAreas: true, hostFileDownload: true, minimalHostChrome: true,
+  })}\n`,
 );

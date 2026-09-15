@@ -24,6 +24,10 @@ export type HostFileOpenParams = {
   path: string;
 };
 
+export type HostFileDownloadParams = {
+  path: string;
+};
+
 export type HostLinkOpenParams = {
   url: string;
 };
@@ -121,6 +125,13 @@ export function openHostOverview(params: HostOverviewOpenParams = {}) {
 
 export function openHostFile(params: HostFileOpenParams) {
   return rpc.command<{ ok: boolean; reason?: string }>('host/file/open', params);
+}
+
+// Hands the file to the host's own download path: the native app fetches the
+// raw route and presents a share sheet, the browser host lets the browser
+// save it. Requires the fileDownload host capability.
+export function downloadHostFile(params: HostFileDownloadParams) {
+  return rpc.command<{ ok: boolean; reason?: string }>('host/file/download', params);
 }
 
 // Opens a url in the device's default browser. In-page escapes like

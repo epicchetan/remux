@@ -218,6 +218,16 @@ export function installDirectHost(target: BrowserWindow = window) {
         respond(id, open(url));
         return;
       }
+      case 'host/file/download': {
+        if (typeof params.path !== 'string' || !params.path.trim() || /^(?:[a-z][a-z\d+.-]*:|\/\/)/iu.test(params.path)) {
+          reject(id, 'Invalid file download params', -32602);
+          return;
+        }
+        // The raw route forces an attachment and authenticates with the
+        // session cookie, so the browser's own download handles the save.
+        respond(id, open(new URL(`/remux/fs/raw?path=${encodeURIComponent(params.path)}&download=1`, target.location.href)));
+        return;
+      }
       default:
         reject(id, `Direct host does not support ${method}`, -32601);
     }
@@ -276,6 +286,9 @@ export function installDirectHost(target: BrowserWindow = window) {
   target.addEventListener('resize', onResize);
   target.addEventListener('pagehide', dispose);
   theme.addEventListener('change', onTheme);
+  // Announced before the first status so a view that reads capabilities while
+  // mounting never sees a host that silently lacks the download command.
+  target.__REMUX_HOST_CAPABILITIES__ = Object.freeze({ fileDownload: true });
   status({ type: 'connecting' });
   connect();
   return { postMessage, dispose };

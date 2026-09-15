@@ -144,6 +144,7 @@ let lifecycleSnapshot: RemuxHostLifecycleEvent = {
 declare global {
   interface Window {
     __REMUX_HOST_CAPABILITIES__?: {
+      fileDownload?: boolean;
       protectedHtmlPreviewTransport?: boolean;
     };
     __REMUX_PROTECTED_POST_MESSAGE__?: (message: string) => void;
@@ -513,11 +514,13 @@ function handleNativeMessage(event: MessageEvent) {
 }
 
 export type RemuxHostCapabilities = Readonly<{
+  fileDownload: boolean;
   protectedHtmlPreviewTransport: boolean;
 }>;
 
 export function getIpcHostCapabilities(): RemuxHostCapabilities {
   return {
+    fileDownload: window.__REMUX_HOST_CAPABILITIES__?.fileDownload === true,
     protectedHtmlPreviewTransport:
       window.__REMUX_HOST_CAPABILITIES__?.protectedHtmlPreviewTransport === true,
   };

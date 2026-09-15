@@ -77,7 +77,7 @@ export function createProtectedViewerBootstrapScript(token: string, documentUrl?
     Object.defineProperty(window, '__REMUX_HOST_CAPABILITIES__', {
       configurable: false,
       enumerable: false,
-      value: Object.freeze({ protectedHtmlPreviewTransport: true }),
+      value: Object.freeze({ fileDownload: true, protectedHtmlPreviewTransport: true }),
       writable: false,
     });
     window.dispatchEvent(new CustomEvent('remux:host-capabilities-ready'));

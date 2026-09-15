@@ -241,6 +241,15 @@ type HostFileOpenResult = {
   reason?: string;
 };
 
+type HostFileDownloadParams = {
+  path: string;
+};
+
+type HostFileDownloadResult = {
+  ok: boolean;
+  reason?: string;
+};
+
 export type ExtensionTabUpdate = {
   handlerId?: string | null;
   launch?: string | null;
@@ -280,6 +289,7 @@ type ExtensionWebViewProps = {
   active: boolean;
   hostChrome?: RemuxViewHostChrome;
   onCloseTab?: () => void;
+  onDownloadFile?: (params: HostFileDownloadParams) => Promise<HostFileDownloadResult>;
   onNavigationDelivered?: (nonce: string) => void;
   onOpenFile?: (params: HostFileOpenParams) => HostFileOpenResult | Promise<HostFileOpenResult>;
   onOpenOverview?: (section?: BrowserSection) => Promise<void> | void;
@@ -303,6 +313,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
     active,
     hostChrome = 'none',
     onCloseTab,
+    onDownloadFile,
     onNavigationDelivered,
     onOpenFile,
     onOpenOverview,
@@ -1066,6 +1077,41 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
             break;
           }
 
+          if (message.method === 'host/file/download') {
+            const params = parseFileDownloadParams(message.params);
+            if (!params) {
+              postToWebView({
+                error: {
+                  code: -32602,
+                  message: 'Invalid file download params',
+                },
+                id: message.id,
+                type: 'remux/error',
+              }, { epoch: requestEpoch });
+              break;
+            }
+
+            void Promise.resolve(onDownloadFile?.(params) ?? { ok: false, reason: 'unavailable' })
+              .then((result) => {
+                postToWebView({
+                  id: message.id,
+                  result,
+                  type: 'remux/response',
+                }, { epoch: requestEpoch });
+              })
+              .catch((requestError) => {
+                postToWebView({
+                  error: {
+                    code: -32000,
+                    message: errorMessage(requestError),
+                  },
+                  id: message.id,
+                  type: 'remux/error',
+                }, { epoch: requestEpoch });
+              });
+            break;
+          }
+
           if (message.method === 'host/link/open') {
             const url = parseLinkOpenUrl(message.params);
             if (!url) {
@@ -1148,6 +1194,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
       dismissKeyboard,
       hostViewportMetrics,
       onCloseTab,
+      onDownloadFile,
       onOpenFile,
       onOpenOverview,
       reloadLatestWebView,
@@ -1783,6 +1830,21 @@ function parseFileOpenParams(params: unknown): HostFileOpenParams | null {
     line: typeof params.line === 'number' && Number.isFinite(params.line)
       ? Math.max(1, Math.floor(params.line))
       : null,
+    path: params.path,
+  };
+}
+
+function parseFileDownloadParams(params: unknown): HostFileDownloadParams | null {
+  if (
+    !isRecord(params)
+    || typeof params.path !== 'string'
+    || params.path.trim().length === 0
+    || !isHostFilePath(params.path)
+  ) {
+    return null;
+  }
+
+  return {
     path: params.path,
   };
 }
