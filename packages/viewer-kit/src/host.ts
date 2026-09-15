@@ -28,6 +28,20 @@ export type HostFileDownloadParams = {
   path: string;
 };
 
+// A rectangle in the page's CSS pixels, relative to the viewport's top-left.
+export type HostPdfFrame = {
+  height: number;
+  width: number;
+  x: number;
+  y: number;
+};
+
+export type HostPdfPresentParams = {
+  frame: HostPdfFrame;
+  path: string;
+  version?: string | null;
+};
+
 export type HostLinkOpenParams = {
   url: string;
 };
@@ -132,6 +146,18 @@ export function openHostFile(params: HostFileOpenParams) {
 // save it. Requires the fileDownload host capability.
 export function downloadHostFile(params: HostFileDownloadParams) {
   return rpc.command<{ ok: boolean; reason?: string }>('host/file/download', params);
+}
+
+// Asks the native host to draw the PDF at `path` as a top-level document over
+// the given page rectangle, using the platform's own PDF view (fit-to-width,
+// pinch zoom, page scrolling). Presenting again moves or replaces the overlay;
+// dismiss removes it. Requires the pdfPresent host capability.
+export function presentHostPdf(params: HostPdfPresentParams) {
+  return rpc.command<{ ok: boolean; reason?: string }>('host/pdf/present', params);
+}
+
+export function dismissHostPdf() {
+  return rpc.command<{ ok: boolean }>('host/pdf/dismiss');
 }
 
 // Opens a url in the device's default browser. In-page escapes like

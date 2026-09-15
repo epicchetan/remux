@@ -43,6 +43,7 @@ import type { BrowserPendingNavigation, BrowserSection, ViewerTab } from '../../
 import { serializedResourceKey } from '@remux/viewer-kit/route';
 import { noteTabPreviewContentChanged } from '../../browser/tabPreviewCapture';
 import { NativeGlassIconButton } from '../../ui/NativeGlassIconButton';
+import { PdfOverlay, pdfOverlayUrl, type HostPdfFrame } from './PdfOverlay';
 import {
   createProtectedViewerBootstrapScript,
   createProtectedViewerToken,
@@ -245,6 +246,12 @@ type HostFileDownloadParams = {
   path: string;
 };
 
+type HostPdfPresentParams = {
+  frame: HostPdfFrame;
+  path: string;
+  version: string | null;
+};
+
 type HostFileDownloadResult = {
   ok: boolean;
   reason?: string;
@@ -334,6 +341,9 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
   const theme = useTheme();
   const hostControlInsetLeft = hostChrome === 'minimal' ? minimalHostControlInsetLeft : 0;
   const [pageState, setPageState] = useState<WebViewPageState>({ type: 'loading' });
+  // The Viewer's PDF renderer asks for a native PDF view over its body rect;
+  // any page load clears it, since the page that asked is gone.
+  const [pdfOverlay, setPdfOverlay] = useState<{ frame: HostPdfFrame; url: string } | null>(null);
   const [reloadNonce, setReloadNonce] = useState(0);
   const [reloadTargetUrl, setReloadTargetUrl] = useState(sourceUrl);
   const automaticReloadAttemptsRef = useRef(0);
@@ -1112,6 +1122,42 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
             break;
           }
 
+          if (message.method === 'host/pdf/present') {
+            const params = parsePdfPresentParams(message.params);
+            if (!params) {
+              postToWebView({
+                error: {
+                  code: -32602,
+                  message: 'Invalid pdf present params',
+                },
+                id: message.id,
+                type: 'remux/error',
+              }, { epoch: requestEpoch });
+              break;
+            }
+
+            setPdfOverlay({
+              frame: params.frame,
+              url: pdfOverlayUrl(webViewSourceUrl, params.path, params.version),
+            });
+            postToWebView({
+              id: message.id,
+              result: { ok: true },
+              type: 'remux/response',
+            }, { epoch: requestEpoch });
+            break;
+          }
+
+          if (message.method === 'host/pdf/dismiss') {
+            setPdfOverlay(null);
+            postToWebView({
+              id: message.id,
+              result: { ok: true },
+              type: 'remux/response',
+            }, { epoch: requestEpoch });
+            break;
+          }
+
           if (message.method === 'host/link/open') {
             const url = parseLinkOpenUrl(message.params);
             if (!url) {
@@ -1329,6 +1375,7 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
     });
     resetWebViewReadiness('load-start');
     setPageState({ type: 'loading' });
+    setPdfOverlay(null);
 
     readyTimeoutRef.current = setTimeout(() => {
       readyTimeoutRef.current = null;
@@ -1552,6 +1599,14 @@ export const ExtensionWebView = forwardRef<ExtensionWebViewHandle, ExtensionWebV
         }}
         style={styles.webView}
       />
+      {pdfOverlay && pageState.type === 'ready' ? (
+        <PdfOverlay
+          authToken={authToken}
+          backgroundColor={theme.surface}
+          frame={pdfOverlay.frame}
+          url={pdfOverlay.url}
+        />
+      ) : null}
       {hostChrome === 'minimal' ? (
         <View
           pointerEvents="box-none"
@@ -1849,6 +1904,32 @@ function parseFileDownloadParams(params: unknown): HostFileDownloadParams | null
   };
 }
 
+function parsePdfPresentParams(params: unknown): HostPdfPresentParams | null {
+  if (
+    !isRecord(params)
+    || typeof params.path !== 'string'
+    || params.path.trim().length === 0
+    || !isHostFilePath(params.path)
+    || !isRecord(params.frame)
+    || (params.version != null && typeof params.version !== 'string')
+  ) {
+    return null;
+  }
+
+  const { frame } = params;
+  const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
+  if (!finite(frame.x) || !finite(frame.y) || !finite(frame.width) || !finite(frame.height)
+    || frame.width <= 0 || frame.height <= 0) {
+    return null;
+  }
+
+  return {
+    frame: { height: frame.height, width: frame.width, x: frame.x, y: frame.y },
+    path: params.path,
+    version: typeof params.version === 'string' ? params.version : null,
+  };
+}
+
 // Only web urls may leave the app; viewers must never reach Linking with
 // custom schemes (javascript:, tel:, app schemes).
 function parseLinkOpenUrl(params: unknown): string | null {
@@ -1953,14 +2034,6 @@ function webViewNavigationDecision({
       : { reason: 'unsupported-external-scheme', type: 'blocked' };
   }
 
-  // The Viewer's PDF renderer is an iframe onto the raw file route. Only a
-  // subframe may go there: a top-frame navigation would replace the viewer,
-  // and the raw response cannot script the origin (nosniff, sandbox CSP for
-  // everything but PDF, which WebKit draws natively).
-  if (!isTopFrame && request.pathname === rawFileRoutePath) {
-    return { type: 'allow' };
-  }
-
   const sourcePath = source.pathname.endsWith('/')
     ? source.pathname
     : source.pathname.slice(0, source.pathname.lastIndexOf('/') + 1);
@@ -1968,8 +2041,6 @@ function webViewNavigationDecision({
     ? { type: 'allow' }
     : { reason: 'outside-viewer-route', type: 'blocked' };
 }
-
-const rawFileRoutePath = '/remux/fs/raw';
 
 function isWebProtocol(protocol: string) {
   return protocol === 'http:' || protocol === 'https:';

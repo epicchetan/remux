@@ -71,13 +71,32 @@ for (const marker of [
   assert.ok(webViewSource.includes(marker), `missing host file download marker: ${marker}`);
 }
 
-// The Viewer's PDF renderer is an iframe onto the raw route; only a subframe
-// may navigate there.
+// The Viewer's PDF renderer asks the host for a native PDF view over its
+// body rect; the host owns the url and the overlay's navigation policy.
 for (const marker of [
-  "if (!isTopFrame && request.pathname === rawFileRoutePath) {",
-  "const rawFileRoutePath = '/remux/fs/raw';",
+  "message.method === 'host/pdf/present'",
+  "message: 'Invalid pdf present params'",
+  "message.method === 'host/pdf/dismiss'",
+  'url: pdfOverlayUrl(webViewSourceUrl, params.path, params.version)',
+  "{pdfOverlay && pageState.type === 'ready' ? (",
 ]) {
-  assert.ok(webViewSource.includes(marker), `missing raw-route subframe marker: ${marker}`);
+  assert.ok(webViewSource.includes(marker), `missing pdf overlay marker: ${marker}`);
+}
+assert.ok(
+  !webViewSource.includes('request.pathname === rawFileRoutePath'),
+  'the viewer WebView must not let any frame navigate to the raw file route',
+);
+const pdfOverlaySource = await readFile(
+  new URL('../src/surfaces/viewer/PdfOverlay.tsx', import.meta.url),
+  'utf8',
+);
+for (const marker of [
+  'javaScriptEnabled={false}',
+  "request.isTopFrame !== false",
+  "requested.pathname === rawFileRoutePath",
+  "requested.searchParams.get('path') === documentUrl.searchParams.get('path')",
+]) {
+  assert.ok(pdfOverlaySource.includes(marker), `missing pdf overlay policy marker: ${marker}`);
 }
 
 const protectedTransportSource = await readFile(
@@ -85,8 +104,8 @@ const protectedTransportSource = await readFile(
   'utf8',
 );
 assert.ok(
-  protectedTransportSource.includes('Object.freeze({ fileDownload: true, protectedHtmlPreviewTransport: true })'),
-  'the native host must advertise the fileDownload capability',
+  protectedTransportSource.includes('Object.freeze({ fileDownload: true, pdfPresent: true, protectedHtmlPreviewTransport: true })'),
+  'the native host must advertise the fileDownload and pdfPresent capabilities',
 );
 
 const activeSurfaceSource = await readFile(
@@ -124,6 +143,6 @@ assert.ok(
 
 process.stdout.write(
   `${JSON.stringify({
-    ok: true, explicitSafeAreas: true, hostFileDownload: true, minimalHostChrome: true, rawRouteSubframe: true,
+    ok: true, explicitSafeAreas: true, hostFileDownload: true, minimalHostChrome: true, pdfOverlay: true,
   })}\n`,
 );

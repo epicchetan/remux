@@ -193,16 +193,30 @@ Windowed text keeps its range controls.
 
 - **source, markdown, html**: existing components moved behind the contract
   with no behavior change beyond lazy loading.
-- **image**: `<img>` from the raw URL, fit-to-width by default, tap toggles
-  1:1, pinch and drag through pointer events with `touch-action: none`, no
-  library. Natural dimensions appear in the status text after load. SVG is
+- **image**: `<img>` from the raw URL at its natural size under a
+  translate-and-scale transform, driven by pointer events with
+  `touch-action: none`, no library. The rest state fits the whole image on
+  both axes. Scale is bounded below by fit and above by 1:1 or four times
+  fit, whichever is larger; the offset never exposes the background on an
+  axis the image fills, and centers it on an axis it does not. A live pinch
+  or drag may overshoot those bounds by a rubber-band fraction and springs
+  back on release. Double tap toggles fit and a closer look at the tapped
+  point (1:1, or twice fit when the image is already near natural size);
+  single tap does nothing. Wheel zooms around the cursor for the browser
+  host. The status text shows natural dimensions and the current zoom
+  percentage. A resize keeps a zoom and re-clamps it, or re-fits. SVG is
   only ever an `<img>` source, never inline markup. Load failure shows a
   retry card; nothing blanks the tab.
-- **pdf**: an `<iframe>` on the raw URL; WKWebView renders PDFs natively.
-  The app's WebView navigation policy blocks same-origin navigations outside
-  the viewer route, so it allows exactly one exception: a subframe (never
-  the top frame) navigating to `/remux/fs/raw`.
-  Android is unsupported and shows the binary fallback.
+- **pdf**: on a host advertising `pdfPresent`, the renderer draws nothing
+  and asks the host to present the file over its body rectangle with
+  `presentHostPdf({ path, version, frame })`, re-sent when the rectangle
+  resizes and dismissed on unmount. The app answers with a second WebView
+  that loads the raw URL as its top-level document, so WebKit uses its
+  native PDF view: fit-to-width, pinch zoom, page scrolling. A PDF in a
+  subframe is drawn at one PDF point per CSS pixel with no fit mode, which
+  is why the earlier `<iframe>` was unusable on a phone. Hosts without the
+  capability (the browser) still get an `<iframe>` on the raw URL; Android
+  shows the binary fallback.
 - **media**: `<audio controls>` or `<video controls playsinline>` on the raw
   URL, relying on range support for seeking.
 - **binary**: name, type, size, version and the Download button.
@@ -234,11 +248,28 @@ photos use the image picker without base64. Each asset is sent with
 line on completion. A 409 prompts Replace or Skip and retries with
 `overwrite=1`. Nothing is read into JavaScript memory.
 
+### PDF presentation
+
+New host commands `host/pdf/present {path, version?, frame}` and
+`host/pdf/dismiss` in `ExtensionWebView`, exposed by viewer-kit as
+`presentHostPdf` and `dismissHostPdf`, advertised as the `pdfPresent`
+capability by the native host only. The frame is the page's CSS-pixel
+rectangle relative to the viewport, which iOS maps 1:1 to points. The host
+builds the URL itself from the viewer's origin and the given path, never from
+a URL the page supplies, and renders `PdfOverlay`: an absolutely positioned
+`WebView` inside the tab's container (so tab previews photograph it) with
+JavaScript off, the bearer header on the document request, and a navigation
+policy that allows only top-frame loads of that exact path on the raw route.
+Present again moves or replaces the overlay; dismiss, any page load and a
+non-ready page state remove it. The viewer's own WebView allows no frame to
+navigate to the raw route.
+
 ### Viewer-kit additions
 
 `fs.ts` gains `statFile`, `writeFile`, `createDirectory`, `renameEntry`,
 `deleteEntry`, and `rawFileUrl(path, version?)`. `host.ts` gains
-`downloadHostFile`. The app's `filesApi.ts` uses the same method names.
+`downloadHostFile`, `presentHostPdf` and `dismissHostPdf`. The app's
+`filesApi.ts` uses the same method names.
 
 ## Files tab mutations
 

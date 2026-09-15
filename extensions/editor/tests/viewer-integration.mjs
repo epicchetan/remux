@@ -65,7 +65,7 @@ function viewerUrl(path, line = null) {
   return url.href;
 }
 
-async function openViewer(path, line = null, pageOptions = {}, fileDownload = false) {
+async function openViewer(path, line = null, pageOptions = {}, fileDownload = false, pdfPresent = false) {
   const page = await browser.newPage(pageOptions);
   await page.addInitScript(({ token, fixtureDescriptors }) => {
     if (window.top !== window) return;
@@ -195,7 +195,9 @@ graph TD
       }
     } };
   }, { token, fixtureDescriptors });
-  await page.addInitScript({ content: createProtectedViewerBootstrapScript(token).replace('fileDownload: true, ', fileDownload ? 'fileDownload: true, ' : '') });
+  await page.addInitScript({ content: createProtectedViewerBootstrapScript(token)
+    .replace('fileDownload: true, ', fileDownload ? 'fileDownload: true, ' : '')
+    .replace('pdfPresent: true, ', pdfPresent ? 'pdfPresent: true, ' : '') });
   page.on('pageerror', error => { throw error; });
   await page.goto(viewerUrl(path, line));
   return page;
@@ -435,16 +437,30 @@ try {
   const rendererChunks = new Set();
   const image = await openViewer('/pixel.png');
   const img = image.locator('.remux-editor-image-stage img');
-  await image.getByText(/pixel.png \/ .* \/ 64×32/u).waitFor();
+  await image.getByText(/pixel.png \/ .* \/ 64×32 · \d+%/u).waitFor();
   assert.equal(await img.evaluate(element => element.naturalWidth), 64);
   await assertOpenTraffic(image, '/pixel.png', 0);
+  const stageBox = await image.locator('.remux-editor-image-stage').evaluate(element => ({ width: element.clientWidth, height: element.clientHeight }));
+  const fit = Math.min(stageBox.width / 64, stageBox.height / 32);
+  const scaleOf = () => img.evaluate(element => new DOMMatrix(getComputedStyle(element).transform).a);
+  const waitForScale = (expected, label) => image.waitForFunction((target) => {
+    const element = document.querySelector('.remux-editor-image-stage img');
+    return element && Math.abs(new DOMMatrix(getComputedStyle(element).transform).a - target) < 0.01;
+  }, expected, { timeout: 5000 }).catch(async () => { throw new Error(`${label}: expected scale ${expected}, got ${await scaleOf()}`); });
+  assert.ok(Math.abs(await scaleOf() - fit) < 0.01, 'rest state is fit-to-screen');
+  const box = await img.boundingBox();
+  assert.ok(Math.abs(box.width - 64 * fit) < 1 && Math.abs(box.height - 32 * fit) < 1, 'fit keeps the aspect ratio');
+  assert.ok(box.x >= -0.5 && box.y >= -0.5, 'fit centers the image inside the stage');
+  // A single tap does nothing; a double tap zooms in at the tapped point and back.
   await img.click({ position: { x: 20, y: 20 } });
-  assert.equal(await image.locator('.remux-editor-image-zoomed').count(), 1);
-  const scale = await img.evaluate(element => new DOMMatrix(getComputedStyle(element).transform).a);
-  const width = await image.locator('.remux-editor-image-stage').evaluate(element => element.clientWidth);
-  assert.ok(Math.abs(scale * width - 64) < 0.1, 'tap must display natural size');
-  await image.locator('.remux-editor-image-stage').click({ position: { x: 20, y: 20 } });
   assert.equal(await image.locator('.remux-editor-image-zoomed').count(), 0);
+  await image.locator('.remux-editor-image-stage').dblclick({ position: { x: 20, y: 20 } });
+  await image.locator('.remux-editor-image-zoomed').waitFor();
+  await waitForScale(Math.min(Math.max(1, fit * 4), Math.max(1, fit * 2)), 'double tap');
+  await image.getByText(/64×32 · \d+%/u).waitFor();
+  await image.locator('.remux-editor-image-stage').dblclick({ position: { x: 20, y: 20 } });
+  await image.waitForFunction(() => document.querySelector('.remux-editor-image-zoomed') === null);
+  await waitForScale(fit, 'double tap back to fit');
   // Two pointers pinch; lifting one must allow dragging without a tap reset.
   const imageCdp = await image.context().newCDPSession(image);
   await imageCdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: 100, y: 100, id: 1 }, { x: 200, y: 100, id: 2 }] });
@@ -453,7 +469,23 @@ try {
   await imageCdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: 120, y: 130, id: 1 }] });
   await imageCdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
   assert.equal(await image.locator('.remux-editor-image-zoomed').count(), 1);
-  assert.equal(await img.evaluate(element => new DOMMatrix(getComputedStyle(element).transform).a), 2);
+  await waitForScale(fit * 2, 'pinch');
+  // Pinching below fit and dragging past the edges spring back on release.
+  await imageCdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: 100, y: 100, id: 1 }, { x: 500, y: 100, id: 2 }] });
+  await imageCdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: 100, y: 100, id: 1 }, { x: 150, y: 100, id: 2 }] });
+  assert.ok(await scaleOf() < fit, 'a live pinch may overshoot below fit');
+  await imageCdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  await waitForScale(fit, 'release springs back to fit');
+  await image.waitForFunction(() => document.querySelector('.remux-editor-image-zoomed') === null);
+  await imageCdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: 300, y: 300, id: 1 }] });
+  await imageCdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: 700, y: 500, id: 1 }] });
+  const dragged = await img.boundingBox();
+  assert.ok(dragged.x > box.x + 1, 'a live drag at fit rubber-bands');
+  await imageCdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  await image.waitForFunction(({ x, y }) => {
+    const rect = document.querySelector('.remux-editor-image-stage img').getBoundingClientRect();
+    return Math.abs(rect.x - x) < 0.5 && Math.abs(rect.y - y) < 0.5;
+  }, { x: box.x, y: box.y });
   await img.evaluate(element => { window.__retainedImage = element; });
   const beforeReload = rawRequests.filter(request => request.path === '/pixel.png').length;
   await image.getByRole('button', { name: 'Reload file' }).click();
@@ -484,6 +516,24 @@ try {
   assert.equal(await svg.evaluate(() => window.__unsafeSvg), undefined);
   await assertOpenTraffic(svg, '/pixel.svg', 0);
   await svg.close();
+
+  // A host with a native PDF view gets the file's path and the body rect; the
+  // page draws nothing itself.
+  const hostedPdf = await openViewer('/minimal.pdf', null, {}, false, true);
+  await hostedPdf.locator('.remux-editor-pdf-stage[data-remux-pdf-path="/minimal.pdf"]').waitFor();
+  await hostedPdf.waitForFunction(() => window.__testHost.requests.some(request => request.method === 'host/pdf/present'));
+  const presented = await hostedPdf.evaluate(() => window.__testHost.requests.find(request => request.method === 'host/pdf/present').params);
+  assert.equal(presented.path, '/minimal.pdf');
+  assert.equal(presented.version, 'fixture-v1');
+  const pdfStage = await hostedPdf.locator('.remux-editor-pdf-stage').boundingBox();
+  assert.deepEqual(presented.frame, { x: pdfStage.x, y: pdfStage.y, width: pdfStage.width, height: pdfStage.height });
+  const pdfViewport = await hostedPdf.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
+  assert.ok(presented.frame.width === pdfViewport.width && presented.frame.height > 100 && presented.frame.height < pdfViewport.height,
+    'the pdf frame is the body, not the toolbar or status line');
+  assert.equal(await hostedPdf.locator('iframe').count(), 0);
+  assert.equal(rawRequests.some(request => request.path === '/minimal.pdf'), false, 'the page must not fetch a hosted PDF itself');
+  await assertOpenTraffic(hostedPdf, '/minimal.pdf', 0);
+  await hostedPdf.close();
 
   const pdf = await openViewer('/minimal.pdf');
   const pdfFrame = pdf.locator('iframe[title="minimal.pdf"]');
@@ -528,8 +578,8 @@ try {
   await downloadable.getByText('fixture download failed', { exact: true }).waitFor();
   await downloadable.close();
   console.log(JSON.stringify({ builtViewerChunks: true, lazyImageChunk: [...rendererChunks],
-    imageNaturalDimensions: true, imageTapPinchDrag: true, mediaReloadWithoutFlash: true, imageRetry: true,
-    svgImgOnly: true, rawPdfFrame: true, androidPdfFallback: true, videoMetadata: true, binaryFallback: true,
+    imageNaturalDimensions: true, imageFitDoubleTapPinchSpring: true, mediaReloadWithoutFlash: true, imageRetry: true,
+    svgImgOnly: true, hostedPdfPresent: true, browserPdfFrame: true, androidPdfFallback: true, videoMetadata: true, binaryFallback: true,
     downloadCapabilityAndCommand: true, downloadFailureStatus: true, oneStatAtMostOneReadPerOpen: true }));
 
   console.log(JSON.stringify({
