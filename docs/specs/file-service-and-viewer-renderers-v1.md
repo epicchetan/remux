@@ -288,4 +288,47 @@ Commit and push each reviewed green slice to main.
 
 ## Implementation record
 
-- 2026-09-15: spec drafted from repository inspection.
+- 2026-09-15: spec drafted from repository inspection (c66b2a3).
+- 2026-09-15: S1 landed (0554080). `remux/fs/stat`, `writeFile`,
+  `createDirectory`, `rename`, `delete`, `GET|HEAD|PUT /remux/fs/raw`,
+  `max_upload_bytes`, relay hook. Two runtime tests
+  (`chaos::manifest_gateway_receives_generation_socket_and_requires_stdio_readiness`,
+  `extension_gateway::authenticated_http_and_websocket_gateway_is_generation_fenced`)
+  fail inside the Claude sandbox on the pristine spec commit too, so they are
+  environmental; the full suite passed outside the sandbox (271 tests).
+- 2026-09-15: S3 landed (0047307). `host/file/download` in ExtensionWebView
+  and the direct host; `downloadAndShareFile` streams to
+  `Paths.cache/remux-downloads` and opens the Share sheet; 24 h cache cleanup at
+  app start. Decision: the app injects `fileDownload: true` only into the
+  Viewer extension WebView (the same scope as the protected transport), so
+  third-party views see the capability as absent until that is widened
+  deliberately.
+- 2026-09-15: S2 landed (53cc6e9). viewer-kit `statFile`, `writeFile`,
+  `createDirectory`, `renameEntry`, `deleteEntry`, `rawFileUrl`; stat-first
+  controller; renderer registry with lazy chunks (Source 666 kB, Markdown
+  443 kB, HTML 4.7 kB, Image 3 kB, PDF 0.4 kB, Media 0.4 kB, Binary 1.2 kB;
+  shell 211 kB); capability toolbar with Download. The static CSP meta in
+  `index.html` became a runtime-appended meta so `frame-src` can name the
+  host's exact `/remux/fs/raw` path (CSP cannot combine `'self'` with a
+  path). Editor suite, typecheck and build green.
+- 2026-09-15: S4 landed (969d41e). Files tab long-press sheet and directory
+  menu: Download, Rename, Copy path, Delete, New folder, Upload files, Upload
+  photos. Uploads stream from the picker URI through
+  `File.createUploadTask` with `httpMethod: 'PUT'` and
+  `UploadType.BINARY_CONTENT`; conflicts prompt Replace or Skip. Delete
+  escalates in place to the typed-name confirmation on `notEmpty`; that is
+  the only call site passing `recursive`. `RemuxRpcError` now carries the
+  JSON-RPC `code` and `data` so `data.kind` is readable. App typecheck and
+  all `test:*` scripts green except the Vite handshake script, which cannot
+  run in the sandbox. Not yet verified on a device: sheet detent heights,
+  keyboard growth, and `autoFocus` inside `RNHostView`.
+- 2026-09-15: S5 staged, not yet live. `npm run build:runtime` produced
+  `target/release/remux` (the `~/.local/bin/remux` symlink target the
+  service runs); the Viewer bundle rebuilt with the renderer chunks. Pending
+  outside any Remux session: Settings → Restart runtime so the supervisor
+  respawns the worker from the new binary, then an OTA publish for the app
+  slices (S3, S4). Live `remux/fs/stat` and `/remux/fs/raw` verification and
+  the published update id go here once that is done. `npm run viewers:build`
+  fails at the terminal extension's state-worker step because the optional
+  `@esbuild/linux-x64` package is missing from `node_modules`; the terminal
+  extension is unchanged by this work, so its existing dist stands.
