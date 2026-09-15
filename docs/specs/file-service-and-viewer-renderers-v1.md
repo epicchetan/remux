@@ -361,4 +361,6 @@ Commit and push each reviewed green slice to main.
   app's `webViewNavigationDecision` blocked the iframe's same-origin
   navigation to `/remux/fs/raw` as `outside-viewer-route` before the request
   left the device. Subframe navigations to that exact path are now allowed;
-  top-frame ones stay blocked. App-only change, shipped by OTA.
+  top-frame ones stay blocked. App-only change (b4c7dd6), shipped as iOS
+  update `01a0a719-fea0-7a63-81e2-5754d5762d1f` (group
+  `d67991df-e1dd-4946-b699-c52447d8e5c9`) on fingerprint `a100fc36…`.
