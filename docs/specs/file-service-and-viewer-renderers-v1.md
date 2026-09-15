@@ -395,3 +395,15 @@ Commit and push each reviewed green slice to main.
   top-frame ones stay blocked. App-only change (b4c7dd6), shipped as iOS
   update `01a0a719-fea0-7a63-81e2-5754d5762d1f` (group
   `d67991df-e1dd-4946-b699-c52447d8e5c9`) on fingerprint `a100fc36…`.
+- 2026-09-15: device use showed the iframe PDF far too zoomed in (a subframe
+  PDF draws at one point per pixel with no fit mode, and the viewer page
+  disables pinch zoom) and the image renderer allowing zoom-out to a
+  floating thumbnail with no clamping. Replaced the iframe with native
+  presentation (`host/pdf/present`, `PdfOverlay`, `pdfPresent` capability;
+  the viewer WebView's raw-route subframe exception is gone) and rewrote the
+  image renderer as a bounded photo viewer (3f39aad). Editor, viewer-kit and
+  host contract suites green; runtime republished the editor bundle without
+  a restart. Shipped as iOS update `01a0a751-33c9-71a3-aedf-921a61376a75`
+  (group `c1c5ed12-3746-4e96-bdc9-124fa6e5d9f6`) on fingerprint `a100fc36…`.
+  Still to confirm on device: the tab preview photographs the overlay, and
+  whether the PDF sandbox-CSP exemption is still needed for a top-level load.
