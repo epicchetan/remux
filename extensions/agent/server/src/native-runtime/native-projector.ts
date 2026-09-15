@@ -720,6 +720,7 @@ export class NativeAgentProjector {
       this.journal.eventsForTurn(turn.turnId, { includeToolOutputPreviews: false }),
       this.journal.legacyEventsForTurn(turn.turnId),
       this.journal,
+      this.modelsByInstance,
       boundaryCompactions(turn, input.turns, compactions),
       { includeToolOutputPreviews: false, ignoredWatchedPaths: this.watchedFiles.get(turn.turnId)?.ignored,
         compactionControls: compactions },
@@ -776,6 +777,7 @@ export class NativeAgentProjector {
       }),
       this.journal.legacyEventsForTurn(turn.turnId),
       this.journal,
+      this.modelsByInstance,
       boundaryCompactions(turn, pathTurns, compactions),
       { includeToolOutputPreviews: !summary, ignoredWatchedPaths: this.watchedFiles.get(turn.turnId)?.ignored,
         compactionControls: compactions },
@@ -868,6 +870,7 @@ function projectTurn(
   allEvents: readonly ProviderEventEnvelope[],
   allLegacyEvents: readonly LegacyJournalEvent[],
   journal: NativeAgentJournal,
+  modelsByInstance: ReadonlyMap<string, readonly ProviderModelDescriptor[]>,
   boundary: NativeAgentTurnFrame['boundaryCompactions'],
   options: {
     includeToolOutputPreviews?: boolean;
@@ -969,10 +972,10 @@ function projectTurn(
   const additionalInputs = journal.additionalTurnMessages(turn.turnId).map((input, inputOrdinal) => ({ ...input, inputOrdinal }));
   const additionalMessages = additionalInputs.filter(input => input.origin === 'user');
   const inputItems: NativeTurnNotice[] = [];
-  if (turn.origin !== 'user') inputItems.push(projectContinuationNotice(journal, turn.conversationId,
+  if (turn.origin !== 'user') inputItems.push(projectContinuationNotice(journal, modelsByInstance, turn.conversationId,
     turn.clientMessageId, null, turn.origin, turn.trigger, turn.startedAt ?? turn.createdAt, undefined, turn.triggers));
   for (const input of additionalInputs) if (input.origin !== 'user') inputItems.push(projectContinuationNotice(
-    journal, turn.conversationId, input.clientMessageId, input.afterBlockId, input.origin, input.trigger, input.createdAt, input.inputOrdinal, input.triggers));
+    journal, modelsByInstance, turn.conversationId, input.clientMessageId, input.afterBlockId, input.origin, input.trigger, input.createdAt, input.inputOrdinal, input.triggers));
   const compactionNotices = withinTurnCompactionNotices(turn, options.compactionControls ?? []);
   inputItems.push(...compactionNotices);
   if (compactionNotices.length) compacted = true;
@@ -1589,7 +1592,8 @@ function hashJson(value: unknown) {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex');
 }
 
-function projectContinuationNotice(journal: NativeAgentJournal, conversationId: string,
+function projectContinuationNotice(journal: NativeAgentJournal,
+  modelsByInstance: ReadonlyMap<string, readonly ProviderModelDescriptor[]>, conversationId: string,
   clientMessageId: string, afterBlockId: string | null, origin: Exclude<TurnOrigin, 'user'>,
   trigger: TurnTrigger | undefined, continuedAt: number, inputOrdinal?: number,
   triggers?: readonly TurnTrigger[]): NativeTurnNotice {
@@ -1598,8 +1602,14 @@ function projectContinuationNotice(journal: NativeAgentJournal, conversationId: 
     const child = source?.childExecutionId ? journal.execution(source.childExecutionId) : undefined;
     return child?.conversationId === conversationId ? child : undefined;
   });
-  const titles = sources.map((source, index) => children[index]?.title
-    ?? (source?.kind === 'federation' ? 'federated child' : 'subagent'));
+  const titles = sources.map((source, index) => {
+    const child = children[index];
+    if (child?.ownership === 'federated') {
+      return modelsByInstance.get(child.providerInstanceId)?.find(({ id }) => id === child.model)?.name
+        ?? child.model ?? child.providerInstanceId ?? 'federated child';
+    }
+    return child?.title ?? (source?.kind === 'federation' ? 'federated child' : 'subagent');
+  });
   const names = titles.length === 1 ? titles[0]
     : `${titles.slice(0, -1).join(', ')} and ${titles.at(-1)}`;
   const startedAt = children.flatMap(child => child ? [child.createdAt] : []);

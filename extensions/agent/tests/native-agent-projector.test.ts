@@ -1047,31 +1047,47 @@ function capabilities(): ProviderCapabilities {
   };
 }
 
-for (const kind of ['federation', 'native-child'] as const) {
-  test(`autonomous ${kind} turns project a read-only continuation notice`, () => {
+for (const [kind, catalog, label] of [
+  ['federation', true, 'GPT-6-Astra'],
+  ['federation', false, 'gpt-6-astra'],
+  ['native-child', true, 'Reviewer'],
+] as const) {
+  test(`autonomous ${kind} turns project a continuation notice named ${label}`, () => {
     const journal = createJournal();
     try {
       seed(journal);
       assert.equal(journal.turn('turn-1')?.origin, 'user');
-      journal.createFederatedExecution({ executionId: 'astra', conversationId: 'conversation-1',
+      if (kind === 'federation') journal.createFederatedExecution({ executionId: 'astra', conversationId: 'conversation-1',
         parentExecutionId: 'execution-1', rootTurnId: 'turn-1', provider: 'fixture', providerInstanceId: 'fixture-local',
-        model: 'fixture-native-v1', access: 'read-only', scheduling: 'foreground', depth: 1, title: 'Astra', now: 4 });
+        model: 'gpt-6-astra', access: 'read-only', scheduling: 'foreground', depth: 1,
+        title: 'Implement the direct host transport for Remux viewers plus a headless view helper', now: 4 });
+      else journal.appendProviderEvent(event('native-reviewer', 4, {
+        type: 'turn.block.started', structure: structure('reviewer', 0),
+        block: { kind: 'native-child', state: 'running', payload: { kind: 'native-child', executionState: 'running',
+          child: { executionId: 'reviewer', ownership: 'native', provider: 'fixture',
+            providerInstanceId: 'fixture-local', model: 'gpt-6-astra', title: 'Reviewer' } } },
+      }, 'reviewer'));
       journal.appendProviderEvent(event('root-finished', 5, { type: 'turn.completed', outcome: 'completed' }));
       const started = event(`continued-${kind}`, 20_004, { type: 'turn.started', origin: 'native',
-        trigger: { kind, ...(kind === 'federation' ? { childExecutionId: 'astra' } : {}), summary: 'Done' } });
+        trigger: { kind, childExecutionId: kind === 'federation' ? 'astra' : 'reviewer', summary: 'Done' } });
       assert.ok(started.scope.kind === 'turn');
       started.scope.turnId = 'continued'; started.native.turnId = 'native-continued';
       journal.appendProviderEvent(started);
       const projector = new NativeAgentProjector(journal);
+      // A catalog for another instance must not name this instance's model.
+      projector.setModels('other-instance', [{ id: 'gpt-6-astra', name: 'Wrong instance',
+        provider: 'fixture', supportedEffort: [], isDefault: true }]);
+      if (catalog) projector.setModels('fixture-local', [{ id: 'gpt-6-astra', name: 'GPT-6-Astra',
+        provider: 'fixture', supportedEffort: [], isDefault: true }]);
       const frame = projector.project('agent/turn:continued') as NativeAgentTurnFrame;
       assert.equal(frame.origin, kind === 'federation' ? 'federation-notification' : 'native-followup');
       assert.deepEqual(frame.userContent, []);
       assert.equal(frame.trigger?.kind, kind);
       assert.equal(frame.inputItems?.[0]?.type, 'notice');
-      assert.equal(frame.inputItems?.[0]?.text, kind === 'federation' ? 'Continued after Astra finished' : 'Continued after subagent finished');
+      assert.equal(frame.inputItems?.[0]?.text, `Continued after ${label} finished`);
       if (kind === 'federation') assert.equal(frame.inputItems?.[0]?.elapsedMs, 20_000);
       const strand = projector.project(`agent/transcript:conversation-1:tail-24`) as NativeTranscriptWindow;
-      assert.equal(strand.turns.find(turn => turn.turnId === 'continued')?.inputItems?.[0]?.type, 'notice');
+      assert.equal(strand.turns.find(turn => turn.turnId === 'continued')?.inputItems?.[0]?.text, `Continued after ${label} finished`);
     } finally { journal.close(); }
   });
 }
@@ -1207,21 +1223,26 @@ test('a continuation names every identified child in trigger arrival order', () 
   const journal = createJournal();
   try {
     seed(journal);
-    for (const [id, title] of [['astra', 'Astra'], ['sol', 'Sol']]) {
+    const projector = new NativeAgentProjector(journal);
+    projector.setModels('fixture-local', ['Astra', 'Sol', 'Terra'].map(name => ({
+      id: name.toLowerCase(), name, provider: 'fixture', supportedEffort: [], isDefault: false,
+    })));
+    for (const id of ['astra', 'sol', 'terra']) {
       journal.createFederatedExecution({ executionId: id!, conversationId: 'conversation-1',
         parentExecutionId: 'execution-1', rootTurnId: 'turn-1', provider: 'fixture', providerInstanceId: 'fixture-local',
-        model: 'fixture-native-v1', access: 'read-only', scheduling: 'foreground', depth: 1, title: title!, now: 4 });
+        model: id, access: 'read-only', scheduling: 'foreground', depth: 1, title: 'Long task prompt', now: 4 });
     }
     journal.appendProviderEvent(event('root-finished', 5, { type: 'turn.completed', outcome: 'completed' }));
     const triggers = [{ kind: 'federation' as const, childExecutionId: 'astra' },
-      { kind: 'federation' as const, childExecutionId: 'sol' }];
+      { kind: 'federation' as const, childExecutionId: 'sol' },
+      { kind: 'federation' as const, childExecutionId: 'terra' }];
     const started = event('two-child-continuation', 10, { type: 'turn.started', origin: 'native', trigger: triggers[0], triggers });
     assert.ok(started.scope.kind === 'turn');
     started.scope.turnId = 'continued'; started.native.turnId = 'native-continued';
     journal.appendProviderEvent(started);
-    const frame = new NativeAgentProjector(journal).project('agent/turn:continued') as NativeAgentTurnFrame;
+    const frame = projector.project('agent/turn:continued') as NativeAgentTurnFrame;
     assert.deepEqual(frame.triggers, triggers);
     assert.deepEqual(frame.inputItems?.[0]?.triggers, triggers);
-    assert.equal(frame.inputItems?.[0]?.text, 'Continued after Astra and Sol finished');
+    assert.equal(frame.inputItems?.[0]?.text, 'Continued after Astra, Sol and Terra finished');
   } finally { journal.close(); }
 });

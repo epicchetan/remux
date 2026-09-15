@@ -588,7 +588,8 @@ export class ClaudeProviderSession implements ProviderSession {
   private federationConnected = false;
   private readonly pendingNativeTriggers: TurnTrigger[] = [];
   private readonly nativeTaskNotifications = new Set<string>();
-  private readonly federationNotifications = new Map<string, { toolUseId: string; summary?: string; status?: string }>();
+  private readonly federationNotifications = new Map<string, { toolUseId: string; trigger?: TurnTrigger }>();
+  private readonly federationResultsByTask = new Map<string, { childExecutionId: string; summary?: string }>();
   private readonly backgroundToolByTask = new Map<string, string>();
   private readonly blocks = new Map<string, ClaudeBlockState>();
   private readonly toolBlockKey = new Map<string, string>();
@@ -1287,6 +1288,9 @@ export class ClaudeProviderSession implements ProviderSession {
     this.state = 'running';
     // Retain overflow for the next autonomous turn instead of dropping notifications.
     const triggers = this.pendingNativeTriggers.splice(0, MAX_TURN_TRIGGERS);
+    for (const notification of this.federationNotifications.values()) {
+      if (notification.trigger && triggers.includes(notification.trigger)) delete notification.trigger;
+    }
     if (!triggers.length) triggers.push({ kind: 'native-child' });
     this.emit({ type: 'turn.started', origin: 'native', trigger: triggers[0]!, triggers },
       'turn/native-started', turnId, nativeTurnId);
@@ -1462,12 +1466,16 @@ export class ClaudeProviderSession implements ProviderSession {
       } else if (subtype === 'task_notification' && !this.federationNotifications.has(taskId)) {
         const summary = stringValue(message.summary);
         const status = stringValue(message.status);
-        this.federationNotifications.set(taskId, { toolUseId, summary, status });
-        const childExecutionId = federationExecutionId(message.summary) ?? linkedTool.executionId;
+        const result = this.federationResultsByTask.get(taskId);
+        const childExecutionId = result?.childExecutionId ?? federationExecutionId(message.summary) ?? linkedTool.executionId;
         if (childExecutionId) linkedTool.executionId = childExecutionId;
-        this.pendingNativeTriggers.push({ kind: 'federation',
+        const trigger: TurnTrigger = { kind: 'federation',
           ...(childExecutionId ? { childExecutionId } : {}),
-          ...(summary ? { summary: fitContractString(summary, PROVIDER_RUNTIME_LIMITS.stringChars) } : {}) });
+          ...(summary ? { summary: fitContractString(summary, PROVIDER_RUNTIME_LIMITS.stringChars) } : {}),
+          ...result };
+        this.federationResultsByTask.delete(taskId);
+        this.federationNotifications.set(taskId, { toolUseId, trigger });
+        this.pendingNativeTriggers.push(trigger);
         linkedTool.backgrounded = false;
         if (owner) this.emit({ type: 'tool.completed', toolCallId: toolUseId, backgrounded: false,
           ...(summary ? { outputPreview: jsonPreview(summary) } : {}),
@@ -1884,6 +1892,21 @@ export class ClaudeProviderSession implements ProviderSession {
   }
 
   private async handleUserMessage(message: Record<string, unknown>) {
+    if (objectValue(message.origin)?.kind === 'task-notification') {
+      const notification = parseFederationTaskNotification(objectValue(message.message)?.content);
+      if (!notification) return;
+      const { taskId, toolUseId, ...result } = notification;
+      const pending = this.federationNotifications.get(taskId);
+      const callId = this.backgroundToolByTask.get(taskId) ?? toolUseId ?? pending?.toolUseId;
+      const linkedTool = callId ? this.tools.get(callId) : undefined;
+      if (!linkedTool?.name.startsWith('mcp__remux-federation__')) return;
+      linkedTool.executionId = result.childExecutionId;
+      // The SDK sends the result separately from the system notification, in
+      // either order and often while idle. Enrich the queued trigger in place.
+      if (pending?.trigger) Object.assign(pending.trigger, result);
+      else if (!pending) this.federationResultsByTask.set(taskId, result);
+      return;
+    }
     const active = this.activeTurn;
     if (!active || this.recoveringAcceptedTurn || message.parent_tool_use_id) return;
     const body = objectValue(message.message);
@@ -3173,6 +3196,26 @@ function knownAuthLabel(value: unknown, allowed: ReadonlySet<string>) {
 
 function isMissingExecutable(error: unknown) {
   return objectValue(error)?.code === 'ENOENT' || /ENOENT|not found/iu.test(safeMessage(error));
+}
+
+/** SDK task notifications wrap the raw MCP result in a user-role XML message. */
+function parseFederationTaskNotification(content: unknown) {
+  if (typeof content !== 'string') return undefined;
+  const body = /^\s*<task-notification>([\s\S]*)<\/task-notification>\s*$/u.exec(content)?.[1];
+  if (!body) return undefined;
+  const taskId = /<task-id>([^<]+)<\/task-id>/u.exec(body)?.[1]?.trim();
+  const resultText = /<result>([\s\S]*)<\/result>/u.exec(body)?.[1];
+  if (!taskId || taskId.length > PROVIDER_RUNTIME_LIMITS.stringChars || !resultText) return undefined;
+  try {
+    const result: unknown = JSON.parse(resultText);
+    const childExecutionId = federationExecutionId(result);
+    if (!childExecutionId || childExecutionId.length > 512) return undefined;
+    const summary = stringValue(objectValue(result)?.summary);
+    const toolUseId = /<tool-use-id>([^<]+)<\/tool-use-id>/u.exec(body)?.[1]?.trim();
+    return { taskId, childExecutionId,
+      ...(toolUseId ? { toolUseId: fitContractString(toolUseId, PROVIDER_RUNTIME_LIMITS.stringChars) } : {}),
+      ...(summary ? { summary: fitContractString(summary, PROVIDER_RUNTIME_LIMITS.stringChars) } : {}) };
+  } catch { return undefined; }
 }
 
 /** MCP results carry structured JSON, directly or in SDK text/content blocks. */

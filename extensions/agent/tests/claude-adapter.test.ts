@@ -2820,8 +2820,18 @@ test('Claude native child completion during a later turn stays on its owner turn
   } finally { await session.close(); }
 });
 
-for (const kind of ['federation', 'native-child'] as const) {
-  test(`Claude ${kind} task notification records a native continuation trigger`, async () => {
+for (const [kind, order] of [
+  ['federation', 'system-json'],
+  ['federation', 'system-first'],
+  ['federation', 'xml-first'],
+  ['federation', 'invalid-json'],
+  ['federation', 'unknown-task'],
+  ['native-child', 'system-json'],
+  ['native-child', 'system-first'],
+  ['native-child', 'xml-first'],
+  ['native-child', 'json-result'],
+] as const) {
+  test(`Claude ${kind} task notification records a native continuation trigger (${order})`, async () => {
     const query = new FakeClaudeQuery();
     let prompt!: AsyncIterable<SDKUserMessage>;
     const adapter = new ClaudeNativeAdapter({ acceptanceTimeoutMs: 1_000,
@@ -2860,13 +2870,36 @@ for (const kind of ['federation', 'native-child'] as const) {
         assert.equal(tool.state, 'running');
       }
       const nextEvents = collectThroughTerminal(session.events);
+      const resultSummary = order === 'xml-first'
+        ? 'Child report. '.repeat(1_000) : '## Child report\nHandled literal </result> markup.';
+      const xmlNotification = { type: 'user', uuid: `xml-${kind}`, session_id: sessionId,
+        parent_tool_use_id: null, origin: { kind: 'task-notification' }, promptSource: 'sdk',
+        message: { role: 'user', content: `<task-notification>
+<task-id>${order === 'unknown-task' ? 'unrelated-task' : 'child-task'}</task-id>
+${kind === 'native-child' ? '<tool-use-id>spawn-call</tool-use-id>\n<output-file>/tmp/child.output</output-file>' : ''}
+<status>completed</status>
+<summary>MCP task child-task (remux-federation/remux_spawn_agent) completed.</summary>
+<result>
+${order === 'invalid-json' ? 'Not JSON: {"executionId":"guessed-child"}'
+  : kind === 'federation' || order === 'json-result' ? JSON.stringify({ executionId: 'astra-child', status: 'completed',
+  provider: 'codex', model: 'gpt-6-astra', summary: resultSummary }) : 'Native review completed; this is not JSON.'}
+</result>
+${kind === 'native-child' ? '<note>Native task completed.</note>' : ''}
+</task-notification>` } };
       const notification = { type: 'system', subtype: 'task_notification', uuid: `notification-${kind}`, session_id: sessionId,
         task_id: 'child-task', tool_use_id: 'spawn-call', status: 'completed',
-        summary: kind === 'federation' ? '{"executionId":"astra-child","status":"completed","finalAnswer":{"kind":"inline","text":"Done"}}' : 'Done' };
+        summary: kind === 'federation' ? order === 'system-json'
+          ? '{"executionId":"astra-child","status":"completed","finalAnswer":{"kind":"inline","text":"Done"}}'
+          : 'remux-federation/remux_spawn_agent' : 'Done' };
+      assert.equal((await session.snapshot({ commandId: 'idle-before-notification' })).state, 'idle');
+      if (order === 'xml-first') query.emit(xmlNotification);
       query.emit(notification);
+      if (order !== 'system-json' && order !== 'xml-first') query.emit(xmlNotification);
       query.emit(notification); // Native retransmission must not duplicate the continuation.
       query.emit({ type: 'assistant', uuid: `continued-${kind}`, session_id: sessionId, parent_tool_use_id: null,
         message: { id: 'continued-message', role: 'assistant', content: [{ type: 'text', text: 'CONTINUED' }] } });
+      // A duplicate result during the active turn must not become user input or tool output.
+      if (order !== 'system-json') query.emit({ ...xmlNotification, uuid: `xml-active-${kind}` });
       query.emit({ type: 'result', subtype: 'success', uuid: `continued-result-${kind}`, session_id: sessionId,
         result: 'CONTINUED', is_error: false });
       const next = await nextEvents;
@@ -2877,12 +2910,28 @@ for (const kind of ['federation', 'native-child'] as const) {
       assert.equal(started.origin, 'native');
       assert.equal(started.trigger?.kind, kind);
       assert.deepEqual(started.triggers, [started.trigger]);
-      assert.ok(started.trigger?.childExecutionId);
+      assert.equal(next.some(({ event }) => event.type === 'user.message'), false);
+      const toolEvents = next.filter(({ event }) => 'block' in event && event.block.kind === 'tool');
+      assert.deepEqual(toolEvents.map(({ native }) => native.kind),
+        kind === 'federation' ? ['task/federation-notification'] : []);
       if (kind === 'federation') {
-        assert.equal(started.trigger?.childExecutionId, 'astra-child');
+        const resolved = order !== 'invalid-json' && order !== 'unknown-task';
+        assert.equal(started.trigger?.childExecutionId, resolved ? 'astra-child' : undefined);
+        if (order !== 'system-json' && resolved) {
+          assert.ok(started.trigger?.summary);
+          assert.ok(started.trigger.summary.startsWith(resultSummary.slice(0, 100)));
+          assert.ok(started.trigger.summary.length <= PROVIDER_RUNTIME_LIMITS.stringChars);
+          if (order === 'system-first') assert.equal(started.trigger.summary, resultSummary);
+        } else if (!resolved) assert.equal(started.trigger?.summary, 'remux-federation/remux_spawn_agent');
         const completed = next.find(envelope => envelope.event.type === 'turn.block.completed' && envelope.event.block.kind === 'tool');
         assert.equal(completed?.scope.kind === 'turn' && completed.scope.turnId, 'spawning-turn');
         assert.equal(completed?.event.type === 'turn.block.completed' && completed.event.block.payload.kind === 'tool' && completed.event.block.payload.backgrounded, false);
+      } else {
+        assert.ok(started.trigger?.childExecutionId);
+        const nativeChild = first.find(({ event }) => 'block' in event && event.block.payload.kind === 'native-child');
+        assert.ok(nativeChild && 'block' in nativeChild.event && nativeChild.event.block.payload.kind === 'native-child');
+        assert.equal(started.trigger.childExecutionId, nativeChild.event.block.payload.child.executionId);
+        assert.equal(started.trigger.summary, 'Done');
       }
     } finally { await session.close(); }
   });
