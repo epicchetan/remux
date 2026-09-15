@@ -56,6 +56,23 @@ export type RemuxRpcMessage = {
   result?: unknown;
 };
 
+/**
+ * A JSON-RPC error answer, with the server's `code` and `data` preserved.
+ * Callers such as the Files tab read structured failure reasons out of `data`
+ * (`remux/fs/*` mutations report their kind there).
+ */
+export class RemuxRpcError extends Error {
+  readonly code: number;
+  readonly data: unknown;
+
+  constructor(message: string, options: { code: number; data: unknown }) {
+    super(message);
+    this.name = 'RemuxRpcError';
+    this.code = options.code;
+    this.data = options.data;
+  }
+}
+
 export class RemuxConnectionClosedError extends Error {
   readonly phase: RemuxConnectionClosedPhase;
   readonly readyState?: number;
@@ -471,7 +488,10 @@ function jsonRpcError(error: Record<string, unknown>, method: string) {
     data: error.data,
     message: typeof error.message === 'string' ? error.message : 'Unknown JSON-RPC error',
   };
-  return new Error(`${method} failed (${normalized.code}): ${normalized.message}`);
+  return new RemuxRpcError(`${method} failed (${normalized.code}): ${normalized.message}`, {
+    code: normalized.code,
+    data: normalized.data,
+  });
 }
 
 function errorMessage(error: unknown) {

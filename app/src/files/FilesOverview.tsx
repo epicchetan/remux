@@ -39,6 +39,9 @@ import { useBrowserStore } from '../browser/browserStore';
 import { useRemuxConnection } from '../remote/RemuxConnectionProvider';
 import { alpha, useTheme, type RemuxTheme } from '../theme/ThemeProvider';
 import { NativeGlassIconButton } from '../ui/NativeGlassIconButton';
+import { DeleteConfirmSheet } from './DeleteConfirmSheet';
+import { EntryNameSheet } from './EntryNameSheet';
+import { FileActionsSheet } from './FileActionsSheet';
 import { matchingFileHandlers } from './fileHandlers';
 import {
   fsDidChangeMethod,
@@ -52,13 +55,17 @@ import {
   type DirectoryRecord,
 } from './filesStore';
 import { isDirectoryLikeEntry, type VisibleFileTreeRow } from './filesTypes';
+import { useFileActions, type FilesSummary } from './useFileActions';
 
 const rowHeight = 64;
 const rowIndent = 20;
 const rowGap = 12;
 const navigationButtonSize = 40;
 const navigationIconSize = 16;
-const headerSideWidth = 48;
+const headerActionGap = 8;
+// Both sides reserve room for two buttons so the centred title never shifts
+// when the collapse button appears next to the directory menu.
+const headerSideWidth = (navigationButtonSize * 2) + headerActionGap;
 const headerTitleGap = 12;
 const headerTopPadding = 4;
 const headerBottomPadding = 2;
@@ -84,6 +91,7 @@ export function FilesOverview() {
   const refreshVisibleDirectories = useFilesStore((state) => state.refreshVisibleDirectories);
   const toggleFolder = useFilesStore((state) => state.toggleFolder);
   const { query: request, subscribe } = useRemuxConnection();
+  const fileActions = useFileActions();
   const listRef = useRef<FlatList<VisibleFileTreeRow>>(null);
   const preloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [viewablePaths, setViewablePaths] = useState<string[]>([]);
@@ -156,6 +164,10 @@ export function FilesOverview() {
   const currentParentPath = currentRecord?.parentPath ?? null;
   const currentLoading = currentRecord?.refreshStatus === 'loading';
   const currentError = currentRecord?.error ?? null;
+  // One line under the header: an action in flight or its failure wins over
+  // the batch-refresh summary, which is the slower-moving of the two.
+  const summary: FilesSummary | null = fileActions.summary
+    ?? (refreshError ? { text: refreshError, tone: 'error' } : null);
   const { styles, theme } = useFilesTheme();
   const listTopPadding =
     insets.top +
@@ -241,7 +253,9 @@ export function FilesOverview() {
             tintColor={theme.textMuted}
           />
         }
-        renderItem={({ item }) => <FileTreeRow row={item} />}
+        renderItem={({ item }) => (
+          <FileTreeRow onLongPress={fileActions.openEntryActions} row={item} />
+        )}
         showsVerticalScrollIndicator={false}
         viewabilityConfig={viewabilityConfig.current}
       />
@@ -269,8 +283,34 @@ export function FilesOverview() {
             });
           }
         }}
-        refreshError={refreshError}
+        onMenuPress={() => {
+          if (currentPath) {
+            fileActions.openDirectoryMenu(currentPath);
+          }
+        }}
+        summary={summary}
         topInset={insets.top}
+      />
+
+      <FileActionsSheet
+        onClose={fileActions.closeActions}
+        onDismissed={fileActions.handleActionsDismissed}
+        onSelect={fileActions.selectAction}
+        request={fileActions.actionsRequest}
+      />
+      <EntryNameSheet
+        onClose={fileActions.closeEntryName}
+        onSubmit={(name) => {
+          void fileActions.submitEntryName(name);
+        }}
+        request={fileActions.entryNameRequest}
+      />
+      <DeleteConfirmSheet
+        onClose={fileActions.closeDeleteConfirm}
+        onConfirm={() => {
+          void fileActions.confirmDelete();
+        }}
+        request={fileActions.deleteRequest}
       />
     </View>
   );
@@ -282,7 +322,8 @@ function FilesHeader({
   currentPath,
   onBackPress,
   onCollapsePress,
-  refreshError,
+  onMenuPress,
+  summary,
   topInset,
 }: {
   canNavigateBack: boolean;
@@ -290,7 +331,8 @@ function FilesHeader({
   currentPath: string | null;
   onBackPress: () => void;
   onCollapsePress: () => void;
-  refreshError: string | null;
+  onMenuPress: () => void;
+  summary: FilesSummary | null;
   topInset: number;
 }) {
   const { styles } = useFilesTheme();
@@ -326,11 +368,24 @@ function FilesHeader({
               systemImage="chevron.up"
             />
           ) : null}
+          <NativeGlassIconButton
+            accessibilityLabel="Directory actions"
+            disabled={!currentPath}
+            iconSize={navigationIconSize}
+            onPress={onMenuPress}
+            size={navigationButtonSize}
+            systemImage="ellipsis"
+          />
         </View>
       </View>
-      {refreshError ? (
-        <View style={styles.refreshErrorPill}>
-          <Text numberOfLines={1} style={styles.refreshErrorText}>{refreshError}</Text>
+      {summary ? (
+        <View style={[styles.summaryPill, summary.tone === 'error' ? styles.summaryPillError : null]}>
+          <Text
+            numberOfLines={1}
+            style={[styles.summaryText, summary.tone === 'error' ? styles.summaryTextError : null]}
+          >
+            {summary.text}
+          </Text>
         </View>
       ) : null}
     </View>
@@ -391,7 +446,13 @@ function NativeTitleButton({
   );
 }
 
-function FileTreeRow({ row }: { row: VisibleFileTreeRow }) {
+function FileTreeRow({
+  onLongPress,
+  row,
+}: {
+  onLongPress: (row: VisibleFileTreeRow) => void;
+  row: VisibleFileTreeRow;
+}) {
   const { styles, theme } = useFilesTheme();
   const extensions = useBrowserStore((state) => state.extensions);
   const openResource = useBrowserStore((state) => state.openResource);
@@ -435,7 +496,7 @@ function FileTreeRow({ row }: { row: VisibleFileTreeRow }) {
         <Pressable
           accessibilityLabel={isDirectoryLike ? `Open ${row.name}` : row.name}
           accessibilityRole={canOpen ? 'button' : undefined}
-          disabled={!canOpen}
+          onLongPress={() => onLongPress(row)}
           onPress={() => {
             if (isDirectoryLike) {
               void navigateToDirectory(request, row.path, row.parentPath);
@@ -455,7 +516,7 @@ function FileTreeRow({ row }: { row: VisibleFileTreeRow }) {
           }}
           style={({ pressed }) => [
             styles.rowBody,
-            pressed ? styles.rowBodyPressed : null,
+            pressed && canOpen ? styles.rowBodyPressed : null,
           ]}
         >
           <View style={styles.iconSlot}>
@@ -750,7 +811,10 @@ function createStyles(theme: RemuxTheme) {
     width: headerSideWidth,
   },
   headerSideRight: {
-    alignItems: 'flex-end',
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: headerActionGap,
+    justifyContent: 'flex-end',
   },
   headerTitleHost: {
     height: navigationButtonSize,
@@ -796,24 +860,6 @@ function createStyles(theme: RemuxTheme) {
     justifyContent: 'center',
     minWidth: 0,
   },
-  refreshErrorPill: {
-    alignSelf: 'center',
-    backgroundColor: alpha(theme.danger, 0.14),
-    borderColor: alpha(theme.danger, 0.32),
-    borderRadius: 10,
-    borderWidth: 1,
-    marginTop: 6,
-    maxWidth: '90%',
-    paddingHorizontal: 10,
-    paddingVertical: 3,
-    pointerEvents: 'none',
-  },
-  refreshErrorText: {
-    color: theme.danger,
-    fontSize: 12,
-    fontWeight: '600',
-    lineHeight: 16,
-  },
   rowTitle: {
     color: theme.text,
     fontSize: 17,
@@ -831,6 +877,31 @@ function createStyles(theme: RemuxTheme) {
     fontSize: 15,
     lineHeight: 20,
     textAlign: 'center',
+  },
+  summaryPill: {
+    alignSelf: 'center',
+    backgroundColor: alpha(theme.textMuted, 0.14),
+    borderColor: alpha(theme.textMuted, 0.28),
+    borderRadius: 10,
+    borderWidth: 1,
+    marginTop: 6,
+    maxWidth: '90%',
+    paddingHorizontal: 10,
+    paddingVertical: 3,
+    pointerEvents: 'none',
+  },
+  summaryPillError: {
+    backgroundColor: alpha(theme.danger, 0.14),
+    borderColor: alpha(theme.danger, 0.32),
+  },
+  summaryText: {
+    color: theme.textMuted,
+    fontSize: 12,
+    fontWeight: '600',
+    lineHeight: 16,
+  },
+  summaryTextError: {
+    color: theme.danger,
   },
   });
 }
