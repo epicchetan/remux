@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { chromium, webkit } from 'playwright';
 import { prepareHtmlPreviewDocument } from '../../../packages/viewer-kit/src/htmlPreview.ts';
+import { viewerFramePolicy } from '../viewer/src/framePolicy.ts';
 
 // Executable proof for the web shell's navigation boundary. Keep the parent
 // policy separate from the report policy: a sandbox alone allows self-navigation.
@@ -30,7 +31,7 @@ try {
     const url = route.request().url();
     if (url === 'https://viewer.test/') return route.fulfill({
       contentType: 'text/html',
-      body: '<!doctype html><meta http-equiv="Content-Security-Policy" content="frame-src blob:; object-src \'none\'"><body><iframe sandbox="allow-scripts" title="Preview"></iframe>',
+      body: `<!doctype html><meta http-equiv="Content-Security-Policy" content="${viewerFramePolicy('https://viewer.test')}"><body><iframe sandbox="allow-scripts" title="Preview"></iframe>`,
     });
     requests.push(url);
     return route.abort();

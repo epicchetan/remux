@@ -1,5 +1,7 @@
 import {
   closeHostTab,
+  downloadHostFile,
+  getHostCapabilities,
   openHostOverview,
   subscribeHostActive,
   subscribeHostConnection,
@@ -8,12 +10,11 @@ import {
 } from '@remux/viewer-kit/host';
 import type { RemuxViewerRoute } from '@remux/viewer-kit/route';
 import { ActionBar, ActionButton } from '@remux/viewer-kit/ui';
-import { Eye, PanelRightOpen, X } from 'lucide-react';
+import { Download, Eye, PanelRightOpen, X } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 
-import { MarkdownPreview } from '../markdown/MarkdownPreview';
-import { HtmlPreview } from '../html';
-import { CodeMirrorViewer } from './CodeMirrorViewer';
+import type { FileDescriptor } from '@remux/viewer-kit/fs';
+import { renderers, type RendererComponent, type RendererDefinition } from '../renderers/registry';
 import type { EditorDocument } from './fileLoading';
 import { useEditorStore } from './store';
 
@@ -23,6 +24,8 @@ export function EditorSurface({ route }: EditorSurfaceProps) {
   const state = useEditorStore();
   const copiedTimeoutRef = useRef<number | null>(null);
   const [copied, setCopied] = useState(false);
+  const [rendererInfo, setRendererInfo] = useState<{ document: EditorDocument; text: string } | null>(null);
+  const [downloadError, setDownloadError] = useState<{ path: string; text: string } | null>(null);
   const [hostActive, setHostActive] = useState(true);
   const initialPath = route.resourceKind === 'file' ? route.resourceId : null;
   const initialLine = route.focusKind === 'line' ? parseLineNumber(route.focusId) : null;
@@ -70,7 +73,21 @@ export function EditorSurface({ route }: EditorSurfaceProps) {
       setCopied(false);
     }
   };
-  const canPreview = state.previewKind !== null && state.document?.kind === 'full';
+  const renderer = renderers.find((entry) => entry.id === state.rendererId);
+  const capabilities = renderer && state.descriptor ? renderer.capabilities(state.descriptor, state.document) : { copy: false, diff: false };
+  const canPreview = renderer?.modes.length === 2 && state.document?.kind === 'full';
+  const canDownload = getHostCapabilities().fileDownload;
+  const download = async () => {
+    if (!state.path || !canDownload) return;
+    const path = state.path;
+    setDownloadError(null);
+    try {
+      const result = await downloadHostFile({ path });
+      if (!result.ok) setDownloadError({ path, text: result.reason ?? 'Download failed.' });
+    } catch (error) {
+      setDownloadError({ path, text: error instanceof Error ? error.message : 'Download failed.' });
+    }
+  };
   const base = state.git.status === 'ready' ? state.git.metadata.base : null;
   const diffUnavailable = state.document?.kind === 'windowed'
     ? 'Diff is unavailable while viewing a file range.'
@@ -92,7 +109,13 @@ export function EditorSurface({ route }: EditorSurfaceProps) {
         mode={state.mode}
         onFocusApplied={() => state.acknowledgeFocus(state.pendingFocus?.nonce ?? null)}
         pendingLine={state.pendingFocus?.line ?? null}
-        previewKind={state.previewKind}
+        descriptor={state.descriptor}
+        renderer={renderer}
+        onInfo={(text) => { if (state.document) setRendererInfo({ document: state.document, text }); }}
+        onReload={() => void state.reload()}
+        onError={state.reportRendererError}
+        onDownload={() => void download()}
+        canDownload={canDownload}
         status={state.status}
       />
       {state.document?.kind === 'windowed' ? <WindowControls document={state.document} /> : null}
@@ -100,7 +123,7 @@ export function EditorSurface({ route }: EditorSurfaceProps) {
         left={<>
           <ActionButton icon={<TabsIcon />} label="Open tabs" onClick={() => void openHostOverview()} />
           <ActionButton icon={<ReloadIcon />} label="Reload file" onClick={() => void state.reload()} />
-          {state.previewKind ? (
+          {renderer?.modes.length === 2 ? (
             <ActionButton
               ariaPressed={state.mode === 'preview'}
               disabled={!canPreview}
@@ -110,72 +133,77 @@ export function EditorSurface({ route }: EditorSurfaceProps) {
             />
           ) : null}
           <ActionButton
-            disabled={state.document?.kind !== 'full'}
+            disabled={!capabilities.copy}
             icon={copied ? <CheckIcon /> : <CopyIcon />}
             label={state.document?.kind === 'windowed' ? 'Full-file copy is unavailable for paged Source' : copied ? 'Copied file contents' : 'Copy file contents'}
             onClick={() => void copyFileContents()}
           />
         </>}
         right={<>
-          <ActionButton disabled={Boolean(diffUnavailable) || state.document?.kind !== 'full'} icon={<DiffIcon />} label={diffUnavailable ?? (state.diffVisible ? 'Hide git diff' : 'Show git diff')} onClick={() => void state.showDiff()} />
+          <ActionButton disabled={Boolean(diffUnavailable) || !capabilities.diff} icon={<DiffIcon />} label={diffUnavailable ?? (state.diffVisible ? 'Hide git diff' : 'Show git diff')} onClick={() => void state.showDiff()} />
+          <ActionButton disabled={!canDownload || !state.path} icon={<Download aria-hidden="true" />}
+            label={canDownload ? 'Download file' : 'Update the app to download files'} onClick={() => void download()} />
           <ActionButton icon={<X aria-hidden="true" />} label="Close tab" onClick={() => void closeHostTab()} />
         </>}
-        status={copied ? 'Copied' : state.error ?? fileInfoText(state.document, state.path)}
+        status={copied ? 'Copied' : (downloadError?.path === state.path ? downloadError.text : null) ?? state.error ?? [fileInfoText(state.document, state.path, state.descriptor), rendererInfo?.document === state.document ? rendererInfo?.text : null].filter(Boolean).join(' / ')}
       />
     </main>
   );
 }
 
-function EditorBody({ active, baseContent, document, error, mode, onFocusApplied, pendingLine, previewKind, status }: {
+function EditorBody({ active, baseContent, document, descriptor, error, mode, onFocusApplied, pendingLine, renderer, status, onInfo, onReload, onError, onDownload, canDownload }: {
   active: boolean;
   baseContent: string | null;
   document: EditorDocument | null;
+  descriptor: FileDescriptor | null;
   error: string | null;
   mode: 'preview' | 'source';
   onFocusApplied: () => void;
   pendingLine: number | null;
-  previewKind: 'html' | 'markdown' | null;
+  renderer: RendererDefinition | undefined;
   status: string;
+  onInfo: (text: string) => void;
+  onReload: () => void;
+  onError: (message: string) => void;
+  onDownload: () => void;
+  canDownload: boolean;
 }) {
+  const [loaded, setLoaded] = useState<{ id: string; Component: RendererComponent } | null>(null);
+  const [chunkError, setChunkError] = useState<string | null>(null);
+  const [chunkRetry, setChunkRetry] = useState(0);
   const [visitedModes, setVisitedModes] = useState<Set<'preview' | 'source'>>(() => new Set([mode]));
   useEffect(() => {
     setVisitedModes((current) => current.has(mode) ? current : new Set([...current, mode]));
   }, [mode]);
+  useEffect(() => {
+    let current = true;
+    setChunkError(null);
+    if (renderer) void renderer.load().then(({ Component }) => {
+      if (current) setLoaded({ id: renderer.id, Component });
+    }, (error: unknown) => {
+      if (current) setChunkError(error instanceof Error ? error.message : String(error));
+    });
+    return () => { current = false; };
+  }, [renderer, chunkRetry]);
   if (!document && (status === 'loading' || status === 'refreshing')) return <Empty title="Reading file" spinner />;
   if (!document && status === 'error') return <Empty copy={error} title="Could not open file" />;
-  if (!document) return <Empty copy="Open a file from Files to view it." title="No file selected" />;
-  const focusLine = document.kind === 'windowed'
-    ? document.targetLine?.lineNumber === pendingLine ? 1 : null
-    : pendingLine;
-  const lineNumberStart = document.kind === 'windowed' ? document.targetLine?.lineNumber ?? null : null;
-  return (
-    <section className="remux-editor-content-shell">
-      {visitedModes.has('source') ? <div aria-hidden={mode !== 'source'} className={`remux-editor-renderer ${mode === 'source' ? '' : 'remux-editor-renderer-hidden'}`}>
-        <CodeMirrorViewer
-          key={document.kind === 'full' ? document.revision : `${document.version}:${document.range.startByte}:${document.range.endByte}`}
-          baseContent={baseContent}
-          content={document.text}
-          fileName={document.name}
-          focusLine={focusLine}
-          lightweight={document.kind === 'windowed' || document.lightweight}
-          lineNumberStart={lineNumberStart}
-          onFocusApplied={onFocusApplied}
-          showDiff={baseContent !== null}
-          visible={mode === 'source'}
-        />
-      </div> : null}
-      {visitedModes.has('preview') && document.kind === 'full' && previewKind === 'markdown' ? (
-        <div aria-hidden={mode !== 'preview'} className={`remux-editor-renderer ${mode === 'preview' ? '' : 'remux-editor-renderer-hidden'}`}>
-          <MarkdownPreview key={document.revision} content={document.text} filePath={document.path} onShowSource={() => useEditorStore.getState().setMode('source')} />
-        </div>
-      ) : null}
-      {visitedModes.has('preview') && document.kind === 'full' && previewKind === 'html' ? (
-        <div aria-hidden={mode !== 'preview'} className={`remux-editor-renderer ${mode === 'preview' ? '' : 'remux-editor-renderer-hidden'}`}>
-          <HtmlPreview key={document.revision} active={active} content={document.text} />
-        </div>
-      ) : null}
-    </section>
-  );
+  if (!document || !descriptor) return <Empty copy="Open a file from Files to view it." title="No file selected" />;
+  if (chunkError) return <section className="remux-editor-empty"><div className="remux-editor-empty-card">
+    <h1 className="remux-editor-empty-title">Could not load viewer</h1><p>{chunkError}</p>
+    <button onClick={() => setChunkRetry((value) => value + 1)}>Retry</button>
+  </div></section>;
+  if (!loaded || loaded.id !== renderer?.id) return <Empty title="Reading file" spinner />;
+  const Component = loaded.Component;
+  const modes = renderer.loads === 'text' ? [...visitedModes].filter((visited) => renderer.modes.includes(visited)) : [mode];
+  return <section className="remux-editor-content-shell">
+    {modes.map((visitedMode) => <div key={visitedMode} aria-hidden={mode !== visitedMode}
+      className={`remux-editor-renderer ${mode === visitedMode ? '' : 'remux-editor-renderer-hidden'}`}>
+      <Component document={document} descriptor={descriptor} mode={visitedMode} active={active} visible={mode === visitedMode}
+        pendingLine={pendingLine} onFocusApplied={onFocusApplied} baseContent={baseContent}
+        onShowSource={() => useEditorStore.getState().setMode('source')}
+        onInfo={onInfo} onReload={onReload} onError={onError} onDownload={onDownload} canDownload={canDownload} />
+    </div>)}
+  </section>;
 }
 
 function WindowControls({ document }: { document: Extract<EditorDocument, { kind: 'windowed' }> }) {
@@ -200,12 +228,19 @@ function Empty({ copy, spinner, title }: { copy?: string | null; spinner?: boole
   </div></section>;
 }
 
+function documentSize(document: EditorDocument) {
+  return document.kind === 'windowed' ? document.totalSizeBytes : document.sizeBytes;
+}
 function fileTabMetadata(state: ReturnType<typeof useEditorStore.getState>) {
   const document = state.document;
-  return { resourceId: state.path, resourceKind: state.path ? 'file' : null, status: state.status === 'error' ? 'Error' : document ? formatSize(document.kind === 'full' ? document.sizeBytes : document.totalSizeBytes) : null, title: document?.name ?? (state.path ? basename(state.path) : 'Viewer') };
+  return { resourceId: state.path, resourceKind: state.path ? 'file' : null,
+    status: state.status === 'error' ? 'Error' : document ? formatSize(documentSize(document)) : null,
+    title: state.descriptor?.name ?? (state.path ? basename(state.path) : 'Viewer') };
 }
-function fileInfoText(document: EditorDocument | null, path: string | null) { return document ? `${document.name} / ${formatSize(document.kind === 'full' ? document.sizeBytes : document.totalSizeBytes)}` : path ? basename(path) : null; }
-function formatSize(value: number) { return value < 1024 ? `${value} B` : value < 1024 * 1024 ? `${Math.round(value / 1024)} KB` : `${(value / 1024 / 1024).toFixed(1)} MB`; }
+function fileInfoText(document: EditorDocument | null, path: string | null, descriptor: FileDescriptor | null) {
+  return document ? `${descriptor?.name ?? (path ? basename(path) : '')} / ${formatSize(documentSize(document))}` : path ? basename(path) : null;
+}
+function formatSize(value: number | null) { return value == null ? 'Unknown size' : value < 1024 ? `${value} B` : value < 1024 * 1024 ? `${Math.round(value / 1024)} KB` : `${(value / 1024 / 1024).toFixed(1)} MB`; }
 function parseLineNumber(value: string | null | undefined) { const line = Number(value); return Number.isFinite(line) && line > 0 ? Math.floor(line) : null; }
 function basename(path: string) { return path.replace(/[\\/]+$/u, '').split(/[\\/]/u).at(-1) || path; }
 async function copyText(text: string) { if (navigator.clipboard?.writeText) return navigator.clipboard.writeText(text); const area = document.createElement('textarea'); area.value = text; document.body.appendChild(area); area.select(); const copied = document.execCommand('copy'); area.remove(); if (!copied) throw new Error('Copy failed'); }

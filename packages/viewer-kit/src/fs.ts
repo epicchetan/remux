@@ -1,5 +1,44 @@
 import { rpc } from './ipc';
 
+export type FileDescriptor = {
+  path: string;
+  name: string;
+  kind: 'file' | 'directory' | 'symlink' | 'other';
+  targetKind: 'file' | 'directory' | null;
+  sizeBytes: number | null;
+  modifiedAtMs: number | null;
+  version: string | null;
+  mimeType: string | null;
+  isBinary: boolean | null;
+};
+
+export function statFile(path: string, options: { signal?: AbortSignal } = {}) {
+  return rpc.query<FileDescriptor>('remux/fs/stat', { path }, {
+    resourceKey: `stat:${path}`,
+    ...(options.signal ? { signal: options.signal } : {}),
+  });
+}
+
+export function writeFile(path: string, content: string, options: { expectedVersion?: string; create?: boolean } = {}) {
+  return rpc.command<FileDescriptor>('remux/fs/writeFile', { path, content, ...options });
+}
+
+export function createDirectory(path: string) {
+  return rpc.command<FileDescriptor>('remux/fs/createDirectory', { path });
+}
+
+export function renameEntry(from: string, to: string, options: { overwrite?: boolean } = {}) {
+  return rpc.command<FileDescriptor>('remux/fs/rename', { from, to, ...options });
+}
+
+export function deleteEntry(path: string, options: { recursive?: boolean } = {}) {
+  return rpc.command<FileDescriptor & { deleted: true }>('remux/fs/delete', { path, ...options });
+}
+
+export function rawFileUrl(path: string, version?: string | null) {
+  return `/remux/fs/raw?path=${encodeURIComponent(path)}${version == null ? '' : `&v=${encodeURIComponent(version)}`}`;
+}
+
 export type FileSystemEntry = {
   git?: FileSystemGitStatus | null;
   itemCount?: number | null;

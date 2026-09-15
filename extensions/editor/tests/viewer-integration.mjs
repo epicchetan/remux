@@ -1,18 +1,57 @@
 import assert from 'node:assert/strict';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { chromium } from 'playwright';
-import { createServer } from 'vite';
+import { build, createServer, preview } from 'vite';
 import { createProtectedViewerBootstrapScript } from '../../../app/src/surfaces/viewer/protectedViewerTransport.ts';
 
-const server = await createServer({
-  configFile: new URL('../viewer/vite.config.ts', import.meta.url).pathname,
-  server: { host: '127.0.0.1', port: 0 },
+const configFile = new URL('../viewer/vite.config.ts', import.meta.url).pathname;
+// Serve production assets (including lazy chunks); a separate dev server exposes
+// the existing shared Mermaid helper contract for its direct API assertions.
+await build({ configFile, logLevel: 'silent' });
+const helperServer = await createServer({ configFile, server: { host: '127.0.0.1', port: 0 } });
+await helperServer.listen();
+const rawFixtures = Object.fromEntries(await Promise.all([
+  ['pixel.png', 'image/png'], ['pixel.svg', 'image/svg+xml'], ['minimal.pdf', 'application/pdf'],
+  ['tiny.webm', 'video/webm'], ['random.bin', 'application/octet-stream'],
+].map(async ([name, mimeType]) => [`/${name}`, { mimeType, bytes: await readFile(new URL(`./fixtures/${name}`, import.meta.url)) }])));
+const rawRequests = [];
+let failNextImage = false;
+const server = await preview({
+  configFile,
+  preview: { host: '127.0.0.1', port: 0 },
+  plugins: [{ name: 'raw-file-fixtures', configurePreviewServer(server) {
+    server.middlewares.use((request, response, next) => {
+      const url = new URL(request.url, 'http://fixture.test');
+      if (url.pathname !== '/remux/fs/raw') return next();
+      const path = url.searchParams.get('path');
+      rawRequests.push({ path, version: url.searchParams.get('v') });
+      const fixture = rawFixtures[path];
+      response.setHeader('Content-Security-Policy', 'sandbox');
+      response.setHeader('X-Content-Type-Options', 'nosniff');
+      response.setHeader('Cache-Control', 'private, no-cache');
+      if (!fixture || (path === '/pixel.png' && failNextImage)) {
+        failNextImage = false;
+        response.statusCode = 404;
+        return response.end('not found');
+      }
+      response.setHeader('Content-Type', fixture.mimeType);
+      response.setHeader('Content-Length', fixture.bytes.length);
+      response.setHeader('Accept-Ranges', 'bytes');
+      response.setHeader('Content-Disposition', fixture.mimeType === 'image/svg+xml' || fixture.mimeType === 'application/octet-stream' ? 'attachment' : 'inline');
+      response.end(fixture.bytes);
+    });
+  } }],
 });
-await server.listen();
 const browser = await chromium.launch();
 const baseUrl = server.resolvedUrls.local[0];
 const token = 'b'.repeat(64);
-const mermaidModuleUrl = new URL(`/@fs${new URL('../../../packages/viewer-kit/src/mermaid.ts', import.meta.url).pathname}`, baseUrl).href;
+const mermaidModuleUrl = new URL(`/@fs${new URL('../../../packages/viewer-kit/src/mermaid.ts', import.meta.url).pathname}`, helperServer.resolvedUrls.local[0]).href;
+const fixtureDescriptors = Object.fromEntries(Object.entries(rawFixtures).map(([path, fixture]) => [path, {
+  path, name: path.slice(1), kind: 'file', targetKind: null, mimeType: fixture.mimeType,
+  isBinary: fixture.mimeType !== 'image/svg+xml', sizeBytes: fixture.bytes.length, modifiedAtMs: 100, version: 'fixture-v1',
+}]));
 
 function viewerUrl(path, line = null) {
   const url = new URL(baseUrl);
@@ -26,9 +65,9 @@ function viewerUrl(path, line = null) {
   return url.href;
 }
 
-async function openViewer(path, line = null, pageOptions = {}) {
+async function openViewer(path, line = null, pageOptions = {}, fileDownload = false) {
   const page = await browser.newPage(pageOptions);
-  await page.addInitScript(({ token }) => {
+  await page.addInitScript(({ token, fixtureDescriptors }) => {
     if (window.top !== window) return;
     const fixtures = {
       '/doc.md': `# Heading
@@ -65,6 +104,8 @@ graph TD
     window.__testHost = {
       copied: null,
       failNextRead: false,
+      version: 'fixture-v1',
+      downloadReason: null,
       fixtures,
       requests: [],
     };
@@ -110,7 +151,15 @@ graph TD
       if (message.type === 'remux/cancel' || message.type === 'remux/notify') return;
       if (message.type !== 'remux/request') return;
       window.__testHost.requests.push({ method: message.method, params: message.params });
-      if (message.method === 'remux/fs/readFile') {
+      if (message.method === 'remux/fs/stat') {
+        const path = message.params.path;
+        reply(message.id, { ...(fixtureDescriptors[path] ?? {
+          path, name: path.split('/').at(-1), kind: 'file', targetKind: null,
+          mimeType: 'text/plain', isBinary: false, sizeBytes: fixtures[path]?.length ?? 10, modifiedAtMs: 100,
+        }), version: window.__testHost.version });
+      } else if (message.method === 'host/file/download') {
+        reply(message.id, window.__testHost.downloadReason ? { ok: false, reason: window.__testHost.downloadReason } : { ok: true });
+      } else if (message.method === 'remux/fs/readFile') {
         if (window.__testHost.failNextRead) {
           window.__testHost.failNextRead = false;
           fail(message.id, 'fixture refresh failed');
@@ -145,8 +194,9 @@ graph TD
         reply(message.id, { ok: true });
       }
     } };
-  }, { token });
-  await page.addInitScript({ content: createProtectedViewerBootstrapScript(token) });
+  }, { token, fixtureDescriptors });
+  await page.addInitScript({ content: createProtectedViewerBootstrapScript(token).replace('fileDownload: true, ', fileDownload ? 'fileDownload: true, ' : '') });
+  page.on('pageerror', error => { throw error; });
   await page.goto(viewerUrl(path, line));
   return page;
 }
@@ -154,6 +204,13 @@ graph TD
 function readCount(page, path = null) {
   return page.evaluate(path => window.__testHost.requests.filter(request =>
     request.method === 'remux/fs/readFile' && (path === null || request.params.path === path)).length, path);
+}
+
+async function assertOpenTraffic(page, path, expectedReads) {
+  const requests = await page.evaluate(path => window.__testHost.requests.filter(request => request.params?.path === path), path);
+  assert.equal(requests.filter(request => request.method === 'remux/fs/stat').length, 1, `${path}: one stat`);
+  assert.equal(requests.filter(request => request.method === 'remux/fs/readFile').length, expectedReads, `${path}: expected reads`);
+  assert.equal(requests[0].method, 'remux/fs/stat', `${path}: stat first`);
 }
 
 async function checkSharedMermaidRenderer(page) {
@@ -254,8 +311,9 @@ try {
   await markdown.setViewportSize({ width: 390, height: 844 });
   assert.equal(await markdown.evaluate(() => document.body.scrollWidth <= document.documentElement.clientWidth), true,
     'phone Markdown must not overflow the body');
-  await mkdir('/tmp/remux-html-preview', { recursive: true });
-  await markdown.screenshot({ fullPage: true, path: '/tmp/remux-html-preview/unified-markdown-phone.png' });
+  const screenshotDir = join(tmpdir(), 'remux-html-preview');
+  await mkdir(screenshotDir, { recursive: true });
+  await markdown.screenshot({ fullPage: true, path: join(screenshotDir, 'unified-markdown-phone.png') });
   const footnoteLink = markdown.locator('a[href="#user-content-fn-proof"]');
   await footnoteLink.click();
   assert.equal(await markdown.evaluate(() => Boolean(document.getElementById(decodeURIComponent(location.hash.slice(1))))), true,
@@ -264,7 +322,7 @@ try {
   assert.deepEqual(leftLabels.slice(0, 4), ['Open tabs', 'Reload file', 'Show source', 'Copy file contents']);
   const markdownEye = markdown.getByRole('button', { name: 'Show source' });
   assert.equal(await markdownEye.getAttribute('aria-pressed'), 'true');
-  assert.equal(await readCount(markdown, '/doc.md'), 1);
+  await assertOpenTraffic(markdown, '/doc.md', 1);
   await markdownEye.click();
   await markdown.locator('.cm-content').waitFor();
   assert.equal(await readCount(markdown, '/doc.md'), 1, 'Preview/Source toggle must not reread');
@@ -328,6 +386,7 @@ try {
   const html = await openViewer('/doc.html');
   const frame = html.frameLocator('iframe[title="Interactive HTML document"]');
   await frame.locator('#increment').click();
+  await assertOpenTraffic(html, '/doc.html', 1);
   assert.equal(await frame.locator('#value').textContent(), '1');
   await html.getByRole('button', { name: 'Show source' }).click();
   await html.getByRole('button', { name: 'Show preview' }).click();
@@ -348,13 +407,14 @@ try {
   await focused.getByRole('button', { name: 'Open tabs' }).waitFor();
   assert.equal(await focused.getByRole('button', { name: 'Show preview' }).count(), 0);
   await focused.locator('.cm-line').filter({ hasText: /^line 50$/ }).waitFor({ state: 'visible' });
+  await assertOpenTraffic(focused, '/lines.txt', 1);
   await focused.close();
 
   const windowed = await openViewer('/large.txt');
   const disabledCopy = windowed.getByRole('button', { name: 'Full-file copy is unavailable for paged Source' });
   await disabledCopy.waitFor();
   assert.equal(await disabledCopy.isDisabled(), true);
-  assert.equal(await windowed.getByText('window page').count() > 0, true);
+  await windowed.getByText('window page', { exact: true }).waitFor();
   assert.equal(await windowed.evaluate(() => window.__testHost.requests.filter(request => request.method === 'remux/fs/readFileWindow').length), 1);
   await windowed.close();
 
@@ -371,6 +431,106 @@ try {
   await largeMarkdown.getByText('This document is too large to preview').waitFor();
   assert.equal(await largeMarkdown.locator('.remux-editor-empty-card').getByRole('button', { name: 'Show source' }).count(), 1);
   await largeMarkdown.close();
+
+  const rendererChunks = new Set();
+  const image = await openViewer('/pixel.png');
+  const img = image.locator('.remux-editor-image-stage img');
+  await image.getByText(/pixel.png \/ .* \/ 64×32/u).waitFor();
+  assert.equal(await img.evaluate(element => element.naturalWidth), 64);
+  await assertOpenTraffic(image, '/pixel.png', 0);
+  await img.click({ position: { x: 20, y: 20 } });
+  assert.equal(await image.locator('.remux-editor-image-zoomed').count(), 1);
+  const scale = await img.evaluate(element => new DOMMatrix(getComputedStyle(element).transform).a);
+  const width = await image.locator('.remux-editor-image-stage').evaluate(element => element.clientWidth);
+  assert.ok(Math.abs(scale * width - 64) < 0.1, 'tap must display natural size');
+  await image.locator('.remux-editor-image-stage').click({ position: { x: 20, y: 20 } });
+  assert.equal(await image.locator('.remux-editor-image-zoomed').count(), 0);
+  // Two pointers pinch; lifting one must allow dragging without a tap reset.
+  const imageCdp = await image.context().newCDPSession(image);
+  await imageCdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: 100, y: 100, id: 1 }, { x: 200, y: 100, id: 2 }] });
+  await imageCdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: 100, y: 100, id: 1 }, { x: 300, y: 100, id: 2 }] });
+  await imageCdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [{ x: 100, y: 100, id: 1 }] });
+  await imageCdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: 120, y: 130, id: 1 }] });
+  await imageCdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  assert.equal(await image.locator('.remux-editor-image-zoomed').count(), 1);
+  assert.equal(await img.evaluate(element => new DOMMatrix(getComputedStyle(element).transform).a), 2);
+  await img.evaluate(element => { window.__retainedImage = element; });
+  const beforeReload = rawRequests.filter(request => request.path === '/pixel.png').length;
+  await image.getByRole('button', { name: 'Reload file' }).click();
+  await image.waitForFunction(() => window.__testHost.requests.filter(request => request.method === 'remux/fs/stat').length === 2);
+  assert.equal(await img.evaluate(element => element === window.__retainedImage), true);
+  assert.equal(rawRequests.filter(request => request.path === '/pixel.png').length, beforeReload, 'unchanged reload must not refetch image');
+  await image.evaluate(() => { window.__testHost.version = 'fixture-v2'; });
+  await image.getByRole('button', { name: 'Reload file' }).click();
+  await image.waitForFunction(() => document.querySelector('.remux-editor-image-stage img')?.getAttribute('src')?.endsWith('&v=fixture-v2'));
+  assert.equal(await img.evaluate(element => element === window.__retainedImage), false);
+  const chunks = await image.evaluate(() => performance.getEntriesByType('resource').map(entry => entry.name).filter(name => /Renderer-.*\.js$/u.test(name)));
+  assert.equal(chunks.some(name => name.includes('ImageRenderer-')), true);
+  assert.equal(chunks.some(name => /SourceRenderer|MarkdownRenderer|HtmlRenderer/u.test(name)), false, 'image open must not fetch text renderers');
+  chunks.forEach(name => rendererChunks.add(new URL(name).pathname.split('/').at(-1)));
+  await image.close();
+
+  failNextImage = true;
+  const retryImage = await openViewer('/pixel.png');
+  await retryImage.getByRole('button', { name: 'Retry', exact: true }).waitFor();
+  await retryImage.getByRole('button', { name: 'Retry', exact: true }).click();
+  await retryImage.getByText(/pixel.png \/ .* \/ 64×32/u).waitFor();
+  assert.equal(await readCount(retryImage), 0);
+  await retryImage.close();
+
+  const svg = await openViewer('/pixel.svg');
+  await svg.getByText(/pixel.svg \/ .* \/ 120×40/u).waitFor();
+  assert.equal(await svg.locator('.remux-editor-image-stage svg').count(), 0);
+  assert.equal(await svg.evaluate(() => window.__unsafeSvg), undefined);
+  await assertOpenTraffic(svg, '/pixel.svg', 0);
+  await svg.close();
+
+  const pdf = await openViewer('/minimal.pdf');
+  const pdfFrame = pdf.locator('iframe[title="minimal.pdf"]');
+  await pdfFrame.waitFor();
+  assert.equal(await pdfFrame.getAttribute('src'), '/remux/fs/raw?path=%2Fminimal.pdf&v=fixture-v1');
+  assert.equal(await pdfFrame.getAttribute('srcdoc'), null);
+  assert.equal(await pdfFrame.getAttribute('sandbox'), null);
+  await pdf.waitForLoadState('networkidle');
+  assert.equal(rawRequests.some(request => request.path === '/minimal.pdf'), true, 'frame policy must allow the raw PDF request');
+  await assertOpenTraffic(pdf, '/minimal.pdf', 0);
+  await pdf.close();
+
+  const androidPdf = await openViewer('/minimal.pdf', null, { userAgent: 'Mozilla/5.0 (Linux; Android 14)' });
+  await androidPdf.getByText('This file cannot be previewed.').waitFor();
+  assert.equal(await androidPdf.locator('iframe').count(), 0);
+  await androidPdf.close();
+
+  const video = await openViewer('/tiny.webm');
+  await video.locator('video[controls][playsinline][preload="metadata"]').waitFor();
+  await video.waitForFunction(() => document.querySelector('video')?.videoWidth === 32);
+  assert.equal(await video.locator('video').getAttribute('src'), '/remux/fs/raw?path=%2Ftiny.webm&v=fixture-v1');
+  await assertOpenTraffic(video, '/tiny.webm', 0);
+  await video.close();
+
+  const binary = await openViewer('/random.bin');
+  await binary.getByText('This file cannot be previewed.').waitFor();
+  const disabledDownload = binary.getByRole('button', { name: 'Update the app to download files' });
+  assert.equal(await disabledDownload.count(), 2, 'toolbar and primary Download are mirrored');
+  for (const button of await disabledDownload.all()) assert.equal(await button.isDisabled(), true);
+  await assertOpenTraffic(binary, '/random.bin', 0);
+  assert.equal(rawRequests.some(request => request.path === '/random.bin'), false);
+  await binary.close();
+
+  const downloadable = await openViewer('/random.bin', null, {}, true);
+  const primaryDownload = downloadable.locator('.remux-editor-binary').getByRole('button', { name: 'Download file' });
+  await primaryDownload.waitFor();
+  assert.equal(await primaryDownload.isEnabled(), true);
+  await primaryDownload.click();
+  await downloadable.waitForFunction(() => window.__testHost.requests.some(request => request.method === 'host/file/download' && request.params.path === '/random.bin'));
+  await downloadable.evaluate(() => { window.__testHost.downloadReason = 'fixture download failed'; });
+  await downloadable.locator('.remux-extension-action-bar').getByRole('button', { name: 'Download file' }).click();
+  await downloadable.getByText('fixture download failed', { exact: true }).waitFor();
+  await downloadable.close();
+  console.log(JSON.stringify({ builtViewerChunks: true, lazyImageChunk: [...rendererChunks],
+    imageNaturalDimensions: true, imageTapPinchDrag: true, mediaReloadWithoutFlash: true, imageRetry: true,
+    svgImgOnly: true, rawPdfFrame: true, androidPdfFallback: true, videoMetadata: true, binaryFallback: true,
+    downloadCapabilityAndCommand: true, downloadFailureStatus: true, oneStatAtMostOneReadPerOpen: true }));
 
   console.log(JSON.stringify({
     copyOriginal: true,
@@ -389,5 +549,6 @@ try {
   }));
 } finally {
   await browser.close();
-  await server.close();
+  await new Promise((resolve) => server.httpServer.close(resolve));
+  await helperServer.close();
 }

@@ -284,3 +284,40 @@ body {
     transform: rotate(360deg);
   }
 }
+
+.remux-editor-image-stage {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  touch-action: none;
+  user-select: none;
+  cursor: zoom-in;
+}
+
+.remux-editor-image-stage img {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-width: none;
+  transform-origin: 0 0;
+}
+
+.remux-editor-image-zoomed { cursor: grab; }
+.remux-editor-image-zoomed:active { cursor: grabbing; }
+.remux-editor-image-stage .remux-editor-empty { height: 100%; }
+.remux-editor-pdf { width: 100%; height: 100%; border: 0; }
+.remux-editor-media-stage { display: grid; height: 100%; place-items: center; }
+.remux-editor-media-stage video { max-width: 100%; max-height: 100%; }
+.remux-editor-media-stage audio { max-width: 100%; }
+.remux-editor-binary { overflow-wrap: anywhere; }
+.remux-editor-binary dt { color: var(--rmx-text-muted); margin-top: 12px; }
+.remux-editor-binary dd { margin: 4px 0; }
+.remux-editor-primary-button {
+  border: 0;
+  border-radius: 8px;
+  padding: 10px 16px;
+  background: var(--rmx-accent);
+  color: var(--rmx-surface);
+  font: inherit;
+}
+.remux-editor-primary-button:disabled { opacity: 0.5; }

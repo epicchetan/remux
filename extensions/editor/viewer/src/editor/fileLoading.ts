@@ -34,13 +34,30 @@ export type WindowedDocument = {
   version: string;
 };
 
-export type EditorDocument = FullDocument | WindowedDocument;
+export type MediaDocument = {
+  kind: 'media';
+  media: 'image' | 'pdf' | 'audio' | 'video';
+  url: string;
+  mimeType: string | null;
+  sizeBytes: number | null;
+  version: string | null;
+};
+
+export type BinaryDocument = {
+  kind: 'binary';
+  mimeType: string | null;
+  sizeBytes: number | null;
+  version: string | null;
+};
+
+export type TextDocument = FullDocument | WindowedDocument;
+export type EditorDocument = TextDocument | MediaDocument | BinaryDocument;
 
 export async function loadInitialDocument(
   path: string,
   signal?: AbortSignal,
   targetLine?: number | null,
-): Promise<EditorDocument> {
+): Promise<TextDocument> {
   const result = await readFile(path, { format: 'base64', signal });
   throwIfAborted(signal);
   if (result.tooLarge) {

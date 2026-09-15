@@ -1,9 +1,9 @@
-import type { ReadFileGitMetadata } from '@remux/viewer-kit/fs';
+import { rawFileUrl, type FileDescriptor, type ReadFileGitMetadata } from '@remux/viewer-kit/fs';
+import { renderers, resolveRenderer, type RendererId } from '../renderers/registry.ts';
 
-import type { EditorDocument, WindowedDocument } from './fileLoading';
+import type { EditorDocument, TextDocument, WindowedDocument } from './fileLoading';
 
 export type EditorMode = 'preview' | 'source';
-export type PreviewKind = 'html' | 'markdown' | null;
 export type PendingFocus = { line: number; nonce: string | null };
 export type GitState =
   | { status: 'idle' }
@@ -20,12 +20,14 @@ export type EditorControllerState = {
   mode: EditorMode;
   path: string | null;
   pendingFocus: PendingFocus | null;
-  previewKind: PreviewKind;
+  descriptor: FileDescriptor | null;
+  rendererId: RendererId | null;
   status: 'error' | 'idle' | 'loading' | 'ready' | 'refreshing';
 };
 
 export type EditorControllerDependencies = {
-  loadInitial: (path: string, signal?: AbortSignal, targetLine?: number | null) => Promise<EditorDocument>;
+  stat: (path: string, signal?: AbortSignal) => Promise<FileDescriptor>;
+  loadInitial: (path: string, signal?: AbortSignal, targetLine?: number | null) => Promise<TextDocument>;
   loadWindow: (path: string, options: {
     expectedVersion?: string;
     offset?: number;
@@ -51,7 +53,8 @@ export class EditorFileController {
     mode: 'source',
     path: null,
     pendingFocus: null,
-    previewKind: null,
+    descriptor: null,
+    rendererId: null,
     status: 'idle',
   };
 
@@ -72,7 +75,7 @@ export class EditorFileController {
       : this.state.hostGeneration;
     const sameTarget = path === this.state.path && hostGeneration === this.state.hostGeneration;
     if (sameTarget) {
-      if (options.focus) {
+      if (options.focus && (!this.state.rendererId || this.renderer()?.modes.includes('source'))) {
         this.publish({ ...this.state, diffVisible: false, mode: 'source', pendingFocus: options.focus });
         if (this.state.document?.kind === 'windowed') void this.loadTargetLine(options.focus.line);
       }
@@ -86,10 +89,11 @@ export class EditorFileController {
       error: null,
       git: { status: 'idle' },
       hostGeneration,
-      mode: options.focus ? 'source' : defaultMode(path),
+      mode: 'source',
       path,
       pendingFocus: options.focus ?? null,
-      previewKind: previewKind(path),
+      descriptor: null,
+      rendererId: null,
       status: 'idle',
     });
   }
@@ -107,7 +111,12 @@ export class EditorFileController {
     else this.publish({ ...this.state, hostGeneration });
   }
 
+  private renderer() {
+    return renderers.find((renderer) => renderer.id === this.state.rendererId);
+  }
+
   setMode(mode: EditorMode) {
+    if (!this.renderer()?.modes.includes(mode)) return;
     if (mode === 'preview' && this.state.git.status === 'loading') {
       this.gitAbortController?.abort('preview-selected');
       this.gitAbortController = null;
@@ -124,7 +133,29 @@ export class EditorFileController {
   async load() {
     const { path, pendingFocus } = this.state;
     if (!path) return false;
-    return this.runDocumentLoad((signal) => this.dependencies.loadInitial(path, signal, pendingFocus?.line));
+    const previousDocument = this.state.document;
+    const previousError = this.state.status === 'error';
+    return this.runDocumentLoad(async (signal, isCurrent) => {
+      const descriptor = await this.dependencies.stat(path, signal);
+      // Stat and byte reads share one generation. A superseded stat must never
+      // install metadata or start the next read, even if it ignores abort.
+      if (!isCurrent()) throw new Error('Stat superseded');
+      const renderer = resolveRenderer(descriptor);
+      const sameRenderer = renderer.id === this.state.rendererId;
+      const mode = this.state.pendingFocus && renderer.modes.includes('source') ? 'source'
+        : sameRenderer && renderer.modes.includes(this.state.mode) ? this.state.mode : renderer.modes[0];
+      this.publish({ ...this.state, descriptor, rendererId: renderer.id, mode,
+        pendingFocus: renderer.modes.includes('source') ? this.state.pendingFocus : null });
+      if (renderer.loads === 'text') return this.dependencies.loadInitial(path, signal, pendingFocus?.line);
+      if (!previousError && sameRenderer && previousDocument
+        && (previousDocument.kind === 'media' || previousDocument.kind === 'binary')
+        && previousDocument.version === descriptor.version) return previousDocument;
+      const metadata = { mimeType: descriptor.mimeType, sizeBytes: descriptor.sizeBytes, version: descriptor.version };
+      if (renderer.loads === 'none') return { kind: 'binary', ...metadata };
+      const media = renderer.id === 'image' ? 'image' : renderer.id === 'pdf' ? 'pdf'
+        : descriptor.mimeType?.startsWith('audio/') ? 'audio' : 'video';
+      return { kind: 'media', media, url: rawFileUrl(descriptor.path, descriptor.version), ...metadata };
+    });
   }
 
   async reload() {
@@ -192,10 +223,14 @@ export class EditorFileController {
     }
   }
 
+  reportRendererError(message: string) {
+    this.publish({ ...this.state, error: message, status: 'error' });
+  }
+
   retire() {
     this.cancel();
     this.generation += 1;
-    this.state = { ...this.state, document: null, error: null, path: null, status: 'idle' };
+    this.state = { ...this.state, document: null, descriptor: null, rendererId: null, error: null, path: null, status: 'idle' };
     this.emit();
   }
 
@@ -208,7 +243,7 @@ export class EditorFileController {
     }));
   }
 
-  private async runDocumentLoad(load: (signal: AbortSignal) => Promise<EditorDocument>) {
+  private async runDocumentLoad(load: (signal: AbortSignal, isCurrent: () => boolean) => Promise<EditorDocument>) {
     this.abortController?.abort('load-superseded');
     this.gitAbortController?.abort('document-reloading');
     this.gitAbortController = null;
@@ -223,9 +258,10 @@ export class EditorFileController {
       git: { status: 'idle' },
       status: this.state.document ? 'refreshing' : 'loading',
     });
+    const isCurrent = () => !controller.signal.aborted && generation === this.generation && path === this.state.path;
     try {
-      const document = await load(controller.signal);
-      if (generation !== this.generation || path !== this.state.path) return false;
+      const document = await load(controller.signal, isCurrent);
+      if (!isCurrent()) return false;
       const installedDocument = document.kind === 'full'
         ? { ...document, revision: `${document.revision}:load:${generation}` }
         : document;
@@ -247,7 +283,7 @@ export class EditorFileController {
       }
       return true;
     } catch (error) {
-      if (generation !== this.generation || path !== this.state.path) return false;
+      if (!isCurrent()) return false;
       this.publish({ ...this.state, error: errorMessage(error), status: 'error' });
       return false;
     }
@@ -268,17 +304,6 @@ export class EditorFileController {
   private emit() {
     for (const listener of this.listeners) listener(this.state);
   }
-}
-
-function previewKind(path: string): PreviewKind {
-  const extension = path.split('.').at(-1)?.toLowerCase();
-  if (extension === 'html' || extension === 'htm') return 'html';
-  if (extension === 'md' || extension === 'markdown' || extension === 'mdown') return 'markdown';
-  return null;
-}
-
-function defaultMode(path: string): EditorMode {
-  return previewKind(path) ? 'preview' : 'source';
 }
 
 function errorMessage(error: unknown) {

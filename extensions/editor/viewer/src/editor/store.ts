@@ -1,10 +1,11 @@
-import { readFileGit } from '@remux/viewer-kit/fs';
+import { readFileGit, statFile } from '@remux/viewer-kit/fs';
 import { create } from 'zustand';
 
 import { EditorFileController, type EditorControllerState, type PendingFocus } from './fileController';
 import { loadDocumentWindow, loadInitialDocument } from './fileLoading';
 
 export const editorController = new EditorFileController({
+  stat: (path, signal) => statFile(path, { signal }),
   loadInitial: loadInitialDocument,
   loadWindow: loadDocumentWindow,
   readGit: readFileGit,
@@ -18,6 +19,7 @@ type EditorStore = EditorControllerState & {
   loadPrevious: () => Promise<boolean>;
   loadStart: () => Promise<boolean>;
   reload: () => Promise<boolean>;
+  reportRendererError: (message: string) => void;
   retarget: (path: string, options?: { hostGeneration?: number | null; focus?: PendingFocus | null }) => void;
   setHostGeneration: (generation: number | null) => void;
   setMode: EditorFileController['setMode'];
@@ -35,6 +37,7 @@ export const useEditorStore = create<EditorStore>((set) => {
     loadPrevious: () => editorController.loadPrevious(),
     loadStart: () => editorController.loadStart(),
     reload: () => editorController.reload(),
+    reportRendererError: (message) => editorController.reportRendererError(message),
     retarget: (path, options) => editorController.retarget(path, options),
     setHostGeneration: (generation) => editorController.setHostGeneration(generation),
     setMode: (mode) => editorController.setMode(mode),
