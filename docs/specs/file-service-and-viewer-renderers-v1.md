@@ -332,3 +332,7 @@ Commit and push each reviewed green slice to main.
   fails at the terminal extension's state-worker step because the optional
   `@esbuild/linux-x64` package is missing from `node_modules`; the terminal
   extension is unchanged by this work, so its existing dist stands.
+- 2026-09-15: main pushed (11a74b1). OTA published to the `preview` branch:
+  iOS update `01a0a705-642a-7fda-8b3e-581924ce09c3` (group
+  `b7d253cd-2cf4-4c95-a17a-a279825768e4`, runtime version
+  `11b00fff61cb9ab6cb72f4498518e4bdcf7c009f`).
