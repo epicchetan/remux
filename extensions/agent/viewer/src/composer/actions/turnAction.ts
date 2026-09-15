@@ -1,14 +1,11 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import type {
   AgentComposerMessagePart,
-  AgentPendingQueueValue,
   ReasoningEffort,
 } from '../../../../shared/protocol.ts';
 import type { AgentRuntimeResource } from '../../../../shared/native-agent-protocol.ts';
 import type { ProviderAccess } from '../../../../shared/provider-runtime.ts';
-import { composerDeliveryState } from '../model/deliveryChoice.ts';
-import { resolveModel } from '../config/modelSelection.ts';
 import { buildComposerSendProjection } from '../model/sendProjection.ts';
 import {
   type ComposerEditTarget,
@@ -26,7 +23,6 @@ export function useComposerTurnAction({
   onFork,
   onSend,
   runtime,
-  queue,
   imagesEnabled,
   fileReferencesEnabled,
   branchEnabled,
@@ -43,7 +39,6 @@ export function useComposerTurnAction({
     setPhase: (phase: 'sending' | 'updating-transcript') => void,
   ) => Promise<void | 'preserve-draft'>;
   runtime: AgentRuntimeResource | null;
-  queue: AgentPendingQueueValue | null;
   imagesEnabled: boolean;
   fileReferencesEnabled: boolean;
   branchEnabled: boolean;
@@ -51,7 +46,6 @@ export function useComposerTurnAction({
   const snapshot = useComposerStore((state) => state.snapshot);
   const editTarget = useComposerStore((state) => state.editTarget);
   const forkTarget = useComposerStore((state) => state.forkTarget);
-  const models = useComposerStore((state) => state.models);
   const modelId = useComposerStore((state) => state.modelId);
   const reasoning = useComposerStore((state) => state.reasoning);
   const serviceTier = useComposerStore((state) => state.serviceTier);
@@ -70,15 +64,11 @@ export function useComposerTurnAction({
     || (part.type === 'mention' && !fileReferencesEnabled));
   const unsupportedBranch = Boolean((editTarget || forkTarget) && !branchEnabled);
 
-  const deliveryState = composerDeliveryState({ runtime, queue,
-    model: resolveModel(models, modelId)?.nativeId ?? null, effort: reasoning,
-    serviceTier: runtime?.composer.nextTurn.serviceTier ?? serviceTier ?? null,
-    access: runtime?.composer.nextTurn.access ?? access });
-  const normalDelivery = deliveryState.currentAllowed ? 'auto' : 'queue';
+  const [delivery, setDelivery] = useState<'auto' | 'queue'>('auto');
+  useEffect(() => setDelivery('auto'), [runtime?.conversationId]);
   const submit = (delivery: 'auto' | 'queue') => {
     if (useComposerStore.getState().submission || submission || !canStart || unsupportedContent || unsupportedBranch
-        || (isWorking && Boolean(editTarget))
-        || (!(editTarget || forkTarget) && (delivery === 'auto' ? !deliveryState.currentAllowed : !deliveryState.queueAllowed))) return;
+        || (isWorking && Boolean(editTarget))) return;
     const projection = buildComposerSendProjection(snapshot);
     if (projection.type === 'error') return;
     const kind = editTarget ? 'edit' : forkTarget ? 'fork' : conversationExists ? 'send' : 'new-chat';
@@ -113,6 +103,7 @@ export function useComposerTurnAction({
         if (result !== 'preserve-draft' && useComposerStore.getState().snapshot.contentKey === next.snapshot.contentKey) {
           clearComposer();
         }
+        setDelivery('auto');
         clearMode();
         clearSubmission(next.id);
       })
@@ -133,9 +124,9 @@ export function useComposerTurnAction({
 
   return {
     handleInterrupt,
-    handleSend: () => submit(normalDelivery),
-    handleDelivery: submit,
-    deliveryState,
+    handleSend: () => submit(editTarget || forkTarget ? 'auto' : delivery),
+    delivery,
+    setDelivery,
     editTarget,
     forkTarget,
     isStopping,

@@ -23,6 +23,8 @@ import {
   parseNativeProviderLoginStartCommand,
   parseNativeProviderPreferenceSetCommand,
   parseNativeTurnMutationCommand,
+  parseNativeDeliveryResolveCommand,
+  type NativeDeliveryResolveCommand,
   type NativeAgentResourceKey,
   type NativeAgentResourceReadParams,
   type NativeBranchCommand,
@@ -145,13 +147,7 @@ export type NativeConversationBranchResult = NativeConversationCreateResult & {
   turnId: string;
 };
 
-export type NativeMessageSendResult = {
-  accepted: true;
-  commandId: string;
-  turnId: string;
-  delivery: 'sent' | 'queued' | 'steered';
-  deliveryError?: string;
-};
+export type NativeMessageSendResult = import('../../../shared/native-agent-protocol.ts').NativeMessageSendResult;
 
 export type NativeCompactConversationResult = {
   accepted: true;
@@ -406,6 +402,16 @@ export class NativeAgentCoordinator {
     for (const execution of this.journal.federatedExecutionsNeedingRecovery()) {
       await this.recoverFederatedExecution(execution);
     }
+    // Cover a crash after a terminal provider event was journaled but before its
+    // completion notification was committed. Schema migration marks older history.
+    const unnotified = this.journal.database.prepare(`SELECT e.execution_id FROM executions e
+      WHERE e.ownership='federated' AND e.state NOT IN ('running','recovering')
+      AND EXISTS (SELECT 1 FROM turns t WHERE t.execution_id=e.execution_id
+        AND t.turn_id=(SELECT latest.turn_id FROM turns latest WHERE latest.execution_id=e.execution_id
+          ORDER BY latest.created_at DESC, latest.rowid DESC LIMIT 1)
+        AND t.outcome IS NOT NULL AND t.turn_id IS NOT e.federation_notified_turn_id)`)
+      .all() as { execution_id: string }[];
+    for (const execution of unnotified) this.finalizeFederatedExecution(execution.execution_id);
     // Native children share their root provider session. Reconcile every
     // unfinished child after root recovery so missed terminal notifications do
     // not depend on opening the Agents view.
@@ -600,7 +606,7 @@ export class NativeAgentCoordinator {
       }
       return { ...base, kind: input.kind, state: 'accepted', result: { accepted: true, conversationId } };
     }
-    const send = result as { commandId?: unknown; turnId?: unknown; delivery?: unknown };
+    const send = result as { commandId?: unknown; turnId?: unknown; delivery?: unknown; reason?: NativeMessageSendResult['reason'] };
     if (typeof send.commandId !== 'string' || typeof send.turnId !== 'string' ||
         !['sent', 'queued', 'steered'].includes(String(send.delivery))) {
       throw new Error(`Accepted turn.send command ${input.commandId} has no valid public result.`);
@@ -614,6 +620,7 @@ export class NativeAgentCoordinator {
         commandId: send.commandId,
         turnId: send.turnId,
         delivery: send.delivery as 'sent' | 'queued' | 'steered',
+        ...(send.reason ? { reason: send.reason } : {}),
         ...(this.journal.messageDeliveryError(send.commandId)
           ? { deliveryError: this.journal.messageDeliveryError(send.commandId) } : {}),
       },
@@ -997,26 +1004,23 @@ export class NativeAgentCoordinator {
     const laneBusy = Boolean(conversation.activeTurnId) || compactionRunning || hasQueuedWork ||
       this.journal.hasUnresolvedRootDelivery(conversation.conversationId) ||
       this.journal.hasConversationQueuePause(conversation.conversationId);
-    const shouldSteer = Boolean(conversation.activeTurnId) && input.delivery === 'steer';
+    const federationBusy = this.foregroundFederationBusy(conversation);
+    const shouldSteer = Boolean(conversation.activeTurnId) && input.delivery === 'steer' &&
+      capabilities.turns.steer && !federationBusy;
     if (input.delivery === 'steer' && !conversation.activeTurnId) {
       const error = coordinatorError('conversation_busy', 'There is no active turn to steer.');
       this.journal.rejectCommand(input.commandId, error.message, this.now());
       throw error;
     }
-    if (shouldSteer) {
-      if (!capabilities.turns.steer) {
-        const error = coordinatorError('capability_unavailable', 'Provider does not support native turn steering.');
-        this.journal.rejectCommand(input.commandId, error.message, this.now());
-        throw error;
-      }
-      return this.steer(input, conversation);
-    }
+    if (shouldSteer) return this.steer(input, conversation);
     const turnId = stableUuid(`turn\0${input.commandId}`);
     const result: NativeMessageSendResult = {
       accepted: true,
       commandId: input.commandId,
       turnId,
       delivery: laneBusy ? 'queued' : 'sent',
+      ...(input.delivery === 'steer' && laneBusy
+        ? { reason: federationBusy ? 'federation-wait' as const : 'steer-unavailable' as const } : {}),
     };
     // Immediate and follow-up messages cross the same atomic durability
     // boundary. The dispatcher may claim an idle lane right away, but the RPC
@@ -1052,6 +1056,75 @@ export class NativeAgentCoordinator {
     else await this.dispatchNext(conversation.conversationId);
     const deliveryError = this.journal.messageDeliveryError(input.commandId);
     return deliveryError ? { ...result, deliveryError } : result;
+  }
+
+  async resolveDelivery(unparsed: NativeDeliveryResolveCommand) {
+    this.assertOpen();
+    const input = parseNativeDeliveryResolveCommand(unparsed);
+    return this.journal.runAsyncCommand(input.commandId, 'delivery.resolve', input, async () => {
+      const claim = this.journal.claimCommand(input.commandId, 'delivery.resolve', input, this.now());
+      const replay = this.replay<{ accepted: true }>(claim.receipt);
+      if (replay) return replay;
+      try {
+        const conversation = this.requireConversation(input.conversationId);
+        const attempt = this.deliveryOwner.get(input.attemptId);
+        if (!attempt || attempt.conversationId !== input.conversationId ||
+            attempt.executionId !== conversation.rootExecutionId || attempt.provider !== 'claude-code' ||
+            attempt.state !== 'unknown' || attempt.kind === 'manual-compact' ||
+            this.journal.nativeSession(attempt.executionId)?.sessionId !== attempt.nativeSessionId) {
+          throw new Error('This message delivery is no longer eligible for recovery.');
+        }
+        if (this.journal.executionsForConversation(input.conversationId).some((execution) =>
+          execution.ownership !== 'root' && ['running', 'recovering'].includes(execution.state))) {
+          throw new Error('Wait for delegated work to finish before ending the interrupted turn.');
+        }
+        const adapter = this.providers.get(attempt.providerInstanceId)?.adapter;
+        if (!adapter?.assertSessionStopped) throw new Error('The provider cannot verify that its original process has stopped.');
+        const session = this.sessions.get(attempt.executionId);
+        const consumer = this.consumers.get(attempt.executionId);
+        if (session) await this.detachAndCloseSession(attempt.executionId, session);
+        await consumer;
+        await adapter.assertSessionStopped(attempt.nativeSessionId);
+        this.assertOpen();
+        // No writer can open while the original attempt remains unknown. Recheck
+        // receipt evidence after closing: a late acknowledgement wins over abandonment.
+        this.journal.transaction(() => {
+          const current = this.requireConversation(input.conversationId);
+          if (current.rootExecutionId !== attempt.executionId) throw new Error('Conversation changed during recovery.');
+          this.deliveryOwner.abandon(input.attemptId, input.commandId);
+          this.journal.database.prepare('DELETE FROM queued_messages WHERE command_id=?').run(attempt.commandId);
+          if (current.activeTurnId) {
+            this.journal.appendProviderEvent(parseProviderEventEnvelope({
+              contractVersion: PROVIDER_RUNTIME_CONTRACT_VERSION,
+              eventId: stableUuid(`delivery-resolution\0${input.commandId}`), provider: attempt.provider,
+              scope: { kind: 'turn', providerInstanceId: attempt.providerInstanceId,
+                conversationId: input.conversationId, executionId: attempt.executionId, turnId: current.activeTurnId },
+              native: { sessionId: attempt.nativeSessionId, kind: 'remux/delivery-abandoned' },
+              observedAt: this.now(), event: { type: 'turn.completed', outcome: 'interrupted' },
+            }));
+          } else {
+            this.journal.database.prepare("UPDATE conversations SET state='idle',health_message=NULL,updated_at=? WHERE conversation_id=?")
+              .run(this.now(), input.conversationId);
+            this.journal.database.prepare("UPDATE executions SET state='idle',updated_at=? WHERE execution_id=?")
+              .run(this.now(), attempt.executionId);
+          }
+          // Preserve queued work, but require an explicit next send before it runs.
+          const intentId = stableUuid(`delivery-resolution-pause\0${input.commandId}`);
+          this.journal.createStopIntent({ intentId, conversationId: input.conversationId,
+            rootExecutionId: attempt.executionId, scopeExecutionId: null, queuePaused: true, now: this.now() });
+          this.journal.settleStopIntent(intentId, this.now());
+          this.journal.acceptCommand(input.commandId, { accepted: true }, this.now());
+          if (this.journal.commandReceipt(attempt.commandId)?.state !== 'accepted') {
+            this.journal.rejectCommand(attempt.commandId, 'Delivery remained unconfirmed; user ended the interrupted turn without resending.', this.now());
+          }
+        });
+        this.invalidateConversation(input.conversationId, attempt.executionId);
+        return { accepted: true as const };
+      } catch (error) {
+        this.journal.rejectCommand(input.commandId, safeMessage(error), this.now());
+        throw error;
+      }
+    });
   }
 
   async interruptTurn(unparsed: NativeTurnMutationCommand) {
@@ -2489,6 +2562,10 @@ export class NativeAgentCoordinator {
           ...(execution.effort ? { effort: execution.effort } : {}),
           ...(execution.serviceTier ? { serviceTier: execution.serviceTier } : {}),
           state: 'running', now: this.now() });
+        // Follow-up sends also promise a completion result, including on a child
+        // originally spawned in the background. Preserve that intent before dispatch.
+        this.journal.database.prepare('UPDATE executions SET federation_waited=1 WHERE execution_id=?')
+          .run(execution.executionId);
         this.journal.markCommandDispatching(input.commandId, this.now());
       },
     });
@@ -2527,6 +2604,7 @@ export class NativeAgentCoordinator {
   }
 
   waitForFederatedExecution(executionId: string, signal?: AbortSignal): Promise<FederatedExecutionResult> {
+    this.journal.database.prepare('UPDATE executions SET federation_waited=1 WHERE execution_id=?').run(executionId);
     const current = this.executionResult(executionId);
     if (current.status !== 'running') return Promise.resolve(current);
     return new Promise((resolve, reject) => {
@@ -3199,8 +3277,11 @@ export class NativeAgentCoordinator {
           executionId: conversation.rootExecutionId,
           eventCount: snapshot.events.length,
         },
+        // A session-local snapshot replays every streaming checkpoint the live
+        // path coalesced away. Keep only each block's newest text revision so
+        // the sync appends nothing the journal already represents.
         () => snapshot.authority === 'session-local'
-          ? this.journal.appendProviderEvents(preparedSnapshotEvents).length
+          ? this.journal.appendProviderEvents(coalesceStreamingTextCheckpoints(preparedSnapshotEvents)).length
           : this.journal.replaceSnapshot(preparedSnapshotEvents, snapshot.coverage),
       );
       this.observePersistedTerminals(preparedSnapshotEvents, snapshot.authority);
@@ -3543,9 +3624,15 @@ export class NativeAgentCoordinator {
       target.nativeTurnId === this.journal.turn(conversation.activeTurnId)?.nativeTurnId ? target : undefined;
   }
 
+  private foregroundFederationBusy(conversation: JournalConversation) {
+    return conversation.provider === 'claude-code' &&
+      (this.sessions.get(conversation.rootExecutionId)?.blockedOnForegroundFederation?.() ?? false);
+  }
+
   private canDeliverActiveInput(conversation: JournalConversation, queued: NativeQueuedMessage) {
     const capabilities = this.requireCapabilities(conversation.providerInstanceId);
-    return queued.deliveryIntent === 'auto' && Boolean(capabilities.turns.activeInput) &&
+    return !this.foregroundFederationBusy(conversation) &&
+      queued.deliveryIntent === 'auto' && Boolean(capabilities.turns.activeInput) &&
       queued.model === conversation.model && (queued.effort ?? null) === (conversation.effort ?? null) &&
       (queued.serviceTier ?? null) === (conversation.serviceTier ?? null) && queued.access === conversation.access;
   }
@@ -3571,7 +3658,7 @@ export class NativeAgentCoordinator {
         executionId: current.rootExecutionId, intendedTurnId: active.turnId,
         clientMessageId: queued.clientMessageId, nativeClientMessageId,
         recoveryPayload: { turnId: active.turnId, clientMessageId: queued.clientMessageId,
-          nativeClientMessageId, content: queued.content, model: queued.model,
+          nativeClientMessageId, content: queued.content, origin: queued.origin, trigger: queued.trigger, triggers: queued.triggers, model: queued.model,
           ...(queued.effort ? { effort: queued.effort } : {}),
           ...(queued.serviceTier ? { serviceTier: queued.serviceTier } : {}), access: queued.access,
           expectedNativeTurnId: active.nativeTurnId, afterBlockId: this.journal.activeInputAnchor(active.turnId) },
@@ -3670,7 +3757,7 @@ export class NativeAgentCoordinator {
           executionId: refreshed.rootExecutionId, intendedTurnId: queued.turnId,
           clientMessageId: queued.clientMessageId, nativeClientMessageId,
           recoveryPayload: { turnId: queued.turnId, clientMessageId: queued.clientMessageId,
-            nativeClientMessageId, content: queued.content, model: queued.model,
+            nativeClientMessageId, content: queued.content, origin: queued.origin, trigger: queued.trigger, triggers: queued.triggers, model: queued.model,
             ...(queued.effort ? { effort: queued.effort } : {}),
             ...(queued.serviceTier ? { serviceTier: queued.serviceTier } : {}), access: queued.access },
           nativeSessionId: nativeSession.sessionId, ownerInstanceId: this.deliveryOwnerInstanceId,
@@ -3724,7 +3811,13 @@ export class NativeAgentCoordinator {
     // Delivery recovery owns this lane until an ownership-free positive read
     // proves native acceptance. Opening or resuming a writer here would cross
     // the same root boundary a second time merely to inspect it.
-    if (this.journal.hasUnresolvedRootDelivery(conversation.conversationId)) return;
+    if (this.journal.hasUnresolvedRootDelivery(conversation.conversationId)) {
+      this.journal.markConversationRecovering(conversation.conversationId,
+        'Message delivery is unconfirmed. Review the pending delivery before resuming.',
+        this.now(), conversation.rootExecutionId);
+      this.invalidateConversation(conversation.conversationId);
+      return;
+    }
     const executionId = conversation.rootExecutionId;
     if (!this.journal.markConversationRecovering(
       conversation.conversationId,
@@ -4024,6 +4117,12 @@ export class NativeAgentCoordinator {
   private attachSession(conversationId: string, executionId: string, session: ProviderSession) {
     const previous = this.sessions.get(executionId);
     if (previous && previous !== session) void previous.close();
+    session.setDeliveryEvidenceHandler?.((nativeClientMessageId, evidence) => {
+      const row = this.journal.database.prepare(`SELECT attempt_id FROM delivery_attempts
+        WHERE execution_id=? AND native_client_message_id=? AND state IN ('dispatching','unknown')`)
+        .get(executionId, nativeClientMessageId) as { attempt_id: string } | undefined;
+      if (row) this.deliveryOwner.recordAcceptance(row.attempt_id, evidence);
+    });
     this.sessions.set(executionId, session);
     this.touchSession(executionId);
     let consumer: Promise<void>;
@@ -4484,6 +4583,14 @@ export class NativeAgentCoordinator {
           this.finalizeFederatedExecution(event.scope.executionId);
         }
       }
+      if (event.provider === 'claude-code' && event.scope.kind === 'turn' &&
+          event.scope.executionId === this.requireConversation(conversationId).rootExecutionId &&
+          (event.event.type === 'turn.block.revised' || event.event.type === 'turn.block.completed') &&
+          event.event.block.payload.kind === 'tool' &&
+          event.event.block.payload.tool.name.startsWith('mcp__remux-federation__') &&
+          (event.event.type === 'turn.block.completed' || event.event.block.payload.backgrounded === true)) {
+        queueMicrotask(() => void this.dispatchNext(conversationId));
+      }
       if (event.scope.kind === 'turn' &&
           (event.event.type === 'turn.block.started' || event.event.type === 'turn.block.completed') &&
           this.journal.queuedEntries(conversationId)[0]?.kind === 'compact' &&
@@ -4522,6 +4629,14 @@ export class NativeAgentCoordinator {
     }
     for (const [changedExecutionId, changedTurnIds] of changedTurnsByExecution) {
       const turnIds = [...changedTurnIds].filter(Boolean);
+      if (inserted.every(({ event }) => event.type === 'turn.file-changed')) {
+        this.onResourcesInvalidated([
+          `agent/transcript:${conversationId}:tail-24`,
+          agentExecutionTranscriptResourceKey(changedExecutionId),
+          ...turnIds.map((id) => `agent/turn:${id}` as const),
+        ]);
+        continue;
+      }
       this.invalidateConversation(
         conversationId,
         changedExecutionId,
@@ -4778,6 +4893,41 @@ export class NativeAgentCoordinator {
     const result = this.executionResult(executionId);
     if (result.status === 'running') return;
     const waiters = this.executionWaiters.get(executionId);
+    // Mark both native watcher and fallback completion durably. A replay or restart
+    // must not turn an already delivered native notification into a second input.
+    const latestTurn = this.journal.turnsForExecution(executionId).at(-1);
+    if (latestTurn) this.journal.transaction(() => {
+      const row = this.journal.database.prepare(`SELECT federation_waited, federation_notified_turn_id
+        FROM executions WHERE execution_id=?`).get(executionId) as {
+          federation_waited: number; federation_notified_turn_id: string | null;
+        };
+      if (row.federation_notified_turn_id === latestTurn.turnId) return;
+      const conversation = this.journal.conversation(execution.conversationId);
+      if (!waiters && conversation?.provider === 'claude-code' && parent?.ownership === 'root' &&
+          (execution.federationScheduling === 'foreground' || row.federation_waited === 1)) {
+        const commandId = stableUuid(`federation-notification\0${executionId}\0${latestTurn.turnId}`);
+        const turnId = stableUuid(`turn\0${commandId}`);
+        const preview = result.finalAnswer?.kind === 'inline' ? result.finalAnswer.text
+          : result.finalAnswer?.preview ?? '';
+        const text = `Federated child ${executionId} (${execution.providerInstanceId}) ${result.status}: ${summary || preview}`;
+        const settings = this.projector.runtimeResource(conversation.conversationId)?.composer.nextTurn;
+        this.journal.claimCommand(commandId, 'turn.send', { executionId, childTurnId: latestTurn.turnId }, this.now());
+        this.journal.enqueueTurn({ commandId, turnId, conversationId: conversation.conversationId,
+          clientMessageId: stableUuid(`federation-notification-message\0${commandId}`),
+          origin: 'federation-notification', trigger: { kind: 'federation', childExecutionId: executionId,
+            summary: boundedSummary(summary || preview, 8_192) },
+          deliveryIntent: 'auto', content: [{ type: 'text', text }],
+          model: settings?.model ?? conversation.model,
+          effort: (settings ? settings.effort : conversation.effort) ?? undefined,
+          serviceTier: (settings ? settings.serviceTier : conversation.serviceTier) ?? undefined,
+          access: settings?.access ?? conversation.access, now: this.now() });
+        this.journal.acceptCommand(commandId, { accepted: true, commandId, turnId, delivery: 'queued' }, this.now());
+        this.invalidateConversation(conversation.conversationId);
+        queueMicrotask(() => { if (!this.closed) void this.dispatchNext(conversation.conversationId); });
+      }
+      this.journal.database.prepare('UPDATE executions SET federation_notified_turn_id=? WHERE execution_id=?')
+        .run(latestTurn.turnId, executionId);
+    });
     this.executionWaiters.delete(executionId);
     for (const resolve of waiters ?? []) resolve(result);
   }

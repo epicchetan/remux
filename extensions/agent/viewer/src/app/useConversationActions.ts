@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState, type Dispatch, type MutableRe
 import {
   type ConversationValue,
 } from '../../../shared/protocol.ts';
-import type { AgentRuntimeResource, NativeAgentResourceKey } from '../../../shared/native-agent-protocol.ts';
+import type { AgentRuntimeResource, NativeAgentResourceKey, NativeMessageSendResult } from '../../../shared/native-agent-protocol.ts';
 import type { TurnSubmissionInput } from '../composer/actions/turnAction.ts';
 import type { ComposerEditTarget, ComposerForkTarget } from '../composer/store.ts';
 import {
@@ -129,7 +129,7 @@ export function useConversationActions(options: {
 
   const finishRecoveredSubmission = useCallback(async (
     record: PendingMessageSubmission,
-    sent: { turnId: string; delivery: 'sent' | 'queued' | 'steered'; deliveryError?: string },
+    sent: Pick<NativeMessageSendResult, 'turnId' | 'delivery' | 'deliveryError' | 'reason'>,
   ) => {
     if (!record.conversationId || !record.message) return;
     if (sent.deliveryError) {
@@ -162,7 +162,8 @@ export function useConversationActions(options: {
       clearConversationDraftContent(record.conversationId);
       if (isSelected) useComposerStore.getState().clearComposer();
     }
-    if (ownsRecord(record)) useComposerStore.setState({ submissionError: null });
+    if (ownsRecord(record)) useComposerStore.setState({ submissionError: null,
+      deliveryNotice: sent.reason ? { conversationId: record.conversationId, turnId: sent.turnId, reason: sent.reason } : null });
     clearPendingMessageSubmission(ownerOperationId(record));
   }, [activeConversationIdRef, ensureConversation, ownsRecord, refresh]);
 

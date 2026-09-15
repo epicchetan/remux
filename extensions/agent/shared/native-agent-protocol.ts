@@ -1,3 +1,4 @@
+import type { TurnOrigin, TurnTrigger } from './provider-runtime.ts';
 import type {
   ContextUsageSnapshot,
   ChildExecutionOwnership,
@@ -54,6 +55,7 @@ export const NATIVE_AGENT_METHODS = {
   conversationStrandActivate: 'remux/agent/conversation/strand/activate',
   turnInterrupt: 'remux/agent/conversation/turn/interrupt',
   conversationInterrupt: 'remux/agent/conversation/interrupt',
+  deliveryResolve: 'remux/agent/conversation/delivery/resolve',
   executionInterrupt: 'remux/agent/conversation/execution/interrupt',
   conversationCompact: 'remux/agent/conversation/compact',
   conversationPreferenceSet: 'remux/agent/composer/conversation-preference/set',
@@ -264,6 +266,7 @@ export type AgentRuntimeResource = {
   activeTurnId: string | null;
   activeTurnElapsedMs: number | null;
   deliveryHeld: boolean;
+  uncertainDelivery?: { attemptId: string; content: readonly UserContentPart[]; canAbandon: boolean };
   lifecycle: {
     state: 'idle' | 'running' | 'checking' | 'stopping' | 'unavailable';
     runningCount: number;
@@ -352,6 +355,10 @@ export type RuntimeCompactionView = {
 };
 
 export type NativeQueuedMessage = {
+  conversationId?: string;
+  origin?: TurnOrigin;
+  trigger?: TurnTrigger;
+  triggers?: readonly TurnTrigger[];
   kind: 'message';
   deliveryIntent?: 'auto' | 'queue';
   commandId: string;
@@ -449,7 +456,25 @@ export type NativeCompactionView = {
   completedAt?: number;
 };
 
+export type NativeTurnNotice = {
+  type: 'notice';
+  clientMessageId: string;
+  afterBlockId: string | null;
+  origin: Exclude<TurnOrigin, 'user'> | 'compaction';
+  trigger?: TurnTrigger;
+  triggers?: readonly TurnTrigger[];
+  text: string;
+  elapsedMs?: number;
+  createdAt?: number;
+  inputOrdinal?: number;
+};
+
 export type NativeAgentTurnFrame = {
+  origin?: TurnOrigin;
+  trigger?: TurnTrigger;
+  triggers?: readonly TurnTrigger[];
+  /** Read-only continuation inputs, including notifications delivered during a turn. */
+  inputItems?: readonly NativeTurnNotice[];
   pathEntryId: string;
   strandId: string;
   ordinal: number;
@@ -460,7 +485,7 @@ export type NativeAgentTurnFrame = {
   outcome?: ProviderTurnOutcome;
   userContent: readonly UserContentPart[];
   additionalMessages?: readonly {
-    clientMessageId: string; content: readonly UserContentPart[]; afterBlockId: string | null;
+    clientMessageId: string; content: readonly UserContentPart[]; afterBlockId: string | null; createdAt?: number; inputOrdinal?: number;
   }[];
   ordering: 'native-exact' | 'live-provisional' | 'legacy-grouped';
   passes: readonly NativeAssistantPass[];
@@ -617,6 +642,7 @@ export type NativeCommandReadResult =
         commandId: string;
         turnId: string;
         delivery: 'sent' | 'queued' | 'steered';
+        reason?: NativeMessageSendResult['reason'];
         deliveryError?: string;
       };
     }
@@ -681,6 +707,15 @@ export type NativeMessageSendCommand = {
   delivery: 'auto' | 'queue' | 'steer';
 };
 
+export type NativeMessageSendResult = {
+  accepted: true;
+  commandId: string;
+  turnId: string;
+  delivery: 'sent' | 'queued' | 'steered';
+  reason?: 'steer-unavailable' | 'federation-wait';
+  deliveryError?: string;
+};
+
 export type NativeTurnMutationCommand = {
   commandId: string;
   conversationId: string;
@@ -735,6 +770,23 @@ export type NativeConversationStrandActivateCommand = {
   strandId: string;
   expectedHeadRevision: number;
 };
+
+export type NativeDeliveryResolveCommand = {
+  commandId: string;
+  conversationId: string;
+  attemptId: string;
+  action: 'abandon';
+};
+
+export function parseNativeDeliveryResolveCommand(value: unknown): NativeDeliveryResolveCommand {
+  const record = strict(value, '$', ['commandId', 'conversationId', 'attemptId', 'action']);
+  return {
+    commandId: identifier(record.commandId, '$.commandId'),
+    conversationId: identifier(record.conversationId, '$.conversationId'),
+    attemptId: identifier(record.attemptId, '$.attemptId'),
+    action: choice(record.action, ['abandon'], '$.action'),
+  };
+}
 
 export type NativeCompactConversationCommand = {
   commandId: string;

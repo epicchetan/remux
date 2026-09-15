@@ -1,4 +1,4 @@
-import type { AgentRuntimeResource } from '../../../../shared/native-agent-protocol.ts';
+import type { AgentRuntimeResource, NativeMessageSendResult } from '../../../../shared/native-agent-protocol.ts';
 import type { AgentPendingQueueValue } from '../../../../shared/protocol.ts';
 import type { ProviderAccess } from '../../../../shared/provider-runtime.ts';
 
@@ -10,40 +10,26 @@ export type ComposerDeliveryInput = {
   serviceTier: string | null;
   access: ProviderAccess;
 };
-export type ComposerDeliveryState = {
-  menu: boolean;
-  currentAllowed: boolean;
-  queueAllowed: boolean;
-  active: boolean;
-  reason: string | null;
-  queueLabel: string;
-  queueDescription: string;
-};
-
-/** UI eligibility only. The coordinator rechecks ordering and captured settings at dispatch. */
-export function composerDeliveryState({ runtime, queue, model, effort, serviceTier, access }: ComposerDeliveryInput): ComposerDeliveryState {
+/** Explanations only. Automatic delivery is always routed by the coordinator. */
+export function composerDeliveryReason({ runtime, queue, model, effort, serviceTier, access }: ComposerDeliveryInput): string | null {
   const active = Boolean(runtime?.activeTurnId);
-  const base = { menu: true, currentAllowed: false, queueAllowed: true, active,
-    reason: null, queueLabel: 'Queue for next turn',
-    queueDescription: active ? 'Let this response finish first.' : 'Start the next turn with this message.' };
-  if (runtime?.deliveryHeld) return { ...base, queueAllowed: false,
-    reason: 'Previous delivery is unconfirmed. Resolve the delivery hold before sending another message.' };
+  if (runtime?.deliveryHeld) return 'Previous delivery is unconfirmed. Resolve the delivery hold before sending another message.';
   if (runtime && ((active && queue?.conversationId !== runtime.conversationId) || runtime.state === 'recovering')) {
-    return { ...base, queueAllowed: false, reason: 'Checking conversation delivery status…' };
+    return 'Checking conversation delivery status…';
   }
-  if (runtime?.compaction.operation.state === 'running') return { ...base,
-    reason: 'This message must wait for compaction and any earlier queued work.',
-    queueLabel: 'Queue after pending work', queueDescription: 'Send after compaction and earlier queued work.' };
-  if (runtime && queue?.conversationId === runtime.conversationId && queue.entries.length) return { ...base,
-    reason: 'Earlier queued work goes first.', queueLabel: 'Queue after pending work',
-    queueDescription: 'Preserve the order of pending messages and operations.' };
-  if (!active || !runtime) return { ...base, menu: false, currentAllowed: true };
+  if (runtime?.compaction.operation.state === 'running') return 'This message must wait for compaction and any earlier queued work.';
+  if (runtime && queue?.conversationId === runtime.conversationId && queue.entries.length) return 'Earlier queued work goes first.';
+  if (!active || !runtime) return null;
   if (model !== runtime.activeConfiguration.model || effort !== (runtime.activeConfiguration.effort ?? null) ||
       serviceTier !== (runtime.activeConfiguration.serviceTier ?? null) || access !== runtime.activeConfiguration.access) {
-    return { ...base, reason: 'The draft uses different settings from the current turn.',
-      queueDescription: 'Start the next turn with the selected settings.' };
+    return 'The draft uses different settings from the current turn.';
   }
-  if (!runtime.capabilities.turns.activeInput) return { ...base,
-    reason: 'This provider cannot accept a message into the current turn.' };
-  return { ...base, currentAllowed: true };
+  if (!runtime.capabilities.turns.activeInput) return 'This provider cannot accept a message into the current turn.';
+  return null;
+}
+
+export function composerDeliveryNotice(reason: NativeMessageSendResult['reason']): string | null {
+  if (reason === 'federation-wait') return 'Message queued because this turn is waiting on a federated child.';
+  if (reason === 'steer-unavailable') return 'Message queued because this provider cannot steer the current turn.';
+  return null;
 }

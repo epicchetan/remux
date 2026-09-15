@@ -90,7 +90,6 @@ export function ComposerActionButtons({
     onInterrupt,
     onSend,
     runtime,
-    queue,
     imagesEnabled: providerCapabilities?.content.images === true,
     fileReferencesEnabled: providerCapabilities?.content.fileReferences === true,
     branchEnabled: runtime?.capabilities.session.forkNative === true,
@@ -121,8 +120,8 @@ export function ComposerActionButtons({
     <div className="remux-composer-actions">
       <div className="remux-composer-action-group">
         {left.map((action) => <ComposerActionKey action={action} key={action.label} />)}
-    <ComposerConfigButton
-      compactEnabled={compactEnabled}
+        <ComposerConfigButton
+          compactEnabled={compactEnabled}
           disabled={pickerOpen}
           onProviderLogin={onProviderLogin}
           onProviderLogout={onProviderLogout}
@@ -132,6 +131,9 @@ export function ComposerActionButtons({
           conversationExists={conversationExists}
           providers={providers}
           runtime={runtime}
+          showDelivery={Boolean(runtime?.activeTurnId || (queue?.conversationId === conversationId && queue?.entries.length))}
+          delivery={turn.delivery}
+          onDeliveryChange={turn.setDelivery}
         />
         {!pickerOpen && conversationExists ? <ComposerActionKey action={{
           className: 'remux-composer-agents-button',
@@ -164,12 +166,8 @@ export function ComposerActionButtons({
         {!pickerOpen && (!isWorking || (turn.hasSendableContent && !turn.isStopping)) ? <ComposerSendButton
           busy={turn.isSubmitting}
           disabled={turn.sendDisabled}
-          scopeKey={`${conversationId ?? 'new'}:${turn.editTarget ? 'edit' : turn.forkTarget ? 'fork' : 'send'}`}
-          delivery={turn.deliveryState}
-          useMenu={!turn.editTarget && !turn.forkTarget}
           directLabel={turn.editTarget ? 'Save edited message' : turn.forkTarget ? 'Send forked message' : 'Send message'}
           onSend={turn.handleSend}
-          onDelivery={turn.handleDelivery}
         /> : null}
       </div>
     </div>

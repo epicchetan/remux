@@ -1,5 +1,9 @@
+import type { AgentPendingQueueValue } from '../../../../shared/protocol.ts';
+import { composerDeliveryNotice, composerDeliveryReason } from '../model/deliveryChoice.ts';
 import { useEffect, useRef, useState } from 'react';
 import { Loader2, X } from 'lucide-react';
+import { agentCommands } from '../../ipc/agentCommands.ts';
+import { createViewerUuid } from '../../identity.ts';
 
 import type { AgentProvidersResource, AgentRuntimeResource, NativeConversationSummary } from '../../../../shared/native-agent-protocol.ts';
 import { reasoningLabel, resolveModel } from '../config/modelSelection.ts';
@@ -17,6 +21,7 @@ export function ComposerInlineStatus({
   pendingRecoveryError,
   providers,
   runtime,
+  queue,
   runtimeError,
 }: {
   expanded: boolean;
@@ -29,12 +34,24 @@ export function ComposerInlineStatus({
   pendingRecoveryError: string | null;
   providers: AgentProvidersResource | null;
   runtime: AgentRuntimeResource | null;
+  queue: AgentPendingQueueValue | null;
   runtimeError: string | null;
 }) {
   const configuredModel = useComposerStore((state) => state.modelId);
   const models = useComposerStore((state) => state.models);
   const configuredReasoning = useComposerStore((state) => state.reasoning);
   const model = resolveModel(models, configuredModel);
+  const serviceTier = useComposerStore(state => state.serviceTier);
+  const access = useComposerStore(state => state.access);
+  const typing = useComposerStore(state => state.snapshot.hasSendableContent);
+  const deliveryNotice = useComposerStore(state => state.deliveryNotice);
+  const queuedReason = deliveryNotice?.conversationId === runtime?.conversationId &&
+    queue?.entries.some(entry => entry.kind === 'message' && entry.id === deliveryNotice?.turnId)
+    ? composerDeliveryNotice(deliveryNotice?.reason) : null;
+  const deliveryReason = queuedReason ?? (typing && runtime?.activeTurnId ? composerDeliveryReason({ runtime, queue,
+    model: model?.nativeId ?? null, effort: configuredReasoning,
+    serviceTier: runtime?.composer.nextTurn.serviceTier ?? serviceTier,
+    access: runtime?.composer.nextTurn.access ?? access }) : null);
   const providerInstanceId = runtime?.providerInstanceId ?? model?.providerInstanceId;
   const provider = providers?.providers.find(({ providerInstanceId: id }) => id === providerInstanceId);
   const context = runtime?.usage.context ?? null;
@@ -69,6 +86,8 @@ export function ComposerInlineStatus({
   const statusIdentity = status ? `${status.kind}:${status.message}` : `normal:${runtime?.conversationId ?? ''}`;
 
   useEffect(() => setDetailsOpen(false), [statusIdentity, runtime?.conversationId]);
+
+  if (runtime?.uncertainDelivery) return <DeliveryRecovery key={runtime.uncertainDelivery.attemptId} runtime={runtime} />;
 
   if (status) {
     const error = status.kind !== 'progress';
@@ -128,6 +147,13 @@ export function ComposerInlineStatus({
       </>
     );
   }
+
+  if (deliveryReason) return <div className="remux-composer-inline-status" data-remux-no-composer-focus>
+    <div className="remux-composer-status-layout" role="status">
+      <span className="remux-composer-message-status-text">{deliveryReason}</span>
+      <UsageSummaryButton canInspect={canInspect} context={context} contextTone={contextTone} expanded={expanded} onToggle={onToggle} />
+    </div>
+  </div>;
 
   return (
     <div className="remux-composer-inline-status" data-remux-no-composer-focus>
@@ -231,4 +257,56 @@ function providerMark(provider: AgentProvidersResource['providers'][number]['pro
   if (provider === 'claude-code') return 'C';
   if (provider === 'codex') return 'O';
   return 'A';
+}
+
+function DeliveryRecovery({ runtime }: { runtime: AgentRuntimeResource }) {
+  const delivery = runtime.uncertainDelivery!;
+  const [expanded, setExpanded] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const commandId = useRef(createViewerUuid());
+  const inFlight = useRef(false);
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (expanded && dialog && !dialog.open) dialog.showModal();
+    return () => dialog?.close();
+  }, [expanded]);
+  const text = delivery.content.filter((part) => part.type === 'text').map((part) => part.text).join('\n');
+  return <>
+    <div className="remux-composer-inline-status remux-composer-transient-status" role="status" data-remux-no-composer-focus>
+      <div className="remux-composer-status-layout">
+      <span className="remux-composer-message-status-text">Message delivery is unconfirmed.</span>
+      <button type="button" className="remux-composer-message-status-action"
+        onClick={() => setExpanded(true)} aria-expanded={expanded}>Review delivery</button>
+      </div>
+    </div>
+    {expanded ? <dialog aria-label="Delivery recovery" className="remux-composer-error-modal"
+      data-remux-no-composer-focus onClose={() => setExpanded(false)} ref={dialogRef}>
+      <section className="agent-exact-content-dialog">
+        <header><strong>Unconfirmed message</strong>
+          <button aria-label="Close delivery recovery" onClick={() => dialogRef.current?.close()} type="button"><X className="size-4" /></button>
+        </header>
+        <div style={{ display: 'grid', gap: '12px', minHeight: 0, overflow: 'auto', padding: '16px', fontSize: '14px', lineHeight: 1.5 }}>
+        <p>The connection ended before receipt was confirmed. The agent may have processed this message.</p>
+        <blockquote style={{ whiteSpace: 'pre-wrap', maxHeight: '12rem', overflow: 'auto', margin: 0, padding: '12px', borderRadius: '8px', background: 'var(--secondary)' }}>{text || 'Message with attachments'}</blockquote>
+        <p>Ending the interrupted turn keeps the message in the recovery record and does not resend it.
+          Delegated work is preserved. You can send a new message afterward.</p>
+        {!delivery.canAbandon ? <p>Recovery is waiting for delegated work or delivery evidence to settle.</p> : null}
+        {error ? <p role="alert">{error}</p> : null}
+        </div>
+        <footer><button type="button"
+          disabled={busy || !delivery.canAbandon} onClick={() => {
+            if (inFlight.current) return;
+            inFlight.current = true;
+            setBusy(true); setError(null);
+            void agentCommands.resolveDelivery(runtime.conversationId, delivery.attemptId, commandId.current)
+              .catch((cause) => {
+                setError(cause instanceof Error ? cause.message : String(cause));
+                commandId.current = createViewerUuid();
+              }).finally(() => { inFlight.current = false; setBusy(false); });
+          }}>{busy ? 'Ending interrupted turn…' : 'End interrupted turn without resending'}</button></footer>
+      </section>
+    </dialog> : null}
+  </>;
 }

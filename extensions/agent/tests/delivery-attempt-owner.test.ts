@@ -519,3 +519,93 @@ test('Claude active input freezes queued content and accepts repeated exact repl
     }), /frozen delivery scope/);
   } finally { journal.close(); }
 });
+
+test('abandonment preserves uncertainty and frozen input, and refuses positive evidence', async () => {
+  for (const positive of [false, true]) {
+    const { journal, owner, attempt } = await fixture();
+    try {
+      await owner.dispatch(attempt.attemptId, async (boundary) => {
+        boundary.markPossiblySent('fixture-session-1');
+        return { accepted: false, outcome: 'unknown', crossing: { phase: 'possibly-sent', detail: 'response-lost' },
+          error: { code: 'lost', message: 'Receipt lost' } };
+      }, () => assert.fail('unknown input cannot be admitted'));
+      if (positive) {
+        owner.recordAcceptance(attempt.attemptId, proof);
+        assert.throws(() => owner.abandon(attempt.attemptId, 'resolve-1'), /unconfirmed message/u);
+        assert.equal(journal.hasUnresolvedRootDelivery('conversation-1'), true);
+      } else {
+        owner.abandon(attempt.attemptId, 'resolve-1');
+        assert.equal(owner.get(attempt.attemptId)?.state, 'abandoned');
+        assert.equal(owner.get(attempt.attemptId)?.recoveryPayloadJson, attempt.recoveryPayloadJson);
+        assert.equal(journal.hasUnresolvedRootDelivery('conversation-1'), false);
+        assert.throws(() => owner.recordAcceptance(attempt.attemptId, proof), /could not be persisted/u);
+      }
+    } finally { journal.close(); }
+  }
+});
+
+test('v18 migration preserves unresolved inputs before allowing audited abandonment', async () => {
+  const { journal, owner, attempt, database } = await fixture();
+  try {
+    await owner.dispatch(attempt.attemptId, async boundary => {
+      boundary.markPossiblySent('fixture-session-1');
+      return { accepted: false, outcome: 'unknown', crossing: { phase: 'possibly-sent', detail: 'response-lost' },
+        error: { code: 'lost', message: 'Receipt lost' } };
+    }, () => assert.fail('No acceptance'));
+    const oldDefinition = String(database.prepare("SELECT sql FROM sqlite_schema WHERE name='delivery_attempts'").get()!.sql)
+      .replaceAll(", 'abandoned'", '').replace("(state IN ('unknown')) =", "(state = 'unknown') =");
+    const staging = String(database.prepare("SELECT sql FROM sqlite_schema WHERE name='delivery_attempt_staging'").get()!.sql);
+    database.exec('CREATE TEMP TABLE saved_attempts AS SELECT * FROM delivery_attempts; DROP TABLE delivery_attempt_staging; DROP TABLE delivery_attempts;');
+    database.exec(oldDefinition);
+    database.exec(staging);
+    database.exec('INSERT INTO delivery_attempts SELECT * FROM saved_attempts; DROP TABLE saved_attempts; PRAGMA user_version=18; BEGIN IMMEDIATE;');
+    migrateNativeAgentSchema(database, 18);
+    database.exec('COMMIT');
+    assert.equal(owner.get(attempt.attemptId)?.state, 'unknown');
+    assert.equal(owner.get(attempt.attemptId)?.recoveryPayloadJson, attempt.recoveryPayloadJson);
+    owner.abandon(attempt.attemptId, 'migration-resolution');
+    assert.equal(owner.get(attempt.attemptId)?.state, 'abandoned');
+    assert.equal(database.prepare('PRAGMA foreign_key_check').all().length, 0);
+  } finally { journal.close(); }
+});
+
+test('active federation notifications retain origin and trigger through correlated delivery admission', async () => {
+  const { journal, owner, attempt } = await fixture(100, new DatabaseSync(':memory:'), 'claude-code');
+  try {
+    await owner.dispatch(attempt.attemptId, async boundary => {
+      boundary.markPossiblySent('fixture-session-1', 'generation-1');
+      return { accepted: true, outcome: 'accepted', nativeTurnId: 'turn-1', evidence: {
+        kind: 'claude-root-processing', sessionId: 'fixture-session-1', userMessageUuid: 'turn-1', observationUuid: 'root-proof',
+      } };
+    }, accepted => journal.admitQueuedTurn(accepted.intendedTurnId!, 100, accepted.nativeTurnId));
+    const trigger = { kind: 'federation' as const, childExecutionId: 'astra', summary: 'Done' };
+    const content = [{ type: 'text' as const, text: 'Federated child astra (codex) completed: Done' }];
+    journal.claimCommand('notification', 'turn.send', { trigger }, 101);
+    journal.enqueueTurn({ commandId: 'notification', conversationId: 'conversation-1', turnId: 'notification-turn',
+      clientMessageId: 'notification-input', origin: 'federation-notification', trigger, content,
+      model: 'fixture-native-v1', access: 'workspace-write', deliveryIntent: 'auto', now: 101 });
+    journal.acceptCommand('notification', { accepted: true }, 101);
+    journal.claimQueuedTurn('conversation-1', 101);
+    const input = { commandId: 'notification', kind: 'steer' as const, provider: 'claude-code' as const,
+      providerInstanceId: 'fixture-local', conversationId: 'conversation-1', executionId: 'execution-1',
+      intendedTurnId: 'turn-1', clientMessageId: 'notification-input', nativeClientMessageId: 'native-notification',
+      nativeSessionId: 'fixture-session-1', ownerInstanceId: 'owner-1', now: 101,
+      recoveryPayload: { turnId: 'turn-1', clientMessageId: 'notification-input', nativeClientMessageId: 'native-notification',
+        origin: 'federation-notification', trigger, content, model: 'fixture-native-v1', access: 'workspace-write',
+        expectedNativeTurnId: 'turn-1', afterBlockId: null } };
+    assert.throws(() => owner.prepare({ ...input, recoveryPayload: { ...input.recoveryPayload, origin: 'user' } }), /frozen input/);
+    assert.throws(() => owner.prepare({ ...input, recoveryPayload: { ...input.recoveryPayload,
+      trigger: { ...trigger, childExecutionId: 'another-child' } } }), /frozen input/);
+    const delivery = owner.prepare(input);
+    await owner.dispatch(delivery.attemptId, async boundary => {
+      boundary.markPossiblySent('fixture-session-1', 'generation-1');
+      return { accepted: true, outcome: 'accepted', nativeTurnId: 'turn-1', evidence: {
+        kind: 'claude-input-replay', sessionId: 'fixture-session-1', userMessageUuid: 'native-notification',
+        nativeTurnId: 'turn-1', processGeneration: 'generation-1',
+      } };
+    }, accepted => journal.admitActiveInput(accepted));
+    assert.equal(journal.additionalTurnMessages('turn-1')[0]?.origin, 'federation-notification');
+    assert.deepEqual(journal.additionalTurnMessages('turn-1')[0]?.trigger, trigger);
+    assert.equal(journal.queuedMessages('conversation-1').length, 0);
+  } finally { journal.close(); }
+});

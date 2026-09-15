@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 
 import type { ModelsValue, ReasoningEffort } from '../../../shared/protocol.ts';
+import type { NativeMessageSendResult } from '../../../shared/native-agent-protocol.ts';
 import type { ProviderAccess } from '../../../shared/provider-runtime.ts';
 import { preferredReasoning, preferredServiceTier, resolveModel } from './config/modelSelection.ts';
 import {
@@ -115,6 +116,7 @@ type ComposerStoreState = {
   startFork: (target: ComposerForkTarget) => void;
   submission: ComposerSubmission | null;
   submissionError: string | null;
+  deliveryNotice: { conversationId: string; turnId: string; reason: NonNullable<NativeMessageSendResult['reason']> } | null;
 };
 
 const noop = () => undefined;
@@ -263,4 +265,5 @@ export const useComposerStore = create<ComposerStoreState>((set, get) => ({
   },
   submission: null,
   submissionError: null,
+  deliveryNotice: null,
 }));

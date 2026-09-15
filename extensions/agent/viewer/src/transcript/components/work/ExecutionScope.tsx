@@ -254,6 +254,7 @@ function ScopeTrace({
 
 function actionRunState(calls: AgentToolCallSummary[]) {
   if (calls.some(({ status }) => status === 'running')) return 'running';
+  if (calls.some(({ status }) => status === 'recovering')) return 'recovering';
   if (calls.some(({ status }) => status === 'failed')) return 'failed';
   if (calls.some(({ status }) => status === 'interrupted')) return 'interrupted';
   return 'completed';
@@ -261,6 +262,7 @@ function actionRunState(calls: AgentToolCallSummary[]) {
 
 function actionRunStatus(calls: AgentToolCallSummary[]): AgentToolCallSummary['status'] {
   if (calls.some((call) => call.status === 'running')) return 'running';
+  if (calls.some((call) => call.status === 'recovering')) return 'recovering';
   if (calls.some((call) => call.status === 'failed')) return 'failed';
   if (calls.some((call) => call.status === 'interrupted')) return 'interrupted';
   return 'completed';

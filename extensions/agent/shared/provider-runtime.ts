@@ -486,6 +486,14 @@ export type ProviderSnapshotCoverage = {
   };
 };
 
+export type TurnOrigin = 'user' | 'native-followup' | 'federation-notification';
+export type TurnTrigger = {
+  kind: 'federation' | 'native-child';
+  childExecutionId?: string;
+  summary?: string;
+};
+export const MAX_TURN_TRIGGERS = 16;
+
 export type TurnBlockState = 'streaming' | 'running' | 'completed' | 'failed' | 'interrupted';
 
 export type TurnBlockPayload =
@@ -495,6 +503,7 @@ export type TurnBlockPayload =
   | {
       kind: 'tool';
       tool: ToolDisplay;
+      backgrounded?: boolean;
       inputPreview?: JsonValue;
       outputPreview?: JsonValue;
       detailRef?: string;
@@ -519,7 +528,7 @@ export type ProviderEvent =
   | { type: 'session.bound'; resumed: boolean }
   | { type: 'session.materialized' }
   | { type: 'session.health'; state: 'ready' | 'recovering' | 'lost'; message?: string }
-  | { type: 'turn.started'; origin?: 'native' }
+  | { type: 'turn.started'; origin?: 'native'; trigger?: TurnTrigger; triggers?: readonly TurnTrigger[] }
   | { type: 'turn.status'; state: 'running' | 'recovering' | 'idle' }
   | { type: 'turn.completed'; outcome: ProviderTurnOutcome; error?: DisplayError }
   | { type: 'user.message'; content: readonly UserContentPart[] }
@@ -1448,9 +1457,16 @@ function parseProviderEvent(
         ...(record.message === undefined ? {} : { message: boundedString(record.message, `${path}.message`) }),
       };
     }
-    case 'turn.started':
-      assertAllowedKeys(record, path, ['type', 'origin']);
-      return { type, ...(record.origin === undefined ? {} : { origin: oneOf(record.origin, ['native'], `${path}.origin`) }) };
+    case 'turn.started': {
+      assertAllowedKeys(record, path, ['type', 'origin', 'trigger', 'triggers']);
+      const triggers = record.triggers === undefined ? undefined : parseTurnTriggers(record.triggers, `${path}.triggers`);
+      const trigger = record.trigger === undefined ? triggers?.[0] : parseTurnTrigger(record.trigger, `${path}.trigger`);
+      if (triggers && JSON.stringify(trigger) !== JSON.stringify(triggers[0])) {
+        throw new ProviderContractError(`${path}.trigger`, 'must equal triggers[0]');
+      }
+      return { type, ...(record.origin === undefined ? {} : { origin: oneOf(record.origin, ['native'], `${path}.origin`) }),
+        ...(trigger ? { trigger } : {}), ...(triggers ? { triggers } : {}) };
+    }
     case 'turn.status':
       assertExactKeys(record, path, ['type', 'state']);
       return { type, state: oneOf(record.state, ['running', 'recovering', 'idle'], `${path}.state`) };
@@ -1746,12 +1762,13 @@ function parseTurnBlockPayload(
   }
   if (kind === 'tool') {
     assertAllowedKeys(record, path, [
-      'kind', 'tool', 'inputPreview', 'outputPreview', 'detailRef',
+      'kind', 'tool', 'inputPreview', 'outputPreview', 'detailRef', 'backgrounded',
     ]);
     if (!('tool' in record)) throw new ProviderContractError(`${path}.tool`, 'is required');
     return {
       kind,
       tool: parseToolDisplay(record.tool, `${path}.tool`),
+      ...(record.backgrounded === undefined ? {} : { backgrounded: bool(record.backgrounded, `${path}.backgrounded`) }),
       ...(record.inputPreview === undefined
         ? {}
         : { inputPreview: boundedJsonPreview(record.inputPreview, `${path}.inputPreview`) }),
@@ -2230,4 +2247,21 @@ function assertEncodedSize(value: unknown, limit: number, path: string) {
   if (encoded === undefined) throw new ProviderContractError(path, 'must be JSON serializable');
   const bytes = new TextEncoder().encode(encoded).byteLength;
   if (bytes > limit) throw new ProviderContractError(path, `encoded value exceeds ${limit} bytes`);
+}
+
+function parseTurnTrigger(value: unknown, path: string): TurnTrigger {
+  const record = recordValue(value, path);
+  assertAllowedKeys(record, path, ['kind', 'childExecutionId', 'summary']);
+  return {
+    kind: oneOf(record.kind, ['federation', 'native-child'], `${path}.kind`),
+    ...(record.childExecutionId === undefined ? {} : { childExecutionId: identifier(record.childExecutionId, `${path}.childExecutionId`) }),
+    ...(record.summary === undefined ? {} : { summary: boundedString(record.summary, `${path}.summary`, PROVIDER_RUNTIME_LIMITS.stringChars) }),
+  };
+}
+
+function parseTurnTriggers(value: unknown, path: string): readonly TurnTrigger[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_TURN_TRIGGERS) {
+    throw new ProviderContractError(path, `must contain 1-${MAX_TURN_TRIGGERS} triggers`);
+  }
+  return value.map((trigger, index) => parseTurnTrigger(trigger, `${path}[${index}]`));
 }

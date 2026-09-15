@@ -1,3 +1,5 @@
+import { FakeClaudeQuery } from './fixtures/fake-claude-query.ts';
+import { CLAUDE_MCP_AUTO_BACKGROUND_MS } from '../server/src/federation/constants.ts';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -13,7 +15,6 @@ import type {
   AccountInfo as ClaudeAccountInfo,
   Options as ClaudeQueryOptions,
   Query as ClaudeQuery,
-  SDKMessage,
   SDKUserMessage,
 } from '@anthropic-ai/claude-agent-sdk';
 
@@ -75,12 +76,19 @@ test('Claude probe accepts native subscription auth and refuses API-key fallback
   assert.equal(unverified.diagnosticCode, 'claude_subscription_required');
 });
 
-test('Claude advertises active-parent compaction only for the verified producer', async () => {
-  const adapter = new ClaudeNativeAdapter({ runCli: async args => args[0] === '--version'
-    ? '2.1.258 (Claude Code)' : JSON.stringify({ loggedIn: true, authMethod: 'claude.ai',
-      apiProvider: 'firstParty', subscriptionType: 'max' }) });
-  assert.equal((await adapter.probe('claude-local')).capabilities?.compaction.activeParent, 'background-native-agent');
-});
+for (const [version, enabled] of [
+  ['2.1.257', false], ['unknown', false], ['invalid', false], ['2.1.258', true],
+  ['2.1.300', true], ['2.2.0', true], ['3.0.0', true],
+] as const) {
+  test(`Claude ${version} ${enabled ? 'enables' : 'disables'} verified active input and compaction`, async () => {
+    const adapter = new ClaudeNativeAdapter({ runCli: async args => args[0] === '--version'
+      ? `${version} (Claude Code)` : JSON.stringify({ loggedIn: true, authMethod: 'claude.ai',
+        apiProvider: 'firstParty', subscriptionType: 'max' }) });
+    const capabilities = (await adapter.probe('claude-local')).capabilities!;
+    assert.equal(capabilities.turns.activeInput, enabled ? 'stream-input' : undefined);
+    assert.equal(capabilities.compaction.activeParent, enabled ? 'background-native-agent' : undefined);
+  });
+}
 
 test('Claude session initialization requires first-party subscription authentication', async () => {
   const openInput = {
@@ -284,6 +292,9 @@ test('Claude Agent SDK session preserves the native harness, MCP scope, and sema
       ANTHROPIC_AUTH_TOKEN: 'must-not-leak',
       REMUX_FEDERATION_MCP_BEARER_TOKEN: 'ambient-must-not-leak',
       CLAUDE_CONFIG_DIR: '/tmp/claude-config',
+      CLAUDE_AUTO_BACKGROUND_TASKS: '0',
+      CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS: '120000',
+      CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND: '1',
     },
     createQuery: ({ prompt, options }) => {
       assert.notEqual(typeof prompt, 'string');
@@ -317,6 +328,9 @@ test('Claude Agent SDK session preserves the native harness, MCP scope, and sema
     const invocation = created[0];
     assert.ok(invocation);
     const options = invocation.options!;
+    assert.equal(options.env?.CLAUDE_AUTO_BACKGROUND_TASKS, '1');
+    assert.equal(options.env?.CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS, String(CLAUDE_MCP_AUTO_BACKGROUND_MS));
+    assert.equal(options.env?.CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND, undefined);
     assert.deepEqual(options.systemPrompt, {
       type: 'preset',
       preset: 'claude_code',
@@ -872,7 +886,11 @@ for (const outcome of ['completed', 'failed'] as const) {
       const result = await pending;
       assert.equal(result.outcome, 'accepted');
       if (result.outcome === 'accepted') assert.equal(result.evidence.kind, 'claude-manual-compact-status');
-      await waitForClaudeEvent(session, ({ event }) => event.type === 'context.compaction.started');
+      const started = await waitForClaudeEvent(session, ({ event }) => event.type === 'context.compaction.started');
+      assert.equal(started.scope.kind, 'conversation');
+      assert.deepEqual(started.native.subject, {
+        kind: 'context-compaction', key: 'claude:context-compaction:fresh-status',
+      });
       assert.equal(session.hasBackgroundWork(), true, 'idle eviction must preserve ongoing compaction');
       await new Promise((resolve) => setTimeout(resolve, 75));
       assert.equal((await session.readCompactionPresence!('status-input')).presence, 'present');
@@ -883,6 +901,12 @@ for (const outcome of ['completed', 'failed'] as const) {
       else status('failure-status', { status: null, compact_result: 'failed', compact_error: 'Summary failed.' });
       const terminal = await waitForClaudeEvent(session, ({ event }) => event.type === `context.compaction.${outcome}`);
       assert.equal('operationId' in terminal.event && terminal.event.operationId, 'status-operation');
+      assert.equal(terminal.scope.kind, 'conversation');
+      assert.deepEqual(terminal.native.subject, {
+        kind: 'context-compaction',
+        key: `claude:context-compaction:${outcome === 'completed' ? 'status-boundary' : 'failure-status'}`,
+      });
+      assert.notEqual(terminal.native.subject?.key, started.native.subject?.key);
       assert.equal(session.hasBackgroundWork(), false);
     } finally { await session.close(); }
   });
@@ -1090,6 +1114,10 @@ test('Claude compact failure reports once, fits provider errors, and retains unk
       event.type === 'context.compaction.failed' && event.trigger === 'automatic');
     assert.ok(automaticFailure.event.type === 'context.compaction.failed');
     assert.match(automaticFailure.event.operationId, /^claude-auto-compact-/u);
+    assert.equal(automaticFailure.scope.kind, 'conversation');
+    assert.deepEqual(automaticFailure.native.subject, {
+      kind: 'context-compaction', key: 'claude:context-compaction:automatic-failure-during-turn',
+    });
     query.emit({
       type: 'result',
       subtype: 'success',
@@ -1357,6 +1385,69 @@ test('Claude stream wrapper UUIDs do not split one native assistant message into
       assert.equal(cursor.previousChainEntryUuid, null);
       assert.equal(cursor.lastChainEntryUuid, '10000000-0000-4000-8000-000000000014');
     }
+  } finally {
+    await session.close();
+  }
+});
+
+test('Claude per-block snapshots complete the streamed thinking block they match, not the first slot', async () => {
+  const query = new FakeClaudeQuery();
+  const adapter = new ClaudeNativeAdapter({
+    acceptanceTimeoutMs: 5,
+    createQuery: () => query as unknown as ClaudeQuery,
+    now: monotonicClock(),
+  });
+  const session = await adapter.openSession({
+    commandId: 'open-claude-per-block-snapshot',
+    providerInstanceId: 'claude-local',
+    conversationId: 'conversation-claude-per-block-snapshot',
+    executionId: 'execution-claude-per-block-snapshot',
+    mode: 'create',
+    cwd: '/workspace/remux',
+    model: 'claude-sonnet-4-6',
+    access: 'read-only',
+    developerInstructions: [],
+  });
+  try {
+    const terminal = collectThroughTerminal(session.events);
+    await session.startTurn({
+      commandId: 'turn-command-per-block-snapshot',
+      conversationId: 'conversation-claude-per-block-snapshot',
+      executionId: 'execution-claude-per-block-snapshot',
+      turnId: 'turn-claude-per-block-snapshot',
+      content: [{ type: 'text', text: 'Reason once.' }],
+    });
+    const stream = (event: unknown) => query.emit({
+      type: 'stream_event', session_id: session.nativeSession.sessionId, parent_tool_use_id: null, event,
+    });
+    const snapshot = (block: Record<string, unknown>) => query.emit({
+      type: 'assistant', session_id: session.nativeSession.sessionId, parent_tool_use_id: null,
+      message: { id: 'msg_per_block', role: 'assistant', content: [block] },
+    });
+    // Observed live shape: an empty signed thinking block precedes the real
+    // one, and the SDK finalizes each content block as its own message.
+    stream({ type: 'message_start', message: { id: 'msg_per_block', role: 'assistant', content: [] } });
+    stream({ type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } });
+    stream({ type: 'content_block_stop', index: 0 });
+    stream({ type: 'content_block_start', index: 1, content_block: { type: 'thinking', thinking: '' } });
+    stream({ type: 'content_block_delta', index: 1, delta: { type: 'thinking_delta', thinking: 'The real reasoning.' } });
+    snapshot({ type: 'thinking', thinking: '', signature: 'sig-empty' });
+    snapshot({ type: 'thinking', thinking: 'The real reasoning.', signature: 'sig-real' });
+    stream({ type: 'content_block_stop', index: 1 });
+    stream({ type: 'content_block_start', index: 2, content_block: { type: 'text', text: '' } });
+    stream({ type: 'content_block_delta', index: 2, delta: { type: 'text_delta', text: 'Done.' } });
+    snapshot({ type: 'text', text: 'Done.' });
+    stream({ type: 'content_block_stop', index: 2 });
+    stream({ type: 'message_stop' });
+    query.emit({ type: 'result', subtype: 'success', is_error: false,
+      session_id: session.nativeSession.sessionId, result: 'Done.' });
+
+    const latest = latestTurnBlocks(await terminal);
+    const reasoning = latest.filter(({ block }) => block.payload.kind === 'reasoning-summary' &&
+      block.payload.text === 'The real reasoning.');
+    assert.equal(reasoning.length, 1, 'the snapshot completes the streamed block instead of adding a twin');
+    assert.equal(reasoning[0]?.block.state, 'completed');
+    assert.equal(latest.filter(({ block }) => block.payload.kind === 'final-message').length, 1);
   } finally {
     await session.close();
   }
@@ -1763,6 +1854,12 @@ test('Claude resume keeps a lost turn bound until native handshake evidence clos
       assert.equal(completed.event.error?.retryable, true);
     }
 
+    query.emit({ type: 'system', subtype: 'compact_boundary', uuid: 'recovery-compaction',
+      session_id: session.nativeSession.sessionId, compact_metadata: { trigger: 'auto', pre_tokens: 90_000 } });
+    const compacted = await waitForClaudeEvent(session, ({ event }) => event.type === 'context.compaction.completed');
+    assert.equal(compacted.native.turnId, undefined);
+    assert.deepEqual(compacted.native.timeline, { previousTurnId: activeTurnBinding.nativeTurnId });
+
     // Claude may emit its own internal resume bookkeeping, but it is not the
     // accepted turn and must remain invisible after that turn is closed.
     query.emit({
@@ -1990,6 +2087,44 @@ test('Claude native fork rejects incompatible account and initialization authent
   }
 });
 
+for (const turnOrigin of ['user', 'native', 'unknown'] as const) {
+  test(`Claude idle compaction retains the previous ${turnOrigin} turn identity when known`, async () => {
+    const query = new FakeClaudeQuery();
+    const adapter = new ClaudeNativeAdapter({ acceptanceTimeoutMs: 5,
+      createQuery: () => query as unknown as ClaudeQuery, now: monotonicClock() });
+    const session = await adapter.openSession({ commandId: 'open-idle-compaction', providerInstanceId: 'claude-local',
+      conversationId: 'idle-conversation', executionId: 'idle-execution', mode: 'create', cwd: '/workspace/remux',
+      model: 'claude-sonnet-4-6', access: 'read-only', developerInstructions: [] });
+    const emit = (message: Record<string, unknown>) => query.emit({
+      session_id: session.nativeSession.sessionId, ...message,
+    });
+    try {
+      let previousNativeTurnId: string | undefined;
+      if (turnOrigin !== 'unknown') {
+        if (turnOrigin === 'user') await session.startTurn({ commandId: 'idle-turn-command', turnId: 'idle-turn',
+          conversationId: 'idle-conversation', executionId: 'idle-execution', content: [{ type: 'text', text: 'Work.' }] });
+        else emit({ type: 'assistant', uuid: 'native-turn-output', parent_tool_use_id: null,
+          message: { id: 'native-turn-message', role: 'assistant', content: [{ type: 'text', text: 'Follow-up.' }] } });
+        emit({ type: 'result', subtype: 'success', uuid: 'idle-turn-result', is_error: false, num_turns: 1 });
+        const completed = await waitForClaudeEvent(session, ({ event }) => event.type === 'turn.completed');
+        previousNativeTurnId = completed.native.turnId;
+        assert.ok(previousNativeTurnId);
+      }
+      emit({ type: 'system', subtype: 'compact_boundary', uuid: 'idle-automatic-boundary',
+        compact_metadata: { trigger: 'auto', pre_tokens: 90_000, post_tokens: 10_000 } });
+      const boundary = await waitForClaudeEvent(session, ({ event }) => event.type === 'context.compaction.completed');
+      assert.equal(boundary.scope.kind, 'conversation');
+      assert.equal(boundary.native.kind, 'system/compact_boundary');
+      assert.equal('turnId' in boundary.native, false);
+      assert.deepEqual(boundary.native.subject, {
+        kind: 'context-compaction', key: 'claude:context-compaction:idle-automatic-boundary',
+      });
+      assert.deepEqual(boundary.native.timeline,
+        previousNativeTurnId ? { previousTurnId: previousNativeTurnId } : undefined);
+    } finally { await session.close(); }
+  });
+}
+
 test('Claude reports root request context independently of result totals and child messages', async () => {
   const query = new FakeClaudeQuery();
   const adapter = new ClaudeNativeAdapter({
@@ -2051,7 +2186,7 @@ test('Claude reports root request context independently of result totals and chi
     emit({ type: 'system', subtype: 'compact_boundary', parent_tool_use_id: 'child-tool',
       compact_metadata: { trigger: 'auto', pre_tokens: 950000 } });
     assistant('request-4', 320000);
-    emit({ type: 'system', subtype: 'compact_boundary',
+    emit({ type: 'system', subtype: 'compact_boundary', uuid: 'context-auto-boundary',
       compact_metadata: { trigger: 'auto', pre_tokens: 320000 } });
     assistant('request-4', 320000); // delayed snapshot from before compaction
     assistant('request-5', 45000);
@@ -2059,7 +2194,16 @@ test('Claude reports root request context independently of result totals and chi
     const secondEvents = await second.terminal;
     const usages = secondEvents.flatMap(({ event }) => event.type === 'turn.usage-updated' ? [event.usage] : []);
     assert.deepEqual(usages.map(({ context }) => context?.usedTokens ?? null), [310000, 320000, null, 45000, 45000]);
-    assert.equal(secondEvents.filter(({ event }) => event.type === 'context.compaction.completed').length, 1);
+    const compacted = secondEvents.filter(({ event }) => event.type === 'context.compaction.completed');
+    assert.equal(compacted.length, 1);
+    assert.equal(compacted[0]?.scope.kind, 'conversation', 'compaction stays conversation-scoped by contract');
+    assert.ok(compacted[0]?.native.turnId, 'the native turn lets the journal locate it inside the running turn');
+    assert.equal(compacted[0]?.native.turnId,
+      secondEvents.find(({ event }) => event.type === 'turn.completed')?.native.turnId);
+    assert.deepEqual(compacted[0]?.native.subject, {
+      kind: 'context-compaction', key: 'claude:context-compaction:context-auto-boundary',
+    });
+    assert.equal(compacted[0]?.native.timeline, undefined);
     assert.equal(usages[0]?.turn, null, 'a live context update cannot report the preceding turn totals');
 
     const third = await start('no-measurement');
@@ -2454,109 +2598,6 @@ for (const mode of ['eligible', 'unsupported', 'older-queue'] as const) {
   });
 }
 
-class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
-  mcpServers: unknown;
-  async setMcpServers(servers: unknown) {
-    this.mcpServers = servers;
-    return { added: ['remux-federation'], removed: [], errors: {} };
-  }
-  async mcpServerStatus() { return [{ name: 'remux-federation', status: 'connected' }]; }
-  private readonly values: SDKMessage[] = [];
-  private readonly waiters: Array<(result: IteratorResult<SDKMessage>) => void> = [];
-  private closed = false;
-  readonly usageResult: unknown;
-  readonly modelChanges: string[] = [];
-  readonly flags: unknown[] = [];
-  readonly stoppedTasks: string[] = [];
-  readonly backgroundedTools: string[] = [];
-  async backgroundTasks(toolUseId: string) { this.backgroundedTools.push(toolUseId); return true; }
-  readonly account: ClaudeAccountInfo;
-  interrupts = 0;
-  nextModelError: Error | undefined;
-  nextFlagError: Error | undefined;
-
-  constructor(
-    usageResult: unknown = { rate_limits_available: true, rate_limits: {} },
-    account: ClaudeAccountInfo = {
-      apiProvider: 'firstParty',
-      apiKeySource: 'none',
-      subscriptionType: 'max',
-      tokenSource: 'oauth',
-    },
-  ) {
-    this.usageResult = usageResult;
-    this.account = account;
-  }
-
-  emit(value: unknown) {
-    const record = value as Record<string, unknown>;
-    const message = (record.type === 'system' && record.subtype === 'init' &&
-        !Object.hasOwn(record, 'apiKeySource')
-      ? { ...record, apiKeySource: 'none' }
-      : record) as SDKMessage;
-    const waiter = this.waiters.shift();
-    if (waiter) waiter({ done: false, value: message });
-    else this.values.push(message);
-  }
-
-  async supportedModels() {
-    return [];
-  }
-
-  async accountInfo() {
-    return this.account;
-  }
-
-  async supportedCommands() {
-    return [{ name: 'compact', description: 'Compact context', argumentHint: '' }];
-  }
-
-  async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET() {
-    return this.usageResult;
-  }
-
-  get isClosed() {
-    return this.closed;
-  }
-
-  async setModel(model: string) {
-    this.modelChanges.push(model);
-    const error = this.nextModelError;
-    this.nextModelError = undefined;
-    if (error) throw error;
-  }
-
-  async applyFlagSettings(flags: unknown) {
-    this.flags.push(flags);
-    const error = this.nextFlagError;
-    this.nextFlagError = undefined;
-    if (error) throw error;
-  }
-
-  async interrupt() {
-    this.interrupts += 1;
-  }
-
-  async stopTask(taskId: string) {
-    this.stoppedTasks.push(taskId);
-  }
-
-  close() {
-    this.closed = true;
-    for (const waiter of this.waiters.splice(0)) waiter({ done: true, value: undefined });
-  }
-
-  [Symbol.asyncIterator](): AsyncIterator<SDKMessage> {
-    return {
-      next: async () => {
-        const value = this.values.shift();
-        if (value) return { done: false, value };
-        if (this.closed) return { done: true, value: undefined };
-        return new Promise((resolve) => this.waiters.push(resolve));
-      },
-    };
-  }
-}
 
 async function collectThroughTerminal(events: AsyncIterable<ProviderEventEnvelope>) {
   const collected: ProviderEventEnvelope[] = [];
@@ -2581,4 +2622,268 @@ async function collectThroughCompaction(events: AsyncIterable<ProviderEventEnvel
 function monotonicClock() {
   let value = 1_000;
   return () => ++value;
+}
+
+for (const lateReceipt of [false, true]) {
+  test(`uncertain Claude active input survives restart with ${lateReceipt ? 'durable late receipt' : 'explicit abandonment'}`, async () => {
+    const database = new DatabaseSync(':memory:');
+    database.exec('PRAGMA foreign_keys=ON'); createNativeAgentSchema(database);
+    const journal = new NativeAgentJournal(database);
+    const query = new FakeClaudeQuery();
+    let prompt!: AsyncIterable<SDKUserMessage>;
+    let opens = 0;
+    let processStopped = false;
+    const claude = new ClaudeNativeAdapter({ acceptanceTimeoutMs: 30, createQuery: (input) => {
+      opens++;
+      prompt = input.prompt as AsyncIterable<SDKUserMessage>;
+      query.emit({ type: 'system', subtype: 'init', uuid: 'recovery-init', session_id: input.options?.sessionId });
+      return query as unknown as ClaudeQuery;
+    } });
+    const fixture = new NativeFixtureAdapter({ provider: 'claude-code' });
+    const providers = [{ providerInstanceId: 'claude-local', provider: 'claude-code' as const,
+      label: 'Claude', adapter: {
+        probe: async (id: string) => { const probe = await fixture.probe(id); return { ...probe,
+          capabilities: { ...probe.capabilities!, turns: { ...probe.capabilities!.turns, activeInput: 'stream-input' as const } } }; },
+        listModels: (id: string) => fixture.listModels(id),
+        openSession: (input: Parameters<typeof claude.openSession>[0]) => claude.openSession(input),
+        assertSessionStopped: async () => { if (!processStopped) throw new Error('Original process still running'); },
+      } }];
+    const coordinator = new NativeAgentCoordinator({ journal, providers });
+    let restarted: NativeAgentCoordinator | undefined;
+    const until = async (fn: () => boolean) => {
+      for (let index = 0; index < 200; index++) {
+        if (fn()) return;
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
+      assert.fail('Recovery condition did not settle');
+    };
+    try {
+      await coordinator.initialize();
+      const { conversationId } = await coordinator.createConversation({ commandId: 'recovery-create',
+        providerInstanceId: 'claude-local', cwd: '/workspace/remux', model: 'fixture-native-v1', access: 'read-only' });
+      const send = (id: string) => {
+        const runtime = coordinator.projector.runtimeResource(conversationId)!;
+        return coordinator.sendMessage({ commandId: id, clientMessageId: `client-${id}`, conversationId,
+          providerInstanceId: runtime.providerInstanceId, model: runtime.composer.nextTurn.model,
+          effort: runtime.composer.nextTurn.effort, access: runtime.composer.nextTurn.access,
+          configurationRevision: runtime.composer.revision, delivery: 'auto', content: [{ type: 'text', text: id }] });
+      };
+      const rootPromise = send('recovery-root');
+      await until(() => Boolean(prompt));
+      const iterator = prompt[Symbol.asyncIterator]();
+      const rootInput = (await iterator.next()).value!;
+      const sessionId = journal.nativeSession(journal.conversation(conversationId)!.rootExecutionId)!.sessionId;
+      query.emit({ type: 'assistant', uuid: 'recovery-root-reply', session_id: sessionId,
+        parent_tool_use_id: null, user_message_uuid: rootInput.uuid,
+        message: { id: 'recovery-assistant', role: 'assistant', content: [{ type: 'text', text: 'Working' }] } });
+      const root = await rootPromise;
+      if (!lateReceipt) journal.createFederatedExecution({ executionId: 'recovery-child', conversationId,
+        parentExecutionId: journal.conversation(conversationId)!.rootExecutionId, rootTurnId: root.turnId,
+        provider: 'claude-code', providerInstanceId: 'claude-local', model: 'fixture-native-v1',
+        access: 'read-only', scheduling: 'foreground', depth: 1, title: 'Delegated work', now: Date.now() });
+      if (!lateReceipt) {
+        query.emit({ type: 'assistant', uuid: 'recovery-wait-open', session_id: sessionId, parent_tool_use_id: null,
+          message: { id: 'recovery-wait-message', role: 'assistant', content: [{ type: 'tool_use', id: 'recovery-wait',
+            name: 'mcp__remux-federation__remux_wait_agent', input: { executionId: 'recovery-child' } }] } });
+        await until(() => journal.orderedPasses(root.turnId).some(pass => pass.blocks.some(block =>
+          block.payload.kind === 'tool' && block.payload.tool.callId === 'recovery-wait')));
+      }
+      await send('recovery-followup');
+      if (!lateReceipt) {
+        await new Promise(resolve => setTimeout(resolve, 15));
+        assert.equal(database.prepare("SELECT 1 FROM delivery_attempts WHERE command_id='recovery-followup'").get(), undefined,
+          'an in-flight federation call keeps the follow-up queued before any provider write');
+        database.prepare("UPDATE executions SET state='idle' WHERE execution_id='recovery-child'").run();
+        query.emit({ type: 'system', subtype: 'task_started', uuid: 'recovery-wait-backgrounded', session_id: sessionId,
+          task_id: 'recovery-wait-task', tool_use_id: 'recovery-wait', task_type: 'mcp_task' });
+      }
+      const followup = (await iterator.next()).value!;
+      await until(() => (database.prepare("SELECT state FROM delivery_attempts WHERE command_id='recovery-followup'").get()?.state) === 'unknown');
+      const attemptId = String(database.prepare("SELECT attempt_id FROM delivery_attempts WHERE command_id='recovery-followup'").get()!.attempt_id);
+      if (lateReceipt) {
+        query.emit({ type: 'user', uuid: followup.uuid, session_id: sessionId, parent_tool_use_id: null,
+          isReplay: true, isSynthetic: false, message: { role: 'user', content: 'recovery-followup' } });
+        await until(() => Boolean(database.prepare('SELECT acceptance_evidence_json FROM delivery_attempts WHERE attempt_id=?').get(attemptId)?.acceptance_evidence_json));
+      }
+      await coordinator.close();
+      restarted = new NativeAgentCoordinator({ journal, providers });
+      await restarted.initialize();
+      if (lateReceipt) {
+        assert.equal(database.prepare('SELECT state FROM delivery_attempts WHERE attempt_id=?').get(attemptId)?.state, 'accepted');
+        assert.equal(journal.hasUnresolvedRootDelivery(conversationId), false);
+      } else {
+        assert.equal(opens, 1, 'restart must not open a writer for uncertain delivery');
+        assert.equal(journal.turn(root.turnId)?.state, 'recovering');
+        assert.equal(restarted.projector.runtimeResource(conversationId)?.uncertainDelivery?.attemptId, attemptId);
+        await assert.rejects(restarted.resolveDelivery({ commandId: 'resolve-live', conversationId, attemptId, action: 'abandon' }), /still running/u);
+        assert.equal(journal.hasUnresolvedRootDelivery(conversationId), true);
+        processStopped = true;
+        const command = { commandId: 'resolve-stopped', conversationId, attemptId, action: 'abandon' as const };
+        assert.deepEqual(await restarted.resolveDelivery(command), { accepted: true });
+        assert.deepEqual(await restarted.resolveDelivery(command), { accepted: true }, 'same resolution is idempotent');
+        assert.equal(journal.hasUnresolvedRootDelivery(conversationId), false);
+        assert.equal(journal.turn(root.turnId)?.outcome, 'interrupted');
+        assert.equal(journal.conversation(conversationId)?.state, 'idle');
+        assert.equal(journal.queuedMessages(conversationId).length, 0);
+        assert.equal(opens, 1, 'recovery must not resend or resume a provider input');
+        const row = database.prepare('SELECT state,recovery_payload_json,recovery_json,acceptance_evidence_json FROM delivery_attempts WHERE attempt_id=?').get(attemptId)!;
+        assert.equal(row.state, 'abandoned');
+        assert.match(String(row.recovery_payload_json), /recovery-followup/u);
+        assert.equal(row.acceptance_evidence_json, null);
+        assert.equal(JSON.parse(String(row.recovery_json)).resolution.deliveryOutcome, 'unknown');
+      }
+    } finally { await restarted?.close(); await coordinator.close(); journal.close(); }
+  });
+}
+
+for (const spawnSource of ['notification', 'result', 'malformed'] as const) {
+  test(`Claude queues two federation triggers with spawn identity from ${spawnSource}`, async () => {
+    const query = new FakeClaudeQuery();
+    const adapter = new ClaudeNativeAdapter({ acceptanceTimeoutMs: 5,
+      createQuery: () => query as unknown as ClaudeQuery });
+    const session = await adapter.openSession({ commandId: 'open-trigger-queue', providerInstanceId: 'claude-local',
+      conversationId: 'trigger-chat', executionId: 'trigger-parent', mode: 'create', cwd: '/tmp',
+      model: 'claude-sonnet-4-6', access: 'read-only', developerInstructions: [] });
+    const emit = (message: Record<string, unknown>) => query.emit({ session_id: session.nativeSession.sessionId, ...message });
+    try {
+      await session.startTurn({ commandId: 'trigger-start', conversationId: 'trigger-chat', executionId: 'trigger-parent',
+        turnId: 'trigger-owner', content: [{ type: 'text', text: 'Delegate.' }] });
+      emit({ type: 'assistant', uuid: 'two-tools', parent_tool_use_id: null,
+        message: { id: 'two-tools-message', role: 'assistant', content: [
+          { type: 'tool_use', id: 'spawn-astra', name: 'mcp__remux-federation__remux_spawn_agent', input: {} },
+          { type: 'tool_use', id: 'wait-sol', name: `mcp__remux-federation__remux_${spawnSource === 'result' ? 'send_message' : 'wait_agent'}`,
+            input: { executionId: 'sol-child' } },
+        ] } });
+      await waitForClaudeEvent(session, ({ event }) => 'block' in event && event.block.payload.kind === 'tool' &&
+        event.block.payload.tool.callId === 'wait-sol');
+      assert.equal(session.blockedOnForegroundFederation?.(), true);
+      for (const [task, tool] of [['astra-task', 'spawn-astra'], ['sol-task', 'wait-sol']]) {
+        emit({ type: 'system', subtype: 'task_started', uuid: `start-${task}`, task_id: task,
+          tool_use_id: tool, task_type: 'mcp_task' });
+        await waitForClaudeEvent(session, ({ native, event }) => native.kind === 'task/federation-backgrounded' &&
+          'block' in event && event.block.payload.kind === 'tool' && event.block.payload.tool.callId === tool);
+        assert.equal(session.blockedOnForegroundFederation?.(), tool === 'spawn-astra');
+      }
+      const result = JSON.stringify({ executionId: 'astra-child', status: 'completed' });
+      if (spawnSource === 'result') emit({ type: 'user', uuid: 'astra-result', parent_tool_use_id: null,
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'spawn-astra',
+          content: [{ type: 'text', text: result }] }] } });
+      emit({ type: 'result', subtype: 'success', uuid: 'trigger-owner-result', is_error: false });
+      await waitForClaudeEvent(session, ({ event }) => event.type === 'turn.completed');
+      emit({ type: 'system', subtype: 'task_notification', uuid: 'astra-finished', task_id: 'astra-task',
+        tool_use_id: 'spawn-astra', status: 'completed', summary: spawnSource === 'notification' ? result : spawnSource === 'malformed'
+          ? 'Not JSON: {"executionId":"guessed-child"}' : 'Spawn finished.' });
+      emit({ type: 'system', subtype: 'task_notification', uuid: 'sol-finished', task_id: 'sol-task',
+        tool_use_id: 'wait-sol', status: 'completed', summary: 'Tool finished.' });
+      emit({ type: 'stream_event', uuid: 'autonomous-message-start', parent_tool_use_id: null,
+        event: { type: 'message_start', message: { id: 'autonomous-message', role: 'assistant', content: [] } } });
+      const started = await waitForClaudeEvent(session, ({ event }) => event.type === 'turn.started' && event.origin === 'native');
+      assert.ok(started.event.type === 'turn.started');
+      assert.deepEqual(started.event.triggers?.map(trigger => trigger.childExecutionId), [spawnSource === 'malformed' ? undefined : 'astra-child', 'sol-child']);
+      assert.deepEqual(started.event.trigger, started.event.triggers?.[0]);
+      assert.ok(started.event.triggers?.every(trigger => trigger.kind === 'federation'));
+      assert.equal((await session.snapshot({ commandId: 'trigger-snapshot' })).events
+        .filter(({ event }) => event.type === 'turn.started' && event.origin === 'native').length, 1);
+      assert.deepEqual(query.backgroundedTools, []);
+    } finally { await session.close(); }
+  });
+}
+
+test('Claude native child completion during a later turn stays on its owner turn', async () => {
+  const query = new FakeClaudeQuery();
+  const adapter = new ClaudeNativeAdapter({ acceptanceTimeoutMs: 5,
+    createQuery: () => query as unknown as ClaudeQuery });
+  const session = await adapter.openSession({ commandId: 'open-owner', providerInstanceId: 'claude-local',
+    conversationId: 'owner-chat', executionId: 'owner-parent', mode: 'create', cwd: '/tmp',
+    model: 'claude-sonnet-4-6', access: 'read-only', developerInstructions: [] });
+  const emit = (message: Record<string, unknown>) => query.emit({ session_id: session.nativeSession.sessionId, ...message });
+  const start = (id: string) => session.startTurn({ commandId: `start-${id}`, conversationId: 'owner-chat',
+    executionId: 'owner-parent', turnId: id, content: [{ type: 'text', text: 'Work.' }] });
+  try {
+    await start('owner-turn');
+    emit({ type: 'assistant', uuid: 'owner-output', parent_tool_use_id: null,
+      message: { id: 'owner-message', role: 'assistant', content: [{ type: 'tool_use', id: 'native-agent', name: 'Agent', input: {} }] } });
+    emit({ type: 'system', subtype: 'task_started', uuid: 'native-agent-started', task_id: 'native-task',
+      tool_use_id: 'native-agent', task_type: 'local_agent' });
+    const child = await waitForClaudeEvent(session, ({ native }) => native.kind === 'task/started');
+    emit({ type: 'result', subtype: 'success', uuid: 'owner-result', is_error: false });
+    await waitForClaudeEvent(session, ({ event }) => event.type === 'turn.completed');
+    await start('later-turn');
+    emit({ type: 'system', subtype: 'task_notification', uuid: 'late-native-completion', task_id: 'native-task',
+      status: 'completed', summary: 'Done.' });
+    const completed = await waitForClaudeEvent(session, ({ native }) => native.kind === 'task/notification');
+    assert.equal(completed.scope.kind === 'turn' && completed.scope.turnId, 'owner-turn');
+    assert.equal(completed.native.turnId, child.native.turnId);
+    assert.equal(completed.event.type, 'turn.block.completed');
+    assert.ok(completed.event.type === 'turn.block.completed' && completed.event.block.payload.kind === 'native-child');
+    assert.equal(completed.event.block.state, 'completed');
+  } finally { await session.close(); }
+});
+
+for (const kind of ['federation', 'native-child'] as const) {
+  test(`Claude ${kind} task notification records a native continuation trigger`, async () => {
+    const query = new FakeClaudeQuery();
+    let prompt!: AsyncIterable<SDKUserMessage>;
+    const adapter = new ClaudeNativeAdapter({ acceptanceTimeoutMs: 1_000,
+      createQuery: input => { prompt = input.prompt as AsyncIterable<SDKUserMessage>; return query as unknown as ClaudeQuery; } });
+    const session = await adapter.openSession({ commandId: `open-${kind}`, providerInstanceId: 'claude-local',
+      conversationId: `chat-${kind}`, executionId: `parent-${kind}`, mode: 'create', cwd: '/tmp',
+      model: 'claude-sonnet-4-6', access: 'read-only', developerInstructions: [] });
+    try {
+      const firstEvents = collectThroughTerminal(session.events);
+      const starting = session.startTurn({ commandId: `start-${kind}`, conversationId: `chat-${kind}`,
+        executionId: `parent-${kind}`, turnId: 'spawning-turn', content: [{ type: 'text', text: 'Delegate' }] },
+      { markPossiblySent: () => undefined });
+      const submitted = (await prompt[Symbol.asyncIterator]().next()).value!;
+      const sessionId = session.nativeSession.sessionId;
+      const name = kind === 'federation' ? 'mcp__remux-federation__remux_spawn_agent' : 'Agent';
+      query.emit({ type: 'assistant', uuid: `assistant-${kind}`, session_id: sessionId,
+        parent_tool_use_id: null, user_message_uuid: submitted.uuid,
+        message: { id: 'spawning-message', role: 'assistant', content: [
+          { type: 'tool_use', id: 'spawn-call', name, input: {} },
+        ] } });
+      assert.equal((await starting).accepted, true);
+      query.emit({ type: 'system', subtype: 'task_started', uuid: `task-start-${kind}`, session_id: sessionId,
+        task_id: 'child-task', tool_use_id: 'spawn-call', task_type: kind === 'federation' ? 'mcp_task' : 'local_agent',
+        description: 'Child' });
+      query.emit({ type: 'user', uuid: `background-result-${kind}`, session_id: sessionId, parent_tool_use_id: null,
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'spawn-call', content:
+          kind === 'federation' ? 'Call moved to the background as task child-task' : 'Agent is running in background' }] } });
+      query.emit({ type: 'result', subtype: 'success', uuid: `first-result-${kind}`, session_id: sessionId,
+        user_message_uuid: submitted.uuid, result: 'WAITING', is_error: false });
+      const first = await firstEvents;
+      if (kind === 'federation') {
+        const blocks = first.flatMap(envelope => 'block' in envelope.event ? [envelope.event.block] : []);
+        assert.equal(blocks.some(block => block.kind === 'native-child'), false, 'mcp_task is not a second child');
+        const tool = blocks.filter(block => block.payload.kind === 'tool').at(-1)!;
+        assert.equal(tool.payload.kind === 'tool' && tool.payload.backgrounded, true);
+        assert.equal(tool.state, 'running');
+      }
+      const nextEvents = collectThroughTerminal(session.events);
+      const notification = { type: 'system', subtype: 'task_notification', uuid: `notification-${kind}`, session_id: sessionId,
+        task_id: 'child-task', tool_use_id: 'spawn-call', status: 'completed',
+        summary: kind === 'federation' ? '{"executionId":"astra-child","status":"completed","finalAnswer":{"kind":"inline","text":"Done"}}' : 'Done' };
+      query.emit(notification);
+      query.emit(notification); // Native retransmission must not duplicate the continuation.
+      query.emit({ type: 'assistant', uuid: `continued-${kind}`, session_id: sessionId, parent_tool_use_id: null,
+        message: { id: 'continued-message', role: 'assistant', content: [{ type: 'text', text: 'CONTINUED' }] } });
+      query.emit({ type: 'result', subtype: 'success', uuid: `continued-result-${kind}`, session_id: sessionId,
+        result: 'CONTINUED', is_error: false });
+      const next = await nextEvents;
+      const starts = next.filter(envelope => envelope.event.type === 'turn.started');
+      assert.equal(starts.length, 1);
+      const started = starts[0]!.event;
+      assert.ok(started.type === 'turn.started');
+      assert.equal(started.origin, 'native');
+      assert.equal(started.trigger?.kind, kind);
+      assert.deepEqual(started.triggers, [started.trigger]);
+      assert.ok(started.trigger?.childExecutionId);
+      if (kind === 'federation') {
+        assert.equal(started.trigger?.childExecutionId, 'astra-child');
+        const completed = next.find(envelope => envelope.event.type === 'turn.block.completed' && envelope.event.block.kind === 'tool');
+        assert.equal(completed?.scope.kind === 'turn' && completed.scope.turnId, 'spawning-turn');
+        assert.equal(completed?.event.type === 'turn.block.completed' && completed.event.block.payload.kind === 'tool' && completed.event.block.payload.backgrounded, false);
+      }
+    } finally { await session.close(); }
+  });
 }

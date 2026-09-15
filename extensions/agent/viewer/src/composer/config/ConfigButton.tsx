@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { Boxes, Check, ChevronDown, Gauge, LogIn, LogOut, Minimize2, Play, RefreshCw, Server, Shield, Sparkles, Wrench } from 'lucide-react';
+import { Boxes, Check, ListPlus, ChevronDown, Gauge, LogIn, LogOut, Minimize2, Play, RefreshCw, Server, Shield, Sparkles, Wrench } from 'lucide-react';
 import { reloadHostView } from '@remux/viewer-kit/host';
 
 import type { AgentProvidersResource, AgentRuntimeResource } from '../../../../shared/native-agent-protocol.ts';
@@ -9,10 +9,13 @@ import { preferredReasoning, preferredServiceTier, reasoningLabel } from './mode
 import { compactActionLabel } from '../usage/compactEligibility.ts';
 import { useComposerStore } from '../store.ts';
 
-type ConfigSection = 'providers' | 'model' | 'speed' | 'reasoning' | 'access';
+type ConfigSection = 'providers' | 'model' | 'speed' | 'reasoning' | 'access' | 'delivery';
 
 export function ComposerConfigButton({
   compactEnabled,
+  showDelivery,
+  delivery,
+  onDeliveryChange,
   disabled = false,
   conversationExists,
   onAccessChange,
@@ -24,6 +27,9 @@ export function ComposerConfigButton({
   runtime,
 }: {
   disabled?: boolean;
+  showDelivery: boolean;
+  delivery: 'auto' | 'queue';
+  onDeliveryChange: (delivery: 'auto' | 'queue') => void;
   compactEnabled: boolean;
   conversationExists: boolean;
   onAccessChange: (access: ProviderAccess) => Promise<void>;
@@ -157,6 +163,18 @@ export function ComposerConfigButton({
               }}
             />
           ) : null}
+          {showDelivery ? <ConfigRow
+            expanded={expanded === 'delivery'}
+            icon={<ListPlus className="size-4" />}
+            label="Delivery"
+            onToggle={() => setExpanded(value => value === 'delivery' ? null : 'delivery')}
+          >
+            <ConfigOptions<'auto' | 'queue'>
+              value={delivery}
+              options={[{ label: 'Reply now', value: 'auto' }, { label: 'Queue for next turn', value: 'queue' }]}
+              onSelect={value => { onDeliveryChange(value); setExpanded(null); }}
+            />
+          </ConfigRow> : null}
           {providers?.providers.length ? (
             <ConfigRow
               expanded={expanded === 'providers'}

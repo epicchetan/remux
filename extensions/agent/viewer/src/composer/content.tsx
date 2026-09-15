@@ -169,6 +169,7 @@ export function ComposerContent({
           pendingRecoveryError={pendingRecoveryError}
           providers={providers}
           runtime={runtime}
+          queue={queue}
           runtimeError={runtimeError}
         />
       ) : null}

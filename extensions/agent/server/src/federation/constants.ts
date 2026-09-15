@@ -1,3 +1,5 @@
+export const CLAUDE_MCP_AUTO_BACKGROUND_MS = 10_000;
+
 export const FEDERATION_SERVER_NAME = 'remux-federation';
 
 export const FEDERATION_TOOLS = [

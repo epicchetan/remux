@@ -40,6 +40,159 @@ test('native Agent schema has a distinct application identity and only provider-
   }
 });
 
+test('schema v21 repairs only uniquely located bare Claude compactions and is idempotent', async () => {
+  const dataRoot = await mkdtemp(join(tmpdir(), 'remux-schema-v20-compaction-'));
+  const path = join(dataRoot, 'agent.sqlite3');
+  let journal: NativeAgentJournal | undefined;
+  try {
+    journal = await openNativeAgentJournal({ dataRoot });
+    const opened = journal;
+    const database = opened.database;
+    const probe = await new NativeFixtureAdapter().probe('fixture-local');
+    journal.upsertProviderInstance({ providerInstanceId: 'fixture-local', provider: 'fixture',
+      label: 'Fixture', probe, now: 1 });
+    journal.createConversation({ conversationId: 'conversation-1', rootExecutionId: 'execution-1',
+      provider: 'fixture', providerInstanceId: 'fixture-local', title: 'Compaction migration',
+      cwd: '/workspace', model: 'fixture-native-v1', access: 'read-only', now: 1 });
+    const turn = (id: string, start: number, end: number | null) => {
+      opened.createTurn({ turnId: id, conversationId: 'conversation-1', executionId: 'execution-1',
+        clientMessageId: `message-${id}`, commandId: `send-${id}`, content: [{ type: 'text', text: id }],
+        model: 'fixture-native-v1', state: 'running', now: start });
+      database.prepare(`UPDATE turns SET native_turn_id=?, started_at=?, completed_at=?, updated_at=?
+        WHERE turn_id=?`).run(`native-${id}`, start, end, end ?? start, id);
+    };
+    turn('turn-1', 10, 30);
+    turn('overlap-a', 60, 80);
+    turn('overlap-b', 65, 90);
+    turn('open-turn', 100, null);
+    journal.createConversation({ conversationId: 'conversation-2', rootExecutionId: 'execution-2',
+      provider: 'fixture', providerInstanceId: 'fixture-local', title: 'Other execution',
+      cwd: '/workspace', model: 'fixture-native-v1', access: 'read-only', now: 1 });
+    journal.createTurn({ turnId: 'other-execution-turn', conversationId: 'conversation-2', executionId: 'execution-2',
+      clientMessageId: 'other-message', commandId: 'other-send', content: [{ type: 'text', text: 'Other work.' }],
+      model: 'fixture-native-v1', state: 'running', now: 35 });
+    database.exec(`UPDATE turns SET started_at=35, completed_at=50, updated_at=50
+      WHERE turn_id='other-execution-turn';`);
+    const pass = database.prepare(`INSERT INTO turn_passes(pass_id,turn_id,ordinal,state,created_at,updated_at)
+      VALUES(?, 'turn-1', ?, 'completed', 10, 30)`);
+    pass.run('pass-first', 0);
+    pass.run('pass-last', 1);
+    const block = database.prepare(`INSERT INTO turn_blocks(block_id,turn_id,pass_id,kind,ordinal,state,revision,
+      payload_json,content_hash,started_at,created_at,updated_at)
+      VALUES(?, 'turn-1', ?, 'commentary', ?, 'completed', 1, ?, ?, ?, 10, 30)`);
+    const addBlock = (id: string, passId: string, ordinal: number, startedAt: number) => block.run(
+      id, passId, ordinal, JSON.stringify({ kind: 'commentary', text: id }), 'a'.repeat(64), startedAt);
+    addBlock('first-pass-high-ordinal', 'pass-first', 4, 19);
+    addBlock('last-pass-first', 'pass-last', 0, 18);
+    addBlock('expected-anchor', 'pass-last', 1, 15);
+    addBlock('later-block', 'pass-last', 2, 25);
+    const insertEvent = database.prepare(`INSERT INTO events(event_id,provider_instance_id,scope_kind,
+      conversation_id,execution_id,event_type,native_kind,envelope_json,observed_at)
+      VALUES(?, 'fixture-local', 'conversation', 'conversation-1', 'execution-1',
+        'context.compaction.completed', 'system/compact_boundary', ?, ?)`);
+    const insertControl = database.prepare(`INSERT INTO conversation_control_events(control_event_id,
+      conversation_id,kind,boundary_json,state,operation_id,payload_json,created_at)
+      VALUES(?, 'conversation-1', 'compaction', ?, 'completed', ?, '{}', ?)`);
+    const addControl = (id: string, provider: string, createdAt: number,
+      boundary: Record<string, unknown> = { kind: 'between-turns' }) => {
+      insertEvent.run(id, JSON.stringify({ provider }), createdAt);
+      insertControl.run(id, JSON.stringify(boundary), id, createdAt);
+    };
+    addControl('inside-claude', 'claude-code', 20);
+    addControl('outside-claude', 'claude-code', 30); // Completion is exclusive.
+    addControl('other-execution-window', 'claude-code', 40);
+    addControl('inside-codex', 'codex', 20);
+    addControl('before-start', 'claude-code', 9);
+    addControl('start-without-blocks', 'claude-code', 10); // Start is inclusive.
+    addControl('ambiguous-claude', 'claude-code', 70);
+    addControl('open-turn-claude', 'claude-code', 101);
+    addControl('native-control', 'claude-code', 20, { kind: 'between-turns', nativeTurnId: 'control-native' });
+    addControl('native-timeline', 'claude-code', 20, { kind: 'between-turns', previousNativeTurnId: 'native-turn-1' });
+    addControl('already-positioned', 'claude-code', 20, {
+      kind: 'within-turn', turnId: 'turn-1', nativeTurnId: 'native-turn-1', afterBlockId: 'last-pass-first',
+    });
+    const boundaries = (db: DatabaseSync) => Object.fromEntries((db.prepare(`
+      SELECT control_event_id, boundary_json FROM conversation_control_events ORDER BY control_event_id
+    `).all() as Array<{ control_event_id: string; boundary_json: string }>).map((row) =>
+      [row.control_event_id, row.boundary_json]));
+    const before = boundaries(database);
+    for (const table of ['turns', 'queued_messages', 'turn_inputs']) database.exec(`ALTER TABLE ${table} DROP COLUMN triggers_json;`);
+    database.exec(`PRAGMA user_version = 20;
+      CREATE TRIGGER fail_compaction_repair BEFORE UPDATE OF boundary_json ON conversation_control_events
+      BEGIN SELECT RAISE(ABORT, 'injected compaction repair failure'); END;`);
+    journal.close();
+    journal = undefined;
+    await assert.rejects(openNativeAgentJournal({ dataRoot }), /injected compaction repair failure/u);
+    const rollback = new DatabaseSync(path);
+    try {
+      assert.equal((rollback.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 20);
+      assert.deepEqual(boundaries(rollback), before);
+      assert.equal(rollback.prepare('PRAGMA table_info(turns)').all().some(row => row.name === 'triggers_json'), false);
+      rollback.exec('DROP TRIGGER fail_compaction_repair');
+    } finally { rollback.close(); }
+    journal = await openNativeAgentJournal({ dataRoot });
+    const after = boundaries(journal.database);
+    assert.deepEqual(after, {
+      ...before,
+      'inside-claude': JSON.stringify({ kind: 'within-turn', turnId: 'turn-1', nativeTurnId: 'native-turn-1',
+        afterBlockId: 'expected-anchor' }),
+      'start-without-blocks': JSON.stringify({ kind: 'within-turn', turnId: 'turn-1', nativeTurnId: 'native-turn-1',
+        afterBlockId: null }),
+      'open-turn-claude': JSON.stringify({ kind: 'within-turn', turnId: 'open-turn', nativeTurnId: 'native-open-turn',
+        afterBlockId: null }),
+    });
+    assert.equal((journal.database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 21);
+    journal.database.exec(`CREATE TRIGGER reject_second_repair BEFORE UPDATE OF boundary_json ON conversation_control_events
+      BEGIN SELECT RAISE(ABORT, 'repair must be idempotent'); END;
+      BEGIN IMMEDIATE;`);
+    migrateNativeAgentSchema(journal.database, 20);
+    journal.database.exec('COMMIT');
+    assert.deepEqual(boundaries(journal.database), after);
+    validateNativeAgentSchema(journal.database);
+    assert.deepEqual(journal.database.prepare('PRAGMA foreign_key_check').all(), []);
+    journal.close();
+    journal = await openNativeAgentJournal({ dataRoot });
+    assert.deepEqual(boundaries(journal.database), after);
+  } finally {
+    journal?.close();
+    await rm(dataRoot, { recursive: true, force: true });
+  }
+});
+
+test('schema v21 backfills ordered trigger lists for turns, queued messages and appended inputs', async () => {
+  const database = new DatabaseSync(':memory:');
+  createNativeAgentSchema(database);
+  const journal = new NativeAgentJournal(database);
+  const trigger = { kind: 'federation' as const, childExecutionId: 'astra', summary: 'Done.' };
+  try {
+    journal.upsertProviderInstance({ providerInstanceId: 'fixture-local', provider: 'fixture', label: 'Fixture',
+      probe: await new NativeFixtureAdapter().probe('fixture-local'), now: 1 });
+    journal.createConversation({ conversationId: 'conversation-1', rootExecutionId: 'execution-1', provider: 'fixture',
+      providerInstanceId: 'fixture-local', title: 'Triggers', cwd: '/tmp', model: 'fixture-native-v1', access: 'read-only', now: 1 });
+    journal.createTurn({ turnId: 'turn-1', conversationId: 'conversation-1', executionId: 'execution-1',
+      clientMessageId: 'message-1', commandId: 'send-1', content: [], origin: 'federation-notification', trigger,
+      model: 'fixture-native-v1', state: 'running', now: 2 });
+    journal.claimCommand('queued-command', 'turn.send', {}, 3);
+    journal.enqueueTurn({ turnId: 'queued-turn', conversationId: 'conversation-1', clientMessageId: 'queued-message',
+      commandId: 'queued-command', content: [], origin: 'federation-notification', trigger,
+      model: 'fixture-native-v1', access: 'read-only', now: 3 });
+    journal.claimCommand('appended-command', 'turn.send', {}, 3);
+    database.prepare(`INSERT INTO turn_inputs(client_message_id,turn_id,command_id,content_json,after_block_id,
+      created_at,origin,trigger_json) VALUES('appended-message','turn-1','appended-command','[]',NULL,3,'federation-notification',?)`)
+      .run(JSON.stringify(trigger));
+    for (const table of ['turns', 'queued_messages', 'turn_inputs']) database.exec(`ALTER TABLE ${table} DROP COLUMN triggers_json;`);
+    database.exec('PRAGMA user_version=20; BEGIN IMMEDIATE;');
+    migrateNativeAgentSchema(database, 20);
+    database.exec('COMMIT');
+    assert.deepEqual(journal.turn('turn-1')?.triggers, [trigger]);
+    assert.deepEqual(journal.queuedMessages('conversation-1')[0]?.triggers, [trigger]);
+    assert.deepEqual(journal.additionalTurnMessages('turn-1')[0]?.triggers, [trigger]);
+    for (const table of ['turns', 'queued_messages', 'turn_inputs']) {
+      assert.deepEqual(JSON.parse(String(database.prepare(`SELECT trigger_json FROM ${table}`).get()?.trigger_json)), trigger);
+    }
+  } finally { journal.close(); }
+});
+
 test('partial version 2 delta fixture adds execution scheduling before rejecting incomplete v13 parents', () => {
   const database = new DatabaseSync(':memory:');
   try {
@@ -411,11 +564,30 @@ test('faithful schema v12 migrates grants, exclusions, constraints, and rollback
     for (const [artifactId, nibble] of images) journal.registerArtifact({ artifactId,
       sha256: nibble.repeat(64), byteLength: 4, mediaType: 'image/png', visibility: 'viewer',
       storagePath: `${nibble}/${artifactId}`, createdAt: 2 });
-    const addTurn = (turnId: string, executionId: string, commandId: string, artifactId: string) =>
-      journal.createTurn({ turnId, conversationId: 'conversation-1', executionId,
-        clientMessageId: `message-${turnId}`, commandId,
-        content: [{ type: 'image-artifact', artifactId, mimeType: 'image/png' }],
-        model: 'fixture-native-v1', state: 'running', now: 3 });
+    // Insert turns with the v12 column set directly: the live journal writes
+    // columns that only exist after later migrations.
+    const addTurn = (turnId: string, executionId: string, commandId: string, artifactId: string) => {
+      const strandId = (database.prepare('SELECT strand_id FROM executions WHERE execution_id = ?')
+        .get(executionId) as { strand_id: string }).strand_id;
+      database.prepare(`
+        INSERT INTO turns(
+          turn_id, conversation_id, origin_strand_id, execution_id, client_message_id, command_id,
+          user_content_json, model, ordering, state, created_at, started_at, updated_at
+        ) VALUES (?, 'conversation-1', ?, ?, ?, ?, ?, 'fixture-native-v1', 'native-exact', 'running', 3, 3, 3)
+      `).run(turnId, strandId, executionId, `message-${turnId}`, commandId,
+        JSON.stringify([{ type: 'image-artifact', artifactId, mimeType: 'image/png' }]));
+      const ordinal = (database.prepare(`
+        SELECT COALESCE(MAX(ordinal), -1) + 1 AS ordinal FROM strand_turn_path WHERE strand_id = ?
+      `).get(strandId) as { ordinal: number }).ordinal;
+      database.prepare(`
+        INSERT INTO strand_turn_path(path_entry_id, strand_id, ordinal, turn_id, source_path_entry_id, relation, branch_binding_id)
+        VALUES (?, ?, ?, ?, NULL, 'local', NULL)
+      `).run(`path:${strandId}:${turnId}`, strandId, ordinal, turnId);
+      database.prepare(`
+        UPDATE conversations SET latest_turn_id = ?, active_turn_id = ?, state = 'running', updated_at = 3
+        WHERE conversation_id = 'conversation-1' AND root_execution_id = ?
+      `).run(turnId, turnId, executionId);
+    };
     journal.claimCommand('send-current', 'turn.send', { destination: 'current' }, 3);
     addTurn('turn-current', 'root-current', 'send-current', 'image-current');
     journal.acceptCommand('send-current', { accepted: true, conversationId: 'conversation-1',

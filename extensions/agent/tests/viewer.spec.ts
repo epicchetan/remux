@@ -203,8 +203,11 @@ test('recovers an accepted queued message without a second native send', async (
   await page.goto(conversationUrl('&fixtureRunning=1'));
   await messageBox(page).fill('Persist this queued follow-up');
   await page.evaluate(() => (window as any).__agentFixture.loseNextMessageAcknowledgement());
-  await page.getByRole('button', { name: 'Choose message delivery', exact: true }).click();
-  await page.getByRole('menuitem', { name: 'Queue for next turn', exact: true }).click();
+  await page.getByRole('button', { name: 'Preferences', exact: true }).click();
+  await page.getByRole('button', { name: 'Delivery', exact: true }).click();
+  await page.getByRole('button', { name: 'Queue for next turn', exact: true }).click();
+  await page.keyboard.press('Escape');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Retry', exact: true })).toBeVisible();
 
   await page.reload();
@@ -1009,8 +1012,11 @@ test('queues a follow-up during active work and dispatches it after stop', async
   await expect(page.getByRole('button', { name: 'Stop turn', exact: true })).toBeVisible();
 
   await messageBox(page).fill('Continue after the stop');
-  await page.getByRole('button', { name: 'Choose message delivery', exact: true }).click();
-  await page.getByRole('menuitem', { name: 'Queue for next turn', exact: true }).click();
+  await page.getByRole('button', { name: 'Preferences', exact: true }).click();
+  await page.getByRole('button', { name: 'Delivery', exact: true }).click();
+  await page.getByRole('button', { name: 'Queue for next turn', exact: true }).click();
+  await page.keyboard.press('Escape');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
   await expect(page.getByText('Queued 1', { exact: true })).toBeVisible();
   await expect(transcript(page).getByText('Continue after the stop', { exact: true })).toHaveCount(0);
   const queuedParams = await lastCommandParams(page, 'remux/agent/conversation/message/send');

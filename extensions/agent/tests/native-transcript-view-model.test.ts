@@ -14,6 +14,22 @@ import type {
 } from '../shared/native-agent-protocol.ts';
 import { AGENT_TRANSCRIPT_PROTOCOL_VERSION } from '../shared/transcript.ts';
 
+test('recovering turns retain work but suppress running scope and unconfirmed tool activity', () => {
+  const turn = frame('recovering-turn', 'root-execution', 'recovering', '');
+  turn.activity.operations = [{ eventId: 'pending-tool', tool: { callId: 'pending-tool', name: 'shell', category: 'shell' },
+    state: 'running', startedAt: 1 }];
+  const work = projectNativeTurn(turn).segments.find((segment) => segment.type === 'work');
+  assert.ok(work && work.type === 'work');
+  assert.equal(work.state, 'recovering');
+  const scope = projectNativeExecutionScope('conversation-1', turn, { type: 'executionScope',
+    protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION, turnId: turn.turnId, scopeId: 'root-execution' }, 1);
+  assert.equal(scope.state, 'recovering');
+  const action = scope.inferences.flatMap(({ blocks }) => blocks).find((block) => block.type === 'action');
+  assert.ok(action && action.type === 'action');
+  assert.equal(action.call.status, 'recovering');
+  assert.equal(turn.activity.operations[0]?.state, 'running', 'projection preserves original provider evidence');
+});
+
 test('native and federated children expose provider-neutral lazy execution scopes', () => {
   const turn = frame('root-turn', 'root-execution', 'completed', 'Root result.');
   turn.activity.children = [{
@@ -261,6 +277,33 @@ test('file changes expose a disclosure only when an exact diff artifact exists',
   assert.equal(calls[1]?.diffArtifactId, undefined);
 });
 
+test('unclaimed watched file changes collapse into one summary row instead of one call per file', () => {
+  const turn = frame('watched-turn', 'root-execution', 'completed', 'Done.');
+  turn.passes = [{
+    passId: 'message-1', ordinal: 0, state: 'completed',
+    blocks: [block('build', 0, 'tool', {
+      kind: 'tool',
+      tool: { callId: 'build-call', name: 'shell', category: 'shell', title: 'npm run build' },
+      inputPreview: { command: 'npm run build', cwd: '/workspace/remux', commandActions: [] },
+    })],
+  }];
+  turn.activity.fileChanges = [
+    ...Array.from({ length: 40 }, (_, index) => ({ path: `dist/chunk-${index}.js`, kind: 'add' as const })),
+    { path: 'src/edited.ts', kind: 'update' as const, diffArtifactId: 'b'.repeat(64) },
+  ];
+  const scope = projectNativeChildExecutionScope('conversation-1', {
+    conversationId: 'conversation-1', strandId: 'strand-fixture', executionId: 'root-execution', activeTurnId: null,
+    turnOrder: [turn.turnId], turns: [turn],
+    window: { startIndex: 0, endIndexExclusive: 1, hasEarlier: false, hasLater: false },
+  }, {
+    type: 'executionScope', protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION, turnId: turn.turnId, scopeId: 'root-execution',
+  }, 1);
+  const calls = scope.inferences.flatMap(({ blocks }) => blocks.flatMap((value) => value.type === 'action' ? [value.call] : []));
+  assert.deepEqual(calls.map((call) => call.presentation.label), ['Ran npm run build', 'Edited edited.ts', 'Added 40 files']);
+  assert.equal(calls[2]?.detailPreview?.split('\n').length, 13);
+  assert.equal(calls[2]?.hasDetail, false);
+});
+
 test('linked file changes render at their provider block instead of a trailing compatibility group', () => {
   const turn = frame('chronological-turn', 'root-execution', 'completed', 'Done.');
   turn.passes = [{
@@ -442,4 +485,76 @@ test('additional input divides display work without changing turn or native bloc
   assert.equal(result.segments.at(-1)?.id, 'assistant:input-turn');
   const again = projectNativeTurn({...turn,renderRevision:'updated'});
   assert.deepEqual(again.segments.map(s=>s.id), result.segments.map(s=>s.id));
+});
+
+for (const origin of ['native-followup', 'federation-notification'] as const) {
+  test(`${origin} uses a notice segment without a user message`, () => {
+    const turn = frame('continued', 'root', 'completed', 'Child result reviewed.');
+    turn.origin = origin;
+    turn.trigger = { kind: origin === 'native-followup' ? 'native-child' : 'federation', childExecutionId: 'astra' };
+    turn.inputItems = [{ type: 'notice', clientMessageId: turn.clientMessageId, afterBlockId: null,
+      origin, trigger: turn.trigger, text: 'Continued after Astra finished', elapsedMs: 20_000 }];
+    const projected = projectNativeTurn(turn);
+    assert.deepEqual(projected.segments.filter(segment => segment.type === 'userMessage'), []);
+    const notice = projected.segments[0]!;
+    assert.equal(notice.type, 'notice');
+    assert.ok(notice.type === 'notice');
+    assert.equal(notice.text, 'Continued after Astra finished');
+    assert.equal(notice.elapsedMs, 20_000);
+    assert.ok(projected.segments.some(segment => segment.type === 'assistantMessage'));
+  });
+}
+
+test('fallback notifications delivered during a user turn render as inline notices', () => {
+  const turn = frame('user-turn', 'root', 'completed', 'Child result reviewed.');
+  turn.inputItems = [{ type: 'notice', clientMessageId: 'notification', afterBlockId: null,
+    origin: 'federation-notification', trigger: { kind: 'federation', childExecutionId: 'astra' },
+    text: 'Continued after Astra finished' }];
+  const projected = projectNativeTurn(turn);
+  assert.equal(projected.segments.filter(segment => segment.type === 'userMessage').length, 1);
+  assert.equal(projected.segments.filter(segment => segment.type === 'notice').length, 1);
+});
+
+test('a backgrounded federation tool row says waiting in background until completion', () => {
+  const turn = frame('spawn-turn', 'root', 'completed', 'Waiting.');
+  turn.passes = [{ passId: 'spawn-pass', ordinal: 0, state: 'completed', blocks: [{
+    blockId: 'spawn-tool', passId: 'spawn-pass', ordinal: 0, kind: 'tool', state: 'running', revision: 1,
+    startedAt: 1, completedAt: null, payload: { kind: 'tool', backgrounded: true,
+      tool: { callId: 'spawn-call', name: 'mcp__remux-federation__remux_spawn_agent', category: 'collaboration' } },
+  }] }];
+  const scope = projectNativeExecutionScope('conversation-1', turn, { type: 'executionScope',
+    protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION, turnId: turn.turnId, scopeId: 'root' }, 1);
+  const action = scope.inferences.flatMap(pass => pass.blocks).find(block => block.type === 'action');
+  assert.ok(action?.type === 'action');
+  assert.equal(action.call.presentation.subject, 'Waiting in background');
+});
+
+test('a positioned compaction notice splits the work and replaces the trailing compaction notice', () => {
+  const turn = frame('compacted-turn', 'root', 'completed', 'Done');
+  turn.passes = [{ passId: 'native-message', ordinal: 0, state: 'completed', blocks: [
+    block('before', 0, 'tool', { kind: 'tool', tool: { callId: 'before', name: 'shell', category: 'shell' } }),
+    block('after', 1, 'tool', { kind: 'tool', tool: { callId: 'after', name: 'shell', category: 'shell' } }),
+    block('final', 2, 'final-message', { kind: 'final-message', text: 'Done' }),
+  ] }];
+  turn.finalBlockId = 'final';
+  turn.activity.compacted = true;
+  turn.inputItems = [{ type: 'notice', clientMessageId: 'compaction:op-1', afterBlockId: 'before',
+    origin: 'compaction', text: 'Compacted 269k → 8k tokens', createdAt: 11 }];
+  const projected = projectNativeTurn(turn);
+  assert.deepEqual(projected.segments.map((segment) => segment.type),
+    ['userMessage', 'work', 'notice', 'work', 'assistantMessage']);
+  const notices = projected.segments.filter((segment) => segment.type === 'notice');
+  assert.equal(notices.length, 1);
+  assert.ok(notices[0]?.type === 'notice');
+  assert.equal(notices[0].text, 'Compacted 269k → 8k tokens');
+  const work = projected.segments.filter((segment) => segment.type === 'work');
+  assert.ok(work[0]?.type === 'work' && work[1]?.type === 'work');
+  assert.equal(work[0].durationMs, 1, 'each section reports its own span');
+  assert.equal(work[1].durationMs, 2);
+  for (const section of work) {
+    const scope = projectNativeExecutionScope('conversation', turn, { type: 'executionScope',
+      protocolVersion: AGENT_TRANSCRIPT_PROTOCOL_VERSION, turnId: turn.turnId, scopeId: section.scopeId }, 1);
+    assert.equal(scope.inferences.some((pass) => pass.id.startsWith('compaction:')), false,
+      'the positioned notice replaces the trailing compatibility notice');
+  }
 });

@@ -17,6 +17,11 @@ import type { ProviderAccess } from '../../../shared/provider-runtime.ts';
 import { createViewerUuid } from '../identity.ts';
 
 export const agentCommands = {
+  resolveDelivery(conversationId: string, attemptId: string, commandId: string) {
+    return rpc.command(NATIVE_AGENT_METHODS.deliveryResolve, {
+      commandId, conversationId, attemptId, action: 'abandon',
+    });
+  },
   cancelLogin(providerInstanceId: string) {
     return rpc.command(NATIVE_AGENT_METHODS.providerLoginCancel, {
       commandId: createViewerUuid(),
@@ -131,6 +136,7 @@ export const agentCommands = {
       commandId: string;
       turnId: string;
       delivery: 'sent' | 'queued' | 'steered';
+      reason?: MessageSendResult['reason'];
       deliveryError?: string;
     }>(NATIVE_AGENT_METHODS.messageSend, {
       commandId: input.operationId,
@@ -150,6 +156,7 @@ export const agentCommands = {
       operationId: input.operationId,
       turnId: result.turnId,
       delivery: result.delivery,
+      ...(result.reason ? { reason: result.reason } : {}),
       ...(result.deliveryError ? { deliveryError: result.deliveryError } : {}),
     } as MessageSendResult;
   },

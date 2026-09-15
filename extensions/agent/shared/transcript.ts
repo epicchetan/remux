@@ -86,7 +86,7 @@ export type AgentWorkRenderSegment = {
   id: string;
   type: 'work';
   scopeId: string;
-  state: 'running' | 'completed' | 'failed' | 'interrupted';
+  state: 'running' | 'recovering' | 'completed' | 'failed' | 'interrupted';
   revision: string;
   layoutRevision: string;
   durationMs: number | null;
@@ -106,7 +106,16 @@ export type AgentCompactionSegment = {
   error?: string;
 };
 
+export type AgentNoticeSegment = {
+  id: string;
+  type: 'notice';
+  revision: string;
+  text: string;
+  elapsedMs?: number;
+};
+
 export type AgentTurnSegment =
+  | AgentNoticeSegment
   | AgentUserMessageSegment
   | AgentWorkRenderSegment
   | AgentAssistantMessageSegment
@@ -225,7 +234,7 @@ export type AgentToolCallSummary = {
   callId: string;
   name: string;
   presentation: AgentToolPresentation;
-  status: 'running' | 'completed' | 'failed' | 'interrupted';
+  status: 'running' | 'recovering' | 'completed' | 'failed' | 'interrupted';
   revision: string;
   detailPreview: string | null;
   outputPreview: string | null;
@@ -257,7 +266,7 @@ export type AgentInferenceBlock =
   | {
       id: string;
       type: 'action';
-      state: 'running' | 'completed' | 'failed' | 'interrupted';
+      state: 'running' | 'recovering' | 'completed' | 'failed' | 'interrupted';
       revision: string;
       call: AgentToolCallSummary;
     };
@@ -317,7 +326,7 @@ export type AgentExecutionScopeResource = {
   parentScopeId: string | null;
   parentOperationId: string | null;
   kind: 'turn' | 'childExecution';
-  state: 'running' | 'completed' | 'partial' | 'blocked' | 'failed' |
+  state: 'running' | 'recovering' | 'completed' | 'partial' | 'blocked' | 'failed' |
     'interrupted' | 'abandoned';
   revision: string;
   basisSequence: number;

@@ -1,6 +1,6 @@
 ---
 name: remux-workloads
-description: Run CPU-intensive local inference, benchmarks, data generation, parallel research, and other sustained shell computation through Remux-managed workload scopes. Use when a command may consume multiple cores, create native worker pools, run for more than a few seconds at high CPU, or materially affect Remux responsiveness.
+description: Run deliberately heavy, sustained multi-core compute (local model inference, benchmarks, bulk data generation, media conversion) through Remux-managed workload scopes. Rarely needed. Never use for project test suites, typecheck, builds, npm scripts, or anything under a few minutes of ordinary CPU.
 ---
 
 # Remux Workloads
@@ -25,9 +25,11 @@ remux workload exec \
   -- <program> <args...>
 ```
 
-Do not wrap interactive editors, tiny filesystem commands, or commands whose
-cost is already negligible. Do wrap Python/ONNX inference, Cargo benchmark or
-test fan-out, model conversion, media generation, and multi-process analysis.
+Do not wrap interactive editors, filesystem commands, `npm run` scripts,
+project test suites (node --test, Playwright, cargo test), typecheck, or builds.
+Those run directly, unwrapped, always. Do wrap Python/ONNX inference, benchmark
+fan-out, model conversion, media generation, and multi-process analysis that
+would otherwise saturate every core for minutes.
 
 ## Interpret execution
 
@@ -40,5 +42,7 @@ test fan-out, model conversion, media generation, and multi-process analysis.
 - Use Remux workload status, pause, and cancel controls when available. Do not
   kill unrelated extension processes to stop one operation.
 
-If workload admission fails, surface the reason. Do not silently fall back to
-unmanaged heavy execution.
+If workload admission fails (for example `Failed to connect to bus`), report
+the reason once. For anything that is not genuinely heavy compute, just run the
+command directly; do not treat a wrapper failure as a reason to skip
+verification.

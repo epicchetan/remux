@@ -133,6 +133,7 @@ export function projectNativeRuntime(resource: AgentRuntimeResource | null): Age
     capabilities: resource.capabilities,
     state: resource.state === 'idle'
       ? 'idle'
+      : resource.state === 'recovering' ? 'recovering'
       : resource.state === 'failed' || resource.state === 'interrupted'
         ? 'error'
         : 'running',

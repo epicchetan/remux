@@ -703,6 +703,9 @@ test('federation HTTP wait deadline leaves the accepted child running and discov
     await client.connect(new StreamableHTTPClientTransport(new URL(federation.endpoint), {
       requestInit: { headers: { Authorization: credential.authorizationHeader } },
     }));
+    let observedInFlight = false;
+    const busy = () => (coordinator as unknown as { foregroundFederationBusy(conversation: NonNullable<ReturnType<NativeAgentJournal['conversation']>>): boolean })
+      .foregroundFederationBusy(journal.conversation(root.conversationId)!);
     const timedOut = await client.callTool({
       name: 'remux_spawn_agent',
       arguments: {
@@ -712,11 +715,14 @@ test('federation HTTP wait deadline leaves the accepted child running and discov
         scheduling: 'foreground',
       },
     }, undefined, {
+      onprogress: () => { observedInFlight ||= busy(); },
       timeout: 1_000,
       resetTimeoutOnProgress: true,
       maxTotalTimeout: 2_000,
     });
     assert.equal(timedOut.isError, true);
+    assert.equal(observedInFlight, false, 'HTTP activity alone cannot prove a foreground Claude tool is blocking');
+    assert.equal(busy(), false, 'the fixture session reports no blocking federation tool');
     assert.match(toolText(timedOut), /accepted child continues in the background/iu);
     const child = journal.childExecutions(root.executionId)[0];
     assert.ok(child);

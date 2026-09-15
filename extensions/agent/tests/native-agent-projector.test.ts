@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
+import { execFileSync } from 'node:child_process';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import { NativeAgentJournal } from '../server/src/native-runtime/native-journal.ts';
@@ -20,6 +24,44 @@ import {
   type ProviderEvent,
   type ProviderEventEnvelope,
 } from '../shared/provider-runtime.ts';
+
+test('historical watcher projection hides ignored artifacts without removing journal evidence or explicit edits', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'remux-history-watcher-'));
+  const journal = createJournal();
+  try {
+    execFileSync('git', ['init', '-q'], { cwd });
+    await writeFile(join(cwd, '.gitignore'), 'target/\n*.generated\n');
+    await writeFile(join(cwd, 'tracked.generated'), 'tracked');
+    execFileSync('git', ['add', '-f', 'tracked.generated'], { cwd });
+    seed(journal);
+    journal.database.prepare('UPDATE conversations SET cwd=?').run(cwd);
+    const add = (id: string, path: string, watcher: boolean, at: number) => {
+      const envelope = event(id, at, { type: 'turn.file-changed', change: { path, kind: 'update' } });
+      if (watcher) envelope.native.kind = 'hook/file_changed';
+      journal.appendProviderEvent(envelope);
+    };
+    add('ignored', 'target/debug/build.o', true, 4);
+    add('source', 'src/main.rs', true, 5);
+    add('tracked', 'tracked.generated', true, 6);
+    add('explicit', 'target/explicit.txt', false, 7);
+    const before = journal.eventsForTurn('turn-1');
+    const projector = new NativeAgentProjector(journal);
+    const request = { requests: [{ key: 'agent/turn:turn-1' as const }] };
+    const unfiltered = projector.read(request).resources[0]!;
+    assert.equal(unfiltered.status, 'ok');
+    await projector.prepareWatchedFileChanges(request);
+    const filtered = projector.read({ requests: [{ ...request.requests[0], ifNoneMatch: unfiltered.status === 'ok' ? unfiltered.revision : 0 }] }).resources[0]!;
+    assert.equal(filtered.status, 'ok');
+    const turn = projector.project('agent/turn:turn-1') as NativeAgentTurnFrame;
+    assert.deepEqual(turn.activity.fileChanges.map(({ path }) => path), ['src/main.rs', 'tracked.generated', 'target/explicit.txt']);
+    assert.deepEqual(journal.eventsForTurn('turn-1'), before);
+    add('later', 'target/later.o', true, 8);
+    await projector.prepareWatchedFileChanges({ requests: [{ key: 'agent/transcript:conversation-1:tail-24' }] });
+    assert.equal((projector.project('agent/turn:turn-1') as NativeAgentTurnFrame).activity.fileChanges.length, 3);
+    journal.markConversationRecovering('conversation-1', 'Unconfirmed delivery', 9, 'execution-1');
+    assert.equal(projectNativeRuntime(projector.runtimeResource('conversation-1')!)?.state, 'recovering');
+  } finally { journal.close(); await rm(cwd, { recursive: true, force: true }); }
+});
 
 test('native projector turns normalized events into provider-private-free virtualized frames', () => {
   const journal = createJournal();
@@ -1004,3 +1046,182 @@ function capabilities(): ProviderCapabilities {
     compaction: { automaticNative: false, manualNative: false },
   };
 }
+
+for (const kind of ['federation', 'native-child'] as const) {
+  test(`autonomous ${kind} turns project a read-only continuation notice`, () => {
+    const journal = createJournal();
+    try {
+      seed(journal);
+      assert.equal(journal.turn('turn-1')?.origin, 'user');
+      journal.createFederatedExecution({ executionId: 'astra', conversationId: 'conversation-1',
+        parentExecutionId: 'execution-1', rootTurnId: 'turn-1', provider: 'fixture', providerInstanceId: 'fixture-local',
+        model: 'fixture-native-v1', access: 'read-only', scheduling: 'foreground', depth: 1, title: 'Astra', now: 4 });
+      journal.appendProviderEvent(event('root-finished', 5, { type: 'turn.completed', outcome: 'completed' }));
+      const started = event(`continued-${kind}`, 20_004, { type: 'turn.started', origin: 'native',
+        trigger: { kind, ...(kind === 'federation' ? { childExecutionId: 'astra' } : {}), summary: 'Done' } });
+      assert.ok(started.scope.kind === 'turn');
+      started.scope.turnId = 'continued'; started.native.turnId = 'native-continued';
+      journal.appendProviderEvent(started);
+      const projector = new NativeAgentProjector(journal);
+      const frame = projector.project('agent/turn:continued') as NativeAgentTurnFrame;
+      assert.equal(frame.origin, kind === 'federation' ? 'federation-notification' : 'native-followup');
+      assert.deepEqual(frame.userContent, []);
+      assert.equal(frame.trigger?.kind, kind);
+      assert.equal(frame.inputItems?.[0]?.type, 'notice');
+      assert.equal(frame.inputItems?.[0]?.text, kind === 'federation' ? 'Continued after Astra finished' : 'Continued after subagent finished');
+      if (kind === 'federation') assert.equal(frame.inputItems?.[0]?.elapsedMs, 20_000);
+      const strand = projector.project(`agent/transcript:conversation-1:tail-24`) as NativeTranscriptWindow;
+      assert.equal(strand.turns.find(turn => turn.turnId === 'continued')?.inputItems?.[0]?.type, 'notice');
+    } finally { journal.close(); }
+  });
+}
+
+test('a turn that ends mid-work has no final answer even when it narrated earlier', () => {
+  const journal = createJournal();
+  try {
+    seed(journal);
+    journal.appendProviderEvent(event('narration', 4, {
+      type: 'turn.block.completed',
+      structure: structure('narration-1', 0),
+      revision: 1,
+      contentHash: 'a'.repeat(64),
+      block: { kind: 'final-message', state: 'completed', payload: { kind: 'final-message', text: 'Reading the spec first.' } },
+    }, 'narration-1'));
+    journal.appendProviderEvent(event('tool-start', 5, {
+      type: 'turn.block.started',
+      structure: structure('tool-1', 1),
+      block: {
+        kind: 'tool', state: 'running',
+        payload: { kind: 'tool', tool: { callId: 'tool-1', name: 'shell', category: 'shell', title: 'Run tests' } },
+      },
+    }, 'tool-1'));
+    journal.appendProviderEvent(event('turn-interrupted', 6, { type: 'turn.completed', outcome: 'interrupted' }));
+    const frame = new NativeAgentProjector(journal).project('agent/turn:turn-1') as NativeAgentTurnFrame;
+    assert.equal(frame.outcome, 'interrupted');
+    assert.equal(frame.finalBlockId, null);
+    assert.equal(frame.assistantText, '');
+    assert.equal(frame.passes.flatMap(({ blocks }) => blocks).find(({ blockId }) => blockId === structure('narration-1', 0).blockId)?.kind, 'final-message');
+  } finally { journal.close(); }
+});
+
+test('an unattributed federation continuation stays generic despite a recently completed child', () => {
+  const journal = createJournal();
+  try {
+    seed(journal);
+    journal.createFederatedExecution({ executionId: 'astra', conversationId: 'conversation-1',
+      parentExecutionId: 'execution-1', rootTurnId: 'turn-1', provider: 'fixture', providerInstanceId: 'fixture-local',
+      model: 'fixture-native-v1', access: 'read-only', scheduling: 'foreground', depth: 1, title: 'Astra', now: 4 });
+    journal.appendProviderEvent(event('root-finished', 5, { type: 'turn.completed', outcome: 'completed' }));
+    journal.closeFederatedExecution('astra', 6);
+    const started = event('continued-unattributed', 20_004, { type: 'turn.started', origin: 'native',
+      trigger: { kind: 'federation', summary: 'remux-federation/remux_spawn_agent' } });
+    assert.ok(started.scope.kind === 'turn');
+    started.scope.turnId = 'continued'; started.native.turnId = 'native-continued';
+    journal.appendProviderEvent(started);
+    assert.equal(journal.turn('continued')?.trigger?.childExecutionId, undefined);
+    const frame = new NativeAgentProjector(journal).project('agent/turn:continued') as NativeAgentTurnFrame;
+    assert.equal(frame.origin, 'federation-notification');
+    assert.equal(frame.inputItems?.[0]?.text, 'Continued after federated child finished');
+  } finally { journal.close(); }
+});
+
+test('an automatic compaction inside a running turn renders at the boundary afterBlockId', () => {
+  const journal = createJournal();
+  try {
+    seed(journal);
+    journal.appendProviderEvent(event('turn-started', 4, { type: 'turn.started' }));
+    journal.appendProviderEvent(event('tool-a', 5, {
+      type: 'turn.block.completed', structure: structure('tool-a', 0), revision: 1, contentHash: '1'.padStart(64, '0'),
+      block: { kind: 'tool', state: 'completed', payload: { kind: 'tool',
+        tool: { callId: 'tool-a', name: 'shell', category: 'shell', title: 'Build' } } },
+    }, 'tool-a'));
+    // Compaction stays conversation-scoped by contract; the native turn id is
+    // what locates it inside the running turn (see the Claude adapter).
+    const compaction = controlEvent('compact-auto', 7, {
+      type: 'context.compaction.completed', trigger: 'automatic',
+      operationId: 'compact-inside', beforeTokens: 269_465, afterTokens: 8_130,
+    });
+    journal.appendProviderEvent({ ...compaction,
+      native: { ...compaction.native, turnId: 'native-turn-1', kind: 'context.compaction.completed' } });
+    const boundary = journal.compactionControlEvents('conversation-1')[0]!.boundary;
+    assert.equal(boundary.kind, 'within-turn');
+    assert.ok(boundary.kind === 'within-turn');
+    assert.equal(boundary.afterBlockId, 'tool-a');
+    // A later emission can have an earlier timestamp. It must not move the
+    // notice away from the block captured when the boundary was ingested.
+    journal.appendProviderEvent(event('tool-b', 6, {
+      type: 'turn.block.completed', structure: structure('tool-b', 1), revision: 1, contentHash: '2'.padStart(64, '0'),
+      block: { kind: 'tool', state: 'completed', payload: { kind: 'tool',
+        tool: { callId: 'tool-b', name: 'shell', category: 'shell', title: 'Test' } } },
+    }, 'tool-b'));
+    journal.appendProviderEvent(event('turn-complete', 9, { type: 'turn.completed', outcome: 'completed' }));
+
+    const frame = new NativeAgentProjector(journal).project('agent/turn:turn-1') as NativeAgentTurnFrame;
+    const notice = frame.inputItems?.find((input) => input.origin === 'compaction');
+    assert.ok(notice, 'the compaction is positioned inside the turn');
+    assert.equal(notice.afterBlockId, boundary.afterBlockId);
+    assert.equal(notice.text, 'Compacted 269k → 8k tokens');
+    assert.equal(notice.createdAt, 7);
+    assert.equal(frame.boundaryCompactions?.afterTurn.length ?? 0, 0, 'no divider stacks after the turn');
+    assert.equal(frame.activity.compacted, true);
+  } finally { journal.close(); }
+});
+
+test('a bare between-turns compaction is not pulled inside a turn by its timestamp', () => {
+  const journal = createJournal();
+  try {
+    seed(journal);
+    journal.appendProviderEvent(event('turn-started', 4, { type: 'turn.started' }));
+    journal.appendProviderEvent(event('tool-a', 5, {
+      type: 'turn.block.completed', structure: structure('tool-a', 0), revision: 1, contentHash: '1'.padStart(64, '0'),
+      block: { kind: 'tool', state: 'completed', payload: { kind: 'tool',
+        tool: { callId: 'tool-a', name: 'shell', category: 'shell', title: 'Build' } } },
+    }, 'tool-a'));
+    journal.appendProviderEvent(controlEvent('compact-legacy', 7, {
+      type: 'context.compaction.completed', trigger: 'automatic',
+      operationId: 'compact-legacy', beforeTokens: 272_422, afterTokens: 11_711,
+    }));
+    journal.appendProviderEvent(event('turn-complete', 9, { type: 'turn.completed', outcome: 'completed' }));
+
+    const projector = new NativeAgentProjector(journal);
+    const frame = projector.project('agent/turn:turn-1') as NativeAgentTurnFrame;
+    assert.equal(frame.inputItems?.some((input) => input.origin === 'compaction'), false);
+    assert.equal(frame.boundaryCompactions?.afterTurn.length, 1);
+    const window = projector.project('agent/transcript:conversation-1:tail-24') as NativeTranscriptWindow;
+    assert.equal(window.turns[0]?.boundaryCompactions?.afterTurn.length, 1);
+
+    journal.claimCommand('send-2', 'turn.send', { content: 'Continue.' }, 19);
+    journal.createTurn({
+      turnId: 'turn-2', conversationId: 'conversation-1', executionId: 'execution-1',
+      clientMessageId: 'message-2', commandId: 'send-2',
+      content: [{ type: 'text', text: 'Continue.' }], model: 'fixture-native-v1', state: 'running', now: 20,
+    });
+    const next = projector.project('agent/turn:turn-2') as NativeAgentTurnFrame;
+    assert.equal(next.boundaryCompactions?.beforeUser.length, 1, 'the unlocated fallback moves before the next turn');
+    const previous = projector.project('agent/turn:turn-1') as NativeAgentTurnFrame;
+    assert.equal(previous.boundaryCompactions?.afterTurn.length ?? 0, 0);
+  } finally { journal.close(); }
+});
+
+test('a continuation names every identified child in trigger arrival order', () => {
+  const journal = createJournal();
+  try {
+    seed(journal);
+    for (const [id, title] of [['astra', 'Astra'], ['sol', 'Sol']]) {
+      journal.createFederatedExecution({ executionId: id!, conversationId: 'conversation-1',
+        parentExecutionId: 'execution-1', rootTurnId: 'turn-1', provider: 'fixture', providerInstanceId: 'fixture-local',
+        model: 'fixture-native-v1', access: 'read-only', scheduling: 'foreground', depth: 1, title: title!, now: 4 });
+    }
+    journal.appendProviderEvent(event('root-finished', 5, { type: 'turn.completed', outcome: 'completed' }));
+    const triggers = [{ kind: 'federation' as const, childExecutionId: 'astra' },
+      { kind: 'federation' as const, childExecutionId: 'sol' }];
+    const started = event('two-child-continuation', 10, { type: 'turn.started', origin: 'native', trigger: triggers[0], triggers });
+    assert.ok(started.scope.kind === 'turn');
+    started.scope.turnId = 'continued'; started.native.turnId = 'native-continued';
+    journal.appendProviderEvent(started);
+    const frame = new NativeAgentProjector(journal).project('agent/turn:continued') as NativeAgentTurnFrame;
+    assert.deepEqual(frame.triggers, triggers);
+    assert.deepEqual(frame.inputItems?.[0]?.triggers, triggers);
+    assert.equal(frame.inputItems?.[0]?.text, 'Continued after Astra and Sol finished');
+  } finally { journal.close(); }
+});

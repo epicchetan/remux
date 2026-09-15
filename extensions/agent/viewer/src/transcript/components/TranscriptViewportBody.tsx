@@ -1,3 +1,4 @@
+import { ContinuationDivider } from './ContinuationDivider.tsx';
 import { Loader2, RotateCcw } from 'lucide-react';
 import { memo } from 'react';
 
@@ -206,6 +207,7 @@ function TranscriptSegmentBody({
       />
     );
   }
+  if (segment.type === 'notice') return <ContinuationDivider notice={segment} />;
   if (segment.type === 'compaction') {
     return <CompactionDivider density="transcript" status={segment.status} title={segment.error} />;
   }

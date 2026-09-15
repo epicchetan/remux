@@ -1,5 +1,6 @@
 import type {
   NativeAssistantPass,
+  NativeTurnNotice,
   NativeAgentTurnFrame,
   NativeFileChangeView,
   NativeOrderedTurnBlock,
@@ -62,12 +63,17 @@ export function projectNativeTranscript(
 }
 
 export function projectNativeTurn(turn: NativeAgentTurnFrame): AgentTurnRenderFrame {
-  if (turn.additionalMessages?.length) return projectTurnWithInputs(turn);
+  if (hasAdditionalInputs(turn)) return projectTurnWithInputs(turn);
   const segments: AgentTurnSegment[] = [];
   const inferences = projectTurnInferences(turn);
   const text = turn.userContent.flatMap((part) => part.type === 'text' ? [part.text] : []).join('');
   segments.push(...(turn.boundaryCompactions?.beforeUser ?? []).map(projectCompactionSegment));
-  segments.push({
+  const notice = turn.inputItems?.find(input => input.clientMessageId === turn.clientMessageId);
+  if (turn.origin && turn.origin !== 'user') segments.push(projectNotice(notice ?? {
+    type: 'notice', clientMessageId: turn.clientMessageId, afterBlockId: null, origin: turn.origin,
+    text: `Continued after ${turn.trigger?.kind === 'federation' ? 'federated child' : 'subagent'} finished`,
+  }, turn.renderRevision));
+  else segments.push({
     id: `user:${turn.turnId}`,
     type: 'userMessage',
     clientMessageId: turn.clientMessageId,
@@ -133,9 +139,25 @@ export function projectNativeTurn(turn: NativeAgentTurnFrame): AgentTurnRenderFr
   };
 }
 
+/** A section's own span; null while any of its blocks is still open in a live turn. */
+function sectionDuration(section: NativeAgentTurnFrame) {
+  const blocks = section.passes.flatMap((pass) => pass.blocks);
+  const started = blocks.flatMap((block) => block.startedAt === null ? [] : [block.startedAt]);
+  const ended = blocks.map((block) => block.completedAt ?? section.completedAt ?? null);
+  if (!started.length || ended.some((value) => value === null)) return null;
+  return Math.max(0, Math.max(...(ended as number[])) - Math.min(...started));
+}
+
 /** Partition presentation only; all sections retain the original native turn. */
 function inputSections(turn: NativeAgentTurnFrame) {
-  const messages = turn.additionalMessages ?? [];
+  const messages = [
+    ...(turn.additionalMessages ?? []).map(input => ({ ...input, type: 'message' as const })),
+    ...(turn.inputItems ?? []).filter(input => input.clientMessageId !== turn.clientMessageId),
+  ];
+  const orderedBlocks = turn.passes.flatMap(pass => pass.blocks);
+  messages.sort((a, b) => orderedBlocks.findIndex(block => block.blockId === a.afterBlockId)
+    - orderedBlocks.findIndex(block => block.blockId === b.afterBlockId)
+    || (a.inputOrdinal ?? 0) - (b.inputOrdinal ?? 0) || (a.createdAt ?? 0) - (b.createdAt ?? 0));
   const blocks = turn.passes.flatMap((pass) => pass.blocks);
   let start = 0;
   return [null, ...messages].map((input, index, entries) => {
@@ -148,7 +170,7 @@ function inputSections(turn: NativeAgentTurnFrame) {
     const tail = index === entries.length - 1;
     const ownsFinal = Boolean(turn.finalBlockId && ids.has(turn.finalBlockId));
     const scoped: NativeAgentTurnFrame = {
-      ...turn, additionalMessages: undefined, boundaryCompactions: undefined,
+      ...turn, additionalMessages: undefined, inputItems: turn.inputItems?.filter(input => input.clientMessageId === turn.clientMessageId), boundaryCompactions: undefined,
       passes: turn.passes.map((pass) => ({ ...pass, blocks: pass.blocks.filter(({ blockId }) => ids.has(blockId)) }))
         .filter(({ blocks }) => blocks.length > 0),
       finalBlockId: ownsFinal ? turn.finalBlockId : null,
@@ -156,7 +178,8 @@ function inputSections(turn: NativeAgentTurnFrame) {
       assistantContent: ownsFinal ? turn.assistantContent : undefined,
       // Compatibility fallbacks must not repeat every tool/child in each section.
       activity: { ...turn.activity, reasoning: '', commentary: '', operations: [], web: [], notices: [],
-        compacted: tail && turn.activity.compacted,
+        // Positioned compaction notices already mark where context was dropped.
+        compacted: tail && turn.activity.compacted && !turn.inputItems?.some((input) => input.origin === 'compaction'),
         fileChanges: turn.activity.fileChanges.filter((change) => Boolean(change.blockId && ids.has(change.blockId))),
         children: turn.activity.children.filter((child) => blocks.some((block) => ids.has(block.blockId) &&
           (block.payload.kind === 'native-child' || block.payload.kind === 'federated-child') &&
@@ -169,12 +192,13 @@ function inputSections(turn: NativeAgentTurnFrame) {
 }
 
 function projectTurnWithInputs(turn: NativeAgentTurnFrame): AgentTurnRenderFrame {
-  const base = projectNativeTurn({ ...turn, additionalMessages: undefined });
+  const base = projectNativeTurn({ ...turn, additionalMessages: undefined, inputItems: turn.inputItems?.filter(input => input.clientMessageId === turn.clientMessageId) });
   const segments: AgentTurnSegment[] = [...(turn.boundaryCompactions?.beforeUser ?? []).map(projectCompactionSegment)];
-  const rootUser = base.segments.find((segment) => segment.type === 'userMessage')!;
+  const rootUser = base.segments.find((segment) => segment.type === 'userMessage' || segment.type === 'notice')!;
   segments.push(rootUser);
   for (const section of inputSections(turn)) {
-    if (section.input) segments.push({
+    if (section.input?.type === 'notice') segments.push(projectNotice(section.input, turn.renderRevision));
+    else if (section.input) segments.push({
       id: `user-input:${section.input.clientMessageId}`, type: 'userMessage',
       clientMessageId: section.input.clientMessageId, revision: turn.renderRevision,
       branchUnavailable: true,
@@ -187,8 +211,8 @@ function projectTurnWithInputs(turn: NativeAgentTurnFrame): AgentTurnRenderFrame
         if (!section.turn.passes.length && !section.tail) continue;
         segments.push({ ...segment, id: `work:${section.scopeId}`, scopeId: section.scopeId,
           // A section can still contain a running tool after the input boundary.
-          // Do not report the original turn duration once per section.
-          durationMs: null });
+          // Report the section's own span, never the whole turn once per section.
+          durationMs: sectionDuration(section.turn) });
       } else if (segment.type === 'assistantMessage') segments.push(segment);
     }
   }
@@ -226,7 +250,7 @@ export function projectNativeExecutionScope(
   request: AgentExecutionScopeRequest,
   basisSequence: number,
 ): AgentExecutionScopeResource {
-  const section = turn.additionalMessages?.length
+  const section = hasAdditionalInputs(turn)
     ? inputSections(turn).find(({ scopeId }) => scopeId === request.scopeId) : undefined;
   const inferences = projectTurnInferences(section?.turn ?? turn);
   return {
@@ -236,7 +260,7 @@ export function projectNativeExecutionScope(
     parentScopeId: null,
     parentOperationId: null,
     kind: 'turn',
-    state: turn.state === 'completed'
+    state: turn.state === 'recovering' ? 'recovering' : turn.state === 'completed'
       ? 'completed'
       : turn.state === 'interrupted' ? 'interrupted'
         : turn.state === 'failed' ? 'failed' : 'running',
@@ -358,7 +382,8 @@ function projectTurnInferences(
     };
     else inferences.push(syntheticInference(turn, [block], 'task'));
   }
-  if (turn.activity.compacted) {
+  // Positioned compaction notices supersede the trailing compatibility notice.
+  if (turn.activity.compacted && !turn.inputItems?.some((input) => input.origin === 'compaction')) {
     inferences.push(syntheticInference(turn, [{
       id: `compaction:${turn.turnId}`,
       type: 'notice',
@@ -383,7 +408,13 @@ function projectTurnInferences(
     })), 'compatibility-actions'));
   }
   return inferences.filter(({ blocks }) => blocks.length > 0)
-    .map((inference, ordinal) => ({ ...inference, ordinal }));
+    .map((inference, ordinal) => ({ ...inference, ordinal,
+      blocks: turn.state !== 'recovering' ? inference.blocks : inference.blocks.map((block): AgentInferenceBlock => {
+        if (block.type === 'action') return block.call.status === 'running' && !block.call.childScopeId
+          ? { ...block, state: 'recovering', call: { ...block.call, status: 'recovering' } } : block;
+        return block.state === 'streaming' ? { ...block, state: 'partial' } : block;
+      }),
+    }));
 }
 
 function projectPass(
@@ -542,7 +573,7 @@ function projectOrderedTool(block: NativeOrderedTurnBlock): AgentToolCallSummary
     presentation: {
       category,
       label: toolLabel(tool.name, tool.title, category, blockActionState(block), block.payload.inputPreview),
-      subject: toolSubject(category, block.payload.inputPreview),
+      subject: block.payload.backgrounded ? 'Waiting in background' : toolSubject(category, block.payload.inputPreview),
     },
     status: blockActionState(block),
     revision: `${block.blockId}:${block.revision}:${block.state}`,
@@ -744,18 +775,27 @@ function projectUserPart(part: NativeAgentTurnFrame['userContent'][number]): Age
 
 function nativeCalls(turn: NativeAgentTurnFrame): AgentToolCallSummary[] {
   const orderedBlocks = turn.passes.flatMap(({ blocks }) => blocks);
+  // Watched workspace changes that no tool block claims and that carry no
+  // diff are observations, not calls: one summary row keeps the count honest.
+  const unclaimed: NativeFileChangeView[] = [];
+  const perFile = turn.activity.fileChanges.flatMap((change, index) => {
+    const block = orderedBlocks.find((candidate) => candidate.payload.kind === 'tool' &&
+      (change.blockId === candidate.blockId || change.blockId === candidate.payload.tool.callId));
+    if (!block && !change.diffArtifactId) {
+      unclaimed.push(change);
+      return [];
+    }
+    const linkedIndex = block
+      ? turn.activity.fileChanges.slice(0, index).filter((candidate) =>
+          candidate.blockId === block.blockId ||
+          (block.payload.kind === 'tool' && candidate.blockId === block.payload.tool.callId)).length
+      : index;
+    return [projectFileChange(turn, change, linkedIndex, block)];
+  });
   return [
     ...turn.activity.operations.map(projectOperation),
-    ...turn.activity.fileChanges.map((change, index) => {
-      const block = orderedBlocks.find((candidate) => candidate.payload.kind === 'tool' &&
-        (change.blockId === candidate.blockId || change.blockId === candidate.payload.tool.callId));
-      const linkedIndex = block
-        ? turn.activity.fileChanges.slice(0, index).filter((candidate) =>
-            candidate.blockId === block.blockId ||
-            (block.payload.kind === 'tool' && candidate.blockId === block.payload.tool.callId)).length
-        : index;
-      return projectFileChange(turn, change, linkedIndex, block);
-    }),
+    ...perFile,
+    ...(unclaimed.length ? [projectWatchedChanges(turn, unclaimed)] : []),
     ...(turn.passes.some(({ blocks }) => blocks.some(({ kind }) => kind === 'web'))
       ? []
       : turn.activity.web.map((activity, index): AgentToolCallSummary => ({
@@ -895,6 +935,38 @@ function projectFileChange(
   };
 }
 
+const WATCHED_CHANGE_PREVIEW_LIMIT = 12;
+
+function projectWatchedChanges(turn: NativeAgentTurnFrame, changes: readonly NativeFileChangeView[]): AgentToolCallSummary {
+  const names = changes.map((change) => fileName(change.path));
+  const uniformKind = changes.every((change) => change.kind === changes[0]!.kind) ? changes[0]!.kind : 'update';
+  const verb = fileChangeVerb(uniformKind, false);
+  const label = changes.length === 1 ? `${verb} ${names[0]}`
+    : changes.length === 2 ? `${verb} ${names[0]} and ${names[1]}`
+      : `${verb} ${changes.length} files`;
+  const preview = changes.slice(0, WATCHED_CHANGE_PREVIEW_LIMIT).map((change) => change.path).join('\n');
+  return {
+    id: `files:${turn.turnId}`,
+    callId: `files:${turn.turnId}`,
+    name: 'file_change',
+    presentation: { category: 'edit', label, subject: changes.length === 1 ? changes[0]!.path : null },
+    status: 'completed',
+    revision: `${turn.renderRevision}:files:${changes.length}`,
+    detailPreview: changes.length > WATCHED_CHANGE_PREVIEW_LIMIT
+      ? `${preview}\n… ${changes.length - WATCHED_CHANGE_PREVIEW_LIMIT} more`
+      : changes.length > 1 ? preview : null,
+    outputPreview: null,
+    durationMs: null,
+    childScopeId: null,
+    childBoundary: null,
+    childState: null,
+    childDurationMs: null,
+    childOperationCount: 0,
+    childArtifactCount: 0,
+    hasDetail: false,
+  };
+}
+
 function fileChangeVerb(kind: NativeFileChangeView['kind'], running: boolean) {
   if (kind === 'add') return running ? 'Adding' : 'Added';
   if (kind === 'delete') return running ? 'Deleting' : 'Deleted';
@@ -972,8 +1044,8 @@ function turnStatus(turn: NativeAgentTurnFrame): AgentTurnRenderFrame['status'] 
   return turn.state;
 }
 
-function workState(turn: NativeAgentTurnFrame): 'running' | 'completed' | 'failed' | 'interrupted' {
-  if (turn.state === 'running' || turn.state === 'recovering' || turn.state === 'queued') return 'running';
+function workState(turn: NativeAgentTurnFrame): 'running' | 'recovering' | 'completed' | 'failed' | 'interrupted' {
+  if (turn.state === 'running' || turn.state === 'queued') return 'running';
   return turn.state;
 }
 
@@ -989,4 +1061,12 @@ function printable(value: unknown) {
 
 function utf8Length(value: string) {
   return new TextEncoder().encode(value).byteLength;
+}
+
+function hasAdditionalInputs(turn: NativeAgentTurnFrame) {
+  return Boolean(turn.additionalMessages?.length || turn.inputItems?.some(input => input.clientMessageId !== turn.clientMessageId));
+}
+function projectNotice(input: NativeTurnNotice, revision: string): Extract<AgentTurnSegment, { type: 'notice' }> {
+  return { id: `notice:${input.clientMessageId}`, type: 'notice', revision, text: input.text,
+    ...(input.elapsedMs === undefined ? {} : { elapsedMs: input.elapsedMs }) };
 }

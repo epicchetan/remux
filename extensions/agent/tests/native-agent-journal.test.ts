@@ -1435,6 +1435,36 @@ test('conversation history reports the last sent message without treating reads 
   }
 });
 
+test('native turn trigger lists survive journal reopen and queued turn admission', async () => {
+  const dataRoot = await mkdtemp(join(tmpdir(), 'remux-trigger-roundtrip-'));
+  let journal = await openNativeAgentJournal({ dataRoot });
+  const triggers = [{ kind: 'federation' as const, childExecutionId: 'astra', summary: 'Astra done.' },
+    { kind: 'federation' as const, childExecutionId: 'sol', summary: 'Sol done.' }];
+  try {
+    seedConversation(journal);
+    journal.appendProviderEvent(event('native-turn-start', 3, { type: 'turn.started', origin: 'native',
+      trigger: triggers[0], triggers }));
+    assert.deepEqual(journal.turn('turn-1')?.triggers, triggers);
+    assert.deepEqual(journal.turn('turn-1')?.trigger, triggers[0]);
+    journal.claimCommand('queued-triggers', 'turn.send', {}, 4);
+    journal.enqueueTurn({ commandId: 'queued-triggers', conversationId: 'conversation-1', turnId: 'queued-turn',
+      clientMessageId: 'queued-message', content: [], model: 'fixture-native-v1', access: 'read-only',
+      origin: 'federation-notification', trigger: triggers[0], triggers, now: 4 });
+    journal.close();
+    journal = await openNativeAgentJournal({ dataRoot });
+    assert.deepEqual(journal.turn('turn-1')?.triggers, triggers);
+    assert.deepEqual(journal.queuedMessages('conversation-1')[0]?.triggers, triggers);
+    assert.deepEqual(journal.queuedEntries('conversation-1')[0]?.kind, 'message');
+    journal.claimQueuedTurn('conversation-1', 5);
+    journal.admitQueuedTurn('queued-turn', 6);
+    assert.deepEqual(journal.turn('queued-turn')?.triggers, triggers);
+    assert.deepEqual(journal.turn('queued-turn')?.trigger, triggers[0]);
+  } finally {
+    journal.close();
+    await rm(dataRoot, { recursive: true, force: true });
+  }
+});
+
 test('compaction controls resolve to their native turn without changing event scope', () => {
   const journal = createJournal();
   try {
@@ -1452,6 +1482,14 @@ test('compaction controls resolve to their native turn without changing event sc
     assert.equal(journal.compactionControlEvents('conversation-1')[0]?.boundary.kind,
       'native-unresolved');
 
+    const block = event('block-before-binding', 4, {
+      type: 'turn.block.completed', structure: blockStructure('unresolved-anchor', 0), revision: 1,
+      contentHash: 'a'.repeat(64), block: { kind: 'commentary', state: 'completed',
+        payload: { kind: 'commentary', text: 'Work before native binding.' } },
+    });
+    delete block.native.turnId;
+    journal.appendProviderEvent(block);
+    assert.equal(journal.compactionControlEvents('conversation-1')[0]?.boundary.kind, 'native-unresolved');
     journal.upsertNativeTurnBinding({
       providerInstanceId: 'fixture-local', executionId: 'execution-1', turnId: 'turn-1',
       nativeTurnId: 'fixture-native-turn-1', state: 'authoritative', now: 4,
@@ -1459,6 +1497,7 @@ test('compaction controls resolve to their native turn without changing event sc
     const [control] = journal.compactionControlEvents('conversation-1');
     assert.deepEqual(control?.boundary, {
       kind: 'within-turn', turnId: 'turn-1', nativeTurnId: 'fixture-native-turn-1',
+      afterBlockId: 'unresolved-anchor',
     });
     const persisted = journal.eventsForConversation('conversation-1')
       .find(({ eventId }) => eventId === 'compact-before-binding');
@@ -1466,6 +1505,142 @@ test('compaction controls resolve to their native turn without changing event sc
   } finally {
     journal.close();
   }
+});
+
+test('within-turn compaction anchors to the last block of the last pass at ingest', () => {
+  const journal = createJournal();
+  try {
+    seedConversation(journal);
+    journal.createTurn({ turnId: 'turn-1', conversationId: 'conversation-1', executionId: 'execution-1',
+      clientMessageId: 'message-1', commandId: 'send-1', content: [{ type: 'text', text: 'Work.' }],
+      model: 'fixture-native-v1', state: 'running', now: 2 });
+    journal.appendProviderEvent(event('turn-start', 3, { type: 'turn.started' }));
+    const compact = (id: string) => event(id, 5, {
+      type: 'context.compaction.completed', trigger: 'automatic', operationId: id,
+      beforeTokens: null, afterTokens: null,
+    });
+    journal.appendProviderEvent(compact('before-blocks'));
+    assert.deepEqual(journal.compactionControlEvents('conversation-1')[0]?.boundary, {
+      kind: 'within-turn', turnId: 'turn-1', nativeTurnId: 'fixture-native-turn-1', afterBlockId: null,
+    });
+    const block = (id: string, passOrdinal: number, blockOrdinal: number, observedAt: number) =>
+      event(id, observedAt, { type: 'turn.block.completed',
+        structure: { passId: `pass-${passOrdinal}`, passOrdinal, blockId: id, blockOrdinal },
+        revision: 1, contentHash: 'b'.repeat(64), block: { kind: 'commentary', state: 'completed',
+          payload: { kind: 'commentary', text: id } } });
+    journal.appendProviderEvent(block('first-pass-block', 0, 0, 20));
+    journal.appendProviderEvent(block('last-pass-first', 1, 0, 12));
+    journal.appendProviderEvent(block('last-pass-last', 1, 1, 10));
+    journal.appendProviderEvent(compact('after-blocks'));
+    journal.appendProviderEvent(block('later-emission', 1, 2, 4));
+    assert.deepEqual(journal.compactionControlEvents('conversation-1')
+      .find(({ operationId }) => operationId === 'after-blocks')?.boundary, {
+      kind: 'within-turn', turnId: 'turn-1', nativeTurnId: 'fixture-native-turn-1', afterBlockId: 'last-pass-last',
+    });
+  } finally { journal.close(); }
+});
+
+test('Claude idle compaction timeline places its strand control after the previous turn', () => {
+  const journal = createJournal();
+  try {
+    seedConversation(journal);
+    journal.createTurn({ turnId: 'turn-1', conversationId: 'conversation-1', executionId: 'execution-1',
+      clientMessageId: 'message-1', commandId: 'send-1', content: [{ type: 'text', text: 'Work.' }],
+      model: 'fixture-native-v1', state: 'running', now: 2 });
+    journal.appendProviderEvent(event('turn-complete', 4, { type: 'turn.completed', outcome: 'completed' }));
+    const compact = event('claude-idle-compaction', 5, {
+      type: 'context.compaction.completed', trigger: 'automatic', operationId: 'idle-compaction',
+      beforeTokens: 90_000, afterTokens: 10_000,
+    });
+    compact.provider = 'claude-code';
+    compact.native = { sessionId: 'fixture-session-1', messageId: 'idle-boundary', kind: 'system/compact_boundary',
+      subject: { kind: 'context-compaction', key: 'claude:context-compaction:idle-boundary' },
+      timeline: { previousTurnId: 'fixture-native-turn-1' } };
+    assert.equal(journal.appendProviderEvent(compact), true);
+    const [control] = journal.compactionControlEvents('conversation-1');
+    assert.deepEqual(control?.boundary, { kind: 'between-turns' });
+    assert.equal(control?.previousTurnId, 'turn-1');
+    assert.equal(control?.nextTurnId, null);
+    assert.equal(control?.strandId, journal.execution('execution-1')?.strandId);
+    assert.deepEqual(journal.database.prepare(`SELECT previous_turn_id, next_turn_id FROM strand_control_path
+      WHERE operation_id = 'idle-compaction'`).all().map((row) => ({ ...row })), [
+      { previous_turn_id: 'turn-1', next_turn_id: null },
+    ]);
+  } finally { journal.close(); }
+});
+
+test('Claude compaction replay with and without an active turn keeps one control per subject state', () => {
+  const journal = createJournal();
+  try {
+    seedConversation(journal);
+    journal.createTurn({ turnId: 'turn-1', conversationId: 'conversation-1', executionId: 'execution-1',
+      clientMessageId: 'message-1', commandId: 'send-1', content: [{ type: 'text', text: 'Work.' }],
+      model: 'fixture-native-v1', state: 'running', now: 2 });
+    journal.appendProviderEvent(event('turn-start', 3, { type: 'turn.started' }));
+    const original = event('claude-boundary-active', 4, {
+      type: 'context.compaction.completed', trigger: 'automatic', operationId: 'active-operation',
+      beforeTokens: 90_000, afterTokens: 10_000,
+    });
+    original.provider = 'claude-code';
+    original.native.kind = 'system/compact_boundary';
+    original.native.messageId = 'replayed-boundary';
+    original.native.subject = { kind: 'context-compaction', key: 'claude:context-compaction:replayed-boundary' };
+    assert.equal(journal.appendProviderEvent(original), true);
+    journal.appendProviderEvent(event('turn-complete', 5, { type: 'turn.completed', outcome: 'completed' }));
+    const replay = structuredClone(original);
+    replay.eventId = 'claude-boundary-idle';
+    delete replay.native.turnId;
+    replay.native.timeline = { previousTurnId: 'fixture-native-turn-1' };
+    assert.ok(replay.event.type === 'context.compaction.completed');
+    replay.event.operationId = 'replay-operation';
+    assert.equal(journal.appendProviderEvent(replay), false);
+    assert.equal(journal.compactionControlEvents('conversation-1').length, 1);
+    assert.equal(journal.compactionControlEvents('conversation-1')[0]?.operationId, 'active-operation');
+    assert.equal(journal.compactionControlEvents('conversation-1')[0]?.state, 'completed');
+    assert.equal(journal.compactionControlEvents('conversation-1')[0]?.boundary.kind, 'within-turn');
+    assert.equal(journal.compactionOperation('replay-operation'), undefined);
+  } finally { journal.close(); }
+});
+
+test('Claude manual boundary replay deduplicates its observation despite losing operation correlation', () => {
+  const journal = createJournal();
+  try {
+    seedConversation(journal);
+    const started = event('manual-status', 3, {
+      type: 'context.compaction.started', trigger: 'manual', operationId: 'manual-op', beforeTokens: null,
+    });
+    started.provider = 'claude-code';
+    started.native = { sessionId: 'fixture-session-1', messageId: 'manual-status-uuid',
+      kind: 'system/status/compacting',
+      subject: { kind: 'context-compaction', key: 'claude:context-compaction:manual-status-uuid' } };
+    assert.equal(journal.appendProviderEvent(started), true);
+
+    const key = 'claude:context-compaction:manual-boundary-uuid';
+    const completed = event('manual-completed', 4, {
+      type: 'context.compaction.completed', trigger: 'manual', operationId: 'manual-op',
+      beforeTokens: 90_000, afterTokens: 10_000,
+    });
+    completed.provider = 'claude-code';
+    completed.native = { sessionId: 'fixture-session-1', messageId: 'manual-boundary-uuid',
+      kind: 'system/compact_boundary', subject: { kind: 'context-compaction', key } };
+    assert.equal(journal.appendProviderEvent(completed), true);
+    // The operation retains its first subject, while each control row stores
+    // its own observation key. Replay must find the completed control by key.
+    assert.equal(journal.compactionOperation('manual-op')?.providerSubjectKey, started.native.subject?.key);
+
+    const replay = structuredClone(completed);
+    replay.eventId = 'manual-completed-replayed';
+    assert.ok(replay.event.type === 'context.compaction.completed');
+    replay.event.operationId = 'uncorrelated-replay-op';
+    assert.equal(journal.appendProviderEvent(replay), false);
+    const controls = journal.compactionControlEvents('conversation-1');
+    assert.equal(controls.length, 2);
+    const completedControls = controls.filter((control) => control.providerSubjectKey === key && control.state === 'completed');
+    assert.equal(completedControls.length, 1);
+    assert.equal(completedControls[0]?.operationId, 'manual-op');
+    assert.equal(journal.compactionOperation('uncorrelated-replay-op'), undefined);
+    assert.equal(journal.database.prepare('SELECT count(*) AS count FROM compaction_operations').get()?.count, 1);
+  } finally { journal.close(); }
 });
 
 test('dedicated native compaction controls remain between turns', () => {

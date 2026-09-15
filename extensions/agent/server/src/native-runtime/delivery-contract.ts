@@ -59,7 +59,7 @@ export type CompactDispatchContext = {
 
 export type ProviderPositiveRead = (attempt: FrozenDeliveryAttempt) => Promise<ProviderPresenceRead>;
 export type DeliveryAttemptKind = 'root-turn' | 'steer' | 'manual-compact';
-export type DeliveryAttemptState = 'preparing' | 'dispatching' | 'accepted' | 'rejected' | 'unknown';
+export type DeliveryAttemptState = 'preparing' | 'dispatching' | 'accepted' | 'rejected' | 'unknown' | 'abandoned';
 export type FrozenDeliveryAttempt = {
   attemptId: string; commandId: string; kind: DeliveryAttemptKind;
   provider: 'codex' | 'claude-code' | 'fixture'; providerInstanceId: string;

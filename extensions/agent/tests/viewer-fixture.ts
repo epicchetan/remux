@@ -43,6 +43,7 @@ export async function installAgentHost(page: Page) {
     let generation = 'fixture-generation';
     const route = new URL(window.location.href).searchParams;
     const signedOut = route.get('fixtureSignedOut') === '1';
+    let deliveryResolved = false;
     const resourceReadFailure = route.get('fixtureResourceFailure') === '1';
     const routedConversation = route.get('remuxResourceKind') === 'agentConversation'
       && route.get('remuxResourceId') === conversationId;
@@ -64,6 +65,7 @@ export async function installAgentHost(page: Page) {
       : null;
 
     const errorGeometryTranscript = route.get('fixtureErrorGeometry') === '1';
+    const inTurnCompactionTranscript = route.get('fixtureInTurnCompaction') === '1';
     const effortFixture = route.get('fixtureEffort');
     const compactEligibility = route.get('fixtureCompactEligibility');
     let deliveryRuntimeOverride: Record<string, unknown> = {};
@@ -253,6 +255,32 @@ export async function installAgentHost(page: Page) {
         touchTurn(workError);
         turns.push(completedTurn('turn-after-work-error', 'Healthy request after work', 'Healthy answer after work.'));
         turnCounter = 50;
+      } else if (inTurnCompactionTranscript) {
+        for (let index = 1; index <= 3; index += 1) {
+          turns.push(completedTurn(`turn-${index}`, `Context request ${index}`, `Context answer ${index}.`));
+        }
+        sequence = 3;
+        turnCounter = 3;
+        const compacted = createRunningTurn('Long request that compacted twice', 'in-turn-compaction-client', undefined, 'turn-in-turn-compaction');
+        compacted.status = 'completed';
+        compacted.completedAt = Date.now();
+        compacted.durationMs = 1_000;
+        const work = compacted.segments.find((segment) => segment.type === 'work');
+        if (work) {
+          work.state = 'completed';
+          work.durationMs = 1_000;
+          const scope = executionScopes.get(executionScopeKey(compacted.id, work.scopeId));
+          if (scope) {
+            scope.state = 'completed';
+            scope.completedAt = compacted.completedAt;
+            scope.durationMs = compacted.durationMs;
+          }
+        }
+        const answer = compacted.segments.find((segment) => segment.type === 'assistantMessage');
+        if (answer) answer.text = 'Finished after two compactions.';
+        touchTurn(compacted);
+        turns.push(completedTurn('turn-after-compaction', 'Follow-up request', 'Follow-up answer.'));
+        turnCounter = 5;
       } else if (runningTranscript) {
         if (longTranscript) {
           for (let index = 1; index <= 48; index += 1) {
@@ -1231,12 +1259,16 @@ export async function installAgentHost(page: Page) {
       return {
         conversationId: targetConversationId,
         executionId: `root:${targetConversationId}`,
-        state,
+        state: route.get('fixtureUncertainDelivery') === '1' && !deliveryResolved ? 'recovering' : state,
         activeTurnId,
         activeTurnElapsedMs: activeTurn
           ? Math.max(0, Date.now() - activeTurn.startedAt)
           : null,
-        deliveryHeld: compactEligibility === 'held',
+        deliveryHeld: compactEligibility === 'held' || (route.get('fixtureUncertainDelivery') === '1' && !deliveryResolved),
+        ...(route.get('fixtureUncertainDelivery') === '1' && !deliveryResolved ? { uncertainDelivery: {
+          attemptId: 'uncertain-attempt', canAbandon: true,
+          content: [{ type: 'text', text: 'How are our actions going to work?' }],
+        } } : {}),
         lifecycle,
         history: historyState === 'failed'
           ? { state: 'failed', error: 'Fixture history read failed.' }
@@ -1482,7 +1514,9 @@ export async function installAgentHost(page: Page) {
           completedAt: turn.completedAt,
         });
       }
-      const state = turn.status === 'inProgress' ? 'running' : turn.status;
+      const state = turn.status === 'inProgress'
+        ? route.get('fixtureUncertainDelivery') === '1' && !deliveryResolved ? 'recovering' : 'running'
+        : turn.status;
       return {
         turnId: turn.id,
         pathEntryId: turn.pathEntryId ?? fixturePathEntryId(targetConversationId, turn.id),
@@ -1495,6 +1529,21 @@ export async function installAgentHost(page: Page) {
         executionId: String(work?.scopeId ?? `root:${turn.id}`),
         state,
         ...(turn.status === 'inProgress' || turn.status === 'queued' ? {} : { outcome: turn.status }),
+        ...(inTurnCompactionTranscript && turn.id === 'turn-in-turn-compaction' ? {
+          inputItems: [{
+            type: 'notice', clientMessageId: 'compaction:fixture-auto-1', afterBlockId: `${turn.id}:commentary`,
+            origin: 'compaction', text: 'Compacted 269k → 8k tokens', createdAt: turn.startedAt + 1,
+          }, {
+            type: 'notice', clientMessageId: 'compaction:fixture-auto-2', afterBlockId: `${turn.id}:action:readme`,
+            origin: 'compaction', text: 'Compacted 272k → 12k tokens', createdAt: turn.startedAt + 2,
+          }],
+        } : {}),
+        ...(route.get('fixtureContinuation') === '1' && targetOrdinal === (turnsByConversation.get(targetConversationId)?.length ?? 0) - 1 ? {
+          origin: 'federation-notification', trigger: { kind: 'federation', childExecutionId: 'astra' },
+          inputItems: [{ type: 'notice', clientMessageId: String(user?.clientMessageId ?? `fixture-client:${turn.id}`),
+            afterBlockId: null, origin: 'federation-notification', trigger: { kind: 'federation', childExecutionId: 'astra' },
+            text: 'Continued after Astra finished', elapsedMs: 20_000 }],
+        } : {}),
         userContent: nativeUserContent(user),
         ordering: 'native-exact',
         passes: nativePasses,
@@ -2094,6 +2143,12 @@ export async function installAgentHost(page: Page) {
           accepted: true,
           revision: `${capabilityRevision}:${runtime.revision}:${String(params.conversationId)}`,
         };
+      }
+      if (request.method === 'remux/agent/conversation/delivery/resolve') {
+        deliveryResolved = true;
+        resources.get('runtime')!.revision += 1;
+        invalidateResource('runtime');
+        return { accepted: true };
       }
       if (request.method === 'remux/agent/conversation/compact') {
         if (holdManualCompaction) {

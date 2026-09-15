@@ -1,3 +1,4 @@
+import type { TurnOrigin, TurnTrigger } from '../../../shared/provider-runtime.ts';
 import type { FrozenDeliveryAttempt } from './delivery-contract.ts';
 import { createHash } from 'node:crypto';
 import { chmod, mkdir } from 'node:fs/promises';
@@ -41,6 +42,8 @@ import {
   validateNativeAgentSchema,
 } from './schema.ts';
 
+/** How far back a federation continuation may be attributed to a completed child. */
+
 export type NativeAgentJournalOptions = {
   dataRoot?: string;
   env?: Readonly<Record<string, string | undefined>>;
@@ -62,6 +65,9 @@ export type JournalConversation = NativeConversationSummary & {
 };
 
 export type JournalTurn = {
+  origin: TurnOrigin;
+  trigger?: TurnTrigger;
+  triggers?: readonly TurnTrigger[];
   pathEntryId?: string;
   strandId?: string;
   ordinal?: number;
@@ -122,6 +128,7 @@ export type JournalCompactionBoundary =
       turnId: string;
       nativeTurnId: string;
       nativeItemId?: string;
+      afterBlockId?: string | null;
     }
   | {
       kind: 'between-turns';
@@ -1542,6 +1549,9 @@ export class NativeAgentJournal {
   }
 
   createTurn(input: {
+    origin?: TurnOrigin;
+    trigger?: TurnTrigger;
+    triggers?: readonly TurnTrigger[];
     turnId: string;
     conversationId: string;
     executionId: string;
@@ -1564,8 +1574,8 @@ export class NativeAgentJournal {
       this.database.prepare(`
       INSERT INTO turns(
         turn_id, conversation_id, origin_strand_id, execution_id, client_message_id, command_id,
-        user_content_json, model, effort, service_tier, ordering, state, created_at, started_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'native-exact', ?, ?, ?, ?)
+        user_content_json, model, effort, service_tier, ordering, state, created_at, started_at, updated_at, origin, trigger_json, triggers_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'native-exact', ?, ?, ?, ?, ?, ?, ?)
       `).run(
         input.turnId,
         input.conversationId,
@@ -1581,6 +1591,9 @@ export class NativeAgentJournal {
         input.now,
         input.state === 'running' ? input.now : null,
         input.now,
+        input.origin ?? 'user',
+        (input.trigger ?? input.triggers?.[0]) ? JSON.stringify(input.trigger ?? input.triggers?.[0]) : null,
+        input.triggers ? JSON.stringify(input.triggers) : input.trigger ? JSON.stringify([input.trigger]) : null,
       );
       if (execution.ownership === 'root') {
         const ordinalRow = this.database.prepare(`
@@ -1628,6 +1641,9 @@ export class NativeAgentJournal {
   }
 
   enqueueTurn(input: {
+    origin?: TurnOrigin;
+    trigger?: TurnTrigger;
+    triggers?: readonly TurnTrigger[];
     deliveryIntent?: 'auto' | 'queue';
     commandId: string;
     conversationId: string;
@@ -1644,8 +1660,8 @@ export class NativeAgentJournal {
     this.database.prepare(`
       INSERT INTO queued_messages(
         command_id, conversation_id, turn_id, client_message_id, content_json,
-        model, effort, service_tier, access, state, ordinal, created_at, delivery_intent
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+        model, effort, service_tier, access, state, ordinal, created_at, delivery_intent, origin, trigger_json, triggers_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
     `).run(
       input.commandId,
       input.conversationId,
@@ -1659,6 +1675,9 @@ export class NativeAgentJournal {
       ordinal,
       input.now,
       input.deliveryIntent ?? 'queue',
+      input.origin ?? 'user',
+      (input.trigger ?? input.triggers?.[0]) ? JSON.stringify(input.trigger ?? input.triggers?.[0]) : null,
+      input.triggers ? JSON.stringify(input.triggers) : input.trigger ? JSON.stringify([input.trigger]) : null,
     );
   }
 
@@ -1690,10 +1709,12 @@ export class NativeAgentJournal {
       .get(attempt.clientMessageId) as { command_id: string } | undefined;
     if (existing && existing.command_id !== attempt.commandId) throw new Error('User message identity was reused.');
     this.database.prepare(`INSERT OR IGNORE INTO turn_inputs(
-      client_message_id,turn_id,command_id,content_json,after_block_id,created_at
-    ) VALUES(?,?,?,?,?,?)`).run(attempt.clientMessageId, attempt.intendedTurnId, attempt.commandId,
+      client_message_id,turn_id,command_id,content_json,after_block_id,created_at,origin,trigger_json,triggers_json
+    ) VALUES(?,?,?,?,?,?,?,?,?)`).run(attempt.clientMessageId, attempt.intendedTurnId, attempt.commandId,
       JSON.stringify(payload.content), payload.afterBlockId ?? null, Number((this.database.prepare(
-        'SELECT created_at FROM delivery_attempts WHERE attempt_id=?').get(attempt.attemptId) as { created_at: number }).created_at));
+        'SELECT created_at FROM delivery_attempts WHERE attempt_id=?').get(attempt.attemptId) as { created_at: number }).created_at),
+      payload.origin ?? 'user', (payload.trigger ?? payload.triggers?.[0]) ? JSON.stringify(payload.trigger ?? payload.triggers?.[0]) : null,
+      payload.triggers ? JSON.stringify(payload.triggers) : payload.trigger ? JSON.stringify([payload.trigger]) : null);
     this.database.prepare('DELETE FROM queued_messages WHERE command_id=?').run(attempt.commandId);
   }
 
@@ -1701,6 +1722,10 @@ export class NativeAgentJournal {
     return (this.database.prepare(`SELECT * FROM turn_inputs WHERE turn_id=?
       ORDER BY created_at, rowid`).all(turnId) as Record<string, unknown>[]).map((row) => ({
         clientMessageId: String(row.client_message_id),
+        createdAt: Number(row.created_at),
+        origin: (row.origin ?? 'user') as TurnOrigin,
+        ...(row.trigger_json == null ? {} : { trigger: JSON.parse(String(row.trigger_json)) as TurnTrigger }),
+        ...(row.triggers_json == null ? {} : { triggers: JSON.parse(String(row.triggers_json)) as TurnTrigger[] }),
         content: JSON.parse(String(row.content_json)) as UserContentPart[],
         afterBlockId: row.after_block_id === null ? null : String(row.after_block_id),
       }));
@@ -1722,6 +1747,9 @@ export class NativeAgentJournal {
         clientMessageId: String(row.client_message_id),
         commandId: queued.commandId,
         content: queued.content,
+        origin: queued.origin,
+        trigger: queued.trigger,
+        triggers: queued.triggers,
         model: queued.model,
         ...(queued.effort ? { effort: queued.effort } : {}),
         ...(queued.serviceTier ? { serviceTier: queued.serviceTier } : {}),
@@ -1922,11 +1950,11 @@ export class NativeAgentJournal {
   queuedEntries(conversationId: string): NativeQueueEntry[] {
     const entries = this.database.prepare(`
       SELECT 'message' AS queue_kind, ordinal, command_id, turn_id, client_message_id,
-        content_json, model, effort, access, state, created_at, NULL AS operation_id, service_tier, delivery_intent
+        content_json, model, effort, access, state, created_at, NULL AS operation_id, service_tier, delivery_intent, origin, trigger_json, triggers_json
       FROM queued_messages WHERE conversation_id = ?
       UNION ALL
       SELECT 'compact' AS queue_kind, ordinal, command_id, NULL, NULL, NULL, NULL, NULL,
-        NULL, NULL, created_at, operation_id, NULL, NULL
+        NULL, NULL, created_at, operation_id, NULL, NULL, NULL, NULL, NULL
       FROM queued_compactions WHERE conversation_id = ?
       ORDER BY ordinal
     `).all(conversationId, conversationId) as Record<string, unknown>[];
@@ -2106,6 +2134,9 @@ export class NativeAgentJournal {
       conversationId: string;
       executionId: string;
       content: readonly UserContentPart[];
+      origin?: TurnOrigin;
+      trigger?: TurnTrigger;
+      triggers?: readonly TurnTrigger[];
       observedAt: number;
     }>();
     for (const event of parsedEvents) {
@@ -2117,6 +2148,13 @@ export class NativeAgentJournal {
         content: event.event.type === 'user.message'
           ? event.event.content
           : current?.content ?? [],
+        origin: event.event.type === 'turn.started' && event.event.origin === 'native'
+          ? event.event.trigger?.kind === 'federation' ? 'federation-notification' : 'native-followup'
+          : current?.origin,
+        trigger: event.event.type === 'turn.started' && event.event.origin === 'native'
+          ? event.event.trigger ?? { kind: 'native-child' } : current?.trigger,
+        triggers: event.event.type === 'turn.started' && event.event.origin === 'native'
+          ? event.event.triggers : current?.triggers,
         observedAt: Math.min(current?.observedAt ?? event.observedAt, event.observedAt),
       });
     }
@@ -2146,6 +2184,9 @@ export class NativeAgentJournal {
           clientMessageId: `native-import-message:${turnId}`,
           commandId: `native-import-command:${turnId}`,
           content: turn.content,
+          origin: turn.origin,
+          trigger: turn.trigger,
+          triggers: turn.triggers,
           model: execution?.model ?? conversation?.model ?? 'unknown',
           ...((execution?.effort ?? conversation?.effort)
             ? { effort: execution?.effort ?? conversation!.effort }
@@ -4140,7 +4181,10 @@ export class NativeAgentJournal {
       throw new Error('Native autonomous turn conflicts with the current root execution or delivery.');
     }
     const content: readonly UserContentPart[] = envelope.event.type === 'user.message' ? envelope.event.content
-      : autonomous ? [{ type: 'text', text: 'Background follow-up' }] : [];
+      : [];
+    const trigger = envelope.event.type === 'turn.started'
+      ? envelope.event.trigger ?? { kind: 'native-child' as const }
+      : undefined;
     this.createTurn({
       turnId: envelope.scope.turnId,
       conversationId: execution.conversationId,
@@ -4148,6 +4192,10 @@ export class NativeAgentJournal {
       clientMessageId: `${autonomous ? 'native-followup' : 'native-child'}-message:${envelope.scope.turnId}`,
       commandId: `${autonomous ? 'native-followup' : 'native-child'}-command:${envelope.scope.turnId}`,
       content,
+      ...(autonomous ? { origin: trigger?.kind === 'federation'
+        ? 'federation-notification' as const : 'native-followup' as const,
+        trigger, ...(envelope.event.type === 'turn.started' && envelope.event.triggers
+          ? { triggers: envelope.event.triggers } : {}) } : {}),
       model: execution.model ?? conversation.model,
       ...(execution.effort ? { effort: execution.effort } : {}),
       state: 'running',
@@ -4272,6 +4320,7 @@ export class NativeAgentJournal {
           kind: 'within-turn',
           turnId: binding.turn_id,
           nativeTurnId,
+          afterBlockId: this.activeInputAnchor(binding.turn_id),
           ...(envelope.native.itemId ? { nativeItemId: envelope.native.itemId } : {}),
         }
       : { kind: 'native-unresolved', nativeTurnId };
@@ -4307,6 +4356,7 @@ export class NativeAgentJournal {
         kind: 'within-turn',
         turnId,
         nativeTurnId,
+        afterBlockId: this.activeInputAnchor(turnId),
         ...(row.native_identity ? { nativeItemId: row.native_identity } : {}),
       }), row.control_event_id);
     }
@@ -4544,6 +4594,9 @@ function nativeTurnBindingRow(row: Record<string, unknown>): JournalNativeTurnBi
 
 function turnRow(row: Record<string, unknown>): JournalTurn {
   return {
+    origin: (row.origin ?? 'user') as TurnOrigin,
+    ...(row.trigger_json == null ? {} : { trigger: JSON.parse(String(row.trigger_json)) as TurnTrigger }),
+    ...(row.triggers_json == null ? {} : { triggers: JSON.parse(String(row.triggers_json)) as TurnTrigger[] }),
     ...(row.path_entry_id === undefined || row.path_entry_id === null
       ? {}
       : { pathEntryId: String(row.path_entry_id) }),
@@ -4619,6 +4672,9 @@ function executionRow(row: Record<string, unknown>): JournalExecution {
 
 function queueRow(row: Record<string, unknown>): NativeQueuedMessage {
   return {
+    origin: (row.origin ?? 'user') as TurnOrigin,
+    ...(row.trigger_json == null ? {} : { trigger: JSON.parse(String(row.trigger_json)) as TurnTrigger }),
+    ...(row.triggers_json == null ? {} : { triggers: JSON.parse(String(row.triggers_json)) as TurnTrigger[] }),
     kind: 'message',
     deliveryIntent: row.delivery_intent === 'auto' ? 'auto' : 'queue',
     commandId: String(row.command_id),

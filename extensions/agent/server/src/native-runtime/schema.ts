@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 
-export const NATIVE_AGENT_SCHEMA_VERSION = 18;
+export const NATIVE_AGENT_SCHEMA_VERSION = 21;
 export const NATIVE_AGENT_APPLICATION_ID = 0x524d584e; // RMXN
 export const NATIVE_AGENT_SCHEMA_ID = 'remux-agent-native-v1';
 
@@ -99,6 +99,8 @@ CREATE TABLE conversations (
 
 
 CREATE TABLE executions (
+  federation_waited INTEGER NOT NULL DEFAULT 0 CHECK (federation_waited IN (0, 1)),
+  federation_notified_turn_id TEXT,
   execution_id TEXT PRIMARY KEY NOT NULL,
   conversation_id TEXT NOT NULL,
   strand_id TEXT,
@@ -189,6 +191,9 @@ CREATE TABLE native_child_handles (
 ) STRICT;
 
 CREATE TABLE turns (
+  origin TEXT DEFAULT 'user' CHECK (origin IS NULL OR origin IN ('user', 'native-followup', 'federation-notification')),
+  trigger_json TEXT CHECK (trigger_json IS NULL OR json_valid(trigger_json)),
+  triggers_json TEXT CHECK (triggers_json IS NULL OR json_valid(triggers_json)),
   turn_id TEXT PRIMARY KEY NOT NULL,
   conversation_id TEXT NOT NULL,
   origin_strand_id TEXT,
@@ -506,6 +511,9 @@ CREATE TABLE command_receipts (
 ) STRICT;
 
 CREATE TABLE turn_inputs (
+  origin TEXT DEFAULT 'user' CHECK (origin IS NULL OR origin IN ('user', 'native-followup', 'federation-notification')),
+  trigger_json TEXT CHECK (trigger_json IS NULL OR json_valid(trigger_json)),
+  triggers_json TEXT CHECK (triggers_json IS NULL OR json_valid(triggers_json)),
   client_message_id TEXT PRIMARY KEY NOT NULL,
   turn_id TEXT NOT NULL,
   command_id TEXT NOT NULL UNIQUE,
@@ -517,6 +525,9 @@ CREATE TABLE turn_inputs (
 ) STRICT;
 
 CREATE TABLE queued_messages (
+  origin TEXT DEFAULT 'user' CHECK (origin IS NULL OR origin IN ('user', 'native-followup', 'federation-notification')),
+  trigger_json TEXT CHECK (trigger_json IS NULL OR json_valid(trigger_json)),
+  triggers_json TEXT CHECK (triggers_json IS NULL OR json_valid(triggers_json)),
   command_id TEXT PRIMARY KEY NOT NULL,
   conversation_id TEXT NOT NULL,
   delivery_intent TEXT NOT NULL DEFAULT 'queue' CHECK (delivery_intent IN ('auto', 'queue')),
@@ -615,7 +626,7 @@ CREATE TABLE delivery_attempts (
   native_turn_id TEXT,
   native_operation_id TEXT,
   owner_instance_id TEXT NOT NULL,
-  state TEXT NOT NULL CHECK (state IN ('preparing', 'dispatching', 'accepted', 'rejected', 'unknown')),
+  state TEXT NOT NULL CHECK (state IN ('preparing', 'dispatching', 'accepted', 'rejected', 'unknown', 'abandoned')),
   crossed_at INTEGER, accepted_at INTEGER, rejected_at INTEGER, unknown_at INTEGER,
   acceptance_evidence_json TEXT CHECK (acceptance_evidence_json IS NULL OR (json_valid(acceptance_evidence_json) AND length(CAST(acceptance_evidence_json AS BLOB)) <= 65536)),
   rejection_json TEXT CHECK (rejection_json IS NULL OR (json_valid(rejection_json) AND length(CAST(rejection_json AS BLOB)) <= 65536)),
@@ -624,10 +635,10 @@ CREATE TABLE delivery_attempts (
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
   CHECK ((kind = 'root-turn' AND intended_turn_id IS NOT NULL AND client_message_id IS NOT NULL AND native_client_message_id IS NOT NULL AND compact_operation_id IS NULL) OR (kind = 'steer' AND intended_turn_id IS NOT NULL AND client_message_id IS NOT NULL AND native_client_message_id IS NOT NULL AND compact_operation_id IS NULL) OR (kind = 'manual-compact' AND intended_turn_id IS NULL AND client_message_id IS NULL AND compact_operation_id IS NOT NULL)),
-  CHECK ((state = 'preparing' AND crossed_at IS NULL) OR (state = 'rejected' AND (crossed_at IS NULL OR (provider = 'codex' AND kind = 'root-turn' AND COALESCE(json_extract(rejection_json, '$.evidence.kind') = 'codex-active-compact-rejection', 0)))) OR (state IN ('dispatching', 'accepted', 'unknown') AND crossed_at IS NOT NULL)),
+  CHECK ((state = 'preparing' AND crossed_at IS NULL) OR (state = 'rejected' AND (crossed_at IS NULL OR (provider = 'codex' AND kind = 'root-turn' AND COALESCE(json_extract(rejection_json, '$.evidence.kind') = 'codex-active-compact-rejection', 0)))) OR (state IN ('dispatching', 'accepted', 'unknown', 'abandoned') AND crossed_at IS NOT NULL)),
   CHECK ((state = 'accepted') = (accepted_at IS NOT NULL)),
   CHECK ((state = 'rejected') = (rejected_at IS NOT NULL)),
-  CHECK ((state = 'unknown') = (unknown_at IS NOT NULL)),
+  CHECK ((state IN ('unknown', 'abandoned')) = (unknown_at IS NOT NULL)),
   CHECK (state != 'accepted' OR acceptance_evidence_json IS NOT NULL),
   CHECK (acceptance_evidence_json IS NULL OR state IN ('dispatching', 'unknown', 'accepted')),
   CHECK ((state = 'rejected') = (rejection_json IS NOT NULL)),
@@ -697,14 +708,15 @@ export function migrateNativeAgentSchema(
   fromVersion: number,
   repairContext?: { backupPath?: string; migratedAt?: number },
 ) {
-  if (fromVersion < 1 || fromVersion > 17) {
+  if (fromVersion < 1 || fromVersion > 20) {
     throw new NativeAgentSchemaError(`No Native Agent migration exists from schema ${fromVersion}.`);
   }
   for (const name of ['delivery_attempts', 'delivery_attempts_lane',
     'delivery_attempts_execution', 'delivery_attempt_staging']) {
     if (database.prepare('SELECT 1 FROM sqlite_schema WHERE name = ?').get(name) &&
         !schemaObjectMatchesDefinition(database, name) &&
-        !(name === 'delivery_attempts' && schemaObjectMatchesDefinition(database, name, true))) {
+        !(name === 'delivery_attempts' && (schemaObjectMatchesDefinition(database, name, true) ||
+          schemaObjectMatchesDefinition(database, name, false, true)))) {
       throw new NativeAgentSchemaError(`Version 15 found conflicting preexisting object ${name}.`);
     }
   }
@@ -826,10 +838,76 @@ export function migrateNativeAgentSchema(
   if (fromVersion <= 13) migrateVersionFourteen(database);
   if (fromVersion <= 14) migrateVersionFifteen(database);
   if (fromVersion <= 15) migrateVersionSixteen(database);
-  if (fromVersion <= 16) migrateVersionSeventeen(database);
+  if (fromVersion <= 18) migrateVersionSeventeen(database);
   if (!schemaColumnExists(database, 'queued_messages', 'delivery_intent')) database.exec("ALTER TABLE queued_messages ADD COLUMN delivery_intent TEXT NOT NULL DEFAULT 'queue' CHECK (delivery_intent IN ('auto', 'queue'));");
-  createObjectsFromSchema(database, ['turn_inputs'], 'Version 18');
+  // Older migrations may create this table directly from the current definition.
+  if (!schemaObjectExists(database, 'table', 'turn_inputs')) createObjectsFromSchema(database, ['turn_inputs'], 'Version 18');
+  for (const table of ['turns', 'queued_messages', 'turn_inputs']) {
+    if (!schemaColumnExists(database, table, 'origin')) database.exec(`ALTER TABLE ${table} ADD COLUMN origin TEXT DEFAULT 'user' CHECK (origin IS NULL OR origin IN ('user', 'native-followup', 'federation-notification'));`);
+    if (!schemaColumnExists(database, table, 'trigger_json')) database.exec(`ALTER TABLE ${table} ADD COLUMN trigger_json TEXT CHECK (trigger_json IS NULL OR json_valid(trigger_json));`);
+  }
+  if (!schemaColumnExists(database, 'executions', 'federation_waited')) database.exec('ALTER TABLE executions ADD COLUMN federation_waited INTEGER NOT NULL DEFAULT 0 CHECK (federation_waited IN (0, 1));');
+  if (!schemaColumnExists(database, 'executions', 'federation_notified_turn_id')) {
+    database.exec(`ALTER TABLE executions ADD COLUMN federation_notified_turn_id TEXT;
+      UPDATE executions SET federation_notified_turn_id = (
+        SELECT t.turn_id FROM turns t WHERE t.execution_id = executions.execution_id
+        ORDER BY t.created_at DESC, t.rowid DESC LIMIT 1
+      ) WHERE ownership = 'federated' AND state NOT IN ('running', 'recovering');`);
+  }
+  // These identities were generated internally, never submitted by a user.
+  database.exec(`UPDATE turns SET origin='native-followup', trigger_json='{"kind":"native-child"}', user_content_json='[]'
+    WHERE client_message_id = 'native-followup-message:' || turn_id AND COALESCE(origin, 'user')='user';`);
+  if (fromVersion <= 20) migrateVersionTwentyOne(database);
   database.exec(`PRAGMA user_version = ${NATIVE_AGENT_SCHEMA_VERSION}`);
+}
+
+function migrateVersionTwentyOne(database: DatabaseSync) {
+  for (const table of ['turns', 'queued_messages', 'turn_inputs']) {
+    if (!schemaColumnExists(database, table, 'triggers_json')) {
+      database.exec(`ALTER TABLE ${table} ADD COLUMN triggers_json TEXT CHECK (triggers_json IS NULL OR json_valid(triggers_json));`);
+    }
+    database.exec(`UPDATE ${table} SET triggers_json = json_array(json(trigger_json))
+      WHERE triggers_json IS NULL AND trigger_json IS NOT NULL;`);
+  }
+
+  // Only legacy Claude observations without native placement evidence need
+  // timestamp repair. New controls capture stream order at journal ingest.
+  const candidates = database.prepare(`
+    SELECT c.control_event_id, c.created_at, e.execution_id
+    FROM conversation_control_events c
+    JOIN events e ON e.event_id = c.control_event_id
+    WHERE c.kind = 'compaction'
+      AND json_extract(c.boundary_json, '$.kind') = 'between-turns'
+      AND json_type(c.boundary_json, '$.nativeTurnId') IS NULL
+      AND (SELECT count(*) FROM json_each(c.boundary_json)) = 1
+      AND json_extract(e.envelope_json, '$.provider') = 'claude-code'
+  `).all() as Array<{ control_event_id: string; created_at: number; execution_id: string }>;
+  const matchingTurns = database.prepare(`
+    SELECT turn_id, native_turn_id FROM turns
+    WHERE execution_id = ? AND started_at <= ?
+      AND (completed_at IS NULL OR ? < completed_at)
+    LIMIT 2
+  `);
+  const lastBlock = database.prepare(`
+    SELECT b.block_id FROM turn_blocks b
+    JOIN turn_passes p ON p.pass_id = b.pass_id
+    WHERE b.turn_id = ? AND b.started_at <= ?
+    ORDER BY p.ordinal DESC, b.ordinal DESC LIMIT 1
+  `);
+  const update = database.prepare(`
+    UPDATE conversation_control_events SET boundary_json = ? WHERE control_event_id = ?
+  `);
+  for (const candidate of candidates) {
+    const matches = matchingTurns.all(candidate.execution_id, candidate.created_at, candidate.created_at) as
+      Array<{ turn_id: string; native_turn_id: string | null }>;
+    if (matches.length !== 1) continue;
+    const turn = matches[0]!;
+    const anchor = lastBlock.get(turn.turn_id, candidate.created_at) as { block_id: string } | undefined;
+    update.run(JSON.stringify({
+      kind: 'within-turn', turnId: turn.turn_id, nativeTurnId: turn.native_turn_id,
+      afterBlockId: anchor?.block_id ?? null,
+    }), candidate.control_event_id);
+  }
 }
 
 function migrateVersionSeventeen(database: DatabaseSync) {
@@ -865,11 +943,14 @@ function migrateVersionSixteen(database: DatabaseSync) {
   }
 }
 
-function schemaObjectMatchesDefinition(database: DatabaseSync, name: string, legacyDelivery = false) {
+function schemaObjectMatchesDefinition(database: DatabaseSync, name: string, legacyDelivery = false, previousDelivery = false) {
   const actual = database.prepare('SELECT sql FROM sqlite_schema WHERE name = ?').get(name) as
     { sql: string | null } | undefined;
   let expected = SCHEMA_SQL.split(';').map((statement) => statement.trim()).find((statement) =>
     new RegExp(`^CREATE\\s+(?:TABLE|(?:UNIQUE\\s+)?INDEX)\\s+${name}\\b`, 'iu').test(statement));
+  if ((legacyDelivery || previousDelivery) && expected) expected = expected
+    .replaceAll(", 'abandoned'", '')
+    .replace("(state IN ('unknown')) =", "(state = 'unknown') =");
   if (legacyDelivery && expected) expected = expected.replace(
     "CHECK ((state = 'preparing' AND crossed_at IS NULL) OR (state = 'rejected' AND (crossed_at IS NULL OR (provider = 'codex' AND kind = 'root-turn' AND COALESCE(json_extract(rejection_json, '$.evidence.kind') = 'codex-active-compact-rejection', 0)))) OR (state IN ('dispatching', 'accepted', 'unknown') AND crossed_at IS NOT NULL))",
     "CHECK ((state IN ('preparing', 'rejected') AND crossed_at IS NULL) OR (state IN ('dispatching', 'accepted', 'unknown') AND crossed_at IS NOT NULL))",

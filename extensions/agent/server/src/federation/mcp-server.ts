@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   createServer,
   type IncomingMessage,
@@ -271,7 +271,12 @@ export class RemuxFederationServer {
     // TypeScript's instantiation depth. Keep that instability at this one seam
     // and parse again in every handler so the coordinator only sees strict,
     // bounded inputs.
-    const registerTool = server.registerTool.bind(server) as unknown as LooseRegisterTool;
+    const nativeRegisterTool = server.registerTool.bind(server) as unknown as LooseRegisterTool;
+    const registerTool: LooseRegisterTool = (name, config, handler) => nativeRegisterTool(name, config, async (input, extra) => {
+      if (!['remux_spawn_agent', 'remux_send_message', 'remux_wait_agent'].includes(name)) return handler(input, extra);
+      this.activeContext(scope);
+      return handler(input, extra);
+    });
     registerTool('remux_list_agents', {
       description: descriptions.list,
       inputSchema: listSchema,
@@ -603,8 +608,18 @@ function progressMessage(
   return `${subject} is still running · ${elapsedSeconds}s elapsed.`;
 }
 
-function federationToolDescriptions(scope: FederationCredentialScope) {
+export function federationToolDescriptions(scope: FederationCredentialScope) {
   const catalog = formatTargetCatalog(scope);
+  const claude = scope.provider === 'claude-code';
+  const background = claude ? [
+    'If the wait exceeds about 10 seconds, Claude Code moves this call to the background and notifies you with the result when the child finishes. End your turn or keep working; do not poll with `remux_wait_agent` in a loop.',
+  ] : [];
+  const scheduling = claude ? [
+    'Use foreground scheduling; workspace-write requires foreground scheduling. Foreground returns within about 10 seconds, either with the child\'s final answer or after Claude Code moves the call to the background, so there is no reason to choose background yourself.',
+  ] : [
+    'foreground waits until the child is idle and returns its final answer; background returns an execution handle for remux_wait_agent.',
+    'workspace-write requires foreground scheduling.',
+  ];
   return {
     list: [
       'List bounded handles for federated children owned by this execution lineage.',
@@ -615,18 +630,21 @@ function federationToolDescriptions(scope: FederationCredentialScope) {
       'Start a new native agent session on a different provider for an explicit, self-contained task.',
       'Use the provider\'s native subagents instead when the work should stay on the same provider.',
       'Write a complete, testable brief because hidden reasoning and the parent transcript are not copied.',
-      'foreground waits until the child is idle and returns its final answer; background returns an execution handle for remux_wait_agent.',
-      'workspace-write requires foreground scheduling. Reuse the returned executionId with remux_send_message for focused corrections.',
+      ...scheduling,
+      'Reuse the returned executionId with remux_send_message for focused corrections.',
+      ...background,
       catalog,
     ].join(' '),
     send: [
       'Send ordinary follow-up text to an idle federated child and wait for its new turn to finish.',
       'The same native provider session continues with its full context, so prefer this over spawning another child for a focused correction.',
       'The result contains the new turn\'s final answer and observed changed files.',
+      ...background,
     ].join(' '),
     wait: [
       'Wait for one or more owned background federated children without creating another session or turn.',
       'Each terminal result contains that child\'s final answer and observed changed files.',
+      ...background,
     ].join(' '),
     interrupt: [
       'Request interruption of a running owned federated child.',

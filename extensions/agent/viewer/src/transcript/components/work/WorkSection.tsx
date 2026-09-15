@@ -83,7 +83,7 @@ export function WorkSection({
         type="button"
       >
         <span className="codex-work-header-title">
-          {completed && segment.durationMs !== null
+          {segment.state === 'recovering' ? 'Waiting for recovery' : completed && segment.durationMs !== null
             ? <>Worked for <span className="tabular-nums">{formatWorkDuration(segment.durationMs)}</span></>
             : <WorkingDuration completed={completed} turnId={turnId} />}
         </span>

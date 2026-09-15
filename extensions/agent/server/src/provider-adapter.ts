@@ -64,6 +64,8 @@ export interface ProviderAdapter {
    * return null when their native harness does not expose plan usage.
    */
   readAccountUsage?(providerInstanceId: string): Promise<ProviderAccountUsage | null>;
+  /** Refuse recovery while an independent process may still consume this session. */
+  assertSessionStopped?(nativeSessionId: string): Promise<void>;
   readRuntimeStatus?(providerInstanceId: string): Promise<ProviderRuntimeStatus>;
   readTurnPresence?(input: { providerInstanceId: string; cwd: string;
     nativeSessionId: string; nativeClientMessageId: string }): Promise<ProviderPresenceRead>;
@@ -90,7 +92,12 @@ export interface ProviderSession {
   connectFederation?(): Promise<void>;
   /** Synchronous process activity guard, including work between root turns. */
   hasBackgroundWork?(): boolean;
+  /** Root MCP federation calls still blocking the active Claude turn. */
+  blockedOnForegroundFederation?(): boolean;
 
+  /** Persist correlated receipt evidence before resolving a possibly timed-out dispatch. */
+  setDeliveryEvidenceHandler?(handler: (nativeClientMessageId: string,
+    evidence: import('./native-runtime/delivery-contract.ts').ProviderAcceptanceEvidence) => void): void;
   startTurn(input: StartProviderTurnInput, boundary?: DispatchBoundary): Promise<ProviderDispatchResult>;
   readTurnPresence?(nativeClientMessageId: string): Promise<ProviderPresenceRead>;
   steer?(input: SteerProviderTurnInput, context: SteerDispatchContext): Promise<ProviderDispatchResult>;

@@ -469,6 +469,22 @@ export class DeliveryAttemptOwner {
     });
   }
 
+  abandon(attemptId: string, resolutionCommandId: string) {
+    return this.journal.transaction(() => {
+      const attempt = this.require(attemptId);
+      if (attempt.state !== 'unknown' || attempt.acceptanceEvidence || attempt.transcriptGap ||
+          this.staged(attemptId).length || attempt.kind === 'manual-compact') {
+        throw new Error('Only an unconfirmed message without acceptance or staged observations can be abandoned.');
+      }
+      const now = this.transitionTime(attemptId);
+      this.journal.database.prepare(`UPDATE delivery_attempts SET state='abandoned',
+        recovery_json=?,updated_at=? WHERE attempt_id=? AND state='unknown'`).run(
+          this.recoveryDetail(attemptId, { resolution: { kind: 'user-abandoned',
+            commandId: resolutionCommandId, resolvedAt: now, deliveryOutcome: 'unknown' } }), now, attemptId);
+      return attempt;
+    });
+  }
+
   private unknown(id: string, error: unknown) {
     const now = this.transitionTime(id);
     this.journal.database.prepare(`UPDATE delivery_attempts SET state='unknown',
@@ -586,7 +602,7 @@ export class DeliveryAttemptOwner {
     const payload = parseRecordJson(payloadJson, 'delivery recovery payload');
     if (input.kind === 'steer') {
       const allowed = new Set(['turnId', 'clientMessageId', 'nativeClientMessageId', 'content',
-        'model', 'effort', 'serviceTier', 'access', 'expectedNativeTurnId', 'afterBlockId']);
+        'model', 'effort', 'serviceTier', 'access', 'expectedNativeTurnId', 'afterBlockId', 'origin', 'trigger']);
       const receipt = this.journal.database.prepare(
         'SELECT kind,state FROM command_receipts WHERE command_id=?',
       ).get(input.commandId) as Record<string, unknown> | undefined;
@@ -594,13 +610,15 @@ export class DeliveryAttemptOwner {
         native_turn_id,state FROM turns WHERE turn_id=?`).get(input.intendedTurnId!) as
         Record<string, unknown> | undefined;
       const queued = receipt?.state === 'accepted' ? this.journal.database.prepare(`SELECT
-        client_message_id,content_json,model,effort,service_tier,access FROM queued_messages
+        client_message_id,content_json,model,effort,service_tier,access,origin,trigger_json FROM queued_messages
         WHERE command_id=? AND conversation_id=? AND delivery_intent='auto' AND state='dispatching'`
       ).get(input.commandId, input.conversationId) as Record<string, unknown> | undefined : undefined;
       const matchesQueuedInput = queued && queued.client_message_id === input.clientMessageId &&
         canonicalJson(JSON.parse(requiredString(queued.content_json, 'queued content', 64 * 1024 * 1024))) === canonicalJson(payload.content) &&
         queued.model === payload.model && (queued.effort ?? undefined) === payload.effort &&
-        (queued.service_tier ?? undefined) === payload.serviceTier && queued.access === payload.access;
+        (queued.service_tier ?? undefined) === payload.serviceTier && queued.access === payload.access &&
+        (queued.origin ?? 'user') === (payload.origin ?? 'user') &&
+        canonicalJson(queued.trigger_json ? JSON.parse(String(queued.trigger_json)) : null) === canonicalJson(payload.trigger ?? null);
       if (!exactKeys(payload, allowed) || payload.turnId !== input.intendedTurnId ||
           payload.clientMessageId !== input.clientMessageId ||
           payload.nativeClientMessageId !== input.nativeClientMessageId ||
@@ -637,7 +655,7 @@ export class DeliveryAttemptOwner {
       return;
     }
     const allowed = new Set(['turnId', 'clientMessageId', 'nativeClientMessageId', 'content',
-      'model', 'effort', 'serviceTier', 'access']);
+      'model', 'effort', 'serviceTier', 'access', 'origin', 'trigger']);
     if (!exactKeys(payload, allowed) ||
         payload.turnId !== input.intendedTurnId ||
         payload.clientMessageId !== input.clientMessageId ||
@@ -648,13 +666,15 @@ export class DeliveryAttemptOwner {
       'SELECT kind,state FROM command_receipts WHERE command_id=?',
     ).get(input.commandId) as Record<string, unknown> | undefined;
     const queued = this.journal.database.prepare(`SELECT turn_id,client_message_id,content_json,
-      model,effort,service_tier,access FROM queued_messages WHERE command_id=? AND conversation_id=?`
+      model,effort,service_tier,access,origin,trigger_json FROM queued_messages WHERE command_id=? AND conversation_id=?`
     ).get(input.commandId, input.conversationId) as Record<string, unknown> | undefined;
     if (receipt?.kind !== 'turn.send' || receipt.state !== 'accepted' || !queued ||
         queued.turn_id !== input.intendedTurnId || queued.client_message_id !== input.clientMessageId ||
         canonicalJson(JSON.parse(requiredString(queued.content_json, 'queued content', 64 * 1024 * 1024))) !== canonicalJson(payload.content) ||
         queued.model !== payload.model || (queued.effort ?? undefined) !== payload.effort ||
-        (queued.service_tier ?? undefined) !== payload.serviceTier || queued.access !== payload.access) {
+        (queued.service_tier ?? undefined) !== payload.serviceTier || queued.access !== payload.access ||
+        (queued.origin ?? 'user') !== (payload.origin ?? 'user') ||
+        canonicalJson(queued.trigger_json ? JSON.parse(String(queued.trigger_json)) : null) !== canonicalJson(payload.trigger ?? null)) {
       throw new Error('Delivery root attempt does not match its accepted queued intent.');
     }
   }
@@ -908,7 +928,7 @@ function canonicalJson(value: unknown): string {
 function decodeAttempt(row: Record<string, unknown>): FrozenDeliveryAttempt {
   const kind = enumString(row.kind, 'kind', ['root-turn', 'steer', 'manual-compact'] as const);
   const provider = enumString(row.provider, 'provider', ['codex', 'claude-code', 'fixture'] as const);
-  const state = enumString(row.state, 'state', ['preparing', 'dispatching', 'accepted', 'rejected', 'unknown'] as const);
+  const state = enumString(row.state, 'state', ['preparing', 'dispatching', 'accepted', 'rejected', 'unknown', 'abandoned'] as const);
   const acceptanceEvidence = row.acceptance_evidence_json === null
     ? undefined
     : parseRecordJson(requiredString(row.acceptance_evidence_json, 'acceptance_evidence_json', 65_536),
@@ -971,8 +991,12 @@ function validateDecodedRootPayload(attempt: FrozenDeliveryAttempt) {
     return;
   }
   const allowed = new Set(['turnId', 'clientMessageId', 'nativeClientMessageId', 'content',
-    'model', 'effort', 'serviceTier', 'access', ...(attempt.kind === 'steer' ? ['expectedNativeTurnId', 'afterBlockId'] : [])]);
+    'model', 'effort', 'serviceTier', 'access', 'origin', 'trigger',
+    ...(attempt.kind === 'steer' ? ['expectedNativeTurnId', 'afterBlockId'] : [])]);
   if (!exactKeys(payload, allowed) || payload.turnId !== attempt.intendedTurnId ||
+      (payload.origin !== undefined &&
+        !['user', 'native-followup', 'federation-notification'].includes(String(payload.origin))) ||
+      (payload.trigger !== undefined && !validTurnTrigger(payload.trigger)) ||
       payload.clientMessageId !== attempt.clientMessageId ||
       payload.nativeClientMessageId !== attempt.nativeClientMessageId ||
       !Array.isArray(payload.content) || typeof payload.model !== 'string' || payload.model.length === 0 ||
@@ -983,6 +1007,15 @@ function validateDecodedRootPayload(attempt: FrozenDeliveryAttempt) {
       !['read-only', 'workspace-write', 'full-access'].includes(String(payload.access))) {
     throw new Error('Durable root recovery payload does not match its frozen attempt shape.');
   }
+}
+
+function validTurnTrigger(value: unknown) {
+  if (!isRecord(value) || !exactKeys(value, new Set(['kind', 'childExecutionId', 'summary']))) return false;
+  if (value.kind !== 'federation' && value.kind !== 'native-child') return false;
+  if (value.childExecutionId !== undefined) {
+    try { identifier(value.childExecutionId, 'trigger child'); } catch { return false; }
+  }
+  return value.summary === undefined || (typeof value.summary === 'string' && Buffer.byteLength(value.summary) <= 65_536);
 }
 
 function validateActiveCompactPayload(payload: Record<string, unknown>, provider: string) {

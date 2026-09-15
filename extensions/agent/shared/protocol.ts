@@ -101,7 +101,7 @@ export type AgentRuntimeValue = {
   effort: ReasoningEffort;
   serviceTier: string | null;
   capabilities: ViewerProviderCapabilities;
-  state: 'unloaded' | 'loading' | 'idle' | 'running' | 'interrupting' | 'error';
+  state: 'unloaded' | 'loading' | 'idle' | 'running' | 'recovering' | 'interrupting' | 'error';
   activeTurnId: string | null;
   activeTurnElapsedMs: number | null;
   error: string | null;
@@ -124,7 +124,7 @@ export type AgentPendingQueueValue = {
 
 /** Viewer-level projection combining one conversation with the singleton runtime. */
 export type ConversationValue = Omit<ConversationSummary, 'status'> & {
-  status: ConversationSummary['status'] | 'loading' | 'interrupting';
+  status: ConversationSummary['status'] | 'loading' | 'recovering' | 'interrupting';
   activeTurnId: string | null;
   activeTurnElapsedMs: number | null;
   error: string | null;
@@ -157,6 +157,7 @@ export type MessageSendResult = {
   operationId: string;
   turnId: string;
   delivery: 'sent' | 'queued' | 'steered';
+  reason?: 'steer-unavailable' | 'federation-wait';
   deliveryError?: string;
   transcriptFence?: AgentTranscriptFence;
 };

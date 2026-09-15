@@ -1,7 +1,7 @@
 Status: Implemented in working tree — automated and installed Codex/Sol plus
 Claude/Fable desktop/mobile-WebView acceptance pass; physical-mobile acceptance
 pending
-Last verified: 2026-09-02
+Last verified: 2026-09-15 (Claude compaction identity, snapshot content matching)
 Canonical code: `extensions/agent/shared/provider-runtime.ts`,
 `extensions/agent/shared/native-agent-protocol.ts`,
 `extensions/agent/server/src/native-runtime/native-journal.ts`,
@@ -482,11 +482,16 @@ synthetic tool items.
 
 The Claude adapter treats the semantic assistant message ID from
 `message_start.message.id` as pass identity. Live content-block indices define
-the provisional block positions, while finalized SDK snapshots reconcile text
-and thinking by semantic-kind position because Claude may omit thinking and
-renumber the remaining visible blocks. The SDK stream wrapper's outer `uuid`
-is event-envelope identity only; it must never split or key assistant passes or
-blocks.
+the provisional block positions. Finalized SDK snapshots arrive one `assistant`
+message per content block, so a snapshot's position inside its own message says
+nothing about which streamed block it completes; the adapter matches the
+streamed block of the same kind whose accumulated text equals the snapshot
+text, and falls back to semantic-kind position only when no content matches
+(Claude may omit thinking and renumber the remaining visible blocks). An empty
+signed thinking block preceding the real one must never make the real one land
+in the empty slot (2026-09-15 duplicate reasoning incident). The SDK stream
+wrapper's outer `uuid` is event-envelope identity only; it must never split or
+key assistant passes or blocks.
 
 - `content_block_start` creates text, thinking-summary, or tool blocks in the
   order Claude emitted them;
@@ -572,6 +577,42 @@ A manual Compact queued behind an active root turn is anchored between that
 turn and the next root operation when dispatched. A provider-native automatic
 compact may have a native within-turn boundary. Neither form creates fake
 assistant or tool blocks.
+
+### Provider compaction identity (2026-09-15)
+
+Both adapters fill the same envelope fields for compaction; the journal never
+infers placement from wall-clock time.
+
+- `native.subject = { kind: 'context-compaction', key }` on every
+  `context.compaction.*` event. The journal stores the key per control-event
+  row and drops a replayed observation on `(conversation, key, state)`, so the
+  key must be stable across process restarts and SDK replays and unique per
+  observation. Codex keys by native turn and occurrence ordinal. Claude keys by
+  the SDK envelope uuid of the observation itself (`compact_boundary` uuid for
+  completed, status uuid for started/failed), for manual and automatic alike;
+  the manual operation lifecycle is linked by `operationId`, not by the key, so
+  an uncorrelated manual boundary replayed after a restart still collapses onto
+  the original row.
+- `native.turnId` on an automatic boundary observed inside a running turn.
+  Scope stays `conversation` by contract; the turn id only lets the journal
+  resolve `within-turn` through `native_turn_bindings` (or `native-unresolved`
+  until the binding exists).
+- `native.timeline.previousTurnId` when the provider observes a boundary with
+  no active turn. Codex supplies its control turn's neighbours; Claude supplies
+  the last completed native turn it saw. With the subject present this yields a
+  `strand_control_path` row and structural placement after that turn.
+- `afterBlockId` on a `within-turn` boundary is captured by the journal at
+  ingest as the turn's current last block (the same rule appended user input
+  uses), i.e. provider stream order, not timestamps. Resolution of a
+  `native-unresolved` row captures the anchor at resolution time.
+
+Projection places `within-turn` boundaries after `afterBlockId` (top of the
+work when null) and structural rows at their strand position. Rows that carry
+none of the above (legacy Claude observations) are the only ones ordered by
+`createdAt`, and schema 21 repairs those once: a bare `between-turns` Claude row
+whose creation time falls inside exactly one turn of its execution is rewritten
+to `within-turn` with the last block started before it as the anchor. No
+timestamp rule remains in the projector.
 
 ## Usage scope
 

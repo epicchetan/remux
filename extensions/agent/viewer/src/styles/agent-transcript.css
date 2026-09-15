@@ -6,7 +6,9 @@
 
 .codex-transcript-row-userMessage,
 .codex-transcript-row-assistantMessage,
-.codex-transcript-row-compaction {
+.codex-transcript-row-compaction,
+.codex-transcript-row-notice {
+  /* Keep in step with measureCollapsedSegment: notice and compaction rows share one modeled gap. */
   padding-bottom: var(--remux-block-gap);
 }
 
@@ -231,6 +233,16 @@
   align-items: center;
   gap: 6px;
   white-space: nowrap;
+}
+
+.agent-continuation-label {
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+.agent-continuation-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .agent-reasoning-block .codex-markdown,

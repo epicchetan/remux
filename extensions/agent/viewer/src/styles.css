@@ -1921,6 +1921,26 @@
     }
   }
 
+  .remux-composer-message-status-row {
+    display: flex;
+    width: 100%;
+    max-width: var(--remux-feed-max-width);
+    min-width: 0;
+    margin: 6px auto 0;
+    align-items: center;
+    padding: 0 3px;
+    color: color-mix(in srgb, var(--muted-foreground) 82%, transparent);
+    font-size: 11px;
+    letter-spacing: 0;
+    line-height: 14px;
+    user-select: none;
+    pointer-events: none;
+  }
+
+  .remux-composer-message-status-row[data-tone="error"] {
+    color: color-mix(in srgb, var(--destructive) 82%, var(--foreground) 18%);
+  }
+
   .remux-composer-message-status-text {
     min-width: 0;
     overflow: hidden;
@@ -2008,53 +2028,6 @@
   .remux-composer-preferences-menu .remux-composer-config-panel {
     left: calc(-1 * var(--remux-composer-menu-edge-offset));
   }
-
-  .remux-composer-send-menu { flex: none; }
-
-  .remux-composer-send-chevron {
-    position: absolute;
-    right: 2px;
-    bottom: 2px;
-    width: 9px;
-    height: 9px;
-  }
-
-  .remux-composer-send-panel {
-    right: 0;
-    left: auto;
-    width: min(296px, calc(100vw - 28px));
-    padding: 5px;
-  }
-
-  .remux-composer-delivery-reason {
-    margin: 0;
-    padding: 8px 10px;
-    color: var(--muted-foreground);
-    font-size: 12px;
-    line-height: 18px;
-  }
-
-  .remux-composer-delivery-option {
-    display: flex;
-    align-items: flex-start;
-    height: 80px;
-    min-height: 80px;
-    gap: 10px;
-    padding: 10px;
-    border: 0;
-    border-radius: 6px;
-    background: transparent;
-    color: var(--foreground);
-    text-align: left;
-  }
-
-  .remux-composer-delivery-option > svg { flex: none; margin-top: 2px; }
-  .remux-composer-delivery-option > span { display: grid; gap: 3px; }
-  .remux-composer-delivery-option strong { font-size: 13px; font-weight: 500; }
-  .remux-composer-delivery-option span span { color: var(--muted-foreground); font-size: 12px; line-height: 17px; }
-  .remux-composer-delivery-option[aria-disabled="true"] { opacity: .5; }
-  .remux-composer-delivery-option:hover:not([aria-disabled="true"]),
-  .remux-composer-delivery-option:focus-visible { background: var(--chrome-hover); outline: 1px solid var(--ring); }
 
   .remux-composer-attachment-panel {
     right: calc(-1 * var(--remux-composer-menu-edge-offset));

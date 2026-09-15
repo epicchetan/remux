@@ -475,3 +475,21 @@ async function collectUntil(
   }
   throw new Error('Provider stream closed before the target event.');
 }
+
+test('native turn trigger lists preserve arrival order and validate their compatibility alias', () => {
+  const triggers = [{ kind: 'federation' as const, childExecutionId: 'astra' },
+    { kind: 'federation' as const, childExecutionId: 'sol', summary: 'Done' }];
+  const envelope = eventEnvelope({ type: 'turn.started', origin: 'native', trigger: triggers[0], triggers });
+  assert.deepEqual(parseProviderEventEnvelope(envelope), envelope);
+  const derived = parseProviderEventEnvelope({ ...envelope, event: { type: 'turn.started', origin: 'native', triggers } }).event;
+  assert.ok(derived.type === 'turn.started');
+  assert.deepEqual(derived.trigger, triggers[0]);
+  assert.deepEqual(derived.triggers, triggers);
+  const legacy = eventEnvelope({ type: 'turn.started', origin: 'native', trigger: triggers[0] });
+  assert.deepEqual(parseProviderEventEnvelope(legacy), legacy);
+  for (const value of [[], Array(17).fill(triggers[0]), 'invalid', [{ kind: 'unknown' }], [{ ...triggers[0], extra: true }]]) {
+    assert.throws(() => parseProviderEventEnvelope({ ...envelope, event: { type: 'turn.started', triggers: value } }), ProviderContractError);
+  }
+  assert.throws(() => parseProviderEventEnvelope({ ...envelope,
+    event: { type: 'turn.started', trigger: triggers[1], triggers } }), /must equal triggers\[0\]/u);
+});

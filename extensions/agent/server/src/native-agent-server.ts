@@ -17,6 +17,7 @@ import {
   type NativeConversationStrandActivateCommand,
   type NativeExecutionMutationCommand,
   type NativeMessageSendCommand,
+  type NativeDeliveryResolveCommand,
   type NativeProviderAuthMutationCommand,
   type NativeProviderLoginStartCommand,
   type NativeProviderPreferenceSetCommand,
@@ -91,12 +92,14 @@ export class NativeAgentServer {
       switch (method) {
       case NATIVE_AGENT_METHODS.resourcesRead:
         this.coordinator.prepareResourceRead(params as NativeAgentResourceReadParams);
+        await this.coordinator.projector.prepareWatchedFileChanges(params as NativeAgentResourceReadParams);
         return this.coordinator.projector.read(params as NativeAgentResourceReadParams);
       case NATIVE_AGENT_METHODS.transcriptRead:
         await this.coordinator.prepareTranscriptRead(
           params as NativeAgentResourceReadParams,
           context.signal,
         );
+        await this.coordinator.projector.prepareWatchedFileChanges(params as NativeAgentResourceReadParams);
         return this.coordinator.projector.read(params as NativeAgentResourceReadParams);
       case NATIVE_AGENT_METHODS.runtimesRead:
         return this.coordinator.readRuntimeStatuses();
@@ -118,6 +121,8 @@ export class NativeAgentServer {
         return this.coordinator.readCommand(params as NativeCommandReadParams);
       case NATIVE_AGENT_METHODS.conversationCreate:
         return this.coordinator.createConversation(params as NativeConversationCreateCommand);
+      case NATIVE_AGENT_METHODS.deliveryResolve:
+        return this.coordinator.resolveDelivery(params as NativeDeliveryResolveCommand);
       case NATIVE_AGENT_METHODS.messageSend:
         return this.coordinator.sendMessage(params as NativeMessageSendCommand);
       case NATIVE_AGENT_METHODS.queuedMessageRemove:

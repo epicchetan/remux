@@ -1,7 +1,8 @@
+import { CLAUDE_MCP_AUTO_BACKGROUND_MS } from '../../federation/constants.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile as execFileCallback } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -19,6 +20,7 @@ import {
 import {
   PROVIDER_RUNTIME_CONTRACT_VERSION,
   PROVIDER_RUNTIME_LIMITS,
+  MAX_TURN_TRIGGERS,
   ProviderContractError,
   parseCompactProviderSessionInput,
   parseInterruptProviderChildInput,
@@ -53,6 +55,7 @@ import {
   type TurnBlockPayload,
   type TurnBlockSnapshot,
   type TurnStructure,
+  type TurnTrigger,
   type UserContentPart,
   type UsageDisplay,
 } from '../../../../shared/provider-runtime.ts';
@@ -78,11 +81,14 @@ import { fitJsonPreview as jsonPreview } from '../preview.ts';
 import { fitDisplayText, fitProviderEventDisplay } from '../display-fitting.ts';
 import { ClaudeContextUsage, claudeCompactWindow, DEFAULT_CLAUDE_COMPACT_WINDOW } from './claude-context-usage.ts';
 
+import { WorkspaceFileChanges } from './workspace-file-changes.ts';
+
 const execFile = promisify(execFileCallback);
 const ADAPTER_VERSION = 'remux-claude-agent-sdk-v1';
 const CLAUDE_AGENT_SDK_VERSION = '0.3.258';
 const DEFAULT_INSTANCE_ID = 'claude-local';
 const DEFAULT_BINARY = 'claude';
+const CLAUDE_SUBAGENT_MODEL = 'sonnet';
 const FEDERATION_ALLOWED_TOOLS = FEDERATION_TOOLS
   .map((tool) => `mcp__${FEDERATION_SERVER_NAME}__${tool}`);
 const PROBE_TIMEOUT_MS = 15_000;
@@ -163,6 +169,10 @@ type ClaudeAssistantBlockRef = {
 };
 
 type ClaudeToolState = {
+  owner?: { turnId: string; nativeTurnId: string };
+  backgrounded?: boolean;
+  completed?: boolean;
+  executionId?: string;
   name: string;
   input?: unknown;
   inputHash?: string;
@@ -350,6 +360,27 @@ export class ClaudeNativeAdapter implements ProviderAdapter {
     this.assertInstance(input.providerInstanceId);
     await this.runCli(['auth', 'logout']);
     return { accepted: true as const };
+  }
+
+  async assertSessionStopped(nativeSessionId: string) {
+    if (this.ownership.snapshot().some(({ sessionId }) => sessionId === nativeSessionId)) {
+      throw new Error('The Claude session is still owned by a live connection.');
+    }
+    if (process.platform !== 'linux') throw new Error('Verifying a stopped Claude session is currently supported on Linux only.');
+    for (const pid of await readdir('/proc')) {
+      if (!/^\d+$/u.test(pid)) continue;
+      let args: string[];
+      try { args = (await readFile(`/proc/${pid}/cmdline`, 'utf8')).split('\0'); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT' ||
+            (error as NodeJS.ErrnoException).code === 'ESRCH') continue;
+        throw new Error('Cannot verify whether the original Claude process has stopped.');
+      }
+      if (args.some((arg, index) => (arg === '--resume' || arg === '--session-id') &&
+          args[index + 1] === nativeSessionId)) {
+        throw new Error('The original Claude process is still running. Stop it before resolving delivery.');
+      }
+    }
   }
 
   async openSession(unparsed: OpenProviderSessionInput): Promise<ClaudeProviderSession> {
@@ -555,6 +586,9 @@ export class ClaudeProviderSession implements ProviderSession {
   private nativeRunning = false;
   private readonly settledPromptUuids = new Set<string>();
   private federationConnected = false;
+  private readonly pendingNativeTriggers: TurnTrigger[] = [];
+  private readonly nativeTaskNotifications = new Set<string>();
+  private readonly federationNotifications = new Map<string, { toolUseId: string; summary?: string; status?: string }>();
   private readonly backgroundToolByTask = new Map<string, string>();
   private readonly blocks = new Map<string, ClaudeBlockState>();
   private readonly toolBlockKey = new Map<string, string>();
@@ -569,6 +603,11 @@ export class ClaudeProviderSession implements ProviderSession {
     resetsAt: number | null;
   }>();
   private fileChangeSequence = 0;
+  private deliveryEvidenceHandler?: (id: string, evidence: ProviderAcceptanceEvidence) => void;
+  setDeliveryEvidenceHandler(handler: (id: string, evidence: ProviderAcceptanceEvidence) => void) {
+    this.deliveryEvidenceHandler = handler;
+  }
+  private readonly fileChanges: WorkspaceFileChanges;
   private sequence = 0;
   private messageSequence = 0;
   private currentEnvelopeUuid: string | undefined;
@@ -584,6 +623,7 @@ export class ClaudeProviderSession implements ProviderSession {
     lastChainEntryUuid?: string;
   } | undefined;
   private lastChainEntryUuid: string | undefined;
+  private lastCompletedNativeTurnId: string | undefined;
   private interruptRequested = false;
   private consumeTask: Promise<void> | undefined;
   private manualCompactionOperationId: string | undefined;
@@ -608,6 +648,11 @@ export class ClaudeProviderSession implements ProviderSession {
 
   constructor(options: ClaudeProviderSessionOptions) {
     this.openedWith = options.input;
+    this.fileChanges = new WorkspaceFileChanges(options.input.cwd, (changes) => {
+      for (const { turnId, nativeTurnId, ...change } of changes) this.emit(
+        { type: 'file.changed', change: { ...change, path: resolve(options.input.cwd, change.path) } }, 'hook/file_changed', turnId, nativeTurnId,
+        `file-change-${++this.fileChangeSequence}`);
+    });
     this.prompt = options.prompt;
     this.query = options.query;
     this.auth = options.auth;
@@ -888,6 +933,14 @@ export class ClaudeProviderSession implements ProviderSession {
     });
   }
 
+  blockedOnForegroundFederation() {
+    const active = this.activeTurn;
+    return Boolean(active && [...this.tools.values()].some(tool =>
+      tool.name.startsWith('mcp__remux-federation__') &&
+      tool.owner?.turnId === active.turnId && tool.owner.nativeTurnId === active.nativeTurnId &&
+      !tool.completed && !tool.backgrounded));
+  }
+
   activeCompactionTarget() {
     const nativeTurnId = this.activeTurn?.nativeTurnId;
     if (!nativeTurnId || this.closed || this.recoveringAcceptedTurn || this.compactAcceptance ||
@@ -1019,6 +1072,7 @@ export class ClaudeProviderSession implements ProviderSession {
       this.prompt.close();
       this.query.close();
       await this.consumeTask?.catch(() => undefined);
+      await this.fileChanges.close();
       this.events.close();
     } finally {
       this.lease.release();
@@ -1027,14 +1081,9 @@ export class ClaudeProviderSession implements ProviderSession {
 
   recordFileChange(change: ClaudeFileChange) {
     const active = this.activeTurn;
-    if (!active) return;
-    this.emit(
-      { type: 'file.changed', change },
-      'hook/file_changed',
-      active.turnId,
-      active.nativeTurnId,
-      `file-change-${++this.fileChangeSequence}`,
-    );
+    if (!active || this.closed) return;
+    return this.fileChanges.add({ path: change.path, kind: change.kind,
+      turnId: active.turnId, nativeTurnId: active.nativeTurnId });
   }
 
   private async consume() {
@@ -1149,6 +1198,7 @@ export class ClaudeProviderSession implements ProviderSession {
       const evidence = { kind: 'claude-input-replay' as const, sessionId,
         userMessageUuid: replayUuid, nativeTurnId: replay.expectedNativeTurnId,
         processGeneration: this.processGeneration };
+      this.deliveryEvidenceHandler?.(replayUuid, evidence);
       this.processingEvidence.set(replayUuid, evidence);
       this.activeInputAcceptances.delete(replayUuid);
       clearTimeout(replay.timeout);
@@ -1175,6 +1225,7 @@ export class ClaudeProviderSession implements ProviderSession {
         kind: 'claude-root-processing', sessionId: this.nativeSession.sessionId,
         userMessageUuid: correlatedUserUuid, observationUuid: this.currentEnvelopeUuid,
       } as const;
+      this.deliveryEvidenceHandler?.(correlatedUserUuid, evidence);
       this.processingEvidence.set(correlatedUserUuid, evidence);
       while (this.processingEvidence.size > 32) {
         this.processingEvidence.delete(this.processingEvidence.keys().next().value!);
@@ -1186,7 +1237,10 @@ export class ClaudeProviderSession implements ProviderSession {
     else if (record.type === 'assistant') await this.handleAssistantMessage(record);
     else if (record.type === 'user') await this.handleUserMessage(record);
     else if (record.type === 'tool_progress') this.handleToolProgress(record);
-    else if (record.type === 'result') this.handleResult(record);
+    else if (record.type === 'result') {
+      await this.fileChanges.drain();
+      this.handleResult(record);
+    }
     else if (record.type === 'rate_limit_event') this.handleRateLimitEvent(record);
     if (this.activeTurn && this.currentEnvelopeUuid && !record.parent_tool_use_id &&
         (record.type === 'system' || record.type === 'assistant' || record.type === 'user')) {
@@ -1231,7 +1285,11 @@ export class ClaudeProviderSession implements ProviderSession {
     this.contextUsage.startTurn();
     this.latestUsage = { ...this.latestUsage, turn: null, context: null };
     this.state = 'running';
-    this.emit({ type: 'turn.started', origin: 'native' }, 'turn/native-started', turnId, nativeTurnId);
+    // Retain overflow for the next autonomous turn instead of dropping notifications.
+    const triggers = this.pendingNativeTriggers.splice(0, MAX_TURN_TRIGGERS);
+    if (!triggers.length) triggers.push({ kind: 'native-child' });
+    this.emit({ type: 'turn.started', origin: 'native', trigger: triggers[0]!, triggers },
+      'turn/native-started', turnId, nativeTurnId);
   }
 
   private resolvePendingCompactAcceptance(inputUuid: string, code: string, message: string) {
@@ -1308,7 +1366,7 @@ export class ClaudeProviderSession implements ProviderSession {
       }
       if (message.compact_result !== 'failed') {
         if (this.manualCompactionOperationId && !this.compactAcceptance) {
-          this.emit({ type: 'context.compaction.started', trigger: 'manual',
+          this.emitCompaction({ type: 'context.compaction.started', trigger: 'manual',
             operationId: this.manualCompactionOperationId, beforeTokens: null }, 'system/status/compacting');
         }
         return;
@@ -1318,7 +1376,7 @@ export class ClaudeProviderSession implements ProviderSession {
           sessionId: this.nativeSession.sessionId,
           statusIdentity,
         }).slice(0, 24)}`;
-      this.emit({
+      this.emitCompaction({
         type: 'context.compaction.failed',
         trigger: this.manualCompactionOperationId ? 'manual' : 'automatic',
         operationId,
@@ -1355,13 +1413,21 @@ export class ClaudeProviderSession implements ProviderSession {
             sessionId: this.nativeSession.sessionId,
             messageId: this.currentEnvelopeUuid,
           }).slice(0, 24)}`;
-      this.emit({
+      // An automatic boundary lands inside the running turn. Compaction stays
+      // conversation-scoped by contract, but carrying the native turn lets the
+      // journal locate it within that turn so the transcript can place the
+      // notice where it happened. Manual compaction is coordinator-owned.
+      const anchor = trigger === 'automatic' ? this.activeTurn : undefined;
+      this.emitCompaction({
         type: 'context.compaction.completed',
         trigger,
         operationId,
         beforeTokens: nonnegativeInteger(metadata?.pre_tokens) ?? null,
         afterTokens: nonnegativeInteger(metadata?.post_tokens) ?? null,
-      }, 'system/compact_boundary');
+      }, 'system/compact_boundary', anchor?.nativeTurnId,
+      !this.activeTurn && this.lastCompletedNativeTurnId
+        ? { previousTurnId: this.lastCompletedNativeTurnId }
+        : undefined);
       if (trigger === 'manual' && sessionId === this.nativeSession.sessionId &&
           this.compactAcceptance?.yielded && !replayedBoundary &&
           this.messageSequence > this.compactAcceptance.watermark && boundaryUuid) {
@@ -1387,6 +1453,28 @@ export class ClaudeProviderSession implements ProviderSession {
     const toolUseId = stringValue(message.tool_use_id)
       ?? this.backgroundToolByTask.get(taskId);
     const linkedTool = toolUseId ? this.tools.get(toolUseId) : undefined;
+    if (linkedTool && toolUseId && linkedTool.name.startsWith('mcp__remux-federation__')) {
+      const owner = linkedTool.owner ?? this.activeTurn;
+      if (subtype === 'task_started') {
+        linkedTool.backgrounded = true;
+        if (owner) this.emit({ type: 'tool.updated', toolCallId: toolUseId, backgrounded: true },
+          'task/federation-backgrounded', owner.turnId, owner.nativeTurnId, toolUseId);
+      } else if (subtype === 'task_notification' && !this.federationNotifications.has(taskId)) {
+        const summary = stringValue(message.summary);
+        const status = stringValue(message.status);
+        this.federationNotifications.set(taskId, { toolUseId, summary, status });
+        const childExecutionId = federationExecutionId(message.summary) ?? linkedTool.executionId;
+        if (childExecutionId) linkedTool.executionId = childExecutionId;
+        this.pendingNativeTriggers.push({ kind: 'federation',
+          ...(childExecutionId ? { childExecutionId } : {}),
+          ...(summary ? { summary: fitContractString(summary, PROVIDER_RUNTIME_LIMITS.stringChars) } : {}) });
+        linkedTool.backgrounded = false;
+        if (owner) this.emit({ type: 'tool.completed', toolCallId: toolUseId, backgrounded: false,
+          ...(summary ? { outputPreview: jsonPreview(summary) } : {}),
+          outcome: status === 'completed' ? 'completed' : 'failed' },
+        'task/federation-notification', owner.turnId, owner.nativeTurnId, toolUseId);
+      }
+    }
     if ((message.task_type && !['local_agent', 'remote_agent'].includes(String(message.task_type))) ||
         (linkedTool && !isClaudeChildTool(linkedTool.name)) ||
         this.backgroundToolByTask.has(taskId)) {
@@ -1459,7 +1547,11 @@ export class ClaudeProviderSession implements ProviderSession {
       return;
     }
     if (subtype === 'task_notification') {
+      if (this.nativeTaskNotifications.has(taskId)) return;
+      this.nativeTaskNotifications.add(taskId);
       const summary = stringValue(message.summary);
+      this.pendingNativeTriggers.push({ kind: 'native-child', childExecutionId,
+        ...(summary ? { summary: fitContractString(summary, PROVIDER_RUNTIME_LIMITS.stringChars) } : {}) });
       if (summary) this.emit({ type: 'child.summary', childExecutionId, summary },
         'task/summary', active.turnId, active.nativeTurnId, taskId);
       const status = stringValue(message.status);
@@ -1613,24 +1705,28 @@ export class ClaudeProviderSession implements ProviderSession {
       const block = objectValue(blockValue);
       if (!block) continue;
       if (block.type === 'thinking') {
+        const thinking = stringValue(block.thinking);
         const blockRef = this.snapshotAssistantBlock(
           'reasoning-summary',
           semanticOrdinals.get('reasoning-summary') ?? 0,
           blockIndex,
+          active.turnId,
+          thinking ?? '',
         );
         semanticOrdinals.set('reasoning-summary', (semanticOrdinals.get('reasoning-summary') ?? 0) + 1);
-        const thinking = stringValue(block.thinking);
         if (thinking) this.emit({ type: 'assistant.reasoning', summary: thinking },
           'assistant/thinking', active.turnId, active.nativeTurnId,
           blockRef.itemId, blockRef.blockIndex);
       } else if (block.type === 'text') {
+        const text = stringValue(block.text);
         const blockRef = this.snapshotAssistantBlock(
           'final-message',
           semanticOrdinals.get('final-message') ?? 0,
           blockIndex,
+          active.turnId,
+          text ?? '',
         );
         semanticOrdinals.set('final-message', (semanticOrdinals.get('final-message') ?? 0) + 1);
-        const text = stringValue(block.text);
         if (text) {
           assistantTexts.push(text);
           this.emit({ type: 'assistant.text', phase: 'final', text },
@@ -1696,16 +1792,30 @@ export class ClaudeProviderSession implements ProviderSession {
     return block;
   }
 
+  /**
+   * The Agent SDK finalizes one `assistant` message per content block, so a
+   * snapshot's position within its own message says nothing about which
+   * streamed block it completes. Match the streamed block whose accumulated
+   * text equals the snapshot first; fall back to semantic order only when no
+   * content matches (for example when thinking was omitted from the snapshot).
+   */
   private snapshotAssistantBlock(
     kind: ClaudeAssistantBlockKind,
     semanticOrdinal: number,
     snapshotBlockIndex: number,
+    turnId?: string,
+    text?: string,
   ): ClaudeAssistantBlockRef {
     const messageId = this.currentMessageId ?? this.lastAssistantMessageId;
     const streamed = messageId
       ? (this.assistantBlocksByMessage.get(messageId) ?? []).filter((block) => block.kind === kind)
       : [];
-    const existing = streamed[semanticOrdinal];
+    const byContent = text === undefined ? undefined : streamed.find((block) => {
+      const previous = this.findBlock(turnId, block.itemId, kind)?.block.payload;
+      const streamedText = previous && 'text' in previous ? previous.text : '';
+      return streamedText === text;
+    });
+    const existing = byContent ?? streamed[semanticOrdinal];
     if (existing) return existing;
     const block = {
       kind,
@@ -1785,6 +1895,9 @@ export class ClaudeProviderSession implements ProviderSession {
       if (!callId || !this.tools.has(callId)) continue;
       const tool = this.tools.get(callId)!;
       this.foregroundAgentTools.delete(callId);
+      if (tool.name.startsWith('mcp__remux-federation__')) {
+        tool.executionId = federationExecutionId(block.content) ?? tool.executionId;
+      }
       this.emit({
         type: 'tool.updated',
         toolCallId: callId,
@@ -1802,6 +1915,7 @@ export class ClaudeProviderSession implements ProviderSession {
           );
         }
       }
+      if (tool.backgrounded) continue;
       this.emit({
         type: 'tool.completed',
         toolCallId: callId,
@@ -1911,6 +2025,7 @@ export class ClaudeProviderSession implements ProviderSession {
         ? { error: { code: 'claude_turn_failed', message: errors.join('\n') || finalText || 'Claude Code turn failed.' } }
         : {}),
     }, 'result/completed', active.turnId, active.nativeTurnId);
+    this.lastCompletedNativeTurnId = active.nativeTurnId;
     if (active.promptUuid) this.settledPromptUuids.add(active.promptUuid);
     this.activeTurn = undefined;
     this.interruptRequested = false;
@@ -1929,6 +2044,7 @@ export class ClaudeProviderSession implements ProviderSession {
         retryable: true,
       },
     }, 'resume/turn_unrecoverable', active.turnId, active.nativeTurnId);
+    this.lastCompletedNativeTurnId = active.nativeTurnId;
     this.activeTurn = undefined;
     this.recoveringAcceptedTurn = false;
     this.interruptRequested = false;
@@ -1968,6 +2084,23 @@ export class ClaudeProviderSession implements ProviderSession {
     }, 'account/rate_limit');
   }
 
+  private emitCompaction(
+    event: Extract<ProviderEvent, { type: `context.compaction.${string}` }>,
+    nativeKind: string,
+    nativeTurnId?: string,
+    timeline?: ProviderEventEnvelope['native']['timeline'],
+  ) {
+    // The SDK observation UUID survives replay even when a manual operation
+    // can no longer be correlated. event.operationId links its lifecycle.
+    if (!this.currentEnvelopeUuid) {
+      throw new ProviderContractError('$.uuid', 'Claude compaction requires an SDK envelope UUID');
+    }
+    this.emit(event, nativeKind, undefined, nativeTurnId, undefined, undefined, {
+      subject: { kind: 'context-compaction', key: `claude:context-compaction:${this.currentEnvelopeUuid}` },
+      ...(timeline ? { timeline } : {}),
+    });
+  }
+
   private emit(
     input: MapperEvent,
     nativeKind: string,
@@ -1975,6 +2108,7 @@ export class ClaudeProviderSession implements ProviderSession {
     nativeTurnId?: string,
     itemId?: string,
     blockIndex?: number,
+    compactionNative?: Pick<ProviderEventEnvelope['native'], 'subject' | 'timeline'>,
   ) {
     if (nativeTurnId && itemId) {
       if (input.type === 'tool.started') this.pendingRootTools.set(itemId, nativeTurnId);
@@ -2016,6 +2150,7 @@ export class ClaudeProviderSession implements ProviderSession {
       },
       native: {
         sessionId: this.nativeSession.sessionId,
+        ...compactionNative,
         ...(nativeTurnId ? { turnId: nativeTurnId } : {}),
         ...((this.currentMessageId ?? this.currentEnvelopeUuid)
           ? { messageId: this.currentMessageId ?? this.currentEnvelopeUuid! }
@@ -2048,6 +2183,21 @@ export class ClaudeProviderSession implements ProviderSession {
     blockIndex?: number,
   ): ProviderEvent {
     const event = input as Record<string, unknown> & { type: string };
+    if (event.type === 'tool.started' && turnId && nativeTurnId) {
+      const tool = objectValue(event.tool);
+      const state = tool ? this.tools.get(String(tool.callId)) : undefined;
+      if (state) state.owner = { turnId, nativeTurnId };
+    }
+    if (event.type === 'tool.started' || event.type === 'tool.updated' || event.type === 'tool.completed') {
+      const callId = stringValue(objectValue(event.tool)?.callId) ?? stringValue(event.toolCallId);
+      const state = callId ? this.tools.get(callId) : undefined;
+      if (state) {
+        if (state.name.startsWith('mcp__remux-federation__')) {
+          state.executionId = federationExecutionId(state.input) ?? state.executionId;
+        }
+        if (event.type === 'tool.completed') state.completed = true;
+      }
+    }
     switch (event.type) {
       case 'assistant.reasoning': {
         const previous = this.findBlock(turnId, itemId, 'reasoning-summary');
@@ -2103,6 +2253,7 @@ export class ClaudeProviderSession implements ProviderSession {
         const completed = event.type === 'tool.completed';
         return this.blockEvent(turnId, nativeTurnId, callId, blockIndex, 'tool', {
           ...payload,
+          ...(event.backgrounded === undefined ? {} : { backgrounded: event.backgrounded as boolean }),
           ...(event.tool === undefined ? {} : {
             tool: event.tool as Extract<TurnBlockPayload, { kind: 'tool' }>['tool'],
           }),
@@ -2364,7 +2515,25 @@ class ClaudeInputQueue implements AsyncIterable<SDKUserMessage> {
   }
 }
 
+// Streamed active input and backgrounding native Agent/Task tools for Compact
+// were verified on Claude Code 2.1.258. MCP calls background themselves.
+const CLAUDE_ACTIVE_INPUT_MIN_VERSION = [2, 1, 258] as const;
+
+function supportsClaudeActiveInput(version: string) {
+  const match = /^(\d+)\.(\d+)\.(\d+)$/u.exec(version);
+  if (!match) return false;
+  const parts = match.slice(1).map(Number);
+  if (!parts.every(Number.isSafeInteger)) return false;
+  for (let index = 0; index < CLAUDE_ACTIVE_INPUT_MIN_VERSION.length; index++) {
+    if (parts[index] !== CLAUDE_ACTIVE_INPUT_MIN_VERSION[index]) {
+      return parts[index]! > CLAUDE_ACTIVE_INPUT_MIN_VERSION[index]!;
+    }
+  }
+  return true;
+}
+
 function claudeCapabilities(providerVersion: string, manualCompact = true): ProviderCapabilities {
+  const activeInput = supportsClaudeActiveInput(providerVersion);
   return {
     protocolVersion: PROVIDER_RUNTIME_CONTRACT_VERSION,
     provider: 'claude-code',
@@ -2390,7 +2559,7 @@ function claudeCapabilities(providerVersion: string, manualCompact = true): Prov
     turns: {
       interrupt: true,
       steer: false,
-      ...(providerVersion === '2.1.258' ? { activeInput: 'stream-input' as const } : {}),
+      ...(activeInput ? { activeInput: 'stream-input' as const } : {}),
       queue: true,
       changeModelOnExistingSession: true,
       changeEffortOnExistingSession: true,
@@ -2421,7 +2590,7 @@ function claudeCapabilities(providerVersion: string, manualCompact = true): Prov
       estimatedCost: true,
     },
     compaction: { automaticNative: true, manualNative: manualCompact,
-      ...(manualCompact && providerVersion === '2.1.258'
+      ...(manualCompact && activeInput
         ? { activeParent: 'background-native-agent' as const } : {}) },
   };
 }
@@ -2449,7 +2618,7 @@ function sessionQueryOptions(input: {
   sessionId: string;
   binaryPath: string;
   environment?: Readonly<Record<string, string | undefined>>;
-  onFileChanged: (change: ClaudeFileChange) => void;
+  onFileChanged: (change: ClaudeFileChange) => void | Promise<void>;
   onStderr: (chunk: string) => void;
 }): ClaudeQueryOptions {
   const instructions = input.input.developerInstructions.join('\n\n');
@@ -2617,7 +2786,7 @@ function diffRange(start: number, count: number) {
 function claudeSessionHooks(
   access: ProviderAccess,
   cwd: string,
-  onFileChanged: (change: ClaudeFileChange) => void,
+  onFileChanged: (change: ClaudeFileChange) => void | Promise<void>,
 ) {
   const preToolUse: HookCallback = async (input) => {
     if (input.hook_event_name !== 'PreToolUse') return { continue: true };
@@ -2642,7 +2811,7 @@ function claudeSessionHooks(
   });
   const fileChanged: HookCallback = async (input) => {
     if (input.hook_event_name === 'FileChanged' && input.file_path) {
-      onFileChanged({
+      await onFileChanged({
         path: input.file_path,
         kind: input.event === 'add' ? 'add' : input.event === 'unlink' ? 'delete' : 'update',
       });
@@ -2753,6 +2922,13 @@ function subscriptionEnvironment(
   delete environment.ANTHROPIC_API_KEY;
   delete environment.ANTHROPIC_AUTH_TOKEN;
   delete environment.REMUX_FEDERATION_MCP_BEARER_TOKEN;
+  // Claude Code's built-in Explore/general-purpose agents inherit the root
+  // model. The root stays on the conversation's model; delegated exploration
+  // runs on Sonnet unless an agent definition names a model explicitly.
+  environment.CLAUDE_CODE_SUBAGENT_MODEL = CLAUDE_SUBAGENT_MODEL;
+  environment.CLAUDE_AUTO_BACKGROUND_TASKS = '1';
+  environment.CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS = String(CLAUDE_MCP_AUTO_BACKGROUND_MS);
+  delete environment.CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND;
   environment.CLAUDE_AGENT_SDK_CLIENT_APP = 'remux-agent/1';
   return environment;
 }
@@ -2997,4 +3173,13 @@ function knownAuthLabel(value: unknown, allowed: ReadonlySet<string>) {
 
 function isMissingExecutable(error: unknown) {
   return objectValue(error)?.code === 'ENOENT' || /ENOENT|not found/iu.test(safeMessage(error));
+}
+
+/** MCP results carry structured JSON, directly or in SDK text/content blocks. */
+function federationExecutionId(value: unknown): string | undefined {
+  if (Array.isArray(value)) return value.map(federationExecutionId).find(Boolean);
+  const record = objectValue(value);
+  if (record) return stringValue(record.executionId) ?? federationExecutionId(record.text ?? record.content);
+  if (typeof value !== 'string') return undefined;
+  try { return federationExecutionId(JSON.parse(value)); } catch { return undefined; }
 }

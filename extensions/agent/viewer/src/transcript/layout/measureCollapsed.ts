@@ -287,6 +287,7 @@ function measureCollapsedSegment({
         transcriptLayout.work.separatorHeight +
         transcriptLayout.row.workBoundaryGap
       );
+    case 'notice':
     case 'compaction':
       return transcriptLayout.compaction.height + transcriptLayout.row.defaultGap;
   }

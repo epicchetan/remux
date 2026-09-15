@@ -1,3 +1,5 @@
+import type { NativeTurnNotice } from '../../../shared/native-agent-protocol.ts';
+import type { TurnOrigin, TurnTrigger } from '../../../shared/provider-runtime.ts';
 import { createHash, randomUUID } from 'node:crypto';
 
 import {
@@ -44,6 +46,7 @@ import {
   viewerCapabilities,
 } from './native-journal.ts';
 import { boundedUtf8Preview } from './native-output.ts';
+import { ignoredWorkspacePaths } from '../providers/claude/workspace-file-changes.ts';
 
 type RevisionEntry = { hash: string; revision: number };
 
@@ -59,6 +62,8 @@ export class NativeAgentProjector {
   private readonly loginByInstance = new Map<string, ProviderLoginOperationView>();
   private readonly revisions = new Map<NativeAgentResourceKey, RevisionEntry>();
   private readonly invalidatedKeys = new Set<NativeAgentResourceKey>();
+  private readonly watchedFiles = new Map<string, { sequence: number; checkedAt: number; ignored: ReadonlySet<string> }>();
+  private readonly pendingWatchedFiles = new Map<string, Promise<void>>();
 
   constructor(journal: NativeAgentJournal, now: () => number = Date.now) {
     this.journal = journal;
@@ -108,6 +113,68 @@ export class NativeAgentProjector {
 
   providersResource() {
     return this.providers();
+  }
+
+  /** Filter historical watcher noise for the requested window without changing journal evidence. */
+  async prepareWatchedFileChanges(unparsed: NativeAgentResourceReadParams) {
+    const input = parseNativeAgentResourceReadParams(unparsed);
+    const selected = new Map<string, JournalTurn>();
+    for (const { key } of input.requests) {
+      let turns: readonly JournalTurn[] = [];
+      let window = 'tail-24';
+      const direct = /^agent\/turn:([^:]+)/u.exec(key);
+      const transcript = /^agent\/transcript:([^:]+)(?::(.+))?$/u.exec(key);
+      const strand = /^agent\/strand-transcript:([^:]+):([^:]+):(.+)$/u.exec(key);
+      const execution = parseAgentExecutionTranscriptResourceKey(key);
+      if (direct) {
+        const turn = this.journal.turn(direct[1]!);
+        if (turn) selected.set(turn.turnId, turn);
+        continue;
+      } else if (transcript) {
+        turns = this.journal.turns(transcript[1]!); window = transcript[2] ?? window;
+      } else if (strand) {
+        try { turns = this.journal.turnsForStrand(decodeURIComponent(strand[2]!)); }
+        catch { continue; }
+        window = strand[3]!;
+      } else if (execution) {
+        turns = this.journal.turnsForExecution(execution.executionId); window = execution.window;
+      }
+      const range = transcriptRange(turns, window);
+      for (const turn of turns.slice(range.startIndex, range.endIndexExclusive)) selected.set(turn.turnId, turn);
+    }
+    // Serial batches avoid launching a Git process for every historical turn at once.
+    for (const turn of selected.values()) {
+      const pending = this.pendingWatchedFiles.get(turn.turnId);
+      if (pending) { await pending; continue; }
+      const task = this.checkWatchedFiles(turn);
+      this.pendingWatchedFiles.set(turn.turnId, task);
+      try { await task; } finally { this.pendingWatchedFiles.delete(turn.turnId); }
+    }
+  }
+
+  private async checkWatchedFiles(turn: JournalTurn) {
+    const execution = this.journal.execution(turn.executionId);
+    const conversation = this.journal.conversation(turn.conversationId);
+    if (!execution || !conversation) return;
+    const sequence = Number(this.journal.database.prepare('SELECT max(sequence) AS sequence FROM events WHERE turn_id=?')
+      .get(turn.turnId)?.sequence ?? 0);
+    const cached = this.watchedFiles.get(turn.turnId);
+    if (cached?.sequence === sequence && this.now() - cached.checkedAt < 30_000) return;
+    const paths = (this.journal.database.prepare(`SELECT DISTINCT json_extract(envelope_json, '$.event.change.path') AS path
+      FROM events WHERE turn_id=? AND native_kind='hook/file_changed' AND event_type='turn.file-changed'`)
+      .all(turn.turnId) as { path: string }[]).map(({ path }) => path);
+    const ignored = new Set<string>();
+    for (let start = 0; start < paths.length; start += 512) {
+      for (const path of await ignoredWorkspacePaths(conversation.cwd, paths.slice(start, start + 512))) ignored.add(path);
+    }
+    this.watchedFiles.delete(turn.turnId);
+    this.watchedFiles.set(turn.turnId, { sequence, checkedAt: this.now(), ignored });
+    while (this.watchedFiles.size > 128) this.watchedFiles.delete(this.watchedFiles.keys().next().value!);
+    this.invalidate([`agent/turn:${turn.turnId}`, `agent/transcript:${turn.conversationId}:tail-24`,
+      `agent/execution-transcript:${encodeURIComponent(turn.executionId)}:tail-24`]);
+    for (const key of this.revisions.keys()) {
+      if (key.startsWith(`agent/strand-transcript:${encodeURIComponent(turn.conversationId)}:`)) this.invalidatedKeys.add(key);
+    }
   }
 
   read(unparsed: NativeAgentResourceReadParams): NativeAgentResourceReadResult {
@@ -357,6 +424,12 @@ export class NativeAgentProjector {
     const activeChildren = this.journal.executionsForConversation(conversationId)
       .filter(({ ownership }) => ownership !== 'root')
       .filter(({ state }) => state === 'running' || state === 'recovering');
+    const uncertain = this.journal.database.prepare(`SELECT attempt_id,kind,provider,recovery_payload_json,
+      acceptance_evidence_json,transcript_gap FROM delivery_attempts WHERE conversation_id=? AND state='unknown'
+      ORDER BY created_at LIMIT 1`).get(conversationId) as {
+        attempt_id: string; kind: string; provider: string; recovery_payload_json: string;
+        acceptance_evidence_json: string | null; transcript_gap: number;
+      } | undefined;
     const stop = this.journal.stopLifecycle(conversationId);
     const rootExecutionId = conversation.rootExecutionId;
     const stoppedAgentIds = new Set(stop.targets
@@ -383,6 +456,13 @@ export class NativeAgentProjector {
       activeTurnId: conversation.activeTurnId,
       activeTurnElapsedMs,
       deliveryHeld: this.journal.hasUnresolvedRootDelivery(conversationId),
+      ...(uncertain ? { uncertainDelivery: {
+        attemptId: uncertain.attempt_id,
+        content: JSON.parse(uncertain.recovery_payload_json).content ?? [],
+        canAbandon: uncertain.provider === 'claude-code' && uncertain.kind !== 'manual-compact' &&
+          !uncertain.acceptance_evidence_json && !uncertain.transcript_gap && activeChildren.length === 0 &&
+          !this.journal.database.prepare('SELECT 1 FROM delivery_attempt_staging WHERE attempt_id=? LIMIT 1').get(uncertain.attempt_id),
+      } } : {}),
       lifecycle: {
         state: stopErrorCount > 0 || typeof rootStopError === 'string' || reconciliationUnavailable
           ? 'unavailable' : stopRequested ? 'stopping' : checkingCount > 0
@@ -641,7 +721,8 @@ export class NativeAgentProjector {
       this.journal.legacyEventsForTurn(turn.turnId),
       this.journal,
       boundaryCompactions(turn, input.turns, compactions),
-      { includeToolOutputPreviews: false },
+      { includeToolOutputPreviews: false, ignoredWatchedPaths: this.watchedFiles.get(turn.turnId)?.ignored,
+        compactionControls: compactions },
     ));
     const projectedTurnBytes = projectedTurns.map(jsonByteLength);
     let projectedTurnsByteLength = projectedTurnBytes.reduce((total, bytes) => total + bytes, 0);
@@ -687,6 +768,7 @@ export class NativeAgentProjector {
     const pathTurns = turn.strandId
       ? this.journal.turnsForStrand(turn.strandId)
       : this.journal.turns(turn.conversationId);
+    const compactions = this.journal.compactionControlEvents(turn.conversationId, turn.strandId);
     return projectTurn(
       turn,
       this.journal.eventsForTurn(turn.turnId, {
@@ -694,12 +776,9 @@ export class NativeAgentProjector {
       }),
       this.journal.legacyEventsForTurn(turn.turnId),
       this.journal,
-      boundaryCompactions(
-        turn,
-        pathTurns,
-        this.journal.compactionControlEvents(turn.conversationId, turn.strandId),
-      ),
-      { includeToolOutputPreviews: !summary },
+      boundaryCompactions(turn, pathTurns, compactions),
+      { includeToolOutputPreviews: !summary, ignoredWatchedPaths: this.watchedFiles.get(turn.turnId)?.ignored,
+        compactionControls: compactions },
     );
   }
 
@@ -790,7 +869,11 @@ function projectTurn(
   allLegacyEvents: readonly LegacyJournalEvent[],
   journal: NativeAgentJournal,
   boundary: NativeAgentTurnFrame['boundaryCompactions'],
-  options: { includeToolOutputPreviews?: boolean } = {},
+  options: {
+    includeToolOutputPreviews?: boolean;
+    ignoredWatchedPaths?: ReadonlySet<string>;
+    compactionControls?: readonly JournalCompactionControlEvent[];
+  } = {},
 ): NativeAgentTurnFrame {
   const events = allEvents.filter((event) =>
     event.scope.kind === 'turn' && event.scope.turnId === turn.turnId);
@@ -823,6 +906,7 @@ function projectTurn(
     const event = envelope.event;
     switch (event.type) {
       case 'turn.file-changed':
+        if (envelope.native.kind === 'hook/file_changed' && options.ignoredWatchedPaths?.has(event.change.path)) break;
         // A file may be revised more than once in a turn. Keep its final
         // display state and its latest causal block so it renders where the
         // provider actually performed the edit rather than in a turn footer.
@@ -873,9 +957,7 @@ function projectTurn(
     lastWorkPosition.block.payload.text.trim()
     ? lastWorkPosition.block
     : turn.outcome
-      ? [...orderedBlocks].reverse().find(({ block }) =>
-          block.kind === 'final-message' && block.payload.kind === 'final-message' &&
-          block.payload.text.trim())?.block
+      ? trailingFinalMessage(orderedBlocks.map(({ block }) => block))
       : undefined;
   const assistantText = finalBlock?.payload.kind === 'final-message'
     ? finalBlock.payload.text
@@ -884,8 +966,22 @@ function projectTurn(
   const assistantArtifact = turn.assistantArtifactId
     ? journal.artifact(turn.assistantArtifactId)
     : undefined;
-  const additionalMessages = journal.additionalTurnMessages(turn.turnId);
+  const additionalInputs = journal.additionalTurnMessages(turn.turnId).map((input, inputOrdinal) => ({ ...input, inputOrdinal }));
+  const additionalMessages = additionalInputs.filter(input => input.origin === 'user');
+  const inputItems: NativeTurnNotice[] = [];
+  if (turn.origin !== 'user') inputItems.push(projectContinuationNotice(journal, turn.conversationId,
+    turn.clientMessageId, null, turn.origin, turn.trigger, turn.startedAt ?? turn.createdAt, undefined, turn.triggers));
+  for (const input of additionalInputs) if (input.origin !== 'user') inputItems.push(projectContinuationNotice(
+    journal, turn.conversationId, input.clientMessageId, input.afterBlockId, input.origin, input.trigger, input.createdAt, input.inputOrdinal, input.triggers));
+  const compactionNotices = withinTurnCompactionNotices(turn, options.compactionControls ?? []);
+  inputItems.push(...compactionNotices);
+  if (compactionNotices.length) compacted = true;
+  if (turn.origin !== 'user') userContent = [];
   const base = {
+    origin: turn.origin,
+    ...(turn.trigger ? { trigger: turn.trigger } : {}),
+    ...(turn.triggers ? { triggers: turn.triggers } : {}),
+    inputItems,
     additionalMessages,
     pathEntryId: turn.pathEntryId ?? `turn:${turn.turnId}`,
     strandId: turn.strandId ?? `execution:${turn.executionId}`,
@@ -934,6 +1030,7 @@ function projectTurn(
     : base);
   const layoutRevision = hashJson({
     projection: 'agent-turn-layout-v1',
+    inputItems,
     turnId: turn.turnId,
     state: projectTurnState(turn.state),
     userContent,
@@ -970,6 +1067,23 @@ function projectTurn(
  * A trailing marker naturally moves in front of the next user message once that
  * turn exists, matching the native transcript chronology.
  */
+/**
+ * A finished turn's answer is the last message the provider wrote after its
+ * work. Narration that preceded later tool calls is progress, not the answer;
+ * an interrupted or failed turn that ended mid-work has no answer at all.
+ */
+function trailingFinalMessage(blocks: readonly NativeOrderedTurnBlock[]) {
+  for (const block of [...blocks].reverse()) {
+    if (block.kind === 'final-message') {
+      if (block.payload.kind === 'final-message' && block.payload.text.trim()) return block;
+      continue;
+    }
+    if (block.kind === 'tool' || block.kind === 'native-child' || block.kind === 'federated-child' ||
+        block.kind === 'web') return undefined;
+  }
+  return undefined;
+}
+
 function boundaryCompactions(
   turn: JournalTurn,
   pathTurns: readonly JournalTurn[],
@@ -1001,17 +1115,61 @@ function boundaryCompactions(
   };
 }
 
+/**
+ * Compactions that happened inside a turn render as positioned notices after
+ * the block that was in flight, so an hour-long turn shows where the provider
+ * dropped its context instead of stacking dividers at the boundary.
+ */
+function withinTurnCompactionNotices(
+  turn: JournalTurn,
+  controls: readonly JournalCompactionControlEvent[],
+): NativeTurnNotice[] {
+  return mergeCompactionControls(controls)
+    .filter(({ event }) => {
+      const boundary = event.boundary;
+      if (boundary.kind === 'within-turn') return boundary.turnId === turn.turnId;
+      if (boundary.kind === 'native-unresolved') return turn.nativeTurnId !== undefined && boundary.nativeTurnId === turn.nativeTurnId;
+      return false;
+    })
+    .map(({ event, createdAt, view }) => {
+      return {
+        type: 'notice' as const,
+        clientMessageId: `compaction:${event.operationId}`,
+        afterBlockId: event.boundary.kind === 'within-turn' ? event.boundary.afterBlockId ?? null : null,
+        origin: 'compaction' as const,
+        createdAt,
+        text: compactionNoticeText(view),
+      };
+    });
+}
+
+function compactionNoticeText(view: NativeCompactionView) {
+  if (view.state === 'failed') return 'Compaction failed';
+  if (view.beforeTokens === null || view.afterTokens === null) return 'Compacted context';
+  return `Compacted ${formatTokenCount(view.beforeTokens)} → ${formatTokenCount(view.afterTokens)} tokens`;
+}
+
+function formatTokenCount(tokens: number) {
+  return tokens >= 1_000 ? `${Math.round(tokens / 1_000)}k` : String(tokens);
+}
+
 function latestBoundaryCompactions(
   events: readonly JournalCompactionControlEvent[],
   executionId: string,
+): Array<{ event: JournalCompactionControlEvent; createdAt: number; view: NativeCompactionView }> {
+  return mergeCompactionControls(events.filter((event) => event.boundary.kind === 'between-turns' &&
+    !(event.strandId === null && event.executionId !== executionId)));
+}
+
+/** One entry per operation: earliest start, latest state. */
+function mergeCompactionControls(
+  events: readonly JournalCompactionControlEvent[],
 ): Array<{ event: JournalCompactionControlEvent; createdAt: number; view: NativeCompactionView }> {
   const latestByOperation = new Map<string, {
     event: JournalCompactionControlEvent;
     createdAt: number;
   }>();
   for (const event of events) {
-    if (event.boundary.kind !== 'between-turns' ||
-        (event.strandId === null && event.executionId !== executionId)) continue;
     const current = latestByOperation.get(event.operationId);
     if (!current) {
       latestByOperation.set(event.operationId, { event, createdAt: event.createdAt });
@@ -1429,4 +1587,25 @@ function unknownAccountUsage(observedAt: number): ProviderAccountUsage {
 
 function hashJson(value: unknown) {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
+
+function projectContinuationNotice(journal: NativeAgentJournal, conversationId: string,
+  clientMessageId: string, afterBlockId: string | null, origin: Exclude<TurnOrigin, 'user'>,
+  trigger: TurnTrigger | undefined, continuedAt: number, inputOrdinal?: number,
+  triggers?: readonly TurnTrigger[]): NativeTurnNotice {
+  const sources = triggers?.length ? triggers : [trigger];
+  const children = sources.map(source => {
+    const child = source?.childExecutionId ? journal.execution(source.childExecutionId) : undefined;
+    return child?.conversationId === conversationId ? child : undefined;
+  });
+  const titles = sources.map((source, index) => children[index]?.title
+    ?? (source?.kind === 'federation' ? 'federated child' : 'subagent'));
+  const names = titles.length === 1 ? titles[0]
+    : `${titles.slice(0, -1).join(', ')} and ${titles.at(-1)}`;
+  const startedAt = children.flatMap(child => child ? [child.createdAt] : []);
+  return { type: 'notice', clientMessageId, afterBlockId, origin, createdAt: continuedAt,
+    ...(inputOrdinal === undefined ? {} : { inputOrdinal }), ...(trigger ? { trigger } : {}),
+    ...(triggers ? { triggers } : {}),
+    text: `Continued after ${names} finished`,
+    ...(startedAt.length ? { elapsedMs: Math.max(0, continuedAt - Math.min(...startedAt)) } : {}) };
 }

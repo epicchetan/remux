@@ -1,6 +1,7 @@
 import type { AgentToolCallSummary } from '../../../../../shared/transcript.ts';
 
 export function summarizeActionRun(calls: AgentToolCallSummary[]) {
+  if (calls.some(({ status }) => status === 'recovering')) return 'Tool activity awaiting recovery';
   const failed = calls.filter(({ status }) => status === 'failed').length;
   const interrupted = calls.filter(({ status }) => status === 'interrupted').length;
   const issues = [failed ? `${failed} failed` : '', interrupted ? `${interrupted} interrupted` : ''].filter(Boolean);
