@@ -96,14 +96,16 @@ existing bearer header or cookie only; the query token form is not used for
 this route.
 
 The route must never let a workspace file run as the runtime origin. Every
-response carries `X-Content-Type-Options: nosniff` and
-`Content-Security-Policy: sandbox`. Inline disposition is allowed only for
+response carries `X-Content-Type-Options: nosniff`, and every response except
+PDF carries `Content-Security-Policy: sandbox`. Inline disposition is allowed only for
 `image/*`, `audio/*`, `video/*`, `font/*` and `application/pdf`; everything
 else, including HTML, SVG documents opened top-level, XML and text, is served
 as `Content-Disposition: attachment` with an RFC 5987 filename. `?download=1`
-forces attachment for any type. Verify on device whether WKWebView renders a
-PDF under the sandbox header; if it does not, exempt `application/pdf` from that
-one header and record it. Responses carry a `RawFileResponse` extension so the
+forces attachment for any type. `application/pdf` responses are the one
+exemption from the sandbox header: WebKit renders PDFs through a plugin, and a
+sandboxed document may not instantiate plugins, so a sandboxed PDF renders
+blank in the Viewer's iframe. PDFKit runs no document script, so the PDF keeps
+nosniff only. Responses carry a `RawFileResponse` extension so the
 compression layer skips them. Concurrency is bounded by a semaphore of 16
 streams with the gateway's 60 s body idle timeout; there is no size cap on GET.
 
@@ -348,3 +350,7 @@ Commit and push each reviewed green slice to main.
   transient systemd unit; `HEAD /remux/fs/raw` on `README.md` answered 200
   with an ETag, `Content-Security-Policy: sandbox` and nosniff, and
   `remux/fs/stat` returned a file descriptor (version `file-v1:18dd63f412426b0eaa6d6f2ecc40eeaf01dc1526`).
+- 2026-09-15: device check found a 10 MB PDF rendering blank in the Viewer.
+  Cause: the sandbox CSP header on the raw response, as anticipated above.
+  Fix: `application/pdf` raw responses no longer carry
+  `Content-Security-Policy: sandbox` (nosniff stays); test added.

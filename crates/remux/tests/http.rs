@@ -429,7 +429,17 @@ fn raw_url(addr: SocketAddr, path: &std::path::Path) -> String {
 
 fn assert_raw_headers(response: &reqwest::Response) {
     assert_eq!(response.headers()["x-content-type-options"], "nosniff");
-    assert_eq!(response.headers()["content-security-policy"], "sandbox");
+    // PDFs are the one type WebKit draws with a plugin; the sandbox header
+    // would blank them, so they carry nosniff only.
+    let pdf = response
+        .headers()
+        .get("content-type")
+        .is_some_and(|value| value.to_str().unwrap().starts_with("application/pdf"));
+    if pdf {
+        assert!(response.headers().get("content-security-policy").is_none());
+    } else {
+        assert_eq!(response.headers()["content-security-policy"], "sandbox");
+    }
     assert_eq!(response.headers()["cache-control"], "private, no-cache");
     assert!(response.headers().get("content-encoding").is_none());
 }
@@ -570,6 +580,7 @@ async fn raw_paths_symlinks_special_files_and_error_headers() {
     let response = client.get(raw_url(addr, &link)).send().await.unwrap();
     assert_eq!(response.status(), 200);
     assert_eq!(response.headers()["content-type"], "application/pdf");
+    assert_raw_headers(&response);
     assert_eq!(response.text().await.unwrap(), "%PDF-1.7");
     let fifo = root.path().join("fifo");
     nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).unwrap();

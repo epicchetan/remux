@@ -73,15 +73,25 @@ pub async fn secure_raw_responses(request: Request, next: axum::middleware::Next
 
 async fn secure_response(mut response: Response) -> Response {
     response.extensions_mut().insert(RawFileResponse);
+    // WebKit draws PDFs with a plugin, and a sandboxed document may not
+    // instantiate plugins, so a sandboxed PDF renders blank in the Viewer's
+    // iframe. PDFKit runs no document script, so the PDF keeps only nosniff.
+    let pdf = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/pdf"));
     let headers = response.headers_mut();
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         header::HeaderValue::from_static("nosniff"),
     );
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        header::HeaderValue::from_static("sandbox"),
-    );
+    if !pdf {
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            header::HeaderValue::from_static("sandbox"),
+        );
+    }
     headers.insert(
         header::CACHE_CONTROL,
         header::HeaderValue::from_static("private, no-cache"),
