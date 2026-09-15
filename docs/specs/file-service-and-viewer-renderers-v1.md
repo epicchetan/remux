@@ -344,3 +344,7 @@ Commit and push each reviewed green slice to main.
   build should add a `fingerprint.config.js` with
   `sourceSkips: PackageJsonScriptsAll` so script edits stop moving the
   fingerprint.
+- 2026-09-15: S5 live. Runtime service restarted into the new binary from a
+  transient systemd unit; `HEAD /remux/fs/raw` on `README.md` answered 200
+  with an ETag, `Content-Security-Policy: sandbox` and nosniff, and
+  `remux/fs/stat` returned a file descriptor (version `file-v1:18dd63f412426b0eaa6d6f2ecc40eeaf01dc1526`).
