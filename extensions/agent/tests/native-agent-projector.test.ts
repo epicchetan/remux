@@ -1092,6 +1092,30 @@ for (const [kind, catalog, label] of [
   });
 }
 
+test('a continuation notice measures the reused child turn, not the child lifetime', () => {
+  const journal = createJournal();
+  try {
+    seed(journal);
+    journal.createFederatedExecution({ executionId: 'astra', conversationId: 'conversation-1',
+      parentExecutionId: 'execution-1', rootTurnId: 'turn-1', provider: 'fixture', providerInstanceId: 'fixture-local',
+      model: 'gpt-6-astra', access: 'read-only', scheduling: 'foreground', depth: 1, title: 'Astra', now: 4 });
+    for (const [turnId, now] of [['astra-turn-1', 4], ['astra-turn-2', 15_004]] as const) {
+      journal.createTurn({ turnId, conversationId: 'conversation-1', executionId: 'astra',
+        clientMessageId: `${turnId}-input`, commandId: `${turnId}-command`, content: [{ type: 'text', text: 'Implement' }],
+        model: 'gpt-6-astra', state: 'running', now });
+    }
+    journal.appendProviderEvent(event('root-finished', 5, { type: 'turn.completed', outcome: 'completed' }));
+    const started = event('continued-reused', 20_004, { type: 'turn.started', origin: 'native',
+      trigger: { kind: 'federation', childExecutionId: 'astra', summary: 'Done' } });
+    assert.ok(started.scope.kind === 'turn');
+    started.scope.turnId = 'continued'; started.native.turnId = 'native-continued';
+    journal.appendProviderEvent(started);
+    const frame = new NativeAgentProjector(journal).project('agent/turn:continued') as NativeAgentTurnFrame;
+    assert.equal(frame.inputItems?.[0]?.text, 'Continued after gpt-6-astra finished');
+    assert.equal(frame.inputItems?.[0]?.elapsedMs, 5_000);
+  } finally { journal.close(); }
+});
+
 test('a turn that ends mid-work has no final answer even when it narrated earlier', () => {
   const journal = createJournal();
   try {

@@ -42,6 +42,7 @@ import {
   type LegacyJournalEvent,
   type JournalConversation,
   type JournalCompactionControlEvent,
+  type JournalExecution,
   type JournalTurn,
   viewerCapabilities,
 } from './native-journal.ts';
@@ -1612,10 +1613,18 @@ function projectContinuationNotice(journal: NativeAgentJournal,
   });
   const names = titles.length === 1 ? titles[0]
     : `${titles.slice(0, -1).join(', ')} and ${titles.at(-1)}`;
-  const startedAt = children.flatMap(child => child ? [child.createdAt] : []);
+  // A reused child accumulates turns; the divider measures the turn that just
+  // finished, not the child's lifetime since it was spawned.
+  const startedAt = children.flatMap(child => child ? [childTurnStart(journal, child, continuedAt)] : []);
   return { type: 'notice', clientMessageId, afterBlockId, origin, createdAt: continuedAt,
     ...(inputOrdinal === undefined ? {} : { inputOrdinal }), ...(trigger ? { trigger } : {}),
     ...(triggers ? { triggers } : {}),
     text: `Continued after ${names} finished`,
     ...(startedAt.length ? { elapsedMs: Math.max(0, continuedAt - Math.min(...startedAt)) } : {}) };
+}
+
+function childTurnStart(journal: NativeAgentJournal, child: JournalExecution, continuedAt: number) {
+  const latest = journal.turnsForExecution(child.executionId)
+    .filter(turn => turn.createdAt <= continuedAt).at(-1);
+  return latest ? latest.startedAt ?? latest.createdAt : child.createdAt;
 }
