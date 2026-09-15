@@ -97,6 +97,7 @@ active product surface, package, service, model, or release requirement.
 
 | Spec | Status | Notes |
 | --- | --- | --- |
+| [file-service-and-viewer-renderers-v1.md](file-service-and-viewer-renderers-v1.md) | Active Spec | Runtime file service (stat, raw HTTP GET/PUT with sandboxed responses, write/mkdir/rename/delete RPCs), Viewer as a lazy renderer host (image, PDF, media, binary), host download/share, and Files tab upload and mutations. |
 | [unified-file-viewer-v1.md](unified-file-viewer-v1.md) | Implemented — deployed; Narrate retired | One web Viewer with default Markdown/HTML preview, shared Source toggle, bounded large-file Source, iframe bridge isolation, and full Narrate retirement with tab migration. |
 | [html-file-preview-v1.md](html-file-preview-v1.md) | Superseded | Historical native HTML preview; replaced by the unified web Viewer. |
 | [multi-provider-agent-workspace-extension.md](multi-provider-agent-workspace-extension.md) | Archived prototype | Historical full-capsule T3 Code integration. Its provider analysis, gateway, and mobile findings remain evidence; its source and extension were removed when Agent became the product path. |
