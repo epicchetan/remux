@@ -20,6 +20,7 @@ export default defineConfig({
   reporter: process.env.CI ? 'list' : 'list',
   testDir: './tests',
   testMatch: 'viewer*.spec.ts',
+  testIgnore: '**/live/**',
   timeout: 30_000,
   use: { baseURL, colorScheme: 'dark', trace: 'on-first-retry' },
   webServer: {

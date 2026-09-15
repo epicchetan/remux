@@ -245,7 +245,7 @@ async fn header_auth_serves_and_hands_off_a_cookie() {
 }
 
 #[tokio::test]
-async fn cookie_and_query_auth_serve_without_setting_cookies() {
+async fn cookie_auth_serves_and_query_auth_hands_off_cookie() {
     let dir = tempfile::tempdir().unwrap();
     let harness = serve(dir.path(), true).await;
 
@@ -262,7 +262,9 @@ async fn cookie_and_query_auth_serve_without_setting_cookies() {
     )
     .await;
     assert_eq!(response.status(), 200);
-    assert!(response.headers().get("set-cookie").is_none());
+    let cookie = response.headers().get("set-cookie").unwrap().to_str().unwrap();
+    assert!(cookie.starts_with(&format!("remux_auth={TOKEN}; ")));
+    assert!(cookie.contains("Path=/; HttpOnly; SameSite=Lax"));
 }
 
 #[tokio::test]

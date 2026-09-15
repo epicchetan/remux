@@ -20,25 +20,22 @@ try {
   ]) {
     const context = await browser.newContext({ colorScheme: 'dark', viewport: target.viewport });
     await context.addCookies([{
-      domain: '127.0.0.1',
+      url: options.httpBase,
       httpOnly: true,
       name: 'remux_auth',
-      path: '/',
       sameSite: 'Lax',
-      secure: false,
+      secure: new URL(options.httpBase).protocol === 'https:',
       value: token,
     }]);
-    await context.addInitScript(installLiveHostBridge, {
-      cwd: options.cwd,
-      endpoint: options.wsEndpoint,
-    });
     const page = await context.newPage();
     const pageErrors = [];
+    page.on('console', (message) => { if (message.type() === 'error') console.error(message.text()); });
     page.on('pageerror', (error) => pageErrors.push(error.message));
     const url = new URL('/viewers/agent/', options.httpBase);
     url.searchParams.set('remuxResourceKind', 'agentConversation');
     url.searchParams.set('remuxResourceId', options.conversationId);
     await page.goto(url.toString(), { waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => window.__REMUX_DIRECT_HOST__?.status.type === 'connected', null, { timeout: 20_000 });
     const transcript = page.getByTestId('agent-transcript-content');
     if (options.generic) {
       await transcript.locator('[data-turn-id]').last().waitFor({ timeout: 20_000 });
@@ -244,7 +241,6 @@ function parseOptions(args) {
   if (!conversationId) throw new Error('--conversation-id is required.');
   return {
     conversationId,
-    cwd: resolve(values.get('--cwd') ?? repositoryRoot),
     generic: flags.has('--generic'),
     expectComposerContext: flags.has('--expect-composer-context'),
     openWork: flags.has('--open-work'),
@@ -253,98 +249,5 @@ function parseOptions(args) {
     sendPrompt: values.get('--send-prompt') ?? null,
     expectText: values.get('--expect-text') ?? null,
     tokenFile: resolve(values.get('--token-file') ?? resolve(repositoryRoot, '.remux/auth-token')),
-    wsEndpoint: values.get('--ws-endpoint') ?? 'ws://127.0.0.1:48123/ws',
   };
-}
-
-function installLiveHostBridge(options) {
-  const pendingFrames = [];
-  let hostReady = false;
-  let socketReady = false;
-  const socket = new WebSocket(options.endpoint);
-
-  const dispatch = (message) => {
-    const event = new MessageEvent('message', { data: JSON.stringify(message) });
-    window.dispatchEvent(event);
-    document.dispatchEvent(event);
-  };
-  const announceReady = () => {
-    if (!hostReady || !socketReady) return;
-    dispatch({
-      error: null,
-      status: { cwd: options.cwd, generation: 1, type: 'connected' },
-      type: 'remux/status',
-    });
-    dispatch({
-      lifecycle: { epoch: 1, reason: 'connect', state: 'active' },
-      type: 'remux/lifecycle',
-    });
-  };
-  const send = (frame) => {
-    if (socketReady) socket.send(JSON.stringify(frame));
-    else pendingFrames.push(frame);
-  };
-  const respond = (id, result) => dispatch({ id, result, type: 'remux/response' });
-
-  socket.addEventListener('open', () => {
-    socketReady = true;
-    for (const frame of pendingFrames.splice(0)) socket.send(JSON.stringify(frame));
-    announceReady();
-  });
-  socket.addEventListener('message', (event) => {
-    const message = JSON.parse(String(event.data));
-    if (message.id !== undefined) {
-      if (message.error) dispatch({ error: message.error, id: message.id, type: 'remux/error' });
-      else respond(message.id, message.result);
-      return;
-    }
-    if (message.method) dispatch({ message, type: 'remux/event' });
-  });
-  socket.addEventListener('close', () => {
-    dispatch({ error: 'Live viewer bridge disconnected.', status: { type: 'closed' }, type: 'remux/status' });
-  });
-
-  Object.defineProperty(window, 'ReactNativeWebView', {
-    configurable: true,
-    value: {
-      postMessage(raw) {
-        const request = JSON.parse(raw);
-        if (request.type === 'remux/ready' || request.type === 'ready') {
-          hostReady = true;
-          announceReady();
-          return;
-        }
-        if (request.type === 'remux/cancel') return;
-        if (request.method?.startsWith('host/')) {
-          if (request.id === undefined) return;
-          if (request.method === 'host/viewport/get') {
-            respond(request.id, {
-              keyboardHeight: 0,
-              keyboardVisible: false,
-              visibleBottom: window.innerHeight,
-              visibleTop: 0,
-              viewportHeight: window.innerHeight,
-              viewportWidth: window.innerWidth,
-            });
-          } else {
-            respond(request.id, { ok: true });
-          }
-          return;
-        }
-        if (request.type === 'remux/notify') {
-          send({ jsonrpc: '2.0', method: request.method, params: request.params });
-          return;
-        }
-        if (request.type === 'remux/request') {
-          send({
-            id: request.id,
-            jsonrpc: '2.0',
-            method: request.method,
-            params: request.params,
-            remuxContract: request.contract,
-          });
-        }
-      },
-    },
-  });
 }

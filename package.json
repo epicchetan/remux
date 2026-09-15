@@ -22,7 +22,10 @@
     "test:agent-viewer": "npm --workspace @remux/agent run test:viewer",
     "test:terminal-server": "cargo test --manifest-path extensions/terminal/server/Cargo.toml",
     "test:terminal-smoke": "node extensions/terminal/tests/ws-smoke.cjs",
-    "test:terminal": "playwright test -c extensions/terminal/playwright.config.ts"
+    "test:terminal": "playwright test -c extensions/terminal/playwright.config.ts",
+    "view:open": "node tools/view/open.mjs",
+    "test:viewer-kit": "npm --workspace @remux/viewer-kit test",
+    "test:viewer:live": "npm --workspace @remux/agent run test:viewer:live"
   },
   "devDependencies": {
     "@playwright/test": "^1.59.1",

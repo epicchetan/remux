@@ -30,7 +30,7 @@ import type {
   BrowserTab,
   ViewerTab,
 } from './browserTypes';
-import { serializedResourceKey } from './resourceKeys';
+import { serializedResourceKey } from '@remux/viewer-kit/route';
 import { migrateNarrateFileTabs } from './narrateTabMigration';
 
 type BrowserCatalogStatus = 'error' | 'idle' | 'loading' | 'ready';

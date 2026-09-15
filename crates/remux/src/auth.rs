@@ -187,8 +187,8 @@ fn cookie_token(headers: &HeaderMap) -> Option<String> {
 }
 
 /// The single auth choke point, layered over the merged `/ws` + HTTP router
-/// in `run_worker`. Header-authenticated responses get the `Set-Cookie`
-/// hand-off so WebView subresources (which cannot carry custom headers) ride
+/// in `run_worker`. Header- and query-authenticated responses get the
+/// `Set-Cookie` hand-off so browser subresources and WebSocket upgrades ride
 /// the cookie on every later same-origin request.
 pub async fn require_auth(
     State(auth): State<Arc<AuthState>>,
@@ -217,13 +217,16 @@ pub async fn require_auth(
         return unauthorized_response();
     }
 
-    let via_header = matches!(candidate, Some((_, TokenSource::Header)));
+    let needs_cookie_handoff = matches!(
+        candidate,
+        Some((_, TokenSource::Header | TokenSource::Query))
+    );
     let has_valid_cookie = cookie_token(request.headers())
         .map(|token| constant_time_eq(&token, &auth.token))
         .unwrap_or(false);
 
     let mut response = next.run(request).await;
-    if via_header && !has_valid_cookie {
+    if needs_cookie_handoff && !has_valid_cookie {
         // No `Secure` attribute: transport is plain HTTP inside WireGuard.
         let cookie = format!(
             "{AUTH_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000",
@@ -247,6 +250,67 @@ fn unauthorized_response() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SilentLog;
+
+    impl WsLog for SilentLog {
+        fn log(&self, _: &str) {}
+        fn warn(&self, _: &str) {}
+        fn error(&self, _: &str) {}
+        fn event(&self, _: crate::rpc::ws::DiagnosticEvent) {}
+    }
+
+    #[tokio::test]
+    async fn query_token_hands_off_cookie_only_after_successful_authentication() {
+        let auth = Arc::new(AuthState {
+            token: "test-token".to_string(),
+            require_auth: true,
+            log: Arc::new(SilentLog),
+        });
+        let router = axum::Router::new()
+            .fallback(|| async { "viewer or asset" })
+            .layer(axum::middleware::from_fn_with_state(auth, require_auth));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("{base}/viewers/agent/?token=test-token"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            cookie,
+            "remux_auth=test-token; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000"
+        );
+        let asset = client
+            .get(format!("{base}/viewers/agent/assets/index.js"))
+            .header(header::COOKIE, cookie.split(';').next().unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(asset.status(), StatusCode::OK);
+        assert!(asset.headers().get(header::SET_COOKIE).is_none());
+        for request in [
+            client.get(format!("{base}/viewers/agent/?token=wrong")),
+            client.get(format!("{base}/viewers/agent/")),
+            client
+                .get(format!("{base}/viewers/agent/?token=test-token"))
+                .header(header::AUTHORIZATION, "Bearer wrong"),
+        ] {
+            let rejected = request.send().await.unwrap();
+            assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+            assert!(rejected.headers().get(header::SET_COOKIE).is_none());
+        }
+        server.abort();
+    }
 
     fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut headers = HeaderMap::new();

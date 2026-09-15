@@ -40,7 +40,7 @@ import type { RemuxViewHostChrome } from '../../remote/remuxExtensions';
 import { useRemuxSettingsStore } from '../../remote/remuxSettingsStore';
 import { useTheme, type RemuxTheme, type RemuxThemeName } from '../../theme/ThemeProvider';
 import type { BrowserPendingNavigation, BrowserSection, ViewerTab } from '../../browser/browserTypes';
-import { serializedResourceKey } from '../../browser/resourceKeys';
+import { serializedResourceKey } from '@remux/viewer-kit/route';
 import { noteTabPreviewContentChanged } from '../../browser/tabPreviewCapture';
 import { NativeGlassIconButton } from '../../ui/NativeGlassIconButton';
 import {

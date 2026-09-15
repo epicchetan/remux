@@ -6,7 +6,7 @@ import * as Notifications from 'expo-notifications';
 
 import { useBrowserStore } from '../browser/browserStore';
 import type { BrowserResourceTarget, ViewerTab } from '../browser/browserTypes';
-import { serializedResourceKey } from '../browser/resourceKeys';
+import { serializedResourceKey } from '@remux/viewer-kit/route';
 import { logRemuxDebug } from '../remote/remuxDebug';
 import { useRemuxConnection, type RemuxConnection } from '../remote/RemuxConnectionProvider';
 import { useRemuxSettingsStore } from '../remote/remuxSettingsStore';

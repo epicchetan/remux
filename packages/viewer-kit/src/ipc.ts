@@ -5,6 +5,7 @@ import {
   type RpcRequestOptions,
 } from './rpc';
 import { isTrustedHostMessageEvent } from './ipcSenderPolicy';
+import { installDirectHost } from './directHost';
 
 export type JsonRpcId = number | string;
 
@@ -30,7 +31,7 @@ export class RemuxRpcError extends Error {
 
 type WebViewReady = { type: 'remux/ready' };
 
-type WebViewRequest =
+export type WebViewRequest =
   | WebViewReady
   | {
       method: string;
@@ -117,6 +118,7 @@ export type IpcStatusSnapshot = {
 
 const requestIdPrefix = 'remux-extension-viewer';
 let initialized = false;
+let directHost: ReturnType<typeof installDirectHost> | null = null;
 let protectedTransportRequired = false;
 let legacyTransportEstablished = false;
 let protectedTransportFailure: string | null = null;
@@ -393,6 +395,10 @@ export function initializeIpc(options: InitializeIpcOptions = {}) {
   window.addEventListener('remux:host-capabilities-ready', flushProtectedTransportQueue);
   initialized = true;
 
+  if (window.parent === window && !window.ReactNativeWebView && !window.__REMUX_PROTECTED_POST_MESSAGE__) {
+    directHost = installDirectHost();
+  }
+
   observePreviewMutations();
   observeResumeSignals();
   postMessage({ type: 'remux/ready' });
@@ -581,6 +587,10 @@ function parseNativeMessage(data: unknown): NativeMessage | null {
 }
 
 function postMessage(message: WebViewRequest) {
+  if (directHost) {
+    directHost.postMessage(message);
+    return;
+  }
   if (
     protectedTransportRequired
     && !legacyTransportEstablished
