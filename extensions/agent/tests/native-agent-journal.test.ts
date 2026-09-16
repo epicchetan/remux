@@ -154,6 +154,37 @@ test('native journal separates command acceptance from native terminal outcome',
   }
 });
 
+test('a provider branch cursor survives the events that follow it', () => {
+  const journal = createJournal();
+  try {
+    seedConversation(journal);
+    journal.claimCommand('send-1', 'turn.send', { a: 1 }, 2);
+    journal.createTurn({
+      turnId: 'turn-1',
+      conversationId: 'conversation-1',
+      executionId: 'execution-1',
+      clientMessageId: 'message-1',
+      commandId: 'send-1',
+      content: [{ type: 'text', text: 'Implement it.' }],
+      model: 'fixture-native-v1',
+      state: 'running',
+      now: 4,
+    });
+    journal.appendProviderEvent(event('turn-started', 7, { type: 'turn.started' }));
+    assert.equal(journal.nativeTurnBinding('execution-1', 'turn-1')?.branchCursor, null);
+    const cursor = { version: 1, promptUuid: 'prompt-1', previousChainEntryUuid: null, lastChainEntryUuid: 'entry-9' };
+    journal.appendProviderEvent(event('branch-point', 8, { type: 'turn.branch-point', cursorVersion: 1, cursor }));
+    journal.appendProviderEvent(event('turn-completed', 9, { type: 'turn.completed', outcome: 'completed' }));
+    const binding = journal.nativeTurnBinding('execution-1', 'turn-1');
+    assert.deepEqual(binding?.branchCursor, cursor);
+    assert.equal(binding?.cursorVersion, 1);
+    assert.equal(binding?.nativeTurnId, 'fixture-native-turn-1');
+    assert.equal(binding?.bindingState, 'authoritative');
+  } finally {
+    journal.close();
+  }
+});
+
 test('history discovery refreshes native metadata without overwriting a running execution', () => {
   const journal = createJournal();
   try {

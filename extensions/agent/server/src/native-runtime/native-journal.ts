@@ -1762,8 +1762,6 @@ export class NativeAgentJournal {
           executionId: conversation.rootExecutionId,
           turnId: queued.turnId,
           nativeTurnId,
-          branchCursor: { version: 1, nativeTurnId },
-          cursorVersion: 1,
           now,
         });
       }
@@ -3763,13 +3761,13 @@ export class NativeAgentJournal {
         UPDATE turns SET native_turn_id = COALESCE(native_turn_id, ?), updated_at = MAX(updated_at, ?)
         WHERE turn_id = ?
       `).run(envelope.native.turnId, now, turnId);
+      // Only the provider's turn.branch-point event carries a branch cursor.
+      // Binding the native turn id here must not replace that cursor.
       this.upsertNativeTurnBinding({
         providerInstanceId: scope.providerInstanceId,
         executionId,
         turnId,
         nativeTurnId: envelope.native.turnId,
-        branchCursor: { version: 1, nativeTurnId: envelope.native.turnId },
-        cursorVersion: 1,
         now,
       });
     }

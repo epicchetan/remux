@@ -1906,7 +1906,6 @@ test('native session resume receives durable Remux-to-provider turn bindings', a
       turnId: first.turnId,
       nativeTurnId,
       nextBlockOrdinal: journal.nextTurnBlockOrdinal(first.turnId),
-      branchCursor: { version: 1, nativeTurnId },
     }]);
     assert.equal(journal.turns(created.conversationId).length, 2);
   } finally {
