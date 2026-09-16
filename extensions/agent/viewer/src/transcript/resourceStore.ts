@@ -139,6 +139,9 @@ export type TranscriptRefreshOptions = {
 };
 
 export type TranscriptRefreshOutcome = 'applied' | 'unavailable';
+// 'deferred' means the viewer left the active/connected state mid-recovery; the
+// resume path performs an authoritative tail sync once it returns.
+export type TranscriptRecoveryOutcome = 'applied' | 'deferred' | 'failed';
 
 type TranscriptSyncWaiter = {
   reject: (reason: unknown) => void;
@@ -447,23 +450,23 @@ export async function recoverActiveTranscriptResources(
     attempts?: number;
     revalidateDetails?: boolean;
   } = {},
-) {
+): Promise<TranscriptRecoveryOutcome> {
   const attempts = Math.max(1, options.attempts ?? 4);
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     if (
       lifecycleState !== 'active' ||
       getHostStatusSnapshot().status.type !== 'connected'
     ) {
-      return false;
+      return 'deferred';
     }
     const outcome = await synchronizeActiveTranscriptResources(options);
     if (outcome === 'applied') {
       if (options.revalidateDetails) await revalidateLoadedTranscriptDetails();
-      return true;
+      return 'applied';
     }
     if (attempt + 1 < attempts) await waitForTranscriptRetry(transcriptRetryDelay(attempt));
   }
-  return false;
+  return 'failed';
 }
 
 export async function invalidateTranscriptResources(

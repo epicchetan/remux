@@ -148,8 +148,10 @@ export function useConversationActions(options: {
       ensureConversation(record.conversationId, true),
       ...(activeConversationIdRef.current === record.conversationId && sent?.delivery !== 'queued' && sent?.turnId
         ? [recoverActiveTranscriptResources({ attempts: 4, forceFullMeasure: false,
-            preserveReady: true, requiredTurnId: sent.turnId, windowPolicy: 'tail' }).then((recovered) => {
-              if (!recovered && activeConversationIdRef.current === record.conversationId) {
+            preserveReady: true, requiredTurnId: sent.turnId, windowPolicy: 'tail' }).then((outcome) => {
+              // A backgrounded or disconnected viewer defers the sync to the
+              // resume path; the message itself is already accepted.
+              if (outcome === 'failed' && activeConversationIdRef.current === record.conversationId) {
                 throw new Error('The message was accepted. Retry to finish syncing its conversation.');
               }
             })]

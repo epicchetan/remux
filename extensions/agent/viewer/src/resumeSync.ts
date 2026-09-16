@@ -61,7 +61,7 @@ export function useAgentResumeSync(
         durationMs: Date.now() - startedAt,
         failures,
         reason,
-        recovered: transcriptResult.status === 'fulfilled' && transcriptResult.value,
+        recovered: transcriptResult.status === 'fulfilled' ? transcriptResult.value : 'failed',
       })}`);
     }).finally(() => {
       inFlight.current = false;
