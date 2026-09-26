@@ -13,6 +13,7 @@ import { createNativeAgentSchema } from '../server/src/native-runtime/schema.ts'
 
 import type {
   AccountInfo as ClaudeAccountInfo,
+  ForkSessionOptions,
   Options as ClaudeQueryOptions,
   Query as ClaudeQuery,
   SDKUserMessage,
@@ -1970,24 +1971,161 @@ function latestTurnBlocks(events: readonly ProviderEventEnvelope[]) {
   return [...latest.values()];
 }
 
-test('Claude native fork uses the persisted chain boundary and guarded dropped turn', async () => {
-  const invocations: Array<{ options?: ClaudeQueryOptions; query: FakeClaudeQuery }> = [];
+for (const boundary of ['before', 'through'] as const) {
+  test(`Claude native fork copies the persisted chain boundary ${boundary} the turn offline`, async () => {
+    const invocations: Array<ClaudeQueryOptions | undefined> = [];
+    const forks: Array<[string, ForkSessionOptions | undefined]> = [];
+    const adapter = new ClaudeNativeAdapter({
+      acceptanceTimeoutMs: 5,
+      createQuery: ({ options }) => {
+        invocations.push(options);
+        return new FakeClaudeQuery() as unknown as ClaudeQuery;
+      },
+      forkSession: async (sessionId, options) => {
+        forks.push([sessionId, options]);
+        return { sessionId: 'forked-session' };
+      },
+    });
+    const session = await adapter.openSession({
+      commandId: 'open-fork-source',
+      providerInstanceId: 'claude-local',
+      conversationId: 'conversation-fork-source',
+      executionId: 'execution-fork-source',
+      mode: 'create',
+      cwd: '/workspace/remux',
+      model: 'claude-sonnet-4-6',
+      access: 'workspace-write',
+      developerInstructions: [],
+    });
+    const branchCursor = {
+      version: 1,
+      promptUuid: '33333333-3333-4333-8333-333333333333',
+      previousChainEntryUuid: '44444444-4444-4444-8444-444444444444',
+      lastChainEntryUuid: '55555555-5555-4555-8555-555555555555',
+    };
+    try {
+      const fork = await session.fork({
+        commandId: `fork-claude-${boundary}`,
+        destinationSessionId: '22222222-2222-4222-8222-222222222222',
+        ...(boundary === 'before'
+          ? { beforeNativeTurnId: 'native-turn-current' }
+          : { throughNativeTurnId: 'native-turn-current' }),
+        branchCursor,
+      });
+      assert.deepEqual(forks, [[session.nativeSession.sessionId, {
+        dir: '/workspace/remux',
+        upToMessageId: boundary === 'before'
+          ? branchCursor.previousChainEntryUuid
+          : branchCursor.lastChainEntryUuid,
+      }]]);
+      assert.equal(invocations.length, 1, 'offline forks must not create another query');
+      assert.deepEqual(fork, {
+        provider: 'claude-code',
+        providerInstanceId: 'claude-local',
+        sessionId: 'forked-session',
+        resumeCursor: { sessionId: 'forked-session' },
+      });
+    } finally {
+      await session.close();
+    }
+  });
+}
+
+for (const destinationSessionId of ['22222222-2222-4222-8222-222222222222', undefined]) {
+  test(`Claude first-turn edit creates a fresh session with a ${destinationSessionId ? 'requested' : 'generated'} ID`, async (t) => {
+    const invocations: Array<ClaudeQueryOptions | undefined> = [];
+    let forkCalls = 0;
+    const adapter = new ClaudeNativeAdapter({
+      acceptanceTimeoutMs: 5,
+      createQuery: ({ options }) => {
+        invocations.push(options);
+        return new FakeClaudeQuery() as unknown as ClaudeQuery;
+      },
+      forkSession: async () => {
+        forkCalls += 1;
+        throw new Error('First-turn edits must not call the SDK fork.');
+      },
+    });
+    const openInput = {
+      commandId: 'open-fresh-source',
+      providerInstanceId: 'claude-local',
+      conversationId: 'conversation-fresh-source',
+      executionId: 'execution-fresh-source',
+      mode: 'create' as const,
+      cwd: '/workspace/remux',
+      model: 'claude-sonnet-4-6',
+      access: 'workspace-write' as const,
+      developerInstructions: [],
+    };
+    const source = await adapter.openSession(openInput);
+    t.after(() => source.close());
+    const fork = await source.fork({
+      commandId: 'fork-claude-first-turn',
+      ...(destinationSessionId ? { destinationSessionId } : {}),
+      beforeNativeTurnId: 'native-turn-first',
+      branchCursor: {
+        version: 1,
+        promptUuid: '33333333-3333-4333-8333-333333333333',
+        previousChainEntryUuid: null,
+        lastChainEntryUuid: '55555555-5555-4555-8555-555555555555',
+      },
+    });
+    assert.equal(forkCalls, 0);
+    assert.equal(invocations.length, 1);
+    if (destinationSessionId) assert.equal(fork.sessionId, destinationSessionId);
+    else assert.match(fork.sessionId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
+    assert.deepEqual(fork, {
+      provider: 'claude-code',
+      providerInstanceId: 'claude-local',
+      sessionId: fork.sessionId,
+      resumeCursor: { sessionId: fork.sessionId, fresh: true },
+    });
+
+    const attached = await adapter.openSession({
+      ...openInput,
+      commandId: 'open-fresh-destination',
+      executionId: 'execution-fresh-destination',
+      mode: 'attach',
+      nativeSession: fork,
+    });
+    t.after(() => attached.close());
+    assert.equal(invocations.length, 2);
+    assert.equal(invocations[1]?.sessionId, fork.sessionId);
+    assert.equal(Object.hasOwn(invocations[1]!, 'resume'), false);
+    assert.deepEqual(attached.nativeSession.resumeCursor, { sessionId: fork.sessionId });
+    await attached.close();
+
+    const resumed = await adapter.openSession({
+      ...openInput,
+      commandId: 'resume-fresh-destination',
+      executionId: 'execution-fresh-destination',
+      mode: 'resume',
+      nativeSession: attached.nativeSession,
+    });
+    t.after(() => resumed.close());
+    assert.equal(invocations.length, 3);
+    assert.equal(invocations[2]?.resume, fork.sessionId);
+    assert.equal(Object.hasOwn(invocations[2]!, 'sessionId'), false);
+  });
+}
+
+test('Claude native fork reports SDK failures with the original error message', async () => {
+  let queryCalls = 0;
   const adapter = new ClaudeNativeAdapter({
     acceptanceTimeoutMs: 5,
-    createQuery: ({ options }) => {
-      const query = new FakeClaudeQuery();
-      invocations.push({ options, query });
-      if (invocations.length > 1) {
-        query.emit({ type: 'system', subtype: 'init', session_id: options?.sessionId });
-      }
-      return query as unknown as ClaudeQuery;
+    createQuery: () => {
+      queryCalls += 1;
+      return new FakeClaudeQuery() as unknown as ClaudeQuery;
+    },
+    forkSession: async () => {
+      throw new Error('Source transcript is missing.');
     },
   });
   const session = await adapter.openSession({
-    commandId: 'open-fork-source',
+    commandId: 'open-fork-error-source',
     providerInstanceId: 'claude-local',
-    conversationId: 'conversation-fork-source',
-    executionId: 'execution-fork-source',
+    conversationId: 'conversation-fork-error-source',
+    executionId: 'execution-fork-error-source',
     mode: 'create',
     cwd: '/workspace/remux',
     model: 'claude-sonnet-4-6',
@@ -1995,93 +2133,23 @@ test('Claude native fork uses the persisted chain boundary and guarded dropped t
     developerInstructions: [],
   });
   try {
-    const destinationSessionId = '22222222-2222-4222-8222-222222222222';
-    const fork = await session.fork!({
-      commandId: 'fork-claude-before',
-      destinationSessionId,
-      beforeNativeTurnId: 'native-turn-current',
-      branchCursor: {
-        version: 1,
-        promptUuid: '33333333-3333-4333-8333-333333333333',
-        previousChainEntryUuid: '44444444-4444-4444-8444-444444444444',
-        lastChainEntryUuid: '55555555-5555-4555-8555-555555555555',
-      },
-    });
-    assert.equal(fork.sessionId, destinationSessionId);
-    assert.equal(invocations[1]?.options?.resume, session.nativeSession.sessionId);
-    assert.equal(invocations[1]?.options?.forkSession, true);
-    assert.equal(invocations[1]?.options?.sessionId, destinationSessionId);
-    assert.equal(invocations[1]?.options?.resumeSessionAt,
-      '44444444-4444-4444-8444-444444444444');
-    assert.equal(invocations[1]?.options?.resumeDropsTurn,
-      '33333333-3333-4333-8333-333333333333');
-  } finally {
-    await session.close();
-  }
-});
-
-test('Claude native fork rejects incompatible account and initialization authentication', async () => {
-  const queries: FakeClaudeQuery[] = [];
-  const adapter = new ClaudeNativeAdapter({
-    acceptanceTimeoutMs: 5,
-    createQuery: ({ options }) => {
-      const index = queries.length;
-      const query = index === 1
-        ? new FakeClaudeQuery(undefined, { apiProvider: 'bedrock', apiKeySource: 'none' })
-        : new FakeClaudeQuery();
-      queries.push(query);
-      if (index === 2) {
-        query.emit({
-          type: 'system',
-          subtype: 'init',
-          session_id: options?.sessionId,
-          apiKeySource: '/login managed key',
-        });
-      }
-      return query as unknown as ClaudeQuery;
-    },
-  });
-  const session = await adapter.openSession({
-    commandId: 'open-fork-auth-source',
-    providerInstanceId: 'claude-local',
-    conversationId: 'conversation-fork-auth-source',
-    executionId: 'execution-fork-auth-source',
-    mode: 'create',
-    cwd: '/workspace/remux',
-    model: 'claude-sonnet-4-6',
-    access: 'read-only',
-    developerInstructions: [],
-  });
-  const fork = (commandId: string) => session.fork!({
-    commandId,
-    destinationSessionId: `${commandId}-destination`,
-    branchCursor: {
-      version: 1,
-      promptUuid: '33333333-3333-4333-8333-333333333333',
-      previousChainEntryUuid: '44444444-4444-4444-8444-444444444444',
-      lastChainEntryUuid: '55555555-5555-4555-8555-555555555555',
-    },
-  });
-  try {
     await assert.rejects(
-      () => fork('fork-incompatible-account'),
-      (error: unknown) => {
-        assert.equal((error as { code?: unknown }).code, 'provider_auth');
-        assert.match(String((error as Error).message), /bedrock/u);
-        return true;
+      session.fork({
+        commandId: 'fork-claude-error',
+        throughNativeTurnId: 'native-turn-current',
+        branchCursor: {
+          version: 1,
+          promptUuid: '33333333-3333-4333-8333-333333333333',
+          previousChainEntryUuid: '44444444-4444-4444-8444-444444444444',
+          lastChainEntryUuid: '55555555-5555-4555-8555-555555555555',
+        },
+      }),
+      {
+        name: 'Error',
+        message: 'Claude could not fork the session: Source transcript is missing.',
       },
     );
-    assert.equal(queries[1]?.isClosed, true);
-
-    await assert.rejects(
-      () => fork('fork-incompatible-init'),
-      (error: unknown) => {
-        assert.equal((error as { code?: unknown }).code, 'provider_auth');
-        assert.match(String((error as Error).message), /\/login managed key/u);
-        return true;
-      },
-    );
-    assert.equal(queries[2]?.isClosed, true);
+    assert.equal(queryCalls, 1);
   } finally {
     await session.close();
   }

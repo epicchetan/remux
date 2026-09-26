@@ -24,6 +24,7 @@ import {
   parseNativeProviderPreferenceSetCommand,
   parseNativeTurnMutationCommand,
   parseNativeDeliveryResolveCommand,
+  type AgentHarnessQuiescence,
   type NativeDeliveryResolveCommand,
   type NativeAgentResourceKey,
   type NativeAgentResourceReadParams,
@@ -475,9 +476,14 @@ export class NativeAgentCoordinator {
           resolvedExecutable: null,
           installedVersion: instance?.probe.capabilities?.providerVersion ?? null,
           runningVersion: null,
+          sessionVersions: [],
+          availableVersion: null,
+          updateCheckedAt: null,
           adapterVersion: instance?.probe.capabilities?.adapterVersion ?? null,
           sdkVersion: null,
           restartRequired: false,
+          supportsUpdate: false,
+          supportsRestart: false,
           activeSessions: 0,
           lastError: null,
         };
@@ -496,15 +502,137 @@ export class NativeAgentCoordinator {
           resolvedExecutable: null,
           installedVersion: instance?.probe.capabilities?.providerVersion ?? null,
           runningVersion: null,
+          sessionVersions: [],
+          availableVersion: null,
+          updateCheckedAt: null,
           adapterVersion: instance?.probe.capabilities?.adapterVersion ?? null,
           sdkVersion: null,
           restartRequired: false,
+          supportsUpdate: false,
+          supportsRestart: false,
           activeSessions: 0,
           lastError: safeMessage(error),
         };
       }
     }));
     return { runtimes, observedAt: this.now() };
+  }
+
+  /**
+   * Whether the harness can be restarted without destroying work.
+   *
+   * A restart rebinds native sessions, so an open-but-idle session is not a
+   * blocker; what cannot be restored is an in-flight model invocation. The
+   * quiet period is the caller's to enforce — this reports `lastActivityAt` so
+   * a maintenance window can require calm rather than a momentary gap between
+   * two turns of a conversation someone is sitting in.
+   */
+  async readQuiescence(): Promise<AgentHarnessQuiescence> {
+    let activeTurns = 0;
+    let queuedMessages = 0;
+    let compacting = 0;
+    let recovering = 0;
+    let lastActivityAt: number | null = null;
+    const blockers: string[] = [];
+    for (const conversation of this.journal.conversations()) {
+      const activity = conversation.lastActivityAt ?? null;
+      if (activity !== null && (lastActivityAt === null || activity > lastActivityAt)) {
+        lastActivityAt = activity;
+      }
+      const queued = this.journal.queuedEntries(conversation.conversationId).length;
+      queuedMessages += queued;
+      if (queued > 0) blockers.push(`${conversation.conversationId}: ${queued} queued`);
+      if (this.journal.pendingCompactionOperation(conversation.conversationId)?.state === 'running') {
+        compacting += 1;
+        blockers.push(`${conversation.conversationId}: compacting`);
+      }
+      if (!conversation.activeTurnId) continue;
+      const turn = this.journal.turn(conversation.activeTurnId);
+      if (turn?.state === 'recovering') {
+        recovering += 1;
+        blockers.push(`${conversation.conversationId}: recovering`);
+        continue;
+      }
+      activeTurns += 1;
+      blockers.push(`${conversation.conversationId}: turn in flight`);
+    }
+    const { runtimes } = await this.readRuntimeStatuses();
+    const activeSessions = runtimes.reduce((total, runtime) => total + runtime.activeSessions, 0);
+    return {
+      quiescent: activeTurns === 0 && queuedMessages === 0 && compacting === 0 && recovering === 0,
+      observedAt: this.now(),
+      activeTurns,
+      queuedMessages,
+      compacting,
+      recovering,
+      activeSessions,
+      lastActivityAt,
+      blockers,
+    };
+  }
+
+  /**
+   * Installs the newest harness release for one provider instance. Safe with
+   * turns in flight: a running process holds the binary it already exec'd.
+   */
+  async updateRuntime(providerInstanceId: string): Promise<{
+    runtime: ProviderRuntimeView; log: readonly string[];
+  }> {
+    const registration = this.providers.get(providerInstanceId);
+    if (!registration) throw new Error(`Unknown provider instance ${JSON.stringify(providerInstanceId)}.`);
+    if (!registration.adapter.updateRuntime) {
+      throw new Error(`${registration.label} does not support managed updates.`);
+    }
+    const result = await registration.adapter.updateRuntime(providerInstanceId);
+    // The model catalog was read from the binary that was installed at startup;
+    // re-probe so the composer offers what the new one supports.
+    await this.refreshProvider(registration);
+    const instance = this.journal.providerInstance(providerInstanceId);
+    this.invalidateProvider(providerInstanceId);
+    return {
+      runtime: {
+        provider: registration.provider,
+        providerInstanceId,
+        label: registration.label,
+        readiness: instance?.probe.state ?? 'error',
+        readinessMessage: instance?.probe.message ?? null,
+        ...result.status,
+      },
+      log: result.log,
+    };
+  }
+
+  /**
+   * Moves a session-process provider onto its installed binary. Each idle
+   * session is closed the way idle eviction closes it, so it resumes on its
+   * next message with nothing lost; a session with a turn, queue, compaction,
+   * or child work in flight keeps its process and is reported instead.
+   */
+  async restartRuntime(providerInstanceId: string): Promise<{
+    runtime: ProviderRuntimeView; log: readonly string[];
+  }> {
+    const registration = this.providers.get(providerInstanceId);
+    if (!registration) throw new Error(`Unknown provider instance ${JSON.stringify(providerInstanceId)}.`);
+    let restarted = 0;
+    let kept = 0;
+    for (const [executionId, session] of [...this.sessions.entries()]) {
+      if (this.journal.execution(executionId)?.providerInstanceId !== providerInstanceId) continue;
+      if (!this.sessionIsIdle(executionId, session)) {
+        kept += 1;
+        continue;
+      }
+      await this.detachAndCloseSession(executionId, session, 'harness-restart');
+      restarted += 1;
+    }
+    this.invalidateProvider(providerInstanceId);
+    const { runtimes } = await this.readRuntimeStatuses();
+    const runtime = runtimes.find((entry) => entry.providerInstanceId === providerInstanceId);
+    if (!runtime) throw new Error(`Unknown provider instance ${JSON.stringify(providerInstanceId)}.`);
+    const plural = (count: number) => `${count} session${count === 1 ? '' : 's'}`;
+    const log = [`Restarted ${plural(restarted)}; ${runtime.installedVersion
+      ? `they resume on ${runtime.installedVersion}` : 'they resume on the installed version'} at their next message.`];
+    if (kept > 0) log.push(`Left ${plural(kept)} running with work in flight.`);
+    return { runtime, log };
   }
 
   prepareResourceRead(unparsed: NativeAgentResourceReadParams) {
@@ -4246,18 +4374,24 @@ export class NativeAgentCoordinator {
     await this.detachAndCloseSession(conversation.rootExecutionId, session, 'passive-history');
   }
 
+  /** Nothing in flight anywhere the session is reachable: closing it loses nothing. */
+  private sessionIsIdle(executionId: string, session: ProviderSession) {
+    if (this.hasSessionWork(executionId, session)) return false;
+    if (this.hydrationJobs.has(executionId) || this.openingSessions.has(executionId)) return false;
+    const execution = this.journal.execution(executionId);
+    if (!execution || execution.state === 'running' || execution.state === 'recovering') return false;
+    const conversation = this.journal.conversation(execution.conversationId);
+    if (!conversation || conversation.activeTurnId) return false;
+    if (executionId === conversation.rootExecutionId &&
+        this.journal.queuedEntries(conversation.conversationId).length > 0) return false;
+    return this.journal.pendingCompactionOperation(conversation.conversationId)?.state !== 'running';
+  }
+
   private async evictIdleSessions() {
     if (this.closed || this.sessions.size === 0) return;
     const now = this.now();
     const candidates = [...this.sessions.entries()].flatMap(([executionId, session]) => {
-      if (this.hasSessionWork(executionId, session)) return [];
-      if (this.hydrationJobs.has(executionId) || this.openingSessions.has(executionId)) return [];
-      const execution = this.journal.execution(executionId);
-      if (!execution || execution.state === 'running' || execution.state === 'recovering') return [];
-      const conversation = this.journal.conversation(execution.conversationId);
-      if (!conversation || conversation.activeTurnId) return [];
-      if (executionId === conversation.rootExecutionId &&
-          this.journal.queuedEntries(conversation.conversationId).length > 0) return [];
+      if (!this.sessionIsIdle(executionId, session)) return [];
       const lastUsedAt = this.sessionLastUsedAt.get(executionId) ?? now;
       return [{ executionId, session, lastUsedAt }];
     }).sort((left, right) => left.lastUsedAt - right.lastUsedAt);

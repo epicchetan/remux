@@ -29,18 +29,36 @@ export type ProviderCommandAcceptance = { accepted: true; nativeTurnId?: string 
 
 export type ProviderRuntimeTopology = 'shared-daemon' | 'session-process' | 'fixture';
 
+/** One live-session cohort: the harness version those sessions actually exec'd. */
+export type ProviderSessionVersion = { version: string; sessions: number };
+
 export type ProviderRuntimeStatus = {
   topology: ProviderRuntimeTopology;
   runtimeState: 'running' | 'idle' | 'stopped' | 'starting' | 'stopping' | 'failed' | 'unknown';
   configuredExecutable: string | null;
   resolvedExecutable: string | null;
   installedVersion: string | null;
+  /**
+   * The single version serving live sessions, or null when the cohorts
+   * disagree. Auto-update routinely outlives a session's binary, so
+   * `sessionVersions` carries the authoritative breakdown.
+   */
   runningVersion: string | null;
+  sessionVersions: readonly ProviderSessionVersion[];
+  availableVersion: string | null;
+  updateCheckedAt: number | null;
   adapterVersion: string | null;
   sdkVersion: string | null;
   restartRequired: boolean;
+  supportsUpdate: boolean;
+  supportsRestart: boolean;
   activeSessions: number;
   lastError: string | null;
+};
+
+export type ProviderRuntimeUpdate = {
+  status: ProviderRuntimeStatus;
+  log: readonly string[];
 };
 
 export type ProviderRuntimeView = ProviderRuntimeStatus & {
@@ -67,6 +85,12 @@ export interface ProviderAdapter {
   /** Refuse recovery while an independent process may still consume this session. */
   assertSessionStopped?(nativeSessionId: string): Promise<void>;
   readRuntimeStatus?(providerInstanceId: string): Promise<ProviderRuntimeStatus>;
+  /**
+   * Installs the newest harness release. Installation never disturbs live
+   * sessions: a running process holds the binary it already exec'd, so
+   * implementations must not stop or restart anything here.
+   */
+  updateRuntime?(providerInstanceId: string): Promise<ProviderRuntimeUpdate>;
   readTurnPresence?(input: { providerInstanceId: string; cwd: string;
     nativeSessionId: string; nativeClientMessageId: string }): Promise<ProviderPresenceRead>;
   discoverSessions?(

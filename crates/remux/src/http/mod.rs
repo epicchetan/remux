@@ -16,7 +16,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::Response;
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use serde_json::Value;
 use tower_http::compression::{
     predicate::{DefaultPredicate, NotForContentType, Predicate},
@@ -99,11 +99,44 @@ pub fn build_router(state: Arc<HttpState>) -> axum::Router {
 pub fn build_router_with_status(
     state: Arc<HttpState>,
     status_state: Arc<ApiStatusState>,
+    maintenance: Arc<crate::maintenance::Maintenance>,
 ) -> axum::Router {
     axum::Router::new()
         .route(
             "/remux/fs/raw",
             raw_files::routes(state.raw_files.max_upload_bytes),
+        )
+        .route(
+            "/api/agent-autoupdate",
+            get({
+                let maintenance = maintenance.clone();
+                move || {
+                    let maintenance = maintenance.clone();
+                    async move { axum::Json(maintenance.status()) }
+                }
+            }),
+        )
+        .route(
+            "/api/agent-autoupdate/run",
+            post({
+                move |axum::Json(request): axum::Json<AgentUpdateRequest>| {
+                    let maintenance = maintenance.clone();
+                    async move {
+                        // The transaction must survive an HTTP client disconnect.
+                        tokio::spawn(async move {
+                            maintenance.run(request.now, request.dry_run).await
+                        })
+                        .await
+                        .map(axum::Json)
+                        .map_err(|error| {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("agent maintenance task failed: {error}"),
+                            )
+                        })
+                    }
+                }
+            }),
         )
         .route(
             "/api/status",
@@ -125,6 +158,13 @@ pub fn build_router_with_status(
         )
         .fallback(handle_request)
         .with_state(state)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AgentUpdateRequest {
+    now: bool,
+    dry_run: bool,
 }
 
 async fn handle_extension_gateway(

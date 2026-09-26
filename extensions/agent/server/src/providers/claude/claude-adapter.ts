@@ -7,6 +7,7 @@ import { isAbsolute, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 
 import {
+  forkSession,
   query as claudeQuery,
   type AccountInfo as ClaudeAccountInfo,
   type HookCallback,
@@ -65,6 +66,7 @@ import type {
   ProviderRuntimeStatus,
   ProviderSession,
 } from '../../provider-adapter.ts';
+import type { ProviderRuntimeUpdate } from '../../provider-adapter.ts';
 import { ProviderEventStream } from '../../provider-adapter.ts';
 import type { CompactDispatchContext, DispatchBoundary, ProviderAcceptanceEvidence,
   ProviderDispatchResult } from '../../native-runtime/delivery-contract.ts';
@@ -81,11 +83,18 @@ import { fitJsonPreview as jsonPreview } from '../preview.ts';
 import { fitDisplayText, fitProviderEventDisplay } from '../display-fitting.ts';
 import { ClaudeContextUsage, claudeCompactWindow, DEFAULT_CLAUDE_COMPACT_WINDOW } from './claude-context-usage.ts';
 
+import agentPackage from '../../../../package.json' with { type: 'json' };
+
+import { PublishedVersionCache } from '../published-version.ts';
 import { WorkspaceFileChanges } from './workspace-file-changes.ts';
 
 const execFile = promisify(execFileCallback);
 const ADAPTER_VERSION = 'remux-claude-agent-sdk-v1';
-const CLAUDE_AGENT_SDK_VERSION = '0.3.258';
+// Read from the installed package: a version the runtime card reports must not
+// be able to drift from the dependency it describes.
+const CLAUDE_AGENT_SDK_VERSION = readInstalledSdkVersion();
+const CLAUDE_CLI_PACKAGE = '@anthropic-ai/claude-code';
+const CLAUDE_UPDATE_TIMEOUT_MS = 180_000;
 const DEFAULT_INSTANCE_ID = 'claude-local';
 const DEFAULT_BINARY = 'claude';
 const CLAUDE_SUBAGENT_MODEL = 'sonnet';
@@ -186,7 +195,12 @@ export type ClaudeNativeAdapterOptions = {
   providerInstanceId?: string;
   environment?: Readonly<Record<string, string | undefined>>;
   createQuery?: ClaudeQueryFactory;
-  runCli?: (args: readonly string[]) => Promise<string>;
+  forkSession?: typeof forkSession;
+  runCli?: (
+    args: readonly string[],
+    options?: { timeoutMs?: number; strict?: boolean },
+  ) => Promise<string>;
+  published?: PublishedVersionCache;
   resolveImageArtifact?: (
     scope: { conversationId: string; executionId: string },
     artifactId: string,
@@ -207,7 +221,14 @@ export class ClaudeNativeAdapter implements ProviderAdapter {
   private readonly providerInstanceId: string;
   private readonly environment?: Readonly<Record<string, string | undefined>>;
   private readonly createQuery: ClaudeQueryFactory;
-  private readonly runCli: (args: readonly string[]) => Promise<string>;
+  private readonly forkSession: typeof forkSession;
+  private readonly runCli: (
+    args: readonly string[],
+    options?: { timeoutMs?: number; strict?: boolean },
+  ) => Promise<string>;
+  private readonly published: PublishedVersionCache;
+  /** sessionId -> the harness version that session exec'd. */
+  private readonly sessionVersions = new Map<string, string>();
   private readonly resolveImageArtifact?: ClaudeNativeAdapterOptions['resolveImageArtifact'];
   private readonly now: () => number;
   private readonly ownership: NativeSessionOwnershipRegistry;
@@ -219,21 +240,26 @@ export class ClaudeNativeAdapter implements ProviderAdapter {
     this.providerInstanceId = options.providerInstanceId ?? DEFAULT_INSTANCE_ID;
     this.environment = options.environment;
     this.createQuery = options.createQuery ?? claudeQuery;
+    this.forkSession = options.forkSession ?? forkSession;
     this.resolveImageArtifact = options.resolveImageArtifact;
     this.now = options.now ?? Date.now;
     this.acceptanceTimeoutMs = options.acceptanceTimeoutMs ?? 30_000;
     this.ownership = options.ownership ?? new NativeSessionOwnershipRegistry(this.now);
-    this.runCli = options.runCli ?? (async (args) => {
+    this.published = options.published ?? new PublishedVersionCache({ now: this.now });
+    this.runCli = options.runCli ?? (async (args, runOptions) => {
       try {
         const result = await execFile(this.binaryPath, [...args], {
           env: subscriptionEnvironment(this.environment),
           maxBuffer: 1024 * 1024,
-          timeout: PROBE_TIMEOUT_MS,
+          timeout: runOptions?.timeoutMs ?? PROBE_TIMEOUT_MS,
         });
         return result.stdout;
       } catch (error) {
+        // `auth status --json` exits non-zero in some signed-out states while
+        // still printing usable JSON, so a non-empty stdout normally wins. An
+        // install is different: a failure there must not read as a no-op.
         const stdout = objectValue(error)?.stdout;
-        if (typeof stdout === 'string' && stdout.trim()) return stdout;
+        if (!runOptions?.strict && typeof stdout === 'string' && stdout.trim()) return stdout;
         throw error;
       }
     });
@@ -305,22 +331,78 @@ export class ClaudeNativeAdapter implements ProviderAdapter {
 
   async readRuntimeStatus(providerInstanceId: string): Promise<ProviderRuntimeStatus> {
     this.assertInstance(providerInstanceId);
-    const activeSessions = this.ownership.snapshot().filter((entry) =>
-      entry.provider === 'claude-code' && entry.providerInstanceId === providerInstanceId).length;
+    const live = this.ownership.snapshot().filter((entry) =>
+      entry.provider === 'claude-code' && entry.providerInstanceId === providerInstanceId);
     const version = this.providerVersion === 'unknown' ? null : this.providerVersion;
+    const sessionVersions = this.liveSessionVersions(live.map((entry) => entry.sessionId), version);
+    const available = this.published.read(CLAUDE_CLI_PACKAGE);
     return {
       topology: 'session-process',
-      runtimeState: activeSessions > 0 ? 'running' : 'idle',
+      runtimeState: live.length > 0 ? 'running' : 'idle',
       configuredExecutable: this.binaryPath,
       resolvedExecutable: null,
       installedVersion: version,
-      runningVersion: activeSessions > 0 ? version : null,
+      runningVersion: sessionVersions.length === 1 ? sessionVersions[0]!.version : null,
+      sessionVersions,
+      availableVersion: available.version,
+      updateCheckedAt: available.checkedAt,
       adapterVersion: ADAPTER_VERSION,
       sdkVersion: CLAUDE_AGENT_SDK_VERSION,
-      restartRequired: false,
-      activeSessions,
+      // A session holds the binary it exec'd: a new install takes effect for
+      // new sessions at once, and for live ones when the coordinator restarts
+      // them idle. Until then the older cohort is what "restart" would move.
+      restartRequired: sessionVersions.some((cohort) => cohort.version !== version),
+      supportsUpdate: true,
+      supportsRestart: true,
+      activeSessions: live.length,
       lastError: null,
     };
+  }
+
+  /**
+   * Cohorts of live sessions by the version each one exec'd. Also prunes
+   * recorded versions whose session is gone, so the map cannot outgrow the
+   * sessions it describes without a separate release hook.
+   */
+  private liveSessionVersions(
+    sessionIds: readonly string[],
+    installedVersion: string | null,
+  ): readonly { version: string; sessions: number }[] {
+    const live = new Set(sessionIds);
+    for (const sessionId of [...this.sessionVersions.keys()]) {
+      if (!live.has(sessionId)) this.sessionVersions.delete(sessionId);
+    }
+    const counts = new Map<string, number>();
+    for (const sessionId of live) {
+      const version = this.sessionVersions.get(sessionId) ?? installedVersion;
+      if (!version || version === 'unknown') continue;
+      counts.set(version, (counts.get(version) ?? 0) + 1);
+    }
+    return [...counts.entries()]
+      .map(([version, sessions]) => ({ version, sessions }))
+      .sort((left, right) => right.sessions - left.sessions || left.version.localeCompare(right.version));
+  }
+
+  /**
+   * Installs the newest Claude Code release. Live sessions keep running on the
+   * binary they exec'd, so this neither waits for idle nor restarts anything;
+   * the version re-probe afterwards is what makes the new install visible.
+   */
+  async updateRuntime(providerInstanceId: string): Promise<ProviderRuntimeUpdate> {
+    this.assertInstance(providerInstanceId);
+    const before = this.providerVersion;
+    const log: string[] = [];
+    const output = await this.runCli(['update'], {
+      timeoutMs: CLAUDE_UPDATE_TIMEOUT_MS,
+      strict: true,
+    });
+    for (const line of output.split('\n').map((entry) => entry.trim()).filter(Boolean)) log.push(line);
+    this.providerVersion = parseVersion(await this.runCli(['--version'])) ?? 'unknown';
+    await this.published.refresh(CLAUDE_CLI_PACKAGE);
+    log.push(before === this.providerVersion
+      ? `Claude Code is current at ${this.providerVersion}.`
+      : `Claude Code updated from ${before} to ${this.providerVersion}.`);
+    return { status: await this.readRuntimeStatus(providerInstanceId), log };
   }
 
   async listModels(providerInstanceId: string): Promise<readonly ProviderModelDescriptor[]> {
@@ -426,6 +508,7 @@ export class ClaudeNativeAdapter implements ProviderAdapter {
         forkNative: (request) => this.materializeFork(input, sessionId, request),
       });
       session.start(input.mode !== 'create');
+      this.sessionVersions.set(sessionId, this.providerVersion);
       return session;
     } catch (error) {
       prompt.close();
@@ -442,81 +525,34 @@ export class ClaudeNativeAdapter implements ProviderAdapter {
   ): Promise<NativeSessionRef> {
     const cursor = claudeBranchCursor(request.branchCursor);
     if (!cursor) throw new Error('Claude native fork requires an authoritative chain cursor.');
-    const destinationSessionId = request.destinationSessionId ?? randomUUID();
     const before = Boolean(request.beforeNativeTurnId);
-    const resumeSessionAt = before
+    const upToMessageId = before
       ? cursor.previousChainEntryUuid
       : cursor.lastChainEntryUuid;
-    const prompt = new ClaudeInputQueue();
-    const diagnostics: string[] = [];
-    const forkInput: OpenProviderSessionInput = {
-      ...sourceInput,
-      commandId: request.commandId,
-      mode: 'resume',
-      nativeSession: {
+    if (upToMessageId === null) {
+      const sessionId = request.destinationSessionId ?? randomUUID();
+      return {
         provider: 'claude-code',
         providerInstanceId: sourceInput.providerInstanceId,
-        sessionId: sourceSessionId,
-      },
-    };
-    const base = sessionQueryOptions({
-      input: forkInput,
-      sessionId: sourceSessionId,
-      binaryPath: this.binaryPath,
-      environment: this.environment,
-      onFileChanged: () => undefined,
-      onStderr: (chunk) => recordClaudeDiagnostic(diagnostics, chunk),
-    });
-    const query = this.createQuery({
-      prompt,
-      options: resumeSessionAt
-        ? {
-            ...base,
-            resume: sourceSessionId,
-            forkSession: true,
-            sessionId: destinationSessionId,
-            resumeSessionAt,
-            ...(before ? { resumeDropsTurn: cursor.promptUuid } : {}),
-          }
-        : {
-            ...base,
-            resume: undefined,
-            forkSession: undefined,
-            resumeSessionAt: undefined,
-            resumeDropsTurn: undefined,
-            sessionId: destinationSessionId,
-          },
-    });
-    try {
-      const auth = requireClaudeSubscription(await query.accountInfo());
-      let materialized = false;
-      for await (const message of query) {
-        const record = message as unknown as Record<string, unknown>;
-        if (record.type === 'system' && record.subtype === 'init') {
-          requireClaudeInitSubscription(record.apiKeySource, auth);
-          materialized = true;
-          break;
-        }
-        if (record.type === 'result' && record.subtype !== 'success') {
-          const errors = Array.isArray(record.errors)
-            ? record.errors.filter((entry): entry is string => typeof entry === 'string')
-            : [];
-          throw new Error(errors.join('\n') || 'Claude rejected the native fork.');
-        }
-      }
-      if (!materialized) {
-        throw new Error(diagnostics.at(-1) ?? 'Claude ended before the forked session materialized.');
-      }
-    } finally {
-      prompt.close();
-      query.close();
+        sessionId,
+        // First-turn edits have no transcript yet; create it on the first open.
+        resumeCursor: { sessionId, fresh: true },
+      };
     }
-    return {
-      provider: 'claude-code',
-      providerInstanceId: sourceInput.providerInstanceId,
-      sessionId: destinationSessionId,
-      resumeCursor: { sessionId: destinationSessionId },
-    };
+    try {
+      const { sessionId } = await this.forkSession(sourceSessionId, {
+        dir: sourceInput.cwd,
+        upToMessageId,
+      });
+      return {
+        provider: 'claude-code',
+        providerInstanceId: sourceInput.providerInstanceId,
+        sessionId,
+        resumeCursor: { sessionId },
+      };
+    } catch (error) {
+      throw new Error(`Claude could not fork the session: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   private assertInstance(providerInstanceId: string) {
@@ -2646,6 +2682,7 @@ function sessionQueryOptions(input: {
 }): ClaudeQueryOptions {
   const instructions = input.input.developerInstructions.join('\n\n');
   const permission = permissionOptions(input.input.access, input.input.cwd);
+  const fresh = objectValue(input.input.nativeSession?.resumeCursor)?.fresh === true;
   return {
     cwd: input.input.cwd,
     model: input.input.model,
@@ -2671,7 +2708,7 @@ function sessionQueryOptions(input: {
     perTaskStopAffordance: true,
     persistSession: true,
     env: subscriptionEnvironment(input.environment),
-    ...(input.input.mode === 'create'
+    ...(input.input.mode === 'create' || fresh
       ? { sessionId: input.sessionId }
       : { resume: input.sessionId }),
     ...permission,
@@ -2926,6 +2963,16 @@ async function mapClaudeUserContent(
     }
   }
   return blocks as unknown as SDKUserMessage['message']['content'];
+}
+
+/**
+ * The pin from the extension's own manifest. Vite inlines this JSON at build
+ * time, so a rebuilt `server/dist` always reports the dependency it was built
+ * against — the previous hand-copied literal could drift silently.
+ */
+function readInstalledSdkVersion(): string {
+  const pinned = agentPackage.dependencies['@anthropic-ai/claude-agent-sdk'];
+  return typeof pinned === 'string' && pinned.trim().length > 0 ? pinned : 'unknown';
 }
 
 function mapClaudeModel(model: ClaudeModelInfo, index: number): ProviderModelDescriptor {

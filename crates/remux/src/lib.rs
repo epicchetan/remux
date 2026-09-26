@@ -6,6 +6,7 @@ pub mod fs;
 pub mod guardian;
 pub mod http;
 pub mod logs;
+pub mod maintenance;
 pub mod monitor;
 pub mod notifications;
 pub mod paths;

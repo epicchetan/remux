@@ -1,6 +1,10 @@
 import type { RemuxConnection } from '../remote/RemuxConnectionProvider';
 
 const agentRuntimesReadMethod = 'remux/agent/runtimes/read';
+const agentRuntimeUpdateMethod = 'remux/agent/runtime/update';
+const agentRuntimeRestartMethod = 'remux/agent/runtime/restart';
+
+export type AgentHarnessSessionVersion = { version: string; sessions: number };
 
 export type AgentHarnessRuntime = {
   providerInstanceId: string;
@@ -14,9 +18,14 @@ export type AgentHarnessRuntime = {
   resolvedExecutable: string | null;
   installedVersion: string | null;
   runningVersion: string | null;
+  sessionVersions: AgentHarnessSessionVersion[];
+  availableVersion: string | null;
+  updateCheckedAt: number | null;
   adapterVersion: string | null;
   sdkVersion: string | null;
   restartRequired: boolean;
+  supportsUpdate: boolean;
+  supportsRestart: boolean;
   activeSessions: number;
   lastError: string | null;
 };
@@ -64,9 +73,13 @@ function parseRuntime(value: unknown, index: number): AgentHarnessRuntime {
     || !nullableString(value.resolvedExecutable)
     || !nullableString(value.installedVersion)
     || !nullableString(value.runningVersion)
+    || !nullableString(value.availableVersion)
+    || !(value.updateCheckedAt === null || isFiniteNumber(value.updateCheckedAt))
     || !nullableString(value.adapterVersion)
     || !nullableString(value.sdkVersion)
     || typeof value.restartRequired !== 'boolean'
+    || typeof value.supportsUpdate !== 'boolean'
+    || typeof value.supportsRestart !== 'boolean'
     || !Number.isSafeInteger(value.activeSessions) || Number(value.activeSessions) < 0
     || !nullableString(value.lastError)
   ) throw new Error(`Invalid Agent runtime at index ${index}`);
@@ -82,11 +95,66 @@ function parseRuntime(value: unknown, index: number): AgentHarnessRuntime {
     resolvedExecutable: value.resolvedExecutable,
     installedVersion: value.installedVersion,
     runningVersion: value.runningVersion,
+    sessionVersions: parseSessionVersions(value.sessionVersions, index),
+    availableVersion: value.availableVersion,
+    updateCheckedAt: value.updateCheckedAt === null ? null : Number(value.updateCheckedAt),
     adapterVersion: value.adapterVersion,
     sdkVersion: value.sdkVersion,
     restartRequired: value.restartRequired,
+    supportsUpdate: value.supportsUpdate,
+    supportsRestart: value.supportsRestart,
     activeSessions: Number(value.activeSessions),
     lastError: value.lastError,
+  };
+}
+
+function parseSessionVersions(value: unknown, index: number): AgentHarnessSessionVersion[] {
+  if (!Array.isArray(value)) throw new Error(`Invalid Agent runtime at index ${index}`);
+  return value.map((entry) => {
+    if (!isRecord(entry) || !nonempty(entry.version) || !Number.isSafeInteger(entry.sessions)
+      || Number(entry.sessions) < 0) {
+      throw new Error(`Invalid Agent runtime session versions at index ${index}`);
+    }
+    return { version: entry.version, sessions: Number(entry.sessions) };
+  });
+}
+
+/**
+ * Installs the newest harness release. Safe with turns in flight — a running
+ * session holds the binary it already exec'd — so this never waits for idle.
+ */
+export async function updateAgentHarnessRuntime(
+  command: RemuxConnection['command'],
+  providerInstanceId: string,
+): Promise<{ runtime: AgentHarnessRuntime; log: string[] }> {
+  // Installing can run for minutes, and the phone's socket may be replaced
+  // mid-flight: an operationId makes this a durable command, so a reconnect
+  // replays the original result instead of installing twice.
+  const response = await command<unknown>(agentRuntimeUpdateMethod, { providerInstanceId }, {
+    operationId: `agent-runtime-update:${providerInstanceId}:${Date.now()}`,
+  });
+  if (!isRecord(response)) throw new Error('Invalid Agent runtime update response');
+  return {
+    runtime: parseRuntime(response.runtime, 0),
+    log: Array.isArray(response.log) ? response.log.filter((line): line is string => typeof line === 'string') : [],
+  };
+}
+
+/**
+ * Moves idle sessions onto the installed binary; anything with a turn in
+ * flight keeps running and the response log says so.
+ */
+export async function restartAgentHarnessRuntime(
+  command: RemuxConnection['command'],
+  providerInstanceId: string,
+): Promise<{ runtime: AgentHarnessRuntime; log: string[] }> {
+  const response = await command<unknown>(agentRuntimeRestartMethod, { providerInstanceId }, {
+    operationId: `agent-runtime-restart:${providerInstanceId}:${Date.now()}`,
+  });
+  if (!isRecord(response)) throw new Error('Invalid Agent runtime restart response');
+  return {
+    runtime: parseRuntime(response.runtime, 0),
+    log: Array.isArray(response.log) ? response.log.filter((line): line is string => typeof line === 'string') : [],
   };
 }
 

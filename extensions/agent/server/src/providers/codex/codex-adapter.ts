@@ -65,6 +65,7 @@ import {
   type CodexServerRequest,
 } from './codex-app-server-process.ts';
 import { CodexRuntimeHost, type CodexRuntimeStatus } from './codex-runtime-host.ts';
+import { PublishedVersionCache } from '../published-version.ts';
 import {
   CodexEventMapper,
   codexStableChildExecutionId,
@@ -78,6 +79,7 @@ import {
 } from '../../federation/constants.ts';
 
 const ADAPTER_VERSION = 'remux-codex-app-server-v1';
+const CODEX_CLI_PACKAGE = '@openai/codex';
 const DEFAULT_INSTANCE_ID = 'codex-local';
 const RESTORED_USAGE_TAIL_BYTES = 2 * 1024 * 1024;
 const CODEX_SNAPSHOT_COVERAGE = {
@@ -106,6 +108,7 @@ export type CodexNativeAdapterOptions = {
   runtimeHost?: Pick<CodexRuntimeHost, 'connectionFactory' | 'readStatus'>;
   ownership?: NativeSessionOwnershipRegistry;
   resolveImageArtifact?: (scope: { conversationId: string; executionId: string }, artifactId: string, mimeType: string) => Promise<ResolvedCodexImage>;
+  published?: PublishedVersionCache;
   importHistoricalImage?: (scope: { conversationId: string; executionId: string }, dataUrl: string) => Promise<{
     artifactId: string;
     mimeType: string;
@@ -124,6 +127,7 @@ export class CodexNativeAdapter implements ProviderAdapter {
   private readonly ownership: NativeSessionOwnershipRegistry;
   private readonly resolveImageArtifact?: CodexNativeAdapterOptions['resolveImageArtifact'];
   private readonly importHistoricalImage?: CodexNativeAdapterOptions['importHistoricalImage'];
+  private readonly published: PublishedVersionCache;
   private readonly now: () => number;
 
   constructor(options: CodexNativeAdapterOptions = {}) {
@@ -142,6 +146,7 @@ export class CodexNativeAdapter implements ProviderAdapter {
     this.ownership = options.ownership ?? new NativeSessionOwnershipRegistry(this.now);
     this.resolveImageArtifact = options.resolveImageArtifact;
     this.importHistoricalImage = options.importHistoricalImage;
+    this.published = options.published ?? new PublishedVersionCache({ now: this.now });
   }
 
   async readRuntimeStatus(providerInstanceId: string): Promise<ProviderRuntimeStatus> {
@@ -149,16 +154,27 @@ export class CodexNativeAdapter implements ProviderAdapter {
     const status: CodexRuntimeStatus | null = await (this.runtimeHost?.readStatus() ?? Promise.resolve(null));
     const activeSessions = this.ownership.snapshot().filter((entry) =>
       entry.provider === 'codex' && entry.providerInstanceId === providerInstanceId).length;
+    const available = this.published.read(CODEX_CLI_PACKAGE);
+    const running = status?.runningVersion ?? null;
     return {
       topology: 'shared-daemon',
       runtimeState: status?.state ?? 'unknown',
       configuredExecutable: this.binaryPath,
       resolvedExecutable: status?.managedCodexPath ?? null,
       installedVersion: status?.installedVersion ?? null,
-      runningVersion: status?.runningVersion ?? null,
+      runningVersion: running,
+      // Every session shares the one daemon, so there is only ever one cohort.
+      sessionVersions: running && activeSessions > 0 ? [{ version: running, sessions: activeSessions }] : [],
+      availableVersion: available.version,
+      updateCheckedAt: available.checkedAt,
       adapterVersion: ADAPTER_VERSION,
       sdkVersion: null,
       restartRequired: status?.restartRequired ?? false,
+      // Update and restart of the shared daemon stay with the Codex extension,
+      // which owns its thread reconciliation; two owners of one daemon
+      // lifecycle would race.
+      supportsUpdate: false,
+      supportsRestart: false,
       activeSessions,
       lastError: status?.lastError ?? null,
     };

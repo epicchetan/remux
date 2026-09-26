@@ -103,6 +103,16 @@ export class NativeAgentServer {
         return this.coordinator.projector.read(params as NativeAgentResourceReadParams);
       case NATIVE_AGENT_METHODS.runtimesRead:
         return this.coordinator.readRuntimeStatuses();
+      case NATIVE_AGENT_METHODS.quiescenceRead:
+        return this.coordinator.readQuiescence();
+      case NATIVE_AGENT_METHODS.runtimeUpdate:
+        return this.coordinator.updateRuntime(
+          parseProviderInstanceParam(params, NATIVE_AGENT_METHODS.runtimeUpdate),
+        );
+      case NATIVE_AGENT_METHODS.runtimeRestart:
+        return this.coordinator.restartRuntime(
+          parseProviderInstanceParam(params, NATIVE_AGENT_METHODS.runtimeRestart),
+        );
       case NATIVE_AGENT_METHODS.providerLoginStart:
         return this.coordinator.startProviderLogin(params as NativeProviderLoginStartCommand);
       case NATIVE_AGENT_METHODS.providerLoginCancel:
@@ -205,6 +215,16 @@ export class NativeAgentRpcError extends Error {
     this.code = code;
     this.data = data;
   }
+}
+
+function parseProviderInstanceParam(params: unknown, method: string): string {
+  const value = params && typeof params === 'object' && !Array.isArray(params)
+    ? (params as { providerInstanceId?: unknown }).providerInstanceId
+    : undefined;
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new Error(`${method} requires a providerInstanceId.`);
+  }
+  return value;
 }
 
 function stripHostRoutingMetadata(value: unknown) {

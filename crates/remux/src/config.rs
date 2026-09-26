@@ -44,9 +44,73 @@ pub struct RemuxConfig {
     /// NOTE: an old runtime rejects this key outright (`deny_unknown_fields`)
     /// and fails to boot — deploy the runtime before adding it.
     pub watch: Option<Vec<String>>,
+    pub agent_autoupdate: Option<AgentAutoupdateConfig>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentAutoupdateConfig {
+    pub enabled: Option<bool>,
+    pub window: Option<String>,
+    pub quiet_minutes: Option<u32>,
+    pub tick_minutes: Option<u32>,
+    pub commit: Option<bool>,
+    pub registry: Option<String>,
+}
+
+impl AgentAutoupdateConfig {
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+    pub fn window(&self) -> &str {
+        self.window.as_deref().unwrap_or("03:30-06:00")
+    }
+    pub fn quiet_minutes(&self) -> u32 {
+        self.quiet_minutes.unwrap_or(20)
+    }
+    pub fn tick_minutes(&self) -> u32 {
+        self.tick_minutes
+            .filter(|minutes| *minutes > 0)
+            .unwrap_or(15)
+    }
+    pub fn commit(&self) -> bool {
+        self.commit.unwrap_or(true)
+    }
+    pub fn registry(&self) -> &str {
+        self.registry
+            .as_deref()
+            .unwrap_or("https://registry.npmjs.org")
+    }
+}
+
+/// Strict local HH:MM-HH:MM, with an exclusive end; midnight wrapping is valid.
+pub fn parse_window(window: &str) -> Result<(u32, u32), String> {
+    let invalid =
+        || format!("agent_autoupdate.window must be HH:MM-HH:MM with distinct endpoints: {window}");
+    let minute = |s: &str| -> Option<u32> {
+        let b = s.as_bytes();
+        if b.len() != 5 || b[2] != b':' || ![b[0], b[1], b[3], b[4]].iter().all(u8::is_ascii_digit)
+        {
+            return None;
+        }
+        let hour = s[..2].parse::<u32>().ok()?;
+        let minute = s[3..].parse::<u32>().ok()?;
+        (hour < 24 && minute < 60).then_some(hour * 60 + minute)
+    };
+    let (start, end) = window.split_once('-').ok_or_else(invalid)?;
+    let start = minute(start).ok_or_else(invalid)?;
+    let end = minute(end).ok_or_else(invalid)?;
+    if start == end {
+        return Err(invalid());
+    }
+    Ok((start, end))
 }
 
 impl RemuxConfig {
+    pub fn agent_autoupdate(&self) -> AgentAutoupdateConfig {
+        self.agent_autoupdate.clone().unwrap_or_default()
+    }
+
     pub fn max_upload_bytes(&self) -> u64 {
         self.max_upload_bytes.unwrap_or(DEFAULT_MAX_UPLOAD_BYTES)
     }
@@ -105,6 +169,8 @@ pub fn parse_remux_config_toml(source: &str, config_path: &str) -> Result<RemuxC
 }
 
 fn validate_config(config: &RemuxConfig, config_path: &str) -> Result<(), String> {
+    parse_window(config.agent_autoupdate().window())
+        .map_err(|error| format!("{config_path}: {error}"))?;
     if let Some(roots) = &config.extension_roots {
         if roots.iter().any(|root| root.trim().is_empty()) {
             return Err(format!(
@@ -180,6 +246,55 @@ fn port_in_range(value: i64) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_autoupdate_defaults_and_validation() {
+        let c = RemuxConfig::default().agent_autoupdate();
+        assert!(c.enabled());
+        assert!(c.commit());
+        assert_eq!(c.window(), "03:30-06:00");
+        assert_eq!(c.quiet_minutes(), 20);
+        assert_eq!(c.tick_minutes(), 15);
+        assert_eq!(c.registry(), "https://registry.npmjs.org");
+        let c = parse_remux_config_toml(
+            "[agent_autoupdate]\nenabled=false\nwindow='23:00-01:00'\nquiet_minutes=0\ntick_minutes=2\ncommit=false\nregistry='http://localhost'",
+            "test.toml").unwrap().agent_autoupdate();
+        assert!(!c.enabled());
+        assert!(!c.commit());
+        assert_eq!(c.quiet_minutes(), 0);
+        assert_eq!(c.tick_minutes(), 2);
+        assert_eq!(c.registry(), "http://localhost");
+        assert_eq!(parse_window(c.window()).unwrap(), (1380, 60));
+        assert_eq!(parse_window("00:00-23:59").unwrap(), (0, 1439));
+        for window in [
+            "3:30-06:00",
+            "24:00-06:00",
+            "03:60-06:00",
+            "03:30",
+            "00:00-00:00",
+            "aé-06:00",
+            " 03:30-06:00",
+        ] {
+            let error = parse_remux_config_toml(
+                &format!("[agent_autoupdate]\nwindow='{window}'"),
+                "test.toml",
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("test.toml: agent_autoupdate.window"),
+                "{error}"
+            );
+        }
+        assert!(parse_remux_config_toml("[agent_autoupdate]\nunknown=true", "test.toml").is_err());
+        assert_eq!(
+            AgentAutoupdateConfig {
+                tick_minutes: Some(0),
+                ..Default::default()
+            }
+            .tick_minutes(),
+            15
+        );
+    }
 
     #[test]
     fn upload_limit_defaults_and_parses() {

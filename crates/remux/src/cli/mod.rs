@@ -4,6 +4,7 @@
 //! implementations together so they can share systemd, install, log, and
 //! status helpers without expanding `main.rs` back into a dispatcher.
 
+pub mod agent;
 pub mod doctor;
 pub mod install;
 pub mod logs;
@@ -29,6 +30,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Maintain the agent harness installations.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     /// Start the runtime, delegating to systemd when installed.
     Start {
         /// Run the L1 supervisor in this terminal.
@@ -72,6 +78,19 @@ pub enum Command {
     Workload {
         #[command(subcommand)]
         command: WorkloadCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentCommand {
+    /// Update CLI installations and safely activate a compatible agent SDK.
+    Update {
+        /// Ignore the maintenance window.
+        #[arg(long)]
+        now: bool,
+        /// Read gates and print the plan without changing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -122,6 +141,12 @@ pub fn run(cli: Cli) -> i32 {
 
 fn run_inner(cli: Cli) -> Result<i32, String> {
     match cli.command {
+        Command::Agent {
+            command: AgentCommand::Update { now, dry_run },
+        } => {
+            let root = root::discover(cli.root.as_deref())?;
+            agent::run(&root, now, dry_run)
+        }
         Command::Start {
             foreground,
             rebuild,
@@ -219,6 +244,24 @@ fn decide_start_mode(
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn parses_agent_update_options() {
+        let cli = Cli::try_parse_from(["remux", "agent", "update", "--now", "--dry-run"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Agent {
+                command: AgentCommand::Update { now: true, dry_run: true }
+            }
+        ));
+        let cli = Cli::try_parse_from(["remux", "agent", "update"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Agent {
+                command: AgentCommand::Update { now: false, dry_run: false }
+            }
+        ));
+    }
 
     #[test]
     fn parses_subcommands_and_global_root() {

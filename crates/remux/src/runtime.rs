@@ -605,6 +605,13 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
     ));
     let _ = shared.router.set(router.clone());
 
+    let maintenance = crate::maintenance::production(
+        root_dir.clone(),
+        config.agent_autoupdate(),
+        router.clone(),
+        journal.clone(),
+    );
+
     // HTTP + WS.
     let viewer_providers: Vec<ViewerProvider> = extensions
         .iter()
@@ -628,7 +635,11 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
         WsHooks {
             notifications: Some(notifications.clone()),
             client_count: Some(Arc::new(RelayClientCount(relay.clone()))),
-            client_scoped: vec![extension_logs.clone(), monitor.clone()],
+            client_scoped: vec![
+                extension_logs.clone(),
+                monitor.clone(),
+                Arc::new(crate::rpc::ws::MaintenanceRead(maintenance.clone())),
+            ],
         },
         journal.clone(),
     );
@@ -652,6 +663,7 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
                 host: runtime.host.clone(),
                 port: runtime.port,
             }),
+            maintenance.clone(),
         ))
         .layer(axum::middleware::from_fn_with_state(
             auth_state,
@@ -684,6 +696,9 @@ pub async fn run_worker(rebuild: bool) -> Result<i32, String> {
         move || shared.shutting_down.load(Ordering::SeqCst)
     });
     monitor.start(config.resource_poll_seconds());
+    if config.agent_autoupdate().enabled() {
+        crate::maintenance::start(maintenance, config.agent_autoupdate().tick_minutes());
+    }
 
     // Relay + extension servers.
     {

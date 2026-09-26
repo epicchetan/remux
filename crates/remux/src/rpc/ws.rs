@@ -387,6 +387,22 @@ pub trait ClientScopedRpc: Send + Sync {
     ) -> Option<RpcResult>;
 }
 
+/// Runtime-owned snapshot; handled before extension routing.
+pub struct MaintenanceRead(pub Arc<crate::maintenance::Maintenance>);
+
+impl ClientScopedRpc for MaintenanceRead {
+    fn handle(
+        &self,
+        _client: &Arc<WsClient>,
+        method: &str,
+        _params: Option<&Value>,
+    ) -> Option<RpcResult> {
+        (method == crate::maintenance::READ_METHOD).then(|| {
+            Ok(serde_json::to_value(self.0.status()).expect("serializable maintenance state"))
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DiagnosticEvent {
     pub detail: Option<Value>,
@@ -1332,7 +1348,10 @@ fn dispatch_lane(client: &WsClient, method: &str, work: &DispatchWork) -> (Strin
     }
     if matches!(
         method,
-        "remux/system/resources" | "remux/extensions/status" | "remux/extensions/logs"
+        "remux/system/resources"
+            | "remux/extensions/status"
+            | "remux/extensions/logs"
+            | crate::maintenance::READ_METHOD
     ) {
         return (
             "control:snapshots".to_string(),
@@ -1420,6 +1439,8 @@ fn dispatch_lane(client: &WsClient, method: &str, work: &DispatchWork) -> (Strin
                 | "remux/agent/artifact/read"
                 | "remux/agent/turn/read"
                 | "remux/agent/files/search"
+                // The maintenance driver polls this while turns are in flight.
+                | "remux/agent/maintenance/quiescence/read"
         ) {
             return (
                 "extension:agent:reads".to_string(),
@@ -1690,6 +1711,20 @@ mod tests {
             origin_context_key(Some(&serde_json::json!({ "tabId": "tab-a" }))),
             origin_context_key(Some(&serde_json::json!({ "tabId": "tab-b" })))
         );
+    }
+
+    #[test]
+    fn maintenance_read_uses_concurrent_control_lane() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let (control_sender, _control_receiver) = mpsc::channel(1);
+        let client = WsClient::new(sender, control_sender, 1);
+        let work = DispatchWork::Request {
+            id: serde_json::json!(1),
+            message: serde_json::json!({}),
+        };
+        let (lane, mode) = dispatch_lane(&client, crate::maintenance::READ_METHOD, &work);
+        assert_eq!(lane, "control:snapshots");
+        assert!(matches!(mode, DispatchMode::ConcurrentControl));
     }
 
     #[test]

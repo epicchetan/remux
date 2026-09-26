@@ -66,9 +66,16 @@ import {
 } from './systemResourcesApi';
 import {
   readAgentHarnessRuntimes,
+  restartAgentHarnessRuntime,
+  updateAgentHarnessRuntime,
   type AgentHarnessRuntime,
   type AgentHarnessRuntimes,
 } from './agentRuntimeApi';
+import {
+  describeAgentAutoupdate,
+  readAgentAutoupdateStatus,
+  type AgentAutoupdateStatus,
+} from './maintenanceApi';
 
 export function SettingsOverview() {
   const catalogError = useBrowserStore((state) => state.catalogError);
@@ -84,6 +91,8 @@ export function SettingsOverview() {
   const [agentRuntimes, setAgentRuntimes] = useState<AgentHarnessRuntimes | null>(null);
   const [agentRuntimesError, setAgentRuntimesError] = useState<string | null>(null);
   const [agentRuntimesLoading, setAgentRuntimesLoading] = useState(false);
+  const [runtimeBusy, setRuntimeBusy] = useState<RuntimeBusy | null>(null);
+  const [autoupdate, setAutoupdate] = useState<AgentAutoupdateStatus | null>(null);
   const resources = useSystemResources(connection);
   const nowMinuteMs = useMinuteTick();
   const bottomPadding = getBottomBarHeight(insets.bottom) + tabGridGap;
@@ -156,12 +165,20 @@ export function SettingsOverview() {
       || extensionStatuses.agent?.running !== true
     ) {
       setAgentRuntimes(null);
+      setAutoupdate(null);
       setAgentRuntimesError(null);
       return;
     }
     setAgentRuntimesLoading(true);
     try {
-      setAgentRuntimes(await readAgentHarnessRuntimes(connection.query));
+      // One read of the runtime's maintenance state rides along with the
+      // runtimes poll: it is the same card and the same refresh cadence.
+      const [runtimes, maintenance] = await Promise.all([
+        readAgentHarnessRuntimes(connection.query),
+        readAgentAutoupdateStatus(connection.query),
+      ]);
+      setAgentRuntimes(runtimes);
+      setAutoupdate(maintenance);
       setAgentRuntimesError(null);
     } catch (error) {
       setAgentRuntimesError(error instanceof Error ? error.message : String(error));
@@ -240,6 +257,23 @@ export function SettingsOverview() {
       setAgentRuntimesError(error instanceof Error ? error.message : String(error));
     } finally {
       setDetailBusyAction(null);
+    }
+  };
+
+  const runHarnessAction = async (action: RuntimeBusy['action'], providerInstanceId: string) => {
+    setAgentRuntimesError(null);
+    setRuntimeBusy({ providerInstanceId, action });
+    try {
+      if (action === 'update') {
+        await updateAgentHarnessRuntime(connection.command, providerInstanceId);
+      } else {
+        await restartAgentHarnessRuntime(connection.command, providerInstanceId);
+      }
+      await refreshAgentRuntimes();
+    } catch (error) {
+      setAgentRuntimesError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRuntimeBusy(null);
     }
   };
 
@@ -324,6 +358,7 @@ export function SettingsOverview() {
 
         {extensionStatuses.agent?.running === true ? (
           <AgentRuntimesSection
+            autoupdate={autoupdate}
             busyAction={detailBusyAction}
             codexManagementAvailable={extensionStatuses.codex?.running === true}
             codexStatus={codexAppServerStatus}
@@ -331,6 +366,8 @@ export function SettingsOverview() {
             loading={agentRuntimesLoading}
             onCodexAction={runRuntimeAction}
             onRefresh={refreshAgentRuntimes}
+            onRuntimeAction={runHarnessAction}
+            runtimeBusy={runtimeBusy}
             runtimes={agentRuntimes}
           />
         ) : null}
@@ -630,7 +667,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
+type RuntimeBusy = { providerInstanceId: string; action: 'update' | 'restart' };
+
 function AgentRuntimesSection({
+  autoupdate,
   busyAction,
   codexManagementAvailable,
   codexStatus,
@@ -638,6 +678,8 @@ function AgentRuntimesSection({
   loading,
   onCodexAction,
   onRefresh,
+  onRuntimeAction,
+  runtimeBusy,
   runtimes,
 }: {
   busyAction: ExtensionDetailAction | null;
@@ -647,7 +689,10 @@ function AgentRuntimesSection({
   loading: boolean;
   onCodexAction: (action: 'start' | 'restart' | 'update') => Promise<void>;
   onRefresh: () => Promise<void>;
+  onRuntimeAction: (action: RuntimeBusy['action'], providerInstanceId: string) => Promise<void>;
+  runtimeBusy: RuntimeBusy | null;
   runtimes: AgentHarnessRuntimes | null;
+  autoupdate: AgentAutoupdateStatus | null;
 }) {
   const { styles } = useSettingsTheme();
   return (
@@ -666,7 +711,10 @@ function AgentRuntimesSection({
             codexStatus={runtime.provider === 'codex' ? codexStatus : null}
             key={runtime.providerInstanceId}
             onCodexAction={onCodexAction}
+            onRuntimeAction={onRuntimeAction}
             runtime={runtime}
+            runtimeAction={runtimeBusy?.providerInstanceId === runtime.providerInstanceId
+              ? runtimeBusy.action : null}
           />
         ))}
       </View>
@@ -677,6 +725,13 @@ function AgentRuntimesSection({
         <Text style={styles.extensionMeta}>Native runtime status is unavailable.</Text>
       ) : null}
       {error ? <Text style={styles.errorText}>{error}</Text> : null}
+      {/* One driver keeps both harnesses current, so this reads once per section
+          rather than once per card. A runtime without it simply says nothing. */}
+      {autoupdate ? (
+        <View style={styles.infoList}>
+          <InfoRow label="Auto-update" value={describeAgentAutoupdate(autoupdate)} />
+        </View>
+      ) : null}
       <View style={styles.actionRow}>
         <SettingsButton
           disabled={loading}
@@ -694,21 +749,40 @@ function AgentRuntimeCard({
   codexManagementAvailable,
   codexStatus,
   onCodexAction,
+  onRuntimeAction,
   runtime,
+  runtimeAction,
 }: {
   busyAction: ExtensionDetailAction | null;
   codexManagementAvailable: boolean;
   codexStatus: CodexAppServerStatus | null;
   onCodexAction: (action: 'start' | 'restart' | 'update') => Promise<void>;
+  onRuntimeAction: (action: RuntimeBusy['action'], providerInstanceId: string) => Promise<void>;
   runtime: AgentHarnessRuntime;
+  runtimeAction: RuntimeBusy['action'] | null;
 }) {
   const { styles } = useSettingsTheme();
-  const busy = busyAction?.startsWith('app-server-') === true;
+  const busy = busyAction?.startsWith('app-server-') === true || runtimeAction !== null;
   const activeTurns = codexStatus?.activeTurnIds.length ?? 0;
   const executable = runtime.resolvedExecutable ?? runtime.configuredExecutable ?? 'Unavailable';
-  const version = runtime.runningVersion && runtime.installedVersion !== runtime.runningVersion
-    ? `${runtime.runningVersion} running · ${runtime.installedVersion} installed`
-    : runtime.installedVersion ?? runtime.runningVersion ?? 'Unknown';
+  // The Codex daemon's update and restart stay with the Codex extension, which
+  // owns its thread reconciliation; everything else updates through the Agent
+  // extension's own seam.
+  const codexManaged = runtime.provider === 'codex';
+  const updateAvailable = Boolean(runtime.availableVersion && runtime.installedVersion
+    && runtime.availableVersion !== runtime.installedVersion);
+  // "Version" is always what is installed. What live sessions actually run only
+  // gets its own row when it differs, so both cards read the same way at rest.
+  const running = runtime.sessionVersions.some(({ version: cohort }) => cohort !== runtime.installedVersion)
+    ? runtime.sessionVersions
+      .map(({ version: cohort, sessions }) => runtime.sessionVersions.length > 1
+        ? `${sessions}×${cohort}`
+        : `${cohort} · ${sessions} session${sessions === 1 ? '' : 's'}`)
+      .join(' · ')
+    : null;
+  const restartHint = runtime.topology === 'shared-daemon'
+    ? `Restart required to apply the installed ${runtime.label} version.`
+    : `Restart moves idle sessions onto ${runtime.installedVersion ?? 'the installed version'}.`;
   return (
     <View style={styles.runtimeCard}>
       <View style={styles.runtimeHeader}>
@@ -721,41 +795,61 @@ function AgentRuntimeCard({
       <Text style={styles.runtimeSummary}>{runtimeSummary(runtime)}</Text>
       <View style={styles.infoList}>
         <InfoRow label="Executable" value={executable} />
-        <InfoRow label="Version" value={version} />
+        <InfoRow label="Version" value={runtime.installedVersion ?? runtime.runningVersion ?? 'Unknown'} />
+        {updateAvailable ? <InfoRow label="Available" value={runtime.availableVersion!} /> : null}
+        {running ? <InfoRow label="Running" value={running} /> : null}
         <InfoRow label="Adapter" value={runtime.adapterVersion ?? 'Unknown'} />
         {runtime.sdkVersion ? <InfoRow label="SDK" value={runtime.sdkVersion} /> : null}
       </View>
-      {runtime.restartRequired ? (
-        <Text style={styles.updateStatusText}>Restart required to apply the installed Codex version.</Text>
-      ) : null}
+      {runtime.restartRequired ? <Text style={styles.updateStatusText}>{restartHint}</Text> : null}
       {runtime.readinessMessage ? <Text style={styles.updateStatusText}>{runtime.readinessMessage}</Text> : null}
       {runtime.lastError ? <Text style={styles.errorText}>{runtime.lastError}</Text> : null}
-      {runtime.provider === 'codex' ? (
+      {codexManaged || runtime.supportsUpdate || runtime.supportsRestart ? (
         <View style={styles.runtimeActionRow}>
-          {runtime.runtimeState === 'stopped' ? (
+          {codexManaged ? (
+            runtime.runtimeState === 'stopped' ? (
+              <SettingsButton
+                disabled={busy || !codexManagementAvailable}
+                label="Start"
+                loading={busyAction === 'app-server-start'}
+                onPress={() => onCodexAction('start')}
+              />
+            ) : (
+              <SettingsButton
+                disabled={busy || !codexManagementAvailable || activeTurns > 0}
+                label="Restart"
+                loading={busyAction === 'app-server-restart'}
+                onPress={() => onCodexAction('restart')}
+              />
+            )
+          ) : null}
+          {codexManaged ? (
             <SettingsButton
               disabled={busy || !codexManagementAvailable}
-              label="Start"
-              loading={busyAction === 'app-server-start'}
-              onPress={() => onCodexAction('start')}
+              label="Update"
+              loading={busyAction === 'app-server-update'}
+              onPress={() => onCodexAction('update')}
             />
-          ) : (
+          ) : null}
+          {runtime.supportsRestart ? (
             <SettingsButton
-              disabled={busy || !codexManagementAvailable || activeTurns > 0}
+              disabled={busy || !runtime.restartRequired}
               label="Restart"
-              loading={busyAction === 'app-server-restart'}
-              onPress={() => onCodexAction('restart')}
+              loading={runtimeAction === 'restart'}
+              onPress={() => onRuntimeAction('restart', runtime.providerInstanceId)}
             />
-          )}
-          <SettingsButton
-            disabled={busy || !codexManagementAvailable}
-            label="Update Codex"
-            loading={busyAction === 'app-server-update'}
-            onPress={() => onCodexAction('update')}
-          />
+          ) : null}
+          {runtime.supportsUpdate ? (
+            <SettingsButton
+              disabled={busy}
+              label={updateAvailable ? `Update to ${runtime.availableVersion}` : 'Update'}
+              loading={runtimeAction === 'update'}
+              onPress={() => onRuntimeAction('update', runtime.providerInstanceId)}
+            />
+          ) : null}
         </View>
       ) : null}
-      {runtime.provider === 'codex' && !codexManagementAvailable ? (
+      {codexManaged && !codexManagementAvailable ? (
         <Text style={styles.updateStatusText}>
           Start the Codex extension server to use managed update and restart actions.
         </Text>

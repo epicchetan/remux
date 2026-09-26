@@ -62,6 +62,9 @@ export const NATIVE_AGENT_METHODS = {
   conversationAccessSet: 'remux/agent/composer/conversation-access/set',
   providerPreferenceSet: 'remux/agent/composer/provider-preference/set',
   runtimesRead: 'remux/agent/runtimes/read',
+  runtimeUpdate: 'remux/agent/runtime/update',
+  runtimeRestart: 'remux/agent/runtime/restart',
+  quiescenceRead: 'remux/agent/maintenance/quiescence/read',
   resourcesInvalidated: 'remux/agent/resources/invalidated',
 } as const;
 
@@ -160,6 +163,8 @@ export type AgentProvidersResource = {
   preferenceRevision: string;
 };
 
+export type AgentHarnessSessionVersion = { version: string; sessions: number };
+
 export type AgentHarnessRuntime = {
   providerInstanceId: string;
   provider: ProviderKind;
@@ -172,11 +177,38 @@ export type AgentHarnessRuntime = {
   resolvedExecutable: string | null;
   installedVersion: string | null;
   runningVersion: string | null;
+  sessionVersions: readonly AgentHarnessSessionVersion[];
+  availableVersion: string | null;
+  updateCheckedAt: number | null;
   adapterVersion: string | null;
   sdkVersion: string | null;
   restartRequired: boolean;
+  supportsUpdate: boolean;
+  supportsRestart: boolean;
   activeSessions: number;
   lastError: string | null;
+};
+
+/**
+ * Whether the harness can be restarted without destroying work. A restart
+ * rebinds native sessions; what it cannot restore is an in-flight model
+ * invocation, so anything mid-turn blocks.
+ */
+export type AgentHarnessQuiescence = {
+  quiescent: boolean;
+  observedAt: number;
+  activeTurns: number;
+  queuedMessages: number;
+  compacting: number;
+  recovering: number;
+  activeSessions: number;
+  lastActivityAt: number | null;
+  blockers: readonly string[];
+};
+
+export type AgentRuntimeUpdateResult = {
+  runtime: AgentHarnessRuntime;
+  log: readonly string[];
 };
 
 export type AgentHarnessRuntimesResource = {
