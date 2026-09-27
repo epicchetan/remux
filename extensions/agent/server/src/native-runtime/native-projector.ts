@@ -889,9 +889,11 @@ function projectTurn(
       if (envelope.event.type === 'user.message') userContent = envelope.event.content;
     }
   }
-  let completePasses = viewerSafePasses(journal.orderedPasses(turn.turnId, {
+  const childRecords = journal.childExecutions(turn.executionId)
+    .filter(({ rootTurnId }) => rootTurnId === turn.turnId);
+  let completePasses = reconcileChildBlocks(viewerSafePasses(journal.orderedPasses(turn.turnId, {
     includeToolOutputPreviews: options.includeToolOutputPreviews !== false,
-  }));
+  })), childRecords);
   if (completePasses.length === 0 && legacyEvents.length > 0) {
     completePasses = projectLegacyPass(turn, legacyEvents);
   }
@@ -935,8 +937,7 @@ function projectTurn(
   // Reconciled execution records fill status/summary if their event arrived
   // outside the currently loaded root event slice.
   const children = new Map(compatibility.children.map((child) => [child.executionId, child]));
-  for (const execution of journal.childExecutions(turn.executionId)
-    .filter(({ rootTurnId }) => rootTurnId === turn.turnId)) {
+  for (const execution of childRecords) {
     const current = children.get(execution.executionId);
     children.set(execution.executionId, {
       ...current,
@@ -1242,6 +1243,41 @@ function visibleBlockLayout(block: NativeOrderedTurnBlock) {
     case 'web':
       return { blockId: block.blockId, kind: payload.kind, activity: payload.activity };
   }
+}
+
+/**
+ * The parent stream can end before a background child's terminal event
+ * reaches its block, so child blocks mirror the reconciled execution record.
+ */
+function reconcileChildBlocks(
+  passes: readonly NativeAssistantPass[],
+  records: readonly JournalExecution[],
+): NativeAssistantPass[] {
+  if (records.length === 0) return [...passes];
+  const byId = new Map(records.map((record) => [record.executionId, record]));
+  return passes.map((pass) => ({
+    ...pass,
+    blocks: pass.blocks.map((block) => {
+      if (block.payload.kind !== 'native-child' && block.payload.kind !== 'federated-child') {
+        return block;
+      }
+      const record = byId.get(block.payload.child.executionId);
+      if (!record) return block;
+      const state = record.state === 'running' || record.state === 'recovering' ? 'running'
+        : record.state === 'idle' ? 'completed' : record.state;
+      if (record.state === block.payload.executionState && state === block.state) return block;
+      return {
+        ...block,
+        state,
+        payload: {
+          ...block.payload,
+          executionState: record.state,
+          ...(record.outcome ? { outcome: record.outcome } : {}),
+          ...(record.summary ? { summary: record.summary } : {}),
+        },
+      };
+    }),
+  }));
 }
 
 function viewerSafePasses(passes: readonly NativeAssistantPass[]): NativeAssistantPass[] {

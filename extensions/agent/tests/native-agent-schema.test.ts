@@ -141,7 +141,7 @@ test('schema v21 repairs only uniquely located bare Claude compactions and is id
       'open-turn-claude': JSON.stringify({ kind: 'within-turn', turnId: 'open-turn', nativeTurnId: 'native-open-turn',
         afterBlockId: null }),
     });
-    assert.equal((journal.database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 21);
+    assert.equal((journal.database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, NATIVE_AGENT_SCHEMA_VERSION);
     journal.database.exec(`CREATE TRIGGER reject_second_repair BEFORE UPDATE OF boundary_json ON conversation_control_events
       BEGIN SELECT RAISE(ABORT, 'repair must be idempotent'); END;
       BEGIN IMMEDIATE;`);
@@ -898,5 +898,67 @@ test('an older source cannot smuggle a malformed future delivery table through m
     assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 13);
   } finally {
     database.close();
+  }
+});
+
+test('schema v22 settles open work left inside terminal turns', async () => {
+  const dataRoot = await mkdtemp(join(tmpdir(), 'remux-schema-v21-open-blocks-'));
+  let journal: NativeAgentJournal | undefined;
+  try {
+    journal = await openNativeAgentJournal({ dataRoot });
+    const opened = journal;
+    const database = opened.database;
+    const probe = await new NativeFixtureAdapter().probe('fixture-local');
+    opened.upsertProviderInstance({ providerInstanceId: 'fixture-local', provider: 'fixture',
+      label: 'Fixture', probe, now: 1 });
+    opened.createConversation({ conversationId: 'conversation-1', rootExecutionId: 'execution-1',
+      provider: 'fixture', providerInstanceId: 'fixture-local', title: 'Open blocks',
+      cwd: '/workspace', model: 'fixture-native-v1', access: 'read-only', now: 1 });
+    const turn = (id: string, state: string) => {
+      opened.createTurn({ turnId: id, conversationId: 'conversation-1', executionId: 'execution-1',
+        clientMessageId: `message-${id}`, commandId: `send-${id}`, content: [{ type: 'text', text: id }],
+        model: 'fixture-native-v1', state: 'running', now: 10 });
+      database.prepare(`UPDATE turns SET state=?, completed_at=?, updated_at=30 WHERE turn_id=?`)
+        .run(state, state === 'running' ? null : 30, id);
+      database.prepare(`INSERT INTO turn_passes(pass_id,turn_id,ordinal,state,created_at,updated_at)
+        VALUES(?, ?, 0, 'completed', 10, 30)`).run(`pass-${id}`, id);
+    };
+    const block = database.prepare(`INSERT INTO turn_blocks(block_id,turn_id,pass_id,kind,ordinal,state,revision,
+      payload_json,content_hash,started_at,created_at,updated_at)
+      VALUES(?, ?, ?, ?, ?, ?, 1, ?, ?, 10, 10, 20)`);
+    const tool = (backgrounded = false) => JSON.stringify({ kind: 'tool',
+      tool: { callId: 'call', name: 'shell', category: 'shell' }, ...(backgrounded ? { backgrounded } : {}) });
+    const addBlock = (id: string, turnId: string, ordinal: number, kind: string, state: string, payload: string) =>
+      block.run(id, turnId, `pass-${turnId}`, kind, ordinal, state, payload, 'a'.repeat(64));
+    turn('completed-turn', 'completed');
+    addBlock('completed-text', 'completed-turn', 0, 'final-message', 'streaming',
+      JSON.stringify({ kind: 'final-message', text: 'Done' }));
+    addBlock('completed-tool', 'completed-turn', 1, 'tool', 'running', tool());
+    addBlock('background-tool', 'completed-turn', 2, 'tool', 'running', tool(true));
+    addBlock('child', 'completed-turn', 3, 'native-child', 'running', JSON.stringify({ kind: 'native-child',
+      executionState: 'running', child: { executionId: 'child', ownership: 'native', provider: 'fixture' } }));
+    turn('interrupted-turn', 'interrupted');
+    addBlock('interrupted-reasoning', 'interrupted-turn', 0, 'reasoning-summary', 'streaming',
+      JSON.stringify({ kind: 'reasoning-summary', text: 'Think', truncated: false }));
+    turn('live-turn', 'running');
+    addBlock('live-tool', 'live-turn', 0, 'tool', 'running', tool());
+    database.exec('PRAGMA user_version = 21');
+    opened.close();
+    journal = undefined;
+
+    journal = await openNativeAgentJournal({ dataRoot });
+    const rows = journal.database.prepare('SELECT block_id, state, completed_at FROM turn_blocks ORDER BY block_id')
+      .all() as Array<{ block_id: string; state: string; completed_at: number | null }>;
+    assert.deepEqual(Object.fromEntries(rows.map((row) => [row.block_id, [row.state, row.completed_at]])), {
+      'background-tool': ['running', null],
+      child: ['running', null],
+      'completed-text': ['completed', 30],
+      'completed-tool': ['interrupted', 30],
+      'interrupted-reasoning': ['interrupted', 30],
+      'live-tool': ['running', null],
+    });
+  } finally {
+    journal?.close();
+    await rm(dataRoot, { recursive: true, force: true });
   }
 });

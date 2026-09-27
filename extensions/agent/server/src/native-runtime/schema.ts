@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 
-export const NATIVE_AGENT_SCHEMA_VERSION = 21;
+export const NATIVE_AGENT_SCHEMA_VERSION = 22;
 export const NATIVE_AGENT_APPLICATION_ID = 0x524d584e; // RMXN
 export const NATIVE_AGENT_SCHEMA_ID = 'remux-agent-native-v1';
 
@@ -708,7 +708,7 @@ export function migrateNativeAgentSchema(
   fromVersion: number,
   repairContext?: { backupPath?: string; migratedAt?: number },
 ) {
-  if (fromVersion < 1 || fromVersion > 20) {
+  if (fromVersion < 1 || fromVersion > 21) {
     throw new NativeAgentSchemaError(`No Native Agent migration exists from schema ${fromVersion}.`);
   }
   for (const name of ['delivery_attempts', 'delivery_attempts_lane',
@@ -858,7 +858,41 @@ export function migrateNativeAgentSchema(
   database.exec(`UPDATE turns SET origin='native-followup', trigger_json='{"kind":"native-child"}', user_content_json='[]'
     WHERE client_message_id = 'native-followup-message:' || turn_id AND COALESCE(origin, 'user')='user';`);
   if (fromVersion <= 20) migrateVersionTwentyOne(database);
+  if (fromVersion <= 21) settleTerminalTurnBlocks(database);
   database.exec(`PRAGMA user_version = ${NATIVE_AGENT_SCHEMA_VERSION}`);
+}
+
+/**
+ * A terminal turn cannot own live work, but providers can end a turn
+ * (interrupt, steer, recovery failure) without settling every open block.
+ * Text finishes with a completed turn and is partial otherwise; an unanswered
+ * tool call is interrupted. Child blocks and backgrounded tool calls outlive
+ * their turn and settle through their own events.
+ */
+export function settleTerminalTurnBlocks(
+  database: DatabaseSync,
+  scope?: { turnId: string } | { executionId: string },
+) {
+  database.prepare(`
+    UPDATE turn_blocks SET
+      state = CASE
+        WHEN t.state = 'completed' AND turn_blocks.kind IN (
+          'reasoning-summary', 'commentary', 'final-message', 'compatibility-notice'
+        ) THEN 'completed'
+        ELSE 'interrupted'
+      END,
+      completed_at = COALESCE(turn_blocks.completed_at, t.completed_at),
+      updated_at = MAX(turn_blocks.updated_at, t.updated_at)
+    FROM turns t
+    WHERE t.turn_id = turn_blocks.turn_id
+      ${!scope ? '' : 'turnId' in scope
+        ? 'AND t.turn_id = ?1 AND turn_blocks.turn_id = ?1'
+        : 'AND t.execution_id = ?1'}
+      AND t.state IN ('completed', 'failed', 'interrupted')
+      AND turn_blocks.state IN ('running', 'streaming')
+      AND turn_blocks.kind NOT IN ('native-child', 'federated-child')
+      AND json_extract(turn_blocks.payload_json, '$.backgrounded') IS NOT 1
+  `).run(...(!scope ? [] : ['turnId' in scope ? scope.turnId : scope.executionId]));
 }
 
 function migrateVersionTwentyOne(database: DatabaseSync) {

@@ -1270,3 +1270,87 @@ test('a continuation names every identified child in trigger arrival order', () 
     assert.equal(frame.inputItems?.[0]?.text, 'Continued after Astra, Sol and Terra finished');
   } finally { journal.close(); }
 });
+
+test('a terminal turn settles open work except children and backgrounded tools', () => {
+  const journal = createJournal();
+  try {
+    seed(journal);
+    const tool = (id: string, ordinal: number, backgrounded?: boolean) => event(`${id}-start`, 4 + ordinal, {
+      type: 'turn.block.started',
+      structure: structure(id, ordinal),
+      block: {
+        kind: 'tool', state: 'running',
+        payload: {
+          kind: 'tool', tool: { callId: id, name: 'shell', category: 'shell', title: id },
+          ...(backgrounded ? { backgrounded } : {}),
+        },
+      },
+    }, id);
+    journal.appendProviderEvent(event('reasoning-start', 3, {
+      type: 'turn.block.started',
+      structure: structure('reasoning', 0),
+      block: { kind: 'reasoning-summary', state: 'streaming', payload: { kind: 'reasoning-summary', text: 'Think', truncated: false } },
+    }, 'reasoning'));
+    journal.appendProviderEvent(tool('open-tool', 1));
+    journal.appendProviderEvent(tool('background-tool', 2, true));
+    journal.appendProviderEvent(event('child-start', 7, {
+      type: 'turn.block.started',
+      structure: structure('child', 3),
+      block: { kind: 'native-child', state: 'running', payload: { kind: 'native-child', executionState: 'running',
+        child: { executionId: 'child', ownership: 'native', provider: 'fixture', providerInstanceId: 'fixture-local' } } },
+    }, 'child'));
+    journal.appendProviderEvent(event('turn-interrupted', 8, { type: 'turn.completed', outcome: 'interrupted' }));
+    // A late streaming revision cannot reopen the ended turn's work.
+    journal.appendProviderEvent(event('late-reasoning', 9, {
+      type: 'turn.block.revised',
+      structure: structure('reasoning', 0),
+      revision: 1,
+      contentHash: 'b'.repeat(64),
+      block: { kind: 'reasoning-summary', state: 'streaming', payload: { kind: 'reasoning-summary', text: 'Thinking', truncated: false } },
+    }, 'reasoning'));
+
+    const states = () => Object.fromEntries((new NativeAgentProjector(journal)
+      .project('agent/turn:turn-1') as NativeAgentTurnFrame).passes
+      .flatMap(({ blocks }) => blocks).map(({ blockId, state }) => [blockId, state]));
+    assert.deepEqual(states(), {
+      reasoning: 'interrupted',
+      'open-tool': 'interrupted',
+      'background-tool': 'running',
+      child: 'running',
+    });
+
+    // Genuine results that arrive after the turn still land.
+    journal.appendProviderEvent(event('open-tool-done', 10, {
+      type: 'turn.block.completed',
+      structure: structure('open-tool', 1),
+      revision: 1,
+      contentHash: 'c'.repeat(64),
+      block: { kind: 'tool', state: 'completed',
+        payload: { kind: 'tool', tool: { callId: 'open-tool', name: 'shell', category: 'shell', title: 'open-tool' } } },
+    }, 'open-tool'));
+    assert.equal(states()['open-tool'], 'completed');
+  } finally { journal.close(); }
+});
+
+test('a child block mirrors its settled execution record when its terminal event never arrived', () => {
+  const journal = createJournal();
+  try {
+    seed(journal);
+    journal.appendProviderEvent(event('child-start', 4, {
+      type: 'turn.block.started',
+      structure: structure('child', 0),
+      block: { kind: 'native-child', state: 'running', payload: { kind: 'native-child', executionState: 'running',
+        child: { executionId: 'child', ownership: 'native', provider: 'fixture', providerInstanceId: 'fixture-local' } } },
+    }, 'child'));
+    journal.appendProviderEvent(event('turn-done', 5, { type: 'turn.completed', outcome: 'completed' }));
+    journal.database.prepare(`UPDATE executions SET state = 'idle', outcome = 'completed', summary = 'Reviewed.'
+      WHERE execution_id = 'child'`).run();
+
+    const frame = new NativeAgentProjector(journal).project('agent/turn:turn-1') as NativeAgentTurnFrame;
+    const block = frame.passes.flatMap(({ blocks }) => blocks).find(({ blockId }) => blockId === 'child');
+    assert.equal(block?.state, 'completed');
+    assert.ok(block?.payload.kind === 'native-child');
+    assert.equal(block.payload.executionState, 'idle');
+    assert.equal(block.payload.summary, 'Reviewed.');
+  } finally { journal.close(); }
+});

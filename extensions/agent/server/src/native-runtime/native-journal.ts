@@ -39,6 +39,7 @@ import {
   createNativeAgentSchema,
   listNativeAgentTables,
   migrateNativeAgentSchema,
+  settleTerminalTurnBlocks,
   validateNativeAgentSchema,
 } from './schema.ts';
 
@@ -1514,6 +1515,7 @@ export class NativeAgentJournal {
             updated_at = ?
         WHERE execution_id = ? AND ownership = 'federated'
       `).run(now, now, executionId);
+      settleTerminalTurnBlocks(this.database, { executionId });
       this.markNativeSessionClosed(executionId, now);
     });
   }
@@ -3336,6 +3338,7 @@ export class NativeAgentJournal {
         UPDATE turns SET state = 'failed', outcome = 'failed', error_json = ?,
           completed_at = ?, updated_at = ? WHERE turn_id = ?
       `).run(JSON.stringify({ code: 'provider_dispatch_failed', message }), now, now, turnId);
+      settleTerminalTurnBlocks(this.database, { turnId });
       if (this.isRootExecution(turn.conversationId, turn.executionId)) {
         this.database.prepare(`
           UPDATE conversations SET state = 'idle', active_turn_id = NULL,
@@ -3377,6 +3380,7 @@ export class NativeAgentJournal {
             SELECT turn_id FROM turns WHERE turn_id = ? AND execution_id = ?
           )
         `).run(now, conversation.activeTurnId, conversation.rootExecutionId);
+        settleTerminalTurnBlocks(this.database, { turnId: conversation.activeTurnId });
       }
       this.database.prepare(`
         UPDATE conversations SET state = 'failed', active_turn_id = NULL,
@@ -3433,6 +3437,7 @@ export class NativeAgentJournal {
           SELECT turn_id FROM turns WHERE execution_id = ?
         )
       `).run(now, executionId);
+      settleTerminalTurnBlocks(this.database, { executionId });
       this.database.prepare(`
         UPDATE executions SET state = 'failed', outcome = 'recovery_failed', summary = ?,
           completed_at = ?, updated_at = ? WHERE execution_id = ?
@@ -3881,6 +3886,7 @@ export class NativeAgentJournal {
           UPDATE turn_passes SET state = 'completed', updated_at = MAX(updated_at, ?)
           WHERE turn_id = ?
         `).run(now, scope.turnId);
+        settleTerminalTurnBlocks(this.database, { turnId: scope.turnId });
         break;
       }
       case 'turn.block.started':
@@ -3944,6 +3950,10 @@ export class NativeAgentJournal {
           now,
           now,
         );
+        if (blockMutation.changes > 0 && (block.state === 'running' || block.state === 'streaming')) {
+          // A late revision must not reopen work in a turn that already ended.
+          settleTerminalTurnBlocks(this.database, { turnId: scope.turnId });
+        }
         if (blockMutation.changes > 0 &&
             (block.payload.kind === 'native-child' || block.payload.kind === 'federated-child')) {
           const { child } = block.payload;
