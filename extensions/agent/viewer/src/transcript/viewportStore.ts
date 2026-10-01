@@ -25,7 +25,7 @@ type TranscriptViewportStoreState = {
   turnScrollError: { message: string; requestId: number } | null;
   clearTurnScroll: (requestId: number) => void;
   failTurnScroll: (requestId: number, message: string) => void;
-  requestTurnScroll: (conversationId: string, turnId: string) => void;
+  requestTurnScroll: (conversationId: string, turnId: string, segmentId?: string | null) => void;
   resolveTurnScroll: (requestId: number) => void;
   trackUserMessage: (conversationId: string, messageId: string, turnId?: string | null) => void;
   scrollDown: () => void;
@@ -42,6 +42,7 @@ type TranscriptTurnScrollRequest = {
   id: number;
   conversationId: string;
   turnId: string;
+  segmentId: string | null;
 };
 
 const noopScrollNavigation = () => undefined;
@@ -71,7 +72,7 @@ const actions: Pick<
     if (state.requestedTurnScroll?.id !== requestId) return;
     viewportStore.setState({ turnScrollError: { message, requestId } });
   },
-  requestTurnScroll(conversationId, turnId) {
+  requestTurnScroll(conversationId, turnId, segmentId) {
     const normalizedConversationId = conversationId.trim();
     const normalizedTurnId = turnId.trim();
     if (!normalizedConversationId || !normalizedTurnId) {
@@ -84,6 +85,7 @@ const actions: Pick<
         id: turnScrollRequestId,
         conversationId: normalizedConversationId,
         turnId: normalizedTurnId,
+        segmentId: segmentId?.trim() || null,
       },
       turnScrollError: null,
     });
@@ -232,8 +234,8 @@ export function resetTranscriptViewportForConversation(conversationId?: string |
   });
 }
 
-export function requestTranscriptTurnScroll(conversationId: string, turnId: string) {
-  viewportStore.getState().requestTurnScroll(conversationId, turnId);
+export function requestTranscriptTurnScroll(conversationId: string, turnId: string, segmentId?: string | null) {
+  viewportStore.getState().requestTurnScroll(conversationId, turnId, segmentId);
 }
 
 export function trackTranscriptUserMessage(

@@ -72,16 +72,20 @@ nativeServer = new NativeAgentServer({
     process.stderr.write(`[agent-runtime] ${JSON.stringify(event)}\n`);
   },
   onTerminalTurn: ({ conversationId, turnId, outcome }) => {
+    if (journal.conversation(conversationId)?.archivedAt != null) return;
+    const turn = journal.turn(turnId);
+    const appendedInput = journal.additionalTurnMessages(turnId).at(-1);
+    const lastInput = appendedInput ?? turn;
+    const segmentId = lastInput && lastInput.origin !== 'user'
+      ? `notice:${lastInput.clientMessageId}`
+      : appendedInput ? `user-input:${appendedInput.clientMessageId}` : undefined;
     const notification = createAgentTurnNotification({
       conversationId,
       turnId,
-      terminalSequence: journal.latestSequence(),
+      ...(segmentId ? { segmentId } : {}),
       status: outcome === 'completed'
         ? 'completed'
         : outcome === 'interrupted' ? 'interrupted' : 'failed',
-      error: outcome === 'completed' || outcome === 'interrupted'
-        ? null
-        : journal.turn(turnId)?.error?.message ?? 'Native provider turn failed.',
     });
     if (notification) output.notify(notification.method, notification.params);
   },

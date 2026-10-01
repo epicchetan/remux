@@ -500,6 +500,7 @@ for (const origin of ['native-followup', 'federation-notification'] as const) {
     assert.equal(notice.type, 'notice');
     assert.ok(notice.type === 'notice');
     assert.equal(notice.text, 'Continued after Astra finished');
+    assert.equal(notice.origin, origin);
     assert.equal(notice.elapsedMs, 20_000);
     assert.ok(projected.segments.some(segment => segment.type === 'assistantMessage'));
   });
@@ -513,6 +514,7 @@ test('fallback notifications delivered during a user turn render as inline notic
   const projected = projectNativeTurn(turn);
   assert.equal(projected.segments.filter(segment => segment.type === 'userMessage').length, 1);
   assert.equal(projected.segments.filter(segment => segment.type === 'notice').length, 1);
+  assert.equal(projected.segments.find(segment => segment.type === 'notice')?.origin, 'federation-notification');
 });
 
 test('a backgrounded federation tool row says waiting in background until completion', () => {

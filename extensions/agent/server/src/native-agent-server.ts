@@ -149,8 +149,17 @@ export class NativeAgentServer {
         });
       case NATIVE_AGENT_METHODS.conversationRename:
         return this.coordinator.renameConversation(params as NativeConversationRenameCommand);
-      case NATIVE_AGENT_METHODS.conversationArchiveSet:
-        return this.coordinator.setConversationArchived(params as NativeConversationArchiveSetCommand);
+      case NATIVE_AGENT_METHODS.conversationArchiveSet: {
+        const input = params as NativeConversationArchiveSetCommand;
+        const result = this.coordinator.setConversationArchived(input);
+        if (this.journal.conversation(input.conversationId)?.archivedAt != null) {
+          this.notify('remux/notifications/audience/remove', {
+            extensionId: 'agent', viewId: 'main',
+            target: { resourceKind: 'agentConversation', resourceId: input.conversationId },
+          });
+        }
+        return result;
+      }
       case NATIVE_AGENT_METHODS.conversationStrandActivate:
         return this.coordinator.activateConversationStrand(
           params as NativeConversationStrandActivateCommand,

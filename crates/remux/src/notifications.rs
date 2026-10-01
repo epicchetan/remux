@@ -1,16 +1,13 @@
-//! Push notification manager, ported 1:1 from `cli/notifications.cjs` —
-//! including its extension-specific correlation tables (Agent and Codex
-//! turns, Codex compaction, terminal session start/attach/kill) with `once`/`target`
-//! audience lifetimes. That hardcoded knowledge is acknowledged debt, not to
-//! be redesigned in this pass.
-//!
-//! `.remux/notifications/clients.json` keeps its exact version-1 format so
-//! push tokens survive the cutover.
+//! Push recipients and visibility suppression. Agent recipients follow a
+//! conversation's root updates; Codex turns remain one-shot and terminal
+//! recipients follow the session. Agent subscriptions and delivery identities
+//! are persisted separately from push tokens.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::rpc::jsonrpc::{JsonRpcError, EXTENSION_ERROR};
@@ -140,13 +137,14 @@ pub fn production_fetch() -> FetchFn {
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Lifetime {
     Once,
     Target,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Audience {
     client_id: String,
     #[allow(dead_code)]
@@ -157,6 +155,13 @@ struct Audience {
     #[allow(dead_code)]
     session_id: Option<String>,
     target: Value,
+    delivered_ids: HashSet<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AgentAudienceStore {
+    version: u32,
+    audiences: Vec<Audience>,
 }
 
 struct SessionState {
@@ -177,6 +182,7 @@ struct ClientState {
 
 pub struct NotificationManager {
     store_path: PathBuf,
+    agent_audience_path: PathBuf,
     fetch: FetchFn,
     log: Arc<dyn NotificationLog>,
     clients: Mutex<HashMap<String, ClientState>>,
@@ -187,12 +193,15 @@ impl NotificationManager {
     pub fn new(root_dir: &Path, fetch: FetchFn, log: Arc<dyn NotificationLog>) -> Arc<Self> {
         let store_path = root_dir.join(".remux/notifications/clients.json");
         let clients = load_persisted_clients(&store_path);
+        let agent_audience_path = root_dir.join(".remux/notifications/agent-audiences.json");
+        let audiences = load_agent_audiences(&agent_audience_path);
         Arc::new(Self {
             store_path,
+            agent_audience_path,
             fetch,
             log,
             clients: Mutex::new(clients),
-            audiences: Mutex::new(HashMap::new()),
+            audiences: Mutex::new(audiences),
         })
     }
 
@@ -252,8 +261,8 @@ impl NotificationManager {
                     updated_at: None,
                 });
 
-            if let Some(token) = &registration.expo_push_token {
-                state.expo_push_token = Some(token.clone());
+            if registration.token_provided {
+                state.expo_push_token = registration.expo_push_token.clone();
                 state.updated_at = Some(now_iso8601());
             }
 
@@ -288,8 +297,17 @@ impl NotificationManager {
             state.expo_push_token.is_some()
         };
 
-        if registration.expo_push_token.is_some() {
+        if registration.token_provided {
             self.persist_clients();
+            if registration.expo_push_token.is_none() {
+                let mut audiences = self.audiences.lock().unwrap();
+                for bucket in audiences.values_mut() {
+                    bucket.remove(&registration.client_id);
+                }
+                audiences.retain(|_, bucket| !bucket.is_empty());
+                drop(audiences);
+                self.persist_agent_audiences();
+            }
         }
 
         self.log.event(
@@ -383,6 +401,12 @@ impl NotificationManager {
             return;
         };
 
+        let mut audiences = self.audiences.lock().unwrap();
+        let bucket = audiences.entry(key).or_default();
+        let delivered_ids = bucket
+            .get(client_id)
+            .map(|audience| audience.delivered_ids.clone())
+            .unwrap_or_default();
         let audience = Audience {
             client_id: client_id.to_string(),
             created_at: now_ms(),
@@ -391,13 +415,13 @@ impl NotificationManager {
             origin_tab_id: origin.1.clone(),
             session_id: session_id.map(str::to_string),
             target: target.clone(),
+            delivered_ids,
         };
-        self.audiences
-            .lock()
-            .unwrap()
-            .entry(key)
-            .or_default()
-            .insert(client_id.to_string(), audience);
+        bucket.insert(client_id.to_string(), audience);
+        drop(audiences);
+        if is_agent_conversation_target(&target) {
+            self.persist_agent_audiences();
+        }
 
         self.log.event(
             "notifications:audience:recorded",
@@ -421,12 +445,19 @@ impl NotificationManager {
         let mut audiences = self.audiences.lock().unwrap();
         let keys = audience_removal_keys(&audiences, target);
         let mut removed = 0;
+        let mut removed_agent = false;
         for key in keys {
             if let Some(bucket) = audiences.remove(&key) {
+                removed_agent |= bucket
+                    .values()
+                    .any(|audience| is_agent_conversation_target(&audience.target));
                 removed += bucket.len();
             }
         }
         drop(audiences);
+        if removed_agent {
+            self.persist_agent_audiences();
+        }
 
         self.log.event(
             "notifications:audience:removed",
@@ -470,19 +501,43 @@ impl NotificationManager {
             return true;
         };
 
-        let audience_key = audience_key_for_intent(&intent);
+        // Subscription scope and tap destination are independent: an Agent
+        // conversation recipient receives later turns and section-addressed
+        // updates while the delivered intent retains its exact focus.
+        let audience_key = agent_conversation_target(&intent)
+            .and_then(|target| audience_key_for_target(&target))
+            .or_else(|| audience_key_for_intent(&intent));
+        let mut had_audience = false;
         let delivery: Vec<Audience> = {
-            let audiences = self.audiences.lock().unwrap();
-            audience_key
-                .as_ref()
-                .and_then(|key| audiences.get(key))
-                .map(|bucket| bucket.values().cloned().collect())
-                .unwrap_or_default()
+            let mut audiences = self.audiences.lock().unwrap();
+            if let Some(bucket) = audience_key.as_ref().and_then(|key| audiences.get_mut(key)) {
+                had_audience = !bucket.is_empty();
+                let id = intent["id"].as_str().expect("normalized notification id");
+                let delivery = bucket
+                    .values_mut()
+                    .filter_map(|audience| {
+                        if is_agent_conversation_target(&audience.target)
+                            && !audience.delivered_ids.insert(id.to_string())
+                        {
+                            return None;
+                        }
+                        Some(audience.clone())
+                    })
+                    .collect();
+                bucket.retain(|_, audience| audience.lifetime != Lifetime::Once);
+                delivery
+            } else {
+                Vec::new()
+            }
         };
 
         if delivery.is_empty() {
             self.log.event(
-                "notifications:intent:no-audience",
+                if had_audience {
+                    "notifications:intent:duplicate"
+                } else {
+                    "notifications:intent:no-audience"
+                },
                 "info",
                 Some(notification_log_detail(&intent)),
                 false,
@@ -490,20 +545,18 @@ impl NotificationManager {
             return true;
         }
 
-        let key = audience_key.expect("delivery non-empty implies key");
+        if delivery
+            .iter()
+            .any(|audience| is_agent_conversation_target(&audience.target))
+        {
+            self.persist_agent_audiences();
+        }
         for audience in delivery {
-            if audience.lifetime == Lifetime::Once {
-                if let Some(bucket) = self.audiences.lock().unwrap().get_mut(&key) {
-                    bucket.remove(&audience.client_id);
-                }
-            }
             self.deliver_notification(&audience, &intent).await;
         }
         {
             let mut audiences = self.audiences.lock().unwrap();
-            if audiences.get(&key).map(HashMap::is_empty).unwrap_or(false) {
-                audiences.remove(&key);
-            }
+            audiences.retain(|_, bucket| !bucket.is_empty());
         }
         true
     }
@@ -793,6 +846,40 @@ impl NotificationManager {
             serde_json::to_string_pretty(&Value::Object(document)).unwrap_or_default(),
         );
     }
+
+    fn persist_agent_audiences(&self) {
+        // Hold the lock through the atomic replacement so concurrent updates
+        // cannot write an older snapshot over a newer subscription or receipt.
+        let audiences = self.audiences.lock().unwrap();
+        let store = AgentAudienceStore {
+            version: 1,
+            audiences: audiences
+                .values()
+                .flat_map(|bucket| bucket.values())
+                .filter(|audience| is_agent_conversation_target(&audience.target))
+                .cloned()
+                .collect(),
+        };
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let parent = self
+                .agent_audience_path
+                .parent()
+                .expect("audience store parent");
+            std::fs::create_dir_all(parent)?;
+            let temporary = self.agent_audience_path.with_extension("tmp");
+            std::fs::write(&temporary, serde_json::to_vec(&store)?)?;
+            std::fs::rename(temporary, &self.agent_audience_path)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.log.event(
+                "notifications:audience:persist-failed",
+                "warn",
+                Some(serde_json::json!({ "error": error.to_string() })),
+                false,
+            );
+        }
+    }
 }
 
 struct Registration {
@@ -801,6 +888,7 @@ struct Registration {
     client_id: String,
     connection_generation: u64,
     expo_push_token: Option<String>,
+    token_provided: bool,
     #[allow(dead_code)]
     platform: String,
     registration_revision: u64,
@@ -821,6 +909,7 @@ fn parse_client_registration(value: Option<&Value>) -> Option<Registration> {
             .and_then(Value::as_u64)
             .unwrap_or(0),
         expo_push_token: optional_string(record.get("expoPushToken")),
+        token_provided: record.contains_key("expoPushToken"),
         platform: optional_string(record.get("platform")).unwrap_or_else(|| "unknown".to_string()),
         registration_revision: record
             .get("registrationRevision")
@@ -841,7 +930,14 @@ fn audience_change_for_client_request(
     result: &Value,
 ) -> Option<AudienceChange> {
     if method == AGENT_MESSAGE_SEND_METHOD || AGENT_BRANCH_REQUEST_METHODS.contains(&method) {
-        let turn_id = required_string(result.get("turnId"))?;
+        if result.get("accepted").and_then(Value::as_bool) == Some(false) {
+            return None;
+        }
+        if result.get("accepted").and_then(Value::as_bool) != Some(true)
+            && required_string(result.get("turnId")).is_none()
+        {
+            return None;
+        }
         let conversation_id = optional_string(result.get("conversationId")).or_else(|| {
             optional_string(
                 request
@@ -850,11 +946,11 @@ fn audience_change_for_client_request(
             )
         })?;
         return Some(AudienceChange::Record {
-            lifetime: Lifetime::Once,
+            lifetime: Lifetime::Target,
             target: serde_json::json!({
                 "extensionId": "agent",
-                "focusId": turn_id,
-                "focusKind": "turn",
+                "focusId": conversation_id,
+                "focusKind": "conversation",
                 "resourceId": conversation_id,
                 "resourceKind": "agentConversation",
                 "viewId": "main",
@@ -917,6 +1013,50 @@ fn audience_change_for_client_request(
     }
 
     None
+}
+
+fn agent_conversation_target(intent: &Value) -> Option<Value> {
+    if intent["extensionId"].as_str() != Some("agent")
+        || intent["target"]["resourceKind"].as_str() != Some("agentConversation")
+    {
+        return None;
+    }
+    let conversation_id = required_string(intent["target"].get("resourceId"))?;
+    Some(serde_json::json!({
+        "extensionId": "agent", "viewId": intent["viewId"],
+        "resourceKind": "agentConversation", "resourceId": conversation_id,
+        "focusKind": "conversation", "focusId": conversation_id,
+    }))
+}
+
+fn is_agent_conversation_target(target: &Value) -> bool {
+    target["extensionId"].as_str() == Some("agent")
+        && target["resourceKind"].as_str() == Some("agentConversation")
+        && target["focusKind"].as_str() == Some("conversation")
+        && target["focusId"] == target["resourceId"]
+}
+
+fn load_agent_audiences(path: &Path) -> HashMap<String, HashMap<String, Audience>> {
+    let mut audiences: HashMap<String, HashMap<String, Audience>> = HashMap::new();
+    let store = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<AgentAudienceStore>(&bytes).ok());
+    let Some(store) = store.filter(|store| store.version == 1) else {
+        return audiences;
+    };
+    for audience in store.audiences {
+        if audience.lifetime != Lifetime::Target || !is_agent_conversation_target(&audience.target)
+        {
+            continue;
+        }
+        if let Some(key) = audience_key_for_target(&audience.target) {
+            audiences
+                .entry(key)
+                .or_default()
+                .insert(audience.client_id.clone(), audience);
+        }
+    }
+    audiences
 }
 
 fn terminal_notification_target(session_id: &str) -> Value {

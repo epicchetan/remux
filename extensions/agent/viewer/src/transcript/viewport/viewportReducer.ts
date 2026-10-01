@@ -36,7 +36,7 @@ export function viewportIntentForStreamingTurn({
     : { kind: 'free' };
 }
 
-export function previousUserMessageScrollAnchor({
+export function previousTranscriptSectionScrollAnchor({
   anchors,
   currentSegmentId = null,
   scrollTop,
@@ -54,7 +54,7 @@ export function previousUserMessageScrollAnchor({
   return null;
 }
 
-export function nextUserMessageScrollAnchor({
+export function nextTranscriptSectionScrollAnchor({
   anchors,
   atBottom,
   currentSegmentId = null,
@@ -102,7 +102,7 @@ export function nextTranscriptNavigationDestination({
   const naturalMax = Math.max(0, naturalMaxScrollTop);
   const naturalContentMax = Math.max(0, naturalContentMaxScrollTop ?? naturalMax);
   if (scrollTop >= naturalContentMax - Math.max(0, threshold)) return null;
-  const anchor = nextUserMessageScrollAnchor({
+  const anchor = nextTranscriptSectionScrollAnchor({
     anchors,
     atBottom,
     currentSegmentId,
@@ -193,7 +193,7 @@ export function initialTranscriptScrollTarget({
   streamingTurnId: string | null;
 }): TranscriptInitialScrollTarget | null {
   const streamingAnchor = streamingTurnId
-    ? anchors.find((anchor) => anchor.turnId === streamingTurnId) ?? null
+    ? anchors.findLast((anchor) => anchor.turnId === streamingTurnId) ?? null
     : null;
   if (streamingAnchor && streamingTurnId) {
     return {

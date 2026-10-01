@@ -300,7 +300,7 @@ async fn pushes_agent_turn_completion_to_the_originating_client() {
 }
 
 #[tokio::test]
-async fn records_agent_send_edit_and_fork_as_turn_audiences() {
+async fn records_agent_send_edit_and_fork_as_conversation_audiences() {
     for method in [
         "remux/agent/conversation/message/send",
         "remux/agent/conversation/message/edit",
@@ -324,7 +324,7 @@ async fn records_agent_send_edit_and_fork_as_turn_audiences() {
 }
 
 #[tokio::test]
-async fn does_not_record_an_agent_audience_before_a_queued_turn_has_an_identity() {
+async fn records_an_agent_conversation_recipient_for_an_accepted_queued_send() {
     let fixture = fixture();
     let client = MockClient::new(false);
     register(&fixture, &client).await;
@@ -346,7 +346,7 @@ async fn does_not_record_an_agent_audience_before_a_queued_turn_has_an_identity(
         .manager
         .handle_extension_notification(&agent_turn_completed_intent())
         .await;
-    assert!(fixture.pushes.lock().unwrap().is_empty());
+    assert_eq!(fixture.pushes.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -815,4 +815,180 @@ async fn notify_system_clears_tokens_on_device_not_registered() {
     .unwrap();
     let store: Value = serde_json::from_str(&store).unwrap();
     assert_eq!(store["clients"]["client-1"]["expoPushToken"], Value::Null);
+}
+
+fn agent_update_intent(turn_id: &str) -> Value {
+    json!({ "method": "remux/notifications/request", "params": {
+        "extensionId": "agent", "viewId": "main", "title": "Done",
+        "id": format!("agent-turn:conversation-1:{turn_id}"),
+        "target": { "resourceKind": "agentConversation", "resourceId": "conversation-1",
+            "focusKind": "section", "focusId": format!("[\"{turn_id}\",\"notice:child-done\"]") }
+    } })
+}
+
+fn restarted_manager(fixture: &Fixture) -> Arc<NotificationManager> {
+    NotificationManager::new(
+        fixture.root.path(),
+        recording_fetch(&fixture.pushes, json!({"data": {"status": "ok"}})),
+        fixture.log.clone(),
+    )
+}
+
+#[tokio::test]
+async fn agent_continuations_keep_exact_focus_and_dedupe_across_restarts_and_renewal() {
+    let fixture = fixture();
+    let client = MockClient::new(false);
+    register(&fixture, &client).await;
+    record_agent_turn(&fixture, &client, "remux/agent/conversation/message/send");
+    fixture.manager.on_client_disconnected(client.as_ref());
+    let update = agent_update_intent("autonomous-2");
+    let restarted = restarted_manager(&fixture);
+    // Concurrent duplicate terminal events still produce one push.
+    tokio::join!(
+        restarted.handle_extension_notification(&update),
+        restarted.handle_extension_notification(&update)
+    );
+    let current = restarted_manager(&fixture);
+    current.handle_extension_notification(&update).await;
+    // A new send renews the subscription without forgetting delivered identities.
+    current
+        .handle_client_request(
+            client.clone(),
+            "remux/clients/register",
+            Some(&json!({
+                "clientId": "client-1", "sessionId": "session-reconnected"
+            })),
+        )
+        .await
+        .unwrap();
+    current.record_client_request(client.as_ref(), &json!({
+        "method": "remux/agent/conversation/message/send", "params": {"conversationId": "conversation-1"}
+    }), &json!({"accepted": true, "turnId": "user-3"}));
+    current.handle_extension_notification(&update).await;
+    let pushes = fixture.pushes.lock().unwrap();
+    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes[0].1["title"], "Done");
+    assert!(pushes[0].1.get("body").is_none());
+    assert_eq!(
+        pushes[0].1["data"]["remuxNotificationIntent"]["target"]["focusKind"],
+        "section"
+    );
+    assert_eq!(
+        pushes[0].1["data"]["remuxNotificationIntent"]["target"]["focusId"],
+        "[\"autonomous-2\",\"notice:child-done\"]"
+    );
+}
+
+#[tokio::test]
+async fn agent_visible_updates_are_consumed_and_later_updates_still_notify() {
+    let fixture = fixture();
+    let client = MockClient::new(true);
+    register(&fixture, &client).await;
+    record_agent_turn(&fixture, &client, "remux/agent/conversation/message/send");
+    fixture
+        .manager
+        .handle_extension_notification(&agent_update_intent("visible-2"))
+        .await;
+    client.visible.store(false, Ordering::SeqCst);
+    record_agent_turn(&fixture, &client, "remux/agent/conversation/message/send");
+    fixture
+        .manager
+        .handle_extension_notification(&agent_update_intent("visible-2"))
+        .await;
+    fixture
+        .manager
+        .handle_extension_notification(&agent_update_intent("next-3"))
+        .await;
+    assert_eq!(fixture.pushes.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn agent_archive_and_notification_disable_remove_persisted_recipients() {
+    for disable in [false, true] {
+        let fixture = fixture();
+        let client = MockClient::new(false);
+        register(&fixture, &client).await;
+        record_agent_turn(&fixture, &client, "remux/agent/conversation/message/send");
+        if disable {
+            fixture
+                .manager
+                .handle_client_request(
+                    client.clone(),
+                    "remux/clients/register",
+                    Some(&json!({
+                        "clientId": "client-1", "sessionId": "session-1", "expoPushToken": null
+                    })),
+                )
+                .await
+                .unwrap();
+        } else {
+            fixture
+                .manager
+                .handle_extension_notification(&json!({
+                    "method": "remux/notifications/audience/remove", "params": {
+                        "extensionId": "agent", "viewId": "main", "target": {
+                            "resourceKind": "agentConversation", "resourceId": "conversation-1"
+                        }
+                    }
+                }))
+                .await;
+        }
+        restarted_manager(&fixture)
+            .handle_extension_notification(&agent_update_intent("later-2"))
+            .await;
+        assert!(fixture.pushes.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn agent_rejected_sends_and_unrelated_conversations_have_no_recipients() {
+    let fixture = fixture();
+    let client = MockClient::new(false);
+    register(&fixture, &client).await;
+    fixture.manager.record_client_request(client.as_ref(), &json!({
+        "method": "remux/agent/conversation/message/send", "params": {"conversationId": "conversation-1"}
+    }), &json!({ "accepted": false, "turnId": "turn-1" }));
+    fixture
+        .manager
+        .handle_extension_notification(&agent_update_intent("later-2"))
+        .await;
+    record_agent_turn(&fixture, &client, "remux/agent/conversation/message/send");
+    let mut other = agent_update_intent("child-turn");
+    other["params"]["target"]["resourceId"] = json!("child-conversation");
+    fixture.manager.handle_extension_notification(&other).await;
+    assert!(fixture.pushes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn agent_subscription_survives_reconnect_without_notifying_unrelated_devices() {
+    let fixture = fixture();
+    let sender = MockClient::new(false);
+    let other = MockClient::new(false);
+    register(&fixture, &sender).await;
+    fixture.manager.handle_client_request(other.clone(), "remux/clients/register", Some(&json!({
+        "clientId": "client-2", "sessionId": "session-2", "expoPushToken": "ExponentPushToken[other]"
+    }))).await.unwrap();
+    record_agent_turn(&fixture, &sender, "remux/agent/conversation/message/send");
+    fixture.manager.on_client_disconnected(sender.as_ref());
+    let replacement = MockClient::new(false);
+    fixture
+        .manager
+        .handle_client_request(
+            replacement.clone(),
+            "remux/clients/register",
+            Some(&json!({
+                "clientId": "client-1", "sessionId": "session-reconnected"
+            })),
+        )
+        .await
+        .unwrap();
+    fixture
+        .manager
+        .handle_extension_notification(&agent_update_intent("later-2"))
+        .await;
+    let pushes = fixture.pushes.lock().unwrap();
+    assert_eq!(pushes.len(), 1);
+    assert_eq!(pushes[0].1["to"], "ExponentPushToken[test]");
+    assert_eq!(replacement.visibility_checks.lock().unwrap().len(), 1);
+    assert!(other.visibility_checks.lock().unwrap().is_empty());
 }

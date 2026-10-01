@@ -1,4 +1,4 @@
-import { RotateCcw, X } from 'lucide-react';
+import { ArrowDown, RotateCcw, X } from 'lucide-react';
 import type { RefObject } from 'react';
 
 import { transcriptLayout } from '../layout/constants';
@@ -18,6 +18,7 @@ export function TranscriptViewport({
   onDismissFocusError,
   onRetryFocus,
   onRetryTranscript,
+  onJumpToNewUpdate,
   status,
   topSpacerHeight,
   totalTurnCount,
@@ -37,6 +38,7 @@ export function TranscriptViewport({
   onDismissFocusError: (() => void) | null;
   onRetryFocus: (() => void) | null;
   onRetryTranscript: () => void;
+  onJumpToNewUpdate: (() => void) | null;
   status: TranscriptStatus;
   topSpacerHeight: number;
   totalTurnCount: number;
@@ -112,6 +114,17 @@ export function TranscriptViewport({
           />
         </div>
       </div>
+      {onJumpToNewUpdate ? (
+        <div className="sticky bottom-3 z-10 h-0">
+          <button
+            className="absolute bottom-0 right-4 flex items-center gap-2 rounded-full border border-border bg-background px-3 py-2 text-sm shadow-md"
+            onClick={onJumpToNewUpdate}
+            type="button"
+          >
+            <ArrowDown className="size-4" /> New update
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }

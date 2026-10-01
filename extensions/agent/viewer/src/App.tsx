@@ -64,7 +64,7 @@ export function App() {
     initialTarget.kind === 'draft' ? initialDraft(initialTarget.id) : null);
   useEffect(() => {
     if (initialTarget.kind === 'conversation' && initialTarget.focusTurnId) {
-      requestTranscriptTurnScroll(initialTarget.id, initialTarget.focusTurnId);
+      requestTranscriptTurnScroll(initialTarget.id, initialTarget.focusTurnId, initialTarget.focusSegmentId);
     }
   }, [initialTarget]);
   const activeConversationIdRef = useRef(activeConversationId);
@@ -422,7 +422,7 @@ export function App() {
     activateDraft(nextDraft);
   }, [activateDraft, saveCurrentTargetDraft]);
 
-  const selectConversation = useCallback((conversationId: string, focusTurnId?: string | null) => {
+  const selectConversation = useCallback((conversationId: string, focusTurnId?: string | null, focusSegmentId?: string | null) => {
     const normalized = conversationId.trim();
     if (!normalized) return;
     if (activeConversationIdRef.current !== normalized || activeDraftIdRef.current) {
@@ -439,7 +439,7 @@ export function App() {
       void getTranscriptResourceState().setActiveConversationId(normalized);
       void ensureConversation(normalized);
     }
-    if (focusTurnId) requestTranscriptTurnScroll(normalized, focusTurnId);
+    if (focusTurnId) requestTranscriptTurnScroll(normalized, focusTurnId, focusSegmentId);
   }, [
     blurComposer,
     clearComposerMode,

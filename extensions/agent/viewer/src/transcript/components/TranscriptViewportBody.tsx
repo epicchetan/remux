@@ -11,6 +11,7 @@ import { AssistantMessage } from './assistantMessage';
 import { CompactionDivider } from './CompactionDivider';
 import { UserMessage } from './userMessage';
 import { WorkSection } from './work/WorkSection';
+import { isContinuationSection } from '../virtualizerScroll';
 
 export function TranscriptViewportBody({
   bottomSpacerHeight,
@@ -127,6 +128,7 @@ const TranscriptRow = memo(function TranscriptRow({
       data-expanded-additional-height={openWork?.additionalHeight ?? 0}
       data-row-kind={row.segment.type === 'work' ? 'workSection' : row.segment.type}
       data-segment-id={row.segmentId}
+      data-section-kind={row.segment.type === 'userMessage' ? 'user' : isContinuationSection(row.segment) ? 'continuation' : undefined}
       data-transcript-row-id={row.id}
       data-turn-id={row.turnId}
     >

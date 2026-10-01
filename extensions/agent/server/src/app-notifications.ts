@@ -1,14 +1,12 @@
-export const REMUX_NOTIFICATION_REQUEST_METHOD = 'remux/notifications/request';
+import { encodeAgentSectionFocus } from '../../shared/section-focus.ts';
 
-const TURN_COMPLETED_BODY = 'Turn completed.';
-const TURN_FAILED_BODY = 'Turn failed.';
+export const REMUX_NOTIFICATION_REQUEST_METHOD = 'remux/notifications/request';
 
 export type AgentTurnTerminalNotificationInput = {
   conversationId: string;
   turnId: string;
-  terminalSequence: number;
+  segmentId?: string;
   status: 'completed' | 'failed' | 'interrupted';
-  error: string | null;
 };
 
 export function createAgentTurnNotification(
@@ -17,9 +15,7 @@ export function createAgentTurnNotification(
   if (
     input.status === 'interrupted' ||
     !input.conversationId.trim() ||
-    !input.turnId.trim() ||
-    !Number.isSafeInteger(input.terminalSequence) ||
-    input.terminalSequence < 0
+    !input.turnId.trim()
   ) {
     return null;
   }
@@ -29,16 +25,16 @@ export function createAgentTurnNotification(
   return {
     method: REMUX_NOTIFICATION_REQUEST_METHOD,
     params: {
-      body: failed ? TURN_FAILED_BODY : TURN_COMPLETED_BODY,
       extensionId: 'agent',
-      id: `agent-turn:${input.conversationId}:${input.turnId}:${input.terminalSequence}`,
+      id: `agent-turn:${input.conversationId}:${input.turnId}`,
       target: {
-        focusId: input.turnId,
-        focusKind: 'turn',
+        focusId: input.segmentId
+          ? encodeAgentSectionFocus({ turnId: input.turnId, segmentId: input.segmentId }) : input.turnId,
+        focusKind: input.segmentId ? 'section' : 'turn',
         resourceId: input.conversationId,
         resourceKind: 'agentConversation',
       },
-      title: failed ? 'Agent turn failed' : 'Agent finished',
+      title: failed ? 'Failed' : 'Done',
       viewId: 'main',
     },
   } as const;

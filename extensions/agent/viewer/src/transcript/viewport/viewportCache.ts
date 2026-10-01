@@ -2,12 +2,12 @@ import type { TranscriptViewportAnchor } from './viewportTypes';
 
 export type TranscriptViewportCacheEntry =
   | { kind: 'bottom' }
-  | { kind: 'user-message'; segmentId: string; turnId: string }
+  | { kind: 'section'; segmentId: string; turnId: string }
   | { kind: 'row-offset'; anchor: TranscriptViewportAnchor };
 
 export type TranscriptInitialViewportIntent = Extract<
   TranscriptViewportCacheEntry,
-  { kind: 'bottom' | 'user-message' }
+  { kind: 'bottom' | 'section' }
 >;
 
 const MAX_CACHED_TRANSCRIPT_VIEWPORTS = 5;

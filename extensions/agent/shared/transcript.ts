@@ -1,5 +1,5 @@
-export const AGENT_TRANSCRIPT_PROTOCOL_VERSION = 7 as const;
-export const AGENT_TRANSCRIPT_PROJECTION_VERSION = 'agent-turn-render-v7' as const;
+export const AGENT_TRANSCRIPT_PROTOCOL_VERSION = 8 as const;
+export const AGENT_TRANSCRIPT_PROJECTION_VERSION = 'agent-turn-render-v8' as const;
 
 export const DEFAULT_TRANSCRIPT_TAIL_TURNS = 24;
 export const DEFAULT_TRANSCRIPT_PREPEND_TURNS = 16;
@@ -112,6 +112,7 @@ export type AgentNoticeSegment = {
   revision: string;
   text: string;
   elapsedMs?: number;
+  origin?: 'native-followup' | 'federation-notification' | 'compaction';
 };
 
 export type AgentTurnSegment =

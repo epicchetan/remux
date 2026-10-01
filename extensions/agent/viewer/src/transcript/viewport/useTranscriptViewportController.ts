@@ -28,7 +28,7 @@ import {
   historicalMessageNavigationDestination,
   initialTranscriptScrollTarget,
   nextTranscriptNavigationDestination,
-  previousUserMessageScrollAnchor,
+  previousTranscriptSectionScrollAnchor,
   resolveInitialTranscriptScrollTarget,
   resolveMessageAnchorScroll,
   viewportIntentAfterNativeScrollSettles,
@@ -57,9 +57,10 @@ import {
   sameTurnIds,
 } from '../virtualizerRange';
 import {
-  anchorTurnUserMessageScrollTop,
-  anchorUserMessageScrollTop,
-  userMessageScrollAnchors,
+  anchorTurnSectionScrollTop,
+  anchorTranscriptSectionScrollTop,
+  isContinuationSection,
+  transcriptSectionScrollAnchors,
 } from '../virtualizerScroll';
 
 const bottomStickThresholdPx = 12;
@@ -126,7 +127,7 @@ export function useTranscriptViewportController(
   const [anchorRunwayHeight, setAnchorRunwayHeight] = useState(0);
   const navigationAnchors = useMemo(
     () =>
-      userMessageScrollAnchors({
+      transcriptSectionScrollAnchors({
         expandedRows,
         geometry,
         topPadding: viewportTopPadding,
@@ -172,6 +173,43 @@ export function useTranscriptViewportController(
   const userScrollArmedRef = useRef(false);
   const focusLoadRequestIdRef = useRef<number | null>(null);
   const [width, setWidth] = useState<number | null>(null);
+  const lastSectionRef = useRef<{ conversationId: string; segmentId: string } | null>(null);
+  const [newUpdate, setNewUpdate] = useState<{ turnId: string; segmentId: string } | null>(null);
+
+  useEffect(() => {
+    if (status !== 'ready' || activeConversationId !== conversationId || hasLaterTurns) return;
+    const latest = navigationAnchors.at(-1);
+    if (!latest) return;
+    const previous = lastSectionRef.current;
+    lastSectionRef.current = { conversationId, segmentId: latest.segmentId };
+    if (!previous || previous.conversationId !== conversationId) {
+      setNewUpdate(null);
+      return;
+    }
+    if (viewportIntent.kind === 'bottom-follow') {
+      setNewUpdate(null);
+      return;
+    }
+    if (previous.segmentId === latest.segmentId) return;
+    const segment = turnsById[latest.turnId]?.rows.find(row => row.segmentId === latest.segmentId)?.segment;
+    setNewUpdate(segment && isContinuationSection(segment)
+      ? { turnId: latest.turnId, segmentId: latest.segmentId }
+      : null);
+  }, [activeConversationId, conversationId, hasLaterTurns, navigationAnchors, status, turnsById, viewportIntent.kind]);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport || !newUpdate) return;
+    const markVisibleUpdateRead = () => {
+      const section = navigationAnchorsRef.current.find(anchor =>
+        anchor.turnId === newUpdate.turnId && anchor.segmentId === newUpdate.segmentId);
+      if (section && section.contentBottom > viewport.scrollTop &&
+          section.contentTop < viewport.scrollTop + viewport.clientHeight) setNewUpdate(null);
+    };
+    markVisibleUpdateRead();
+    viewport.addEventListener('scroll', markVisibleUpdateRead, { passive: true });
+    return () => viewport.removeEventListener('scroll', markVisibleUpdateRead);
+  }, [newUpdate]);
 
   useEffect(() => {
     void setActiveConversationId(conversationId);
@@ -179,6 +217,8 @@ export function useTranscriptViewportController(
 
   useLayoutEffect(() => {
     navigationCursorSegmentIdRef.current = null;
+    lastSectionRef.current = null;
+    setNewUpdate(null);
   }, [conversationId]);
 
   useLayoutEffect(() => {
@@ -319,21 +359,21 @@ export function useTranscriptViewportController(
     }
     if (mode.kind === 'message-anchor') {
       return {
-        kind: 'user-message',
+        kind: 'section',
         segmentId: mode.segmentId,
         turnId: mode.turnId,
       };
     }
 
-    const latestUserMessage = navigationAnchorsRef.current.at(-1) ?? null;
-    if (latestUserMessage) {
+    const latestSection = navigationAnchorsRef.current.at(-1) ?? null;
+    if (latestSection) {
       if (
-        Math.abs(viewport.scrollTop - latestUserMessage.scrollTop) <= 2
+        Math.abs(viewport.scrollTop - latestSection.scrollTop) <= 2
       ) {
         return {
-          kind: 'user-message',
-          segmentId: latestUserMessage.segmentId,
-          turnId: latestUserMessage.turnId,
+          kind: 'section',
+          segmentId: latestSection.segmentId,
+          turnId: latestSection.turnId,
         };
       }
     }
@@ -361,7 +401,7 @@ export function useTranscriptViewportController(
     const cachedEntry = cachedTranscriptViewportAnchor(conversationId);
     const cachedAnchor = cachedEntry?.kind === 'row-offset' ? cachedEntry.anchor : null;
     scrollAnchorRef.current = cachedAnchor;
-    initialViewportIntentRef.current = cachedEntry?.kind === 'bottom' || cachedEntry?.kind === 'user-message'
+    initialViewportIntentRef.current = cachedEntry?.kind === 'bottom' || cachedEntry?.kind === 'section'
       ? cachedEntry
       : null;
     if (cachedAnchor) initialScrollConversationIdRef.current = conversationId;
@@ -468,7 +508,7 @@ export function useTranscriptViewportController(
     let nextRunwayHeight = 0;
 
     if (mode.kind === 'message-anchor') {
-      const desiredScrollTop = anchorUserMessageScrollTop({
+      const desiredScrollTop = anchorTranscriptSectionScrollTop({
         expandedRows: [],
         geometry: geometryRef.current,
         segmentId: mode.segmentId,
@@ -825,7 +865,7 @@ export function useTranscriptViewportController(
     const currentSegmentId = mode.kind === 'message-anchor'
       ? mode.segmentId
       : navigationCursorSegmentIdRef.current;
-    const anchor = previousUserMessageScrollAnchor({
+    const anchor = previousTranscriptSectionScrollAnchor({
       anchors: navigationAnchorsRef.current,
       atBottom: mode.kind === 'bottom-follow' && isNearBottom(viewport),
       currentSegmentId,
@@ -874,7 +914,7 @@ export function useTranscriptViewportController(
       return;
     }
 
-    // No later user row can reach the normal anchor offset. The remaining
+    // No later section can reach the normal anchor offset. The remaining
     // destination is the transcript's real bottom, not a synthetic runway
     // that lifts an already-visible tail row to the top.
     navigationCursorSegmentIdRef.current = null;
@@ -934,17 +974,26 @@ export function useTranscriptViewportController(
     if (
       !requestedTurnScroll ||
       requestedTurnScroll.conversationId !== activeConversationId ||
+      turnScrollError?.requestId === requestedTurnScroll.id ||
       status !== 'ready' ||
       width === null
     ) return;
-    const desiredScrollTop = anchorTurnUserMessageScrollTop({
+    const sectionOptions = {
       expandedRows,
       geometry,
       topPadding: viewportTopPadding,
       turns,
       turnId: requestedTurnScroll.turnId,
-    });
-    if (desiredScrollTop === null) return;
+    };
+    const desiredScrollTop = requestedTurnScroll.segmentId
+      ? anchorTranscriptSectionScrollTop({ ...sectionOptions, segmentId: requestedTurnScroll.segmentId })
+      : anchorTurnSectionScrollTop(sectionOptions);
+    if (desiredScrollTop === null) {
+      if (turnsById[requestedTurnScroll.turnId]) {
+        failTurnScroll(requestedTurnScroll.id, 'The requested update could not be loaded.');
+      }
+      return;
+    }
     navigationCursorSegmentIdRef.current = null;
     scrollToPosition(desiredScrollTop, { kind: 'free' }, 'host-navigate', false, () => {
       resolveTurnScroll(requestedTurnScroll.id);
@@ -958,6 +1007,9 @@ export function useTranscriptViewportController(
     status,
     turns,
     viewportTopPadding,
+    turnsById,
+    failTurnScroll,
+    turnScrollError,
     width,
   ]);
 
@@ -1371,10 +1423,10 @@ export function useTranscriptViewportController(
       streamingTurnId,
     });
     const cachedIntent = initialViewportIntentRef.current;
-    const cachedMessage = cachedIntent?.kind === 'user-message' ? cachedIntent : null;
-    const cachedAnchor = cachedMessage
+    const cachedSection = cachedIntent?.kind === 'section' ? cachedIntent : null;
+    const cachedAnchor = cachedSection
       ? navigationAnchors.find((anchor) =>
-          anchor.segmentId === cachedMessage.segmentId && anchor.turnId === cachedMessage.turnId) ?? null
+          anchor.segmentId === cachedSection.segmentId && anchor.turnId === cachedSection.turnId) ?? null
       : null;
     const modeledInitialTarget = cachedIntent?.kind === 'bottom'
       ? null
@@ -1442,9 +1494,13 @@ export function useTranscriptViewportController(
       ? () => clearTurnScroll(requestedTurnScroll.id)
       : null,
     onRetryFocus: requestedTurnScroll
-      ? () => requestTurnScroll(conversationId, requestedTurnScroll.turnId)
+      ? () => requestTurnScroll(conversationId, requestedTurnScroll.turnId, requestedTurnScroll.segmentId)
       : null,
     onRetryTranscript: () => void refreshTranscript({ forceFullMeasure: true }),
+    onJumpToNewUpdate: newUpdate ? () => {
+      requestTurnScroll(conversationId, newUpdate.turnId, newUpdate.segmentId);
+      setNewUpdate(null);
+    } : null,
     status,
     topSpacerHeight: spacerRange.topSpacerHeight,
     totalTurnCount: turns.length,
@@ -1472,7 +1528,7 @@ function scrollNavigationAvailability(
     : navigationCursorSegmentId;
   const atBottom = mode.kind === 'bottom-follow' &&
     node.scrollTop >= naturalMaxScrollTop - bottomStickThresholdPx;
-  const previousAnchor = previousUserMessageScrollAnchor({
+  const previousAnchor = previousTranscriptSectionScrollAnchor({
     anchors,
     atBottom,
     currentSegmentId,

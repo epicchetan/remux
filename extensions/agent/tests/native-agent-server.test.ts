@@ -170,3 +170,40 @@ test('native Agent JSON-RPC surface serves versioned resources and commands only
     journal.close();
   }
 });
+
+test('archive removes conversation notification recipients only after acceptance', async () => {
+  const database = new DatabaseSync(':memory:');
+  createNativeAgentSchema(database);
+  const journal = new NativeAgentJournal(database);
+  const notifications: Array<{ method: string; params: unknown }> = [];
+  const server = new NativeAgentServer({ journal, providers: [{ providerInstanceId: 'fixture-local',
+    provider: 'fixture', label: 'Fixture', adapter: new NativeFixtureAdapter() }],
+    notify: (method, params) => notifications.push({ method, params }) });
+  try {
+    await server.initialize();
+    const { conversationId } = await server.handle(NATIVE_AGENT_METHODS.conversationCreate, {
+      commandId: 'create-archive', providerInstanceId: 'fixture-local', cwd: '/workspace/remux',
+      model: 'fixture-native-v1', access: 'workspace-write',
+    }) as { conversationId: string };
+    await assert.rejects(server.handle(NATIVE_AGENT_METHODS.conversationArchiveSet, {
+      commandId: 'bad-archive', conversationId, archived: true, expectedMetadataRevision: -1,
+    }));
+    assert.equal(notifications.filter(event => event.method === 'remux/notifications/audience/remove').length, 0);
+    const archiveCommand = {
+      commandId: 'archive', conversationId, archived: true,
+      expectedMetadataRevision: journal.conversation(conversationId)!.metadataRevision,
+    };
+    await server.handle(NATIVE_AGENT_METHODS.conversationArchiveSet, archiveCommand);
+    assert.deepEqual(notifications.filter(event => event.method === 'remux/notifications/audience/remove'), [{
+      method: 'remux/notifications/audience/remove', params: { extensionId: 'agent', viewId: 'main',
+        target: { resourceKind: 'agentConversation', resourceId: conversationId } },
+    }]);
+    await server.handle(NATIVE_AGENT_METHODS.conversationArchiveSet, {
+      commandId: 'unarchive', conversationId, archived: false,
+      expectedMetadataRevision: journal.conversation(conversationId)!.metadataRevision,
+    });
+    await server.handle(NATIVE_AGENT_METHODS.conversationArchiveSet, archiveCommand);
+    assert.equal(notifications.filter(event => event.method === 'remux/notifications/audience/remove').length, 1,
+      'replaying an old archive receipt must not unsubscribe a reopened conversation');
+  } finally { await server.close(); database.close(); }
+});

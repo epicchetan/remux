@@ -42,7 +42,7 @@ type RemuxClientRegistration = {
   activeTarget: BrowserResourceTarget | null;
   appState: string;
   clientId: string;
-  expoPushToken?: string;
+  expoPushToken?: string | null;
   platform: typeof Platform.OS;
   sessionId: string;
 };
@@ -71,7 +71,7 @@ export function RemuxNotificationProvider({ children }: { children: ReactNode })
   const tabs = useBrowserStore((state) => state.tabs);
   const [appState, setAppState] = useState(AppState.currentState);
   const [clientId, setClientId] = useState<string | null>(null);
-  const [expoPushToken, setExpoPushToken] = useState<string | null>(null);
+  const [expoPushToken, setExpoPushToken] = useState<string | null | undefined>(undefined);
   const handledNotificationResponsesRef = useRef(new Set<string>());
   const lastSuccessfulRegistrationKeyRef = useRef<string | null>(null);
   const pendingRegistrationKeyRef = useRef<string | null>(null);
@@ -106,7 +106,7 @@ export function RemuxNotificationProvider({ children }: { children: ReactNode })
   }, []);
 
   useEffect(() => {
-    if (!settingsLoaded || !clientId || expoPushToken || pushTokenRequestInFlightRef.current) {
+    if (!settingsLoaded || !clientId || pushTokenRequestInFlightRef.current) {
       return;
     }
 
@@ -123,7 +123,7 @@ export function RemuxNotificationProvider({ children }: { children: ReactNode })
       .finally(() => {
         pushTokenRequestInFlightRef.current = false;
       });
-  }, [appState, clientId, expoPushToken, settingsLoaded]);
+  }, [appState, clientId, settingsLoaded]);
 
   useEffect(() => subscribeVisibilityChecks(remux), [remux]);
 
@@ -143,7 +143,7 @@ export function RemuxNotificationProvider({ children }: { children: ReactNode })
       activeTarget,
       appState,
       clientId,
-      ...(expoPushToken ? { expoPushToken } : {}),
+      ...(expoPushToken === undefined ? {} : { expoPushToken }),
       platform: Platform.OS,
       sessionId: sessionIdRef.current,
     };

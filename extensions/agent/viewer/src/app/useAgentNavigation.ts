@@ -4,6 +4,7 @@ import {
   updateHostTab,
 } from '@remux/viewer-kit';
 import { useEffect } from 'react';
+import { decodeAgentSectionFocus } from '../../../shared/section-focus';
 
 import type { ConversationSummary, ConversationValue } from '../../../shared/protocol.ts';
 import { conversationHistoryTitle } from '../conversation/historyPresentation.ts';
@@ -14,14 +15,16 @@ import {
 } from '../identity.ts';
 
 export type AgentInitialTarget =
-  | { focusTurnId: string | null; id: string; kind: 'conversation' }
+  | { focusTurnId: string | null; focusSegmentId: string | null; id: string; kind: 'conversation' }
   | { id: string; kind: 'draft' };
 
 export function readInitialTarget(): AgentInitialTarget {
   const route = parseRemuxViewerRoute(window.location.href);
   if (route.resourceKind === 'agentConversation' && route.resourceId) {
+    const section = route.focusKind === 'section' ? decodeAgentSectionFocus(route.focusId) : null;
     return {
-      focusTurnId: route.focusKind === 'turn' ? route.focusId : null,
+      focusTurnId: section?.turnId ?? (route.focusKind === 'turn' ? route.focusId : null),
+      focusSegmentId: section?.segmentId ?? null,
       id: route.resourceId,
       kind: 'conversation',
     };
@@ -41,7 +44,7 @@ export function useAgentNavigation(options: {
   conversation: ConversationValue | null;
   conversationMissing: boolean;
   conversationSummary: ConversationSummary | null;
-  selectConversation: (conversationId: string, focusTurnId?: string | null) => void;
+  selectConversation: (conversationId: string, focusTurnId?: string | null, focusSegmentId?: string | null) => void;
   startNewChat: (preferredDraftId?: string | null) => void;
 }) {
   const {
@@ -56,9 +59,11 @@ export function useAgentNavigation(options: {
 
   useEffect(() => subscribeHostNavigate((navigation) => {
     if (navigation.resourceKind === 'agentConversation' && navigation.resourceId) {
+      const section = navigation.focusKind === 'section' ? decodeAgentSectionFocus(navigation.focusId) : null;
       selectConversation(
         navigation.resourceId,
-        navigation.focusKind === 'turn' ? navigation.focusId : null,
+        section?.turnId ?? (navigation.focusKind === 'turn' ? navigation.focusId : null),
+        section?.segmentId ?? null,
       );
       return;
     }

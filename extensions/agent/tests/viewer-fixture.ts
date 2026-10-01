@@ -34,6 +34,7 @@ export async function installAgentHost(page: Page) {
       renderRevision: string;
       layoutRevision: string;
       segments: any[];
+      continuation?: boolean;
     };
 
     const conversationId = '11111111-1111-4111-8111-111111111111';
@@ -1538,7 +1539,8 @@ export async function installAgentHost(page: Page) {
             origin: 'compaction', text: 'Compacted 272k → 12k tokens', createdAt: turn.startedAt + 2,
           }],
         } : {}),
-        ...(route.get('fixtureContinuation') === '1' && targetOrdinal === (turnsByConversation.get(targetConversationId)?.length ?? 0) - 1 ? {
+        ...(turn.continuation || (route.get('fixtureContinuation') === '1' && targetOrdinal === (turnsByConversation.get(targetConversationId)?.length ?? 0) - 1) ||
+          (route.get('fixtureContinuationChain') === '1' && targetOrdinal >= (turnsByConversation.get(targetConversationId)?.length ?? 0) - 3) ? {
           origin: 'federation-notification', trigger: { kind: 'federation', childExecutionId: 'astra' },
           inputItems: [{ type: 'notice', clientMessageId: String(user?.clientMessageId ?? `fixture-client:${turn.id}`),
             afterBlockId: null, origin: 'federation-notification', trigger: { kind: 'federation', childExecutionId: 'astra' },
@@ -2675,6 +2677,15 @@ export async function installAgentHost(page: Page) {
         requestLog,
         resources,
         turns,
+        appendContinuation(assistant: string) {
+          turnCounter += 1;
+          const turn = completedTurn(`continuation-turn-${turnCounter}`, '', assistant);
+          turn.continuation = true;
+          turns.push(turn);
+          sequence += 1;
+          invalidateTranscript(turn.id, 'terminal', true);
+          return turn.id;
+        },
         appendCompletedTurn(user: string, assistant: string) {
           turnCounter += 1;
           const turn = completedTurn(`external-turn-${turnCounter}`, user, assistant);

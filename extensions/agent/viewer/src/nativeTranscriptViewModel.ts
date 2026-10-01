@@ -1067,6 +1067,6 @@ function hasAdditionalInputs(turn: NativeAgentTurnFrame) {
   return Boolean(turn.additionalMessages?.length || turn.inputItems?.some(input => input.clientMessageId !== turn.clientMessageId));
 }
 function projectNotice(input: NativeTurnNotice, revision: string): Extract<AgentTurnSegment, { type: 'notice' }> {
-  return { id: `notice:${input.clientMessageId}`, type: 'notice', revision, text: input.text,
+  return { id: `notice:${input.clientMessageId}`, type: 'notice', revision, text: input.text, origin: input.origin,
     ...(input.elapsedMs === undefined ? {} : { elapsedMs: input.elapsedMs }) };
 }

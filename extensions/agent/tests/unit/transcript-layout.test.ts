@@ -18,9 +18,9 @@ import {
   viewportIntentForStreamingTurn,
   historicalMessageNavigationDestination,
   initialTranscriptScrollTarget,
-  nextUserMessageScrollAnchor,
+  nextTranscriptSectionScrollAnchor,
   nextTranscriptNavigationDestination,
-  previousUserMessageScrollAnchor,
+  previousTranscriptSectionScrollAnchor,
   resolveInitialTranscriptScrollTarget,
   resolveMessageAnchorScroll,
   transcriptMessageAnchorTopOffset,
@@ -226,24 +226,24 @@ test('navigates compact transcript tails by user-message identity instead of cla
     { contentBottom: 390, contentTop: 364, segmentId: 'user-3', scrollTop: 340, turnId: 'turn-3' },
   ];
 
-  assert.deepEqual(previousUserMessageScrollAnchor({
+  assert.deepEqual(previousTranscriptSectionScrollAnchor({
     anchors,
     atBottom: true,
     scrollTop: 300,
   }), anchors[1]);
-  assert.deepEqual(previousUserMessageScrollAnchor({
+  assert.deepEqual(previousTranscriptSectionScrollAnchor({
     anchors,
     atBottom: false,
     currentSegmentId: 'user-3',
     scrollTop: 340,
   }), anchors[1]);
-  assert.deepEqual(nextUserMessageScrollAnchor({
+  assert.deepEqual(nextTranscriptSectionScrollAnchor({
     anchors,
     atBottom: false,
     currentSegmentId: 'user-2',
     scrollTop: 220,
   }), anchors[2]);
-  assert.equal(nextUserMessageScrollAnchor({
+  assert.equal(nextTranscriptSectionScrollAnchor({
     anchors,
     atBottom: false,
     currentSegmentId: 'user-3',
@@ -258,7 +258,7 @@ test('next-turn navigation selects identity before resolving live reachability',
     { contentBottom: 380, contentTop: 320, segmentId: 'user-3', scrollTop: 296, turnId: 'turn-3' },
   ];
 
-  assert.deepEqual(nextUserMessageScrollAnchor({
+  assert.deepEqual(nextTranscriptSectionScrollAnchor({
     anchors,
     atBottom: false,
     currentSegmentId: 'user-1',
@@ -359,12 +359,12 @@ test('previous-turn navigation skips every user message already visible at the c
     { contentBottom: 510, contentTop: 450, segmentId: 'user-4', scrollTop: 426, turnId: 'turn-4' },
   ];
 
-  assert.deepEqual(previousUserMessageScrollAnchor({
+  assert.deepEqual(previousTranscriptSectionScrollAnchor({
     anchors,
     atBottom: true,
     scrollTop: 180,
   }), anchors[0], 'visible tail messages are skipped in favor of the newest fully hidden row');
-  assert.equal(previousUserMessageScrollAnchor({
+  assert.equal(previousTranscriptSectionScrollAnchor({
     anchors,
     atBottom: true,
     scrollTop: 0,
@@ -835,3 +835,27 @@ function work(
     type: 'work',
   };
 }
+
+test('continuation sections participate in placement, focus, and chronological navigation', async () => {
+  const { transcriptSectionScrollAnchors, anchorTurnSectionScrollTop, anchorTranscriptSectionScrollTop } =
+    await import('../../viewer/src/transcript/virtualizerScroll.ts');
+  const notice = (id: string, origin?: 'native-followup' | 'federation-notification' | 'compaction'): AgentTurnSegment =>
+    ({ id, type: 'notice', revision: '1', text: 'Continued', origin });
+  const layout = measureCollapsedTranscript({ turns: [
+    frame('human', [user('user', 'Start'), assistant('answer', 'Initial response')]),
+    inProgressFrame('continuation', [notice('notice:first', 'federation-notification'),
+      assistant('report', 'Report'), notice('compatibility'), notice('compaction', 'compaction'),
+      notice('notice:second', 'native-followup'), assistant('final', 'Next report')]),
+  ], width: 600 });
+  const options = { turns: layout.turns, expandedRows: [], topPadding: 24 };
+  const anchors = transcriptSectionScrollAnchors(options);
+  assert.deepEqual(anchors.map(anchor => anchor.segmentId), ['user', 'notice:first', 'notice:second']);
+  assert.equal(previousTranscriptSectionScrollAnchor({ anchors, atBottom: false, currentSegmentId: 'notice:second', scrollTop: anchors[2]!.scrollTop }), anchors[1]);
+  assert.equal(nextTranscriptSectionScrollAnchor({ anchors, atBottom: false, currentSegmentId: 'notice:first', scrollTop: anchors[1]!.scrollTop }), anchors[2]);
+  assert.equal(anchorTurnSectionScrollTop({ ...options, turnId: 'continuation' }), anchors[1]!.scrollTop);
+  assert.equal(anchorTranscriptSectionScrollTop({ ...options, turnId: 'continuation', segmentId: 'notice:second' }), anchors[2]!.scrollTop);
+  assert.equal(anchorTranscriptSectionScrollTop({ ...options, turnId: 'human', segmentId: 'notice:second' }), null);
+  const initial = initialTranscriptScrollTarget({ anchors, conversationId: 'conversation', streamingTurnId: 'continuation' });
+  assert.equal(initial?.scrollTop, anchors[2]!.scrollTop);
+  assert.equal(initial?.intent.kind, 'message-anchor');
+});

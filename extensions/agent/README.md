@@ -97,6 +97,27 @@ the viewer rereads authoritative runtime, transcript, queue, and any expanded
 child resources. Menus and sheets account for top, bottom, and keyboard safe
 areas.
 
+Transcript navigation treats human messages and autonomous continuation
+dividers as section boundaries. Opening a conversation starts at its latest
+section when the reply is long, or at the natural bottom when it is short.
+Existing reading positions take precedence when switching conversations;
+notification taps take precedence over those positions and target the exact
+completed section. A continuation arriving while someone is reading earlier
+content preserves their position and offers a **New update** jump.
+
+Completion notifications use **Done** or **Failed** with no body. **Done**
+means a parent response is ready; the conversation can still have background
+work. Native and federated child completions do not notify independently.
+An accepted send, edit, or fork subscribes the originating device to that
+conversation's later parent responses. Subscriptions and handled notification
+identities survive reconnects and runtime restarts in
+`.remux/notifications/agent-audiences.json`. Visible updates are consumed without
+a push. Archiving removes conversation recipients; registering an explicit
+null push token clears that device's token and recipients. Omitting the token
+during registration preserves it. Delivery identities are claimed before
+visibility checks and push delivery to prevent duplicate announcements;
+this does not provide retries after a failed push request.
+
 Normal messages are acknowledged only after their logical turn and immutable
 provider/model/effort/access envelope are committed to the Agent journal. The
 server serializes and wakes each conversation lane on enqueue, terminal events,

@@ -3,20 +3,30 @@ import {
   type TranscriptExpandedRow,
 } from './geometry/geometryIndex';
 import type { TranscriptMeasuredTurn } from './layout/types';
+import type { AgentTurnSegment } from '../../../shared/transcript';
 import { userMessageRowMatchesId } from './viewport/viewportReducer';
 import type { TranscriptScrollAnchor } from './viewport/viewportTypes';
 
 export const messageAnchorTopOffsetPx = 24;
 
+export function isTranscriptSection(segment: AgentTurnSegment) {
+  return segment.type === 'userMessage' || isContinuationSection(segment);
+}
+
+export function isContinuationSection(segment: AgentTurnSegment) {
+  return segment.type === 'notice' &&
+    (segment.origin === 'native-followup' || segment.origin === 'federation-notification');
+}
+
 export function transcriptMessageAnchorTopOffset(topPadding: number) {
   return Math.max(messageAnchorTopOffsetPx, topPadding);
 }
 
-export function userMessageAnchorScrollTop(rowTop: number, topPadding: number) {
+export function transcriptSectionAnchorScrollTop(rowTop: number, topPadding: number) {
   return Math.max(0, topPadding + rowTop - transcriptMessageAnchorTopOffset(topPadding));
 }
 
-export function userMessageScrollAnchors({
+export function transcriptSectionScrollAnchors({
   expandedRows,
   geometry,
   topPadding,
@@ -32,12 +42,12 @@ export function userMessageScrollAnchors({
   turns.forEach((turn, turnIndex) => {
     let rowTop = index.turnTop(turnIndex);
     for (const row of turn.rows) {
-      if (row.segment.type === 'userMessage') {
+      if (isTranscriptSection(row.segment)) {
         anchors.push({
           contentBottom: topPadding + rowTop + row.height,
           contentTop: topPadding + rowTop,
           segmentId: row.segmentId,
-          scrollTop: userMessageAnchorScrollTop(rowTop, topPadding),
+          scrollTop: transcriptSectionAnchorScrollTop(rowTop, topPadding),
           turnId: turn.turnId,
         });
       }
@@ -47,7 +57,7 @@ export function userMessageScrollAnchors({
   return anchors;
 }
 
-export function anchorTurnUserMessageScrollTop({
+export function anchorTurnSectionScrollTop({
   expandedRows,
   geometry,
   topPadding,
@@ -67,15 +77,15 @@ export function anchorTurnUserMessageScrollTop({
 
   let rowTop = index.turnTop(turnIndex);
   for (const row of turn.rows) {
-    if (row.segment.type === 'userMessage') {
-      return userMessageAnchorScrollTop(rowTop, topPadding);
+    if (isTranscriptSection(row.segment)) {
+      return transcriptSectionAnchorScrollTop(rowTop, topPadding);
     }
     rowTop += row.height + index.heightAfterRow(turn.turnId, row.id);
   }
   return null;
 }
 
-export function anchorUserMessageScrollTop({
+export function anchorTranscriptSectionScrollTop({
   expandedRows,
   geometry,
   segmentId,
@@ -98,10 +108,11 @@ export function anchorUserMessageScrollTop({
   let rowTop = index.turnTop(turnIndex);
   for (const row of turn.rows) {
     if (
-      row.segment.type === 'userMessage' &&
-      userMessageRowMatchesId(row.segmentId, row.segment.clientMessageId, segmentId)
+      isTranscriptSection(row.segment) &&
+      userMessageRowMatchesId(row.segmentId,
+        row.segment.type === 'userMessage' ? row.segment.clientMessageId : null, segmentId)
     ) {
-      return userMessageAnchorScrollTop(rowTop, topPadding);
+      return transcriptSectionAnchorScrollTop(rowTop, topPadding);
     }
     rowTop += row.height + index.heightAfterRow(turn.turnId, row.id);
   }
@@ -111,9 +122,9 @@ export function anchorUserMessageScrollTop({
 export {
   historicalMessageNavigationDestination,
   initialTranscriptScrollTarget,
-  nextUserMessageScrollAnchor,
+  nextTranscriptSectionScrollAnchor,
   nextTranscriptNavigationDestination,
-  previousUserMessageScrollAnchor,
+  previousTranscriptSectionScrollAnchor,
   resolveInitialTranscriptScrollTarget,
   resolveMessageAnchorScroll,
   transcriptViewportAnchorScrollTop,
