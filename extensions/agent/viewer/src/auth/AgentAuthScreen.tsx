@@ -2,6 +2,7 @@ import { openHostLink } from '@remux/viewer-kit';
 
 import type { AuthValue } from '../../../shared/protocol.ts';
 import { agentCommands } from '../ipc/agentCommands.ts';
+import { AgentExitToTabs } from '../app/AgentExitToTabs.tsx';
 
 type AgentAuthScreenProps = {
   auth: AuthValue;
@@ -63,6 +64,7 @@ export function AgentAuthScreen({
               {loginMode === 'browser' ? 'Sign in in browser' : 'Sign in with device code'}
             </button>
           )}
+          <AgentExitToTabs />
         </div>
       </section>
     </main>

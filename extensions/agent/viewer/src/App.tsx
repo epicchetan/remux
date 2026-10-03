@@ -39,6 +39,7 @@ import { agentCommands } from './ipc/agentCommands.ts';
 import { viewerModelId } from './nativeViewModel.ts';
 import { useComposerViewport } from './app/useComposerViewport.ts';
 import { useAgentResources } from './app/useAgentResources.ts';
+import { AgentExitToTabs } from './app/AgentExitToTabs.tsx';
 import { AgentExecutionsView } from './agents/AgentExecutionsView.tsx';
 import { useAgentExecutions } from './agents/useAgentExecutions.ts';
 import { readInitialTarget, useAgentNavigation } from './app/useAgentNavigation.ts';
@@ -631,16 +632,20 @@ export function App() {
               >
                 Retry
               </button>
+              <AgentExitToTabs />
             </div>
           </section>
         </main>
       );
     }
     return (
-      <main className="agent-app agent-center" aria-live="polite">
-        <p>{connectionStatus.type === 'connected'
+      <main className="agent-app agent-center flex-col text-center">
+        <p aria-live="polite">{connectionStatus.type === 'connected'
           ? 'Connecting to agent runtime…'
           : 'Reconnecting to Remux…'}</p>
+        <div className="agent-auth-actions">
+          <AgentExitToTabs />
+        </div>
       </main>
     );
   }

@@ -46,6 +46,8 @@ export async function installAgentHost(page: Page) {
     const signedOut = route.get('fixtureSignedOut') === '1';
     let deliveryResolved = false;
     const resourceReadFailure = route.get('fixtureResourceFailure') === '1';
+    const holdAgentResources = route.get('fixtureHoldAgentResources') === '1';
+    const initialHostDisconnected = route.get('fixtureHostDisconnected') === '1';
     const routedConversation = route.get('remuxResourceKind') === 'agentConversation'
       && route.get('remuxResourceId') === conversationId;
     const longTranscript = route.get('fixtureLong') === '1';
@@ -2599,7 +2601,7 @@ export async function installAgentHost(page: Page) {
           if (request.type === 'remux/ready' || request.type === 'ready') {
             dispatch({
               type: 'remux/status', error: null,
-              status: { type: 'connected', cwd: '/tmp/remux-fixture', generation: 1 },
+              status: initialHostDisconnected ? { type: 'reconnecting' } : { type: 'connected', cwd: '/tmp/remux-fixture', generation: 1 },
             });
             dispatch({
               type: 'remux/lifecycle',
@@ -2608,6 +2610,7 @@ export async function installAgentHost(page: Page) {
             return;
           }
           if (request.id !== undefined && request.method) {
+            if (holdAgentResources && request.method === 'remux/agent/resources/read') return;
             try {
               if (request.method === 'remux/agent/conversation/create' && nextCreateResponseDelayMs > 0) {
                 const delay = nextCreateResponseDelayMs;
