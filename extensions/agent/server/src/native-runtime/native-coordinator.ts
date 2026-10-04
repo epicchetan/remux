@@ -3537,11 +3537,7 @@ export class NativeAgentCoordinator {
             }),
         (accepted, staged) => {
           if (accepted.kind === 'root-turn') {
-            const admitted = this.journal.admitQueuedTurn(
-              accepted.intendedTurnId!, this.now(), accepted.nativeTurnId);
-            if (!admitted && !this.journal.turn(accepted.intendedTurnId!)) {
-              throw new Error('Queued message disappeared before recovered acceptance was admitted.');
-            }
+            const admitted = this.journal.admitRootDelivery(accepted, this.now());
             inserted = this.journal.appendProviderEvents(staged.map(({ envelope }) => envelope));
             return admitted;
           }
@@ -3903,8 +3899,7 @@ export class NativeAgentCoordinator {
             ...(queued.effort ? { effort: queued.effort } : {}),
             ...(queued.serviceTier ? { serviceTier: queued.serviceTier } : {}),
           }, boundary), (accepted, staged) => {
-            const admitted = this.journal.admitQueuedTurn(queued.turnId, this.now(), accepted.nativeTurnId);
-            if (!admitted && !this.journal.turn(queued.turnId)) throw new Error('Queued message disappeared before provider acceptance was admitted.');
+            const admitted = this.journal.admitRootDelivery(accepted, this.now());
             admittedEvents = this.journal.appendProviderEvents(staged.map(({ envelope }) => envelope));
             return admitted;
           }, (staged) => this.prepareStagedProviderEvents(conversationId, staged));
@@ -4603,14 +4598,7 @@ export class NativeAgentCoordinator {
           unresolved.attemptId,
           () => session.readTurnPresence!(unresolved.nativeClientMessageId!),
           (accepted, staged) => {
-            const admitted = this.journal.admitQueuedTurn(
-              accepted.intendedTurnId!,
-              this.now(),
-              accepted.nativeTurnId,
-            );
-            if (!admitted && !this.journal.turn(accepted.intendedTurnId!)) {
-              throw new Error('Queued message disappeared before late acceptance was admitted.');
-            }
+            const admitted = this.journal.admitRootDelivery(accepted, this.now());
             admittedEvents = this.journal.appendProviderEvents(staged.map(({ envelope }) => envelope));
             return admitted;
           },

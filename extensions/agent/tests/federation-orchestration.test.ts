@@ -1,3 +1,4 @@
+import { rootDeliveryFixture } from './fixtures/root-delivery.ts';
 import type { Query as ClaudeQuery, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { FakeClaudeQuery } from './fixtures/fake-claude-query.ts';
 import { ClaudeNativeAdapter } from '../server/src/providers/claude/claude-adapter.ts';
@@ -240,7 +241,7 @@ test('restart after watcher loss retains exactly one origin-tagged continuation'
     finish(journal, 'child', 'child-turn');
     control(after).finalizeFederatedExecution('child');
     const queued = journal.claimQueuedTurn('chat', 41)!;
-    journal.admitQueuedTurn(queued.turnId, 42);
+    journal.admitRootDelivery(rootDeliveryFixture(journal.conversation('chat')!, queued), 42);
     assert.equal(journal.turn(queued.turnId)?.origin, 'federation-notification');
     assert.deepEqual(journal.turn(queued.turnId)?.trigger, { kind: 'federation', childExecutionId: 'child', summary: '' });
     control(after).finalizeFederatedExecution('child');

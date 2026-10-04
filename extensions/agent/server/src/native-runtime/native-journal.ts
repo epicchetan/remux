@@ -1733,64 +1733,70 @@ export class NativeAgentJournal {
       }));
   }
 
-  admitQueuedTurn(turnId: string, now: number, nativeTurnId?: string) {
+  admitRootDelivery(attempt: FrozenDeliveryAttempt, now: number) {
     return this.transaction(() => {
-      const row = this.database.prepare(`
-        SELECT * FROM queued_messages WHERE turn_id = ? AND state = 'dispatching'
-      `).get(turnId) as Record<string, unknown> | undefined;
-      if (!row) return undefined;
-      const queued = queueRow(row);
-      const conversation = this.conversation(String(row.conversation_id));
-      if (!conversation) throw new Error('Queued message conversation does not exist.');
+      if (attempt.kind !== 'root-turn' || !attempt.intendedTurnId || !attempt.clientMessageId ||
+          !attempt.acceptanceEvidence || !['dispatching', 'unknown'].includes(attempt.state)) {
+        throw new Error('Root turn admission requires a proven delivery attempt.');
+      }
+      const conversation = this.conversation(attempt.conversationId);
+      if (!conversation || conversation.rootExecutionId !== attempt.executionId ||
+          conversation.providerInstanceId !== attempt.providerInstanceId) {
+        throw new Error('Root delivery does not belong to the current conversation execution.');
+      }
+      const existing = this.turn(attempt.intendedTurnId);
+      if (existing) {
+        if (existing.conversationId !== attempt.conversationId ||
+            existing.executionId !== attempt.executionId || existing.commandId !== attempt.commandId ||
+            existing.clientMessageId !== attempt.clientMessageId) {
+          throw new Error('Root delivery conflicts with an existing turn.');
+        }
+        this.database.prepare('DELETE FROM queued_messages WHERE command_id = ?').run(attempt.commandId);
+        return existing;
+      }
+      // The queue is a removable composer proposal. The frozen delivery body
+      // remains authoritative after a timeout or after its queue card is removed.
+      const payload = JSON.parse(attempt.recoveryPayloadJson) as {
+        content: UserContentPart[]; model: string; effort?: string; serviceTier?: string;
+        access: string; origin?: TurnOrigin; trigger?: TurnTrigger; triggers?: TurnTrigger[];
+      };
       this.createTurn({
-        turnId: queued.turnId,
-        conversationId: conversation.conversationId,
-        executionId: conversation.rootExecutionId,
-        clientMessageId: String(row.client_message_id),
-        commandId: queued.commandId,
-        content: queued.content,
-        origin: queued.origin,
-        trigger: queued.trigger,
-        triggers: queued.triggers,
-        model: queued.model,
-        ...(queued.effort ? { effort: queued.effort } : {}),
-        ...(queued.serviceTier ? { serviceTier: queued.serviceTier } : {}),
+        turnId: attempt.intendedTurnId,
+        conversationId: attempt.conversationId,
+        executionId: attempt.executionId,
+        clientMessageId: attempt.clientMessageId,
+        commandId: attempt.commandId,
+        content: payload.content,
+        origin: payload.origin,
+        trigger: payload.trigger,
+        triggers: payload.triggers,
+        model: payload.model,
+        effort: payload.effort,
+        serviceTier: payload.serviceTier,
         state: 'running',
         now,
       });
-      if (nativeTurnId) {
+      if (attempt.nativeTurnId) {
         this.upsertNativeTurnBinding({
-          providerInstanceId: conversation.providerInstanceId,
-          executionId: conversation.rootExecutionId,
-          turnId: queued.turnId,
-          nativeTurnId,
+          providerInstanceId: attempt.providerInstanceId,
+          executionId: attempt.executionId,
+          turnId: attempt.intendedTurnId,
+          nativeTurnId: attempt.nativeTurnId,
           now,
         });
       }
       this.database.prepare(`
         UPDATE conversations SET model = ?, effort = ?, service_tier = ?, access = ?, health_message = NULL,
           updated_at = ? WHERE conversation_id = ?
-      `).run(
-        queued.model,
-        queued.effort ?? null,
-        queued.serviceTier ?? null,
-        queued.access,
-        now,
-        conversation.conversationId,
-      );
+      `).run(payload.model, payload.effort ?? null, payload.serviceTier ?? null, payload.access,
+        now, attempt.conversationId);
       this.database.prepare(`
         UPDATE executions SET model = ?, effort = ?, service_tier = ?, access = ?, updated_at = ?
         WHERE execution_id = ?
-      `).run(
-        queued.model,
-        queued.effort ?? null,
-        queued.serviceTier ?? null,
-        queued.access,
-        now,
-        conversation.rootExecutionId,
-      );
-      this.database.prepare('DELETE FROM queued_messages WHERE turn_id = ?').run(turnId);
-      return queued;
+      `).run(payload.model, payload.effort ?? null, payload.serviceTier ?? null, payload.access,
+        now, attempt.executionId);
+      this.database.prepare('DELETE FROM queued_messages WHERE command_id = ?').run(attempt.commandId);
+      return this.turn(attempt.intendedTurnId)!;
     });
   }
 

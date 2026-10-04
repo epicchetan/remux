@@ -76,7 +76,7 @@ test('delivery owner persists proof and stage across atomic admission rollback, 
       try { boundary.markPossiblySent('fixture-session-1', 'generation-1'); } catch (error) { secondCrossError = error; }
       return { accepted: true, outcome: 'accepted', evidence: proof, nativeTurnId: 'turn-1' };
     }, () => {
-      journal.admitQueuedTurn('turn-1', 100, 'turn-1');
+      journal.admitRootDelivery(owner.get(attempt.attemptId)!, 100);
       throw new Error('injected admission fault');
     }), /injected admission fault/u);
     assert.match(String(secondCrossError), /only be used once/u);
@@ -88,7 +88,7 @@ test('delivery owner persists proof and stage across atomic admission rollback, 
     await owner.reconcile(attempt.attemptId, async () => ({ presence: 'unknown', reason: 'unused' }),
       (accepted, staged) => {
         admissions += 1;
-        const admitted = journal.admitQueuedTurn(accepted.intendedTurnId!, 100, accepted.nativeTurnId);
+        const admitted = journal.admitRootDelivery(accepted, 100);
         journal.appendProviderEvents(staged.map(({ envelope: event }) => event));
         return admitted;
       });
@@ -109,7 +109,7 @@ test('delivery owner persists proof and stage across atomic admission rollback, 
   } finally { journal.close(); }
 });
 
-test('file-backed proof and stage survive close after admission rollback and recover exactly once', async () => {
+test('file-backed proof and stage recover exactly once after admission rollback and queue-card removal', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'remux-delivery-owner-reopen-'));
   const path = join(directory, 'agent.sqlite3');
   const first = await fixture(100, new DatabaseSync(path));
@@ -119,9 +119,11 @@ test('file-backed proof and stage survive close after admission rollback and rec
       boundary.markPossiblySent('fixture-session-1', 'generation-1');
       return { accepted: true, outcome: 'accepted', evidence: proof, nativeTurnId: 'turn-1' };
     }, (accepted) => {
-      first.journal.admitQueuedTurn(accepted.intendedTurnId!, 100, accepted.nativeTurnId);
+      first.journal.admitRootDelivery(accepted, 100);
       throw new Error('file-backed admission fault');
     }), /file-backed admission fault/u);
+    first.journal.markQueuedTurnDeliveryUnknown('turn-1');
+    assert.equal(first.journal.removeQueuedTurnById('conversation-1', 'turn-1', 101), true);
   } finally { first.journal.close(); }
 
   const reopenedJournal = new NativeAgentJournal(new DatabaseSync(path));
@@ -140,7 +142,7 @@ test('file-backed proof and stage survive close after admission rollback and rec
       return { presence: 'unknown', reason: 'durable proof makes this unnecessary' };
     }, (accepted, staged) => {
       admissions += 1;
-      reopenedJournal.admitQueuedTurn(accepted.intendedTurnId!, 200, accepted.nativeTurnId);
+      reopenedJournal.admitRootDelivery(accepted, 200);
       reopenedJournal.appendProviderEvents(staged.map(({ envelope: event }) => event));
     });
     await reopenedOwner.reconcile('attempt-1', async () => {
@@ -271,7 +273,7 @@ test('atomic prefix admission retains and orders observations staged during prep
       boundary.markPossiblySent('fixture-session-1', 'generation-1');
       return { accepted: true, outcome: 'accepted', evidence: proof, nativeTurnId: 'turn-1' };
     }, (accepted, staged) => {
-      journal.admitQueuedTurn(accepted.intendedTurnId!, 100, accepted.nativeTurnId);
+      journal.admitRootDelivery(accepted, 100);
       journal.appendProviderEvents(staged.map(({ envelope: event }) => event));
     }, async (staged) => {
       preparationStarted();
@@ -485,7 +487,7 @@ test('Claude active input freezes queued content and accepts repeated exact repl
         kind: 'claude-root-processing', sessionId: 'fixture-session-1',
         userMessageUuid: 'turn-1', observationUuid: 'root-observation',
       } };
-    }, (accepted) => journal.admitQueuedTurn(accepted.intendedTurnId!, 100, accepted.nativeTurnId));
+    }, (accepted) => journal.admitRootDelivery(accepted, 100));
     journal.claimCommand('command-2', 'turn.send', { commandId: 'command-2' }, 101);
     journal.enqueueTurn({ commandId: 'command-2', conversationId: 'conversation-1', turnId: 'reserved-turn-2',
       clientMessageId: 'viewer-message-2', content: [{ type: 'text', text: 'follow up' }],
@@ -577,7 +579,7 @@ test('active federation notifications retain origin and trigger through correlat
       return { accepted: true, outcome: 'accepted', nativeTurnId: 'turn-1', evidence: {
         kind: 'claude-root-processing', sessionId: 'fixture-session-1', userMessageUuid: 'turn-1', observationUuid: 'root-proof',
       } };
-    }, accepted => journal.admitQueuedTurn(accepted.intendedTurnId!, 100, accepted.nativeTurnId));
+    }, accepted => journal.admitRootDelivery(accepted, 100));
     const trigger = { kind: 'federation' as const, childExecutionId: 'astra', summary: 'Done' };
     const content = [{ type: 'text' as const, text: 'Federated child astra (codex) completed: Done' }];
     journal.claimCommand('notification', 'turn.send', { trigger }, 101);

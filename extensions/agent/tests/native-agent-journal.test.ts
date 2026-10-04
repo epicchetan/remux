@@ -1,3 +1,4 @@
+import { rootDeliveryFixture } from './fixtures/root-delivery.ts';
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -865,7 +866,8 @@ test('native journal queue is durable FIFO and retains a claim until provider ac
     assert.equal(journal.claimQueuedTurn('conversation-1', 11), undefined,
       'a dispatching head blocks later FIFO entries');
     assert.equal(journal.queuedMessages('conversation-1')[0]?.serviceTier, 'priority');
-    assert.equal(journal.admitQueuedTurn('turn-1', 11, 'fixture-native-turn-1')?.turnId, 'turn-1');
+    assert.equal(journal.admitRootDelivery(rootDeliveryFixture(journal.conversation('conversation-1')!,
+      journal.queuedMessages('conversation-1')[0]!, 'fixture-native-turn-1'), 11)?.turnId, 'turn-1');
     assert.equal(journal.turn('turn-1')?.state, 'running');
     assert.equal(journal.turn('turn-1')?.serviceTier, 'priority',
       'queue admission snapshots the inference tier into transcript history');
@@ -1487,7 +1489,8 @@ test('native turn trigger lists survive journal reopen and queued turn admission
     assert.deepEqual(journal.queuedMessages('conversation-1')[0]?.triggers, triggers);
     assert.deepEqual(journal.queuedEntries('conversation-1')[0]?.kind, 'message');
     journal.claimQueuedTurn('conversation-1', 5);
-    journal.admitQueuedTurn('queued-turn', 6);
+    journal.admitRootDelivery(rootDeliveryFixture(journal.conversation('conversation-1')!,
+      journal.queuedMessages('conversation-1')[0]!), 6);
     assert.deepEqual(journal.turn('queued-turn')?.triggers, triggers);
     assert.deepEqual(journal.turn('queued-turn')?.trigger, triggers[0]);
   } finally {

@@ -2677,6 +2677,71 @@ test('provider-accepted edit fails closed when the conversation head changes bef
   }
 });
 
+for (const removeQueueCard of [false, true]) {
+  test(`late root processing recovers a timed-out delivery with ${removeQueueCard ? 'a removed' : 'an uncertain'} queue card`, async () => {
+    const journal = createJournal();
+    const fixture = new NativeFixtureAdapter({ delayMs: 80, finalText: 'Recovered reply.' });
+    let proofAvailable = false;
+    let writes = 0;
+    const adapter: ProviderAdapter = {
+      probe: (id) => fixture.probe(id),
+      listModels: (id) => fixture.listModels(id),
+      openSession: async (input) => {
+        const session = await fixture.openSession(input);
+        const start = session.startTurn.bind(session);
+        let proof: Extract<Awaited<ReturnType<typeof start>>, { accepted: true }> | undefined;
+        session.startTurn = async (request, boundary) => {
+          writes += 1;
+          const result = await start(request, boundary);
+          assert.equal(result.accepted, true);
+          if (writes > 1) return result;
+          if (result.accepted) proof = result;
+          return { accepted: false, outcome: 'unknown',
+            crossing: { phase: 'possibly-sent', detail: 'response-lost' },
+            error: { code: 'fixture_acceptance_timeout', message: 'Processing proof arrived after timeout.' } };
+        };
+        const providerSession: ProviderSession = session;
+        providerSession.readTurnPresence = async () => proofAvailable && proof
+          ? { presence: 'present', evidence: proof.evidence }
+          : { presence: 'unknown', reason: 'Waiting for root processing.' };
+        return providerSession;
+      },
+    };
+    const terminals: string[] = [];
+    const coordinator = new NativeAgentCoordinator({ journal, providers: [{
+      providerInstanceId: 'fixture-local', provider: 'fixture', label: 'Fixture', adapter,
+    }], onTerminalTurn: ({ turnId }) => terminals.push(turnId) });
+    try {
+      await coordinator.initialize();
+      const created = await coordinator.createConversation({ commandId: 'create-late-root',
+        providerInstanceId: 'fixture-local', cwd: '/workspace/remux', model: 'fixture-native-v1',
+        access: 'workspace-write' });
+      const first = await coordinator.sendMessage(configuredMessage(coordinator, {
+        commandId: 'late-root', conversationId: created.conversationId,
+        clientMessageId: 'late-client', content: [{ type: 'text', text: 'Explain this.' }],
+      }));
+      assert.equal(journal.queuedMessages(created.conversationId)[0]?.state, 'delivery-unknown');
+      assert.equal(journal.turn(first.turnId), undefined);
+      if (removeQueueCard) journal.removeQueuedTurnById(created.conversationId, first.turnId, Date.now());
+      await coordinator.sendMessage(configuredMessage(coordinator, {
+        commandId: 'after-late-root', conversationId: created.conversationId,
+        clientMessageId: 'after-late-client', content: [{ type: 'text', text: 'Next message.' }],
+      }));
+      assert.equal(writes, 1, 'unproven delivery holds later work');
+      proofAvailable = true;
+      await waitFor(() => terminals.length === 2);
+      assert.equal(writes, 2, 'recovering the first message never resends it');
+      assert.equal(journal.turn(first.turnId)?.outcome, 'completed');
+      assert.deepEqual(journal.turn(first.turnId)?.userContent, [{ type: 'text', text: 'Explain this.' }]);
+      assert.equal(journal.database.prepare("SELECT state FROM delivery_attempts WHERE command_id='late-root'")
+        .get()?.state, 'accepted');
+      assert.equal(journal.database.prepare('SELECT COUNT(*) count FROM delivery_attempt_staging').get()?.count, 0);
+      assert.equal(coordinator.projector.runtimeResource(created.conversationId)?.deliveryHeld, false);
+      assert.equal(journal.queuedMessages(created.conversationId).length, 0);
+    } finally { await coordinator.close(); journal.close(); }
+  });
+}
+
 test('an unknown durable root delivery fences later work after its queue card is removed', async () => {
   const journal = createJournal();
   const fixture = new NativeFixtureAdapter();
