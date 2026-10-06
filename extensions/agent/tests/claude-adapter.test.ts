@@ -17,6 +17,13 @@ import type {
   Options as ClaudeQueryOptions,
   Query as ClaudeQuery,
   SDKUserMessage,
+  SessionMessage,
+} from '@anthropic-ai/claude-agent-sdk';
+
+import {
+  forkSession as sdkForkSession,
+  getSessionMessages as sdkGetSessionMessages,
+  InMemorySessionStore,
 } from '@anthropic-ai/claude-agent-sdk';
 
 import {
@@ -1971,6 +1978,169 @@ function latestTurnBlocks(events: readonly ProviderEventEnvelope[]) {
   return [...latest.values()];
 }
 
+function savedClaudeMessage(uuid: string, type: SessionMessage['type']): SessionMessage {
+  return {
+    type, uuid, session_id: 'saved-session', message: { role: type, content: [] },
+    parent_tool_use_id: null, parent_agent_id: null,
+  };
+}
+
+for (const boundary of ['before', 'through'] as const) {
+  test(`Claude first turn after a ${boundary} fork retains inherited history across reopen and another edit`, async (t) => {
+    const forks: Array<[string, ForkSessionOptions | undefined]> = [];
+    let query: FakeClaudeQuery;
+    let prompt: AsyncIterable<SDKUserMessage>;
+    let nextPromptUuid = '';
+    const originalCursor = {
+      version: 1, promptUuid: 'original-prompt',
+      previousChainEntryUuid: 'original-prefix', lastChainEntryUuid: 'original-answer',
+    };
+    const inheritedBoundary = boundary === 'before' ? 'original-prefix' : 'original-answer';
+    const forkedBoundary = 'rewritten-prefix-in-fork';
+    const adapter = new ClaudeNativeAdapter({
+      acceptanceTimeoutMs: 50,
+      createQuery: (input) => {
+        query = new FakeClaudeQuery();
+        prompt = input.prompt as AsyncIterable<SDKUserMessage>;
+        return query as unknown as ClaudeQuery;
+      },
+      getSessionMessages: async (sessionId, options) => {
+        assert.deepEqual(options, { dir: '/workspace/remux', includeSystemMessages: true });
+        if (sessionId === 'saved-source') return [
+          savedClaudeMessage('original-prefix', 'assistant'), savedClaudeMessage('original-prompt', 'user'),
+        ];
+        if (sessionId === 'saved-fork-1') return [
+          savedClaudeMessage(forkedBoundary, 'assistant'),
+          ...(nextPromptUuid ? [savedClaudeMessage(nextPromptUuid, 'user')] : []),
+        ];
+        return [savedClaudeMessage('rewritten-prefix-in-second-fork', 'assistant')];
+      },
+      forkSession: async (sessionId, options) => {
+        forks.push([sessionId, options]);
+        return { sessionId: `saved-fork-${forks.length}` };
+      },
+    });
+    const input = {
+      commandId: 'open-saved-source', providerInstanceId: 'claude-local',
+      conversationId: 'conversation-repeat-edit', executionId: 'source-execution',
+      mode: 'resume' as const,
+      nativeSession: { provider: 'claude-code' as const, providerInstanceId: 'claude-local', sessionId: 'saved-source' },
+      cwd: '/workspace/remux', model: 'claude-sonnet-4-6', access: 'workspace-write' as const,
+      developerInstructions: [],
+    };
+    const source = await adapter.openSession(input);
+    t.after(() => source.close());
+    const fork = await source.fork({ commandId: 'first-fork', branchCursor: originalCursor,
+      ...(boundary === 'before' ? { beforeNativeTurnId: 'original-turn' } : { throughNativeTurnId: 'original-turn' }) });
+    const attached = await adapter.openSession({ ...input, commandId: 'attach-fork',
+      executionId: 'fork-execution', mode: 'attach', nativeSession: fork });
+    t.after(() => attached.close());
+    const persistedSession = attached.nativeSession;
+    await attached.close();
+    const resumed = await adapter.openSession({ ...input, commandId: 'reopen-fork',
+      executionId: 'fork-execution', nativeSession: persistedSession });
+    t.after(() => resumed.close());
+    const turn = resumed.startTurn({ commandId: 'edited-prompt', conversationId: input.conversationId,
+      executionId: 'fork-execution', turnId: 'edited-turn', content: [{ type: 'text', text: 'Explain ideas 1 and 6.' }] });
+    const sent = await prompt![Symbol.asyncIterator]().next();
+    nextPromptUuid = sent.value!.uuid!;
+    query!.emit({ ...sent.value, session_id: resumed.nativeSession.sessionId });
+    query!.emit({ type: 'assistant', uuid: 'edited-answer', session_id: resumed.nativeSession.sessionId,
+      parent_tool_use_id: null, user_message_uuid: nextPromptUuid,
+      message: { id: 'edited-answer-id', role: 'assistant', content: [{ type: 'text', text: 'Using the earlier ideas.' }] } });
+    query!.emit({ type: 'result', subtype: 'success', uuid: 'edited-result',
+      session_id: resumed.nativeSession.sessionId, is_error: false });
+    await turn;
+    const event = await waitForClaudeEvent(resumed, ({ event }) => event.type === 'turn.branch-point');
+    assert.ok(event.event.type === 'turn.branch-point');
+    const cursor = event.event.cursor as Record<string, string>;
+    assert.equal(cursor.previousChainEntryUuid, forkedBoundary,
+      'the first turn in a new execution is not the first turn in the inherited native history');
+    await resumed.fork({ commandId: 'repeat-edit', beforeNativeTurnId: 'edited-turn', branchCursor: event.event.cursor });
+    assert.deepEqual(forks, [
+      ['saved-source', { dir: input.cwd, upToMessageId: inheritedBoundary }],
+      ['saved-fork-1', { dir: input.cwd, upToMessageId: forkedBoundary }],
+    ]);
+  });
+}
+
+test('Claude edit uses the saved chain when a recorded previous cursor incorrectly says first turn', async (t) => {
+  const forks: Array<ForkSessionOptions | undefined> = [];
+  const adapter = new ClaudeNativeAdapter({
+    createQuery: () => new FakeClaudeQuery() as unknown as ClaudeQuery,
+    getSessionMessages: async (sessionId) => sessionId === 'repaired-fork'
+      ? [savedClaudeMessage('rewritten-compact-boundary', 'system')]
+      : [
+      savedClaudeMessage('earlier-answer', 'assistant'),
+      savedClaudeMessage('compact-boundary', 'system'),
+      savedClaudeMessage('edited-prompt', 'user'),
+    ],
+    forkSession: async (_sessionId, options) => { forks.push(options); return { sessionId: 'repaired-fork' }; },
+  });
+  const session = await adapter.openSession({ commandId: 'open-bad-cursor', providerInstanceId: 'claude-local',
+    conversationId: 'bad-cursor-conversation', executionId: 'bad-cursor-execution', mode: 'create',
+    cwd: '/workspace/remux', model: 'claude-sonnet-4-6', access: 'workspace-write', developerInstructions: [] });
+  t.after(() => session.close());
+  const fork = await session.fork({ commandId: 'edit-bad-cursor', beforeNativeTurnId: 'edited-turn', branchCursor: {
+    version: 1, promptUuid: 'edited-prompt', previousChainEntryUuid: null, lastChainEntryUuid: 'edited-answer',
+  } });
+  assert.deepEqual(forks, [{ dir: '/workspace/remux', upToMessageId: 'compact-boundary' }]);
+  assert.deepEqual(fork.resumeCursor, { sessionId: 'repaired-fork', lastChainEntryUuid: 'rewritten-compact-boundary' });
+});
+
+test('Claude edit preserves the earlier answer using the actual SDK fork and rewritten transcript IDs', async (t) => {
+  const store = new InMemorySessionStore();
+  const sessionId = '11111111-1111-4111-8111-111111111111';
+  const promptUuid = '22222222-2222-4222-8222-222222222222';
+  const prefixUuid = '33333333-3333-4333-8333-333333333333';
+  const editedUuid = '44444444-4444-4444-8444-444444444444';
+  const records = [
+    { type: 'user', uuid: promptUuid, parentUuid: null,
+      message: { role: 'user', content: 'What research ideas should we test?' } },
+    { type: 'assistant', uuid: prefixUuid, parentUuid: promptUuid,
+      message: { role: 'assistant', content: [{ type: 'text', text: '1. Risk premium. 6. Compare products.' }] } },
+    { type: 'user', uuid: editedUuid, parentUuid: prefixUuid,
+      message: { role: 'user', content: 'Explain ideas 1 and 6.' } },
+  ].map((record, index) => ({ ...record, sessionId, isSidechain: false,
+    timestamp: new Date(1_700_000_000_000 + index).toISOString() }));
+  await store.append({ projectKey: '-workspace-remux', sessionId }, records);
+  const adapter = new ClaudeNativeAdapter({
+    createQuery: () => new FakeClaudeQuery() as unknown as ClaudeQuery,
+    forkSession: (id, options) => sdkForkSession(id, { ...options, sessionStore: store }),
+    getSessionMessages: (id, options) => sdkGetSessionMessages(id, { ...options, sessionStore: store }),
+  });
+  const session = await adapter.openSession({ commandId: 'open-sdk-source', providerInstanceId: 'claude-local',
+    conversationId: 'sdk-conversation', executionId: 'sdk-execution', mode: 'resume', cwd: '/workspace/remux',
+    nativeSession: { provider: 'claude-code', providerInstanceId: 'claude-local', sessionId },
+    model: 'claude-sonnet-4-6', access: 'workspace-write', developerInstructions: [] });
+  t.after(() => session.close());
+  const fork = await session.fork({ commandId: 'edit-sdk-source', beforeNativeTurnId: 'edited-turn', branchCursor: {
+    version: 1, promptUuid: editedUuid, previousChainEntryUuid: null, lastChainEntryUuid: editedUuid,
+  } });
+  const messages = await sdkGetSessionMessages(fork.sessionId, { dir: '/workspace/remux', sessionStore: store });
+  assert.equal(messages.length, 2);
+  assert.deepEqual(messages.map(({ message }) => message), records.slice(0, 2).map(({ message }) => message));
+  assert.notEqual(messages.at(-1)!.uuid, prefixUuid, 'the SDK generates destination UUIDs');
+  assert.deepEqual(fork.resumeCursor, { sessionId: fork.sessionId, lastChainEntryUuid: messages.at(-1)!.uuid });
+});
+
+for (const savedMessages of [[], [savedClaudeMessage('missing-prompt', 'assistant')]]) {
+  test(`Claude refuses an edit whose saved user message is ${savedMessages.length ? 'not a user entry' : 'missing'}`, async (t) => {
+    const adapter = new ClaudeNativeAdapter({
+      createQuery: () => new FakeClaudeQuery() as unknown as ClaudeQuery,
+      getSessionMessages: async () => savedMessages,
+      forkSession: async () => { assert.fail('An unverified edit must not fork or start fresh.'); },
+    });
+    const session = await adapter.openSession({ commandId: 'open-missing-prompt', providerInstanceId: 'claude-local',
+      conversationId: 'missing-conversation', executionId: 'missing-execution', mode: 'create', cwd: '/workspace/remux',
+      model: 'claude-sonnet-4-6', access: 'workspace-write', developerInstructions: [] });
+    t.after(() => session.close());
+    await assert.rejects(session.fork({ commandId: 'edit-missing-prompt', beforeNativeTurnId: 'missing-turn', branchCursor: {
+      version: 1, promptUuid: 'missing-prompt', previousChainEntryUuid: null, lastChainEntryUuid: 'missing-answer',
+    } }), /could not locate the original message.*edit was not applied/u);
+  });
+}
+
 for (const boundary of ['before', 'through'] as const) {
   test(`Claude native fork copies the persisted chain boundary ${boundary} the turn offline`, async () => {
     const invocations: Array<ClaudeQueryOptions | undefined> = [];
@@ -1985,6 +2155,7 @@ for (const boundary of ['before', 'through'] as const) {
         forks.push([sessionId, options]);
         return { sessionId: 'forked-session' };
       },
+      getSessionMessages: async () => [savedClaudeMessage('rewritten-fork-tail', 'assistant')],
     });
     const session = await adapter.openSession({
       commandId: 'open-fork-source',
@@ -2023,7 +2194,10 @@ for (const boundary of ['before', 'through'] as const) {
         provider: 'claude-code',
         providerInstanceId: 'claude-local',
         sessionId: 'forked-session',
-        resumeCursor: { sessionId: 'forked-session' },
+        resumeCursor: {
+          sessionId: 'forked-session',
+          lastChainEntryUuid: 'rewritten-fork-tail',
+        },
       });
     } finally {
       await session.close();
@@ -2045,6 +2219,10 @@ for (const destinationSessionId of ['22222222-2222-4222-8222-222222222222', unde
         forkCalls += 1;
         throw new Error('First-turn edits must not call the SDK fork.');
       },
+      getSessionMessages: async () => [
+        savedClaudeMessage('33333333-3333-4333-8333-333333333333', 'user'),
+        savedClaudeMessage('55555555-5555-4555-8555-555555555555', 'assistant'),
+      ],
     });
     const openInput = {
       commandId: 'open-fresh-source',

@@ -8,6 +8,7 @@ import { promisify } from 'node:util';
 
 import {
   forkSession,
+  getSessionMessages,
   query as claudeQuery,
   type AccountInfo as ClaudeAccountInfo,
   type HookCallback,
@@ -196,6 +197,7 @@ export type ClaudeNativeAdapterOptions = {
   environment?: Readonly<Record<string, string | undefined>>;
   createQuery?: ClaudeQueryFactory;
   forkSession?: typeof forkSession;
+  getSessionMessages?: typeof getSessionMessages;
   runCli?: (
     args: readonly string[],
     options?: { timeoutMs?: number; strict?: boolean },
@@ -222,6 +224,7 @@ export class ClaudeNativeAdapter implements ProviderAdapter {
   private readonly environment?: Readonly<Record<string, string | undefined>>;
   private readonly createQuery: ClaudeQueryFactory;
   private readonly forkSession: typeof forkSession;
+  private readonly getSessionMessages: typeof getSessionMessages;
   private readonly runCli: (
     args: readonly string[],
     options?: { timeoutMs?: number; strict?: boolean },
@@ -241,6 +244,7 @@ export class ClaudeNativeAdapter implements ProviderAdapter {
     this.environment = options.environment;
     this.createQuery = options.createQuery ?? claudeQuery;
     this.forkSession = options.forkSession ?? forkSession;
+    this.getSessionMessages = options.getSessionMessages ?? getSessionMessages;
     this.resolveImageArtifact = options.resolveImageArtifact;
     this.now = options.now ?? Date.now;
     this.acceptanceTimeoutMs = options.acceptanceTimeoutMs ?? 30_000;
@@ -526,9 +530,21 @@ export class ClaudeNativeAdapter implements ProviderAdapter {
     const cursor = claudeBranchCursor(request.branchCursor);
     if (!cursor) throw new Error('Claude native fork requires an authoritative chain cursor.');
     const before = Boolean(request.beforeNativeTurnId);
-    const upToMessageId = before
-      ? cursor.previousChainEntryUuid
-      : cursor.lastChainEntryUuid;
+    let upToMessageId = before ? cursor.previousChainEntryUuid : cursor.lastChainEntryUuid;
+    if (before && upToMessageId === null) {
+      // A new execution on a fork can have no local turn bindings even though
+      // its native transcript has inherited history. Resolve the edit boundary
+      // from Claude's persisted chain, never from an absent in-memory cursor.
+      const messages = await this.getSessionMessages(sourceSessionId, {
+        dir: sourceInput.cwd,
+        includeSystemMessages: true,
+      });
+      const promptIndex = messages.findIndex(({ uuid }) => uuid === cursor.promptUuid);
+      if (promptIndex < 0 || messages[promptIndex]?.type !== 'user') {
+        throw new Error('Claude could not locate the original message in its saved history. The edit was not applied.');
+      }
+      upToMessageId = promptIndex === 0 ? null : messages[promptIndex - 1]!.uuid;
+    }
     if (upToMessageId === null) {
       const sessionId = request.destinationSessionId ?? randomUUID();
       return {
@@ -544,11 +560,19 @@ export class ClaudeNativeAdapter implements ProviderAdapter {
         dir: sourceInput.cwd,
         upToMessageId,
       });
+      // The SDK rewrites message UUIDs when it copies the transcript. Carry
+      // the destination's boundary, not the UUID from the source session.
+      const forkMessages = await this.getSessionMessages(sessionId, {
+        dir: sourceInput.cwd,
+        includeSystemMessages: true,
+      });
+      const lastChainEntryUuid = forkMessages.at(-1)?.uuid;
+      if (!lastChainEntryUuid) throw new Error('The forked session has no readable saved history.');
       return {
         provider: 'claude-code',
         providerInstanceId: sourceInput.providerInstanceId,
         sessionId,
-        resumeCursor: { sessionId },
+        resumeCursor: { sessionId, lastChainEntryUuid },
       };
     } catch (error) {
       throw new Error(`Claude could not fork the session: ${error instanceof Error ? error.message : String(error)}`);
@@ -702,11 +726,17 @@ export class ClaudeProviderSession implements ProviderSession {
       throw new Error('Claude native fork is unavailable for this session.');
     });
     this.lease = options.lease;
+    const inheritedChainEntryUuid = stringValue(
+      objectValue(options.input.nativeSession?.resumeCursor)?.lastChainEntryUuid,
+    );
     this.nativeSession = {
       provider: 'claude-code',
       providerInstanceId: options.input.providerInstanceId,
       sessionId: options.sessionId,
-      resumeCursor: { sessionId: options.sessionId },
+      resumeCursor: {
+        sessionId: options.sessionId,
+        ...(inheritedChainEntryUuid ? { lastChainEntryUuid: inheritedChainEntryUuid } : {}),
+      },
     };
     if (options.input.activeTurnBinding) {
       this.activeTurn = {
@@ -720,7 +750,7 @@ export class ClaudeProviderSession implements ProviderSession {
       ?.map(({ branchCursor }) => claudeBranchCursor(branchCursor))
       .filter((cursor): cursor is ClaudeBranchCursor => Boolean(cursor))
       .at(-1);
-    this.lastChainEntryUuid = lastCursor?.lastChainEntryUuid;
+    this.lastChainEntryUuid = lastCursor?.lastChainEntryUuid ?? inheritedChainEntryUuid;
     for (const binding of options.input.nativeTurnBindings ?? []) {
       const cursor = claudeBranchCursor(binding.branchCursor);
       if (cursor) this.settledPromptUuids.add(cursor.promptUuid);
