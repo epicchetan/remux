@@ -132,6 +132,7 @@ export function useFileActions() {
     let failed = 0;
     let skipped = 0;
     let uploaded = 0;
+    const failures: string[] = [];
 
     for (const [index, asset] of assets.entries()) {
       const position = `(${index + 1} of ${assets.length})`;
@@ -192,6 +193,7 @@ export function useFileActions() {
 
       if (result.status === 'failed') {
         failed += 1;
+        failures.push(`${asset.name}: ${result.reason}`);
         continue;
       }
 
@@ -200,6 +202,15 @@ export function useFileActions() {
 
     showSummary(uploadSummary({ failed, skipped, total: assets.length, uploaded }));
     refreshAfterMutation();
+    if (failures.length > 0) {
+      Alert.alert(
+        failures.length === 1 ? 'Upload failed' : 'Uploads failed',
+        [
+          ...failures.slice(0, 5),
+          ...(failures.length > 5 ? [`${failures.length - 5} more failed. See diagnostics for details.`] : []),
+        ].join('\n\n'),
+      );
+    }
   }, [refreshAfterMutation, showSummary]);
 
   const runAction = useCallback(async ({ action, target }: PendingFileAction) => {
